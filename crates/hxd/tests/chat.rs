@@ -1,5 +1,5 @@
-//! Phase 2a end-to-end tests: chat, private chats, messaging, and
-//! moderation, driven by scripted legacy clients over real TCP.
+//! Chat, private chats, messaging, and moderation end-to-end tests,
+//! driven by scripted legacy clients over real TCP.
 
 use std::net::SocketAddr;
 use std::path::Path;
