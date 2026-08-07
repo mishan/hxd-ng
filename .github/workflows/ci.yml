@@ -1,0 +1,54 @@
+# hxd-ng CI: the same gates that run locally before anything is called
+# done — fmt, clippy with warnings denied, the full test suite (unit,
+# frame-level, and the e2e suites that drive scripted legacy and WebSocket
+# clients against live servers on ephemeral ports), and a syntax check of
+# the Node test client.
+#
+# The gtkhx submodule pin is fetched over https; advancing it is a
+# deliberate act that this workflow then validates.
+#
+# TODO: add an MSRV (1.85) job once the lockfile is verified to resolve at
+# that toolchain — the pin is inherited from gtkhx's Debian-stable floor
+# but has only ever been exercised on newer rustc here.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  node-client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Syntax-check the ng test client
+        run: node --check tools/ng-client.mjs
