@@ -62,6 +62,7 @@ let session = null; // { session, token }
 let lastSeq = 0;
 let detachInfo = null; // { grace } | null
 let intentionalClose = false;
+let reloginOnClose = false;
 let resumeDelayMs = 1000;
 
 const ts = () => new Date().toISOString().slice(11, 19);
@@ -145,11 +146,14 @@ function connect(kind) {
         lastSeq = r.seq;
         say(`users: ${r.users.map(showUser).join(", ")}`);
       } else if (e?.code === "session_expired") {
+        // Route the reconnect through the close handler — closing fires a
+        // close event on THIS socket, and reconnecting before it lands
+        // would make that handler see a null session and exit.
         say("session expired; logging in fresh");
         session = null;
         lastSeq = 0;
+        reloginOnClose = true;
         ws.close();
-        connect("login");
       } else {
         say("handshake failed:", e?.code ?? e, e?.text ?? "");
         process.exit(1);
@@ -171,6 +175,11 @@ function connect(kind) {
     pending.forEach((p) => p.reject({ code: "closed" }));
     pending.clear();
     if (intentionalClose) process.exit(0);
+    if (reloginOnClose) {
+      reloginOnClose = false;
+      connect("login");
+      return;
+    }
     if (session && detachInfo) {
       say(`connection lost; resuming in ${resumeDelayMs}ms (last_seq=${lastSeq})`);
       setTimeout(() => connect("resume"), resumeDelayMs);

@@ -202,7 +202,25 @@ async fn handle_login(
     req: &ReqEnvelope,
     ws_tx: &mut WsTx,
 ) -> Option<(SessState, UnboundedReceiver<SeqEvent>)> {
-    let p: LoginParams = serde_json::from_value(req.params.clone()).unwrap_or_default();
+    // Absent params is a guest login; *malformed* params is an error, like
+    // every other handler — never mistake a client bug for a guest.
+    let p: LoginParams = if req.params.is_null() {
+        LoginParams::default()
+    } else {
+        match serde_json::from_value(req.params.clone()) {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = ws_tx
+                    .send(Message::Text(reply_err(
+                        req.id,
+                        "bad_request",
+                        "Malformed login.",
+                    )))
+                    .await;
+                return None;
+            }
+        }
+    };
 
     let auth = ctx.auth.clone();
     let (login, password) = (p.login.clone(), p.password.clone());
@@ -270,7 +288,11 @@ async fn handle_login(
         return None;
     };
 
-    let me = ctx.core.user(uid)?;
+    let Some(me) = ctx.core.user(uid) else {
+        ctx.core.end_session(uid);
+        ctx.registry.remove(&session_id);
+        return None;
+    };
     let users: Vec<_> = ctx.core.snapshot().iter().map(user_json).collect();
     let detach = if account.can_detach {
         json!({ "grace": ctx.cfg.grace.as_secs() })
@@ -293,7 +315,17 @@ async fn handle_login(
         "detach": detach,
         "seq": 0,
     });
-    ws_tx.send(Message::Text(reply_ok(req.id, ok))).await.ok()?;
+    if ws_tx
+        .send(Message::Text(reply_ok(req.id, ok)))
+        .await
+        .is_err()
+    {
+        // The client never learned it was logged in; a ghost session with
+        // no transport (and a leaked token) must not linger.
+        ctx.core.end_session(uid);
+        ctx.registry.remove(&session_id);
+        return None;
+    }
     info!(uid, login = %account.login, "ng logged in");
 
     Some((
@@ -354,27 +386,50 @@ async fn handle_resume(
         access,
     };
 
+    // From here the session is attached: any send failure means the new
+    // transport died mid-handshake, and the session must go back through
+    // the connection-lost policy (detach or end) rather than sit live
+    // with a dropped receiver.
+    let lost = |ctx: &NgCtx| {
+        if !ctx.core.connection_lost(uid, ctx.cfg.max_detached_per_addr) {
+            ctx.registry.remove(&p.session);
+        }
+    };
     match replay {
         Some(replay) => {
-            let me = ctx.core.user(uid)?;
+            let Some(me) = ctx.core.user(uid) else {
+                lost(ctx);
+                return None;
+            };
             let ok = json!({ "replay": replay.len(), "self": user_json(&me) });
-            ws_tx.send(Message::Text(reply_ok(req.id, ok))).await.ok()?;
+            if ws_tx
+                .send(Message::Text(reply_ok(req.id, ok)))
+                .await
+                .is_err()
+            {
+                lost(ctx);
+                return None;
+            }
             for se in &replay {
-                ws_tx.send(Message::Text(event_json(se))).await.ok()?;
+                if ws_tx.send(Message::Text(event_json(se))).await.is_err() {
+                    lost(ctx);
+                    return None;
+                }
             }
             info!(uid, replayed = replay.len(), "ng resumed");
         }
         None => {
             // The session is attached and live, but the gap is gone —
             // the client follows with `sync` on this same connection.
-            ws_tx
-                .send(Message::Text(reply_err(
-                    req.id,
-                    "resync_required",
-                    "Event gap unrecoverable; sync required.",
-                )))
-                .await
-                .ok()?;
+            let err = reply_err(
+                req.id,
+                "resync_required",
+                "Event gap unrecoverable; sync required.",
+            );
+            if ws_tx.send(Message::Text(err)).await.is_err() {
+                lost(ctx);
+                return None;
+            }
             info!(uid, "ng resumed with resync required");
         }
     }
@@ -444,10 +499,14 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 "access_denied",
                 "You are not allowed to send private messages.",
             ),
-            Ok(p) => match ctx.core.msg(state.uid, p.to, p.text) {
-                Ok(()) => reply_ok(req.id, json!({})),
-                Err(_) => reply_err(req.id, "bad_request", "That user is not connected."),
-            },
+            Ok(p) => {
+                let mut text = p.text;
+                text.truncate_to_char_boundary(4096);
+                match ctx.core.msg(state.uid, p.to, text) {
+                    Ok(()) => reply_ok(req.id, json!({})),
+                    Err(_) => reply_err(req.id, "bad_request", "That user is not connected."),
+                }
+            }
             Err(_) => reply_err(req.id, "bad_request", "Malformed msg."),
         },
 

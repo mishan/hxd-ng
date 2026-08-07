@@ -404,6 +404,32 @@ async fn bad_token_and_stale_gap_paths() {
 }
 
 #[tokio::test]
+async fn malformed_login_params_are_rejected_not_guested() {
+    let td = tempfile::tempdir().unwrap();
+    let (_legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
+
+    let mut c = Ng::connect(ng_addr).await;
+    let v = c.request("login", json!(42)).await;
+    assert_eq!(v["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn oversized_private_messages_are_truncated() {
+    let td = tempfile::tempdir().unwrap();
+    let (_legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
+
+    let (mut a, _) = Ng::login(ng_addr, "misha", "s3cret", "Misha").await;
+    let (mut b, hello_b) = Ng::login(ng_addr, "", "", "target").await;
+    let b_uid = hello_b["self"]["uid"].as_u64().unwrap();
+
+    let big = "x".repeat(5000);
+    a.request_ok("msg", json!({ "to": b_uid, "text": big }))
+        .await;
+    let ev = b.event("msg").await;
+    assert_eq!(ev["data"]["text"].as_str().unwrap().len(), 4096);
+}
+
+#[tokio::test]
 async fn takeover_closes_the_older_connection() {
     let td = tempfile::tempdir().unwrap();
     let (_legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
