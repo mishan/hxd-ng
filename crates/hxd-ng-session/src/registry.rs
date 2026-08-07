@@ -66,17 +66,29 @@ impl Registry {
     /// matches *and* the session it named still exists (serial check —
     /// a recycled uid must not honor an old token). Invalid or stale
     /// entries are dropped on the way through.
+    ///
+    /// Lock discipline: the entry's fields are copied out and the registry
+    /// lock released *before* consulting the core, so the two mutexes are
+    /// never held together — no ordering to get wrong, no cross-lock
+    /// contention, and immune by construction if the core ever grows a
+    /// path back into the registry.
     pub fn validate(&self, core: &Core, session_id: &str, token: &str) -> Option<Uid> {
-        let mut entries = self.entries.lock().unwrap();
-        let entry = entries.get(session_id)?;
-        if !constant_time_eq(&entry.token_hash, &hash(token)) {
+        let (token_hash, uid, serial) = {
+            let entries = self.entries.lock().unwrap();
+            let entry = entries.get(session_id)?;
+            (entry.token_hash, entry.uid, entry.serial)
+        };
+        if !constant_time_eq(&token_hash, &hash(token)) {
             return None;
         }
-        if core.session_serial(entry.uid) != Some(entry.serial) {
-            entries.remove(session_id);
+        if core.session_serial(uid) != Some(serial) {
+            // Stale: the named session is gone (or its uid was recycled).
+            // Session ids are never reused (monotonic counter), so the key
+            // can't have become valid again since the snapshot.
+            self.entries.lock().unwrap().remove(session_id);
             return None;
         }
-        Some(entry.uid)
+        Some(uid)
     }
 
     /// Forget a session (logout, kick, denial-of-detach).
@@ -85,11 +97,31 @@ impl Registry {
     }
 
     /// Drop entries whose sessions no longer exist (sweeper hygiene).
+    ///
+    /// Same lock discipline as [`Registry::validate`]: snapshot under the
+    /// registry lock, consult the core with no lock held, remove under a
+    /// reacquired lock. Session ids are never reused, so a key stale at
+    /// snapshot time is stale forever — the deferred removal races nothing.
     pub fn prune(&self, core: &Core) {
-        self.entries
-            .lock()
-            .unwrap()
-            .retain(|_, e| core.session_serial(e.uid) == Some(e.serial));
+        let snapshot: Vec<(String, Uid, u64)> = {
+            let entries = self.entries.lock().unwrap();
+            entries
+                .iter()
+                .map(|(k, e)| (k.clone(), e.uid, e.serial))
+                .collect()
+        };
+        let stale: Vec<String> = snapshot
+            .into_iter()
+            .filter(|(_, uid, serial)| core.session_serial(*uid) != Some(*serial))
+            .map(|(k, _, _)| k)
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let mut entries = self.entries.lock().unwrap();
+        for k in stale {
+            entries.remove(&k);
+        }
     }
 
     #[cfg(test)]
