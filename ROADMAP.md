@@ -309,9 +309,18 @@ In rough order of value-for-effort:
    server implements the spec (GtkHx tests against a mock); hxd-ng becoming
    the **first real implementation — and thus the reference** — is a strong
    motivator and instantly useful to GtkHx's own test matrix.
-2. **GIF icons, inline media, colored nicknames, emoji shortcodes** — mostly
+2. **Text-Encoding** (fogWraith `Capabilities-Text-Encoding.md`) — a
+   legacy-wire client advertising bit 1 of `DATA_CAPABILITIES` speaks UTF-8
+   in every text field; Mac Roman becomes the non-negotiating fallback.
+   hxd-core is already UTF-8 internally (the spec's own requirement), so
+   this is edge work in `hxd-session`: a per-connection encoding flag
+   gating the conversion calls, CR↔LF normalization, and the capability
+   echo. Do it early in this phase — it's the cheapest extension and every
+   modern client benefits. A `DefaultTextEncoding`-style config (Shift-JIS
+   / Latin-1 legacy communities) and HOPE `app_id` sniffing can follow.
+3. **GIF icons, inline media, colored nicknames, emoji shortcodes** — mostly
    relay + capability bits, cheap once the capability negotiation exists.
-3. **Voice** — an SFU, a genuinely large subsystem (this is where Janus has
+4. **Voice** — an SFU, a genuinely large subsystem (this is where Janus has
    two known server-side bugs; the renegotiation one is documented in gtkhx's
    `docs/janus-voice-renegotiation-bug.md` — read it as a spec of what not to
    do). `hotline-proto::voice` (ICE/SDP JSON) is shared already; the

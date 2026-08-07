@@ -7,6 +7,14 @@
 //! but the Hotline-ng phase adds sessions that outlive their connections,
 //! and it does that here, not in a rewrite.
 //!
+//! **The domain is UTF-8.** Nicks, chat text, subjects — everything textual
+//! is a `String`. The legacy frontend converts Mac Roman ↔ UTF-8 at its
+//! edges (lossless for legacy-origin text: Mac Roman → UTF-8 is injective
+//! and round-trips exactly); the ng frontend is UTF-8 natively. The domain
+//! also carries no wire presentation: `admin` is a bool and status an enum —
+//! the legacy color bitfield (bit 1 away, bit 2 admin) is derived at the
+//! legacy edge.
+//!
 //! Fan-out is a per-session unbounded channel of [`Event`]s. In-process
 //! today; the clustering phase puts a bus behind the same shape. Events are
 //! domain-typed — the session layer encodes them to wire pushes.
@@ -27,16 +35,31 @@ use crate::chat::{Ban, PrivateChat};
 /// A user id, as seen on the wire (16-bit, never 0 for a real user).
 pub type Uid = u16;
 
+/// A session's presence state. Only `Active` occurs until the Hotline-ng
+/// frontend lands detached sessions; the enum exists now so every consumer
+/// is written against the full model. See `docs/hotline-ng.md` §2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionStatus {
+    /// A connection is attached.
+    #[default]
+    Active,
+    /// Attached but quiet / away.
+    Idle,
+    /// No connection attached; grace window running.
+    Detached,
+}
+
 /// The visible-to-others part of a session: what a user-list row shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInfo {
     pub uid: Uid,
-    /// Nickname, raw wire bytes (Mac Roman). The domain layer relays these
-    /// untouched; only configured strings get converted at the edges.
-    pub nick: Vec<u8>,
+    /// Nickname, UTF-8.
+    pub nick: String,
     pub icon: u16,
-    /// 0 = normal, 2 = admin (the legacy color/status field).
-    pub color: u16,
+    /// Administrator affordance (the legacy edge renders it as color
+    /// bit 2).
+    pub admin: bool,
+    pub status: SessionStatus,
 }
 
 /// The fuller view one session may request of another (the user-info op).
@@ -54,7 +77,7 @@ pub struct UserDetails {
 pub enum Event {
     /// A session became visible. Not delivered to the joiner itself.
     Joined(UserInfo),
-    /// A visible session changed nick/icon/color. Delivered to everyone,
+    /// A visible session changed nick/icon/status. Delivered to everyone,
     /// including the changer (matching the reference server, whose clients
     /// rely on the echo).
     Changed(UserInfo),
@@ -65,22 +88,22 @@ pub enum Event {
     Chat {
         cid: u32,
         from: UserInfo,
-        text: Vec<u8>,
+        text: String,
         style: u16,
     },
-    /// A pre-formatted chat line (server notices: kicks, etc.). The legacy
-    /// frontend emits it verbatim.
-    ChatLine { cid: u32, from: Uid, line: Vec<u8> },
+    /// A server notice into a chat (kick announcements and the like).
+    /// Semantic text; each frontend formats it (legacy: `\r<text>`).
+    Notice { cid: u32, from: Uid, text: String },
     /// A chat (or, for cid 0, server) subject change.
-    ChatSubject { cid: u32, subject: Vec<u8> },
+    ChatSubject { cid: u32, subject: String },
     /// A private chat's password change, announced to its members
     /// (reference-server behavior).
-    ChatPassword { cid: u32, password: Vec<u8> },
+    ChatPassword { cid: u32, password: String },
     /// An invitation to a private chat.
     ChatInvite {
         cid: u32,
         from: Uid,
-        from_nick: Vec<u8>,
+        from_nick: String,
     },
     /// Someone joined a private chat the recipient is in.
     ChatUserJoined { cid: u32, user: UserInfo },
@@ -89,15 +112,15 @@ pub enum Event {
     /// A private message to the recipient.
     Msg {
         from: Uid,
-        from_nick: Vec<u8>,
-        text: Vec<u8>,
+        from_nick: String,
+        text: String,
     },
     /// An administrator broadcast. Delivered to everyone, sender included
     /// (the wire push carries the sender, matching the reference server).
     Broadcast {
         from: Uid,
-        from_nick: Vec<u8>,
-        text: Vec<u8>,
+        from_nick: String,
+        text: String,
     },
     /// The recipient has been kicked; its transport should close.
     Kicked,
@@ -121,9 +144,9 @@ pub(crate) struct UserSession {
 /// What a transport hands the roster at login.
 #[derive(Debug, Clone)]
 pub struct AttachInfo {
-    pub nick: Vec<u8>,
+    pub nick: String,
     pub icon: u16,
-    pub color: u16,
+    pub admin: bool,
     pub access: AccessBits,
     pub login: String,
     pub addr: Option<IpAddr>,
@@ -133,7 +156,7 @@ pub struct AttachInfo {
 pub(crate) struct RosterInner {
     pub(crate) users: HashMap<Uid, UserSession>,
     last_uid: Uid,
-    pub(crate) public_subject: Vec<u8>,
+    pub(crate) public_subject: String,
     pub(crate) chats: HashMap<u32, PrivateChat>,
     pub(crate) last_chat_ref: u32,
     pub(crate) bans: Vec<Ban>,
@@ -213,7 +236,8 @@ impl Core {
                     uid,
                     nick: info.nick,
                     icon: info.icon,
-                    color: info.color,
+                    admin: info.admin,
+                    status: SessionStatus::Active,
                 },
                 access: info.access,
                 login: info.login,
@@ -244,7 +268,7 @@ impl Core {
     /// Update a session's nick and/or icon. Broadcasts a change event (to
     /// everyone, echo included) only if something actually changed and the
     /// session is visible. Returns whether anything changed.
-    pub fn update(&self, uid: Uid, nick: Option<Vec<u8>>, icon: Option<u16>) -> bool {
+    pub fn update(&self, uid: Uid, nick: Option<String>, icon: Option<u16>) -> bool {
         let mut r = self.roster.lock().unwrap();
         let Some(sess) = r.users.get_mut(&uid) else {
             return false;
@@ -318,7 +342,7 @@ impl Core {
     }
 
     /// The public chat subject.
-    pub fn public_subject(&self) -> Vec<u8> {
+    pub fn public_subject(&self) -> String {
         self.roster.lock().unwrap().public_subject.clone()
     }
 }
@@ -331,16 +355,16 @@ pub(crate) fn reads_public_chat(sess: &UserSession) -> bool {
 #[cfg(test)]
 pub(crate) fn test_attach(
     core: &Core,
-    nick: &[u8],
+    nick: &str,
     access: AccessBits,
 ) -> (Uid, UnboundedReceiver<Event>) {
     let (uid, rx) = core
         .attach(AttachInfo {
-            nick: nick.to_vec(),
+            nick: nick.to_string(),
             icon: 1,
-            color: 0,
+            admin: false,
             access,
-            login: String::from_utf8_lossy(nick).into_owned(),
+            login: nick.to_string(),
             addr: None,
         })
         .unwrap();
@@ -363,33 +387,33 @@ mod tests {
     #[test]
     fn join_is_broadcast_to_others_not_self() {
         let core = Core::new();
-        let (_a, mut rx_a) = test_attach(&core, b"alice", AccessBits::empty());
-        let (_b, mut rx_b) = test_attach(&core, b"bob", AccessBits::empty());
+        let (_a, mut rx_a) = test_attach(&core, "alice", AccessBits::empty());
+        let (_b, mut rx_b) = test_attach(&core, "bob", AccessBits::empty());
 
         let evs = drain(&mut rx_a);
         assert_eq!(evs.len(), 1);
-        assert!(matches!(&evs[0], Event::Joined(u) if u.nick == b"bob"));
+        assert!(matches!(&evs[0], Event::Joined(u) if u.nick == "bob"));
         assert!(drain(&mut rx_b).is_empty());
     }
 
     #[test]
     fn change_echoes_to_everyone_and_only_on_diff() {
         let core = Core::new();
-        let (a, mut rx_a) = test_attach(&core, b"alice", AccessBits::empty());
+        let (a, mut rx_a) = test_attach(&core, "alice", AccessBits::empty());
 
-        assert!(!core.update(a, Some(b"alice".to_vec()), Some(1)));
+        assert!(!core.update(a, Some("alice".into()), Some(1)));
         assert!(drain(&mut rx_a).is_empty());
 
-        assert!(core.update(a, Some(b"al".to_vec()), None));
+        assert!(core.update(a, Some("al".into()), None));
         let evs = drain(&mut rx_a);
-        assert!(matches!(&evs[0], Event::Changed(u) if u.nick == b"al" && u.uid == a));
+        assert!(matches!(&evs[0], Event::Changed(u) if u.nick == "al" && u.uid == a));
     }
 
     #[test]
     fn part_reaches_survivors_and_frees_the_uid_slot() {
         let core = Core::new();
-        let (_a, mut rx_a) = test_attach(&core, b"alice", AccessBits::empty());
-        let (b, _rx_b) = test_attach(&core, b"bob", AccessBits::empty());
+        let (_a, mut rx_a) = test_attach(&core, "alice", AccessBits::empty());
+        let (b, _rx_b) = test_attach(&core, "bob", AccessBits::empty());
         drain(&mut rx_a);
 
         core.detach(b);
@@ -401,12 +425,12 @@ mod tests {
     #[test]
     fn unannounced_sessions_are_invisible_and_part_silently() {
         let core = Core::new();
-        let (_a, mut rx_a) = test_attach(&core, b"alice", AccessBits::empty());
+        let (_a, mut rx_a) = test_attach(&core, "alice", AccessBits::empty());
         let (b, _rx_b) = core
             .attach(AttachInfo {
-                nick: b"ghost".to_vec(),
+                nick: "ghost".into(),
                 icon: 2,
-                color: 0,
+                admin: false,
                 access: AccessBits::empty(),
                 login: "ghost".into(),
                 addr: None,
@@ -421,11 +445,11 @@ mod tests {
     #[test]
     fn uids_are_sequential_and_skip_zero_and_live_ids() {
         let core = Core::new();
-        let (a, _ra) = test_attach(&core, b"a", AccessBits::empty());
-        let (b, _rb) = test_attach(&core, b"b", AccessBits::empty());
+        let (a, _ra) = test_attach(&core, "a", AccessBits::empty());
+        let (b, _rb) = test_attach(&core, "b", AccessBits::empty());
         assert_eq!((a, b), (1, 2));
         core.detach(a);
-        let (c, _rc) = test_attach(&core, b"c", AccessBits::empty());
+        let (c, _rc) = test_attach(&core, "c", AccessBits::empty());
         // Sequential, not first-free: c gets 3, not the freed 1.
         assert_eq!(c, 3);
     }
@@ -433,19 +457,31 @@ mod tests {
     #[test]
     fn user_details_carry_login_and_visibility_gate() {
         let core = Core::new();
-        let (a, _ra) = test_attach(&core, b"alice", AccessBits::empty());
+        let (a, _ra) = test_attach(&core, "alice", AccessBits::empty());
         let d = core.user_details(a).unwrap();
         assert_eq!(d.login, "alice");
+        assert_eq!(d.info.status, SessionStatus::Active);
         let (ghost, _rg) = core
             .attach(AttachInfo {
-                nick: b"g".to_vec(),
+                nick: "g".into(),
                 icon: 0,
-                color: 0,
+                admin: false,
                 access: AccessBits::empty(),
                 login: "g".into(),
                 addr: None,
             })
             .unwrap();
         assert!(core.user_details(ghost).is_none());
+    }
+
+    #[test]
+    fn non_ascii_nicks_are_preserved_verbatim() {
+        // The domain is UTF-8; nothing in it may mangle text. (The lossy
+        // Mac Roman rendering is the legacy edge's business, not ours.)
+        let core = Core::new();
+        let (_a, mut rx_a) = test_attach(&core, "alice", AccessBits::empty());
+        let (_b, _rx_b) = test_attach(&core, "Мишенька 🎈", AccessBits::empty());
+        let evs = drain(&mut rx_a);
+        assert!(matches!(&evs[0], Event::Joined(u) if u.nick == "Мишенька 🎈"));
     }
 }
