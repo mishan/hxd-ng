@@ -13,6 +13,7 @@ members = [
     "crates/hxd-core",
     "crates/hxd-auth-file",
     "crates/hxd-session",
+    "crates/hxd-ng-session",
     "crates/hxd",
 ]
 # Without this, cargo auto-adopts the submodule's crates as workspace
@@ -37,6 +38,7 @@ hotline-proto = { path = "gtkhx/rust/crates/hotline-proto" }
 hxd-core = { path = "crates/hxd-core" }
 hxd-auth-file = { path = "crates/hxd-auth-file" }
 hxd-session = { path = "crates/hxd-session" }
+hxd-ng-session = { path = "crates/hxd-ng-session" }
 
 # External.
 tokio = { version = "1", default-features = false, features = [

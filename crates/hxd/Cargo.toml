@@ -16,6 +16,7 @@ path = "src/main.rs"
 hxd-core = { workspace = true }
 hxd-auth-file = { workspace = true }
 hxd-session = { workspace = true }
+hxd-ng-session = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -24,4 +25,7 @@ toml = { workspace = true }
 
 [dev-dependencies]
 hotline-proto = { workspace = true }
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false }
+serde_json = "1"
 tempfile = "3"

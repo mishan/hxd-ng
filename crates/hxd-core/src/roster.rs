@@ -198,6 +198,10 @@ impl Outbox {
 
 /// One user's presence and its outbox.
 pub(crate) struct UserSession {
+    /// Distinguishes this session from any other that ever held the same
+    /// uid (uids recycle after 65k sessions; serials never). External
+    /// registries key trust decisions on (uid, serial).
+    pub(crate) serial: u64,
     pub(crate) info: UserInfo,
     pub(crate) access: AccessBits,
     pub(crate) login: String,
@@ -242,6 +246,7 @@ pub enum Resume {
 pub(crate) struct RosterInner {
     pub(crate) users: HashMap<Uid, UserSession>,
     last_uid: Uid,
+    last_serial: u64,
     pub(crate) public_subject: String,
     pub(crate) chats: HashMap<u32, PrivateChat>,
     pub(crate) last_chat_ref: u32,
@@ -338,10 +343,13 @@ impl Core {
     pub fn attach(&self, info: AttachInfo) -> Option<(Uid, UnboundedReceiver<SeqEvent>)> {
         let mut r = self.roster.lock().unwrap();
         let uid = r.next_uid()?;
+        r.last_serial += 1;
+        let serial = r.last_serial;
         let (tx, rx) = mpsc::unbounded_channel();
         r.users.insert(
             uid,
             UserSession {
+                serial,
                 info: UserInfo {
                     uid,
                     nick: info.nick,
@@ -563,6 +571,20 @@ impl Core {
                 addr: s.addr,
                 connected_at: s.connected_at,
             })
+    }
+
+    /// The session's serial — the anti-uid-recycling token for external
+    /// registries. `None` when no session holds the uid.
+    pub fn session_serial(&self, uid: Uid) -> Option<u64> {
+        let r = self.roster.lock().unwrap();
+        r.users.get(&uid).map(|s| s.serial)
+    }
+
+    /// The last event seq this session has emitted (0 if none yet) — what
+    /// a fresh sync reports so the client can resume from there.
+    pub fn current_seq(&self, uid: Uid) -> Option<u64> {
+        let r = self.roster.lock().unwrap();
+        r.users.get(&uid).map(|s| s.outbox.next_seq - 1)
     }
 
     /// The public chat subject.

@@ -21,7 +21,8 @@ cargo run --bin hxd -- --config /path/to/hxd-ng.toml
 First run creates `accounts/` with a guest account. Add accounts as TOML
 files in that directory (see `crates/hxd-auth-file`'s docs for the format).
 
-Configuration (`hxd-ng.toml`, all keys optional):
+Configuration (`hxd-ng.toml`, all keys optional; the `[ng]` section enables
+the Hotline-ng WebSocket frontend — see [docs/hotline-ng.md](docs/hotline-ng.md)):
 
 ```toml
 [server]
@@ -33,6 +34,19 @@ login_timeout = 10
 [paths]
 accounts = "accounts"
 agreement = "agreement.txt"
+
+[ng]
+bind = "127.0.0.1:5700"   # plaintext; put a WSS-terminating proxy in front
+grace = 300               # detached-session grace window, seconds
+max_detached_per_addr = 2
+```
+
+Try the ng frontend with the bundled client (no install on Node 22+;
+on older Node, `cd tools && npm install` once for the `ws` fallback):
+
+```sh
+node tools/ng-client.mjs ws://127.0.0.1:5700 --login misha --password pw
+# then type to chat; /drop tests detach+resume; /logout to leave
 ```
 
 Wire tracing mirrors gtkhx's client-side trace so the two line up:

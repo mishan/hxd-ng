@@ -79,6 +79,27 @@ async fn main() {
             config.server.version
         );
 
+        // The Hotline-ng WebSocket frontend, when configured: its accept
+        // loop plus the detached-session sweeper.
+        if let Some(ng_ctx) = hxd::build_ng_ctx(&config, &ctx) {
+            let ng = config.ng.as_ref().unwrap();
+            let ng_listener = TcpListener::bind(&ng.bind)
+                .await
+                .map_err(|e| format!("ng bind {}: {e}", ng.bind))?;
+            tracing::info!(
+                "hotline-ng WebSocket on {} (grace {}s) — TLS is the reverse proxy's job",
+                ng.bind,
+                ng.grace
+            );
+            let grace = ng_ctx.cfg.grace;
+            tokio::spawn(hxd_ng_session::sweeper(
+                ng_ctx.core.clone(),
+                ng_ctx.registry.clone(),
+                grace,
+            ));
+            tokio::spawn(hxd_ng_session::serve(ng_listener, ng_ctx));
+        }
+
         tokio::select! {
             r = hxd_session::serve(listener, ctx) => {
                 r.map_err(|e| format!("accept loop: {e}"))

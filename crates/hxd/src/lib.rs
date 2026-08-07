@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use hxd_auth_file::FileAuth;
 use hxd_core::Core;
+use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::{ServerConfig, ServerCtx};
 use serde::Deserialize;
 
@@ -20,6 +21,33 @@ pub struct Config {
     pub server: ServerSection,
     #[serde(default)]
     pub paths: PathsSection,
+    /// The Hotline-ng WebSocket frontend. Absent = disabled.
+    pub ng: Option<NgSection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NgSection {
+    /// Listen address for the WebSocket endpoint. Plaintext — production
+    /// puts a TLS-terminating reverse proxy in front (docs/hotline-ng.md).
+    #[serde(default = "default_ng_bind")]
+    pub bind: String,
+    /// Seconds a detached session survives without a connection.
+    #[serde(default = "default_grace")]
+    pub grace: u64,
+    /// Detached-sessions-per-address backstop.
+    #[serde(default = "default_max_detached")]
+    pub max_detached_per_addr: usize,
+}
+
+fn default_ng_bind() -> String {
+    "127.0.0.1:5700".into()
+}
+fn default_grace() -> u64 {
+    300
+}
+fn default_max_detached() -> usize {
+    2
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +132,24 @@ impl Config {
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
     }
+}
+
+/// Build the ng frontend context sharing the legacy context's core and
+/// auth. `None` when the config has no `[ng]` section.
+pub fn build_ng_ctx(config: &Config, legacy: &ServerCtx) -> Option<NgCtx> {
+    let ng = config.ng.as_ref()?;
+    Some(NgCtx {
+        core: legacy.core.clone(),
+        auth: legacy.auth.clone(),
+        cfg: Arc::new(NgConfig {
+            server_name: config.server.name.clone(),
+            agreement: legacy.cfg.agreement.clone(),
+            login_timeout: Duration::from_secs(config.server.login_timeout),
+            grace: Duration::from_secs(ng.grace),
+            max_detached_per_addr: ng.max_detached_per_addr,
+        }),
+        registry: Arc::new(Registry::new()),
+    })
 }
 
 /// Assemble the shared server context from a config: bootstrap the accounts
