@@ -290,12 +290,23 @@ fn format_chat_line(out: &mut Vec<u8>, nick: &[u8], line: &[u8], style: u16) {
     out.extend_from_slice(line);
 }
 
-/// Split multi-line input and format each line (the reference server's
-/// `cr_strtok_r` loop).
+/// Split multi-line input and format each line, mirroring the reference
+/// server's `cr_strtok_r` loop: empty segments (consecutive or trailing
+/// `\r`/`\n`, including CRLF pairs) are skipped rather than rendered as
+/// blank attributed lines. Input that is *only* delimiters (or empty)
+/// still formats one empty line — the reference's "no token found" path.
 fn format_chat(nick: &[u8], text: &[u8], style: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len() + 32);
+    let mut wrote = false;
     for line in text.split(|b| *b == b'\r' || *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
         format_chat_line(&mut out, nick, line, style);
+        wrote = true;
+    }
+    if !wrote {
+        format_chat_line(&mut out, nick, b"", style);
     }
     out
 }

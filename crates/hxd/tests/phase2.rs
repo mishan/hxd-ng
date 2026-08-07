@@ -195,6 +195,17 @@ async fn public_chat_is_formatted_and_echoed() {
         chunk(&fb, tag::BODY).unwrap(),
         b"\r        alice:  one\r        alice:  two".to_vec()
     );
+
+    // Empty segments — CRLF pairs, doubled and trailing delimiters — are
+    // skipped, not rendered as blank attributed lines (the reference
+    // server's tokenizer behavior).
+    a.send(REQ_CHAT, &[(tag::BODY, b"one\r\ntwo\r\r\n".to_vec())])
+        .await;
+    let fb = b.recv_type(HDR_CHAT).await;
+    assert_eq!(
+        chunk(&fb, tag::BODY).unwrap(),
+        b"\r        alice:  one\r        alice:  two".to_vec()
+    );
 }
 
 #[tokio::test]
