@@ -9,8 +9,10 @@
 
 pub mod access;
 pub mod account;
+pub mod chat;
 pub mod roster;
 
 pub use access::AccessBits;
 pub use account::{Account, AuthBackend, AuthError, Proof};
-pub use roster::{Core, Event, Uid, UserInfo};
+pub use chat::ChatError;
+pub use roster::{AttachInfo, Core, Event, Uid, UserDetails, UserInfo};

@@ -38,6 +38,9 @@ pub struct ServerSection {
     /// Seconds a connection may take to complete its login.
     #[serde(default = "default_login_timeout")]
     pub login_timeout: u64,
+    /// Seconds a kick-with-ban keeps the address banned.
+    #[serde(default = "default_ban_time")]
+    pub ban_time: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +66,9 @@ fn default_version() -> u16 {
 fn default_login_timeout() -> u64 {
     10
 }
+fn default_ban_time() -> u64 {
+    1800
+}
 fn default_accounts() -> PathBuf {
     "accounts".into()
 }
@@ -74,6 +80,7 @@ impl Default for ServerSection {
             name: default_name(),
             version: default_version(),
             login_timeout: default_login_timeout(),
+            ban_time: default_ban_time(),
         }
     }
 }
@@ -118,6 +125,7 @@ pub fn build_ctx(config: &Config) -> Result<ServerCtx, String> {
             version: config.server.version,
             agreement,
             login_timeout: Duration::from_secs(config.server.login_timeout),
+            ban_time: Duration::from_secs(config.server.ban_time),
         }),
     })
 }

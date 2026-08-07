@@ -10,13 +10,19 @@
 //! Fan-out is a per-session unbounded channel of [`Event`]s. In-process
 //! today; the clustering phase puts a bus behind the same shape. Events are
 //! domain-typed — the session layer encodes them to wire pushes.
+//!
+//! Chat rooms, messaging and moderation live in [`crate::chat`], as further
+//! `impl Core` blocks over the same state.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::access::AccessBits;
+use crate::access::{bit, AccessBits};
+use crate::chat::{Ban, PrivateChat};
 
 /// A user id, as seen on the wire (16-bit, never 0 for a real user).
 pub type Uid = u16;
@@ -33,7 +39,17 @@ pub struct UserInfo {
     pub color: u16,
 }
 
-/// A presence event, delivered to every attached session's channel.
+/// The fuller view one session may request of another (the user-info op).
+#[derive(Debug, Clone)]
+pub struct UserDetails {
+    pub info: UserInfo,
+    pub login: String,
+    pub addr: Option<IpAddr>,
+    pub connected_at: Instant,
+}
+
+/// A domain event, delivered on session channels. The session layer encodes
+/// these to wire pushes; a future frontend encodes them differently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A session became visible. Not delivered to the joiner itself.
@@ -44,27 +60,83 @@ pub enum Event {
     Changed(UserInfo),
     /// A visible session left. Not delivered to the leaver.
     Parted(Uid),
+    /// A chat line (semantic: unformatted). `cid` 0 is the public chat.
+    /// `style` 1 is an action (`/me`). Delivered to the sender too.
+    Chat {
+        cid: u32,
+        from: UserInfo,
+        text: Vec<u8>,
+        style: u16,
+    },
+    /// A pre-formatted chat line (server notices: kicks, etc.). The legacy
+    /// frontend emits it verbatim.
+    ChatLine { cid: u32, from: Uid, line: Vec<u8> },
+    /// A chat (or, for cid 0, server) subject change.
+    ChatSubject { cid: u32, subject: Vec<u8> },
+    /// A private chat's password change, announced to its members
+    /// (reference-server behavior).
+    ChatPassword { cid: u32, password: Vec<u8> },
+    /// An invitation to a private chat.
+    ChatInvite {
+        cid: u32,
+        from: Uid,
+        from_nick: Vec<u8>,
+    },
+    /// Someone joined a private chat the recipient is in.
+    ChatUserJoined { cid: u32, user: UserInfo },
+    /// Someone left a private chat the recipient is in.
+    ChatUserParted { cid: u32, uid: Uid },
+    /// A private message to the recipient.
+    Msg {
+        from: Uid,
+        from_nick: Vec<u8>,
+        text: Vec<u8>,
+    },
+    /// An administrator broadcast. Delivered to everyone, sender included
+    /// (the wire push carries the sender, matching the reference server).
+    Broadcast {
+        from: Uid,
+        from_nick: Vec<u8>,
+        text: Vec<u8>,
+    },
+    /// The recipient has been kicked; its transport should close.
+    Kicked,
 }
 
 /// One user's presence. Today: exactly one attached connection, whose
 /// death detaches the session. (See the module comment for where this
 /// grows.)
-struct UserSession {
-    info: UserInfo,
-    /// Access bits, kept here so later phases can enforce per-operation
-    /// permissions without a second lookup.
-    #[allow(dead_code)]
-    access: AccessBits,
+pub(crate) struct UserSession {
+    pub(crate) info: UserInfo,
+    pub(crate) access: AccessBits,
+    pub(crate) login: String,
+    pub(crate) addr: Option<IpAddr>,
+    pub(crate) connected_at: Instant,
     /// Whether this session has been announced (shows on the user list,
     /// generates events). False between login and login-completion.
-    visible: bool,
-    events: UnboundedSender<Event>,
+    pub(crate) visible: bool,
+    pub(crate) events: UnboundedSender<Event>,
+}
+
+/// What a transport hands the roster at login.
+#[derive(Debug, Clone)]
+pub struct AttachInfo {
+    pub nick: Vec<u8>,
+    pub icon: u16,
+    pub color: u16,
+    pub access: AccessBits,
+    pub login: String,
+    pub addr: Option<IpAddr>,
 }
 
 #[derive(Default)]
-struct RosterInner {
-    users: HashMap<Uid, UserSession>,
+pub(crate) struct RosterInner {
+    pub(crate) users: HashMap<Uid, UserSession>,
     last_uid: Uid,
+    pub(crate) public_subject: Vec<u8>,
+    pub(crate) chats: HashMap<u32, PrivateChat>,
+    pub(crate) last_chat_ref: u32,
+    pub(crate) bans: Vec<Ban>,
 }
 
 impl RosterInner {
@@ -83,22 +155,38 @@ impl RosterInner {
         None
     }
 
-    fn broadcast(&self, ev: &Event, skip: Option<Uid>) {
-        for (uid, sess) in &self.users {
-            if Some(*uid) == skip {
-                continue;
-            }
+    pub(crate) fn send_to(&self, uid: Uid, ev: Event) {
+        if let Some(sess) = self.users.get(&uid) {
             // A closed receiver just means that session is tearing down;
             // its detach will clean up.
+            let _ = sess.events.send(ev);
+        }
+    }
+
+    /// Deliver to every *visible* session matching `pred` (skipping `skip`).
+    pub(crate) fn broadcast_where<F: Fn(&UserSession) -> bool>(
+        &self,
+        ev: &Event,
+        skip: Option<Uid>,
+        pred: F,
+    ) {
+        for (uid, sess) in &self.users {
+            if Some(*uid) == skip || !sess.visible || !pred(sess) {
+                continue;
+            }
             let _ = sess.events.send(ev.clone());
         }
+    }
+
+    fn broadcast(&self, ev: &Event, skip: Option<Uid>) {
+        self.broadcast_where(ev, skip, |_| true);
     }
 }
 
 /// The domain core. One per server; shared across sessions.
 #[derive(Default)]
 pub struct Core {
-    roster: Mutex<RosterInner>,
+    pub(crate) roster: Mutex<RosterInner>,
 }
 
 impl Core {
@@ -114,13 +202,7 @@ impl Core {
     /// user-list fetch.
     ///
     /// Returns `None` only if all 65535 uids are in use.
-    pub fn attach(
-        &self,
-        nick: Vec<u8>,
-        icon: u16,
-        color: u16,
-        access: AccessBits,
-    ) -> Option<(Uid, UnboundedReceiver<Event>)> {
+    pub fn attach(&self, info: AttachInfo) -> Option<(Uid, UnboundedReceiver<Event>)> {
         let mut r = self.roster.lock().unwrap();
         let uid = r.next_uid()?;
         let (tx, rx) = mpsc::unbounded_channel();
@@ -129,11 +211,14 @@ impl Core {
             UserSession {
                 info: UserInfo {
                     uid,
-                    nick,
-                    icon,
-                    color,
+                    nick: info.nick,
+                    icon: info.icon,
+                    color: info.color,
                 },
-                access,
+                access: info.access,
+                login: info.login,
+                addr: info.addr,
+                connected_at: Instant::now(),
                 visible: false,
                 events: tx,
             },
@@ -184,9 +269,11 @@ impl Core {
         changed
     }
 
-    /// Remove a session. Broadcasts the part if it was visible.
+    /// Remove a session: leave every private chat (announcing the parts),
+    /// then broadcast the part if it was visible.
     pub fn detach(&self, uid: Uid) {
         let mut r = self.roster.lock().unwrap();
+        Self::leave_all_chats(&mut r, uid);
         let Some(sess) = r.users.remove(&uid) else {
             return;
         };
@@ -215,13 +302,57 @@ impl Core {
         let r = self.roster.lock().unwrap();
         r.users.get(&uid).map(|s| s.info.clone())
     }
+
+    /// The fuller view of a *visible* user (the user-info op).
+    pub fn user_details(&self, uid: Uid) -> Option<UserDetails> {
+        let r = self.roster.lock().unwrap();
+        r.users
+            .get(&uid)
+            .filter(|s| s.visible)
+            .map(|s| UserDetails {
+                info: s.info.clone(),
+                login: s.login.clone(),
+                addr: s.addr,
+                connected_at: s.connected_at,
+            })
+    }
+
+    /// The public chat subject.
+    pub fn public_subject(&self) -> Vec<u8> {
+        self.roster.lock().unwrap().public_subject.clone()
+    }
+}
+
+/// Convenience for chat delivery: does this session receive public chat?
+pub(crate) fn reads_public_chat(sess: &UserSession) -> bool {
+    sess.access.has(bit::READ_CHAT)
+}
+
+#[cfg(test)]
+pub(crate) fn test_attach(
+    core: &Core,
+    nick: &[u8],
+    access: AccessBits,
+) -> (Uid, UnboundedReceiver<Event>) {
+    let (uid, rx) = core
+        .attach(AttachInfo {
+            nick: nick.to_vec(),
+            icon: 1,
+            color: 0,
+            access,
+            login: String::from_utf8_lossy(nick).into_owned(),
+            addr: None,
+        })
+        .unwrap();
+    core.announce(uid);
+    (uid, rx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn drain(rx: &mut UnboundedReceiver<Event>) -> Vec<Event> {
+    pub(crate) fn drain(rx: &mut UnboundedReceiver<Event>) -> Vec<Event> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             out.push(ev);
@@ -232,14 +363,8 @@ mod tests {
     #[test]
     fn join_is_broadcast_to_others_not_self() {
         let core = Core::new();
-        let (a, mut rx_a) = core
-            .attach(b"alice".to_vec(), 1, 0, AccessBits::empty())
-            .unwrap();
-        core.announce(a);
-        let (b, mut rx_b) = core
-            .attach(b"bob".to_vec(), 2, 0, AccessBits::empty())
-            .unwrap();
-        core.announce(b);
+        let (_a, mut rx_a) = test_attach(&core, b"alice", AccessBits::empty());
+        let (_b, mut rx_b) = test_attach(&core, b"bob", AccessBits::empty());
 
         let evs = drain(&mut rx_a);
         assert_eq!(evs.len(), 1);
@@ -250,10 +375,7 @@ mod tests {
     #[test]
     fn change_echoes_to_everyone_and_only_on_diff() {
         let core = Core::new();
-        let (a, mut rx_a) = core
-            .attach(b"alice".to_vec(), 1, 0, AccessBits::empty())
-            .unwrap();
-        core.announce(a);
+        let (a, mut rx_a) = test_attach(&core, b"alice", AccessBits::empty());
 
         assert!(!core.update(a, Some(b"alice".to_vec()), Some(1)));
         assert!(drain(&mut rx_a).is_empty());
@@ -266,14 +388,8 @@ mod tests {
     #[test]
     fn part_reaches_survivors_and_frees_the_uid_slot() {
         let core = Core::new();
-        let (a, mut rx_a) = core
-            .attach(b"alice".to_vec(), 1, 0, AccessBits::empty())
-            .unwrap();
-        core.announce(a);
-        let (b, _rx_b) = core
-            .attach(b"bob".to_vec(), 2, 0, AccessBits::empty())
-            .unwrap();
-        core.announce(b);
+        let (_a, mut rx_a) = test_attach(&core, b"alice", AccessBits::empty());
+        let (b, _rx_b) = test_attach(&core, b"bob", AccessBits::empty());
         drain(&mut rx_a);
 
         core.detach(b);
@@ -285,12 +401,16 @@ mod tests {
     #[test]
     fn unannounced_sessions_are_invisible_and_part_silently() {
         let core = Core::new();
-        let (a, mut rx_a) = core
-            .attach(b"alice".to_vec(), 1, 0, AccessBits::empty())
-            .unwrap();
-        core.announce(a);
+        let (_a, mut rx_a) = test_attach(&core, b"alice", AccessBits::empty());
         let (b, _rx_b) = core
-            .attach(b"ghost".to_vec(), 2, 0, AccessBits::empty())
+            .attach(AttachInfo {
+                nick: b"ghost".to_vec(),
+                icon: 2,
+                color: 0,
+                access: AccessBits::empty(),
+                login: "ghost".into(),
+                addr: None,
+            })
             .unwrap();
 
         assert_eq!(core.snapshot().len(), 1);
@@ -301,18 +421,31 @@ mod tests {
     #[test]
     fn uids_are_sequential_and_skip_zero_and_live_ids() {
         let core = Core::new();
-        let (a, _ra) = core
-            .attach(b"a".to_vec(), 0, 0, AccessBits::empty())
-            .unwrap();
-        let (b, _rb) = core
-            .attach(b"b".to_vec(), 0, 0, AccessBits::empty())
-            .unwrap();
+        let (a, _ra) = test_attach(&core, b"a", AccessBits::empty());
+        let (b, _rb) = test_attach(&core, b"b", AccessBits::empty());
         assert_eq!((a, b), (1, 2));
         core.detach(a);
-        let (c, _rc) = core
-            .attach(b"c".to_vec(), 0, 0, AccessBits::empty())
-            .unwrap();
+        let (c, _rc) = test_attach(&core, b"c", AccessBits::empty());
         // Sequential, not first-free: c gets 3, not the freed 1.
         assert_eq!(c, 3);
+    }
+
+    #[test]
+    fn user_details_carry_login_and_visibility_gate() {
+        let core = Core::new();
+        let (a, _ra) = test_attach(&core, b"alice", AccessBits::empty());
+        let d = core.user_details(a).unwrap();
+        assert_eq!(d.login, "alice");
+        let (ghost, _rg) = core
+            .attach(AttachInfo {
+                nick: b"g".to_vec(),
+                icon: 0,
+                color: 0,
+                access: AccessBits::empty(),
+                login: "g".into(),
+                addr: None,
+            })
+            .unwrap();
+        assert!(core.user_details(ghost).is_none());
     }
 }

@@ -1,27 +1,33 @@
 //! The per-connection session actor.
 //!
-//! One tokio task reads and dispatches frames; a second owns the write half
-//! and serializes every outbound frame through a mailbox, stamping the
-//! server-push transaction counter in exactly one place. Domain events
-//! arrive on the session's roster channel and are encoded here — the domain
-//! layer never sees wire bytes.
+//! Three tasks per connection: a **reader** that frames the socket and
+//! feeds a channel, a **writer** that owns the write half and stamps the
+//! push transaction counter in one place, and the **session loop** that
+//! selects over incoming frames and domain events. The split keeps
+//! `read_frame` cancel-safety out of the picture (the reader never races a
+//! select) and gives moderation a clean lever: a kick event just breaks the
+//! session loop.
 //!
 //! The protocol flow (magic exchange, login chunk-walk, the version-driven
-//! agreement dance, user-list shape) mirrors mhxd's `rcv.c` /
-//! `protocol/hotline.c`, which is the behavioral reference for what 1.2 and
-//! 1.5 clients expect. Deviations are deliberate and commented.
+//! agreement dance, chat formatting, private-chat lifecycle) mirrors mhxd's
+//! `rcv.c` / `chat.c` / `protocol/hotline.c`, the behavioral reference for
+//! what 1.2 and 1.5 clients expect. Deviations are deliberate and
+//! commented.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hotline_proto::messages::{tag, ClientHdr};
 use hotline_proto::text;
 use hxd_core::access::bit;
-use hxd_core::{Account, AuthBackend, AuthError, Core, Event, Proof, Uid, UserInfo};
+use hxd_core::{
+    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Proof, Uid, UserInfo,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
@@ -36,16 +42,30 @@ mod hdr {
     pub const USER_CHANGE: u32 = 0x0000_012d;
     pub const USER_PART: u32 = 0x0000_012e;
     pub const USER_SELFINFO: u32 = 0x0000_0162;
+    pub const CHAT: u32 = 0x0000_006a;
+    pub const MSG: u32 = 0x0000_0068;
+    pub const MSG_BROADCAST: u32 = 0x0000_0163;
+    pub const CHAT_INVITE: u32 = 0x0000_0071;
+    pub const CHAT_USER_CHANGE: u32 = 0x0000_0075;
+    pub const CHAT_USER_PART: u32 = 0x0000_0076;
+    pub const CHAT_SUBJECT: u32 = 0x0000_0077;
 }
 
-/// `HTLS_DATA_BANNERID` — hotline-proto has no constant for it (the gtkhx
-/// client ignores the chunk).
+/// Data tags hotline-proto has no constants for (the gtkhx client ignores
+/// or hand-rolls them).
 const TAG_BANNERID: u16 = 0x00a1;
+/// `HTLC_DATA_CHAT_AWAY` — away-toggle rider on a chat send. Parsed and
+/// ignored until away state exists.
+const TAG_CHAT_AWAY: u16 = 0x0ea1;
 
 /// The client hello: `"TRTPHOTL" 0x0001 0x0002`.
 const CLIENT_MAGIC: [u8; 12] = *b"TRTPHOTL\x00\x01\x00\x02";
 /// The server's answer: `"TRTP"` + a zero error code.
 const SERVER_MAGIC: [u8; 8] = *b"TRTP\x00\x00\x00\x00";
+
+/// Longest accepted chat/message payload, matching the reference server's
+/// buffer cap.
+const MAX_CHAT_INPUT: usize = 4096;
 
 /// Server-wide configuration the sessions need.
 #[derive(Debug, Clone)]
@@ -59,6 +79,8 @@ pub struct ServerConfig {
     pub agreement: Option<String>,
     /// How long a connection may exist before completing its login.
     pub login_timeout: Duration,
+    /// How long a kick-with-ban keeps the address banned.
+    pub ban_time: Duration,
 }
 
 impl Default for ServerConfig {
@@ -68,6 +90,7 @@ impl Default for ServerConfig {
             version: 185,
             agreement: None,
             login_timeout: Duration::from_secs(10),
+            ban_time: Duration::from_secs(1800),
         }
     }
 }
@@ -87,7 +110,7 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) -> std::io::Result<()>
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let span = tracing::info_span!("session", %peer);
-            run_session(stream, ctx).instrument(span).await;
+            run_session(stream, peer, ctx).instrument(span).await;
         });
     }
 }
@@ -135,6 +158,29 @@ async fn writer_task(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Outbound>
         }
     }
     let _ = wr.shutdown().await;
+}
+
+/// Reader task: frames the socket into a bounded channel (backpressure for
+/// a flooding client). Exits on EOF, error, or a malformed frame.
+async fn reader_task(mut rd: OwnedReadHalf, frames: Sender<Frame>) {
+    loop {
+        match read_frame(&mut rd).await {
+            Ok(f) => {
+                if frames.send(f).await.is_err() {
+                    return; // Session loop is gone.
+                }
+            }
+            Err(ReadError::Eof) => return,
+            Err(ReadError::Io(e)) => {
+                debug!("read error: {e}");
+                return;
+            }
+            Err(ReadError::Malformed(why)) => {
+                warn!("malformed frame: {why}");
+                return;
+            }
+        }
+    }
 }
 
 fn trace_out(ty: u32, trans: u32, flag: u32, chunks: &[(u16, Vec<u8>)]) {
@@ -210,6 +256,50 @@ fn cap31(data: &[u8]) -> &[u8] {
     &data[..data.len().min(31)]
 }
 
+fn err_text(e: ChatError) -> &'static str {
+    match e {
+        ChatError::NoSuchUser => "That user is not connected.",
+        ChatError::NoSuchChat => "That chat does not exist.",
+        ChatError::NotAMember => "You are not in that chat.",
+        ChatError::AlreadyThere => "Already there.",
+        ChatError::WrongPassword => "Wrong chat password.",
+    }
+}
+
+// --- Chat line formatting ----------------------------------------------
+//
+// Hotline chat is server-formatted: the server composes the display line
+// and clients render it verbatim. These mirror the reference server's
+// default formats — `"\r%13.13s:  %s"` and `"\r *** %s %s"` — byte for
+// byte, name field right-aligned in 13 columns and truncated to 13.
+
+fn format_chat_line(out: &mut Vec<u8>, nick: &[u8], line: &[u8], style: u16) {
+    out.push(b'\r');
+    if style == 1 {
+        out.extend_from_slice(b" *** ");
+        out.extend_from_slice(nick);
+        out.push(b' ');
+    } else {
+        let shown = &nick[..nick.len().min(13)];
+        for _ in shown.len()..13 {
+            out.push(b' ');
+        }
+        out.extend_from_slice(shown);
+        out.extend_from_slice(b":  ");
+    }
+    out.extend_from_slice(line);
+}
+
+/// Split multi-line input and format each line (the reference server's
+/// `cr_strtok_r` loop).
+fn format_chat(nick: &[u8], text: &[u8], style: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 32);
+    for line in text.split(|b| *b == b'\r' || *b == b'\n') {
+        format_chat_line(&mut out, nick, line, style);
+    }
+    out
+}
+
 /// What the login chunk-walk yielded.
 #[derive(Default)]
 struct LoginRequest {
@@ -255,7 +345,17 @@ struct Session {
     announced: bool,
 }
 
-pub async fn run_session(stream: TcpStream, ctx: ServerCtx) {
+impl Session {
+    fn can(&self, b: u8) -> bool {
+        self.account.access.has(b)
+    }
+}
+
+pub async fn run_session(stream: TcpStream, peer: SocketAddr, ctx: ServerCtx) {
+    if ctx.core.is_banned(peer.ip()) {
+        info!("refusing banned address");
+        return;
+    }
     let _ = stream.set_nodelay(true);
     let (mut rd, wr) = stream.into_split();
 
@@ -273,42 +373,39 @@ pub async fn run_session(stream: TcpStream, ctx: ServerCtx) {
         return;
     }
 
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, out_rx) = mpsc::unbounded_channel();
     let mut wr_for_magic = wr;
     if wr_for_magic.write_all(&SERVER_MAGIC).await.is_err() {
         return;
     }
-    let writer = tokio::spawn(writer_task(wr_for_magic, rx));
+    let writer = tokio::spawn(writer_task(wr_for_magic, out_rx));
+    let (frames_tx, mut frames) = mpsc::channel(32);
+    let reader = tokio::spawn(reader_task(rd, frames_tx));
 
-    // --- Login, then the frame loop -------------------------------------
-    let sess = match login_phase(&mut rd, &tx, &ctx).await {
-        Some(sess) => sess,
-        None => {
-            drop(tx);
-            let _ = writer.await;
-            return;
-        }
-    };
-    let uid = sess.uid;
-    info!(uid, login = %sess.account.login, "logged in");
-
-    frame_loop(&mut rd, &tx, &ctx, sess).await;
-
-    ctx.core.detach(uid);
-    info!(uid, "disconnected");
+    // --- Login, then the session loop -----------------------------------
+    let outcome = login_phase(&mut frames, &tx, &ctx, peer).await;
+    if let Some((mut sess, mut events)) = outcome {
+        let uid = sess.uid;
+        info!(uid, login = %sess.account.login, "logged in");
+        session_loop(&mut frames, &mut events, &tx, &ctx, &mut sess).await;
+        ctx.core.detach(uid);
+        info!(uid, "disconnected");
+    }
+    reader.abort();
     drop(tx);
     let _ = writer.await;
 }
 
 /// Wait for the LOGIN transaction and run the login flow. `None` = close.
-async fn login_phase(rd: &mut OwnedReadHalf, tx: &Tx, ctx: &ServerCtx) -> Option<Session> {
-    let f = match timeout(ctx.cfg.login_timeout, read_frame(rd)).await {
-        Ok(Ok(f)) => f,
-        Ok(Err(ReadError::Malformed(why))) => {
-            warn!("malformed frame before login: {why}");
-            return None;
-        }
-        _ => return None, // timeout, EOF, io error
+async fn login_phase(
+    frames: &mut Receiver<Frame>,
+    tx: &Tx,
+    ctx: &ServerCtx,
+    peer: SocketAddr,
+) -> Option<(Session, UnboundedReceiver<Event>)> {
+    let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
+        Ok(Some(f)) => f,
+        _ => return None, // timeout or reader gone
     };
     trace_in(&f);
     if f.ty != ClientHdr::Login.as_u32() {
@@ -362,7 +459,15 @@ async fn login_phase(rd: &mut OwnedReadHalf, tx: &Tx, ctx: &ServerCtx) -> Option
         0
     };
 
-    let Some((uid, events)) = ctx.core.attach(nick, req.icon, color, account.access) else {
+    let attach = AttachInfo {
+        nick,
+        icon: req.icon,
+        color,
+        access: account.access,
+        login: account.login.clone(),
+        addr: Some(peer.ip()),
+    };
+    let Some((uid, events)) = ctx.core.attach(attach) else {
         reply_error(tx, f.trans, "Server full.");
         return None;
     };
@@ -406,9 +511,6 @@ async fn login_phase(rd: &mut OwnedReadHalf, tx: &Tx, ctx: &ServerCtx) -> Option
         );
     }
 
-    // Start the event pump now that the roster feeds us.
-    spawn_event_pump(events, tx.clone());
-
     let mut sess = Session {
         uid,
         account,
@@ -420,7 +522,7 @@ async fn login_phase(rd: &mut OwnedReadHalf, tx: &Tx, ctx: &ServerCtx) -> Option
     if req.clientversion < 150 || got_name {
         complete_login(tx, ctx, &mut sess);
     }
-    Some(sess)
+    Some((sess, events))
 }
 
 /// The "loginupdate" moment: hand the client its self-info and make it
@@ -448,101 +550,499 @@ fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
     sess.announced = true;
 }
 
-fn spawn_event_pump(mut events: UnboundedReceiver<Event>, tx: Tx) {
-    tokio::spawn(async move {
-        while let Some(ev) = events.recv().await {
-            match ev {
-                Event::Joined(u) | Event::Changed(u) => {
-                    push(&tx, hdr::USER_CHANGE, user_change_chunks(&u));
-                }
-                Event::Parted(uid) => {
-                    push(
-                        &tx,
-                        hdr::USER_PART,
-                        vec![(tag::UID, uid.to_be_bytes().to_vec())],
-                    );
-                }
-            }
+/// Encode one domain event onto the wire. Returns `false` when the session
+/// must end (kicked).
+fn deliver_event(tx: &Tx, ev: Event) -> bool {
+    match ev {
+        Event::Joined(u) | Event::Changed(u) => {
+            push(tx, hdr::USER_CHANGE, user_change_chunks(&u));
         }
-    });
+        Event::Parted(uid) => {
+            push(
+                tx,
+                hdr::USER_PART,
+                vec![(tag::UID, uid.to_be_bytes().to_vec())],
+            );
+        }
+        Event::Chat {
+            cid,
+            from,
+            text,
+            style,
+        } => {
+            let line = format_chat(&from.nick, &text, style);
+            let mut chunks = vec![(tag::BODY, line)];
+            if cid != 0 {
+                chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
+            }
+            chunks.push((tag::UID, from.uid.to_be_bytes().to_vec()));
+            push(tx, hdr::CHAT, chunks);
+        }
+        Event::ChatLine { cid, from, line } => {
+            let mut chunks = vec![(tag::BODY, line)];
+            if cid != 0 {
+                chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
+            }
+            chunks.push((tag::UID, from.to_be_bytes().to_vec()));
+            push(tx, hdr::CHAT, chunks);
+        }
+        Event::ChatSubject { cid, subject } => {
+            push(
+                tx,
+                hdr::CHAT_SUBJECT,
+                vec![
+                    (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
+                    (tag::CHAT_SUBJECT, subject),
+                ],
+            );
+        }
+        Event::ChatPassword { cid, password } => {
+            push(
+                tx,
+                hdr::CHAT_SUBJECT,
+                vec![
+                    (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
+                    (tag::PASSWORD, password),
+                ],
+            );
+        }
+        Event::ChatInvite {
+            cid,
+            from,
+            from_nick,
+        } => {
+            push(
+                tx,
+                hdr::CHAT_INVITE,
+                vec![
+                    (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
+                    (tag::UID, from.to_be_bytes().to_vec()),
+                    (tag::NAME, from_nick),
+                ],
+            );
+        }
+        Event::ChatUserJoined { cid, user } => {
+            push(
+                tx,
+                hdr::CHAT_USER_CHANGE,
+                vec![
+                    (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
+                    (tag::UID, user.uid.to_be_bytes().to_vec()),
+                    (tag::ICON, user.icon.to_be_bytes().to_vec()),
+                    (tag::COLOUR, user.color.to_be_bytes().to_vec()),
+                    (tag::NAME, user.nick),
+                ],
+            );
+        }
+        Event::ChatUserParted { cid, uid } => {
+            push(
+                tx,
+                hdr::CHAT_USER_PART,
+                vec![
+                    (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
+                    (tag::UID, uid.to_be_bytes().to_vec()),
+                ],
+            );
+        }
+        Event::Msg {
+            from,
+            from_nick,
+            text,
+        } => {
+            push(
+                tx,
+                hdr::MSG,
+                vec![
+                    (tag::UID, from.to_be_bytes().to_vec()),
+                    (tag::BODY, text),
+                    (tag::NAME, from_nick),
+                ],
+            );
+        }
+        Event::Broadcast {
+            from,
+            from_nick,
+            text,
+        } => {
+            push(
+                tx,
+                hdr::MSG_BROADCAST,
+                vec![
+                    (tag::UID, from.to_be_bytes().to_vec()),
+                    (tag::BODY, text),
+                    (tag::NAME, from_nick),
+                ],
+            );
+        }
+        Event::Kicked => return false,
+    }
+    true
 }
 
-async fn frame_loop(rd: &mut OwnedReadHalf, tx: &Tx, ctx: &ServerCtx, mut sess: Session) {
+async fn session_loop(
+    frames: &mut Receiver<Frame>,
+    events: &mut UnboundedReceiver<Event>,
+    tx: &Tx,
+    ctx: &ServerCtx,
+    sess: &mut Session,
+) {
     loop {
-        let f = match read_frame(rd).await {
-            Ok(f) => f,
-            Err(ReadError::Eof) => return,
-            Err(ReadError::Io(e)) => {
-                debug!("read error: {e}");
-                return;
-            }
-            Err(ReadError::Malformed(why)) => {
-                warn!("malformed frame: {why}");
-                return;
-            }
-        };
-        trace_in(&f);
+        tokio::select! {
+            maybe = frames.recv() => match maybe {
+                Some(f) => {
+                    trace_in(&f);
+                    dispatch(&f, tx, ctx, sess);
+                }
+                None => return, // Reader exited: EOF, error, or bad frame.
+            },
+            maybe = events.recv() => match maybe {
+                Some(ev) => {
+                    if !deliver_event(tx, ev) {
+                        info!(uid = sess.uid, "kicked");
+                        return;
+                    }
+                }
+                None => return, // Detached elsewhere; shouldn't happen.
+            },
+        }
+    }
+}
 
-        match f.ty {
-            t if t == ClientHdr::Ping.as_u32() => reply(tx, f.trans, vec![]),
-            t if t == ClientHdr::UserGetList.as_u32() => {
-                let mut chunks: Vec<(u16, Vec<u8>)> = ctx
-                    .core
-                    .snapshot()
-                    .iter()
-                    .map(|u| (tag::USER_LIST, userlist_payload(u)))
-                    .collect();
-                // The reference server always appends the public-chat
-                // subject; empty until the chat phase gives it content.
-                chunks.push((tag::CHAT_SUBJECT, Vec::new()));
-                reply(tx, f.trans, chunks);
-            }
-            t if t == ClientHdr::UserChange.as_u32() => {
-                let (mut nick, mut icon) = (None, None);
-                for c in f.chunks() {
-                    match c.tag {
-                        tag::NAME if sess.account.access.has(bit::USE_ANY_NAME) => {
-                            nick = Some(cap31(c.data).to_vec());
-                        }
-                        tag::ICON => icon = Some(c.as_uint() as u16),
-                        _ => {}
+fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
+    match f.ty {
+        t if t == ClientHdr::Ping.as_u32() => reply(tx, f.trans, vec![]),
+
+        t if t == ClientHdr::UserGetList.as_u32() => {
+            let mut chunks: Vec<(u16, Vec<u8>)> = ctx
+                .core
+                .snapshot()
+                .iter()
+                .map(|u| (tag::USER_LIST, userlist_payload(u)))
+                .collect();
+            chunks.push((tag::CHAT_SUBJECT, ctx.core.public_subject()));
+            reply(tx, f.trans, chunks);
+        }
+
+        t if t == ClientHdr::UserChange.as_u32() => {
+            let (mut nick, mut icon) = (None, None);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::NAME if sess.can(bit::USE_ANY_NAME) => {
+                        nick = Some(cap31(c.data).to_vec());
                     }
+                    tag::ICON => icon = Some(c.as_uint() as u16),
+                    _ => {}
                 }
-                ctx.core.update(sess.uid, nick, icon);
-                if !sess.announced {
-                    complete_login(tx, ctx, &mut sess);
-                }
-                // No reply — USER_CHANGE is fire-and-forget on the wire.
             }
-            t if t == ClientHdr::AgreementAgree.as_u32() => {
-                let (mut nick, mut icon) = (None, None);
-                for c in f.chunks() {
-                    match c.tag {
-                        tag::NAME if sess.account.access.has(bit::USE_ANY_NAME) => {
-                            nick = Some(cap31(c.data).to_vec());
-                        }
-                        tag::ICON => {
-                            let v = c.as_uint() as u16;
-                            if v != 0 {
-                                icon = Some(v);
-                            }
-                        }
-                        _ => {}
+            ctx.core.update(sess.uid, nick, icon);
+            if !sess.announced {
+                complete_login(tx, ctx, sess);
+            }
+            // No reply — USER_CHANGE is fire-and-forget on the wire.
+        }
+
+        t if t == ClientHdr::AgreementAgree.as_u32() => {
+            let (mut nick, mut icon) = (None, None);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::NAME if sess.can(bit::USE_ANY_NAME) => {
+                        nick = Some(cap31(c.data).to_vec());
                     }
+                    tag::ICON => {
+                        let v = c.as_uint() as u16;
+                        if v != 0 {
+                            icon = Some(v);
+                        }
+                    }
+                    _ => {}
                 }
-                reply(tx, f.trans, vec![]); // ack first, like the reference
-                ctx.core.update(sess.uid, nick, icon);
-                if !sess.announced {
-                    complete_login(tx, ctx, &mut sess);
+            }
+            reply(tx, f.trans, vec![]); // ack first, like the reference
+            ctx.core.update(sess.uid, nick, icon);
+            if !sess.announced {
+                complete_login(tx, ctx, sess);
+            }
+        }
+
+        // --- Chat -----------------------------------------------------
+        t if t == ClientHdr::Chat.as_u32() => {
+            let (mut cid, mut style, mut body) = (0u32, 0u16, Vec::new());
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_ID => cid = c.as_uint(),
+                    tag::STYLE => style = c.as_uint() as u16,
+                    tag::BODY => body = c.data[..c.data.len().min(MAX_CHAT_INPUT)].to_vec(),
+                    TAG_CHAT_AWAY => {} // No away state yet; rider ignored.
+                    _ => {}
                 }
             }
-            t if t == ClientHdr::Login.as_u32() => {
-                reply_error(tx, f.trans, "Already logged in.");
+            // The reference server drops unpermitted chat silently (no
+            // task reply exists for a notification-style send).
+            if !sess.can(bit::SEND_CHAT) {
+                debug!(uid = sess.uid, "chat dropped: no send_chat access");
+                return;
             }
-            other => {
-                debug!("unimplemented transaction {other:#x}");
-                reply_error(tx, f.trans, "Not implemented.");
+            if cid == 0 {
+                ctx.core.chat_public(sess.uid, body, style);
+            } else if let Err(e) = ctx.core.chat_private(cid, sess.uid, body, style) {
+                debug!(uid = sess.uid, cid, "private chat dropped: {e:?}");
             }
+        }
+
+        t if t == ClientHdr::ChatSubject.as_u32() => {
+            let (mut cid, mut subject, mut password) = (0u32, None, None);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_ID => cid = c.as_uint(),
+                    tag::CHAT_SUBJECT => subject = Some(c.data[..c.data.len().min(255)].to_vec()),
+                    tag::PASSWORD => password = Some(cap31(c.data).to_vec()),
+                    _ => {}
+                }
+            }
+            // Public-subject policy: the reference server gates this on a
+            // config list (access_extra.set_subject, default nobody); we
+            // approximate with the disconnect_users (admin) bit until
+            // account files grow an extras section.
+            if cid == 0 && !sess.can(bit::DISCONNECT_USERS) {
+                debug!(uid = sess.uid, "public subject refused");
+                return;
+            }
+            if let Some(s) = subject {
+                if let Err(e) = ctx.core.chat_subject(cid, sess.uid, s) {
+                    debug!(uid = sess.uid, cid, "subject refused: {e:?}");
+                }
+            }
+            if cid != 0 {
+                if let Some(p) = password {
+                    let _ = ctx.core.chat_password(cid, sess.uid, p);
+                }
+            }
+            // No task reply — the reference server never acks this opcode,
+            // and clients are built around that.
+        }
+
+        // --- Private chats --------------------------------------------
+        t if t == ClientHdr::ChatCreate.as_u32() => {
+            if !sess.can(bit::CREATE_PCHATS) {
+                reply_error(tx, f.trans, "You are not allowed to create private chats.");
+                return;
+            }
+            let Some(invitee) = f
+                .chunks()
+                .find(|c| c.tag == tag::UID)
+                .map(|c| c.as_uint() as Uid)
+            else {
+                reply_error(tx, f.trans, "Invite whom?");
+                return;
+            };
+            match ctx.core.chat_create(sess.uid, invitee) {
+                Ok((cid, me)) => reply(
+                    tx,
+                    f.trans,
+                    vec![
+                        (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
+                        (tag::UID, me.uid.to_be_bytes().to_vec()),
+                        (tag::ICON, me.icon.to_be_bytes().to_vec()),
+                        (tag::COLOUR, me.color.to_be_bytes().to_vec()),
+                        (tag::NAME, me.nick),
+                    ],
+                ),
+                Err(e) => reply_error(tx, f.trans, err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::ChatInvite.as_u32() => {
+            let (mut cid, mut target) = (0u32, 0 as Uid);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_ID => cid = c.as_uint(),
+                    tag::UID => target = c.as_uint() as Uid,
+                    _ => {}
+                }
+            }
+            match ctx.core.chat_invite(cid, sess.uid, target) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::ChatDecline.as_u32() => {
+            if let Some(cid) = f
+                .chunks()
+                .find(|c| c.tag == tag::CHAT_ID)
+                .map(|c| c.as_uint())
+            {
+                ctx.core.chat_decline(cid, sess.uid);
+            }
+            // No reply, like the reference.
+        }
+
+        t if t == ClientHdr::ChatJoin.as_u32() => {
+            let (mut cid, mut password) = (0u32, Vec::new());
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_ID => cid = c.as_uint(),
+                    tag::PASSWORD => password = cap31(c.data).to_vec(),
+                    _ => {}
+                }
+            }
+            match ctx.core.chat_join(cid, sess.uid, &password) {
+                Ok((rows, subject)) => {
+                    let mut chunks: Vec<(u16, Vec<u8>)> = rows
+                        .iter()
+                        .map(|u| (tag::USER_LIST, userlist_payload(u)))
+                        .collect();
+                    chunks.push((tag::CHAT_SUBJECT, subject));
+                    reply(tx, f.trans, chunks);
+                }
+                Err(e) => reply_error(tx, f.trans, err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::ChatPart.as_u32() => {
+            if let Some(cid) = f
+                .chunks()
+                .find(|c| c.tag == tag::CHAT_ID)
+                .map(|c| c.as_uint())
+            {
+                ctx.core.chat_part(cid, sess.uid);
+            }
+            // No reply, like the reference.
+        }
+
+        // --- Messaging ------------------------------------------------
+        t if t == ClientHdr::Msg.as_u32() => {
+            if !sess.can(bit::SEND_MSGS) {
+                reply_error(tx, f.trans, "You are not allowed to send private messages.");
+                return;
+            }
+            let (mut to, mut body) = (0 as Uid, Vec::new());
+            for c in f.chunks() {
+                match c.tag {
+                    tag::UID => to = c.as_uint() as Uid,
+                    tag::BODY => body = c.data[..c.data.len().min(MAX_CHAT_INPUT)].to_vec(),
+                    _ => {}
+                }
+            }
+            if to == 0 || body.is_empty() {
+                reply_error(tx, f.trans, "Empty message or no recipient.");
+                return;
+            }
+            match ctx.core.msg(sess.uid, to, body) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::MsgBroadcast.as_u32() => {
+            if !sess.can(bit::CAN_BROADCAST) {
+                reply_error(tx, f.trans, "You are not allowed to broadcast.");
+                return;
+            }
+            let body = f
+                .chunks()
+                .find(|c| c.tag == tag::BODY)
+                .map(|c| c.data[..c.data.len().min(MAX_CHAT_INPUT)].to_vec())
+                .unwrap_or_default();
+            if body.is_empty() {
+                reply_error(tx, f.trans, "Empty broadcast.");
+                return;
+            }
+            let _ = ctx.core.broadcast(sess.uid, body);
+            // The reference server never acks a broadcast, leaving the
+            // sender's task dangling; we ack, which clients accept.
+            reply(tx, f.trans, vec![]);
+        }
+
+        // --- User info & moderation -----------------------------------
+        t if t == ClientHdr::UserGetInfo.as_u32() => {
+            let target = f
+                .chunks()
+                .find(|c| c.tag == tag::UID)
+                .map(|c| c.as_uint() as Uid)
+                .unwrap_or(0);
+            // Self-info is always allowed (the reference server's
+            // options.self_info default); other users need the bit.
+            if target != sess.uid && !sess.can(bit::GET_USER_INFO) {
+                reply_error(tx, f.trans, "You are not allowed to get user information.");
+                return;
+            }
+            let Some(d) = ctx.core.user_details(target) else {
+                reply_error(tx, f.trans, "That user is not connected.");
+                return;
+            };
+            let secs = d.connected_at.elapsed().as_secs();
+            let info = format!(
+                "    name: {}\r   login: {}\r address: {}\r  online: {}h {}m {}s\r",
+                String::from_utf8_lossy(&d.info.nick),
+                d.login,
+                d.addr.map_or_else(|| "-".into(), |a| a.to_string()),
+                secs / 3600,
+                (secs % 3600) / 60,
+                secs % 60,
+            );
+            reply(
+                tx,
+                f.trans,
+                vec![
+                    (tag::BODY, text::from_utf8(&info)),
+                    (tag::NAME, d.info.nick),
+                ],
+            );
+        }
+
+        t if t == ClientHdr::UserKick.as_u32() => {
+            if !sess.can(bit::DISCONNECT_USERS) {
+                reply_error(tx, f.trans, "You are not allowed to disconnect users.");
+                return;
+            }
+            let (mut target, mut ban) = (0 as Uid, false);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::UID => target = c.as_uint() as Uid,
+                    tag::BAN => ban = c.as_uint() != 0,
+                    _ => {}
+                }
+            }
+            if ctx
+                .core
+                .access_of(target)
+                .is_some_and(|a| a.has(bit::CANT_BE_DISCONNECTED))
+            {
+                reply_error(tx, f.trans, "That user cannot be disconnected.");
+                return;
+            }
+            let ban_for = ban.then_some(ctx.cfg.ban_time);
+            match ctx.core.kick(target, ban_for) {
+                Ok(nick) => {
+                    reply(tx, f.trans, vec![]);
+                    // The public-chat announcement, in the reference
+                    // server's wording.
+                    let me = ctx.core.user(sess.uid);
+                    let by = me.map(|u| u.nick).unwrap_or_default();
+                    let mut line = Vec::new();
+                    line.extend_from_slice(b"\r<");
+                    line.extend_from_slice(&nick);
+                    line.extend_from_slice(if ban {
+                        b" has been banned by "
+                    } else {
+                        b" has been kicked by "
+                    });
+                    line.extend_from_slice(&by);
+                    line.push(b'>');
+                    ctx.core.chat_notice(0, sess.uid, line);
+                }
+                Err(e) => reply_error(tx, f.trans, err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::Login.as_u32() => {
+            reply_error(tx, f.trans, "Already logged in.");
+        }
+
+        other => {
+            debug!("unimplemented transaction {other:#x}");
+            reply_error(tx, f.trans, "Not implemented.");
         }
     }
 }

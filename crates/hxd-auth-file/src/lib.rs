@@ -137,6 +137,8 @@ impl FileAuth {
              [access]\n\
              read_chat = true\n\
              send_chat = true\n\
+             create_pchats = true\n\
+             send_msgs = true\n\
              get_user_info = true\n\
              use_any_name = true\n",
         )?;
