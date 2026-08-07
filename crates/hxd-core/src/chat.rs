@@ -12,6 +12,9 @@
 //! public chat and is never in the registry), invitation is optional — any
 //! member can invite, joining an un-passworded chat needs no invitation,
 //! an invitation bypasses the password, the last part deletes the chat.
+//!
+//! All text is UTF-8 (`String`) — see the roster module docs for the
+//! conversion rules at the legacy edge.
 
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -25,8 +28,8 @@ use crate::Core;
 pub(crate) struct PrivateChat {
     pub(crate) members: Vec<Uid>,
     pub(crate) invited: Vec<Uid>,
-    pub(crate) subject: Vec<u8>,
-    pub(crate) password: Vec<u8>,
+    pub(crate) subject: String,
+    pub(crate) password: String,
 }
 
 /// A ban-list entry. Matching is by address (the reference server also
@@ -53,7 +56,7 @@ impl Core {
 
     /// A public chat line. Delivered (sender included) to every visible
     /// session allowed to read chat.
-    pub fn chat_public(&self, from: Uid, text: Vec<u8>, style: u16) {
+    pub fn chat_public(&self, from: Uid, text: String, style: u16) {
         let r = self.roster.lock().unwrap();
         let Some(sess) = r.users.get(&from) else {
             return;
@@ -72,7 +75,7 @@ impl Core {
         &self,
         cid: u32,
         from: Uid,
-        text: Vec<u8>,
+        text: String,
         style: u16,
     ) -> Result<(), ChatError> {
         let r = self.roster.lock().unwrap();
@@ -97,11 +100,12 @@ impl Core {
         Ok(())
     }
 
-    /// A pre-formatted server notice into a chat (kick announcements and
-    /// the like). Public delivery honors the read-chat filter.
-    pub fn chat_notice(&self, cid: u32, from: Uid, line: Vec<u8>) {
+    /// A server notice into a chat (kick announcements and the like).
+    /// Semantic text — each frontend formats it. Public delivery honors the
+    /// read-chat filter.
+    pub fn chat_notice(&self, cid: u32, from: Uid, text: String) {
         let r = self.roster.lock().unwrap();
-        let ev = Event::ChatLine { cid, from, line };
+        let ev = Event::Notice { cid, from, text };
         if cid == 0 {
             r.broadcast_where(&ev, None, reads_public_chat);
         } else if let Some(chat) = r.chats.get(&cid) {
@@ -193,8 +197,8 @@ impl Core {
         &self,
         cid: u32,
         uid: Uid,
-        password: &[u8],
-    ) -> Result<(Vec<UserInfo>, Vec<u8>), ChatError> {
+        password: &str,
+    ) -> Result<(Vec<UserInfo>, String), ChatError> {
         let mut r = self.roster.lock().unwrap();
         let me = r
             .users
@@ -234,7 +238,7 @@ impl Core {
 
     /// Set a chat's subject. cid 0 is the public subject (policy-gated by
     /// the caller); private chats require membership.
-    pub fn chat_subject(&self, cid: u32, uid: Uid, subject: Vec<u8>) -> Result<(), ChatError> {
+    pub fn chat_subject(&self, cid: u32, uid: Uid, subject: String) -> Result<(), ChatError> {
         let mut r = self.roster.lock().unwrap();
         let ev = Event::ChatSubject {
             cid,
@@ -258,7 +262,7 @@ impl Core {
 
     /// Set a private chat's password (members only; announced to members,
     /// mirroring the reference server).
-    pub fn chat_password(&self, cid: u32, uid: Uid, password: Vec<u8>) -> Result<(), ChatError> {
+    pub fn chat_password(&self, cid: u32, uid: Uid, password: String) -> Result<(), ChatError> {
         let mut r = self.roster.lock().unwrap();
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
         if !chat.members.contains(&uid) {
@@ -321,7 +325,7 @@ impl Core {
     // --- Messaging ------------------------------------------------------
 
     /// A private message. The sender's ack is the frontend's task reply.
-    pub fn msg(&self, from: Uid, to: Uid, text: Vec<u8>) -> Result<(), ChatError> {
+    pub fn msg(&self, from: Uid, to: Uid, text: String) -> Result<(), ChatError> {
         let r = self.roster.lock().unwrap();
         let from_nick = r
             .users
@@ -343,7 +347,7 @@ impl Core {
     }
 
     /// An administrator broadcast, to everyone (sender included).
-    pub fn broadcast(&self, from: Uid, text: Vec<u8>) -> Result<(), ChatError> {
+    pub fn broadcast(&self, from: Uid, text: String) -> Result<(), ChatError> {
         let r = self.roster.lock().unwrap();
         let from_nick = r
             .users
@@ -369,7 +373,7 @@ impl Core {
     /// announcement is the caller's job (it owns the wording). Returns the
     /// target's nick. The cant-be-disconnected check is policy and lives in
     /// the caller, which has the target's access via [`Core::access_of`].
-    pub fn kick(&self, target: Uid, ban_for: Option<Duration>) -> Result<Vec<u8>, ChatError> {
+    pub fn kick(&self, target: Uid, ban_for: Option<Duration>) -> Result<String, ChatError> {
         let mut r = self.roster.lock().unwrap();
         let sess = r.users.get(&target).ok_or(ChatError::NoSuchUser)?;
         let nick = sess.info.nick.clone();
@@ -426,15 +430,15 @@ mod tests {
     #[test]
     fn public_chat_reaches_readers_only_including_sender() {
         let core = Core::new();
-        let (a, mut rx_a) = test_attach(&core, b"alice", chatter());
-        let (_b, mut rx_b) = test_attach(&core, b"bob", chatter());
-        let (_m, mut rx_m) = test_attach(&core, b"mute", AccessBits::empty());
+        let (a, mut rx_a) = test_attach(&core, "alice", chatter());
+        let (_b, mut rx_b) = test_attach(&core, "bob", chatter());
+        let (_m, mut rx_m) = test_attach(&core, "mute", AccessBits::empty());
         drain(&mut rx_a);
         drain(&mut rx_b);
 
-        core.chat_public(a, b"hi".to_vec(), 0);
+        core.chat_public(a, "hi".into(), 0);
         assert!(
-            matches!(&drain(&mut rx_a)[..], [Event::Chat { cid: 0, text, .. }] if text == b"hi")
+            matches!(&drain(&mut rx_a)[..], [Event::Chat { cid: 0, text, .. }] if text == "hi")
         );
         assert_eq!(drain(&mut rx_b).len(), 1);
         assert!(drain(&mut rx_m).is_empty());
@@ -443,8 +447,8 @@ mod tests {
     #[test]
     fn private_chat_lifecycle_create_invite_join_part() {
         let core = Core::new();
-        let (a, mut rx_a) = test_attach(&core, b"alice", chatter());
-        let (b, mut rx_b) = test_attach(&core, b"bob", chatter());
+        let (a, mut rx_a) = test_attach(&core, "alice", chatter());
+        let (b, mut rx_b) = test_attach(&core, "bob", chatter());
         drain(&mut rx_a);
 
         let (cid, me) = core.chat_create(a, b).unwrap();
@@ -456,16 +460,16 @@ mod tests {
         // Chatting before joining is refused; joining via invite skips the
         // password.
         assert_eq!(
-            core.chat_private(cid, b, b"early".to_vec(), 0),
+            core.chat_private(cid, b, "early".into(), 0),
             Err(ChatError::NotAMember)
         );
-        let (rows, _subject) = core.chat_join(cid, b, b"").unwrap();
+        let (rows, _subject) = core.chat_join(cid, b, "").unwrap();
         assert_eq!(rows.len(), 2);
         assert!(
             matches!(&drain(&mut rx_a)[..], [Event::ChatUserJoined { user, .. }] if user.uid == b)
         );
 
-        core.chat_private(cid, b, b"hello".to_vec(), 0).unwrap();
+        core.chat_private(cid, b, "hello".into(), 0).unwrap();
         assert_eq!(drain(&mut rx_a).len(), 1);
         assert_eq!(drain(&mut rx_b).len(), 1);
 
@@ -473,31 +477,31 @@ mod tests {
         core.chat_part(cid, b);
         assert!(matches!(&drain(&mut rx_a)[..], [Event::ChatUserParted { uid, .. }] if *uid == b));
         core.chat_part(cid, a);
-        assert_eq!(core.chat_join(cid, a, b""), Err(ChatError::NoSuchChat));
+        assert_eq!(core.chat_join(cid, a, ""), Err(ChatError::NoSuchChat));
     }
 
     #[test]
     fn passworded_chat_gates_uninvited_joiners() {
         let core = Core::new();
-        let (a, _rx_a) = test_attach(&core, b"alice", chatter());
-        let (b, _rx_b) = test_attach(&core, b"bob", chatter());
+        let (a, _rx_a) = test_attach(&core, "alice", chatter());
+        let (b, _rx_b) = test_attach(&core, "bob", chatter());
         let (cid, _) = core.chat_create(a, a).unwrap();
-        core.chat_password(cid, a, b"sesame".to_vec()).unwrap();
+        core.chat_password(cid, a, "sesame".into()).unwrap();
 
         assert_eq!(
-            core.chat_join(cid, b, b"wrong"),
+            core.chat_join(cid, b, "wrong"),
             Err(ChatError::WrongPassword)
         );
-        assert!(core.chat_join(cid, b, b"sesame").is_ok());
+        assert!(core.chat_join(cid, b, "sesame").is_ok());
     }
 
     #[test]
     fn detach_parts_every_chat() {
         let core = Core::new();
-        let (a, mut rx_a) = test_attach(&core, b"alice", chatter());
-        let (b, _rx_b) = test_attach(&core, b"bob", chatter());
+        let (a, mut rx_a) = test_attach(&core, "alice", chatter());
+        let (b, _rx_b) = test_attach(&core, "bob", chatter());
         let (cid, _) = core.chat_create(b, a).unwrap();
-        core.chat_join(cid, a, b"").unwrap();
+        core.chat_join(cid, a, "").unwrap();
         drain(&mut rx_a);
 
         core.detach(b);
@@ -511,47 +515,52 @@ mod tests {
     #[test]
     fn subjects_public_and_private() {
         let core = Core::new();
-        let (a, mut rx_a) = test_attach(&core, b"alice", chatter());
-        let (b, mut rx_b) = test_attach(&core, b"bob", AccessBits::empty());
+        let (a, mut rx_a) = test_attach(&core, "alice", chatter());
+        let (b, mut rx_b) = test_attach(&core, "bob", AccessBits::empty());
         drain(&mut rx_a);
 
-        core.chat_subject(0, a, b"welcome!".to_vec()).unwrap();
+        core.chat_subject(0, a, "welcome!".into()).unwrap();
         // Public subject reaches everyone, even non-chat-readers.
         assert_eq!(drain(&mut rx_b).len(), 1);
-        assert_eq!(core.public_subject(), b"welcome!");
+        assert_eq!(core.public_subject(), "welcome!");
 
         let (cid, _) = core.chat_create(a, a).unwrap();
         assert_eq!(
-            core.chat_subject(cid, b, b"x".to_vec()),
+            core.chat_subject(cid, b, "x".into()),
             Err(ChatError::NotAMember)
         );
-        core.chat_subject(cid, a, b"private".to_vec()).unwrap();
+        core.chat_subject(cid, a, "private".into()).unwrap();
         let (_rows, subject) = {
             core.chat_invite(cid, a, b).unwrap();
-            core.chat_join(cid, b, b"").unwrap()
+            core.chat_join(cid, b, "").unwrap()
         };
-        assert_eq!(subject, b"private");
+        assert_eq!(subject, "private");
     }
 
     #[test]
-    fn msg_and_broadcast_and_kick_ban() {
+    fn msg_broadcast_notice_and_kick_ban() {
         let core = Core::new();
-        let (a, mut rx_a) = test_attach(&core, b"alice", chatter());
-        let (b, mut rx_b) = test_attach(&core, b"bob", chatter());
+        let (a, mut rx_a) = test_attach(&core, "alice", chatter());
+        let (b, mut rx_b) = test_attach(&core, "bob", chatter());
         drain(&mut rx_a);
 
-        core.msg(a, b, b"psst".to_vec()).unwrap();
+        core.msg(a, b, "psst".into()).unwrap();
         assert!(
-            matches!(&drain(&mut rx_b)[..], [Event::Msg { from, text, .. }] if *from == a && text == b"psst")
+            matches!(&drain(&mut rx_b)[..], [Event::Msg { from, text, .. }] if *from == a && text == "psst")
         );
-        assert_eq!(core.msg(a, 999, b"x".to_vec()), Err(ChatError::NoSuchUser));
+        assert_eq!(core.msg(a, 999, "x".into()), Err(ChatError::NoSuchUser));
 
-        core.broadcast(a, b"attention".to_vec()).unwrap();
+        core.broadcast(a, "attention".into()).unwrap();
         assert_eq!(drain(&mut rx_a).len(), 1);
         assert_eq!(drain(&mut rx_b).len(), 1);
 
+        core.chat_notice(0, a, "bob has been warned".into());
+        assert!(
+            matches!(&drain(&mut rx_b)[..], [Event::Notice { cid: 0, text, .. }] if text == "bob has been warned")
+        );
+
         let nick = core.kick(b, Some(Duration::from_secs(60))).unwrap();
-        assert_eq!(nick, b"bob");
+        assert_eq!(nick, "bob");
         assert!(drain(&mut rx_b).contains(&Event::Kicked));
         // No address on test sessions, so nothing bannable by IP — but the
         // expiry path shouldn't panic.

@@ -344,6 +344,31 @@ async fn old_client_without_version_skips_the_agreement_dance() {
 }
 
 #[tokio::test]
+async fn mac_roman_nick_roundtrips_exactly() {
+    // The domain is UTF-8 but the wire is Mac Roman; a legacy nick with a
+    // high byte (0x8e = é) must come back byte-identical through the
+    // convert-in/convert-out path.
+    let td = tempfile::tempdir().unwrap();
+    let addr = start_server(td.path(), None).await;
+    let mut c = Client::connect(addr).await;
+    let nick = vec![b'r', b'e', b'n', 0x8e, b'e']; // "renée" in Mac Roman
+    let t = c
+        .send(
+            HDR_LOGIN,
+            &[
+                (tag::NAME, nick.clone()),
+                (tag::VERSION, 150u16.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    let f = c.recv_type(HDR_TASK).await;
+    assert_eq!((f.trans, f.flag), (t, 0));
+    let selfinfo = c.recv_type(HDR_SELFINFO).await;
+    let (_, _, _, wire_nick) = parse_userlist(&chunk(&selfinfo, tag::USER_LIST).unwrap());
+    assert_eq!(wire_nick, nick);
+}
+
+#[tokio::test]
 async fn hope_probe_and_prelogin_requests_are_refused_cleanly() {
     let td = tempfile::tempdir().unwrap();
     let addr = start_server(td.path(), None).await;

@@ -22,7 +22,8 @@ use hotline_proto::messages::{tag, ClientHdr};
 use hotline_proto::text;
 use hxd_core::access::bit;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Proof, Uid, UserInfo,
+    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Proof, SessionStatus, Uid,
+    UserInfo,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -225,15 +226,37 @@ fn push(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
     let _ = tx.send(Outbound::Push { ty, chunks });
 }
 
+/// The domain is UTF-8; this edge speaks Mac Roman. Egress conversion is
+/// lossy (`?` for unmappable) and nicks are truncated to the wire's 31
+/// bytes *after* conversion (Mac Roman is single-byte, so no split risk).
+fn mac_nick(nick: &str) -> Vec<u8> {
+    let mut v = text::from_utf8(nick);
+    v.truncate(31);
+    v
+}
+
+/// The legacy color field is a bitfield in practice: bit 1 away, bit 2
+/// admin. The domain stores `admin` + status; the wire form is derived
+/// here and only here.
+fn wire_color(u: &UserInfo) -> u16 {
+    (if u.admin { 2 } else { 0 })
+        | (if u.status == SessionStatus::Active {
+            0
+        } else {
+            1
+        })
+}
+
 /// The `HTLS_DATA_USER_LIST` payload: uid, icon, color, nlen (all u16 BE),
 /// then the name bytes. `struct hl_userlist_hdr` minus the chunk header.
 fn userlist_payload(u: &UserInfo) -> Vec<u8> {
-    let mut v = Vec::with_capacity(8 + u.nick.len());
+    let nick = mac_nick(&u.nick);
+    let mut v = Vec::with_capacity(8 + nick.len());
     v.extend_from_slice(&u.uid.to_be_bytes());
     v.extend_from_slice(&u.icon.to_be_bytes());
-    v.extend_from_slice(&u.color.to_be_bytes());
-    v.extend_from_slice(&(u.nick.len() as u16).to_be_bytes());
-    v.extend_from_slice(&u.nick);
+    v.extend_from_slice(&wire_color(u).to_be_bytes());
+    v.extend_from_slice(&(nick.len() as u16).to_be_bytes());
+    v.extend_from_slice(&nick);
     v
 }
 
@@ -241,8 +264,8 @@ fn user_change_chunks(u: &UserInfo) -> Vec<(u16, Vec<u8>)> {
     vec![
         (tag::UID, u.uid.to_be_bytes().to_vec()),
         (tag::ICON, u.icon.to_be_bytes().to_vec()),
-        (tag::COLOUR, u.color.to_be_bytes().to_vec()),
-        (tag::NAME, u.nick.clone()),
+        (tag::COLOUR, wire_color(u).to_be_bytes().to_vec()),
+        (tag::NAME, mac_nick(&u.nick)),
     ]
 }
 
@@ -432,10 +455,13 @@ async fn login_phase(
         return None;
     }
 
-    // Authenticate on the blocking pool — backends do file I/O.
+    // Authenticate on the blocking pool — backends do file I/O. Login and
+    // password are canonicalized Mac Roman → UTF-8 before the backend sees
+    // them, so an accented password typed on a legacy client matches the
+    // UTF-8 account file. (HOPE proofs will need this same canonical form.)
     let auth = ctx.auth.clone();
-    let login_str = String::from_utf8_lossy(&req.login).into_owned();
-    let password = req.password.clone();
+    let login_str = text::to_utf8(&req.login);
+    let password = text::to_utf8(&req.password).into_bytes();
     let verdict =
         tokio::task::spawn_blocking(move || auth.authenticate(&login_str, Proof::Plain(&password)))
             .await
@@ -461,19 +487,14 @@ async fn login_phase(
     // the client's own nick to stick; otherwise the account name rules.
     let got_name = req.nick.is_some();
     let nick = match (&req.nick, account.access.has(bit::USE_ANY_NAME)) {
-        (Some(n), true) => n.clone(),
-        _ => text::from_utf8(&account.name),
-    };
-    let color = if account.access.has(bit::DISCONNECT_USERS) {
-        2
-    } else {
-        0
+        (Some(n), true) => text::to_utf8(n),
+        _ => account.name.clone(),
     };
 
     let attach = AttachInfo {
         nick,
         icon: req.icon,
-        color,
+        admin: account.access.has(bit::DISCONNECT_USERS),
         access: account.access,
         login: account.login.clone(),
         addr: Some(peer.ip()),
@@ -581,7 +602,9 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
             text,
             style,
         } => {
-            let line = format_chat(&from.nick, &text, style);
+            // Format at the edge, in Mac Roman, so the 13-column name
+            // alignment stays byte-correct for legacy renderers.
+            let line = format_chat(&mac_nick(&from.nick), &text::from_utf8(&text), style);
             let mut chunks = vec![(tag::BODY, line)];
             if cid != 0 {
                 chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
@@ -589,7 +612,13 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
             chunks.push((tag::UID, from.uid.to_be_bytes().to_vec()));
             push(tx, hdr::CHAT, chunks);
         }
-        Event::ChatLine { cid, from, line } => {
+        Event::Notice { cid, from, text } => {
+            // The legacy rendering of a server notice: `\r<text>`.
+            let mut line = Vec::with_capacity(text.len() + 3);
+            line.push(b'\r');
+            line.push(b'<');
+            line.extend_from_slice(&text::from_utf8(&text));
+            line.push(b'>');
             let mut chunks = vec![(tag::BODY, line)];
             if cid != 0 {
                 chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
@@ -603,7 +632,7 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
                 hdr::CHAT_SUBJECT,
                 vec![
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
-                    (tag::CHAT_SUBJECT, subject),
+                    (tag::CHAT_SUBJECT, text::from_utf8(&subject)),
                 ],
             );
         }
@@ -613,7 +642,7 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
                 hdr::CHAT_SUBJECT,
                 vec![
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
-                    (tag::PASSWORD, password),
+                    (tag::PASSWORD, text::from_utf8(&password)),
                 ],
             );
         }
@@ -628,7 +657,7 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
                 vec![
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
                     (tag::UID, from.to_be_bytes().to_vec()),
-                    (tag::NAME, from_nick),
+                    (tag::NAME, mac_nick(&from_nick)),
                 ],
             );
         }
@@ -640,8 +669,8 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
                     (tag::UID, user.uid.to_be_bytes().to_vec()),
                     (tag::ICON, user.icon.to_be_bytes().to_vec()),
-                    (tag::COLOUR, user.color.to_be_bytes().to_vec()),
-                    (tag::NAME, user.nick),
+                    (tag::COLOUR, wire_color(&user).to_be_bytes().to_vec()),
+                    (tag::NAME, mac_nick(&user.nick)),
                 ],
             );
         }
@@ -665,8 +694,8 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
                 hdr::MSG,
                 vec![
                     (tag::UID, from.to_be_bytes().to_vec()),
-                    (tag::BODY, text),
-                    (tag::NAME, from_nick),
+                    (tag::BODY, text::from_utf8(&text)),
+                    (tag::NAME, mac_nick(&from_nick)),
                 ],
             );
         }
@@ -680,8 +709,8 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
                 hdr::MSG_BROADCAST,
                 vec![
                     (tag::UID, from.to_be_bytes().to_vec()),
-                    (tag::BODY, text),
-                    (tag::NAME, from_nick),
+                    (tag::BODY, text::from_utf8(&text)),
+                    (tag::NAME, mac_nick(&from_nick)),
                 ],
             );
         }
@@ -730,7 +759,10 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .iter()
                 .map(|u| (tag::USER_LIST, userlist_payload(u)))
                 .collect();
-            chunks.push((tag::CHAT_SUBJECT, ctx.core.public_subject()));
+            chunks.push((
+                tag::CHAT_SUBJECT,
+                text::from_utf8(&ctx.core.public_subject()),
+            ));
             reply(tx, f.trans, chunks);
         }
 
@@ -739,7 +771,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::NAME if sess.can(bit::USE_ANY_NAME) => {
-                        nick = Some(cap31(c.data).to_vec());
+                        nick = Some(text::to_utf8(cap31(c.data)));
                     }
                     tag::ICON => icon = Some(c.as_uint() as u16),
                     _ => {}
@@ -757,7 +789,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::NAME if sess.can(bit::USE_ANY_NAME) => {
-                        nick = Some(cap31(c.data).to_vec());
+                        nick = Some(text::to_utf8(cap31(c.data)));
                     }
                     tag::ICON => {
                         let v = c.as_uint() as u16;
@@ -777,12 +809,12 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
 
         // --- Chat -----------------------------------------------------
         t if t == ClientHdr::Chat.as_u32() => {
-            let (mut cid, mut style, mut body) = (0u32, 0u16, Vec::new());
+            let (mut cid, mut style, mut body) = (0u32, 0u16, String::new());
             for c in f.chunks() {
                 match c.tag {
                     tag::CHAT_ID => cid = c.as_uint(),
                     tag::STYLE => style = c.as_uint() as u16,
-                    tag::BODY => body = c.data[..c.data.len().min(MAX_CHAT_INPUT)].to_vec(),
+                    tag::BODY => body = text::to_utf8(&c.data[..c.data.len().min(MAX_CHAT_INPUT)]),
                     TAG_CHAT_AWAY => {} // No away state yet; rider ignored.
                     _ => {}
                 }
@@ -805,8 +837,10 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::CHAT_ID => cid = c.as_uint(),
-                    tag::CHAT_SUBJECT => subject = Some(c.data[..c.data.len().min(255)].to_vec()),
-                    tag::PASSWORD => password = Some(cap31(c.data).to_vec()),
+                    tag::CHAT_SUBJECT => {
+                        subject = Some(text::to_utf8(&c.data[..c.data.len().min(255)]))
+                    }
+                    tag::PASSWORD => password = Some(text::to_utf8(cap31(c.data))),
                     _ => {}
                 }
             }
@@ -854,8 +888,8 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
                         (tag::UID, me.uid.to_be_bytes().to_vec()),
                         (tag::ICON, me.icon.to_be_bytes().to_vec()),
-                        (tag::COLOUR, me.color.to_be_bytes().to_vec()),
-                        (tag::NAME, me.nick),
+                        (tag::COLOUR, wire_color(&me).to_be_bytes().to_vec()),
+                        (tag::NAME, mac_nick(&me.nick)),
                     ],
                 ),
                 Err(e) => reply_error(tx, f.trans, err_text(e)),
@@ -889,11 +923,11 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
 
         t if t == ClientHdr::ChatJoin.as_u32() => {
-            let (mut cid, mut password) = (0u32, Vec::new());
+            let (mut cid, mut password) = (0u32, String::new());
             for c in f.chunks() {
                 match c.tag {
                     tag::CHAT_ID => cid = c.as_uint(),
-                    tag::PASSWORD => password = cap31(c.data).to_vec(),
+                    tag::PASSWORD => password = text::to_utf8(cap31(c.data)),
                     _ => {}
                 }
             }
@@ -903,7 +937,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         .iter()
                         .map(|u| (tag::USER_LIST, userlist_payload(u)))
                         .collect();
-                    chunks.push((tag::CHAT_SUBJECT, subject));
+                    chunks.push((tag::CHAT_SUBJECT, text::from_utf8(&subject)));
                     reply(tx, f.trans, chunks);
                 }
                 Err(e) => reply_error(tx, f.trans, err_text(e)),
@@ -927,11 +961,11 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "You are not allowed to send private messages.");
                 return;
             }
-            let (mut to, mut body) = (0 as Uid, Vec::new());
+            let (mut to, mut body) = (0 as Uid, String::new());
             for c in f.chunks() {
                 match c.tag {
                     tag::UID => to = c.as_uint() as Uid,
-                    tag::BODY => body = c.data[..c.data.len().min(MAX_CHAT_INPUT)].to_vec(),
+                    tag::BODY => body = text::to_utf8(&c.data[..c.data.len().min(MAX_CHAT_INPUT)]),
                     _ => {}
                 }
             }
@@ -953,7 +987,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             let body = f
                 .chunks()
                 .find(|c| c.tag == tag::BODY)
-                .map(|c| c.data[..c.data.len().min(MAX_CHAT_INPUT)].to_vec())
+                .map(|c| text::to_utf8(&c.data[..c.data.len().min(MAX_CHAT_INPUT)]))
                 .unwrap_or_default();
             if body.is_empty() {
                 reply_error(tx, f.trans, "Empty broadcast.");
@@ -985,7 +1019,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             let secs = d.connected_at.elapsed().as_secs();
             let info = format!(
                 "    name: {}\r   login: {}\r address: {}\r  online: {}h {}m {}s\r",
-                String::from_utf8_lossy(&d.info.nick),
+                d.info.nick,
                 d.login,
                 d.addr.map_or_else(|| "-".into(), |a| a.to_string()),
                 secs / 3600,
@@ -997,7 +1031,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 f.trans,
                 vec![
                     (tag::BODY, text::from_utf8(&info)),
-                    (tag::NAME, d.info.nick),
+                    (tag::NAME, mac_nick(&d.info.nick)),
                 ],
             );
         }
@@ -1028,20 +1062,12 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 Ok(nick) => {
                     reply(tx, f.trans, vec![]);
                     // The public-chat announcement, in the reference
-                    // server's wording.
-                    let me = ctx.core.user(sess.uid);
-                    let by = me.map(|u| u.nick).unwrap_or_default();
-                    let mut line = Vec::new();
-                    line.extend_from_slice(b"\r<");
-                    line.extend_from_slice(&nick);
-                    line.extend_from_slice(if ban {
-                        b" has been banned by "
-                    } else {
-                        b" has been kicked by "
-                    });
-                    line.extend_from_slice(&by);
-                    line.push(b'>');
-                    ctx.core.chat_notice(0, sess.uid, line);
+                    // server's wording (each frontend adds its own framing
+                    // — this edge renders it as `\r<text>`).
+                    let by = ctx.core.user(sess.uid).map(|u| u.nick).unwrap_or_default();
+                    let verb = if ban { "banned" } else { "kicked" };
+                    ctx.core
+                        .chat_notice(0, sess.uid, format!("{nick} has been {verb} by {by}"));
                 }
                 Err(e) => reply_error(tx, f.trans, err_text(e)),
             }

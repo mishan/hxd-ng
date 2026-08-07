@@ -278,6 +278,21 @@ Chat text crossing to legacy clients is converted with `?` for unmappable
 characters — tell your users their emoji become question marks on
 twenty-five-year-old Macs, which is honestly part of the charm.
 
+**The legacy wire itself can negotiate UTF-8.** fogWraith's
+[Text-Encoding extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Text-Encoding.md)
+defines `CAPABILITY_TEXT_ENCODING` (bit 1 of `DATA_CAPABILITIES`, field
+`0x01F0`): a legacy-wire client that advertises it, and gets the bit echoed
+in the login reply, exchanges UTF-8 in every text field — Mac Roman becomes
+the fallback for clients that don't negotiate, exactly the per-connection
+bridge that spec mandates ("servers MUST store all text internally as
+UTF-8", which is what hxd-core now does). Implementing it is legacy-frontend
+work, tracked on the roadmap: the conversion calls at `hxd-session`'s edges
+become conditional on a per-connection encoding flag, plus the spec's
+CR↔LF line-ending normalization (internal text uses LF; legacy Mac clients
+get CR). Its future HOPE `app_id` refinement (per-client encoding guesses
+for Shift-JIS/Latin-1 legacy clients) can ride the HOPE work when that
+lands.
+
 ## 9. Security posture
 
 - WSS mandatory in production; the plaintext listener binds localhost by
