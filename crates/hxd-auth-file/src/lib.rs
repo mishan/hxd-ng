@@ -189,6 +189,17 @@ impl AuthBackend for FileAuth {
         }
         let file = self.load(&login)?;
         let stored = file.password.as_deref().unwrap_or("");
+        // Legacy clients send passwords as raw Mac Roman bytes, but this
+        // file stores UTF-8 — a non-ASCII stored password could never
+        // match, so every login would fail with no hint why. Refuse loudly
+        // at the source instead. (Lifted once the wire edge canonicalizes
+        // credentials to UTF-8 before the backend sees them.)
+        if !stored.is_ascii() {
+            return Err(AuthError::Backend(format!(
+                "{login}: non-ASCII stored passwords are not supported yet \
+                 (legacy clients send Mac Roman bytes; use ASCII for now)"
+            )));
+        }
         match proof {
             Proof::Plain(given) => {
                 if !constant_time_eq(stored.as_bytes(), given) {
@@ -261,6 +272,19 @@ mod tests {
             auth.authenticate("MiSha", Proof::Plain(b"")).unwrap().login,
             "misha"
         );
+    }
+
+    #[test]
+    fn non_ascii_stored_password_is_refused_loudly() {
+        // A Mac-Roman-typing legacy client could never match a non-ASCII
+        // UTF-8 stored password byte-for-byte; the backend refuses with a
+        // diagnosable error rather than an eternal BadProof.
+        let (td, auth) = backend();
+        write(td.path(), "cafe.toml", "password = \"café\"\n");
+        assert!(matches!(
+            auth.authenticate("cafe", Proof::Plain("café".as_bytes())),
+            Err(AuthError::Backend(_))
+        ));
     }
 
     #[test]

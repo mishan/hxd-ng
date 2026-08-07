@@ -208,7 +208,9 @@ impl Core {
         v
     }
 
-    /// One visible user's info.
+    /// One attached user's info, announced or not — the login-completion
+    /// path reads it *before* the session becomes visible. (Use
+    /// [`Core::user_details`] when visibility must gate the answer.)
     pub fn user(&self, uid: Uid) -> Option<UserInfo> {
         let r = self.roster.lock().unwrap();
         r.users.get(&uid).map(|s| s.info.clone())

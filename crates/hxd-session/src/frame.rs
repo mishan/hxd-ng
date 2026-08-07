@@ -60,11 +60,12 @@ impl From<std::io::Error> for ReadError {
 /// Read one transaction.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, ReadError> {
     let mut hdr = [0u8; HL_HDR_LEN];
-    // Distinguish "EOF before any byte" (clean close) from a torn header.
-    if r.read(&mut hdr[..1]).await? == 0 {
-        return Err(ReadError::Eof);
-    }
-    r.read_exact(&mut hdr[1..]).await?;
+    // A clean close between frames and a torn header both surface as
+    // [`ReadError::Eof`]: `read_exact` reports either as `UnexpectedEof`,
+    // and the `From` impl folds that into `Eof`. That's deliberate — a
+    // client dying mid-header is routine (phones, sleep, cable pulls) and
+    // doesn't merit a scarier verdict than a hangup at a frame boundary.
+    r.read_exact(&mut hdr).await?;
 
     let ty = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
     let trans = u32::from_be_bytes(hdr[4..8].try_into().unwrap());
