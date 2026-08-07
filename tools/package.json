@@ -1,0 +1,9 @@
+{
+  "name": "hxd-ng-tools",
+  "private": true,
+  "type": "module",
+  "description": "Test tooling for the hxd-ng Hotline-ng frontend. On Node 22+ ng-client.mjs needs no install at all; `npm install` here only fetches the `ws` fallback for older Nodes.",
+  "dependencies": {
+    "ws": "^8"
+  }
+}

@@ -1,5 +1,7 @@
 /target
 Cargo.lock.orig
+/tools/node_modules/
+/tools/package-lock.json
 
 # Runtime state of a locally-run server: config and the accounts
 # directory (which holds recoverable password secrets — never commit it).

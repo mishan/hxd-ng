@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Interactive Hotline-ng test client. Zero dependencies — uses Node's
-// built-in WebSocket (Node 22+). Speaks the MVP protocol from
+// Interactive Hotline-ng test client. Zero dependencies on Node 22+
+// (built-in WebSocket); on older Node it falls back to the `ws` package —
+// run `npm install` in tools/ once. Speaks the MVP protocol from
 // docs/hotline-ng.md and exercises the parts a real mobile app will lean
 // on hardest: login, live events, and detach/resume across dropped
 // connections.
@@ -23,6 +24,21 @@
 //   /quit            exit without logout (session lingers if detachable)
 
 import * as readline from "node:readline";
+
+// Node 22+ has WebSocket built in; older Nodes borrow it from `ws`
+// (which implements the same addEventListener/event.data surface).
+let WebSocketImpl = globalThis.WebSocket;
+if (!WebSocketImpl) {
+  try {
+    ({ WebSocket: WebSocketImpl } = await import("ws"));
+  } catch {
+    console.error(
+      "No WebSocket available: use Node 22+, or run `npm install` in tools/ " +
+        "to get the `ws` fallback.",
+    );
+    process.exit(1);
+  }
+}
 
 const args = process.argv.slice(2);
 const url = args.find((a) => !a.startsWith("--")) ?? "ws://127.0.0.1:5700";
@@ -104,7 +120,7 @@ function handleEvent({ seq, ev, data }) {
 }
 
 function connect(kind) {
-  ws = new WebSocket(url);
+  ws = new WebSocketImpl(url);
   ws.addEventListener("open", async () => {
     try {
       if (kind === "resume" && session) {
@@ -173,6 +189,10 @@ const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", async (line) => {
   line = line.trim();
   if (!line) return;
+  if (!ws || ws.readyState !== 1) {
+    say("not connected yet, ignoring input");
+    return;
+  }
   try {
     if (line === "/drop") {
       say("dropping socket (no logout) — detach test");

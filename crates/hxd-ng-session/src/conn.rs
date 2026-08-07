@@ -1,0 +1,493 @@
+//! One WebSocket connection: handshake (login / resume), then a select
+//! loop over incoming requests and outgoing domain events.
+//!
+//! Requests are handled inline, in order, replies written directly — the
+//! spec promises in-order replies and this is the cheapest way to keep the
+//! promise. Domain events arrive on the session's outbox channel already
+//! seq-stamped; this layer only encodes them.
+
+use std::net::SocketAddr;
+
+use futures_util::{SinkExt, StreamExt};
+use hxd_core::access::bit;
+use hxd_core::{AccessBits, AttachInfo, AuthError, Proof, Resume, SeqEvent, Uid};
+use serde_json::json;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+use tracing::{debug, info, warn};
+
+use crate::proto::{
+    event_json, reply_err, reply_ok, user_json, ChatParams, LoginParams, MsgParams, NickParams,
+    ReqEnvelope, ResumeParams,
+};
+use crate::NgCtx;
+
+type Ws = WebSocketStream<TcpStream>;
+
+/// Per-connection state once a session is attached.
+struct SessState {
+    uid: Uid,
+    session_id: String,
+    access: AccessBits,
+}
+
+/// Why the connection loop ended, deciding the session's fate.
+enum Exit {
+    /// Socket died or closed without logout → detach if permitted.
+    ConnectionLost,
+    /// Clean logout or kick → session already ended; registry cleaned.
+    SessionOver,
+    /// The outbox channel closed under us: another connection took the
+    /// session over (or it ended elsewhere). Not ours anymore.
+    Replaced,
+}
+
+pub(crate) async fn run(stream: TcpStream, peer: SocketAddr, ctx: NgCtx) {
+    if ctx.core.is_banned(peer.ip()) {
+        info!("refusing banned address");
+        return;
+    }
+    let config = WebSocketConfig {
+        max_message_size: Some(256 * 1024),
+        max_frame_size: Some(256 * 1024),
+        ..Default::default()
+    };
+    let ws = match timeout(
+        ctx.cfg.login_timeout,
+        tokio_tungstenite::accept_async_with_config(stream, Some(config)),
+    )
+    .await
+    {
+        Ok(Ok(ws)) => ws,
+        _ => return,
+    };
+    let (mut ws_tx, mut ws_rx) = ws.split();
+
+    // --- Handshake: the first request must be login or resume. ----------
+    let first = match timeout(ctx.cfg.login_timeout, next_request(&mut ws_rx)).await {
+        Ok(Some(req)) => req,
+        _ => return,
+    };
+
+    let (state, mut events) = match first.req.as_str() {
+        "login" => match handle_login(&ctx, peer, &first, &mut ws_tx).await {
+            Some(v) => v,
+            None => return,
+        },
+        "resume" => match handle_resume(&ctx, &first, &mut ws_tx).await {
+            Some(v) => v,
+            None => return,
+        },
+        _ => {
+            let _ = ws_tx
+                .send(Message::Text(reply_err(
+                    first.id,
+                    "not_logged_in",
+                    "Log in or resume first.",
+                )))
+                .await;
+            return;
+        }
+    };
+    info!(uid = state.uid, session = %state.session_id, "ng session attached");
+
+    // --- Main loop -------------------------------------------------------
+    let mut ping = tokio::time::interval(std::time::Duration::from_secs(30));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await; // Consume the immediate first tick.
+
+    let exit = loop {
+        tokio::select! {
+            msg = ws_rx.next() => match msg {
+                Some(Ok(Message::Text(text))) => {
+                    let Ok(req) = serde_json::from_str::<ReqEnvelope>(&text) else {
+                        debug!("unparseable request frame");
+                        break Exit::ConnectionLost;
+                    };
+                    match dispatch(&ctx, &state, &req, &mut ws_tx).await {
+                        Flow::Continue => {}
+                        Flow::LoggedOut => break Exit::SessionOver,
+                        Flow::Dead => break Exit::ConnectionLost,
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break Exit::ConnectionLost,
+                Some(Ok(_)) => {} // ping/pong/binary — ignored
+                Some(Err(e)) => {
+                    debug!("ws error: {e}");
+                    break Exit::ConnectionLost;
+                }
+            },
+            ev = events.recv() => match ev {
+                Some(se) => {
+                    let kicked = matches!(se.event, hxd_core::Event::Kicked);
+                    if ws_tx.send(Message::Text(event_json(&se))).await.is_err() {
+                        break Exit::ConnectionLost;
+                    }
+                    if kicked {
+                        ctx.core.end_session(state.uid);
+                        ctx.registry.remove(&state.session_id);
+                        let _ = ws_tx.send(Message::Close(Some(CloseFrame {
+                            code: CloseCode::Normal,
+                            reason: "kicked".into(),
+                        }))).await;
+                        break Exit::SessionOver;
+                    }
+                }
+                None => break Exit::Replaced,
+            },
+            _ = ping.tick() => {
+                if ws_tx.send(Message::Ping(Vec::new())).await.is_err() {
+                    break Exit::ConnectionLost;
+                }
+            }
+        }
+    };
+
+    match exit {
+        Exit::ConnectionLost => {
+            let survived = ctx
+                .core
+                .connection_lost(state.uid, ctx.cfg.max_detached_per_addr);
+            if survived {
+                info!(uid = state.uid, "ng session detached");
+            } else {
+                ctx.registry.remove(&state.session_id);
+                info!(uid = state.uid, "ng session ended (no detach)");
+            }
+        }
+        Exit::SessionOver => {
+            info!(uid = state.uid, "ng session ended");
+        }
+        Exit::Replaced => {
+            info!(uid = state.uid, "ng connection replaced by a newer one");
+            let _ = ws_tx
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "replaced".into(),
+                })))
+                .await;
+        }
+    }
+}
+
+/// Read frames until a parseable request arrives (or the stream ends).
+async fn next_request(ws_rx: &mut futures_util::stream::SplitStream<Ws>) -> Option<ReqEnvelope> {
+    while let Some(msg) = ws_rx.next().await {
+        match msg {
+            Ok(Message::Text(text)) => match serde_json::from_str(&text) {
+                Ok(req) => return Some(req),
+                Err(e) => {
+                    debug!("bad handshake frame: {e}");
+                    return None;
+                }
+            },
+            Ok(Message::Close(_)) | Err(_) => return None,
+            Ok(_) => continue,
+        }
+    }
+    None
+}
+
+type WsTx = futures_util::stream::SplitSink<Ws, Message>;
+
+async fn handle_login(
+    ctx: &NgCtx,
+    peer: SocketAddr,
+    req: &ReqEnvelope,
+    ws_tx: &mut WsTx,
+) -> Option<(SessState, UnboundedReceiver<SeqEvent>)> {
+    let p: LoginParams = serde_json::from_value(req.params.clone()).unwrap_or_default();
+
+    let auth = ctx.auth.clone();
+    let (login, password) = (p.login.clone(), p.password.clone());
+    let verdict = tokio::task::spawn_blocking(move || {
+        auth.authenticate(&login, Proof::Plain(password.as_bytes()))
+    })
+    .await
+    .ok()?;
+
+    let account = match verdict {
+        Ok(a) => a,
+        Err(e @ (AuthError::NoSuchAccount | AuthError::BadProof)) => {
+            info!(login = %p.login, "ng login refused: {e}");
+            let _ = ws_tx
+                .send(Message::Text(reply_err(
+                    req.id,
+                    "login_failed",
+                    "Login failed.",
+                )))
+                .await;
+            return None;
+        }
+        Err(AuthError::Backend(e)) => {
+            warn!("auth backend failure: {e}");
+            let _ = ws_tx
+                .send(Message::Text(reply_err(
+                    req.id,
+                    "server_error",
+                    "Server error.",
+                )))
+                .await;
+            return None;
+        }
+    };
+
+    let nick = match (&p.nick, account.access.has(bit::USE_ANY_NAME)) {
+        (Some(n), true) if !n.is_empty() => n.clone(),
+        _ => account.name.clone(),
+    };
+    let attach = AttachInfo {
+        nick,
+        icon: p.icon.unwrap_or(128),
+        admin: account.access.has(bit::DISCONNECT_USERS),
+        access: account.access,
+        login: account.login.clone(),
+        addr: Some(peer.ip()),
+        can_detach: account.can_detach,
+    };
+    let Some((uid, events)) = ctx.core.attach(attach) else {
+        let _ = ws_tx
+            .send(Message::Text(reply_err(
+                req.id,
+                "server_full",
+                "Server full.",
+            )))
+            .await;
+        return None;
+    };
+    // ng has no agreement dance: announce immediately (the snapshot below
+    // then includes self).
+    ctx.core.announce(uid);
+
+    let Some((session_id, token)) = ctx.registry.issue(&ctx.core, uid) else {
+        ctx.core.end_session(uid);
+        return None;
+    };
+
+    let me = ctx.core.user(uid)?;
+    let users: Vec<_> = ctx.core.snapshot().iter().map(user_json).collect();
+    let detach = if account.can_detach {
+        json!({ "grace": ctx.cfg.grace.as_secs() })
+    } else {
+        serde_json::Value::Null
+    };
+    let mut server = json!({
+        "name": ctx.cfg.server_name,
+        "subject": ctx.core.public_subject(),
+    });
+    if let Some(agreement) = &ctx.cfg.agreement {
+        server["agreement"] = json!(agreement);
+    }
+    let ok = json!({
+        "session": session_id,
+        "token": token,
+        "self": user_json(&me),
+        "server": server,
+        "users": users,
+        "detach": detach,
+        "seq": 0,
+    });
+    ws_tx.send(Message::Text(reply_ok(req.id, ok))).await.ok()?;
+    info!(uid, login = %account.login, "ng logged in");
+
+    Some((
+        SessState {
+            uid,
+            session_id,
+            access: account.access,
+        },
+        events,
+    ))
+}
+
+async fn handle_resume(
+    ctx: &NgCtx,
+    req: &ReqEnvelope,
+    ws_tx: &mut WsTx,
+) -> Option<(SessState, UnboundedReceiver<SeqEvent>)> {
+    let Ok(p) = serde_json::from_value::<ResumeParams>(req.params.clone()) else {
+        let _ = ws_tx
+            .send(Message::Text(reply_err(
+                req.id,
+                "bad_request",
+                "Malformed resume.",
+            )))
+            .await;
+        return None;
+    };
+    let Some(uid) = ctx.registry.validate(&ctx.core, &p.session, &p.token) else {
+        let _ = ws_tx
+            .send(Message::Text(reply_err(
+                req.id,
+                "session_expired",
+                "Session expired; log in again.",
+            )))
+            .await;
+        return None;
+    };
+
+    let (events, replay) = match ctx.core.resume(uid, p.last_seq) {
+        Resume::Replayed(rx, replay) => (rx, Some(replay)),
+        Resume::ResyncRequired(rx) => (rx, None),
+        Resume::Gone => {
+            ctx.registry.remove(&p.session);
+            let _ = ws_tx
+                .send(Message::Text(reply_err(
+                    req.id,
+                    "session_expired",
+                    "Session expired; log in again.",
+                )))
+                .await;
+            return None;
+        }
+    };
+    let access = ctx.core.access_of(uid).unwrap_or_default();
+    let state = SessState {
+        uid,
+        session_id: p.session.clone(),
+        access,
+    };
+
+    match replay {
+        Some(replay) => {
+            let me = ctx.core.user(uid)?;
+            let ok = json!({ "replay": replay.len(), "self": user_json(&me) });
+            ws_tx.send(Message::Text(reply_ok(req.id, ok))).await.ok()?;
+            for se in &replay {
+                ws_tx.send(Message::Text(event_json(se))).await.ok()?;
+            }
+            info!(uid, replayed = replay.len(), "ng resumed");
+        }
+        None => {
+            // The session is attached and live, but the gap is gone —
+            // the client follows with `sync` on this same connection.
+            ws_tx
+                .send(Message::Text(reply_err(
+                    req.id,
+                    "resync_required",
+                    "Event gap unrecoverable; sync required.",
+                )))
+                .await
+                .ok()?;
+            info!(uid, "ng resumed with resync required");
+        }
+    }
+    Some((state, events))
+}
+
+enum Flow {
+    Continue,
+    LoggedOut,
+    Dead,
+}
+
+async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut WsTx) -> Flow {
+    let send = |s: String| Message::Text(s);
+    let out = match req.req.as_str() {
+        "ping" => reply_ok(req.id, json!({})),
+
+        "sync" => {
+            let users: Vec<_> = ctx.core.snapshot().iter().map(user_json).collect();
+            reply_ok(
+                req.id,
+                json!({
+                    "server": {
+                        "name": ctx.cfg.server_name,
+                        "subject": ctx.core.public_subject(),
+                    },
+                    "users": users,
+                    "seq": ctx.core.current_seq(state.uid).unwrap_or(0),
+                }),
+            )
+        }
+
+        "chat" => match serde_json::from_value::<ChatParams>(req.params.clone()) {
+            Ok(p) if !state.access.has(bit::SEND_CHAT) => {
+                let _ = p;
+                reply_err(req.id, "access_denied", "You are not allowed to send chat.")
+            }
+            Ok(p) => {
+                let style = if p.style.as_deref() == Some("action") {
+                    1
+                } else {
+                    0
+                };
+                let mut text = p.text;
+                text.truncate_to_char_boundary(4096);
+                ctx.core.chat_public(state.uid, text, style);
+                reply_ok(req.id, json!({}))
+            }
+            Err(_) => reply_err(req.id, "bad_request", "Malformed chat."),
+        },
+
+        "nick" => match serde_json::from_value::<NickParams>(req.params.clone()) {
+            Ok(p) => {
+                let nick = p
+                    .nick
+                    .filter(|_| state.access.has(bit::USE_ANY_NAME))
+                    .filter(|n| !n.is_empty());
+                ctx.core.update(state.uid, nick, p.icon);
+                reply_ok(req.id, json!({}))
+            }
+            Err(_) => reply_err(req.id, "bad_request", "Malformed nick."),
+        },
+
+        "msg" => match serde_json::from_value::<MsgParams>(req.params.clone()) {
+            Ok(_) if !state.access.has(bit::SEND_MSGS) => reply_err(
+                req.id,
+                "access_denied",
+                "You are not allowed to send private messages.",
+            ),
+            Ok(p) => match ctx.core.msg(state.uid, p.to, p.text) {
+                Ok(()) => reply_ok(req.id, json!({})),
+                Err(_) => reply_err(req.id, "bad_request", "That user is not connected."),
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed msg."),
+        },
+
+        "logout" => {
+            ctx.core.end_session(state.uid);
+            ctx.registry.remove(&state.session_id);
+            let _ = ws_tx.send(send(reply_ok(req.id, json!({})))).await;
+            let _ = ws_tx
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "logout".into(),
+                })))
+                .await;
+            return Flow::LoggedOut;
+        }
+
+        "login" | "resume" => reply_err(req.id, "bad_request", "Already logged in."),
+
+        _ => reply_err(req.id, "unknown_method", "Unknown request."),
+    };
+    if ws_tx.send(send(out)).await.is_err() {
+        return Flow::Dead;
+    }
+    Flow::Continue
+}
+
+/// `String::truncate` panics off char boundaries; chat caps shouldn't.
+trait TruncateToCharBoundary {
+    fn truncate_to_char_boundary(&mut self, max: usize);
+}
+
+impl TruncateToCharBoundary for String {
+    fn truncate_to_char_boundary(&mut self, max: usize) {
+        if self.len() <= max {
+            return;
+        }
+        let mut end = max;
+        while end > 0 && !self.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.truncate(end);
+    }
+}
