@@ -27,6 +27,8 @@ const HDR_SELFINFO: u32 = 0x162;
 const HDR_CHAT: u32 = 0x6a;
 const REQ_LOGIN: u32 = 0x6b;
 const REQ_CHAT: u32 = 0x69;
+const REQ_MSG: u32 = 0x6c;
+const HDR_MSG: u32 = 0x68;
 
 async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
@@ -401,6 +403,92 @@ async fn bad_token_and_stale_gap_paths() {
         .event_matching("chat", |d| d["text"] == "recovered")
         .await;
     assert_eq!(ev["data"]["from"]["nick"], "Misha");
+}
+
+#[tokio::test]
+async fn private_messages_cross_both_wire_eras() {
+    let td = tempfile::tempdir().unwrap();
+    let (legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
+
+    let mut alice = Legacy::login(legacy_addr, "alice").await;
+    let (mut app, hello) = Ng::login(ng_addr, "misha", "s3cret", "Misha").await;
+    let app_uid = hello["self"]["uid"].as_u64().unwrap();
+    let alice_uid = hello["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["nick"] == "alice")
+        .unwrap()["uid"]
+        .as_u64()
+        .unwrap();
+    alice.recv_type(HDR_USER_CHANGE).await; // misha's join
+
+    // ng → legacy: the 1.5 client gets the 0x68 push with uid/text/nick.
+    app.request_ok("msg", json!({ "to": alice_uid, "text": "hi alice" }))
+        .await;
+    let pm = alice.recv_type(HDR_MSG).await;
+    assert_eq!(chunk(&pm, tag::BODY).unwrap(), b"hi alice".to_vec());
+    assert_eq!(chunk(&pm, tag::NAME).unwrap(), b"Misha".to_vec());
+    assert_eq!(chunk_u16(&pm, tag::UID), Some(app_uid as u16));
+
+    // legacy → ng: the ack comes back to alice, the semantic event to the
+    // app.
+    let t = alice
+        .send(
+            REQ_MSG,
+            &[
+                (tag::UID, (app_uid as u32).to_be_bytes().to_vec()),
+                (tag::BODY, b"hi misha".to_vec()),
+            ],
+        )
+        .await;
+    let ack = alice.recv_type(HDR_TASK).await;
+    assert_eq!((ack.trans, ack.flag), (t, 0));
+    let ev = app.event("msg").await;
+    assert_eq!(ev["data"]["from"]["nick"], "alice");
+    assert_eq!(ev["data"]["text"], "hi misha");
+}
+
+#[tokio::test]
+async fn private_messages_to_detached_sessions_replay_on_resume() {
+    let td = tempfile::tempdir().unwrap();
+    let (legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
+
+    let mut alice = Legacy::login(legacy_addr, "alice").await;
+    let (app, hello) = Ng::login(ng_addr, "misha", "s3cret", "Misha").await;
+    let session = hello["session"].as_str().unwrap().to_string();
+    let token = hello["token"].as_str().unwrap().to_string();
+    let app_uid = hello["self"]["uid"].as_u64().unwrap();
+    let last_seq = app.last_seq;
+    alice.recv_type(HDR_USER_CHANGE).await;
+
+    // The app drops; alice PMs it while it's detached. The sender's ack
+    // succeeds — the session is still on the roster.
+    drop(app);
+    alice.recv_type(HDR_USER_CHANGE).await; // away flip
+    let t = alice
+        .send(
+            REQ_MSG,
+            &[
+                (tag::UID, (app_uid as u32).to_be_bytes().to_vec()),
+                (tag::BODY, b"call me when you're back".to_vec()),
+            ],
+        )
+        .await;
+    let ack = alice.recv_type(HDR_TASK).await;
+    assert_eq!((ack.trans, ack.flag), (t, 0));
+
+    // Resume replays the PM — the grace window's answer to offline
+    // delivery.
+    let mut app = Ng::connect(ng_addr).await;
+    app.request_ok(
+        "resume",
+        json!({ "session": session, "token": token, "last_seq": last_seq }),
+    )
+    .await;
+    let ev = app.event("msg").await;
+    assert_eq!(ev["data"]["from"]["nick"], "alice");
+    assert_eq!(ev["data"]["text"], "call me when you're back");
 }
 
 #[tokio::test]

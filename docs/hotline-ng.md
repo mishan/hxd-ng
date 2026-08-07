@@ -24,13 +24,15 @@ guest, see the user list with live updates, read and send public chat
 network blips without churning the roster, and log out. Legacy and ng users
 see each other and chat together; neither knows the other is different.
 
+A mobile client can also send and receive **private messages** — first-class
+in the MVP: they cross to and from legacy clients, and a PM to a detached
+session buffers and replays on resume, which is the closest thing the grace
+window offers to offline delivery.
+
 Out of scope for the MVP, listed so their absence is a decision and not an
-oversight: private chats, news, files and transfers, account administration,
-tracker anything, message history from before your session, push
-notifications, and offline delivery. Private messages sit on the fence — the
-domain layer already routes them, so the spec defines `msg` (send and event)
-as an **MVP+ extension** a client may implement, but the MVP bar doesn't
-require it.
+oversight: private chats (rooms), news, files and transfers, account
+administration, tracker anything, message history from before your session,
+push notifications, and durable offline delivery.
 
 ## 2. The paradigm shift, concretely
 
@@ -239,6 +241,7 @@ Requests:
 |---|---|---|---|
 | `login` / `resume` / `sync` | above | above | handshake only |
 | `chat` | `text`, `style?` (`"normal"`\|`"action"`) | `{}` | needs send-chat access; multi-line allowed, server relays as one event |
+| `msg` | `to` (uid), `text` | `{}` | needs send-msgs access; same 4096-byte cap as chat; a detached recipient buffers it for replay |
 | `nick` | `nick?`, `icon?` | `{}` | nick honored only with use_any_name |
 | `ping` | — | `{}` | keepalive for clients that want RTT |
 | `logout` | — | `{}` | ends the session *now* (no grace) |
@@ -259,14 +262,9 @@ Events (all carry `seq`):
 A `user` object is `{ uid, nick, icon, admin, status }`. Uids remain the
 16-bit legacy ids so the two rosters are one roster.
 
-**MVP+ (optional): private messages.** `{ "req": "msg", "params": { "to":
-uid, "text": … } }` and the `msg` event `{ from: {uid, nick}, text }` —
-already routed by the domain; a client may ship without it. Incoming PMs to
-a client that doesn't render them may be shown as notices or dropped;
-server-side they're delivered regardless (the sender's client can't know).
-
-Events that exist in the domain but have no ng mapping yet (private-chat
-family) are simply not delivered to ng sessions in the MVP.
+Events that exist in the domain but have no ng mapping yet (the
+private-chat room family) are delivered to ng sessions as placeholder
+frames the client ignores, keeping seq accounting gapless.
 
 ## 8. Text, encoding, limits
 
