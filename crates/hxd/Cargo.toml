@@ -1,0 +1,27 @@
+[package]
+name = "hxd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "hxd-ng: a Hotline server"
+publish = false
+default-run = "hxd"
+
+[[bin]]
+name = "hxd"
+path = "src/main.rs"
+
+[dependencies]
+hxd-core = { workspace = true }
+hxd-auth-file = { workspace = true }
+hxd-session = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+hotline-proto = { workspace = true }
+tempfile = "3"

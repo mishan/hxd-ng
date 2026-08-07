@@ -1,0 +1,9 @@
+//! hxd-ng's legacy-wire session layer: TRTP handshake, transaction framing,
+//! dispatch, and the per-connection actor pair (reader + writer). The
+//! Hotline-ng protocol frontend will be a sibling of this crate, not an
+//! extension of it — both speak to `hxd-core`.
+
+pub mod frame;
+pub mod session;
+
+pub use session::{run_session, serve, ServerConfig, ServerCtx};

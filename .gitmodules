@@ -1,0 +1,3 @@
+[submodule "gtkhx"]
+	path = gtkhx
+	url = https://github.com/mishan/gtkhx.git

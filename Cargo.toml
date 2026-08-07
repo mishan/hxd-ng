@@ -1,0 +1,54 @@
+# hxd-ng — a new Hotline server in Rust. See ROADMAP.md.
+#
+# The protocol crates are consumed from the gtkhx submodule (Phase 0 of the
+# roadmap — a shared-crate extraction — is deferred). After cloning:
+#
+#     git submodule update --init
+#
+# Bumping the shared crates = advancing the submodule pin, deliberately.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/hxd-core",
+    "crates/hxd-auth-file",
+    "crates/hxd-session",
+    "crates/hxd",
+]
+# Without this, cargo auto-adopts the submodule's crates as workspace
+# members (path deps living under the workspace root), and `--workspace`
+# test/lint runs start covering gtkhx's code with hxd-ng's settings. The
+# submodule crates stay governed by their own workspace; the pin's health
+# is gtkhx CI's job.
+exclude = ["gtkhx"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-2.0-or-later"
+# The shared crates must keep building at gtkhx's MSRV (its Debian-stable
+# pin); hxd-ng itself simply matches it for now.
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Shared with gtkhx (see the note at the top of this file).
+hotline-proto = { path = "gtkhx/rust/crates/hotline-proto" }
+
+# Internal.
+hxd-core = { path = "crates/hxd-core" }
+hxd-auth-file = { path = "crates/hxd-auth-file" }
+hxd-session = { path = "crates/hxd-session" }
+
+# External.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+    "signal",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
