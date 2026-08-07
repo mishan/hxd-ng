@@ -20,14 +20,54 @@ Hotline server is exactly the audience that section says is already GPL.
 
 ## Phase 0 — Extract the shared crates into `hotline-rs` *(punted, 2026-08)*
 
-**Status: deferred.** For now hxd-ng consumes the crates straight from the
-gtkhx tree via path dependencies (`../gtkhx/rust/crates/...`) — the two
-checkouts live side by side, the crates are `publish = false` anyway, and
-Cargo resolves their workspace-inherited fields against gtkhx's workspace, so
-this works with zero gtkhx changes. The extraction below remains the intended
-end state; everything in it is still accurate when the time comes. Until
-then: hxd-ng CI (when it exists) needs a gtkhx checkout beside it, and API
-changes in the shared crates get coordinated across both trees by hand.
+**Status: deferred.** For now hxd-ng consumes the crates from a **gtkhx git
+submodule** (`gtkhx/`, pinned to a rev; path deps into
+`gtkhx/rust/crates/...`). The crates are `publish = false` anyway, and Cargo
+resolves their workspace-inherited fields against the submodule's own
+workspace, so this works with zero gtkhx changes — and a clone of hxd-ng is
+self-contained (`git submodule update --init`). Advancing the pin is a
+deliberate act with a test run behind it. The extraction below remains the
+candidate end state; everything in it is still accurate when the time comes.
+Until then, API changes in the shared crates get coordinated across the two
+trees by hand.
+
+**And the target may not be ours to create.** A third-party
+[github.com/hotline-rs](https://github.com/hotline-rs) org exists (August
+2026) — "Rust implementations of the Hotline protocol", hotline.rs domain,
+code still private but described as hotline-proto → hotline-codec →
+hotline-{client,server,tracker}, maintainer open to being a community
+integration point and to accepting contributions. Misha is a member. That is
+a *better* shape than a gtkhx-satellite extraction — a shared seam nobody's
+client owns — so the working plan is:
+
+- **Don't extract, don't stall.** Keep building on the path-dep crates;
+  revisit when his code is public and readable.
+- **Share knowledge and fixtures first, code later if ever.** The durable
+  protocol findings (DataSize framing, the HOPE rekey marker, the Mobius
+  options-field drop, Mac Roman fidelity, tracker v3 probe-fallback) and the
+  Tier 2 wire-fixture corpus are facts, license-thin, and worth months to
+  anyone implementing this protocol. A shared conformance corpus both stacks
+  pass *is* interoperability, without either adopting the other's code.
+- **Mind the license asymmetry.** Our `hotline-proto` is hxd-derived and
+  permanently GPL; if the org's crates are permissive and independently
+  written, code flows one way only — we can build on his, ours can't merge
+  into his. Realistic convergence is hxd-ng/gtkhx eventually sitting on the
+  org's crates *if* their coverage earns it; evaluate on a matrix of
+  opcode/version coverage, extension support, real-server testing, license,
+  and MSRV when the code posts.
+- Crate-boundary differences (his codec split vs. our proto-with-framing)
+  are cosmetic next to wire-truth coverage; don't weigh them heavily.
+- His architecture sketch (August 2026): hotline-proto → hotline-codec →
+  hotline-{client,server,tracker}, with binaries on top — hotline-cli /
+  hotline-gui over the client crate, a hotline-daemon that injects Account
+  and Files *providers* into the server crate, and a tracker daemon. The
+  provider-injection shape mirrors our AuthBackend/store traits, which
+  bodes well. **The convergence question to ask when code posts:** is his
+  hotline-server's session model socket-scoped and wire-typed, or can it
+  host our user-scoped, wire-free domain core? If the former, the realistic
+  adoption surface is proto + codec under hxd-session, keeping hxd-core
+  ours. Also unknowns: where HOPE/ciphers live, extension scope, tests,
+  license. His tracker daemon covers a component we lack entirely.
 
 The original decision: the protocol crates move out of the gtkhx tree into a
 shared repo (working name **`hotline-rs`**) that both gtkhx and hxd-ng depend
@@ -195,6 +235,12 @@ control socket for reload can come later.
 ---
 
 ## Phase 1 — Skeleton: a server you can log into
+
+**Status: implemented** (branch `claude/phase1-skeleton`) and green against
+a scripted hotline-proto client — the guest and account login flows, the
+parked 1.5 agreement dance, presence fan-out, ping, and the refusal paths.
+What remains before calling the exit criteria met: a session with real
+clients (GtkHx, and a period 1.5 client) against a running instance.
 
 - TCP listener, TRTP magic exchange, version handshake.
 - Legacy 1.2-style login (XOR-obfuscated login/password) against the file

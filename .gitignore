@@ -1,2 +1,9 @@
 /target
 Cargo.lock.orig
+
+# Runtime state of a locally-run server: config and the accounts
+# directory (which holds recoverable password secrets — never commit it).
+/accounts/
+/config.toml
+/hxd-ng.toml
+/agreement.txt

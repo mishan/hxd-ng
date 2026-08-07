@@ -1,0 +1,12 @@
+[package]
+name = "hxd-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "hxd-ng domain layer: presence roster, access bits, auth traits"
+publish = false
+
+[dependencies]
+# tokio::sync only — the domain layer schedules nothing itself.
+tokio = { version = "1", default-features = false, features = ["sync"] }
