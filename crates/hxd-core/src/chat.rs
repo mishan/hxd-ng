@@ -57,13 +57,13 @@ impl Core {
     /// A public chat line. Delivered (sender included) to every visible
     /// session allowed to read chat.
     pub fn chat_public(&self, from: Uid, text: String, style: u16) {
-        let r = self.roster.lock().unwrap();
-        let Some(sess) = r.users.get(&from) else {
+        let mut r = self.roster.lock().unwrap();
+        let Some(info) = r.users.get(&from).map(|s| s.info.clone()) else {
             return;
         };
         let ev = Event::Chat {
             cid: 0,
-            from: sess.info.clone(),
+            from: info,
             text,
             style,
         };
@@ -78,24 +78,25 @@ impl Core {
         text: String,
         style: u16,
     ) -> Result<(), ChatError> {
-        let r = self.roster.lock().unwrap();
+        let mut r = self.roster.lock().unwrap();
         let Some(chat) = r.chats.get(&cid) else {
             return Err(ChatError::NoSuchChat);
         };
         if !chat.members.contains(&from) {
             return Err(ChatError::NotAMember);
         }
-        let Some(sess) = r.users.get(&from) else {
+        let members = chat.members.clone();
+        let Some(info) = r.users.get(&from).map(|s| s.info.clone()) else {
             return Err(ChatError::NoSuchUser);
         };
         let ev = Event::Chat {
             cid,
-            from: sess.info.clone(),
+            from: info,
             text,
             style,
         };
-        for uid in &chat.members {
-            r.send_to(*uid, ev.clone());
+        for uid in members {
+            r.send_to(uid, ev.clone());
         }
         Ok(())
     }
@@ -104,13 +105,13 @@ impl Core {
     /// Semantic text — each frontend formats it. Public delivery honors the
     /// read-chat filter.
     pub fn chat_notice(&self, cid: u32, from: Uid, text: String) {
-        let r = self.roster.lock().unwrap();
+        let mut r = self.roster.lock().unwrap();
         let ev = Event::Notice { cid, from, text };
         if cid == 0 {
             r.broadcast_where(&ev, None, reads_public_chat);
-        } else if let Some(chat) = r.chats.get(&cid) {
-            for uid in &chat.members {
-                r.send_to(*uid, ev.clone());
+        } else if let Some(members) = r.chats.get(&cid).map(|c| c.members.clone()) {
+            for uid in members {
+                r.send_to(uid, ev.clone());
             }
         }
     }
@@ -326,7 +327,7 @@ impl Core {
 
     /// A private message. The sender's ack is the frontend's task reply.
     pub fn msg(&self, from: Uid, to: Uid, text: String) -> Result<(), ChatError> {
-        let r = self.roster.lock().unwrap();
+        let mut r = self.roster.lock().unwrap();
         let from_nick = r
             .users
             .get(&from)
@@ -348,7 +349,7 @@ impl Core {
 
     /// An administrator broadcast, to everyone (sender included).
     pub fn broadcast(&self, from: Uid, text: String) -> Result<(), ChatError> {
-        let r = self.roster.lock().unwrap();
+        let mut r = self.roster.lock().unwrap();
         let from_nick = r
             .users
             .get(&from)
@@ -385,6 +386,14 @@ impl Core {
             r.bans.push(ban);
         }
         r.send_to(target, Event::Kicked);
+        // A detached session has no connection to observe the event; the
+        // kick must end it here or it would linger on the roster.
+        if r.users
+            .get(&target)
+            .is_some_and(crate::roster::is_buffering)
+        {
+            r.end_session(target);
+        }
         Ok(nick)
     }
 
@@ -409,17 +418,9 @@ impl Core {
 mod tests {
     use super::*;
     use crate::access::bit;
+    use crate::roster::drain;
     use crate::roster::test_attach;
     use crate::AccessBits;
-    use tokio::sync::mpsc::UnboundedReceiver;
-
-    fn drain(rx: &mut UnboundedReceiver<Event>) -> Vec<Event> {
-        let mut out = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            out.push(ev);
-        }
-        out
-    }
 
     fn chatter() -> AccessBits {
         AccessBits::empty()
@@ -504,7 +505,7 @@ mod tests {
         core.chat_join(cid, a, "").unwrap();
         drain(&mut rx_a);
 
-        core.detach(b);
+        core.end_session(b);
         let evs = drain(&mut rx_a);
         assert!(evs.contains(&Event::ChatUserParted { cid, uid: b }));
         assert!(evs.contains(&Event::Parted(b)));
