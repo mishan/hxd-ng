@@ -13,6 +13,7 @@
 //     --icon <n>          legacy icon id
 //
 // Once connected, type to chat. Commands:
+//   /msg <who> <txt> private message (nick or uid)
 //   /me <text>       action-style chat
 //   /nick <nick>     change nickname
 //   /icon <n>        change icon
@@ -61,6 +62,7 @@ const pending = new Map(); // id -> {resolve, reject, method}
 let session = null; // { session, token }
 let lastSeq = 0;
 let detachInfo = null; // { grace } | null
+const roster = new Map(); // uid -> user object, kept fresh from events
 let intentionalClose = false;
 let reloginOnClose = false;
 let resumeDelayMs = 1000;
@@ -74,6 +76,22 @@ function request(method, params = {}) {
     pending.set(id, { resolve, reject, method });
     ws.send(JSON.stringify({ id, req: method, params }));
   });
+}
+
+function rosterReset(users) {
+  roster.clear();
+  for (const u of users) roster.set(u.uid, u);
+}
+
+/// /msg target: a uid, or a case-insensitive nick (must be unambiguous).
+function resolveTarget(word) {
+  if (/^\d+$/.test(word)) return Number(word);
+  const matches = [...roster.values()].filter(
+    (u) => u.nick.toLowerCase() === word.toLowerCase(),
+  );
+  if (matches.length === 1) return matches[0].uid;
+  say(matches.length === 0 ? `no user "${word}"` : `"${word}" is ambiguous, use a uid`);
+  return null;
 }
 
 function showUser(u) {
@@ -97,12 +115,15 @@ function handleEvent({ seq, ev, data }) {
       say(`*** BROADCAST from ${data.from.nick}: ${data.text}`);
       break;
     case "user_joined":
+      roster.set(data.user.uid, data.user);
       say(`--> ${showUser(data.user)} joined`);
       break;
     case "user_changed":
+      roster.set(data.user.uid, data.user);
       say(`--- ${showUser(data.user)} changed`);
       break;
     case "user_parted":
+      roster.delete(data.uid);
       say(`<-- uid ${data.uid} left`);
       break;
     case "subject":
@@ -132,6 +153,7 @@ function connect(kind) {
         session = { session: r.session, token: r.token };
         lastSeq = r.seq;
         detachInfo = r.detach;
+        rosterReset(r.users);
         say(
           `logged in as ${showUser(r.self)} on "${r.server.name}"` +
             (detachInfo ? ` (detach grace ${detachInfo.grace}s)` : " (no detach)"),
@@ -144,6 +166,7 @@ function connect(kind) {
         say("resume gap too large; syncing fresh");
         const r = await request("sync");
         lastSeq = r.seq;
+        rosterReset(r.users);
         say(`users: ${r.users.map(showUser).join(", ")}`);
       } else if (e?.code === "session_expired") {
         // Route the reconnect through the close handler — closing fires a
@@ -219,7 +242,20 @@ rl.on("line", async (line) => {
     } else if (line === "/users") {
       const r = await request("sync");
       lastSeq = r.seq;
+      rosterReset(r.users);
       say(`users: ${r.users.map(showUser).join(", ")}`);
+    } else if (line.startsWith("/msg ")) {
+      const rest = line.slice(5).trim();
+      const space = rest.indexOf(" ");
+      if (space < 0) {
+        say("usage: /msg <nick|uid> <text>");
+        return;
+      }
+      const to = resolveTarget(rest.slice(0, space));
+      if (to !== null) {
+        await request("msg", { to, text: rest.slice(space + 1) });
+        say(`[PM to ${to}] sent`);
+      }
     } else if (line.startsWith("/me ")) {
       await request("chat", { text: line.slice(4), style: "action" });
     } else if (line.startsWith("/nick ")) {
