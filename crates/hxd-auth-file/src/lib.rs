@@ -79,6 +79,24 @@ struct AccountFile {
     password: Option<String>,
     #[serde(default)]
     access: AccessTable,
+    /// Server-local policy that never crosses the wire (mhxd's
+    /// `access_extra` concept). Absent keys fall back to derived defaults
+    /// — see `authenticate`.
+    #[serde(default)]
+    extra: ExtraTable,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtraTable {
+    /// May sessions survive their connection (Hotline-ng detach)?
+    /// Default: true iff the account has a password — a drive-by guest
+    /// shouldn't get to park a nick on the roster.
+    can_detach: Option<bool>,
+    /// May this account set the public chat subject? Default: tracks the
+    /// disconnect_users (admin) bit, preserving the reference server's
+    /// spirit (a config-granted privilege, not a wire access bit).
+    set_subject: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -199,9 +217,16 @@ impl AuthBackend for FileAuth {
             }
         }
         let path = self.dir.join(format!("{login}.toml"));
+        let access = file.access_bits(&path);
+        let has_password = !stored.is_empty();
         Ok(Account {
             name: file.name.clone().unwrap_or_else(|| login.clone()),
-            access: file.access_bits(&path),
+            can_detach: file.extra.can_detach.unwrap_or(has_password),
+            set_subject: file
+                .extra
+                .set_subject
+                .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
+            access,
             login,
         })
     }
@@ -298,6 +323,40 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn extra_defaults_derive_from_password_and_admin_bit() {
+        let (td, auth) = backend();
+        // Password-less: no detach; no admin bit: no subject.
+        write(td.path(), "guest.toml", "");
+        let g = auth.authenticate("guest", Proof::Plain(b"")).unwrap();
+        assert!(!g.can_detach);
+        assert!(!g.set_subject);
+        // Passworded admin: both derived on.
+        write(
+            td.path(),
+            "root.toml",
+            "password = \"pw\"\n[access]\ndisconnect_users = true\n",
+        );
+        let r = auth.authenticate("root", Proof::Plain(b"pw")).unwrap();
+        assert!(r.can_detach);
+        assert!(r.set_subject);
+        // Explicit overrides beat the derivation, both directions.
+        write(
+            td.path(),
+            "kiosk.toml",
+            "[extra]\ncan_detach = true\nset_subject = true\n",
+        );
+        let k = auth.authenticate("kiosk", Proof::Plain(b"")).unwrap();
+        assert!(k.can_detach && k.set_subject);
+        write(
+            td.path(),
+            "probation.toml",
+            "password = \"pw\"\n[extra]\ncan_detach = false\n",
+        );
+        let p = auth.authenticate("probation", Proof::Plain(b"pw")).unwrap();
+        assert!(!p.can_detach);
     }
 
     #[test]

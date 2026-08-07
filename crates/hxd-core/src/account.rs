@@ -26,6 +26,14 @@ pub struct Account {
     pub name: String,
     /// The access bitmap.
     pub access: AccessBits,
+    /// Server-local policy, not wire vocabulary (the account file's
+    /// `[extra]` section — mhxd's `access_extra` concept). May this
+    /// account's sessions survive their connection (Hotline-ng detach)?
+    /// Backend default: only password-protected accounts.
+    pub can_detach: bool,
+    /// May this account set the public chat subject? Backend default:
+    /// tracks the disconnect-users (admin) bit.
+    pub set_subject: bool,
 }
 
 /// The client's proof of identity.

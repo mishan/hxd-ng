@@ -22,8 +22,8 @@ use hotline_proto::messages::{tag, ClientHdr};
 use hotline_proto::text;
 use hxd_core::access::bit;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Proof, SessionStatus, Uid,
-    UserInfo,
+    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Proof, SeqEvent,
+    SessionStatus, Uid, UserInfo,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -422,7 +422,7 @@ pub async fn run_session(stream: TcpStream, peer: SocketAddr, ctx: ServerCtx) {
         let uid = sess.uid;
         info!(uid, login = %sess.account.login, "logged in");
         session_loop(&mut frames, &mut events, &tx, &ctx, &mut sess).await;
-        ctx.core.detach(uid);
+        ctx.core.end_session(uid);
         info!(uid, "disconnected");
     }
     reader.abort();
@@ -436,7 +436,7 @@ async fn login_phase(
     tx: &Tx,
     ctx: &ServerCtx,
     peer: SocketAddr,
-) -> Option<(Session, UnboundedReceiver<Event>)> {
+) -> Option<(Session, UnboundedReceiver<SeqEvent>)> {
     let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
         Ok(Some(f)) => f,
         _ => return None, // timeout or reader gone
@@ -498,6 +498,7 @@ async fn login_phase(
         access: account.access,
         login: account.login.clone(),
         addr: Some(peer.ip()),
+        can_detach: account.can_detach,
     };
     let Some((uid, events)) = ctx.core.attach(attach) else {
         reply_error(tx, f.trans, "Server full.");
@@ -721,7 +722,7 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
 
 async fn session_loop(
     frames: &mut Receiver<Frame>,
-    events: &mut UnboundedReceiver<Event>,
+    events: &mut UnboundedReceiver<SeqEvent>,
     tx: &Tx,
     ctx: &ServerCtx,
     sess: &mut Session,
@@ -736,8 +737,8 @@ async fn session_loop(
                 None => return, // Reader exited: EOF, error, or bad frame.
             },
             maybe = events.recv() => match maybe {
-                Some(ev) => {
-                    if !deliver_event(tx, ev) {
+                Some(se) => {
+                    if !deliver_event(tx, se.event) {
                         info!(uid = sess.uid, "kicked");
                         return;
                     }
@@ -844,11 +845,10 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     _ => {}
                 }
             }
-            // Public-subject policy: the reference server gates this on a
-            // config list (access_extra.set_subject, default nobody); we
-            // approximate with the disconnect_users (admin) bit until
-            // account files grow an extras section.
-            if cid == 0 && !sess.can(bit::DISCONNECT_USERS) {
+            // Public-subject policy: the account file's [extra]
+            // set_subject flag (default: tracks the admin bit) — the
+            // reference server's config-granted privilege, done properly.
+            if cid == 0 && !sess.account.set_subject {
                 debug!(uid = sess.uid, "public subject refused");
                 return;
             }
