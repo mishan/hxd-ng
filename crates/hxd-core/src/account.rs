@@ -1,12 +1,13 @@
 //! Accounts and the pluggable authentication backend.
 //!
-//! The backend trait is the modular-auth seam from the roadmap: Phase 1
-//! ships a flat-file implementation (hxd-auth-file); the persistence phase
-//! adds a database one behind the same trait.
+//! The backend trait is the modular-auth seam from the roadmap: the
+//! flat-file implementation (hxd-auth-file) ships first; the persistence
+//! phase adds a database one behind the same trait.
 //!
 //! **On password storage:** the legacy wire constrains us. A 1.5 login
 //! carries the password XOR-0xff — effectively plaintext — and the HOPE
-//! login (Phase 2) proves knowledge of the password via HMAC, which the
+//! login (with the secure-login work) proves knowledge of the password
+//! via HMAC, which the
 //! server can only verify by holding a plaintext-equivalent secret. So
 //! backends store recoverable secrets for legacy-capable accounts; real
 //! password hashing arrives with the Hotline-ng protocol and applies only
@@ -30,8 +31,8 @@ pub struct Account {
 /// The client's proof of identity.
 ///
 /// `Plain` is the classic login (already de-obfuscated from the wire's
-/// XOR-0xff form). HOPE HMAC proofs join in Phase 2 as a second variant —
-/// that's why this is an enum and not a bare byte slice.
+/// XOR-0xff form). HOPE HMAC proofs join as a second variant when secure
+/// login lands — that's why this is an enum and not a bare byte slice.
 #[derive(Debug)]
 pub enum Proof<'a> {
     /// The password as typed, raw bytes (clients send Mac Roman).

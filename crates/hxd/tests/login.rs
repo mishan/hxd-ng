@@ -1,5 +1,5 @@
-//! Phase 1 end-to-end tests: a scripted legacy client against a live
-//! server on an ephemeral port. The client side packs and parses with the
+//! Legacy login and presence end-to-end tests: a scripted client against
+//! a live server on an ephemeral port. The client side packs and parses with the
 //! same `hotline-proto` the real gtkhx client uses, so these double as
 //! wire-compat checks, not just self-consistency.
 

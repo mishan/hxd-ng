@@ -318,7 +318,8 @@ async fn login_phase(rd: &mut OwnedReadHalf, tx: &Tx, ctx: &ServerCtx) -> Option
 
     let req = parse_login(&f);
     if req.hope_probe {
-        // Phase 2 brings HOPE; refuse it cleanly rather than desync.
+        // HOPE arrives with the secure-login work; refuse it cleanly
+        // rather than desync.
         reply_error(tx, f.trans, "Secure login (HOPE) is not supported yet.");
         return None;
     }
