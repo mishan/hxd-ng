@@ -3,7 +3,9 @@
 //! Hotline-ng protocol frontend will be a sibling of this crate, not an
 //! extension of it — both speak to `hxd-core`.
 
+pub mod caps;
 pub mod frame;
 pub mod session;
 
+pub use caps::{cap, Caps};
 pub use session::{run_session, serve, ServerConfig, ServerCtx};

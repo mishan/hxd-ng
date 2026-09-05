@@ -313,6 +313,10 @@ async fn handle_login(
         "server": server,
         "users": users,
         "detach": detach,
+        // Always present, empty when this build offers no extensions:
+        // absent and empty mean the same thing, and one shape is one
+        // less case for a client to get wrong.
+        "caps": ctx.cfg.caps,
         "seq": 0,
     });
     if ws_tx

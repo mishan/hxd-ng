@@ -32,6 +32,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSend
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
+use crate::caps::Caps;
 use crate::frame::{pack_frame, read_frame, Frame, ReadError};
 
 /// Server → client transaction opcodes not covered by
@@ -82,6 +83,12 @@ pub struct ServerConfig {
     pub login_timeout: Duration,
     /// How long a kick-with-ban keeps the address banned.
     pub ban_time: Duration,
+    /// The `DATA_CAPABILITIES` bits this server can actually honor. A
+    /// session negotiates the intersection of these and what the client
+    /// offered; the binary derives them from what is wired and
+    /// configured, so a bit is never advertised by a build that can't
+    /// serve it.
+    pub caps: Caps,
 }
 
 impl Default for ServerConfig {
@@ -92,6 +99,7 @@ impl Default for ServerConfig {
             agreement: None,
             login_timeout: Duration::from_secs(10),
             ban_time: Duration::from_secs(1800),
+            caps: Caps::empty(),
         }
     }
 }
@@ -342,6 +350,8 @@ struct LoginRequest {
     nick: Option<Vec<u8>>,
     icon: u16,
     clientversion: u16,
+    /// The extensions the client says it implements (`0x01F0`).
+    caps: Caps,
     /// A 1-byte all-zero LOGIN chunk: the HOPE session-key probe.
     hope_probe: bool,
 }
@@ -353,6 +363,7 @@ fn parse_login(f: &Frame) -> LoginRequest {
             tag::NAME => req.nick = Some(cap31(c.data).to_vec()),
             tag::ICON => req.icon = c.as_uint() as u16,
             tag::VERSION => req.clientversion = c.as_uint() as u16,
+            tag::CAPABILITIES => req.caps = Caps::from_wire(c.data),
             tag::LOGIN => {
                 if c.data.len() == 1 && c.data[0] == 0 {
                     req.hope_probe = true;
@@ -377,11 +388,22 @@ struct Session {
     /// Visible on the roster yet? False while a 1.5 client is still inside
     /// the agreement dance.
     announced: bool,
+    /// The extensions negotiated at LOGIN — what the client offered
+    /// intersected with what this server supports. Extension traffic is
+    /// gated on these: a client that didn't negotiate a capability must
+    /// never be sent its transactions.
+    caps: Caps,
 }
 
 impl Session {
     fn can(&self, b: u8) -> bool {
         self.account.access.has(b)
+    }
+
+    /// Did this session negotiate capability bit `n`?
+    #[allow(dead_code)] // The first caller is the voice frontend (V3).
+    fn has_cap(&self, n: u8) -> bool {
+        self.caps.has(n)
     }
 }
 
@@ -507,20 +529,25 @@ async fn login_phase(
 
     // Login reply. A version-0 server sends only the uid (and a 1.0/1.2
     // client wouldn't know what to do with more).
-    if ctx.cfg.version == 0 {
-        reply(tx, f.trans, vec![(tag::UID, uid.to_be_bytes().to_vec())]);
+    let mut login_reply = if ctx.cfg.version == 0 {
+        vec![(tag::UID, uid.to_be_bytes().to_vec())]
     } else {
-        reply(
-            tx,
-            f.trans,
-            vec![
-                (tag::UID, uid.to_be_bytes().to_vec()),
-                (tag::VERSION, ctx.cfg.version.to_be_bytes().to_vec()),
-                (TAG_BANNERID, 0u16.to_be_bytes().to_vec()),
-                (tag::SERVERNAME, text::from_utf8(&ctx.cfg.name)),
-            ],
-        );
+        vec![
+            (tag::UID, uid.to_be_bytes().to_vec()),
+            (tag::VERSION, ctx.cfg.version.to_be_bytes().to_vec()),
+            (TAG_BANNERID, 0u16.to_be_bytes().to_vec()),
+            (tag::SERVERNAME, text::from_utf8(&ctx.cfg.name)),
+        ]
+    };
+    // The capability echo: the bits we agreed to, and nothing when we
+    // agreed to none (the spec's "omit it and the session is standard
+    // mode"). It rides even a version-0 reply — only a modern client
+    // asks the question, and one that asked deserves the answer.
+    let caps = req.caps.intersect(ctx.cfg.caps);
+    if !caps.is_empty() {
+        login_reply.push((tag::CAPABILITIES, caps.to_wire()));
     }
+    reply(tx, f.trans, login_reply);
 
     // Agreement dance (1.5 flow).
     let mut agreement_sent = false;
@@ -548,6 +575,7 @@ async fn login_phase(
         uid,
         account,
         announced: false,
+        caps,
     };
 
     // A 1.5+ client that sent no name finishes its login via

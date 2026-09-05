@@ -201,6 +201,9 @@ login timeout.
     "detach": { "grace": 300 },      // null when the account can't detach —
                                      // the client then knows a resume will
                                      // never succeed and re-logins instead
+    "caps": [ "voice" ],             // optional extensions this server
+                                     // offers; always present, empty when
+                                     // the build offers none (§11)
     "seq": 0                          // events start at seq 1
 } }
 ```
@@ -345,9 +348,10 @@ Each lands separately with tests, roughly a branch apiece:
   once chat lines persist; the event shape doesn't change.
 - **Private chats**: the domain events exist; ng needs a `cid` field on
   `chat`/`subject` events and room-lifecycle requests.
-- **Capabilities**: the login reply grows a `caps: [...]` list the moment
-  any of the above ships, so clients feature-detect instead of
-  version-sniff.
+- **Capabilities**: the login reply carries a `caps: [...]` list so
+  clients feature-detect instead of version-sniffing. It ships with the
+  legacy wire's `DATA_CAPABILITIES` negotiation (`docs/voice.md` §7) and
+  starts empty; each extension adds its name as it lands.
 - The hotline-rs org's protocol work, if it converges here: this spec is
   the artifact to share — it's implementation-independent and the org's
   server could adopt it wholesale.
