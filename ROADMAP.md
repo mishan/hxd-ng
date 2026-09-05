@@ -332,7 +332,18 @@ In rough order of value-for-effort:
    voice room for free; only the signalling is per-frontend. The
    capability-negotiation plumbing it needs (parse and echo
    `DATA_CAPABILITIES`) is the same plumbing Text-Encoding needs, so that
-   lands first and both ride it.
+   lands first and both ride it. **Implemented 2026-09** and tested end to
+   end against a real client.
+5. **Video** — camera and screen share on top of the voice room, specced
+   2026-09 in [docs/capabilities-video.md](docs/capabilities-video.md): a
+   draft written in fogWraith's shape for upstream contribution as
+   `Capabilities-Video.md`, plus the Hotline-ng binding. It reuses the
+   voice SFU, peer connection, room and SDP path wholesale — the new wire
+   surface is five control transactions and a status notification — and it
+   degrades per client, so a voice-only or classic client is unaffected by
+   a room that has video in it. Not started; the largest new pieces are
+   keyframe/PLI plumbing (no analogue in an audio SFU) and, on the client
+   side, video rendering.
 
 ## Phase 7 — Hotline-ng: the HTTP-era protocol, and the presence paradigm shift
 
