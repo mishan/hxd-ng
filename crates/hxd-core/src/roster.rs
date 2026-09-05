@@ -249,7 +249,6 @@ pub(crate) struct RosterInner {
     last_serial: u64,
     pub(crate) public_subject: String,
     pub(crate) chats: HashMap<u32, PrivateChat>,
-    pub(crate) last_chat_ref: u32,
     pub(crate) bans: Vec<Ban>,
 }
 
@@ -264,6 +263,33 @@ impl RosterInner {
             }
             if !self.users.contains_key(&self.last_uid) {
                 return Some(self.last_uid);
+            }
+        }
+        None
+    }
+
+    /// Allocate a private chat's id: nonzero, unused, and from the OS
+    /// CSPRNG. `None` if the CSPRNG refuses (or, absurdly, if the id
+    /// space is so full that a hundred draws all collide).
+    ///
+    /// **Random rather than sequential, and unconditionally.** A chat id
+    /// is opaque to every client — nothing on either wire derives meaning
+    /// from its value — but it is also the whole address of a voice room
+    /// (fogWraith Capabilities-Voice.md, "Room Membership"), which a
+    /// voice-capable client can name directly. Sequential ids are
+    /// guessable, so they would let such a client name a private chat's
+    /// voice room it was never invited to. Membership checks are the real
+    /// defence and live where the joins are; this is the cheap layer
+    /// underneath, and doing it always is one less mode than doing it
+    /// only when voice is enabled.
+    pub(crate) fn next_chat_id(&mut self) -> Option<u32> {
+        for _ in 0..100 {
+            let mut raw = [0u8; 4];
+            getrandom::getrandom(&mut raw).ok()?;
+            let cid = u32::from_be_bytes(raw);
+            // 0 is the public chat and never appears in the registry.
+            if cid != 0 && !self.chats.contains_key(&cid) {
+                return Some(cid);
             }
         }
         None

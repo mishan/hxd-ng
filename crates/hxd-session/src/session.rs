@@ -294,6 +294,7 @@ fn err_text(e: ChatError) -> &'static str {
         ChatError::NotAMember => "You are not in that chat.",
         ChatError::AlreadyThere => "Already there.",
         ChatError::WrongPassword => "Wrong chat password.",
+        ChatError::ServerError => "Server error.",
     }
 }
 

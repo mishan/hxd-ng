@@ -10,3 +10,5 @@ publish = false
 [dependencies]
 # tokio::sync only — the domain layer schedules nothing itself.
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# The OS CSPRNG, for chat ids (which are also voice-room addresses).
+getrandom = "0.2"
