@@ -30,6 +30,13 @@ pub struct NgConfig {
     pub grace: Duration,
     /// Detached-sessions-per-address backstop.
     pub max_detached_per_addr: usize,
+    /// Optional protocol extensions this server offers, reported in the
+    /// login reply's `caps` list so clients feature-detect instead of
+    /// version-sniffing (`docs/hotline-ng.md` §11). The ng twin of the
+    /// legacy wire's `DATA_CAPABILITIES` bitmask — a list of names
+    /// because the transport is already JSON and a name outlives a bit
+    /// allocation.
+    pub caps: Vec<String>,
 }
 
 impl Default for NgConfig {
@@ -40,6 +47,7 @@ impl Default for NgConfig {
             login_timeout: Duration::from_secs(10),
             grace: Duration::from_secs(300),
             max_detached_per_addr: 2,
+            caps: Vec::new(),
         }
     }
 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 use hxd_auth_file::FileAuth;
 use hxd_core::Core;
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
-use hxd_session::{ServerConfig, ServerCtx};
+use hxd_session::{Caps, ServerConfig, ServerCtx};
 use serde::Deserialize;
 
 /// The `hxd-ng.toml` schema. Everything has a default; an absent file is a
@@ -134,6 +134,21 @@ impl Config {
     }
 }
 
+/// The `DATA_CAPABILITIES` bits this build can honor for a legacy
+/// session. A capability lands here only once the code behind it is
+/// wired and enabled — never from a config key alone, because the echo
+/// is a promise that the extension's transactions will work.
+fn legacy_caps(_config: &Config) -> Caps {
+    Caps::empty()
+}
+
+/// The same answer for the ng wire, where capabilities are names rather
+/// than bits. Kept beside [`legacy_caps`] so the two wires can't drift
+/// into advertising different things.
+fn ng_caps(_config: &Config) -> Vec<String> {
+    Vec::new()
+}
+
 /// Build the ng frontend context sharing the legacy context's core and
 /// auth. `None` when the config has no `[ng]` section.
 pub fn build_ng_ctx(config: &Config, legacy: &ServerCtx) -> Option<NgCtx> {
@@ -147,6 +162,7 @@ pub fn build_ng_ctx(config: &Config, legacy: &ServerCtx) -> Option<NgCtx> {
             login_timeout: Duration::from_secs(config.server.login_timeout),
             grace: Duration::from_secs(ng.grace),
             max_detached_per_addr: ng.max_detached_per_addr,
+            caps: ng_caps(config),
         }),
         registry: Arc::new(Registry::new()),
     })
@@ -172,6 +188,7 @@ pub fn build_ctx(config: &Config) -> Result<ServerCtx, String> {
             agreement,
             login_timeout: Duration::from_secs(config.server.login_timeout),
             ban_time: Duration::from_secs(config.server.ban_time),
+            caps: legacy_caps(config),
         }),
     })
 }

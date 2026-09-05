@@ -50,6 +50,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             agreement: None,
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
+            caps: hxd_session::Caps::empty(),
         }),
     };
     let ng_ctx = NgCtx {
@@ -61,6 +62,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             login_timeout: Duration::from_secs(5),
             grace: Duration::from_secs(300),
             max_detached_per_addr: 2,
+            caps: Vec::new(),
         }),
         registry: Arc::new(Registry::new()),
     };
