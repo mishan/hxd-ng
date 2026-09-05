@@ -321,11 +321,18 @@ In rough order of value-for-effort:
 3. **GIF icons, inline media, colored nicknames, emoji shortcodes** — mostly
    relay + capability bits, cheap once the capability negotiation exists.
 4. **Voice** — an SFU, a genuinely large subsystem (this is where Janus has
-   two known server-side bugs; the renegotiation one is documented in gtkhx's
-   `docs/janus-voice-renegotiation-bug.md` — read it as a spec of what not to
-   do). `hotline-proto::voice` (ICE/SDP JSON) is shared already; the
-   pure-Rust `hxvoice` state machine may be partially reusable. Explicitly
-   deferred until everything above is solid.
+   two known server-side bugs, both written up in the "Open" section of
+   gtkhx's `docs/voice.md` — read them as a spec of what not to do).
+   `hotline-proto::voice` (ICE/SDP JSON, participants blob) is shared
+   already. **Pulled forward and designed 2026-09 in
+   [docs/voice.md](docs/voice.md)**: the room state and policy live in
+   `hxd-core` behind a `VoiceMedia` trait, the SFU is a separate
+   `hxd-voice` crate on str0m, and — the reason it jumped the queue — the
+   server *being* the SFU means legacy and Hotline-ng clients share a
+   voice room for free; only the signalling is per-frontend. The
+   capability-negotiation plumbing it needs (parse and echo
+   `DATA_CAPABILITIES`) is the same plumbing Text-Encoding needs, so that
+   lands first and both ride it.
 
 ## Phase 7 — Hotline-ng: the HTTP-era protocol, and the presence paradigm shift
 
@@ -459,5 +466,16 @@ resist the reorder.
   kick a detached session.
 - Session lifetime policy: how long a detached session stays on the roster
   before it lapses (fixed TTL, per-account, or admin-set).
-- Which push providers ship first (UnifiedPush is the self-hosting-friendly
-  one; APNs/FCM need app-store presence that doesn't exist yet).
+- ~~Which push providers ship first~~ — **answered 2026-08: UnifiedPush /
+  Web Push.** It needs no vendor account, no certificate and no app-store
+  presence, and RFC 8291 payload encryption means the content-policy knob
+  leaks nothing to a third party — which APNs and FCM cannot say. (When
+  first decided it was also the only uniqush backend that worked; since
+  uniqush-push 2.8.0 FCM is verified and APNs probably works, so that
+  argument has retired and the others carry it.) APNs/FCM follow when
+  there is an app to receive them. See docs/push-notifications.md §3.
+- How a mention is defined, given that Hotline nicks are neither unique nor
+  stable — and whether mentions are in the first push cut at all, or DMs
+  carry it alone (docs/push-notifications.md §11).
+- Where push coalescing lives (domain rate limit, gateway digest window, or
+  vendor collapse keys) — twenty chat lines should not be twenty buzzes.
