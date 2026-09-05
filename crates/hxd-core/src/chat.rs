@@ -12,6 +12,9 @@
 //! public chat and is never in the registry), invitation is optional — any
 //! member can invite, joining an un-passworded chat needs no invitation,
 //! an invitation bypasses the password, the last part deletes the chat.
+//! One deliberate departure from the reference: chat ids come from the OS
+//! CSPRNG rather than a counter, because the id is also a voice room's
+//! whole address — see `RosterInner::next_chat_id`.
 //!
 //! All text is UTF-8 (`String`) — see the roster module docs for the
 //! conversion rules at the legacy edge.
@@ -49,6 +52,10 @@ pub enum ChatError {
     NotAMember,
     AlreadyThere,
     WrongPassword,
+    /// The server couldn't complete the operation — today only a chat id
+    /// the OS CSPRNG refused to produce. Not the client's fault and not
+    /// something it can retry usefully.
+    ServerError,
 }
 
 impl Core {
@@ -131,8 +138,7 @@ impl Core {
             .get(&creator)
             .map(|s| s.info.clone())
             .ok_or(ChatError::NoSuchUser)?;
-        r.last_chat_ref += 1;
-        let cid = r.last_chat_ref;
+        let cid = r.next_chat_id().ok_or(ChatError::ServerError)?;
         let mut chat = PrivateChat {
             members: vec![creator],
             ..Default::default()
@@ -479,6 +485,29 @@ mod tests {
         assert!(matches!(&drain(&mut rx_a)[..], [Event::ChatUserParted { uid, .. }] if *uid == b));
         core.chat_part(cid, a);
         assert_eq!(core.chat_join(cid, a, ""), Err(ChatError::NoSuchChat));
+    }
+
+    #[test]
+    fn chat_ids_are_unguessable_and_never_zero() {
+        let core = Core::new();
+        let (a, _rx_a) = test_attach(&core, "alice", chatter());
+        let cids: Vec<u32> = (0..16).map(|_| core.chat_create(a, a).unwrap().0).collect();
+
+        assert!(cids.iter().all(|c| *c != 0), "0 is the public chat");
+        let unique: std::collections::HashSet<_> = cids.iter().collect();
+        assert_eq!(unique.len(), cids.len(), "ids collide");
+        // The property that matters: knowing one id tells you nothing
+        // about the next. A counter would fail this on every pair.
+        assert!(
+            cids.windows(2).all(|w| w[1] != w[0].wrapping_add(1)),
+            "ids look sequential: {cids:?}"
+        );
+        // And they're spread across the space rather than clustered
+        // low. With sixteen draws a false failure is one run in 65536;
+        // the two checks above carry the claim, so this one only has to
+        // be cheap and honest about what it's asserting.
+        let high = cids.iter().filter(|c| **c > u32::MAX / 2).count();
+        assert!(high > 0 && high < cids.len(), "not spread: {cids:?}");
     }
 
     #[test]
