@@ -38,6 +38,7 @@ it should be cut or this document should change first.
 | **Other users** | whatever the server shows them; decrypted PMs they receive |
 | **Network attacker** | passive or active position on the wire |
 | **Legacy (1.x) client** | a classic account or guest login; no identity; possibly cleartext |
+| **Tunnel / relay operator** | transport identity of every socket it fronts; the tunnelled bytes pass through it under TLS on both sides, but a tunnel on the user's own machine, or a relay, terminates that TLS and can read them |
 
 ## Assets, ranked
 
@@ -103,6 +104,15 @@ Can:
 Cannot:
 - read PMs between two other identity users
 - claim a reserved name held by a linked identity on that server
+
+### Tunnel and relay operators
+
+A tunnel on the user's machine is the user's own device and sees what the
+user sees. A relay in front of a legacy server is, for identity purposes,
+a server operator: it can see every tunnelled byte (it terminates TLS),
+gatekeep by identity, and sign ban lists — and it can do nothing with
+accounts, because it has none. Trusting a relay is trusting its operator
+exactly as one trusts the operator of the server behind it.
 
 ### Network attacker
 
