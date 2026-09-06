@@ -723,6 +723,12 @@ Account records gain `identity_fingerprint` (optional, 32 bytes),
 - Rate limits: `/identity/challenge` and `/identity/auth` per source address
   like login attempts. A forged card costs an attacker nothing and the
   server two signature checks.
+- **Interaction with `CAPABILITY_MESSAGING`.** fogWraith's messaging
+  extension keys everything on the account Login; a linked identity is an
+  account, so the two compose without change. The seams — a durable key
+  beside the Login, lookup by handle, an opaque envelope through the
+  message path for E2E — are proposed as amendments to that extension in
+  `docs/proposals/messaging-identity-amendment.md`.
 
 ---
 
