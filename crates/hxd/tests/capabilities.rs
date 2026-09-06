@@ -40,6 +40,7 @@ async fn start_server(dir: &Path, supported: Caps, ng_caps: &[&str]) -> (SocketA
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
             caps: supported,
+            mark_cleartext: false,
         }),
     };
     let ng_ctx = NgCtx {
@@ -52,8 +53,11 @@ async fn start_server(dir: &Path, supported: Caps, ng_caps: &[&str]) -> (SocketA
             grace: Duration::from_secs(60),
             max_detached_per_addr: 2,
             caps: ng_caps.iter().map(|s| s.to_string()).collect(),
+            trusted_proxies: Vec::new(),
         }),
         registry: Arc::new(Registry::new()),
+        identity: None,
+        tunnel: None,
     };
 
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

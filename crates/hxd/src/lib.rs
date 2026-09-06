@@ -6,9 +6,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+
+use hl_identity::ServerKey;
 use hxd_auth_file::FileAuth;
-use hxd_core::Core;
-use hxd_ng_session::{NgConfig, NgCtx, Registry};
+use hxd_core::{Core, Transport};
+use hxd_ng_session::{
+    IdentityConfig, IdentityState, NewAccounts, NgConfig, NgCtx, Registry, TunnelSink,
+    TunnelStream, Unattested,
+};
 use hxd_session::{cap, Caps, ServerConfig, ServerCtx};
 use serde::Deserialize;
 
@@ -29,6 +38,9 @@ pub struct Config {
     /// Voice chat. Absent = disabled, which is the spec's default and
     /// the right one for a subsystem that opens a UDP port.
     pub voice: Option<VoiceSection>,
+    /// Portable identity (`docs/hotline-ng-identity.md`). Absent =
+    /// disabled: no identity endpoints, no TRTP tunnel path. Needs `[ng]`.
+    pub identity: Option<IdentitySection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +217,53 @@ fn default_screen_bitrate() -> u32 {
     hxd_core::VideoLimits::SCREEN.max_bitrate
 }
 
+/// `[identity]`, per `docs/hotline-ng-identity.md` §12.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentitySection {
+    /// Where the server's Ed25519 seed lives; generated on first run.
+    #[serde(default = "default_identity_key")]
+    pub key: PathBuf,
+    /// `deny`, `guest`, or `create` (spec §8.1; `create` is not
+    /// implemented yet and behaves as `guest`).
+    #[serde(default = "default_new_accounts")]
+    pub new_accounts: String,
+    /// Fingerprints or handles; non-empty restricts identity login to
+    /// these.
+    #[serde(default)]
+    pub allow_list: Vec<String>,
+    #[serde(default)]
+    pub min_attestation_age: u64,
+    /// `deny`, `guest`, or `allow`.
+    #[serde(default = "default_unattested")]
+    pub unattested: String,
+    /// Registrar host → base64url public key. Static until the registrar
+    /// spec's discovery fetch exists.
+    #[serde(default)]
+    pub registrar_keys: HashMap<String, String>,
+    #[serde(default = "default_clock_skew")]
+    pub clock_skew: u64,
+    /// Serve the TRTP-over-WebSocket path.
+    #[serde(default = "default_true")]
+    pub trtp: bool,
+}
+
+fn default_identity_key() -> PathBuf {
+    "identity-server.key".into()
+}
+fn default_new_accounts() -> String {
+    "guest".into()
+}
+fn default_unattested() -> String {
+    "guest".into()
+}
+fn default_clock_skew() -> u64 {
+    300
+}
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NgSection {
@@ -218,6 +277,10 @@ pub struct NgSection {
     /// Detached-sessions-per-address backstop.
     #[serde(default = "default_max_detached")]
     pub max_detached_per_addr: usize,
+    /// Reverse-proxy addresses whose `X-Hotline-Client-Cert` header is
+    /// believed (identity spec §5.3). Empty = mTLS binding off.
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 fn default_ng_bind() -> String {
@@ -249,6 +312,11 @@ pub struct ServerSection {
     /// Seconds a kick-with-ban keeps the address banned.
     #[serde(default = "default_ban_time")]
     pub ban_time: u64,
+    /// Set the cleartext marker bit in legacy user flags for unencrypted
+    /// sessions (identity spec §10). Off until proven against every 1.x
+    /// client we care about.
+    #[serde(default)]
+    pub mark_cleartext: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,6 +357,7 @@ impl Default for ServerSection {
             version: default_version(),
             login_timeout: default_login_timeout(),
             ban_time: default_ban_time(),
+            mark_cleartext: false,
         }
     }
 }
@@ -355,11 +424,127 @@ fn ng_caps(config: &Config, voice: Option<&Voice>) -> Vec<String> {
     caps
 }
 
+/// The TRTP tunnel's other end: the legacy frontend, run on the byte
+/// stream the ng layer hands over (identity spec §6.3).
+pub struct LegacyTunnel(pub ServerCtx);
+
+impl TunnelSink for LegacyTunnel {
+    fn run(
+        &self,
+        stream: TunnelStream,
+        peer: SocketAddr,
+        transport: Transport,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let ctx = self.0.clone();
+        Box::pin(async move {
+            let span = tracing::info_span!("tunnel", %peer);
+            tracing::Instrument::instrument(
+                hxd_session::run_session(stream, peer, ctx, transport),
+                span,
+            )
+            .await
+        })
+    }
+}
+
+/// Load or create the server's identity key. Created with mode 0600 on
+/// Unix; the file is a 32-byte seed, hex-encoded, so it can be backed up
+/// with the account directory.
+fn load_server_key(path: &Path) -> Result<ServerKey, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let hex = text.trim();
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("zz"), 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| format!("{}: not a hex seed", path.display()))?;
+            let seed: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| format!("{}: seed must be 32 bytes", path.display()))?;
+            Ok(ServerKey::from_seed(&seed))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let key = ServerKey::generate();
+            let hex: String = key.seed().iter().map(|b| format!("{b:02x}")).collect();
+            write_private(path, &hex).map_err(|e| format!("{}: {e}", path.display()))?;
+            tracing::info!("generated server identity key at {}", path.display());
+            Ok(key)
+        }
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    writeln!(f, "{text}")
+}
+
+fn build_identity(section: &IdentitySection) -> Result<IdentityState, String> {
+    use base64::Engine;
+    let key = load_server_key(&section.key)?;
+    let new_accounts = match section.new_accounts.as_str() {
+        "deny" => NewAccounts::Deny,
+        "guest" => NewAccounts::Guest,
+        "create" => NewAccounts::Create,
+        other => return Err(format!("[identity] new_accounts: unknown value {other:?}")),
+    };
+    let unattested = match section.unattested.as_str() {
+        "deny" => Unattested::Deny,
+        "guest" => Unattested::Guest,
+        "allow" => Unattested::Allow,
+        other => return Err(format!("[identity] unattested: unknown value {other:?}")),
+    };
+    let mut registrar_keys = HashMap::new();
+    for (host, b64) in &section.registrar_keys {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(b64)
+            .map_err(|_| format!("[identity] registrar_keys.{host}: not base64url"))?;
+        let key: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| format!("[identity] registrar_keys.{host}: key must be 32 bytes"))?;
+        registrar_keys.insert(host.to_lowercase(), key);
+    }
+    Ok(IdentityState::new(
+        key,
+        IdentityConfig {
+            new_accounts,
+            allow_list: section.allow_list.clone(),
+            min_attestation_age: section.min_attestation_age,
+            unattested,
+            registrar_keys,
+            clock_skew: section.clock_skew,
+            trtp: section.trtp,
+        },
+    ))
+}
+
 /// Build the ng frontend context sharing the legacy context's core and
 /// auth. `None` when the config has no `[ng]` section.
-pub fn build_ng_ctx(config: &Config, legacy: &ServerCtx, voice: Option<&Voice>) -> Option<NgCtx> {
-    let ng = config.ng.as_ref()?;
-    Some(NgCtx {
+pub fn build_ng_ctx(
+    config: &Config,
+    legacy: &ServerCtx,
+    voice: Option<&Voice>,
+) -> Result<Option<NgCtx>, String> {
+    let Some(ng) = config.ng.as_ref() else {
+        return Ok(None);
+    };
+    let identity = match config.identity.as_ref() {
+        Some(section) => Some(Arc::new(build_identity(section)?)),
+        None => None,
+    };
+    let tunnel: Option<Arc<dyn TunnelSink>> = identity
+        .as_ref()
+        .map(|_| Arc::new(LegacyTunnel(legacy.clone())) as Arc<dyn TunnelSink>);
+    Ok(Some(NgCtx {
         core: legacy.core.clone(),
         auth: legacy.auth.clone(),
         cfg: Arc::new(NgConfig {
@@ -369,9 +554,12 @@ pub fn build_ng_ctx(config: &Config, legacy: &ServerCtx, voice: Option<&Voice>) 
             grace: Duration::from_secs(ng.grace),
             max_detached_per_addr: ng.max_detached_per_addr,
             caps: ng_caps(config, voice),
+            trusted_proxies: ng.trusted_proxies.clone(),
         }),
         registry: Arc::new(Registry::new()),
-    })
+        identity,
+        tunnel,
+    }))
 }
 
 /// Assemble the shared server context from a config: bootstrap the accounts
@@ -414,6 +602,7 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
             login_timeout: Duration::from_secs(config.server.login_timeout),
             ban_time: Duration::from_secs(config.server.ban_time),
             caps: legacy_caps(config, voice),
+            mark_cleartext: config.server.mark_cleartext,
         }),
     })
 }

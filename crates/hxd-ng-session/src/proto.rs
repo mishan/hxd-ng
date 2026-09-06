@@ -301,13 +301,23 @@ pub fn status_str(s: SessionStatus) -> &'static str {
 }
 
 pub fn user_json(u: &UserInfo) -> Value {
-    json!({
+    let mut v = json!({
         "uid": u.uid,
         "nick": u.nick,
         "icon": u.icon,
         "admin": u.admin,
         "status": status_str(u.status),
-    })
+        // `docs/hotline-ng-identity.md` §6.2, §10: what other users may
+        // know about this session's link.
+        "transport": if u.transport.encrypted { "encrypted" } else { "cleartext" },
+    });
+    if let Some(id) = &u.transport.identity {
+        v["identity"] = json!({
+            "fingerprint": hl_identity::Fingerprint(id.fingerprint).to_string(),
+            "handle": id.handle,
+        });
+    }
+    v
 }
 
 /// Encode one domain event as a wire event frame.

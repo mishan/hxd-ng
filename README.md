@@ -45,6 +45,15 @@ agreement = "agreement.txt"
 bind = "127.0.0.1:5700"   # plaintext; put a WSS-terminating proxy in front
 grace = 300               # detached-session grace window, seconds
 max_detached_per_addr = 2
+# trusted_proxies = ["127.0.0.1"]   # believe X-Hotline-Client-Cert from these (mTLS binding)
+
+[identity]                # portable identity — docs/hotline-ng-identity.md; needs [ng]
+key = "identity-server.key"        # server Ed25519 seed, generated on first run
+new_accounts = "guest"             # deny | guest | create (create not implemented yet)
+unattested = "guest"               # deny | guest | allow
+# allow_list = ["misha@hl.example", "<fingerprint>"]
+# registrar_keys = { "hl.example" = "<base64url public key>" }
+trtp = true                        # serve TRTP-over-WebSocket at /trtp for tunnelled legacy clients
 
 [voice]                          # absent = voice off, and that's the default
 # bind = "0.0.0.0:5504"          # default: the [server] bind, port + 4 (UDP)
@@ -79,6 +88,10 @@ opt-in on both sides at runtime too: nobody publishes until they ask, and
 nobody receives a stream until they ask for that stream in particular, so
 a room with video in it costs a voice-only participant nothing. See
 [docs/capabilities-video.md](docs/capabilities-video.md).
+
+With `[identity]` on, the ng listener also answers HTTP: `GET
+/.well-known/hotline` for discovery, `POST /identity/challenge` and
+`/identity/auth` for the challenge binding, `GET /identity/card/<fp>`.
 
 Try the ng frontend with the bundled client (no install on Node 22+;
 on older Node, `cd tools && npm install` once for the `ws` fallback):

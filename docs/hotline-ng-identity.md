@@ -201,6 +201,7 @@ authentication, with `Content-Type: application/json`:
     "enabled": true,
     "bindings": [ "challenge", "mtls" ],    // which of §5 this server accepts
     "new_accounts": "guest",                // deny | guest | create
+    "association": "server",                // or "none" on a relay (§11.2)
     "min_attestation_age": 0,
     "trusted_registrars": [],               // empty = any
     "endpoints": {
@@ -671,7 +672,7 @@ offer.
 |---|---|---|
 | `[identity] enabled` | `false` | Master switch; when off, discovery reports `enabled: false` and the endpoints return 404 |
 | `[identity] bindings` | `["challenge"]` | Which of §5 to accept |
-| `[identity] new_accounts` | `deny` | `deny`, `guest`, `create` |
+| `[identity] new_accounts` | `guest` | `deny`, `guest`, `create`. The default is `guest` rather than `deny` so that, with `unattested = guest`, an attested identity is never treated worse than an unattested one |
 | `[identity] default_access` | guest access | Access bitmap for created accounts |
 | `[identity] allow_list` | empty | Fingerprints or handles; non-empty means identity login is restricted to these |
 | `[identity] min_attestation_age` | `0` | Seconds |

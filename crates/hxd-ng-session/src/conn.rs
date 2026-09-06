@@ -13,17 +13,18 @@ use hxd_core::access::bit;
 use hxd_core::video::VideoKind;
 use hxd_core::voice::IceCandidate;
 use hxd_core::{AccessBits, AttachInfo, AuthError, Proof, Resume, SeqEvent, Uid};
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
 use serde_json::json;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, warn};
 
+use crate::identity::{Outcome, TransportIdentity};
 use crate::proto::{
     event_json, parse_streams, participants_json, reply_err, reply_ok, user_json, video_err,
     video_limits_json, voice_err, ChatParams, LoginParams, MsgParams, NickParams, ReqEnvelope,
@@ -32,7 +33,8 @@ use crate::proto::{
 };
 use crate::NgCtx;
 
-type Ws = WebSocketStream<TcpStream>;
+/// The socket after the HTTP layer upgraded it.
+type Ws = WebSocketStream<TokioIo<Upgraded>>;
 
 /// Per-connection state once a session is attached.
 struct SessState {
@@ -52,25 +54,11 @@ enum Exit {
     Replaced,
 }
 
-pub(crate) async fn run(stream: TcpStream, peer: SocketAddr, ctx: NgCtx) {
-    if ctx.core.is_banned(peer.ip()) {
-        info!("refusing banned address");
-        return;
-    }
-    let config = WebSocketConfig {
-        max_message_size: Some(256 * 1024),
-        max_frame_size: Some(256 * 1024),
-        ..Default::default()
-    };
-    let ws = match timeout(
-        ctx.cfg.login_timeout,
-        tokio_tungstenite::accept_async_with_config(stream, Some(config)),
-    )
-    .await
-    {
-        Ok(Ok(ws)) => ws,
-        _ => return,
-    };
+/// Run the JSON protocol on an upgraded socket. `identity` is the
+/// transport identity the HTTP layer authenticated, if any
+/// (`docs/hotline-ng-identity.md` §6.2); the ban check happened before
+/// the upgrade.
+pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<TransportIdentity>) {
     let (mut ws_tx, mut ws_rx) = ws.split();
 
     // --- Handshake: the first request must be login or resume. ----------
@@ -80,7 +68,7 @@ pub(crate) async fn run(stream: TcpStream, peer: SocketAddr, ctx: NgCtx) {
     };
 
     let (state, mut events) = match first.req.as_str() {
-        "login" => match handle_login(&ctx, peer, &first, &mut ws_tx).await {
+        "login" => match handle_login(&ctx, peer, &first, identity.as_ref(), &mut ws_tx).await {
             Some(v) => v,
             None => return,
         },
@@ -204,6 +192,7 @@ async fn handle_login(
     ctx: &NgCtx,
     peer: SocketAddr,
     req: &ReqEnvelope,
+    identity: Option<&TransportIdentity>,
     ws_tx: &mut WsTx,
 ) -> Option<(SessState, UnboundedReceiver<SeqEvent>)> {
     // Absent params is a guest login; *malformed* params is an error, like
@@ -226,8 +215,21 @@ async fn handle_login(
         }
     };
 
+    // An authenticated socket ignores credentials (§6.2, §8.1). Until
+    // account association lands, every identity outcome is a guest
+    // session that knows who it is; `deny` was already applied at
+    // `/identity/auth`, so the only outcomes that reach here are guests.
+    let (login, password) = match identity {
+        Some(i) => {
+            debug_assert!(matches!(
+                i.outcome,
+                Outcome::Guest | Outcome::UnattestedGuest
+            ));
+            (String::new(), String::new())
+        }
+        None => (p.login.clone(), p.password.clone()),
+    };
     let auth = ctx.auth.clone();
-    let (login, password) = (p.login.clone(), p.password.clone());
     let verdict = tokio::task::spawn_blocking(move || {
         auth.authenticate(&login, Proof::Plain(password.as_bytes()))
     })
@@ -272,6 +274,14 @@ async fn handle_login(
         login: account.login.clone(),
         addr: Some(peer.ip()),
         can_detach: account.can_detach,
+        // The plaintext listener is loopback-only and WSS is mandatory in
+        // production (`docs/hotline-ng.md` §9), so ng sockets are
+        // encrypted by construction; the identity is whatever the
+        // upgrade proved.
+        transport: hxd_core::Transport {
+            encrypted: true,
+            identity: identity.map(TransportIdentity::tag),
+        },
     };
     let Some((uid, events)) = ctx.core.attach(attach) else {
         let _ = ws_tx
@@ -310,17 +320,33 @@ async fn handle_login(
     if let Some(agreement) = &ctx.cfg.agreement {
         server["agreement"] = json!(agreement);
     }
+    let mut me_json = user_json(&me);
+    if let Some(i) = identity {
+        // `age` and `outcome` are for the user themself, never the roster.
+        me_json["identity"] = json!({
+            "fingerprint": i.fingerprint.to_string(),
+            "handle": i.handle,
+            "age": i.age,
+            "outcome": i.outcome.as_str(),
+        });
+    }
+    // `identity` is a property of the server, not of the config's
+    // extension list: it's on whenever the identity endpoints are.
+    let mut caps = ctx.cfg.caps.clone();
+    if ctx.identity.is_some() && !caps.iter().any(|c| c == "identity") {
+        caps.push("identity".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
-        "self": user_json(&me),
+        "self": me_json,
         "server": server,
         "users": users,
         "detach": detach,
         // Always present, empty when this build offers no extensions:
         // absent and empty mean the same thing, and one shape is one
         // less case for a client to get wrong.
-        "caps": ctx.cfg.caps,
+        "caps": caps,
         "seq": 0,
     });
     // The ceilings, so a client configures its encoders before the first
