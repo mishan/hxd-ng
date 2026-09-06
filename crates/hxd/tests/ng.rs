@@ -51,6 +51,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
             caps: hxd_session::Caps::empty(),
+            mark_cleartext: false,
         }),
     };
     let ng_ctx = NgCtx {
@@ -63,8 +64,11 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             grace: Duration::from_secs(300),
             max_detached_per_addr: 2,
             caps: Vec::new(),
+            trusted_proxies: Vec::new(),
         }),
         registry: Arc::new(Registry::new()),
+        identity: None,
+        tunnel: None,
     };
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

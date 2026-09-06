@@ -1009,6 +1009,7 @@ fn losing_the_connection_ends_the_publication_even_though_the_session_lives() {
             login: "mobile".into(),
             addr: None,
             can_detach: true,
+            transport: crate::Transport::default(),
         })
         .unwrap();
     core.announce(a);

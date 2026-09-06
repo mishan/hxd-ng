@@ -39,6 +39,41 @@ impl Fingerprint {
     pub fn short(&self) -> String {
         self.to_string().chars().take(8).collect()
     }
+
+    /// Parse the display form: exactly 52 Crockford base32 digits. Case
+    /// and the usual Crockford confusables (`o`→`0`, `i`/`l`→`1`) are
+    /// accepted, since the form exists to be typed and pasted.
+    pub fn parse(s: &str) -> Option<Fingerprint> {
+        if s.len() != 52 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        let mut acc: u64 = 0;
+        let mut nbits = 0;
+        let mut i = 0;
+        for c in s.bytes() {
+            let c = match c.to_ascii_lowercase() {
+                b'o' => b'0',
+                b'i' | b'l' => b'1',
+                c => c,
+            };
+            let d = CROCKFORD.iter().position(|&x| x == c)? as u64;
+            acc = (acc << 5) | d;
+            nbits += 5;
+            if nbits >= 8 {
+                nbits -= 8;
+                if i < 32 {
+                    out[i] = ((acc >> nbits) & 0xff) as u8;
+                    i += 1;
+                }
+            }
+        }
+        // 52 digits carry 260 bits; the trailing 4 must be zero.
+        if i != 32 || acc & ((1 << nbits) - 1) != 0 {
+            return None;
+        }
+        Some(Fingerprint(out))
+    }
 }
 
 const CROCKFORD: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
@@ -254,6 +289,19 @@ mod tests {
         // four zeros: 0b10000 = 16 = 'g'.
         assert_eq!(fp.to_string(), format!("{}g", "z".repeat(51)));
         assert_eq!(fp.short().len(), 8);
+    }
+
+    #[test]
+    fn fingerprint_parse_round_trips() {
+        let fp = Fingerprint::of(&IdentityKey::from_seed(&[3u8; 32]).public());
+        let text = fp.to_string();
+        assert_eq!(Fingerprint::parse(&text), Some(fp));
+        assert_eq!(Fingerprint::parse(&text.to_uppercase()), Some(fp));
+        assert_eq!(Fingerprint::parse(&text[..51]), None);
+        let mut bad = text.clone();
+        bad.replace_range(51..52, "z"); // non-zero padding bits
+        assert_eq!(Fingerprint::parse(&bad), None);
+        assert_eq!(Fingerprint::parse(&"u".repeat(52)), None); // 'u' isn't in the alphabet
     }
 
     #[test]

@@ -25,11 +25,10 @@ use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
     Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Proof, SeqEvent,
-    SessionStatus, Uid, UserInfo,
+    SessionStatus, Transport, Uid, UserInfo,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
@@ -93,6 +92,10 @@ pub struct ServerConfig {
     /// configured, so a bit is never advertised by a build that can't
     /// serve it.
     pub caps: Caps,
+    /// Set the cleartext marker bit in user flags for unencrypted
+    /// sessions (`docs/hotline-ng-identity.md` §10). Off by default: see
+    /// [`wire_color`].
+    pub mark_cleartext: bool,
 }
 
 impl Default for ServerConfig {
@@ -104,6 +107,7 @@ impl Default for ServerConfig {
             login_timeout: Duration::from_secs(10),
             ban_time: Duration::from_secs(1800),
             caps: Caps::empty(),
+            mark_cleartext: false,
         }
     }
 }
@@ -116,14 +120,18 @@ pub struct ServerCtx {
     pub cfg: Arc<ServerConfig>,
 }
 
-/// Accept loop: one [`run_session`] task per connection.
+/// Accept loop: one [`run_session`] task per connection. Plain TCP, so
+/// the transport is cleartext and carries no identity.
 pub async fn serve(listener: TcpListener, ctx: ServerCtx) -> std::io::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let span = tracing::info_span!("session", %peer);
-            run_session(stream, peer, ctx).instrument(span).await;
+            run_session(stream, peer, ctx, Transport::default())
+                .instrument(span)
+                .await;
         });
     }
 }
@@ -157,7 +165,7 @@ enum Outbound {
 
 type Tx = UnboundedSender<Outbound>;
 
-async fn writer_task(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Outbound>) {
+async fn writer_task<W: AsyncWrite + Unpin>(mut wr: W, mut rx: UnboundedReceiver<Outbound>) {
     // Server pushes count their own transactions, starting at 1 (mhxd's
     // convention; clients ignore the value everywhere but task replies).
     let mut push_trans: u32 = 1;
@@ -182,7 +190,7 @@ async fn writer_task(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Outbound>
                 pack_frame(ty, 0, 0, &chunks)
             }
         };
-        if wr.write_all(&bytes).await.is_err() {
+        if wr.write_all(&bytes).await.is_err() || wr.flush().await.is_err() {
             break; // Reader will observe the dead socket and clean up.
         }
     }
@@ -191,7 +199,7 @@ async fn writer_task(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Outbound>
 
 /// Reader task: frames the socket into a bounded channel (backpressure for
 /// a flooding client). Exits on EOF, error, or a malformed frame.
-async fn reader_task(mut rd: OwnedReadHalf, frames: Sender<Frame>) {
+async fn reader_task<R: AsyncRead + Unpin>(mut rd: R, frames: Sender<Frame>) {
     loop {
         match read_frame(&mut rd).await {
             Ok(f) => {
@@ -273,33 +281,48 @@ fn mac_nick(nick: &str) -> Vec<u8> {
 /// The legacy color field is a bitfield in practice: bit 1 away, bit 2
 /// admin. The domain stores `admin` + status; the wire form is derived
 /// here and only here.
-fn wire_color(u: &UserInfo) -> u16 {
+///
+/// Bit 4 (value 16) marks a session whose link is cleartext
+/// (`docs/hotline-ng-identity.md` §10): a plain TCP legacy session. Old
+/// clients ignore flag bits they don't know, but the reference server
+/// never set one, so this is a deliberate deviation behind
+/// `ServerConfig::mark_cleartext` (default off) until it has been seen
+/// against every 1.x client we care about.
+fn wire_color(u: &UserInfo, mark_cleartext: bool) -> u16 {
     (if u.admin { 2 } else { 0 })
         | (if u.status == SessionStatus::Active {
             0
         } else {
             1
         })
+        | (if mark_cleartext && !u.transport.encrypted {
+            16
+        } else {
+            0
+        })
 }
 
 /// The `HTLS_DATA_USER_LIST` payload: uid, icon, color, nlen (all u16 BE),
 /// then the name bytes. `struct hl_userlist_hdr` minus the chunk header.
-fn userlist_payload(u: &UserInfo) -> Vec<u8> {
+fn userlist_payload(u: &UserInfo, mark_cleartext: bool) -> Vec<u8> {
     let nick = mac_nick(&u.nick);
     let mut v = Vec::with_capacity(8 + nick.len());
     v.extend_from_slice(&u.uid.to_be_bytes());
     v.extend_from_slice(&u.icon.to_be_bytes());
-    v.extend_from_slice(&wire_color(u).to_be_bytes());
+    v.extend_from_slice(&wire_color(u, mark_cleartext).to_be_bytes());
     v.extend_from_slice(&(nick.len() as u16).to_be_bytes());
     v.extend_from_slice(&nick);
     v
 }
 
-fn user_change_chunks(u: &UserInfo) -> Vec<(u16, Vec<u8>)> {
+fn user_change_chunks(u: &UserInfo, mark_cleartext: bool) -> Vec<(u16, Vec<u8>)> {
     vec![
         (tag::UID, u.uid.to_be_bytes().to_vec()),
         (tag::ICON, u.icon.to_be_bytes().to_vec()),
-        (tag::COLOUR, wire_color(u).to_be_bytes().to_vec()),
+        (
+            tag::COLOUR,
+            wire_color(u, mark_cleartext).to_be_bytes().to_vec(),
+        ),
         (tag::NAME, mac_nick(&u.nick)),
     ]
 }
@@ -458,13 +481,21 @@ impl Session {
     }
 }
 
-pub async fn run_session(stream: TcpStream, peer: SocketAddr, ctx: ServerCtx) {
+/// Run one legacy session over any byte stream: a TCP socket from
+/// [`serve`], or a TRTP-over-WebSocket tunnel handed over by the ng
+/// frontend (`docs/hotline-ng-identity.md` §6.3). `transport` says what
+/// the caller knows about the link — encrypted or not, and the transport
+/// identity if the caller authenticated one — and is carried to the
+/// roster untouched. The protocol inside doesn't know which it got.
+pub async fn run_session<S>(stream: S, peer: SocketAddr, ctx: ServerCtx, transport: Transport)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     if ctx.core.is_banned(peer.ip()) {
         info!("refusing banned address");
         return;
     }
-    let _ = stream.set_nodelay(true);
-    let (mut rd, wr) = stream.into_split();
+    let (mut rd, wr): (ReadHalf<S>, WriteHalf<S>) = tokio::io::split(stream);
 
     // --- Magic exchange -------------------------------------------------
     // Read exactly the 12 client-hello bytes; anything the client pipelined
@@ -482,7 +513,9 @@ pub async fn run_session(stream: TcpStream, peer: SocketAddr, ctx: ServerCtx) {
 
     let (tx, out_rx) = mpsc::unbounded_channel();
     let mut wr_for_magic = wr;
-    if wr_for_magic.write_all(&SERVER_MAGIC).await.is_err() {
+    // TCP needs no flush; a tunnelled stream buffers frames until one
+    // (`WsByteStream`), so flush after every write on the generic path.
+    if wr_for_magic.write_all(&SERVER_MAGIC).await.is_err() || wr_for_magic.flush().await.is_err() {
         return;
     }
     let writer = tokio::spawn(writer_task(wr_for_magic, out_rx));
@@ -490,7 +523,7 @@ pub async fn run_session(stream: TcpStream, peer: SocketAddr, ctx: ServerCtx) {
     let reader = tokio::spawn(reader_task(rd, frames_tx));
 
     // --- Login, then the session loop -----------------------------------
-    let outcome = login_phase(&mut frames, &tx, &ctx, peer).await;
+    let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport).await;
     if let Some((mut sess, mut events)) = outcome {
         let uid = sess.uid;
         info!(uid, login = %sess.account.login, "logged in");
@@ -509,6 +542,7 @@ async fn login_phase(
     tx: &Tx,
     ctx: &ServerCtx,
     peer: SocketAddr,
+    transport: Transport,
 ) -> Option<(Session, UnboundedReceiver<SeqEvent>)> {
     let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
         Ok(Some(f)) => f,
@@ -572,6 +606,7 @@ async fn login_phase(
         login: account.login.clone(),
         addr: Some(peer.ip()),
         can_detach: account.can_detach,
+        transport,
     };
     let Some((uid, events)) = ctx.core.attach(attach) else {
         reply_error(tx, f.trans, "Server full.");
@@ -667,7 +702,10 @@ fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 hdr::USER_SELFINFO,
                 vec![
                     (tag::ACCESS, sess.account.access.to_wire().to_vec()),
-                    (tag::USER_LIST, userlist_payload(&me)),
+                    (
+                        tag::USER_LIST,
+                        userlist_payload(&me, ctx.cfg.mark_cleartext),
+                    ),
                 ],
             );
         }
@@ -681,7 +719,11 @@ fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
 fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
     match ev {
         Event::Joined(u) | Event::Changed(u) => {
-            push(tx, hdr::USER_CHANGE, user_change_chunks(&u));
+            push(
+                tx,
+                hdr::USER_CHANGE,
+                user_change_chunks(&u, ctx.cfg.mark_cleartext),
+            );
         }
         Event::Parted(uid) => {
             push(
@@ -763,7 +805,12 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
                     (tag::UID, user.uid.to_be_bytes().to_vec()),
                     (tag::ICON, user.icon.to_be_bytes().to_vec()),
-                    (tag::COLOUR, wire_color(&user).to_be_bytes().to_vec()),
+                    (
+                        tag::COLOUR,
+                        wire_color(&user, ctx.cfg.mark_cleartext)
+                            .to_be_bytes()
+                            .to_vec(),
+                    ),
                     (tag::NAME, mac_nick(&user.nick)),
                 ],
             );
@@ -922,7 +969,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .core
                 .snapshot()
                 .iter()
-                .map(|u| (tag::USER_LIST, userlist_payload(u)))
+                .map(|u| (tag::USER_LIST, userlist_payload(u, ctx.cfg.mark_cleartext)))
                 .collect();
             chunks.push((
                 tag::CHAT_SUBJECT,
@@ -1052,7 +1099,12 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
                         (tag::UID, me.uid.to_be_bytes().to_vec()),
                         (tag::ICON, me.icon.to_be_bytes().to_vec()),
-                        (tag::COLOUR, wire_color(&me).to_be_bytes().to_vec()),
+                        (
+                            tag::COLOUR,
+                            wire_color(&me, ctx.cfg.mark_cleartext)
+                                .to_be_bytes()
+                                .to_vec(),
+                        ),
                         (tag::NAME, mac_nick(&me.nick)),
                     ],
                 ),
@@ -1099,7 +1151,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 Ok((rows, subject)) => {
                     let mut chunks: Vec<(u16, Vec<u8>)> = rows
                         .iter()
-                        .map(|u| (tag::USER_LIST, userlist_payload(u)))
+                        .map(|u| (tag::USER_LIST, userlist_payload(u, ctx.cfg.mark_cleartext)))
                         .collect();
                     chunks.push((tag::CHAT_SUBJECT, text::from_utf8(&subject)));
                     reply(tx, f.trans, chunks);

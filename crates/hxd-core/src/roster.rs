@@ -54,10 +54,36 @@ pub enum SessionStatus {
     Detached,
 }
 
+/// What the session layer knows about the connection carrying a session,
+/// as far as other users are entitled to see it (`docs/hotline-ng-identity.md`
+/// §6.2, §10). Purely descriptive: the domain never acts on it, it only
+/// carries it to the roster so frontends can mark sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Transport {
+    /// The link to this session's client is encrypted end to end
+    /// (TLS WebSocket, or a tunnelled legacy client). A plain TCP legacy
+    /// session is not, and other users get warned before PMing it.
+    pub encrypted: bool,
+    /// The transport identity, when the connection was authenticated
+    /// with one. Never inferred — set only by a frontend that verified it.
+    pub identity: Option<IdentityTag>,
+}
+
+/// The public part of a transport identity: enough for a roster row and
+/// for a reserved-name check, nothing that could authorize anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityTag {
+    /// SHA-256 of the identity public key.
+    pub fingerprint: [u8; 32],
+    /// `handle@registrar`, when an attestation was accepted.
+    pub handle: Option<String>,
+}
+
 /// The visible-to-others part of a session: what a user-list row shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInfo {
     pub uid: Uid,
+    pub transport: Transport,
     /// Nickname, UTF-8.
     pub nick: String,
     pub icon: u16,
@@ -259,6 +285,7 @@ pub struct AttachInfo {
     pub login: String,
     pub addr: Option<IpAddr>,
     pub can_detach: bool,
+    pub transport: Transport,
 }
 
 /// The outcome of a [`Core::resume`].
@@ -416,6 +443,7 @@ impl Core {
                 serial,
                 info: UserInfo {
                     uid,
+                    transport: info.transport,
                     nick: info.nick,
                     icon: info.icon,
                     admin: info.admin,
@@ -698,6 +726,7 @@ pub(crate) fn test_attach(
             login: nick.to_string(),
             addr: None,
             can_detach: false,
+            transport: Transport::default(),
         })
         .unwrap();
     core.announce(uid);
@@ -729,6 +758,7 @@ mod tests {
                 login: nick.to_string(),
                 addr: Some(addr.parse().unwrap()),
                 can_detach: true,
+                transport: Transport::default(),
             })
             .unwrap();
         core.announce(uid);
@@ -800,6 +830,7 @@ mod tests {
                 login: "ghost".into(),
                 addr: None,
                 can_detach: false,
+                transport: Transport::default(),
             })
             .unwrap();
 

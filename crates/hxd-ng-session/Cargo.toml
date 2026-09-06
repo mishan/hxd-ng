@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 hxd-core = { workspace = true }
+hl-identity = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
@@ -17,3 +18,12 @@ tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 sha2 = "0.10"
 getrandom = "0.2"
+# The HTTP layer in front of the WebSocket (docs/hotline-ng-identity.md
+# §2): discovery and the identity endpoints, plus the upgrade itself.
+# hyper directly rather than a framework — five routes don't need one.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-tungstenite = "0.15"
+http-body-util = "0.1"
+bytes = "1"
+base64 = "0.22"
