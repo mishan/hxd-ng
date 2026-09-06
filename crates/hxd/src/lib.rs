@@ -9,8 +9,11 @@ use std::time::Duration;
 use hxd_auth_file::FileAuth;
 use hxd_core::Core;
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
-use hxd_session::{Caps, ServerConfig, ServerCtx};
+use hxd_session::{cap, Caps, ServerConfig, ServerCtx};
 use serde::Deserialize;
+
+pub mod voice;
+pub use voice::Voice;
 
 /// The `hxd-ng.toml` schema. Everything has a default; an absent file is a
 /// runnable server.
@@ -23,6 +26,31 @@ pub struct Config {
     pub paths: PathsSection,
     /// The Hotline-ng WebSocket frontend. Absent = disabled.
     pub ng: Option<NgSection>,
+    /// Voice chat. Absent = disabled, which is the spec's default and
+    /// the right one for a subsystem that opens a UDP port.
+    pub voice: Option<VoiceSection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceSection {
+    /// UDP listen address for WebRTC media. Default: the legacy bind
+    /// address with the spec's base-port-plus-four.
+    pub bind: Option<String>,
+    /// The addresses clients should be told to send media to — the
+    /// server's ICE candidates. Defaults to `bind` when that names a
+    /// concrete address; required when it doesn't, because ICE-lite
+    /// gives a client nothing else to go on. List both a v4 and a v6
+    /// address to serve both.
+    #[serde(default)]
+    pub advertise: Vec<String>,
+    /// The spec's `VoiceMaxPerRoom`.
+    #[serde(default = "default_max_per_room")]
+    pub max_per_room: usize,
+}
+
+fn default_max_per_room() -> usize {
+    hxd_core::DEFAULT_MAX_PER_ROOM
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,20 +166,28 @@ impl Config {
 /// session. A capability lands here only once the code behind it is
 /// wired and enabled — never from a config key alone, because the echo
 /// is a promise that the extension's transactions will work.
-fn legacy_caps(_config: &Config) -> Caps {
-    Caps::empty()
+fn legacy_caps(voice: Option<&Voice>) -> Caps {
+    let mut caps = Caps::empty();
+    if voice.is_some() {
+        caps = caps.with(cap::VOICE);
+    }
+    caps
 }
 
 /// The same answer for the ng wire, where capabilities are names rather
 /// than bits. Kept beside [`legacy_caps`] so the two wires can't drift
 /// into advertising different things.
-fn ng_caps(_config: &Config) -> Vec<String> {
-    Vec::new()
+fn ng_caps(voice: Option<&Voice>) -> Vec<String> {
+    let mut caps = Vec::new();
+    if voice.is_some() {
+        caps.push("voice".to_string());
+    }
+    caps
 }
 
 /// Build the ng frontend context sharing the legacy context's core and
 /// auth. `None` when the config has no `[ng]` section.
-pub fn build_ng_ctx(config: &Config, legacy: &ServerCtx) -> Option<NgCtx> {
+pub fn build_ng_ctx(config: &Config, legacy: &ServerCtx, voice: Option<&Voice>) -> Option<NgCtx> {
     let ng = config.ng.as_ref()?;
     Some(NgCtx {
         core: legacy.core.clone(),
@@ -162,7 +198,7 @@ pub fn build_ng_ctx(config: &Config, legacy: &ServerCtx) -> Option<NgCtx> {
             login_timeout: Duration::from_secs(config.server.login_timeout),
             grace: Duration::from_secs(ng.grace),
             max_detached_per_addr: ng.max_detached_per_addr,
-            caps: ng_caps(config),
+            caps: ng_caps(voice),
         }),
         registry: Arc::new(Registry::new()),
     })
@@ -170,7 +206,7 @@ pub fn build_ng_ctx(config: &Config, legacy: &ServerCtx) -> Option<NgCtx> {
 
 /// Assemble the shared server context from a config: bootstrap the accounts
 /// directory, read the agreement file, wire the domain core and backend.
-pub fn build_ctx(config: &Config) -> Result<ServerCtx, String> {
+pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, String> {
     FileAuth::bootstrap(&config.paths.accounts)
         .map_err(|e| format!("{}: {e}", config.paths.accounts.display()))?;
 
@@ -179,8 +215,13 @@ pub fn build_ctx(config: &Config) -> Result<ServerCtx, String> {
         None => None,
     };
 
+    let core = match voice {
+        Some(v) => Core::new().with_voice(v.media(), v.max_per_room()),
+        None => Core::new(),
+    };
+
     Ok(ServerCtx {
-        core: Arc::new(Core::new()),
+        core: Arc::new(core),
         auth: Arc::new(FileAuth::new(&config.paths.accounts)),
         cfg: Arc::new(ServerConfig {
             name: config.server.name.clone(),
@@ -188,7 +229,7 @@ pub fn build_ctx(config: &Config) -> Result<ServerCtx, String> {
             agreement,
             login_timeout: Duration::from_secs(config.server.login_timeout),
             ban_time: Duration::from_secs(config.server.ban_time),
-            caps: legacy_caps(config),
+            caps: legacy_caps(voice),
         }),
     })
 }

@@ -6,6 +6,7 @@
 pub mod caps;
 pub mod frame;
 pub mod session;
+pub mod voice;
 
 pub use caps::{cap, Caps};
 pub use session::{run_session, serve, ServerConfig, ServerCtx};

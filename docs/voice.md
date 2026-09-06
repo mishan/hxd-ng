@@ -76,7 +76,7 @@ Condensed; the spec is normative and this is the checklist.
 - **Room identifiers MUST be server-allocated from a CSPRNG** and unique
   among rooms in use, because a voice room is addressed by a bare cid and
   a guessable cid lets a voice-capable client join a room it was never
-  invited to. Our `chat_create` allocates sequentially today (§11).
+  invited to. `chat_create` draws one from the OS CSPRNG (§11).
 - **One room at a time.** Joining voice in room B implicitly leaves A;
   the A teardown and its status notification complete before the B join
   starts. If B fails, the user is in no room and is not re-joined to A.
@@ -373,9 +373,15 @@ leave the rest as they are, with the deviation commented at the site.
 
 The `VOICE_PARTICIPANTS` blob (u16 uid, u16 flags, u16 codec id, all
 big-endian, six bytes per entry) has a parser in `hotline-proto::voice`
-and needs the matching builder; that belongs in the shared crate next to
-its parser, round-trip tested there, and is a coordinated change across
-the two trees. Everything else on this wire is plain chunk assembly.
+and needs the matching builder. **It stays in `hxd-session` for now**, not
+in the shared crate: advancing the submodule pin needs the gtkhx side
+merged first, and six bytes an entry does not earn a coordinated bump
+across two trees when the check that matters is available without one —
+the round-trip test here runs our encoder against
+`hotline_proto::voice::parse_voice_participants`, the decoder GtkHx
+actually uses, and pins the bytes besides. It moves next door to its
+parser when Phase 0's shared-crate extraction gives them a home together.
+Everything else on this wire is plain chunk assembly.
 
 ## 8. The ng wire (`hxd-ng-session`)
 
@@ -485,11 +491,11 @@ Each stage is a branch with tests, in the house style.
 
 ## 11. Open questions
 
-- **Random cids.** The spec MUSTs a CSPRNG-allocated, collision-checked
-  room id because voice rooms are addressed by bare cid. Legacy clients
-  treat a cid as opaque, so switching `chat_create` to a random nonzero
-  u32 costs nothing on the wire. Do it unconditionally, or only when
-  voice is enabled? Unconditionally is simpler and one less mode.
+- ~~**Random cids.**~~ Settled: `chat_create` draws a nonzero,
+  collision-checked u32 from the OS CSPRNG, unconditionally rather than
+  only when voice is enabled — one less mode, and a cid is opaque to
+  every client either way. Membership checks are still the real defence;
+  this is the layer underneath.
 - **Payload-type fallback for answers with no `a=ssrc`.** GtkHx declares
   it; browsers declare it; the spec tolerates its absence. Whether str0m
   in RTP mode surfaces an unknown SSRC we can bind on first sight decides

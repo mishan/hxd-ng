@@ -14,7 +14,8 @@ git submodule update --init
 Building the voice SFU needs a C/assembly toolchain and **cmake**: the
 WebRTC stack's DTLS certificate generation reaches aws-lc-sys whichever
 crypto provider is selected. On Debian/Ubuntu, `apt install build-essential
-cmake`.
+cmake`. A build with `--no-default-features` leaves voice out and needs
+neither.
 
 ## Run
 
@@ -44,7 +45,20 @@ agreement = "agreement.txt"
 bind = "127.0.0.1:5700"   # plaintext; put a WSS-terminating proxy in front
 grace = 300               # detached-session grace window, seconds
 max_detached_per_addr = 2
+
+[voice]                          # absent = voice off, and that's the default
+# bind = "0.0.0.0:5504"          # default: the [server] bind, port + 4 (UDP)
+advertise = ["203.0.113.5:5504"] # what clients are told to send media to;
+                                 # required when bind is a wildcard, because
+                                 # ICE-lite gives a client nothing else to
+                                 # go on. List a v4 and a v6 to serve both.
+max_per_room = 16                # the spec's VoiceMaxPerRoom
 ```
+
+Voice needs its **UDP** port reachable — the one thing operators most often
+miss. It is behind the `voice` Cargo feature, on by default;
+`cargo build --no-default-features` leaves the WebRTC stack out of the
+binary entirely. See [docs/voice.md](docs/voice.md).
 
 Try the ng frontend with the bundled client (no install on Node 22+;
 on older Node, `cd tools && npm install` once for the `ws` fallback):

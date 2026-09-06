@@ -18,9 +18,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hotline_proto::messages::{tag, ClientHdr};
+use hotline_proto::messages::{tag, ClientHdr, ServerHdr};
 use hotline_proto::text;
 use hxd_core::access::bit;
+use hxd_core::voice::VoiceError;
 use hxd_core::{
     Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Proof, SeqEvent,
     SessionStatus, Uid, UserInfo,
@@ -32,8 +33,9 @@ use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSend
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
-use crate::caps::Caps;
+use crate::caps::{cap, Caps};
 use crate::frame::{pack_frame, read_frame, Frame, ReadError};
+use crate::voice;
 
 /// Server → client transaction opcodes not covered by
 /// `hotline_proto::messages::ServerHdr` (which only carries what the gtkhx
@@ -137,6 +139,18 @@ enum Outbound {
         ty: u32,
         chunks: Vec<(u16, Vec<u8>)>,
     },
+    /// Server-initiated notification stamped with **task id 0**.
+    ///
+    /// The base protocol's pushes count their own transactions (mhxd's
+    /// convention, which this frontend follows everywhere else), but the
+    /// voice extension's transaction-semantics section says its three
+    /// server-initiated notifications use task id 0 with the reply flag
+    /// unset. GtkHx dispatches them by type and doesn't care either way;
+    /// Janus sends 0; so we send 0, and only there.
+    Notify {
+        ty: u32,
+        chunks: Vec<(u16, Vec<u8>)>,
+    },
 }
 
 type Tx = UnboundedSender<Outbound>;
@@ -160,6 +174,10 @@ async fn writer_task(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Outbound>
                 push_trans = push_trans.wrapping_add(1);
                 trace_out(ty, trans, 0, &chunks);
                 pack_frame(ty, trans, 0, &chunks)
+            }
+            Outbound::Notify { ty, chunks } => {
+                trace_out(ty, 0, 0, &chunks);
+                pack_frame(ty, 0, 0, &chunks)
             }
         };
         if wr.write_all(&bytes).await.is_err() {
@@ -234,6 +252,12 @@ fn push(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
     let _ = tx.send(Outbound::Push { ty, chunks });
 }
 
+/// A server-initiated notification with task id 0 — see
+/// [`Outbound::Notify`]. Only the voice extension's 602/604/605 use it.
+fn notify(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
+    let _ = tx.send(Outbound::Notify { ty, chunks });
+}
+
 /// The domain is UTF-8; this edge speaks Mac Roman. Egress conversion is
 /// lossy (`?` for unmappable) and nicks are truncated to the wire's 31
 /// bytes *after* conversion (Mac Roman is single-byte, so no split risk).
@@ -285,6 +309,15 @@ fn hl_decode(data: &[u8]) -> Vec<u8> {
 
 fn cap31(data: &[u8]) -> &[u8] {
     &data[..data.len().min(31)]
+}
+
+/// The `CHAT_ID` of a voice transaction. Absent means the public chat,
+/// which is also what `0` means — every voice transaction carries the
+/// field, and a client that omits it is asking about the lobby.
+fn voice_cid(f: &Frame) -> u32 {
+    f.chunks()
+        .find(|c| c.tag == tag::CHAT_ID)
+        .map_or(0, |c| c.as_uint())
 }
 
 fn err_text(e: ChatError) -> &'static str {
@@ -402,7 +435,6 @@ impl Session {
     }
 
     /// Did this session negotiate capability bit `n`?
-    #[allow(dead_code)] // The first caller is the voice frontend (V3).
     fn has_cap(&self, n: u8) -> bool {
         self.caps.has(n)
     }
@@ -744,10 +776,48 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
                 ],
             );
         }
-        // Voice: this edge can't send 602/604/605 yet, and no legacy
-        // session can be in voice until it can — nothing generates these
-        // for a connection that never joined.
-        Event::VoiceOffer { .. } | Event::VoiceIce { .. } | Event::VoiceStatus { .. } => {}
+        // Voice notifications: task id 0, per the extension spec's
+        // transaction semantics. Only a session that negotiated the
+        // capability and then joined can be here at all.
+        Event::VoiceOffer { cid, sdp } => {
+            // A chunk's length is 16 bits, and `pack_frame` asserts it.
+            // The SFU caps its own offers well under that, so this is
+            // the belt to that braces: an offer that somehow outgrew the
+            // wire is dropped and logged rather than turned into a
+            // panic in this connection's writer.
+            if sdp.len() > u16::MAX as usize {
+                warn!(cid, len = sdp.len(), "voice offer too large for the wire");
+                return true;
+            }
+            notify(
+                tx,
+                ServerHdr::VoiceSdpOffer as u32,
+                vec![voice::chat_id(cid), (tag::VOICE_SDP, sdp.into_bytes())],
+            );
+        }
+        Event::VoiceIce { cid, candidate } => {
+            notify(
+                tx,
+                ServerHdr::VoiceIce as u32,
+                vec![
+                    voice::chat_id(cid),
+                    (tag::VOICE_ICE, voice::ice_payload(&candidate)),
+                ],
+            );
+        }
+        Event::VoiceStatus { cid, participants } => {
+            notify(
+                tx,
+                ServerHdr::VoiceRoomStatus as u32,
+                vec![
+                    voice::chat_id(cid),
+                    (
+                        tag::VOICE_PARTICIPANTS,
+                        voice::participants_payload(&participants),
+                    ),
+                ],
+            );
+        }
 
         Event::Kicked => return false,
     }
@@ -1104,6 +1174,135 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         .chat_notice(0, sess.uid, format!("{nick} has been {verb} by {by}"));
                 }
                 Err(e) => reply_error(tx, f.trans, err_text(e)),
+            }
+        }
+
+        // --- Voice (fogWraith Capabilities-Voice.md) ------------------
+        //
+        // A client that didn't negotiate CAPABILITY_VOICE never sends
+        // these, and never receives one: the gate is the first line of
+        // every arm, and a task error is a base-protocol reply rather
+        // than a voice transaction, so answering one doesn't break that
+        // rule.
+        t if t == ClientHdr::VoiceJoin.as_u32() => {
+            if !sess.has_cap(cap::VOICE) {
+                reply_error(tx, f.trans, "Voice chat is not available on this server.");
+                return;
+            }
+            // The privilege check lives here, with its wording, and says
+            // only that the user may join voice *somewhere*. Which room
+            // is the domain's membership check.
+            if !sess.can(bit::VOICE_CHAT) {
+                reply_error(tx, f.trans, "You are not allowed to join voice chat.");
+                return;
+            }
+            let cid = voice_cid(f);
+            match ctx.core.voice_join(sess.uid, cid) {
+                Ok(join) => reply(
+                    tx,
+                    f.trans,
+                    vec![
+                        voice::chat_id(cid),
+                        (tag::VOICE_SDP, join.sdp.into_bytes()),
+                        (tag::VOICE_CODEC, join.codec.as_bytes().to_vec()),
+                        (
+                            tag::VOICE_PARTICIPANTS,
+                            voice::participants_payload(&join.participants),
+                        ),
+                    ],
+                ),
+                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::VoiceLeave.as_u32() => {
+            if !sess.has_cap(cap::VOICE) {
+                reply_error(tx, f.trans, "Voice chat is not available on this server.");
+                return;
+            }
+            match ctx.core.voice_leave(sess.uid, voice_cid(f)) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::VoiceSdpAnswer.as_u32() => {
+            if !sess.has_cap(cap::VOICE) {
+                reply_error(tx, f.trans, "Voice chat is not available on this server.");
+                return;
+            }
+            let (mut cid, mut sdp) = (0u32, Ok(String::new()));
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_ID => cid = c.as_uint(),
+                    // SDP is UTF-8 by the spec and never Mac Roman: it is
+                    // a media-plane blob that happens to travel on this
+                    // wire, not text anyone reads. So it is validated
+                    // rather than converted: a lossy decode would put
+                    // U+FFFD into a fingerprint or an ICE password and
+                    // hand the media layer an answer that is subtly not
+                    // the one the client sent. A client that can't send
+                    // us UTF-8 gets told its answer was rejected, which
+                    // is what happened.
+                    tag::VOICE_SDP => sdp = std::str::from_utf8(c.data).map(str::to_string),
+                    _ => {}
+                }
+            }
+            let Ok(sdp) = sdp else {
+                debug!(uid = sess.uid, cid, "voice answer is not valid UTF-8");
+                reply_error(tx, f.trans, voice::err_text(VoiceError::BadAnswer));
+                return;
+            };
+            match ctx.core.voice_answer(sess.uid, cid, sdp) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::VoiceIce.as_u32() => {
+            // A notification in both directions: no reply exists, so a
+            // candidate we can't use is dropped rather than answered.
+            if !sess.has_cap(cap::VOICE) {
+                return;
+            }
+            let (mut cid, mut candidate) = (0u32, None);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_ID => cid = c.as_uint(),
+                    tag::VOICE_ICE => candidate = voice::parse_ice(c.data),
+                    _ => {}
+                }
+            }
+            match candidate {
+                // The refusal is discarded, not ignored: this
+                // transaction has no reply to put it in. A candidate for
+                // a room the user isn't in is dropped, which is what the
+                // domain did with it anyway.
+                Some(c) => {
+                    if let Err(e) = ctx.core.voice_ice(sess.uid, cid, c) {
+                        debug!(uid = sess.uid, cid, "ICE candidate dropped: {e:?}");
+                    }
+                }
+                None => debug!(uid = sess.uid, cid, "unparseable ICE candidate dropped"),
+            }
+        }
+
+        t if t == ClientHdr::VoiceMute.as_u32() => {
+            if !sess.has_cap(cap::VOICE) {
+                reply_error(tx, f.trans, "Voice chat is not available on this server.");
+                return;
+            }
+            let (mut cid, mut muted) = (0u32, false);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_ID => cid = c.as_uint(),
+                    tag::VOICE_MUTED => muted = c.as_uint() != 0,
+                    _ => {}
+                }
+            }
+            match ctx.core.voice_mute(sess.uid, cid, muted) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
             }
         }
 

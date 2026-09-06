@@ -58,7 +58,8 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman ↔ UTF-8 at its edges. |
 | `hxd-ng-session` | The ng frontend: WebSocket accept, login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy), first-run guest bootstrap. |
-| `hxd` | The binary: config, wiring, the ng sweeper task, `HXD_DEBUG` tracing. Its `tests/` hold the e2e suites. |
+| `hxd-voice` | The voice SFU: str0m, one UDP port, hand-written SDP, RTP forwarding. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
+| `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing. Its `tests/` hold the e2e suites. |
 
 `tools/ng-client.mjs` is an interactive ng test client (Node 22+, or
 `npm install` in tools/ for the `ws` fallback) — `/drop` exercises
