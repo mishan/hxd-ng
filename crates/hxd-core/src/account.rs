@@ -34,6 +34,29 @@ pub struct Account {
     /// May this account set the public chat subject? Backend default:
     /// tracks the disconnect-users (admin) bit.
     pub set_subject: bool,
+    /// Whether a non-empty password is set. Identity unlinking refuses
+    /// to orphan an account that has no other way in.
+    pub has_password: bool,
+    /// Portable-identity association (`docs/hotline-ng-identity.md` §8).
+    pub identity: IdentityLink,
+}
+
+/// How an account relates to a portable identity. All server-local
+/// policy; nothing here crosses the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdentityLink {
+    /// The linked identity's fingerprint (SHA-256 of its public key), if
+    /// any. At most one per account; at most one account per identity.
+    pub fingerprint: Option<[u8; 32]>,
+    /// May the linked identity log in without a password? Operator
+    /// switch; backend default true.
+    pub identity_login: bool,
+    /// May a user link an identity to this account themself (with the
+    /// password) rather than the operator doing it? Backend default true.
+    pub allow_self_link: bool,
+    /// Is this account's login name reserved as a display name on the
+    /// server (§9)? Backend default false.
+    pub reserve_name: bool,
 }
 
 /// The client's proof of identity.
@@ -82,4 +105,37 @@ pub trait AuthBackend: Send + Sync + 'static {
     /// Authenticate `login` with `proof`. An empty login means guest;
     /// backends decide whether a guest account exists.
     fn authenticate(&self, login: &str, proof: Proof<'_>) -> Result<Account, AuthError>;
+
+    /// Load an account without a proof. For the identity paths, where
+    /// possession of the key stood in for the password; callers must
+    /// have established that before calling.
+    fn lookup(&self, login: &str) -> Result<Account, AuthError>;
+
+    /// The account linked to an identity, if any.
+    fn find_by_fingerprint(&self, fingerprint: &[u8; 32]) -> Result<Option<Account>, AuthError>;
+
+    /// Set or clear an account's identity link. Callers enforce the
+    /// one-to-one rule; the backend just writes.
+    fn set_identity_link(
+        &self,
+        login: &str,
+        fingerprint: Option<[u8; 32]>,
+    ) -> Result<(), AuthError>;
+
+    /// Create an account linked to an identity (`new_accounts = create`).
+    /// `login` is the caller's proposal; the backend may return a
+    /// different one if it had to disambiguate. `access` is the initial
+    /// bitmap; the account gets no password.
+    fn create_linked(
+        &self,
+        login: &str,
+        name: &str,
+        fingerprint: [u8; 32],
+        access: AccessBits,
+    ) -> Result<Account, AuthError>;
+
+    /// Which account, if any, reserves `name` as a display name (§9):
+    /// an account with `reserve_name` whose login equals `name`,
+    /// case-insensitively. Returns the login.
+    fn reserved_by(&self, name: &str) -> Result<Option<String>, AuthError>;
 }
