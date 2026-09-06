@@ -96,6 +96,22 @@ pub struct ServerConfig {
     /// sessions (`docs/hotline-ng-identity.md` §10). Off by default: see
     /// [`wire_color`].
     pub mark_cleartext: bool,
+    /// How a tunnelled session's classic login reconciles with the
+    /// socket's transport identity (`docs/hotline-ng-identity.md` §8.3).
+    pub trtp_login: TrtpLogin,
+}
+
+/// See [`ServerConfig::trtp_login`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrtpLogin {
+    /// Classic credentials are checked as on the TCP port; a named
+    /// account must be the linked one or self-linkable (then it gets
+    /// linked). Identity adds marking and admission, never replaces a
+    /// password.
+    #[default]
+    Verify,
+    /// A linked account is used and the classic credentials ignored.
+    Trust,
 }
 
 impl Default for ServerConfig {
@@ -108,6 +124,7 @@ impl Default for ServerConfig {
             ban_time: Duration::from_secs(1800),
             caps: Caps::empty(),
             mark_cleartext: false,
+            trtp_login: TrtpLogin::Verify,
         }
     }
 }
@@ -536,6 +553,51 @@ where
     let _ = writer.await;
 }
 
+/// The classic login, reconciled with the socket's transport identity
+/// when it has one (`docs/hotline-ng-identity.md` §8.3). Without an
+/// identity this is just `authenticate`.
+fn reconcile_login(
+    auth: &dyn AuthBackend,
+    login: &str,
+    password: &[u8],
+    identity_fp: Option<[u8; 32]>,
+    policy: TrtpLogin,
+) -> Result<Account, AuthError> {
+    let Some(fp) = identity_fp else {
+        return auth.authenticate(login, Proof::Plain(password));
+    };
+    let linked = auth
+        .find_by_fingerprint(&fp)?
+        .filter(|a| a.identity.identity_login);
+    if policy == TrtpLogin::Trust {
+        if let Some(a) = linked {
+            debug!(login = %a.login, "trtp_login = trust: using the linked account");
+            return Ok(a);
+        }
+    }
+    let account = auth.authenticate(login, Proof::Plain(password))?;
+    if account.login == "guest" {
+        // A guest login on an identity socket lands on the linked
+        // account if there is one — the same rule as the ng path.
+        return Ok(linked.unwrap_or(account));
+    }
+    match account.identity.fingerprint {
+        Some(f) if f == fp => Ok(account),
+        Some(_) => {
+            info!(login = %account.login, "tunnelled login names an account linked to another identity");
+            Err(AuthError::BadProof)
+        }
+        None if account.identity.allow_self_link && linked.is_none() => {
+            auth.set_identity_link(&account.login, Some(fp))?;
+            info!(login = %account.login, "identity linked by tunnelled login");
+            auth.lookup(&account.login)
+        }
+        // Not linkable: the password was right, so the classic login
+        // stands; the identity is decoration on this session only.
+        None => Ok(account),
+    }
+}
+
 /// Wait for the LOGIN transaction and run the login flow. `None` = close.
 async fn login_phase(
     frames: &mut Receiver<Frame>,
@@ -569,10 +631,13 @@ async fn login_phase(
     let auth = ctx.auth.clone();
     let login_str = text::to_utf8(&req.login);
     let password = text::to_utf8(&req.password).into_bytes();
-    let verdict =
-        tokio::task::spawn_blocking(move || auth.authenticate(&login_str, Proof::Plain(&password)))
-            .await
-            .ok()?;
+    let identity_fp = transport.identity.as_ref().map(|t| t.fingerprint);
+    let policy = ctx.cfg.trtp_login;
+    let verdict = tokio::task::spawn_blocking(move || {
+        reconcile_login(&*auth, &login_str, &password, identity_fp, policy)
+    })
+    .await
+    .ok()?;
 
     let account = match verdict {
         Ok(a) => a,

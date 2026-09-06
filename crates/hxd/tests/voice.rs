@@ -88,6 +88,7 @@ async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<Rec
                 Caps::empty()
             },
             mark_cleartext: false,
+            trtp_login: hxd_session::TrtpLogin::Verify,
         }),
     };
     let ng_ctx = NgCtx {

@@ -18,7 +18,7 @@ use hxd_ng_session::{
     IdentityConfig, IdentityState, NewAccounts, NgConfig, NgCtx, Registry, TunnelSink,
     TunnelStream, Unattested,
 };
-use hxd_session::{cap, Caps, ServerConfig, ServerCtx};
+use hxd_session::{cap, Caps, ServerConfig, ServerCtx, TrtpLogin};
 use serde::Deserialize;
 
 pub mod voice;
@@ -224,8 +224,7 @@ pub struct IdentitySection {
     /// Where the server's Ed25519 seed lives; generated on first run.
     #[serde(default = "default_identity_key")]
     pub key: PathBuf,
-    /// `deny`, `guest`, or `create` (spec §8.1; `create` is not
-    /// implemented yet and behaves as `guest`).
+    /// `deny`, `guest`, or `create` (spec §8.1).
     #[serde(default = "default_new_accounts")]
     pub new_accounts: String,
     /// Fingerprints or handles; non-empty restricts identity login to
@@ -246,6 +245,10 @@ pub struct IdentitySection {
     /// Serve the TRTP-over-WebSocket path.
     #[serde(default = "default_true")]
     pub trtp: bool,
+    /// `verify` or `trust` (spec §8.3): how a tunnelled classic login
+    /// reconciles with the socket's identity.
+    #[serde(default = "default_trtp_login")]
+    pub trtp_login: String,
 }
 
 fn default_identity_key() -> PathBuf {
@@ -262,6 +265,9 @@ fn default_clock_skew() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_trtp_login() -> String {
+    "verify".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -488,7 +494,10 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     writeln!(f, "{text}")
 }
 
-fn build_identity(section: &IdentitySection) -> Result<IdentityState, String> {
+fn build_identity(
+    section: &IdentitySection,
+    auth: Arc<dyn hxd_core::AuthBackend>,
+) -> Result<IdentityState, String> {
     use base64::Engine;
     let key = load_server_key(&section.key)?;
     let new_accounts = match section.new_accounts.as_str() {
@@ -523,7 +532,9 @@ fn build_identity(section: &IdentitySection) -> Result<IdentityState, String> {
             registrar_keys,
             clock_skew: section.clock_skew,
             trtp: section.trtp,
+            default_access: None,
         },
+        auth,
     ))
 }
 
@@ -538,7 +549,7 @@ pub fn build_ng_ctx(
         return Ok(None);
     };
     let identity = match config.identity.as_ref() {
-        Some(section) => Some(Arc::new(build_identity(section)?)),
+        Some(section) => Some(Arc::new(build_identity(section, legacy.auth.clone())?)),
         None => None,
     };
     let tunnel: Option<Arc<dyn TunnelSink>> = identity
@@ -603,6 +614,13 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
             ban_time: Duration::from_secs(config.server.ban_time),
             caps: legacy_caps(config, voice),
             mark_cleartext: config.server.mark_cleartext,
+            trtp_login: match config.identity.as_ref().map(|i| i.trtp_login.as_str()) {
+                None | Some("verify") => TrtpLogin::Verify,
+                Some("trust") => TrtpLogin::Trust,
+                Some(other) => {
+                    return Err(format!("[identity] trtp_login: unknown value {other:?}"))
+                }
+            },
         }),
     })
 }

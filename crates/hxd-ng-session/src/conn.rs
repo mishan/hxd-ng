@@ -15,7 +15,7 @@ use hxd_core::voice::IceCandidate;
 use hxd_core::{AccessBits, AttachInfo, AuthError, Proof, Resume, SeqEvent, Uid};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -215,22 +215,25 @@ async fn handle_login(
         }
     };
 
-    // An authenticated socket ignores credentials (§6.2, §8.1). Until
-    // account association lands, every identity outcome is a guest
-    // session that knows who it is; `deny` was already applied at
-    // `/identity/auth`, so the only outcomes that reach here are guests.
+    // An authenticated socket ignores credentials (§6.2, §8.1): the
+    // linked account if there is one (re-read now, so a link made since
+    // the token was issued counts), else guest. `deny` outcomes never
+    // got a token, so they can't reach here.
+    let auth = ctx.auth.clone();
+    let identity_state = ctx.identity.clone();
     let (login, password) = match identity {
-        Some(i) => {
-            debug_assert!(matches!(
-                i.outcome,
-                Outcome::Guest | Outcome::UnattestedGuest
-            ));
-            (String::new(), String::new())
-        }
+        Some(_) => (String::new(), String::new()),
         None => (p.login.clone(), p.password.clone()),
     };
-    let auth = ctx.auth.clone();
+    let ident = identity.cloned();
     let verdict = tokio::task::spawn_blocking(move || {
+        if let (Some(i), Some(st)) = (ident.as_ref(), identity_state.as_ref()) {
+            match st.account_for(i) {
+                Ok(Some(account)) => return Ok(account),
+                Ok(None) => {}
+                Err(_) => return Err(AuthError::BadProof),
+            }
+        }
         auth.authenticate(&login, Proof::Plain(password.as_bytes()))
     })
     .await
@@ -323,11 +326,24 @@ async fn handle_login(
     let mut me_json = user_json(&me);
     if let Some(i) = identity {
         // `age` and `outcome` are for the user themself, never the roster.
+        // The outcome reflects the account this session actually landed
+        // on, which can differ from the token's if a link was made in
+        // between.
+        let outcome = if account.identity.fingerprint == Some(i.fingerprint.0) {
+            if i.outcome == Outcome::Created {
+                "created"
+            } else {
+                "linked"
+            }
+        } else {
+            i.outcome.as_str()
+        };
         me_json["identity"] = json!({
             "fingerprint": i.fingerprint.to_string(),
             "handle": i.handle,
             "age": i.age,
-            "outcome": i.outcome.as_str(),
+            "outcome": outcome,
+            "account": if account.login == "guest" { Value::Null } else { json!(account.login) },
         });
     }
     // `identity` is a property of the server, not of the config's

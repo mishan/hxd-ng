@@ -1,8 +1,12 @@
 # Hotline-ng identity — HTTP-layer authentication and portable identity
 
-Status: draft, for discussion. The identity objects (§3) are implemented in
-`crates/hl-identity` with test vectors in `identity-test-vectors.json`;
-nothing server-side is. Supersedes the earlier `Capabilities-Identity`
+Status: draft, for discussion. Implemented in hxd-ng: the identity
+objects (§3, `crates/hl-identity`, with test vectors in
+`identity-test-vectors.json`), discovery and the endpoints of §4–§8, both
+WebSocket paths of §6, account association including `trtp_login`, and
+the `hlid` tool. Not yet: revocation, reserved-name enforcement, the
+mTLS binding beyond the header contract, and everything in the registrar
+and federation specs. Supersedes the earlier `Capabilities-Identity`
 draft, which put authentication inside the legacy transaction protocol;
 this version keeps TRTP unchanged and does authentication where the ng
 transport already lives, in HTTP.
@@ -673,7 +677,7 @@ offer.
 | `[identity] enabled` | `false` | Master switch; when off, discovery reports `enabled: false` and the endpoints return 404 |
 | `[identity] bindings` | `["challenge"]` | Which of §5 to accept |
 | `[identity] new_accounts` | `guest` | `deny`, `guest`, `create`. The default is `guest` rather than `deny` so that, with `unattested = guest`, an attested identity is never treated worse than an unattested one |
-| `[identity] default_access` | guest access | Access bitmap for created accounts |
+| `[identity] default_access` | guest access | Access bitmap for created accounts, as a list of named bits. The guest fallback is convenient but wrong for anything guests may not have — the messaging extension's `AccessMessaging`, for one — so operators using `create` should set it explicitly |
 | `[identity] allow_list` | empty | Fingerprints or handles; non-empty means identity login is restricted to these |
 | `[identity] min_attestation_age` | `0` | Seconds |
 | `[identity] unattested` | `guest` | `deny`, `guest`, `allow` |

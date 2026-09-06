@@ -65,6 +65,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, ServerCtx) {
             ban_time: Duration::from_secs(60),
             caps: hxd_session::Caps::empty(),
             mark_cleartext: false,
+            trtp_login: hxd_session::TrtpLogin::Verify,
         }),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

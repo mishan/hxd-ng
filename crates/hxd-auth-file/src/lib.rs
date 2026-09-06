@@ -13,7 +13,18 @@
 //! send_msgs = true
 //! read_users = true
 //! # any named bit below; plus raw_bits = [55] as an escape hatch
+//!
+//! [identity]              # portable identity (docs/hotline-ng-identity.md §8)
+//! fingerprint = "318s87c…" # 52-char fingerprint of the linked identity; set by
+//!                         # linking, or by hand
+//! login = true            # may the identity log in without the password
+//! allow_self_link = true  # may the user link with just the password
+//! reserve_name = false    # is the login name reserved as a display name (§9)
 //! ```
+//!
+//! Identity links are written back with `toml_edit`, so comments and
+//! layout in a hand-maintained file survive. Lookups by fingerprint scan
+//! the directory; fine for the account counts a Hotline server has.
 //!
 //! The password is a plaintext-equivalent secret — a legacy-wire
 //! constraint, not an oversight; see `hxd_core::account`'s module docs.
@@ -23,7 +34,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use hxd_core::access::{bit, AccessBits};
-use hxd_core::{Account, AuthBackend, AuthError, Proof};
+use hxd_core::{Account, AuthBackend, AuthError, IdentityLink, Proof};
 use serde::Deserialize;
 
 /// Named access keys, mapped to protocol bit numbers. Names mirror
@@ -89,6 +100,17 @@ struct AccountFile {
     /// — see `authenticate`.
     #[serde(default)]
     extra: ExtraTable,
+    #[serde(default)]
+    identity: IdentityTable,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityTable {
+    fingerprint: Option<String>,
+    login: Option<bool>,
+    allow_self_link: Option<bool>,
+    reserve_name: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -116,6 +138,48 @@ struct AccessTable {
 }
 
 impl AccountFile {
+    /// Everything but the password check: shared by `authenticate` and
+    /// `lookup`.
+    fn into_account(self, login: String, path: &Path) -> Account {
+        let access = self.access_bits(path);
+        let stored = self.password.as_deref().unwrap_or("");
+        let has_password = !stored.is_empty();
+        let fingerprint = self.identity.fingerprint.as_deref().and_then(|f| {
+            let parsed = hl_identity::Fingerprint::parse(f);
+            if parsed.is_none() {
+                tracing::warn!(
+                    "{}: identity.fingerprint is not a valid fingerprint; ignored",
+                    path.display()
+                );
+            }
+            parsed.map(|fp| fp.0)
+        });
+        Account {
+            name: self.name.clone().unwrap_or_else(|| login.clone()),
+            // A password makes an account a person rather than a door,
+            // and so does a linked identity: accounts made by
+            // `new_accounts = create` have no password and are still
+            // exactly one person's.
+            can_detach: self
+                .extra
+                .can_detach
+                .unwrap_or(has_password || fingerprint.is_some()),
+            set_subject: self
+                .extra
+                .set_subject
+                .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
+            has_password,
+            identity: IdentityLink {
+                fingerprint,
+                identity_login: self.identity.login.unwrap_or(true),
+                allow_self_link: self.identity.allow_self_link.unwrap_or(true),
+                reserve_name: self.identity.reserve_name.unwrap_or(false),
+            },
+            access,
+            login,
+        }
+    }
+
     fn access_bits(&self, source: &Path) -> AccessBits {
         let mut acc = AccessBits::empty();
         for (key, on) in &self.access.named {
@@ -222,19 +286,180 @@ impl AuthBackend for FileAuth {
             }
         }
         let path = self.dir.join(format!("{login}.toml"));
-        let access = file.access_bits(&path);
-        let has_password = !stored.is_empty();
-        Ok(Account {
-            name: file.name.clone().unwrap_or_else(|| login.clone()),
-            can_detach: file.extra.can_detach.unwrap_or(has_password),
-            set_subject: file
-                .extra
-                .set_subject
-                .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
-            access,
-            login,
-        })
+        Ok(file.into_account(login, &path))
     }
+
+    fn lookup(&self, login: &str) -> Result<Account, AuthError> {
+        let login = if login.is_empty() { "guest" } else { login };
+        let login = login.to_ascii_lowercase();
+        if !valid_login(&login) {
+            return Err(AuthError::NoSuchAccount);
+        }
+        let file = self.load(&login)?;
+        let path = self.dir.join(format!("{login}.toml"));
+        Ok(file.into_account(login, &path))
+    }
+
+    fn find_by_fingerprint(&self, fingerprint: &[u8; 32]) -> Result<Option<Account>, AuthError> {
+        let want = hl_identity::Fingerprint(*fingerprint).to_string();
+        for login in self.logins()? {
+            let file = match self.load(&login) {
+                Ok(f) => f,
+                Err(AuthError::NoSuchAccount) => continue,
+                Err(e) => return Err(e),
+            };
+            // Compare the stored text form (case-folded) before parsing:
+            // an unparseable value in some other account file shouldn't
+            // break lookups for everyone.
+            if file
+                .identity
+                .fingerprint
+                .as_deref()
+                .is_some_and(|f| f.eq_ignore_ascii_case(&want))
+            {
+                let path = self.dir.join(format!("{login}.toml"));
+                return Ok(Some(file.into_account(login, &path)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn set_identity_link(
+        &self,
+        login: &str,
+        fingerprint: Option<[u8; 32]>,
+    ) -> Result<(), AuthError> {
+        let login = login.to_ascii_lowercase();
+        if !valid_login(&login) {
+            return Err(AuthError::NoSuchAccount);
+        }
+        let path = self.dir.join(format!("{login}.toml"));
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AuthError::NoSuchAccount
+            } else {
+                AuthError::Backend(format!("{}: {e}", path.display()))
+            }
+        })?;
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .map_err(|e| AuthError::Backend(format!("{}: {e}", path.display())))?;
+        match fingerprint {
+            Some(fp) => {
+                let table =
+                    doc["identity"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+                table["fingerprint"] = toml_edit::value(hl_identity::Fingerprint(fp).to_string());
+            }
+            None => {
+                if let Some(table) = doc.get_mut("identity").and_then(|i| i.as_table_mut()) {
+                    table.remove("fingerprint");
+                }
+            }
+        }
+        write_atomic(&path, &doc.to_string())
+            .map_err(|e| AuthError::Backend(format!("{}: {e}", path.display())))
+    }
+
+    fn create_linked(
+        &self,
+        login: &str,
+        name: &str,
+        fingerprint: [u8; 32],
+        access: AccessBits,
+    ) -> Result<Account, AuthError> {
+        let base: String = login
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            .take(24)
+            .collect();
+        let base = base.trim_start_matches(['.', '-']).to_owned();
+        let base = if base.is_empty() {
+            format!("id-{}", hl_identity::Fingerprint(fingerprint).short())
+        } else {
+            base
+        };
+        // First free of base, base-2, base-3, …
+        let mut candidate = base.clone();
+        let mut n = 1;
+        loop {
+            if !self.dir.join(format!("{candidate}.toml")).exists() {
+                break;
+            }
+            n += 1;
+            if n > 1000 {
+                return Err(AuthError::Backend(format!("no free login for {base}")));
+            }
+            candidate = format!("{base}-{n}");
+        }
+        let mut doc = toml_edit::DocumentMut::new();
+        doc["name"] = toml_edit::value(name);
+        let mut acc = toml_edit::Table::new();
+        for (key, b) in NAMED_BITS {
+            if access.has(*b) {
+                acc[key] = toml_edit::value(true);
+            }
+        }
+        doc["access"] = toml_edit::Item::Table(acc);
+        let mut id = toml_edit::Table::new();
+        id["fingerprint"] = toml_edit::value(hl_identity::Fingerprint(fingerprint).to_string());
+        doc["identity"] = toml_edit::Item::Table(id);
+        doc.decor_mut()
+            .set_prefix("# Created by identity login (new_accounts = create).\n");
+        let path = self.dir.join(format!("{candidate}.toml"));
+        write_new(&path, &doc.to_string())
+            .map_err(|e| AuthError::Backend(format!("{}: {e}", path.display())))?;
+        self.lookup(&candidate)
+    }
+
+    fn reserved_by(&self, name: &str) -> Result<Option<String>, AuthError> {
+        let login = name.to_ascii_lowercase();
+        if !valid_login(&login) {
+            return Ok(None);
+        }
+        match self.load(&login) {
+            Ok(f) if f.identity.reserve_name.unwrap_or(false) => Ok(Some(login)),
+            Ok(_) | Err(AuthError::NoSuchAccount) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl FileAuth {
+    fn logins(&self) -> Result<Vec<String>, AuthError> {
+        let rd = std::fs::read_dir(&self.dir)
+            .map_err(|e| AuthError::Backend(format!("{}: {e}", self.dir.display())))?;
+        let mut out = Vec::new();
+        for entry in rd {
+            let entry = entry.map_err(|e| AuthError::Backend(e.to_string()))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(login) = name.strip_suffix(".toml") {
+                if valid_login(login) {
+                    out.push(login.to_owned());
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+}
+
+/// Write via a temp file and rename, so a crash mid-write can't leave a
+/// half-written account file.
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(text.as_bytes())
 }
 
 #[cfg(test)]
@@ -383,5 +608,94 @@ mod tests {
         std::fs::remove_file(sub.join("guest.toml")).unwrap();
         FileAuth::bootstrap(&sub).unwrap();
         assert!(!sub.join("guest.toml").exists());
+    }
+
+    #[test]
+    fn identity_link_round_trip_preserves_comments() {
+        let (td, auth) = backend();
+        write(
+            td.path(),
+            "misha.toml",
+            "# Misha's account\nname = \"Misha\"\npassword = \"pw\" # keep\n\n[access]\nsend_chat = true\n",
+        );
+        let fp = [0xabu8; 32];
+        assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
+        auth.set_identity_link("misha", Some(fp)).unwrap();
+        let text = std::fs::read_to_string(td.path().join("misha.toml")).unwrap();
+        assert!(text.starts_with("# Misha's account\n"), "{text}");
+        assert!(text.contains("password = \"pw\" # keep"), "{text}");
+        assert!(text.contains("[identity]"), "{text}");
+        let a = auth.find_by_fingerprint(&fp).unwrap().unwrap();
+        assert_eq!(a.login, "misha");
+        assert_eq!(a.identity.fingerprint, Some(fp));
+        assert!(
+            a.identity.identity_login && a.identity.allow_self_link && !a.identity.reserve_name
+        );
+        assert!(a.has_password);
+        // lookup() agrees and needs no password.
+        assert_eq!(auth.lookup("Misha").unwrap().identity.fingerprint, Some(fp));
+        // Unlink removes only the fingerprint.
+        auth.set_identity_link("misha", None).unwrap();
+        let text = std::fs::read_to_string(td.path().join("misha.toml")).unwrap();
+        assert!(!text.contains("fingerprint"), "{text}");
+        assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
+        assert_eq!(
+            auth.set_identity_link("nobody", Some(fp)).unwrap_err(),
+            AuthError::NoSuchAccount
+        );
+    }
+
+    #[test]
+    fn identity_flags_and_reserved_names() {
+        let (td, auth) = backend();
+        write(
+            td.path(),
+            "misha.toml",
+            "[identity]\nfingerprint = \"junk\"\nlogin = false\nallow_self_link = false\nreserve_name = true\n",
+        );
+        let a = auth.lookup("misha").unwrap();
+        assert_eq!(
+            a.identity.fingerprint, None,
+            "unparseable fingerprint is ignored, not fatal"
+        );
+        assert!(
+            !a.identity.identity_login && !a.identity.allow_self_link && a.identity.reserve_name
+        );
+        assert_eq!(auth.reserved_by("MISHA").unwrap(), Some("misha".into()));
+        assert_eq!(auth.reserved_by("guest").unwrap(), None);
+        assert_eq!(auth.reserved_by("../misha").unwrap(), None);
+    }
+
+    #[test]
+    fn create_linked_picks_a_free_login() {
+        let (td, auth) = backend();
+        write(td.path(), "misha.toml", "name = \"Misha\"\n");
+        let fp = [7u8; 32];
+        let access = AccessBits::empty()
+            .with(bit::READ_CHAT)
+            .with(bit::SEND_CHAT);
+        let a = auth.create_linked("misha", "Misha", fp, access).unwrap();
+        assert_eq!(a.login, "misha-2");
+        assert_eq!(a.name, "Misha");
+        assert_eq!(a.identity.fingerprint, Some(fp));
+        assert!(!a.has_password);
+        assert!(
+            a.can_detach,
+            "a linked, password-less account is still a person"
+        );
+        assert!(a.access.has(bit::SEND_CHAT) && !a.access.has(bit::DELETE_FILES));
+        assert_eq!(
+            auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
+            "misha-2"
+        );
+        // Hostile proposals are sanitised.
+        let b = auth
+            .create_linked("../../etc", "x", [8u8; 32], AccessBits::empty())
+            .unwrap();
+        assert_eq!(b.login, "etc");
+        let c = auth
+            .create_linked("", "x", [9u8; 32], AccessBits::empty())
+            .unwrap();
+        assert!(c.login.starts_with("id-"), "{}", c.login);
     }
 }
