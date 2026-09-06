@@ -26,8 +26,31 @@ const HDR_TASK: u32 = 0x0001_0000;
 const HDR_SELFINFO: u32 = 0x162;
 
 async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_with(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+    )
+    .await
+}
+
+async fn start_server_with(
+    dir: &Path,
+    cfg: IdentityConfig,
+    trtp_login: hxd_session::TrtpLogin,
+) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
+    std::fs::write(
+        accounts.join("misha.toml"),
+        "# hand-maintained\nname = \"Misha\"\npassword = \"s3cret\"\n[access]\nread_chat = true\nsend_chat = true\nsend_msgs = true\nuse_any_name = true\ndisconnect_users = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        accounts.join("locked.toml"),
+        "name = \"Locked\"\npassword = \"pw\"\n[identity]\nallow_self_link = false\n",
+    )
+    .unwrap();
     let core = Arc::new(Core::new());
     let auth: Arc<dyn hxd_core::AuthBackend> = Arc::new(hxd_auth_file::FileAuth::new(accounts));
     let legacy_ctx = ServerCtx {
@@ -41,9 +64,10 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             ban_time: Duration::from_secs(60),
             caps: hxd_session::Caps::empty(),
             mark_cleartext: true,
+            trtp_login,
         }),
     };
-    let identity = IdentityState::new(ServerKey::from_seed(&[0x55; 32]), IdentityConfig::default());
+    let identity = IdentityState::new(ServerKey::from_seed(&[0x55; 32]), cfg, auth.clone());
     let tunnel: Arc<dyn TunnelSink> = Arc::new(hxd::LegacyTunnel(legacy_ctx.clone()));
     let ng_ctx = NgCtx {
         core,
@@ -182,6 +206,13 @@ fn person(seed: u8, name: &str) -> Person {
 
 /// The challenge binding, start to finish: returns the auth reply.
 async fn authenticate(ng: SocketAddr, p: &Person) -> Value {
+    let r = try_authenticate(ng, p, json!({})).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    r.json()
+}
+
+/// Same, with extra JSON fields (`login`/`password`) and no status check.
+async fn try_authenticate(ng: SocketAddr, p: &Person, extra: Value) -> HttpReply {
     let ch = http(ng, "POST", "/identity/challenge", &[], b"").await;
     assert_eq!(ch.status, 200);
     let ch = ch.json();
@@ -190,18 +221,30 @@ async fn authenticate(ng: SocketAddr, p: &Person) -> Value {
         .try_into()
         .unwrap();
     let proof = LoginProof::sign(&p.dev, &challenge, &server_key, now());
-    let body = json!({ "card": b64(&p.card), "device_cert": b64(&p.cert), "proof": b64(&proof) })
-        .to_string();
-    let auth = http(
+    let mut body =
+        json!({ "card": b64(&p.card), "device_cert": b64(&p.cert), "proof": b64(&proof) });
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    http(
         ng,
         "POST",
         "/identity/auth",
         &[("Content-Type", "application/json")],
-        body.as_bytes(),
+        body.to_string().as_bytes(),
     )
-    .await;
-    assert_eq!(auth.status, 200, "{}", String::from_utf8_lossy(&auth.body));
-    auth.json()
+    .await
+}
+
+async fn ng_login(ng: SocketAddr, token: &str, nick: &str) -> (Ng, Value) {
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng?token={token}"))
+        .await
+        .unwrap();
+    let mut c = Ng::from_ws(ws).await;
+    let ok = c.request("login", json!({ "nick": nick })).await;
+    assert!(ok.get("ok").is_some(), "{ok}");
+    let ok = ok["ok"].clone();
+    (c, ok)
 }
 
 // --- ng JSON client (trimmed from tests/ng.rs) ----------------------------
@@ -638,4 +681,230 @@ async fn plain_tcp_legacy_session_is_marked_cleartext_on_both_wires() {
         .clone();
     assert_eq!(row["transport"], "cleartext");
     assert!(row.get("identity").is_none());
+}
+
+#[tokio::test]
+async fn linking_at_auth_lands_on_the_account_and_survives_unlink_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(4, "Misha");
+
+    // Wrong password: refused, nothing written.
+    let r = try_authenticate(ng, &p, json!({ "login": "misha", "password": "wrong" })).await;
+    assert_eq!(r.status, 401);
+    assert_eq!(r.json()["error"], "login_failed");
+    let file = std::fs::read_to_string(dir.path().join("accounts/misha.toml")).unwrap();
+    assert!(!file.contains("fingerprint"));
+
+    // Right password: linked in the same step, comments intact.
+    let r = try_authenticate(ng, &p, json!({ "login": "misha", "password": "s3cret" })).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let auth = r.json();
+    assert_eq!(auth["outcome"], "linked");
+    assert_eq!(auth["account"], "misha");
+    let file = std::fs::read_to_string(dir.path().join("accounts/misha.toml")).unwrap();
+    assert!(file.starts_with("# hand-maintained\n"), "{file}");
+    assert!(
+        file.contains(&format!("fingerprint = \"{}\"", p.id.fingerprint())),
+        "{file}"
+    );
+
+    // The JSON login lands on the account: admin bit, account name.
+    let (_c, ok) = ng_login(ng, auth["token"].as_str().unwrap(), "whatever").await;
+    assert_eq!(ok["self"]["identity"]["account"], "misha");
+    assert_eq!(ok["self"]["identity"]["outcome"], "linked");
+    assert_eq!(ok["self"]["admin"], true);
+
+    // From now on, no credentials needed.
+    let auth2 = authenticate(ng, &p).await;
+    assert_eq!(auth2["outcome"], "linked");
+
+    // Another identity can't take misha: pending, and link() is refused.
+    let q = person(5, "Impostor");
+    let r = try_authenticate(ng, &q, json!({ "login": "misha", "password": "s3cret" })).await;
+    assert_eq!(r.status, 200);
+    let qa = r.json();
+    assert_eq!(qa["outcome"], "classic_pending_link");
+    let r = http(
+        ng,
+        "POST",
+        "/identity/link",
+        &[(
+            "Authorization",
+            &format!("Bearer {}", qa["token"].as_str().unwrap()),
+        )],
+        json!({ "login": "misha", "password": "s3cret" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 403);
+    assert_eq!(r.json()["error"], "denied");
+
+    // Self-linking can be switched off per account.
+    let r = try_authenticate(ng, &q, json!({ "login": "locked", "password": "pw" })).await;
+    assert_eq!(r.json()["outcome"], "classic_pending_link");
+
+    // Unlink needs a fresh token (single use) and the manage bit; the
+    // account has a password, so it's allowed.
+    let auth3 = authenticate(ng, &p).await;
+    let r = http(
+        ng,
+        "POST",
+        "/identity/unlink",
+        &[(
+            "Authorization",
+            &format!("Bearer {}", auth3["token"].as_str().unwrap()),
+        )],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["unlinked"], "misha");
+    let auth4 = authenticate(ng, &p).await;
+    assert_eq!(auth4["outcome"], "unattested_guest");
+
+    // A web-capped device can't manage the link.
+    let mut web = person(6, "Web");
+    let mut c = DeviceCert::for_device(&web.id, &web.dev, now() - 5, cert::RECOMMENDED_LIFETIME);
+    c.caps = Some(hl_identity::caps::WEB);
+    web.cert = c.sign(&web.id);
+    let wa = authenticate(ng, &web).await;
+    let r = http(
+        ng,
+        "POST",
+        "/identity/link",
+        &[(
+            "Authorization",
+            &format!("Bearer {}", wa["token"].as_str().unwrap()),
+        )],
+        json!({ "login": "misha", "password": "s3cret" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 403);
+    assert_eq!(r.json()["error"], "no_manage");
+}
+
+#[tokio::test]
+async fn new_accounts_create_writes_an_account_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = IdentityConfig {
+        new_accounts: hxd_ng_session::NewAccounts::Create,
+        ..Default::default()
+    };
+    let reg = ServerKey::from_seed(&[0x33; 32]);
+    cfg.registrar_keys.insert("hl.example".into(), reg.public());
+    let (_legacy, ng, _ctx) =
+        start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+
+    let mut p = person(7, "Misha N");
+    let att = hl_identity::Attestation {
+        identity: p.id.public(),
+        registrar: "hl.example".into(),
+        registrar_key: reg.public(),
+        handle: "misha".into(),
+        registered: now() - 86_400,
+        issued: now() - 5,
+        expires: now() + 86_400,
+        level: None,
+    };
+    p.card = Card::new(&p.id, "Misha N", now())
+        .sign(&p.id, vec![att.signed_value(&reg)])
+        .unwrap();
+
+    let auth = authenticate(ng, &p).await;
+    assert_eq!(auth["outcome"], "created");
+    assert_eq!(auth["handle"], "misha@hl.example");
+    // `misha` is taken by the fixture, so the handle's local part got a suffix.
+    assert_eq!(auth["account"], "misha-2");
+    assert!(dir.path().join("accounts/misha-2.toml").exists());
+    let (_c, ok) = ng_login(ng, auth["token"].as_str().unwrap(), "x").await;
+    assert_eq!(ok["self"]["identity"]["account"], "misha-2");
+    assert_eq!(ok["self"]["identity"]["outcome"], "created");
+    // Guest access was the template, so no admin bit.
+    assert_eq!(ok["self"]["admin"], false);
+
+    // Second time round it's simply linked.
+    assert_eq!(authenticate(ng, &p).await["outcome"], "linked");
+}
+
+#[tokio::test]
+async fn tunnelled_classic_login_links_under_verify_and_refuses_strangers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    async fn tunnel_login(
+        ng: SocketAddr,
+        p: &Person,
+        login: &[u8],
+        password: &[u8],
+    ) -> Option<Tunnel> {
+        let token = authenticate(ng, p).await["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut req = format!("ws://{ng}/trtp").into_client_request().unwrap();
+        req.headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let mut t = Tunnel::new(ws);
+        t.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
+        t.read_exact(8).await;
+        let xor: Vec<u8> = password.iter().map(|b| b ^ 0xff).collect();
+        let xlogin: Vec<u8> = login.iter().map(|b| b ^ 0xff).collect();
+        t.send(
+            REQ_LOGIN,
+            &[
+                (tag::LOGIN, xlogin),
+                (tag::PASSWORD, xor),
+                (tag::NAME, b"n".to_vec()),
+                (tag::VERSION, 150u16.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+        let reply = t.recv_type(HDR_TASK).await;
+        if reply.flag != 0 {
+            return None; // error reply
+        }
+        t.recv_type(HDR_SELFINFO).await;
+        Some(t)
+    }
+
+    // A tunnelled classic login with the password links the account.
+    let p = person(8, "Misha");
+    let t = tunnel_login(ng, &p, b"misha", b"s3cret")
+        .await
+        .expect("login with password");
+    let file = std::fs::read_to_string(dir.path().join("accounts/misha.toml")).unwrap();
+    assert!(
+        file.contains(&format!("fingerprint = \"{}\"", p.id.fingerprint())),
+        "{file}"
+    );
+    drop(t);
+
+    // A stranger naming the now-linked account, with the right password,
+    // is refused: verify mode never lets an identity borrow someone
+    // else's account.
+    let q = person(9, "Stranger");
+    assert!(tunnel_login(ng, &q, b"misha", b"s3cret").await.is_none());
+
+    // The owner logging in as guest through the tunnel lands on the
+    // linked account (admin bit shows on the roster).
+    let t = tunnel_login(ng, &p, b"", b"").await.expect("guest login");
+    let (ws2, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng"))
+        .await
+        .unwrap();
+    let mut obs = Ng::from_ws(ws2).await;
+    let ok = obs.request("login", json!({ "nick": "obs" })).await;
+    let row = ok["ok"]["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["identity"]["fingerprint"] == p.id.fingerprint().to_string())
+        .unwrap()
+        .clone();
+    assert_eq!(row["admin"], true, "{row}");
+    drop(t);
 }

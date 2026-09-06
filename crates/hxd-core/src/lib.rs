@@ -15,7 +15,7 @@ pub mod video;
 pub mod voice;
 
 pub use access::AccessBits;
-pub use account::{Account, AuthBackend, AuthError, Proof};
+pub use account::{Account, AuthBackend, AuthError, IdentityLink, Proof};
 pub use chat::ChatError;
 pub use roster::{
     AttachInfo, Core, Event, IdentityTag, Resume, SeqEvent, SessionStatus, Transport, Uid,

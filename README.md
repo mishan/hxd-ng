@@ -54,6 +54,7 @@ unattested = "guest"               # deny | guest | allow
 # allow_list = ["misha@hl.example", "<fingerprint>"]
 # registrar_keys = { "hl.example" = "<base64url public key>" }
 trtp = true                        # serve TRTP-over-WebSocket at /trtp for tunnelled legacy clients
+trtp_login = "verify"              # verify | trust: how a tunnelled classic login meets the socket's identity
 
 [voice]                          # absent = voice off, and that's the default
 # bind = "0.0.0.0:5504"          # default: the [server] bind, port + 4 (UDP)
@@ -89,6 +90,10 @@ nobody receives a stream until they ask for that stream in particular, so
 a room with video in it costs a voice-only participant nothing. See
 [docs/capabilities-video.md](docs/capabilities-video.md).
 
+An account links to an identity through an `[identity]` table in its file
+(written by linking, or by hand): `fingerprint`, `login = true` (identity
+may log in without the password), `allow_self_link = true`, `reserve_name`.
+
 With `[identity]` on, the ng listener also answers HTTP: `GET
 /.well-known/hotline` for discovery, `POST /identity/challenge` and
 `/identity/auth` for the challenge binding, `GET /identity/card/<fp>`.
@@ -101,6 +106,7 @@ hlid keygen identity id.key && hlid keygen device dev.key
 hlid cert --identity id.key --device dev.key --caps web -o cert.cbor
 hlid card --identity id.key --name Misha -o card.cbor
 hlid auth   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
+hlid link   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor --login misha --password pw
 hlid tunnel --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
 # then point any 1.x client at 127.0.0.1:5500 — it logs in through the tunnel with your identity
 ```
