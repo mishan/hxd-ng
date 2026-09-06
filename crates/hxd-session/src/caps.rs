@@ -109,6 +109,12 @@ pub mod cap {
     pub const DIRECT_TRANSFER: u8 = 7;
     pub const MESSENGER_SESSION: u8 = 8;
     pub const MODERN_DATES: u8 = 9;
+    /// Camera video and screen sharing in voice rooms
+    /// (`docs/capabilities-video.md`). **Depends on [`VOICE`]** — the
+    /// server must not confirm this bit without confirming that one in
+    /// the same login reply, because video has no meaning without the
+    /// voice room that carries it.
+    pub const VIDEO: u8 = 10;
 }
 
 #[cfg(test)]
@@ -127,6 +133,8 @@ mod tests {
             vec![0, 0x10]
         );
         assert_eq!(Caps::empty().with(cap::MODERN_DATES).to_wire(), vec![2, 0]);
+        // Video is bit 10, the next one after modern dates: 0x0400.
+        assert_eq!(Caps::empty().with(cap::VIDEO).to_wire(), vec![0x04, 0x00]);
         // "When all three extensions are active (large files, text
         // encoding, voice), the capability bitmask is 0x0007."
         let three = Caps::empty()

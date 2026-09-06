@@ -8,6 +8,12 @@ description = "hxd-ng: a Hotline server"
 publish = false
 default-run = "hxd"
 
+[features]
+# Voice chat. On by default so CI covers it; a server that doesn't want
+# a WebRTC stack in its binary builds with --no-default-features.
+default = ["voice"]
+voice = ["dep:hxd-voice"]
+
 [[bin]]
 name = "hxd"
 path = "src/main.rs"
@@ -17,6 +23,7 @@ hxd-core = { workspace = true }
 hxd-auth-file = { workspace = true }
 hxd-session = { workspace = true }
 hxd-ng-session = { workspace = true }
+hxd-voice = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -25,6 +32,9 @@ toml = { workspace = true }
 
 [dev-dependencies]
 hotline-proto = { workspace = true }
+# The media e2e stands real WebRTC clients up against the real SFU.
+hxd-voice = { workspace = true }
+str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false }
 serde_json = "1"

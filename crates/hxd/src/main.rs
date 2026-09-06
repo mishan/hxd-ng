@@ -67,7 +67,8 @@ async fn main() {
     let result = async {
         let config_path = parse_args()?;
         let config = Config::load(&config_path)?;
-        let ctx = build_ctx(&config)?;
+        let voice = hxd::voice::build(&config)?;
+        let ctx = build_ctx(&config, voice.as_ref())?;
 
         let listener = TcpListener::bind(&config.server.bind)
             .await
@@ -79,9 +80,29 @@ async fn main() {
             config.server.version
         );
 
+        // The ng context is built before voice is consumed below, so its
+        // capability list can see it.
+        let ng_ctx = hxd::build_ng_ctx(&config, &ctx, voice.as_ref());
+
+        // Voice: the UDP media socket and the pump that drives it. Both
+        // wires advertise the capability only because building this
+        // succeeded, so the bit is never a promise the server can't keep.
+        if let Some(voice) = voice {
+            tracing::info!(
+                "voice media on {} (UDP) — clients need that port reachable",
+                voice.bind()
+            );
+            let core = ctx.core.clone();
+            tokio::spawn(async move {
+                if let Err(e) = voice.serve(core).await {
+                    tracing::error!("voice media socket: {e}");
+                }
+            });
+        }
+
         // The Hotline-ng WebSocket frontend, when configured: its accept
         // loop plus the detached-session sweeper.
-        if let Some(ng_ctx) = hxd::build_ng_ctx(&config, &ctx) {
+        if let Some(ng_ctx) = ng_ctx {
             let ng = config.ng.as_ref().unwrap();
             let ng_listener = TcpListener::bind(&ng.bind)
                 .await

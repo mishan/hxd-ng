@@ -1,0 +1,525 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>hxd-ng voice + video</title>
+<!--
+  A voice and video client for the Hotline-ng wire, in one file with no
+  build step.
+
+  It exists because a browser is the cheapest real WebRTC stack there is
+  to point at the server: `RTCPeerConnection` is libwebrtc, it is strict
+  about SDP, and it will complain loudly about anything hxd-voice gets
+  wrong. Open it from a file:// URL against a server on localhost, or
+  serve it over https next to a wss:// endpoint — getUserMedia and
+  getDisplayMedia need a secure context, and localhost counts as one.
+
+      cargo run --bin hxd            # with [voice] (and [voice.video])
+      xdg-open tools/ng-voice.html
+
+  The wire it speaks is docs/hotline-ng.md §5-§7, docs/voice.md §8, and
+  the Hotline-ng binding of docs/capabilities-video.md.
+
+  Video is the half worth pointing a browser at. `RTCPeerConnection`
+  supplies VP8, `a=ssrc`, NACK/PLI and RTX without being asked, and
+  `getDisplayMedia` supplies the screen share with the browser's own
+  consent step and sharing indicator — so a browser satisfies the spec's
+  privacy requirements by construction rather than by discipline, and
+  anything the server gets wrong shows up as a black tile immediately.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 1.5rem;
+         max-width: 56rem; }
+  h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+  fieldset { border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+             border-radius: 6px; margin: 0 0 1rem; padding: .75rem 1rem 1rem; }
+  legend { padding: 0 .4rem; opacity: .7; font-size: .85rem; }
+  label { display: inline-block; margin-right: 1rem; }
+  input[type=text], input[type=password] { font: inherit; padding: .25rem .4rem;
+    border-radius: 4px; border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+    background: transparent; color: inherit; width: 12rem; }
+  button { font: inherit; padding: .3rem .8rem; border-radius: 5px;
+    border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+    background: transparent; color: inherit; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  #people { list-style: none; margin: 0; padding: 0; }
+  #people li { padding: .2rem 0; }
+  .muted { opacity: .55; }
+  .speaking { font-weight: 600; }
+  #tiles { display: flex; flex-wrap: wrap; gap: .6rem; margin: 0; padding: 0; }
+  #tiles figure { margin: 0; }
+  #tiles video { width: 16rem; background: #000; border-radius: 6px;
+                 display: block; }
+  #tiles figcaption { font: 12px/1.4 ui-monospace, monospace; opacity: .7;
+                      padding-top: .2rem; }
+  #log { font: 12px/1.45 ui-monospace, monospace; white-space: pre-wrap;
+         max-height: 16rem; overflow: auto; margin: 0;
+         background: color-mix(in srgb, currentColor 6%, transparent);
+         border-radius: 6px; padding: .6rem .8rem; }
+  .err { color: #c0392b; }
+</style>
+
+<h1>hxd-ng voice + video</h1>
+
+<fieldset>
+  <legend>server</legend>
+  <label>url <input id="url" type="text" value="ws://127.0.0.1:5700"></label>
+  <label>login <input id="login" type="text" placeholder="(guest)"></label>
+  <label>password <input id="password" type="password"></label>
+  <label>nick <input id="nick" type="text" value="browser"></label>
+  <button id="connect">Connect</button>
+</fieldset>
+
+<fieldset>
+  <legend>voice</legend>
+  <button id="join" disabled>Join voice</button>
+  <button id="mute" disabled>Mute</button>
+  <button id="leave" disabled>Leave</button>
+  <span id="codec"></span>
+</fieldset>
+
+<fieldset>
+  <legend>video</legend>
+  <button id="camera" disabled>Start camera</button>
+  <button id="pause" disabled>Pause camera</button>
+  <button id="share" disabled>Share screen</button>
+  <button id="watch" disabled>Watch everyone</button>
+  <span id="limits" class="muted"></span>
+</fieldset>
+
+<fieldset>
+  <legend>in voice</legend>
+  <ul id="people"><li class="muted">nobody</li></ul>
+</fieldset>
+
+<fieldset>
+  <legend>streams</legend>
+  <div id="tiles"></div>
+</fieldset>
+
+<pre id="log"></pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = {
+  ws: null, id: 0, pending: new Map(),
+  uid: null, cid: 0, pc: null, mic: null, muted: false,
+  audio: new Map(),          // mid -> <audio>
+  participants: [],
+  // --- video ---
+  hasVideo: false,           // the server confirmed the capability
+  limits: null,              // the login reply's ceilings, per kind
+  cam: null, screen: null,   // our own capture streams
+  camPaused: false,
+  publications: [],          // the room's, from video_status
+  watching: false,           // the "subscribe to everything" toggle
+  tiles: new Map(),          // mid -> <figure>
+};
+
+function log(msg, cls) {
+  const line = document.createElement('span');
+  if (cls) line.className = cls;
+  line.textContent = `${new Date().toLocaleTimeString()}  ${msg}\n`;
+  $('log').append(line);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+// --- the wire ------------------------------------------------------------
+
+function send(req, params = {}) {
+  const id = ++state.id;
+  state.ws.send(JSON.stringify({ id, req, params }));
+  return new Promise((resolve, reject) => state.pending.set(id, { resolve, reject }));
+}
+
+// A closed socket is the reply that never comes. Every request still in
+// flight is rejected here, so an await somewhere up the stack fails
+// instead of hanging — which is what left the UI stuck mid-join when the
+// server went away at the wrong moment.
+function failPending(why) {
+  const waiting = [...state.pending.values()];
+  state.pending.clear();
+  for (const p of waiting) p.reject(new Error(why));
+}
+
+function onFrame(msg) {
+  if (msg.reply !== undefined) {
+    const p = state.pending.get(msg.reply);
+    state.pending.delete(msg.reply);
+    if (!p) return;
+    if (msg.error) p.reject(new Error(`${msg.error.code}: ${msg.error.text}`));
+    else p.resolve(msg.ok);
+    return;
+  }
+  if (msg.ev !== undefined) onEvent(msg.ev, msg.data || {});
+}
+
+function onEvent(ev, data) {
+  switch (ev) {
+    // The server is always the offerer, so this is the only negotiation
+    // path there is: take the offer, answer it, send the answer back.
+    // Video renegotiation arrives here too, unchanged in shape — it is
+    // the same peer connection.
+    case 'voice_offer':
+      return answerOffer(data).catch((e) => log(`renegotiation failed: ${e.message}`, 'err'));
+    case 'voice_ice':
+      // `null` is end-of-candidates, which is what addIceCandidate(null)
+      // means to a browser too.
+      return state.pc?.addIceCandidate(data.candidate ?? null)
+        .catch((e) => log(`ICE candidate refused: ${e}`, 'err'));
+    case 'voice_status':
+      state.participants = data.participants;
+      return renderPeople();
+    // The complete publication list, every time: replace the whole view
+    // of the room's video state rather than patching it.
+    case 'video_status': return onVideoStatus(data);
+    case 'chat': return log(`${data.from.nick}: ${data.text}`);
+    case 'user_joined': return log(`${data.user.nick} joined`);
+    case 'user_parted': return log(`uid ${data.uid} left`);
+    default: return;   // unknown events are ignored, per spec
+  }
+}
+
+// --- voice ---------------------------------------------------------------
+
+async function answerOffer({ cid, sdp }) {
+  if (!state.pc) return;
+  await state.pc.setRemoteDescription({ type: 'offer', sdp });
+  // Attach our capture tracks *before* creating the answer. The answer's
+  // `a=ssrc` comes from the sender's track, and the server requires it on
+  // every video send section with no fallback to guess from — camera and
+  // screen are both VP8 at payload type 96 on one transport.
+  await bindSendSections();
+  const answer = await state.pc.createAnswer();
+  await state.pc.setLocalDescription(answer);
+  await send('voice_answer', { cid, sdp: answer.sdp });
+  log(`answered an offer (${sdp.match(/a=mid:\S+/g)?.join(' ') ?? 'no mids'})`);
+}
+
+function newPeerConnection() {
+  // No ICE servers: the server is the only peer and we already know its
+  // address. That is the whole point of the SFU model — no STUN, no TURN.
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  pc.onicecandidate = (e) => {
+    // A null candidate is end-of-candidates; the wire carries that as a
+    // null too.
+    send('voice_ice', { cid: state.cid, candidate: e.candidate ?? null })
+      .catch((err) => log(`voice_ice: ${err.message}`, 'err'));
+  };
+  pc.ontrack = (e) => {
+    // Track-to-user mapping is the transceiver's mid: `user-{UID}` for
+    // audio, `cam-user-{UID}` and `scr-user-{UID}` for video. Never the
+    // m-line index — the sections differ per peer and move as
+    // subscriptions change.
+    const mid = e.transceiver?.mid ?? '?';
+    const stream = e.streams[0] ?? new MediaStream([e.track]);
+    if (e.track.kind === 'video') {
+      showTile(mid, stream);
+    } else {
+      let el = state.audio.get(mid);
+      if (!el) {
+        el = new Audio();
+        el.autoplay = true;
+        state.audio.set(mid, el);
+      }
+      el.srcObject = stream;
+    }
+    log(`track on mid ${mid} (${e.track.kind})`);
+    renderPeople();
+  };
+  pc.onconnectionstatechange = () => log(`peer connection: ${pc.connectionState}`);
+  return pc;
+}
+
+async function joinVoice() {
+  state.mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+  state.pc = newPeerConnection();
+  for (const track of state.mic.getTracks()) state.pc.addTrack(track, state.mic);
+
+  const ok = await send('voice_join', { cid: state.cid });
+  $('codec').textContent = `codec ${ok.codec}`;
+  state.participants = ok.participants;
+  renderPeople();
+  await answerOffer({ cid: state.cid, sdp: ok.sdp });
+
+  // Clients SHOULD join muted; the server is told, and enforces it.
+  await setMuted(true);
+  $('join').disabled = true;
+  $('mute').disabled = false;
+  $('leave').disabled = false;
+  // Video is opt-in on both sides: joining is joining voice, and nothing
+  // is published or received until the user asks.
+  if (state.hasVideo) {
+    $('camera').disabled = false;
+    $('share').disabled = false;
+    $('watch').disabled = false;
+  }
+}
+
+async function setMuted(muted) {
+  await send('voice_mute', { cid: state.cid, muted });
+  state.muted = muted;
+  // Local enforcement as well as server-side: replacing the microphone
+  // with silence keeps RTP flowing at the normal rate, which keeps the
+  // NAT path warm. Dropping the packets instead would save nothing worth
+  // having and risk the path going cold.
+  for (const t of state.mic?.getAudioTracks() ?? []) t.enabled = !muted;
+  $('mute').textContent = muted ? 'Unmute' : 'Mute';
+}
+
+async function leaveVoice() {
+  await send('voice_leave', { cid: state.cid }).catch(() => {});
+  teardown();
+}
+
+function teardown() {
+  state.pc?.close();
+  state.pc = null;
+  for (const t of state.mic?.getTracks() ?? []) t.stop();
+  state.mic = null;
+  state.audio.clear();
+  state.participants = [];
+  renderPeople();
+  stopCapture('cam');
+  stopCapture('screen');
+  state.publications = [];
+  state.watching = false;
+  state.camPaused = false;
+  for (const mid of [...state.tiles.keys()]) dropTile(mid);
+  $('codec').textContent = '';
+  $('join').disabled = false;
+  $('mute').disabled = true;
+  $('leave').disabled = true;
+  for (const b of ['camera', 'pause', 'share', 'watch']) $(b).disabled = true;
+  $('camera').textContent = 'Start camera';
+  $('share').textContent = 'Share screen';
+  $('pause').textContent = 'Pause camera';
+  $('watch').textContent = 'Watch everyone';
+}
+
+function renderPeople() {
+  const ul = $('people');
+  ul.textContent = '';
+  if (!state.participants.length) {
+    const li = document.createElement('li');
+    li.className = 'muted';
+    li.textContent = 'nobody';
+    ul.append(li);
+    return;
+  }
+  for (const p of state.participants) {
+    const li = document.createElement('li');
+    const self = p.uid === state.uid ? ' (you)' : '';
+    // Publications are a room-wide fact, so they are shown next to the
+    // participant whether or not we are watching them — a voice-only
+    // participant is entitled to know a camera is on.
+    const mine = state.publications.filter((x) => x.uid === p.uid);
+    const video = mine.length
+      ? ` — ${mine.map((x) => x.kind + (x.paused ? ' (paused)' : '')).join(', ')}`
+      : '';
+    li.textContent = `uid ${p.uid}${self}${p.muted ? ' — muted' : ''}${video}`;
+    if (p.muted) li.className = 'muted';
+    ul.append(li);
+  }
+}
+
+// --- video ---------------------------------------------------------------
+
+function onVideoStatus(data) {
+  state.publications = data.publishers ?? [];
+  renderPeople();
+  // A standing "watch everyone" preference: re-declare it whenever the
+  // room changes, so a camera that has just appeared is picked up. The
+  // server would retain a subscription naming a stream that doesn't
+  // exist yet, but re-declaring is what keeps this demo's set honest
+  // when a publisher leaves.
+  if (state.watching) subscribeAll().catch((e) => log(e.message, 'err'));
+}
+
+/// Attach our capture tracks to the send sections the server offered.
+async function bindSendSections() {
+  for (const [mid, stream] of [['cam-send', state.cam], ['scr-send', state.screen]]) {
+    const tr = state.pc.getTransceivers().find((t) => t.mid === mid);
+    if (!tr) continue;
+    const track = stream?.getVideoTracks()[0] ?? null;
+    if (tr.sender.track !== track) await tr.sender.replaceTrack(track);
+    if (track) tr.direction = 'sendonly';
+  }
+}
+
+function stopCapture(which) {
+  for (const t of state[which]?.getTracks() ?? []) t.stop();
+  state[which] = null;
+}
+
+async function toggleCamera() {
+  if (state.cam) {
+    await send('video_stop', { cid: state.cid, kind: 'camera' });
+    stopCapture('cam');
+    state.camPaused = false;
+    $('camera').textContent = 'Start camera';
+    $('pause').disabled = true;
+    $('pause').textContent = 'Pause camera';
+    return;
+  }
+  // Configure the encoder inside the advertised ceiling before
+  // publishing: they are configuration, not negotiation, and a client
+  // that cannot be constrained to them must not publish at all.
+  const l = state.limits?.camera ?? {};
+  state.cam = await navigator.mediaDevices.getUserMedia({
+    video: {
+      width: { max: l.max_width ?? 1280 },
+      height: { max: l.max_height ?? 720 },
+      frameRate: { max: l.max_fps ?? 30 },
+    },
+  });
+  const ok = await send('video_start', { cid: state.cid, kind: 'camera' });
+  log(`publishing a camera (${ok.codec})`);
+  // No offer came back with that reply and none was expected: one may
+  // already be outstanding toward us, and the server sends ours as a
+  // voice_offer when serialisation allows. Capture starts when the
+  // negotiation completes, which bindSendSections does.
+  $('camera').textContent = 'Stop camera';
+  $('pause').disabled = false;
+}
+
+async function togglePause() {
+  const paused = !state.camPaused;
+  await send('video_state', { cid: state.cid, kind: 'camera', paused });
+  state.camPaused = paused;
+  // Pause is to video what mute is to audio: no renegotiation, the
+  // section and the slot both stay. Stopping the local track as well is
+  // what turns the camera's hardware light off, which is the half of it
+  // the user actually checks.
+  for (const t of state.cam?.getVideoTracks() ?? []) t.enabled = !paused;
+  $('pause').textContent = paused ? 'Resume camera' : 'Pause camera';
+}
+
+async function toggleShare() {
+  if (state.screen) {
+    await send('video_stop', { cid: state.cid, kind: 'screen' });
+    stopCapture('screen');
+    $('share').textContent = 'Share screen';
+    return;
+  }
+  const l = state.limits?.screen ?? {};
+  // getDisplayMedia is its own consent step, per share, with the
+  // browser's own sharing indicator — which is exactly what the spec
+  // asks a client to provide and forbids it from remembering.
+  state.screen = await navigator.mediaDevices.getDisplayMedia({
+    video: {
+      width: { max: l.max_width ?? 1920 },
+      height: { max: l.max_height ?? 1080 },
+      frameRate: { max: l.max_fps ?? 15 },
+    },
+  });
+  // The user can end a share from the browser's own UI, and that has to
+  // reach the server or the room's one screen slot stays occupied.
+  state.screen.getVideoTracks()[0]?.addEventListener('ended', () => {
+    toggleShare().catch((e) => log(e.message, 'err'));
+  });
+  try {
+    await send('video_start', { cid: state.cid, kind: 'screen' });
+  } catch (e) {
+    stopCapture('screen');
+    throw e;
+  }
+  $('share').textContent = 'Stop sharing';
+}
+
+async function subscribeAll() {
+  // The complete desired set in one request — four separate subscribes
+  // would cost four renegotiations serialised behind one another.
+  const streams = state.publications
+    .filter((p) => p.uid !== state.uid)
+    .map((p) => ({ uid: p.uid, kind: p.kind }));
+  await send('video_subscribe', { cid: state.cid, streams });
+}
+
+async function toggleWatch() {
+  state.watching = !state.watching;
+  $('watch').textContent = state.watching ? 'Stop watching' : 'Watch everyone';
+  if (state.watching) {
+    await subscribeAll();
+  } else {
+    // `[]` turns it all off in one request, which is the message this
+    // whole binding exists for on a metered connection.
+    await send('video_subscribe', { cid: state.cid, streams: [] });
+    for (const mid of [...state.tiles.keys()]) dropTile(mid);
+  }
+}
+
+function showTile(mid, stream) {
+  let fig = state.tiles.get(mid);
+  if (!fig) {
+    fig = document.createElement('figure');
+    const v = document.createElement('video');
+    v.autoplay = true;
+    v.playsInline = true;
+    v.muted = true;             // video tiles carry no audio; audio is its own section
+    const cap = document.createElement('figcaption');
+    cap.textContent = mid;
+    fig.append(v, cap);
+    state.tiles.set(mid, fig);
+    $('tiles').append(fig);
+  }
+  fig.querySelector('video').srcObject = stream;
+}
+
+function dropTile(mid) {
+  state.tiles.get(mid)?.remove();
+  state.tiles.delete(mid);
+}
+
+// --- connect -------------------------------------------------------------
+
+$('connect').onclick = async () => {
+  const ws = new WebSocket($('url').value);
+  state.ws = ws;
+  ws.onmessage = (e) => onFrame(JSON.parse(e.data));
+  ws.onclose = () => {
+    log('disconnected');
+    failPending('disconnected');
+    teardown();
+    $('join').disabled = true;
+  };
+  ws.onerror = () => log('websocket error', 'err');
+  await new Promise((r) => (ws.onopen = r));
+  log('connected');
+
+  try {
+    const ok = await send('login', {
+      login: $('login').value,
+      password: $('password').value,
+      nick: $('nick').value,
+    });
+    state.uid = ok.self.uid;
+    log(`logged in as ${ok.self.nick} (uid ${ok.self.uid}) — caps: ${JSON.stringify(ok.caps)}`);
+    if (!ok.caps?.includes('voice')) {
+      log('this server has no voice; the join button stays disabled', 'err');
+      return;
+    }
+    // "video" never appears without "voice", so this order is safe.
+    state.hasVideo = !!ok.caps?.includes('video');
+    state.limits = ok.video ?? null;
+    if (state.hasVideo && state.limits) {
+      const c = state.limits.camera, s = state.limits.screen;
+      $('limits').textContent =
+        `camera ≤ ${c.max_width}×${c.max_height}@${c.max_fps} (${c.max_per_room} a room) · ` +
+        `screen ≤ ${s.max_width}×${s.max_height}@${s.max_fps} (${s.max_per_room} a room)`;
+    } else if (!state.hasVideo) {
+      $('limits').textContent = 'this server has voice but no video';
+    }
+    $('join').disabled = false;
+  } catch (e) {
+    log(e.message, 'err');
+  }
+};
+
+$('join').onclick = () => joinVoice().catch((e) => log(e.message, 'err'));
+$('mute').onclick = () => setMuted(!state.muted).catch((e) => log(e.message, 'err'));
+$('leave').onclick = () => leaveVoice().catch((e) => log(e.message, 'err'));
+$('camera').onclick = () => toggleCamera().catch((e) => log(e.message, 'err'));
+$('pause').onclick = () => togglePause().catch((e) => log(e.message, 'err'));
+$('share').onclick = () => toggleShare().catch((e) => log(e.message, 'err'));
+$('watch').onclick = () => toggleWatch().catch((e) => log(e.message, 'err'));
+</script>

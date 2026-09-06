@@ -58,7 +58,8 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman ↔ UTF-8 at its edges. |
 | `hxd-ng-session` | The ng frontend: WebSocket accept, login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy), first-run guest bootstrap. |
-| `hxd` | The binary: config, wiring, the ng sweeper task, `HXD_DEBUG` tracing. Its `tests/` hold the e2e suites. |
+| `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
+| `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing. Its `tests/` hold the e2e suites. |
 
 `tools/ng-client.mjs` is an interactive ng test client (Node 22+, or
 `npm install` in tools/ for the `ws` fallback) — `/drop` exercises
@@ -102,6 +103,21 @@ skipped), user-list payloads, task-reply conventions (replies echo the
 request trans; pushes count their own). It is vendored for cross-reading
 at `gtkhx/mhxd/`. Where we deviate on purpose — real access bits in
 SELFINFO, readable task errors, acked broadcasts — the site says so.
+
+**Video is layered on voice, never beside it.** One peer connection, one
+UDP port, one room, one SDP path: video adds media sections to the voice
+session and reuses 602/603/604 for every renegotiation. What it adds is
+publication control and a status notification. Two rules carry the
+weight, and both are load-bearing rather than stylistic. **Nothing is
+delivered unasked** — a peer receives a publication only while it holds a
+subscription to it, so a voice-only client is not a special case the
+forwarding path has to remember to exclude, it is a peer whose
+subscription set is permanently empty. And **inbound video is keyed by
+the SSRC the answer declared, never by mid**: a camera and a screen from
+one participant are the same codec at the same payload type on one
+bundled transport, so there is nothing else to tell them apart and an
+answer that omits `a=ssrc` costs that publication rather than being
+guessed at.
 
 **The access bitmap is shared wire vocabulary; don't squat on bits.**
 Reserved bits stay reserved (fogWraith allocates upward from 55).
@@ -188,7 +204,8 @@ a client trace and a server trace of the same session line up.
 ROADMAP.md carries live status. In brief: the legacy server covers login,
 presence, chat, private chats, PMs, broadcast, and moderation; the
 Hotline-ng MVP (roster + chat + PMs with detach/resume) is complete and
-cross-tested. The large open fronts, in rough order: HOPE + ciphers on the
+cross-tested; voice and video are implemented on both wires, sharing one
+room and one SFU. The large open fronts, in rough order: HOPE + ciphers on the
 legacy wire (`hxcrypto` sits ready in the submodule), the ng rate-limit and
 client-quickstart polish, the fogWraith Text-Encoding capability (cheap —
 the UTF-8 interior already satisfies its core mandate), files/HTXF, news,

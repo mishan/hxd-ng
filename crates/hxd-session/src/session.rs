@@ -18,9 +18,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hotline_proto::messages::{tag, ClientHdr};
+use hotline_proto::messages::{tag, ClientHdr, ServerHdr};
 use hotline_proto::text;
 use hxd_core::access::bit;
+use hxd_core::video::VideoKind;
+use hxd_core::voice::VoiceError;
 use hxd_core::{
     Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Proof, SeqEvent,
     SessionStatus, Uid, UserInfo,
@@ -32,8 +34,10 @@ use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSend
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
-use crate::caps::Caps;
+use crate::caps::{cap, Caps};
 use crate::frame::{pack_frame, read_frame, Frame, ReadError};
+use crate::video;
+use crate::voice;
 
 /// Server → client transaction opcodes not covered by
 /// `hotline_proto::messages::ServerHdr` (which only carries what the gtkhx
@@ -137,6 +141,18 @@ enum Outbound {
         ty: u32,
         chunks: Vec<(u16, Vec<u8>)>,
     },
+    /// Server-initiated notification stamped with **task id 0**.
+    ///
+    /// The base protocol's pushes count their own transactions (mhxd's
+    /// convention, which this frontend follows everywhere else), but the
+    /// voice extension's transaction-semantics section says its three
+    /// server-initiated notifications use task id 0 with the reply flag
+    /// unset. GtkHx dispatches them by type and doesn't care either way;
+    /// Janus sends 0; so we send 0, and only there.
+    Notify {
+        ty: u32,
+        chunks: Vec<(u16, Vec<u8>)>,
+    },
 }
 
 type Tx = UnboundedSender<Outbound>;
@@ -160,6 +176,10 @@ async fn writer_task(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Outbound>
                 push_trans = push_trans.wrapping_add(1);
                 trace_out(ty, trans, 0, &chunks);
                 pack_frame(ty, trans, 0, &chunks)
+            }
+            Outbound::Notify { ty, chunks } => {
+                trace_out(ty, 0, 0, &chunks);
+                pack_frame(ty, 0, 0, &chunks)
             }
         };
         if wr.write_all(&bytes).await.is_err() {
@@ -234,6 +254,13 @@ fn push(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
     let _ = tx.send(Outbound::Push { ty, chunks });
 }
 
+/// A server-initiated notification with task id 0 — see
+/// [`Outbound::Notify`]. The voice extension's 602/604/605 and the video
+/// extension's 611 use it.
+fn notify(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
+    let _ = tx.send(Outbound::Notify { ty, chunks });
+}
+
 /// The domain is UTF-8; this edge speaks Mac Roman. Egress conversion is
 /// lossy (`?` for unmappable) and nicks are truncated to the wire's 31
 /// bytes *after* conversion (Mac Roman is single-byte, so no split risk).
@@ -285,6 +312,25 @@ fn hl_decode(data: &[u8]) -> Vec<u8> {
 
 fn cap31(data: &[u8]) -> &[u8] {
     &data[..data.len().min(31)]
+}
+
+/// The `CHAT_ID` of a voice transaction. Absent means the public chat,
+/// which is also what `0` means — every voice transaction carries the
+/// field, and a client that omits it is asking about the lobby.
+fn voice_cid(f: &Frame) -> u32 {
+    f.chunks()
+        .find(|c| c.tag == tag::CHAT_ID)
+        .map_or(0, |c| c.as_uint())
+}
+
+/// The `DATA_VIDEO_KIND` of a video transaction, where it is required.
+/// `None` covers both a missing field and a kind this revision doesn't
+/// define — kind `0` is invalid on purpose, so a zeroed field is caught
+/// rather than read as a camera.
+fn video_kind(f: &Frame) -> Option<VideoKind> {
+    f.chunks()
+        .find(|c| c.tag == video::field::VIDEO_KIND)
+        .and_then(|c| VideoKind::from_wire(c.as_uint() as u16))
 }
 
 fn err_text(e: ChatError) -> &'static str {
@@ -402,7 +448,6 @@ impl Session {
     }
 
     /// Did this session negotiate capability bit `n`?
-    #[allow(dead_code)] // The first caller is the voice frontend (V3).
     fn has_cap(&self, n: u8) -> bool {
         self.caps.has(n)
     }
@@ -544,9 +589,23 @@ async fn login_phase(
     // agreed to none (the spec's "omit it and the session is standard
     // mode"). It rides even a version-0 reply — only a modern client
     // asks the question, and one that asked deserves the answer.
-    let caps = req.caps.intersect(ctx.cfg.caps);
+    let mut caps = req.caps.intersect(ctx.cfg.caps);
+    // Bit 10 depends on bit 2. A client that asked for video without
+    // voice gets neither the bit nor a video transaction that works,
+    // because there is no voice room for video to live in — and echoing
+    // a bit whose transactions would all fail is the one thing the
+    // capability handshake must never do.
+    if caps.has(cap::VIDEO) && !caps.has(cap::VOICE) {
+        caps = Caps::from_bits(caps.bits() & !(1u64 << cap::VIDEO));
+    }
     if !caps.is_empty() {
         login_reply.push((tag::CAPABILITIES, caps.to_wire()));
+    }
+    // The ceilings, one field per kind, so the client can configure its
+    // encoders before the first join rather than discovering them by
+    // rejection.
+    if caps.has(cap::VIDEO) {
+        login_reply.extend(video::limits_chunks(&ctx.core.video_config()));
     }
     reply(tx, f.trans, login_reply);
 
@@ -614,7 +673,7 @@ fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
 
 /// Encode one domain event onto the wire. Returns `false` when the session
 /// must end (kicked).
-fn deliver_event(tx: &Tx, ev: Event) -> bool {
+fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
     match ev {
         Event::Joined(u) | Event::Changed(u) => {
             push(tx, hdr::USER_CHANGE, user_change_chunks(&u));
@@ -744,6 +803,77 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
                 ],
             );
         }
+        // Voice notifications: task id 0, per the extension spec's
+        // transaction semantics. Only a session that negotiated the
+        // capability and then joined can be here at all.
+        Event::VoiceOffer { cid, sdp } => {
+            // A chunk's length is 16 bits, and `pack_frame` asserts it.
+            // The SFU caps its own offers well under that, so this is
+            // the belt to that braces: an offer that somehow outgrew the
+            // wire is dropped and logged rather than turned into a
+            // panic in this connection's writer.
+            if sdp.len() > u16::MAX as usize {
+                warn!(cid, len = sdp.len(), "voice offer too large for the wire");
+                return true;
+            }
+            notify(
+                tx,
+                ServerHdr::VoiceSdpOffer as u32,
+                vec![voice::chat_id(cid), (tag::VOICE_SDP, sdp.into_bytes())],
+            );
+        }
+        Event::VoiceIce { cid, candidate } => {
+            notify(
+                tx,
+                ServerHdr::VoiceIce as u32,
+                vec![
+                    voice::chat_id(cid),
+                    (tag::VOICE_ICE, voice::ice_payload(&candidate)),
+                ],
+            );
+        }
+        Event::VoiceStatus { cid, participants } => {
+            notify(
+                tx,
+                ServerHdr::VoiceRoomStatus as u32,
+                vec![
+                    voice::chat_id(cid),
+                    (
+                        tag::VOICE_PARTICIPANTS,
+                        voice::participants_payload(&participants),
+                    ),
+                ],
+            );
+        }
+
+        // Video's one notification. Dropped for a session that didn't
+        // negotiate `CAPABILITY_VIDEO`: the domain sends the event to
+        // everyone in the room on purpose, because whether a wire can
+        // say "a camera is on" is the frontend's business, and this wire
+        // can only say it to a client that asked for the extension.
+        // Unlike the ng wire there is no seq accounting to keep here, so
+        // dropping it really is dropping it.
+        Event::VideoStatus { cid, publications } => {
+            if !sess.has_cap(cap::VIDEO) {
+                return true;
+            }
+            notify(
+                tx,
+                video::trans::VIDEO_STATUS,
+                vec![
+                    video::chat_id(cid),
+                    (
+                        video::field::VIDEO_PUBLISHERS,
+                        video::publishers_payload(&publications),
+                    ),
+                    (
+                        video::field::VIDEO_CODEC,
+                        ctx.core.video_codec().as_bytes().to_vec(),
+                    ),
+                ],
+            );
+        }
+
         Event::Kicked => return false,
     }
     true
@@ -767,7 +897,7 @@ async fn session_loop(
             },
             maybe = events.recv() => match maybe {
                 Some(se) => {
-                    if !deliver_event(tx, se.event) {
+                    if !deliver_event(tx, ctx, sess, se.event) {
                         info!(uid = sess.uid, "kicked");
                         return;
                     }
@@ -1099,6 +1229,256 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         .chat_notice(0, sess.uid, format!("{nick} has been {verb} by {by}"));
                 }
                 Err(e) => reply_error(tx, f.trans, err_text(e)),
+            }
+        }
+
+        // --- Voice (fogWraith Capabilities-Voice.md) ------------------
+        //
+        // A client that didn't negotiate CAPABILITY_VOICE never sends
+        // these, and never receives one: the gate is the first line of
+        // every arm, and a task error is a base-protocol reply rather
+        // than a voice transaction, so answering one doesn't break that
+        // rule.
+        t if t == ClientHdr::VoiceJoin.as_u32() => {
+            if !sess.has_cap(cap::VOICE) {
+                reply_error(tx, f.trans, "Voice chat is not available on this server.");
+                return;
+            }
+            // The privilege check lives here, with its wording, and says
+            // only that the user may join voice *somewhere*. Which room
+            // is the domain's membership check.
+            if !sess.can(bit::VOICE_CHAT) {
+                reply_error(tx, f.trans, "You are not allowed to join voice chat.");
+                return;
+            }
+            let cid = voice_cid(f);
+            match ctx.core.voice_join(sess.uid, cid) {
+                Ok(join) => reply(
+                    tx,
+                    f.trans,
+                    vec![
+                        voice::chat_id(cid),
+                        (tag::VOICE_SDP, join.sdp.into_bytes()),
+                        (tag::VOICE_CODEC, join.codec.as_bytes().to_vec()),
+                        (
+                            tag::VOICE_PARTICIPANTS,
+                            voice::participants_payload(&join.participants),
+                        ),
+                    ],
+                ),
+                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::VoiceLeave.as_u32() => {
+            if !sess.has_cap(cap::VOICE) {
+                reply_error(tx, f.trans, "Voice chat is not available on this server.");
+                return;
+            }
+            match ctx.core.voice_leave(sess.uid, voice_cid(f)) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::VoiceSdpAnswer.as_u32() => {
+            if !sess.has_cap(cap::VOICE) {
+                reply_error(tx, f.trans, "Voice chat is not available on this server.");
+                return;
+            }
+            let (mut cid, mut sdp) = (0u32, Ok(String::new()));
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_ID => cid = c.as_uint(),
+                    // SDP is UTF-8 by the spec and never Mac Roman: it is
+                    // a media-plane blob that happens to travel on this
+                    // wire, not text anyone reads. So it is validated
+                    // rather than converted: a lossy decode would put
+                    // U+FFFD into a fingerprint or an ICE password and
+                    // hand the media layer an answer that is subtly not
+                    // the one the client sent. A client that can't send
+                    // us UTF-8 gets told its answer was rejected, which
+                    // is what happened.
+                    tag::VOICE_SDP => sdp = std::str::from_utf8(c.data).map(str::to_string),
+                    _ => {}
+                }
+            }
+            let Ok(sdp) = sdp else {
+                debug!(uid = sess.uid, cid, "voice answer is not valid UTF-8");
+                reply_error(tx, f.trans, voice::err_text(VoiceError::BadAnswer));
+                return;
+            };
+            match ctx.core.voice_answer(sess.uid, cid, sdp) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+            }
+        }
+
+        t if t == ClientHdr::VoiceIce.as_u32() => {
+            // A notification in both directions: no reply exists, so a
+            // candidate we can't use is dropped rather than answered.
+            if !sess.has_cap(cap::VOICE) {
+                return;
+            }
+            let (mut cid, mut candidate) = (0u32, None);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_ID => cid = c.as_uint(),
+                    tag::VOICE_ICE => candidate = voice::parse_ice(c.data),
+                    _ => {}
+                }
+            }
+            match candidate {
+                // The refusal is discarded, not ignored: this
+                // transaction has no reply to put it in. A candidate for
+                // a room the user isn't in is dropped, which is what the
+                // domain did with it anyway.
+                Some(c) => {
+                    if let Err(e) = ctx.core.voice_ice(sess.uid, cid, c) {
+                        debug!(uid = sess.uid, cid, "ICE candidate dropped: {e:?}");
+                    }
+                }
+                None => debug!(uid = sess.uid, cid, "unparseable ICE candidate dropped"),
+            }
+        }
+
+        t if t == ClientHdr::VoiceMute.as_u32() => {
+            if !sess.has_cap(cap::VOICE) {
+                reply_error(tx, f.trans, "Voice chat is not available on this server.");
+                return;
+            }
+            let (mut cid, mut muted) = (0u32, false);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_ID => cid = c.as_uint(),
+                    tag::VOICE_MUTED => muted = c.as_uint() != 0,
+                    _ => {}
+                }
+            }
+            match ctx.core.voice_mute(sess.uid, cid, muted) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+            }
+        }
+
+        // --- Video (docs/capabilities-video.md) -----------------------
+        //
+        // Video is layered on voice, so every transaction here needs both
+        // capabilities and a voice session; the domain enforces the
+        // second, this frontend the first. SDP and ICE are not repeated:
+        // a video renegotiation is a 602/603 on the same peer connection,
+        // handled above without knowing video exists.
+        t if t == video::trans::VIDEO_START => {
+            if !sess.has_cap(cap::VIDEO) {
+                reply_error(tx, f.trans, "Video is not available on this server.");
+                return;
+            }
+            let cid = voice_cid(f);
+            let Some(kind) = video_kind(f) else {
+                // Kind 0 is deliberately invalid and a reserved kind is a
+                // later revision's, so neither is guessed at.
+                reply_error(tx, f.trans, "That is not a video stream kind.");
+                return;
+            };
+            // Camera and screen are separate trust decisions and neither
+            // bit implies the other: an operator may reasonably let
+            // someone show their face and not their desktop.
+            let allowed = match kind {
+                VideoKind::Camera => sess.can(bit::VIDEO_CHAT),
+                VideoKind::Screen => sess.can(bit::SCREEN_SHARE),
+            };
+            if !allowed {
+                reply_error(
+                    tx,
+                    f.trans,
+                    match kind {
+                        VideoKind::Camera => "You are not allowed to share video.",
+                        VideoKind::Screen => "You are not allowed to share your screen.",
+                    },
+                );
+                return;
+            }
+            match ctx.core.video_start(sess.uid, cid, kind) {
+                // No SDP here, deliberately: a renegotiation may already
+                // be outstanding toward this peer, and the offer follows
+                // as a 602 when serialisation allows. A client must not
+                // wait for it to consider the start to have succeeded.
+                Ok(codec) => reply(
+                    tx,
+                    f.trans,
+                    vec![
+                        video::chat_id(cid),
+                        video::kind_chunk(kind),
+                        (video::field::VIDEO_CODEC, codec.as_bytes().to_vec()),
+                    ],
+                ),
+                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+            }
+        }
+
+        t if t == video::trans::VIDEO_STOP => {
+            if !sess.has_cap(cap::VIDEO) {
+                reply_error(tx, f.trans, "Video is not available on this server.");
+                return;
+            }
+            // The kind is optional here and only here: omitting it stops
+            // everything this client is publishing in the room.
+            let kind = f
+                .chunks()
+                .find(|c| c.tag == video::field::VIDEO_KIND)
+                .map(|c| VideoKind::from_wire(c.as_uint() as u16));
+            let kind = match kind {
+                Some(None) => {
+                    reply_error(tx, f.trans, "That is not a video stream kind.");
+                    return;
+                }
+                Some(Some(k)) => Some(k),
+                None => None,
+            };
+            match ctx.core.video_stop(sess.uid, voice_cid(f), kind) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+            }
+        }
+
+        t if t == video::trans::VIDEO_STATE => {
+            if !sess.has_cap(cap::VIDEO) {
+                reply_error(tx, f.trans, "Video is not available on this server.");
+                return;
+            }
+            let Some(kind) = video_kind(f) else {
+                reply_error(tx, f.trans, "That is not a video stream kind.");
+                return;
+            };
+            let paused = f
+                .chunks()
+                .find(|c| c.tag == video::field::VIDEO_PAUSED)
+                .is_some_and(|c| c.as_uint() != 0);
+            match ctx.core.video_state(sess.uid, voice_cid(f), kind, paused) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+            }
+        }
+
+        t if t == video::trans::VIDEO_SUBSCRIBE => {
+            if !sess.has_cap(cap::VIDEO) {
+                reply_error(tx, f.trans, "Video is not available on this server.");
+                return;
+            }
+            // No privilege check: receiving video needs nothing beyond
+            // being in the room. The bits govern publishing.
+            //
+            // An absent field is an empty set, which is how a client
+            // turns everything off in one request — and the state it
+            // started in.
+            let streams = f
+                .chunks()
+                .find(|c| c.tag == video::field::VIDEO_SUBSCRIPTIONS)
+                .map(|c| video::parse_subscriptions(c.data))
+                .unwrap_or_default();
+            match ctx.core.video_subscribe(sess.uid, voice_cid(f), &streams) {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
             }
         }
 

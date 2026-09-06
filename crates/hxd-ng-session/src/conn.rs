@@ -10,6 +10,8 @@ use std::net::SocketAddr;
 
 use futures_util::{SinkExt, StreamExt};
 use hxd_core::access::bit;
+use hxd_core::video::VideoKind;
+use hxd_core::voice::IceCandidate;
 use hxd_core::{AccessBits, AttachInfo, AuthError, Proof, Resume, SeqEvent, Uid};
 use serde_json::json;
 use tokio::net::TcpStream;
@@ -23,8 +25,10 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, warn};
 
 use crate::proto::{
-    event_json, reply_err, reply_ok, user_json, ChatParams, LoginParams, MsgParams, NickParams,
-    ReqEnvelope, ResumeParams,
+    event_json, parse_streams, participants_json, reply_err, reply_ok, user_json, video_err,
+    video_limits_json, voice_err, ChatParams, LoginParams, MsgParams, NickParams, ReqEnvelope,
+    ResumeParams, VideoStartParams, VideoStateParams, VideoStopParams, VideoSubscribeParams,
+    VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -306,7 +310,7 @@ async fn handle_login(
     if let Some(agreement) = &ctx.cfg.agreement {
         server["agreement"] = json!(agreement);
     }
-    let ok = json!({
+    let mut ok = json!({
         "session": session_id,
         "token": token,
         "self": user_json(&me),
@@ -319,6 +323,13 @@ async fn handle_login(
         "caps": ctx.cfg.caps,
         "seq": 0,
     });
+    // The ceilings, so a client configures its encoders before the first
+    // join rather than discovering them by rejection. Present only when
+    // video is — `"video"` never appears in `caps` without `"voice"`,
+    // and this object never appears without `"video"`.
+    if ctx.core.video_enabled() {
+        ok["video"] = video_limits_json(&ctx.core.video_config());
+    }
     if ws_tx
         .send(Message::Text(reply_ok(req.id, ok)))
         .await
@@ -513,6 +524,192 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed msg."),
         },
+
+        // --- Voice (docs/voice.md §8) ---------------------------------
+        //
+        // The same six messages the legacy wire carries as 600–606. No
+        // capability gate here: the ng handshake has no per-session
+        // negotiation, and its `caps` list is a hint for feature
+        // detection rather than a switch — a client that calls these on a
+        // server without an SFU gets `voice_disabled` from the domain.
+        "voice_join" => match serde_json::from_value::<VoiceRoomParams>(req.params.clone()) {
+            Ok(_) if !state.access.has(bit::VOICE_CHAT) => reply_err(
+                req.id,
+                "access_denied",
+                "You are not allowed to join voice chat.",
+            ),
+            Ok(p) => match ctx.core.voice_join(state.uid, p.cid) {
+                Ok(join) => reply_ok(
+                    req.id,
+                    json!({
+                        "cid": p.cid,
+                        "sdp": join.sdp,
+                        "codec": join.codec,
+                        "participants": participants_json(&join.participants),
+                    }),
+                ),
+                Err(e) => {
+                    let (code, text) = voice_err(e);
+                    reply_err(req.id, code, text)
+                }
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed voice_join."),
+        },
+
+        "voice_leave" => match serde_json::from_value::<VoiceRoomParams>(req.params.clone()) {
+            Ok(p) => match ctx.core.voice_leave(state.uid, p.cid) {
+                Ok(()) => reply_ok(req.id, json!({})),
+                Err(e) => {
+                    let (code, text) = voice_err(e);
+                    reply_err(req.id, code, text)
+                }
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed voice_leave."),
+        },
+
+        "voice_answer" => match serde_json::from_value::<VoiceAnswerParams>(req.params.clone()) {
+            Ok(p) => match ctx.core.voice_answer(state.uid, p.cid, p.sdp) {
+                Ok(()) => reply_ok(req.id, json!({})),
+                Err(e) => {
+                    let (code, text) = voice_err(e);
+                    reply_err(req.id, code, text)
+                }
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed voice_answer."),
+        },
+
+        "voice_ice" => match serde_json::from_value::<VoiceIceParams>(req.params.clone()) {
+            Ok(p) => {
+                // `null` is end-of-candidates, which the domain carries
+                // as a candidate with an empty string.
+                let candidate = p.candidate.map(IceCandidate::from).unwrap_or_default();
+                // Every request on this wire gets an answer, so a
+                // candidate for a room the caller isn't in is refused
+                // rather than acknowledged — `docs/voice.md` §8, and the
+                // same shape as voice_leave, voice_answer and
+                // voice_mute. The legacy wire, which has no reply here,
+                // drops it instead.
+                match ctx.core.voice_ice(state.uid, p.cid, candidate) {
+                    Ok(()) => reply_ok(req.id, json!({})),
+                    Err(e) => {
+                        let (code, text) = voice_err(e);
+                        reply_err(req.id, code, text)
+                    }
+                }
+            }
+            Err(_) => reply_err(req.id, "bad_request", "Malformed voice_ice."),
+        },
+
+        "voice_mute" => match serde_json::from_value::<VoiceMuteParams>(req.params.clone()) {
+            Ok(p) => match ctx.core.voice_mute(state.uid, p.cid, p.muted) {
+                Ok(()) => reply_ok(req.id, json!({})),
+                Err(e) => {
+                    let (code, text) = voice_err(e);
+                    reply_err(req.id, code, text)
+                }
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed voice_mute."),
+        },
+
+        // --- Video (docs/capabilities-video.md §"Hotline-ng Binding") -
+        //
+        // Layered on voice exactly as on the classic wire: the same peer
+        // connection, the same SFU, the same room, and `voice_offer` /
+        // `voice_answer` / `voice_ice` carrying every SDP and ICE
+        // exchange without changing shape. No capability gate, for the
+        // same reason voice has none here.
+        "video_start" => match serde_json::from_value::<VideoStartParams>(req.params.clone()) {
+            Ok(p) => match VideoKind::from_name(&p.kind) {
+                None => reply_err(req.id, "bad_request", "Unknown video stream kind."),
+                // Camera and screen are separate trust decisions; neither
+                // bit implies the other.
+                Some(kind)
+                    if !state.access.has(match kind {
+                        VideoKind::Camera => bit::VIDEO_CHAT,
+                        VideoKind::Screen => bit::SCREEN_SHARE,
+                    }) =>
+                {
+                    reply_err(
+                        req.id,
+                        "access_denied",
+                        match kind {
+                            VideoKind::Camera => "You are not allowed to share video.",
+                            VideoKind::Screen => "You are not allowed to share your screen.",
+                        },
+                    )
+                }
+                Some(kind) => match ctx.core.video_start(state.uid, p.cid, kind) {
+                    // No SDP in the reply: the offer follows as a
+                    // `voice_offer` when serialisation allows, and a
+                    // client must not wait for it to consider the start
+                    // to have succeeded.
+                    Ok(codec) => reply_ok(req.id, json!({ "codec": codec })),
+                    Err(e) => {
+                        let (code, text) = video_err(e);
+                        reply_err(req.id, code, text)
+                    }
+                },
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed video_start."),
+        },
+
+        "video_stop" => match serde_json::from_value::<VideoStopParams>(req.params.clone()) {
+            // An absent kind stops everything this session is publishing
+            // in the room; a kind we don't know is a mistake rather than
+            // a wildcard, so it must not fall through to the wildcard.
+            Ok(p)
+                if p.kind
+                    .as_deref()
+                    .is_some_and(|k| VideoKind::from_name(k).is_none()) =>
+            {
+                reply_err(req.id, "bad_request", "Unknown video stream kind.")
+            }
+            Ok(p) => {
+                let kind = p.kind.as_deref().and_then(VideoKind::from_name);
+                match ctx.core.video_stop(state.uid, p.cid, kind) {
+                    Ok(()) => reply_ok(req.id, json!({})),
+                    Err(e) => {
+                        let (code, text) = video_err(e);
+                        reply_err(req.id, code, text)
+                    }
+                }
+            }
+            Err(_) => reply_err(req.id, "bad_request", "Malformed video_stop."),
+        },
+
+        "video_state" => match serde_json::from_value::<VideoStateParams>(req.params.clone()) {
+            Ok(p) => match VideoKind::from_name(&p.kind) {
+                None => reply_err(req.id, "bad_request", "Unknown video stream kind."),
+                Some(kind) => match ctx.core.video_state(state.uid, p.cid, kind, p.paused) {
+                    Ok(()) => reply_ok(req.id, json!({})),
+                    Err(e) => {
+                        let (code, text) = video_err(e);
+                        reply_err(req.id, code, text)
+                    }
+                },
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed video_state."),
+        },
+
+        "video_subscribe" => {
+            match serde_json::from_value::<VideoSubscribeParams>(req.params.clone()) {
+                // Receiving needs no privilege bit beyond being in the
+                // room; the bits govern publishing. An absent or empty
+                // array is "no video at all", which is where every
+                // session starts.
+                Ok(p) => {
+                    let streams = parse_streams(&p.streams);
+                    match ctx.core.video_subscribe(state.uid, p.cid, &streams) {
+                        Ok(()) => reply_ok(req.id, json!({})),
+                        Err(e) => {
+                            let (code, text) = video_err(e);
+                            reply_err(req.id, code, text)
+                        }
+                    }
+                }
+                Err(_) => reply_err(req.id, "bad_request", "Malformed video_subscribe."),
+            }
+        }
 
         "logout" => {
             ctx.core.end_session(state.uid);

@@ -310,6 +310,12 @@ impl Core {
     }
 
     fn part_one(r: &mut RosterInner, cid: u32, uid: Uid) {
+        // Leaving a chat leaves its voice room — the spec's "if a user is
+        // kicked from a chat room, their voice session MUST also be
+        // terminated", and the same is true of walking out voluntarily.
+        // Ahead of the early returns below: voice outlives a chat whose
+        // membership has already been torn up.
+        r.voice_part_room(uid, cid);
         let Some(chat) = r.chats.get_mut(&cid) else {
             return;
         };
