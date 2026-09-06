@@ -146,6 +146,22 @@ pub enum Event {
         cid: u32,
         participants: Vec<crate::voice::VoiceParticipant>,
     },
+
+    // --- Video (see [`crate::video`]) ---------------------------------
+    /// The room's video publications changed — a start, a stop, a pause,
+    /// a resume, or a publisher leaving. **Always the complete list**,
+    /// never a delta: a client replaces its whole view of the room's
+    /// video state on each one, which is what makes the notification
+    /// idempotent and a missed one self-healing.
+    ///
+    /// Delivered to every participant in the room, video-capable or not.
+    /// A voice-only participant is entitled to know a camera is on in
+    /// the room it is sitting in; whether its wire can say so is the
+    /// frontend's business, not the domain's.
+    VideoStatus {
+        cid: u32,
+        publications: Vec<crate::video::VideoPublication>,
+    },
 }
 
 /// An event stamped with its position in the session's stream. `seq` is

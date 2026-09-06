@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::roster::{Event, RosterInner, Uid};
+use crate::video::{VideoKind, VideoStream};
 use crate::Core;
 
 /// The spec's `VoiceMaxPerRoom` default.
@@ -177,6 +178,45 @@ pub trait VoiceMedia: Send + Sync + 'static {
     /// Mute is enforced here: a muted peer's RTP is dropped rather than
     /// forwarded, whatever the client chooses to keep sending.
     fn set_muted(&self, uid: Uid, cid: u32, muted: bool);
+
+    // --- Video (see [`crate::video`]) ---------------------------------
+    //
+    // Video is layered on this same peer connection: no new session, no
+    // new port, no new SDP transaction. These five methods are the whole
+    // of what the media layer has to be told about it — the rooms, the
+    // slots and the subscription bookkeeping are the domain's, and
+    // [`VoiceMedia::offer`] answers for video sections the same way it
+    // already does for audio ones, from state the media layer holds.
+
+    /// The room's video codec name, for a start reply and a status.
+    /// One room, one codec, forever `VP8` unless the spec grows another
+    /// — an SFU does not transcode.
+    fn video_codec(&self) -> &'static str;
+
+    /// Add a send section of `kind` for this peer, so its next offer
+    /// carries somewhere to publish on.
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind);
+
+    /// Drop a publication. The section survives as `a=inactive` — mids
+    /// are never reassigned and `m=` lines are never deleted — but
+    /// nothing is forwarded on it and any receiver's copy goes inactive
+    /// too.
+    fn unpublish(&self, uid: Uid, cid: u32, kind: VideoKind);
+
+    /// Pause or resume forwarding of a publication. Enforced by
+    /// discarding the publisher's inbound RTP, exactly as mute is, and
+    /// **not** by trusting the client to stop sending. On resume the
+    /// implementation must ask the publisher for a keyframe: a decoder
+    /// cannot start mid-stream, so a resumed stream is a black tile
+    /// until the next one arrives.
+    fn set_paused(&self, uid: Uid, cid: u32, kind: VideoKind, paused: bool);
+
+    /// This peer's complete set of receive streams, already filtered by
+    /// the domain to publications that exist. Absolute, not a delta: a
+    /// stream that has dropped out of the set has its section set
+    /// inactive and stops being forwarded. Newly added streams get a
+    /// keyframe request, for the same reason resume does.
+    fn set_subscriptions(&self, uid: Uid, cid: u32, streams: &[VideoStream]);
 }
 
 /// Something the media plane noticed, on its way back into the domain.
@@ -198,11 +238,17 @@ pub enum MediaEvent {
     /// status that any leave produces; the user's control connection is
     /// untouched.
     Failed { uid: Uid, cid: u32 },
+    /// One publication's media stopped arriving while the peer's session
+    /// stayed alive. The publication is dropped and its slot released;
+    /// the call is not touched. **Losing video is a degradation; losing
+    /// the call is a failure**, and the spec is explicit that a failed
+    /// publication must never tear down the voice session.
+    VideoFailed { uid: Uid, cid: u32, kind: VideoKind },
 }
 
 /// A peer's voice state within its room.
-struct Peer {
-    uid: Uid,
+pub(crate) struct Peer {
+    pub(crate) uid: Uid,
     muted: bool,
     /// An offer has been sent and not yet answered. **No second offer
     /// may go out while this is set** — most WebRTC stacks treat
@@ -212,6 +258,11 @@ struct Peer {
     /// releases one consolidated follow-up offer covering everything
     /// that accumulated.
     dirty: bool,
+    /// What this peer is publishing and what it has asked to see. Video
+    /// hangs off the voice peer rather than beside it, so the four
+    /// cleanup paths that end a voice session end the publications too
+    /// without any of them being told about video. See [`crate::video`].
+    pub(crate) video: crate::video::PeerVideo,
 }
 
 impl Peer {
@@ -225,6 +276,7 @@ impl Peer {
             muted: false,
             offer_outstanding: false,
             dirty: false,
+            video: crate::video::PeerVideo::default(),
         }
     }
 }
@@ -232,12 +284,16 @@ impl Peer {
 /// The domain's whole voice state, living inside the roster so that every
 /// path which removes a user can reach it.
 pub(crate) struct VoiceState {
-    media: Option<Arc<dyn VoiceMedia>>,
+    pub(crate) media: Option<Arc<dyn VoiceMedia>>,
     max_per_room: usize,
-    rooms: HashMap<u32, Vec<Peer>>,
+    pub(crate) rooms: HashMap<u32, Vec<Peer>>,
     /// The one-room-at-a-time index: a user is in at most one room, and
     /// this is where.
-    room_of: HashMap<Uid, u32>,
+    pub(crate) room_of: HashMap<Uid, u32>,
+    /// Video is off unless an operator turns it on, and can only be on
+    /// where voice is: the capability bit for it depends on voice's.
+    pub(crate) video_enabled: bool,
+    pub(crate) video: crate::video::VideoConfig,
 }
 
 impl Default for VoiceState {
@@ -247,12 +303,14 @@ impl Default for VoiceState {
             max_per_room: DEFAULT_MAX_PER_ROOM,
             rooms: HashMap::new(),
             room_of: HashMap::new(),
+            video_enabled: false,
+            video: crate::video::VideoConfig::default(),
         }
     }
 }
 
 impl VoiceState {
-    fn peer_mut(&mut self, cid: u32, uid: Uid) -> Option<&mut Peer> {
+    pub(crate) fn peer_mut(&mut self, cid: u32, uid: Uid) -> Option<&mut Peer> {
         self.rooms.get_mut(&cid)?.iter_mut().find(|p| p.uid == uid)
     }
 
@@ -292,9 +350,16 @@ impl RosterInner {
         };
         peers.retain(|p| p.uid != uid);
         if peers.is_empty() {
-            // Last one out: the room's state goes with them.
+            // Last one out: the room's state goes with them, publications
+            // and subscriptions included.
             self.voice.rooms.remove(&cid);
         } else {
+            // The leaver's publications went with it. Anyone subscribed
+            // to one loses it here — before the offers are built, so the
+            // sections they describe match what the media layer will
+            // actually forward. `voice_renegotiate` then covers everyone,
+            // so the peers `video_resync` names need no second offer.
+            self.video_resync(cid);
             self.voice_renegotiate(cid, Some(uid));
         }
         // The room hears about it, and so does the user who left.
@@ -315,6 +380,16 @@ impl RosterInner {
             },
         );
         self.voice_status(cid);
+        // The same courtesy for video: the leaver's own publications are
+        // gone, and the room needs to stop drawing their tile.
+        self.send_to(
+            uid,
+            Event::VideoStatus {
+                cid,
+                publications: Vec::new(),
+            },
+        );
+        self.video_status(cid);
     }
 
     /// The same, but only if the user's voice room is `cid` — for a chat
@@ -347,6 +422,39 @@ impl RosterInner {
                 // arrive: it is about to be parted from the room anyway,
                 // and marking an offer outstanding would only leave a
                 // dead peer looking like it owes us an answer.
+                let Some(sdp) = media.offer(p.uid, cid) else {
+                    continue;
+                };
+                p.offer_outstanding = true;
+                offers.push((p.uid, sdp));
+            }
+        }
+        for (uid, sdp) in offers {
+            self.send_to(uid, Event::VoiceOffer { cid, sdp });
+        }
+    }
+
+    /// Send fresh offers to exactly these peers, obeying the same
+    /// serialisation rule.
+    ///
+    /// Video needs this where voice never did. A voice change is a room
+    /// change and every peer's offer moves with it; a video change moves
+    /// the publisher's offer and the offers of whoever subscribed, and
+    /// nobody else's. Renegotiating the room for one camera would be the
+    /// fifteen-peer storm the opt-in receive model exists to avoid.
+    pub(crate) fn voice_renegotiate_peers(&mut self, cid: u32, uids: &[Uid]) {
+        let Some(media) = self.voice_media() else {
+            return;
+        };
+        let mut offers: Vec<(Uid, String)> = Vec::new();
+        if let Some(peers) = self.voice.rooms.get_mut(&cid) {
+            for p in peers.iter_mut().filter(|p| uids.contains(&p.uid)) {
+                if p.offer_outstanding {
+                    p.dirty = true;
+                    continue;
+                }
+                // See `voice_renegotiate`: no offer is a peer the media
+                // layer has already torn down.
                 let Some(sdp) = media.offer(p.uid, cid) else {
                     continue;
                 };
@@ -462,6 +570,12 @@ impl Core {
 
         r.voice_renegotiate(cid, Some(uid));
         r.voice_status(cid);
+        // Video state arrives as its own notification rather than as
+        // extra fields on the join reply, so voice's reply shape is
+        // untouched and a voice-only client sees exactly what it always
+        // saw. A joiner with no publications still needs this: it is how
+        // it learns what everyone else is already showing.
+        r.video_status(cid);
 
         Ok(VoiceJoin {
             sdp,
@@ -614,6 +728,27 @@ impl Core {
                 if r.voice.room_of.get(&uid) == Some(&cid) {
                     r.voice_part(uid);
                 }
+            }
+            MediaEvent::VideoFailed { uid, cid, kind } => {
+                if r.voice.room_of.get(&uid) != Some(&cid) {
+                    return;
+                }
+                let mut stopped = false;
+                if let Some(p) = r.voice.peer_mut(cid, uid) {
+                    let before = p.video.publications.len();
+                    p.video.publications.retain(|(k, _)| *k != kind);
+                    stopped = p.video.publications.len() != before;
+                }
+                if !stopped {
+                    return;
+                }
+                // The media layer has already dropped it on its side; the
+                // domain releases the slot, tells the subscribers, and
+                // leaves the audio alone.
+                let mut targets = vec![uid];
+                targets.extend(r.video_resync(cid).into_iter().filter(|u| *u != uid));
+                r.voice_renegotiate_peers(cid, &targets);
+                r.video_status(cid);
             }
         }
     }

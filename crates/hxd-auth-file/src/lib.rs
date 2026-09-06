@@ -68,6 +68,11 @@ const NAMED_BITS: &[(&str, u8)] = &[
     ("send_msgs", bit::SEND_MSGS),
     ("voice_chat", bit::VOICE_CHAT),
     ("chat_history", bit::CHAT_HISTORY),
+    ("video_chat", bit::VIDEO_CHAT),
+    // Off for guests by default, per the video spec: a screen share can
+    // leak documents, credentials and other people's messages in a way a
+    // camera generally cannot. Bootstrap's guest account grants neither.
+    ("screen_share", bit::SCREEN_SHARE),
 ];
 
 #[derive(Debug, Deserialize)]

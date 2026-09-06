@@ -108,6 +108,18 @@ pub mod bit {
     // Extensions (fogWraith allocations)
     pub const VOICE_CHAT: u8 = 55;
     pub const CHAT_HISTORY: u8 = 56;
+    // 57 AccessSendMedia and 58 AccessMessaging are allocated by the
+    // inline-media and messaging extensions; neither is implemented here
+    // yet, and the numbers stay reserved so video's don't drift.
+    /// May publish camera video in a voice room
+    /// (`docs/capabilities-video.md` §"Access Privileges").
+    pub const VIDEO_CHAT: u8 = 59;
+    /// May publish a screen share. **Its own bit, deliberately**:
+    /// showing your face and showing your desktop are different trust
+    /// decisions, and a screen share can leak documents, credentials and
+    /// other people's messages in a way a camera generally cannot.
+    /// Neither bit implies the other.
+    pub const SCREEN_SHARE: u8 = 60;
 }
 
 #[cfg(test)]

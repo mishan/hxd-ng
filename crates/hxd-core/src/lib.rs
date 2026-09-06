@@ -11,6 +11,7 @@ pub mod access;
 pub mod account;
 pub mod chat;
 pub mod roster;
+pub mod video;
 pub mod voice;
 
 pub use access::AccessBits;
@@ -20,6 +21,7 @@ pub use roster::{
     AttachInfo, Core, Event, Resume, SeqEvent, SessionStatus, Uid, UserDetails, UserInfo,
     OUTBOX_BUFFER_CAP,
 };
+pub use video::{VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream};
 pub use voice::{
     IceCandidate, MediaEvent, VoiceError, VoiceJoin, VoiceMedia, VoiceParticipant,
     DEFAULT_MAX_PER_ROOM,

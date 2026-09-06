@@ -16,6 +16,7 @@ use std::sync::Mutex;
 
 use super::{IceCandidate, VoiceError, VoiceMedia};
 use crate::roster::Uid;
+use crate::video::{VideoKind, VideoStream};
 
 /// One call the domain made into the media layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,30 @@ pub enum MediaCall {
         uid: Uid,
         cid: u32,
         muted: bool,
+    },
+    Publish {
+        uid: Uid,
+        cid: u32,
+        kind: VideoKind,
+    },
+    Unpublish {
+        uid: Uid,
+        cid: u32,
+        kind: VideoKind,
+    },
+    SetPaused {
+        uid: Uid,
+        cid: u32,
+        kind: VideoKind,
+        paused: bool,
+    },
+    /// The peer's whole receive set, as the domain computed it — already
+    /// filtered to publications that exist, which is the half of the
+    /// subscription rule these tests care about.
+    SetSubscriptions {
+        uid: Uid,
+        cid: u32,
+        streams: Vec<VideoStream>,
     },
 }
 
@@ -180,5 +205,46 @@ impl VoiceMedia for RecordingMedia {
             .unwrap()
             .calls
             .push(MediaCall::SetMuted { uid, cid, muted });
+    }
+
+    fn video_codec(&self) -> &'static str {
+        "VP8"
+    }
+
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) {
+        self.inner
+            .lock()
+            .unwrap()
+            .calls
+            .push(MediaCall::Publish { uid, cid, kind });
+    }
+
+    fn unpublish(&self, uid: Uid, cid: u32, kind: VideoKind) {
+        self.inner
+            .lock()
+            .unwrap()
+            .calls
+            .push(MediaCall::Unpublish { uid, cid, kind });
+    }
+
+    fn set_paused(&self, uid: Uid, cid: u32, kind: VideoKind, paused: bool) {
+        self.inner.lock().unwrap().calls.push(MediaCall::SetPaused {
+            uid,
+            cid,
+            kind,
+            paused,
+        });
+    }
+
+    fn set_subscriptions(&self, uid: Uid, cid: u32, streams: &[VideoStream]) {
+        self.inner
+            .lock()
+            .unwrap()
+            .calls
+            .push(MediaCall::SetSubscriptions {
+                uid,
+                cid,
+                streams: streams.to_vec(),
+            });
     }
 }

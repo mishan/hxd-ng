@@ -19,8 +19,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hxd_core::video::{VideoConfig, VideoKind, VideoStream};
 use hxd_core::voice::{IceCandidate, VoiceError, VoiceMedia};
 use hxd_core::Uid;
+use hxd_voice::sdp::{CAM_SEND_MID, SCR_SEND_MID, VP8_PT};
 use hxd_voice::Sfu;
 use str0m::config::Fingerprint;
 use str0m::media::MediaKind;
@@ -30,6 +32,20 @@ use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig};
 
 const SERVER: &str = "192.0.2.1:5504";
 const PCMU_PT: u8 = 0;
+
+fn cam(uid: Uid) -> VideoStream {
+    VideoStream {
+        uid,
+        kind: VideoKind::Camera,
+    }
+}
+
+fn screen(uid: Uid) -> VideoStream {
+    VideoStream {
+        uid,
+        kind: VideoKind::Screen,
+    }
+}
 
 fn server_addr() -> SocketAddr {
     SERVER.parse().unwrap()
@@ -42,10 +58,21 @@ struct Client {
     addr: SocketAddr,
     rtc: Rtc,
     mic_ssrc: u32,
+    /// One SSRC per publication kind. **Two of them, distinct**, because
+    /// a camera and a screen are both VP8 at payload type 96 on one
+    /// bundled transport and the SSRC is the only thing that tells the
+    /// server which is which.
+    cam_ssrc: u32,
+    scr_ssrc: u32,
+    /// Suppress the `a=ssrc` on a video send section, to stand in for a
+    /// client whose stack didn't emit one.
+    declare_video_ssrc: bool,
     /// What arrived, by the mid it arrived on.
     heard: HashMap<String, Vec<Vec<u8>>>,
     seq: u64,
     time: u32,
+    video_seq: u64,
+    video_time: u32,
 }
 
 impl Client {
@@ -54,6 +81,7 @@ impl Client {
         let mut rtc = RtcConfig::new()
             .clear_codecs()
             .enable_pcmu(true)
+            .enable_vp8(true)
             .set_rtp_mode(true)
             .build(now);
         rtc.add_local_candidate(Candidate::host(addr, "udp").unwrap());
@@ -61,14 +89,29 @@ impl Client {
         // server, and takes the DTLS client role.
         rtc.direct_api().set_ice_controlling(true);
         let mic_ssrc = *rtc.direct_api().new_ssrc();
+        let cam_ssrc = *rtc.direct_api().new_ssrc();
+        let scr_ssrc = *rtc.direct_api().new_ssrc();
         Client {
             uid,
             addr,
             rtc,
             mic_ssrc,
+            cam_ssrc,
+            scr_ssrc,
+            declare_video_ssrc: true,
             heard: HashMap::new(),
             seq: 1000,
             time: 160_000,
+            video_seq: 5000,
+            video_time: 900_000,
+        }
+    }
+
+    fn send_ssrc(&self, mid: &str) -> u32 {
+        match mid {
+            CAM_SEND_MID => self.cam_ssrc,
+            SCR_SEND_MID => self.scr_ssrc,
+            _ => self.mic_ssrc,
         }
     }
 
@@ -76,30 +119,40 @@ impl Client {
     /// answer it the way a conforming client would.
     fn answer(&mut self, offer: &str, first_time: bool) -> String {
         let sections = sections_of(offer);
-        for (mid, dir, ssrc) in &sections {
-            if self.rtc.media(mid.as_str().into()).is_none() {
-                self.rtc
-                    .direct_api()
-                    .declare_media(mid.as_str().into(), MediaKind::Audio);
+        for sec in &sections {
+            let mid = sec.mid.as_str();
+            if self.rtc.media(mid.into()).is_none() {
+                let kind = if sec.video {
+                    MediaKind::Video
+                } else {
+                    MediaKind::Audio
+                };
+                self.rtc.direct_api().declare_media(mid.into(), kind);
             }
-            if mid == "send" {
-                self.rtc.direct_api().declare_stream_tx(
-                    Ssrc::from(self.mic_ssrc),
-                    None,
-                    mid.as_str().into(),
-                    None,
-                );
-            } else if dir == "sendonly" {
+            let is_send_section = mid == "send" || mid == CAM_SEND_MID || mid == SCR_SEND_MID;
+            if is_send_section {
+                let ssrc = self.send_ssrc(mid);
+                if self.rtc.direct_api().stream_tx(&ssrc.into()).is_none() {
+                    self.rtc.direct_api().declare_stream_tx(
+                        Ssrc::from(ssrc),
+                        None,
+                        mid.into(),
+                        None,
+                    );
+                }
+            } else if sec.dir == "sendonly" {
                 // The server told us which SSRC this section carries;
                 // without that a bundled client has nothing to
                 // demultiplex on.
-                let ssrc = ssrc.expect("a live section declares its ssrc");
-                self.rtc.direct_api().expect_stream_rx(
-                    Ssrc::from(ssrc),
-                    None,
-                    mid.as_str().into(),
-                    None,
-                );
+                let ssrc = sec.ssrc.expect("a live section declares its ssrc");
+                if self.rtc.direct_api().stream_rx(&ssrc.into()).is_none() {
+                    self.rtc.direct_api().expect_stream_rx(
+                        Ssrc::from(ssrc),
+                        None,
+                        mid.into(),
+                        None,
+                    );
+                }
             }
         }
 
@@ -125,19 +178,28 @@ impl Client {
         let fp_hex: Vec<String> = fp.bytes.iter().map(|b| format!("{b:02X}")).collect();
         let mut s = String::from("v=0\r\no=- 42 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n");
         s.push_str("a=group:BUNDLE");
-        for (mid, _, _) in &sections {
-            s.push_str(&format!(" {mid}"));
+        for sec in &sections {
+            s.push_str(&format!(" {}", sec.mid));
         }
         s.push_str("\r\na=msid-semantic: WMS\r\n");
-        for (mid, dir, _) in &sections {
-            let mirrored = match dir.as_str() {
+        for sec in &sections {
+            let mid = sec.mid.as_str();
+            let mirrored = match sec.dir.as_str() {
                 "sendonly" => "recvonly",
                 "recvonly" => "sendonly",
                 _ => "inactive",
             };
-            s.push_str("m=audio 9 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\n");
+            if sec.video {
+                s.push_str("m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\nc=IN IP4 0.0.0.0\r\n");
+            } else {
+                s.push_str("m=audio 9 UDP/TLS/RTP/SAVPF 0\r\nc=IN IP4 0.0.0.0\r\n");
+            }
             s.push_str(&format!("a=mid:{mid}\r\n"));
-            s.push_str("a=rtpmap:0 PCMU/8000\r\n");
+            if sec.video {
+                s.push_str("a=rtpmap:96 VP8/90000\r\n");
+            } else {
+                s.push_str("a=rtpmap:0 PCMU/8000\r\n");
+            }
             s.push_str(&format!("a={mirrored}\r\n"));
             s.push_str("a=rtcp-mux\r\na=setup:active\r\n");
             s.push_str(&format!("a=ice-ufrag:{}\r\n", creds.ufrag));
@@ -152,9 +214,41 @@ impl Client {
                     "a=ssrc:{} cname:mic-{}\r\n",
                     self.mic_ssrc, self.uid
                 ));
+            } else if (mid == CAM_SEND_MID || mid == SCR_SEND_MID) && self.declare_video_ssrc {
+                // Mandatory on video send sections, with no fallback: the
+                // server cannot tell a face from a spreadsheet without it.
+                s.push_str(&format!(
+                    "a=ssrc:{} cname:{}-{}\r\n",
+                    self.send_ssrc(mid),
+                    if mid == CAM_SEND_MID {
+                        "video"
+                    } else {
+                        "screen"
+                    },
+                    self.uid
+                ));
             }
         }
         s
+    }
+
+    /// Send one VP8 packet on a publication.
+    fn publish_frame(&mut self, kind: VideoKind, payload: &[u8], now: Instant) {
+        self.video_seq += 1;
+        self.video_time += 3000;
+        let ssrc = Ssrc::from(match kind {
+            VideoKind::Camera => self.cam_ssrc,
+            VideoKind::Screen => self.scr_ssrc,
+        });
+        let mut api = self.rtc.direct_api();
+        let stream = api.stream_tx(&ssrc).expect("video stream");
+        stream.write_rtp(RtpWrite::new(
+            VP8_PT.into(),
+            self.video_seq.into(),
+            self.video_time,
+            now,
+            payload.to_vec(),
+        ));
     }
 
     fn ice_candidate(&self) -> IceCandidate {
@@ -201,18 +295,29 @@ impl Client {
 }
 
 /// `(mid, direction, ssrc)` for each media section of an SDP.
-fn sections_of(sdp: &str) -> Vec<(String, String, Option<u32>)> {
-    let mut out: Vec<(String, String, Option<u32>)> = Vec::new();
+fn sections_of(sdp: &str) -> Vec<Section> {
+    let mut out: Vec<Section> = Vec::new();
+    let mut video = false;
     for line in sdp.lines() {
-        if let Some(mid) = line.strip_prefix("a=mid:") {
-            out.push((mid.to_string(), String::new(), None));
+        if let Some(rest) = line.strip_prefix("m=") {
+            video = rest.starts_with("video");
+        } else if let Some(mid) = line.strip_prefix("a=mid:") {
+            out.push(Section {
+                mid: mid.to_string(),
+                dir: String::new(),
+                ssrc: None,
+                video,
+            });
         } else if let Some(rest) = line.strip_prefix("a=") {
             if let Some(last) = out.last_mut() {
                 match rest {
-                    "sendonly" | "recvonly" | "inactive" => last.1 = rest.to_string(),
+                    "sendonly" | "recvonly" | "inactive" => last.dir = rest.to_string(),
                     _ => {
                         if let Some(v) = rest.strip_prefix("ssrc:") {
-                            last.2 = v.split_whitespace().next().and_then(|n| n.parse().ok());
+                            if last.ssrc.is_none() {
+                                last.ssrc =
+                                    v.split_whitespace().next().and_then(|n| n.parse().ok());
+                            }
                         }
                     }
                 }
@@ -220,6 +325,14 @@ fn sections_of(sdp: &str) -> Vec<(String, String, Option<u32>)> {
         }
     }
     out
+}
+
+/// One media section of an offer, as a client reads it.
+struct Section {
+    mid: String,
+    dir: String,
+    ssrc: Option<u32>,
+    video: bool,
 }
 
 fn attr(sdp: &str, prefix: &str) -> Option<String> {
@@ -355,7 +468,7 @@ fn renegotiate(sfu: &Sfu, c: &mut Client, cid: u32) {
 }
 
 fn new_sfu() -> Arc<Sfu> {
-    let (sfu, _events) = Sfu::new(&[server_addr()]).unwrap();
+    let (sfu, _events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
     // The event receiver is dropped: sends into a closed channel are
     // discarded, which is what a server with no domain attached wants.
     sfu
@@ -562,8 +675,8 @@ fn an_unknown_datagram_is_dropped_without_a_session() {
 
 #[test]
 fn a_server_with_no_advertisable_address_refuses_to_start() {
-    assert!(Sfu::new(&[]).is_err());
-    assert!(Sfu::new(&["0.0.0.0:5504".parse().unwrap()]).is_err());
+    assert!(Sfu::new(&[], VideoConfig::default()).is_err());
+    assert!(Sfu::new(&["0.0.0.0:5504".parse().unwrap()], VideoConfig::default()).is_err());
 }
 
 // --- The spec's timeout table -------------------------------------------
@@ -573,7 +686,7 @@ fn a_peer_that_never_answers_is_torn_down() {
     // "No SDP answer received after Join Voice Room reply: 10 seconds."
     // The SFU is sans-I/O, so the clock is whatever the caller says it
     // is and this costs no wall time at all.
-    let (sfu, mut events) = Sfu::new(&[server_addr()]).unwrap();
+    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
     let t0 = Instant::now();
     sfu.join(1, 0);
     offer_of(&sfu, 1, 0);
@@ -598,7 +711,7 @@ fn a_peer_whose_dtls_stalls_gets_the_dtls_deadline_not_the_ice_one() {
     // spent and only the handshake is left.
     let t0 = Instant::now();
     let mut now = t0;
-    let (sfu, mut events) = Sfu::new(&[server_addr()]).unwrap();
+    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
     let mut a = Client::new(1, 6000, now);
     sfu.join(1, 0);
     let offer = offer_of(&sfu, 1, 0);
@@ -656,7 +769,7 @@ fn a_forged_datagram_cannot_hold_a_dead_session_open() {
     // session's room slot open indefinitely, one byte at a time.
     let t0 = Instant::now();
     let mut now = t0;
-    let (sfu, mut events) = Sfu::new(&[server_addr()]).unwrap();
+    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
     let mut a = Client::new(1, 6000, now);
     join(&sfu, &mut a, 0);
     pump(&sfu, &mut [&mut a], &mut now, 40);
@@ -708,7 +821,7 @@ fn a_forged_datagram_cannot_hold_a_dead_session_open() {
 fn a_peer_that_answers_but_never_connects_is_torn_down() {
     // The ICE deadline proper: answered, and no path ever found.
     let now = Instant::now();
-    let (sfu, mut events) = Sfu::new(&[server_addr()]).unwrap();
+    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
     let mut a = Client::new(1, 6000, now);
     sfu.join(1, 0);
     let offer = offer_of(&sfu, 1, 0);
@@ -734,7 +847,7 @@ fn a_session_that_collects_too_many_sections_is_ended() {
     // alongside it. Unbounded that would outgrow the wire's own chunk
     // length; the session is ended at the cap instead, and the client
     // reconnects with a clean list.
-    let (sfu, mut events) = Sfu::new(&[server_addr()]).unwrap();
+    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
     sfu.join(1, 0);
     offer_of(&sfu, 1, 0);
 
@@ -797,4 +910,242 @@ fn only_pcmu_is_forwarded() {
         pump(&sfu, &mut [&mut a, &mut b], &mut now, 4);
     }
     assert_eq!(a.heard_total(), 0, "a non-PCMU payload type is dropped");
+}
+
+// --- Video ---------------------------------------------------------------
+
+#[test]
+fn video_reaches_a_subscriber_and_nobody_else() {
+    // The rule the whole extension rests on: publishing announces a
+    // stream, it does not deliver it. A peer in the room that never
+    // subscribed is on the same code path as a client that has never
+    // heard of this document.
+    let mut now = Instant::now();
+    let sfu = new_sfu();
+    let mut a = Client::new(1, 6100, now);
+    let mut b = Client::new(2, 6101, now);
+    let mut c = Client::new(3, 6102, now);
+    join(&sfu, &mut a, 0);
+    join(&sfu, &mut b, 0);
+    join(&sfu, &mut c, 0);
+    renegotiate(&sfu, &mut a, 0);
+    renegotiate(&sfu, &mut b, 0);
+    pump(&sfu, &mut [&mut a, &mut b, &mut c], &mut now, 60);
+    assert!(a.is_connected() && b.is_connected() && c.is_connected());
+
+    // A publishes; B asks to see it; C does not.
+    sfu.publish(1, 0, VideoKind::Camera);
+    renegotiate(&sfu, &mut a, 0);
+    sfu.set_subscriptions(2, 0, &[cam(1)]);
+    renegotiate(&sfu, &mut b, 0);
+    pump(&sfu, &mut [&mut a, &mut b, &mut c], &mut now, 40);
+
+    b.heard.clear();
+    c.heard.clear();
+    for i in 0..5u8 {
+        a.publish_frame(VideoKind::Camera, &[0xf0, i], now);
+        pump(&sfu, &mut [&mut a, &mut b, &mut c], &mut now, 4);
+    }
+
+    assert_eq!(
+        b.heard_on("cam-user-1").len(),
+        5,
+        "the subscriber sees it on the mid the spec names"
+    );
+    assert_eq!(
+        c.heard_total(),
+        0,
+        "and a peer that asked for nothing is sent nothing — no video          section in its offer, no RTP on its transport"
+    );
+}
+
+#[test]
+fn a_camera_and_a_screen_from_one_peer_are_told_apart_by_ssrc() {
+    // The implementation note that matters most: both are VP8 at payload
+    // type 96 on one bundled transport within one peer connection, so a
+    // server keying receive state by mid or payload type would collide
+    // them — and forwarding a screen share into the tile where a face
+    // belongs is worse than forwarding nothing.
+    let mut now = Instant::now();
+    let sfu = new_sfu();
+    let mut a = Client::new(1, 6110, now);
+    let mut b = Client::new(2, 6111, now);
+    join(&sfu, &mut a, 0);
+    join(&sfu, &mut b, 0);
+    renegotiate(&sfu, &mut a, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 60);
+
+    sfu.publish(1, 0, VideoKind::Camera);
+    sfu.publish(1, 0, VideoKind::Screen);
+    renegotiate(&sfu, &mut a, 0);
+    sfu.set_subscriptions(2, 0, &[cam(1), screen(1)]);
+    renegotiate(&sfu, &mut b, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 40);
+
+    b.heard.clear();
+    a.publish_frame(VideoKind::Camera, b"face", now);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 6);
+    a.publish_frame(VideoKind::Screen, b"desktop", now);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 6);
+
+    assert_eq!(b.heard_on("cam-user-1"), [b"face".to_vec()]);
+    assert_eq!(b.heard_on("scr-user-1"), [b"desktop".to_vec()]);
+}
+
+#[test]
+fn pause_is_enforced_by_dropping_the_publishers_rtp() {
+    // Exactly as mute is, and for the same reason: a client that keeps
+    // capturing must not keep being forwarded.
+    let mut now = Instant::now();
+    let sfu = new_sfu();
+    let mut a = Client::new(1, 6120, now);
+    let mut b = Client::new(2, 6121, now);
+    join(&sfu, &mut a, 0);
+    join(&sfu, &mut b, 0);
+    renegotiate(&sfu, &mut a, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 60);
+
+    sfu.publish(1, 0, VideoKind::Camera);
+    renegotiate(&sfu, &mut a, 0);
+    sfu.set_subscriptions(2, 0, &[cam(1)]);
+    renegotiate(&sfu, &mut b, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 40);
+    b.heard.clear();
+
+    sfu.set_paused(1, 0, VideoKind::Camera, true);
+    for _ in 0..4 {
+        a.publish_frame(VideoKind::Camera, b"paused", now);
+        pump(&sfu, &mut [&mut a, &mut b], &mut now, 4);
+    }
+    assert_eq!(b.heard_total(), 0, "nothing is forwarded while paused");
+
+    // Resume needs no renegotiation — the section, the mid and the slot
+    // all stayed.
+    sfu.set_paused(1, 0, VideoKind::Camera, false);
+    a.publish_frame(VideoKind::Camera, b"live", now);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 6);
+    assert_eq!(b.heard_on("cam-user-1"), [b"live".to_vec()]);
+}
+
+#[test]
+fn unsubscribing_stops_the_stream_and_keeps_the_mid() {
+    // From a receiver's point of view unsubscribing is indistinguishable
+    // from the publisher having stopped, which is what lets the same
+    // machinery serve both.
+    let mut now = Instant::now();
+    let sfu = new_sfu();
+    let mut a = Client::new(1, 6130, now);
+    let mut b = Client::new(2, 6131, now);
+    join(&sfu, &mut a, 0);
+    join(&sfu, &mut b, 0);
+    renegotiate(&sfu, &mut a, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 60);
+
+    sfu.publish(1, 0, VideoKind::Camera);
+    renegotiate(&sfu, &mut a, 0);
+    sfu.set_subscriptions(2, 0, &[cam(1)]);
+    let subscribed = offer_of(&sfu, 2, 0);
+    assert!(subscribed.contains("a=mid:cam-user-1\r\n"));
+    assert!(
+        subscribed.contains("b=AS:1500\r\n"),
+        "the configured ceiling"
+    );
+    renegotiate(&sfu, &mut b, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 40);
+    b.heard.clear();
+
+    sfu.set_subscriptions(2, 0, &[]);
+    let dropped = offer_of(&sfu, 2, 0);
+    // The m= line is still there and still port 9: deleting it would
+    // misalign every later sdpMLineIndex.
+    assert!(dropped.contains("a=mid:cam-user-1\r\n"));
+    assert!(
+        dropped.contains("a=mid:cam-user-1\r\na=rtpmap:96 VP8/90000"),
+        "the section keeps its codec attributes"
+    );
+    assert_eq!(
+        dropped.matches("a=inactive\r\n").count(),
+        1,
+        "and goes inactive rather than away"
+    );
+    renegotiate(&sfu, &mut b, 0);
+
+    a.publish_frame(VideoKind::Camera, b"unwatched", now);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 6);
+    assert_eq!(b.heard_total(), 0);
+}
+
+#[test]
+fn a_video_send_section_without_an_ssrc_costs_the_publication_not_the_call() {
+    // The one place this implementation refuses to guess. The answer is
+    // otherwise fine, so audio carries on; the publication does not.
+    let mut now = Instant::now();
+    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
+    let mut a = Client::new(1, 6140, now);
+    let mut b = Client::new(2, 6141, now);
+    join(&sfu, &mut a, 0);
+    join(&sfu, &mut b, 0);
+    renegotiate(&sfu, &mut a, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 60);
+    while events.try_recv().is_ok() {}
+
+    // A's stack answers the camera section without declaring an SSRC.
+    a.declare_video_ssrc = false;
+    sfu.publish(1, 0, VideoKind::Camera);
+    renegotiate(&sfu, &mut a, 0);
+
+    let failed = std::iter::from_fn(|| events.try_recv().ok())
+        .find(|e| matches!(e, hxd_core::voice::MediaEvent::VideoFailed { .. }));
+    assert!(
+        matches!(
+            failed,
+            Some(hxd_core::voice::MediaEvent::VideoFailed {
+                uid: 1,
+                cid: 0,
+                kind: VideoKind::Camera
+            })
+        ),
+        "the domain is told to release the slot"
+    );
+
+    // Audio is untouched: losing video is a degradation, losing the call
+    // is a failure.
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 10);
+    assert!(a.is_connected());
+    b.heard.clear();
+    a.speak(b"still talking", now);
+    pump(&sfu, &mut [&mut a, &mut b], &mut now, 6);
+    assert_eq!(b.heard_on("user-1"), [b"still talking".to_vec()]);
+}
+
+#[test]
+fn a_voice_only_peers_offer_never_grows_a_video_section() {
+    // The normative rule, checked where it is actually enforced: a server
+    // MUST NOT include a video media section in an offer to a peer that
+    // has not subscribed to that publication.
+    let now = Instant::now();
+    let sfu = new_sfu();
+    let mut a = Client::new(1, 6150, now);
+    let mut b = Client::new(2, 6151, now);
+    join(&sfu, &mut a, 0);
+    join(&sfu, &mut b, 0);
+    sfu.publish(1, 0, VideoKind::Camera);
+    sfu.publish(1, 0, VideoKind::Screen);
+
+    // The publisher gets its own send sections, and nothing else does.
+    let publisher = offer_of(&sfu, 1, 0);
+    assert!(publisher.contains("a=mid:cam-send\r\n"));
+    assert!(publisher.contains("a=mid:scr-send\r\n"));
+    assert!(publisher.contains("a=content:slides\r\n"), "only on screen");
+    assert_eq!(publisher.matches("a=content:slides").count(), 1);
+
+    let bystander = offer_of(&sfu, 2, 0);
+    assert!(
+        !bystander.contains("m=video"),
+        "not one video section for a peer that asked for nothing"
+    );
+    assert!(
+        bystander.contains("a=mid:user-1\r\n"),
+        "audio is unaffected"
+    );
 }

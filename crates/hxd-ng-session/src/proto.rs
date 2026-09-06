@@ -2,6 +2,9 @@
 //! encoding. The normative description is `docs/hotline-ng.md` §5–§7; this
 //! module is its executable form.
 
+use hxd_core::video::{
+    VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,
+};
 use hxd_core::voice::{IceCandidate, VoiceError, VoiceParticipant};
 use hxd_core::{Event, SeqEvent, SessionStatus, UserInfo};
 use serde::Deserialize;
@@ -148,6 +151,119 @@ pub fn participants_json(ps: &[VoiceParticipant]) -> Value {
     )
 }
 
+// --- Video (docs/capabilities-video.md §"Hotline-ng Binding") -----------
+//
+// The same four requests and one event the classic wire carries as
+// 607-611, transliterated. `kind` is a string here rather than an
+// integer, `paused` a boolean rather than a flags word, and `streams` an
+// array of objects rather than a packed blob — for the same reason the
+// voice binding sends a participant array: the transport is already JSON
+// and a mobile client should not be decoding bit fields.
+//
+// SDP and ICE are *not* transliterated, because there is nothing to
+// transliterate: video renegotiation is `voice_offer` / `voice_answer` /
+// `voice_ice` on the same peer connection, unchanged in shape.
+
+#[derive(Debug, Deserialize)]
+pub struct VideoStartParams {
+    #[serde(default)]
+    pub cid: u32,
+    pub kind: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct VideoStopParams {
+    #[serde(default)]
+    pub cid: u32,
+    /// Omitted stops every publication this session holds in the room.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VideoStateParams {
+    #[serde(default)]
+    pub cid: u32,
+    pub kind: String,
+    pub paused: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct VideoSubscribeParams {
+    #[serde(default)]
+    pub cid: u32,
+    /// The **complete** desired set; `[]` turns all video off in one
+    /// request. For a mobile client this is the whole point of the
+    /// binding — the ng protocol exists for clients on cellular
+    /// connections, and this is the message that keeps a video room
+    /// affordable on one.
+    #[serde(default)]
+    pub streams: Vec<VideoStreamJson>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VideoStreamJson {
+    pub uid: u16,
+    pub kind: String,
+}
+
+/// Read a subscription array, dropping entries that name a kind this
+/// revision doesn't define rather than failing the whole request — a
+/// client from a later revision asking for screen audio should lose that
+/// one stream, not its subscription set.
+pub fn parse_streams(v: &[VideoStreamJson]) -> Vec<VideoStream> {
+    v.iter()
+        .filter_map(|s| {
+            Some(VideoStream {
+                uid: s.uid,
+                kind: VideoKind::from_name(&s.kind)?,
+            })
+        })
+        .collect()
+}
+
+pub fn publishers_json(ps: &[VideoPublication]) -> Value {
+    Value::Array(
+        ps.iter()
+            .map(|p| json!({ "uid": p.uid, "kind": p.kind.name(), "paused": p.paused }))
+            .collect(),
+    )
+}
+
+fn limits_json(l: &VideoLimits) -> Value {
+    json!({
+        "max_width": l.max_width,
+        "max_height": l.max_height,
+        "max_fps": l.max_fps,
+        "max_bitrate": l.max_bitrate,
+        "max_per_room": l.max_per_room,
+    })
+}
+
+/// The login reply's `video` object: the ceilings, reported once as an
+/// object rather than as a repeated field.
+pub fn video_limits_json(c: &VideoConfig) -> Value {
+    json!({
+        "camera": limits_json(&c.camera),
+        "screen": limits_json(&c.screen),
+    })
+}
+
+/// The error code and text for a refused video operation. Codes are the
+/// closed set the spec's ng-binding table lists.
+pub fn video_err(e: VideoError) -> (&'static str, &'static str) {
+    match e {
+        VideoError::Disabled => ("video_disabled", "Video is not available on this server."),
+        VideoError::NotInVoice => ("not_in_voice", "You are not in that voice chat."),
+        VideoError::AlreadyPublishing => ("already_publishing", "You are already publishing that."),
+        VideoError::NotPublishing => ("not_publishing", "You are not publishing that."),
+        VideoError::Full => (
+            "video_full",
+            "Someone else is already sharing. Ask them to stop first.",
+        ),
+    }
+}
+
 /// The error code and text for a refused voice operation. Codes are the
 /// closed set docs/voice.md §8 lists; the text is for a human.
 pub fn voice_err(e: VoiceError) -> (&'static str, &'static str) {
@@ -242,6 +358,13 @@ pub fn event_json(se: &SeqEvent) -> String {
         Event::VoiceStatus { cid, participants } => (
             "voice_status",
             json!({ "cid": cid, "participants": participants_json(participants) }),
+        ),
+        // The complete publication list on every emission, exactly as
+        // transaction 611 carries it: a client replaces its whole view of
+        // the room's video state on each one.
+        Event::VideoStatus { cid, publications } => (
+            "video_status",
+            json!({ "cid": cid, "publishers": publishers_json(publications) }),
         ),
         // No ng mapping yet (private-chat family, and any future event this
         // build predates): emit a placeholder so seq accounting stays

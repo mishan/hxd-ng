@@ -45,6 +45,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
+use hxd_core::video::{VideoConfig, VideoKind, VideoStream};
 use hxd_core::voice::{IceCandidate, MediaEvent, VoiceError, VoiceMedia};
 use hxd_core::Uid;
 use str0m::net::{Protocol, Receive};
@@ -54,7 +55,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info, warn};
 
 use crate::peer::Peer;
-use crate::sdp::{host_candidates, MIC_MID, PCMU_PT};
+use crate::sdp::{host_candidates, MIC_MID, PCMU_PT, VP8_PT};
 
 /// The spec's timeouts, as minimums. All measured against the monotonic
 /// clock the caller passes in.
@@ -73,7 +74,22 @@ mod timeouts {
     pub const DTLS: Duration = Duration::from_secs(10);
     /// No RTP *or RTCP* from a client whose session was established.
     pub const MEDIA: Duration = Duration::from_secs(30);
+    /// A publication whose RTP has stopped while the peer's session
+    /// stays alive. It costs the publication and its slot, and **never**
+    /// the call: losing video is a degradation, losing the call is a
+    /// failure.
+    pub const VIDEO: Duration = Duration::from_secs(30);
 }
+
+/// The floor between keyframe requests for one publication.
+///
+/// The spec RECOMMENDS one second, and the number is load-bearing rather
+/// than decorative: eight receivers whose renegotiations complete
+/// together will each want a keyframe within a few milliseconds, and
+/// eight keyframes is a bitrate spike at precisely the wrong moment. One
+/// request coalesces the burst into the one keyframe that satisfies all
+/// of them.
+const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long the pump waits when no peer has anything to do.
 const IDLE_TICK: Duration = Duration::from_millis(500);
@@ -121,12 +137,26 @@ struct Inner {
     candidates: Vec<Candidate>,
     events: UnboundedSender<MediaEvent>,
     next_session_id: u64,
+    /// The configured per-kind ceilings, reflected in `b=AS` on every
+    /// video section. Configuration, not negotiation.
+    video: VideoConfig,
+}
+
+/// Which of a peer's streams a packet belongs to. Audio is the peer
+/// itself; video needs the kind too, because one peer can be sending a
+/// camera and a screen at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Audio,
+    Video(VideoKind),
 }
 
 /// One packet on its way from one peer to the others.
 struct Forward {
     from: Uid,
     cid: u32,
+    stream: Stream,
+    pt: u8,
     seq_no: str0m::rtp::SeqNo,
     time: u32,
     marker: bool,
@@ -141,6 +171,7 @@ impl Sfu {
     /// hands back.
     pub fn new(
         advertise: &[SocketAddr],
+        video: VideoConfig,
     ) -> Result<(Arc<Sfu>, UnboundedReceiver<MediaEvent>), SfuError> {
         install_crypto();
         let candidates = host_candidates(advertise);
@@ -155,6 +186,7 @@ impl Sfu {
                 candidates,
                 events: tx,
                 next_session_id: 1,
+                video,
             }),
         });
         Ok((sfu, rx))
@@ -330,6 +362,38 @@ impl Inner {
         for uid in failed {
             self.fail(uid);
         }
+        self.expire_publications(now);
+    }
+
+    /// A publication whose media has stopped while its peer's session is
+    /// healthy: drop it, release its slot, and leave the audio alone.
+    ///
+    /// Only a publication that has been live counts. One that has never
+    /// sent anything is either paused or still negotiating, and both of
+    /// those are legitimately silent — reaping them would make "turn my
+    /// camera off for a minute" end the publication.
+    fn expire_publications(&mut self, now: Instant) {
+        let mut stalled = Vec::new();
+        for (uid, p) in &self.peers {
+            for pubn in &p.publications {
+                if pubn.paused {
+                    continue;
+                }
+                if pubn
+                    .last_media
+                    .is_some_and(|t| now.duration_since(t) >= timeouts::VIDEO)
+                {
+                    stalled.push((*uid, p.cid, pubn.kind));
+                }
+            }
+        }
+        for (uid, cid, kind) in stalled {
+            info!(uid, cid, ?kind, "video publication stalled; dropping it");
+            if let Some(peer) = self.peers.get_mut(&uid) {
+                peer.undeclare_video_send(kind);
+            }
+            self.emit(MediaEvent::VideoFailed { uid, cid, kind });
+        }
     }
 
     /// One pass over every peer: drive its clock, take its outbound
@@ -338,6 +402,7 @@ impl Inner {
         let mut forwards = Vec::new();
         let uids: Vec<Uid> = self.peers.keys().copied().collect();
         let mut broken = Vec::new();
+        let mut keyframes: Vec<(Uid, VideoKind)> = Vec::new();
         for uid in uids {
             let Some(peer) = self.peers.get_mut(&uid) else {
                 continue;
@@ -380,24 +445,65 @@ impl Inner {
                         Event::SenderFeedback(_) => peer.last_media = Some(now),
                         Event::RtpPacket(p) => {
                             peer.last_media = Some(now);
-                            if peer.muted {
-                                // Server-enforced mute, and it really is
-                                // one `if`: the packet is dropped before
-                                // anyone could be sent it, whatever the
-                                // client chooses to keep sending.
+                            let pt = *p.header.payload_type;
+                            let stream = if pt == PCMU_PT {
+                                if peer.muted {
+                                    // Server-enforced mute, and it really
+                                    // is one `if`: the packet is dropped
+                                    // before anyone could be sent it,
+                                    // whatever the client keeps sending.
+                                    continue;
+                                }
+                                Stream::Audio
+                            } else if pt == VP8_PT {
+                                // Keyed by SSRC, never by mid or payload
+                                // type: a camera and a screen from one
+                                // peer are the same codec on the same
+                                // transport, and the SSRC the answer
+                                // declared is the only thing that tells
+                                // them apart. No match means no
+                                // publication to attribute it to, and
+                                // guessing is worse than dropping.
+                                let Some(pubn) = peer.publication_by_ssrc(*p.header.ssrc) else {
+                                    continue;
+                                };
+                                let kind = pubn.kind;
+                                let paused = pubn.paused;
+                                if let Some(pubn) = peer.publication_mut(kind) {
+                                    pubn.last_media = Some(now);
+                                }
+                                if paused {
+                                    // Pause is enforced exactly as mute
+                                    // is: by discarding the inbound RTP,
+                                    // not by trusting the client to have
+                                    // stopped capturing.
+                                    continue;
+                                }
+                                Stream::Video(kind)
+                            } else {
+                                // RTX (97) and anything else a client
+                                // sends uninvited.
                                 continue;
-                            }
-                            if *p.header.payload_type != PCMU_PT {
-                                continue;
-                            }
+                            };
                             forwards.push(Forward {
                                 from: uid,
                                 cid: peer.cid,
+                                stream,
+                                pt,
                                 seq_no: p.seq_no,
                                 time: p.header.timestamp,
                                 marker: p.header.marker,
                                 payload: p.payload.clone(),
                             });
+                        }
+                        Event::KeyframeRequest(req) => {
+                            // A receiver has no keyframe and said so.
+                            // Relay it to whoever is publishing that
+                            // section — rate-limited at the publisher, so
+                            // a room asking at once costs one keyframe.
+                            if let Some((publisher, kind)) = peer.publisher_for_mid(req.mid) {
+                                keyframes.push((publisher, kind));
+                            }
                         }
                         _ => {}
                     },
@@ -412,11 +518,30 @@ impl Inner {
         for uid in broken {
             self.fail(uid);
         }
+        for (uid, kind) in keyframes {
+            self.request_keyframe(uid, kind, now);
+        }
         forwards
+    }
+
+    /// Ask a publisher for a keyframe, no more than once a second per
+    /// publication.
+    fn request_keyframe(&mut self, uid: Uid, kind: VideoKind, now: Instant) {
+        if let Some(peer) = self.peers.get_mut(&uid) {
+            if peer.request_keyframe(kind, now, KEYFRAME_INTERVAL) {
+                debug!(uid, ?kind, "requested a keyframe from the publisher");
+            }
+        }
     }
 
     /// The SFU's whole job: copy each packet onto every other peer in the
     /// room, on the section that peer knows as this speaker's.
+    ///
+    /// Audio goes to everyone in the room; **video goes only to peers
+    /// that asked for it.** That single difference is what keeps a
+    /// video-less client safe without a special case for it: it is a peer
+    /// whose subscription set is empty, and it takes the same code path
+    /// as a video-capable one that hasn't subscribed yet.
     fn forward_all(&mut self, forwards: Vec<Forward>, now: Instant) {
         for f in forwards {
             let Some(room) = self.rooms.get(&f.cid) else {
@@ -430,7 +555,16 @@ impl Inner {
                 if !peer.connected {
                     continue;
                 }
-                let Some(mid) = peer.mid_for(f.from).map(str::to_string) else {
+                let mid = match f.stream {
+                    Stream::Audio => peer.mid_for(f.from).map(str::to_string),
+                    Stream::Video(kind) => {
+                        if !peer.subscribes_to(f.from, kind) {
+                            continue;
+                        }
+                        peer.video_mid_for(f.from, kind).map(str::to_string)
+                    }
+                };
+                let Some(mid) = mid else {
                     continue;
                 };
                 let mut api = peer.rtc.direct_api();
@@ -441,14 +575,8 @@ impl Inner {
                 // pass through untouched; only the SSRC is ours, and it
                 // is the one this peer's SDP declared.
                 stream.write_rtp(
-                    RtpWrite::new(
-                        PCMU_PT.into(),
-                        f.seq_no,
-                        f.time,
-                        now,
-                        Arc::clone(&f.payload),
-                    )
-                    .marker(f.marker),
+                    RtpWrite::new(f.pt.into(), f.seq_no, f.time, now, Arc::clone(&f.payload))
+                        .marker(f.marker),
                 );
             }
         }
@@ -462,6 +590,31 @@ impl Inner {
             .unwrap_or(now + IDLE_TICK)
             .max(now)
             .min(now + IDLE_TICK)
+    }
+
+    /// The publications `viewer` has subscribed to that still exist, and
+    /// the SSRC each is forwarded on.
+    ///
+    /// The intersection is taken here rather than trusted from the
+    /// domain's last call, because a publisher can stop or leave between
+    /// one and the next and an offer must never describe a section the
+    /// forwarding path won't fill.
+    fn present_video(&self, cid: u32, viewer: Uid) -> Vec<(Uid, VideoKind, u32)> {
+        let Some(peer) = self.peers.get(&viewer) else {
+            return Vec::new();
+        };
+        let Some(room) = self.rooms.get(&cid) else {
+            return Vec::new();
+        };
+        peer.subscriptions
+            .iter()
+            .filter(|s| s.uid != viewer && room.contains(&s.uid))
+            .filter_map(|s| {
+                let publisher = self.peers.get(&s.uid)?;
+                let pubn = publisher.publication(s.kind)?;
+                Some((s.uid, s.kind, pubn.forward_ssrc))
+            })
+            .collect()
     }
 
     /// Who else is in this room, and on which SSRC their audio arrives.
@@ -524,7 +677,9 @@ impl VoiceMedia for Sfu {
     fn offer(&self, uid: Uid, cid: u32) -> Option<String> {
         let mut inner = self.inner.lock().unwrap();
         let present = inner.present(cid, uid);
+        let present_video = inner.present_video(cid, uid);
         let candidates = inner.candidates.clone();
+        let limits = inner.video;
         let Some(peer) = inner.peers.get_mut(&uid) else {
             // The domain never asks for an offer for a peer it hasn't
             // joined, but the sentinel is exactly for the case where it
@@ -537,7 +692,17 @@ impl VoiceMedia for Sfu {
                 full = true;
             }
         }
-        let sdp = peer.offer(&present, &candidates);
+        // Only subscribed publications get a section. A peer that has
+        // subscribed to nothing is offered no video sections at all,
+        // which is what stops the server inviting itself to send
+        // megabits to a client that would decode them and throw them
+        // away.
+        for (other, kind, ssrc) in &present_video {
+            if !peer.declare_remote_video(*other, *kind, *ssrc) {
+                full = true;
+            }
+        }
+        let sdp = peer.offer(&present, &present_video, &candidates, &limits);
         let peer_cid = peer.cid;
         if full {
             // This session has been in the room long enough to collect
@@ -580,9 +745,26 @@ impl VoiceMedia for Sfu {
         let Some(peer) = inner.peers.get_mut(&uid) else {
             return Err(VoiceError::NotInVoice);
         };
-        if let Err(e) = peer.apply_answer(&answer, now) {
-            warn!(uid, cid, "voice answer refused by the stack: {e}");
-            return Err(VoiceError::BadAnswer);
+        let unbindable = match peer.apply_answer(&answer, now) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(uid, cid, "voice answer refused by the stack: {e}");
+                return Err(VoiceError::BadAnswer);
+            }
+        };
+        // A video send section the client answered without an `a=ssrc`,
+        // or declined outright. The publication goes; the call stays.
+        for kind in unbindable {
+            warn!(
+                uid,
+                cid,
+                ?kind,
+                "video answer declares no SSRC for this publication; dropping it"
+            );
+            if let Some(peer) = inner.peers.get_mut(&uid) {
+                peer.undeclare_video_send(kind);
+            }
+            inner.emit(MediaEvent::VideoFailed { uid, cid, kind });
         }
         // ICE-lite: our candidates rode the offer, so the only thing
         // left to trickle is the end of them. Sending it after the
@@ -623,6 +805,90 @@ impl VoiceMedia for Sfu {
                 }
                 peer.muted = muted;
             }
+        }
+    }
+
+    // --- Video ----------------------------------------------------------
+
+    fn video_codec(&self) -> &'static str {
+        "VP8"
+    }
+
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) {
+        let mut inner = self.inner.lock().unwrap();
+        // The forwarding SSRC is allocated up front, exactly as audio's
+        // is: the offer for a publication has to be complete before the
+        // publisher's answer arrives, or every subscriber who joined
+        // first would need renegotiating again the moment it did.
+        let Some(peer) = inner.peers.get_mut(&uid) else {
+            return;
+        };
+        if peer.cid != cid {
+            return;
+        }
+        let ssrc = *peer.rtc.direct_api().new_ssrc();
+        if peer.declare_video_send(kind, ssrc) {
+            info!(uid, cid, ?kind, "video publication started");
+        }
+    }
+
+    fn unpublish(&self, uid: Uid, cid: u32, kind: VideoKind) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(peer) = inner.peers.get_mut(&uid) else {
+            return;
+        };
+        if peer.cid == cid && peer.undeclare_video_send(kind) {
+            info!(uid, cid, ?kind, "video publication stopped");
+        }
+    }
+
+    fn set_paused(&self, uid: Uid, cid: u32, kind: VideoKind, paused: bool) {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        let Some(peer) = inner.peers.get_mut(&uid) else {
+            return;
+        };
+        if peer.cid != cid {
+            return;
+        }
+        if let Some(pubn) = peer.publication_mut(kind) {
+            pubn.paused = paused;
+            if paused {
+                // A paused publication sends nothing, so its media clock
+                // must stop counting against the stall reaper too.
+                pubn.last_media = None;
+            }
+        }
+        if !paused {
+            // A decoder cannot start mid-stream, so a resumed publication
+            // is a black tile until the next keyframe. Ask for one rather
+            // than waiting for the encoder to volunteer it, which VP8 may
+            // not do for many seconds.
+            inner.request_keyframe(uid, kind, now);
+        }
+    }
+
+    fn set_subscriptions(&self, uid: Uid, cid: u32, streams: &[VideoStream]) {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        let Some(peer) = inner.peers.get_mut(&uid) else {
+            return;
+        };
+        if peer.cid != cid {
+            return;
+        }
+        // Only what is newly arriving needs a keyframe. A set that is
+        // re-declared unchanged — which is what an idempotent absolute
+        // set invites a client to do — must not cost the room a keyframe
+        // each time.
+        let added: Vec<VideoStream> = streams
+            .iter()
+            .filter(|s| !peer.subscriptions.contains(s))
+            .copied()
+            .collect();
+        peer.subscriptions = streams.to_vec();
+        for s in added {
+            inner.request_keyframe(s.uid, s.kind, now);
         }
     }
 }

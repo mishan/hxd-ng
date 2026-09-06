@@ -6,6 +6,7 @@
 pub mod caps;
 pub mod frame;
 pub mod session;
+pub mod video;
 pub mod voice;
 
 pub use caps::{cap, Caps};

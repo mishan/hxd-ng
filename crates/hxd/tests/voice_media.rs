@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use hotline_proto::messages::tag;
+use hxd_core::video::VideoConfig;
 use hxd_core::Core;
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::{cap, Caps};
@@ -63,7 +64,7 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
     // client will ever try.
     let media_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let media_addr = media_socket.local_addr().unwrap();
-    let (sfu, mut events) = Sfu::new(&[media_addr]).unwrap();
+    let (sfu, mut events) = Sfu::new(&[media_addr], VideoConfig::default()).unwrap();
 
     let core = Arc::new(Core::new().with_voice(sfu.clone(), 16));
     let core_for_events = core.clone();

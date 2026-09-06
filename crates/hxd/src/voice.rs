@@ -109,6 +109,7 @@ mod tests {
             bind: bind.map(str::to_string),
             advertise: advertise.iter().map(|s| s.to_string()).collect(),
             max_per_room: 16,
+            video: None,
         }
     }
 
@@ -171,6 +172,7 @@ mod tests {
 #[cfg(feature = "voice")]
 mod imp {
     use super::*;
+    use hxd_core::video::VideoConfig;
     use hxd_core::voice::MediaEvent;
     use hxd_core::VoiceMedia;
     use hxd_voice::Sfu;
@@ -194,7 +196,11 @@ mod imp {
             .voice
             .as_ref()
             .map_or(hxd_core::DEFAULT_MAX_PER_ROOM, |v| v.max_per_room);
-        let (sfu, events) = Sfu::new(&advertise).map_err(|e| e.to_string())?;
+        let video = config
+            .voice
+            .as_ref()
+            .map_or_else(VideoConfig::default, |v| v.video_config());
+        let (sfu, events) = Sfu::new(&advertise, video).map_err(|e| e.to_string())?;
         // Bind here, not in `serve`. Everything downstream — the
         // capability bit on both wires, `Core::with_voice`, the room
         // state — is a promise that a join will work, and a port that
