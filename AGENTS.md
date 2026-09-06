@@ -66,9 +66,9 @@ Outside the workspace, `client/` is the **web client** for the ng wire
 reference for the protocol): chat, the user list with the cicn icons
 packed into a committed sprite sheet, PMs, voice and video, resume across
 a dropped socket *and* a page reload, and a debug drawer carrying the
-whole frame trace. `client/dist/` and `client/public/icons.png` are
-generated **and committed**, so a source change is not finished until
-`npm run build` has been run and its output committed with it.
+whole frame trace. `client/public/icons.png` is generated and committed
+— regenerate it only when `icons.rsrc` changes — while `client/dist/` is
+a build artefact and is not.
 
 `tools/ng-client.mjs` is an interactive ng test client (Node 22+, or
 `npm install` in tools/ for the `ws` fallback) — `/drop` exercises
@@ -178,7 +178,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 node --check tools/ng-client.mjs
-(cd client && npm run build)   # typechecks, and refreshes the committed dist/
+(cd client && npm run build)   # typecheck and build the client
 ```
 
 The best end-to-end check of all: point a real GtkHx at the legacy port

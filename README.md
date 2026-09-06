@@ -107,10 +107,17 @@ clipboard.
 cd client && npm install && npm run dev     # http://localhost:5701
 ```
 
-`client/dist/` is a committed static build, so serving that directory
-with anything at all — `python3 -m http.server` included — works with no
-toolchain. The icons come from `gtkhx/icons.rsrc`, packed into one
-committed sprite sheet by `client/tools/build-icons.py`. See
+`npm run build` produces `client/dist/`, a directory of plain static
+files any web server can host; it is a build artefact and is not
+committed. The icons *are*: they come from `gtkhx/icons.rsrc`, packed
+into one sprite sheet by `client/tools/build-icons.py`, so running the
+client needs no Python.
+
+Voice and video need a **secure context** — `navigator.mediaDevices` is
+undefined without one — so a phone reaching the client over plain http on
+the LAN gets chat and the user list but no microphone. Serve the page
+over https (the same certificate the `wss://` endpoint wants), or tunnel
+it so the browser sees `localhost`. See
 [client/README.md](client/README.md).
 
 The web client and a real GtkHx on the legacy port, chatting to each

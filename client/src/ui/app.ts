@@ -25,7 +25,7 @@ import { DebugPanel } from './debug';
 import { clock, fill, h } from './dom';
 import { icon } from './icons';
 import { pickIcon } from './iconpicker';
-import { Media } from './media';
+import { captureBlockedReason, Media, screenShareBlockedReason } from './media';
 import { renderRoster } from './roster';
 import { appendLine, isAtBottom, renderTranscript, scrollToEnd } from './transcript';
 
@@ -56,6 +56,12 @@ export class App {
   });
   private composerHint = h('span', { class: 'composer-hint' });
   private rosterEl = h('aside', { class: 'roster' });
+  private scrim = h('div', { class: 'scrim' });
+  private peopleBtn = h(
+    'button',
+    { class: 'ghost people-toggle', title: 'Show the user list' },
+    'People',
+  );
   private meButton = h('button', { class: 'identity', title: 'Change your icon' });
 
   constructor(private root: HTMLElement) {
@@ -70,6 +76,9 @@ export class App {
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'd') {
         e.preventDefault();
         this.debug.toggle();
+      }
+      if (e.key === 'Escape' && document.body.classList.contains('show-roster')) {
+        this.showRoster(false);
       }
     });
   }
@@ -453,8 +462,9 @@ export class App {
     renderRoster(this.rosterEl, this.store, this.media, {
       onMessage: (u) => {
         this.select(this.store.openPm(u.uid, u.nick).id);
-        document.body.classList.remove('show-roster');
+        this.showRoster(false);
       },
+      onClose: () => this.showRoster(false),
     });
   }
 
@@ -499,8 +509,19 @@ export class App {
       buttons.push(b);
     };
 
+    // Capture permission is a property of how the page was *served*, not
+    // of the server or the account, so it is checked here and reported
+    // in the bar rather than discovered by a failed tap.
+    const noCapture = captureBlockedReason();
+    const disable = (why: string) => {
+      const b = buttons[buttons.length - 1] as HTMLButtonElement;
+      b.disabled = true;
+      b.title = why;
+    };
+
     if (!media.joined) {
       add('Join voice', false, () => media.join(), 'suggest');
+      if (noCapture) disable(noCapture);
     } else {
       add(media.muted ? 'Unmute' : 'Mute', !media.muted, () => media.setMuted(!media.muted));
       add('Leave voice', false, () => media.leave());
@@ -510,6 +531,8 @@ export class App {
         if (cam) add(media.camPaused ? 'Resume' : 'Pause', media.camPaused, () => media.togglePause());
         const scr = media.publishing.includes('screen');
         add(scr ? 'Stop sharing' : 'Share screen', scr, () => media.toggleShare());
+        const noShare = scr ? null : screenShareBlockedReason();
+        if (noShare) disable(noShare);
         add(
           media.watching ? 'Stop watching' : 'Watch video',
           media.watching,
@@ -519,10 +542,16 @@ export class App {
     }
     const detail = media.joined
       ? `${media.participants.length} in voice${media.codec ? ` · ${media.codec}` : ''}`
-      : media.hasVideo
-        ? 'voice and video'
-        : 'voice';
-    fill(this.callbar, ...buttons, h('span', { class: 'call-detail muted' }, detail));
+      : noCapture
+        ? noCapture
+        : media.hasVideo
+          ? 'voice and video'
+          : 'voice';
+    fill(
+      this.callbar,
+      ...buttons,
+      h('span', { class: `call-detail ${noCapture && !media.joined ? 'warn' : 'muted'}` }, detail),
+    );
   }
 
   // --- shell ------------------------------------------------------------
@@ -531,8 +560,9 @@ export class App {
     // The roster is a column on a desktop and a slide-in panel on a
     // phone; this button only exists for the second case, and CSS is
     // what decides which case we are in.
-    const peopleBtn = h('button', { class: 'ghost people-toggle', title: 'Show the user list' }, 'People');
-    peopleBtn.onclick = () => document.body.classList.toggle('show-roster');
+    this.peopleBtn.onclick = () =>
+      this.showRoster(!document.body.classList.contains('show-roster'));
+    this.scrim.onclick = () => this.showRoster(false);
 
     const debugBtn = h('button', { class: 'ghost', title: 'Wire trace and session state (⇧⌘D)' }, 'Debug');
     debugBtn.onclick = () => this.debug.toggle();
@@ -579,7 +609,7 @@ export class App {
         h('div', { class: 'spacer' }),
         this.meButton,
         this.pill,
-        peopleBtn,
+        this.peopleBtn,
         themeBtn,
         debugBtn,
       ),
@@ -595,6 +625,10 @@ export class App {
           this.transcript,
           h('div', { class: 'composer' }, this.composer, this.composerHint),
         ),
+        // Both live inside `.panes` rather than the document, so the
+        // slide-in panel is bounded by the pane area and never covers
+        // the title bar — including the button that opens it.
+        this.scrim,
         this.rosterEl,
       ),
     );
@@ -606,6 +640,20 @@ export class App {
   private mountTiles(): void {
     const slot = this.shell.querySelector('.tiles-slot');
     if (slot && this.media && !this.media.tiles.isConnected) slot.append(this.media.tiles);
+  }
+
+  /** Open or close the narrow-layout roster panel.
+   *
+   *  A panel you cannot dismiss is worse than no panel, so there are
+   *  four ways out and this is the one place that knows about all of
+   *  them: the same button (which stays reachable because the panel is
+   *  confined to the pane area), the scrim behind it, Escape, and
+   *  picking someone to message. */
+  private showRoster(open: boolean): void {
+    document.body.classList.toggle('show-roster', open);
+    this.peopleBtn.classList.toggle('on', open);
+    this.peopleBtn.setAttribute('aria-expanded', String(open));
+    this.peopleBtn.title = open ? 'Hide the user list' : 'Show the user list';
   }
 
   private async editSelf(): Promise<void> {

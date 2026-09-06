@@ -35,6 +35,44 @@ export interface MediaHooks {
 
 const MID_RE = /^(cam|scr)-user-(\d+)$/;
 
+/**
+ * Why this page cannot capture a microphone or camera, or `null` when it
+ * can.
+ *
+ * `navigator.mediaDevices` is only *defined* in a secure context. A page
+ * served over plain http from anything but localhost therefore does not
+ * have a `getUserMedia` that refuses politely — it has no `mediaDevices`
+ * at all, and reaching through it throws a TypeError about reading a
+ * property of undefined. That is exactly what a phone opening this
+ * client over the LAN hits, so the condition is checked up front and
+ * reported in words rather than left to surface as a type error.
+ */
+export function captureBlockedReason(): string | null {
+  if (!window.isSecureContext) {
+    return (
+      `Voice needs a secure context and ${location.origin} is not one, so this ` +
+      'browser withholds the microphone entirely. Serve the client over https, ' +
+      'or reach it as localhost (an SSH tunnel counts).'
+    );
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return 'This browser does not offer getUserMedia, so voice is unavailable here.';
+  }
+  return null;
+}
+
+/** Screen sharing is a separate capability, not a corollary of the one
+ *  above: iOS Safari has `getUserMedia` and no `getDisplayMedia` at all. */
+export function screenShareBlockedReason(): string | null {
+  const blocked = captureBlockedReason();
+  if (blocked) return blocked;
+  // Typed as always present, actually optional in the wild.
+  const md = navigator.mediaDevices as Partial<MediaDevices>;
+  return md.getDisplayMedia
+    ? null
+    : 'This browser cannot share a screen — it has no getDisplayMedia.';
+}
+
 export class Media {
   readonly tiles: HTMLElement;
 
@@ -109,6 +147,8 @@ export class Media {
   // --- voice ------------------------------------------------------------
 
   async join(): Promise<void> {
+    const blocked = captureBlockedReason();
+    if (blocked) throw new Error(blocked);
     this.mic = await navigator.mediaDevices.getUserMedia({ audio: true });
     this.pc = this.newPeerConnection();
     for (const t of this.mic.getTracks()) this.pc.addTrack(t, this.mic);
@@ -225,6 +265,8 @@ export class Media {
       this.hooks.onControls();
       return;
     }
+    const blocked = captureBlockedReason();
+    if (blocked) throw new Error(blocked);
     // Configure the encoder inside the advertised ceiling *before*
     // publishing: the limits are configuration, not negotiation, and a
     // client that cannot be constrained to them must not publish.
@@ -271,6 +313,8 @@ export class Media {
       this.hooks.onControls();
       return;
     }
+    const blocked = screenShareBlockedReason();
+    if (blocked) throw new Error(blocked);
     // getDisplayMedia is its own consent step, per share, with the
     // browser's own sharing indicator — exactly what the spec asks a
     // client to provide and forbids it from remembering.

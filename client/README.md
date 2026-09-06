@@ -27,15 +27,33 @@ npm run build
 cd dist && python3 -m http.server 8080
 ```
 
-**`dist/` is committed.** So is `public/icons.png`. Both are generated,
-and both are checked in so that the client can be served without a
-toolchain — but that means a source change is not finished until
-`npm run build` has been run and the result committed with it.
+`dist/` is a build artefact and is **not** committed — it would churn on
+every change. `public/icons.png` and `public/icons.json` are, because
+they change only when `icons.rsrc` does, and committing them means
+running the client needs no Python.
 
-In production the page must be served over **https** next to a **wss://**
-endpoint: `getUserMedia` and `getDisplayMedia` need a secure context, and
-the ng spec mandates WSS anyway. `localhost` counts as secure, which is
-why the development setup above works unencrypted.
+### Serving it to a phone, and why voice needs https
+
+`getUserMedia` and `getDisplayMedia` do not merely *fail* outside a
+secure context — `navigator.mediaDevices` is **undefined** there. So a
+phone opening `http://titan:5701/` over the LAN gets chat, the roster and
+private messages working perfectly and no microphone at all. The client
+detects this and says so in the voice bar instead of throwing; there is
+no way around it from the page's side.
+
+Two ways to get a secure context for testing:
+
+```sh
+# a tunnel, so the phone's browser sees localhost
+ssh -L 5701:localhost:5701 -L 5700:localhost:5700 titan
+
+# or a real certificate in front of both, which is what production wants
+# anyway: https for the page, wss:// for the ng endpoint
+```
+
+The ng spec mandates WSS in production for its own reasons; the same
+certificate serves the page. `localhost` counts as secure, which is why
+the development setup above works unencrypted on the machine itself.
 
 ## The icons
 

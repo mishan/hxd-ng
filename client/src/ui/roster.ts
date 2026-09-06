@@ -21,17 +21,28 @@ export const ROSTER_SCALE = 2;
 
 export interface RosterHooks {
   onMessage: (u: User) => void;
+  /** Dismiss the panel. Only reachable on the narrow layout, where the
+   *  roster slides in over the conversation. */
+  onClose: () => void;
 }
 
 export function renderRoster(el: HTMLElement, store: Store, media: Media, hooks: RosterHooks): void {
   const users = store.roster();
   const rows = users.map((u) => row(u, store, media, hooks));
+  const close = h(
+    'button',
+    { class: 'roster-close', type: 'button', title: 'Hide the user list' },
+    '\u00d7',
+  );
+  close.onclick = () => hooks.onClose();
   fill(
     el,
     h(
       'div',
       { class: 'roster-head' },
       h('span', {}, users.length === 1 ? '1 person' : `${users.length} people`),
+      h('div', { class: 'spacer' }),
+      close,
     ),
     ...rows,
   );

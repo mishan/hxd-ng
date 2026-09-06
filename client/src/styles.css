@@ -257,6 +257,22 @@ input:focus-visible, textarea:focus-visible, button:focus-visible {
   padding: 0.4rem 0.5rem 0.5rem;
 }
 
+.roster-head { display: flex; align-items: center; }
+
+/* Shown only on the narrow layout, where the roster is dismissible. */
+.roster-close {
+  display: none;
+  font-size: 1.15rem;
+  line-height: 1;
+  color: var(--muted);
+  padding: 0.05rem 0.4rem 0.2rem;
+  border-radius: 6px;
+}
+.roster-close:hover { background: var(--surface-2); color: var(--text); }
+
+/* The backdrop behind that panel; inert until the layout calls for it. */
+.scrim { display: none; }
+
 .rail-item {
   display: flex;
   align-items: center;
@@ -319,6 +335,7 @@ button.call.on { border-color: var(--accent); color: var(--accent); background: 
 button.call.suggest { border-color: var(--accent); color: var(--accent); }
 button.call:disabled { opacity: 0.45; cursor: default; }
 .call-detail { font-size: 0.78rem; margin-left: 0.35rem; }
+.call-detail.warn { color: var(--warn); }
 
 .tiles {
   display: flex;
@@ -660,18 +677,35 @@ dialog.picker header input { width: 9rem; }
    wrapping as one paragraph — and the roster becomes a panel you slide
    in rather than a column that is simply gone. */
 @media (max-width: 44rem) {
-  .panes { grid-template-columns: minmax(0, 1fr); }
+  /* `position: relative` is what confines the panel and its scrim to the
+     pane area. Positioned against the viewport instead, the panel would
+     cover the title bar — and with it the People button, which is the
+     first thing anyone reaches for to close it again. */
+  .panes { position: relative; grid-template-columns: minmax(0, 1fr); }
   .people-toggle { display: inline-flex; }
+  .people-toggle.on { border-color: var(--accent); color: var(--accent); }
   .roster {
-    position: fixed;
+    position: absolute;
     inset: 0 0 0 auto;
     width: min(17rem, 78vw);
-    z-index: 5;
+    z-index: 20;
     box-shadow: var(--shadow);
     transform: translateX(100%);
     transition: transform 0.18s ease;
   }
   body.show-roster .roster { transform: none; }
+  .roster-close { display: inline-flex; }
+  .scrim {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 19;
+    background: rgb(0 0 0 / 45%);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease;
+  }
+  body.show-roster .scrim { opacity: 1; pointer-events: auto; }
 
   .line { display: block; padding: 0.12rem 0; }
   .line .time { display: none; }
