@@ -10,4 +10,4 @@ pub mod video;
 pub mod voice;
 
 pub use caps::{cap, Caps};
-pub use session::{run_session, serve, ServerConfig, ServerCtx};
+pub use session::{run_session, serve, ServerConfig, ServerCtx, TrtpLogin};

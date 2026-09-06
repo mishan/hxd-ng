@@ -36,7 +36,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, info, warn};
 
-use crate::identity::{b64, unb64, AuthRefused, TransportIdentity};
+use crate::identity::{b64, unb64, AuthRefused, ClassicLogin, TransportIdentity};
 use crate::{conn, tunnel, NgCtx};
 
 type Resp = Response<Full<Bytes>>;
@@ -84,6 +84,8 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         (&Method::GET, "/.well-known/hotline") => discovery(&ctx),
         (&Method::POST, "/identity/challenge") => challenge(&ctx),
         (&Method::POST, "/identity/auth") => auth(req, peer, &ctx).await,
+        (&Method::POST, "/identity/link") => link(req, peer, &ctx).await,
+        (&Method::POST, "/identity/unlink") => unlink(req, peer, &ctx).await,
         (&Method::PUT, "/identity/card") => put_card(req, peer, &ctx).await,
         (&Method::GET, p) if p.starts_with("/identity/card/") => {
             get_card(&p["/identity/card/".len()..], &ctx)
@@ -249,6 +251,8 @@ fn discovery(ctx: &NgCtx) -> Resp {
                     "challenge": "/identity/challenge",
                     "auth": "/identity/auth",
                     "card": "/identity/card",
+                    "link": "/identity/link",
+                    "unlink": "/identity/unlink",
                 },
             })
         }
@@ -294,22 +298,42 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     let (Some(card), Some(cert)) = (field("card"), field("device_cert")) else {
         return plain(StatusCode::BAD_REQUEST, "card and device_cert are required");
     };
-    if body.get("login").is_some() || body.get("password").is_some() {
-        // §5.4 / §8.2 arrive with account association.
+    // §5.4: classic credentials, verified and linked in the same step.
+    let login = body.get("login").and_then(Value::as_str).map(str::to_owned);
+    let password = body
+        .get("password")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if login.is_some() != password.is_some() {
+        return plain(StatusCode::BAD_REQUEST, "login and password go together");
+    }
+    let proof = field("proof");
+    if proof.is_none() && device_from_cert.is_none() {
         return plain(
-            StatusCode::NOT_IMPLEMENTED,
-            "account linking is not available yet",
+            StatusCode::BAD_REQUEST,
+            "proof is required without a client certificate",
         );
     }
-    let result = match (field("proof"), device_from_cert) {
-        (Some(proof), _) => st.auth_with_proof(&card, &cert, &proof),
-        (None, Some(device)) => st.auth_presented(&card, &cert, &device),
-        (None, None) => {
-            return plain(
-                StatusCode::BAD_REQUEST,
-                "proof is required without a client certificate",
-            )
+    // The state does signature checks and, with credentials or a
+    // create policy, file I/O: off the reactor.
+    let st = st.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let classic = login
+            .as_deref()
+            .zip(password.as_deref())
+            .map(|(login, password)| ClassicLogin {
+                login,
+                password: password.as_bytes(),
+            });
+        match (proof, device_from_cert) {
+            (Some(proof), _) => st.auth_with_proof(&card, &cert, &proof, classic),
+            (None, Some(device)) => st.auth_presented(&card, &cert, &device, classic),
+            (None, None) => unreachable!("checked above"),
         }
+    })
+    .await;
+    let Ok(result) = result else {
+        return plain(StatusCode::INTERNAL_SERVER_ERROR, "auth task failed");
     };
     match result {
         Ok((token, ident)) => {
@@ -323,10 +347,77 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
                     "handle": ident.handle,
                     "age": ident.age,
                     "outcome": ident.outcome.as_str(),
+                    "account": ident.account,
                 }),
             )
         }
         Err(e) => refused(e),
+    }
+}
+
+/// `POST /identity/link` (§8.2). The socket that proved the identity is
+/// whichever presented the token or certificate; a running guest session
+/// of the same identity is told to reconnect rather than upgraded in
+/// place (the spec allows either).
+async fn link(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
+    let Some(st) = ctx.identity.as_ref() else {
+        return plain(StatusCode::NOT_FOUND, "identity disabled");
+    };
+    let ident = match transport_identity(&req, peer, ctx) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return plain(
+                StatusCode::UNAUTHORIZED,
+                "a transport token or client certificate is required",
+            )
+        }
+        Err(resp) => return *resp,
+    };
+    let Some(body) = read_json(req).await else {
+        return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
+    };
+    let (Some(login), Some(password)) = (
+        body.get("login").and_then(Value::as_str).map(str::to_owned),
+        body.get("password")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    ) else {
+        return plain(StatusCode::BAD_REQUEST, "login and password are required");
+    };
+    let st = st.clone();
+    let result =
+        tokio::task::spawn_blocking(move || st.link(&ident, &login, password.as_bytes())).await;
+    match result {
+        Ok(Ok(account)) => json_resp(
+            StatusCode::OK,
+            json!({ "linked": account.login, "reconnect": true }),
+        ),
+        Ok(Err(e)) => refused(e),
+        Err(_) => plain(StatusCode::INTERNAL_SERVER_ERROR, "link task failed"),
+    }
+}
+
+/// `POST /identity/unlink` (§8.4).
+async fn unlink(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
+    let Some(st) = ctx.identity.as_ref() else {
+        return plain(StatusCode::NOT_FOUND, "identity disabled");
+    };
+    let ident = match transport_identity(&req, peer, ctx) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return plain(
+                StatusCode::UNAUTHORIZED,
+                "a transport token or client certificate is required",
+            )
+        }
+        Err(resp) => return *resp,
+    };
+    let st = st.clone();
+    let result = tokio::task::spawn_blocking(move || st.unlink(&ident)).await;
+    match result {
+        Ok(Ok(account)) => json_resp(StatusCode::OK, json!({ "unlinked": account.login })),
+        Ok(Err(e)) => refused(e),
+        Err(_) => plain(StatusCode::INTERNAL_SERVER_ERROR, "unlink task failed"),
     }
 }
 
@@ -362,11 +453,9 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
         }
         Err(resp) => return *resp,
     };
-    // The manage bit (§7) is checked against the certificate on file.
-    // `identity_for_device` re-verifies, so a device without it never gets
-    // this far via mTLS; the token path carries the parsed cert's caps
-    // forward when TransportIdentity grows them. For now: token holders
-    // may update; tighten when device caps ride the token.
+    if !ident.allows(hl_identity::caps::MANAGE) {
+        return refused(AuthRefused::NoManage);
+    }
     let Some(bytes) = read_body(req).await else {
         return plain(StatusCode::BAD_REQUEST, "expected a CBOR body");
     };
@@ -407,6 +496,12 @@ fn refused(e: AuthRefused) -> Resp {
             AuthRefused::Denied => "refused by server policy",
             AuthRefused::CardTooLarge => "the user card exceeds 16 KiB",
             AuthRefused::UnknownChallenge => "unknown or expired challenge",
+            AuthRefused::LoginFailed => "the account name or password is wrong",
+            AuthRefused::NoManage => "this device's certificate does not allow account management",
+            AuthRefused::AlreadyLinked => "this identity is already linked to another account here",
+            AuthRefused::WouldOrphan => "set a password on the account before unlinking; it has no other way in",
+            AuthRefused::NotLinked => "this identity has no linked account here",
+            AuthRefused::Backend => "server error",
         } }),
     )
 }

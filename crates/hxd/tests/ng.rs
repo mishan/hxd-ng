@@ -52,6 +52,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             ban_time: Duration::from_secs(60),
             caps: hxd_session::Caps::empty(),
             mark_cleartext: false,
+            trtp_login: hxd_session::TrtpLogin::Verify,
         }),
     };
     let ng_ctx = NgCtx {

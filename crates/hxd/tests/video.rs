@@ -136,6 +136,7 @@ async fn start_both(dir: &Path, video: bool) -> Server {
             ban_time: Duration::from_secs(60),
             caps,
             mark_cleartext: false,
+            trtp_login: hxd_session::TrtpLogin::Verify,
         }),
     };
     let ng_caps = if video {

@@ -10,7 +10,10 @@
 //! hlid attest  --registrar-key K --registrar HOST --identity K|--identity-pub HEX --handle S
 //!              [--registered UNIX] [--days N] [--level N] -o FILE
 //! hlid inspect FILE                           print any signed object
-//! hlid auth    --server URL --device K --card FILE --cert FILE     challenge binding → token
+//! hlid auth    --server URL --device K --card FILE --cert FILE [--login L --password P]
+//!              challenge binding → token; with credentials, links the account (§8.2)
+//! hlid link    --server URL --device K --card FILE --cert FILE --login L --password P
+//! hlid unlink  --server URL --device K --card FILE --cert FILE
 //! hlid tunnel  --server URL --device K --card FILE --cert FILE [--listen ADDR]
 //!              local TCP port for a classic client, TRTP over WebSocket upstream
 //! ```
@@ -45,6 +48,8 @@ fn main() {
         "attest" => make_attestation(&args[1..]),
         "inspect" => inspect(&args[1..]),
         "auth" => auth_cmd(&args[1..]),
+        "link" => link_cmd(&args[1..]),
+        "unlink" => unlink_cmd(&args[1..]),
         "tunnel" => tunnel_cmd(&args[1..]),
         _ => usage(),
     };
@@ -56,7 +61,7 @@ fn main() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  hlid keygen identity|device|server PATH\n  hlid cert --identity K --device K [--days N] [--caps all|web|LIST] [--name S] -o FILE\n  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]... -o FILE\n  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n  hlid inspect FILE\n  hlid auth --server URL --device K --card FILE --cert FILE\n  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500]"
+        "usage:\n  hlid keygen identity|device|server PATH\n  hlid cert --identity K --device K [--days N] [--caps all|web|LIST] [--name S] -o FILE\n  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]... -o FILE\n  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n  hlid inspect FILE\n  hlid auth --server URL --device K --card FILE --cert FILE [--login L --password P]\n  hlid link --server URL --device K --card FILE --cert FILE --login L --password P\n  hlid unlink --server URL --device K --card FILE --cert FILE\n  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500]"
     );
     exit(2)
 }
@@ -390,6 +395,12 @@ fn server_base(a: &Args) -> R<String> {
 
 /// The challenge binding (§5.2) against a server. Blocking; small.
 fn authenticate(base: &str, c: &Credentials) -> R<Value> {
+    authenticate_with(base, c, None)
+}
+
+/// Same, optionally with classic credentials to link in the same step
+/// (§5.4, §8.2).
+fn authenticate_with(base: &str, c: &Credentials, classic: Option<(&str, &str)>) -> R<Value> {
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(10))
         .build();
@@ -406,7 +417,12 @@ fn authenticate(base: &str, c: &Credentials) -> R<Value> {
         .try_into()
         .map_err(|_| "server_key: bad length".to_string())?;
     let proof = LoginProof::sign(&c.device, &challenge, &server_key, now());
-    let body = json!({ "card": b64(&c.card), "device_cert": b64(&c.cert), "proof": b64(&proof) });
+    let mut body =
+        json!({ "card": b64(&c.card), "device_cert": b64(&c.cert), "proof": b64(&proof) });
+    if let Some((login, password)) = classic {
+        body["login"] = json!(login);
+        body["password"] = json!(password);
+    }
     match agent.post(&format!("{base}/identity/auth")).send_json(body) {
         Ok(resp) => resp.into_json().map_err(|e| format!("auth: {e}")),
         Err(ureq::Error::Status(code, resp)) => {
@@ -421,7 +437,52 @@ fn auth_cmd(args: &[String]) -> R<()> {
     let a = parse(args);
     let base = server_base(&a)?;
     let c = credentials(&a)?;
-    let reply = authenticate(&base, &c)?;
+    let classic = a.opt("login").zip(a.opt("password"));
+    let reply = authenticate_with(&base, &c, classic)?;
+    println!("{}", serde_json::to_string_pretty(&reply).unwrap());
+    Ok(())
+}
+
+/// A token-authenticated POST to an identity endpoint.
+fn post_with_token(base: &str, c: &Credentials, path: &str, body: Value) -> R<Value> {
+    let token = authenticate(base, c)?;
+    let token = token["token"].as_str().ok_or("auth reply had no token")?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let req = agent
+        .post(&format!("{base}{path}"))
+        .set("Authorization", &format!("Bearer {token}"));
+    let result = if body.is_null() {
+        req.call()
+    } else {
+        req.send_json(body)
+    };
+    match result {
+        Ok(resp) => resp.into_json().map_err(|e| format!("{path}: {e}")),
+        Err(ureq::Error::Status(code, resp)) => Err(format!(
+            "{path} refused ({code}): {}",
+            resp.into_string().unwrap_or_default()
+        )),
+        Err(e) => Err(format!("{path}: {e}")),
+    }
+}
+
+fn link_cmd(args: &[String]) -> R<()> {
+    let a = parse(args);
+    let base = server_base(&a)?;
+    let c = credentials(&a)?;
+    let body = json!({ "login": a.one("login")?, "password": a.one("password")? });
+    let reply = post_with_token(&base, &c, "/identity/link", body)?;
+    println!("{}", serde_json::to_string_pretty(&reply).unwrap());
+    Ok(())
+}
+
+fn unlink_cmd(args: &[String]) -> R<()> {
+    let a = parse(args);
+    let base = server_base(&a)?;
+    let c = credentials(&a)?;
+    let reply = post_with_token(&base, &c, "/identity/unlink", Value::Null)?;
     println!("{}", serde_json::to_string_pretty(&reply).unwrap());
     Ok(())
 }

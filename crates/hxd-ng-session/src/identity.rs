@@ -7,17 +7,22 @@
 //! cryptographic is `hl-identity`'s; what's here is the bookkeeping a
 //! server adds on top — and the policy knobs from the spec's §12.
 //!
+//! Account association (§8) lives here too: `/identity/auth` decides
+//! what an identity will get at application login, and the link /
+//! unlink / create paths write through the auth backend. Everything that
+//! touches the backend is synchronous file I/O — `http.rs` calls in from
+//! the blocking pool.
+//!
 //! Not yet here, deliberately: revocation (needs a registrar to fetch
-//! from), account association (needs the auth backend to grow a
-//! fingerprint lookup), rate limiting (should share the login-attempt
-//! limiter when that exists). Each is marked where it would go.
+//! from) and rate limiting (should share the login-attempt limiter when
+//! that exists). Each is marked where it would go.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hl_identity::{Attestation, Fingerprint, LoginContext, PublicKey, ServerKey};
-use hxd_core::IdentityTag;
+use hl_identity::{caps, Attestation, Fingerprint, LoginContext, PublicKey, ServerKey};
+use hxd_core::{AccessBits, Account, AuthBackend, AuthError, IdentityTag, Proof};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
@@ -29,8 +34,8 @@ const TTL: Duration = Duration::from_secs(60);
 pub enum NewAccounts {
     Deny,
     Guest,
-    /// Not implemented yet: treated as `Guest` and logged. Account
-    /// creation needs the auth backend to grow a fingerprint column.
+    /// Create and link an account named from the handle (or the
+    /// fingerprint), with `IdentityConfig::default_access`.
     Create,
 }
 
@@ -57,6 +62,9 @@ pub struct IdentityConfig {
     pub clock_skew: u64,
     /// Serve the TRTP-over-WebSocket path.
     pub trtp: bool,
+    /// Access bitmap for accounts made by `new_accounts = create`. `None`
+    /// means "whatever the guest account has", resolved at creation.
+    pub default_access: Option<AccessBits>,
 }
 
 impl Default for IdentityConfig {
@@ -69,6 +77,7 @@ impl Default for IdentityConfig {
             registrar_keys: HashMap::new(),
             clock_skew: 300,
             trtp: true,
+            default_access: None,
         }
     }
 }
@@ -77,19 +86,28 @@ impl Default for IdentityConfig {
 /// (§5.2 `outcome`, §8.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
+    /// An account links this identity; login lands on it.
     Linked,
-    WillCreate,
+    /// `new_accounts = create`: the account was created at auth time.
+    /// Reported as its own value so a client can say "welcome" rather
+    /// than "welcome back".
+    Created,
     Guest,
     UnattestedGuest,
+    /// `login`/`password` named an account that couldn't be linked
+    /// (someone else's identity, or self-linking off); the session will
+    /// be a guest and the operator has to resolve it.
+    ClassicPendingLink,
 }
 
 impl Outcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Outcome::Linked => "linked",
-            Outcome::WillCreate => "will_create",
+            Outcome::Created => "created",
             Outcome::Guest => "guest",
             Outcome::UnattestedGuest => "unattested_guest",
+            Outcome::ClassicPendingLink => "classic_pending_link",
         }
     }
 }
@@ -106,6 +124,18 @@ pub struct TransportIdentity {
     /// when unattested.
     pub age: u64,
     pub outcome: Outcome,
+    /// The device certificate's capability mask (`None` = all).
+    pub device_caps: Option<u64>,
+    /// The linked account's login when `outcome` is `Linked` or
+    /// `Created`. The application login re-reads the account; this is
+    /// which one.
+    pub account: Option<String>,
+}
+
+impl TransportIdentity {
+    pub fn allows(&self, cap: u64) -> bool {
+        self.device_caps.is_none_or(|c| c & cap == cap)
+    }
 }
 
 impl TransportIdentity {
@@ -128,6 +158,18 @@ pub enum AuthRefused {
     Denied,
     CardTooLarge,
     UnknownChallenge,
+    /// `login`/`password` didn't verify (§5.4).
+    LoginFailed,
+    /// The device certificate lacks the manage bit (§8.2, §8.4).
+    NoManage,
+    /// This identity already links a different account here (§8.2).
+    AlreadyLinked,
+    /// Unlinking would leave a password-less account with no way in.
+    WouldOrphan,
+    /// The account isn't linked, or is linked to someone else.
+    NotLinked,
+    /// The auth backend failed; logged, not shown.
+    Backend,
 }
 
 impl AuthRefused {
@@ -140,13 +182,22 @@ impl AuthRefused {
             AuthRefused::Denied => "denied",
             AuthRefused::CardTooLarge => "card_too_large",
             AuthRefused::UnknownChallenge => "unknown_challenge",
+            AuthRefused::LoginFailed => "login_failed",
+            AuthRefused::NoManage => "no_manage",
+            AuthRefused::AlreadyLinked => "already_linked",
+            AuthRefused::WouldOrphan => "would_orphan",
+            AuthRefused::NotLinked => "not_linked",
+            AuthRefused::Backend => "server_error",
         }
     }
 
-    /// 401 for "prove it again", 403 for "no".
+    /// 401 for "prove it again", 403 for "no", 409 for "that conflicts
+    /// with the account's state", 500 for us.
     pub fn status(self) -> u16 {
         match self {
-            AuthRefused::Denied | AuthRefused::Revoked => 403,
+            AuthRefused::Denied | AuthRefused::Revoked | AuthRefused::NoManage => 403,
+            AuthRefused::AlreadyLinked | AuthRefused::WouldOrphan | AuthRefused::NotLinked => 409,
+            AuthRefused::Backend => 500,
             _ => 401,
         }
     }
@@ -175,7 +226,15 @@ struct Tables {
 pub struct IdentityState {
     key: ServerKey,
     cfg: IdentityConfig,
+    auth: Arc<dyn AuthBackend>,
     tables: Mutex<Tables>,
+}
+
+/// Credentials a client may add to `/identity/auth` (§5.4) to verify a
+/// classic account and link it in the same step.
+pub struct ClassicLogin<'a> {
+    pub login: &'a str,
+    pub password: &'a [u8],
 }
 
 fn now_unix() -> u64 {
@@ -208,10 +267,11 @@ pub fn unb64(s: &str) -> Option<Vec<u8>> {
 }
 
 impl IdentityState {
-    pub fn new(key: ServerKey, cfg: IdentityConfig) -> Self {
+    pub fn new(key: ServerKey, cfg: IdentityConfig, auth: Arc<dyn AuthBackend>) -> Self {
         IdentityState {
             key,
             cfg,
+            auth,
             tables: Mutex::new(Tables {
                 challenges: HashMap::new(),
                 tokens: HashMap::new(),
@@ -251,6 +311,7 @@ impl IdentityState {
         card: &[u8],
         cert: &[u8],
         proof: &[u8],
+        classic: Option<ClassicLogin<'_>>,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
         // Peek at the challenge inside the proof so we can consume it
         // before doing any signature work; a bad proof still burns it.
@@ -275,7 +336,7 @@ impl IdentityState {
             debug!("identity auth refused: {e}");
             classify(&e, card.len())
         })?;
-        self.admit(v.card, v.cert, cert.to_vec(), card.to_vec())
+        self.admit(v.card, v.cert, cert.to_vec(), card.to_vec(), classic)
     }
 
     /// `POST /identity/auth`, mTLS binding (§5.3): `device` is the key the
@@ -285,20 +346,23 @@ impl IdentityState {
         card: &[u8],
         cert: &[u8],
         device: &PublicKey,
+        classic: Option<ClassicLogin<'_>>,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
         let (c, dc) =
             hl_identity::verify_presented(card, cert, device, now_unix(), self.cfg.clock_skew)
                 .map_err(|e| classify(&e, card.len()))?;
-        self.admit(c, dc, cert.to_vec(), card.to_vec())
+        self.admit(c, dc, cert.to_vec(), card.to_vec(), classic)
     }
 
-    /// Steps 5–6 and the token issue, shared by both bindings.
+    /// Steps 5–6, account association (§8.1–§8.2), and the token issue,
+    /// shared by both bindings.
     fn admit(
         &self,
         card: hl_identity::Card,
         cert: hl_identity::DeviceCert,
         cert_bytes: Vec<u8>,
         card_bytes: Vec<u8>,
+        classic: Option<ClassicLogin<'_>>,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
         // Step 4, revocation: no registrar to ask yet. When there is one,
         // this is where a cached revocation list is consulted and
@@ -322,28 +386,96 @@ impl IdentityState {
             }
         }
         let attested = handle.is_some() && age >= self.cfg.min_attestation_age;
-        let outcome = if attested {
-            match self.cfg.new_accounts {
-                NewAccounts::Deny => return Err(AuthRefused::Denied),
-                NewAccounts::Guest => Outcome::Guest,
-                NewAccounts::Create => {
-                    info!("new_accounts = create not implemented; treating as guest");
-                    Outcome::Guest
-                }
-            }
-        } else {
+        if !attested {
             match self.cfg.unattested {
                 Unattested::Deny => return Err(AuthRefused::Denied),
-                Unattested::Guest => Outcome::UnattestedGuest,
-                Unattested::Allow => match self.cfg.new_accounts {
-                    NewAccounts::Deny => return Err(AuthRefused::Denied),
-                    _ => Outcome::Guest,
-                },
+                Unattested::Guest | Unattested::Allow => {}
             }
+        }
+
+        // §8.2 "at auth": classic credentials, verified as for a normal
+        // login, then linked if the account allows it.
+        let mut linked: Option<Account> = None;
+        let mut pending = false;
+        if let Some(c) = classic {
+            let account = match self.auth.authenticate(c.login, Proof::Plain(c.password)) {
+                Ok(a) => a,
+                Err(AuthError::NoSuchAccount | AuthError::BadProof) => {
+                    return Err(AuthRefused::LoginFailed)
+                }
+                Err(AuthError::Backend(e)) => {
+                    tracing::warn!("auth backend failure: {e}");
+                    return Err(AuthRefused::Backend);
+                }
+            };
+            if account.login == "guest" {
+                // Logging in as guest names no account to link.
+            } else if account.identity.fingerprint == Some(fingerprint.0) {
+                linked = Some(account);
+            } else if account.identity.fingerprint.is_none() && account.identity.allow_self_link {
+                match self.find_linked(&fingerprint)? {
+                    Some(other) => {
+                        debug!(login = %other.login, "identity already links another account");
+                        return Err(AuthRefused::AlreadyLinked);
+                    }
+                    None => {
+                        self.auth
+                            .set_identity_link(&account.login, Some(fingerprint.0))
+                            .map_err(|e| {
+                                tracing::warn!("link write failed: {e}");
+                                AuthRefused::Backend
+                            })?;
+                        info!(login = %account.login, fingerprint = %fingerprint.short(), "identity linked at auth");
+                        linked = self.auth.lookup(&account.login).ok();
+                    }
+                }
+            } else {
+                pending = true;
+            }
+        }
+
+        // §8.1: an existing link, else the new_accounts policy.
+        if linked.is_none() {
+            linked = self.find_linked(&fingerprint)?;
+        }
+        let (outcome, account) = match linked {
+            Some(a) if a.identity.identity_login => (Outcome::Linked, Some(a.login)),
+            Some(a) => {
+                debug!(login = %a.login, "identity_login is off for the linked account");
+                return Err(AuthRefused::Denied);
+            }
+            None if pending => (Outcome::ClassicPendingLink, None),
+            None if !attested && self.cfg.unattested == Unattested::Guest => {
+                (Outcome::UnattestedGuest, None)
+            }
+            None => match self.cfg.new_accounts {
+                NewAccounts::Deny => return Err(AuthRefused::Denied),
+                NewAccounts::Guest => (Outcome::Guest, None),
+                NewAccounts::Create => {
+                    let proposed = match &handle {
+                        Some(h) => h.split('@').next().unwrap_or("").to_owned(),
+                        None => format!("id-{}", fingerprint.short()),
+                    };
+                    let access = match self.cfg.default_access {
+                        Some(a) => a,
+                        None => self
+                            .auth
+                            .lookup("")
+                            .map(|g| g.access)
+                            .unwrap_or_else(|_| AccessBits::empty()),
+                    };
+                    let created = self
+                        .auth
+                        .create_linked(&proposed, &card.name, fingerprint.0, access)
+                        .map_err(|e| {
+                            tracing::warn!("account creation failed: {e}");
+                            AuthRefused::Backend
+                        })?;
+                    info!(login = %created.login, fingerprint = %fingerprint.short(), "account created for identity");
+                    (Outcome::Created, Some(created.login))
+                }
+            },
         };
-        // Account association (Linked / WillCreate) arrives with the
-        // fingerprint lookup on the auth backend; until then every
-        // identity is a guest that knows who it is.
 
         let ident = TransportIdentity {
             identity: card.identity,
@@ -352,6 +484,8 @@ impl IdentityState {
             handle,
             age,
             outcome,
+            device_caps: cert.caps,
+            account,
         };
 
         let token = random32();
@@ -379,6 +513,87 @@ impl IdentityState {
             };
         }
         Ok((b64(&token), ident))
+    }
+
+    fn find_linked(&self, fp: &Fingerprint) -> Result<Option<Account>, AuthRefused> {
+        self.auth.find_by_fingerprint(&fp.0).map_err(|e| {
+            tracing::warn!("fingerprint lookup failed: {e}");
+            AuthRefused::Backend
+        })
+    }
+
+    /// `POST /identity/link` (§8.2 "after auth"): verify the password,
+    /// then link if the account allows it and neither side is taken.
+    pub fn link(
+        &self,
+        ident: &TransportIdentity,
+        login: &str,
+        password: &[u8],
+    ) -> Result<Account, AuthRefused> {
+        if !ident.allows(caps::MANAGE) {
+            return Err(AuthRefused::NoManage);
+        }
+        let account = match self.auth.authenticate(login, Proof::Plain(password)) {
+            Ok(a) if a.login != "guest" => a,
+            Ok(_) | Err(AuthError::NoSuchAccount | AuthError::BadProof) => {
+                return Err(AuthRefused::LoginFailed)
+            }
+            Err(AuthError::Backend(e)) => {
+                tracing::warn!("auth backend failure: {e}");
+                return Err(AuthRefused::Backend);
+            }
+        };
+        if account.identity.fingerprint == Some(ident.fingerprint.0) {
+            return Ok(account);
+        }
+        if account.identity.fingerprint.is_some() || !account.identity.allow_self_link {
+            return Err(AuthRefused::Denied);
+        }
+        if self.find_linked(&ident.fingerprint)?.is_some() {
+            return Err(AuthRefused::AlreadyLinked);
+        }
+        self.auth
+            .set_identity_link(&account.login, Some(ident.fingerprint.0))
+            .map_err(|e| {
+                tracing::warn!("link write failed: {e}");
+                AuthRefused::Backend
+            })?;
+        info!(login = %account.login, fingerprint = %ident.fingerprint.short(), "identity linked");
+        self.auth
+            .lookup(&account.login)
+            .map_err(|_| AuthRefused::Backend)
+    }
+
+    /// `POST /identity/unlink` (§8.4).
+    pub fn unlink(&self, ident: &TransportIdentity) -> Result<Account, AuthRefused> {
+        if !ident.allows(caps::MANAGE) {
+            return Err(AuthRefused::NoManage);
+        }
+        let Some(account) = self.find_linked(&ident.fingerprint)? else {
+            return Err(AuthRefused::NotLinked);
+        };
+        if !account.has_password {
+            return Err(AuthRefused::WouldOrphan);
+        }
+        self.auth
+            .set_identity_link(&account.login, None)
+            .map_err(|e| {
+                tracing::warn!("unlink write failed: {e}");
+                AuthRefused::Backend
+            })?;
+        info!(login = %account.login, fingerprint = %ident.fingerprint.short(), "identity unlinked");
+        Ok(account)
+    }
+
+    /// The account an authenticated socket's application login lands on
+    /// (§8.1), re-read from the backend so a link made between auth and
+    /// upgrade is honoured. `None` = guest.
+    pub fn account_for(&self, ident: &TransportIdentity) -> Result<Option<Account>, AuthRefused> {
+        match self.find_linked(&ident.fingerprint)? {
+            Some(a) if a.identity.identity_login => Ok(Some(a)),
+            Some(_) => Err(AuthRefused::Denied),
+            None => Ok(None),
+        }
     }
 
     fn accept_attestations(&self, atts: &[Attestation], now: u64) -> (Option<String>, u64) {
@@ -428,7 +643,7 @@ impl IdentityState {
         drop(t);
         // Re-run the checks rather than trusting the cache's shape; it's
         // two signature verifications.
-        self.auth_presented(&card_bytes, &cert_bytes, device)
+        self.auth_presented(&card_bytes, &cert_bytes, device, None)
             .ok()
             .map(|(_, ident)| ident)
     }
@@ -483,8 +698,114 @@ mod tests {
     use super::*;
     use hl_identity::{cert, Card, DeviceCert, DeviceKey, IdentityKey, LoginProof};
 
+    /// An in-memory backend: `guest` (no password) and `misha` (password
+    /// `pw`), plus whatever `create_linked` adds.
+    #[derive(Default)]
+    struct MemAuth {
+        accounts: Mutex<HashMap<String, Account>>,
+    }
+
+    fn account(login: &str, password: bool) -> Account {
+        Account {
+            login: login.into(),
+            name: login.into(),
+            access: AccessBits::empty(),
+            can_detach: password,
+            set_subject: false,
+            has_password: password,
+            identity: hxd_core::IdentityLink {
+                identity_login: true,
+                allow_self_link: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    impl MemAuth {
+        fn new() -> Arc<Self> {
+            let m = MemAuth::default();
+            let mut a = m.accounts.lock().unwrap();
+            a.insert("guest".into(), account("guest", false));
+            a.insert("misha".into(), account("misha", true));
+            drop(a);
+            Arc::new(m)
+        }
+    }
+
+    impl AuthBackend for MemAuth {
+        fn authenticate(&self, login: &str, proof: Proof<'_>) -> Result<Account, AuthError> {
+            let login = if login.is_empty() { "guest" } else { login };
+            let a = self.lookup(login)?;
+            let Proof::Plain(pw) = proof;
+            let want: &[u8] = if a.has_password { b"pw" } else { b"" };
+            if pw != want {
+                return Err(AuthError::BadProof);
+            }
+            Ok(a)
+        }
+        fn lookup(&self, login: &str) -> Result<Account, AuthError> {
+            let login = if login.is_empty() { "guest" } else { login };
+            self.accounts
+                .lock()
+                .unwrap()
+                .get(login)
+                .cloned()
+                .ok_or(AuthError::NoSuchAccount)
+        }
+        fn find_by_fingerprint(&self, fp: &[u8; 32]) -> Result<Option<Account>, AuthError> {
+            Ok(self
+                .accounts
+                .lock()
+                .unwrap()
+                .values()
+                .find(|a| a.identity.fingerprint == Some(*fp))
+                .cloned())
+        }
+        fn set_identity_link(&self, login: &str, fp: Option<[u8; 32]>) -> Result<(), AuthError> {
+            let mut a = self.accounts.lock().unwrap();
+            a.get_mut(login)
+                .ok_or(AuthError::NoSuchAccount)?
+                .identity
+                .fingerprint = fp;
+            Ok(())
+        }
+        fn create_linked(
+            &self,
+            login: &str,
+            name: &str,
+            fp: [u8; 32],
+            access: AccessBits,
+        ) -> Result<Account, AuthError> {
+            let mut a = self.accounts.lock().unwrap();
+            let login = if a.contains_key(login) {
+                format!("{login}-2")
+            } else {
+                login.to_owned()
+            };
+            let mut acct = account(&login, false);
+            acct.name = name.into();
+            acct.access = access;
+            acct.identity.fingerprint = Some(fp);
+            a.insert(login.clone(), acct.clone());
+            Ok(acct)
+        }
+        fn reserved_by(&self, name: &str) -> Result<Option<String>, AuthError> {
+            Ok(self
+                .accounts
+                .lock()
+                .unwrap()
+                .get(&name.to_ascii_lowercase())
+                .filter(|a| a.identity.reserve_name)
+                .map(|a| a.login.clone()))
+        }
+    }
+
     fn state(cfg: IdentityConfig) -> IdentityState {
-        IdentityState::new(ServerKey::from_seed(&[5u8; 32]), cfg)
+        IdentityState::new(ServerKey::from_seed(&[5u8; 32]), cfg, MemAuth::new())
+    }
+
+    fn state_with(cfg: IdentityConfig, auth: Arc<MemAuth>) -> IdentityState {
+        IdentityState::new(ServerKey::from_seed(&[5u8; 32]), cfg, auth)
     }
 
     fn objects(id: &IdentityKey, dev: &DeviceKey) -> (Vec<u8>, Vec<u8>) {
@@ -505,7 +826,7 @@ mod tests {
         let (card, cert) = objects(&id, &dev);
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
-        let (token, ident) = st.auth_with_proof(&card, &cert, &proof).unwrap();
+        let (token, ident) = st.auth_with_proof(&card, &cert, &proof, None).unwrap();
         assert_eq!(ident.outcome, Outcome::UnattestedGuest);
         assert_eq!(ident.fingerprint, id.fingerprint());
         let redeemed = st.redeem(&token).unwrap();
@@ -514,7 +835,7 @@ mod tests {
         // The challenge is consumed too.
         let proof2 = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof2),
+            st.auth_with_proof(&card, &cert, &proof2, None),
             Err(AuthRefused::UnknownChallenge)
         );
         // And the card is cached byte-exactly.
@@ -534,7 +855,7 @@ mod tests {
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof).unwrap_err(),
+            st.auth_with_proof(&card, &cert, &proof, None).unwrap_err(),
             AuthRefused::Denied
         );
 
@@ -544,7 +865,7 @@ mod tests {
         });
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
-        assert!(st.auth_with_proof(&card, &cert, &proof).is_ok());
+        assert!(st.auth_with_proof(&card, &cert, &proof, None).is_ok());
 
         let st = state(IdentityConfig {
             allow_list: vec!["someone-else".into()],
@@ -553,7 +874,7 @@ mod tests {
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof).unwrap_err(),
+            st.auth_with_proof(&card, &cert, &proof, None).unwrap_err(),
             AuthRefused::Denied
         );
     }
@@ -587,7 +908,7 @@ mod tests {
         let st = state(cfg);
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now);
-        let (_, ident) = st.auth_with_proof(&card, &cert, &proof).unwrap();
+        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, None).unwrap();
         assert_eq!(ident.handle.as_deref(), Some("misha@hl.example"));
         assert!(ident.age >= 1000);
         assert_eq!(ident.outcome, Outcome::Guest);
@@ -596,7 +917,7 @@ mod tests {
         let st = state(IdentityConfig::default());
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now);
-        let (_, ident) = st.auth_with_proof(&card, &cert, &proof).unwrap();
+        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, None).unwrap();
         assert_eq!(ident.handle, None);
         assert_eq!(ident.outcome, Outcome::UnattestedGuest);
     }
@@ -616,5 +937,151 @@ mod tests {
             st.update_card(&other.public(), &c2).unwrap_err(),
             AuthRefused::BadCard
         );
+    }
+
+    fn proof_for(st: &IdentityState, dev: &DeviceKey) -> Vec<u8> {
+        let ch = st.issue_challenge();
+        LoginProof::sign(dev, &ch, &st.server_key(), now_unix())
+    }
+
+    #[test]
+    fn linking_at_auth_then_linked_outcome_then_unlink() {
+        let auth = MemAuth::new();
+        let st = state_with(IdentityConfig::default(), auth.clone());
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = DeviceKey::from_seed(&[2u8; 32]);
+        let (card, cert) = objects(&id, &dev);
+
+        // Wrong password: refused, nothing linked.
+        let proof = proof_for(&st, &dev);
+        let bad = ClassicLogin {
+            login: "misha",
+            password: b"nope",
+        };
+        assert_eq!(
+            st.auth_with_proof(&card, &cert, &proof, Some(bad))
+                .unwrap_err(),
+            AuthRefused::LoginFailed
+        );
+        assert!(auth
+            .find_by_fingerprint(&id.fingerprint().0)
+            .unwrap()
+            .is_none());
+
+        // Right password: linked in the same step.
+        let proof = proof_for(&st, &dev);
+        let ok = ClassicLogin {
+            login: "misha",
+            password: b"pw",
+        };
+        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, Some(ok)).unwrap();
+        assert_eq!(ident.outcome, Outcome::Linked);
+        assert_eq!(ident.account.as_deref(), Some("misha"));
+        assert_eq!(
+            auth.find_by_fingerprint(&id.fingerprint().0)
+                .unwrap()
+                .unwrap()
+                .login,
+            "misha"
+        );
+
+        // Next auth with no credentials finds the link.
+        let proof = proof_for(&st, &dev);
+        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, None).unwrap();
+        assert_eq!(ident.outcome, Outcome::Linked);
+        assert_eq!(st.account_for(&ident).unwrap().unwrap().login, "misha");
+
+        // A second identity can't take the same account.
+        let id2 = IdentityKey::from_seed(&[11u8; 32]);
+        let dev2 = DeviceKey::from_seed(&[12u8; 32]);
+        let (card2, cert2) = objects(&id2, &dev2);
+        let proof = proof_for(&st, &dev2);
+        let (_, ident2) = st
+            .auth_with_proof(
+                &card2,
+                &cert2,
+                &proof,
+                Some(ClassicLogin {
+                    login: "misha",
+                    password: b"pw",
+                }),
+            )
+            .unwrap();
+        assert_eq!(ident2.outcome, Outcome::ClassicPendingLink);
+        assert_eq!(
+            st.link(&ident2, "misha", b"pw").unwrap_err(),
+            AuthRefused::Denied
+        );
+
+        // Unlink needs the manage bit and a password on the account.
+        let mut no_manage = ident.clone();
+        no_manage.device_caps = Some(caps::WEB);
+        assert_eq!(st.unlink(&no_manage).unwrap_err(), AuthRefused::NoManage);
+        assert_eq!(st.unlink(&ident).unwrap().login, "misha");
+        assert_eq!(st.unlink(&ident).unwrap_err(), AuthRefused::NotLinked);
+        assert!(auth
+            .find_by_fingerprint(&id.fingerprint().0)
+            .unwrap()
+            .is_none());
+
+        // Link after auth, then a password-less account can't be unlinked.
+        assert_eq!(st.link(&ident, "misha", b"pw").unwrap().login, "misha");
+        auth.accounts
+            .lock()
+            .unwrap()
+            .get_mut("misha")
+            .unwrap()
+            .has_password = false;
+        assert_eq!(st.unlink(&ident).unwrap_err(), AuthRefused::WouldOrphan);
+    }
+
+    #[test]
+    fn new_accounts_create_makes_a_linked_account() {
+        let auth = MemAuth::new();
+        let reg = ServerKey::from_seed(&[3u8; 32]);
+        let mut cfg = IdentityConfig {
+            new_accounts: NewAccounts::Create,
+            ..Default::default()
+        };
+        cfg.registrar_keys.insert("hl.example".into(), reg.public());
+        cfg.default_access = Some(AccessBits::empty().with(hxd_core::access::bit::SEND_CHAT));
+        let st = state_with(cfg, auth.clone());
+
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = DeviceKey::from_seed(&[2u8; 32]);
+        let now = now_unix();
+        let att = Attestation {
+            identity: id.public(),
+            registrar: "hl.example".into(),
+            registrar_key: reg.public(),
+            handle: "misha".into(),
+            registered: now - 1000,
+            issued: now - 10,
+            expires: now + 1000,
+            level: None,
+        };
+        let card = Card::new(&id, "Misha N", now)
+            .sign(&id, vec![att.signed_value(&reg)])
+            .unwrap();
+        let cert = DeviceCert::for_device(&id, &dev, now - 10, 1000).sign(&id);
+        let proof = proof_for(&st, &dev);
+        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, None).unwrap();
+        assert_eq!(ident.outcome, Outcome::Created);
+        // `misha` exists already, so the handle's local part got a suffix.
+        assert_eq!(ident.account.as_deref(), Some("misha-2"));
+        let a = auth
+            .find_by_fingerprint(&id.fingerprint().0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.name, "Misha N");
+        assert!(a.access.has(hxd_core::access::bit::SEND_CHAT));
+
+        // Unattested identities don't get accounts; they're guests.
+        let id3 = IdentityKey::from_seed(&[31u8; 32]);
+        let dev3 = DeviceKey::from_seed(&[32u8; 32]);
+        let (card3, cert3) = objects(&id3, &dev3);
+        let proof = proof_for(&st, &dev3);
+        let (_, ident3) = st.auth_with_proof(&card3, &cert3, &proof, None).unwrap();
+        assert_eq!(ident3.outcome, Outcome::UnattestedGuest);
     }
 }
