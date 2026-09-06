@@ -490,7 +490,7 @@ V5 is what remains: real clients, real microphones, one room.
 | ~~str0m's direct API is documented as low-level and *can* panic on an internally inconsistent setup~~ | Answered | It didn't. The two panic paths it documents are `declare_stream_tx` / `expect_stream_rx` against a mid with no media, and neither is reachable: a section is declared before either. The seam to webrtc-rs stays unused. |
 | `webrtcbin` (GtkHx) against an ICE-lite server has not been tried by us | Medium — it's standard, but GtkHx's gotchas list is long | First thing V3 tests with a real GtkHx; fallback is full ICE with host candidates only, which str0m also does |
 | RTP-mode forwarding fidelity (seq/timestamp/marker passthrough, RTCP the client needs for keepalive and jitter) | Medium | Assert passthrough in V2's two-`Rtc` tests; str0m generates RR/SR itself; the spec asks the SFU to forward feedback "SHOULD", not MUST — v1 forwards RTP and lets each leg's RTCP be per-peer |
-| An unauthenticated UDP port on the internet | Medium | str0m drops anything that doesn't match a live ICE credential or an established peer; rate-limit `accepts()` misses per source; document the port in the firewall notes; voice is off by default |
+| An unauthenticated UDP port on the internet | Medium — answered | str0m drops anything that doesn't match a live ICE credential or an established peer; the pump rate-limits `accepts()` misses per source, because *deciding* a datagram matches nothing means offering it to every live `Rtc` under one mutex, and a spoofed flood would otherwise cost the room its forwarding latency. Only misses are charged, so a peer sending real media is never throttled. Document the port in the firewall notes; voice is off by default |
 | Bandwidth: PCMU has no DTX, 64 kbps per stream each way, N−1 downstream per client | Low for Hotline-sized rooms, real at 16 | The per-room cap is the knob; the spec's bandwidth table goes in the operator docs |
 | Sequential cids are guessable, and the spec's room-membership rules say a guessed cid is a joinable private room | **High if membership isn't checked; Low once it is** | Membership check in V1 is the real defence; random cids (§11) are defence in depth and cheap |
 | ~~`hotline-proto` changes coordinated by hand across two trees~~ | Avoided | Nothing crossed. The participants encoder stayed server-side (§7), round-tripped against the shared parser. |
@@ -565,3 +565,29 @@ listener's section, forwarding payload, sequence numbers, timestamps and
 marker bits unchanged. It is invisible to a client, which demultiplexes
 by the declared SSRC either way, and a rejoin gets a fresh one exactly as
 the spec's own rejoin case describes.
+
+**Building an `Rtc` generates a certificate, and that is not an in-memory
+state change.** §4 permits `VoiceMedia` calls under the roster lock on the
+grounds that every one of them is a cheap in-memory mutation. `Rtc::new`
+was not: it generates a P-256 key pair and self-signs a DTLS certificate,
+about 1.4 ms, and `voice_join` was spending that inside the server-wide
+lock — so one authenticated client looping joins could saturate the lock
+every login, chat message and user-list update on both wires also needs.
+The SFU now generates one certificate at startup and hands every peer a
+clone. Sharing it is the ordinary shape for a server: a fingerprint
+identifies the server, not the session, and each peer still verifies the
+one its own offer carried.
+
+**ICE-lite makes the *local* address load-bearing, and NAT breaks it.**
+str0m's ICE agent discards an inbound STUN request whose destination is
+not one of its local candidates — silently, inside the agent, after
+`accepts()` has already claimed the datagram by ufrag, so it is not even
+stray enough to log. A server behind NAT binds a private address and
+advertises the public one it is forwarded from, and every join then gets a
+perfect offer and dies thirty seconds later on the ICE timeout. `Sfu` now
+takes the bind address as an additional *local* candidate that never
+reaches the SDP: the agent accepts traffic to it, and a client is still
+only ever pointed at an address the operator said it can reach. The shape
+that remains unserveable — a wildcard bind with two advertised addresses
+of one family, which can only be told apart by guessing — is refused at
+startup rather than discovered in production.

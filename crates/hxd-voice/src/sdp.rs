@@ -72,7 +72,7 @@ pub enum SectionMedia {
 }
 
 impl SectionMedia {
-    fn is_video(self) -> bool {
+    pub fn is_video(self) -> bool {
         !matches!(self, SectionMedia::Audio)
     }
 
@@ -124,6 +124,17 @@ pub struct OfferSection<'a> {
     /// `a=ssrc:<n> cname:<kind>-<uid>` line. Absent on the client's own
     /// capture sections, whose SSRCs the *client* declares in its answer.
     pub ssrc: Option<(u32, u16)>,
+    /// The retransmission SSRC paired with [`OfferSection::ssrc`], for a
+    /// video section that offers RTX.
+    ///
+    /// **Offering `a=rtpmap:97 rtx` without this is worse than offering
+    /// no RTX at all.** A receiver binds a repair stream to its media
+    /// stream through `a=ssrc-group:FID`, and nothing else in an offer
+    /// says which SSRC the retransmissions will arrive on — so a stack
+    /// that promises RTX and never names the SSRC sends repairs the
+    /// receiver drops as unknown, spending the bandwidth and recovering
+    /// nothing.
+    pub rtx_ssrc: Option<u32>,
     /// The `b=AS` ceiling in kbit/s for this section, from the server's
     /// configured limit for the kind. Ceilings are configuration, not
     /// negotiation.
@@ -138,6 +149,7 @@ impl<'a> OfferSection<'a> {
             media: SectionMedia::Audio,
             direction,
             ssrc,
+            rtx_ssrc: None,
             bandwidth_kbps: None,
         }
     }
@@ -235,15 +247,79 @@ pub fn offer(params: &OfferParams<'_>, sections: &[OfferSection<'_>]) -> String 
             // publications from one participant share a payload type and
             // a transport, and the SSRC is the only thing that separates
             // them.
-            let _ = write!(
-                s,
-                "a=ssrc:{ssrc} cname:{}-{uid}\r\n",
-                sec.media.cname_prefix()
-            );
+            let cname = sec.media.cname_prefix();
+            // The FID group first: RFC 5576 wants the grouping declared
+            // alongside the sources it groups, and a receiver reads it to
+            // learn that the second SSRC repairs the first. Both members
+            // then need their own `a=ssrc` line with the same `cname`,
+            // which is what puts them in one synchronisation context.
+            if let Some(rtx) = sec.rtx_ssrc {
+                let _ = write!(s, "a=ssrc-group:FID {ssrc} {rtx}\r\n");
+                let _ = write!(s, "a=ssrc:{ssrc} cname:{cname}-{uid}\r\n");
+                let _ = write!(s, "a=ssrc:{rtx} cname:{cname}-{uid}\r\n");
+            } else {
+                let _ = write!(s, "a=ssrc:{ssrc} cname:{cname}-{uid}\r\n");
+            }
         }
     }
     s
 }
+
+/// How many bytes [`offer`] will spend on one section, for the budget in
+/// `peer.rs`.
+///
+/// This exists because the offer has a size ceiling and sections are
+/// append-only, so something has to decide *before* a section is added
+/// whether it still fits. Counting sections instead is what the earlier
+/// revision did, and it stopped being a proxy for size the moment video
+/// arrived: a video section carries three `a=rtpmap`/`a=fmtp` lines,
+/// three `a=rtcp-fb` lines, a `b=AS` line and two more `a=ssrc` lines
+/// that an audio section does not, so one cap cannot serve both.
+///
+/// It is an upper bound rather than an exact count — the direction word
+/// and the SSRC digits vary — and deliberately so: the budget is a
+/// SHOULD-NOT to stay under, and over-estimating by a few bytes a section
+/// costs nothing while under-estimating defeats the point.
+pub fn section_bytes(mid: &str, media: SectionMedia, candidate_bytes: usize) -> usize {
+    // `m=`, `c=`, `a=mid`, direction, `a=rtcp-mux`, `a=setup`, ufrag,
+    // pwd, fingerprint — the fixed frame every section carries, with the
+    // credentials and a SHA-256 fingerprint at their real widths, plus
+    // slack for wider ICE credentials than the ones measured against.
+    let mut n = 300 + mid.len();
+    if media.is_video() {
+        // rtpmap ×2, fmtp, rtcp-fb ×3, b=AS, ssrc-group and a second
+        // a=ssrc.
+        n += 190;
+    }
+    if media == SectionMedia::Screen {
+        n += "a=content:slides\r\n".len();
+    }
+    // `a=ssrc:<10> cname:<prefix>-<5>\r\n`, plus the BUNDLE mid.
+    n += 40 + mid.len() + 1;
+    n + candidate_bytes
+}
+
+/// What one section's `a=candidate` lines cost, summed once per peer:
+/// the candidate list is fixed for a session's life, so there is no
+/// reason to re-measure it on every section.
+pub fn candidate_bytes(candidates: &[Candidate]) -> usize {
+    candidates.iter().map(|c| c.to_sdp_string().len() + 4).sum()
+}
+
+/// The most an offer may grow to.
+///
+/// `docs/capabilities-video.md` and the voice spec both put a 32 KB
+/// SHOULD-NOT on a session description, and the Hotline wire puts a hard
+/// 16-bit length on the chunk that carries one. The first is what we
+/// budget against, because staying under it keeps us under the second by
+/// a wide margin.
+pub const MAX_OFFER_BYTES: usize = 32_000;
+
+/// What [`offer`] spends before any section: the `v=`/`o=`/`s=`/`t=`
+/// lines, `a=group:BUNDLE`'s own prefix, `a=msid-semantic` and
+/// `a=ice-lite`. Each section's own BUNDLE mid is counted in
+/// [`section_bytes`].
+pub const OFFER_BASE_BYTES: usize = 120;
 
 fn fingerprint_hex(fp: &Fingerprint) -> String {
     let mut out = String::with_capacity(fp.bytes.len() * 3);
@@ -293,6 +369,14 @@ pub struct VideoSendAnswer {
     /// The SSRC the client declared for the stream it will send here.
     /// **Required**, unlike the microphone's — see the module docs.
     pub ssrc: Option<u32>,
+    /// The repair SSRC the client paired with [`VideoSendAnswer::ssrc`]
+    /// in `a=ssrc-group:FID`, when it offered one.
+    ///
+    /// Without this the stack has no way to recognise the client's
+    /// retransmissions, so it NACKs a gap, the client dutifully resends,
+    /// and the resend is discarded as an unknown SSRC — loss recovery
+    /// that costs bandwidth on both hops and repairs nothing.
+    pub rtx_ssrc: Option<u32>,
 }
 
 /// What the server needs out of a client's answer.
@@ -341,6 +425,12 @@ pub fn parse_answer(sdp: &str) -> Result<Answer, AnswerError> {
     let mut video_open: Option<bool> = None;
     let mut video_mid: Option<String> = None;
     let mut video_ssrc: Option<u32> = None;
+    // The `a=ssrc-group:FID <primary> <rtx>` pair, when the section
+    // declared one. Read as a pair rather than inferred from the order of
+    // the `a=ssrc` lines: the grouping is the only statement that one
+    // SSRC repairs the other, and stacks are free to list them either way
+    // round.
+    let mut video_fid: Option<(u32, u32)> = None;
 
     // Close whichever video send section was open, if it was one of ours.
     fn flush(
@@ -348,15 +438,25 @@ pub fn parse_answer(sdp: &str) -> Result<Answer, AnswerError> {
         open: &mut Option<bool>,
         mid: &mut Option<String>,
         ssrc: &mut Option<u32>,
+        fid: &mut Option<(u32, u32)>,
     ) {
         let accepted = open.take().unwrap_or(false);
-        let ssrc = ssrc.take();
+        let first = ssrc.take();
+        let fid = fid.take();
+        // The group is authoritative where it exists: it names the
+        // primary explicitly, so a stack that emitted the repair SSRC
+        // first can't be misread as publishing on it.
+        let (ssrc, rtx_ssrc) = match fid {
+            Some((primary, rtx)) => (Some(primary), Some(rtx)),
+            None => (first, None),
+        };
         if let Some(mid) = mid.take() {
             if mid == CAM_SEND_MID || mid == SCR_SEND_MID {
                 out.push(VideoSendAnswer {
                     mid,
                     accepted,
                     ssrc,
+                    rtx_ssrc,
                 });
             }
         }
@@ -370,6 +470,7 @@ pub fn parse_answer(sdp: &str) -> Result<Answer, AnswerError> {
                 &mut video_open,
                 &mut video_mid,
                 &mut video_ssrc,
+                &mut video_fid,
             );
             in_mic_section = false;
             // "m=audio 9 UDP/TLS/RTP/SAVPF 0 8" — PCMU is payload type 0
@@ -410,11 +511,20 @@ pub fn parse_answer(sdp: &str) -> Result<Answer, AnswerError> {
                 mic_ssrc = n.parse::<u32>().ok();
             }
             if video_open.is_some() && video_ssrc.is_none() {
-                // The first `a=ssrc` in the section. A stack that emits
-                // the RTX SSRC as well lists the primary first and pairs
-                // them in `a=ssrc-group:FID`; taking the first is what
-                // that grouping means.
+                // The first `a=ssrc` in the section, used only when the
+                // section declared no FID group; `flush` prefers the
+                // group's primary when there is one.
                 video_ssrc = n.parse::<u32>().ok();
+            }
+        } else if let Some(v) = line.strip_prefix("a=ssrc-group:FID ") {
+            if video_open.is_some() && video_fid.is_none() {
+                let mut it = v.split_whitespace();
+                if let (Some(Ok(a)), Some(Ok(b))) = (
+                    it.next().map(str::parse::<u32>),
+                    it.next().map(str::parse::<u32>),
+                ) {
+                    video_fid = Some((a, b));
+                }
             }
         }
     }
@@ -423,6 +533,7 @@ pub fn parse_answer(sdp: &str) -> Result<Answer, AnswerError> {
         &mut video_open,
         &mut video_mid,
         &mut video_ssrc,
+        &mut video_fid,
     );
 
     if !has_pcmu {
@@ -650,6 +761,7 @@ mod tests {
                 media: SectionMedia::Camera,
                 direction: Direction::SendOnly,
                 ssrc: Some((1111111111, 12)),
+                rtx_ssrc: None,
                 bandwidth_kbps: Some(1500),
             },
             OfferSection {
@@ -657,6 +769,7 @@ mod tests {
                 media: SectionMedia::Screen,
                 direction: Direction::SendOnly,
                 ssrc: Some((2222222222, 23)),
+                rtx_ssrc: None,
                 bandwidth_kbps: Some(2500),
             },
             OfferSection {
@@ -664,6 +777,7 @@ mod tests {
                 media: SectionMedia::Camera,
                 direction: Direction::RecvOnly,
                 ssrc: None,
+                rtx_ssrc: None,
                 bandwidth_kbps: Some(1500),
             },
         ]);
@@ -693,6 +807,85 @@ mod tests {
         // The client's own camera is the section the server receives on.
         assert!(sdp.contains("a=mid:cam-send\r\n"));
         assert!(sdp.contains("\r\na=group:BUNDLE cam-user-12 scr-user-23 cam-send\r\n"));
+    }
+
+    #[test]
+    fn a_video_section_that_offers_rtx_names_the_repair_ssrc() {
+        // Offering `a=rtpmap:97 rtx` and never saying which SSRC the
+        // retransmissions arrive on is worse than offering no RTX at
+        // all: the receiver NACKs, the server resends on an SSRC the
+        // receiver was never told about, and the repair is dropped as
+        // unknown. `a=ssrc-group:FID` is the binding, and both members
+        // need their own `a=ssrc` with a matching cname to sit in one
+        // synchronisation context.
+        let sdp = build(&[OfferSection {
+            mid: "cam-user-12",
+            media: SectionMedia::Camera,
+            direction: Direction::SendOnly,
+            ssrc: Some((1111111111, 12)),
+            rtx_ssrc: Some(1111111112),
+            bandwidth_kbps: Some(1500),
+        }]);
+        assert!(sdp.contains("a=ssrc-group:FID 1111111111 1111111112\r\n"));
+        assert!(sdp.contains("a=ssrc:1111111111 cname:video-12\r\n"));
+        assert!(
+            sdp.contains("a=ssrc:1111111112 cname:video-12\r\n"),
+            "the repair stream shares the cname or it is a different source"
+        );
+    }
+
+    #[test]
+    fn an_audio_section_never_grows_an_rtx_group() {
+        // PCMU has no retransmission story and the voice extension does
+        // not offer one; the field exists for video alone.
+        let sdp = build(&[OfferSection::audio(
+            "user-12",
+            Direction::SendOnly,
+            Some((4242, 12)),
+        )]);
+        assert!(!sdp.contains("a=ssrc-group"));
+        assert_eq!(sdp.matches("a=ssrc:").count(), 1);
+    }
+
+    #[test]
+    fn the_section_budget_is_an_upper_bound_on_what_the_offer_writes() {
+        // The budget refuses a section *before* it is appended, so it has
+        // to over-estimate rather than under-estimate: a section that
+        // costs more than it was budgeted for is a ceiling that does not
+        // hold. Measured against the real writer for each shape.
+        let cands = host_candidates(&["192.0.2.1:5504".parse().unwrap()]);
+        let bytes = candidate_bytes(&cands);
+        for (mid, media, section) in [
+            (
+                "send",
+                SectionMedia::Audio,
+                OfferSection::audio("send", Direction::RecvOnly, None),
+            ),
+            (
+                "user-65535",
+                SectionMedia::Audio,
+                OfferSection::audio("user-65535", Direction::SendOnly, Some((4294967295, 65535))),
+            ),
+            (
+                "scr-user-65535",
+                SectionMedia::Screen,
+                OfferSection {
+                    mid: "scr-user-65535",
+                    media: SectionMedia::Screen,
+                    direction: Direction::SendOnly,
+                    ssrc: Some((4294967295, 65535)),
+                    rtx_ssrc: Some(4294967294),
+                    bandwidth_kbps: Some(2500),
+                },
+            ),
+        ] {
+            let one = build(&[section]).len();
+            let budgeted = OFFER_BASE_BYTES + section_bytes(mid, media, bytes);
+            assert!(
+                budgeted >= one,
+                "{mid}: budgeted {budgeted} but the writer spent {one}"
+            );
+        }
     }
 
     #[test]
@@ -777,9 +970,15 @@ mod tests {
         // The whole point: camera and screen are the same codec at the
         // same payload type, so there is nothing to fall back to. The
         // answer still parses — losing video must not lose the call.
+        // The FID group goes too: naming the pair *is* declaring the
+        // SSRC, so a section that keeps it has not omitted anything.
         let no_ssrc: String = VIDEO_ANSWER
             .lines()
-            .filter(|l| !l.starts_with("a=ssrc:3000") && !l.starts_with("a=ssrc:3001"))
+            .filter(|l| {
+                !l.starts_with("a=ssrc:3000")
+                    && !l.starts_with("a=ssrc:3001")
+                    && !l.starts_with("a=ssrc-group:FID 3000")
+            })
             .collect::<Vec<_>>()
             .join("\r\n");
         let a = parse_answer(&no_ssrc).unwrap();
@@ -787,6 +986,31 @@ mod tests {
         let cam = a.video_send(CAM_SEND_MID).unwrap();
         assert!(cam.accepted, "the section itself was answered");
         assert_eq!(cam.ssrc, None, "and it is unusable without an SSRC");
+    }
+
+    #[test]
+    fn the_fid_group_names_the_primary_whichever_order_the_ssrc_lines_come_in() {
+        // `a=ssrc-group:FID <primary> <rtx>` is the only statement that
+        // one SSRC repairs the other. Reading the first `a=ssrc` line
+        // instead works until a stack lists the repair stream first, and
+        // then the server binds inbound video to the retransmission SSRC
+        // and hears nothing at all.
+        let reordered = VIDEO_ANSWER.replace(
+            "a=ssrc:3000 cname:clientvideo\r\n\
+             a=ssrc:3001 cname:clientvideo\r\n",
+            "a=ssrc:3001 cname:clientvideo\r\n\
+             a=ssrc:3000 cname:clientvideo\r\n",
+        );
+        let a = parse_answer(&reordered).unwrap();
+        let cam = a.video_send(CAM_SEND_MID).unwrap();
+        assert_eq!(cam.ssrc, Some(3000), "the group's first member");
+        assert_eq!(cam.rtx_ssrc, Some(3001), "and its second is the repair");
+
+        // A section with no group at all still binds on the one SSRC it
+        // declared, and claims no repair stream.
+        let scr = a.video_send(SCR_SEND_MID).unwrap();
+        assert_eq!(scr.ssrc, Some(4000));
+        assert_eq!(scr.rtx_ssrc, None);
     }
 
     #[test]

@@ -59,15 +59,83 @@ pub fn ice_payload(c: &IceCandidate) -> Vec<u8> {
     .into_bytes()
 }
 
+/// How deeply a `DATA_VOICE_ICE` payload may nest objects and arrays
+/// before [`parse_ice`] refuses it.
+///
+/// An `RTCIceCandidateInit` is a flat object of four scalar members, so
+/// the shape the spec defines never gets past depth one. Eight leaves
+/// room for a future member that is itself an object or an array —
+/// forward compatibility is the point of the shared parser skipping
+/// members it doesn't know — while staying far below anything that
+/// troubles the stack.
+const MAX_ICE_DEPTH: usize = 8;
+
+/// Whether `data` nests no deeper than [`MAX_ICE_DEPTH`].
+///
+/// This is a backstop, not the fix. `wire_ice::parse`'s `skip_value`,
+/// `skip_object` and `skip_array` are mutually recursive with no depth
+/// limit, and unknown members are skipped before the required-key check
+/// ever runs, so a few tens of thousands of `[` — still an order of
+/// magnitude inside the 65535-byte chunk limit — overflow the stack and
+/// abort the process. 604 is a notification any logged-in client that
+/// negotiated voice may send, so that is one frame against every session
+/// on both wires. One pass over bytes we are about to parse anyway is a
+/// cheap price for closing it here.
+///
+/// The real fix belongs upstream in `hotline-proto`, which is a read-only
+/// submodule to us: GtkHx runs the same parser on server-supplied 604s
+/// and has the mirror-image exposure, which nothing on this side can help
+/// with. Drop this guard once the shared parser carries its own depth
+/// limit.
+///
+/// Braces inside a string literal are content, not nesting — a candidate
+/// attribute may legitimately contain them — so the scan tracks strings
+/// and their escapes rather than counting bytes blindly.
+fn ice_depth_ok(data: &[u8]) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in data {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > MAX_ICE_DEPTH {
+                    return false;
+                }
+            }
+            // Unbalanced closers are the shared parser's business to
+            // reject; here they only need to not underflow.
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    true
+}
+
 /// Read a `DATA_VOICE_ICE` payload.
 ///
 /// An empty field is the spec's end-of-candidates shorthand and is a
 /// candidate with an empty string, not a parse failure. Anything else
 /// that doesn't parse is dropped: 604 is a notification, so there is no
 /// reply to carry an error and nothing useful to do with a malformed one.
+/// A payload that nests too deeply is refused before the shared parser
+/// sees it at all — see [`ice_depth_ok`].
 pub fn parse_ice(data: &[u8]) -> Option<IceCandidate> {
     if data.is_empty() {
         return Some(IceCandidate::default());
+    }
+    if !ice_depth_ok(data) {
+        return None;
     }
     let c = wire_ice::parse(data)?;
     Some(IceCandidate {
@@ -159,5 +227,36 @@ mod tests {
     fn a_malformed_ice_payload_is_dropped_not_guessed_at() {
         assert_eq!(parse_ice(b"{not json"), None);
         assert_eq!(parse_ice(b"{}"), None);
+    }
+
+    #[test]
+    fn a_deeply_nested_ice_payload_is_refused_before_it_overflows_the_stack() {
+        // A thousand is far past the ceiling and cheap to build; the
+        // payload that actually aborted the process needed some
+        // twenty-six thousand, which the chunk limit still admits.
+        let mut deep = b"{\"x\":".to_vec();
+        deep.extend(std::iter::repeat_n(b'[', 1000));
+        assert_eq!(parse_ice(&deep), None);
+    }
+
+    #[test]
+    fn an_ice_candidate_with_an_unknown_member_still_parses() {
+        let json = br#"{"candidate":"candidate:1 1 UDP 2130706431 192.0.2.1 5504 typ host",
+                        "sdpMid":"send","futureThing":{"nested":[1,2]}}"#;
+        let c = parse_ice(json).expect("an unknown member is skipped, not refused");
+        assert_eq!(c.sdp_mid.as_deref(), Some("send"));
+    }
+
+    #[test]
+    fn an_ice_candidate_whose_candidate_string_contains_brackets_still_parses() {
+        // The depth scan has to know a brace inside a string literal is
+        // content: IPv6 candidates bracket their addresses.
+        let c = IceCandidate {
+            candidate: "candidate:1 1 UDP 2130706431 [2001:db8::1] 5504 typ host {}".into(),
+            sdp_mid: Some("send".into()),
+            sdp_mline_index: None,
+            username_fragment: None,
+        };
+        assert_eq!(parse_ice(&ice_payload(&c)), Some(c));
     }
 }

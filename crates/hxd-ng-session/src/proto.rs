@@ -257,9 +257,13 @@ pub fn video_err(e: VideoError) -> (&'static str, &'static str) {
         VideoError::NotInVoice => ("not_in_voice", "You are not in that voice chat."),
         VideoError::AlreadyPublishing => ("already_publishing", "You are already publishing that."),
         VideoError::NotPublishing => ("not_publishing", "You are not publishing that."),
-        VideoError::Full => (
+        VideoError::Full(VideoKind::Screen) => (
             "video_full",
             "Someone else is already sharing. Ask them to stop first.",
+        ),
+        VideoError::Full(VideoKind::Camera) => (
+            "video_full",
+            "This room has as many cameras on as it allows.",
         ),
     }
 }

@@ -215,7 +215,7 @@ fn screen_slots_are_room_wide_and_the_existing_share_is_never_preempted() {
     core.video_start(a, 0, VideoKind::Screen).unwrap();
     assert_eq!(
         core.video_start(b, 0, VideoKind::Screen),
-        Err(VideoError::Full),
+        Err(VideoError::Full(VideoKind::Screen)),
         "one screen slot a room by default"
     );
     // Cameras have their own slots and are unaffected.
@@ -231,6 +231,51 @@ fn screen_slots_are_room_wide_and_the_existing_share_is_never_preempted() {
 }
 
 #[test]
+fn the_camera_cap_is_room_wide_and_a_paused_camera_still_holds_its_slot() {
+    // The screen cap of one is tested above; the camera cap of eight falls
+    // out of the same expression but is the case the kind in `Full` exists
+    // for. A second sharer really is blocked by the one person already
+    // sharing, and can be told so; the ninth camera in a room of eight is
+    // blocked by nobody, and telling its user to go and ask someone to
+    // stop would simply be false.
+    let (core, media) = videoed();
+    let cap = VideoConfig::default().camera.max_per_room as usize;
+    let mut sessions: Vec<(Uid, UnboundedReceiver<SeqEvent>)> = (0..=cap)
+        .map(|i| quiet(&core, &format!("user{i}")))
+        .collect();
+    let uids: Vec<Uid> = sessions.iter().map(|(uid, _)| *uid).collect();
+    {
+        let mut users: Vec<(Uid, &mut UnboundedReceiver<SeqEvent>)> =
+            sessions.iter_mut().map(|(uid, rx)| (*uid, rx)).collect();
+        joined(&core, &media, &mut users);
+    }
+
+    for uid in &uids[..cap] {
+        core.video_start(*uid, 0, VideoKind::Camera).unwrap();
+    }
+    // One of the eight steps away from their desk. A paused publication is
+    // still a publication and still holds its slot: if it did not, the
+    // room's capacity would depend on who happened to have their camera
+    // off at that instant, and stepping back would be a refusal.
+    core.video_state(uids[0], 0, VideoKind::Camera, true)
+        .unwrap();
+
+    let ninth = uids[cap];
+    assert_eq!(
+        core.video_start(ninth, 0, VideoKind::Camera),
+        Err(VideoError::Full(VideoKind::Camera)),
+        "the ninth camera is refused, and the refusal names the kind"
+    );
+    // Screens are counted separately, so the ninth participant can still
+    // share one — a full camera room says nothing about the screen slot.
+    core.video_start(ninth, 0, VideoKind::Screen).unwrap();
+    // And only stopping gives the camera slot back.
+    core.video_stop(uids[0], 0, Some(VideoKind::Camera))
+        .unwrap();
+    core.video_start(ninth, 0, VideoKind::Camera).unwrap();
+}
+
+#[test]
 fn a_paused_publication_still_holds_its_slot() {
     // What makes pause cheap and stop meaningful. If pausing released the
     // slot, someone else could take it while a sharer stepped away.
@@ -243,12 +288,76 @@ fn a_paused_publication_still_holds_its_slot() {
     core.video_state(a, 0, VideoKind::Screen, true).unwrap();
     assert_eq!(
         core.video_start(b, 0, VideoKind::Screen),
-        Err(VideoError::Full)
+        Err(VideoError::Full(VideoKind::Screen))
     );
 
     // Stopping does release it.
     core.video_stop(a, 0, Some(VideoKind::Screen)).unwrap();
     core.video_start(b, 0, VideoKind::Screen).unwrap();
+}
+
+#[test]
+fn a_publication_the_media_layer_refuses_is_rolled_back_entirely() {
+    // By the time the media layer is asked, the domain has already claimed
+    // the room's slot and is about to announce the publication to
+    // everyone. A refusal that was dropped on the floor would leave a
+    // publication that shows as live, can never carry a frame, and holds
+    // the room's only screen slot until its publisher stops it by hand.
+    let (core, media) = videoed();
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    joined(&core, &media, &mut [(a, &mut rx_a), (b, &mut rx_b)]);
+    // B is standing by for A's screen, so a publication announced despite
+    // the refusal would have B rendering a tile that stays black forever.
+    core.video_subscribe(b, 0, &[screen(a)]).unwrap();
+    drain(&mut rx_a);
+    drain(&mut rx_b);
+    media.take_calls();
+
+    media.refuse_next_publish();
+    assert_eq!(
+        core.video_start(a, 0, VideoKind::Screen),
+        Err(VideoError::Full(VideoKind::Screen)),
+        "the peer could not be seated, which is the same answer to a \
+         client as a slot someone else already holds"
+    );
+    assert_eq!(
+        media.take_calls(),
+        vec![MediaCall::Publish {
+            uid: a,
+            cid: 0,
+            kind: VideoKind::Screen
+        }],
+        "and it stops there: no offer, and no subscriber activated"
+    );
+    assert!(core.video_publications(0).is_empty());
+    assert_eq!(offer_targets(&drain(&mut rx_a)), 0);
+    assert!(
+        publications(&drain(&mut rx_b)).is_empty(),
+        "the room is never told about a publication that did not happen"
+    );
+    // Nothing was recorded on the peer either, so a stop finds nothing to
+    // stop rather than an entry only the domain knows about.
+    core.video_stop(a, 0, Some(VideoKind::Screen)).unwrap();
+    assert!(media.take_calls().is_empty());
+
+    // And the slot came back with it: A can try again — which it could
+    // not if a ghost publication were still sitting on its peer, and
+    // nobody could if the room's one screen slot were still spoken for.
+    assert_eq!(core.video_start(a, 0, VideoKind::Screen).unwrap(), "VP8");
+    assert!(media.take_calls().contains(&MediaCall::SetSubscriptions {
+        uid: b,
+        cid: 0,
+        streams: vec![screen(a)]
+    }));
+    assert_eq!(
+        latest(&drain(&mut rx_b)),
+        vec![VideoPublication {
+            uid: a,
+            kind: VideoKind::Screen,
+            paused: false
+        }]
+    );
 }
 
 #[test]
@@ -507,6 +616,92 @@ fn a_subscription_to_a_stream_that_does_not_exist_is_retained_and_activates() {
 }
 
 #[test]
+fn a_stream_named_twice_is_kept_once() {
+    let (core, media) = videoed();
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    joined(&core, &media, &mut [(a, &mut rx_a), (b, &mut rx_b)]);
+    core.video_start(a, 0, VideoKind::Camera).unwrap();
+    core.video_start(a, 0, VideoKind::Screen).unwrap();
+    drain(&mut rx_b);
+    media.take_calls();
+
+    core.video_subscribe(b, 0, &[cam(a), cam(a), screen(a), cam(a)])
+        .unwrap();
+    assert_eq!(
+        media.take_calls(),
+        vec![
+            MediaCall::SetSubscriptions {
+                uid: b,
+                cid: 0,
+                streams: vec![cam(a), screen(a)]
+            },
+            MediaCall::Offer { uid: b, cid: 0 },
+        ],
+        "one section per stream, in the order the client first named them"
+    );
+
+    // The set that was *stored* is the deduplicated one, not the list as
+    // it arrived — so re-declaring it in that canonical form is the same
+    // set and costs nothing, rather than looking like a change.
+    answer_offers(&core, b, &mut rx_b);
+    media.take_calls();
+    core.video_subscribe(b, 0, &[cam(a), screen(a)]).unwrap();
+    assert!(media.take_calls().is_empty());
+}
+
+#[test]
+fn a_subscription_set_is_bounded_and_the_overflow_is_dropped() {
+    // The set is a client-supplied list, processed under the server-wide
+    // roster lock and re-scanned on every later start, stop, leave and
+    // subscribe. Its length is therefore the server's problem, not the
+    // client's, and past the cap the extra entries go silently: a client
+    // that named thousands of streams was not describing a room.
+    let (core, media) = videoed();
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    joined(&core, &media, &mut [(a, &mut rx_a), (b, &mut rx_b)]);
+    core.video_start(a, 0, VideoKind::Camera).unwrap();
+    drain(&mut rx_b);
+    media.take_calls();
+
+    // Strangers, none of whom is in the room. Naming a stream that does
+    // not exist is legal and is retained, which is precisely why the
+    // length has to be bounded somewhere.
+    let strangers: Vec<VideoStream> = (0..MAX_SUBSCRIPTIONS as Uid)
+        .map(|i| cam(9000 + i))
+        .collect();
+
+    let mut oversized = strangers.clone();
+    oversized.push(cam(a));
+    core.video_subscribe(b, 0, &oversized).unwrap();
+    assert!(
+        media.take_calls().is_empty(),
+        "the one real stream in that set fell past the cap, so nothing \
+         was activated"
+    );
+    assert_eq!(offer_targets(&drain(&mut rx_b)), 0);
+
+    // The same set one entry shorter keeps it. Asserting both sides of the
+    // boundary is what says the cap is where the code says it is.
+    let mut fits = strangers;
+    fits.pop();
+    fits.push(cam(a));
+    core.video_subscribe(b, 0, &fits).unwrap();
+    assert_eq!(
+        media.take_calls(),
+        vec![
+            MediaCall::SetSubscriptions {
+                uid: b,
+                cid: 0,
+                streams: vec![cam(a)]
+            },
+            MediaCall::Offer { uid: b, cid: 0 },
+        ]
+    );
+}
+
+#[test]
 fn a_peer_never_subscribes_to_its_own_publication() {
     // There is no loopback section for it; a client renders its camera
     // from the local capture, which costs nothing and has no round trip.
@@ -605,6 +800,60 @@ fn a_video_change_defers_behind_an_unanswered_offer_and_consolidates() {
 
 // --- Cleanup -----------------------------------------------------------
 
+/// A sharing its screen in `cid` with B watching it, everything settled
+/// and both outboxes quiet.
+///
+/// This is the state each cleanup path below has to unwind, and the reason
+/// it takes this much setup is that all three of its parts are separately
+/// forgettable: a publication on the peer, the room's only screen slot,
+/// and a watcher whose media session is receiving it.
+fn watched_share(
+    core: &Core,
+    media: &RecordingMedia,
+    cid: u32,
+    a: Uid,
+    rx_a: &mut UnboundedReceiver<SeqEvent>,
+    b: Uid,
+    rx_b: &mut UnboundedReceiver<SeqEvent>,
+) {
+    for (uid, rx) in [(a, &mut *rx_a), (b, &mut *rx_b)] {
+        let join = core.voice_join(uid, cid).unwrap();
+        core.voice_answer(uid, cid, format!("answer to {}", join.sdp))
+            .unwrap();
+        drain(rx);
+    }
+    core.video_start(a, cid, VideoKind::Screen).unwrap();
+    core.video_subscribe(
+        b,
+        cid,
+        &[VideoStream {
+            uid: a,
+            kind: VideoKind::Screen,
+        }],
+    )
+    .unwrap();
+    // Settle every offer, including the follow-ups an answer can itself
+    // release: a peer still owing an answer would absorb the cleanup below
+    // into a consolidated offer instead of getting one for it, which is
+    // correct behaviour and not what these tests mean to measure.
+    loop {
+        let mut answered = false;
+        for (uid, rx) in [(a, &mut *rx_a), (b, &mut *rx_b)] {
+            for ev in drain(rx) {
+                if let Event::VoiceOffer { cid, sdp } = ev {
+                    core.voice_answer(uid, cid, format!("answer to {sdp}"))
+                        .unwrap();
+                    answered = true;
+                }
+            }
+        }
+        if !answered {
+            break;
+        }
+    }
+    media.take_calls();
+}
+
 #[test]
 fn leaving_voice_ends_every_publication_and_resyncs_the_watchers() {
     let (core, media) = videoed();
@@ -692,6 +941,120 @@ fn a_failed_publication_costs_the_publication_and_not_the_call() {
     }));
 }
 
+#[test]
+fn a_part_from_the_chat_ends_the_publication_and_frees_the_slot() {
+    // "If a user is kicked from a chat room, their voice session MUST also
+    // be terminated" — and walking out is the same path. What makes this
+    // worth its own test is that the path never mentions video: it ends
+    // the voice session, and the publications have to come with it because
+    // they hang off the peer rather than beside it.
+    let (core, media) = videoed();
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    let (cid, _) = core.chat_create(a, b).unwrap();
+    core.chat_join(cid, b, "").unwrap();
+    watched_share(&core, &media, cid, a, &mut rx_a, b, &mut rx_b);
+
+    core.chat_part(cid, a);
+
+    assert!(core.video_publications(cid).is_empty());
+    assert!(
+        media.take_calls().contains(&MediaCall::SetSubscriptions {
+            uid: b,
+            cid,
+            streams: vec![]
+        }),
+        "B stops receiving it"
+    );
+    assert_eq!(latest(&drain(&mut rx_b)), vec![], "and is told so");
+    // The room's one screen slot went with the publication, so B can take
+    // it — the assertion that says the slot was released and not merely
+    // hidden from the status.
+    core.video_start(b, cid, VideoKind::Screen).unwrap();
+}
+
+#[test]
+fn ending_a_session_ends_the_publication_and_frees_the_slot() {
+    let (core, media) = videoed();
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    watched_share(&core, &media, 0, a, &mut rx_a, b, &mut rx_b);
+
+    core.end_session(a);
+
+    assert!(core.video_publications(0).is_empty());
+    assert!(media.take_calls().contains(&MediaCall::SetSubscriptions {
+        uid: b,
+        cid: 0,
+        streams: vec![]
+    }));
+    assert_eq!(latest(&drain(&mut rx_b)), vec![]);
+    core.video_start(b, 0, VideoKind::Screen).unwrap();
+}
+
+#[test]
+fn losing_the_connection_ends_the_publication_even_though_the_session_lives() {
+    // A detached session survives, and its media path does not: the UDP
+    // flow went with the control connection and a resuming client re-joins
+    // voice explicitly. So the publication cannot be held for it — the
+    // room would be short a screen slot for as long as the client stayed
+    // away.
+    let (core, media) = videoed();
+    let (a, mut rx_a) = core
+        .attach(crate::AttachInfo {
+            nick: "mobile".into(),
+            icon: 1,
+            admin: false,
+            access: AccessBits::empty(),
+            login: "mobile".into(),
+            addr: None,
+            can_detach: true,
+        })
+        .unwrap();
+    core.announce(a);
+    let (b, mut rx_b) = quiet(&core, "bob");
+    watched_share(&core, &media, 0, a, &mut rx_a, b, &mut rx_b);
+
+    assert!(core.connection_lost(a, 8), "the session detaches");
+
+    assert_eq!(core.voice_room_of(a), None);
+    assert!(core.video_publications(0).is_empty());
+    assert!(media.take_calls().contains(&MediaCall::SetSubscriptions {
+        uid: b,
+        cid: 0,
+        streams: vec![]
+    }));
+    assert_eq!(latest(&drain(&mut rx_b)), vec![]);
+    core.video_start(b, 0, VideoKind::Screen).unwrap();
+}
+
+#[test]
+fn a_media_timeout_ends_the_publication_and_frees_the_slot() {
+    // A peer whose session failed one of the spec's timeouts is parted
+    // from the room, and unlike `VideoFailed` above this takes the call
+    // with it — so it has to take the publications too.
+    let (core, media) = videoed();
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    watched_share(&core, &media, 0, a, &mut rx_a, b, &mut rx_b);
+
+    core.voice_media_event(crate::voice::MediaEvent::Failed { uid: a, cid: 0 });
+
+    assert_eq!(core.voice_room_of(a), None);
+    assert!(core.video_publications(0).is_empty());
+    assert!(media.take_calls().contains(&MediaCall::SetSubscriptions {
+        uid: b,
+        cid: 0,
+        streams: vec![]
+    }));
+    assert_eq!(latest(&drain(&mut rx_b)), vec![]);
+    // The failed peer hears about its own video coming down too: a
+    // timeout has no reply to carry an ack, so without this its video UI
+    // would sit there live with nothing behind it.
+    assert_eq!(latest(&drain(&mut rx_a)), vec![]);
+    core.video_start(b, 0, VideoKind::Screen).unwrap();
+}
+
 // --- Preconditions -----------------------------------------------------
 
 #[test]
@@ -741,6 +1104,32 @@ fn a_server_without_video_refuses_every_video_operation() {
     assert_eq!(core.video_subscribe(a, 0, &[]), Err(VideoError::Disabled));
     // And no status is emitted into a room that can't have publications.
     assert!(publications(&drain(&mut rx_a)).is_empty());
+}
+
+#[test]
+fn a_server_without_video_emits_no_video_status_when_someone_leaves() {
+    // The refusals above are only half of it, and the half that is easy to
+    // get right: they are all reached through `video_media`. The leave
+    // path emits a video status of its own — the courtesy one that tells a
+    // leaver its publications are gone — and reaches it without asking
+    // for the media layer at all, so it needs the same guard spelled out
+    // separately. Without it this was the one video event a voice-only
+    // server still produced, and the ng wire, which has no per-session
+    // capability check on the way out because its `caps` list is supposed
+    // to make one unnecessary, delivered it to a client whose `caps` said
+    // `["voice"]`.
+    let media = Arc::new(RecordingMedia::new());
+    let core = Core::new().with_voice(media.clone(), DEFAULT_MAX_PER_ROOM);
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    joined(&core, &media, &mut [(a, &mut rx_a), (b, &mut rx_b)]);
+
+    core.voice_leave(a, 0).unwrap();
+    assert!(
+        publications(&drain(&mut rx_a)).is_empty(),
+        "not even to the leaver, which is where it used to escape"
+    );
+    assert!(publications(&drain(&mut rx_b)).is_empty());
 }
 
 #[test]

@@ -376,6 +376,79 @@ fn a_rejected_answer_tears_the_peer_down() {
 }
 
 #[test]
+fn an_answer_to_no_outstanding_offer_is_refused_and_costs_the_peer_nothing() {
+    // The server is always the offerer, so a client may only answer while
+    // it owes one. Without the check it could re-answer as often as it
+    // liked, and each answer would bind another expected SSRC in the media
+    // layer that nothing would ever retire.
+    let (core, media) = voiced(DEFAULT_MAX_PER_ROOM);
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let join = core.voice_join(a, 0).unwrap();
+    core.voice_answer(a, 0, format!("answer to {}", join.sdp))
+        .unwrap();
+    drain(&mut rx_a);
+    media.take_calls();
+
+    assert_eq!(
+        core.voice_answer(a, 0, "answer to nothing at all".into()),
+        Err(VoiceError::BadAnswer)
+    );
+    assert!(
+        media.take_calls().is_empty(),
+        "the media layer is never told about it, which is the point"
+    );
+    assert_eq!(
+        core.voice_room_of(a),
+        Some(0),
+        "and the peer is not torn down for it — this is a client repeating \
+         itself, not a client that cannot do PCMU"
+    );
+    assert!(drain(&mut rx_a).is_empty());
+}
+
+#[test]
+fn the_gate_on_answers_still_lets_a_consolidated_follow_up_through() {
+    // The refusal above must not cost renegotiation anything: the peer
+    // that answers an offer and is immediately handed the follow-up its
+    // dirty flag was holding has to be able to answer that one too.
+    let (core, media) = voiced(DEFAULT_MAX_PER_ROOM);
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, _rx_b) = quiet(&core, "bob");
+
+    let a_join = core.voice_join(a, 0).unwrap();
+    drain(&mut rx_a);
+    // B's arrival changes the room while A still owes an answer, so A goes
+    // dirty rather than getting a second offer.
+    core.voice_join(b, 0).unwrap();
+    assert!(offers(&drain(&mut rx_a)).is_empty());
+
+    // The good path: the answer to the offer that rode the join reply.
+    core.voice_answer(a, 0, format!("answer to {}", a_join.sdp))
+        .unwrap();
+    let follow_up = offers(&drain(&mut rx_a))
+        .pop()
+        .expect("the dirty flag releases exactly one consolidated offer");
+
+    // That follow-up is outstanding in its own right, so answering it is
+    // allowed — once.
+    assert_eq!(core.voice_answer(a, 0, follow_up.clone()), Ok(()));
+    assert_eq!(
+        core.voice_answer(a, 0, follow_up),
+        Err(VoiceError::BadAnswer)
+    );
+    assert_eq!(core.voice_room_of(a), Some(0));
+    assert_eq!(
+        media
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, MediaCall::Answer { uid, .. } if *uid == a))
+            .count(),
+        2,
+        "two offers, two answers — the third never reached the media layer"
+    );
+}
+
+#[test]
 fn mute_is_recorded_enforced_and_announced_once() {
     let (core, media) = voiced(DEFAULT_MAX_PER_ROOM);
     let (a, mut rx_a) = quiet(&core, "alice");
@@ -769,20 +842,27 @@ fn the_last_participant_out_takes_the_room_with_them() {
 // --- Without an SFU -----------------------------------------------------
 
 #[test]
-fn every_voice_call_is_disabled_without_a_media_layer() {
+fn every_voice_call_is_refused_without_a_media_layer() {
     let core = Core::new();
     let (a, mut rx_a) = quiet(&core, "alice");
     assert!(!core.voice_enabled());
+    // Each method answers from the closed set `docs/voice.md` §8 lists
+    // for it, and no method answers outside its own. `voice_disabled` is
+    // in join's set and in nobody else's, which is right on both counts:
+    // it is the honest answer to "let me in" and it would be a
+    // gratuitously different answer to "let me out" — with no SFU nobody
+    // is in voice, so `not_in_voice` is the accurate answer as well as
+    // the documented one.
     assert_eq!(core.voice_join(a, 0), Err(VoiceError::Disabled));
-    assert_eq!(core.voice_leave(a, 0), Err(VoiceError::Disabled));
+    assert_eq!(core.voice_leave(a, 0), Err(VoiceError::NotInVoice));
     assert_eq!(
         core.voice_answer(a, 0, "x".into()),
-        Err(VoiceError::Disabled)
+        Err(VoiceError::NotInVoice)
     );
-    assert_eq!(core.voice_mute(a, 0, true), Err(VoiceError::Disabled));
+    assert_eq!(core.voice_mute(a, 0, true), Err(VoiceError::NotInVoice));
     assert_eq!(
         core.voice_ice(a, 0, IceCandidate::default()),
-        Err(VoiceError::Disabled)
+        Err(VoiceError::NotInVoice)
     );
     assert!(core.voice_participants(0).is_empty());
     // And a voice-free server is exactly the server it was before: no

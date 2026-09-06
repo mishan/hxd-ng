@@ -44,8 +44,12 @@ pub struct VoiceSection {
     /// address to serve both.
     #[serde(default)]
     pub advertise: Vec<String>,
-    /// The spec's `VoiceMaxPerRoom`.
-    #[serde(default = "default_max_per_room")]
+    /// The spec's `VoiceMaxPerRoom`, capped at [`MAX_PER_ROOM_CEILING`]
+    /// because the participant list has to fit on the legacy wire.
+    #[serde(
+        default = "default_max_per_room",
+        deserialize_with = "deserialize_max_per_room"
+    )]
     pub max_per_room: usize,
     /// Video chat. Absent = disabled, which is the video spec's
     /// `EnableVideo` default.
@@ -56,6 +60,48 @@ pub struct VoiceSection {
     /// of its own would suggest there is a second thing to bind, and
     /// there isn't.
     pub video: Option<VideoSection>,
+}
+
+/// The largest `[voice] max_per_room` this server will accept.
+///
+/// The hard limit is the legacy wire's. A room's membership is sent as
+/// the `DATA_VOICE_PARTICIPANTS` chunk, six bytes per participant, and a
+/// Hotline chunk carries a `u16` length — so 10,922 participants is the
+/// point at which `hxd_session::frame::pack_frame` can no longer encode
+/// the blob at all. That limit is enforced by an assertion in a spawned
+/// writer task, which is the worst place to hit it: the process lives,
+/// that one connection's writer dies, and the session goes on reading
+/// frames and answering none of them.
+///
+/// So the ceiling sits an order of magnitude below it. 4096 participants
+/// is 24 KiB of blob against a 64 KiB chunk, which leaves the rest of the
+/// frame — the cid, and whatever else a future notification carries
+/// beside the roster — room it doesn't have to account for, and it is
+/// still far past any room a human would speak in. The spec's default is
+/// 16.
+pub const MAX_PER_ROOM_CEILING: usize = 4096;
+
+/// Refuse a `max_per_room` the wire can't carry, rather than clamping it.
+///
+/// A bad value here is a config error like any other in this file: the
+/// video limits are `u16` and a `70000` in the TOML is rejected by serde
+/// with the field named, and [`Config::load`] refuses a broken file
+/// outright instead of half-configuring a server. Silently serving 4096
+/// when the operator wrote 50000 would be the same kind of quiet
+/// disagreement between config and behaviour that the cap exists to
+/// prevent.
+fn deserialize_max_per_room<'de, D>(d: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let n = usize::deserialize(d)?;
+    if n > MAX_PER_ROOM_CEILING {
+        return Err(serde::de::Error::custom(format!(
+            "[voice] max_per_room {n} is above the {MAX_PER_ROOM_CEILING} this server \
+             can send a room's participant list for"
+        )));
+    }
+    Ok(n)
 }
 
 impl VoiceSection {
@@ -370,4 +416,193 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
             caps: legacy_caps(config, voice),
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a config the way [`Config::load`] would, without a file.
+    fn parse(toml_text: &str) -> Result<Config, String> {
+        toml::from_str(toml_text).map_err(|e| e.to_string())
+    }
+
+    /// A `[voice.video]` section with every field distinct, so a limit
+    /// copied into the wrong slot shows up as a mismatched number rather
+    /// than an equal one.
+    fn distinct_video() -> VideoSection {
+        VideoSection {
+            max_cameras_per_room: 11,
+            max_screens_per_room: 12,
+            max_width: 1281,
+            max_height: 721,
+            max_fps: 31,
+            max_bitrate: 1_500_001,
+            screen_max_width: 1921,
+            screen_max_height: 1081,
+            screen_max_fps: 16,
+            screen_max_bitrate: 2_500_001,
+        }
+    }
+
+    #[test]
+    fn every_video_limit_lands_on_the_kind_it_names() {
+        let cfg = distinct_video().to_video_config();
+        assert_eq!(cfg.camera.max_width, 1281);
+        assert_eq!(cfg.camera.max_height, 721);
+        assert_eq!(cfg.camera.max_fps, 31);
+        assert_eq!(cfg.camera.max_bitrate, 1_500_001);
+        assert_eq!(cfg.camera.max_per_room, 11);
+        assert_eq!(cfg.screen.max_width, 1921);
+        assert_eq!(cfg.screen.max_height, 1081);
+        assert_eq!(cfg.screen.max_fps, 16);
+        assert_eq!(cfg.screen.max_bitrate, 2_500_001);
+        assert_eq!(cfg.screen.max_per_room, 12);
+    }
+
+    #[test]
+    fn a_video_section_is_read_out_of_the_voice_table() {
+        // Nested, not beside `[voice]`: video shares the voice room's
+        // transport, so the TOML nests the way the subsystems do.
+        let c = parse(
+            r#"
+            [server]
+            bind = "0.0.0.0:5500"
+
+            [voice]
+            advertise = ["198.51.100.9:5504"]
+            max_per_room = 24
+
+            [voice.video]
+            max_cameras_per_room = 4
+            max_screens_per_room = 2
+            max_width = 1280
+            max_height = 720
+            max_fps = 24
+            max_bitrate = 1200000
+            "#,
+        )
+        .expect("a realistic voice-with-video config");
+        let voice = c.voice.as_ref().expect("[voice]");
+        assert_eq!(voice.max_per_room, 24);
+        let video = voice.video.as_ref().expect("[voice.video]");
+        assert_eq!(video.max_cameras_per_room, 4);
+        assert_eq!(video.max_width, 1280);
+        // Anything the snippet left out keeps the spec's default rather
+        // than becoming zero.
+        assert_eq!(video.screen_max_fps, default_screen_fps());
+        assert!(video_enabled(&c));
+    }
+
+    #[test]
+    fn a_voice_section_without_a_video_table_leaves_video_off() {
+        let c = parse(
+            r#"
+            [voice]
+            advertise = ["198.51.100.9:5504"]
+            "#,
+        )
+        .expect("voice without video");
+        assert!(c.voice.as_ref().unwrap().video.is_none());
+        assert!(!video_enabled(&c));
+        // And the ceilings still resolve, to the built-in defaults, so
+        // nothing downstream has to special-case the absence.
+        assert_eq!(
+            c.voice.as_ref().unwrap().video_config().camera.max_width,
+            hxd_core::VideoLimits::CAMERA.max_width
+        );
+    }
+
+    #[test]
+    fn max_per_room_defaults_to_the_spec_value_and_may_reach_the_ceiling() {
+        let c = parse("[voice]\nadvertise = [\"198.51.100.9:5504\"]\n").unwrap();
+        assert_eq!(
+            c.voice.as_ref().unwrap().max_per_room,
+            hxd_core::DEFAULT_MAX_PER_ROOM
+        );
+        let c = parse(&format!(
+            "[voice]\nadvertise = [\"198.51.100.9:5504\"]\nmax_per_room = {MAX_PER_ROOM_CEILING}\n"
+        ))
+        .expect("the ceiling itself is a legal value");
+        assert_eq!(c.voice.unwrap().max_per_room, MAX_PER_ROOM_CEILING);
+    }
+
+    #[test]
+    fn a_max_per_room_the_wire_cannot_carry_is_a_config_error() {
+        // Six bytes a participant in a `u16`-length chunk, so a room this
+        // size would trip the assertion in `pack_frame` inside a writer
+        // task and leave that connection mute. The operator hears about
+        // it now instead.
+        let err = parse(&format!(
+            "[voice]\nadvertise = [\"198.51.100.9:5504\"]\nmax_per_room = {}\n",
+            u16::MAX as usize / 6 + 1
+        ))
+        .unwrap_err();
+        assert!(err.contains(&MAX_PER_ROOM_CEILING.to_string()), "{err}");
+        assert!(err.contains("max_per_room"), "{err}");
+    }
+
+    #[test]
+    fn neither_wire_advertises_voice_or_video_without_an_sfu() {
+        // `[voice.video]` in the file is not enough: the bits and the
+        // strings follow the SFU that was actually built, never the
+        // config alone.
+        let c = parse(
+            r#"
+            [voice]
+            advertise = ["198.51.100.9:5504"]
+
+            [voice.video]
+            max_width = 1280
+            "#,
+        )
+        .unwrap();
+        assert!(video_enabled(&c));
+        assert!(legacy_caps(&c, None).is_empty());
+        assert!(ng_caps(&c, None).is_empty());
+    }
+
+    /// The capability answers with a real SFU behind them. Building one
+    /// binds a UDP socket, which is all `Voice` needs — no `Core`, no
+    /// listener, no session — so these can be unit tests. An ephemeral
+    /// port keeps them from colliding with anything.
+    #[cfg(feature = "voice")]
+    mod with_an_sfu {
+        use super::*;
+
+        fn voiced(video: bool) -> (Config, Voice) {
+            let mut text = String::from(
+                "[voice]\nbind = \"127.0.0.1:0\"\nadvertise = [\"198.51.100.9:5504\"]\n",
+            );
+            if video {
+                text.push_str("\n[voice.video]\nmax_width = 1280\n");
+            }
+            let config = parse(&text).unwrap();
+            let voice = voice::build(&config)
+                .expect("a concrete bind and one advertised address")
+                .expect("[voice] is present");
+            (config, voice)
+        }
+
+        #[test]
+        fn voice_alone_is_advertised_when_video_is_not_configured() {
+            let (config, voice) = voiced(false);
+            let caps = legacy_caps(&config, Some(&voice));
+            assert!(caps.has(cap::VOICE));
+            assert!(!caps.has(cap::VIDEO));
+            assert_eq!(ng_caps(&config, Some(&voice)), vec!["voice".to_string()]);
+        }
+
+        #[test]
+        fn video_is_advertised_only_alongside_voice() {
+            let (config, voice) = voiced(true);
+            let caps = legacy_caps(&config, Some(&voice));
+            assert!(caps.has(cap::VOICE));
+            assert!(caps.has(cap::VIDEO));
+            assert_eq!(
+                ng_caps(&config, Some(&voice)),
+                vec!["voice".to_string(), "video".to_string()]
+            );
+        }
+    }
 }

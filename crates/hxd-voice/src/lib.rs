@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 use hxd_core::video::{VideoConfig, VideoKind, VideoStream};
 use hxd_core::voice::{IceCandidate, MediaEvent, VoiceError, VoiceMedia};
 use hxd_core::Uid;
+use str0m::config::DtlsCert;
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::RtpWrite;
 use str0m::{Candidate, Event, IceConnectionState, Input, Output};
@@ -109,6 +110,10 @@ pub enum SfuError {
     /// client — it would hand out `0.0.0.0` and let every session time
     /// out. Better to refuse at startup.
     NoAdvertisableAddress,
+    /// The crypto provider would not produce a DTLS certificate. Nothing
+    /// can be negotiated without one, so this is fatal rather than
+    /// per-session.
+    NoDtlsCertificate,
 }
 
 impl std::fmt::Display for SfuError {
@@ -118,6 +123,9 @@ impl std::fmt::Display for SfuError {
                 "voice has no advertisable address: set [voice] advertise to an address \
                  clients can reach",
             ),
+            SfuError::NoDtlsCertificate => {
+                f.write_str("voice could not generate a DTLS certificate")
+            }
         }
     }
 }
@@ -127,6 +135,18 @@ impl std::error::Error for SfuError {}
 /// The forwarder.
 pub struct Sfu {
     inner: Mutex<Inner>,
+    /// Where "now" comes from for the [`VoiceMedia`] calls, which the
+    /// domain makes without a clock of its own.
+    ///
+    /// [`Sfu::poll`] and [`Sfu::handle_datagram`] take the caller's
+    /// instant, so the sans-I/O tests drive a virtual clock through
+    /// them — but the trait's methods had no such parameter and reached
+    /// for `Instant::now()`, which put real time inside otherwise
+    /// deterministic tests: a two-second stall between a join and a poll
+    /// eleven virtual seconds later flipped a timeout assertion. It also
+    /// made the keyframe rate limiter untestable without sleeping. One
+    /// injectable source fixes both.
+    clock: Box<dyn Fn() -> Instant + Send + Sync>,
 }
 
 struct Inner {
@@ -134,9 +154,42 @@ struct Inner {
     /// Room membership, kept only so forwarding knows where a packet
     /// goes. The domain owns the authoritative one.
     rooms: HashMap<u32, Vec<Uid>>,
+    /// The host candidates every peer offers, which is exactly what the
+    /// operator asked us to advertise.
     candidates: Vec<Candidate>,
+    /// Addresses a datagram may legitimately have arrived on, but which
+    /// are **not** put in an offer.
+    ///
+    /// A server behind NAT advertises the public address it is
+    /// port-forwarded from and binds a private one. ICE checks the
+    /// destination of an inbound STUN request against the agent's local
+    /// candidates and silently discards anything else — after
+    /// `Rtc::accepts` has already claimed the datagram by ufrag, so the
+    /// packet is not even stray enough to log. Giving the agent the bind
+    /// address as well makes that config work, and telling nobody about
+    /// it keeps the offer honest: a client is still only ever pointed at
+    /// an address the operator says it can reach.
+    extra_locals: Vec<Candidate>,
     events: UnboundedSender<MediaEvent>,
     next_session_id: u64,
+    /// The server's DTLS certificate, generated once and shared by every
+    /// peer.
+    ///
+    /// Letting `RtcConfig::build` generate one per session meant a P-256
+    /// key pair and a self-signature on every join — about 1.4 ms, spent
+    /// inside `Core::voice_join` with the **server-wide roster lock
+    /// held**, because `VoiceMedia` calls are made under it. One
+    /// authenticated client looping joins could therefore saturate the
+    /// lock that every login, chat message and user-list update on both
+    /// wires also needs. `docs/voice.md` §4 permits calls under that lock
+    /// only because they are in-memory state changes; certificate
+    /// generation never was one.
+    ///
+    /// Sharing it is the ordinary shape for a server — a fingerprint
+    /// identifies the server, not the session, and each peer still
+    /// verifies the one its own offer carried. Nothing about the private
+    /// key reaches a peer.
+    cert: DtlsCert,
     /// The configured per-kind ceilings, reflected in `b=AS` on every
     /// video section. Configuration, not negotiation.
     video: VideoConfig,
@@ -173,31 +226,71 @@ impl Sfu {
         advertise: &[SocketAddr],
         video: VideoConfig,
     ) -> Result<(Arc<Sfu>, UnboundedReceiver<MediaEvent>), SfuError> {
+        Sfu::with_locals(advertise, &[], video, Box::new(Instant::now))
+    }
+
+    /// The same, plus addresses a datagram may arrive on that are not
+    /// advertised (see [`Inner::extra_locals`]), and the clock the
+    /// [`VoiceMedia`] methods read.
+    pub fn with_locals(
+        advertise: &[SocketAddr],
+        extra: &[SocketAddr],
+        video: VideoConfig,
+        clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Result<(Arc<Sfu>, UnboundedReceiver<MediaEvent>), SfuError> {
         install_crypto();
         let candidates = host_candidates(advertise);
         if candidates.is_empty() {
             return Err(SfuError::NoAdvertisableAddress);
         }
+        // Anything already advertised is not "extra", and offering the
+        // same address twice would only give ICE a duplicate to check.
+        let extra_locals: Vec<Candidate> = host_candidates(extra)
+            .into_iter()
+            .filter(|c| !candidates.iter().any(|a| a.addr() == c.addr()))
+            .collect();
+        let cert = str0m::crypto::from_feature_flags()
+            .dtls_provider
+            .generate_certificate()
+            .ok_or(SfuError::NoDtlsCertificate)?;
         let (tx, rx) = unbounded_channel();
         let sfu = Arc::new(Sfu {
             inner: Mutex::new(Inner {
                 peers: HashMap::new(),
                 rooms: HashMap::new(),
                 candidates,
+                extra_locals,
                 events: tx,
                 next_session_id: 1,
                 video,
+                cert,
             }),
+            clock,
         });
         Ok((sfu, rx))
     }
 
+    fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
     /// Feed one received datagram. `to` is the local address it arrived
     /// on, which ICE matches against our host candidates.
-    pub fn handle_datagram(&self, from: SocketAddr, to: SocketAddr, data: &[u8], now: Instant) {
+    ///
+    /// Returns whether it belonged to a live session. A `false` is what
+    /// the pump's rate limiter charges against the source: deciding a
+    /// datagram matches nothing means offering it to every `Rtc` under
+    /// this mutex, so it is the expensive answer, not the cheap one.
+    pub fn handle_datagram(
+        &self,
+        from: SocketAddr,
+        to: SocketAddr,
+        data: &[u8],
+        now: Instant,
+    ) -> bool {
         let Ok(contents) = data.try_into() else {
             debug!(%from, "unparseable datagram");
-            return;
+            return false;
         };
         let input = Input::Receive(
             now,
@@ -237,12 +330,13 @@ impl Sfu {
         else {
             // Not for any live session. On an open UDP port this is the
             // normal case for scanners and stray packets alike, and
-            // dropping it is the whole defence.
+            // dropping it is most of the defence; the pump rate-limits
+            // the source so that deciding this stays cheap in aggregate.
             debug!(%from, "datagram matched no voice session");
-            return;
+            return false;
         };
         let Some(peer) = inner.peers.get_mut(&uid) else {
-            return;
+            return false;
         };
         // Note what is *not* here: the media clock. A datagram's shape
         // says nothing about who sent it — this code runs before str0m
@@ -259,6 +353,7 @@ impl Sfu {
             warn!(uid, "voice session error: {e}");
             inner.fail(uid);
         }
+        true
     }
 
     /// Drain everything the SFU wants to send and report when it next
@@ -637,7 +732,7 @@ impl VoiceMedia for Sfu {
     }
 
     fn join(&self, uid: Uid, cid: u32) {
-        let now = Instant::now();
+        let now = self.now();
         let mut inner = self.inner.lock().unwrap();
         // A rejoin arrives here as leave-then-join from the domain, but
         // the media layer must not depend on that to avoid two sessions
@@ -647,7 +742,9 @@ impl VoiceMedia for Sfu {
         let session_id = inner.next_session_id;
         inner.next_session_id += 1;
         let candidates = inner.candidates.clone();
-        let mut peer = Peer::new(cid, now, &candidates, session_id, 0);
+        let extra = inner.extra_locals.clone();
+        let cert = inner.cert.clone();
+        let mut peer = Peer::new(cid, now, &candidates, &extra, cert, session_id, 0);
         // str0m's own SSRC allocator: random, and one less dependency
         // than reaching for a CSPRNG here.
         peer.forward_ssrc = *peer.rtc.direct_api().new_ssrc();
@@ -692,6 +789,11 @@ impl VoiceMedia for Sfu {
                 full = true;
             }
         }
+        // Retire whatever is no longer coming through before declaring
+        // what is, so a publication this peer has just resubscribed to is
+        // seen as returning rather than continuing — which is what earns
+        // it a fresh SSRC instead of a sequence-number cliff.
+        peer.deactivate_absent_video(&present_video);
         // Only subscribed publications get a section. A peer that has
         // subscribed to nothing is offered no video sections at all,
         // which is what stops the server inviting itself to send
@@ -705,10 +807,10 @@ impl VoiceMedia for Sfu {
         let sdp = peer.offer(&present, &present_video, &candidates, &limits);
         let peer_cid = peer.cid;
         if full {
-            // This session has been in the room long enough to collect
-            // MAX_SECTIONS worth of people, and its offer can't grow to
-            // fit another. End it: the client reconnects with a clean
-            // section list, which is the only way back under the cap.
+            // This session has been in the room long enough that its
+            // offer has no room left for another section. End it: the
+            // client reconnects with a clean section list, which is the
+            // only way back under the ceiling.
             //
             // The offer just built goes in the bin with it. It is short
             // by whoever didn't fit, and by the next line it describes a
@@ -727,7 +829,7 @@ impl VoiceMedia for Sfu {
     }
 
     fn answer(&self, uid: Uid, cid: u32, sdp: &str) -> Result<(), VoiceError> {
-        let now = Instant::now();
+        let now = self.now();
         let mut inner = self.inner.lock().unwrap();
         let answer = match sdp::parse_answer(sdp) {
             Ok(a) => a,
@@ -766,6 +868,23 @@ impl VoiceMedia for Sfu {
             }
             inner.emit(MediaEvent::VideoFailed { uid, cid, kind });
         }
+        // The renegotiation this answer completes is the moment a
+        // receiver's newly-active sections actually have a decoder behind
+        // them, and the spec makes that one of the four keyframe
+        // triggers. Asking at subscribe time alone is not enough: the
+        // subscriber's offer may sit behind an unanswered one for an
+        // arbitrary interval, so the keyframe arrives before there is
+        // anything to decode it and the rate limiter then blocks the
+        // retry. Asking again here costs nothing when it is redundant —
+        // the limiter collapses it.
+        let subscriptions: Vec<VideoStream> = inner
+            .peers
+            .get(&uid)
+            .map(|p| p.subscriptions.clone())
+            .unwrap_or_default();
+        for s in subscriptions {
+            inner.request_keyframe(s.uid, s.kind, now);
+        }
         // ICE-lite: our candidates rode the offer, so the only thing
         // left to trickle is the end of them. Sending it after the
         // answer means the client already has the offer it refers to.
@@ -792,6 +911,7 @@ impl VoiceMedia for Sfu {
     }
 
     fn set_muted(&self, uid: Uid, cid: u32, muted: bool) {
+        let now = self.now();
         let mut inner = self.inner.lock().unwrap();
         if let Some(peer) = inner.peers.get_mut(&uid) {
             if peer.cid == cid {
@@ -801,7 +921,7 @@ impl VoiceMedia for Sfu {
                 // be reaped the instant it unmuted, on the strength of
                 // silence it was entitled to.
                 if peer.muted && !muted {
-                    peer.last_media = Some(Instant::now());
+                    peer.last_media = Some(now);
                 }
                 peer.muted = muted;
             }
@@ -814,22 +934,41 @@ impl VoiceMedia for Sfu {
         "VP8"
     }
 
-    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) {
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> bool {
         let mut inner = self.inner.lock().unwrap();
         // The forwarding SSRC is allocated up front, exactly as audio's
         // is: the offer for a publication has to be complete before the
         // publisher's answer arrives, or every subscriber who joined
         // first would need renegotiating again the moment it did.
+        //
+        // The `bool` matters. This can fail — the session may have been
+        // reaped with a `Failed` already in flight, or its offer may have
+        // no room left for another section — and the domain has by this
+        // point claimed a room slot and is about to announce the
+        // publication to everyone. Dropping the answer left the publisher
+        // with no send section, no way to send a frame, no `VideoFailed`
+        // to release the slot, and a room whose single screen slot stayed
+        // occupied by a publication that could never produce a pixel.
+        // `answer` reports its failures through `VideoFailed` for exactly
+        // this reason; this had no channel at all.
         let Some(peer) = inner.peers.get_mut(&uid) else {
-            return;
+            return false;
         };
         if peer.cid != cid {
-            return;
+            return false;
         }
         let ssrc = *peer.rtc.direct_api().new_ssrc();
-        if peer.declare_video_send(kind, ssrc) {
-            info!(uid, cid, ?kind, "video publication started");
+        if !peer.declare_video_send(kind, ssrc) {
+            warn!(
+                uid,
+                cid,
+                ?kind,
+                "video publication refused: no room in the offer"
+            );
+            return false;
         }
+        info!(uid, cid, ?kind, "video publication started");
+        true
     }
 
     fn unpublish(&self, uid: Uid, cid: u32, kind: VideoKind) {
@@ -843,7 +982,7 @@ impl VoiceMedia for Sfu {
     }
 
     fn set_paused(&self, uid: Uid, cid: u32, kind: VideoKind, paused: bool) {
-        let now = Instant::now();
+        let now = self.now();
         let mut inner = self.inner.lock().unwrap();
         let Some(peer) = inner.peers.get_mut(&uid) else {
             return;
@@ -869,7 +1008,7 @@ impl VoiceMedia for Sfu {
     }
 
     fn set_subscriptions(&self, uid: Uid, cid: u32, streams: &[VideoStream]) {
-        let now = Instant::now();
+        let now = self.now();
         let mut inner = self.inner.lock().unwrap();
         let Some(peer) = inner.peers.get_mut(&uid) else {
             return;
@@ -901,6 +1040,7 @@ impl VoiceMedia for Sfu {
 pub async fn run(sfu: Arc<Sfu>, socket: tokio::net::UdpSocket) -> std::io::Result<()> {
     let local = socket.local_addr()?;
     let mut buf = vec![0u8; 2048];
+    let mut unmatched = UnmatchedLimiter::default();
     loop {
         let (datagrams, deadline) = sfu.poll(Instant::now());
         for d in datagrams {
@@ -911,16 +1051,109 @@ pub async fn run(sfu: Arc<Sfu>, socket: tokio::net::UdpSocket) -> std::io::Resul
         tokio::select! {
             r = socket.recv_from(&mut buf) => match r {
                 Ok((n, from)) => {
-                    // With a wildcard bind the socket can't tell us which
-                    // local address the datagram arrived on, and ICE
-                    // matches candidates by it — so report the advertised
-                    // address of the right family.
-                    let to = local_for(&sfu, local, from);
-                    sfu.handle_datagram(from, to, &buf[..n], Instant::now());
+                    feed(&sfu, &socket, local, from, &buf[..n], &mut unmatched);
+                    // Drain whatever else is already queued before going
+                    // back round. Polling is O(peers) and the loop polls
+                    // once per iteration, so a burst — a talkative room,
+                    // or a flood — otherwise costs one full pass over
+                    // every session per packet. Taking the burst in one
+                    // go amortises that, and the deadline below is
+                    // recomputed straight after.
+                    for _ in 0..BURST_DRAIN {
+                        match socket.try_recv_from(&mut buf) {
+                            Ok((n, from)) => {
+                                feed(&sfu, &socket, local, from, &buf[..n], &mut unmatched);
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 }
                 Err(e) => debug!("voice recv failed: {e}"),
             },
             _ = tokio::time::sleep_until(deadline.into()) => {}
+        }
+    }
+}
+
+/// How many further datagrams one wake-up may take before polling again.
+/// Bounded so a sustained flood can't starve the timers that drive ICE,
+/// DTLS and the timeout table.
+const BURST_DRAIN: usize = 64;
+
+/// Hand one datagram to the SFU, unless its source has spent its budget
+/// for datagrams that match no session.
+fn feed(
+    sfu: &Sfu,
+    socket: &tokio::net::UdpSocket,
+    local: SocketAddr,
+    from: SocketAddr,
+    data: &[u8],
+    unmatched: &mut UnmatchedLimiter,
+) {
+    let _ = socket;
+    if !unmatched.allow(from, Instant::now()) {
+        return;
+    }
+    // With a wildcard bind the socket can't tell us which local address
+    // the datagram arrived on, and ICE matches candidates by it — so
+    // report the advertised address of the right family.
+    let to = local_for(sfu, local, from);
+    if !sfu.handle_datagram(from, to, data, Instant::now()) {
+        unmatched.miss(from, Instant::now());
+    }
+}
+
+/// A token bucket over sources whose datagrams match no live session.
+///
+/// `docs/voice.md` §10 names this as the answer to "an unauthenticated
+/// UDP port on the internet", and it was the one part of that answer not
+/// implemented. Dropping an unmatched datagram is cheap, but *deciding*
+/// it is unmatched is not: the datagram is offered to every live `Rtc` in
+/// turn, under the SFU's mutex. A trivial spoofed flood therefore costs
+/// the room its forwarding latency, with nothing above a `debug!` to say
+/// why.
+///
+/// Only misses are charged, so a peer sending real media is never
+/// throttled however fast it sends. The table is keyed by address and
+/// swept whole rather than per entry, which keeps a spoofed-source flood
+/// from turning the defence into the memory leak.
+#[derive(Default)]
+struct UnmatchedLimiter {
+    seen: HashMap<SocketAddr, u32>,
+    window_started: Option<Instant>,
+}
+
+impl UnmatchedLimiter {
+    /// Misses one source may spend per window before it is ignored.
+    /// Generous next to a real handshake, which matches on its first
+    /// STUN and is never charged at all.
+    const BUDGET: u32 = 32;
+    const WINDOW: Duration = Duration::from_secs(1);
+    /// Distinct sources tracked before the table is swept early. A
+    /// spoofed flood is the case this bounds.
+    const MAX_SOURCES: usize = 4096;
+
+    fn roll(&mut self, now: Instant) {
+        let stale = self
+            .window_started
+            .is_none_or(|t| now.duration_since(t) >= Self::WINDOW);
+        if stale || self.seen.len() > Self::MAX_SOURCES {
+            self.seen.clear();
+            self.window_started = Some(now);
+        }
+    }
+
+    fn allow(&mut self, from: SocketAddr, now: Instant) -> bool {
+        self.roll(now);
+        self.seen.get(&from).is_none_or(|n| *n < Self::BUDGET)
+    }
+
+    fn miss(&mut self, from: SocketAddr, now: Instant) {
+        self.roll(now);
+        let n = self.seen.entry(from).or_insert(0);
+        *n += 1;
+        if *n == Self::BUDGET {
+            debug!(%from, "ignoring further unmatched voice datagrams this second");
         }
     }
 }

@@ -19,6 +19,18 @@ use crate::Config;
 ///
 /// Absent section means voice is off, which is the spec's `EnableVoice`
 /// default and the safe one — it is an open UDP port on the internet.
+///
+/// The addressing rules below are checked here, at startup, because the
+/// media plane has no way to complain about them later: a datagram whose
+/// local address doesn't match one of the SFU's candidates is dropped
+/// inside str0m's ICE agent — after `Rtc::accepts` has already claimed it
+/// by ufrag, so it isn't even a stray packet anyone could log. The
+/// symptom is a join that gets a perfectly good offer, never connects,
+/// and dies on the 30 s ICE timeout, with nothing in the server log but
+/// the address it is listening on. An operator can't debug that, so a
+/// configuration that can only produce it has to be refused before the
+/// port is ever opened — which is what `NoAdvertisableAddress` already
+/// does for the emptier version of the same mistake.
 pub(crate) fn addresses(config: &Config) -> Result<Option<(SocketAddr, Vec<SocketAddr>)>, String> {
     let Some(v) = &config.voice else {
         return Ok(None);
@@ -68,7 +80,37 @@ pub(crate) fn addresses(config: &Config) -> Result<Option<(SocketAddr, Vec<Socke
         }
         advertise.push(bind);
     }
+    // A wildcard bind gives the socket no address of its own to report,
+    // so the media plane can only decide which advertised address a
+    // datagram arrived on by matching address families. Two of a family
+    // are therefore indistinguishable, and whichever one loses the guess
+    // is unreachable: clients that nominate it are discarded. One address
+    // per family is the shape the docs describe ("list both a v4 and a v6
+    // address to serve both") and the only one a wildcard can serve, so
+    // this refuses a config that was already silently broken.
+    if bind.ip().is_unspecified() {
+        if let Some((a, b)) = same_family_pair(&advertise) {
+            return Err(format!(
+                "[voice] bind is {bind}, so an incoming datagram can only be matched to \
+                 an advertised address by family, and {a} and {b} share one: give each \
+                 address its own concrete [voice] bind, or advertise one address per family"
+            ));
+        }
+    }
     Ok(Some((bind, advertise)))
+}
+
+/// The first two advertised addresses of the same family, if any — the
+/// pair a wildcard bind cannot tell apart.
+fn same_family_pair(advertise: &[SocketAddr]) -> Option<(SocketAddr, SocketAddr)> {
+    for (i, a) in advertise.iter().enumerate() {
+        for b in &advertise[i + 1..] {
+            if a.is_ipv4() == b.is_ipv4() {
+                return Some((*a, *b));
+            }
+        }
+    }
+    None
 }
 
 /// `[server] bind` as an address, resolving a host name the way the
@@ -158,6 +200,57 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_bind_advertising_two_addresses_of_one_family_is_refused() {
+        // The dual-homed host: both addresses are real and reachable, but
+        // a wildcard socket can't say which one a datagram came in on, so
+        // one of the two would silently never connect.
+        let c = config(
+            "0.0.0.0:5500",
+            Some(voice_section(
+                None,
+                &["198.51.100.9:5504", "203.0.113.7:5504"],
+            )),
+        );
+        let err = addresses(&c).unwrap_err();
+        assert!(err.contains("198.51.100.9:5504"), "{err}");
+        assert!(err.contains("203.0.113.7:5504"), "{err}");
+        assert!(err.contains("one address per family"), "{err}");
+    }
+
+    #[test]
+    fn a_wildcard_bind_may_advertise_one_address_per_family() {
+        // The documented way to serve v4 and v6 clients from a single
+        // socket, which the same-family check must not catch.
+        let c = config(
+            "0.0.0.0:5500",
+            Some(voice_section(
+                None,
+                &["198.51.100.9:5504", "[2001:db8::1]:5504"],
+            )),
+        );
+        let (_, advertise) = addresses(&c).unwrap().unwrap();
+        assert_eq!(advertise.len(), 2);
+    }
+
+    #[test]
+    fn a_concrete_bind_may_advertise_as_many_addresses_as_it_likes() {
+        // With a real address on the socket the media plane knows what it
+        // received a datagram on without guessing, so several addresses
+        // of one family — a NAT's public address alongside the private
+        // one, say — are fine.
+        let c = config(
+            "127.0.0.1:5500",
+            Some(voice_section(
+                Some("10.0.0.5:5504"),
+                &["203.0.113.7:5504", "10.0.0.5:5504"],
+            )),
+        );
+        let (bind, advertise) = addresses(&c).unwrap().unwrap();
+        assert_eq!(bind, "10.0.0.5:5504".parse().unwrap());
+        assert_eq!(advertise.len(), 2);
+    }
+
+    #[test]
     fn an_explicit_voice_bind_is_taken_as_written() {
         let c = config(
             "localhost:5500",
@@ -200,7 +293,22 @@ mod imp {
             .voice
             .as_ref()
             .map_or_else(VideoConfig::default, |v| v.video_config());
-        let (sfu, events) = Sfu::new(&advertise, video).map_err(|e| e.to_string())?;
+        // The bind address goes in as a local candidate that is never
+        // advertised. A server behind NAT binds a private address and
+        // advertises the public one it is port-forwarded from, and ICE
+        // discards an inbound STUN request whose destination is not one
+        // of its local candidates — silently, inside the agent, after the
+        // datagram has already been claimed by ufrag. Naming it here is
+        // what makes that configuration work; not advertising it is what
+        // keeps the offer honest, since a client should still only ever
+        // be pointed at an address the operator says it can reach.
+        let (sfu, events) = Sfu::with_locals(
+            &advertise,
+            &[bind],
+            video,
+            Box::new(std::time::Instant::now),
+        )
+        .map_err(|e| e.to_string())?;
         // Bind here, not in `serve`. Everything downstream — the
         // capability bit on both wires, `Core::with_voice`, the room
         // state — is a promise that a join will work, and a port that

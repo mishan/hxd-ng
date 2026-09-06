@@ -19,8 +19,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use hotline_proto::messages::tag;
-use hxd_core::video::VideoConfig;
-use hxd_core::voice::fake::RecordingMedia;
+use hxd_core::video::{VideoConfig, VideoKind, VideoStream};
+use hxd_core::voice::fake::{MediaCall, RecordingMedia};
+use hxd_core::voice::MediaEvent;
 use hxd_core::Core;
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::{cap, Caps};
@@ -40,8 +41,15 @@ const REQ_LOGIN: u32 = 0x6b;
 // Voice's, because video is layered on it and every test here has to get
 // into a room first.
 const REQ_VOICE_JOIN: u32 = 600;
+const REQ_VOICE_LEAVE: u32 = 601;
 const NOTIFY_VOICE_OFFER: u32 = 602;
 const REQ_VOICE_ANSWER: u32 = 603;
+const NOTIFY_VOICE_STATUS: u32 = 605;
+/// Voice mute (606). The tests below use it as an errand rather than for
+/// muting: it is the cheapest request that makes the server send this
+/// client a notification, which is what the quiet assertions synchronise
+/// on. See [`Client::sync`].
+const REQ_VOICE_MUTE: u32 = 606;
 
 // The video extension's opcodes and fields, spelled out rather than
 // imported so a change on either side has to be deliberate.
@@ -61,9 +69,24 @@ const FIELD_VIDEO_SUBSCRIPTIONS: u16 = 0x0225;
 const KIND_CAMERA: u16 = 1;
 const KIND_SCREEN: u16 = 2;
 
+/// A running server: both wires, the media layer behind them, and the
+/// core itself.
+///
+/// The last two are what let a test assert on more than the wire. The
+/// media layer records what the domain actually asked the SFU to
+/// forward, which is the difference between "the request was accepted"
+/// and "the subscription happened"; the core is where `hxd`'s event pump
+/// delivers what the SFU says back.
+struct Server {
+    legacy: SocketAddr,
+    ng: SocketAddr,
+    media: Arc<RecordingMedia>,
+    core: Arc<Core>,
+}
+
 /// A server on both wires sharing one core, with video on unless asked
 /// otherwise.
-async fn start_both(dir: &Path, video: bool) -> (SocketAddr, SocketAddr, Arc<RecordingMedia>) {
+async fn start_both(dir: &Path, video: bool) -> Server {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     // Everything: voice, camera and screen.
@@ -96,13 +119,14 @@ async fn start_both(dir: &Path, video: bool) -> (SocketAddr, SocketAddr, Arc<Rec
     if video {
         core = core.with_video(VideoConfig::default());
     }
+    let core = Arc::new(core);
     let caps = if video {
         Caps::empty().with(cap::VOICE).with(cap::VIDEO)
     } else {
         Caps::empty().with(cap::VOICE)
     };
     let ctx = ServerCtx {
-        core: Arc::new(core),
+        core: core.clone(),
         auth: Arc::new(hxd_auth_file::FileAuth::new(accounts)),
         cfg: Arc::new(ServerConfig {
             name: "video test".into(),
@@ -138,12 +162,17 @@ async fn start_both(dir: &Path, video: bool) -> (SocketAddr, SocketAddr, Arc<Rec
     let ng_addr = ng_listener.local_addr().unwrap();
     tokio::spawn(hxd_session::serve(listener, ctx));
     tokio::spawn(hxd_ng_session::serve(ng_listener, ng_ctx));
-    (addr, ng_addr, media)
+    Server {
+        legacy: addr,
+        ng: ng_addr,
+        media,
+        core,
+    }
 }
 
-async fn start_server(dir: &Path) -> (SocketAddr, Arc<RecordingMedia>) {
-    let (legacy, _ng, media) = start_both(dir, true).await;
-    (legacy, media)
+/// The common case: video on, both wires up.
+async fn start_server(dir: &Path) -> Server {
+    start_both(dir, true).await
 }
 
 fn xor(b: &[u8]) -> Vec<u8> {
@@ -164,6 +193,10 @@ struct Client {
     /// wasn't waiting for would drop the very notifications these tests
     /// are about.
     pending: Vec<Frame>,
+    /// This client's own mute state, tracked so [`Client::sync`] can flip
+    /// it: a mute that changes nothing is acked and tells the room
+    /// nothing, and the room's answer is the whole point of that call.
+    muted: bool,
 }
 
 impl Client {
@@ -181,6 +214,7 @@ impl Client {
             caps: None,
             limits: Vec::new(),
             pending: Vec::new(),
+            muted: false,
         };
         let mut chunks = vec![
             (tag::NAME, login.as_bytes().to_vec()),
@@ -304,19 +338,105 @@ impl Client {
         panic!("no video status matching {want:?}");
     }
 
-    async fn expect_quiet(&mut self) {
-        assert!(
-            self.pending.iter().all(|f| f.ty != NOTIFY_VIDEO_STATUS),
-            "expected no video status, but one was already buffered"
-        );
-        let r = timeout(Duration::from_millis(200), read_frame(&mut self.stream)).await;
-        if let Ok(Ok(f)) = r {
-            assert_ne!(
-                f.ty, NOTIFY_VIDEO_STATUS,
-                "a client without the capability must never see 611"
-            );
+    /// Read everything the server owes this client so far, using a frame
+    /// it must send as the finish line rather than a sleep.
+    ///
+    /// Muting is the errand: the domain answers it with a room status
+    /// (605) to everyone in the room, and that status travels on the same
+    /// per-session event channel a video status (611) would. Events on
+    /// that channel are delivered in order, so **any notification caused
+    /// by something that happened before this call has to arrive in front
+    /// of the status it returns on**. That is what makes the assertions
+    /// built on it fail closed: a stray 611 is a buffered frame, not a
+    /// race against a wall clock.
+    ///
+    /// The mute is a toggle rather than a fixed value because a no-op
+    /// toggle is acked without telling the room anything, and it is the
+    /// telling that this waits for. Waiting for *this* mute's status
+    /// rather than the next one to arrive matters for the same reason:
+    /// a join leaves statuses of its own on the wire.
+    async fn sync(&mut self, cid: u32) {
+        self.muted = !self.muted;
+        let muted = self.muted;
+        self.ok(
+            REQ_VOICE_MUTE,
+            &[
+                chat_id(cid),
+                (tag::VOICE_MUTED, u16::from(muted).to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+        let me = self.uid;
+        for _ in 0..24 {
+            let f = self.recv_type(NOTIFY_VOICE_STATUS).await;
+            if participants(&f).contains(&(me, muted)) {
+                return;
+            }
+        }
+        panic!("the room status this mute caused never arrived");
+    }
+
+    /// Read everything the server has for this client and answer every
+    /// offer, until it owes nothing and is owed nothing.
+    ///
+    /// One pass is not enough: [`Client::settle`] answers what is already
+    /// buffered, and an answer can release the consolidated follow-up
+    /// offer that the per-peer serialisation rule held back. A test that
+    /// goes on to assert "no offer arrived" would otherwise be measuring
+    /// that deferred offer instead of what it meant to.
+    async fn quiesce(&mut self, cid: u32) {
+        for _ in 0..8 {
+            self.sync(cid).await;
+            if !self.pending.iter().any(|f| f.ty == NOTIFY_VOICE_OFFER) {
+                self.pending.clear();
+                return;
+            }
+            self.settle(cid).await;
+        }
+        panic!("this peer never stopped owing an answer");
+    }
+
+    /// Wait for a voice room status describing exactly these
+    /// participants, muted flags included.
+    async fn voice_status_for(&mut self, want: &[(u16, bool)]) -> Frame {
+        for _ in 0..24 {
+            let f = self.recv_type(NOTIFY_VOICE_STATUS).await;
+            if participants(&f) == want {
+                return f;
+            }
+        }
+        panic!("no voice status matching {want:?}");
+    }
+
+    /// Everything buffered, drained — a quiet assertion has to look at
+    /// all of it, not at whichever frame happened to be next.
+    fn buffered(&self) -> Vec<u32> {
+        self.pending.iter().map(|f| f.ty).collect()
+    }
+
+    /// Nothing from the video extension has reached this client.
+    ///
+    /// Synchronised with [`Client::sync`], so this is an assertion about
+    /// frames that have already been written rather than a bet on how
+    /// long a regression would take to arrive. The backstop read is only
+    /// that: by the time it runs the question is already answered.
+    async fn expect_no_video(&mut self, cid: u32) {
+        self.sync(cid).await;
+        while let Ok(Ok(f)) = timeout(Duration::from_millis(50), read_frame(&mut self.stream)).await
+        {
             self.pending.push(f);
         }
+        let seen = self.buffered();
+        let video: Vec<u32> = seen
+            .iter()
+            .copied()
+            .filter(|t| (REQ_VIDEO_START..=NOTIFY_VIDEO_STATUS).contains(t))
+            .collect();
+        assert!(
+            video.is_empty(),
+            "a client that negotiated no video must see none of 607–611; got {video:?} \
+             among {seen:?}"
+        );
     }
 }
 
@@ -354,6 +474,20 @@ fn publishers(f: &Frame) -> Vec<(u16, u16, bool)> {
             let codec = u16::from_be_bytes([e[6], e[7]]);
             assert_eq!(codec, 0, "VP8 is codec 0 in *this* number space");
             (uid, kind, flags & 1 != 0)
+        })
+        .collect()
+}
+
+/// Decode a `DATA_VOICE_PARTICIPANTS` blob: six bytes an entry, uid then
+/// flags then codec. Voice's, not video's — the video tests read it to
+/// check the call is still standing after a video event.
+fn participants(f: &Frame) -> Vec<(u16, bool)> {
+    let blob = chunk(f, tag::VOICE_PARTICIPANTS).expect("participants blob");
+    blob.chunks_exact(6)
+        .map(|e| {
+            let uid = u16::from_be_bytes([e[0], e[1]]);
+            let flags = u16::from_be_bytes([e[2], e[3]]);
+            (uid, flags & 1 != 0)
         })
         .collect()
 }
@@ -519,7 +653,7 @@ fn ng_publishers(ev: &Value) -> Vec<(u16, &str, bool)> {
 #[tokio::test]
 async fn the_video_bit_is_echoed_only_alongside_the_voice_bit() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
 
     let both = Client::video_login(addr, "sharer").await;
     assert_eq!(
@@ -546,7 +680,7 @@ async fn the_video_bit_is_echoed_only_alongside_the_voice_bit() {
 #[tokio::test]
 async fn the_login_reply_carries_one_limits_field_per_kind() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let c = Client::video_login(addr, "sharer").await;
 
     assert_eq!(
@@ -573,7 +707,7 @@ async fn the_login_reply_carries_one_limits_field_per_kind() {
 #[tokio::test]
 async fn a_server_without_video_advertises_none_and_refuses_it() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, _ng, _) = start_both(td.path(), false).await;
+    let addr = start_both(td.path(), false).await.legacy;
     let mut c = Client::video_login(addr, "sharer").await;
     assert_eq!(
         c.caps,
@@ -592,7 +726,7 @@ async fn a_server_without_video_advertises_none_and_refuses_it() {
 #[tokio::test]
 async fn starting_replies_with_the_codec_and_tells_the_room() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let mut a = Client::video_login(addr, "sharer").await;
     let mut b = Client::video_login(addr, "camera").await;
     a.join_voice(0).await;
@@ -626,7 +760,7 @@ async fn starting_replies_with_the_codec_and_tells_the_room() {
 #[tokio::test]
 async fn one_participant_can_publish_a_camera_and_a_screen_at_once() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let mut a = Client::video_login(addr, "sharer").await;
     a.join_voice(0).await;
 
@@ -645,7 +779,7 @@ async fn one_participant_can_publish_a_camera_and_a_screen_at_once() {
 #[tokio::test]
 async fn pausing_reaches_the_room_without_renegotiating_anyone() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let mut a = Client::video_login(addr, "sharer").await;
     let mut b = Client::video_login(addr, "camera").await;
     a.join_voice(0).await;
@@ -676,7 +810,7 @@ async fn stopping_what_is_not_running_is_accepted() {
     // Disconnect races make this idempotent, and a client should not have
     // to tell a real failure from a lost race.
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let mut a = Client::video_login(addr, "sharer").await;
     a.join_voice(0).await;
     a.ok(REQ_VIDEO_STOP, &[chat_id(0), kind_chunk(KIND_SCREEN)])
@@ -687,7 +821,7 @@ async fn stopping_what_is_not_running_is_accepted() {
 #[tokio::test]
 async fn an_invalid_kind_is_refused_rather_than_read_as_a_camera() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let mut a = Client::video_login(addr, "sharer").await;
     a.join_voice(0).await;
     // Joining already brought one status — an empty one, which is how a
@@ -713,7 +847,7 @@ async fn an_invalid_kind_is_refused_rather_than_read_as_a_camera() {
 #[tokio::test]
 async fn video_outside_a_voice_room_is_refused() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let mut a = Client::video_login(addr, "sharer").await;
     let err = a
         .refused(REQ_VIDEO_START, &[chat_id(0), kind_chunk(KIND_CAMERA)])
@@ -726,7 +860,7 @@ async fn video_outside_a_voice_room_is_refused() {
 #[tokio::test]
 async fn the_camera_bit_and_the_screen_bit_are_separate_decisions() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let mut cam = Client::video_login(addr, "camera").await;
     cam.join_voice(0).await;
 
@@ -744,7 +878,8 @@ async fn a_watcher_may_receive_everything_and_publish_nothing() {
     // Receiving video requires no privilege bit beyond being in the room;
     // the bits govern publishing.
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let s = start_server(td.path()).await;
+    let addr = s.legacy;
     let mut a = Client::video_login(addr, "sharer").await;
     let mut w = Client::video_login(addr, "watcher").await;
     a.join_voice(0).await;
@@ -752,16 +887,69 @@ async fn a_watcher_may_receive_everything_and_publish_nothing() {
     a.settle(0).await;
     a.start(0, KIND_CAMERA).await;
 
+    // Publishing is what the missing bit costs the watcher.
     w.refused(REQ_VIDEO_START, &[chat_id(0), kind_chunk(KIND_CAMERA)])
         .await;
+
+    // Starting renegotiates the publisher, for its own send section, and
+    // announces the publication. Consume and answer both here: it clears
+    // them out of the way of the quiet assertion below, and an offer the
+    // publisher never gets — or one it still owes an answer to — would
+    // make "the publisher gets no offer from someone else's subscribe"
+    // vacuously true.
+    a.status_for(&[(a.uid, KIND_CAMERA, false)]).await;
+    a.quiesce(0).await;
+    s.media.take_calls();
+
     w.ok(
         REQ_VIDEO_SUBSCRIBE,
         &[chat_id(0), subscriptions(&[(a.uid, KIND_CAMERA)])],
     )
     .await;
-    // Subscribing gets the subscriber an offer, and tells the publisher
-    // nothing: who is watching whom is not published.
+
+    // Subscribing gets the subscriber an offer. What that offer has to
+    // describe is the publisher's camera, and the SDP the fake media
+    // layer writes says nothing about sections — so the assertion that
+    // the section is really there is on the call the domain made into
+    // the media layer, which is what a real SFU would turn into a
+    // `cam-user-N` receive section and the forwarding behind it.
+    // (`hxd-voice`'s `sdp` tests own the section itself.)
+    let calls = s.media.take_calls();
+    assert!(
+        calls.contains(&MediaCall::SetSubscriptions {
+            uid: w.uid,
+            cid: 0,
+            streams: vec![VideoStream {
+                uid: a.uid,
+                kind: VideoKind::Camera,
+            }],
+        }),
+        "the watcher's receive set must reach the SFU naming the publisher's \
+         camera; got {calls:?}"
+    );
+    assert!(
+        calls.contains(&MediaCall::Offer { uid: w.uid, cid: 0 }),
+        "and the subscriber is renegotiated so it has a section to receive on"
+    );
     w.recv_type(NOTIFY_VOICE_OFFER).await;
+
+    // And it tells the publisher nothing: who is watching whom is not
+    // published. Neither on the wire — `sync` puts a frame the publisher
+    // is owed behind anything the subscribe would have produced — nor
+    // into the media layer, which was never asked to renegotiate it.
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, MediaCall::Offer { uid, .. } if *uid == a.uid)),
+        "the publisher must not be renegotiated by someone else's subscribe; \
+         got {calls:?}"
+    );
+    a.sync(0).await;
+    assert_eq!(
+        a.buffered(),
+        Vec::<u32>::new(),
+        "the publisher hears nothing at all about a subscription"
+    );
 }
 
 #[tokio::test]
@@ -770,7 +958,7 @@ async fn the_capability_echo_survives_a_privilege_refusal() {
     // permission. A client shows a disabled control with a tooltip
     // rather than hiding it, which it can only do if the bit came back.
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let w = Client::video_login(addr, "watcher").await;
     assert_eq!(
         w.caps,
@@ -784,7 +972,7 @@ async fn the_capability_echo_survives_a_privilege_refusal() {
 #[tokio::test]
 async fn the_screen_slot_is_room_wide_and_the_refusal_says_why() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let mut a = Client::video_login(addr, "sharer").await;
     let mut b = Client::video_login(addr, "sharer").await;
     a.join_voice(0).await;
@@ -806,6 +994,47 @@ async fn the_screen_slot_is_room_wide_and_the_refusal_says_why() {
     b.start(0, KIND_CAMERA).await;
 }
 
+#[tokio::test]
+async fn a_publication_the_media_layer_cannot_seat_gives_its_slot_back() {
+    // A full room is not the only thing that refuses a start: the SFU can
+    // fail to seat one, and the domain answers both with
+    // `VideoError::Full`. The refusal carries the kind because the two
+    // cases need different words — telling the ninth camera's user to ask
+    // someone to stop sharing would be false, since no one person is in
+    // its way — so this asserts the camera wording rather than the screen
+    // share's.
+    let td = tempfile::tempdir().unwrap();
+    let s = start_server(td.path()).await;
+    let mut a = Client::video_login(s.legacy, "sharer").await;
+    a.join_voice(0).await;
+    // The empty status a joiner gets, out of the way.
+    a.status_for(&[]).await;
+    a.pending.clear();
+
+    s.media.refuse_next_publish();
+    let err = a
+        .refused(REQ_VIDEO_START, &[chat_id(0), kind_chunk(KIND_CAMERA)])
+        .await;
+    assert!(
+        err.contains("cameras"),
+        "a camera the SFU could not seat is refused in the room's words, not \
+         the screen share's; got {err:?}"
+    );
+
+    // A publication that was never seated is not news.
+    a.sync(0).await;
+    assert_eq!(
+        a.buffered(),
+        Vec::<u32>::new(),
+        "nothing may be announced for a start that failed"
+    );
+
+    // And the slot came back with it, so the retry every client makes
+    // works.
+    a.start(0, KIND_CAMERA).await;
+    a.status_for(&[(a.uid, KIND_CAMERA, false)]).await;
+}
+
 // --- Compatibility ------------------------------------------------------
 
 #[tokio::test]
@@ -814,7 +1043,7 @@ async fn a_voice_only_client_never_sees_a_video_transaction() {
     // this document is a full member of a room in which others use all
     // of it.
     let td = tempfile::tempdir().unwrap();
-    let (addr, _) = start_server(td.path()).await;
+    let addr = start_server(td.path()).await.legacy;
     let mut a = Client::video_login(addr, "sharer").await;
     let mut legacy = Client::login(addr, "watcher", Caps::empty().with(cap::VOICE)).await;
     a.join_voice(0).await;
@@ -825,11 +1054,23 @@ async fn a_voice_only_client_never_sees_a_video_transaction() {
 
     a.start(0, KIND_CAMERA).await;
     a.start(0, KIND_SCREEN).await;
+    // Waiting for the video-capable client's own status first is what
+    // makes the assertion below about a delivery decision rather than
+    // about timing: by the time this returns the room's notifications
+    // for both publications have been generated, and any copy destined
+    // for the voice-only client is already queued on its session.
     a.status_for(&[(a.uid, KIND_CAMERA, false), (a.uid, KIND_SCREEN, false)])
         .await;
 
-    // Not one 611, and the voice session is untouched.
-    legacy.expect_quiet().await;
+    // Not one frame from the 607–611 block.
+    legacy.expect_no_video(0).await;
+
+    // And the voice session is untouched rather than merely quiet: the
+    // mute `expect_no_video` sent reached the room, so the publisher can
+    // see the voice-only client is still in it. A dead session would
+    // have passed the assertion above and failed this one.
+    a.voice_status_for(&[(a.uid, false), (legacy.uid, true)])
+        .await;
 }
 
 // --- The ng wire --------------------------------------------------------
@@ -837,7 +1078,7 @@ async fn a_voice_only_client_never_sees_a_video_transaction() {
 #[tokio::test]
 async fn the_ng_login_reply_carries_the_caps_and_the_ceilings() {
     let td = tempfile::tempdir().unwrap();
-    let (_legacy, ng, _) = start_both(td.path(), true).await;
+    let ng = start_server(td.path()).await.ng;
     let c = Ng::login(ng, "sharer").await;
     assert_eq!(
         c.caps,
@@ -853,7 +1094,8 @@ async fn the_ng_login_reply_carries_the_caps_and_the_ceilings() {
 #[tokio::test]
 async fn the_ng_binding_publishes_pauses_and_subscribes() {
     let td = tempfile::tempdir().unwrap();
-    let (_legacy, ng, _) = start_both(td.path(), true).await;
+    let s = start_server(td.path()).await;
+    let ng = s.ng;
     let mut a = Ng::login(ng, "sharer").await;
     let mut b = Ng::login(ng, "camera").await;
     a.join_voice(0).await;
@@ -876,13 +1118,49 @@ async fn the_ng_binding_publishes_pauses_and_subscribes() {
     b.status_for(&[(a.uid, "camera", true)]).await;
 
     // The complete desired set, and `[]` turns it all off in one request.
+    //
+    // Both are asserted by their consequences rather than by their `ok`:
+    // a handler that accepted the request and did nothing would satisfy
+    // the reply, so what is checked is the receive set that reached the
+    // media layer and the renegotiation the subscriber needs before it
+    // has anywhere to put the stream.
+    assert!(
+        !b.pending.iter().any(|v| v["ev"] == json!("voice_offer")),
+        "nothing has renegotiated the subscriber up to here, so the offer \
+         asserted below can only be the subscribe's"
+    );
+    s.media.take_calls();
     b.ok(
         "video_subscribe",
         json!({ "cid": 0, "streams": [{ "uid": a.uid, "kind": "camera" }] }),
     )
     .await;
+    let calls = s.media.take_calls();
+    assert!(
+        calls.contains(&MediaCall::SetSubscriptions {
+            uid: b.uid,
+            cid: 0,
+            streams: vec![VideoStream {
+                uid: a.uid,
+                kind: VideoKind::Camera,
+            }],
+        }),
+        "subscribing must tell the SFU what to forward; got {calls:?}"
+    );
+    b.event("voice_offer").await;
+
     b.ok("video_subscribe", json!({ "cid": 0, "streams": [] }))
         .await;
+    let calls = s.media.take_calls();
+    assert!(
+        calls.contains(&MediaCall::SetSubscriptions {
+            uid: b.uid,
+            cid: 0,
+            streams: vec![],
+        }),
+        "and `[]` must reach it as an empty set, not as nothing at all; \
+         got {calls:?}"
+    );
 
     a.ok("video_stop", json!({ "cid": 0 })).await;
     b.status_for(&[]).await;
@@ -891,7 +1169,7 @@ async fn the_ng_binding_publishes_pauses_and_subscribes() {
 #[tokio::test]
 async fn the_ng_error_codes_are_the_closed_set() {
     let td = tempfile::tempdir().unwrap();
-    let (_legacy, ng, _) = start_both(td.path(), true).await;
+    let ng = start_server(td.path()).await.ng;
     let mut a = Ng::login(ng, "sharer").await;
 
     assert_eq!(
@@ -955,6 +1233,78 @@ async fn the_ng_error_codes_are_the_closed_set() {
     );
 }
 
+// --- The media plane talking back ---------------------------------------
+
+#[tokio::test]
+async fn a_publication_whose_media_dies_takes_neither_the_call_nor_the_room() {
+    // The `MediaEvent::VideoFailed` round trip. `hxd`'s event pump does
+    // exactly one thing with what the SFU says — hands it to
+    // `Core::voice_media_event` (`crates/hxd/src/voice.rs`) — so feeding
+    // one in at that seam exercises everything downstream of the pump,
+    // on both wires at once. What makes a real SFU emit it (a publication
+    // whose RTP stopped while the peer's session stayed healthy) is
+    // `hxd-voice`'s own test; what the server does about it is this one.
+    let td = tempfile::tempdir().unwrap();
+    let s = start_server(td.path()).await;
+    let mut old = Client::video_login(s.legacy, "sharer").await;
+    let mut new = Ng::login(s.ng, "camera").await;
+    old.join_voice(0).await;
+    new.join_voice(0).await;
+    old.settle(0).await;
+
+    old.start(0, KIND_CAMERA).await;
+    old.start(0, KIND_SCREEN).await;
+    new.status_for(&[(old.uid, "camera", false), (old.uid, "screen", false)])
+        .await;
+    new.ok(
+        "video_subscribe",
+        json!({ "cid": 0, "streams": [{ "uid": old.uid, "kind": "camera" }] }),
+    )
+    .await;
+    s.media.take_calls();
+
+    s.core.voice_media_event(MediaEvent::VideoFailed {
+        uid: old.uid,
+        cid: 0,
+        kind: VideoKind::Camera,
+    });
+
+    // The camera is gone from the room on both wires. The screen share is
+    // not: one publication failing says nothing about the other.
+    new.status_for(&[(old.uid, "screen", false)]).await;
+    old.status_for(&[(old.uid, KIND_SCREEN, false)]).await;
+
+    let calls = s.media.take_calls();
+    assert!(
+        calls.contains(&MediaCall::SetSubscriptions {
+            uid: new.uid,
+            cid: 0,
+            streams: vec![],
+        }),
+        "the watcher's forwarding stops with the publication; got {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| matches!(c, MediaCall::Leave { .. })),
+        "losing video is a degradation and losing the call is a failure: a \
+         failed publication must never end the voice session; got {calls:?}"
+    );
+
+    // Which the two of them can still prove: a mute outside a voice room
+    // is refused, so an accepted one says the call is still standing.
+    old.ok(
+        REQ_VOICE_MUTE,
+        &[chat_id(0), (tag::VOICE_MUTED, 1u16.to_be_bytes().to_vec())],
+    )
+    .await;
+    new.ok("voice_mute", json!({ "cid": 0, "muted": true }))
+        .await;
+
+    // And the slot came back, so the publisher may try its camera again.
+    old.start(0, KIND_CAMERA).await;
+    old.status_for(&[(old.uid, KIND_SCREEN, false), (old.uid, KIND_CAMERA, false)])
+        .await;
+}
+
 // --- One room, both eras ------------------------------------------------
 
 #[tokio::test]
@@ -963,7 +1313,8 @@ async fn a_1_5_client_and_a_browser_share_one_video_room() {
     // classic client's packed publishers blob and the ng client's JSON
     // array describe the same publications, and each sees the other's.
     let td = tempfile::tempdir().unwrap();
-    let (legacy_addr, ng_addr, _) = start_both(td.path(), true).await;
+    let s = start_server(td.path()).await;
+    let (legacy_addr, ng_addr) = (s.legacy, s.ng);
 
     let mut old = Client::video_login(legacy_addr, "sharer").await;
     let mut new = Ng::login(ng_addr, "camera").await;
@@ -983,7 +1334,11 @@ async fn a_1_5_client_and_a_browser_share_one_video_room() {
     old.status_for(&[(old.uid, KIND_SCREEN, false), (new.uid, KIND_CAMERA, false)])
         .await;
 
-    // Each subscribes to the other, across the era boundary.
+    // Each subscribes to the other, across the era boundary. A packed
+    // four-byte-stride blob and a JSON array have to arrive at the SFU as
+    // the same thing, so the assertion is on what the media layer was
+    // told rather than on the two replies.
+    s.media.take_calls();
     old.ok(
         REQ_VIDEO_SUBSCRIBE,
         &[chat_id(0), subscriptions(&[(new.uid, KIND_CAMERA)])],
@@ -994,6 +1349,29 @@ async fn a_1_5_client_and_a_browser_share_one_video_room() {
         json!({ "cid": 0, "streams": [{ "uid": old.uid, "kind": "screen" }] }),
     )
     .await;
+    let calls = s.media.take_calls();
+    assert!(
+        calls.contains(&MediaCall::SetSubscriptions {
+            uid: old.uid,
+            cid: 0,
+            streams: vec![VideoStream {
+                uid: new.uid,
+                kind: VideoKind::Camera,
+            }],
+        }),
+        "the 1.5 client's subscription must reach the SFU; got {calls:?}"
+    );
+    assert!(
+        calls.contains(&MediaCall::SetSubscriptions {
+            uid: new.uid,
+            cid: 0,
+            streams: vec![VideoStream {
+                uid: old.uid,
+                kind: VideoKind::Screen,
+            }],
+        }),
+        "and so must the browser's; got {calls:?}"
+    );
 
     // A pause on one wire is a paused flag on the other.
     new.ok(
@@ -1004,7 +1382,27 @@ async fn a_1_5_client_and_a_browser_share_one_video_room() {
     old.status_for(&[(old.uid, KIND_SCREEN, false), (new.uid, KIND_CAMERA, true)])
         .await;
 
-    // And leaving voice on one wire clears that publisher for the other.
-    old.ok(REQ_VIDEO_STOP, &[chat_id(0)]).await;
+    // And leaving voice on one wire clears that publisher for the other:
+    // a leave, not a stop, because publications hang off the voice peer
+    // and dying with it is the property worth testing. The browser's
+    // subscription to the departed screen goes with it.
+    old.ok(REQ_VOICE_LEAVE, &[chat_id(0)]).await;
     new.status_for(&[(new.uid, "camera", true)]).await;
+    let calls = s.media.take_calls();
+    assert!(
+        calls.contains(&MediaCall::SetSubscriptions {
+            uid: new.uid,
+            cid: 0,
+            streams: vec![],
+        }),
+        "the browser was watching that screen; the SFU has to be told to \
+         stop forwarding it; got {calls:?}"
+    );
+    assert!(
+        calls.contains(&MediaCall::Leave {
+            uid: old.uid,
+            cid: 0,
+        }),
+        "and the leaver really left the voice room; got {calls:?}"
+    );
 }
