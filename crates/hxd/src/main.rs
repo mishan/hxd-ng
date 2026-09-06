@@ -82,7 +82,7 @@ async fn main() {
 
         // The ng context is built before voice is consumed below, so its
         // capability list can see it.
-        let ng_ctx = hxd::build_ng_ctx(&config, &ctx, voice.as_ref());
+        let ng_ctx = hxd::build_ng_ctx(&config, &ctx, voice.as_ref())?;
 
         // Voice: the UDP media socket and the pump that drives it. Both
         // wires advertise the capability only because building this
@@ -112,6 +112,13 @@ async fn main() {
                 ng.bind,
                 ng.grace
             );
+            if let Some(id) = ng_ctx.identity.as_ref() {
+                tracing::info!(
+                    "identity enabled (server key {}, TRTP tunnel {})",
+                    hl_identity::Fingerprint::of(&id.server_key()).short(),
+                    if id.config().trtp { "on" } else { "off" }
+                );
+            }
             let grace = ng_ctx.cfg.grace;
             tokio::spawn(hxd_ng_session::sweeper(
                 ng_ctx.core.clone(),

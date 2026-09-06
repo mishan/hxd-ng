@@ -24,6 +24,8 @@ hxd-auth-file = { workspace = true }
 hxd-session = { workspace = true }
 hxd-ng-session = { workspace = true }
 hxd-voice = { workspace = true, optional = true }
+hl-identity = { workspace = true }
+base64 = "0.22"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

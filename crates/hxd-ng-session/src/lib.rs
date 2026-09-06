@@ -5,17 +5,44 @@
 //! share one roster and one chat.
 
 mod conn;
+mod http;
+pub mod identity;
 pub mod proto;
 mod registry;
+mod tunnel;
 
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hxd_core::{AuthBackend, Core};
+use hxd_core::{AuthBackend, Core, Transport};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{info, Instrument};
 
+pub use identity::{IdentityConfig, IdentityState, NewAccounts, Unattested};
 pub use registry::Registry;
+
+/// A byte stream handed to the legacy frontend by the TRTP-over-WebSocket
+/// path (`docs/hotline-ng-identity.md` §6.3).
+pub trait ByteStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> ByteStream for T {}
+pub type TunnelStream = Box<dyn ByteStream>;
+
+/// Who runs a tunnelled legacy session. The binary implements this with
+/// `hxd_session::run_session`; this crate deliberately doesn't depend on
+/// the legacy frontend — the tunnel is transport, and what's inside it
+/// is the caller's protocol.
+pub trait TunnelSink: Send + Sync {
+    fn run(
+        &self,
+        stream: TunnelStream,
+        peer: SocketAddr,
+        transport: Transport,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+}
 
 /// Configuration for the ng listener.
 #[derive(Debug, Clone)]
@@ -37,6 +64,10 @@ pub struct NgConfig {
     /// because the transport is already JSON and a name outlives a bit
     /// allocation.
     pub caps: Vec<String>,
+    /// Reverse-proxy addresses whose `X-Hotline-Client-Cert` header is
+    /// believed (`docs/hotline-ng-identity.md` §5.3). Empty = the mTLS
+    /// binding is off.
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 impl Default for NgConfig {
@@ -48,6 +79,7 @@ impl Default for NgConfig {
             grace: Duration::from_secs(300),
             max_detached_per_addr: 2,
             caps: Vec::new(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -59,16 +91,25 @@ pub struct NgCtx {
     pub auth: Arc<dyn AuthBackend>,
     pub cfg: Arc<NgConfig>,
     pub registry: Arc<Registry>,
+    /// Identity state, when `[identity]` is enabled. `None` means the
+    /// identity endpoints 404 and every socket is unauthenticated.
+    pub identity: Option<Arc<IdentityState>>,
+    /// Who runs TRTP tunnels. `None` means the `/trtp` path is off.
+    pub tunnel: Option<Arc<dyn TunnelSink>>,
 }
 
-/// Accept loop: one connection task per WebSocket.
+/// Accept loop: one connection task per socket. Each is HTTP until it
+/// upgrades (`http.rs`).
 pub async fn serve(listener: TcpListener, ctx: NgCtx) -> std::io::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let span = tracing::info_span!("ng", %peer);
-            conn::run(stream, peer, ctx).instrument(span).await;
+            http::serve_connection(stream, peer, ctx)
+                .instrument(span)
+                .await;
         });
     }
 }

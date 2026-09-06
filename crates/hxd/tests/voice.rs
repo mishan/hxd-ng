@@ -87,6 +87,7 @@ async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<Rec
             } else {
                 Caps::empty()
             },
+            mark_cleartext: false,
         }),
     };
     let ng_ctx = NgCtx {
@@ -103,8 +104,11 @@ async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<Rec
             } else {
                 Vec::new()
             },
+            trusted_proxies: Vec::new(),
         }),
         registry: Arc::new(Registry::new()),
+        identity: None,
+        tunnel: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

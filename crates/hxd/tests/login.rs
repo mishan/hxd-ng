@@ -39,6 +39,7 @@ async fn start_server(accounts: &Path, agreement: Option<&str>) -> SocketAddr {
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
             caps: hxd_session::Caps::empty(),
+            mark_cleartext: false,
         }),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -18,8 +18,8 @@ pub use access::AccessBits;
 pub use account::{Account, AuthBackend, AuthError, Proof};
 pub use chat::ChatError;
 pub use roster::{
-    AttachInfo, Core, Event, Resume, SeqEvent, SessionStatus, Uid, UserDetails, UserInfo,
-    OUTBOX_BUFFER_CAP,
+    AttachInfo, Core, Event, IdentityTag, Resume, SeqEvent, SessionStatus, Transport, Uid,
+    UserDetails, UserInfo, OUTBOX_BUFFER_CAP,
 };
 pub use video::{VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream};
 pub use voice::{

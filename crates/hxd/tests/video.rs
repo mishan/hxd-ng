@@ -135,6 +135,7 @@ async fn start_both(dir: &Path, video: bool) -> Server {
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
             caps,
+            mark_cleartext: false,
         }),
     };
     let ng_caps = if video {
@@ -152,8 +153,11 @@ async fn start_both(dir: &Path, video: bool) -> Server {
             grace: Duration::from_secs(60),
             max_detached_per_addr: 2,
             caps: ng_caps,
+            trusted_proxies: Vec::new(),
         }),
         registry: Arc::new(Registry::new()),
+        identity: None,
+        tunnel: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
