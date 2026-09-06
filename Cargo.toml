@@ -17,6 +17,7 @@ members = [
     "crates/hxd-voice",
     "crates/hxd-ng-session",
     "crates/hxd",
+    "crates/hlid",
 ]
 # Without this, cargo auto-adopts the submodule's crates as workspace
 # members (path deps living under the workspace root), and `--workspace`

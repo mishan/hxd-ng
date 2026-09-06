@@ -1,0 +1,21 @@
+[package]
+name = "hlid"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hotline identity tool: keys, certificates, cards, attestations; authenticate to a server; tunnel a legacy client"
+publish = false
+
+[[bin]]
+name = "hlid"
+path = "src/main.rs"
+
+[dependencies]
+hl-identity = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+serde_json = "1"
+base64 = "0.22"
