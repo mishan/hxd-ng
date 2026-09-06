@@ -93,6 +93,18 @@ With `[identity]` on, the ng listener also answers HTTP: `GET
 /.well-known/hotline` for discovery, `POST /identity/challenge` and
 `/identity/auth` for the challenge binding, `GET /identity/card/<fp>`.
 
+`hlid` (`cargo run --bin hlid`) makes the keys and objects and talks to
+the server:
+
+```sh
+hlid keygen identity id.key && hlid keygen device dev.key
+hlid cert --identity id.key --device dev.key --caps web -o cert.cbor
+hlid card --identity id.key --name Misha -o card.cbor
+hlid auth   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
+hlid tunnel --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
+# then point any 1.x client at 127.0.0.1:5500 — it logs in through the tunnel with your identity
+```
+
 Try the ng frontend with the bundled client (no install on Node 22+;
 on older Node, `cd tools && npm install` once for the `ws` fallback):
 
