@@ -1,27 +1,34 @@
-//! Voice over the legacy wire, end to end: scripted 1.5 clients speaking
-//! transactions 600–606 to a live server.
+//! Voice end to end, on both wires: scripted 1.5 clients speaking
+//! transactions 600–606, and scripted ng clients speaking `voice_*`, to
+//! one live server.
 //!
 //! The media layer is `hxd_core::voice::fake::RecordingMedia`, so these
-//! test the *wire* — the capability gate, the privilege gate, the chunk
-//! shapes, the task ids, and which notifications land on whom — against
-//! a real server with real sockets. Whether the SDP is any good is
-//! `hxd-voice`'s question and its tests answer it with real DTLS.
+//! test the *signalling* — the capability gate, the privilege gate, the
+//! chunk and JSON shapes, the task ids, and which notification lands on
+//! whom. Whether the SDP is any good is `hxd-voice`'s question and its
+//! tests answer it with real DTLS; whether the two wires share one room
+//! is the last test here.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use hotline_proto::messages::tag;
 use hotline_proto::voice::{ice as wire_ice, parse_voice_participants};
 use hxd_core::voice::fake::RecordingMedia;
 use hxd_core::Core;
+use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::{cap, Caps};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{ServerConfig, ServerCtx};
+use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 
 const HDR_TASK: u32 = 0x0001_0000;
 const HDR_SELFINFO: u32 = 0x162;
@@ -38,6 +45,12 @@ const NOTIFY_VOICE_STATUS: u32 = 605;
 const REQ_VOICE_MUTE: u32 = 606;
 
 async fn start_server(dir: &Path, voice: bool) -> (SocketAddr, Arc<RecordingMedia>) {
+    let (legacy, _ng, media) = start_both(dir, voice).await;
+    (legacy, media)
+}
+
+/// A server on both wires, sharing one core — which is the whole point.
+async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<RecordingMedia>) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     std::fs::write(
@@ -76,10 +89,162 @@ async fn start_server(dir: &Path, voice: bool) -> (SocketAddr, Arc<RecordingMedi
             },
         }),
     };
+    let ng_ctx = NgCtx {
+        core: ctx.core.clone(),
+        auth: ctx.auth.clone(),
+        cfg: Arc::new(NgConfig {
+            server_name: "voice test".into(),
+            agreement: None,
+            login_timeout: Duration::from_secs(5),
+            grace: Duration::from_secs(60),
+            max_detached_per_addr: 2,
+            caps: if voice {
+                vec!["voice".to_string()]
+            } else {
+                Vec::new()
+            },
+        }),
+        registry: Arc::new(Registry::new()),
+    };
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let ng_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ng_addr = ng_listener.local_addr().unwrap();
     tokio::spawn(hxd_session::serve(listener, ctx));
-    (addr, media)
+    tokio::spawn(hxd_ng_session::serve(ng_listener, ng_ctx));
+    (addr, ng_addr, media)
+}
+
+/// A scripted ng client: the same buffering discipline as the legacy one,
+/// because voice interleaves replies and events on this wire too.
+struct Ng {
+    ws: WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    id: u64,
+    uid: u16,
+    caps: Value,
+    pending: Vec<Value>,
+}
+
+impl Ng {
+    async fn login(addr: SocketAddr, login: &str) -> Ng {
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let mut c = Ng {
+            ws,
+            id: 0,
+            uid: 0,
+            caps: Value::Null,
+            pending: Vec::new(),
+        };
+        let ok = c
+            .request(
+                "login",
+                json!({ "login": login, "password": "pw", "nick": login }),
+            )
+            .await
+            .expect("login");
+        c.uid = ok["self"]["uid"].as_u64().unwrap() as u16;
+        c.caps = ok["caps"].clone();
+        c
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, (String, String)> {
+        self.id += 1;
+        let id = self.id;
+        self.ws
+            .send(Message::Text(
+                json!({ "id": id, "req": method, "params": params }).to_string(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let v = self.recv().await;
+            if v["reply"] == json!(id) {
+                return match v.get("error") {
+                    Some(e) => Err((
+                        e["code"].as_str().unwrap_or_default().to_string(),
+                        e["text"].as_str().unwrap_or_default().to_string(),
+                    )),
+                    None => Ok(v["ok"].clone()),
+                };
+            }
+            self.pending.push(v);
+        }
+    }
+
+    async fn ok(&mut self, method: &str, params: Value) -> Value {
+        self.request(method, params)
+            .await
+            .unwrap_or_else(|(c, t)| panic!("{method} refused: {c}: {t}"))
+    }
+
+    async fn recv(&mut self) -> Value {
+        loop {
+            let msg = timeout(Duration::from_secs(5), self.ws.next())
+                .await
+                .expect("timed out waiting for an ng frame")
+                .expect("stream ended")
+                .expect("ws error");
+            if let Message::Text(t) = msg {
+                return serde_json::from_str(&t).unwrap();
+            }
+        }
+    }
+
+    /// The next event of this kind, buffering anything else.
+    async fn event(&mut self, ev: &str) -> Value {
+        if let Some(i) = self.pending.iter().position(|v| v["ev"] == json!(ev)) {
+            return self.pending.remove(i);
+        }
+        for _ in 0..16 {
+            let v = self.recv().await;
+            if v["ev"] == json!(ev) {
+                return v;
+            }
+            self.pending.push(v);
+        }
+        panic!("ng event {ev} never arrived");
+    }
+
+    /// Wait for a room status describing exactly this room.
+    async fn status_for(&mut self, want: &[(u16, bool)]) -> Value {
+        for _ in 0..16 {
+            let v = self.event("voice_status").await;
+            if ng_participants(&v) == want {
+                return v;
+            }
+        }
+        panic!("no ng room status matching {want:?}");
+    }
+
+    /// Join and answer, as a real client does the moment it has an offer.
+    async fn join_voice(&mut self, cid: u32) -> Value {
+        let ok = self.ok("voice_join", json!({ "cid": cid })).await;
+        let sdp = ok["sdp"].as_str().unwrap().to_string();
+        self.ok(
+            "voice_answer",
+            json!({ "cid": cid, "sdp": format!("answer to {sdp}") }),
+        )
+        .await;
+        ok
+    }
+}
+
+/// The uids in a `voice_status` event's participant list.
+fn ng_participants(ev: &Value) -> Vec<(u16, bool)> {
+    ev["data"]["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["uid"].as_u64().unwrap() as u16,
+                p["muted"].as_bool().unwrap(),
+            )
+        })
+        .collect()
 }
 
 fn xor(b: &[u8]) -> Vec<u8> {
@@ -179,6 +344,21 @@ impl Client {
         if let Ok(Ok(f)) = r {
             panic!("expected silence, got a frame of type {}", f.ty);
         }
+    }
+
+    /// Wait for a room status describing exactly this room.
+    ///
+    /// Matching by predicate rather than taking the next one: a room that
+    /// changes twice in quick succession produces two notifications, and
+    /// which one arrives first is not what any of these tests are about.
+    async fn status_for(&mut self, want: &[(u16, bool)]) -> Frame {
+        for _ in 0..16 {
+            let f = self.recv_type(NOTIFY_VOICE_STATUS).await;
+            if participants(&f) == want {
+                return f;
+            }
+        }
+        panic!("no room status matching {want:?}");
     }
 
     /// Join voice and answer the offer, which is what a real client does
@@ -558,4 +738,196 @@ async fn a_server_without_an_sfu_never_offers_voice_at_all() {
     a.send(REQ_VOICE_JOIN, &[chat_id(0)]).await;
     let reply = a.recv_type(HDR_TASK).await;
     assert_eq!(reply.flag, 1);
+}
+
+// --- The ng wire ---------------------------------------------------------
+
+#[tokio::test]
+async fn the_ng_join_reply_mirrors_the_legacy_one() {
+    let td = tempfile::tempdir().unwrap();
+    let (_legacy, ng, media) = start_both(td.path(), true).await;
+
+    let mut a = Ng::login(ng, "talker").await;
+    assert_eq!(a.caps, json!(["voice"]), "the login reply feature-detects");
+
+    let ok = a.ok("voice_join", json!({ "cid": 0 })).await;
+    assert_eq!(ok["codec"], json!("PCMU"));
+    assert!(!ok["sdp"].as_str().unwrap().is_empty());
+    assert_eq!(ok["participants"], json!([]), "the room before the joiner");
+    assert!(media.calls().iter().any(
+        |c| matches!(c, hxd_core::voice::fake::MediaCall::Join { uid, cid: 0 } if *uid == a.uid)
+    ));
+
+    let status = a.event("voice_status").await;
+    assert_eq!(status["data"]["cid"], json!(0));
+    assert_eq!(ng_participants(&status), vec![(a.uid, false)]);
+}
+
+#[tokio::test]
+async fn ng_ice_carries_the_dictionary_as_an_object_and_null_for_the_end() {
+    let td = tempfile::tempdir().unwrap();
+    let (_legacy, ng, media) = start_both(td.path(), true).await;
+    let mut a = Ng::login(ng, "talker").await;
+    a.join_voice(0).await;
+
+    a.ok(
+        "voice_ice",
+        json!({ "cid": 0, "candidate": {
+            "candidate": "candidate:1 1 UDP 2130706431 192.0.2.9 40000 typ host",
+            "sdpMid": "send",
+            "sdpMLineIndex": 0,
+        }}),
+    )
+    .await;
+    let got = media
+        .calls()
+        .into_iter()
+        .find_map(|c| match c {
+            hxd_core::voice::fake::MediaCall::Ice { candidate, .. } => Some(candidate),
+            _ => None,
+        })
+        .expect("the candidate reached the media layer");
+    assert_eq!(got.sdp_mid.as_deref(), Some("send"));
+    assert!(got.candidate.contains("192.0.2.9"));
+
+    // `null` is end-of-candidates — what a browser passes to
+    // addIceCandidate to mean the same thing.
+    a.ok("voice_ice", json!({ "cid": 0, "candidate": null }))
+        .await;
+    let last = media
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            hxd_core::voice::fake::MediaCall::Ice { candidate, .. } => Some(candidate),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert!(last.is_end_of_candidates());
+}
+
+#[tokio::test]
+async fn ng_voice_errors_use_the_documented_codes() {
+    let td = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _media) = start_both(td.path(), true).await;
+
+    // No voice_chat bit.
+    let mut l = Ng::login(ng, "listener").await;
+    let (code, _) = l.request("voice_join", json!({})).await.unwrap_err();
+    assert_eq!(code, "access_denied");
+
+    let mut a = Ng::login(ng, "talker").await;
+    let (code, _) = a.request("voice_leave", json!({})).await.unwrap_err();
+    assert_eq!(code, "not_in_voice");
+    let (code, _) = a
+        .request("voice_answer", json!({ "sdp": "v=0" }))
+        .await
+        .unwrap_err();
+    assert_eq!(code, "not_in_voice");
+    let (code, _) = a
+        .request("voice_mute", json!({ "muted": true }))
+        .await
+        .unwrap_err();
+    assert_eq!(code, "not_in_voice");
+    // voice_ice answers like its neighbours. On the legacy wire this is a
+    // notification with nowhere to put a refusal; here every request gets
+    // a reply, so acknowledging a candidate for a room the caller isn't
+    // in would be a lie in the shape of an `ok`.
+    let (code, _) = a
+        .request("voice_ice", json!({ "cid": 0, "candidate": null }))
+        .await
+        .unwrap_err();
+    assert_eq!(code, "not_in_voice");
+    // A missing required field is a bad request, not a guess.
+    let (code, _) = a.request("voice_mute", json!({})).await.unwrap_err();
+    assert_eq!(code, "bad_request");
+    // Including inside the candidate: an empty string there is
+    // end-of-candidates, so a missing `candidate` must not default into
+    // one and turn a malformed request into a signal.
+    let (code, _) = a
+        .request("voice_ice", json!({ "cid": 0, "candidate": {} }))
+        .await
+        .unwrap_err();
+    assert_eq!(code, "bad_request");
+    let (code, _) = a
+        .request(
+            "voice_ice",
+            json!({ "cid": 0, "candidate": { "sdpMid": "send" } }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code, "bad_request");
+
+    // The room cap is 2 in these tests.
+    let mut b = Ng::login(ng, "talker").await;
+    let mut c = Ng::login(ng, "talker").await;
+    a.join_voice(0).await;
+    b.join_voice(0).await;
+    let (code, _) = c.request("voice_join", json!({})).await.unwrap_err();
+    assert_eq!(code, "voice_full");
+}
+
+#[tokio::test]
+async fn a_server_without_an_sfu_says_so_on_the_ng_wire_too() {
+    let td = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _media) = start_both(td.path(), false).await;
+    let mut a = Ng::login(ng, "talker").await;
+    assert_eq!(a.caps, json!([]));
+    let (code, _) = a.request("voice_join", json!({})).await.unwrap_err();
+    assert_eq!(code, "voice_disabled");
+}
+
+#[tokio::test]
+async fn ng_voice_ends_when_the_connection_does() {
+    // A detached session is out of voice: its UDP path went with its
+    // WebSocket, and a resumed client re-joins explicitly.
+    let td = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _media) = start_both(td.path(), true).await;
+    let mut a = Ng::login(ng, "talker").await;
+    let mut b = Ng::login(ng, "talker").await;
+    a.join_voice(0).await;
+    b.join_voice(0).await;
+    a.status_for(&[(a.uid, false), (b.uid, false)]).await;
+
+    drop(b);
+    a.status_for(&[(a.uid, false)]).await;
+}
+
+// --- One room, both eras -------------------------------------------------
+
+#[tokio::test]
+async fn a_legacy_client_and_an_ng_client_share_one_voice_room() {
+    let td = tempfile::tempdir().unwrap();
+    let (legacy, ng, _media) = start_both(td.path(), true).await;
+
+    let mut old = Client::login(legacy, "talker", true).await;
+    old.join_voice(0).await;
+    old.recv_type(NOTIFY_VOICE_STATUS).await;
+
+    let mut new = Ng::login(ng, "talker").await;
+    let ok = new.join_voice(0).await;
+    assert_eq!(
+        ok["participants"],
+        json!([{ "uid": old.uid, "muted": false }]),
+        "the ng client's reply names the 1.x client already in the room"
+    );
+
+    // The legacy client is renegotiated in its own wire's shape — a 602
+    // with task id 0 — because someone it can now hear arrived.
+    let offer = old.recv_type(NOTIFY_VOICE_OFFER).await;
+    assert_eq!(offer.trans, 0);
+
+    // And both are told the same room, each in its own encoding.
+    old.status_for(&[(old.uid, false), (new.uid, false)]).await;
+    new.status_for(&[(old.uid, false), (new.uid, false)]).await;
+
+    // Mute crosses too: the ng client mutes, the 1.x client sees it.
+    new.ok("voice_mute", json!({ "cid": 0, "muted": true }))
+        .await;
+    old.status_for(&[(old.uid, false), (new.uid, true)]).await;
+
+    // And a departure on one wire is a departure on the other.
+    old.send(REQ_VOICE_LEAVE, &[chat_id(0)]).await;
+    old.recv_type(HDR_TASK).await;
+    new.status_for(&[(new.uid, true)]).await;
 }

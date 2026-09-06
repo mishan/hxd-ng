@@ -32,6 +32,9 @@ toml = { workspace = true }
 
 [dev-dependencies]
 hotline-proto = { workspace = true }
+# The media e2e stands real WebRTC clients up against the real SFU.
+hxd-voice = { workspace = true }
+str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false }
 serde_json = "1"

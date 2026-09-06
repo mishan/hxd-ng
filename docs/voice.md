@@ -395,7 +395,7 @@ of [hotline-ng.md](hotline-ng.md) §5. The login reply's `caps` list
 | `voice_join` | `cid` | `{ "sdp", "codec": "PCMU", "participants": [ {uid, muted} ] }` | `voice_disabled`, `access_denied`, `no_such_chat`, `not_a_member`, `voice_full` |
 | `voice_leave` | `cid` | `{}` | `not_in_voice` |
 | `voice_answer` | `cid`, `sdp` | `{}` | `not_in_voice`, `bad_answer` |
-| `voice_ice` | `cid`, `candidate` (object, or `null` for end-of-candidates) | `{}` | `not_in_voice` |
+| `voice_ice` | `cid`, `candidate` (object, or `null` for end-of-candidates) | `{}` | `voice_disabled`, `not_in_voice` |
 | `voice_mute` | `cid`, `muted` (bool) | `{}` | `not_in_voice` |
 
 | `ev` | data |
@@ -432,6 +432,14 @@ nothing changes then.
 
 Each stage is a branch with tests, in the house style.
 
+**Status (2026-09).** V0–V4 have landed, as the branches `capabilities`,
+`random-chat-ids`, `voice-domain`, `voice-sfu`, `voice-legacy-wire` and
+`voice-ng-wire`. What each turned out to be, where it differed from the
+sketch below, and what it cost is in the commit messages; the deviations
+worth knowing about are recorded in §7 (the participants builder), §5
+(the forwarding SSRC and the ICE-lite demux workaround) and §12 below.
+V5 is what remains: real clients, real microphones, one room.
+
 0. **V0 — capabilities.** `DATA_CAPABILITIES` parse/echo in
    `hxd-session`; `caps` list in the ng login reply; e2e that a client
    offering bits gets back only the ones the server supports, and that a
@@ -459,13 +467,12 @@ Each stage is a branch with tests, in the house style.
    whether the direct API is the right tool; if it isn't, the trait means
    V1 and V3+ don't change.
 3. **V3 — legacy wire.** 600–606 in `hxd-session`, the participants
-   builder in `hotline-proto` (submodule pin advanced deliberately),
-   `[voice]` config and the `voice` feature in `hxd`. E2E with a scripted
-   legacy client that speaks the transactions and a str0m client for
-   media, on a real server. Then the check that matters: **a real GtkHx**
-   against hxd-ng — GtkHx's voice integration suite currently targets
-   Janus only, and adding hxd-ng as a target is the conformance statement
-   the ROADMAP's testing section has wanted since Phase 1.
+   encoder (§7), `[voice]` config and the `voice` feature in `hxd`. E2E
+   with a scripted legacy client that speaks the transactions, on a real
+   server. Then the check that matters: **a real GtkHx** against hxd-ng —
+   GtkHx's voice integration suite currently targets Janus only, and
+   adding hxd-ng as a target is the conformance statement the ROADMAP's
+   testing section has wanted since Phase 1. That part is V5's.
 4. **V4 — ng wire.** The `voice_*` requests and events, `caps: ["voice"]`,
    a browser-based ng voice client under `tools/` (a page with
    `RTCPeerConnection` is the cheapest real WebRTC stack we can point at
@@ -480,13 +487,13 @@ Each stage is a branch with tests, in the house style.
 
 | Risk | Severity | Response |
 |---|---|---|
-| str0m's direct API is documented as low-level and *can* panic on an internally inconsistent setup | Medium | V2 exists to find out early; every panic path becomes a test; `VoiceMedia` is the seam to webrtc-rs if the API fights us |
+| ~~str0m's direct API is documented as low-level and *can* panic on an internally inconsistent setup~~ | Answered | It didn't. The two panic paths it documents are `declare_stream_tx` / `expect_stream_rx` against a mid with no media, and neither is reachable: a section is declared before either. The seam to webrtc-rs stays unused. |
 | `webrtcbin` (GtkHx) against an ICE-lite server has not been tried by us | Medium — it's standard, but GtkHx's gotchas list is long | First thing V3 tests with a real GtkHx; fallback is full ICE with host candidates only, which str0m also does |
 | RTP-mode forwarding fidelity (seq/timestamp/marker passthrough, RTCP the client needs for keepalive and jitter) | Medium | Assert passthrough in V2's two-`Rtc` tests; str0m generates RR/SR itself; the spec asks the SFU to forward feedback "SHOULD", not MUST — v1 forwards RTP and lets each leg's RTCP be per-peer |
 | An unauthenticated UDP port on the internet | Medium | str0m drops anything that doesn't match a live ICE credential or an established peer; rate-limit `accepts()` misses per source; document the port in the firewall notes; voice is off by default |
 | Bandwidth: PCMU has no DTX, 64 kbps per stream each way, N−1 downstream per client | Low for Hotline-sized rooms, real at 16 | The per-room cap is the knob; the spec's bandwidth table goes in the operator docs |
 | Sequential cids are guessable, and the spec's room-membership rules say a guessed cid is a joinable private room | **High if membership isn't checked; Low once it is** | Membership check in V1 is the real defence; random cids (§11) are defence in depth and cheap |
-| `hotline-proto` changes coordinated by hand across two trees | Low, recurring | Keep the shared-crate delta to the participants builder; everything else stays in hxd-ng |
+| ~~`hotline-proto` changes coordinated by hand across two trees~~ | Avoided | Nothing crossed. The participants encoder stayed server-side (§7), round-tripped against the shared parser. |
 | The mute-debounce timer has no natural home in a domain that "schedules nothing" | Low | Ship without it (it's a SHOULD); if PTT flapping is noisy in practice, the `hxd-voice` task owns the timer and calls `core.voice_flush_status(cid)` |
 
 ## 11. Open questions
@@ -516,3 +523,45 @@ Each stage is a branch with tests, in the house style.
 - **The spec pin.** Diff `75d4485` against GtkHx's `525e94e` before V3 and
   record the pin here; if they differ in anything normative, GtkHx is the
   client we test against and its reading wins until it updates.
+
+---
+
+## 12. What building it turned out to cost
+
+Three things worth knowing that the design above could not have known.
+
+**str0m's `accepts()` refuses an ICE-lite session's first DTLS record.**
+`Rtc::accepts()` recognises STUN by ICE credentials, traffic from the
+address ICE nominated for sending, and traffic from a remote candidate
+one of its own connectivity checks validated. An ICE-lite agent sends no
+checks, so that third path never fires for it — permanently, not just at
+startup — and the peer's ClientHello routinely arrives between our
+answering its binding request and our polling out the nomination that
+sets a send address. Demultiplexing purely with `accepts()`, which is the
+documented one-socket-many-peers pattern, therefore drops that record and
+every join waits out a DTLS retransmit: about a second of silence. The
+workaround in `hxd-voice` falls back to the address a peer's own
+integrity-checked STUN came from, which is the same thing the fast path
+vouches for. Reported upstream with a patch; the comment at the site says
+to drop the fallback when it lands.
+
+**str0m's `Mid` rewrites every non-alphanumeric character to `_`.** The
+spec's `user-5` is `user_5` once it is inside the library. That is
+harmless while it stays inside — every lookup goes through the same
+conversion — and fatal on the wire, because `a=mid:user_5` fails the
+spec's strict `user-{UID}` parse and a conforming client drops the track.
+`hxd-voice` keeps the wire spelling in its own `String` and never asks
+str0m for one.
+
+**The forwarding SSRC is the server's, not the publisher's.** The spec
+describes an SFU that forwards a publisher's own SSRC untouched. A
+publisher's SSRC isn't known until its answer arrives, so offers built
+from it are incomplete for anyone who joined first, and the server would
+have to renegotiate the whole room again on every answer — which would
+break the property the domain's serialisation model rests on, that "the
+current offer for this peer" is a pure function of room state. `hxd-voice`
+allocates one per join instead and declares it in `a=ssrc` on every
+listener's section, forwarding payload, sequence numbers, timestamps and
+marker bits unchanged. It is invisible to a client, which demultiplexes
+by the declared SSRC either way, and a rejoin gets a fresh one exactly as
+the spec's own rejoin case describes.

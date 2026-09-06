@@ -347,7 +347,8 @@ Each lands separately with tests, roughly a branch apiece:
 - **History**: `{ "req": "history", "params": { "before_seq", "limit" } }`
   once chat lines persist; the event shape doesn't change.
 - **Private chats**: the domain events exist; ng needs a `cid` field on
-  `chat`/`subject` events and room-lifecycle requests.
+  `chat`/`subject` events and room-lifecycle requests. Voice already
+  carries `cid` on every request and event, so nothing there changes.
 - **Capabilities**: the login reply carries a `caps: [...]` list so
   clients feature-detect instead of version-sniffing. It ships with the
   legacy wire's `DATA_CAPABILITIES` negotiation (`docs/voice.md` §7) and

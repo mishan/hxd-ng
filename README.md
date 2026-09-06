@@ -68,6 +68,10 @@ node tools/ng-client.mjs ws://127.0.0.1:5700 --login misha --password pw
 # then type to chat; /drop tests detach+resume; /logout to leave
 ```
 
+`tools/ng-voice.html` is the voice counterpart: open it in a browser
+against a server with `[voice]` configured and it joins the lobby's voice
+room with a real `RTCPeerConnection`. No build step, one file.
+
 Wire tracing mirrors gtkhx's client-side trace so the two line up:
 
 ```sh

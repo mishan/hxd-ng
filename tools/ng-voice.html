@@ -1,0 +1,282 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>hxd-ng voice</title>
+<!--
+  A voice client for the Hotline-ng wire, in one file with no build step.
+
+  It exists because a browser is the cheapest real WebRTC stack there is
+  to point at the server: `RTCPeerConnection` is libwebrtc, it is strict
+  about SDP, and it will complain loudly about anything hxd-voice gets
+  wrong. Open it from a file:// URL against a server on localhost, or
+  serve it over https next to a wss:// endpoint — getUserMedia needs a
+  secure context, and localhost counts as one.
+
+      cargo run --bin hxd            # with [voice] in the config
+      xdg-open tools/ng-voice.html
+
+  The wire it speaks is docs/hotline-ng.md §5-§7 plus docs/voice.md §8.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 1.5rem;
+         max-width: 44rem; }
+  h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+  fieldset { border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+             border-radius: 6px; margin: 0 0 1rem; padding: .75rem 1rem 1rem; }
+  legend { padding: 0 .4rem; opacity: .7; font-size: .85rem; }
+  label { display: inline-block; margin-right: 1rem; }
+  input[type=text], input[type=password] { font: inherit; padding: .25rem .4rem;
+    border-radius: 4px; border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+    background: transparent; color: inherit; width: 12rem; }
+  button { font: inherit; padding: .3rem .8rem; border-radius: 5px;
+    border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+    background: transparent; color: inherit; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  #people { list-style: none; margin: 0; padding: 0; }
+  #people li { padding: .2rem 0; }
+  .muted { opacity: .55; }
+  .speaking { font-weight: 600; }
+  #log { font: 12px/1.45 ui-monospace, monospace; white-space: pre-wrap;
+         max-height: 16rem; overflow: auto; margin: 0;
+         background: color-mix(in srgb, currentColor 6%, transparent);
+         border-radius: 6px; padding: .6rem .8rem; }
+  .err { color: #c0392b; }
+</style>
+
+<h1>hxd-ng voice</h1>
+
+<fieldset>
+  <legend>server</legend>
+  <label>url <input id="url" type="text" value="ws://127.0.0.1:5700"></label>
+  <label>login <input id="login" type="text" placeholder="(guest)"></label>
+  <label>password <input id="password" type="password"></label>
+  <label>nick <input id="nick" type="text" value="browser"></label>
+  <button id="connect">Connect</button>
+</fieldset>
+
+<fieldset>
+  <legend>voice</legend>
+  <button id="join" disabled>Join voice</button>
+  <button id="mute" disabled>Mute</button>
+  <button id="leave" disabled>Leave</button>
+  <span id="codec"></span>
+</fieldset>
+
+<fieldset>
+  <legend>in voice</legend>
+  <ul id="people"><li class="muted">nobody</li></ul>
+</fieldset>
+
+<pre id="log"></pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = {
+  ws: null, id: 0, pending: new Map(),
+  uid: null, cid: 0, pc: null, mic: null, muted: false,
+  audio: new Map(),          // mid -> <audio>
+  participants: [],
+};
+
+function log(msg, cls) {
+  const line = document.createElement('span');
+  if (cls) line.className = cls;
+  line.textContent = `${new Date().toLocaleTimeString()}  ${msg}\n`;
+  $('log').append(line);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+// --- the wire ------------------------------------------------------------
+
+function send(req, params = {}) {
+  const id = ++state.id;
+  state.ws.send(JSON.stringify({ id, req, params }));
+  return new Promise((resolve, reject) => state.pending.set(id, { resolve, reject }));
+}
+
+// A closed socket is the reply that never comes. Every request still in
+// flight is rejected here, so an await somewhere up the stack fails
+// instead of hanging — which is what left the UI stuck mid-join when the
+// server went away at the wrong moment.
+function failPending(why) {
+  const waiting = [...state.pending.values()];
+  state.pending.clear();
+  for (const p of waiting) p.reject(new Error(why));
+}
+
+function onFrame(msg) {
+  if (msg.reply !== undefined) {
+    const p = state.pending.get(msg.reply);
+    state.pending.delete(msg.reply);
+    if (!p) return;
+    if (msg.error) p.reject(new Error(`${msg.error.code}: ${msg.error.text}`));
+    else p.resolve(msg.ok);
+    return;
+  }
+  if (msg.ev !== undefined) onEvent(msg.ev, msg.data || {});
+}
+
+function onEvent(ev, data) {
+  switch (ev) {
+    // The server is always the offerer, so this is the only negotiation
+    // path there is: take the offer, answer it, send the answer back.
+    case 'voice_offer':
+      return answerOffer(data).catch((e) => log(`renegotiation failed: ${e.message}`, 'err'));
+    case 'voice_ice':
+      // `null` is end-of-candidates, which is what addIceCandidate(null)
+      // means to a browser too.
+      return state.pc?.addIceCandidate(data.candidate ?? null)
+        .catch((e) => log(`ICE candidate refused: ${e}`, 'err'));
+    case 'voice_status':
+      state.participants = data.participants;
+      return renderPeople();
+    case 'chat': return log(`${data.from.nick}: ${data.text}`);
+    case 'user_joined': return log(`${data.user.nick} joined`);
+    case 'user_parted': return log(`uid ${data.uid} left`);
+    default: return;   // unknown events are ignored, per spec
+  }
+}
+
+// --- voice ---------------------------------------------------------------
+
+async function answerOffer({ cid, sdp }) {
+  if (!state.pc) return;
+  await state.pc.setRemoteDescription({ type: 'offer', sdp });
+  const answer = await state.pc.createAnswer();
+  await state.pc.setLocalDescription(answer);
+  await send('voice_answer', { cid, sdp: answer.sdp });
+  log(`answered an offer (${sdp.match(/a=mid:\S+/g)?.join(' ') ?? 'no mids'})`);
+}
+
+function newPeerConnection() {
+  // No ICE servers: the server is the only peer and we already know its
+  // address. That is the whole point of the SFU model — no STUN, no TURN.
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  pc.onicecandidate = (e) => {
+    // A null candidate is end-of-candidates; the wire carries that as a
+    // null too.
+    send('voice_ice', { cid: state.cid, candidate: e.candidate ?? null })
+      .catch((err) => log(`voice_ice: ${err.message}`, 'err'));
+  };
+  pc.ontrack = (e) => {
+    // Track-to-user mapping is the transceiver's mid: `user-{UID}`.
+    const mid = e.transceiver?.mid ?? '?';
+    let el = state.audio.get(mid);
+    if (!el) {
+      el = new Audio();
+      el.autoplay = true;
+      state.audio.set(mid, el);
+    }
+    el.srcObject = e.streams[0] ?? new MediaStream([e.track]);
+    log(`track on mid ${mid}`);
+    renderPeople();
+  };
+  pc.onconnectionstatechange = () => log(`peer connection: ${pc.connectionState}`);
+  return pc;
+}
+
+async function joinVoice() {
+  state.mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+  state.pc = newPeerConnection();
+  for (const track of state.mic.getTracks()) state.pc.addTrack(track, state.mic);
+
+  const ok = await send('voice_join', { cid: state.cid });
+  $('codec').textContent = `codec ${ok.codec}`;
+  state.participants = ok.participants;
+  renderPeople();
+  await answerOffer({ cid: state.cid, sdp: ok.sdp });
+
+  // Clients SHOULD join muted; the server is told, and enforces it.
+  await setMuted(true);
+  $('join').disabled = true;
+  $('mute').disabled = false;
+  $('leave').disabled = false;
+}
+
+async function setMuted(muted) {
+  await send('voice_mute', { cid: state.cid, muted });
+  state.muted = muted;
+  // Local enforcement as well as server-side: replacing the microphone
+  // with silence keeps RTP flowing at the normal rate, which keeps the
+  // NAT path warm. Dropping the packets instead would save nothing worth
+  // having and risk the path going cold.
+  for (const t of state.mic?.getAudioTracks() ?? []) t.enabled = !muted;
+  $('mute').textContent = muted ? 'Unmute' : 'Mute';
+}
+
+async function leaveVoice() {
+  await send('voice_leave', { cid: state.cid }).catch(() => {});
+  teardown();
+}
+
+function teardown() {
+  state.pc?.close();
+  state.pc = null;
+  for (const t of state.mic?.getTracks() ?? []) t.stop();
+  state.mic = null;
+  state.audio.clear();
+  state.participants = [];
+  renderPeople();
+  $('codec').textContent = '';
+  $('join').disabled = false;
+  $('mute').disabled = true;
+  $('leave').disabled = true;
+}
+
+function renderPeople() {
+  const ul = $('people');
+  ul.textContent = '';
+  if (!state.participants.length) {
+    const li = document.createElement('li');
+    li.className = 'muted';
+    li.textContent = 'nobody';
+    ul.append(li);
+    return;
+  }
+  for (const p of state.participants) {
+    const li = document.createElement('li');
+    const self = p.uid === state.uid ? ' (you)' : '';
+    li.textContent = `uid ${p.uid}${self}${p.muted ? ' — muted' : ''}`;
+    if (p.muted) li.className = 'muted';
+    ul.append(li);
+  }
+}
+
+// --- connect -------------------------------------------------------------
+
+$('connect').onclick = async () => {
+  const ws = new WebSocket($('url').value);
+  state.ws = ws;
+  ws.onmessage = (e) => onFrame(JSON.parse(e.data));
+  ws.onclose = () => {
+    log('disconnected');
+    failPending('disconnected');
+    teardown();
+    $('join').disabled = true;
+  };
+  ws.onerror = () => log('websocket error', 'err');
+  await new Promise((r) => (ws.onopen = r));
+  log('connected');
+
+  try {
+    const ok = await send('login', {
+      login: $('login').value,
+      password: $('password').value,
+      nick: $('nick').value,
+    });
+    state.uid = ok.self.uid;
+    log(`logged in as ${ok.self.nick} (uid ${ok.self.uid}) — caps: ${JSON.stringify(ok.caps)}`);
+    if (!ok.caps?.includes('voice')) {
+      log('this server has no voice; the join button stays disabled', 'err');
+      return;
+    }
+    $('join').disabled = false;
+  } catch (e) {
+    log(e.message, 'err');
+  }
+};
+
+$('join').onclick = () => joinVoice().catch((e) => log(e.message, 'err'));
+$('mute').onclick = () => setMuted(!state.muted).catch((e) => log(e.message, 'err'));
+$('leave').onclick = () => leaveVoice().catch((e) => log(e.message, 'err'));
+</script>

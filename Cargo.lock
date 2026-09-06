@@ -702,6 +702,7 @@ dependencies = [
  "hxd-voice",
  "serde",
  "serde_json",
+ "str0m",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

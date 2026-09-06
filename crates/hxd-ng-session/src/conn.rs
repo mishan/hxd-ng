@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 
 use futures_util::{SinkExt, StreamExt};
 use hxd_core::access::bit;
+use hxd_core::voice::IceCandidate;
 use hxd_core::{AccessBits, AttachInfo, AuthError, Proof, Resume, SeqEvent, Uid};
 use serde_json::json;
 use tokio::net::TcpStream;
@@ -23,8 +24,9 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, warn};
 
 use crate::proto::{
-    event_json, reply_err, reply_ok, user_json, ChatParams, LoginParams, MsgParams, NickParams,
-    ReqEnvelope, ResumeParams,
+    event_json, participants_json, reply_err, reply_ok, user_json, voice_err, ChatParams,
+    LoginParams, MsgParams, NickParams, ReqEnvelope, ResumeParams, VoiceAnswerParams,
+    VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -512,6 +514,92 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 }
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed msg."),
+        },
+
+        // --- Voice (docs/voice.md §8) ---------------------------------
+        //
+        // The same six messages the legacy wire carries as 600–606. No
+        // capability gate here: the ng handshake has no per-session
+        // negotiation, and its `caps` list is a hint for feature
+        // detection rather than a switch — a client that calls these on a
+        // server without an SFU gets `voice_disabled` from the domain.
+        "voice_join" => match serde_json::from_value::<VoiceRoomParams>(req.params.clone()) {
+            Ok(_) if !state.access.has(bit::VOICE_CHAT) => reply_err(
+                req.id,
+                "access_denied",
+                "You are not allowed to join voice chat.",
+            ),
+            Ok(p) => match ctx.core.voice_join(state.uid, p.cid) {
+                Ok(join) => reply_ok(
+                    req.id,
+                    json!({
+                        "cid": p.cid,
+                        "sdp": join.sdp,
+                        "codec": join.codec,
+                        "participants": participants_json(&join.participants),
+                    }),
+                ),
+                Err(e) => {
+                    let (code, text) = voice_err(e);
+                    reply_err(req.id, code, text)
+                }
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed voice_join."),
+        },
+
+        "voice_leave" => match serde_json::from_value::<VoiceRoomParams>(req.params.clone()) {
+            Ok(p) => match ctx.core.voice_leave(state.uid, p.cid) {
+                Ok(()) => reply_ok(req.id, json!({})),
+                Err(e) => {
+                    let (code, text) = voice_err(e);
+                    reply_err(req.id, code, text)
+                }
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed voice_leave."),
+        },
+
+        "voice_answer" => match serde_json::from_value::<VoiceAnswerParams>(req.params.clone()) {
+            Ok(p) => match ctx.core.voice_answer(state.uid, p.cid, p.sdp) {
+                Ok(()) => reply_ok(req.id, json!({})),
+                Err(e) => {
+                    let (code, text) = voice_err(e);
+                    reply_err(req.id, code, text)
+                }
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed voice_answer."),
+        },
+
+        "voice_ice" => match serde_json::from_value::<VoiceIceParams>(req.params.clone()) {
+            Ok(p) => {
+                // `null` is end-of-candidates, which the domain carries
+                // as a candidate with an empty string.
+                let candidate = p.candidate.map(IceCandidate::from).unwrap_or_default();
+                // Every request on this wire gets an answer, so a
+                // candidate for a room the caller isn't in is refused
+                // rather than acknowledged — `docs/voice.md` §8, and the
+                // same shape as voice_leave, voice_answer and
+                // voice_mute. The legacy wire, which has no reply here,
+                // drops it instead.
+                match ctx.core.voice_ice(state.uid, p.cid, candidate) {
+                    Ok(()) => reply_ok(req.id, json!({})),
+                    Err(e) => {
+                        let (code, text) = voice_err(e);
+                        reply_err(req.id, code, text)
+                    }
+                }
+            }
+            Err(_) => reply_err(req.id, "bad_request", "Malformed voice_ice."),
+        },
+
+        "voice_mute" => match serde_json::from_value::<VoiceMuteParams>(req.params.clone()) {
+            Ok(p) => match ctx.core.voice_mute(state.uid, p.cid, p.muted) {
+                Ok(()) => reply_ok(req.id, json!({})),
+                Err(e) => {
+                    let (code, text) = voice_err(e);
+                    reply_err(req.id, code, text)
+                }
+            },
+            Err(_) => reply_err(req.id, "bad_request", "Malformed voice_mute."),
         },
 
         "logout" => {
