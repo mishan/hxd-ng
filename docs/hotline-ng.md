@@ -349,6 +349,14 @@ Each lands separately with tests, roughly a branch apiece:
 - **Private chats**: the domain events exist; ng needs a `cid` field on
   `chat`/`subject` events and room-lifecycle requests. Voice already
   carries `cid` on every request and event, so nothing there changes.
+- **Identity** (`docs/hotline-ng-identity.md`): authentication moves to
+  the HTTP layer before the upgrade, so an authenticated socket arrives
+  knowing which device key holds it; `login` then ignores credentials for
+  identity users and associates an account. The same design adds a
+  second WebSocket path carrying TRTP in binary frames, so a legacy client
+  behind a plain tunnel gets an identity-aware, encrypted session with no
+  change to the legacy wire. This is what ends the "no HTTP framework"
+  decision above.
 - **Capabilities**: the login reply carries a `caps: [...]` list so
   clients feature-detect instead of version-sniffing. It ships with the
   legacy wire's `DATA_CAPABILITIES` negotiation (`docs/voice.md` §7) and
