@@ -89,6 +89,18 @@ pub struct VideoPublication {
     pub paused: bool,
 }
 
+/// How many streams one client may name in its desired receive set.
+///
+/// A room holds at most `VoiceMaxPerRoom` participants with two kinds
+/// each, so anything a subscription could usefully name fits in a few
+/// dozen entries. This sits far above that and far below what either
+/// wire can carry, which is the point: it is a bound on the work one
+/// request can make the domain do under the roster lock, not a limit any
+/// real client will meet. Entries past it are dropped, silently — the
+/// set is declarative and a client that sent thousands was not
+/// describing a room.
+pub const MAX_SUBSCRIPTIONS: usize = 256;
+
 /// One entry in a client's desired receive set: whose, and of what kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VideoStream {
@@ -181,10 +193,17 @@ pub enum VideoError {
     AlreadyPublishing,
     /// No publication of that kind to pause, resume or describe.
     NotPublishing,
-    /// The room's slots for that kind are taken. With the default
-    /// `VideoMaxScreensPerRoom` of 1 this is what a second sharer gets,
-    /// and the existing share is never preempted.
-    Full,
+    /// The room's slots for that kind are taken. **Carries the kind**,
+    /// because the two cases need different words: with the default
+    /// `VideoMaxScreensPerRoom` of 1 a second sharer is told someone else
+    /// is already sharing, which is true — while the ninth camera in a
+    /// room of eight is not being blocked by any one person, and telling
+    /// its user to go and ask someone to stop is simply false.
+    ///
+    /// It is also what a refusal from the media layer becomes: the peer
+    /// could not be seated, which is the same answer to a client either
+    /// way — the room cannot take this right now.
+    Full(VideoKind),
 }
 
 impl From<VoiceError> for VideoError {
@@ -420,13 +439,23 @@ impl Core {
         // screen share occupies the room's screen slot whether one
         // person is watching it or none.
         if r.video_slots_used(cid, kind) >= r.voice.video.limits(kind).max_per_room as usize {
-            return Err(VideoError::Full);
+            return Err(VideoError::Full(kind));
         }
 
         if let Some(p) = r.voice.peer_mut(cid, uid) {
             p.video.publications.push((kind, false));
         }
-        media.publish(uid, cid, kind);
+        if !media.publish(uid, cid, kind) {
+            // The media layer could not seat it — the session is gone, or
+            // its offer has no room left for another section. Give the
+            // slot back rather than announcing a publication that can
+            // never carry a frame and that only the publisher could ever
+            // clear.
+            if let Some(p) = r.voice.peer_mut(cid, uid) {
+                p.video.publications.retain(|(k, _)| *k != kind);
+            }
+            return Err(VideoError::Full(kind));
+        }
 
         // The publisher, for its own send section; then anyone whose
         // standing subscription this publication just activated.
@@ -551,17 +580,37 @@ impl Core {
         if r.voice.room_of.get(&uid) != Some(&cid) {
             return Err(VideoError::NotInVoice);
         }
-        let mut wanted: Vec<VideoStream> = Vec::with_capacity(streams.len());
+        // **Bounded, and deduplicated by a set rather than a scan.**
+        // This runs under the server-wide roster lock, and the request
+        // that drives it is a client-supplied list: the legacy wire's
+        // chunk holds 16,383 entries at four bytes each and the ng wire's
+        // message cap allows thousands, so an `O(n²)` `Vec::contains`
+        // over that costs tens of milliseconds of exclusive hold — per
+        // request, with no rate limiter in front of it, on the one lock
+        // every login and chat message on both wires also needs. The
+        // retained set is then re-scanned against the room's publications
+        // on every start, stop, leave and subscribe, so an oversized one
+        // goes on costing long after the request that sent it.
+        //
+        // The cap is generous by design: the spec's "retain a
+        // subscription to a publication that does not exist yet" only
+        // needs room for the streams a room could actually hold, and this
+        // leaves an order of magnitude over that.
+        let mut seen: std::collections::HashSet<VideoStream> = std::collections::HashSet::new();
+        let mut wanted: Vec<VideoStream> = Vec::with_capacity(streams.len().min(MAX_SUBSCRIPTIONS));
         for s in streams {
             // A peer never receives its own publication back. The SFU
             // offers no loopback section for it — the same rule that
             // keeps a participant's own audio out of its offer — and a
             // client renders its camera from the local capture, which
             // costs nothing and has no round trip in it.
-            if s.uid == uid || wanted.contains(s) {
+            if s.uid == uid || !seen.insert(*s) {
                 continue;
             }
             wanted.push(*s);
+            if wanted.len() == MAX_SUBSCRIPTIONS {
+                break;
+            }
         }
         let changed = match r.voice.peer_mut(cid, uid) {
             Some(p) if p.video.wanted != wanted => {

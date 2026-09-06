@@ -195,7 +195,15 @@ pub trait VoiceMedia: Send + Sync + 'static {
 
     /// Add a send section of `kind` for this peer, so its next offer
     /// carries somewhere to publish on.
-    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind);
+    ///
+    /// Returns whether the media layer took it. **A refusal has to be
+    /// reported, not swallowed**: by the time this is called the domain
+    /// has claimed a room slot and is about to announce the publication
+    /// to everyone, so a media layer that quietly declined would leave a
+    /// publication that shows as live, can never carry a frame, and holds
+    /// its slot until the user stops it by hand — with a room's single
+    /// screen slot, that is the room's screen share gone.
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> bool;
 
     /// Drop a publication. The section survives as `a=inactive` — mids
     /// are never reassigned and `m=` lines are never deleted — but
@@ -382,13 +390,22 @@ impl RosterInner {
         self.voice_status(cid);
         // The same courtesy for video: the leaver's own publications are
         // gone, and the room needs to stop drawing their tile.
-        self.send_to(
-            uid,
-            Event::VideoStatus {
-                cid,
-                publications: Vec::new(),
-            },
-        );
+        //
+        // Gated exactly as `video_status` is. Without the guard this was
+        // the one video event a server with no video configured could
+        // still emit, and the ng wire — which has no per-session
+        // capability check on the way out, because its `caps` list is
+        // supposed to make one unnecessary — delivered it to a client
+        // whose `caps` said `["voice"]` and nothing else.
+        if self.voice.video_enabled {
+            self.send_to(
+                uid,
+                Event::VideoStatus {
+                    cid,
+                    publications: Vec::new(),
+                },
+            );
+        }
         self.video_status(cid);
     }
 
@@ -585,11 +602,16 @@ impl Core {
     }
 
     /// Leave voice in `cid`.
+    ///
+    /// `Disabled` is deliberately not among the answers here, nor in
+    /// [`Core::voice_answer`] or [`Core::voice_mute`]: `docs/voice.md` §8
+    /// lists a closed error set per method and none of the three includes
+    /// it. Nor would it say anything true — with no SFU wired in, nobody
+    /// is in voice anywhere, so `NotInVoice` is both the documented answer
+    /// and the accurate one, and a client with a strict error map never
+    /// sees a code its method's set doesn't contain.
     pub fn voice_leave(&self, uid: Uid, cid: u32) -> Result<(), VoiceError> {
         let mut r = self.roster.lock().unwrap();
-        if r.voice.media.is_none() {
-            return Err(VoiceError::Disabled);
-        }
         if r.voice.room_of.get(&uid) != Some(&cid) {
             return Err(VoiceError::NotInVoice);
         }
@@ -607,11 +629,25 @@ impl Core {
     /// consolidated offer covering all of it.
     pub fn voice_answer(&self, uid: Uid, cid: u32, sdp: String) -> Result<(), VoiceError> {
         let mut r = self.roster.lock().unwrap();
-        let Some(media) = r.voice_media() else {
-            return Err(VoiceError::Disabled);
-        };
         if r.voice.room_of.get(&uid) != Some(&cid) {
+            // See `voice_leave` on why this, and not `Disabled`.
             return Err(VoiceError::NotInVoice);
+        }
+        let Some(media) = r.voice_media() else {
+            return Err(VoiceError::NotInVoice);
+        };
+        // An answer to nothing is not an answer. The server is always the
+        // offerer, so a client may only answer while an offer is
+        // outstanding — and without this check it could re-answer as
+        // often as it liked, each time binding another expected SSRC in
+        // the media layer that nothing would ever retire. Refusing costs
+        // a conforming client nothing: it has an offer or it does not.
+        let expected = r
+            .voice
+            .peer_mut(cid, uid)
+            .is_some_and(|p| p.offer_outstanding);
+        if !expected {
+            return Err(VoiceError::BadAnswer);
         }
         // Whatever the media layer refused this answer for, the peer goes
         // with it — a half-negotiated session is the thing we are here to
@@ -663,12 +699,13 @@ impl Core {
     /// deciding for itself.
     pub fn voice_ice(&self, uid: Uid, cid: u32, candidate: IceCandidate) -> Result<(), VoiceError> {
         let r = self.roster.lock().unwrap();
-        let Some(media) = r.voice_media() else {
-            return Err(VoiceError::Disabled);
-        };
         if r.voice.room_of.get(&uid) != Some(&cid) {
+            // See `voice_leave` on why this, and not `Disabled`.
             return Err(VoiceError::NotInVoice);
         }
+        let Some(media) = r.voice_media() else {
+            return Err(VoiceError::NotInVoice);
+        };
         media.remote_ice(uid, cid, &candidate);
         Ok(())
     }
@@ -677,12 +714,13 @@ impl Core {
     /// drops a muted peer's RTP regardless of what the client sends.
     pub fn voice_mute(&self, uid: Uid, cid: u32, muted: bool) -> Result<(), VoiceError> {
         let mut r = self.roster.lock().unwrap();
-        let Some(media) = r.voice_media() else {
-            return Err(VoiceError::Disabled);
-        };
         if r.voice.room_of.get(&uid) != Some(&cid) {
+            // See `voice_leave` on why this, and not `Disabled`.
             return Err(VoiceError::NotInVoice);
         }
+        let Some(media) = r.voice_media() else {
+            return Err(VoiceError::NotInVoice);
+        };
         let changed = match r.voice.peer_mut(cid, uid) {
             Some(p) if p.muted != muted => {
                 p.muted = muted;

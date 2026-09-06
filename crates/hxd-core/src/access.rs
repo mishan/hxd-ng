@@ -141,6 +141,62 @@ mod tests {
     }
 
     #[test]
+    fn the_extension_bits_are_pinned_to_their_wire_positions() {
+        // Every other privilege test in this tree is symmetric: a toml
+        // key names a constant, and the assertion is against that same
+        // constant. Renumbering one of these three would keep all of
+        // them green while silently breaking interop with every other
+        // implementation of the extensions, so they are pinned here to
+        // their numbers *and* to the bytes they set — the way
+        // `hxd_session::caps` pins the capability bitmask.
+        //
+        // Bit 55 is `accessVoiceChat` (fogWraith `Capabilities-Voice.md`
+        // §"Access Privileges"). Bits 59 and 60 are `accessVideoChat`
+        // and `accessScreenShare` (`docs/capabilities-video.md`
+        // §"Access Privileges"), which follow the inline-media (57) and
+        // messaging (58) allocations this server does not implement.
+        assert_eq!(bit::VOICE_CHAT, 55);
+        assert_eq!(bit::VIDEO_CHAT, 59);
+        assert_eq!(bit::SCREEN_SHARE, 60);
+
+        // Bit 55 is the LSB of byte 6; bits 59 and 60 are 0x10 and 0x08
+        // of byte 7. A client reading these bytes is what makes the
+        // numbering matter, so assert on the bytes.
+        assert_eq!(
+            AccessBits::empty().with(bit::VOICE_CHAT).to_wire(),
+            [0, 0, 0, 0, 0, 0, 0x01, 0x00]
+        );
+        assert_eq!(
+            AccessBits::empty().with(bit::VIDEO_CHAT).to_wire(),
+            [0, 0, 0, 0, 0, 0, 0x00, 0x10]
+        );
+        assert_eq!(
+            AccessBits::empty().with(bit::SCREEN_SHARE).to_wire(),
+            [0, 0, 0, 0, 0, 0, 0x00, 0x08]
+        );
+
+        // Showing your face and showing your desktop are separate trust
+        // decisions, and neither is voice's: granting one must never
+        // read back as granting another.
+        let cam = AccessBits::empty().with(bit::VIDEO_CHAT);
+        assert!(cam.has(bit::VIDEO_CHAT));
+        assert!(!cam.has(bit::SCREEN_SHARE));
+        assert!(!cam.has(bit::VOICE_CHAT));
+        let screen = AccessBits::empty().with(bit::SCREEN_SHARE);
+        assert!(!screen.has(bit::VIDEO_CHAT));
+
+        // And from the other direction: an account granted both video
+        // bits sets exactly those two, leaving the reserved 57 and 58
+        // clear so a later extension can still have them.
+        let both = AccessBits::from_wire([0, 0, 0, 0, 0, 0, 0x00, 0x18]);
+        assert!(both.has(bit::VIDEO_CHAT));
+        assert!(both.has(bit::SCREEN_SHARE));
+        assert!(!both.has(57));
+        assert!(!both.has(58));
+        assert_eq!(both, cam.with(bit::SCREEN_SHARE));
+    }
+
+    #[test]
     fn matches_mhxd_fakeaccess_constant() {
         // mhxd's "everything enabled" SELFINFO constant is the byte pair
         // 0xfff3cfef / 0xff800000 — a handy cross-check that our bit

@@ -22,15 +22,17 @@ use std::time::Instant;
 
 use hxd_core::video::{VideoConfig, VideoKind, VideoStream};
 use hxd_core::Uid;
+use str0m::config::DtlsCert;
 use str0m::media::MediaKind;
 use str0m::rtp::Ssrc;
 use str0m::{Candidate, Rtc, RtcConfig};
 
 use crate::sdp::{
-    self, Direction, OfferParams, OfferSection, SectionMedia, CAM_SEND_MID, MIC_MID, SCR_SEND_MID,
+    self, candidate_bytes, section_bytes, Direction, OfferParams, OfferSection, SectionMedia,
+    CAM_SEND_MID, MIC_MID, OFFER_BASE_BYTES, SCR_SEND_MID,
 };
 
-/// How many media sections one peer's session may accumulate.
+/// How large one peer's offer may grow before the session is ended.
 ///
 /// Sections are append-only and a departed participant keeps theirs
 /// forever — the spec forbids deleting an `m=` line from a later offer,
@@ -41,18 +43,21 @@ use crate::sdp::{
 /// SHOULD-NOT and then past the Hotline wire's 16-bit chunk length, and
 /// what a 1.x client would get at that point is a broken frame.
 ///
-/// Video widens each section and multiplies how many a room can produce
-/// — up to two publications a participant, each with its own section in
-/// every subscriber's offer — so the cap now bounds a mixture rather
-/// than a list of audio sections. It is deliberately not raised for
-/// video: the same ceiling on the same wire, reached sooner in a room
-/// that uses everything.
+/// **The budget is in bytes and not in sections**, which is the whole of
+/// the change video forced. A fixed count of 64 was a fair proxy for
+/// 32 KB while every section was audio; a video section carries three
+/// more `a=rtpmap`/`a=fmtp` lines, three `a=rtcp-fb` lines, a `b=AS` and
+/// two more `a=ssrc` lines, so the same 64 sections come to roughly 37 KB
+/// of video against 28 KB of audio — and 64 audio sections were already
+/// over the line on a host advertising both a v4 and a v6 candidate. One
+/// count cannot serve both, and the thing actually being bounded was
+/// always the size.
 ///
-/// At the cap the peer's session is ended instead, so it reconnects with
-/// a clean section list — a rejoin is exactly the reset the spec's own
-/// model has for this, and it keeps "a mid is never reassigned *within a
-/// session*" true.
-const MAX_SECTIONS: usize = 64;
+/// At the ceiling the peer's session is ended instead, so it reconnects
+/// with a clean section list — a rejoin is exactly the reset the spec's
+/// own model has for this, and it keeps "a mid is never reassigned
+/// *within a session*" true.
+const MAX_OFFER_BYTES: usize = sdp::MAX_OFFER_BYTES;
 
 /// What a media section carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +126,19 @@ pub(crate) struct Section {
     /// gives the participant a new forwarding SSRC, and the section has
     /// to be re-declared to match.
     pub(crate) ssrc: Option<u32>,
+    /// The repair SSRC paired with [`Section::ssrc`] in
+    /// `a=ssrc-group:FID`, on a video section.
+    pub(crate) rtx_ssrc: Option<u32>,
+    /// What the *source* of this section's stream was when its SSRC was
+    /// last chosen: the publisher's forwarding SSRC for a remote video
+    /// section. A change means the publisher restarted, and the section
+    /// has to be re-declared even if it never went inactive.
+    pub(crate) source: Option<u32>,
+    /// Whether the last offer described this section as live. Sections
+    /// are never removed, so this is what distinguishes "still running"
+    /// from "coming back", and coming back needs a fresh SSRC — see
+    /// [`Peer::declare_remote_video`].
+    pub(crate) active: bool,
 }
 
 /// One of this peer's outbound publications.
@@ -150,6 +168,20 @@ pub(crate) struct Publication {
     /// keyframes in a few milliseconds and get eight, a bitrate spike
     /// precisely when the network is busiest.
     pub(crate) last_keyframe: Option<Instant>,
+    /// Whether an offer carrying this publication's send section has
+    /// actually been built yet.
+    ///
+    /// **This is what stops an answer destroying a publication that was
+    /// started a moment ago.** The start transaction deliberately carries
+    /// no offer — a renegotiation may already be outstanding, and the
+    /// voice extension forbids a second offer before the first is
+    /// answered — so between the start and the offer that follows it, the
+    /// next answer to arrive is the answer to the *previous* offer, which
+    /// of course never mentioned `cam-send`. Reading that absence as "the
+    /// client declined" killed the publication before its offer had even
+    /// been written. A section the client has never been shown cannot
+    /// have been declined by it.
+    pub(crate) offered: bool,
 }
 
 pub(crate) struct Peer {
@@ -158,6 +190,13 @@ pub(crate) struct Peer {
     pub(crate) cid: u32,
     pub(crate) rtc: Rtc,
     pub(crate) sections: Vec<Section>,
+    /// What this peer's candidate lines cost, once. Fixed for the
+    /// session's life, so the section budget doesn't re-measure them.
+    candidate_bytes: usize,
+    /// A running upper bound on the size of this peer's next offer, kept
+    /// so a section can be refused *before* it is appended. See
+    /// [`MAX_OFFER_BYTES`].
+    offer_bytes: usize,
     /// The SSRC every *other* peer's `user-{this uid}` section declares
     /// and this peer's audio is forwarded on. Allocated per join, so a
     /// rejoin can't collide its fresh sequence numbers with the stream
@@ -173,6 +212,9 @@ pub(crate) struct Peer {
     /// leaves. There is no "is this client video-capable" branch
     /// anywhere below; that absence is the compatibility guarantee.
     pub(crate) subscriptions: Vec<VideoStream>,
+    /// The SSRC the client's answer last declared for its microphone,
+    /// so a renegotiation that moves it can retire the old binding.
+    pub(crate) mic_ssrc: Option<u32>,
     /// The client's answer has been applied and DTLS has been started.
     pub(crate) answered: bool,
     /// Whether we've seen ICE + DTLS complete.
@@ -201,10 +243,17 @@ impl Peer {
         cid: u32,
         now: Instant,
         candidates: &[Candidate],
+        extra_locals: &[Candidate],
+        cert: DtlsCert,
         session_id: u64,
         forward_ssrc: u32,
     ) -> Self {
         let mut rtc = RtcConfig::new()
+            // One certificate for the whole server rather than one per
+            // session: generating a P-256 key pair and self-signing it
+            // costs milliseconds, and this constructor runs under the
+            // domain's roster lock.
+            .set_dtls_cert(cert)
             // The server is the passive side: it publishes host
             // candidates and answers checks rather than making them.
             .set_ice_lite(true)
@@ -222,7 +271,9 @@ impl Peer {
             .set_rtp_mode(true)
             .build(now);
 
-        for c in candidates {
+        for c in candidates.iter().chain(extra_locals) {
+            // Both sets are local candidates as far as ICE is concerned;
+            // only `candidates` reaches the SDP. See `Inner::extra_locals`.
             rtc.add_local_candidate(c.clone());
         }
         {
@@ -235,10 +286,13 @@ impl Peer {
             cid,
             rtc,
             sections: Vec::new(),
+            candidate_bytes: candidate_bytes(candidates),
+            offer_bytes: OFFER_BASE_BYTES,
             forward_ssrc,
             muted: false,
             publications: Vec::new(),
             subscriptions: Vec::new(),
+            mic_ssrc: None,
             answered: false,
             connected: false,
             ice_connected_at: None,
@@ -257,6 +311,53 @@ impl Peer {
         self.sections.iter().position(|s| s.kind == kind)
     }
 
+    /// Append a section, or refuse it because the offer has no room left.
+    ///
+    /// Every section this peer will ever have goes through here, so the
+    /// budget is enforced in exactly one place and there is nowhere for a
+    /// caller to forget it.
+    fn push_section(&mut self, mid: String, kind: SectionKind) -> bool {
+        let media = kind.media();
+        // A mid too long for RFC 8285's one-byte header form cannot be
+        // carried by the MID extension every mainstream stack negotiates,
+        // and the abbreviated prefixes exist precisely so this never
+        // happens. `Uid` is a `u16`, so the longest mid this grammar can
+        // build is `scr-user-65535` at 14 bytes; the check is here so the
+        // invariant is load-bearing rather than a comment, and so a
+        // future kind with a longer prefix fails loudly instead of
+        // colliding inside str0m — which truncates a `Mid` to 16 bytes
+        // silently, turning `screen-user-65535` and `screen-user-65534`
+        // into the same id.
+        debug_assert!(
+            mid.len() <= sdp::MAX_MID_LEN,
+            "mid {mid:?} exceeds the RFC 8285 one-byte header form"
+        );
+        if mid.len() > sdp::MAX_MID_LEN {
+            return false;
+        }
+        let cost = section_bytes(&mid, media, self.candidate_bytes);
+        if self.offer_bytes + cost > MAX_OFFER_BYTES {
+            return false;
+        }
+        let media_kind = match media {
+            SectionMedia::Audio => MediaKind::Audio,
+            _ => MediaKind::Video,
+        };
+        self.rtc
+            .direct_api()
+            .declare_media(mid.as_str().into(), media_kind);
+        self.offer_bytes += cost;
+        self.sections.push(Section {
+            mid,
+            kind,
+            ssrc: None,
+            rtx_ssrc: None,
+            source: None,
+            active: false,
+        });
+        true
+    }
+
     /// Declare this peer's own microphone section. Called once, at join,
     /// after the sections for whoever is already in the room — which is
     /// the order the spec's own offer example uses.
@@ -264,14 +365,10 @@ impl Peer {
         if self.section_index(SectionKind::Mic).is_some() {
             return;
         }
-        self.rtc
-            .direct_api()
-            .declare_media(MIC_MID.into(), MediaKind::Audio);
-        self.sections.push(Section {
-            mid: MIC_MID.to_string(),
-            kind: SectionKind::Mic,
-            ssrc: None,
-        });
+        // A fresh session's budget cannot be exhausted by its own
+        // microphone, so this cannot fail in practice; ignoring the
+        // answer keeps the signature honest for the one caller.
+        self.push_section(MIC_MID.to_string(), SectionKind::Mic);
     }
 
     /// Make sure this peer has a section for `other`, carrying `ssrc`.
@@ -280,34 +377,33 @@ impl Peer {
     /// mid it already had, with its new forwarding SSRC swapped in. The
     /// mid is the spec's track-to-user mapping and is never reassigned.
     ///
-    /// Returns `false` when the section list is full — see
-    /// [`MAX_SECTIONS`].
+    /// Returns `false` when the offer has no room left for it — see
+    /// [`MAX_OFFER_BYTES`].
     pub(crate) fn declare_remote(&mut self, other: Uid, ssrc: u32) -> bool {
+        let section = SectionKind::Remote(other);
         let mid = format!("user-{other}");
-        match self.section_index(SectionKind::Remote(other)) {
+        match self.section_index(section) {
             Some(i) => {
                 if self.sections[i].ssrc == Some(ssrc) {
+                    self.sections[i].active = true;
                     return true;
                 }
                 if let Some(old) = self.sections[i].ssrc {
                     self.rtc.direct_api().remove_stream_tx(old.into());
                 }
-                self.sections[i].ssrc = Some(ssrc);
             }
             None => {
-                if self.sections.len() >= MAX_SECTIONS {
+                if !self.push_section(mid.clone(), section) {
                     return false;
                 }
-                self.rtc
-                    .direct_api()
-                    .declare_media(mid.as_str().into(), MediaKind::Audio);
-                self.sections.push(Section {
-                    mid: mid.clone(),
-                    kind: SectionKind::Remote(other),
-                    ssrc: Some(ssrc),
-                });
             }
         }
+        let Some(i) = self.section_index(section) else {
+            return false;
+        };
+        self.sections[i].ssrc = Some(ssrc);
+        self.sections[i].source = Some(ssrc);
+        self.sections[i].active = true;
         self.rtc
             .direct_api()
             .declare_stream_tx(ssrc.into(), None, mid.as_str().into(), None);
@@ -350,18 +446,10 @@ impl Peer {
             return false;
         }
         let mid = send_mid(kind);
-        if self.section_index(SectionKind::VideoSend(kind)).is_none() {
-            if self.sections.len() >= MAX_SECTIONS {
-                return false;
-            }
-            self.rtc
-                .direct_api()
-                .declare_media(mid.into(), MediaKind::Video);
-            self.sections.push(Section {
-                mid: mid.to_string(),
-                kind: SectionKind::VideoSend(kind),
-                ssrc: None,
-            });
+        if self.section_index(SectionKind::VideoSend(kind)).is_none()
+            && !self.push_section(mid.to_string(), SectionKind::VideoSend(kind))
+        {
+            return false;
         }
         self.publications.push(Publication {
             kind,
@@ -370,6 +458,7 @@ impl Peer {
             recv_ssrc: None,
             last_media: None,
             last_keyframe: None,
+            offered: false,
         });
         true
     }
@@ -389,44 +478,81 @@ impl Peer {
         true
     }
 
-    /// Make sure this peer has a receive section for `other`'s
-    /// publication of `kind`, carrying `ssrc`.
-    pub(crate) fn declare_remote_video(&mut self, other: Uid, kind: VideoKind, ssrc: u32) -> bool {
+    /// Make sure this peer has a live receive section for `other`'s
+    /// publication of `kind`. `source` is the publisher's forwarding
+    /// SSRC, used only to notice that the publisher restarted.
+    ///
+    /// **The SSRC on the wire is this peer's, not the publisher's**, and
+    /// it is drawn fresh whenever the section comes back to life. That is
+    /// not symmetry with audio for its own sake: subscription is
+    /// per-receiver, so between one peer unsubscribing and resubscribing
+    /// the publisher's stream carried on to everyone else, and resuming
+    /// it on the same SSRC would hand this receiver a sequence-number gap
+    /// of every packet it missed. libwebrtc answers a gap that size with
+    /// a NACK storm for packets no cache still holds. A new SSRC is a new
+    /// stream, which is what actually happened from the receiver's side.
+    pub(crate) fn declare_remote_video(
+        &mut self,
+        other: Uid,
+        kind: VideoKind,
+        source: u32,
+    ) -> bool {
         let mid = remote_video_mid(other, kind);
         let section = SectionKind::RemoteVideo(other, kind);
-        let rtx: Ssrc = self.rtc.direct_api().new_ssrc();
         match self.section_index(section) {
             Some(i) => {
-                if self.sections[i].ssrc == Some(ssrc) {
+                // Still running on the same publisher stream: nothing to
+                // re-declare, and re-declaring would reset a stream the
+                // receiver is happily decoding.
+                if self.sections[i].active && self.sections[i].source == Some(source) {
                     return true;
                 }
                 if let Some(old) = self.sections[i].ssrc {
                     self.rtc.direct_api().remove_stream_tx(old.into());
                 }
-                self.sections[i].ssrc = Some(ssrc);
             }
             None => {
-                if self.sections.len() >= MAX_SECTIONS {
+                if !self.push_section(mid.clone(), section) {
                     return false;
                 }
-                self.rtc
-                    .direct_api()
-                    .declare_media(mid.as_str().into(), MediaKind::Video);
-                self.sections.push(Section {
-                    mid: mid.clone(),
-                    kind: section,
-                    ssrc: Some(ssrc),
-                });
             }
         }
+        let ssrc: Ssrc = self.rtc.direct_api().new_ssrc();
+        let rtx: Ssrc = self.rtc.direct_api().new_ssrc();
+        let Some(i) = self.section_index(section) else {
+            return false;
+        };
+        self.sections[i].ssrc = Some(*ssrc);
+        self.sections[i].rtx_ssrc = Some(*rtx);
+        self.sections[i].source = Some(source);
+        self.sections[i].active = true;
         // With an RTX SSRC declared, str0m answers a receiver's NACK from
-        // its own cache. A server that offered no RTX would have to
-        // forward the NACK to the publisher instead; doing it here costs
-        // one SSRC and recovers the loss a hop earlier.
+        // its own cache, recovering the loss a hop earlier than forwarding
+        // the NACK to the publisher would. That only works if the offer
+        // *names* the repair SSRC in `a=ssrc-group:FID`, which is what
+        // `Section::rtx_ssrc` is carried into the offer for — declaring it
+        // here and not there is what made the whole mechanism inert.
         self.rtc
             .direct_api()
-            .declare_stream_tx(ssrc.into(), Some(rtx), mid.as_str().into(), None);
+            .declare_stream_tx(ssrc, Some(rtx), mid.as_str().into(), None);
         true
+    }
+
+    /// Mark every remote-video section not in `present` as no longer
+    /// live, so that if it comes back it comes back on a new SSRC.
+    ///
+    /// Called from the offer path, which is the only place that knows the
+    /// room's current shape. Unsubscribed, stopped and departed all land
+    /// here, which is right: the spec says a receiver should not be able
+    /// to tell those three apart.
+    pub(crate) fn deactivate_absent_video(&mut self, present: &[(Uid, VideoKind, u32)]) {
+        for s in &mut self.sections {
+            if let SectionKind::RemoteVideo(other, kind) = s.kind {
+                if !present.iter().any(|(u, k, _)| *u == other && *k == kind) {
+                    s.active = false;
+                }
+            }
+        }
     }
 
     /// The mid carrying `other`'s publication of `kind` to this peer.
@@ -444,6 +570,12 @@ impl Peer {
     /// wire spelling the same way and comparing the results is what keeps
     /// the round trip honest — parsing str0m's form back would mean
     /// guessing which underscores used to be hyphens.
+    /// Sections are never removed, so a peer that subscribed once and
+    /// unsubscribed still has one, still has a receive stream behind it,
+    /// and its stack will happily go on sending PLIs for a tile nobody is
+    /// looking at. Answering those would spend the publisher's keyframes
+    /// — and therefore the whole room's bitrate — on a viewer who left.
+    /// A request only counts while the subscription does.
     pub(crate) fn publisher_for_mid(&self, mid: str0m::media::Mid) -> Option<(Uid, VideoKind)> {
         self.sections
             .iter()
@@ -452,6 +584,14 @@ impl Peer {
                 SectionKind::RemoteVideo(uid, kind) => Some((uid, kind)),
                 _ => None,
             })
+            .filter(|(uid, kind)| self.subscribes_to(*uid, *kind))
+    }
+
+    /// Drop a receive stream this session no longer expects anything on.
+    fn retire_rx(&mut self, ssrc: Option<u32>) {
+        if let Some(ssrc) = ssrc {
+            self.rtc.direct_api().remove_stream_rx(ssrc.into());
+        }
     }
 
     /// Is this peer subscribed to that publication? The one question the
@@ -520,6 +660,12 @@ impl Peer {
         let creds = self.rtc.direct_api().local_ice_credentials();
         let fingerprint = self.rtc.direct_api().local_dtls_fingerprint().clone();
         let publishing: Vec<VideoKind> = self.publications.iter().map(|p| p.kind).collect();
+        // A send section is about to be described to the client, so from
+        // here on its absence from an answer really does mean the client
+        // declined it. See `Publication::offered`.
+        for p in &mut self.publications {
+            p.offered = true;
+        }
         let sections: Vec<OfferSection<'_>> = self
             .sections
             .iter()
@@ -531,6 +677,11 @@ impl Peer {
                     }
                     _ => None,
                 };
+                // The SSRC comes from the section and not from the room
+                // state: the section is what was declared to str0m, and
+                // an offer that named a different one would describe a
+                // stream this peer will never receive.
+                let live = |other: Uid| (Direction::SendOnly, s.ssrc.map(|n| (n, other)));
                 let (direction, ssrc) = match s.kind {
                     SectionKind::Mic => (Direction::RecvOnly, None),
                     SectionKind::Remote(other) => {
@@ -538,7 +689,7 @@ impl Peer {
                             // Live while its offered direction says so; a
                             // participant who has left keeps the section
                             // and loses the direction.
-                            Some((_, ssrc)) => (Direction::SendOnly, Some((*ssrc, other))),
+                            Some(_) => live(other),
                             None => (Direction::Inactive, None),
                         }
                     }
@@ -554,7 +705,7 @@ impl Peer {
                             .iter()
                             .find(|(u, pk, _)| *u == other && *pk == k)
                         {
-                            Some((_, _, ssrc)) => (Direction::SendOnly, Some((*ssrc, other))),
+                            Some(_) => live(other),
                             // Unsubscribed, stopped, or the publisher
                             // left: all three look the same from here,
                             // which is exactly what the spec says a
@@ -568,6 +719,13 @@ impl Peer {
                     media,
                     direction,
                     ssrc,
+                    // Only on a live video section: naming a repair SSRC
+                    // for a stream that isn't flowing says nothing, and
+                    // the section is `a=inactive` anyway.
+                    rtx_ssrc: match direction {
+                        Direction::SendOnly if media.is_video() => s.rtx_ssrc,
+                        _ => None,
+                    },
                     bandwidth_kbps,
                 }
             })
@@ -614,10 +772,24 @@ impl Peer {
             api.set_remote_ice_credentials(answer.creds.clone());
             api.set_remote_fingerprint(answer.fingerprint.clone());
         }
+        // Every SSRC this session has already been told to expect. An
+        // answer that reuses one is ambiguous, and `expect_stream_rx` is
+        // keyed by SSRC — a second call with the same number and a
+        // different mid keeps the *first* binding and returns silently,
+        // so nothing downstream would ever notice.
+        let mut claimed: Vec<u32> = Vec::with_capacity(3);
         if let Some(ssrc) = answer.mic_ssrc {
+            // A renegotiation that moves the microphone to a new SSRC
+            // must retire the old binding, or the session accumulates one
+            // `StreamRx` per answer for the rest of its life.
+            if self.mic_ssrc.is_some_and(|old| old != ssrc) {
+                self.retire_rx(self.mic_ssrc);
+            }
             self.rtc
                 .direct_api()
                 .expect_stream_rx(Ssrc::from(ssrc), None, MIC_MID.into(), None);
+            self.mic_ssrc = Some(ssrc);
+            claimed.push(ssrc);
         }
 
         let mut unbindable = Vec::new();
@@ -625,33 +797,48 @@ impl Peer {
         for kind in kinds {
             let mid = send_mid(kind);
             match answer.video_send(mid) {
-                // A renegotiation that didn't carry this section at all
-                // leaves whatever we already bound alone; a client only
-                // answers the sections the offer held, and the offer for
-                // a publication it already answered hasn't changed.
+                // A renegotiation that didn't carry this section leaves
+                // whatever we already bound alone — a client only answers
+                // the sections the offer held. Unbindable only if the
+                // client has actually *seen* the section and left it out;
+                // a publication started since the last offer has not been
+                // offered yet, and this answer belongs to the offer
+                // before it.
                 None => {
-                    if self
+                    let never_bound = self
                         .publication(kind)
-                        .is_some_and(|p| p.recv_ssrc.is_none())
-                    {
+                        .is_some_and(|p| p.recv_ssrc.is_none() && p.offered);
+                    if never_bound {
                         unbindable.push(kind);
                     }
                 }
                 Some(v) if !v.accepted => unbindable.push(kind),
                 // The rule with no fallback: two video streams from one
                 // peer share a payload type and a transport, so an
-                // answer with no SSRC leaves nothing to demultiplex by,
-                // and forwarding a screen share into the tile where a
-                // face belongs is worse than forwarding nothing.
+                // answer with no SSRC — or one that reuses an SSRC it
+                // already spent — leaves nothing to demultiplex by, and
+                // forwarding a screen share into the tile where a face
+                // belongs is worse than forwarding nothing. The spec is
+                // explicit that the server rejects such a section rather
+                // than guessing.
                 Some(v) => match v.ssrc {
                     None => unbindable.push(kind),
+                    Some(ssrc) if claimed.contains(&ssrc) => unbindable.push(kind),
                     Some(ssrc) => {
+                        let previous = self.publication(kind).and_then(|p| p.recv_ssrc);
+                        if previous.is_some_and(|old| old != ssrc) {
+                            self.retire_rx(previous);
+                        }
                         self.rtc.direct_api().expect_stream_rx(
                             Ssrc::from(ssrc),
-                            None,
+                            v.rtx_ssrc.map(Ssrc::from),
                             mid.into(),
                             None,
                         );
+                        claimed.push(ssrc);
+                        if let Some(rtx) = v.rtx_ssrc {
+                            claimed.push(rtx);
+                        }
                         if let Some(p) = self.publication_mut(kind) {
                             p.recv_ssrc = Some(ssrc);
                         }

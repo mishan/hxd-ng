@@ -160,10 +160,16 @@ pub fn err_text(e: VideoError) -> &'static str {
         VideoError::AlreadyPublishing => "You are already publishing that.",
         VideoError::NotPublishing => "You are not publishing that.",
         // The spec asks that the wording say *why*, so a client can say
-        // so plainly: with one screen slot a room, this is the common
-        // refusal and "the room is full" would be misleading — the room
-        // has space, the slot doesn't.
-        VideoError::Full => "Someone else is already sharing. Ask them to stop first.",
+        // so plainly. With one screen slot a room, "the room is full"
+        // would be misleading — the room has space, the slot doesn't —
+        // and with eight camera slots the reverse is true: nobody in
+        // particular is in the way, so telling the user to go and ask
+        // someone to stop would send them after a person who doesn't
+        // exist.
+        VideoError::Full(VideoKind::Screen) => {
+            "Someone else is already sharing. Ask them to stop first."
+        }
+        VideoError::Full(VideoKind::Camera) => "This room has as many cameras on as it allows.",
     }
 }
 

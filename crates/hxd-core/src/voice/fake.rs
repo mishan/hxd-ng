@@ -86,6 +86,9 @@ struct Inner {
     /// Answer the next offer with `None`, standing in for a session the
     /// media layer has torn down.
     no_next_offer: bool,
+    /// Make the next `publish` refuse, the way a real SFU does when the
+    /// session is gone or its offer has no room left.
+    refuse_publish: bool,
     /// What a rejected answer is rejected with.
     answer_error: VoiceError,
 }
@@ -97,6 +100,7 @@ impl Default for Inner {
             generation: 0,
             reject_next_answer: false,
             no_next_offer: false,
+            refuse_publish: false,
             answer_error: VoiceError::BadAnswer,
         }
     }
@@ -141,6 +145,11 @@ impl RecordingMedia {
     /// whose media session is gone.
     pub fn no_next_offer(&self) {
         self.inner.lock().unwrap().no_next_offer = true;
+    }
+
+    /// Make the next [`VoiceMedia::publish`] refuse.
+    pub fn refuse_next_publish(&self) {
+        self.inner.lock().unwrap().refuse_publish = true;
     }
 }
 
@@ -211,12 +220,14 @@ impl VoiceMedia for RecordingMedia {
         "VP8"
     }
 
-    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) {
-        self.inner
-            .lock()
-            .unwrap()
-            .calls
-            .push(MediaCall::Publish { uid, cid, kind });
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(MediaCall::Publish { uid, cid, kind });
+        // The real SFU can refuse — its session may already have been
+        // reaped, or its offer may have no room left for another section
+        // — so the fake has to be able to as well, or the domain's
+        // rollback path is only ever exercised in production.
+        !std::mem::take(&mut inner.refuse_publish)
     }
 
     fn unpublish(&self, uid: Uid, cid: u32, kind: VideoKind) {

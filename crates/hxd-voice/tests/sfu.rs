@@ -13,25 +13,66 @@
 //! own `user-{UID}` section rather than being bundled onto `send`, that
 //! mute is enforced by the server, and that a departure leaves the mid in
 //! place and inactive.
+//!
+//! **One clock, shared with the server.** Every test drives a [`Clock`]
+//! that it also hands to `Sfu::with_locals`, so the instant a test
+//! computes and the instant the SFU reads inside `join`, `answer`,
+//! `set_muted`, `set_paused` and `set_subscriptions` are the same value.
+//! Those five used to reach for `Instant::now()` on their own, which put
+//! real elapsed time inside otherwise deterministic tests — a stalled CI
+//! runner could age a session past a deadline the test had not advanced
+//! its clock to — and made anything measured in seconds, the keyframe
+//! limiter above all, untestable without sleeping.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hxd_core::video::{VideoConfig, VideoKind, VideoStream};
-use hxd_core::voice::{IceCandidate, VoiceError, VoiceMedia};
+use hxd_core::voice::{IceCandidate, MediaEvent, VoiceError, VoiceMedia};
 use hxd_core::Uid;
 use hxd_voice::sdp::{CAM_SEND_MID, SCR_SEND_MID, VP8_PT};
 use hxd_voice::Sfu;
 use str0m::config::Fingerprint;
-use str0m::media::MediaKind;
+use str0m::media::{KeyframeRequestKind, MediaKind};
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::{RtpWrite, Ssrc};
 use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 const SERVER: &str = "192.0.2.1:5504";
 const PCMU_PT: u8 = 0;
+
+/// The one source of "now" for a test and for the SFU it is driving.
+///
+/// A test advances this and both sides move together: `pump` steps it,
+/// and the closure `Sfu::with_locals` holds reads the same cell. Without
+/// that the `VoiceMedia` methods measured against wall time while the
+/// rest of the test measured against a virtual one, so two deadlines were
+/// only accidentally deterministic and the one-second keyframe interval
+/// could not be crossed at all.
+struct Clock(Arc<Mutex<Instant>>);
+
+impl Clock {
+    fn new() -> Clock {
+        Clock(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    fn now(&self) -> Instant {
+        *self.0.lock().unwrap()
+    }
+
+    fn advance(&self, by: Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+
+    /// The clock as `Sfu::with_locals` wants it.
+    fn source(&self) -> Box<dyn Fn() -> Instant + Send + Sync> {
+        let cell = Arc::clone(&self.0);
+        Box::new(move || *cell.lock().unwrap())
+    }
+}
 
 fn cam(uid: Uid) -> VideoStream {
     VideoStream {
@@ -69,6 +110,16 @@ struct Client {
     declare_video_ssrc: bool,
     /// What arrived, by the mid it arrived on.
     heard: HashMap<String, Vec<Vec<u8>>>,
+    /// The SSRC the server declared for each section this client
+    /// receives on, as of the last offer it answered. A receiver needs it
+    /// to ask for a keyframe, and it is the thing that must change when a
+    /// section is resubscribed.
+    rx_ssrc: HashMap<String, u32>,
+    /// Keyframe requests that reached this client, by the mid they name.
+    /// A publisher's stack raises one for every PLI or FIR the server
+    /// relays to it, which is the same event a real encoder acts on — so
+    /// this is the honest observation point for "the server asked".
+    keyframes: HashMap<String, usize>,
     seq: u64,
     time: u32,
     video_seq: u64,
@@ -100,6 +151,8 @@ impl Client {
             scr_ssrc,
             declare_video_ssrc: true,
             heard: HashMap::new(),
+            rx_ssrc: HashMap::new(),
+            keyframes: HashMap::new(),
             seq: 1000,
             time: 160_000,
             video_seq: 5000,
@@ -145,10 +198,16 @@ impl Client {
                 // without that a bundled client has nothing to
                 // demultiplex on.
                 let ssrc = sec.ssrc.expect("a live section declares its ssrc");
+                self.rx_ssrc.insert(mid.to_string(), ssrc);
                 if self.rtc.direct_api().stream_rx(&ssrc.into()).is_none() {
+                    // The repair SSRC comes from `a=ssrc-group:FID`, and
+                    // a receiver that ignored it would drop every
+                    // retransmission the server sent as an unknown
+                    // source — which is what makes naming it in the
+                    // offer worth anything.
                     self.rtc.direct_api().expect_stream_rx(
                         Ssrc::from(ssrc),
-                        None,
+                        sec.rtx.map(Ssrc::from),
                         mid.into(),
                         None,
                     );
@@ -281,6 +340,27 @@ impl Client {
         ));
     }
 
+    /// Say "I have no keyframe" on a section this client receives on,
+    /// which is what a decoder handed a mid-stream first packet does.
+    fn ask_for_a_keyframe(&mut self, mid: &str) {
+        self.ask_for_a_keyframe_as(mid, KeyframeRequestKind::Pli);
+    }
+
+    /// The same, in either of the two forms the offer's `a=rtcp-fb` lines
+    /// invite. Which one a receiver picks is its own business — both mean
+    /// the same thing to the publisher, and the server relays either.
+    fn ask_for_a_keyframe_as(&mut self, mid: &str, kind: KeyframeRequestKind) {
+        let ssrc = *self
+            .rx_ssrc
+            .get(mid)
+            .unwrap_or_else(|| panic!("{mid} was never declared to this client"));
+        self.rtc
+            .direct_api()
+            .stream_rx(&Ssrc::from(ssrc))
+            .expect("a receive stream for the section")
+            .request_keyframe(kind);
+    }
+
     fn is_connected(&self) -> bool {
         self.rtc.is_connected()
     }
@@ -291,6 +371,12 @@ impl Client {
 
     fn heard_total(&self) -> usize {
         self.heard.values().map(Vec::len).sum()
+    }
+
+    /// How many keyframe requests have reached this client on a section
+    /// it publishes.
+    fn keyframes_on(&self, mid: &str) -> usize {
+        self.keyframes.get(mid).copied().unwrap_or(0)
     }
 }
 
@@ -306,6 +392,7 @@ fn sections_of(sdp: &str) -> Vec<Section> {
                 mid: mid.to_string(),
                 dir: String::new(),
                 ssrc: None,
+                rtx: None,
                 video,
             });
         } else if let Some(rest) = line.strip_prefix("a=") {
@@ -317,6 +404,17 @@ fn sections_of(sdp: &str) -> Vec<Section> {
                             if last.ssrc.is_none() {
                                 last.ssrc =
                                     v.split_whitespace().next().and_then(|n| n.parse().ok());
+                            }
+                        } else if let Some(v) = rest.strip_prefix("ssrc-group:FID ") {
+                            // The group names the pair, and its second
+                            // member is the repair stream. Read as a pair
+                            // rather than inferred from the order of the
+                            // `a=ssrc` lines, for the same reason the
+                            // server's own parser does.
+                            let mut it = v.split_whitespace().filter_map(|n| n.parse().ok());
+                            if let (Some(primary), Some(rtx)) = (it.next(), it.next()) {
+                                last.ssrc = Some(primary);
+                                last.rtx = Some(rtx);
                             }
                         }
                     }
@@ -332,7 +430,17 @@ struct Section {
     mid: String,
     dir: String,
     ssrc: Option<u32>,
+    /// The repair SSRC of this section's `a=ssrc-group:FID`, if it has one.
+    rtx: Option<u32>,
     video: bool,
+}
+
+/// One named section of an SDP, for a test that wants to look at it.
+fn section_of(sdp: &str, mid: &str) -> Section {
+    sections_of(sdp)
+        .into_iter()
+        .find(|s| s.mid == mid)
+        .unwrap_or_else(|| panic!("no section {mid} in\n{sdp}"))
 }
 
 fn attr(sdp: &str, prefix: &str) -> Option<String> {
@@ -356,8 +464,24 @@ fn parse_fingerprint(v: &str) -> Fingerprint {
 
 /// Run the exchange forward: everything the server wants to send goes to
 /// the client it is addressed to, and vice versa.
-fn pump(sfu: &Sfu, clients: &mut [&mut Client], now: &mut Instant, steps: usize) {
-    pump_filtered(sfu, clients, now, steps, Duration::from_millis(5), |_| true)
+fn pump(sfu: &Sfu, clients: &mut [&mut Client], clock: &Clock, steps: usize) {
+    pump_filtered(sfu, clients, clock, steps, Duration::from_millis(5), |_| {
+        true
+    })
+}
+
+/// The same, in strides long enough that a second of virtual time passes
+/// in a handful of them — which is what a test of the keyframe limiter
+/// needs, and what it would otherwise spend hundreds of steps reaching.
+fn pump_slowly(sfu: &Sfu, clients: &mut [&mut Client], clock: &Clock, steps: usize) {
+    pump_filtered(
+        sfu,
+        clients,
+        clock,
+        steps,
+        Duration::from_millis(250),
+        |_| true,
+    )
 }
 
 /// The same, with two things a timeout test needs: a step size, and a
@@ -370,17 +494,18 @@ fn pump(sfu: &Sfu, clients: &mut [&mut Client], now: &mut Instant, steps: usize)
 fn pump_filtered(
     sfu: &Sfu,
     clients: &mut [&mut Client],
-    now: &mut Instant,
+    clock: &Clock,
     steps: usize,
     step: Duration,
     allow: impl Fn(&[u8]) -> bool,
 ) {
     for _ in 0..steps {
-        let (out, _deadline) = sfu.poll(*now);
+        let now = clock.now();
+        let (out, _deadline) = sfu.poll(now);
         for d in out {
             if let Some(c) = clients.iter_mut().find(|c| c.addr == d.to) {
                 let input = Input::Receive(
-                    *now,
+                    now,
                     Receive {
                         proto: Protocol::Udp,
                         source: server_addr(),
@@ -394,7 +519,7 @@ fn pump_filtered(
             }
         }
         for c in clients.iter_mut() {
-            c.rtc.handle_input(Input::Timeout(*now)).unwrap();
+            c.rtc.handle_input(Input::Timeout(now)).unwrap();
             let mut transmits: Vec<Vec<u8>> = Vec::new();
             loop {
                 match c.rtc.poll_output().unwrap() {
@@ -404,16 +529,21 @@ fn pump_filtered(
                         let mid = mid_of_ssrc(&mut c.rtc, p.header.ssrc);
                         c.heard.entry(mid).or_default().push(p.payload.to_vec());
                     }
+                    Output::Event(Event::KeyframeRequest(req)) => {
+                        *c.keyframes
+                            .entry(spec_mid(&req.mid.to_string()))
+                            .or_default() += 1;
+                    }
                     Output::Event(_) => {}
                 }
             }
             for data in transmits {
                 if allow(&data) {
-                    sfu.handle_datagram(c.addr, server_addr(), &data, *now);
+                    sfu.handle_datagram(c.addr, server_addr(), &data, now);
                 }
             }
         }
-        *now += step;
+        clock.advance(step);
     }
 }
 
@@ -467,8 +597,19 @@ fn renegotiate(sfu: &Sfu, c: &mut Client, cid: u32) {
     sfu.answer(c.uid, cid, &answer).unwrap();
 }
 
-fn new_sfu() -> Arc<Sfu> {
-    let (sfu, _events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
+/// An SFU reading the test's clock, and the events it emits.
+fn sfu_with_events(clock: &Clock) -> (Arc<Sfu>, UnboundedReceiver<MediaEvent>) {
+    Sfu::with_locals(
+        &[server_addr()],
+        &[],
+        VideoConfig::default(),
+        clock.source(),
+    )
+    .unwrap()
+}
+
+fn new_sfu(clock: &Clock) -> Arc<Sfu> {
+    let (sfu, _events) = sfu_with_events(clock);
     // The event receiver is dropped: sends into a closed channel are
     // discarded, which is what a server with no domain attached wants.
     sfu
@@ -478,26 +619,26 @@ fn new_sfu() -> Arc<Sfu> {
 
 #[test]
 fn two_clients_hear_each_other_over_real_dtls_srtp() {
-    let mut now = Instant::now();
-    let sfu = new_sfu();
-    let mut a = Client::new(1, 6000, now);
-    let mut b = Client::new(2, 6001, now);
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6000, clock.now());
+    let mut b = Client::new(2, 6001, clock.now());
 
     join(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a], &mut now, 60);
+    pump(&sfu, &mut [&mut a], &clock, 60);
     assert!(a.is_connected(), "the first joiner completes ICE and DTLS");
 
     join(&sfu, &mut b, 0);
     // A learns about B the way the domain would tell it to.
     renegotiate(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 80);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 80);
     assert!(b.is_connected());
 
     // The Janus bug that motivated this design: the first joiner must
     // hear the second.
     for _ in 0..5 {
-        b.speak(&[0xff; 160], now);
-        pump(&sfu, &mut [&mut a, &mut b], &mut now, 4);
+        b.speak(&[0xff; 160], clock.now());
+        pump(&sfu, &mut [&mut a, &mut b], &clock, 4);
     }
     assert!(
         !a.heard_on("user-2").is_empty(),
@@ -507,8 +648,8 @@ fn two_clients_hear_each_other_over_real_dtls_srtp() {
     assert_eq!(a.heard_on("user-2")[0], vec![0xff; 160]);
     // And the second hears the first.
     for _ in 0..5 {
-        a.speak(&[0x7f; 160], now);
-        pump(&sfu, &mut [&mut a, &mut b], &mut now, 4);
+        a.speak(&[0x7f; 160], clock.now());
+        pump(&sfu, &mut [&mut a, &mut b], &clock, 4);
     }
     assert!(!b.heard_on("user-1").is_empty());
 
@@ -520,42 +661,42 @@ fn two_clients_hear_each_other_over_real_dtls_srtp() {
 
 #[test]
 fn mute_is_enforced_by_the_server() {
-    let mut now = Instant::now();
-    let sfu = new_sfu();
-    let mut a = Client::new(1, 6000, now);
-    let mut b = Client::new(2, 6001, now);
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6000, clock.now());
+    let mut b = Client::new(2, 6001, clock.now());
     join(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a], &mut now, 60);
+    pump(&sfu, &mut [&mut a], &clock, 60);
     join(&sfu, &mut b, 0);
     renegotiate(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 80);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 80);
 
     sfu.set_muted(2, 0, true);
     // A muted client that keeps streaming — which is exactly what a
     // client sending digital silence to keep its NAT binding warm does —
     // is dropped at the server.
     for _ in 0..5 {
-        b.speak(&[0x11; 160], now);
-        pump(&sfu, &mut [&mut a, &mut b], &mut now, 4);
+        b.speak(&[0x11; 160], clock.now());
+        pump(&sfu, &mut [&mut a, &mut b], &clock, 4);
     }
     assert_eq!(a.heard_total(), 0, "muted audio must not be forwarded");
 
     sfu.set_muted(2, 0, false);
     for _ in 0..5 {
-        b.speak(&[0x22; 160], now);
-        pump(&sfu, &mut [&mut a, &mut b], &mut now, 4);
+        b.speak(&[0x22; 160], clock.now());
+        pump(&sfu, &mut [&mut a, &mut b], &clock, 4);
     }
     assert!(!a.heard_on("user-2").is_empty(), "unmuting restores audio");
 }
 
 #[test]
 fn a_departure_leaves_the_mid_in_place_and_inactive() {
-    let mut now = Instant::now();
-    let sfu = new_sfu();
-    let mut a = Client::new(1, 6000, now);
-    let mut b = Client::new(2, 6001, now);
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6000, clock.now());
+    let mut b = Client::new(2, 6001, clock.now());
     join(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a], &mut now, 40);
+    pump(&sfu, &mut [&mut a], &clock, 40);
     join(&sfu, &mut b, 0);
     let with_b = offer_of(&sfu, 1, 0);
     assert!(with_b.contains("a=mid:user-2\r\na=rtpmap:0 PCMU/8000\r\na=sendonly\r\n"));
@@ -587,7 +728,8 @@ fn a_departure_leaves_the_mid_in_place_and_inactive() {
 
 #[test]
 fn the_offer_grows_one_section_per_participant() {
-    let sfu = new_sfu();
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
     sfu.join(1, 0);
     sfu.join(2, 0);
     sfu.join(3, 0);
@@ -611,7 +753,8 @@ fn the_offer_grows_one_section_per_participant() {
 
 #[test]
 fn a_later_joiner_appends_after_the_microphone() {
-    let sfu = new_sfu();
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
     sfu.join(1, 0);
     sfu.join(2, 0);
     let offer = offer_of(&sfu, 1, 0);
@@ -624,9 +767,9 @@ fn a_later_joiner_appends_after_the_microphone() {
 
 #[test]
 fn an_answer_without_pcmu_is_refused_and_one_with_it_is_not() {
-    let now = Instant::now();
-    let sfu = new_sfu();
-    let mut a = Client::new(1, 6000, now);
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6000, clock.now());
     sfu.join(1, 0);
     let offer = offer_of(&sfu, 1, 0);
     let answer = a.answer(&offer, true);
@@ -640,7 +783,8 @@ fn the_offer_parses_as_sdp_in_a_real_stack() {
     // Our offer is hand-written, so the thing worth proving is that a
     // WebRTC stack that has never seen this server can read it: str0m's
     // own SDP parser, standing in for the browser and webrtcbin.
-    let sfu = new_sfu();
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
     sfu.join(1, 0);
     sfu.join(2, 0);
     let offer = offer_of(&sfu, 2, 0);
@@ -659,17 +803,22 @@ fn the_offer_parses_as_sdp_in_a_real_stack() {
 
 #[test]
 fn an_unknown_datagram_is_dropped_without_a_session() {
-    let sfu = new_sfu();
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
     sfu.join(1, 0);
     // An open UDP port on the internet gets scanned. Nothing that
     // doesn't match a live ICE credential or an established peer may
     // reach a session.
-    sfu.handle_datagram(
+    let matched = sfu.handle_datagram(
         "198.51.100.7:1234".parse().unwrap(),
         server_addr(),
         &[0u8; 64],
-        Instant::now(),
+        clock.now(),
     );
+    // And the caller is told so, which is what the pump charges against
+    // the source: deciding a datagram matches nothing means offering it
+    // to every live session, so it is the expensive answer.
+    assert!(!matched);
     assert_eq!(sfu.peer_count(), 1);
 }
 
@@ -685,9 +834,13 @@ fn a_server_with_no_advertisable_address_refuses_to_start() {
 fn a_peer_that_never_answers_is_torn_down() {
     // "No SDP answer received after Join Voice Room reply: 10 seconds."
     // The SFU is sans-I/O, so the clock is whatever the caller says it
-    // is and this costs no wall time at all.
-    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
-    let t0 = Instant::now();
+    // is and this costs no wall time at all — and `join` reads the same
+    // clock the poll below is measured against, so the ten seconds are
+    // entirely virtual rather than nine virtual and however many real
+    // ones the test itself took.
+    let clock = Clock::new();
+    let (sfu, mut events) = sfu_with_events(&clock);
+    let t0 = clock.now();
     sfu.join(1, 0);
     offer_of(&sfu, 1, 0);
 
@@ -699,7 +852,7 @@ fn a_peer_that_never_answers_is_torn_down() {
     assert_eq!(sfu.peer_count(), 0);
     assert_eq!(
         events.try_recv().ok(),
-        Some(hxd_core::voice::MediaEvent::Failed { uid: 1, cid: 0 })
+        Some(MediaEvent::Failed { uid: 1, cid: 0 })
     );
 }
 
@@ -709,10 +862,10 @@ fn a_peer_whose_dtls_stalls_gets_the_dtls_deadline_not_the_ice_one() {
     // 10 seconds." Two deadlines, and which one a peer is under depends
     // on how far it got: once ICE has a path, the thirty seconds are
     // spent and only the handshake is left.
-    let t0 = Instant::now();
-    let mut now = t0;
-    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
-    let mut a = Client::new(1, 6000, now);
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (sfu, mut events) = sfu_with_events(&clock);
+    let mut a = Client::new(1, 6000, clock.now());
     sfu.join(1, 0);
     let offer = offer_of(&sfu, 1, 0);
     let answer = a.answer(&offer, true);
@@ -727,13 +880,13 @@ fn a_peer_whose_dtls_stalls_gets_the_dtls_deadline_not_the_ice_one() {
     pump_filtered(
         &sfu,
         &mut [&mut a],
-        &mut now,
+        &clock,
         90,
         Duration::from_millis(100),
         stun_only,
     );
     assert!(
-        now.duration_since(t0) >= Duration::from_secs(9),
+        clock.now().duration_since(t0) >= Duration::from_secs(9),
         "nine seconds of stalled handshake"
     );
     assert_eq!(sfu.peer_count(), 1, "still inside the DTLS window");
@@ -742,7 +895,7 @@ fn a_peer_whose_dtls_stalls_gets_the_dtls_deadline_not_the_ice_one() {
     pump_filtered(
         &sfu,
         &mut [&mut a],
-        &mut now,
+        &clock,
         20,
         Duration::from_millis(100),
         stun_only,
@@ -754,7 +907,7 @@ fn a_peer_whose_dtls_stalls_gets_the_dtls_deadline_not_the_ice_one() {
     );
     assert_eq!(
         events.try_recv().ok(),
-        Some(hxd_core::voice::MediaEvent::Failed { uid: 1, cid: 0 })
+        Some(MediaEvent::Failed { uid: 1, cid: 0 })
     );
 }
 
@@ -767,12 +920,12 @@ fn a_forged_datagram_cannot_hold_a_dead_session_open() {
     // endpoint to this peer. If the shape of it counted, anyone who
     // could reach the port and guess an address could hold a dead
     // session's room slot open indefinitely, one byte at a time.
-    let t0 = Instant::now();
-    let mut now = t0;
-    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
-    let mut a = Client::new(1, 6000, now);
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (sfu, mut events) = sfu_with_events(&clock);
+    let mut a = Client::new(1, 6000, clock.now());
     join(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a], &mut now, 40);
+    pump(&sfu, &mut [&mut a], &clock, 40);
     assert_eq!(sfu.peer_count(), 1, "a real session, fully connected");
     let _ = events.try_recv();
 
@@ -785,26 +938,26 @@ fn a_forged_datagram_cannot_hold_a_dead_session_open() {
         pump_filtered(
             &sfu,
             &mut [&mut a],
-            &mut now,
+            &clock,
             1,
             Duration::from_millis(250),
             stun_only,
         );
-        sfu.handle_datagram(a.addr, server_addr(), &forged, now);
+        sfu.handle_datagram(a.addr, server_addr(), &forged, clock.now());
     }
-    assert!(now.duration_since(t0) < Duration::from_secs(30));
+    assert!(clock.now().duration_since(t0) < Duration::from_secs(30));
     assert_eq!(sfu.peer_count(), 1, "not yet — the window hasn't closed");
 
     for _ in 0..16 {
         pump_filtered(
             &sfu,
             &mut [&mut a],
-            &mut now,
+            &clock,
             1,
             Duration::from_millis(250),
             stun_only,
         );
-        sfu.handle_datagram(a.addr, server_addr(), &forged, now);
+        sfu.handle_datagram(a.addr, server_addr(), &forged, clock.now());
     }
     assert_eq!(
         sfu.peer_count(),
@@ -813,16 +966,17 @@ fn a_forged_datagram_cannot_hold_a_dead_session_open() {
     );
     assert_eq!(
         events.try_recv().ok(),
-        Some(hxd_core::voice::MediaEvent::Failed { uid: 1, cid: 0 })
+        Some(MediaEvent::Failed { uid: 1, cid: 0 })
     );
 }
 
 #[test]
 fn a_peer_that_answers_but_never_connects_is_torn_down() {
     // The ICE deadline proper: answered, and no path ever found.
-    let now = Instant::now();
-    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
-    let mut a = Client::new(1, 6000, now);
+    let clock = Clock::new();
+    let t0 = clock.now();
+    let (sfu, mut events) = sfu_with_events(&clock);
+    let mut a = Client::new(1, 6000, clock.now());
     sfu.join(1, 0);
     let offer = offer_of(&sfu, 1, 0);
     let answer = a.answer(&offer, true);
@@ -830,24 +984,33 @@ fn a_peer_that_answers_but_never_connects_is_torn_down() {
     // The client is never driven, so nothing ever reaches the server.
     let _ = events.try_recv(); // the end-of-candidates the answer emits
 
-    sfu.poll(now + Duration::from_secs(20));
+    sfu.poll(t0 + Duration::from_secs(20));
     assert_eq!(sfu.peer_count(), 1);
-    sfu.poll(now + Duration::from_secs(31));
+    sfu.poll(t0 + Duration::from_secs(31));
     assert_eq!(sfu.peer_count(), 0);
     assert_eq!(
         events.try_recv().ok(),
-        Some(hxd_core::voice::MediaEvent::Failed { uid: 1, cid: 0 })
+        Some(MediaEvent::Failed { uid: 1, cid: 0 })
     );
 }
 
 #[test]
-fn a_session_that_collects_too_many_sections_is_ended() {
+fn a_session_whose_offer_outgrows_its_byte_budget_is_ended() {
     // A peer's sections are append-only, so one that sits in a busy room
     // accumulates an inactive section per person who ever joined
     // alongside it. Unbounded that would outgrow the wire's own chunk
     // length; the session is ended at the cap instead, and the client
     // reconnects with a clean list.
-    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
+    //
+    // **The cap is `sdp::MAX_OFFER_BYTES` and not a section count**,
+    // which is why the assertion below is the one that matters: a video
+    // section costs half as much again as an audio one, so a fixed count
+    // that fitted 32 KB of audio was already over the line for a room
+    // with cameras in it. This loop's visitors are voice-only, so what it
+    // measures is that the budget still bites at all and still bites
+    // before the ceiling — not how many sections that came to.
+    let clock = Clock::new();
+    let (sfu, mut events) = sfu_with_events(&clock);
     sfu.join(1, 0);
     offer_of(&sfu, 1, 0);
 
@@ -862,7 +1025,7 @@ fn a_session_that_collects_too_many_sections_is_ended() {
             // not a truncated description of the room.
             assert_eq!(
                 events.try_recv().ok(),
-                Some(hxd_core::voice::MediaEvent::Failed { uid: 1, cid: 0 }),
+                Some(MediaEvent::Failed { uid: 1, cid: 0 }),
                 "and the domain is told, in the same breath"
             );
             sfu.leave(visitor, 0);
@@ -895,19 +1058,19 @@ fn only_pcmu_is_forwarded() {
     // The spec's payload type table has one row. Anything else on the
     // wire is a client bug or an attack, and is dropped rather than
     // relayed to everyone in the room.
-    let mut now = Instant::now();
-    let sfu = new_sfu();
-    let mut a = Client::new(1, 6000, now);
-    let mut b = Client::new(2, 6001, now);
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6000, clock.now());
+    let mut b = Client::new(2, 6001, clock.now());
     join(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a], &mut now, 60);
+    pump(&sfu, &mut [&mut a], &clock, 60);
     join(&sfu, &mut b, 0);
     renegotiate(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 80);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 80);
 
     for _ in 0..5 {
-        b.speak_as(111, &[0x33; 160], now);
-        pump(&sfu, &mut [&mut a, &mut b], &mut now, 4);
+        b.speak_as(111, &[0x33; 160], clock.now());
+        pump(&sfu, &mut [&mut a, &mut b], &clock, 4);
     }
     assert_eq!(a.heard_total(), 0, "a non-PCMU payload type is dropped");
 }
@@ -920,17 +1083,17 @@ fn video_reaches_a_subscriber_and_nobody_else() {
     // stream, it does not deliver it. A peer in the room that never
     // subscribed is on the same code path as a client that has never
     // heard of this document.
-    let mut now = Instant::now();
-    let sfu = new_sfu();
-    let mut a = Client::new(1, 6100, now);
-    let mut b = Client::new(2, 6101, now);
-    let mut c = Client::new(3, 6102, now);
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6100, clock.now());
+    let mut b = Client::new(2, 6101, clock.now());
+    let mut c = Client::new(3, 6102, clock.now());
     join(&sfu, &mut a, 0);
     join(&sfu, &mut b, 0);
     join(&sfu, &mut c, 0);
     renegotiate(&sfu, &mut a, 0);
     renegotiate(&sfu, &mut b, 0);
-    pump(&sfu, &mut [&mut a, &mut b, &mut c], &mut now, 60);
+    pump(&sfu, &mut [&mut a, &mut b, &mut c], &clock, 60);
     assert!(a.is_connected() && b.is_connected() && c.is_connected());
 
     // A publishes; B asks to see it; C does not.
@@ -938,13 +1101,13 @@ fn video_reaches_a_subscriber_and_nobody_else() {
     renegotiate(&sfu, &mut a, 0);
     sfu.set_subscriptions(2, 0, &[cam(1)]);
     renegotiate(&sfu, &mut b, 0);
-    pump(&sfu, &mut [&mut a, &mut b, &mut c], &mut now, 40);
+    pump(&sfu, &mut [&mut a, &mut b, &mut c], &clock, 40);
 
     b.heard.clear();
     c.heard.clear();
     for i in 0..5u8 {
-        a.publish_frame(VideoKind::Camera, &[0xf0, i], now);
-        pump(&sfu, &mut [&mut a, &mut b, &mut c], &mut now, 4);
+        a.publish_frame(VideoKind::Camera, &[0xf0, i], clock.now());
+        pump(&sfu, &mut [&mut a, &mut b, &mut c], &clock, 4);
     }
 
     assert_eq!(
@@ -966,27 +1129,27 @@ fn a_camera_and_a_screen_from_one_peer_are_told_apart_by_ssrc() {
     // server keying receive state by mid or payload type would collide
     // them — and forwarding a screen share into the tile where a face
     // belongs is worse than forwarding nothing.
-    let mut now = Instant::now();
-    let sfu = new_sfu();
-    let mut a = Client::new(1, 6110, now);
-    let mut b = Client::new(2, 6111, now);
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6110, clock.now());
+    let mut b = Client::new(2, 6111, clock.now());
     join(&sfu, &mut a, 0);
     join(&sfu, &mut b, 0);
     renegotiate(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 60);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 60);
 
     sfu.publish(1, 0, VideoKind::Camera);
     sfu.publish(1, 0, VideoKind::Screen);
     renegotiate(&sfu, &mut a, 0);
     sfu.set_subscriptions(2, 0, &[cam(1), screen(1)]);
     renegotiate(&sfu, &mut b, 0);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 40);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 40);
 
     b.heard.clear();
-    a.publish_frame(VideoKind::Camera, b"face", now);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 6);
-    a.publish_frame(VideoKind::Screen, b"desktop", now);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 6);
+    a.publish_frame(VideoKind::Camera, b"face", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
+    a.publish_frame(VideoKind::Screen, b"desktop", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
 
     assert_eq!(b.heard_on("cam-user-1"), [b"face".to_vec()]);
     assert_eq!(b.heard_on("scr-user-1"), [b"desktop".to_vec()]);
@@ -996,34 +1159,34 @@ fn a_camera_and_a_screen_from_one_peer_are_told_apart_by_ssrc() {
 fn pause_is_enforced_by_dropping_the_publishers_rtp() {
     // Exactly as mute is, and for the same reason: a client that keeps
     // capturing must not keep being forwarded.
-    let mut now = Instant::now();
-    let sfu = new_sfu();
-    let mut a = Client::new(1, 6120, now);
-    let mut b = Client::new(2, 6121, now);
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6120, clock.now());
+    let mut b = Client::new(2, 6121, clock.now());
     join(&sfu, &mut a, 0);
     join(&sfu, &mut b, 0);
     renegotiate(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 60);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 60);
 
     sfu.publish(1, 0, VideoKind::Camera);
     renegotiate(&sfu, &mut a, 0);
     sfu.set_subscriptions(2, 0, &[cam(1)]);
     renegotiate(&sfu, &mut b, 0);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 40);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 40);
     b.heard.clear();
 
     sfu.set_paused(1, 0, VideoKind::Camera, true);
     for _ in 0..4 {
-        a.publish_frame(VideoKind::Camera, b"paused", now);
-        pump(&sfu, &mut [&mut a, &mut b], &mut now, 4);
+        a.publish_frame(VideoKind::Camera, b"paused", clock.now());
+        pump(&sfu, &mut [&mut a, &mut b], &clock, 4);
     }
     assert_eq!(b.heard_total(), 0, "nothing is forwarded while paused");
 
     // Resume needs no renegotiation — the section, the mid and the slot
     // all stayed.
     sfu.set_paused(1, 0, VideoKind::Camera, false);
-    a.publish_frame(VideoKind::Camera, b"live", now);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 6);
+    a.publish_frame(VideoKind::Camera, b"live", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
     assert_eq!(b.heard_on("cam-user-1"), [b"live".to_vec()]);
 }
 
@@ -1032,14 +1195,14 @@ fn unsubscribing_stops_the_stream_and_keeps_the_mid() {
     // From a receiver's point of view unsubscribing is indistinguishable
     // from the publisher having stopped, which is what lets the same
     // machinery serve both.
-    let mut now = Instant::now();
-    let sfu = new_sfu();
-    let mut a = Client::new(1, 6130, now);
-    let mut b = Client::new(2, 6131, now);
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6130, clock.now());
+    let mut b = Client::new(2, 6131, clock.now());
     join(&sfu, &mut a, 0);
     join(&sfu, &mut b, 0);
     renegotiate(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 60);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 60);
 
     sfu.publish(1, 0, VideoKind::Camera);
     renegotiate(&sfu, &mut a, 0);
@@ -1051,7 +1214,7 @@ fn unsubscribing_stops_the_stream_and_keeps_the_mid() {
         "the configured ceiling"
     );
     renegotiate(&sfu, &mut b, 0);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 40);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 40);
     b.heard.clear();
 
     sfu.set_subscriptions(2, 0, &[]);
@@ -1070,8 +1233,8 @@ fn unsubscribing_stops_the_stream_and_keeps_the_mid() {
     );
     renegotiate(&sfu, &mut b, 0);
 
-    a.publish_frame(VideoKind::Camera, b"unwatched", now);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 6);
+    a.publish_frame(VideoKind::Camera, b"unwatched", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
     assert_eq!(b.heard_total(), 0);
 }
 
@@ -1079,14 +1242,14 @@ fn unsubscribing_stops_the_stream_and_keeps_the_mid() {
 fn a_video_send_section_without_an_ssrc_costs_the_publication_not_the_call() {
     // The one place this implementation refuses to guess. The answer is
     // otherwise fine, so audio carries on; the publication does not.
-    let mut now = Instant::now();
-    let (sfu, mut events) = Sfu::new(&[server_addr()], VideoConfig::default()).unwrap();
-    let mut a = Client::new(1, 6140, now);
-    let mut b = Client::new(2, 6141, now);
+    let clock = Clock::new();
+    let (sfu, mut events) = sfu_with_events(&clock);
+    let mut a = Client::new(1, 6140, clock.now());
+    let mut b = Client::new(2, 6141, clock.now());
     join(&sfu, &mut a, 0);
     join(&sfu, &mut b, 0);
     renegotiate(&sfu, &mut a, 0);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 60);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 60);
     while events.try_recv().is_ok() {}
 
     // A's stack answers the camera section without declaring an SSRC.
@@ -1095,11 +1258,11 @@ fn a_video_send_section_without_an_ssrc_costs_the_publication_not_the_call() {
     renegotiate(&sfu, &mut a, 0);
 
     let failed = std::iter::from_fn(|| events.try_recv().ok())
-        .find(|e| matches!(e, hxd_core::voice::MediaEvent::VideoFailed { .. }));
+        .find(|e| matches!(e, MediaEvent::VideoFailed { .. }));
     assert!(
         matches!(
             failed,
-            Some(hxd_core::voice::MediaEvent::VideoFailed {
+            Some(MediaEvent::VideoFailed {
                 uid: 1,
                 cid: 0,
                 kind: VideoKind::Camera
@@ -1110,11 +1273,11 @@ fn a_video_send_section_without_an_ssrc_costs_the_publication_not_the_call() {
 
     // Audio is untouched: losing video is a degradation, losing the call
     // is a failure.
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 10);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 10);
     assert!(a.is_connected());
     b.heard.clear();
-    a.speak(b"still talking", now);
-    pump(&sfu, &mut [&mut a, &mut b], &mut now, 6);
+    a.speak(b"still talking", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
     assert_eq!(b.heard_on("user-1"), [b"still talking".to_vec()]);
 }
 
@@ -1123,10 +1286,10 @@ fn a_voice_only_peers_offer_never_grows_a_video_section() {
     // The normative rule, checked where it is actually enforced: a server
     // MUST NOT include a video media section in an offer to a peer that
     // has not subscribed to that publication.
-    let now = Instant::now();
-    let sfu = new_sfu();
-    let mut a = Client::new(1, 6150, now);
-    let mut b = Client::new(2, 6151, now);
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6150, clock.now());
+    let mut b = Client::new(2, 6151, clock.now());
     join(&sfu, &mut a, 0);
     join(&sfu, &mut b, 0);
     sfu.publish(1, 0, VideoKind::Camera);
@@ -1147,5 +1310,469 @@ fn a_voice_only_peers_offer_never_grows_a_video_section() {
     assert!(
         bystander.contains("a=mid:user-1\r\n"),
         "audio is unaffected"
+    );
+}
+
+/// One publisher — `clients[0]` — with a live camera every other client
+/// in the slice is subscribed to, negotiated and connected.
+///
+/// The publication's *receive* SSRC is bound by the time this returns,
+/// which is the part that matters for the keyframe tests below: a
+/// request for a publication nothing has been bound to has nowhere to go
+/// and is silently not sent, so a test that skipped the publisher's own
+/// renegotiation would be asserting on the wrong absence.
+fn camera_published(sfu: &Sfu, clock: &Clock, clients: &mut [&mut Client]) {
+    for c in clients.iter_mut() {
+        join(sfu, c, 0);
+    }
+    // Everyone who joined before the last arrival has to be told about
+    // the ones after it, which is what the domain does.
+    for c in clients.iter_mut() {
+        renegotiate(sfu, c, 0);
+    }
+    pump(sfu, clients, clock, 80);
+    let publisher = clients[0].uid;
+    assert!(
+        sfu.publish(publisher, 0, VideoKind::Camera),
+        "the SFU seated the publication"
+    );
+    renegotiate(sfu, clients[0], 0);
+    for c in clients.iter_mut().skip(1) {
+        sfu.set_subscriptions(c.uid, 0, &[cam(publisher)]);
+        renegotiate(sfu, c, 0);
+    }
+    pump(sfu, clients, clock, 40);
+}
+
+// --- Keyframes -----------------------------------------------------------
+
+#[test]
+fn a_new_subscription_asks_the_publisher_for_a_keyframe() {
+    // The first of the spec's four keyframe triggers. A subscriber
+    // arriving mid-stream has no keyframe and can decode nothing until
+    // one comes, and VP8 will not volunteer one for many seconds — so the
+    // server asks rather than waiting.
+    //
+    // The observation point is the publisher's own stack raising
+    // `KeyframeRequest`, which is the event a real encoder acts on: it
+    // means the PLI was built, encrypted, sent, and understood at the far
+    // end, rather than merely that a field moved on the server.
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6160, clock.now());
+    let mut b = Client::new(2, 6161, clock.now());
+    join(&sfu, &mut a, 0);
+    join(&sfu, &mut b, 0);
+    renegotiate(&sfu, &mut a, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 60);
+
+    assert!(sfu.publish(1, 0, VideoKind::Camera));
+    renegotiate(&sfu, &mut a, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 10);
+    assert_eq!(
+        a.keyframes_on(CAM_SEND_MID),
+        0,
+        "publishing announces a stream; nobody is watching it yet"
+    );
+
+    sfu.set_subscriptions(2, 0, &[cam(1)]);
+    renegotiate(&sfu, &mut b, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 10);
+    assert_eq!(
+        a.keyframes_on(CAM_SEND_MID),
+        1,
+        "the subscriber's arrival is what asks"
+    );
+}
+
+#[test]
+fn resuming_a_paused_publication_asks_for_a_keyframe() {
+    // A decoder cannot start mid-stream, so a resumed publication is a
+    // black tile in every subscriber's grid until the next keyframe.
+    // Pausing keeps the section, the mid and the slot, which is why
+    // nothing else in the negotiation would prompt one.
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6170, clock.now());
+    let mut b = Client::new(2, 6171, clock.now());
+    camera_published(&sfu, &clock, &mut [&mut a, &mut b]);
+
+    // Past the limiter's second, so what is counted below is the resume's
+    // own request and not the subscription's still being in flight.
+    pump_slowly(&sfu, &mut [&mut a, &mut b], &clock, 6);
+    let before = a.keyframes_on(CAM_SEND_MID);
+
+    sfu.set_paused(1, 0, VideoKind::Camera, true);
+    sfu.set_paused(1, 0, VideoKind::Camera, false);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 10);
+    assert_eq!(a.keyframes_on(CAM_SEND_MID), before + 1);
+}
+
+#[test]
+fn a_receivers_keyframe_request_is_relayed_to_the_publisher() {
+    // The server does not decode, so it cannot produce a keyframe itself;
+    // a receiver that says "I have no keyframe" is asking the publisher,
+    // through us. The three `a=rtcp-fb` lines on every video section are
+    // what make the request legal in the first place.
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6180, clock.now());
+    let mut b = Client::new(2, 6181, clock.now());
+    camera_published(&sfu, &clock, &mut [&mut a, &mut b]);
+    pump_slowly(&sfu, &mut [&mut a, &mut b], &clock, 6);
+    let before = a.keyframes_on(CAM_SEND_MID);
+
+    b.ask_for_a_keyframe_as("cam-user-1", KeyframeRequestKind::Pli);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 10);
+    assert_eq!(
+        a.keyframes_on(CAM_SEND_MID),
+        before + 1,
+        "the PLI arrived on the receiver's mid and left on the publisher's"
+    );
+
+    // FIR is the other half of what the offer's `a=rtcp-fb` lines invite,
+    // and means the same thing to a publisher: a receiver that has picked
+    // it must not be ignored because it picked the other spelling.
+    pump_slowly(&sfu, &mut [&mut a, &mut b], &clock, 6);
+    b.ask_for_a_keyframe_as("cam-user-1", KeyframeRequestKind::Fir);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 10);
+    assert_eq!(a.keyframes_on(CAM_SEND_MID), before + 2);
+}
+
+#[test]
+fn a_burst_of_requests_from_a_room_costs_the_publisher_one_keyframe() {
+    // The rate limit is not an optimisation. Three receivers whose
+    // renegotiations complete together each want a keyframe within a few
+    // milliseconds of each other, and three keyframes is a bitrate spike
+    // at precisely the moment the network is busiest — for one keyframe's
+    // worth of benefit, because the first satisfies all three.
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6190, clock.now());
+    let mut b = Client::new(2, 6191, clock.now());
+    let mut c = Client::new(3, 6192, clock.now());
+    let mut d = Client::new(4, 6193, clock.now());
+    camera_published(&sfu, &clock, &mut [&mut a, &mut b, &mut c, &mut d]);
+    pump_slowly(&sfu, &mut [&mut a, &mut b, &mut c, &mut d], &clock, 6);
+    a.keyframes.clear();
+    let burst_began = clock.now();
+
+    // Pumped between each, so every request really does reach the
+    // publisher's stack separately: without the limiter this would be
+    // three events, and not one only because a pending request is an
+    // `Option` that the next one overwrote.
+    b.ask_for_a_keyframe("cam-user-1");
+    pump(&sfu, &mut [&mut a, &mut b, &mut c, &mut d], &clock, 6);
+    c.ask_for_a_keyframe("cam-user-1");
+    pump(&sfu, &mut [&mut a, &mut b, &mut c, &mut d], &clock, 6);
+    d.ask_for_a_keyframe("cam-user-1");
+    pump(&sfu, &mut [&mut a, &mut b, &mut c, &mut d], &clock, 6);
+
+    assert!(
+        clock.now().duration_since(burst_began) < Duration::from_secs(1),
+        "the whole burst has to fit inside one interval to be a burst"
+    );
+    assert_eq!(
+        a.keyframes_on(CAM_SEND_MID),
+        1,
+        "three askers, one keyframe"
+    );
+}
+
+#[test]
+fn a_peer_that_has_unsubscribed_can_no_longer_ask_for_a_keyframe() {
+    // Sections are never removed, so a peer that subscribed once and
+    // unsubscribed still has one, still has a receive stream behind it,
+    // and its stack will happily go on sending PLIs for a tile nobody is
+    // looking at. Answering those would spend the publisher's keyframes —
+    // and so the whole room's bitrate — on a viewer who left.
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6194, clock.now());
+    let mut b = Client::new(2, 6195, clock.now());
+    camera_published(&sfu, &clock, &mut [&mut a, &mut b]);
+
+    sfu.set_subscriptions(2, 0, &[]);
+    renegotiate(&sfu, &mut b, 0);
+    pump_slowly(&sfu, &mut [&mut a, &mut b], &clock, 6);
+    let before = a.keyframes_on(CAM_SEND_MID);
+
+    b.ask_for_a_keyframe("cam-user-1");
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 10);
+    assert_eq!(
+        a.keyframes_on(CAM_SEND_MID),
+        before,
+        "a request only counts while the subscription does"
+    );
+}
+
+// --- Stopping a publication ----------------------------------------------
+
+#[test]
+fn unpublishing_deactivates_both_ends_and_stops_the_forwarding() {
+    // The publisher's half of "the stream stopped", which is a different
+    // code path from the receiver's: unsubscribing changes one peer's
+    // subscription set, unpublishing removes the publication every
+    // subscriber's section was derived from. Both must leave the mid
+    // where it is — deleting an `m=` line would misalign every later
+    // sdpMLineIndex — and both must stop the RTP.
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6200, clock.now());
+    let mut b = Client::new(2, 6201, clock.now());
+    camera_published(&sfu, &clock, &mut [&mut a, &mut b]);
+
+    b.heard.clear();
+    a.publish_frame(VideoKind::Camera, b"live", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
+    assert_eq!(
+        b.heard_on("cam-user-1"),
+        [b"live".to_vec()],
+        "flowing before it is stopped"
+    );
+
+    sfu.unpublish(1, 0, VideoKind::Camera);
+    let publisher = offer_of(&sfu, 1, 0);
+    assert!(
+        publisher.contains("a=mid:cam-send\r\n"),
+        "the mid is kept, which is how the publication comes back"
+    );
+    assert_eq!(section_of(&publisher, CAM_SEND_MID).dir, "inactive");
+    let viewer = offer_of(&sfu, 2, 0);
+    assert!(viewer.contains("a=mid:cam-user-1\r\n"));
+    assert_eq!(
+        section_of(&viewer, "cam-user-1").dir,
+        "inactive",
+        "and every subscriber's section goes with it"
+    );
+    renegotiate(&sfu, &mut a, 0);
+    renegotiate(&sfu, &mut b, 0);
+
+    // The client keeps capturing, because a stop is a server-side fact
+    // and the SFU does not trust a client to have honoured it.
+    b.heard.clear();
+    for _ in 0..4 {
+        a.publish_frame(VideoKind::Camera, b"stopped", clock.now());
+        pump(&sfu, &mut [&mut a, &mut b], &clock, 4);
+    }
+    assert_eq!(b.heard_total(), 0, "nothing is forwarded after the stop");
+}
+
+// --- Publications and outstanding offers ---------------------------------
+
+#[test]
+fn a_publication_started_under_an_outstanding_offer_survives_its_answer() {
+    // The start transaction deliberately carries no offer of its own — a
+    // renegotiation may already be in flight, and the extension forbids a
+    // second offer before the first is answered — so between the start
+    // and the offer that follows it, the next answer to arrive is the
+    // answer to the *previous* offer, which of course never mentioned
+    // `cam-send`. Reading that absence as "the client declined the
+    // section" destroyed the publication a moment after it started and
+    // told the domain to release a slot it had just claimed.
+    let clock = Clock::new();
+    let (sfu, mut events) = sfu_with_events(&clock);
+    let mut a = Client::new(1, 6210, clock.now());
+    let mut b = Client::new(2, 6211, clock.now());
+    join(&sfu, &mut a, 0);
+    join(&sfu, &mut b, 0);
+    renegotiate(&sfu, &mut a, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 60);
+    while events.try_recv().is_ok() {}
+
+    // An offer goes out for something else entirely, and is not answered
+    // yet when the publication starts.
+    let outstanding = offer_of(&sfu, 1, 0);
+    assert!(
+        !outstanding.contains("cam-send"),
+        "the offer was built before the publication existed"
+    );
+    assert!(sfu.publish(1, 0, VideoKind::Camera));
+
+    // Now the client answers the offer it was actually sent.
+    let answer = a.answer(&outstanding, false);
+    sfu.answer(1, 0, &answer).unwrap();
+    assert!(
+        !std::iter::from_fn(|| events.try_recv().ok())
+            .any(|e| matches!(e, MediaEvent::VideoFailed { .. })),
+        "a section the client has never been shown cannot have been declined by it"
+    );
+
+    // And the publication is still there to be offered, answered and used.
+    renegotiate(&sfu, &mut a, 0);
+    sfu.set_subscriptions(2, 0, &[cam(1)]);
+    renegotiate(&sfu, &mut b, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 40);
+    b.heard.clear();
+    a.publish_frame(VideoKind::Camera, b"face", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
+    assert_eq!(b.heard_on("cam-user-1"), [b"face".to_vec()]);
+}
+
+#[test]
+fn one_ssrc_declared_for_two_publications_costs_the_second_one() {
+    // `expect_stream_rx` is keyed by SSRC, so a second call with the same
+    // number and a different mid keeps the first binding and returns
+    // silently. An answer that spends one SSRC on both send sections
+    // therefore used to leave camera and screen pointing at the same
+    // inbound stream, with whichever publication was found first winning
+    // — which is a screen share arriving in the tile where a face belongs.
+    // There is nothing left to demultiplex by, so the second section is
+    // refused exactly as one with no SSRC at all is.
+    let clock = Clock::new();
+    let (sfu, mut events) = sfu_with_events(&clock);
+    let mut a = Client::new(1, 6220, clock.now());
+    let mut b = Client::new(2, 6221, clock.now());
+    join(&sfu, &mut a, 0);
+    join(&sfu, &mut b, 0);
+    renegotiate(&sfu, &mut a, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 60);
+    while events.try_recv().is_ok() {}
+
+    assert!(sfu.publish(1, 0, VideoKind::Camera));
+    assert!(sfu.publish(1, 0, VideoKind::Screen));
+    let offer = offer_of(&sfu, 1, 0);
+    let answer = a.answer(&offer, false);
+    let colliding = answer.replace(
+        &format!("a=ssrc:{} cname:screen-1", a.scr_ssrc),
+        &format!("a=ssrc:{} cname:screen-1", a.cam_ssrc),
+    );
+    assert_ne!(colliding, answer, "the screen section declared an SSRC");
+    sfu.answer(1, 0, &colliding).unwrap();
+
+    let failed: Vec<MediaEvent> = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|e| matches!(e, MediaEvent::VideoFailed { .. }))
+        .collect();
+    assert_eq!(
+        failed,
+        vec![MediaEvent::VideoFailed {
+            uid: 1,
+            cid: 0,
+            kind: VideoKind::Screen
+        }],
+        "the camera was seated first, so the screen is the one with nothing to bind to"
+    );
+
+    // The camera keeps its section live; the screen's keeps its mid and
+    // goes inactive, which is the same shape a stopped publication has.
+    let publisher = offer_of(&sfu, 1, 0);
+    assert_eq!(section_of(&publisher, CAM_SEND_MID).dir, "recvonly");
+    assert_eq!(section_of(&publisher, SCR_SEND_MID).dir, "inactive");
+
+    // A subscriber to both is offered a section for the publication that
+    // exists and none at all for the one that doesn't, so the streams
+    // cannot cross however the client's SDP was written.
+    sfu.set_subscriptions(2, 0, &[cam(1), screen(1)]);
+    let viewer = offer_of(&sfu, 2, 0);
+    assert_eq!(section_of(&viewer, "cam-user-1").dir, "sendonly");
+    assert!(
+        !viewer.contains("a=mid:scr-user-1"),
+        "no section for a publication the answer cost"
+    );
+    renegotiate(&sfu, &mut a, 0);
+    renegotiate(&sfu, &mut b, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 40);
+
+    b.heard.clear();
+    a.publish_frame(VideoKind::Screen, b"desktop", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
+    assert_eq!(
+        b.heard_total(),
+        0,
+        "the refused publication forwards nothing, least of all as the camera"
+    );
+    a.publish_frame(VideoKind::Camera, b"face", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
+    assert_eq!(b.heard_on("cam-user-1"), [b"face".to_vec()]);
+}
+
+// --- Remote video sections -----------------------------------------------
+
+#[test]
+fn resubscribing_gets_a_fresh_ssrc_on_the_same_mid() {
+    // Subscription is per-receiver, so between one peer unsubscribing and
+    // resubscribing the publisher's stream carried on to everyone else.
+    // Resuming it on the SSRC this receiver already knew would hand it a
+    // sequence-number gap of every packet it missed, and libwebrtc
+    // answers a gap that size with a NACK storm for packets no cache
+    // still holds. A new SSRC is a new stream, which is what actually
+    // happened from the receiver's side — while the mid must not move,
+    // because it is the spec's track-to-user mapping.
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6230, clock.now());
+    let mut b = Client::new(2, 6231, clock.now());
+    camera_published(&sfu, &clock, &mut [&mut a, &mut b]);
+
+    let subscribed = offer_of(&sfu, 2, 0);
+    let first = section_of(&subscribed, "cam-user-1")
+        .ssrc
+        .expect("a live section declares its ssrc");
+
+    sfu.set_subscriptions(2, 0, &[]);
+    let dropped = offer_of(&sfu, 2, 0);
+    assert_eq!(section_of(&dropped, "cam-user-1").dir, "inactive");
+    renegotiate(&sfu, &mut b, 0);
+
+    sfu.set_subscriptions(2, 0, &[cam(1)]);
+    let again = offer_of(&sfu, 2, 0);
+    let back = section_of(&again, "cam-user-1");
+    assert_eq!(back.dir, "sendonly");
+    assert_ne!(
+        back.ssrc.expect("a live section declares its ssrc"),
+        first,
+        "a resumed subscription is a new stream to the receiver"
+    );
+    assert_eq!(
+        again.matches("a=mid:cam-user-1\r\n").count(),
+        1,
+        "on the mid it always had, and only that one"
+    );
+
+    // And the new stream is one the receiver can actually decode, which
+    // is the whole reason for the change.
+    renegotiate(&sfu, &mut b, 0);
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 20);
+    b.heard.clear();
+    a.publish_frame(VideoKind::Camera, b"back", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
+    assert_eq!(b.heard_on("cam-user-1"), [b"back".to_vec()]);
+}
+
+#[test]
+fn a_live_video_section_names_its_repair_ssrc_and_an_inactive_one_does_not() {
+    // Offering `a=rtpmap:97 rtx` and never saying which SSRC the
+    // retransmissions arrive on is worse than offering no RTX at all: the
+    // receiver NACKs, the server resends on an SSRC the receiver was
+    // never told about, and the repair is dropped as unknown — bandwidth
+    // spent on both hops, nothing recovered. `a=ssrc-group:FID` is the
+    // binding, and it belongs only on a section that is actually flowing.
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6240, clock.now());
+    let mut b = Client::new(2, 6241, clock.now());
+    camera_published(&sfu, &clock, &mut [&mut a, &mut b]);
+
+    let subscribed = offer_of(&sfu, 2, 0);
+    let sec = section_of(&subscribed, "cam-user-1");
+    let ssrc = sec.ssrc.expect("a live section declares its ssrc");
+    let rtx = sec.rtx.expect("and groups the repair stream with it");
+    assert_ne!(ssrc, rtx);
+    assert!(subscribed.contains(&format!("a=ssrc-group:FID {ssrc} {rtx}\r\n")));
+    assert!(subscribed.contains(&format!("a=ssrc:{ssrc} cname:video-1\r\n")));
+    assert!(
+        subscribed.contains(&format!("a=ssrc:{rtx} cname:video-1\r\n")),
+        "the repair stream shares the cname or it is a different source"
+    );
+    // The publisher's own capture section carries no SSRC — the client
+    // declares that one — so it names no repair stream either.
+    assert!(!offer_of(&sfu, 1, 0).contains("a=ssrc-group"));
+
+    sfu.set_subscriptions(2, 0, &[]);
+    let dropped = offer_of(&sfu, 2, 0);
+    assert_eq!(section_of(&dropped, "cam-user-1").dir, "inactive");
+    assert!(
+        !dropped.contains("a=ssrc-group"),
+        "naming a repair SSRC for a stream that isn't flowing says nothing"
     );
 }

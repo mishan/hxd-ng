@@ -327,10 +327,15 @@ fn voice_cid(f: &Frame) -> u32 {
 /// `None` covers both a missing field and a kind this revision doesn't
 /// define — kind `0` is invalid on purpose, so a zeroed field is caught
 /// rather than read as a camera.
+///
+/// The field is a UInt16, but `as_uint` widens a four-byte chunk to
+/// `u32`; the conversion is checked so that a client sending a wide value
+/// is refused rather than truncated into a kind it didn't name.
 fn video_kind(f: &Frame) -> Option<VideoKind> {
     f.chunks()
         .find(|c| c.tag == video::field::VIDEO_KIND)
-        .and_then(|c| VideoKind::from_wire(c.as_uint() as u16))
+        .and_then(|c| u16::try_from(c.as_uint()).ok())
+        .and_then(VideoKind::from_wire)
 }
 
 fn err_text(e: ChatError) -> &'static str {
@@ -1426,7 +1431,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             let kind = f
                 .chunks()
                 .find(|c| c.tag == video::field::VIDEO_KIND)
-                .map(|c| VideoKind::from_wire(c.as_uint() as u16));
+                .map(|c| VideoKind::from_wire(u16::try_from(c.as_uint()).ok()?));
             let kind = match kind {
                 Some(None) => {
                     reply_error(tx, f.trans, "That is not a video stream kind.");
