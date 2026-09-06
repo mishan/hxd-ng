@@ -1,0 +1,28 @@
+[package]
+name = "hxd-voice"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "hxd-ng voice SFU: a str0m WebRTC forwarder behind hxd-core's VoiceMedia trait"
+publish = false
+
+[dependencies]
+hxd-core = { workspace = true }
+# Sans-I/O WebRTC. `rust-crypto` puts DTLS-SRTP and the handshake
+# primitives in Rust rather than in the default aws-lc-rs provider.
+#
+# It does *not* get rid of aws-lc-rs: str0m-rust-crypto asks dimpl for
+# `rcgen` too (the self-signed DTLS certificate), and dimpl's `rcgen`
+# feature implies its `aws-lc-rs` one, so aws-lc-sys is still in the
+# graph and still wants a C/assembly toolchain and cmake to build.
+# Nothing selectable from here changes that — see README's build
+# prerequisites, and `cargo tree -i aws-lc-rs` for the path.
+str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The tests stand a real str0m client up against the server side, so
+# they need the same stack the SFU is built on.
+str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }

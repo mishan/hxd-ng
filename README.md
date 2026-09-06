@@ -11,6 +11,11 @@ to a known-good revision:
 git submodule update --init
 ```
 
+Building the voice SFU needs a C/assembly toolchain and **cmake**: the
+WebRTC stack's DTLS certificate generation reaches aws-lc-sys whichever
+crypto provider is selected. On Debian/Ubuntu, `apt install build-essential
+cmake`.
+
 ## Run
 
 ```sh
