@@ -61,9 +61,20 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
 | `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing. Its `tests/` hold the e2e suites. |
 
+Outside the workspace, `client/` is the **web client** for the ng wire
+(Vite + TypeScript, no UI framework on purpose — it doubles as a readable
+reference for the protocol): chat, the user list with the cicn icons
+packed into a committed sprite sheet, PMs, voice and video, resume across
+a dropped socket *and* a page reload, and a debug drawer carrying the
+whole frame trace. `client/dist/` and `client/public/icons.png` are
+generated **and committed**, so a source change is not finished until
+`npm run build` has been run and its output committed with it.
+
 `tools/ng-client.mjs` is an interactive ng test client (Node 22+, or
 `npm install` in tools/ for the `ws` fallback) — `/drop` exercises
-detach/resume, `/msg` PMs by nick or uid.
+detach/resume, `/msg` PMs by nick or uid. `tools/ng-voice.html` is the
+same idea for the SFU: one file, no build step, a real
+`RTCPeerConnection`.
 
 ## Invariants that matter
 
@@ -167,10 +178,12 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 node --check tools/ng-client.mjs
+(cd client && npm run build)   # typechecks, and refreshes the committed dist/
 ```
 
 The best end-to-end check of all: point a real GtkHx at the legacy port
-and `tools/ng-client.mjs` at the ng port, and chat between them.
+and the web client (or `tools/ng-client.mjs`) at the ng port, and chat
+between them.
 
 ## Debugging
 
@@ -205,7 +218,7 @@ ROADMAP.md carries live status. In brief: the legacy server covers login,
 presence, chat, private chats, PMs, broadcast, and moderation; the
 Hotline-ng MVP (roster + chat + PMs with detach/resume) is complete and
 cross-tested; voice and video are implemented on both wires, sharing one
-room and one SFU. The large open fronts, in rough order: HOPE + ciphers on the
+room and one SFU; `client/` is a web client that covers all of it. The large open fronts, in rough order: HOPE + ciphers on the
 legacy wire (`hxcrypto` sits ready in the submodule), the ng rate-limit and
 client-quickstart polish, the fogWraith Text-Encoding capability (cheap —
 the UTF-8 interior already satisfies its core mandate), files/HTXF, news,

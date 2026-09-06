@@ -92,8 +92,29 @@ node tools/ng-client.mjs ws://127.0.0.1:5700 --login misha --password pw
 browser against a server with `[voice]` configured and it joins the
 lobby's voice room with a real `RTCPeerConnection` — camera, screen share
 and per-stream subscription included when `[voice.video]` is on. No build
-step, one file. Two browser tabs and a real GtkHx on the legacy port is
-the end-to-end check worth running before believing any of this.
+step, one file.
+
+### The web client
+
+`client/` is a full browser client for the ng wire: public chat, the user
+list with the classic Hotline icons, private messages, and the voice and
+video above. It is the one to reach for when you want to *use* the server
+rather than poke at it, and its debug drawer (⇧⌘D, or `?debug` in the URL)
+shows every frame in both directions and copies a bug report to the
+clipboard.
+
+```sh
+cd client && npm install && npm run dev     # http://localhost:5701
+```
+
+`client/dist/` is a committed static build, so serving that directory
+with anything at all — `python3 -m http.server` included — works with no
+toolchain. The icons come from `gtkhx/icons.rsrc`, packed into one
+committed sprite sheet by `client/tools/build-icons.py`. See
+[client/README.md](client/README.md).
+
+The web client and a real GtkHx on the legacy port, chatting to each
+other, is the end-to-end check worth running before believing any of this.
 
 Wire tracing mirrors gtkhx's client-side trace so the two line up:
 

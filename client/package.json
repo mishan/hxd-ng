@@ -1,0 +1,19 @@
+{
+  "name": "hxd-ng-client",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A web client for the Hotline-ng wire: chat, the user list, private messages, voice and video.",
+  "license": "GPL-2.0-or-later",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "icons": "python3 tools/build-icons.py ../gtkhx/icons.rsrc public"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
