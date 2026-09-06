@@ -10,6 +10,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/hl-identity",
     "crates/hxd-core",
     "crates/hxd-auth-file",
     "crates/hxd-session",
@@ -36,6 +37,7 @@ rust-version = "1.85"
 hotline-proto = { path = "gtkhx/rust/crates/hotline-proto" }
 
 # Internal.
+hl-identity = { path = "crates/hl-identity" }
 hxd-core = { path = "crates/hxd-core" }
 hxd-auth-file = { path = "crates/hxd-auth-file" }
 hxd-session = { path = "crates/hxd-session" }
