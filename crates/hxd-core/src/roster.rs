@@ -129,6 +129,23 @@ pub enum Event {
     },
     /// The recipient has been kicked; its transport should close.
     Kicked,
+
+    // --- Voice (see [`crate::voice`]) ---------------------------------
+    /// An SDP offer for the recipient's own peer connection: the initial
+    /// one answering a join, or a renegotiation. Opaque to the domain —
+    /// both frontends carry the string verbatim.
+    VoiceOffer { cid: u32, sdp: String },
+    /// A server ICE candidate, or (empty candidate) end-of-candidates.
+    VoiceIce {
+        cid: u32,
+        candidate: crate::voice::IceCandidate,
+    },
+    /// The voice room's participant list changed — someone joined, left,
+    /// or changed mute state.
+    VoiceStatus {
+        cid: u32,
+        participants: Vec<crate::voice::VoiceParticipant>,
+    },
 }
 
 /// An event stamped with its position in the session's stream. `seq` is
@@ -250,6 +267,7 @@ pub(crate) struct RosterInner {
     pub(crate) public_subject: String,
     pub(crate) chats: HashMap<u32, PrivateChat>,
     pub(crate) bans: Vec<Ban>,
+    pub(crate) voice: crate::voice::VoiceState,
 }
 
 impl RosterInner {
@@ -320,8 +338,12 @@ impl RosterInner {
         self.broadcast_where(ev, skip, |_| true);
     }
 
-    /// Full teardown: leave chats, remove, announce the part.
+    /// Full teardown: leave voice and chats, remove, announce the part.
     pub(crate) fn end_session(&mut self, uid: Uid) {
+        // Voice first, while the session is still on the roster: the
+        // room it leaves has to be renegotiated and re-announced, and
+        // that has nothing to do with the chat rooms below.
+        self.voice_part(uid);
         crate::Core::leave_all_chats(self, uid);
         let Some(sess) = self.users.remove(&uid) else {
             return;
@@ -462,6 +484,17 @@ impl Core {
             r.end_session(uid);
             return false;
         }
+        // Buffer first, *then* leave voice. A detached session's media
+        // path is dead or about to be — the UDP flow went with the
+        // control connection, and a client that resumes re-joins voice
+        // explicitly — so the departure has to happen here. But the
+        // status announcing it is the one event of this whole teardown
+        // the resuming client must see: without it (docs/voice.md §8)
+        // the client comes back to a voice UI that is live with nothing
+        // behind it. Sent while the sink is still `Live` it would go to
+        // the socket that just died. So the order is load-bearing, and
+        // it is also what makes the buffer's voice content exactly the
+        // tail of this departure and nothing else.
         sess.outbox.sink = Sink::Buffering {
             since: Instant::now(),
             start_seq: sess.outbox.next_seq,
@@ -469,6 +502,10 @@ impl Core {
             broken: false,
         };
         let addr = sess.addr;
+        r.voice_part(uid);
+        if !r.users.contains_key(&uid) {
+            return false;
+        }
         r.set_status(uid, SessionStatus::Detached);
 
         // Per-address backstop: a spammer with detach permission still

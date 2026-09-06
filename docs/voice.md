@@ -165,18 +165,32 @@ pub enum Event {
 }
 
 impl Core {
+    pub fn with_voice(self, media: Arc<dyn VoiceMedia>, max_per_room: usize) -> Self;
+    pub fn voice_enabled(&self) -> bool;
+
     pub fn voice_join(&self, uid: Uid, cid: u32) -> Result<VoiceJoin, VoiceError>;
     pub fn voice_leave(&self, uid: Uid, cid: u32) -> Result<(), VoiceError>;
     pub fn voice_answer(&self, uid: Uid, cid: u32, sdp: String) -> Result<(), VoiceError>;
     pub fn voice_ice(&self, uid: Uid, cid: u32, candidate: IceCandidate);
     pub fn voice_mute(&self, uid: Uid, cid: u32, muted: bool) -> Result<(), VoiceError>;
     pub fn voice_participants(&self, cid: u32) -> Vec<VoiceParticipant>;
+    pub fn voice_room_of(&self, uid: Uid) -> Option<u32>;
+    pub fn voice_media_event(&self, ev: MediaEvent);
 }
 
 pub struct VoiceJoin { pub sdp: String, pub codec: &'static str, pub participants: Vec<VoiceParticipant> }
 
 pub enum VoiceError { Disabled, NoSuchChat, NotAMember, RoomFull, NotInVoice, BadAnswer }
 ```
+
+`VoiceJoin::participants` is the room **as the joiner found it** — the
+spec's join-reply example carries `[A]` when B joins a room A is in, and
+the joiner appears in the room status that follows. Joins land *unmuted*:
+the spec asks clients to join muted, and a client that wants that sends
+its own 606 the moment it has a session. A server muting on its owner's
+behalf would make a silent room the normal case and every silence
+ambiguous — which is exactly what softened GtkHx's media timeout against
+Janus.
 
 `voice_join` is where the spec's ordering lives: check membership, leave
 any current room (teardown, status to that room), then join — cap check,

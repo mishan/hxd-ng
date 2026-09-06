@@ -744,6 +744,11 @@ fn deliver_event(tx: &Tx, ev: Event) -> bool {
                 ],
             );
         }
+        // Voice: this edge can't send 602/604/605 yet, and no legacy
+        // session can be in voice until it can — nothing generates these
+        // for a connection that never joined.
+        Event::VoiceOffer { .. } | Event::VoiceIce { .. } | Event::VoiceStatus { .. } => {}
+
         Event::Kicked => return false,
     }
     true
