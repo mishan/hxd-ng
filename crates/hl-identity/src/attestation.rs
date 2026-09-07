@@ -89,14 +89,18 @@ impl Attestation {
 
     /// Decode and check the signature against the embedded registrar key.
     pub fn parse(bytes: &[u8]) -> Result<Attestation, Error> {
-        Self::from_envelope(Envelope::open(bytes)?)
+        Self::from_envelope(Envelope::open(bytes)?, None)
     }
 
-    pub(crate) fn from_value(value: Value) -> Result<Attestation, Error> {
-        Self::from_envelope(Envelope::from_value(value)?)
+    /// Parse an attestation embedded in a card. `expect` is the card's
+    /// identity: an attestation about someone else fails the card, and
+    /// checking that before the signature keeps a card full of
+    /// well-formed attestations from costing a verification each.
+    pub(crate) fn from_value(value: Value, expect: &PublicKey) -> Result<Attestation, Error> {
+        Self::from_envelope(Envelope::from_value(value)?, Some(expect))
     }
 
-    fn from_envelope(env: Envelope) -> Result<Attestation, Error> {
+    fn from_envelope(env: Envelope, expect: Option<&PublicKey>) -> Result<Attestation, Error> {
         let v = &env.value;
         let a = Attestation {
             identity: signed::bytes32(v, "identity")?,
@@ -116,19 +120,29 @@ impl Attestation {
             return Err(Error::BadField("registrar"));
         }
         // `handle` and `registrar` are rendered next to user-chosen names
-        // and logged; control characters and whitespace in them are a
-        // spoofing tool, not a naming choice.
+        // and logged; control characters, whitespace, and the invisible
+        // formatting characters are a spoofing tool in them, not a
+        // naming choice. `is_control` misses that last group entirely:
+        // a zero-width space or a right-to-left override renders as
+        // nothing, so `admin\u{200b}@hl.example` reads as
+        // `admin@hl.example` wherever a handle is shown.
         if a.handle.is_empty()
             || a.handle.len() > MAX_HANDLE_BYTES
             || a.handle.contains('@')
             || a.handle
                 .chars()
-                .any(|c| c.is_control() || c.is_whitespace())
+                .any(|c| c == ' ' || crate::names::is_deceptive(c))
         {
             return Err(Error::BadField("handle"));
         }
         if a.level.is_some_and(|l| l > 3) {
             return Err(Error::BadField("level"));
+        }
+        // Before the signature check: whose attestation this is costs
+        // nothing to read, and a card carrying dozens about someone
+        // else shouldn't cost a verification each to reject.
+        if expect.is_some_and(|e| &a.identity != e) {
+            return Err(Error::KeyMismatch);
         }
         // The timeline has to make sense, because `registered` is what
         // `min_attestation_age` is measured from: a sloppy registrar
@@ -264,5 +278,30 @@ mod tests {
             Attestation::parse(&a.sign(&reg)),
             Err(Error::BadField("registrar"))
         );
+    }
+
+    #[test]
+    fn a_handle_may_not_hide_characters() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let reg = ServerKey::from_seed(&[3u8; 32]);
+        let with = |handle: &str| {
+            let a = Attestation {
+                identity: id.public(),
+                registrar: "hl.example".into(),
+                registrar_key: reg.public(),
+                handle: handle.into(),
+                registered: 1_600_000_000,
+                issued: 1_700_000_000,
+                expires: 1_800_000_000,
+                level: None,
+            };
+            Attestation::parse(&a.sign(&reg))
+        };
+        // Zero-width space, right-to-left override, byte-order mark: all
+        // render as nothing, all read as `admin`.
+        for handle in ["admin\u{200b}", "ad\u{202e}min", "admin\u{feff}"] {
+            assert_eq!(with(handle), Err(Error::BadField("handle")), "{handle:?}");
+        }
+        assert!(with("admin").is_ok());
     }
 }

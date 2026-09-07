@@ -19,14 +19,21 @@ pub const MAX_BYTES: usize = 16 * 1024;
 pub const NAME_MAX_CHARS: usize = 32;
 /// Profile text limit in bytes (§3.4).
 pub const PROFILE_MAX_BYTES: usize = 2048;
+/// How many attestations one card may embed (§3.4). Generous for a user
+/// with several registrars, and a bound on what one card costs to
+/// verify — the size limit alone allowed dozens.
+pub const MAX_ATTESTATIONS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {
     pub identity: PublicKey,
     pub updated: u64,
-    /// Display name. Callers are expected to NFC-normalise before signing;
-    /// this crate checks length only, so two cards can carry visually
-    /// identical names with different code points. Servers that enforce
+    /// Display name. Callers are expected to NFC-normalise before
+    /// signing; this crate checks length and refuses invisible
+    /// characters, but does not normalise, so two cards can carry
+    /// visually identical names with different code points. §3.4 says
+    /// so rather than requiring normalisation a verifier would have to
+    /// perform on bytes it must re-serve unchanged. Servers that enforce
     /// reserved names should normalise on their side too.
     pub name: String,
     pub icon: Option<u64>,
@@ -128,6 +135,9 @@ impl Card {
             "signing a card with a key that is not its identity"
         );
         self.check_fields()?;
+        if attestations.len() > MAX_ATTESTATIONS {
+            return Err(Error::BadField("attestations"));
+        }
         let bytes = signed::seal(self.unsigned(attestations), |body| {
             identity.sign(DOMAIN, body)
         });
@@ -140,6 +150,12 @@ impl Card {
     fn check_fields(&self) -> Result<(), Error> {
         let chars = self.name.chars().count();
         if chars == 0 || chars > NAME_MAX_CHARS {
+            return Err(Error::BadField("name"));
+        }
+        // A display name sits next to handles and logins in every
+        // client; the same invisible characters that spoof a handle
+        // spoof it (§3.4).
+        if self.name.chars().any(crate::names::is_deceptive) {
             return Err(Error::BadField("name"));
         }
         if self
@@ -165,7 +181,9 @@ impl Card {
     /// failing the card (§5.2 step 5): a registrar that starts issuing v2
     /// attestations would otherwise lock its users out of every v1
     /// server. One that parses but doesn't verify, or that is about a
-    /// different identity, still fails the card — the signer embedded it.
+    /// different identity, still fails the card — the signer embedded it;
+    /// the identity check happens before that attestation's signature is
+    /// looked at, for the same reason the card's envelope comes first.
     pub fn parse(bytes: &[u8]) -> Result<Card, Error> {
         if bytes.len() > MAX_BYTES {
             return Err(Error::TooLarge);
@@ -175,9 +193,19 @@ impl Card {
         let identity: PublicKey = signed::bytes32(v, "identity")?;
         env.verify(&identity, DOMAIN)?;
 
+        // Everything that costs no signature check first: the count,
+        // the fields, and (inside `from_value`) whose attestation this
+        // is. A 16 KiB card fits dozens of minimal attestations, so a
+        // card that verifies its own envelope and then fails could
+        // otherwise buy dozens of Ed25519 verifications with one
+        // unauthenticated request.
+        let embedded = signed::opt_array(v, "attestations")?;
+        if embedded.len() > MAX_ATTESTATIONS {
+            return Err(Error::BadField("attestations"));
+        }
         let mut attestations = Vec::new();
-        for value in signed::opt_array(v, "attestations")? {
-            match Attestation::from_value(value) {
+        for value in embedded {
+            match Attestation::from_value(value, &identity) {
                 Ok(a) => attestations.push(a),
                 Err(Error::UnsupportedVersion(v)) => {
                     // Not ours to read; the card is still the user's.
@@ -205,13 +233,6 @@ impl Card {
             successor: signed::opt_bytes32(v, "successor")?,
         };
         card.check_fields()?;
-        if card
-            .attestations
-            .iter()
-            .any(|a| a.identity != card.identity)
-        {
-            return Err(Error::KeyMismatch);
-        }
         Ok(card)
     }
 }
@@ -334,6 +355,66 @@ mod tests {
         let n = bytes.len();
         bytes[n - 1] ^= 0xff;
         assert_eq!(Card::parse(&bytes), Err(Error::BadSignature));
+    }
+
+    #[test]
+    fn a_card_may_not_buy_verifications_with_attestations() {
+        // The card's envelope verifies, so the loop is reached — and
+        // everything that costs nothing is checked first: how many, and
+        // whose. Both used to be decided after every embedded signature
+        // had been verified, and a 16 KiB card holds dozens.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let other = IdentityKey::from_seed(&[7u8; 32]);
+        let reg = ServerKey::from_seed(&[3u8; 32]);
+        let att = |about: &IdentityKey| Attestation {
+            identity: about.public(),
+            registrar: "hl.example".into(),
+            registrar_key: reg.public(),
+            handle: "misha".into(),
+            registered: 1_600_000_000,
+            issued: 1_700_000_000,
+            expires: 1_800_000_000,
+            level: None,
+        };
+        let many: Vec<_> = (0..MAX_ATTESTATIONS + 1)
+            .map(|_| att(&id).signed_value(&reg))
+            .collect();
+        assert_eq!(
+            Card::new(&id, "Misha", 10).sign(&id, many.clone()).err(),
+            Some(Error::BadField("attestations"))
+        );
+        // Signing one anyway — an attacker signs their own card — is
+        // refused on the way in, which is the side that matters.
+        let over = signed::seal(Card::new(&id, "Misha", 10).unsigned(many), |body| {
+            id.sign(DOMAIN, body)
+        });
+        assert_eq!(
+            Card::parse(&over).err(),
+            Some(Error::BadField("attestations"))
+        );
+
+        // Signed by a real registrar, but about someone else.
+        let bytes = Card::new(&id, "Misha", 10)
+            .sign(&id, vec![att(&other).signed_value(&reg)])
+            .unwrap();
+        assert_eq!(Card::parse(&bytes), Err(Error::KeyMismatch));
+    }
+
+    #[test]
+    fn a_display_name_may_not_hide_characters() {
+        // `admin\u{200b}` renders as `admin` — the card's name sits next
+        // to logins and handles in every client that shows one.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        for name in ["admin\u{200b}", "ad\u{202e}min", "misha\u{feff}"] {
+            assert_eq!(
+                Card::new(&id, name, 10).sign(&id, vec![]),
+                Err(Error::BadField("name")),
+                "{name:?}"
+            );
+        }
+        assert!(Card::new(&id, "Misha Nasledov", 10)
+            .sign(&id, vec![])
+            .is_ok());
     }
 
     #[test]
