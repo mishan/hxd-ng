@@ -11,11 +11,10 @@
 //! | `POST /identity/auth` | §5.2 step 2 / §5.3 |
 //! | `GET  /identity/card/<fp>` | §7 |
 //! | `PUT  /identity/card` | §7 |
+//! | `POST /identity/link` | §8.2 |
+//! | `POST /identity/unlink` | §8.4 |
 //! | `GET  /ng` (and `/`) | upgrade → the JSON protocol |
 //! | `GET  /trtp` | upgrade → the TRTP tunnel |
-//!
-//! `/identity/link` and `/identity/unlink` (§8.2, §8.4) arrive with account
-//! association and 404 until then, and discovery doesn't list them.
 //!
 //! TLS is still the reverse proxy's job. The one thing this layer asks of
 //! the proxy is the mTLS header contract (§5.3): `X-Hotline-Client-Cert`

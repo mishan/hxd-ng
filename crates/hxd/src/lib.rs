@@ -592,6 +592,22 @@ fn build_identity(
     ))
 }
 
+/// Config-level checks a `Deserialize` can't make: sections whose
+/// meaning depends on another section's presence.
+///
+/// Run before anything is built, so the operator hears about it at
+/// startup rather than wondering why identity does nothing.
+pub fn check_config(config: &Config) -> Result<(), String> {
+    if config.identity.is_some() && config.ng.is_none() {
+        return Err(
+            "[identity] needs [ng]: the identity endpoints and the TRTP tunnel are \
+             served by the ng listener, so [identity] without [ng] does nothing"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Build the ng frontend context sharing the legacy context's core and
 /// auth. `None` when the config has no `[ng]` section.
 pub fn build_ng_ctx(

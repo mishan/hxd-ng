@@ -67,6 +67,7 @@ async fn main() {
     let result = async {
         let config_path = parse_args()?;
         let config = Config::load(&config_path)?;
+        hxd::check_config(&config)?;
         let voice = hxd::voice::build(&config)?;
         let ctx = build_ctx(&config, voice.as_ref())?;
 

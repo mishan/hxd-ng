@@ -208,7 +208,8 @@ authentication, with `Content-Type: application/json`:
     "new_accounts": "guest",                // deny | guest | create
     "association": "server",                // or "none" on a relay (§11.2)
     "min_attestation_age": 0,
-    "trusted_registrars": [],               // empty = any
+    "trusted_registrars": [],               // hosts whose attestations are accepted;
+                                            // empty accepts none — every identity is unattested
     "endpoints": {
       "challenge": "/identity/challenge",
       "auth":      "/identity/auth",
@@ -304,13 +305,36 @@ Success (200):
   "fingerprint": "…",
   "handle": "misha@hl.example",            // null if no accepted attestation
   "age": 31536000,                          // seconds; 0 if unattested
-  "outcome": "linked"                       // linked | will_create | guest | unattested_guest
+  "outcome": "linked",                      // see below
+  "account": "misha"                        // the login, when one is associated
 }
 ```
 
-Failure (401 or 403) with `{ "error": code, "text": "…" }` where `code` is
-one of `bad_card`, `bad_cert`, `bad_proof`, `revoked`, `denied`,
-`card_too_large`, `unknown_challenge`.
+`outcome` is one of:
+
+| | |
+|---|---|
+| `linked` | an account already associates this identity, and login lands on it |
+| `created` | `new_accounts = create` made one during this call; `account` names it |
+| `guest` | no association; the session will be a guest |
+| `unattested_guest` | as `guest`, and the reason is that no attestation was accepted |
+| `classic_pending_link` | `login`/`password` named an account that could not be linked (someone else's identity, or self-linking off). The session will be a guest and an operator has to resolve it |
+
+The request may also carry `"create": false`, which suppresses account
+creation for this call on a `new_accounts = create` server. A client that
+means to link an *existing* classic account should send it: otherwise the
+first auth creates a new account, and `/identity/link` afterwards can only
+answer `already_linked`. Sending credentials implies it.
+
+Failure with `{ "error": code, "text": "…" }`:
+
+| code | status | |
+|---|---|---|
+| `bad_card`, `bad_cert`, `bad_proof`, `card_too_large`, `unknown_challenge` | 401 | prove it again |
+| `login_failed` | 401 | the `login`/`password` of §5.4 didn't verify |
+| `denied`, `revoked`, `no_manage` | 403 | policy, or the device certificate lacks `manage` |
+| `already_linked`, `would_orphan`, `not_linked` | 409 | conflicts with the account's state (§8.2, §8.4) |
+| `server_error` | 500 | ours, logged, not explained |
 
 `outcome` tells the client what account association will happen when an
 application login runs on a socket carrying this token (§8), so a guest
@@ -328,6 +352,18 @@ else in the certificate is examined; validity dates, subject and extensions
 are ignored, since the device certificate (§3.3) is the authority on all of
 that.
 
+Ignoring the rest is not the same as not parsing it. The key MUST be taken
+from the SubjectPublicKeyInfo by position — walk `Certificate` →
+`TBSCertificate`, skip `version`, `serialNumber`, `signature`, `issuer`,
+`validity` and `subject`, and read the seventh field. Everything ahead of
+the SPKI is chosen by whoever requested the certificate (`serialNumber` is
+an arbitrary INTEGER; a `Name` attribute value is `ANY`), so an
+implementation that *searches* the DER for RFC 8410's algorithm identifier
+will find whatever bytes the subject planted there. A certificate whose own
+SPKI is the attacker's key — which is what the proxy's handshake validates
+— carrying a victim's device key inside its subject would then be read as
+the victim's device.
+
 hxd-ng does not terminate TLS. The reverse proxy requests (but must not
 require) a client certificate and forwards it on the upstream request as
 `X-Hotline-Client-Cert` (base64 DER). The server honours that header only
@@ -338,12 +374,31 @@ Trusting the proxy's address is necessary but not sufficient. The proxy
 MUST set `X-Hotline-Client-Cert` from the certificate that took part in
 *its own* TLS handshake, and MUST drop any copy of the header the client
 sent — otherwise a client can send the header through the proxy carrying
-any device's public certificate and impersonate that device. In nginx,
-`proxy_set_header X-Hotline-Client-Cert $ssl_client_escaped_cert;`
-does both (a `proxy_set_header` replaces the inbound value, and an empty
-value when there was no client certificate removes the header); in Caddy,
+any device's public certificate and impersonate that device. In Caddy,
 `header_up X-Hotline-Client-Cert {http.request.tls.client.certificate_der_base64}`
-likewise. An operator who lists a proxy in `trusted_proxies` is asserting
+does both: it replaces any inbound value, and sets nothing when there was
+no client certificate.
+
+nginx has no base64-DER variable. `$ssl_client_escaped_cert` is
+**URL-encoded PEM**, not base64 DER, and a server that can't decode the
+header must answer 400 rather than fall through to an unauthenticated
+request — which is what makes this worth spelling out, since the
+fall-through failure looks like "mTLS silently isn't working". The
+workable nginx form strips the PEM armour and the encoding in one map:
+
+```nginx
+map $ssl_client_raw_cert $hotline_client_cert {
+    ""      "";
+    default $ssl_client_raw_cert;   # PEM; see the note below
+}
+proxy_set_header X-Hotline-Client-Cert $hotline_client_cert;
+```
+
+`$ssl_client_raw_cert` is PEM with real newlines, which a header cannot
+carry, so this needs either an nginx built with njs (a one-line
+`.replace(/\s|-----[^-]+-----/g, '')`) or Lua. Until you have one of
+those, use Caddy for the mTLS binding, or the challenge binding of §5.2,
+which needs no proxy cooperation at all. An operator who lists a proxy in `trusted_proxies` is asserting
 that it is configured this way; the server cannot check it. Operators who
 terminate TLS in the server itself in some future build get the same
 header semantics from the in-process listener, with the same contract
@@ -471,9 +526,14 @@ this.
 certificate; the
 device certificate must carry the manage bit. Body is the new card as
 `application/cbor`. Verified as in §5.2 step 3; the `updated` monotonicity
-rule applies. On acceptance the server emits `user_changed` for that user's
+rule applies, and a card that changes a committed `successor` is refused
+with `bad_card` (§3.4).
+
+On acceptance a server should emit `user_changed` for that identity's
 sessions and, on the legacy wire, Notify Change User (301) if the name or
-icon changed.
+icon changed. hxd-ng does not yet: sessions carry no identity → uid index,
+so it answers `{"updated": true}` and the roster catches up at the next
+login. Clients should not depend on the notification.
 
 Cards are per identity, not per session or per wire. A card set from a
 web client is the card the server shows for the same identity's tunnelled
@@ -704,28 +764,40 @@ offer.
 
 ## 12. Settings
 
+The table is what `hxd-ng` reads today; a row marked *(not implemented)*
+is design, not configuration, and setting it is a startup error —
+`[identity]` uses `deny_unknown_fields`.
+
 | Setting | Default | Meaning |
 |---|---|---|
-| `[identity] enabled` | `false` | Master switch; when off, discovery reports `enabled: false` and the endpoints return 404 |
-| `[identity] bindings` | `["challenge"]` | Which of §5 to accept |
+| `[identity]` present | absent | The section's presence is the master switch. Absent, discovery reports `enabled: false` and the endpoints 404. The section is only read when `[ng]` is also present — without an ng listener there is nothing to serve them from |
+| `[identity] key` | `identity-server.key` | The server's Ed25519 seed, hex, mode 0600; generated on first run |
 | `[identity] new_accounts` | `guest` | `deny`, `guest`, `create`. The default is `guest` rather than `deny` so that, with `unattested = guest`, an attested identity is never treated worse than an unattested one |
-| `[identity] default_access` | guest access | Access bitmap for created accounts, as a list of named bits. The guest fallback is convenient but wrong for anything guests may not have — the messaging extension's `AccessMessaging`, for one — so operators using `create` should set it explicitly |
+| `[identity.default_access]` | guest access | Access bits for accounts `create` writes, keyed exactly as an account file's `[access]` table. The guest fallback is convenient but wrong for anything guests may not have — the messaging extension's `AccessMessaging`, for one — so operators using `create` should set it explicitly |
+| `[identity] max_new_accounts_per_hour` | `60` | Ceiling on accounts `create` may write per hour. Past it, identities are still admitted, as guests. `create` writes a file per never-seen key, and with `unattested = guest` any fresh key qualifies |
 | `[identity] allow_list` | empty | Fingerprints or handles; non-empty means identity login is restricted to these |
 | `[identity] min_attestation_age` | `0` | Seconds |
 | `[identity] unattested` | `guest` | `deny`, `guest`, `allow` |
-| `[identity] trusted_registrars` | empty | Empty = any |
-| `[identity] revocation_max_age` | `86400` | Seconds before the cache must refresh |
-| `[identity] revocation_stale` | `allow` | `allow` or `guest` |
+| `[identity.registrar_keys]` | empty | Registrar host → base64url public key. **Empty accepts no attestation at all**, so every identity is unattested; there is no "empty means any". Static until the registrar spec's discovery fetch exists |
 | `[identity] clock_skew` | `300` | Seconds |
+| `[identity] trtp` | `true` | Serve the TRTP-over-WebSocket path |
 | `[identity] trtp_login` | `verify` | `verify` or `trust`; see §8.3 |
-| `[ng] trusted_proxies` | empty | Addresses whose `X-Hotline-Client-Cert` header is believed |
-| `[ng] trtp` | `true` | Serve the TRTP-over-WebSocket path |
-| `[legacy] cleartext` | `on` | `off`, `restricted`, `on` |
-| `[legacy] cleartext_mask` | chat + news | Access mask for `restricted` |
+| `[identity] successors` | `identity-successors` | Where §3.4 successor commitments are kept. `""` keeps them in memory only, which means a restart forgets them — and making the caches forget is the attack the commitment exists to stop |
+| `[ng] trusted_proxies` | empty | Addresses whose `X-Hotline-Client-Cert` header is believed. Single addresses or CIDR blocks (`["127.0.0.1", "10.0.0.0/8"]`); IPv4-mapped peers on a `[::]` bind match their IPv4 form |
+| `[server] mark_cleartext` | `true` | Whether the legacy user list marks unencrypted sessions (§10) |
+| `[identity] bindings` | — | *(not implemented)* Both bindings of §5 are served: challenge always, mTLS whenever `[ng] trusted_proxies` is non-empty |
+| `[identity] revocation_max_age`, `revocation_stale` | — | *(not implemented)* §5.2 step 4 is stubbed; there is no registrar to fetch a list from yet |
+| `[legacy] cleartext`, `cleartext_mask` | — | *(not implemented)* §10 marks cleartext sessions; it does not restrict them |
 
-Account records gain `identity_fingerprint` (optional, 32 bytes),
-`identity_login` (bool, default true), `allow_self_link` (bool) and
-`reserve_name` (bool). Existing account files without these are valid.
+Account files gain an `[identity]` table: `fingerprint` (the 52-character
+form), `login` (bool, default true), `allow_self_link` (bool, default
+true) and `reserve_name` (bool, default false). Existing account files
+without it are valid.
+
+An account with a linked identity and no password is reachable *only* by
+proving the identity: the password path refuses it outright, empty
+password included (§8.3). That is what makes `new_accounts = create` safe
+to run on a server that also serves the legacy port.
 
 ---
 
@@ -745,16 +817,31 @@ Account records gain `identity_fingerprint` (optional, 32 bytes),
   binary frames as `AsyncRead`/`AsyncWrite`, plus one extra field on the
   session (the transport identity, if any) consulted at Login (107). The
   legacy frontend otherwise doesn't know it isn't on TCP.
-- The cached card and device certificate per device key are what make the
-  mTLS "connection is the credential" path work; keep them keyed by device
-  fingerprint, with the identity fingerprint alongside.
+- The cached card and device certificate are what make the mTLS
+  "connection is the credential" path work. hxd-ng keys them by device
+  public key (not its fingerprint — the key is what arrives in the
+  certificate, and hashing it to look it up buys nothing), with the
+  identity public key alongside. Both tables are bounded and evicted:
+  they are filled by `/identity/auth`, which any fresh key can reach when
+  `unattested = guest`.
+- Re-admitting a device already on file is a *read-only* admission. It
+  re-checks the signatures, honours an existing account link, and writes
+  nothing — no link, no account creation. Otherwise every upgrade repeats
+  the side effects of the `/identity/auth` that first recorded the device.
+- The successor commitment of §3.4 must outlive the process. A server that
+  holds it only in memory hands an attacker "restart the server" as the
+  way to move it, which is exactly the attack the commitment exists to
+  stop. hxd-ng writes `[identity] successors`.
 - Registrar keys for attestation checks are fetched from the registrar's
   `/.well-known/hotline` over HTTPS and cached with a long lifetime. A
   server with no outbound network still runs identity; it just accepts no
   attestations.
 - Rate limits: `/identity/challenge` and `/identity/auth` per source address
   like login attempts. A forged card costs an attacker nothing and the
-  server two signature checks.
+  server two signature checks. Not implemented in hxd-ng yet; the growth
+  of every table an unauthenticated caller can touch is bounded
+  independently, so the limiter is a refinement rather than a load-bearing
+  part of the design.
 - **Interaction with `CAPABILITY_MESSAGING`.** fogWraith's messaging
   extension keys everything on the account Login; a linked identity is an
   account, so the two compose without change. The seams — a durable key
