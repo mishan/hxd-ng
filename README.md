@@ -36,6 +36,9 @@ bind = "0.0.0.0:5500"
 name = "My Server"
 version = 185          # 0 mimics a pre-1.5 server
 login_timeout = 10
+# mark_cleartext = false  # set User Flags bit 4 on unencrypted legacy sessions
+                          # (identity spec §10); off until that bit is confirmed
+                          # free against 1.8/1.9 clients
 
 [paths]
 accounts = "accounts"
@@ -45,7 +48,8 @@ agreement = "agreement.txt"
 bind = "127.0.0.1:5700"   # plaintext; put a WSS-terminating proxy in front
 grace = 300               # detached-session grace window, seconds
 max_detached_per_addr = 2
-# trusted_proxies = ["127.0.0.1"]   # believe X-Hotline-Client-Cert from these (mTLS binding)
+# trusted_proxies = ["127.0.0.1"]   # believe X-Hotline-Client-Cert (mTLS binding) and
+                                    # Forwarded/X-Forwarded-For (who a ban is about) from these
 
 [identity]                # portable identity — docs/hotline-ng-identity.md; needs [ng]
 key = "identity-server.key"        # server Ed25519 seed, generated on first run
@@ -123,7 +127,10 @@ hlid card --identity id.key --name Misha -o card.cbor
 hlid auth   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
 hlid link   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor --login misha --password-stdin < pw.txt
 hlid tunnel --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
-# then point any 1.x client at 127.0.0.1:5500 — it logs in through the tunnel with your identity
+# then point any 1.x client at 127.0.0.1:5500 — it logs in through the tunnel with your identity.
+# The tunnelled login can link an account too (§8.3), which is why this
+# certificate carries `manage`; a tunnel used with an account that is
+# already linked wants `--caps login,message` instead.
 ```
 
 Try the ng frontend with the bundled client (no install on Node 22+;
