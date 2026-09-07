@@ -217,8 +217,10 @@ async fn handle_login(
 
     // An authenticated socket ignores credentials (§6.2, §8.1): the
     // linked account if there is one (re-read now, so a link made since
-    // the token was issued counts), else guest. `deny` outcomes never
-    // got a token, so they can't reach here.
+    // the token was issued counts), else guest. A socket the identity
+    // layer refused never got a token or a certificate admission, so it
+    // can't reach here — `new_accounts = deny` is decided there, on
+    // every admitting path.
     let auth = ctx.auth.clone();
     let identity_state = ctx.identity.clone();
     let (login, password) = match identity {

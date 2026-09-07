@@ -254,13 +254,18 @@ struct CardRecord {
 }
 
 struct Tables {
+    /// Keyed by SHA-256 of the challenge, as tokens are: §13 says every
+    /// nonce this layer holds is stored hashed, and a nonce is cheap to
+    /// hash.
     challenges: HashMap<[u8; 32], Instant>,
     /// Keyed by SHA-256 of the token, as session tokens are.
     tokens: HashMap<[u8; 32], (TransportIdentity, Instant)>,
     devices: HashMap<PublicKey, DeviceRecord>,
     cards: HashMap<Fingerprint, CardRecord>,
-    /// Inserts since the last expiry sweep of `challenges`.
+    /// Inserts since the last expiry sweep of `challenges`, and when
+    /// that sweep last ran.
     since_sweep: usize,
+    swept: Instant,
     /// When accounts were created by `new_accounts = create`, newest
     /// last; trimmed to the last hour.
     created: Vec<Instant>,
@@ -292,10 +297,23 @@ pub struct IdentityState {
 
 /// Credentials a client may add to `/identity/auth` (§5.4) to verify a
 /// classic account and link it in the same step.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Debug` is hand-written: this rides in `AuthRequest`, which is a
+/// parameter of every admission path, so a derived one puts a
+/// plaintext-equivalent password one `{:?}` away from a log line.
+#[derive(Clone, Copy)]
 pub struct ClassicLogin<'a> {
     pub login: &'a str,
     pub password: &'a [u8],
+}
+
+impl std::fmt::Debug for ClassicLogin<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassicLogin")
+            .field("login", &self.login)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// What a client asks for at `/identity/auth` beyond proving its key.
@@ -376,6 +394,7 @@ impl IdentityState {
                 devices: HashMap::new(),
                 cards: HashMap::new(),
                 since_sweep: 0,
+                swept: Instant::now(),
                 created: Vec::new(),
             }),
             anchors,
@@ -400,8 +419,16 @@ impl IdentityState {
         let now = Instant::now();
         let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         t.since_sweep += 1;
-        if t.since_sweep >= SWEEP_EVERY || t.challenges.len() >= MAX_CHALLENGES {
+        // The second condition used to be "the table is full", which
+        // made every request past the ceiling walk all 65 536 entries on
+        // the way to its 503. Once a second is often enough to notice
+        // the minute-long TTL expiring.
+        let full = t.challenges.len() >= MAX_CHALLENGES;
+        if t.since_sweep >= SWEEP_EVERY
+            || (full && now.duration_since(t.swept) >= Duration::from_secs(1))
+        {
             t.since_sweep = 0;
+            t.swept = now;
             t.challenges
                 .retain(|_, issued| now.duration_since(*issued) < TTL);
         }
@@ -410,7 +437,7 @@ impl IdentityState {
             // shed rather than grow. The client can retry in a minute.
             return None;
         }
-        t.challenges.insert(ch, now);
+        t.challenges.insert(hash(&ch), now);
         Some(ch)
     }
 
@@ -433,7 +460,7 @@ impl IdentityState {
         };
         {
             let mut t = self.tables.lock().unwrap();
-            match t.challenges.remove(&challenge) {
+            match t.challenges.remove(&hash(&challenge)) {
                 Some(issued) if issued.elapsed() < TTL => {}
                 _ => return Err(AuthRefused::UnknownChallenge),
             }
@@ -580,12 +607,24 @@ impl IdentityState {
                 debug!(login = %a.login, "identity_login is off for the linked account");
                 return Err(AuthRefused::Denied);
             }
+            // The classic credentials verified against a real account;
+            // the link is the only thing that didn't happen, and the
+            // operator is who resolves it (§8.2).
             None if pending => (Outcome::ClassicPendingLink, None),
+            // §8.1: `deny` is decided before any of the guest fallbacks,
+            // because it has to hold on every path that admits — the
+            // unattested one, and re-admission of a device already on
+            // file. A device cached while its account was linked used to
+            // be let in as a guest on every upgrade after the operator
+            // removed the link, for the life of its certificate, which
+            // left `deny` no way to lock anyone out.
+            None if self.cfg.new_accounts == NewAccounts::Deny => return Err(AuthRefused::Denied),
             None if !attested && self.cfg.unattested == Unattested::Guest => {
                 (Outcome::UnattestedGuest, None)
             }
             None if assoc == Assoc::ReadOnly => (Outcome::Guest, None),
             None => match self.cfg.new_accounts {
+                // Refused above, ahead of the fallbacks.
                 NewAccounts::Deny => return Err(AuthRefused::Denied),
                 NewAccounts::Guest => (Outcome::Guest, None),
                 // §8.2: `create` used to make `/identity/link`
@@ -595,7 +634,7 @@ impl IdentityState {
                 // account says so, and gets a guest session to do it from.
                 NewAccounts::Create if classic_offered || !req.create => (Outcome::Guest, None),
                 NewAccounts::Create => {
-                    if !self.allow_creation() {
+                    if !self.creation_allowed() {
                         tracing::warn!(
                             fingerprint = %fingerprint.short(),
                             "account-creation rate limit reached; admitting as a guest"
@@ -622,6 +661,11 @@ impl IdentityState {
                                 AuthRefused::Backend
                             })?;
                         if is_new {
+                            // Charged here rather than before the call:
+                            // an identity that already had an account
+                            // isn't creating one, and a failed create
+                            // shouldn't cost the next caller its slot.
+                            self.charge_creation();
                             info!(login = %created.login, fingerprint = %fingerprint.short(), "account created for identity");
                         }
                         (
@@ -671,8 +715,16 @@ impl IdentityState {
         }
         // Anchor a first commitment outside the table lock — it writes a
         // file. A changed one was refused at the top of this function.
-        if let (Some(anchors), Some(s)) = (self.anchors.as_ref(), card.successor) {
-            anchors.commit(&fingerprint, s);
+        //
+        // Only for an identity with standing here: an account (linked or
+        // just created) or an attestation this server accepted. §13 says
+        // every table an unauthenticated caller can grow is bounded, and
+        // with `unattested = guest` a durable line per fresh key is not
+        // that. What the commitment protects is an identity people on
+        // this server have a relationship with; a key nobody knows has
+        // nothing to protect yet, and anchors on its first login here.
+        if let Some(s) = card.successor {
+            self.anchor(&ident, s);
         }
         Ok((b64(&token), ident))
     }
@@ -697,7 +749,7 @@ impl IdentityState {
     /// any fresh key qualifies. Past the ceiling, identities are still
     /// admitted — as guests — so a flood degrades the feature rather
     /// than the server.
-    fn allow_creation(&self) -> bool {
+    fn creation_allowed(&self) -> bool {
         let Some(limit) = self.cfg.max_new_accounts_per_hour else {
             return true;
         };
@@ -705,11 +757,18 @@ impl IdentityState {
         let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         t.created
             .retain(|at| now.duration_since(*at) < Duration::from_secs(3600));
-        if t.created.len() >= limit {
-            return false;
+        t.created.len() < limit
+    }
+
+    /// Count one account against the hour's ceiling.
+    fn charge_creation(&self) {
+        if self.cfg.max_new_accounts_per_hour.is_some() {
+            self.tables
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .created
+                .push(Instant::now());
         }
-        t.created.push(now);
-        true
     }
 
     /// `POST /identity/link` (§8.2 "after auth"): verify the password,
@@ -826,8 +885,10 @@ impl IdentityState {
     ///
     /// Re-admits read-only. The upgrade that lands here is not a fresh
     /// `/identity/auth`, so it doesn't get to repeat that call's side
-    /// effects — no link, no account creation, and no token minted only
-    /// to be thrown away. Signatures *are* re-checked rather than the
+    /// effects — no link and no account creation. It shares `admit`'s
+    /// token issue, so a token is minted and dropped unread; that costs
+    /// one map insert, and having one code path decide admission is
+    /// worth more than saving it. Signatures *are* re-checked rather than the
     /// cache's shape trusted; that's two verifications, which is why
     /// callers run this on the blocking pool.
     pub fn identity_for_device(&self, device: &PublicKey) -> Option<TransportIdentity> {
@@ -868,12 +929,16 @@ impl IdentityState {
 
     /// `PUT /identity/card` for the identity a token or device proved.
     /// Returns the outcome so the caller can broadcast a change.
-    pub fn update_card(&self, identity: &PublicKey, bytes: &[u8]) -> Result<bool, AuthRefused> {
+    pub fn update_card(
+        &self,
+        ident: &TransportIdentity,
+        bytes: &[u8],
+    ) -> Result<bool, AuthRefused> {
         let card = hl_identity::Card::parse(bytes).map_err(|e| classify(&e, bytes.len()))?;
-        if &card.identity != identity {
+        if card.identity != ident.identity {
             return Err(AuthRefused::BadCard);
         }
-        let fp = Fingerprint::of(identity);
+        let fp = ident.fingerprint;
         if successor_changed(self.committed_successor(&fp), &card) {
             return Err(AuthRefused::BadCard);
         }
@@ -884,10 +949,21 @@ impl IdentityState {
             }
             remember_card(&mut t.cards, fp, &card, bytes.to_vec(), Instant::now());
         }
-        if let (Some(anchors), Some(s)) = (self.anchors.as_ref(), card.successor) {
-            anchors.commit(&fp, s);
+        if let Some(s) = card.successor {
+            self.anchor(ident, s);
         }
         Ok(true)
+    }
+
+    /// Persist a successor commitment for an identity with standing —
+    /// see the call in `admit` for why standing is the rule.
+    fn anchor(&self, ident: &TransportIdentity, successor: [u8; 32]) {
+        let Some(anchors) = self.anchors.as_ref() else {
+            return;
+        };
+        if ident.account.is_some() || ident.handle.is_some() {
+            anchors.commit(&ident.fingerprint, successor);
+        }
     }
 
     /// The successor this server has anchored for an identity, if any.
@@ -949,7 +1025,11 @@ fn remember_card(
     });
     entry.seen = seen;
     entry.successor = entry.successor.or(card.successor);
-    if card.updated >= entry.updated {
+    // Strictly newer, matching what `update_card` accepts. With `>=`,
+    // two cards signed in the same second could share an ETag and carry
+    // different bytes, and §7 promises a strong validator. The empty
+    // check is the fresh entry above, whose `updated` is 0.
+    if entry.bytes.is_empty() || card.updated > entry.updated {
         entry.updated = card.updated;
         entry.bytes = bytes;
     }
@@ -970,20 +1050,49 @@ fn successor_changed(committed: Option<[u8; 32]>, card: &hl_identity::Card) -> b
 /// The threat model says every server that cached a card "holds the
 /// commitment"; a table that only lives in the process holds it until the
 /// next restart, and a restart is cheap for the attacker to arrange. One
-/// line per identity, `fingerprint = successor`, both base64url — small
-/// enough to rewrite whole, and readable enough for an operator to audit.
+/// line per identity, `fingerprint = successor`, both base64url —
+/// readable enough for an operator to audit.
+///
+/// Append-only, and written only for identities with standing: rewriting
+/// the whole file under the lock on every insert made one line from an
+/// unauthenticated caller cost a rewrite of every line before it, and
+/// §13's "the growth of every table an unauthenticated caller can touch
+/// is bounded" was not true of this one. Duplicates and junk from an
+/// older build or an interrupted write are compacted away once, at load.
 struct Anchors {
     path: std::path::PathBuf,
-    /// Fingerprint → committed successor, mirroring the file.
+    /// Fingerprint → committed successor, mirroring the file. Read on
+    /// every auth and every card update, so no I/O happens under it.
     map: Mutex<HashMap<Fingerprint, [u8; 32]>>,
+    /// Serialises appends without holding `map`.
+    io: Mutex<()>,
+    /// False when the file exists and could not be read. Writing from
+    /// the empty map we would otherwise start with is "make the caches
+    /// forget", done durably, by a transient `EACCES`.
+    writable: bool,
 }
+
+/// Ceiling on anchored identities. Standing (an account here, or an
+/// accepted attestation) is the real bound; this is the backstop that
+/// doesn't depend on the operator's policy being restrictive.
+const MAX_ANCHORS: usize = 16384;
+
+const ANCHORS_HEADER: &str = "\
+# Successor commitments (docs/hotline-ng-identity.md §3.4).
+# One line per identity: <fingerprint> = <successor, base64url>.
+# Deleting a line un-anchors that identity; that is the attack.
+";
 
 impl Anchors {
     /// Load, tolerating a missing file. A malformed line is skipped with
     /// a warning rather than refusing to start: losing one anchor is bad,
     /// but a server that won't boot is worse, and the operator sees it.
+    /// Any other read failure leaves the table read-only for the run.
     fn load(path: std::path::PathBuf) -> Anchors {
-        let mut map = HashMap::new();
+        use std::collections::hash_map::Entry;
+        let mut map: HashMap<Fingerprint, [u8; 32]> = HashMap::new();
+        let mut writable = true;
+        let mut compact = false;
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 for (n, line) in text.lines().enumerate() {
@@ -997,24 +1106,63 @@ impl Anchors {
                         Some((fp, s))
                     });
                     match parsed {
-                        Some((fp, s)) => {
-                            map.insert(fp, s);
+                        // The first line for an identity wins: the
+                        // commitment is immutable, so a later line is
+                        // not a change to honour. Compacted away below.
+                        Some((fp, s)) => match map.entry(fp) {
+                            Entry::Occupied(e) => {
+                                compact = true;
+                                if *e.get() != s {
+                                    tracing::warn!(
+                                        "{}:{}: second successor for {}, keeping the first",
+                                        path.display(),
+                                        n + 1,
+                                        fp.short()
+                                    );
+                                }
+                            }
+                            Entry::Vacant(v) => {
+                                v.insert(s);
+                            }
+                        },
+                        None => {
+                            compact = true;
+                            tracing::warn!(
+                                "{}:{}: malformed successor anchor, skipped",
+                                path.display(),
+                                n + 1
+                            );
                         }
-                        None => tracing::warn!(
-                            "{}:{}: malformed successor anchor, skipped",
-                            path.display(),
-                            n + 1
-                        ),
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!("{}: {e}; successor anchors not loaded", path.display()),
+            Err(e) => {
+                tracing::error!(
+                    "{}: {e}; successor anchors not loaded, and none will be written until \
+                     this is fixed and the server restarted",
+                    path.display()
+                );
+                writable = false;
+            }
         }
         info!(anchors = map.len(), path = %path.display(), "successor commitments loaded");
+        if writable && compact {
+            let mut text = String::from(ANCHORS_HEADER);
+            let mut lines: Vec<_> = map.iter().collect();
+            lines.sort_by_key(|(fp, _)| fp.to_string());
+            for (fp, s) in lines {
+                text.push_str(&format!("{fp} = {}\n", b64(s)));
+            }
+            if let Err(e) = write_private(&path, &text) {
+                tracing::warn!("{}: {e}; successor anchors not compacted", path.display());
+            }
+        }
         Anchors {
             path,
             map: Mutex::new(map),
+            io: Mutex::new(()),
+            writable,
         }
     }
 
@@ -1027,29 +1175,61 @@ impl Anchors {
     }
 
     /// Record a first commitment. Never overwrites: a changed successor
-    /// is refused before we get here.
+    /// is refused before we get here, and a second value for an identity
+    /// already on file is dropped rather than replacing the anchor in
+    /// memory — memory outranks disk in `committed_successor`, so the
+    /// key holder could otherwise make their own card unusable until the
+    /// next restart.
     fn commit(&self, fp: &Fingerprint, successor: [u8; 32]) {
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        if map.insert(*fp, successor).is_some() {
+        if !self.writable {
             return;
         }
-        let mut text = String::from(
-            "# Successor commitments (docs/hotline-ng-identity.md §3.4).\n\
-             # One line per identity: <fingerprint> = <successor, base64url>.\n\
-             # Deleting a line un-anchors that identity; that is the attack.\n",
-        );
-        let mut lines: Vec<_> = map.iter().collect();
-        lines.sort_by_key(|(fp, _)| fp.to_string());
-        for (fp, s) in lines {
-            text.push_str(&format!("{fp} = {}\n", b64(s)));
+        {
+            use std::collections::hash_map::Entry;
+            let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            if map.len() >= MAX_ANCHORS && !map.contains_key(fp) {
+                tracing::warn!(
+                    anchors = map.len(),
+                    "successor anchor table is full; {} not anchored",
+                    fp.short()
+                );
+                return;
+            }
+            match map.entry(*fp) {
+                Entry::Occupied(_) => return,
+                Entry::Vacant(v) => v.insert(successor),
+            };
         }
-        if let Err(e) = write_private(&self.path, &text) {
+        // The file, outside the map lock: `get` runs on every auth.
+        let _io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = append_private(&self.path, &format!("{fp} = {}\n", b64(&successor))) {
+            // Memory keeps the commitment, which is the safe direction:
+            // it is enforced for this run and lost at the next restart.
             tracing::error!(
                 "{}: {e}; successor anchor not persisted",
                 self.path.display()
             );
         }
     }
+}
+
+/// Append one line to a 0600 file, fsynced, creating it with its header
+/// if it isn't there yet.
+fn append_private(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    if f.metadata()?.len() == 0 {
+        f.write_all(ANCHORS_HEADER.as_bytes())?;
+    }
+    f.write_all(line.as_bytes())?;
+    f.sync_all()
 }
 
 /// Write a file 0600 through a temp-and-rename, fsynced.
@@ -1352,6 +1532,25 @@ mod tests {
         assert!(ident.age >= 1000);
         assert_eq!(ident.outcome, Outcome::Guest);
 
+        // Trusted, but the registration is younger than the server
+        // asks for: §12's `min_attestation_age`, which is the knob for
+        // "a handle registered this morning is not standing".
+        let mut cfg = IdentityConfig {
+            min_attestation_age: 100_000_000,
+            ..Default::default()
+        };
+        cfg.registrar_keys.insert("hl.example".into(), reg.public());
+        let st = state(cfg);
+        let ch = st.issue_challenge().unwrap();
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now);
+        let (_, ident) = st
+            .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .unwrap();
+        // The handle is still reported — it verified — but the identity
+        // counts as unattested for policy.
+        assert_eq!(ident.handle.as_deref(), Some("misha@hl.example"));
+        assert_eq!(ident.outcome, Outcome::UnattestedGuest);
+
         // Same card, registrar not trusted: unattested.
         let st = state(IdentityConfig::default());
         let ch = st.issue_challenge().unwrap();
@@ -1363,19 +1562,42 @@ mod tests {
         assert_eq!(ident.outcome, Outcome::UnattestedGuest);
     }
 
+    /// The transport identity a token or a client certificate would
+    /// have left behind, for the endpoints that take one.
+    fn transport_of(id: &IdentityKey, dev: &DeviceKey, handle: Option<&str>) -> TransportIdentity {
+        TransportIdentity {
+            identity: id.public(),
+            device: dev.public(),
+            fingerprint: id.fingerprint(),
+            handle: handle.map(str::to_owned),
+            age: 0,
+            outcome: Outcome::Guest,
+            device_caps: None,
+            account: None,
+            downstream_cleartext: false,
+        }
+    }
+
     #[test]
     fn card_update_needs_a_newer_timestamp() {
         let st = state(IdentityConfig::default());
         let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = DeviceKey::from_seed(&[2u8; 32]);
+        let ident = transport_of(&id, &dev, None);
         let now = now_unix();
         let c1 = Card::new(&id, "One", now).sign(&id, vec![]).unwrap();
         let c2 = Card::new(&id, "Two", now + 1).sign(&id, vec![]).unwrap();
-        assert!(st.update_card(&id.public(), &c2).unwrap());
-        assert!(!st.update_card(&id.public(), &c1).unwrap());
+        let c3 = Card::new(&id, "Three", now + 1).sign(&id, vec![]).unwrap();
+        assert!(st.update_card(&ident, &c2).unwrap());
+        assert!(!st.update_card(&ident, &c1).unwrap());
+        // Equal `updated` doesn't replace the bytes either: the ETag is
+        // `updated`, and §7 calls it a strong validator.
+        assert!(!st.update_card(&ident, &c3).unwrap());
         assert_eq!(st.card(&id.fingerprint()).unwrap().1, c2);
         let other = IdentityKey::from_seed(&[9u8; 32]);
         assert_eq!(
-            st.update_card(&other.public(), &c2).unwrap_err(),
+            st.update_card(&transport_of(&other, &dev, None), &c2)
+                .unwrap_err(),
             AuthRefused::BadCard
         );
     }

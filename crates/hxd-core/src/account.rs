@@ -68,7 +68,8 @@ pub enum LinkOutcome {
     Already(Account),
     /// The identity already links a different account — which one.
     Taken(Account),
-    /// The account links another identity, or forbids self-linking.
+    /// The account links another identity, forbids self-linking, or has
+    /// no password — see [`AuthBackend::link_identity`].
     Refused(Account),
 }
 
@@ -166,6 +167,13 @@ pub trait AuthBackend: Send + Sync + 'static {
     /// separate calls, two concurrent logins by one identity naming two
     /// different accounts both see "not linked" and both write, and the
     /// identity ends up linked to two accounts.
+    ///
+    /// A password-less account is refused here, for the same reason
+    /// [`AuthBackend::authenticate`] refuses one that is already linked:
+    /// every caller verifies the password first, and for such an account
+    /// the empty password verifies for anyone. Self-linking is "prove
+    /// you own the account, then bind it to your key"; without a
+    /// password there is nothing to prove.
     fn link_identity(&self, login: &str, fingerprint: &[u8; 32]) -> Result<LinkOutcome, AuthError>;
 
     /// Clear the link on whichever account `fingerprint` links (§8.4).

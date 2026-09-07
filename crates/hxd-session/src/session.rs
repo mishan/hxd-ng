@@ -564,6 +564,12 @@ pub async fn run_session<S>(
     let _ = writer.await;
 }
 
+/// Does this login name the guest account? Empty is guest by convention
+/// (`AuthBackend::authenticate`), and so is the name itself.
+fn names_guest(login: &str) -> bool {
+    login.is_empty() || login.eq_ignore_ascii_case("guest")
+}
+
 /// The classic login, reconciled with the socket's transport identity
 /// when it has one (`docs/hotline-ng-identity.md` §8.3). Without an
 /// identity this is just `authenticate`.
@@ -589,8 +595,17 @@ fn reconcile_login(
         debug!(login = %a.login, "trtp_login = trust: using the linked account");
         return Ok(a);
     }
-    let account = auth.authenticate(login, Proof::Plain(password))?;
-    if account.login == "guest" {
+    let account = match auth.authenticate(login, Proof::Plain(password)) {
+        Ok(a) => Some(a),
+        // Deleting `guest.toml` is the documented way to turn guests
+        // off, and it used to refuse a linked identity's guest login on
+        // this wire while the JSON wire admitted the same identity on
+        // the link alone. Naming no account is a question about the
+        // identity; only a linked account that may log in answers it.
+        Err(AuthError::NoSuchAccount) if names_guest(login) && identity_admits => None,
+        Err(e) => return Err(e),
+    };
+    if account.as_ref().is_none_or(|a| a.login == "guest") {
         // §8.1: naming no account on an identity socket associates by
         // identity. A link the operator has disabled is a refusal, not a
         // fallback to guest — the account said no, and handing out a
@@ -601,9 +616,10 @@ fn reconcile_login(
                 info!(login = %a.login, "identity_login is off for the linked account");
                 Err(AuthError::BadProof)
             }
-            None => Ok(account),
+            None => account.ok_or(AuthError::NoSuchAccount),
         };
     }
+    let account = account.expect("a named account was authenticated");
     match account.identity.fingerprint {
         Some(f) if f == fp => Ok(account),
         Some(_) => {

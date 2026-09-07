@@ -282,6 +282,18 @@ impl FileAuth {
     }
 }
 
+/// Has this file's stamp settled? A file modified within the last second
+/// may be edited again at the same length inside one mtime tick — some
+/// filesystems only keep whole seconds — and the index would not see it.
+/// So a just-touched file is re-read on every lookup until it stops
+/// being just-touched, which costs one read on a file someone is editing.
+fn settled(stamp: &FileStamp, now: SystemTime) -> bool {
+    stamp
+        .modified
+        .and_then(|m| now.duration_since(m).ok())
+        .is_some_and(|age| age >= std::time::Duration::from_secs(1))
+}
+
 /// A login is a filename component; keep it boring. Same character set the
 /// original servers accepted in practice.
 fn valid_login(login: &str) -> bool {
@@ -291,6 +303,12 @@ fn valid_login(login: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@'))
         && !login.starts_with('.')
+}
+
+/// Logins the server gives its own meaning to, so an account created
+/// for an identity may not be named one.
+fn is_reserved_login(login: &str) -> bool {
+    login == "guest"
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -360,7 +378,16 @@ impl AuthBackend for FileAuth {
         if account.identity.fingerprint == Some(*fingerprint) {
             return Ok(LinkOutcome::Already(account));
         }
-        if account.identity.fingerprint.is_some() || !account.identity.allow_self_link {
+        // A password-less account has nothing to prove: `authenticate`
+        // admits it on `""`, so every link site's "verify the credentials
+        // first" step passes for anyone. Linking one would hand the
+        // account to whoever asked, and the link then makes the password
+        // path refuse everybody else (§8.3) while `unlink` answers
+        // `would_orphan` — a capture only a hand edit undoes.
+        if !account.has_password
+            || account.identity.fingerprint.is_some()
+            || !account.identity.allow_self_link
+        {
             return Ok(LinkOutcome::Refused(account));
         }
         if let Some(other) = self.find_by_fingerprint(fingerprint)? {
@@ -441,6 +468,17 @@ impl AuthBackend for FileAuth {
         // lock, since an operator can drop a file in at any moment.
         let mut candidate = base.clone();
         for n in 2..=1001 {
+            // `guest` is the login every wire resolves an empty one to,
+            // and the one the identity paths special-case; a handle of
+            // `guest@registrar` on a server with no guest account would
+            // otherwise write a password-less `guest.toml` with a
+            // fingerprint in it, and `lookup("")` would find it. An
+            // existing account file collides on its own, which covers
+            // reserved names.
+            if !valid_login(&candidate) || is_reserved_login(&candidate) {
+                candidate = format!("{base}-{n}");
+                continue;
+            }
             let path = self.dir.join(format!("{candidate}.toml"));
             match write_new(&path, &text) {
                 Ok(()) => return Ok((self.lookup(&candidate)?, true)),
@@ -507,9 +545,10 @@ impl FileAuth {
         let entries = self.entries()?;
         let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
         index.retain(|login, _| entries.iter().any(|(l, _)| l == login));
+        let now = SystemTime::now();
         let mut found = None;
         for (login, stamp) in entries {
-            let fresh = index.get(&login).is_some_and(|(s, _)| *s == stamp);
+            let fresh = settled(&stamp, now) && index.get(&login).is_some_and(|(s, _)| *s == stamp);
             if !fresh {
                 let fp = match self.load(&login) {
                     Ok(f) => f.identity.fingerprint,
@@ -943,6 +982,27 @@ mod tests {
     }
 
     #[test]
+    fn a_password_less_account_cannot_be_captured_by_linking() {
+        // The empty password verifies for anyone, so every link site's
+        // "check the credentials first" step passes; linking would then
+        // shut everyone else out of a kiosk account, and `unlink` would
+        // answer `would_orphan`. Self-linking needs something to prove.
+        let (td, auth) = backend();
+        write(td.path(), "kiosk.toml", "name = \"Kiosk\"\n");
+        assert!(matches!(
+            auth.link_identity("kiosk", &[9u8; 32]).unwrap(),
+            LinkOutcome::Refused(_)
+        ));
+        assert!(auth.lookup("kiosk").unwrap().identity.fingerprint.is_none());
+        // With a password it links as usual.
+        write(td.path(), "kiosk.toml", "password = \"pw\"\n");
+        assert!(matches!(
+            auth.link_identity("kiosk", &[9u8; 32]).unwrap(),
+            LinkOutcome::Linked(_)
+        ));
+    }
+
+    #[test]
     fn unlink_refuses_to_orphan_a_password_less_account() {
         let (td, auth) = backend();
         let fp = [4u8; 32];
@@ -983,20 +1043,15 @@ mod tests {
     fn the_fingerprint_index_notices_an_edited_file() {
         let (td, auth) = backend();
         let fp = [8u8; 32];
-        write(td.path(), "misha.toml", "password = \"pw\"\n");
+        let mine = hl_identity::Fingerprint(fp).to_string();
+        let other = hl_identity::Fingerprint([9u8; 32]).to_string();
+        let file = |f: &str| format!("password = \"pw\"\n[identity]\nfingerprint = \"{f}\"\n");
+        write(td.path(), "misha.toml", &file(&other));
         assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
-        // A hand edit, not one of ours. Sleep past the mtime granularity
-        // some filesystems have; the length changes too, which is the
-        // other half of the stamp.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        write(
-            td.path(),
-            "misha.toml",
-            &format!(
-                "password = \"pw\"\n[identity]\nfingerprint = \"{}\"\n",
-                hl_identity::Fingerprint(fp)
-            ),
-        );
+        // A hand edit, not one of ours — and the same length, inside one
+        // mtime tick, which is all the stamp has to go on. A file this
+        // fresh is re-read rather than trusted.
+        write(td.path(), "misha.toml", &file(&mine));
         assert_eq!(
             auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
             "misha"
@@ -1072,6 +1127,20 @@ mod tests {
         // And it reads back as exactly what went in.
         let back = auth.lookup(&a.login).unwrap();
         assert_eq!(back.access, access);
+    }
+
+    #[test]
+    fn create_never_writes_the_guest_account() {
+        // `guest` is what an empty login resolves to and what the
+        // identity paths special-case. A handle of `guest@registrar`
+        // used to write a password-less `guest.toml` with a fingerprint.
+        let (td, auth) = backend();
+        let (acct, made) = auth
+            .find_or_create_linked("guest", "Guest", &[5u8; 32], AccessBits::empty())
+            .unwrap();
+        assert!(made);
+        assert_eq!(acct.login, "guest-2");
+        assert!(!td.path().join("guest.toml").exists());
     }
 
     #[test]
