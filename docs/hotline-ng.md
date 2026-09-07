@@ -62,7 +62,9 @@ not**, overridable per account either way (`[extra] can_detach = true` for
 a trusted kiosk account, `= false` for a passworded account on probation).
 Two backstops keep even permitted detaching bounded: at most **2 detached
 sessions per source address** (config `[ng] max_detached_per_addr`; the
-oldest is ended when exceeded), and admin moderation works on detached
+oldest is ended when exceeded; behind a reverse proxy the address is the
+one the proxy forwards, see the identity spec's §5.3, since otherwise
+every client shares the proxy's), and admin moderation works on detached
 users — they sit on the roster, so they can be kicked and banned like
 anyone else, which ends the session on the spot.
 

@@ -150,13 +150,13 @@ encoded.
 | `v` | uint | yes | `1` |
 | `identity` | bstr(32) | yes | |
 | `updated` | uint | yes | Servers never replace a cached card with an older one |
-| `name` | tstr | yes | Display name, 1–32 chars after NFC |
+| `name` | tstr | yes | Display name, 1–32 characters. No control or invisible characters (§3.5); signers SHOULD normalise to NFC, but verifiers do not — a verifier re-serves the exact bytes it was given, so it cannot normalise them |
 | `icon` | uint | no | Legacy icon id |
 | `profile` | tstr | no | ≤ 2048 bytes |
-| `attestations` | array | no | Attestation objects, each fully signed |
+| `attestations` | array | no | Attestation objects, each fully signed; at most 8. The size limit alone allows dozens, and each one an unauthenticated caller embeds is a signature the server verifies |
 | `vouches` | array | no | Federation spec; ignored by servers that don't implement it |
 | `links` | array of tstr | no | URLs to display; servers never fetch them |
-| `successor` | bstr(32) | no | SHA-256 of a pre-committed successor identity key (threat model, "stolen identity key"). Once set, immutable: a later card for the same identity that changes or omits it is refused (`bad_card`) by any server that cached the earlier one, and rotation is accepted only to the committed key. |
+| `successor` | bstr(32) | no | SHA-256 of a pre-committed successor identity key (threat model, "stolen identity key"). Once set, immutable: a later card for the same identity that changes or omits it is refused (`bad_card`) by any server that cached the earlier one, and rotation is accepted only to the committed key. A server persists the commitment for identities with standing on it — see §13. |
 | `sig` | bstr(64) | yes | |
 
 ### 3.5 Attestation
@@ -169,7 +169,7 @@ Domain `hl-identity/attestation/v1`, signed by a registrar key.
 | `identity` | bstr(32) | yes | |
 | `registrar` | tstr | yes | Registrar host, lowercase |
 | `registrar_key` | bstr(32) | yes | Hint only; verifiers confirm against the registrar's published key |
-| `handle` | tstr | yes | Local part; full handle is `handle@registrar` |
+| `handle` | tstr | yes | Local part; full handle is `handle@registrar`. No `@`, no whitespace, and no control or invisible characters — a handle is rendered next to account logins and display names, so a zero-width space or a bidi override in one is a spoof of another |
 | `registered` | uint | yes | First registration; preserved across reissue; the value used for age |
 | `issued` | uint | yes | |
 | `expires` | uint | yes | Recommended one year |
@@ -397,7 +397,17 @@ sent — otherwise a client can send the header through the proxy carrying
 any device's public certificate and impersonate that device. In Caddy,
 `header_up X-Hotline-Client-Cert {http.request.tls.client.certificate_der_base64}`
 does both: it replaces any inbound value, and sets nothing when there was
-no client certificate.
+no client certificate. An empty value means the client offered no
+certificate, which is "none" and not "a broken one" — some proxies send
+the header unconditionally.
+
+A trusted proxy is also believed about *who* it is speaking for:
+`Forwarded: for=…` (RFC 7239) or `X-Forwarded-For`, first element, is the
+address the server keys bans and per-address session limits on. Without
+that, every client behind the proxy shares one address, so banning one of
+them bans the deployment. The same "set it, don't pass it through" rule
+applies: a proxy that forwards a client-supplied `Forwarded` lets a
+client choose whose ban it inherits.
 
 nginx has no base64-DER variable. `$ssl_client_escaped_cert` is
 **URL-encoded PEM**, not base64 DER, and a server that can't decode the
@@ -592,14 +602,30 @@ Login (107) as guest):
   (for reserved-name enforcement, marking, and linking later); `create`
   makes an account named from the handle's local part (numeric suffix on
   collision) or the short fingerprint, with the server's default identity
-  access, no password, and the link set.
+  access, no password, and the link set. The login name an account is
+  created under is never one the server gives its own meaning to, `guest`
+  in particular.
+
+`deny` is decided on every path that admits an identity with no linked
+account — including the unattested one and the re-admission of a device
+already on file (§5.3) — so removing a link locks that device out at its
+next connection rather than at its certificate's expiry.
 
 `/identity/auth` reports which of these will happen as `outcome`.
 
 ### 8.2 Linking an existing classic account
 
-Two ways, both requiring the account to allow self-linking and to have no
-link to a different identity:
+**Writing a link is account management, and every path that writes one
+requires the device certificate's `manage` capability** — at auth, after
+auth, and inside a tunnel (§8.3). A certificate without it can still log
+in and use the server; it cannot bind an account to the key. Note what
+this means for a tunnel that will self-link: §11.1's advice to carry only
+the login and message bits is right for a tunnel used with an
+already-linked account, and a tunnel that is expected to make the link
+needs `manage` as well.
+
+Three ways, all requiring the account to allow self-linking, to have a
+password, and to have no link to a different identity:
 
 - **At auth.** `/identity/auth` includes `login` and `password`. The server
   verifies the password as for a normal login. If the identity also
@@ -608,8 +634,11 @@ link to a different identity:
   `classic_pending_link`, and a subsequent ng `login` naming that account
   logs in by identity as a guest of that account's name — the operator
   resolves the link.
+- **Inside a tunnel.** A classic Login (107) on a tunnelled socket that
+  names a self-linkable account and gives its password links it, exactly
+  as "at auth" does (§8.3).
 - **After auth.** `POST /identity/link` with `{ "login", "password" }`.
-  Requires the manage bit. On success a guest session belonging to this
+  On success a guest session belonging to this
   identity is upgraded in place: the server sends `user_changed` for it
   with the new nick and admin flag and a `self` refresh event carrying the
   new access. Servers that don't want to support in-place upgrade may
@@ -618,6 +647,14 @@ link to a different identity:
 
 Linking an identity to a second account on the same server is refused
 with `already_linked`.
+
+**A password-less account is never linked this way.** Every path above
+verifies the account's password first, and an account with no password
+verifies for anybody — so self-linking one would hand it to whoever
+asked, and §8.3's rule that a linked password-less account refuses the
+password path would then lock everyone else out. The operator links such
+an account by editing its file, which is also where the account came
+from.
 
 ### 8.3 Tunnelled TRTP sessions
 
@@ -628,11 +665,15 @@ reconciles the two is the `[identity] trtp_login` setting:
 
 - `verify` (default) — classic credentials are checked exactly as on the
   TCP port. If they name an account, that account must be the one linked
-  to the identity, or have no link and be self-linkable (in which case the
-  login links it, as §8.2 "at auth" does); naming someone else's account
-  fails the login. A guest login associates per §8.1. The identity adds
-  marking, reserved-name enforcement and admission; it never substitutes
-  for a password.
+  to the identity, or have no link and be self-linkable *and the socket's
+  certificate must carry `manage`* (in which case the login links it, as
+  §8.2 "at auth" does); naming someone else's account fails the login, and
+  so does naming a linkable account from a certificate that may not write
+  links. A guest login associates per §8.1, and does so even on a server
+  with no guest account at all: naming no account is a question about the
+  identity, and a linked account that may log in answers it. The identity
+  adds marking, reserved-name enforcement and admission; it never
+  substitutes for a password.
 - `trust` — if the identity has a linked account **whose
   `identity_login` is on**, that account is used and the classic
   credentials are ignored. This lets a linked account be password-less
@@ -647,6 +688,14 @@ reconciles the two is the `[identity] trtp_login` setting:
   setting unreliable in exactly the deployments that set it. A session
   reaching such an account still needs its password, and a guest login
   on that socket fails with `denied` per §8.1.
+
+  "Still needs its password" is a TRTP-path statement. On the ng JSON
+  path an identity socket ignores credentials entirely (§6.2) — there is
+  nowhere to put a password that the server will read — so an account
+  with `identity_login = false` is reachable only from a socket with no
+  transport identity. That is the intended shape (the account has said it
+  does not want identity login), but a client has to know to open a plain
+  socket for it.
 
 Either way the session is identity-aware from the server's point of view
 and indistinguishable from a native identity session in the roster.
@@ -683,7 +732,9 @@ current practice; the identity layer only adds enforcement for sessions the
 server can recognise.
 
 When any session tries to set a display name reserved by another account,
-the server refuses it. On ng, `nick` replies `error: name_reserved`. On the
+the server refuses it. *(hxd-ng reads and stores `reserve_name`; the
+enforcement described in the rest of this section is not wired to the
+name-setting paths yet.)* On ng, `nick` replies `error: name_reserved`. On the
 legacy wire, where Set Client User Info (304) has no reply, the server
 substitutes a discriminated name (`misha~7f3a` for a tunnelled session
 with an identity, `misha (2)` for a plain classic one) and announces the
@@ -706,9 +757,20 @@ classic session *sees*, not about authentication:
 - **Transport marking.** So that ng users can be warned before PMing a
   session whose link is readable in transit, every roster entry on ng
   carries `transport`. On the legacy wire, servers *may* set bit 4 (value
-  16) of User Flags (112) for cleartext sessions; classic clients ignore
+  16) of User Flags (112) for cleartext sessions; 1.2/1.5 clients ignore
   unknown flag bits, and clients that know it render a marker. This is the
   one TRTP-visible change and a server may omit it.
+
+  **The bit is not settled.** Hotline 1.8/1.9 may already allocate value
+  16 in field 112 as "automatic response", in which case setting it makes
+  every cleartext session look auto-responding to those clients, and this
+  document has to move the marker to a bit nothing has claimed. Nothing
+  in the tree the reference implementation was written from confirms
+  either reading, so hxd-ng ships the marking **off by default**
+  (`[server] mark_cleartext`) until it has been checked against a real
+  1.8.5 or 1.9 client. An implementation that turns it on by default is
+  betting on the reading that has not been verified, which the "never
+  break old clients" rule does not allow.
 - **Cleartext policy.** A three-position setting: `off` (legacy port
   refuses sessions that don't negotiate HOPE transport encryption, or is
   behind a TLS wrapper), `restricted` (cleartext sessions have their access
@@ -759,8 +821,12 @@ key, listens on a local TCP port for the classic client, and forwards
 bytes over a TRTP-over-WebSocket connection (§6.3) to the server.
 
 - It authenticates upstream with its own device key by either binding. Its
-  device certificate should carry only the login and message bits; it is
-  a device like any other and appears in the user's device list as one.
+  device certificate should carry only the login and message bits, unless
+  the user means to link an account through it: writing a link needs
+  `manage` on every path (§8.2), the tunnelled classic login included, so
+  a tunnel that will self-link needs that bit too and should lose it once
+  the link is made. It is a device like any other and appears in the
+  user's device list as one.
 - It presents the identity's current card, cached from wherever the user
   last set it; it does not synthesise cards.
 - It forwards bytes verbatim in both directions and does nothing else. In
@@ -825,11 +891,11 @@ is design, not configuration, and setting it is a startup error —
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `[identity]` present | absent | The section's presence is the master switch. Absent, discovery reports `enabled: false` and the endpoints 404. The section is only read when `[ng]` is also present — without an ng listener there is nothing to serve them from |
+| `[identity]` present | absent | The section's presence is the master switch. Absent, discovery reports `enabled: false` and the endpoints 404. It needs `[ng]`: without an ng listener there is nothing to serve the endpoints from, so `[identity]` without `[ng]` is a startup error rather than a section quietly ignored |
 | `[identity] key` | `identity-server.key` | The server's Ed25519 seed, hex, mode 0600; generated on first run |
 | `[identity] new_accounts` | `guest` | `deny`, `guest`, `create`. The default is `guest` rather than `deny` so that, with `unattested = guest`, an attested identity is never treated worse than an unattested one |
 | `[identity.default_access]` | guest access | Access bits for accounts `create` writes, keyed exactly as an account file's `[access]` table. The guest fallback is convenient but wrong for anything guests may not have — the messaging extension's `AccessMessaging`, for one — so operators using `create` should set it explicitly |
-| `[identity] max_new_accounts_per_hour` | `60` | Ceiling on accounts `create` may write per hour. Past it, identities are still admitted, as guests. `create` writes a file per never-seen key, and with `unattested = guest` any fresh key qualifies |
+| `[identity] max_new_accounts_per_hour` | `60` | Ceiling on accounts `create` may write per hour; `0` turns creation off while leaving the rest of `create` in place. Past the ceiling, identities are still admitted, as guests. `create` writes a file per never-seen key, and with `unattested = guest` any fresh key qualifies |
 | `[identity] allow_list` | empty | Fingerprints or handles; non-empty means identity login is restricted to these |
 | `[identity] min_attestation_age` | `0` | Seconds |
 | `[identity] unattested` | `guest` | `deny`, `guest`, `allow` |
@@ -837,9 +903,9 @@ is design, not configuration, and setting it is a startup error —
 | `[identity] clock_skew` | `300` | Seconds |
 | `[identity] trtp` | `true` | Serve the TRTP-over-WebSocket path |
 | `[identity] trtp_login` | `verify` | `verify` or `trust`; see §8.3 |
-| `[identity] successors` | `identity-successors` | Where §3.4 successor commitments are kept. `""` keeps them in memory only, which means a restart forgets them — and making the caches forget is the attack the commitment exists to stop |
-| `[ng] trusted_proxies` | empty | Addresses whose `X-Hotline-Client-Cert` header is believed. Single addresses or CIDR blocks (`["127.0.0.1", "10.0.0.0/8"]`); IPv4-mapped peers on a `[::]` bind match their IPv4 form |
-| `[server] mark_cleartext` | `true` | Whether the legacy user list marks unencrypted sessions (§10) |
+| `[identity] successors` | `identity-successors` | Where §3.4 successor commitments are kept, for the identities §13 says get one. `""` keeps them in the card cache only, which a restart forgets — and so does enough traffic to evict the card. Making the caches forget is the attack the commitment exists to stop |
+| `[ng] trusted_proxies` | empty | Addresses whose `X-Hotline-Client-Cert` and `Forwarded`/`X-Forwarded-For` headers are believed (§5.3). Single addresses or CIDR blocks (`["127.0.0.1", "10.0.0.0/8"]`); IPv4-mapped peers on a `[::]` bind match their IPv4 form |
+| `[server] mark_cleartext` | `false` | Whether the legacy user list marks unencrypted sessions with User Flags bit 4. Off until that bit is confirmed free against 1.8/1.9 — see §10 |
 | `[identity] bindings` | — | *(not implemented)* Both bindings of §5 are served: challenge always, mTLS whenever `[ng] trusted_proxies` is non-empty |
 | `[identity] revocation_max_age`, `revocation_stale` | — | *(not implemented)* §5.2 step 4 is stubbed; there is no registrar to fetch a list from yet |
 | `[legacy] cleartext`, `cleartext_mask` | — | *(not implemented)* §10 marks cleartext sessions; it does not restrict them |
@@ -883,14 +949,36 @@ to run on a server that also serves the legacy port.
   re-checks the signatures, honours an existing account link, and writes
   nothing — no link, no account creation. Otherwise every upgrade repeats
   the side effects of the `/identity/auth` that first recorded the device.
+  Read-only is about *writes*, not about policy: `new_accounts = deny`,
+  the allow list and the attestation rules are decided again on every
+  admission. A device cached while its account was linked must not keep
+  being admitted as a guest after the operator removes the link.
 - The successor commitment of §3.4 must outlive the process. A server that
   holds it only in memory hands an attacker "restart the server" as the
   way to move it, which is exactly the attack the commitment exists to
-  stop. hxd-ng writes `[identity] successors`.
+  stop. hxd-ng writes `[identity] successors`, one line per identity,
+  appended and compacted at load rather than rewritten per insert.
+- **Who gets anchored.** Only an identity with *standing* on this server:
+  one with an account here (linked or created) or an attestation the
+  server accepted. Anchoring every card that ever authenticated
+  contradicts the bounded-growth rule below — with `unattested = guest`
+  any fresh key can reach `/identity/auth`, and each one would leave a
+  durable line behind. What a commitment protects is a relationship
+  people on the server have with an identity; a key nobody here knows has
+  none yet, and gets its anchor on the login that gives it one. A server
+  bounds the table as well and says so in its log when it is full: a
+  ceiling that only holds while the operator's policy is restrictive is
+  not a bound.
 - Registrar keys for attestation checks are fetched from the registrar's
   `/.well-known/hotline` over HTTPS and cached with a long lifetime. A
   server with no outbound network still runs identity; it just accepts no
   attestations.
+- Bounding the verification work one request can buy matters as much as
+  bounding storage: a card is an unauthenticated caller's bytes, and
+  everything in it that costs a signature check needs a count. hxd-ng
+  verifies a card's own envelope before anything it contains, caps the
+  attestations it will look at (§3.4), and checks each one's cheap fields
+  and subject before its signature.
 - Rate limits: `/identity/challenge` and `/identity/auth` per source address
   like login attempts. A forged card costs an attacker nothing and the
   server two signature checks. Not implemented in hxd-ng yet; the growth
@@ -929,6 +1017,11 @@ to run on a server that also serves the legacy port.
   key can't mint its own renewal. The registrar spec needs a renew-device
   flow that doesn't unwrap the identity key on the device; its shape decides
   whether 90-day certificates are practical.
+- **User Flags bit 4 on 1.8/1.9.** §10's cleartext marker takes value 16
+  in field 112 on the strength of "classic clients ignore unknown bits".
+  If 1.8/1.9 already means "automatic response" by that value, the marker
+  has to move to a bit nothing has claimed. Needs testing against a real
+  client before any server turns marking on by default.
 - **Multiple sessions per identity on one server.** `hotline-ng.md` §12
   already asks whether the roster should group same-user sessions. Identity
   gives it a reliable key to group on; this document doesn't require it.

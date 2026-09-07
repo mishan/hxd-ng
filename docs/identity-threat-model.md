@@ -171,6 +171,12 @@ Mitigations:
   the "make the caches forget" move the commitment exists to block. The attacker
   can therefore publish a card with their own commitment only to servers
   that have never seen the user, which is the registrar's job to cover.
+  "Every server that cached the card" is narrower in practice: a server
+  anchors an identity it has a relationship with — an account, or an
+  attestation it accepted — because a durable line per passing key is a
+  disk-filling primitive for anyone who can reach the auth endpoint (spec
+  §13). A user who has never logged in anywhere is covered by the
+  registrar's record, not by servers that have only seen their card.
 
 Residual risk: between theft and freeze, the attacker is the user. Reserved
 names and standing follow the successor key after rotation, so a frozen
