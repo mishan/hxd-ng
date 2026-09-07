@@ -1238,7 +1238,9 @@ mod tests {
     fn objects(id: &IdentityKey, dev: &DeviceKey) -> (Vec<u8>, Vec<u8>) {
         let now = now_unix();
         let card = Card::new(id, "Misha", now).sign(id, vec![]).unwrap();
-        let cert = DeviceCert::for_device(id, dev, now - 10, cert::RECOMMENDED_LIFETIME).sign(id);
+        let cert = DeviceCert::for_device(id, dev, now - 10, cert::RECOMMENDED_LIFETIME)
+            .unwrap()
+            .sign(id);
         (card, cert)
     }
 
@@ -1331,7 +1333,9 @@ mod tests {
         let card = Card::new(&id, "Misha", now)
             .sign(&id, vec![att.signed_value(&reg)])
             .unwrap();
-        let cert = DeviceCert::for_device(&id, &dev, now - 10, 1000).sign(&id);
+        let cert = DeviceCert::for_device(&id, &dev, now - 10, 1000)
+            .unwrap()
+            .sign(&id);
 
         let mut cfg = IdentityConfig {
             new_accounts: NewAccounts::Guest,
@@ -1523,7 +1527,9 @@ mod tests {
         let card = Card::new(&id, "Misha N", now)
             .sign(&id, vec![att.signed_value(&reg)])
             .unwrap();
-        let cert = DeviceCert::for_device(&id, &dev, now - 10, 1000).sign(&id);
+        let cert = DeviceCert::for_device(&id, &dev, now - 10, 1000)
+            .unwrap()
+            .sign(&id);
         let proof = proof_for(&st, &dev);
         let (_, ident) = st
             .auth_with_proof(&card, &cert, &proof, AuthRequest::default())

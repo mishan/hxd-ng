@@ -202,9 +202,6 @@ async fn transport_identity(
     ctx: &NgCtx,
     consume: Consume,
 ) -> Result<Option<TransportIdentity>, Box<Resp>> {
-    let Some(state) = ctx.identity.as_ref() else {
-        return Ok(None);
-    };
     let bearer = req
         .headers()
         .get(AUTHORIZATION)
@@ -216,6 +213,20 @@ async fn transport_identity(
         .query()
         .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")))
         .map(str::to_owned);
+    let Some(state) = ctx.identity.as_ref() else {
+        // Identity is off, so nothing here can redeem a token — but a
+        // client that presented one believes it authenticated, and
+        // upgrading it as an anonymous guest tells it otherwise only by
+        // implication. The guarantee is the same either way: a token
+        // that doesn't work is a 401, never a silent downgrade.
+        if bearer.or(query).is_some() {
+            return Err(Box::new(plain(
+                StatusCode::UNAUTHORIZED,
+                "identity is not enabled on this server",
+            )));
+        }
+        return Ok(None);
+    };
     if let Some(token) = bearer.or(query) {
         return match state.redeem(&token, consume == Consume::Yes) {
             Some(i) => Ok(Some(i)),
@@ -406,6 +417,17 @@ fn der_tlv(der: &[u8]) -> Option<(Tlv<'_>, &[u8])> {
     Some((Tlv { tag, value }, rest))
 }
 
+/// A JSON field that must be a string if it is there at all. `Err` means
+/// "present and not a string", which is a client bug worth reporting
+/// rather than treating as absence.
+fn opt_str(body: &Value, key: &str) -> Result<Option<String>, ()> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(()),
+    }
+}
+
 fn base64_any(s: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     let s = s.trim();
@@ -498,14 +520,22 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
         return plain(StatusCode::BAD_REQUEST, "card and device_cert are required");
     };
     // §5.4: classic credentials, verified and linked in the same step.
-    let login = body.get("login").and_then(Value::as_str).map(str::to_owned);
-    let password = body
-        .get("password")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    if login.is_some() != password.is_some() {
-        return plain(StatusCode::BAD_REQUEST, "login and password go together");
-    }
+    //
+    // A present field of the wrong type is an error, not an absence:
+    // `{"login": 7, "password": 7}` would otherwise read as "no
+    // credentials", pass the pairing check, and answer 200 with a guest
+    // or created outcome — a link the client asked for and did not get,
+    // reported as success.
+    let (login, password) = match (opt_str(&body, "login"), opt_str(&body, "password")) {
+        (Ok(l), Ok(p)) if l.is_some() == p.is_some() => (l, p),
+        (Ok(_), Ok(_)) => return plain(StatusCode::BAD_REQUEST, "login and password go together"),
+        _ => {
+            return plain(
+                StatusCode::BAD_REQUEST,
+                "login and password must be strings",
+            )
+        }
+    };
     let downstream = match body.get("downstream").and_then(Value::as_str) {
         None | Some("local") | Some("loopback") => Downstream::Local,
         Some("cleartext") => Downstream::Cleartext,
@@ -594,13 +624,13 @@ async fn link(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
         return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
     };
-    let (Some(login), Some(password)) = (
-        body.get("login").and_then(Value::as_str).map(str::to_owned),
-        body.get("password")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-    ) else {
-        return plain(StatusCode::BAD_REQUEST, "login and password are required");
+    let (Ok(Some(login)), Ok(Some(password))) =
+        (opt_str(&body, "login"), opt_str(&body, "password"))
+    else {
+        return plain(
+            StatusCode::BAD_REQUEST,
+            "login and password are required, as strings",
+        );
     };
     let st = st.clone();
     let result =

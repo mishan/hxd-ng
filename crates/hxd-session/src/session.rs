@@ -578,20 +578,31 @@ fn reconcile_login(
     let Some(fp) = identity_fp else {
         return auth.authenticate(login, Proof::Plain(password));
     };
-    let linked = auth
-        .find_by_fingerprint(&fp)?
-        .filter(|a| a.identity.identity_login);
-    if policy == TrtpLogin::Trust {
-        if let Some(a) = linked {
-            debug!(login = %a.login, "trtp_login = trust: using the linked account");
-            return Ok(a);
-        }
+    // Unfiltered: "no account links this identity" and "one does but the
+    // operator turned identity login off" are different answers, and
+    // §8.1 gives them different outcomes. Collapsing them here turned the
+    // second into a silent guest session, where the ng path denies it.
+    let linked = auth.find_by_fingerprint(&fp)?;
+    let identity_admits = linked.as_ref().is_some_and(|a| a.identity.identity_login);
+    if policy == TrtpLogin::Trust && identity_admits {
+        let a = linked.expect("identity_admits implies a linked account");
+        debug!(login = %a.login, "trtp_login = trust: using the linked account");
+        return Ok(a);
     }
     let account = auth.authenticate(login, Proof::Plain(password))?;
     if account.login == "guest" {
-        // A guest login on an identity socket lands on the linked
-        // account if there is one — the same rule as the ng path.
-        return Ok(linked.unwrap_or(account));
+        // §8.1: naming no account on an identity socket associates by
+        // identity. A link the operator has disabled is a refusal, not a
+        // fallback to guest — the account said no, and handing out a
+        // guest session instead is answering a different question.
+        return match linked {
+            Some(a) if identity_admits => Ok(a),
+            Some(a) => {
+                info!(login = %a.login, "identity_login is off for the linked account");
+                Err(AuthError::BadProof)
+            }
+            None => Ok(account),
+        };
     }
     match account.identity.fingerprint {
         Some(f) if f == fp => Ok(account),
@@ -611,13 +622,29 @@ fn reconcile_login(
                     Ok(a)
                 }
                 LinkOutcome::Already(a) => Ok(a),
-                // Someone else's, or the account refused: the password
-                // was right, so the classic login stands and the
-                // identity is decoration on this session only.
-                LinkOutcome::Taken(_) | LinkOutcome::Refused(_) => Ok(account),
+                // The identity already links someone else's account, or
+                // this one refused. §8.3 `verify` allows exactly two
+                // shapes — the account linked to this identity, or an
+                // unlinked self-linkable one — so this is neither.
+                LinkOutcome::Taken(_) | LinkOutcome::Refused(_) => {
+                    info!(login = %account.login, "tunnelled login names an account this identity may not have");
+                    Err(AuthError::BadProof)
+                }
             }
         }
-        None => Ok(account),
+        // Unlinked, and either not self-linkable or this socket's
+        // certificate lacks `manage`. §8.3 `verify`: an identity socket
+        // may land on the account linked to it, or on an unlinked
+        // account it is allowed to link — nothing else. Admitting it
+        // anyway would put an account that refused association on the
+        // roster as identity-bound, which is the state `allow_self_link
+        // = false` exists to prevent. The password still works on the
+        // plain TCP port, which is where an account that wants nothing
+        // to do with identities belongs.
+        None => {
+            info!(login = %account.login, "tunnelled login names an account that refuses self-linking");
+            Err(AuthError::BadProof)
+        }
     }
 }
 

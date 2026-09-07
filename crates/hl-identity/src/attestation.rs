@@ -69,8 +69,16 @@ impl Attestation {
 
     /// Sign as the registrar. `self.registrar_key` must be `key`'s public
     /// half.
+    ///
+    /// `assert!`, not `debug_assert!` (AGENTS.md): a wire invariant a
+    /// release build must not skip, or a registrar ships attestations
+    /// that verify nowhere.
     pub fn sign(&self, key: &ServerKey) -> Vec<u8> {
-        debug_assert_eq!(key.public(), self.registrar_key);
+        assert_eq!(
+            key.public(),
+            self.registrar_key,
+            "signing an attestation with a key that is not its registrar_key"
+        );
         signed::seal(self.unsigned(), |body| key.sign(DOMAIN, body))
     }
 

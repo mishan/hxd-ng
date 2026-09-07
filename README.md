@@ -115,7 +115,10 @@ the server:
 
 ```sh
 hlid keygen identity id.key && hlid keygen device dev.key
-hlid cert --identity id.key --device dev.key --caps web -o cert.cbor
+# `login,message,manage` — anything that writes an account link needs
+# `manage`, and `--caps web` deliberately excludes it. A browser device
+# gets `web`; the device you administer your account from gets this.
+hlid cert --identity id.key --device dev.key --caps login,message,manage -o cert.cbor
 hlid card --identity id.key --name Misha -o card.cbor
 hlid auth   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
 hlid link   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor --login misha --password-stdin < pw.txt
