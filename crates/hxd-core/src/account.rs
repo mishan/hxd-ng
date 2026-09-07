@@ -17,7 +17,7 @@ use crate::access::AccessBits;
 
 /// A resolved account: what the auth backend hands the session layer after
 /// a successful authentication.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     /// The canonical login name (lowercase by convention).
     pub login: String,
@@ -57,6 +57,42 @@ pub struct IdentityLink {
     /// Is this account's login name reserved as a display name on the
     /// server (§9)? Backend default false.
     pub reserve_name: bool,
+}
+
+/// What [`AuthBackend::link_identity`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkOutcome {
+    /// The link was written; the account as it now reads.
+    Linked(Account),
+    /// The account already linked this identity; nothing written.
+    Already(Account),
+    /// The identity already links a different account — which one.
+    Taken(Account),
+    /// The account links another identity, or forbids self-linking.
+    Refused(Account),
+}
+
+/// What [`AuthBackend::unlink_identity`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnlinkOutcome {
+    /// The link was cleared; the account as it read before.
+    Unlinked(Account),
+    /// No account links this identity here.
+    NotLinked,
+    /// The account has no password, so the link is its only way in
+    /// (§8.4). Set a password first.
+    WouldOrphan(Account),
+}
+
+/// What a transport-authenticated socket may change about account
+/// association (`docs/hotline-ng-identity.md` §8.2): the device
+/// certificate's `manage` capability, carried alongside `Transport`
+/// rather than inside it — `Transport` is descriptive and roster-visible,
+/// and this authorizes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkAuthority {
+    /// The device certificate grants `manage`.
+    pub may_link: bool,
 }
 
 /// The client's proof of identity.
@@ -104,6 +140,14 @@ impl std::error::Error for AuthError {}
 pub trait AuthBackend: Send + Sync + 'static {
     /// Authenticate `login` with `proof`. An empty login means guest;
     /// backends decide whether a guest account exists.
+    ///
+    /// An account that has no password but *does* link an identity must
+    /// be refused here, whatever the proof (§8.3): for those accounts the
+    /// device key is the credential, and an empty password is not one.
+    /// Otherwise every account `new_accounts = create` writes is open to
+    /// anyone who types its login and presses return on the legacy port.
+    /// The identity paths reach such accounts through
+    /// [`AuthBackend::lookup`], having proved the key first.
     fn authenticate(&self, login: &str, proof: Proof<'_>) -> Result<Account, AuthError>;
 
     /// Load an account without a proof. For the identity paths, where
@@ -114,25 +158,37 @@ pub trait AuthBackend: Send + Sync + 'static {
     /// The account linked to an identity, if any.
     fn find_by_fingerprint(&self, fingerprint: &[u8; 32]) -> Result<Option<Account>, AuthError>;
 
-    /// Set or clear an account's identity link. Callers enforce the
-    /// one-to-one rule; the backend just writes.
-    fn set_identity_link(
-        &self,
-        login: &str,
-        fingerprint: Option<[u8; 32]>,
-    ) -> Result<(), AuthError>;
+    /// Link `fingerprint` to `login`, enforcing the one-to-one rule.
+    ///
+    /// **The whole decision happens inside the backend**, because the
+    /// callers can't make it safely: read the account, check whether the
+    /// identity is spoken for, and write, all as one step. Done as
+    /// separate calls, two concurrent logins by one identity naming two
+    /// different accounts both see "not linked" and both write, and the
+    /// identity ends up linked to two accounts.
+    fn link_identity(&self, login: &str, fingerprint: &[u8; 32]) -> Result<LinkOutcome, AuthError>;
 
-    /// Create an account linked to an identity (`new_accounts = create`).
-    /// `login` is the caller's proposal; the backend may return a
-    /// different one if it had to disambiguate. `access` is the initial
-    /// bitmap; the account gets no password.
-    fn create_linked(
+    /// Clear the link on whichever account `fingerprint` links (§8.4).
+    /// Atomic for the same reason as [`AuthBackend::link_identity`], and
+    /// it refuses to leave a password-less account with no way in.
+    fn unlink_identity(&self, fingerprint: &[u8; 32]) -> Result<UnlinkOutcome, AuthError>;
+
+    /// The account linked to `fingerprint`, creating one if there is
+    /// none (`new_accounts = create`). `proposed` is the caller's
+    /// suggested login; the backend may pick another if it collides.
+    /// `access` is the initial bitmap, and the account gets no password
+    /// — so it is reachable only by proving the identity.
+    ///
+    /// The `bool` is true when the account was created by this call.
+    /// Atomic: without that, two logins by one never-seen identity make
+    /// two accounts for it.
+    fn find_or_create_linked(
         &self,
-        login: &str,
+        proposed: &str,
         name: &str,
-        fingerprint: [u8; 32],
+        fingerprint: &[u8; 32],
         access: AccessBits,
-    ) -> Result<Account, AuthError>;
+    ) -> Result<(Account, bool), AuthError>;
 
     /// Which account, if any, reserves `name` as a display name (§9):
     /// an account with `reserve_name` whose login equals `name`,

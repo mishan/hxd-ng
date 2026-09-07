@@ -23,20 +23,23 @@
 //! everyone else.
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hxd_core::{IdentityTag, Transport};
+use hxd_core::{IdentityTag, LinkAuthority, Transport};
 use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, CONTENT_TYPE, ETAG};
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, info, warn};
 
-use crate::identity::{b64, unb64, AuthRefused, ClassicLogin, Downstream, TransportIdentity};
+use crate::identity::{
+    b64, unb64, AuthRefused, AuthRequest, ClassicLogin, Downstream, TransportIdentity,
+};
 use crate::{conn, tunnel, NgCtx};
 
 type Resp = Response<Full<Bytes>>;
@@ -52,11 +55,18 @@ pub(crate) async fn serve_connection(stream: TcpStream, peer: SocketAddr, ctx: N
         return;
     }
     let io = TokioIo::new(stream);
+    let head_timeout = ctx.cfg.login_timeout;
     let svc = hyper::service::service_fn(move |req| {
         let ctx = ctx.clone();
         async move { Ok::<_, std::convert::Infallible>(route(req, peer, ctx).await) }
     });
+    // hyper's default 30 s header timeout is silently inert without a
+    // timer, so a half-open `GET /ng` would hold a task forever. On the
+    // TCP listener the accept itself was under `login_timeout`; here the
+    // request head is, and the body timeout is in `read_body`.
     let conn = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(head_timeout)
         .serve_connection(io, svc)
         .with_upgrades();
     if let Err(e) = conn.await {
@@ -69,12 +79,12 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
 
     if hyper_tungstenite::is_upgrade_request(&req) {
         return match path.as_str() {
-            "/" | "/ng" => upgrade(&mut req, peer, ctx, Proto::Json),
+            "/" | "/ng" => upgrade(&mut req, peer, ctx, Proto::Json).await,
             "/trtp"
                 if ctx.identity.as_ref().is_some_and(|i| i.config().trtp)
                     && ctx.tunnel.is_some() =>
             {
-                upgrade(&mut req, peer, ctx, Proto::Trtp)
+                upgrade(&mut req, peer, ctx, Proto::Trtp).await
             }
             _ => plain(StatusCode::NOT_FOUND, "no such WebSocket path"),
         };
@@ -104,11 +114,24 @@ enum Proto {
     Trtp,
 }
 
+/// Whether presenting a transport token spends it.
+///
+/// §6.1 makes the token single-use for the *upgrade*. The management
+/// endpoints are not upgrades, and spending the token there left the
+/// client unable to open a socket afterwards without re-running the whole
+/// challenge/auth dance — so a client would link and then have to
+/// authenticate again to use what it had just linked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Consume {
+    Yes,
+    No,
+}
+
 /// Authenticate the upgrade (§6.1), then hand the socket to the
 /// application protocol. The upgrade itself completes in a spawned task
 /// once this response has gone out.
-fn upgrade(req: &mut Request<Incoming>, peer: SocketAddr, ctx: NgCtx, proto: Proto) -> Resp {
-    let identity = match transport_identity(req, peer, &ctx) {
+async fn upgrade(req: &mut Request<Incoming>, peer: SocketAddr, ctx: NgCtx, proto: Proto) -> Resp {
+    let identity = match transport_identity(req, peer, &ctx, Consume::Yes).await {
         Ok(i) => i,
         Err(resp) => return *resp,
     };
@@ -144,8 +167,21 @@ fn upgrade(req: &mut Request<Incoming>, peer: SocketAddr, ctx: NgCtx, proto: Pro
                     encrypted: !identity.as_ref().is_some_and(|i| i.downstream_cleartext),
                     identity: identity.as_ref().map(TransportIdentity::tag),
                 };
-                sink.run(Box::new(tunnel::WsByteStream::new(ws)), peer, transport)
-                    .await;
+                // §8.2: the tunnelled login can self-link, which is a
+                // write of an association — so it needs the same `manage`
+                // capability `/identity/link` asks for.
+                let link = LinkAuthority {
+                    may_link: identity
+                        .as_ref()
+                        .is_some_and(|i| i.allows(hl_identity::caps::MANAGE)),
+                };
+                sink.run(
+                    Box::new(tunnel::WsByteStream::new(ws)),
+                    peer,
+                    transport,
+                    link,
+                )
+                .await;
             }
         }
     });
@@ -157,10 +193,15 @@ fn upgrade(req: &mut Request<Incoming>, peer: SocketAddr, ctx: NgCtx, proto: Pro
 /// §6.1: bearer token in `Authorization`, `?token=` in the URL, or a
 /// client certificate from a trusted proxy. An invalid token is a 401,
 /// never a silent downgrade to unauthenticated.
-fn transport_identity(
+///
+/// Async because the certificate path re-verifies two signatures and may
+/// read the accounts directory: that is not work for the reactor, and it
+/// used to run there on every upgrade.
+async fn transport_identity(
     req: &Request<Incoming>,
     peer: SocketAddr,
     ctx: &NgCtx,
+    consume: Consume,
 ) -> Result<Option<TransportIdentity>, Box<Resp>> {
     let Some(state) = ctx.identity.as_ref() else {
         return Ok(None);
@@ -177,7 +218,7 @@ fn transport_identity(
         .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")))
         .map(str::to_owned);
     if let Some(token) = bearer.or(query) {
-        return match state.redeem(&token) {
+        return match state.redeem(&token, consume == Consume::Yes) {
             Some(i) => Ok(Some(i)),
             None => Err(Box::new(plain(
                 StatusCode::UNAUTHORIZED,
@@ -185,8 +226,17 @@ fn transport_identity(
             ))),
         };
     }
-    if let Some(device) = client_cert_device(req, peer.ip(), ctx) {
-        return match state.identity_for_device(&device) {
+    if let Some(device) = client_cert_device(req, peer.ip(), ctx)? {
+        let state = state.clone();
+        let found = tokio::task::spawn_blocking(move || state.identity_for_device(&device))
+            .await
+            .map_err(|_| {
+                Box::new(plain(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "certificate check failed",
+                ))
+            })?;
+        return match found {
             Some(i) => Ok(Some(i)),
             None => Err(Box::new(plain(
                 StatusCode::UNAUTHORIZED,
@@ -200,28 +250,161 @@ fn transport_identity(
 /// The mTLS header contract (§5.3): `X-Hotline-Client-Cert` is base64
 /// DER, believed only from `trusted_proxies`. Only the Ed25519 public key
 /// is extracted; nothing else in the certificate is examined.
-fn client_cert_device(req: &Request<Incoming>, peer: IpAddr, ctx: &NgCtx) -> Option<[u8; 32]> {
-    let header = req.headers().get("x-hotline-client-cert")?;
-    if !ctx.cfg.trusted_proxies.contains(&peer) {
-        warn!(%peer, "X-Hotline-Client-Cert from an untrusted address, ignored");
-        return None;
+///
+/// `Ok(None)` means "no certificate was offered": either the header is
+/// absent, or it came from somewhere we don't trust and was ignored. A
+/// header we *do* trust but can't decode is an error, not an absence —
+/// falling through would quietly admit the request as a guest, which is
+/// the failure mode a misconfigured proxy (nginx's URL-encoded
+/// `$ssl_client_escaped_cert`, say) produces.
+fn client_cert_device(
+    req: &Request<Incoming>,
+    peer: IpAddr,
+    ctx: &NgCtx,
+) -> Result<Option<[u8; 32]>, Box<Resp>> {
+    let Some(header) = req.headers().get("x-hotline-client-cert") else {
+        return Ok(None);
+    };
+    if !ctx.cfg.trusted_proxies.contains(peer) {
+        // `debug`, not `warn`: anyone on the internet can send this
+        // header, and a per-request warning is a log-flood primitive.
+        debug!(%peer, "X-Hotline-Client-Cert from an untrusted address, ignored");
+        return Ok(None);
     }
-    let der = base64_any(header.to_str().ok()?)?;
-    spki_ed25519(&der)
+    let bad = || {
+        warn!(%peer, "trusted proxy sent an undecodable X-Hotline-Client-Cert");
+        Box::new(plain(
+            StatusCode::BAD_REQUEST,
+            "X-Hotline-Client-Cert must be base64 DER (see §5.3)",
+        ))
+    };
+    let der = header.to_str().ok().and_then(base64_any).ok_or_else(bad)?;
+    spki_ed25519(&der).map(Some).ok_or_else(bad)
 }
 
-/// Locate an Ed25519 SubjectPublicKeyInfo in a DER certificate: the
-/// algorithm OID 1.3.101.112 (`06 03 2b 65 70`) followed by a 33-byte BIT
-/// STRING with no unused bits. A full DER parser would find the same
-/// bytes by a longer road; RFC 8410 fixes this encoding, so a search for
-/// it is exact rather than heuristic. Replace with a real parser when
-/// the certificate has to be examined for anything else.
+/// The Ed25519 public key from a DER certificate's
+/// `subjectPublicKeyInfo`, found by position.
+///
+/// ```text
+/// Certificate    ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+/// TBSCertificate ::= SEQUENCE { [0] version DEFAULT v1, serialNumber, signature,
+///                               issuer, validity, subject, subjectPublicKeyInfo, ... }
+/// ```
+///
+/// Everything ahead of the SPKI is chosen by whoever requested the
+/// certificate — `serialNumber` is an arbitrary INTEGER and a `Name`
+/// attribute value is `ANY` — so *searching* the DER for RFC 8410's
+/// algorithm identifier finds whatever bytes the subject planted, not
+/// the key the proxy validated the handshake against. That is an
+/// impersonation primitive: a self-signed certificate carrying the
+/// attacker's own key in the SPKI (so `optional_no_ca` accepts it) and a
+/// victim's device key in the subject would yield the victim's key.
+///
+/// So: walk the skeleton, skip the five fields between the version and
+/// the SPKI without looking inside them, and take the key only from the
+/// SPKI, and only under the Ed25519 OID.
 fn spki_ed25519(der: &[u8]) -> Option<[u8; 32]> {
-    const PATTERN: [u8; 8] = [0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
-    let at = der.windows(PATTERN.len()).position(|w| w == PATTERN)?;
-    der.get(at + PATTERN.len()..at + PATTERN.len() + 32)?
-        .try_into()
-        .ok()
+    const SEQUENCE: u8 = 0x30;
+    const INTEGER: u8 = 0x02;
+    const BIT_STRING: u8 = 0x03;
+    const OID: u8 = 0x06;
+    /// `[0] EXPLICIT` — the optional version.
+    const CONTEXT_0: u8 = 0xa0;
+    /// 1.3.101.112 (RFC 8410), the OID body without its header.
+    const ED25519_OID: [u8; 3] = [0x2b, 0x65, 0x70];
+
+    let (cert, after) = der_tlv(der)?;
+    if cert.tag != SEQUENCE || !after.is_empty() {
+        return None;
+    }
+    let (tbs, _) = der_tlv(cert.value)?;
+    if tbs.tag != SEQUENCE {
+        return None;
+    }
+    let mut rest = tbs.value;
+    // `version` is `[0] EXPLICIT` and absent from a v1 certificate.
+    let (first, after_version) = der_tlv(rest)?;
+    if first.tag == CONTEXT_0 {
+        rest = after_version;
+    }
+    // serialNumber, signature, issuer, validity, subject: skipped by
+    // shape. Their contents are never examined, which is the point.
+    for tag in [INTEGER, SEQUENCE, SEQUENCE, SEQUENCE, SEQUENCE] {
+        let (field, after) = der_tlv(rest)?;
+        if field.tag != tag {
+            return None;
+        }
+        rest = after;
+    }
+    // SubjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey }
+    let (spki, _) = der_tlv(rest)?;
+    if spki.tag != SEQUENCE {
+        return None;
+    }
+    let (alg, after_alg) = der_tlv(spki.value)?;
+    if alg.tag != SEQUENCE {
+        return None;
+    }
+    // RFC 8410 §3: the algorithm identifier is the OID alone, and the
+    // parameters field is absent.
+    let (oid, alg_tail) = der_tlv(alg.value)?;
+    if oid.tag != OID || oid.value != ED25519_OID || !alg_tail.is_empty() {
+        return None;
+    }
+    let (key, spki_tail) = der_tlv(after_alg)?;
+    if key.tag != BIT_STRING || !spki_tail.is_empty() {
+        return None;
+    }
+    // A BIT STRING's first content byte counts its unused trailing bits;
+    // a key has none.
+    match key.value.split_first() {
+        Some((0, bits)) => bits.try_into().ok(),
+        _ => None,
+    }
+}
+
+/// One DER tag-length-value.
+struct Tlv<'a> {
+    tag: u8,
+    value: &'a [u8],
+}
+
+/// Split the leading TLV off `der`, returning it and what follows.
+/// Definite lengths in their minimal encoding only — DER permits nothing
+/// else, and being strict here keeps the walk above honest.
+fn der_tlv(der: &[u8]) -> Option<(Tlv<'_>, &[u8])> {
+    let (&tag, rest) = der.split_first()?;
+    // High-tag-number form doesn't occur in a certificate's skeleton.
+    if tag & 0x1f == 0x1f {
+        return None;
+    }
+    let (&first, rest) = rest.split_first()?;
+    let (len, rest) = if first < 0x80 {
+        (usize::from(first), rest)
+    } else {
+        // 0x80 is the indefinite form (not DER); four length bytes is
+        // already longer than any certificate.
+        let n = usize::from(first & 0x7f);
+        if n == 0 || n > 4 || rest.len() < n {
+            return None;
+        }
+        let (bytes, rest) = rest.split_at(n);
+        if bytes[0] == 0 {
+            return None; // non-minimal
+        }
+        let len = bytes
+            .iter()
+            .fold(0usize, |acc, b| (acc << 8) | usize::from(*b));
+        if len < 0x80 {
+            return None; // should have used the short form
+        }
+        (len, rest)
+    };
+    if rest.len() < len {
+        return None;
+    }
+    let (value, rest) = rest.split_at(len);
+    Some((Tlv { tag, value }, rest))
 }
 
 fn base64_any(s: &str) -> Option<Vec<u8>> {
@@ -285,8 +468,15 @@ fn challenge(ctx: &NgCtx) -> Resp {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
     // Rate limiting belongs here (§13); it should share whatever the
-    // login-attempt limiter becomes rather than grow its own.
-    let ch = st.issue_challenge();
+    // login-attempt limiter becomes rather than grow its own. Until it
+    // exists, the challenge table has a ceiling of its own, and reaching
+    // it sheds rather than grows.
+    let Some(ch) = st.issue_challenge() else {
+        return plain(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many outstanding challenges; retry shortly",
+        );
+    };
     json_resp(
         StatusCode::OK,
         json!({ "challenge": b64(&ch), "server_key": b64(&st.server_key()), "expires_in": 60 }),
@@ -297,8 +487,11 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     let Some(st) = ctx.identity.as_ref() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
-    let device_from_cert = client_cert_device(&req, peer.ip(), ctx);
-    let Some(body) = read_json(req).await else {
+    let device_from_cert = match client_cert_device(&req, peer.ip(), ctx) {
+        Ok(d) => d,
+        Err(resp) => return *resp,
+    };
+    let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
         return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
     };
     let field = |k: &str| body.get(k).and_then(Value::as_str).and_then(unb64);
@@ -324,6 +517,10 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
             )
         }
     };
+    // §8.2: a client that means to link an existing classic account
+    // says `create: false`, so the server doesn't make it a new one
+    // first and then refuse the link as `already_linked`.
+    let create = body.get("create").and_then(Value::as_bool).unwrap_or(true);
     let proof = field("proof");
     if proof.is_none() && device_from_cert.is_none() {
         return plain(
@@ -342,9 +539,14 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
                 login,
                 password: password.as_bytes(),
             });
+        let req = AuthRequest {
+            classic,
+            downstream,
+            create,
+        };
         match (proof, device_from_cert) {
-            (Some(proof), _) => st.auth_with_proof(&card, &cert, &proof, classic, downstream),
-            (None, Some(device)) => st.auth_presented(&card, &cert, &device, classic, downstream),
+            (Some(proof), _) => st.auth_with_proof(&card, &cert, &proof, req),
+            (None, Some(device)) => st.auth_presented(&card, &cert, &device, req),
             (None, None) => unreachable!("checked above"),
         }
     })
@@ -380,7 +582,7 @@ async fn link(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     let Some(st) = ctx.identity.as_ref() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
-    let ident = match transport_identity(&req, peer, ctx) {
+    let ident = match transport_identity(&req, peer, ctx, Consume::No).await {
         Ok(Some(i)) => i,
         Ok(None) => {
             return plain(
@@ -390,7 +592,7 @@ async fn link(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
         }
         Err(resp) => return *resp,
     };
-    let Some(body) = read_json(req).await else {
+    let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
         return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
     };
     let (Some(login), Some(password)) = (
@@ -419,7 +621,7 @@ async fn unlink(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     let Some(st) = ctx.identity.as_ref() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
-    let ident = match transport_identity(&req, peer, ctx) {
+    let ident = match transport_identity(&req, peer, ctx, Consume::No).await {
         Ok(Some(i)) => i,
         Ok(None) => {
             return plain(
@@ -474,7 +676,7 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
     let Some(st) = ctx.identity.as_ref() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
-    let ident = match transport_identity(&req, peer, ctx) {
+    let ident = match transport_identity(&req, peer, ctx, Consume::No).await {
         Ok(Some(i)) => i,
         Ok(None) => {
             return plain(
@@ -487,10 +689,16 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
     if !ident.allows(hl_identity::caps::MANAGE) {
         return refused(AuthRefused::NoManage);
     }
-    let Some(bytes) = read_body(req).await else {
+    let Some(bytes) = read_body(req, ctx.cfg.login_timeout).await else {
         return plain(StatusCode::BAD_REQUEST, "expected a CBOR body");
     };
-    match st.update_card(&ident.identity, &bytes) {
+    let state = st.clone();
+    let identity = ident.identity;
+    let updated = tokio::task::spawn_blocking(move || state.update_card(&identity, &bytes)).await;
+    let Ok(updated) = updated else {
+        return plain(StatusCode::INTERNAL_SERVER_ERROR, "card update task failed");
+    };
+    match updated {
         Ok(true) => {
             // §7: notify sessions of the change. Sessions don't yet carry
             // an identity → uid index; this lands with account association.
@@ -506,13 +714,26 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
 
 // --- Plumbing -----------------------------------------------------------
 
-async fn read_body(req: Request<Incoming>) -> Option<Vec<u8>> {
+/// Read a request body, bounded in both size and time: `Content-Length:
+/// 1000` followed by one byte is otherwise a task held open for as long
+/// as the client cares to hold it.
+async fn read_body(req: Request<Incoming>, within: Duration) -> Option<Vec<u8>> {
     let limited = Limited::new(req.into_body(), MAX_BODY);
-    limited.collect().await.ok().map(|c| c.to_bytes().to_vec())
+    match tokio::time::timeout(within, limited.collect()).await {
+        Ok(Ok(c)) => Some(c.to_bytes().to_vec()),
+        Ok(Err(e)) => {
+            debug!("body read failed: {e}");
+            None
+        }
+        Err(_) => {
+            debug!("body read timed out");
+            None
+        }
+    }
 }
 
-async fn read_json(req: Request<Incoming>) -> Option<Value> {
-    let bytes = read_body(req).await?;
+async fn read_json(req: Request<Incoming>, within: Duration) -> Option<Value> {
+    let bytes = read_body(req, within).await?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -564,15 +785,122 @@ impl From<&TransportIdentity> for IdentityTag {
 mod tests {
     use super::*;
 
+    /// Encode one TLV with a minimal definite length.
+    fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let n = body.len();
+        if n < 0x80 {
+            out.push(n as u8);
+        } else {
+            let bytes = n.to_be_bytes();
+            let start = bytes.iter().position(|b| *b != 0).unwrap();
+            out.push(0x80 | (bytes.len() - start) as u8);
+            out.extend_from_slice(&bytes[start..]);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn ed25519_spki(key: &[u8; 32]) -> Vec<u8> {
+        let alg = tlv(0x06, &[0x2b, 0x65, 0x70]);
+        let mut bits = vec![0x00];
+        bits.extend_from_slice(key);
+        let mut body = tlv(0x30, &alg);
+        body.extend_from_slice(&tlv(0x03, &bits));
+        tlv(0x30, &body)
+    }
+
+    /// A certificate skeleton: `subject` is whatever the requester asked
+    /// for, `key` is what the proxy actually validated against.
+    fn certificate(key: &[u8; 32], subject: &[u8], serial: &[u8]) -> Vec<u8> {
+        let mut tbs = tlv(0xa0, &tlv(0x02, &[0x02])); // [0] version v3
+        tbs.extend_from_slice(&tlv(0x02, serial)); // serialNumber
+        tbs.extend_from_slice(&tlv(0x30, &tlv(0x06, &[0x2b, 0x65, 0x70]))); // signature
+        tbs.extend_from_slice(&tlv(0x30, &[])); // issuer
+        tbs.extend_from_slice(&tlv(0x30, &[])); // validity
+        tbs.extend_from_slice(&tlv(0x30, subject)); // subject
+        tbs.extend_from_slice(&ed25519_spki(key));
+        let mut cert = tlv(0x30, &tbs);
+        let mut outer = cert.clone();
+        outer.extend_from_slice(&tlv(0x30, &tlv(0x06, &[0x2b, 0x65, 0x70])));
+        outer.extend_from_slice(&tlv(0x03, &[0x00; 65]));
+        cert = tlv(0x30, &outer);
+        cert
+    }
+
     #[test]
     fn spki_extraction_finds_the_key() {
         let key = [0xabu8; 32];
-        let mut der = vec![0x30, 0x82, 0x01, 0x00, 0x02, 0x01, 0x02];
-        der.extend_from_slice(&[0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]);
-        der.extend_from_slice(&[0x03, 0x21, 0x00]);
-        der.extend_from_slice(&key);
-        der.extend_from_slice(&[0xa3, 0x00]);
+        let der = certificate(&key, &[], &[0x01]);
         assert_eq!(spki_ed25519(&der), Some(key));
         assert_eq!(spki_ed25519(&der[..der.len() - 40]), None);
+        assert_eq!(spki_ed25519(&[]), None);
+        assert_eq!(spki_ed25519(&[0x30, 0x00]), None);
+    }
+
+    #[test]
+    fn a_key_planted_ahead_of_the_spki_is_not_the_certificates_key() {
+        let attacker = [0x11u8; 32];
+        let victim = [0x22u8; 32];
+        // Exactly the byte pattern RFC 8410 fixes for an Ed25519 SPKI,
+        // planted where the requester controls the encoding: once in an
+        // attribute value inside `subject`, once inside `serialNumber`.
+        let mut planted = vec![0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+        planted.extend_from_slice(&victim);
+
+        let der = certificate(&attacker, &tlv(0x13, &planted), &[0x01]);
+        assert_eq!(
+            spki_ed25519(&der),
+            Some(attacker),
+            "the key must come from the SPKI, never from the subject"
+        );
+
+        let mut serial = vec![0x01];
+        serial.extend_from_slice(&planted);
+        let der = certificate(&attacker, &[], &serial);
+        assert_eq!(spki_ed25519(&der), Some(attacker));
+    }
+
+    #[test]
+    fn a_non_ed25519_certificate_yields_nothing() {
+        // Same skeleton, but the SPKI names some other algorithm.
+        let alg = tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]); // ecPublicKey
+        let mut bits = vec![0x00];
+        bits.extend_from_slice(&[0x04; 64]);
+        let mut spki_body = tlv(0x30, &alg);
+        spki_body.extend_from_slice(&tlv(0x03, &bits));
+        let mut tbs = tlv(0xa0, &tlv(0x02, &[0x02]));
+        tbs.extend_from_slice(&tlv(0x02, &[0x01]));
+        tbs.extend_from_slice(&tlv(0x30, &[]));
+        tbs.extend_from_slice(&tlv(0x30, &[]));
+        tbs.extend_from_slice(&tlv(0x30, &[]));
+        tbs.extend_from_slice(&tlv(0x30, &[]));
+        tbs.extend_from_slice(&tlv(0x30, &spki_body));
+        let der = tlv(0x30, &tlv(0x30, &tbs));
+        assert_eq!(spki_ed25519(&der), None);
+    }
+
+    #[test]
+    fn v1_certificates_have_no_version_field() {
+        let key = [0x33u8; 32];
+        let mut tbs = tlv(0x02, &[0x01]); // serialNumber, no [0] version
+        tbs.extend_from_slice(&tlv(0x30, &tlv(0x06, &[0x2b, 0x65, 0x70])));
+        tbs.extend_from_slice(&tlv(0x30, &[]));
+        tbs.extend_from_slice(&tlv(0x30, &[]));
+        tbs.extend_from_slice(&tlv(0x30, &[]));
+        tbs.extend_from_slice(&ed25519_spki(&key));
+        let der = tlv(0x30, &tlv(0x30, &tbs));
+        assert_eq!(spki_ed25519(&der), Some(key));
+    }
+
+    #[test]
+    fn lengths_must_be_definite_and_minimal() {
+        // Indefinite length, and a long form that should have been short.
+        assert!(der_tlv(&[0x30, 0x80, 0x00, 0x00]).is_none());
+        assert!(der_tlv(&[0x30, 0x81, 0x01, 0xff]).is_none());
+        // Trailing garbage after the certificate is not a certificate.
+        let mut der = certificate(&[0x44u8; 32], &[], &[0x01]);
+        der.push(0x00);
+        assert_eq!(spki_ed25519(&der), None);
     }
 }

@@ -8,15 +8,15 @@ use std::time::Duration;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 
 use hl_identity::ServerKey;
 use hxd_auth_file::FileAuth;
-use hxd_core::{Core, Transport};
+use hxd_core::{Core, LinkAuthority, Transport};
 use hxd_ng_session::{
-    IdentityConfig, IdentityState, NewAccounts, NgConfig, NgCtx, Registry, TunnelSink,
-    TunnelStream, Unattested,
+    IdentityConfig, IdentityState, NewAccounts, NgConfig, NgCtx, Registry, TrustedProxies,
+    TunnelSink, TunnelStream, Unattested,
 };
 use hxd_session::{cap, Caps, ServerConfig, ServerCtx, TrtpLogin};
 use serde::Deserialize;
@@ -249,6 +249,23 @@ pub struct IdentitySection {
     /// reconciles with the socket's identity.
     #[serde(default = "default_trtp_login")]
     pub trtp_login: String,
+    /// Access bits for accounts made by `new_accounts = create`, as
+    /// `[identity.default_access]` with the same key names as an account
+    /// file's `[access]`. Absent means "whatever the guest account has",
+    /// resolved at creation.
+    #[serde(default)]
+    pub default_access: Option<HashMap<String, bool>>,
+    /// Ceiling on accounts `new_accounts = create` may write per hour.
+    /// 0 disables creation; past the ceiling identities are admitted as
+    /// guests. Only meaningful with `new_accounts = create`.
+    #[serde(default = "default_max_new_accounts")]
+    pub max_new_accounts_per_hour: usize,
+    /// Where successor commitments (§3.4) are kept across restarts.
+    /// Set it to `""` to keep them per-process, which the threat model
+    /// calls the weaker mode: a restart forgets the commitment, and
+    /// making the caches forget is the attack it exists to stop.
+    #[serde(default = "default_anchors")]
+    pub successors: PathBuf,
 }
 
 fn default_identity_key() -> PathBuf {
@@ -265,6 +282,12 @@ fn default_clock_skew() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_max_new_accounts() -> usize {
+    60
+}
+fn default_anchors() -> PathBuf {
+    "identity-successors".into()
 }
 fn default_trtp_login() -> String {
     "verify".into()
@@ -285,8 +308,9 @@ pub struct NgSection {
     pub max_detached_per_addr: usize,
     /// Reverse-proxy addresses whose `X-Hotline-Client-Cert` header is
     /// believed (identity spec §5.3). Empty = mTLS binding off.
+    /// Single addresses or CIDR blocks, e.g. `["127.0.0.1", "10.0.0.0/8"]`.
     #[serde(default)]
-    pub trusted_proxies: Vec<IpAddr>,
+    pub trusted_proxies: Vec<String>,
 }
 
 fn default_ng_bind() -> String {
@@ -440,12 +464,13 @@ impl TunnelSink for LegacyTunnel {
         stream: TunnelStream,
         peer: SocketAddr,
         transport: Transport,
+        link: LinkAuthority,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let ctx = self.0.clone();
         Box::pin(async move {
             let span = tracing::info_span!("tunnel", %peer);
             tracing::Instrument::instrument(
-                hxd_session::run_session(stream, peer, ctx, transport),
+                hxd_session::run_session(stream, peer, ctx, transport, link),
                 span,
             )
             .await
@@ -522,6 +547,29 @@ fn build_identity(
             .map_err(|_| format!("[identity] registrar_keys.{host}: key must be 32 bytes"))?;
         registrar_keys.insert(host.to_lowercase(), key);
     }
+    let default_access = match &section.default_access {
+        None => None,
+        Some(named) => {
+            let mut bits = hxd_core::AccessBits::empty();
+            for (key, on) in named {
+                if !on {
+                    continue;
+                }
+                match hxd_auth_file::named_bit(key) {
+                    Some(b) => bits = bits.with(b),
+                    None => {
+                        return Err(format!(
+                            "[identity.default_access]: unknown access key {key:?}"
+                        ))
+                    }
+                }
+            }
+            Some(bits)
+        }
+    };
+    if section.new_accounts != "create" && section.default_access.is_some() {
+        tracing::warn!("[identity] default_access has no effect unless new_accounts = create");
+    }
     Ok(IdentityState::new(
         key,
         IdentityConfig {
@@ -532,7 +580,13 @@ fn build_identity(
             registrar_keys,
             clock_skew: section.clock_skew,
             trtp: section.trtp,
-            default_access: None,
+            default_access,
+            max_new_accounts_per_hour: Some(section.max_new_accounts_per_hour),
+            anchors: if section.successors.as_os_str().is_empty() {
+                None
+            } else {
+                Some(section.successors.clone())
+            },
         },
         auth,
     ))
@@ -565,7 +619,7 @@ pub fn build_ng_ctx(
             grace: Duration::from_secs(ng.grace),
             max_detached_per_addr: ng.max_detached_per_addr,
             caps: ng_caps(config, voice),
-            trusted_proxies: ng.trusted_proxies.clone(),
+            trusted_proxies: TrustedProxies::parse(&ng.trusted_proxies)?,
         }),
         registry: Arc::new(Registry::new()),
         identity,

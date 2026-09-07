@@ -99,7 +99,7 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
             grace: Duration::from_secs(60),
             max_detached_per_addr: 2,
             caps: vec!["voice".to_string()],
-            trusted_proxies: Vec::new(),
+            trusted_proxies: Default::default(),
         }),
         registry: Arc::new(Registry::new()),
         identity: None,

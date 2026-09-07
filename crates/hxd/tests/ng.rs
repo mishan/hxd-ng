@@ -65,7 +65,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             grace: Duration::from_secs(300),
             max_detached_per_addr: 2,
             caps: Vec::new(),
-            trusted_proxies: Vec::new(),
+            trusted_proxies: Default::default(),
         }),
         registry: Arc::new(Registry::new()),
         identity: None,
