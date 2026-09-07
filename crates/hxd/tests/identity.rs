@@ -39,6 +39,24 @@ async fn start_server_with(
     cfg: IdentityConfig,
     trtp_login: hxd_session::TrtpLogin,
 ) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_full(dir, cfg, trtp_login, &[]).await
+}
+
+/// Same, with `[ng] trusted_proxies` set — the mTLS binding (§5.3).
+async fn start_server_with_proxies(
+    dir: &Path,
+    cfg: IdentityConfig,
+    proxies: &[&str],
+) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_full(dir, cfg, hxd_session::TrtpLogin::Verify, proxies).await
+}
+
+async fn start_server_full(
+    dir: &Path,
+    cfg: IdentityConfig,
+    trtp_login: hxd_session::TrtpLogin,
+    proxies: &[&str],
+) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     std::fs::write(
@@ -79,7 +97,7 @@ async fn start_server_with(
             grace: Duration::from_secs(300),
             max_detached_per_addr: 2,
             caps: Vec::new(),
-            trusted_proxies: Default::default(),
+            trusted_proxies: hxd_ng_session::TrustedProxies::parse(proxies).unwrap(),
         }),
         registry: Arc::new(Registry::new()),
         identity: Some(Arc::new(identity)),
@@ -1025,4 +1043,442 @@ async fn card_etag_successor_commitment_and_downstream_cleartext() {
     );
     let r = try_authenticate(ng, &t, json!({ "downstream": "wat" })).await;
     assert_eq!(r.status, 400);
+}
+
+// --- The mTLS binding (§5.3) ---------------------------------------------
+
+/// A self-signed X.509 skeleton carrying `key` in its SubjectPublicKeyInfo
+/// and `planted` inside its subject. Enough of a certificate for the
+/// header contract; the server examines nothing else.
+fn client_cert_der(key: &[u8; 32], planted: Option<&[u8; 32]>) -> Vec<u8> {
+    fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let n = body.len();
+        if n < 0x80 {
+            out.push(n as u8);
+        } else {
+            let b = n.to_be_bytes();
+            let start = b.iter().position(|x| *x != 0).unwrap();
+            out.push(0x80 | (b.len() - start) as u8);
+            out.extend_from_slice(&b[start..]);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+    let ed = || tlv(0x06, &[0x2b, 0x65, 0x70]);
+    let spki = {
+        let mut bits = vec![0x00];
+        bits.extend_from_slice(key);
+        let mut body = tlv(0x30, &ed());
+        body.extend_from_slice(&tlv(0x03, &bits));
+        tlv(0x30, &body)
+    };
+    let subject = match planted {
+        // Exactly the byte pattern RFC 8410 fixes, in a field the
+        // requester chooses: a naive scan finds this, not the SPKI.
+        Some(victim) => {
+            let mut v = vec![0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+            v.extend_from_slice(victim);
+            tlv(0x30, &tlv(0x13, &v))
+        }
+        None => tlv(0x30, &[]),
+    };
+    let mut tbs = tlv(0xa0, &tlv(0x02, &[0x02]));
+    tbs.extend_from_slice(&tlv(0x02, &[0x01]));
+    tbs.extend_from_slice(&tlv(0x30, &ed()));
+    tbs.extend_from_slice(&tlv(0x30, &[]));
+    tbs.extend_from_slice(&tlv(0x30, &[]));
+    tbs.extend_from_slice(&subject);
+    tbs.extend_from_slice(&spki);
+    let mut outer = tlv(0x30, &tbs);
+    outer.extend_from_slice(&tlv(0x30, &ed()));
+    outer.extend_from_slice(&tlv(0x03, &[0x00; 65]));
+    tlv(0x30, &outer)
+}
+
+fn cert_header(key: &[u8; 32], planted: Option<&[u8; 32]>) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(client_cert_der(key, planted))
+}
+
+#[tokio::test]
+async fn mtls_header_is_ignored_from_an_untrusted_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(20, "Certified");
+    // No trusted_proxies: the header carries no weight, so an auth with
+    // no proof is a 400 rather than an authentication.
+    let hdr = cert_header(&p.dev.public(), None);
+    let r = http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hotline-Client-Cert", &hdr),
+        ],
+        json!({ "card": b64(&p.card), "device_cert": b64(&p.cert) })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    // And an upgrade offering it is an ordinary unauthenticated socket.
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng"))
+        .await
+        .unwrap();
+    let mut c = Ng::from_ws(ws).await;
+    let ok = c.request("login", json!({ "nick": "nobody" })).await;
+    assert!(ok["ok"]["self"].get("identity").is_none(), "{ok}");
+}
+
+#[tokio::test]
+async fn mtls_takes_the_key_from_the_spki_not_from_the_subject() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig::default();
+    let (_legacy, ng, _ctx) = start_server_with_proxies(dir.path(), cfg, &["127.0.0.1"]).await;
+
+    let victim = person(21, "Victim");
+    let attacker = person(22, "Attacker");
+    // The victim's device is on file; the attacker's is not.
+    authenticate(ng, &victim).await;
+
+    // A certificate the proxy would accept — its own SPKI is the
+    // attacker's key — with the victim's device key planted in the
+    // subject. A scan for the RFC 8410 pattern finds the victim.
+    let hdr = cert_header(&attacker.dev.public(), Some(&victim.dev.public()));
+    let r = http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hotline-Client-Cert", &hdr),
+        ],
+        json!({ "card": b64(&victim.card), "device_cert": b64(&victim.cert) })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        401,
+        "the attacker must not authenticate as the victim: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["error"], "bad_proof");
+
+    // The victim's own certificate still works — this is the mTLS
+    // binding, not a blanket refusal.
+    let hdr = cert_header(&victim.dev.public(), None);
+    let r = http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hotline-Client-Cert", &hdr),
+        ],
+        json!({ "card": b64(&victim.card), "device_cert": b64(&victim.cert) })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["fingerprint"], victim.id.fingerprint().to_string());
+
+    // And "the connection is the credential": an upgrade with the same
+    // header and no token lands an authenticated session.
+    let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("X-Hotline-Client-Cert", hdr.parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let mut c = Ng::from_ws(ws).await;
+    let ok = c.request("login", json!({ "nick": "v" })).await;
+    assert_eq!(
+        ok["ok"]["self"]["identity"]["fingerprint"],
+        victim.id.fingerprint().to_string(),
+        "{ok}"
+    );
+}
+
+#[tokio::test]
+async fn an_undecodable_cert_header_from_a_trusted_proxy_is_a_400() {
+    // nginx's `$ssl_client_escaped_cert` is URL-encoded PEM. Falling
+    // through would admit the request as an unauthenticated guest, and
+    // the operator would see "mTLS silently isn't working".
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) =
+        start_server_with_proxies(dir.path(), IdentityConfig::default(), &["127.0.0.1"]).await;
+    let escaped = "-----BEGIN%20CERTIFICATE-----%0AMIIB...%0A-----END%20CERTIFICATE-----%0A";
+    let r = http(
+        ng,
+        "GET",
+        "/.well-known/hotline",
+        &[("X-Hotline-Client-Cert", escaped)],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 200, "discovery doesn't read the header");
+    let r = http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hotline-Client-Cert", escaped),
+        ],
+        json!({ "card": "", "device_cert": "" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 400);
+    assert!(
+        String::from_utf8_lossy(&r.body).contains("base64 DER"),
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+}
+
+// --- Bounds and refusals -------------------------------------------------
+
+#[tokio::test]
+async fn a_token_expires_and_an_oversized_body_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(23, "Bounded");
+
+    // A token is single-use at upgrade.
+    let token = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (_c, _ok) = ng_login(ng, &token, "once").await;
+    let r = tokio_tungstenite::connect_async(format!("ws://{ng}/ng?token={token}")).await;
+    assert!(r.is_err(), "a spent token must not open a second socket");
+
+    // A garbage token is a 401, never a silent downgrade to guest.
+    let r = tokio_tungstenite::connect_async(format!("ws://{ng}/ng?token=AAAA")).await;
+    assert!(r.is_err());
+
+    // Bodies are capped well below what a card storm would need.
+    let big = vec![b'x'; 128 * 1024];
+    let r = http(
+        ng,
+        "PUT",
+        "/identity/card",
+        &[("Content-Type", "application/cbor")],
+        &big,
+    )
+    .await;
+    assert!(r.status == 401 || r.status == 400, "status {}", r.status);
+}
+
+#[tokio::test]
+async fn a_request_head_that_never_arrives_is_dropped() {
+    // hyper's header timeout is inert without a timer, and the move to
+    // hyper took away the accept timeout the port used to have.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let mut s = TcpStream::connect(ng).await.unwrap();
+    s.write_all(b"GET /ng HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    // `login_timeout` in the fixture is 5s; the server must close on its
+    // own rather than hold the task for as long as we care to wait.
+    let mut buf = Vec::new();
+    let closed = timeout(Duration::from_secs(15), s.read_to_end(&mut buf)).await;
+    assert!(closed.is_ok(), "the connection was never closed");
+}
+
+#[tokio::test]
+async fn identity_login_false_denies_and_a_created_account_refuses_the_legacy_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig {
+        new_accounts: hxd_ng_session::NewAccounts::Create,
+        unattested: hxd_ng_session::Unattested::Allow,
+        ..Default::default()
+    };
+    let (legacy, ng, _ctx) =
+        start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+
+    let p = person(24, "Newcomer");
+    let auth = authenticate(ng, &p).await;
+    assert_eq!(auth["outcome"], "created");
+    let login = auth["account"].as_str().unwrap().to_owned();
+    let file = dir.path().join(format!("accounts/{login}.toml"));
+    assert!(file.exists());
+
+    // The whole point of §8.3: the account has no password, and an empty
+    // one is not a way in. Without this every created account is open to
+    // anyone who types its login on :5500.
+    let mut s = TcpStream::connect(legacy).await.unwrap();
+    s.write_all(b"TRTPHOTL\x00\x01\x00\x02").await.unwrap();
+    let mut hello = [0u8; 8];
+    s.read_exact(&mut hello).await.unwrap();
+    s.write_all(&pack_frame(
+        REQ_LOGIN,
+        1,
+        0,
+        &[
+            (tag::LOGIN, login.bytes().map(|b| b ^ 0xff).collect()),
+            (tag::PASSWORD, Vec::new()),
+            (tag::VERSION, 150u16.to_be_bytes().to_vec()),
+        ],
+    ))
+    .await
+    .unwrap();
+    let f = timeout(
+        Duration::from_secs(5),
+        hxd_session::frame::read_frame(&mut s),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(f.flag, 1, "the login must be refused");
+
+    // `login = false` on the account denies the identity path too.
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        text.replace("[identity]", "[identity]\nlogin = false"),
+    )
+    .unwrap();
+    let r = try_authenticate(ng, &p, json!({})).await;
+    assert_eq!(r.status, 403);
+    assert_eq!(r.json()["error"], "denied");
+}
+
+#[tokio::test]
+async fn create_does_not_make_link_unreachable() {
+    // With `create`, the first token-only auth used to make an account,
+    // after which `/identity/link` could only ever say `already_linked`.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig {
+        new_accounts: hxd_ng_session::NewAccounts::Create,
+        unattested: hxd_ng_session::Unattested::Allow,
+        ..Default::default()
+    };
+    let (_legacy, ng, _ctx) =
+        start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+
+    let p = person(25, "Linker");
+    let auth = try_authenticate(ng, &p, json!({ "create": false })).await;
+    assert_eq!(auth.status, 200);
+    let auth = auth.json();
+    assert_eq!(auth["outcome"], "guest");
+    assert!(auth["account"].is_null());
+
+    let r = http(
+        ng,
+        "POST",
+        "/identity/link",
+        &[(
+            "Authorization",
+            &format!("Bearer {}", auth["token"].as_str().unwrap()),
+        )],
+        json!({ "login": "misha", "password": "s3cret" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["linked"], "misha");
+    // Credentials on the auth itself imply the same thing.
+    let q = person(26, "Direct");
+    let auth = try_authenticate(ng, &q, json!({ "login": "locked", "password": "pw" })).await;
+    assert_eq!(auth.status, 200);
+    // `locked` forbids self-linking, so this is a pending link — not a
+    // brand-new account made behind the user's back.
+    assert_eq!(auth.json()["outcome"], "classic_pending_link");
+    assert!(!dir.path().join("accounts/direct.toml").exists());
+}
+
+#[tokio::test]
+async fn a_management_token_still_opens_a_socket() {
+    // `/identity/link` used to spend the single-use token, so a client
+    // had to re-run challenge/auth to use what it had just linked.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(27, "Manager");
+    let auth = authenticate(ng, &p).await;
+    let token = auth["token"].as_str().unwrap().to_owned();
+    let r = http(
+        ng,
+        "POST",
+        "/identity/link",
+        &[("Authorization", &format!("Bearer {token}"))],
+        json!({ "login": "misha", "password": "s3cret" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let (_c, ok) = ng_login(ng, &token, "m").await;
+    assert_eq!(ok["self"]["identity"]["account"], "misha");
+}
+
+#[tokio::test]
+async fn a_successor_commitment_survives_a_restart() {
+    // A commitment only this process remembers hands the attacker
+    // "restart the server" as the way to move it.
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = dir.path().join("successors");
+    let cfg = || IdentityConfig {
+        anchors: Some(anchors.clone()),
+        ..Default::default()
+    };
+    let (_legacy, ng, _ctx) =
+        start_server_with(dir.path(), cfg(), hxd_session::TrtpLogin::Verify).await;
+    let id = IdentityKey::from_seed(&[28; 32]);
+    let dev = DeviceKey::from_seed(&[128; 32]);
+    let cert = DeviceCert::for_device(&id, &dev, now() - 5, cert::RECOMMENDED_LIFETIME).sign(&id);
+    let card = |successor: Option<[u8; 32]>, at: u64| {
+        let mut c = Card::new(&id, "Anchored", at);
+        c.successor = successor;
+        c.sign(&id, vec![]).unwrap()
+    };
+    let p = Person {
+        id: IdentityKey::from_seed(&[28; 32]),
+        dev: DeviceKey::from_seed(&[128; 32]),
+        card: card(Some([0x99; 32]), now()),
+        cert: cert.clone(),
+    };
+    assert_eq!(try_authenticate(ng, &p, json!({})).await.status, 200);
+    assert!(anchors.exists(), "the commitment must reach disk");
+
+    // A second server over the same directory — a restart, in effect.
+    let dir2 = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir2.path()).unwrap();
+    let cfg2 = IdentityConfig {
+        anchors: Some(anchors.clone()),
+        ..Default::default()
+    };
+    let (_l2, ng2, _c2) =
+        start_server_with(dir2.path(), cfg2, hxd_session::TrtpLogin::Verify).await;
+    let moved = Person {
+        id: IdentityKey::from_seed(&[28; 32]),
+        dev: DeviceKey::from_seed(&[128; 32]),
+        card: card(Some([0x9a; 32]), now() + 1),
+        cert,
+    };
+    let r = try_authenticate(ng2, &moved, json!({})).await;
+    assert_eq!(r.status, 401, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["error"], "bad_card");
+}
+
+#[tokio::test]
+async fn identity_without_ng_is_reported_rather_than_ignored() {
+    // `[identity]` is only read when `[ng]` is present, and a config that
+    // sets one without the other looks like it works.
+    let toml = r#"
+[server]
+bind = "127.0.0.1:0"
+[identity]
+new_accounts = "create"
+"#;
+    let config: hxd::Config = toml::from_str(toml).unwrap();
+    let err = hxd::check_config(&config).unwrap_err();
+    assert!(err.contains("[ng]"), "{err}");
 }

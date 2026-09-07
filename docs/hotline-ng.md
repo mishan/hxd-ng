@@ -262,8 +262,37 @@ Events (all carry `seq`):
 | `broadcast` | `{ "from": {uid, nick}, "text" }` | `Broadcast` |
 | `kicked` | `{}` | `Kicked`; server then closes, session ends |
 
-A `user` object is `{ uid, nick, icon, admin, status }`. Uids remain the
-16-bit legacy ids so the two rosters are one roster.
+A `user` object is:
+
+```jsonc
+{
+  "uid": 3, "nick": "Misha", "icon": 128,
+  "admin": false,
+  "status": "active",              // active | idle | detached
+  "transport": "encrypted",        // encrypted | cleartext — see below
+  "identity": {                    // absent unless the socket proved one
+    "fingerprint": "6htgz65…",     // 52 characters, Crockford base32
+    "handle": "misha@hl.example"   // null when no attestation was accepted
+  }
+}
+```
+
+Uids remain the 16-bit legacy ids so the two rosters are one roster.
+
+`transport` and `identity` come from
+[`hotline-ng-identity.md`](hotline-ng-identity.md) §6.2 and §10, and are
+present whether or not that spec's endpoints are enabled — a plain TCP
+legacy session reads as `"cleartext"` with no `identity`, so a client can
+warn before a private message goes somewhere unencrypted without
+feature-detecting anything. A session is `"cleartext"` when the legacy
+client is on plain TCP, or when a tunnel told the server at
+`/identity/auth` that its own downstream hop is cleartext (§5.2
+`downstream`): a client may declare itself less safe than it looks, never
+more. `identity` carries only what the roster is entitled to show —
+never `age`, `outcome`, or anything that authorizes.
+
+The login reply's `self` object carries the same fields, plus `age` and
+`outcome` from `/identity/auth`, which are for the user themself.
 
 Events that exist in the domain but have no ng mapping yet (the
 private-chat room family) are delivered to ng sessions as placeholder

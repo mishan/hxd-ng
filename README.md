@@ -49,10 +49,15 @@ max_detached_per_addr = 2
 
 [identity]                # portable identity — docs/hotline-ng-identity.md; needs [ng]
 key = "identity-server.key"        # server Ed25519 seed, generated on first run
-new_accounts = "guest"             # deny | guest | create (create not implemented yet)
+new_accounts = "guest"             # deny | guest | create
 unattested = "guest"               # deny | guest | allow
+successors = "identity-successors" # where §3.4 successor commitments live; "" = memory only
+# max_new_accounts_per_hour = 60   # ceiling on what new_accounts = "create" writes
 # allow_list = ["misha@hl.example", "<fingerprint>"]
 # registrar_keys = { "hl.example" = "<base64url public key>" }
+# [identity.default_access]        # access bits for accounts "create" makes;
+# read_chat = true                 # same key names as an account file's [access].
+# send_chat = true                 # Absent = whatever guest has, which is rarely right.
 trtp = true                        # serve TRTP-over-WebSocket at /trtp for tunnelled legacy clients
 trtp_login = "verify"              # verify | trust: how a tunnelled classic login meets the socket's identity
 
@@ -93,10 +98,17 @@ a room with video in it costs a voice-only participant nothing. See
 An account links to an identity through an `[identity]` table in its file
 (written by linking, or by hand): `fingerprint`, `login = true` (identity
 may log in without the password), `allow_self_link = true`, `reserve_name`.
+An account with a fingerprint and no password is reachable *only* by
+proving the identity — the password path refuses it, empty password
+included — which is what makes `new_accounts = "create"` safe alongside
+the legacy port. (`reserve_name` is read but not yet enforced: §9's
+reserved-name rules are still unimplemented on both wires.)
 
 With `[identity]` on, the ng listener also answers HTTP: `GET
 /.well-known/hotline` for discovery, `POST /identity/challenge` and
-`/identity/auth` for the challenge binding, `GET /identity/card/<fp>`.
+`/identity/auth` for the challenge binding, `GET /identity/card/<fp>` and
+`PUT /identity/card`, and `POST /identity/link` and `/identity/unlink`
+for account association.
 
 `hlid` (`cargo run --bin hlid`) makes the keys and objects and talks to
 the server:
@@ -106,7 +118,7 @@ hlid keygen identity id.key && hlid keygen device dev.key
 hlid cert --identity id.key --device dev.key --caps web -o cert.cbor
 hlid card --identity id.key --name Misha -o card.cbor
 hlid auth   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
-hlid link   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor --login misha --password pw
+hlid link   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor --login misha --password-stdin < pw.txt
 hlid tunnel --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
 # then point any 1.x client at 127.0.0.1:5500 — it logs in through the tunnel with your identity
 ```

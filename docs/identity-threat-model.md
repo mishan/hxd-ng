@@ -1,6 +1,13 @@
 # hxd-ng identity: threat model
 
-Status: draft, for discussion. Nothing here is implemented.
+Status: draft, for discussion. Most of it is still design. What hxd-ng
+implements today is the transport layer of `hotline-ng-identity.md` —
+the identity objects, both bindings, account association, and the
+successor commitment described below. Not implemented anywhere yet:
+revocation and freezing, recovery codes, vouches, reserved names, and
+everything the registrar and federation specs cover. Read a "the server
+refuses…" sentence as what the design requires, not as a guarantee you
+can rely on today.
 
 This document says what the identity system is meant to protect, from whom,
 and what it deliberately does not protect. The mechanism specs
@@ -104,6 +111,7 @@ Can:
 Cannot:
 - read PMs between two other identity users
 - claim a reserved name held by a linked identity on that server
+  (design; hxd-ng does not enforce reserved names yet)
 
 ### Tunnel and relay operators
 
@@ -157,7 +165,10 @@ Mitigations:
   binding is that it is *anchored before compromise*: every server that
   cached the card holds the commitment, refuses any later card that
   changes or drops it, and accepts rotation only to the committed key. The
-  registrar records it at registration for the same reason. The attacker
+  registrar records it at registration for the same reason. "Holds" has
+  to mean *on disk*: an anchor a server keeps only in memory is one an
+  attacker can clear by getting the server restarted, which is precisely
+  the "make the caches forget" move the commitment exists to block. The attacker
   can therefore publish a card with their own commitment only to servers
   that have never seen the user, which is the registrar's job to cover.
 

@@ -58,6 +58,11 @@ Worth stating so the review is about the deltas:
   transactions 800–826 and fields `0x0600`–`0x0627` are all clear of the
   identity spec, which uses HTTP and defines no TRTP numbers. (An earlier
   hxd-ng draft had proposed 800–809 for identity; it was withdrawn.)
+  Because the identity spec allocates nothing on the legacy wire, the two
+  capability bits this proposal needs — 11 for `CAPABILITY_IDENTITY` and
+  12 for `CAPABILITY_MESSAGE_ENVELOPE` — are allocated *here*, and both
+  are subject to the messaging extension's own registry. hxd-ng's
+  allocations stop at 10 (video), so 11 and 12 are free today.
 
 ---
 
@@ -112,10 +117,17 @@ Replace the rename bullet under *Persistence* with:
 > stale Login followed by the fresh entry, as before. A client that keys
 > rows by Login therefore never sees a Login change without a `Removed`.
 
-The server has the signal it needs: a session's `DATA_CAPABILITIES` from
-Login (107) says whether it understands identity fields, and the identity
-spec allocates bit 11 for exactly that. `DATA_MESSAGING_FEATURES` (below)
-is the server-side half and does not substitute for it.
+The server needs a per-session signal for this, and `DATA_CAPABILITIES`
+from Login (107) is where it belongs. **This proposal allocates bit 11,
+`CAPABILITY_IDENTITY`**, for it — the identity spec does not, and cannot:
+it works entirely over HTTP and states that it defines no TRTP numbers.
+The bit means "this client understands `DATA_FRIEND_IDENTITY` and
+`DATA_FRIEND_HANDLE` on a roster entry"; a client may negotiate it
+whether or not the server or the client has an identity of its own.
+
+`DATA_MESSAGING_FEATURES` (below) is the server-side half and does not
+substitute for it: it says what the *server* offers, and the rename rule
+turns on what a particular *client* can parse.
 
 ### Client rule
 
@@ -380,10 +392,12 @@ Not part of the proposal, listed so the whole picture is visible:
 | Field | `0x061F` | `DATA_MESSAGE_ENVELOPE` |
 | Field | `0x0623` | `DATA_MESSAGING_FEATURES` |
 | Field | `0x0628` | `DATA_FRIEND_DEVICE_CERT` (needs the reserved range extended) |
-| Capability bit | 12 | `CAPABILITY_MESSAGE_ENVELOPE` (provisional; next after identity's 11) |
+| Capability bit | 11 | `CAPABILITY_IDENTITY` (provisional; allocated by this proposal, not by the identity spec) |
+| Capability bit | 12 | `CAPABILITY_MESSAGE_ENVELOPE` (provisional; next after 11) |
 | Reason code | 14 | `NoDeviceKeys` |
 | Reason code | 15 | `BodyRequired` |
 
-No new access bits or transactions. The capability bit is the one
-addition since the first draft, and it is what makes body-less delivery
-safe for sessions that predate this proposal.
+No new access bits or transactions. The two capability bits are the
+additions since the first draft: 11 tells the server a client can parse
+identity fields on a roster entry, and 12 is what makes body-less
+delivery safe for sessions that predate this proposal.
