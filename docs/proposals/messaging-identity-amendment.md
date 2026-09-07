@@ -298,6 +298,14 @@ Rules:
 
 ### Allocation note
 
+**Both numbers below are ours to propose, not ours to assign**, and one
+of them needs checking before this goes anywhere: `0x0623` is picked as a
+free slot in the limits sub-block, and the copy of the extension this was
+written against may not be the current one. Confirm `0x0623` and the
+`0x0628`–`0x062F` suggestion against fogWraith's latest text before
+sending; if either is taken, the shape of the proposal is unchanged and
+only the number moves.
+
 `0x061D`–`0x061F` are the three general IDs the spec reserves for future
 messaging fields. This proposal uses all of them, and puts the device key
 at `0x0628`, the first ID after the limits sub-block, which would need
