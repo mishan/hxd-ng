@@ -17,6 +17,17 @@ pub const DOMAIN: &str = "hl-identity/attestation/v1";
 /// The recommended attestation lifetime (§3.5).
 pub const RECOMMENDED_LIFETIME: u64 = 365 * 24 * 3600;
 
+/// A registrar host and a handle are both bounded: the pair is rendered
+/// as `handle@registrar` wherever a name goes.
+const MAX_HOST_BYTES: usize = 253;
+const MAX_HANDLE_BYTES: usize = 64;
+
+/// The character set a registrar host may use: hostname syntax, nothing
+/// that could be read as a different host by something downstream.
+fn is_host_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '.')
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attestation {
     pub identity: PublicKey,
@@ -89,14 +100,34 @@ impl Attestation {
             expires: signed::uint(v, "expires")?,
             level: signed::opt_uint(v, "level")?,
         };
-        if a.registrar != a.registrar.to_lowercase() || a.registrar.is_empty() {
+        if a.registrar != a.registrar.to_lowercase()
+            || a.registrar.is_empty()
+            || a.registrar.len() > MAX_HOST_BYTES
+            || !a.registrar.chars().all(is_host_char)
+        {
             return Err(Error::BadField("registrar"));
         }
-        if a.handle.is_empty() || a.handle.contains('@') {
+        // `handle` and `registrar` are rendered next to user-chosen names
+        // and logged; control characters and whitespace in them are a
+        // spoofing tool, not a naming choice.
+        if a.handle.is_empty()
+            || a.handle.len() > MAX_HANDLE_BYTES
+            || a.handle.contains('@')
+            || a.handle
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+        {
             return Err(Error::BadField("handle"));
         }
         if a.level.is_some_and(|l| l > 3) {
             return Err(Error::BadField("level"));
+        }
+        // The timeline has to make sense, because `registered` is what
+        // `min_attestation_age` is measured from: a sloppy registrar
+        // writing `registered: 0` would otherwise hand every one of its
+        // users infinite standing on every server that trusts it.
+        if a.registered > a.issued || a.issued >= a.expires || a.registered == 0 {
+            return Err(Error::BadField("registered"));
         }
         env.verify(&a.registrar_key, DOMAIN)?;
         Ok(a)
@@ -178,11 +209,52 @@ mod tests {
         );
         let a = Attestation {
             level: Some(4),
-            ..base
+            ..base.clone()
         };
         assert_eq!(
             Attestation::parse(&a.sign(&reg)),
             Err(Error::BadField("level"))
+        );
+        // `registered` is what min_attestation_age measures from, so a
+        // sloppy registrar's zero would be infinite standing everywhere.
+        for bad in [
+            Attestation {
+                registered: 0,
+                ..base.clone()
+            },
+            Attestation {
+                registered: 3,
+                issued: 2,
+                ..base.clone()
+            },
+            Attestation {
+                issued: 3,
+                expires: 3,
+                ..base.clone()
+            },
+        ] {
+            assert_eq!(
+                Attestation::parse(&bad.sign(&reg)),
+                Err(Error::BadField("registered")),
+                "{bad:?}"
+            );
+        }
+        // Handles and hosts are rendered next to user-chosen names.
+        let a = Attestation {
+            handle: "mi sha".into(),
+            ..base.clone()
+        };
+        assert_eq!(
+            Attestation::parse(&a.sign(&reg)),
+            Err(Error::BadField("handle"))
+        );
+        let a = Attestation {
+            registrar: "hl example".into(),
+            ..base
+        };
+        assert_eq!(
+            Attestation::parse(&a.sign(&reg)),
+            Err(Error::BadField("registrar"))
         );
     }
 }

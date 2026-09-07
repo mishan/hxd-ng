@@ -146,19 +146,39 @@ impl Card {
     }
 
     /// Decode, check size and fields, verify the card signature against
-    /// the embedded identity key, and parse each attestation (an
-    /// attestation that fails to parse fails the card: a signer who
-    /// embeds garbage is not someone whose card should be cached).
+    /// the embedded identity key, then parse each attestation.
+    ///
+    /// The card's own envelope is verified *first*. Verifying the
+    /// attestations first meant a card with a garbage signature and ~55
+    /// self-signed attestations cost ~57 Ed25519 verifications to reject,
+    /// which is a cheap way to spend a server's CPU. One signature says
+    /// whether the rest is worth looking at.
+    ///
+    /// An attestation this version can't read is discarded rather than
+    /// failing the card (§5.2 step 5): a registrar that starts issuing v2
+    /// attestations would otherwise lock its users out of every v1
+    /// server. One that parses but doesn't verify, or that is about a
+    /// different identity, still fails the card — the signer embedded it.
     pub fn parse(bytes: &[u8]) -> Result<Card, Error> {
         if bytes.len() > MAX_BYTES {
             return Err(Error::TooLarge);
         }
         let env = Envelope::open(bytes)?;
         let v = &env.value;
-        let attestations = signed::opt_array(v, "attestations")?
-            .into_iter()
-            .map(Attestation::from_value)
-            .collect::<Result<Vec<_>, _>>()?;
+        let identity: PublicKey = signed::bytes32(v, "identity")?;
+        env.verify(&identity, DOMAIN)?;
+
+        let mut attestations = Vec::new();
+        for value in signed::opt_array(v, "attestations")? {
+            match Attestation::from_value(value) {
+                Ok(a) => attestations.push(a),
+                Err(Error::UnsupportedVersion(v)) => {
+                    // Not ours to read; the card is still the user's.
+                    let _ = v;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         let links = signed::opt_array(v, "links")?
             .into_iter()
             .map(|l| match l {
@@ -167,7 +187,7 @@ impl Card {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let card = Card {
-            identity: signed::bytes32(v, "identity")?,
+            identity,
             updated: signed::uint(v, "updated")?,
             name: signed::text(v, "name")?,
             icon: signed::opt_uint(v, "icon")?,
@@ -185,7 +205,6 @@ impl Card {
         {
             return Err(Error::KeyMismatch);
         }
-        env.verify(&card.identity, DOMAIN)?;
         Ok(card)
     }
 }
@@ -249,6 +268,65 @@ mod tests {
         let card = Card::new(&id, "Misha", 10);
         let bytes = card.sign(&id, vec![att.signed_value(&reg)]).unwrap();
         assert_eq!(Card::parse(&bytes), Err(Error::KeyMismatch));
+    }
+
+    #[test]
+    fn an_attestation_this_version_cannot_read_is_discarded_not_fatal() {
+        // §5.2 step 5. A registrar that starts issuing v2 attestations
+        // would otherwise lock its users out of every v1 server.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let reg = ServerKey::from_seed(&[3u8; 32]);
+        let att = Attestation {
+            identity: id.public(),
+            registrar: "hl.example".into(),
+            registrar_key: reg.public(),
+            handle: "misha".into(),
+            registered: 1_600_000_000,
+            issued: 1_700_000_000,
+            expires: 1_800_000_000,
+            level: None,
+        };
+        // Take the signed attestation and bump its `v`; the signature no
+        // longer matches, but the version check comes first.
+        let crate::cbor::Value::Map(mut entries) = att.signed_value(&reg) else {
+            panic!("attestations are maps")
+        };
+        for (k, v) in &mut entries {
+            if *k == crate::cbor::Value::Text("v".into()) {
+                *v = crate::cbor::Value::Uint(2);
+            }
+        }
+        let future = crate::cbor::Value::Map(entries);
+        let card = Card::new(&id, "Misha", 10);
+        let bytes = card
+            .sign(&id, vec![future, att.signed_value(&reg)])
+            .unwrap();
+        let back = Card::parse(&bytes).unwrap();
+        assert_eq!(back.attestations, vec![att], "the v1 one still counts");
+    }
+
+    #[test]
+    fn the_cards_own_signature_is_checked_before_the_attestations() {
+        // A garbage-signature card with 50 attestations should cost one
+        // verification to reject, not 51.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let reg = ServerKey::from_seed(&[3u8; 32]);
+        let att = Attestation {
+            identity: id.public(),
+            registrar: "hl.example".into(),
+            registrar_key: reg.public(),
+            handle: "misha".into(),
+            registered: 1_600_000_000,
+            issued: 1_700_000_000,
+            expires: 1_800_000_000,
+            level: None,
+        };
+        // Each embedded attestation is fine; the card's own sig is not.
+        let atts: Vec<_> = (0..8).map(|_| att.signed_value(&reg)).collect();
+        let mut bytes = Card::new(&id, "Misha", 10).sign(&id, atts).unwrap();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xff;
+        assert_eq!(Card::parse(&bytes), Err(Error::BadSignature));
     }
 
     #[test]

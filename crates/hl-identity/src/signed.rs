@@ -31,8 +31,11 @@ impl Envelope {
         if !matches!(value, Value::Map(_)) {
             return Err(Error::NotAMap);
         }
+        // `!=`, not `>`: `v = 0` is not "an older version we can read",
+        // it is a version that never existed, and accepting it would let
+        // one object's bytes be re-read as another version later.
         let v = uint(&value, "v")?;
-        if v > VERSION {
+        if v != VERSION {
             return Err(Error::UnsupportedVersion(v));
         }
         let sig = bytes32x2(&value, "sig")?;
