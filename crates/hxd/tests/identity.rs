@@ -908,3 +908,121 @@ async fn tunnelled_classic_login_links_under_verify_and_refuses_strangers() {
     assert_eq!(row["admin"], true, "{row}");
     drop(t);
 }
+
+#[tokio::test]
+async fn card_etag_successor_commitment_and_downstream_cleartext() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(10, "Anchor");
+    authenticate(ng, &p).await;
+
+    // ETag is entity-tag syntax and If-None-Match yields 304.
+    let path = format!("/identity/card/{}", p.id.fingerprint());
+    let r = http(ng, "GET", &path, &[], b"").await;
+    let etag = r.header("etag").unwrap().to_owned();
+    assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+    let r = http(ng, "GET", &path, &[("If-None-Match", &etag)], b"").await;
+    assert_eq!(r.status, 304);
+    assert!(r.body.is_empty());
+
+    // A card that sets a successor commitment is accepted once...
+    let mut committed = Card::new(&p.id, "Anchor", now() + 1);
+    committed.successor = Some([0x77; 32]);
+    let committed = committed.sign(&p.id, vec![]).unwrap();
+    let q = Person {
+        id: IdentityKey::from_seed(&[10; 32]),
+        dev: DeviceKey::from_seed(&[110; 32]),
+        card: committed,
+        cert: p.cert.clone(),
+    };
+    assert_eq!(
+        authenticate(ng, &q).await["fingerprint"],
+        p.id.fingerprint().to_string()
+    );
+    // ...and a later card that changes or drops it is refused, even
+    // though it is validly signed and newer: the anchor is the point.
+    let mut moved = Card::new(&p.id, "Anchor", now() + 2);
+    moved.successor = Some([0x78; 32]);
+    let moved = Person {
+        card: moved.sign(&p.id, vec![]).unwrap(),
+        ..Person {
+            id: IdentityKey::from_seed(&[10; 32]),
+            dev: DeviceKey::from_seed(&[110; 32]),
+            card: vec![],
+            cert: p.cert.clone(),
+        }
+    };
+    let r = try_authenticate(ng, &moved, json!({})).await;
+    assert_eq!(r.status, 401);
+    assert_eq!(r.json()["error"], "bad_card");
+    let dropped = Person {
+        card: Card::new(&p.id, "Anchor", now() + 3)
+            .sign(&p.id, vec![])
+            .unwrap(),
+        ..Person {
+            id: IdentityKey::from_seed(&[10; 32]),
+            dev: DeviceKey::from_seed(&[110; 32]),
+            card: vec![],
+            cert: p.cert.clone(),
+        }
+    };
+    let r = try_authenticate(ng, &dropped, json!({})).await;
+    assert_eq!(r.json()["error"], "bad_card");
+    // Re-presenting the same commitment is fine.
+    let same = Person {
+        card: {
+            let mut c = Card::new(&p.id, "Anchor", now() + 4);
+            c.successor = Some([0x77; 32]);
+            c.sign(&p.id, vec![]).unwrap()
+        },
+        ..Person {
+            id: IdentityKey::from_seed(&[10; 32]),
+            dev: DeviceKey::from_seed(&[110; 32]),
+            card: vec![],
+            cert: p.cert.clone(),
+        }
+    };
+    assert_eq!(try_authenticate(ng, &same, json!({})).await.status, 200);
+
+    // A tunnel that declares a cleartext hop behind it gets a session
+    // marked cleartext on the roster, TLS notwithstanding.
+    let t = person(11, "Remote");
+    let r = try_authenticate(ng, &t, json!({ "downstream": "cleartext" })).await;
+    assert_eq!(r.status, 200);
+    let token = r.json()["token"].as_str().unwrap().to_owned();
+    let mut req = format!("ws://{ng}/trtp").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let mut tun = Tunnel::new(ws);
+    tun.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
+    tun.read_exact(8).await;
+    tun.send(
+        REQ_LOGIN,
+        &[
+            (tag::NAME, b"Remote".to_vec()),
+            (tag::VERSION, 150u16.to_be_bytes().to_vec()),
+        ],
+    )
+    .await;
+    tun.recv_type(HDR_SELFINFO).await;
+    let (ws2, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng"))
+        .await
+        .unwrap();
+    let mut obs = Ng::from_ws(ws2).await;
+    let ok = obs.request("login", json!({ "nick": "obs" })).await;
+    let row = ok["ok"]["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["nick"] == "Remote")
+        .unwrap()
+        .clone();
+    assert_eq!(row["transport"], "cleartext", "{row}");
+    assert_eq!(
+        row["identity"]["fingerprint"],
+        t.id.fingerprint().to_string()
+    );
+    let r = try_authenticate(ng, &t, json!({ "downstream": "wat" })).await;
+    assert_eq!(r.status, 400);
+}

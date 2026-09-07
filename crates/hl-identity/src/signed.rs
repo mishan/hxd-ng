@@ -88,6 +88,18 @@ pub(crate) fn bytes32(v: &Value, key: &'static str) -> Result<[u8; 32], Error> {
     }
 }
 
+pub(crate) fn opt_bytes32(v: &Value, key: &'static str) -> Result<Option<[u8; 32]>, Error> {
+    match v.get(key) {
+        Some(Value::Bytes(b)) => b
+            .as_slice()
+            .try_into()
+            .map(Some)
+            .map_err(|_| Error::BadField(key)),
+        Some(_) => Err(Error::BadField(key)),
+        None => Ok(None),
+    }
+}
+
 fn bytes32x2(v: &Value, key: &'static str) -> Result<[u8; 64], Error> {
     match v.get(key) {
         Some(Value::Bytes(b)) => b.as_slice().try_into().map_err(|_| Error::BadField(key)),

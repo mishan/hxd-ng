@@ -374,6 +374,9 @@ struct Credentials {
     device: DeviceKey,
     card: Vec<u8>,
     cert: Vec<u8>,
+    /// What the tunnel says about the hop behind it (spec §5.2
+    /// `downstream`): `cleartext` when listening off loopback.
+    downstream: &'static str,
 }
 
 fn credentials(a: &Args) -> R<Credentials> {
@@ -381,6 +384,7 @@ fn credentials(a: &Args) -> R<Credentials> {
         device: DeviceKey::from_seed(&read_seed(a.one("device")?)?),
         card: read_file(a.one("card")?)?,
         cert: read_file(a.one("cert")?)?,
+        downstream: "local",
     })
 }
 
@@ -417,8 +421,12 @@ fn authenticate_with(base: &str, c: &Credentials, classic: Option<(&str, &str)>)
         .try_into()
         .map_err(|_| "server_key: bad length".to_string())?;
     let proof = LoginProof::sign(&c.device, &challenge, &server_key, now());
-    let mut body =
-        json!({ "card": b64(&c.card), "device_cert": b64(&c.cert), "proof": b64(&proof) });
+    let mut body = json!({
+        "card": b64(&c.card),
+        "device_cert": b64(&c.cert),
+        "proof": b64(&proof),
+        "downstream": c.downstream,
+    });
     if let Some((login, password)) = classic {
         body["login"] = json!(login);
         body["password"] = json!(password);
@@ -490,7 +498,7 @@ fn unlink_cmd(args: &[String]) -> R<()> {
 fn tunnel_cmd(args: &[String]) -> R<()> {
     let a = parse(args);
     let base = server_base(&a)?;
-    let c = credentials(&a)?;
+    let mut c = credentials(&a)?;
     let listen = a.opt("listen").unwrap_or("127.0.0.1:5500").to_owned();
     if !listen.starts_with("127.")
         && !listen.starts_with("[::1]")
@@ -503,6 +511,9 @@ fn tunnel_cmd(args: &[String]) -> R<()> {
                 "{listen} is not loopback; pass --allow-remote-listen 1 if you mean it"
             ));
         }
+        // And tell the server so, so the session is marked cleartext and
+        // other users get the PM warning (spec §5.2 `downstream`).
+        c.downstream = "cleartext";
     }
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async move {
@@ -517,6 +528,7 @@ fn tunnel_cmd(args: &[String]) -> R<()> {
                 device: DeviceKey::from_seed(&c.device.seed()),
                 card: c.card.clone(),
                 cert: c.cert.clone(),
+                downstream: c.downstream,
             };
             move || authenticate(&base, &creds)
         })
@@ -555,6 +567,7 @@ async fn tunnel_one(
             device: DeviceKey::from_seed(&c.device.seed()),
             card: c.card.clone(),
             cert: c.cert.clone(),
+            downstream: c.downstream,
         };
         tokio::task::spawn_blocking(move || authenticate(&base, &creds))
             .await

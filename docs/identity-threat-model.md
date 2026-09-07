@@ -149,9 +149,17 @@ Mitigations:
   gates a user action.
 - *Recovery code.* A second envelope of the identity key, unlockable by a
   one-time code shown at registration. This covers *loss*, not theft.
-- *Optional pre-committed successor key.* A signed commitment to a next key,
-  stored offline. The older commitment wins any rotation dispute, so it
-  beats an attacker holding the current key without trusting the registrar.
+- *Optional pre-committed successor key.* The user generates a next key,
+  stores it offline, and publishes `SHA-256(next public key)` as the
+  `successor` field of their user card. A signature carries no trustworthy
+  time, so "older" cannot mean "signed earlier" — an attacker holding the
+  identity key can sign and backdate anything. What makes the commitment
+  binding is that it is *anchored before compromise*: every server that
+  cached the card holds the commitment, refuses any later card that
+  changes or drops it, and accepts rotation only to the committed key. The
+  registrar records it at registration for the same reason. The attacker
+  can therefore publish a card with their own commitment only to servers
+  that have never seen the user, which is the registrar's job to cover.
 
 Residual risk: between theft and freeze, the attacker is the user. Reserved
 names and standing follow the successor key after rotation, so a frozen
