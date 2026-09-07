@@ -16,11 +16,17 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
+use std::time::Duration;
 
 use futures_util::{Sink, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::{interval_at, Instant, Interval, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+
+/// How often the server pings a quiet tunnel — the same clock the JSON
+/// path uses, for the same reasons.
+const PING_EVERY: Duration = Duration::from_secs(30);
 
 pub struct WsByteStream<S> {
     ws: WebSocketStream<S>,
@@ -28,15 +34,29 @@ pub struct WsByteStream<S> {
     pending: Vec<u8>,
     pending_at: usize,
     eof: bool,
+    /// Server-initiated keep-alive, driven from the read side.
+    ping: Interval,
 }
 
 impl<S> WsByteStream<S> {
     pub fn new(ws: WebSocketStream<S>) -> Self {
+        Self::with_ping_period(ws, PING_EVERY)
+    }
+
+    /// The same, with the keep-alive period named — for tests, which
+    /// cannot wait half a minute to see one.
+    pub(crate) fn with_ping_period(ws: WebSocketStream<S>, every: Duration) -> Self {
+        // `interval_at`, not `interval`: the latter's first tick is
+        // immediate, and a ping before the client has said anything is
+        // noise on every connection.
+        let mut ping = interval_at(Instant::now() + every, every);
+        ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
         WsByteStream {
             ws,
             pending: Vec::new(),
             pending_at: 0,
             eof: false,
+            ping,
         }
     }
 }
@@ -50,25 +70,48 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
         loop {
-            if self.pending_at < self.pending.len() {
-                let n = (self.pending.len() - self.pending_at).min(buf.remaining());
-                let at = self.pending_at;
-                buf.put_slice(&self.pending[at..at + n]);
-                self.pending_at += n;
+            if this.pending_at < this.pending.len() {
+                let n = (this.pending.len() - this.pending_at).min(buf.remaining());
+                let at = this.pending_at;
+                buf.put_slice(&this.pending[at..at + n]);
+                this.pending_at += n;
                 return Poll::Ready(Ok(()));
             }
-            if self.eof {
+            if this.eof {
                 return Poll::Ready(Ok(()));
             }
-            match ready!(Pin::new(&mut self.ws).poll_next(cx)) {
+            // Keep-alive. A tunnelled session can be silent for hours —
+            // a classic client watching chat sends nothing — and nothing
+            // else on this path would notice a peer that went away or a
+            // NAT that dropped the mapping; the JSON path has pinged
+            // every 30 s since it was written. It goes out from here
+            // because the read side is the task that is otherwise
+            // parked, and because polling the stream is what registers
+            // the timer's wake-up. The halves of a `tokio::io::split`
+            // take turns, so the writer cannot be mid-frame while this
+            // runs.
+            if this.ping.poll_tick(cx).is_ready() {
+                // Not ready to send is not an error: the socket is
+                // busy, which is the thing a ping is asking about.
+                if let Poll::Ready(Ok(())) = Pin::new(&mut this.ws).poll_ready(cx) {
+                    Pin::new(&mut this.ws)
+                        .start_send(Message::Ping(Vec::new()))
+                        .map_err(ws_err)?;
+                    if let Poll::Ready(Err(e)) = Pin::new(&mut this.ws).poll_flush(cx) {
+                        return Poll::Ready(Err(ws_err(e)));
+                    }
+                }
+            }
+            match ready!(Pin::new(&mut this.ws).poll_next(cx)) {
                 Some(Ok(Message::Binary(data))) => {
-                    self.pending = data;
-                    self.pending_at = 0;
+                    this.pending = data;
+                    this.pending_at = 0;
                 }
                 // tungstenite answers pings itself; pongs and frames
                 // carrying nothing are just skipped.
@@ -76,7 +119,7 @@ where
                 | Some(Ok(Message::Pong(_)))
                 | Some(Ok(Message::Frame(_))) => {}
                 Some(Ok(Message::Close(_))) | None => {
-                    self.eof = true;
+                    this.eof = true;
                     return Poll::Ready(Ok(()));
                 }
                 Some(Ok(Message::Text(_))) => {
@@ -159,6 +202,49 @@ mod tests {
             stream.read(&mut [0u8; 4]).await.unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[tokio::test]
+    async fn a_quiet_tunnel_is_pinged() {
+        // The legacy frontend's reader task is parked on a read for as
+        // long as the client says nothing, which on this wire can be
+        // hours. Without this the server would never notice a peer that
+        // went away, and a NAT in between would drop the mapping.
+        let (a, b) = tokio::io::duplex(4096);
+        let server = WebSocketStream::from_raw_socket(a, Role::Server, None).await;
+        let mut client = WebSocketStream::from_raw_socket(b, Role::Client, None).await;
+        let mut stream = WsByteStream::with_ping_period(server, Duration::from_millis(20));
+
+        // Nobody is writing; the read is what drives the clock.
+        let reader = tokio::spawn(async move {
+            let mut buf = [0u8; 8];
+            let n = stream.read(&mut buf).await.unwrap();
+            (stream, n)
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .expect("a ping should arrive on a quiet tunnel")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, Message::Ping(Vec::new()));
+        // And it keeps happening, rather than being a one-off.
+        let second = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .expect("and another")
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, Message::Ping(Vec::new()));
+
+        // Bytes still arrive through all of it.
+        client
+            .send(Message::Binary(b"hello".to_vec()))
+            .await
+            .unwrap();
+        let (_stream, n) = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the read completes")
+            .unwrap();
+        assert_eq!(n, 5);
     }
 
     #[tokio::test]

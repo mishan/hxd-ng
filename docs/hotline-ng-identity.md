@@ -545,6 +545,14 @@ a TCP socket, plus the identity annotation on the session. HOPE transport
 encryption is unnecessary inside the tunnel and a server may refuse to
 negotiate it there.
 
+**Keep-alive is the server's job here, as on the JSON path.** A classic
+session says nothing for as long as its user is only watching, and the
+protocol inside has no idle traffic of its own — so the server sends a
+WebSocket ping on a quiet socket (hxd-ng: every 30 seconds), which is
+what notices a peer that has gone away and what keeps a NAT mapping
+alive. A tunnel answers with a pong, as any WebSocket library does for
+it, and needs no code for this.
+
 ---
 
 ## 7. Cards
@@ -876,7 +884,7 @@ server. It has a transport identity for every socket and no account table.
 Discovery is stable, cards are byte-exact, tokens and challenges are
 single-use, the mTLS header contract is honoured only from trusted
 proxies, and the TRTP-over-WebSocket path carries exactly the bytes the
-TCP port would. A tunnel or relay that follows this section is
+TCP port would and pings a quiet socket (§6.3). A tunnel or relay that follows this section is
 indistinguishable from a native client to the server and to other users,
 except that a relay-fronted legacy server has no account association to
 offer.
