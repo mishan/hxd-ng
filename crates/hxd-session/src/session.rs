@@ -24,8 +24,8 @@ use hxd_core::access::bit;
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Proof, SeqEvent,
-    SessionStatus, Transport, Uid, UserInfo,
+    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, LinkAuthority,
+    LinkOutcome, Proof, SeqEvent, SessionStatus, Transport, Uid, UserInfo,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
@@ -146,9 +146,15 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) -> std::io::Result<()>
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let span = tracing::info_span!("session", %peer);
-            run_session(stream, peer, ctx, Transport::default())
-                .instrument(span)
-                .await;
+            run_session(
+                stream,
+                peer,
+                ctx,
+                Transport::default(),
+                LinkAuthority::default(),
+            )
+            .instrument(span)
+            .await;
         });
     }
 }
@@ -504,8 +510,13 @@ impl Session {
 /// the caller knows about the link — encrypted or not, and the transport
 /// identity if the caller authenticated one — and is carried to the
 /// roster untouched. The protocol inside doesn't know which it got.
-pub async fn run_session<S>(stream: S, peer: SocketAddr, ctx: ServerCtx, transport: Transport)
-where
+pub async fn run_session<S>(
+    stream: S,
+    peer: SocketAddr,
+    ctx: ServerCtx,
+    transport: Transport,
+    link: LinkAuthority,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     if ctx.core.is_banned(peer.ip()) {
@@ -540,7 +551,7 @@ where
     let reader = tokio::spawn(reader_task(rd, frames_tx));
 
     // --- Login, then the session loop -----------------------------------
-    let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport).await;
+    let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport, link).await;
     if let Some((mut sess, mut events)) = outcome {
         let uid = sess.uid;
         info!(uid, login = %sess.account.login, "logged in");
@@ -562,6 +573,7 @@ fn reconcile_login(
     password: &[u8],
     identity_fp: Option<[u8; 32]>,
     policy: TrtpLogin,
+    link: LinkAuthority,
 ) -> Result<Account, AuthError> {
     let Some(fp) = identity_fp else {
         return auth.authenticate(login, Proof::Plain(password));
@@ -587,13 +599,24 @@ fn reconcile_login(
             info!(login = %account.login, "tunnelled login names an account linked to another identity");
             Err(AuthError::BadProof)
         }
-        None if account.identity.allow_self_link && linked.is_none() => {
-            auth.set_identity_link(&account.login, Some(fp))?;
-            info!(login = %account.login, "identity linked by tunnelled login");
-            auth.lookup(&account.login)
+        // Self-linking here writes an association exactly as
+        // `/identity/link` does, so it needs the same `manage`
+        // capability (identity spec §8.2) — and it goes through the
+        // backend's exclusive op, so two tunnelled logins by one
+        // identity can't both decide the identity is free.
+        None if account.identity.allow_self_link && link.may_link => {
+            match auth.link_identity(&account.login, &fp)? {
+                LinkOutcome::Linked(a) => {
+                    info!(login = %a.login, "identity linked by tunnelled login");
+                    Ok(a)
+                }
+                LinkOutcome::Already(a) => Ok(a),
+                // Someone else's, or the account refused: the password
+                // was right, so the classic login stands and the
+                // identity is decoration on this session only.
+                LinkOutcome::Taken(_) | LinkOutcome::Refused(_) => Ok(account),
+            }
         }
-        // Not linkable: the password was right, so the classic login
-        // stands; the identity is decoration on this session only.
         None => Ok(account),
     }
 }
@@ -605,6 +628,7 @@ async fn login_phase(
     ctx: &ServerCtx,
     peer: SocketAddr,
     transport: Transport,
+    link: LinkAuthority,
 ) -> Option<(Session, UnboundedReceiver<SeqEvent>)> {
     let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
         Ok(Some(f)) => f,
@@ -634,7 +658,7 @@ async fn login_phase(
     let identity_fp = transport.identity.as_ref().map(|t| t.fingerprint);
     let policy = ctx.cfg.trtp_login;
     let verdict = tokio::task::spawn_blocking(move || {
-        reconcile_login(&*auth, &login_str, &password, identity_fp, policy)
+        reconcile_login(&*auth, &login_str, &password, identity_fp, policy, link)
     })
     .await
     .ok()?;

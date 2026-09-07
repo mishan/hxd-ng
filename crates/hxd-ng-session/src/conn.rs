@@ -279,10 +279,12 @@ async fn handle_login(
         can_detach: account.can_detach,
         // The plaintext listener is loopback-only and WSS is mandatory in
         // production (`docs/hotline-ng.md` §9), so ng sockets are
-        // encrypted by construction; the identity is whatever the
-        // upgrade proved.
+        // encrypted by construction — unless the client told us at
+        // `/identity/auth` that it forwards over a cleartext hop (§5.2
+        // `downstream`). A client may make itself look less safe than it
+        // is, never more, and the `/trtp` path already honoured this.
         transport: hxd_core::Transport {
-            encrypted: true,
+            encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
             identity: identity.map(TransportIdentity::tag),
         },
     };

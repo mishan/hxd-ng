@@ -17,12 +17,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hxd_core::{AuthBackend, Core, Transport};
+use hxd_core::{AuthBackend, Core, LinkAuthority, Transport};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{info, Instrument};
 
-pub use identity::{Downstream, IdentityConfig, IdentityState, NewAccounts, Unattested};
+pub use identity::{
+    AuthRequest, ClassicLogin, Downstream, IdentityConfig, IdentityState, NewAccounts, Unattested,
+};
 pub use registry::Registry;
 
 /// A byte stream handed to the legacy frontend by the TRTP-over-WebSocket
@@ -41,6 +43,10 @@ pub trait TunnelSink: Send + Sync {
         stream: TunnelStream,
         peer: SocketAddr,
         transport: Transport,
+        // `link` is what the socket's device certificate lets a tunnelled
+        // login change about account association (§8.2) — separate from
+        // `transport`, which is descriptive; this authorizes.
+        link: LinkAuthority,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
@@ -67,7 +73,84 @@ pub struct NgConfig {
     /// Reverse-proxy addresses whose `X-Hotline-Client-Cert` header is
     /// believed (`docs/hotline-ng-identity.md` §5.3). Empty = the mTLS
     /// binding is off.
-    pub trusted_proxies: Vec<IpAddr>,
+    pub trusted_proxies: TrustedProxies,
+}
+
+/// Addresses whose mTLS header is believed: single addresses or CIDR
+/// blocks.
+///
+/// Both sides are canonicalised before comparing. A proxy on 127.0.0.1
+/// reaching a server bound to `[::]` arrives as `::ffff:127.0.0.1`, and
+/// an exact `IpAddr` comparison would silently never match — the mTLS
+/// binding would look configured and be off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedProxies(Vec<(IpAddr, u32)>);
+
+impl TrustedProxies {
+    /// Parse `"192.0.2.7"`, `"10.0.0.0/8"`, `"2001:db8::/32"`. The error
+    /// names the offending entry; it reaches the operator at startup.
+    pub fn parse<S: AsRef<str>>(entries: &[S]) -> Result<Self, String> {
+        let mut out = Vec::new();
+        for e in entries {
+            let e = e.as_ref().trim();
+            let (addr, prefix) = match e.split_once('/') {
+                Some((a, p)) => (a, Some(p)),
+                None => (e, None),
+            };
+            let addr: IpAddr = addr
+                .parse()
+                .map_err(|_| format!("trusted_proxies: {e:?} is not an IP address"))?;
+            let addr = addr.to_canonical();
+            let full = if addr.is_ipv4() { 32 } else { 128 };
+            let bits = match prefix {
+                None => full,
+                Some(p) => {
+                    let bits: u32 = p
+                        .parse()
+                        .map_err(|_| format!("trusted_proxies: {e:?} has a bad prefix length"))?;
+                    if bits > full {
+                        return Err(format!("trusted_proxies: {e:?} prefix exceeds {full} bits"));
+                    }
+                    bits
+                }
+            };
+            out.push((addr, bits));
+        }
+        Ok(TrustedProxies(out))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn contains(&self, peer: IpAddr) -> bool {
+        let peer = peer.to_canonical();
+        self.0
+            .iter()
+            .any(|(net, bits)| prefix_eq(peer, *net, *bits))
+    }
+}
+
+fn prefix_eq(a: IpAddr, b: IpAddr, bits: u32) -> bool {
+    fn octets(ip: IpAddr) -> Vec<u8> {
+        match ip {
+            IpAddr::V4(v) => v.octets().to_vec(),
+            IpAddr::V6(v) => v.octets().to_vec(),
+        }
+    }
+    if a.is_ipv4() != b.is_ipv4() {
+        return false;
+    }
+    let (a, b) = (octets(a), octets(b));
+    let (whole, rest) = ((bits / 8) as usize, bits % 8);
+    if a[..whole] != b[..whole] {
+        return false;
+    }
+    if rest == 0 {
+        return true;
+    }
+    let mask = 0xffu8 << (8 - rest);
+    a[whole] & mask == b[whole] & mask
 }
 
 impl Default for NgConfig {
@@ -79,7 +162,7 @@ impl Default for NgConfig {
             grace: Duration::from_secs(300),
             max_detached_per_addr: 2,
             caps: Vec::new(),
-            trusted_proxies: Vec::new(),
+            trusted_proxies: TrustedProxies::default(),
         }
     }
 }

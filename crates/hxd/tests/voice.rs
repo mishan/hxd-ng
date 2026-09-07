@@ -105,7 +105,7 @@ async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<Rec
             } else {
                 Vec::new()
             },
-            trusted_proxies: Vec::new(),
+            trusted_proxies: Default::default(),
         }),
         registry: Arc::new(Registry::new()),
         identity: None,
