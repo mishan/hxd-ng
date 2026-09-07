@@ -24,6 +24,7 @@ pub mod cbor;
 pub mod cert;
 mod error;
 pub mod keys;
+mod names;
 pub mod proof;
 mod signed;
 

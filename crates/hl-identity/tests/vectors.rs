@@ -218,6 +218,7 @@ fn card_successor_vector() {
     let back = Card::parse(&signed).unwrap();
     assert_eq!(back.successor, Some(unhex32(str_of(f, "successor"))));
     assert_eq!(back.identity, unhex32(str_of(f, "identity")));
+    check_signed(e, card::DOMAIN, &k.id.public(), &signed);
 }
 
 #[test]
