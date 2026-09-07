@@ -21,7 +21,8 @@ needs. It asks for four things, in decreasing order of importance:
 1. an optional stable key beside the Login on roster, presence and
    discovery entries, so rows survive account renames and can be matched
    across servers;
-2. lookup by handle or fingerprint in Find User and User Search;
+2. lookup by handle or fingerprint in Find User and User Search, and
+   blocking by fingerprint;
 3. field reservations and one rule change so an encrypted message body
    can travel through IM Send / IM Deliver and the offline queue opaquely;
 4. two paragraphs in Security Considerations reflecting what an
@@ -116,6 +117,21 @@ Add to *Client Behaviour*:
 >     person even if their Login differs, and a client MAY offer to merge
 >     local state (aliases, history) across them. The Login remains the
 >     addressing key on the wire.
+> 12. Treats a Roster Entry (801) whose Login matches an existing row but
+>     whose `DATA_FRIEND_IDENTITY` differs, with no intervening `Removed`
+>     for that Login, as an identity rotation (identity spec §8.5): the
+>     row keeps its state and takes the new fingerprint. A reassigned
+>     Login always arrives after a `Removed` (the *Delete* rule above), so
+>     the two cases cannot be confused.
+
+### Rotation
+
+The identity spec lets an identity rotate to a successor key, after
+which the linked account carries a new fingerprint and the same Login. A
+server MUST send a Roster Entry (801) with the new `DATA_FRIEND_IDENTITY`
+to every online friend when that happens, exactly as for a rename, and
+MUST NOT send `Removed`. Nothing else changes: the offline queue, blocks
+and receipts belong to the account and follow it.
 
 ---
 
@@ -140,6 +156,18 @@ User Search (823) matches `DATA_FRIEND_HANDLE` on substring as it matches
 Login and display name, gated by the subject's `DATA_DISCOVERABLE`
 preference exactly as those are. Fingerprints are not searched: a hash is
 not something a person types a fragment of.
+
+Block User (806) likewise accepts `DATA_FRIEND_IDENTITY` in place of
+`DATA_FRIEND_LOGIN`. This is the one place a fingerprint is needed as an
+*address* rather than a lookup key: under the identity spec's
+`new_accounts = guest` policy an identity user is a `guest` session that
+carries a fingerprint, and while such a session cannot use this
+extension's IM (the `guest` rule stands), it can still send a classic
+Send Private Message (108) to anyone on the user list. A block by
+fingerprint is the only kind that can stick to it. Servers store such a
+block against the fingerprint and apply it to 108 as they apply Login
+blocks; Block Update (807) echoes it with `DATA_FRIEND_IDENTITY` and no
+Login.
 
 All existing enumeration rules apply: rate limits, `AccountNotFound` for
 a subject who has blocked the caller, no presence for non-friends.
@@ -184,7 +212,14 @@ Rules:
   also carry a body (a fallback for the recipient's non-E2E devices, or
   a placeholder); a send carrying neither is a failure.
 - IM Deliver (811) forwards every envelope unchanged, and the body if
-  present. The offline queue stores envelopes as it stores bodies.
+  present. The offline queue stores envelopes as it stores bodies, but
+  delivery is per device: a message may be delivered to one of the
+  recipient's devices and still pending for another, and each device's
+  flush on connect carries the envelopes addressed to it. A device
+  certified after the message was queued has no envelope and cannot read
+  it; the E2E document owes an answer to that (a body fallback, or a
+  re-send the recipient's other device performs), and this amendment
+  only requires that the queue not pretend otherwise.
   `MaxMessageBytes` bounds the encoded size of the whole transaction's
   bodies and envelopes together, so an operator's cap means the same
   thing for both.
