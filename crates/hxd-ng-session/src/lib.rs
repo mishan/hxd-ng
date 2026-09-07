@@ -211,3 +211,37 @@ pub async fn sweeper(core: Arc<Core>, registry: Arc<Registry>, grace: Duration) 
         registry.prune(&core);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_proxies_match_by_prefix_and_across_ipv4_mapping() {
+        let t = TrustedProxies::parse(&["127.0.0.1", "10.0.0.0/8", "2001:db8::/32"]).unwrap();
+        assert!(t.contains("127.0.0.1".parse().unwrap()));
+        assert!(!t.contains("127.0.0.2".parse().unwrap()));
+        assert!(t.contains("10.9.8.7".parse().unwrap()));
+        assert!(!t.contains("11.0.0.1".parse().unwrap()));
+        assert!(t.contains("2001:db8::5".parse().unwrap()));
+        assert!(!t.contains("2001:db9::5".parse().unwrap()));
+        // A `[::]` bind reports IPv4 peers in their mapped form; §12 says
+        // those match the IPv4 entry, and the proxy is usually loopback.
+        assert!(t.contains("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(t.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!t.contains("::ffff:11.1.2.3".parse().unwrap()));
+        // And a mapped entry in the config matches a plain IPv4 peer.
+        let t = TrustedProxies::parse(&["::ffff:192.0.2.7"]).unwrap();
+        assert!(t.contains("192.0.2.7".parse().unwrap()));
+
+        // Prefixes that aren't whole octets.
+        let t = TrustedProxies::parse(&["192.0.2.0/26"]).unwrap();
+        assert!(t.contains("192.0.2.63".parse().unwrap()));
+        assert!(!t.contains("192.0.2.64".parse().unwrap()));
+
+        assert!(TrustedProxies::parse(&["10.0.0.0/33"]).is_err());
+        assert!(TrustedProxies::parse(&["not-an-address"]).is_err());
+        assert!(TrustedProxies::default().is_empty());
+        assert!(!TrustedProxies::default().contains("127.0.0.1".parse().unwrap()));
+    }
+}

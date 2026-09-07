@@ -17,7 +17,7 @@
 //! hlid link    --server URL --device K --card FILE --cert FILE --login L --password P
 //! hlid unlink  --server URL --device K --card FILE --cert FILE
 //! hlid tunnel  --server URL --device K --card FILE --cert FILE [--listen ADDR]
-//!              [--allow-remote-listen]
+//!              [--allow-remote-listen] [--create]
 //!              local TCP port for a classic client, TRTP over WebSocket upstream
 //! ```
 //!
@@ -69,7 +69,7 @@ fn main() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  hlid keygen identity|device|server PATH\n  hlid cert --identity K --device K [--days N] [--caps all|web|LIST] [--name S] -o FILE\n  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n       [--successor HEX | --successor-key FILE] -o FILE\n  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n  hlid inspect FILE\n  hlid auth --server URL --device K --card FILE --cert FILE [--login L] [--password P | --password-file F | --password-stdin] [--no-create]\n  hlid link --server URL --device K --card FILE --cert FILE --login L [--password P | --password-file F | --password-stdin]\n  hlid unlink --server URL --device K --card FILE --cert FILE\n  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500] [--allow-remote-listen]\n\nPassword options: --password puts the secret in `ps` output; prefer\n--password-file or --password-stdin."
+        "usage:\n  hlid keygen identity|device|server PATH\n  hlid cert --identity K --device K [--days N] [--caps all|web|LIST] [--name S] -o FILE\n  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n       [--successor HEX | --successor-key FILE] -o FILE\n  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n  hlid inspect FILE\n  hlid auth --server URL --device K --card FILE --cert FILE [--login L] [--password P | --password-file F | --password-stdin] [--no-create]\n  hlid link --server URL --device K --card FILE --cert FILE --login L [--password P | --password-file F | --password-stdin]\n  hlid unlink --server URL --device K --card FILE --cert FILE\n  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500] [--allow-remote-listen] [--create]\n\nPassword options: --password puts the secret in `ps` output; prefer\n--password-file or --password-stdin."
     );
     exit(2)
 }
@@ -85,7 +85,12 @@ struct Args {
 /// Flags that stand alone; everything else takes a value. Without this
 /// list a bare `--allow-remote-listen` swallowed the next argument, so it
 /// needed a dummy value nothing documented.
-const BARE: &[&str] = &["allow-remote-listen", "password-stdin", "no-create"];
+const BARE: &[&str] = &[
+    "allow-remote-listen",
+    "password-stdin",
+    "no-create",
+    "create",
+];
 
 fn parse(args: &[String]) -> Args {
     let mut flags: HashMap<String, Vec<String>> = HashMap::new();
@@ -174,6 +179,11 @@ impl Args {
 /// wraps silently in release for anything past ~2^44, which would produce
 /// a signed object with an expiry in the past.
 fn seconds(days: u64) -> R<u64> {
+    if days == 0 {
+        // Issued and expiring at the same second: every verifier refuses
+        // it, so writing it only wastes the user's next command.
+        return Err("--days: must be at least 1".into());
+    }
     days.checked_mul(86_400)
         .filter(|_| days <= 36_500)
         .ok_or_else(|| "--days: must be 36500 or fewer (100 years)".to_string())
@@ -190,14 +200,24 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Hex to bytes, over bytes rather than characters: `&s[i..i + 2]` on a
+/// `&str` panics when the split lands inside a multi-byte character, so
+/// a key file with an accent in it aborted the tool instead of failing.
 fn unhex(s: &str) -> R<Vec<u8>> {
-    let s = s.trim();
+    let s = s.trim().as_bytes();
     if s.len() % 2 != 0 {
         return Err("odd-length hex".into());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| "not hex".to_string()))
+    fn digit(b: u8) -> R<u8> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err("not hex".to_string()),
+        }
+    }
+    s.chunks(2)
+        .map(|p| Ok(digit(p[0])? << 4 | digit(p[1])?))
         .collect()
 }
 
@@ -227,6 +247,14 @@ fn write_out(a: &Args, bytes: &[u8]) -> R<()> {
     std::fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))?;
     eprintln!("wrote {} bytes to {path}", bytes.len());
     Ok(())
+}
+
+/// An object this build would refuse to read is not one to write. The
+/// checks live in `hl-identity`'s parsers, so this is the one place that
+/// has to know they exist: `--level 7`, an attestation about someone
+/// else, a name with an invisible character in it.
+fn refuse_unreadable(kind: &str, e: hl_identity::Error) -> String {
+    format!("refusing to write a {kind} this build would reject: {e}")
 }
 
 fn read_file(path: &str) -> R<Vec<u8>> {
@@ -313,7 +341,9 @@ fn make_cert(args: &[String]) -> R<()> {
         ),
     };
     c.name = a.opt("name").map(str::to_owned);
-    write_out(&a, &c.sign(&id))
+    let bytes = c.sign(&id);
+    DeviceCert::parse(&bytes).map_err(|e| refuse_unreadable("device certificate", e))?;
+    write_out(&a, &bytes)
 }
 
 fn make_card(args: &[String]) -> R<()> {
@@ -351,7 +381,9 @@ fn make_card(args: &[String]) -> R<()> {
             cbor::decode_canonical(&bytes).map_err(|e| format!("{p}: {e}"))
         })
         .collect::<R<Vec<_>>>()?;
-    write_out(&a, &card.sign(&id, atts).map_err(|e| e.to_string())?)
+    let bytes = card.sign(&id, atts).map_err(|e| e.to_string())?;
+    Card::parse(&bytes).map_err(|e| refuse_unreadable("card", e))?;
+    write_out(&a, &bytes)
 }
 
 fn make_attestation(args: &[String]) -> R<()> {
@@ -382,7 +414,9 @@ fn make_attestation(args: &[String]) -> R<()> {
             None => None,
         },
     };
-    write_out(&a, &att.sign(&reg))
+    let bytes = att.sign(&reg);
+    Attestation::parse(&bytes).map_err(|e| refuse_unreadable("attestation", e))?;
+    write_out(&a, &bytes)
 }
 
 fn inspect(args: &[String]) -> R<()> {
@@ -455,6 +489,25 @@ struct Credentials {
     /// What the tunnel says about the hop behind it (spec §5.2
     /// `downstream`): `cleartext` when listening off loopback.
     downstream: &'static str,
+    /// §8.2 `create`: may the server make an account for this identity
+    /// on a `new_accounts = create` server? Off by default here — the
+    /// token these paths fetch is for `link` or `unlink`, and an account
+    /// created first makes the link that follows `already_linked`.
+    create: bool,
+}
+
+impl Credentials {
+    /// A copy for a task that needs its own (the device key is a seed,
+    /// so this is a re-derivation rather than a clone of secret state).
+    fn dup(&self) -> Credentials {
+        Credentials {
+            device: DeviceKey::from_seed(&self.device.seed()),
+            card: self.card.clone(),
+            cert: self.cert.clone(),
+            downstream: self.downstream,
+            create: self.create,
+        }
+    }
 }
 
 fn credentials(a: &Args) -> R<Credentials> {
@@ -463,6 +516,7 @@ fn credentials(a: &Args) -> R<Credentials> {
         card: read_file(a.one("card")?)?,
         cert: read_file(a.one("cert")?)?,
         downstream: "local",
+        create: false,
     })
 }
 
@@ -477,10 +531,8 @@ fn server_base(a: &Args) -> R<String> {
 
 /// The challenge binding (§5.2) against a server. Blocking; small.
 fn authenticate(base: &str, c: &Credentials) -> R<Value> {
-    // `create: false`: this path exists to get a token for `link` or
-    // `unlink`, and on a `new_accounts = create` server letting it create
-    // an account first would make the link that follows `already_linked`.
-    authenticate_with(base, c, None, false)
+    // `create` is off unless the caller asked for it — see the field.
+    authenticate_with(base, c, None, c.create)
 }
 
 /// Same, optionally with classic credentials to link in the same step
@@ -603,6 +655,7 @@ fn tunnel_cmd(args: &[String]) -> R<()> {
     let a = parse(args);
     let base = server_base(&a)?;
     let mut c = credentials(&a)?;
+    c.create = a.has("create");
     let listen = a.opt("listen").unwrap_or("127.0.0.1:5500").to_owned();
     if !listen.starts_with("127.")
         && !listen.starts_with("[::1]")
@@ -612,7 +665,7 @@ fn tunnel_cmd(args: &[String]) -> R<()> {
         // unless the user says otherwise on purpose.
         if !a.has("allow-remote-listen") {
             return Err(format!(
-                "{listen} is not loopback; pass --allow-remote-listen 1 if you mean it"
+                "{listen} is not loopback; pass --allow-remote-listen if you mean it"
             ));
         }
         // And tell the server so, so the session is marked cleartext and
@@ -627,13 +680,7 @@ fn tunnel_cmd(args: &[String]) -> R<()> {
         // Check credentials once up front so a typo fails now, not on the
         // first connection.
         let probe = tokio::task::spawn_blocking({
-            let base = base.clone();
-            let creds = Credentials {
-                device: DeviceKey::from_seed(&c.device.seed()),
-                card: c.card.clone(),
-                cert: c.cert.clone(),
-                downstream: c.downstream,
-            };
+            let (base, creds) = (base.clone(), c.dup());
             move || authenticate(&base, &creds)
         })
         .await
@@ -666,13 +713,7 @@ async fn tunnel_one(
 ) -> R<()> {
     let _ = sock.set_nodelay(true);
     let token = {
-        let base = base.to_owned();
-        let creds = Credentials {
-            device: DeviceKey::from_seed(&c.device.seed()),
-            card: c.card.clone(),
-            cert: c.cert.clone(),
-            downstream: c.downstream,
-        };
+        let (base, creds) = (base.to_owned(), c.dup());
         tokio::task::spawn_blocking(move || authenticate(&base, &creds))
             .await
             .map_err(|e| e.to_string())??

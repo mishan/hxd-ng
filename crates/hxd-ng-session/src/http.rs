@@ -129,22 +129,45 @@ enum Consume {
 /// Authenticate the upgrade (§6.1), then hand the socket to the
 /// application protocol. The upgrade itself completes in a spawned task
 /// once this response has gone out.
-async fn upgrade(req: &mut Request<Incoming>, peer: SocketAddr, ctx: NgCtx, proto: Proto) -> Resp {
-    let identity = match transport_identity(req, peer, &ctx, Consume::Yes).await {
-        Ok(i) => i,
-        Err(resp) => return *resp,
-    };
+async fn upgrade(
+    req: &mut Request<Incoming>,
+    socket: SocketAddr,
+    ctx: NgCtx,
+    proto: Proto,
+) -> Resp {
+    // Everything the session layer keys on an address — bans,
+    // `max_detached_per_addr`, the roster's `addr` — wants the client's
+    // address, not the reverse proxy's (§2). `serve_connection` checked
+    // the socket's peer; this checks the one behind it.
+    let peer = client_addr(req, socket, &ctx);
+    if peer != socket && ctx.core.is_banned(peer.ip()) {
+        info!(%peer, "refusing banned address behind the proxy");
+        return plain(StatusCode::FORBIDDEN, "banned");
+    }
     let config = WebSocketConfig {
         max_message_size: Some(256 * 1024),
         max_frame_size: Some(256 * 1024),
         ..Default::default()
     };
-    let (response, websocket) = match hyper_tungstenite::upgrade(req, Some(config)) {
+    // The upgrade request is validated *before* the token is redeemed:
+    // §6.1 spends the token on the upgrade, and a malformed handshake
+    // used to burn it on the way to a 400, leaving the client to run the
+    // whole challenge dance again over a missing `Sec-WebSocket-Key`.
+    let (response, websocket) = match hyper_tungstenite::upgrade(&mut *req, Some(config)) {
         Ok(v) => v,
         Err(e) => {
             debug!("bad upgrade request: {e}");
             return plain(StatusCode::BAD_REQUEST, "bad upgrade");
         }
+    };
+    // The certificate header is believed by the *socket's* peer, which
+    // is the proxy; the forwarded address is who the proxy is speaking
+    // for and carries no trust of its own.
+    let identity = match transport_identity(req, socket, &ctx, Consume::Yes).await {
+        Ok(i) => i,
+        // The upgrade never happens: this response isn't a 101, so the
+        // socket stays HTTP and the future above is dropped unpolled.
+        Err(resp) => return *resp,
     };
     tokio::spawn(async move {
         let ws = match websocket.await {
@@ -202,12 +225,22 @@ async fn transport_identity(
     ctx: &NgCtx,
     consume: Consume,
 ) -> Result<Option<TransportIdentity>, Box<Resp>> {
-    let bearer = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
+    // A present `Authorization` that isn't a bearer token is a 401, not
+    // an unauthenticated request: §6.1's rule is that a token that
+    // doesn't work is never a silent downgrade, and a client sending
+    // `Basic` or a mis-cased scheme believes it authenticated.
+    let bearer = match req.headers().get(AUTHORIZATION) {
+        Some(v) => match v.to_str().ok().and_then(bearer_token) {
+            Some(t) => Some(t.to_owned()),
+            None => {
+                return Err(Box::new(plain(
+                    StatusCode::UNAUTHORIZED,
+                    "Authorization must be a Bearer transport token (see §6.1)",
+                )))
+            }
+        },
+        None => None,
+    };
     let query = req
         .uri()
         .query()
@@ -257,6 +290,79 @@ async fn transport_identity(
     Ok(None)
 }
 
+/// The client's address, as far as this server can tell: the socket's
+/// peer, unless it is a trusted proxy (§2, `[ng] trusted_proxies`) that
+/// named someone else in `Forwarded` or `X-Forwarded-For`.
+///
+/// Behind a proxy every client shares one socket peer, so a ban keyed on
+/// it bans the deployment and `max_detached_per_addr` is a global cap of
+/// two. Only trusted proxies are believed, for the same reason the
+/// certificate header is.
+fn client_addr(req: &Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> SocketAddr {
+    if !ctx.cfg.trusted_proxies.contains(peer.ip()) {
+        return peer;
+    }
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let forwarded = header("forwarded").and_then(|v| forwarded_for(&v).map(str::to_owned));
+    let xff = || {
+        header("x-forwarded-for")
+            .and_then(|v| v.split(',').next().map(|s| s.trim().to_owned()))
+            .filter(|s| !s.is_empty())
+    };
+    match forwarded.or_else(xff).as_deref().and_then(host_ip) {
+        Some(ip) => SocketAddr::new(ip, 0),
+        None => peer,
+    }
+}
+
+/// The first `for=` value of an RFC 7239 `Forwarded` header. The first
+/// element is the client; anything after it is another hop.
+fn forwarded_for(header: &str) -> Option<&str> {
+    let first = header.split(',').next()?;
+    for param in first.split(';') {
+        let (k, v) = param.split_once('=')?;
+        if k.trim().eq_ignore_ascii_case("for") {
+            return Some(v.trim().trim_matches('"'));
+        }
+    }
+    None
+}
+
+/// An IP out of a `for=` or `X-Forwarded-For` value, which may be
+/// `1.2.3.4`, `1.2.3.4:5678`, `[2001:db8::1]:5678`, or one of RFC 7239's
+/// obfuscated forms — those name nobody, so they leave the socket's peer
+/// in place.
+fn host_ip(value: &str) -> Option<IpAddr> {
+    let v = value.trim();
+    if let Ok(ip) = v.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Some(rest) = v.strip_prefix('[') {
+        let (inside, _) = rest.split_once(']')?;
+        return inside.parse().ok();
+    }
+    // `1.2.3.4:5678`; a bare IPv6 has colons of its own and parsed above.
+    v.rsplit_once(':').and_then(|(host, _)| host.parse().ok())
+}
+
+/// The token out of an `Authorization` header. The scheme is
+/// case-insensitive (RFC 7235) and the separator is one or more spaces;
+/// a case-sensitive `strip_prefix("Bearer ")` treated `bearer x` as no
+/// credentials at all.
+fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, rest) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim_start_matches(' ');
+    (!token.is_empty()).then_some(token)
+}
+
 /// The mTLS header contract (§5.3): `X-Hotline-Client-Cert` is base64
 /// DER, believed only from `trusted_proxies`. Only the Ed25519 public key
 /// is extracted; nothing else in the certificate is examined.
@@ -275,6 +381,13 @@ fn client_cert_device(
     let Some(header) = req.headers().get("x-hotline-client-cert") else {
         return Ok(None);
     };
+    // HAProxy's `%[ssl_c_der,base64]` sends an empty value when the
+    // client offered no certificate, which is "no certificate", not a
+    // broken one. Treating it as an error made every plain upgrade
+    // through such a proxy a 400 with a `warn!` per request.
+    if header.as_bytes().is_empty() {
+        return Ok(None);
+    }
     if !ctx.cfg.trusted_proxies.contains(peer) {
         // `debug`, not `warn`: anyone on the internet can send this
         // header, and a per-request warning is a log-flood primitive.
@@ -722,8 +835,7 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
         return plain(StatusCode::BAD_REQUEST, "expected a CBOR body");
     };
     let state = st.clone();
-    let identity = ident.identity;
-    let updated = tokio::task::spawn_blocking(move || state.update_card(&identity, &bytes)).await;
+    let updated = tokio::task::spawn_blocking(move || state.update_card(&ident, &bytes)).await;
     let Ok(updated) = updated else {
         return plain(StatusCode::INTERNAL_SERVER_ERROR, "card update task failed");
     };
@@ -813,6 +925,38 @@ impl From<&TransportIdentity> for IdentityTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bearer_token_survives_its_scheme_being_shouted() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("BEARER  abc"), Some("abc"));
+        assert_eq!(bearer_token("Bearer "), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Basic abc"), None);
+    }
+
+    #[test]
+    fn a_forwarded_header_names_the_first_hop() {
+        assert_eq!(forwarded_for("for=192.0.2.1"), Some("192.0.2.1"));
+        assert_eq!(
+            forwarded_for("for=192.0.2.1;proto=https, for=198.51.100.9"),
+            Some("192.0.2.1")
+        );
+        assert_eq!(
+            forwarded_for("proto=https;For=\"[2001:db8::1]:4711\""),
+            Some("[2001:db8::1]:4711")
+        );
+        assert_eq!(forwarded_for("proto=https"), None);
+
+        assert_eq!(host_ip("192.0.2.1"), "192.0.2.1".parse().ok());
+        assert_eq!(host_ip("192.0.2.1:4711"), "192.0.2.1".parse().ok());
+        assert_eq!(host_ip("2001:db8::1"), "2001:db8::1".parse().ok());
+        assert_eq!(host_ip("[2001:db8::1]:4711"), "2001:db8::1".parse().ok());
+        // RFC 7239's obfuscated identifiers name nobody.
+        assert_eq!(host_ip("_hidden"), None);
+        assert_eq!(host_ip("unknown"), None);
+    }
 
     /// Encode one TLV with a minimal definite length.
     fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
