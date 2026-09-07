@@ -413,6 +413,22 @@ impl AuthBackend for FileAuth {
                 acc[key] = toml_edit::value(true);
             }
         }
+        // Whatever is set and has no name goes to `raw_bits`, the same
+        // escape hatch a hand-written file uses. Writing only the named
+        // ones silently dropped every reserved or future allocation —
+        // and the template these accounts are created from is usually
+        // the guest account, which is exactly where an operator puts a
+        // `raw_bits` entry for a bit this build has no name for yet.
+        let unnamed: Vec<u8> = (0..64)
+            .filter(|b| access.has(*b) && !NAMED_BITS.iter().any(|(_, n)| n == b))
+            .collect();
+        if !unnamed.is_empty() {
+            let mut arr = toml_edit::Array::new();
+            for b in unnamed {
+                arr.push(i64::from(b));
+            }
+            acc["raw_bits"] = toml_edit::value(arr);
+        }
         doc["access"] = toml_edit::Item::Table(acc);
         let mut id = toml_edit::Table::new();
         id["fingerprint"] = toml_edit::value(hl_identity::Fingerprint(*fingerprint).to_string());
@@ -1037,6 +1053,25 @@ mod tests {
         assert_eq!(auth.reserved_by("MISHA").unwrap(), Some("misha".into()));
         assert_eq!(auth.reserved_by("guest").unwrap(), None);
         assert_eq!(auth.reserved_by("../misha").unwrap(), None);
+    }
+
+    #[test]
+    fn a_created_account_keeps_bits_this_build_has_no_name_for() {
+        // The guest account is the usual template, and `raw_bits` is
+        // where an operator puts an allocation this build predates —
+        // the messaging extension's access bit 58, for one. Emitting
+        // only `NAMED_BITS` dropped them on the floor.
+        let (td, auth) = backend();
+        let access = AccessBits::empty().with(bit::SEND_CHAT).with(58).with(61);
+        let (a, created) = auth
+            .find_or_create_linked("newbie", "Newbie", &[5u8; 32], access)
+            .unwrap();
+        assert!(created);
+        let text = std::fs::read_to_string(td.path().join(format!("{}.toml", a.login))).unwrap();
+        assert!(text.contains("raw_bits"), "{text}");
+        // And it reads back as exactly what went in.
+        let back = auth.lookup(&a.login).unwrap();
+        assert_eq!(back.access, access);
     }
 
     #[test]

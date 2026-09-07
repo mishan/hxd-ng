@@ -119,7 +119,14 @@ impl Card {
     /// signatures). Returns [`Error::TooLarge`] rather than a card no
     /// server will accept.
     pub fn sign(&self, identity: &IdentityKey, attestations: Vec<Value>) -> Result<Vec<u8>, Error> {
-        debug_assert_eq!(identity.public(), self.identity);
+        // `assert!`, not `debug_assert!` (AGENTS.md): a wire invariant a
+        // release build must not skip. Skipping it returns `Ok` holding a
+        // card whose signature verifies against nothing.
+        assert_eq!(
+            identity.public(),
+            self.identity,
+            "signing a card with a key that is not its identity"
+        );
         self.check_fields()?;
         let bytes = signed::seal(self.unsigned(attestations), |body| {
             identity.sign(DOMAIN, body)

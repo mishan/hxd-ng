@@ -170,6 +170,15 @@ impl Args {
 
 // --- Files ---------------------------------------------------------------
 
+/// Days as seconds, refusing a number that cannot be one. `days * 86_400`
+/// wraps silently in release for anything past ~2^44, which would produce
+/// a signed object with an expiry in the past.
+fn seconds(days: u64) -> R<u64> {
+    days.checked_mul(86_400)
+        .filter(|_| days <= 36_500)
+        .ok_or_else(|| "--days: must be 36500 or fewer (100 years)".to_string())
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -284,7 +293,8 @@ fn make_cert(args: &[String]) -> R<()> {
     let id = IdentityKey::from_seed(&read_seed(a.one("identity")?)?);
     let dev = DeviceKey::from_seed(&read_seed(a.one("device")?)?);
     let days = a.u64("days", cert::RECOMMENDED_LIFETIME / 86_400)?;
-    let mut c = DeviceCert::for_device(&id, &dev, now(), days * 86_400);
+    let mut c = DeviceCert::for_device(&id, &dev, now(), seconds(days)?)
+        .map_err(|e| format!("--days: {e}"))?;
     c.caps = match a.opt("caps") {
         None | Some("all") => None,
         Some("web") => Some(caps::WEB),
@@ -362,7 +372,11 @@ fn make_attestation(args: &[String]) -> R<()> {
         handle: a.one("handle")?.to_owned(),
         registered: a.u64("registered", t)?,
         issued: t,
-        expires: t + a.u64("days", attestation::RECOMMENDED_LIFETIME / 86_400)? * 86_400,
+        expires: t
+            .checked_add(seconds(
+                a.u64("days", attestation::RECOMMENDED_LIFETIME / 86_400)?,
+            )?)
+            .ok_or("--days: the expiry does not fit")?,
         level: match a.opt("level") {
             Some(s) => Some(s.parse().map_err(|_| "--level: not a number".to_string())?),
             None => None,

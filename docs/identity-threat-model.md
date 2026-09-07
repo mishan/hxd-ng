@@ -45,7 +45,7 @@ it should be cut or this document should change first.
 | **Other users** | whatever the server shows them; decrypted PMs they receive |
 | **Network attacker** | passive or active position on the wire |
 | **Legacy (1.x) client** | a classic account or guest login; no identity; possibly cleartext |
-| **Tunnel / relay operator** | transport identity of every socket it fronts; the tunnelled bytes pass through it under TLS on both sides, but a tunnel on the user's own machine, or a relay, terminates that TLS and can read them |
+| **Tunnel / relay operator** | transport identity of every socket it fronts, and the payload in the clear — it terminates the TLS it forwards under. The hops differ and neither is protected end to end: a *tunnel* takes cleartext TCP from the classic client (loopback by default, off-loopback opt-in) and speaks TLS upstream; a *relay* takes TLS from the client and speaks **plain TCP** to the legacy server behind it, so credentials and messages cross that last hop unprotected |
 
 ## Assets, ranked
 

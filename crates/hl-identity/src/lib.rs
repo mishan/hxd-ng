@@ -151,8 +151,9 @@ mod tests {
         let card = Card::new(&id, "Misha", 1_700_000_000)
             .sign(&id, vec![])
             .unwrap();
-        let cert =
-            DeviceCert::for_device(&id, &dev, 1_700_000_000, cert::RECOMMENDED_LIFETIME).sign(&id);
+        let cert = DeviceCert::for_device(&id, &dev, 1_700_000_000, cert::RECOMMENDED_LIFETIME)
+            .unwrap()
+            .sign(&id);
         World {
             id,
             dev,
@@ -232,7 +233,7 @@ mod tests {
             Error::Expired
         );
 
-        let mut c = DeviceCert::for_device(&w.id, &w.dev, 1_700_000_000, 1000);
+        let mut c = DeviceCert::for_device(&w.id, &w.dev, 1_700_000_000, 1000).unwrap();
         c.caps = Some(caps::MESSAGE);
         let cert = c.sign(&w.id);
         let proof = LoginProof::sign(&w.dev, &ch, &w.srv.public(), 1_700_000_100);

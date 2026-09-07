@@ -41,9 +41,17 @@ and certificate. Two ways to do the proof — a challenge signed by the
 device key, or a TLS client certificate presented to the reverse proxy —
 end in the same state: *this connection belongs to device key D of
 identity I*. Anything that terminates the HTTP handshake can establish
-this, including a relay that then tunnels bytes it never reads. It is
-enough for admission (allow lists, bans by fingerprint), rate limits,
-marking the session for other users, and presence.
+this, including a relay that only forwards the bytes it carries. It is
+enough, on its own, for admission (allow lists, bans by fingerprint) and
+rate limits — decisions a transport can make about a connection.
+
+Roster marking and presence are *not* in that set, though they are
+downstream of it: they are things the application protocol says about a
+session, so only a server that terminates that protocol can do them. A
+relay that forwards opaque TRTP establishes the transport identity and
+then has no way to tell the legacy server behind it (§11.2), which is why
+a relayed session shows no identity to other users while a tunnelled one
+(§6.3, where the identity-aware server *is* the endpoint) does.
 
 **Account association** — which local account, if any, this identity is.
 Only a server that also implements the application protocol on the socket
@@ -337,9 +345,21 @@ Failure with `{ "error": code, "text": "…" }`:
 | `server_error` | 500 | ours, logged, not explained |
 
 `outcome` tells the client what account association will happen when an
-application login runs on a socket carrying this token (§8), so a guest
-downgrade can be shown as information rather than discovered as a
-surprise.
+application login runs on a socket carrying this token *and presents no
+credentials of its own* (§8), so a guest downgrade can be shown as
+information rather than discovered as a surprise.
+
+That qualifier matters because the token is path-agnostic: the same token
+admits an ng `login` and a tunnelled TRTP Login (107), and only the ng path
+is fully decided at auth time. A tunnelled classic login under
+`trtp_login = verify` (§8.3) carries a name and password that
+`/identity/auth` never saw, so it can land on — and link — an account this
+response could not have named. `outcome` is therefore a prediction, not a
+commitment, and a client MUST take the association the application login
+actually reports (the ng `self` event, or the classic Login reply) as
+authoritative. A client that intends to send classic credentials later
+should treat `guest` as "unless my credentials say otherwise" rather than
+displaying it as settled.
 
 ### 5.3 mTLS binding
 
@@ -446,8 +466,14 @@ An upgrade request is authenticated by one of, in order of preference:
 - `?token=<token>` in the upgrade URL — browsers, whose `WebSocket` API
   takes a URL and a protocol list and nothing else. The token is
   single-use and expires in 60 seconds, which is what makes a value in
-  the URL tolerable; servers should still keep the query string out of
-  access logs on these paths;
+  the URL tolerable at all.
+
+  A deployment that serves this form **MUST** keep the query string out
+  of its logs on these paths — access logs, error logs, and any redirect
+  or upgrade-failure log — because common reverse-proxy defaults record
+  it, and an upgrade that fails or is abandoned leaves the token
+  unredeemed and live for its remaining seconds. "Single-use" bounds the
+  damage only once someone has used it;
 - a client certificate on the connection for a device key on file,
   forwarded under the §5.3 proxy contract, which needs no token at all.
 
@@ -607,11 +633,20 @@ reconciles the two is the `[identity] trtp_login` setting:
   fails the login. A guest login associates per §8.1. The identity adds
   marking, reserved-name enforcement and admission; it never substitutes
   for a password.
-- `trust` — if the identity has a linked account, that account is used
-  and the classic credentials are ignored. This lets a linked account be
-  password-less and lets a user type anything into a 1.5 login box.
-  Operators who enable it are trusting their allow list and registrar
-  policy in place of passwords for those accounts.
+- `trust` — if the identity has a linked account **whose
+  `identity_login` is on**, that account is used and the classic
+  credentials are ignored. This lets a linked account be password-less
+  and lets a user type anything into a 1.5 login box. Operators who
+  enable it are trusting their allow list and registrar policy in place
+  of passwords for those accounts.
+
+  `identity_login = false` is not overridden by `trust`. The two settings
+  answer different questions — one is the operator's policy for the
+  server, the other is the account's own — and a server-wide switch that
+  silently cancelled a per-account refusal would make the per-account
+  setting unreliable in exactly the deployments that set it. A session
+  reaching such an account still needs its password, and a guest login
+  on that socket fails with `denied` per §8.1.
 
 Either way the session is identity-aware from the server's point of view
 and indistinguishable from a native identity session in the roster.
@@ -681,10 +716,24 @@ classic session *sees*, not about authentication:
   and news reading only), `on` (legacy behaviour, with a warning in
   operator tooling).
 
-A tunnelled TRTP session (§6.3) is `encrypted`: the tunnel is TLS end to
-end and the server never sees the bytes in the clear on the wire. This,
-rather than HOPE transport encryption, is the recommended way for a
-legacy client to get an encrypted session — it also gets an identity.
+A tunnelled TRTP session (§6.3) is `encrypted` **when the tunnel's own
+local hop is**. The hop the server can see — tunnel to server — is TLS,
+and the server never sees those bytes in the clear. The other hop, the
+classic client to the tunnel, is cleartext by construction (§11.1): the
+tunnel exists because the client cannot speak TLS. On loopback that hop
+crosses nothing, and the session is `encrypted`. Off loopback — which
+§11.1 permits, deliberately and opt-in — it crosses a network, and the
+session is `cleartext`.
+
+The server cannot observe which, so the tunnel declares it: `downstream`
+at `/identity/auth` (§5.2), `cleartext` when the tunnel listens anywhere
+but loopback. A client may declare itself less safe than it looks and
+never more, so a tunnel that lies can only cost its own user a warning
+they didn't need. `hlid tunnel` sets it from its own `--listen`.
+
+With that hop on loopback this is, rather than HOPE transport
+encryption, the recommended way for a legacy client to get an encrypted
+session — it also gets an identity.
 
 An ng client must warn before sending a private message to a `cleartext`
 session.
@@ -693,9 +742,15 @@ session.
 
 ## 11. Tunnels and relays
 
-Neither reads the protocol it carries. That is the point: everything in
-this section is possible with an HTTP client library, a WebSocket library,
-and `hl-identity`, and nothing here requires TRTP knowledge.
+Neither needs to *parse* the protocol it carries. That is the point:
+everything in this section is possible with an HTTP client library, a
+WebSocket library, and `hl-identity`, and nothing here requires TRTP
+knowledge.
+
+It is not a confidentiality claim. Both processes handle the payload
+bytes in the clear and can read or alter them at will; the threat model
+says so of their operators explicitly. What they are spared is
+understanding those bytes, not seeing them.
 
 ### 11.1 Tunnel: legacy client → identity-aware server
 

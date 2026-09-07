@@ -69,6 +69,46 @@ fn vectors() -> Json {
     serde_json::from_str(VECTORS).unwrap()
 }
 
+/// Hold a published object to *every* field the file states about it, not
+/// just `signed_hex`.
+///
+/// `unsigned_hex`, `signature_hex` and `signature_input_hex` are what
+/// another implementation reads to find out where its own bytes diverge —
+/// they are the debugging surface of the whole vector file. Asserting
+/// only the signed form let all three drift or rot while the suite stayed
+/// green, which is the one failure a contract file must not have.
+fn check_signed(e: &Json, domain: &str, public: &[u8; 32], signed: &[u8]) {
+    let unsigned = unhex(str_of(e, "unsigned_hex"));
+    let sig = unhex(str_of(e, "signature_hex"));
+    let input = unhex(str_of(e, "signature_input_hex"));
+
+    // The signature input is the domain, a NUL, and the unsigned bytes.
+    let mut expect = domain.as_bytes().to_vec();
+    expect.push(0);
+    expect.extend_from_slice(&unsigned);
+    assert_eq!(input, expect, "{domain}: signature_input_hex");
+
+    // The unsigned form is the signed one minus `sig`.
+    let value = hl_identity::cbor::decode_canonical(signed).expect("signed_hex is canonical");
+    assert_eq!(
+        hl_identity::cbor::encode(&value.without("sig")),
+        unsigned,
+        "{domain}: unsigned_hex"
+    );
+
+    // And the signature in the object is the one the file publishes, and
+    // it verifies over the input the file publishes.
+    match value.get("sig") {
+        Some(hl_identity::cbor::Value::Bytes(b)) => {
+            assert_eq!(b.as_slice(), sig.as_slice(), "{domain}: signature_hex")
+        }
+        other => panic!("{domain}: no sig in the signed object: {other:?}"),
+    }
+    let sig: [u8; 64] = sig.try_into().expect("64-byte signature");
+    hl_identity::keys::verify_domain(public, domain, &unsigned, &sig)
+        .unwrap_or_else(|e| panic!("{domain}: published signature does not verify: {e}"));
+}
+
 #[test]
 fn device_cert_vector() {
     let v = vectors();
@@ -93,6 +133,7 @@ fn device_cert_vector() {
         "device cert re-signs to the vector bytes"
     );
     assert_eq!(DeviceCert::parse(&signed).unwrap(), dc);
+    check_signed(e, cert::DOMAIN, &k.id.public(), &signed);
 }
 
 #[test]
@@ -120,6 +161,7 @@ fn attestation_vector() {
     assert!(back
         .verify_registrar(&k.reg.public(), u64_of(&v["login"], "now"), 300)
         .is_ok());
+    check_signed(e, attestation::DOMAIN, &k.reg.public(), &signed);
 }
 
 #[test]
@@ -157,6 +199,7 @@ fn card_vector() {
     assert_eq!(back.profile.as_deref(), f["profile"].as_str());
     assert_eq!(back.links, c.links);
     assert_eq!(back.successor, None);
+    check_signed(e, card::DOMAIN, &k.id.public(), &signed);
 }
 
 #[test]
@@ -194,6 +237,7 @@ fn login_proof_vector_and_composed_login() {
     );
     let p = LoginProof::parse(&signed).unwrap();
     assert_eq!(p.device, k.dev.public());
+    check_signed(e, proof::DOMAIN, &k.dev.public(), &signed);
 
     let login = &v["login"];
     let ctx = LoginContext {

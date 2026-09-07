@@ -213,7 +213,9 @@ fn person(seed: u8, name: &str) -> Person {
     let id = IdentityKey::from_seed(&[seed; 32]);
     let dev = DeviceKey::from_seed(&[seed + 100; 32]);
     let card = Card::new(&id, name, now()).sign(&id, vec![]).unwrap();
-    let cert = DeviceCert::for_device(&id, &dev, now() - 5, cert::RECOMMENDED_LIFETIME).sign(&id);
+    let cert = DeviceCert::for_device(&id, &dev, now() - 5, cert::RECOMMENDED_LIFETIME)
+        .unwrap()
+        .sign(&id);
     Person {
         id,
         dev,
@@ -784,7 +786,8 @@ async fn linking_at_auth_lands_on_the_account_and_survives_unlink_rules() {
 
     // A web-capped device can't manage the link.
     let mut web = person(6, "Web");
-    let mut c = DeviceCert::for_device(&web.id, &web.dev, now() - 5, cert::RECOMMENDED_LIFETIME);
+    let mut c =
+        DeviceCert::for_device(&web.id, &web.dev, now() - 5, cert::RECOMMENDED_LIFETIME).unwrap();
     c.caps = Some(hl_identity::caps::WEB);
     web.cert = c.sign(&web.id);
     let wa = authenticate(ng, &web).await;
@@ -1433,7 +1436,9 @@ async fn a_successor_commitment_survives_a_restart() {
         start_server_with(dir.path(), cfg(), hxd_session::TrtpLogin::Verify).await;
     let id = IdentityKey::from_seed(&[28; 32]);
     let dev = DeviceKey::from_seed(&[128; 32]);
-    let cert = DeviceCert::for_device(&id, &dev, now() - 5, cert::RECOMMENDED_LIFETIME).sign(&id);
+    let cert = DeviceCert::for_device(&id, &dev, now() - 5, cert::RECOMMENDED_LIFETIME)
+        .unwrap()
+        .sign(&id);
     let card = |successor: Option<[u8; 32]>, at: u64| {
         let mut c = Card::new(&id, "Anchored", at);
         c.successor = successor;
@@ -1481,4 +1486,146 @@ new_accounts = "create"
     let config: hxd::Config = toml::from_str(toml).unwrap();
     let err = hxd::check_config(&config).unwrap_err();
     assert!(err.contains("[ng]"), "{err}");
+}
+
+/// §8.3 `verify`: an identity socket may land on the account linked to
+/// it, or on an unlinked account it is allowed to link — nothing else.
+/// §8.1: a link the operator disabled is a refusal, not a fallback.
+#[tokio::test]
+async fn a_tunnel_may_not_use_an_account_that_refuses_association() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    // `locked` has a password and `allow_self_link = false`.
+    let p = person(50, "Tunneller");
+    let auth = authenticate(ng, &p).await;
+    let token = auth["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        tunnel_login_flag(ng, &token, "locked", "pw").await,
+        1,
+        "an account that refuses self-linking must not be reachable from \
+         an identity socket, even with its password"
+    );
+
+    // And a self-linkable account still works, and gets linked.
+    let auth = authenticate(ng, &p).await;
+    let token = auth["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        tunnel_login_flag(ng, &token, "misha", "s3cret").await,
+        0,
+        "an unlinked, self-linkable account links and logs in"
+    );
+    assert_eq!(
+        authenticate(ng, &p).await["outcome"],
+        "linked",
+        "and the link stuck"
+    );
+}
+
+#[tokio::test]
+async fn identity_login_false_denies_a_tunnelled_guest_rather_than_guesting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(51, "Refused");
+
+    // Link, then the operator turns identity login off for the account.
+    let auth = try_authenticate(ng, &p, json!({ "login": "misha", "password": "s3cret" })).await;
+    assert_eq!(auth.json()["outcome"], "linked");
+    let path = dir.path().join("accounts/misha.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        text.replace("[identity]", "[identity]\nlogin = false"),
+    )
+    .unwrap();
+
+    // ng denies it (`account_for` → Denied → login_failed).
+    let auth = try_authenticate(ng, &p, json!({})).await;
+    assert_eq!(auth.status, 403, "{}", String::from_utf8_lossy(&auth.body));
+
+    // And so must the tunnel: a guest login on that socket used to fall
+    // through to an ordinary guest session, which answers a question
+    // nobody asked.
+    let auth = try_authenticate(ng, &p, json!({ "login": "misha", "password": "s3cret" })).await;
+    assert_eq!(auth.status, 403, "{}", String::from_utf8_lossy(&auth.body));
+}
+
+/// A tunnelled classic login; returns the login reply's error flag.
+async fn tunnel_login_flag(ng: SocketAddr, token: &str, login: &str, password: &str) -> u32 {
+    let mut req = format!("ws://{ng}/trtp").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let mut tun = Tunnel::new(ws);
+    tun.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
+    tun.read_exact(8).await;
+    tun.send(
+        REQ_LOGIN,
+        &[
+            (tag::LOGIN, login.bytes().map(|b| b ^ 0xff).collect()),
+            (tag::PASSWORD, password.bytes().map(|b| b ^ 0xff).collect()),
+            (tag::NAME, login.as_bytes().to_vec()),
+            (tag::VERSION, 150u16.to_be_bytes().to_vec()),
+        ],
+    )
+    .await;
+    tun.recv_type(HDR_TASK).await.flag
+}
+
+/// A token is a 401 on a server with identity off, not a silent guest.
+#[tokio::test]
+async fn a_token_offered_to_a_server_without_identity_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let accounts = dir.path().join("accounts");
+    hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
+    let core = Arc::new(Core::new());
+    let auth: Arc<dyn hxd_core::AuthBackend> = Arc::new(hxd_auth_file::FileAuth::new(accounts));
+    let ng_ctx = NgCtx {
+        core,
+        auth,
+        cfg: Arc::new(NgConfig::default()),
+        registry: Arc::new(Registry::new()),
+        identity: None,
+        tunnel: None,
+    };
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ng = l.local_addr().unwrap();
+    tokio::spawn(hxd_ng_session::serve(l, ng_ctx));
+
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{ng}/ng?token=AAAA"))
+            .await
+            .is_err(),
+        "a client that believes it authenticated must not be quietly guested"
+    );
+    // Without a token it is an ordinary anonymous socket, as before.
+    assert!(tokio_tungstenite::connect_async(format!("ws://{ng}/ng"))
+        .await
+        .is_ok());
+}
+
+/// A `login`/`password` of the wrong JSON type is a client bug, not an
+/// absence: reading it as "no credentials" answered 200 with a guest or
+/// created outcome for a request that asked to link.
+#[tokio::test]
+async fn malformed_classic_credentials_are_a_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(52, "Typed");
+    for body in [
+        json!({ "login": 7, "password": 7 }),
+        json!({ "login": "misha", "password": ["s3cret"] }),
+        json!({ "login": { "name": "misha" }, "password": "s3cret" }),
+    ] {
+        let r = try_authenticate(ng, &p, body.clone()).await;
+        assert_eq!(
+            r.status,
+            400,
+            "{body}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+    }
+    // A null is an absence, which is what a JSON encoder emits for None.
+    let r = try_authenticate(ng, &p, json!({ "login": null, "password": null })).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
 }

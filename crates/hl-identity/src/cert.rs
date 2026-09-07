@@ -39,21 +39,30 @@ pub struct DeviceCert {
 impl DeviceCert {
     /// A certificate for `device`, valid from `issued` for `lifetime`
     /// seconds, unrestricted and unnamed. Adjust fields before signing.
+    ///
+    /// Refuses a window that doesn't fit in the field rather than
+    /// wrapping into one: `issued + lifetime` overflowing would panic a
+    /// debug build and, in release, silently produce a certificate that
+    /// expired in 1970 — build-dependent bytes for something that gets
+    /// signed.
     pub fn for_device(
         identity: &IdentityKey,
         device: &DeviceKey,
         issued: u64,
         lifetime: u64,
-    ) -> Self {
-        DeviceCert {
+    ) -> Result<Self, Error> {
+        let expires = issued
+            .checked_add(lifetime)
+            .ok_or(Error::BadField("expires"))?;
+        Ok(DeviceCert {
             identity: identity.public(),
             device: device.public(),
             device_enc: device.public_enc(),
             issued,
-            expires: issued + lifetime,
+            expires,
             caps: None,
             name: None,
-        }
+        })
     }
 
     fn unsigned(&self) -> Value {
@@ -69,10 +78,18 @@ impl DeviceCert {
         ])
     }
 
-    /// Sign with the identity key. The key must match `self.identity`;
-    /// signing with another produces a certificate nobody will accept.
+    /// Sign with the identity key, which must match `self.identity`.
+    ///
+    /// `assert!`, not `debug_assert!` (AGENTS.md): this is a wire
+    /// invariant, and a release build that skipped it would hand back a
+    /// certificate whose signature cannot verify — a failure that shows
+    /// up as "the server rejects my device" a long way from its cause.
     pub fn sign(&self, identity: &IdentityKey) -> Vec<u8> {
-        debug_assert_eq!(identity.public(), self.identity);
+        assert_eq!(
+            identity.public(),
+            self.identity,
+            "signing a device certificate with a key that is not its identity"
+        );
         signed::seal(self.unsigned(), |body| identity.sign(DOMAIN, body))
     }
 
@@ -118,12 +135,40 @@ impl DeviceCert {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lifetime_that_does_not_fit_is_refused_not_wrapped() {
+        use super::*;
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = DeviceKey::from_seed(&[2u8; 32]);
+        assert_eq!(
+            DeviceCert::for_device(&id, &dev, u64::MAX - 5, 10),
+            Err(Error::BadField("expires")),
+            "a release build would otherwise sign a cert that expired in 1970"
+        );
+        assert!(DeviceCert::for_device(&id, &dev, 0, u64::MAX).is_ok());
+        assert!(DeviceCert::for_device(&id, &dev, 1, u64::MAX).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "not its identity")]
+    fn signing_with_the_wrong_key_is_caught_in_every_build() {
+        use super::*;
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let other = IdentityKey::from_seed(&[9u8; 32]);
+        let dev = DeviceKey::from_seed(&[2u8; 32]);
+        // `debug_assert!` here meant a release build shipped a
+        // certificate that verifies nowhere (AGENTS.md).
+        let _ = DeviceCert::for_device(&id, &dev, 0, 10)
+            .unwrap()
+            .sign(&other);
+    }
+
     use super::*;
 
     fn fixture() -> (IdentityKey, DeviceKey, DeviceCert) {
         let id = IdentityKey::from_seed(&[1u8; 32]);
         let dev = DeviceKey::from_seed(&[2u8; 32]);
-        let cert = DeviceCert::for_device(&id, &dev, 1_700_000_000, RECOMMENDED_LIFETIME);
+        let cert = DeviceCert::for_device(&id, &dev, 1_700_000_000, RECOMMENDED_LIFETIME).unwrap();
         (id, dev, cert)
     }
 
@@ -166,7 +211,7 @@ mod tests {
         // through the public path with a mismatched claim.
         let claim = DeviceCert {
             identity: IdentityKey::from_seed(&[1u8; 32]).public(),
-            ..DeviceCert::for_device(&other, &dev, 0, 10)
+            ..DeviceCert::for_device(&other, &dev, 0, 10).unwrap()
         };
         let bytes = signed::seal(claim.unsigned(), |b| other.sign(DOMAIN, b));
         assert_eq!(DeviceCert::parse(&bytes), Err(Error::BadSignature));
