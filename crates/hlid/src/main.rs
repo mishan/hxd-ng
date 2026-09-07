@@ -6,17 +6,25 @@
 //! ```text
 //! hlid keygen identity|device|server PATH     make a key (32-byte seed, hex, mode 0600)
 //! hlid cert    --identity K --device K [--days N] [--caps all|web|LIST] [--name S] -o FILE
-//! hlid card    --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]... -o FILE
+//! hlid card    --identity K --name S [--icon N] [--profile S] [--link URL]...
+//!              [--attestation FILE]... [--successor HEX|--successor-key FILE] -o FILE
 //! hlid attest  --registrar-key K --registrar HOST --identity K|--identity-pub HEX --handle S
 //!              [--registered UNIX] [--days N] [--level N] -o FILE
 //! hlid inspect FILE                           print any signed object
-//! hlid auth    --server URL --device K --card FILE --cert FILE [--login L --password P]
+//! hlid auth    --server URL --device K --card FILE --cert FILE [--login L]
+//!              [--password P | --password-file F | --password-stdin] [--no-create]
 //!              challenge binding → token; with credentials, links the account (§8.2)
 //! hlid link    --server URL --device K --card FILE --cert FILE --login L --password P
 //! hlid unlink  --server URL --device K --card FILE --cert FILE
 //! hlid tunnel  --server URL --device K --card FILE --cert FILE [--listen ADDR]
+//!              [--allow-remote-listen]
 //!              local TCP port for a classic client, TRTP over WebSocket upstream
 //! ```
+//!
+//! `--password` puts a secret on the command line, where anyone on the
+//! machine can read it out of `ps`. `--password-file` and
+//! `--password-stdin` don't; prefer them, and prompt-based entry lands
+//! with the registrar spec's password-wrapped key envelope.
 //!
 //! Key files are the raw seed in hex. That is the prototype's storage;
 //! the registrar spec's password-wrapped envelope replaces it, and the
@@ -61,7 +69,7 @@ fn main() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  hlid keygen identity|device|server PATH\n  hlid cert --identity K --device K [--days N] [--caps all|web|LIST] [--name S] -o FILE\n  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]... -o FILE\n  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n  hlid inspect FILE\n  hlid auth --server URL --device K --card FILE --cert FILE [--login L --password P]\n  hlid link --server URL --device K --card FILE --cert FILE --login L --password P\n  hlid unlink --server URL --device K --card FILE --cert FILE\n  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500]"
+        "usage:\n  hlid keygen identity|device|server PATH\n  hlid cert --identity K --device K [--days N] [--caps all|web|LIST] [--name S] -o FILE\n  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n       [--successor HEX | --successor-key FILE] -o FILE\n  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n  hlid inspect FILE\n  hlid auth --server URL --device K --card FILE --cert FILE [--login L] [--password P | --password-file F | --password-stdin] [--no-create]\n  hlid link --server URL --device K --card FILE --cert FILE --login L [--password P | --password-file F | --password-stdin]\n  hlid unlink --server URL --device K --card FILE --cert FILE\n  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500] [--allow-remote-listen]\n\nPassword options: --password puts the secret in `ps` output; prefer\n--password-file or --password-stdin."
     );
     exit(2)
 }
@@ -73,6 +81,11 @@ type R<T> = Result<T, String>;
 struct Args {
     flags: HashMap<String, Vec<String>>,
 }
+
+/// Flags that stand alone; everything else takes a value. Without this
+/// list a bare `--allow-remote-listen` swallowed the next argument, so it
+/// needed a dummy value nothing documented.
+const BARE: &[&str] = &["allow-remote-listen", "password-stdin", "no-create"];
 
 fn parse(args: &[String]) -> Args {
     let mut flags: HashMap<String, Vec<String>> = HashMap::new();
@@ -86,7 +99,15 @@ fn parse(args: &[String]) -> Args {
                 exit(2);
             }
         };
-        let v = args.get(i + 1).cloned().unwrap_or_default();
+        if BARE.contains(&key) {
+            flags.entry(key.to_owned()).or_default().push(String::new());
+            i += 1;
+            continue;
+        }
+        let Some(v) = args.get(i + 1).cloned() else {
+            eprintln!("hlid: --{key} needs a value");
+            exit(2);
+        };
         flags.entry(key.to_owned()).or_default().push(v);
         i += 2;
     }
@@ -106,6 +127,32 @@ impl Args {
             .get(k)
             .and_then(|v| v.first())
             .map(String::as_str)
+    }
+    fn has(&self, k: &str) -> bool {
+        self.flags.contains_key(k)
+    }
+    /// A password from the least-bad source the user offered.
+    /// `--password` is accepted because scripts exist, but it is visible
+    /// in `ps` to everyone on the machine, so the other two come first.
+    fn password(&self) -> R<Option<String>> {
+        if self.has("password-stdin") {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+                .map_err(|e| format!("--password-stdin: {e}"))?;
+            return Ok(Some(s.trim_end_matches(['\r', '\n']).to_owned()));
+        }
+        if let Some(path) = self.opt("password-file") {
+            let s = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            return Ok(Some(s.trim_end_matches(['\r', '\n']).to_owned()));
+        }
+        if let Some(p) = self.opt("password") {
+            eprintln!(
+                "hlid: --password is visible to other users via `ps`; \
+                 prefer --password-file or --password-stdin"
+            );
+            return Ok(Some(p.to_owned()));
+        }
+        Ok(None)
     }
     fn many(&self, k: &str) -> Vec<&str> {
         self.flags
@@ -269,6 +316,22 @@ fn make_card(args: &[String]) -> R<()> {
     };
     card.profile = a.opt("profile").map(str::to_owned);
     card.links = a.many("link").into_iter().map(str::to_owned).collect();
+    // §3.4: a one-way commitment to the identity that may succeed this
+    // one. `--successor-key` takes the successor's *key file* and hashes
+    // its public half, which is what a user actually has to hand.
+    card.successor = match (a.opt("successor"), a.opt("successor-key")) {
+        (Some(_), Some(_)) => return Err("--successor and --successor-key are alternatives".into()),
+        (Some(h), None) => Some(
+            unhex(h)?
+                .try_into()
+                .map_err(|_| "--successor: 32 bytes of hex".to_string())?,
+        ),
+        (None, Some(path)) => {
+            let key = IdentityKey::from_seed(&read_seed(path)?);
+            Some(Fingerprint::of(&key.public()).0)
+        }
+        (None, None) => None,
+    };
     let atts = a
         .many("attestation")
         .into_iter()
@@ -323,6 +386,7 @@ fn inspect(args: &[String]) -> R<()> {
             "type": "card",
             "identity": hex(&c.identity), "identity_fingerprint": Fingerprint::of(&c.identity).to_string(),
             "updated": c.updated, "name": c.name, "icon": c.icon, "profile": c.profile, "links": c.links,
+            "successor": c.successor.as_ref().map(|s| hex(s)),
             "attestations": c.attestations.iter().map(|a| json!({
                 "handle": a.full_handle(), "registered": a.registered, "issued": a.issued, "expires": a.expires,
                 "level": a.level, "registrar_key": hex(&a.registrar_key),
@@ -399,12 +463,20 @@ fn server_base(a: &Args) -> R<String> {
 
 /// The challenge binding (§5.2) against a server. Blocking; small.
 fn authenticate(base: &str, c: &Credentials) -> R<Value> {
-    authenticate_with(base, c, None)
+    // `create: false`: this path exists to get a token for `link` or
+    // `unlink`, and on a `new_accounts = create` server letting it create
+    // an account first would make the link that follows `already_linked`.
+    authenticate_with(base, c, None, false)
 }
 
 /// Same, optionally with classic credentials to link in the same step
-/// (§5.4, §8.2).
-fn authenticate_with(base: &str, c: &Credentials, classic: Option<(&str, &str)>) -> R<Value> {
+/// (§5.4, §8.2). `create` is §8.2's opt-out.
+fn authenticate_with(
+    base: &str,
+    c: &Credentials,
+    classic: Option<(&str, &str)>,
+    create: bool,
+) -> R<Value> {
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(10))
         .build();
@@ -426,6 +498,7 @@ fn authenticate_with(base: &str, c: &Credentials, classic: Option<(&str, &str)>)
         "device_cert": b64(&c.cert),
         "proof": b64(&proof),
         "downstream": c.downstream,
+        "create": create,
     });
     if let Some((login, password)) = classic {
         body["login"] = json!(login);
@@ -445,8 +518,22 @@ fn auth_cmd(args: &[String]) -> R<()> {
     let a = parse(args);
     let base = server_base(&a)?;
     let c = credentials(&a)?;
-    let classic = a.opt("login").zip(a.opt("password"));
-    let reply = authenticate_with(&base, &c, classic)?;
+    let password = a.password()?;
+    // A login with no password used to be dropped on the floor. It is
+    // always a mistake — say so rather than authenticating as nobody.
+    let classic = match (a.opt("login"), password.as_deref()) {
+        (Some(l), Some(p)) => Some((l, p)),
+        (Some(_), None) => {
+            return Err(
+                "--login needs a password (--password-file, --password-stdin \
+                        or --password)"
+                    .into(),
+            )
+        }
+        (None, Some(_)) => return Err("--password without --login".into()),
+        (None, None) => None,
+    };
+    let reply = authenticate_with(&base, &c, classic, !a.has("no-create"))?;
     println!("{}", serde_json::to_string_pretty(&reply).unwrap());
     Ok(())
 }
@@ -480,7 +567,10 @@ fn link_cmd(args: &[String]) -> R<()> {
     let a = parse(args);
     let base = server_base(&a)?;
     let c = credentials(&a)?;
-    let body = json!({ "login": a.one("login")?, "password": a.one("password")? });
+    let password = a
+        .password()?
+        .ok_or("a password is required (--password-file, --password-stdin or --password)")?;
+    let body = json!({ "login": a.one("login")?, "password": password });
     let reply = post_with_token(&base, &c, "/identity/link", body)?;
     println!("{}", serde_json::to_string_pretty(&reply).unwrap());
     Ok(())
@@ -506,7 +596,7 @@ fn tunnel_cmd(args: &[String]) -> R<()> {
     {
         // §11.1: the local hop is cleartext, so it stays on loopback
         // unless the user says otherwise on purpose.
-        if a.opt("allow-remote-listen").is_none() {
+        if !a.has("allow-remote-listen") {
             return Err(format!(
                 "{listen} is not loopback; pass --allow-remote-listen 1 if you mean it"
             ));

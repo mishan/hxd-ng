@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -124,8 +124,16 @@ fn sign_domain(key: &SigningKey, domain: &str, bytes: &[u8]) -> [u8; 64] {
     key.sign(&msg).to_bytes()
 }
 
-/// Verify a domain-separated signature. The public key is validated here
-/// (small-order and off-curve points are rejected by `VerifyingKey`).
+/// Verify a domain-separated signature.
+///
+/// The key is checked, not merely decompressed. `VerifyingKey::from_bytes`
+/// only says the bytes are a point; the small-order points are points
+/// too, and the neutral element with `S = 0` verifies *any* message under
+/// the permissive equation. Since a fingerprint is a hash of the public
+/// key, such a key would be a shared identity — one every holder could
+/// sign for, and a single allow-list entry, link or block for all of
+/// them. `is_weak` rejects the small-order points, and `verify_strict`
+/// closes the cofactor ambiguity for everything else.
 pub fn verify_domain(
     public: &PublicKey,
     domain: &str,
@@ -133,11 +141,14 @@ pub fn verify_domain(
     sig: &[u8; 64],
 ) -> Result<(), Error> {
     let key = VerifyingKey::from_bytes(public).map_err(|_| Error::InvalidKey)?;
+    if key.is_weak() {
+        return Err(Error::InvalidKey);
+    }
     let mut msg = Vec::with_capacity(domain.len() + 1 + bytes.len());
     msg.extend_from_slice(domain.as_bytes());
     msg.push(0);
     msg.extend_from_slice(bytes);
-    key.verify(&msg, &Signature::from_bytes(sig))
+    key.verify_strict(&msg, &Signature::from_bytes(sig))
         .map_err(|_| Error::BadSignature)
 }
 
@@ -326,6 +337,31 @@ mod tests {
         assert_eq!(a.public(), b.public());
         assert_eq!(a.public_enc(), b.public_enc());
         assert_ne!(a.public(), a.public_enc());
+    }
+
+    #[test]
+    fn small_order_keys_cannot_sign_for_everyone() {
+        // The neutral element with S = 0 verifies any message under the
+        // permissive equation, and its fingerprint would then be an
+        // identity shared by everyone who tried it.
+        let neutral = [0u8; 32];
+        let sig = [0u8; 64];
+        assert_eq!(
+            verify_domain(&neutral, "hl-identity/card/v1", b"anything", &sig),
+            Err(Error::InvalidKey)
+        );
+        assert_eq!(
+            verify_domain(&neutral, "hl-identity/card/v1", b"something else", &sig),
+            Err(Error::InvalidKey)
+        );
+        // The order-8 point with the low bit set decompresses fine and is
+        // still weak.
+        let mut order8 = [0u8; 32];
+        order8[0] = 0x01;
+        assert!(matches!(
+            verify_domain(&order8, "hl-identity/card/v1", b"x", &sig),
+            Err(Error::InvalidKey) | Err(Error::BadSignature)
+        ));
     }
 
     #[test]

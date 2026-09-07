@@ -150,6 +150,31 @@ fn card_vector() {
     assert_eq!(back.identity, unhex32(str_of(f, "identity")));
     assert_eq!(back.name, c.name);
     assert_eq!(back.attestations, vec![att]);
+    // The optional fields are part of the contract too; asserting only
+    // the name let a card round-trip while silently dropping them.
+    assert_eq!(back.updated, u64_of(f, "updated"));
+    assert_eq!(back.icon, f["icon"].as_u64());
+    assert_eq!(back.profile.as_deref(), f["profile"].as_str());
+    assert_eq!(back.links, c.links);
+    assert_eq!(back.successor, None);
+}
+
+#[test]
+fn card_successor_vector() {
+    let v = vectors();
+    let k = keys(&v);
+    let e = &v["card_successor"];
+    let f = &e["fields"];
+    assert_eq!(str_of(e, "domain"), card::DOMAIN);
+
+    let mut c = Card::new(&k.id, str_of(f, "name"), u64_of(f, "updated"));
+    c.successor = Some(unhex32(str_of(f, "successor")));
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(c.sign(&k.id, vec![]).unwrap(), signed);
+
+    let back = Card::parse(&signed).unwrap();
+    assert_eq!(back.successor, Some(unhex32(str_of(f, "successor"))));
+    assert_eq!(back.identity, unhex32(str_of(f, "identity")));
 }
 
 #[test]
