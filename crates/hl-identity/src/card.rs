@@ -41,6 +41,15 @@ pub struct Card {
     /// callers that want to inspect them).
     pub vouches: Vec<Value>,
     pub links: Vec<String>,
+    /// `SHA-256` of a successor identity public key the user has
+    /// pre-committed to (threat model, "stolen identity key"). Once a
+    /// card carries one, later cards for the same identity must carry
+    /// the same value; servers refuse a card that changes it. Rotation
+    /// to any other key is then refused wherever this card was cached,
+    /// which is what makes the commitment worth anything: an attacker
+    /// with the identity key can sign a new commitment but cannot make
+    /// caches forget the old one.
+    pub successor: Option<[u8; 32]>,
 }
 
 impl Card {
@@ -56,6 +65,7 @@ impl Card {
             attestations: Vec::new(),
             vouches: Vec::new(),
             links: Vec::new(),
+            successor: None,
         }
     }
 
@@ -95,6 +105,10 @@ impl Card {
                         self.links.iter().cloned().map(Value::Text).collect(),
                     ))
                 },
+            ),
+            (
+                "successor",
+                self.successor.map(|s| Value::Bytes(s.to_vec())),
             ),
         ])
     }
@@ -161,6 +175,7 @@ impl Card {
             attestations,
             vouches: signed::opt_array(v, "vouches")?,
             links,
+            successor: signed::opt_bytes32(v, "successor")?,
         };
         card.check_fields()?;
         if card
@@ -204,6 +219,16 @@ mod tests {
         assert_eq!(back.icon, Some(128));
         assert_eq!(back.links, card.links);
         assert_eq!(back.attestations, vec![att]);
+        assert_eq!(back.successor, None);
+    }
+
+    #[test]
+    fn successor_round_trips() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let mut card = Card::new(&id, "Misha", 10);
+        card.successor = Some([0x5a; 32]);
+        let back = Card::parse(&card.sign(&id, vec![]).unwrap()).unwrap();
+        assert_eq!(back.successor, Some([0x5a; 32]));
     }
 
     #[test]

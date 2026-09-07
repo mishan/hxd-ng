@@ -148,6 +148,7 @@ encoded.
 | `attestations` | array | no | Attestation objects, each fully signed |
 | `vouches` | array | no | Federation spec; ignored by servers that don't implement it |
 | `links` | array of tstr | no | URLs to display; servers never fetch them |
+| `successor` | bstr(32) | no | SHA-256 of a pre-committed successor identity key (threat model, "stolen identity key"). Once set, immutable: a later card for the same identity that changes or omits it is refused (`bad_card`) by any server that cached the earlier one, and rotation is accepted only to the committed key. |
 | `sig` | bstr(64) | yes | |
 
 ### 3.5 Attestation
@@ -267,9 +268,19 @@ attempts; it is free to call and costs the server a random draw.
 {
   "card":        "…base64url CBOR…",
   "device_cert": "…base64url CBOR…",
-  "proof":       "…base64url CBOR…"
+  "proof":       "…base64url CBOR…",
+  "downstream":  "local"                 // optional: local | cleartext
 }
 ```
+
+`downstream` is what the client declares about the hop *behind* it. A
+client that is the endpoint, or a tunnel forwarding only over loopback,
+says `local` (the default). A tunnel forwarding over a cleartext network
+hop (§11.1) MUST say `cleartext`; the server then marks the session
+`cleartext` on the roster (§10) so other users get the PM warning, TLS on
+the WebSocket notwithstanding. The server has no way to verify the claim
+and takes the conservative direction at face value: a client may make a
+session look less safe than it is, never more.
 
 The server verifies in this order and fails on the first error:
 
@@ -321,8 +332,22 @@ hxd-ng does not terminate TLS. The reverse proxy requests (but must not
 require) a client certificate and forwards it on the upstream request as
 `X-Hotline-Client-Cert` (base64 DER). The server honours that header only
 from addresses listed in `[ng] trusted_proxies`; from anywhere else it is
-stripped. Operators who terminate TLS in the server itself in some future
-build get the same header semantics from the in-process listener.
+stripped.
+
+Trusting the proxy's address is necessary but not sufficient. The proxy
+MUST set `X-Hotline-Client-Cert` from the certificate that took part in
+*its own* TLS handshake, and MUST drop any copy of the header the client
+sent — otherwise a client can send the header through the proxy carrying
+any device's public certificate and impersonate that device. In nginx,
+`proxy_set_header X-Hotline-Client-Cert $ssl_client_escaped_cert;`
+does both (a `proxy_set_header` replaces the inbound value, and an empty
+value when there was no client certificate removes the header); in Caddy,
+`header_up X-Hotline-Client-Cert {http.request.tls.client.certificate_der_base64}`
+likewise. An operator who lists a proxy in `trusted_proxies` is asserting
+that it is configured this way; the server cannot check it. Operators who
+terminate TLS in the server itself in some future build get the same
+header semantics from the in-process listener, with the same contract
+satisfied by construction.
 
 With a client certificate on the connection, `POST /identity/auth` omits
 `proof`:
@@ -368,8 +393,8 @@ An upgrade request is authenticated by one of, in order of preference:
   single-use and expires in 60 seconds, which is what makes a value in
   the URL tolerable; servers should still keep the query string out of
   access logs on these paths;
-- a client certificate on the connection for a device key on file (§5.3),
-  which needs no token at all.
+- a client certificate on the connection for a device key on file,
+  forwarded under the §5.3 proxy contract, which needs no token at all.
 
 Cookies are not used: they would make every cross-site page a potential
 initiator of an authenticated socket.
@@ -435,9 +460,12 @@ negotiate it there.
 
 `GET /identity/card/<fingerprint>` — public, no authentication. Returns the
 server's cached card for that identity as `application/cbor`, exactly the
-bytes received, so the signature verifies; 404 if none. Cacheable; the
-server sets `ETag` to the card's `updated` value. Relays, tunnels, other
-servers and registrars all use this.
+bytes received, so the signature verifies; 404 if none. Cacheable: the
+server sets `ETag` to the card's `updated` value in entity-tag syntax —
+the decimal in double quotes, `ETag: "1757116860"` — and answers
+`If-None-Match` with 304. `updated` is the card's own version, so it is a
+strong validator. Relays, tunnels, other servers and registrars all use
+this.
 
 `PUT /identity/card` — authenticated by transport token or client
 certificate; the
@@ -625,7 +653,11 @@ bytes over a TRTP-over-WebSocket connection (§6.3) to the server.
   inside the tunnel and applies §8.3.
 - Its local hop is cleartext on loopback. It must not be configured to
   listen on a non-loopback address without the user opting in, since that
-  would re-create exactly the exposure the tunnel exists to remove.
+  would re-create exactly the exposure the tunnel exists to remove — and
+  when the user does opt in, the tunnel MUST say `"downstream":
+  "cleartext"` at `/identity/auth` (§5.2) so the session is marked and
+  other users are warned before PMing it. A tunnel has no other way to
+  tell the server, and the server has no other way to know.
 
 This is stunnel with an identity. A relay (§11.2) can also act as one
 downstream, and a native client can embed one.

@@ -23,8 +23,10 @@ needs. It asks for four things, in decreasing order of importance:
    across servers;
 2. lookup by handle or fingerprint in Find User and User Search, and
    blocking by fingerprint;
-3. field reservations and one rule change so an encrypted message body
-   can travel through IM Send / IM Deliver and the offline queue opaquely;
+3. field reservations, a client capability bit, per-device queue state
+   and the rules that let an encrypted message body travel through IM
+   Send / IM Deliver and the offline queue opaquely without leaving any
+   session a message it cannot read;
 4. two paragraphs in Security Considerations reflecting what an
    identity-bound session changes.
 
@@ -100,13 +102,20 @@ They are added to the field lists of:
 Replace the rename bullet under *Persistence* with:
 
 > **Rename.** Rewrite all references atomically. For each affected online
-> friend, send a Roster Entry (801) for the new Login. If the account has
-> a linked identity, that entry carries `DATA_FRIEND_IDENTITY`, and a
-> client that finds an existing row with the same fingerprint MUST
-> rename that row in place, preserving its alias and local state; the
-> server MUST NOT send a `Removed` for the old Login in that case. If the
-> account has no linked identity, send a removal for the stale Login
-> followed by the fresh entry, as before.
+> friend, send a Roster Entry (801) for the new Login. To a friend's
+> session that negotiated `CAPABILITY_IDENTITY` (bit 11) *and* whose
+> subject has a linked identity, that entry carries `DATA_FRIEND_IDENTITY`
+> and no `Removed` precedes it: the client MUST rename the row it holds
+> under that fingerprint in place, preserving its alias and local state.
+> To every other session — a client that did not negotiate bit 11, or any
+> client when the account has no linked identity — send a removal for the
+> stale Login followed by the fresh entry, as before. A client that keys
+> rows by Login therefore never sees a Login change without a `Removed`.
+
+The server has the signal it needs: a session's `DATA_CAPABILITIES` from
+Login (107) says whether it understands identity fields, and the identity
+spec allocates bit 11 for exactly that. `DATA_MESSAGING_FEATURES` (below)
+is the server-side half and does not substitute for it.
 
 ### Client rule
 
@@ -203,42 +212,72 @@ so that this extension's review is not held up on cryptography.
 | ID (hex) | Dec | Name | Type | Description |
 |---|---|---|---|---|
 | `0x061F` | 1567 | `DATA_MESSAGE_ENVELOPE` | Binary | An encrypted message body addressed to one recipient device; **repeated**, one per device. Opaque to the server |
-| `0x0628` | 1576 | `DATA_FRIEND_DEVICE_KEY` | Binary (32) | A recipient device's X25519 public key; **repeated**. Friend-only |
+| `0x0628` | 1576 | `DATA_FRIEND_DEVICE_CERT` | Binary | A recipient device's identity-signed device certificate (identity spec §3.3, CBOR); **repeated**. Friend-only. The X25519 key is its `device_enc` |
+
+A client that can produce and consume envelopes says so at Login (107)
+with `CAPABILITY_MESSAGE_ENVELOPE` (bit 12 of `DATA_CAPABILITIES`,
+provisional). Everything below is conditioned on that bit, per session.
 
 Rules:
 
 - In IM Send (810), `DATA_MESSAGE_BODY` becomes REQUIRED **unless at least
   one `DATA_MESSAGE_ENVELOPE` is present**. A send carrying envelopes MAY
-  also carry a body (a fallback for the recipient's non-E2E devices, or
-  a placeholder); a send carrying neither is a failure.
-- IM Deliver (811) forwards every envelope unchanged, and the body if
-  present. The offline queue stores envelopes as it stores bodies, but
-  delivery is per device: a message may be delivered to one of the
-  recipient's devices and still pending for another, and each device's
-  flush on connect carries the envelopes addressed to it. A device
-  certified after the message was queued has no envelope and cannot read
-  it; the E2E document owes an answer to that (a body fallback, or a
-  re-send the recipient's other device performs), and this amendment
-  only requires that the queue not pretend otherwise.
-  `MaxMessageBytes` bounds the encoded size of the whole transaction's
+  also carry a body; a send carrying neither is a failure.
+- **A body-less send must be deliverable to everyone it will reach.** If
+  any of the recipient's live sessions did not negotiate bit 12, the
+  server fails the send with reason `15 BodyRequired` and delivers
+  nothing; the sender re-sends with a body. (A device with a
+  message-capable certificate on file is envelope-capable by definition,
+  so offline devices never trigger this.) `DATA_FRIEND_CAPABILITIES` on
+  the roster row lets a sender see it coming.
+- IM Deliver (811) to a session that negotiated bit 12 carries the
+  envelope(s) addressed to that session's device and the body if present.
+  To a session that did not, it carries the body only; envelopes are
+  stripped. A session never receives an envelope it cannot open or a
+  message with nothing it can read.
+- **Delivery and the offline queue are per device for envelopes.** The
+  existing queue is account-scoped and one `Delivered` from any session
+  settles the message; that cannot work when each device needs its own
+  envelope. For a message with envelopes the server keeps delivery state
+  per `(message, device)`: an envelope is queued for its device whether or
+  not another device is live, `IM Acknowledge (812) Delivered` from a
+  device settles that device's envelope only, and a device's flush on
+  connect (Get Offline Messages, or the login-time flush) carries the
+  envelopes still outstanding for it. The message as a whole is retained
+  until every addressed device has acknowledged or `OfflineRetentionDays`
+  elapses, whichever is first. Body-only messages keep the account-scoped
+  behaviour unchanged. A device certified *after* a message was queued has
+  no envelope for it and does not receive it; the E2E document owes an
+  answer to that (a body fallback, or a re-send the recipient's other
+  device performs), and this amendment only requires that the queue not
+  pretend otherwise.
+- `MaxMessageBytes` bounds the encoded size of the whole transaction's
   bodies and envelopes together, so an operator's cap means the same
   thing for both.
-- Get User Info (825) returns `DATA_FRIEND_DEVICE_KEY` for each of the
+- Get User Info (825) returns `DATA_FRIEND_DEVICE_CERT` for each of the
   subject's devices whose certificate is on file and grants the message
   capability, **only when the caller is an accepted friend**, under the
-  same rule as `DATA_FRIEND_CAPABILITIES`. Device keys are not part of
-  the public card; they change with the subject's device list, which is
-  a fact about the person's life a stranger has no business with.
-- A new reason code: `14 NoDeviceKeys` — the recipient has no device the
-  server can encrypt to. Returned by IM Send when a send carries
-  envelopes only and the server knows the recipient has no message-capable
-  device on file; informational, since a sender who fetched keys first
-  will not see it.
+  same rule as `DATA_FRIEND_CAPABILITIES`. It is the identity-signed
+  device certificate itself (identity spec §3.3), not a bare key: a server
+  that handed out raw X25519 keys could substitute its own and read
+  everything, which is exactly the malicious-operator case the threat
+  model says E2E defeats. A client MUST verify each certificate against
+  the subject's identity key — the one in `DATA_FRIEND_IDENTITY`, which it
+  should already hold from the roster — check validity and the message
+  capability, and encrypt only to `device_enc` keys that pass; a
+  certificate that fails is treated as absent. Device certificates are
+  not part of the public card; they change with the subject's device
+  list, which is a fact about the person's life a stranger has no
+  business with.
+- Two new reason codes. `14 NoDeviceKeys`: an envelope-only send names a
+  recipient with no message-capable device certificate on file, so there
+  is nothing the *sender* could have encrypted to; this is a failure
+  (error flag set), not information. `15 BodyRequired`: as above.
 - A new advertisement in the login reply's limits sub-block:
 
   | ID (hex) | Dec | Name | Type | |
   |---|---|---|---|---|
-  | `0x0623` | 1571 | `DATA_MESSAGING_FEATURES` | UInt16 | Bit 0: identity fields (Amendment A/B) are sent; bit 1: envelopes are accepted and forwarded |
+  | `0x0623` | 1571 | `DATA_MESSAGING_FEATURES` | UInt16 | Bit 0: identity fields (Amendment A/B) are sent; bit 1: envelopes are accepted, stored per device and forwarded |
 
   Absent means neither, which is what a server predating this proposal
   is. A client MUST NOT send envelopes to a server that has not set bit
@@ -277,11 +316,15 @@ handle* bullet:
 
 **Transport encryption.** After the existing bullet:
 
-> Where both peers are identity users on message-capable devices, the
-> envelope path of IM Send (810) carries content the server cannot read.
-> This changes the trust statement for that path only: the server still
-> sees who messages whom, when, and how much. A relayed file transfer and
-> the public chat are unchanged.
+> A message sent as envelopes only, to device certificates the sender
+> verified against the recipient's identity key, carries content the
+> server cannot read. That is the whole of the guarantee: a send that also
+> carries a plaintext body is readable by the server regardless of the
+> envelopes beside it, and a client that encrypts to a device key it did
+> not verify has encrypted to whoever supplied the key. Where the
+> guarantee holds it changes the trust statement for that path only: the
+> server still sees who messages whom, when, and how much. A relayed file
+> transfer and the public chat are unchanged.
 
 **Identifier spoofing.** Append to the existing bullet:
 
@@ -336,7 +379,11 @@ Not part of the proposal, listed so the whole picture is visible:
 | Field | `0x061E` | `DATA_FRIEND_HANDLE` |
 | Field | `0x061F` | `DATA_MESSAGE_ENVELOPE` |
 | Field | `0x0623` | `DATA_MESSAGING_FEATURES` |
-| Field | `0x0628` | `DATA_FRIEND_DEVICE_KEY` (needs the reserved range extended) |
+| Field | `0x0628` | `DATA_FRIEND_DEVICE_CERT` (needs the reserved range extended) |
+| Capability bit | 12 | `CAPABILITY_MESSAGE_ENVELOPE` (provisional; next after identity's 11) |
 | Reason code | 14 | `NoDeviceKeys` |
+| Reason code | 15 | `BodyRequired` |
 
-No new capability bits, access bits or transactions.
+No new access bits or transactions. The capability bit is the one
+addition since the first draft, and it is what makes body-less delivery
+safe for sessions that predate this proposal.

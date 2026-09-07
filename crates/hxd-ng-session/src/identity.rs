@@ -130,6 +130,12 @@ pub struct TransportIdentity {
     /// `Created`. The application login re-reads the account; this is
     /// which one.
     pub account: Option<String>,
+    /// The client said at `/identity/auth` that what it forwards for
+    /// arrives over a cleartext hop (a tunnel listening off loopback,
+    /// §11.1). The session is marked `cleartext` on the roster so the PM
+    /// warning fires; the server has no way to check this and takes the
+    /// conservative claim at face value.
+    pub downstream_cleartext: bool,
 }
 
 impl TransportIdentity {
@@ -211,6 +217,10 @@ struct DeviceRecord {
 
 struct CardRecord {
     updated: u64,
+    /// The pre-committed successor, once seen. Immutable for the life of
+    /// the identity (threat model: it is the anchor an attacker holding
+    /// the key can't move).
+    successor: Option<[u8; 32]>,
     bytes: Vec<u8>,
 }
 
@@ -235,6 +245,16 @@ pub struct IdentityState {
 pub struct ClassicLogin<'a> {
     pub login: &'a str,
     pub password: &'a [u8],
+}
+
+/// What a client declares about the hop *behind* it (§5.2 `downstream`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Downstream {
+    /// The client is the endpoint, or forwards only over loopback.
+    #[default]
+    Local,
+    /// The client forwards over a cleartext network hop.
+    Cleartext,
 }
 
 fn now_unix() -> u64 {
@@ -312,6 +332,7 @@ impl IdentityState {
         cert: &[u8],
         proof: &[u8],
         classic: Option<ClassicLogin<'_>>,
+        downstream: Downstream,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
         // Peek at the challenge inside the proof so we can consume it
         // before doing any signature work; a bad proof still burns it.
@@ -336,7 +357,14 @@ impl IdentityState {
             debug!("identity auth refused: {e}");
             classify(&e, card.len())
         })?;
-        self.admit(v.card, v.cert, cert.to_vec(), card.to_vec(), classic)
+        self.admit(
+            v.card,
+            v.cert,
+            cert.to_vec(),
+            card.to_vec(),
+            classic,
+            downstream,
+        )
     }
 
     /// `POST /identity/auth`, mTLS binding (§5.3): `device` is the key the
@@ -347,11 +375,12 @@ impl IdentityState {
         cert: &[u8],
         device: &PublicKey,
         classic: Option<ClassicLogin<'_>>,
+        downstream: Downstream,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
         let (c, dc) =
             hl_identity::verify_presented(card, cert, device, now_unix(), self.cfg.clock_skew)
                 .map_err(|e| classify(&e, card.len()))?;
-        self.admit(c, dc, cert.to_vec(), card.to_vec(), classic)
+        self.admit(c, dc, cert.to_vec(), card.to_vec(), classic, downstream)
     }
 
     /// Steps 5–6, account association (§8.1–§8.2), and the token issue,
@@ -363,6 +392,7 @@ impl IdentityState {
         cert_bytes: Vec<u8>,
         card_bytes: Vec<u8>,
         classic: Option<ClassicLogin<'_>>,
+        downstream: Downstream,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
         // Step 4, revocation: no registrar to ask yet. When there is one,
         // this is where a cached revocation list is consulted and
@@ -486,10 +516,17 @@ impl IdentityState {
             outcome,
             device_caps: cert.caps,
             account,
+            downstream_cleartext: downstream == Downstream::Cleartext,
         };
 
         let token = random32();
         let mut t = self.tables.lock().unwrap();
+        // Before anything is recorded: a card that moves a committed
+        // successor is refused outright, token and all.
+        if successor_changed(t.cards.get(&fingerprint), &card) {
+            debug!(fingerprint = %fingerprint.short(), "card changes a committed successor");
+            return Err(AuthRefused::BadCard);
+        }
         let inst = Instant::now();
         t.tokens
             .retain(|_, (_, issued)| inst.duration_since(*issued) < TTL);
@@ -504,11 +541,13 @@ impl IdentityState {
         );
         let entry = t.cards.entry(fingerprint).or_insert(CardRecord {
             updated: 0,
+            successor: None,
             bytes: Vec::new(),
         });
         if card.updated >= entry.updated {
             *entry = CardRecord {
                 updated: card.updated,
+                successor: entry.successor.or(card.successor),
                 bytes: card_bytes,
             };
         }
@@ -643,7 +682,7 @@ impl IdentityState {
         drop(t);
         // Re-run the checks rather than trusting the cache's shape; it's
         // two signature verifications.
-        self.auth_presented(&card_bytes, &cert_bytes, device, None)
+        self.auth_presented(&card_bytes, &cert_bytes, device, None, Downstream::Local)
             .ok()
             .map(|(_, ident)| ident)
     }
@@ -663,8 +702,12 @@ impl IdentityState {
         }
         let fp = Fingerprint::of(identity);
         let mut t = self.tables.lock().unwrap();
+        if successor_changed(t.cards.get(&fp), &card) {
+            return Err(AuthRefused::BadCard);
+        }
         let entry = t.cards.entry(fp).or_insert(CardRecord {
             updated: 0,
+            successor: None,
             bytes: Vec::new(),
         });
         if card.updated <= entry.updated {
@@ -672,9 +715,32 @@ impl IdentityState {
         }
         *entry = CardRecord {
             updated: card.updated,
+            successor: entry.successor.or(card.successor),
             bytes: bytes.to_vec(),
         };
         Ok(true)
+    }
+
+    /// The successor this server has anchored for an identity, if any.
+    /// Rotation (registrar spec) consults it: with a commitment on file,
+    /// only a rotation to that key is accepted here.
+    pub fn committed_successor(&self, fp: &Fingerprint) -> Option<[u8; 32]> {
+        self.tables
+            .lock()
+            .unwrap()
+            .cards
+            .get(fp)
+            .and_then(|c| c.successor)
+    }
+}
+
+/// A card may set a successor commitment once, and never change or drop
+/// it afterwards. Dropping is refused too: the attack this defends
+/// against is precisely "make the caches forget".
+fn successor_changed(cached: Option<&CardRecord>, card: &hl_identity::Card) -> bool {
+    match cached.and_then(|c| c.successor) {
+        Some(committed) => card.successor != Some(committed),
+        None => false,
     }
 }
 
@@ -826,7 +892,9 @@ mod tests {
         let (card, cert) = objects(&id, &dev);
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
-        let (token, ident) = st.auth_with_proof(&card, &cert, &proof, None).unwrap();
+        let (token, ident) = st
+            .auth_with_proof(&card, &cert, &proof, None, Downstream::Local)
+            .unwrap();
         assert_eq!(ident.outcome, Outcome::UnattestedGuest);
         assert_eq!(ident.fingerprint, id.fingerprint());
         let redeemed = st.redeem(&token).unwrap();
@@ -835,7 +903,7 @@ mod tests {
         // The challenge is consumed too.
         let proof2 = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof2, None),
+            st.auth_with_proof(&card, &cert, &proof2, None, Downstream::Local),
             Err(AuthRefused::UnknownChallenge)
         );
         // And the card is cached byte-exactly.
@@ -855,7 +923,8 @@ mod tests {
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof, None).unwrap_err(),
+            st.auth_with_proof(&card, &cert, &proof, None, Downstream::Local)
+                .unwrap_err(),
             AuthRefused::Denied
         );
 
@@ -865,7 +934,9 @@ mod tests {
         });
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
-        assert!(st.auth_with_proof(&card, &cert, &proof, None).is_ok());
+        assert!(st
+            .auth_with_proof(&card, &cert, &proof, None, Downstream::Local)
+            .is_ok());
 
         let st = state(IdentityConfig {
             allow_list: vec!["someone-else".into()],
@@ -874,7 +945,8 @@ mod tests {
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof, None).unwrap_err(),
+            st.auth_with_proof(&card, &cert, &proof, None, Downstream::Local)
+                .unwrap_err(),
             AuthRefused::Denied
         );
     }
@@ -908,7 +980,9 @@ mod tests {
         let st = state(cfg);
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now);
-        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, None).unwrap();
+        let (_, ident) = st
+            .auth_with_proof(&card, &cert, &proof, None, Downstream::Local)
+            .unwrap();
         assert_eq!(ident.handle.as_deref(), Some("misha@hl.example"));
         assert!(ident.age >= 1000);
         assert_eq!(ident.outcome, Outcome::Guest);
@@ -917,7 +991,9 @@ mod tests {
         let st = state(IdentityConfig::default());
         let ch = st.issue_challenge();
         let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now);
-        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, None).unwrap();
+        let (_, ident) = st
+            .auth_with_proof(&card, &cert, &proof, None, Downstream::Local)
+            .unwrap();
         assert_eq!(ident.handle, None);
         assert_eq!(ident.outcome, Outcome::UnattestedGuest);
     }
@@ -959,7 +1035,7 @@ mod tests {
             password: b"nope",
         };
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof, Some(bad))
+            st.auth_with_proof(&card, &cert, &proof, Some(bad), Downstream::Local)
                 .unwrap_err(),
             AuthRefused::LoginFailed
         );
@@ -974,7 +1050,9 @@ mod tests {
             login: "misha",
             password: b"pw",
         };
-        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, Some(ok)).unwrap();
+        let (_, ident) = st
+            .auth_with_proof(&card, &cert, &proof, Some(ok), Downstream::Local)
+            .unwrap();
         assert_eq!(ident.outcome, Outcome::Linked);
         assert_eq!(ident.account.as_deref(), Some("misha"));
         assert_eq!(
@@ -987,7 +1065,9 @@ mod tests {
 
         // Next auth with no credentials finds the link.
         let proof = proof_for(&st, &dev);
-        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, None).unwrap();
+        let (_, ident) = st
+            .auth_with_proof(&card, &cert, &proof, None, Downstream::Local)
+            .unwrap();
         assert_eq!(ident.outcome, Outcome::Linked);
         assert_eq!(st.account_for(&ident).unwrap().unwrap().login, "misha");
 
@@ -1005,6 +1085,7 @@ mod tests {
                     login: "misha",
                     password: b"pw",
                 }),
+                Downstream::Local,
             )
             .unwrap();
         assert_eq!(ident2.outcome, Outcome::ClassicPendingLink);
@@ -1065,7 +1146,9 @@ mod tests {
             .unwrap();
         let cert = DeviceCert::for_device(&id, &dev, now - 10, 1000).sign(&id);
         let proof = proof_for(&st, &dev);
-        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, None).unwrap();
+        let (_, ident) = st
+            .auth_with_proof(&card, &cert, &proof, None, Downstream::Local)
+            .unwrap();
         assert_eq!(ident.outcome, Outcome::Created);
         // `misha` exists already, so the handle's local part got a suffix.
         assert_eq!(ident.account.as_deref(), Some("misha-2"));
@@ -1081,7 +1164,9 @@ mod tests {
         let dev3 = DeviceKey::from_seed(&[32u8; 32]);
         let (card3, cert3) = objects(&id3, &dev3);
         let proof = proof_for(&st, &dev3);
-        let (_, ident3) = st.auth_with_proof(&card3, &cert3, &proof, None).unwrap();
+        let (_, ident3) = st
+            .auth_with_proof(&card3, &cert3, &proof, None, Downstream::Local)
+            .unwrap();
         assert_eq!(ident3.outcome, Outcome::UnattestedGuest);
     }
 }

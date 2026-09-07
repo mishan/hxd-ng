@@ -36,7 +36,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, info, warn};
 
-use crate::identity::{b64, unb64, AuthRefused, ClassicLogin, TransportIdentity};
+use crate::identity::{b64, unb64, AuthRefused, ClassicLogin, Downstream, TransportIdentity};
 use crate::{conn, tunnel, NgCtx};
 
 type Resp = Response<Full<Bytes>>;
@@ -88,7 +88,12 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         (&Method::POST, "/identity/unlink") => unlink(req, peer, &ctx).await,
         (&Method::PUT, "/identity/card") => put_card(req, peer, &ctx).await,
         (&Method::GET, p) if p.starts_with("/identity/card/") => {
-            get_card(&p["/identity/card/".len()..], &ctx)
+            let inm = req
+                .headers()
+                .get(hyper::header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            get_card(&p["/identity/card/".len()..], inm.as_deref(), &ctx)
         }
         _ => plain(StatusCode::NOT_FOUND, "not found"),
     }
@@ -133,8 +138,10 @@ fn upgrade(req: &mut Request<Incoming>, peer: SocketAddr, ctx: NgCtx, proto: Pro
                 let Some(sink) = ctx.tunnel.as_ref() else {
                     return;
                 };
+                // The WebSocket hop is TLS; the hop behind the tunnel is
+                // whatever the tunnel said it was (§5.2 `downstream`).
                 let transport = Transport {
-                    encrypted: true,
+                    encrypted: !identity.as_ref().is_some_and(|i| i.downstream_cleartext),
                     identity: identity.as_ref().map(TransportIdentity::tag),
                 };
                 sink.run(Box::new(tunnel::WsByteStream::new(ws)), peer, transport)
@@ -307,6 +314,16 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     if login.is_some() != password.is_some() {
         return plain(StatusCode::BAD_REQUEST, "login and password go together");
     }
+    let downstream = match body.get("downstream").and_then(Value::as_str) {
+        None | Some("local") | Some("loopback") => Downstream::Local,
+        Some("cleartext") => Downstream::Cleartext,
+        Some(_) => {
+            return plain(
+                StatusCode::BAD_REQUEST,
+                "downstream must be local, loopback or cleartext",
+            )
+        }
+    };
     let proof = field("proof");
     if proof.is_none() && device_from_cert.is_none() {
         return plain(
@@ -326,8 +343,8 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
                 password: password.as_bytes(),
             });
         match (proof, device_from_cert) {
-            (Some(proof), _) => st.auth_with_proof(&card, &cert, &proof, classic),
-            (None, Some(device)) => st.auth_presented(&card, &cert, &device, classic),
+            (Some(proof), _) => st.auth_with_proof(&card, &cert, &proof, classic, downstream),
+            (None, Some(device)) => st.auth_presented(&card, &cert, &device, classic, downstream),
             (None, None) => unreachable!("checked above"),
         }
     })
@@ -421,7 +438,7 @@ async fn unlink(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     }
 }
 
-fn get_card(fp: &str, ctx: &NgCtx) -> Resp {
+fn get_card(fp: &str, if_none_match: Option<&str>, ctx: &NgCtx) -> Resp {
     let Some(st) = ctx.identity.as_ref() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
@@ -429,12 +446,26 @@ fn get_card(fp: &str, ctx: &NgCtx) -> Resp {
         return plain(StatusCode::BAD_REQUEST, "malformed fingerprint");
     };
     match st.card(&fp) {
-        Some((updated, bytes)) => Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/cbor")
-            .header(ETAG, format!("\"{updated}\""))
-            .body(Full::new(Bytes::from(bytes)))
-            .unwrap(),
+        Some((updated, bytes)) => {
+            // Entity-tag syntax: a quoted string (§7). `updated` is the
+            // card's own version, so it is a strong validator.
+            let etag = format!("\"{updated}\"");
+            if if_none_match
+                .is_some_and(|inm| inm.split(',').any(|t| t.trim() == etag || t.trim() == "*"))
+            {
+                return Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(ETAG, etag)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/cbor")
+                .header(ETAG, etag)
+                .body(Full::new(Bytes::from(bytes)))
+                .unwrap()
+        }
         None => plain(StatusCode::NOT_FOUND, "no card for that identity"),
     }
 }

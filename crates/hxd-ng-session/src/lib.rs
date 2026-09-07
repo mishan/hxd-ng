@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{info, Instrument};
 
-pub use identity::{IdentityConfig, IdentityState, NewAccounts, Unattested};
+pub use identity::{Downstream, IdentityConfig, IdentityState, NewAccounts, Unattested};
 pub use registry::Registry;
 
 /// A byte stream handed to the legacy frontend by the TRTP-over-WebSocket
