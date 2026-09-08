@@ -94,6 +94,14 @@ pub(crate) fn bytes(v: &Value, key: &'static str) -> Result<Vec<u8>, Error> {
     }
 }
 
+pub(crate) fn opt_bytes(v: &Value, key: &'static str) -> Result<Option<Vec<u8>>, Error> {
+    match v.get(key) {
+        Some(Value::Bytes(b)) => Ok(Some(b.clone())),
+        Some(_) => Err(Error::BadField(key)),
+        None => Ok(None),
+    }
+}
+
 pub(crate) fn bytes32(v: &Value, key: &'static str) -> Result<[u8; 32], Error> {
     match v.get(key) {
         Some(Value::Bytes(b)) => b.as_slice().try_into().map_err(|_| Error::BadField(key)),

@@ -15,6 +15,10 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "z
 # only carries it). `static_secrets` because the key persists.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 sha2 = "0.10"
+# HMAC for the enrollment pairing tag (identity-enrollment.md §4 `pair`).
+# RustCrypto's, so it is the same SHA-256 as everything else here, and its
+# `verify_slice` is a constant-time compare we would otherwise hand-roll.
+hmac = "0.12"
 getrandom = "0.2"
 zeroize = "1"
 
