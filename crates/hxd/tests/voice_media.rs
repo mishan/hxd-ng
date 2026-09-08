@@ -254,33 +254,67 @@ impl Media {
         ));
     }
 
-    /// One pass: hand str0m the clock, send what it wants sent, and take
-    /// whatever has arrived.
-    async fn step(&mut self, buf: &mut [u8]) {
-        let now = Instant::now();
-        let _ = self.rtc.handle_input(Input::Timeout(now));
+    /// Put a run of encrypted audio packets in the server socket's receive
+    /// queue without yielding to its task between them. Browser video sends
+    /// the fragments of one frame in just such a burst.
+    fn queue_speech_burst(&mut self, packets: usize) {
+        let mut transmits = Vec::with_capacity(packets);
+        for _ in 0..packets {
+            self.speak();
+            let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
+            loop {
+                match self.rtc.poll_output() {
+                    Ok(Output::Timeout(_)) => break,
+                    Ok(Output::Transmit(t)) => {
+                        transmits.push((t.destination, t.contents.to_vec()));
+                    }
+                    Ok(Output::Event(Event::RtpPacket(p))) => self.record_packet(p),
+                    Ok(Output::Event(_)) => {}
+                    Err(e) => panic!("client failed while building RTP burst: {e}"),
+                }
+            }
+        }
+
+        for (to, data) in transmits {
+            self.sock
+                .try_send_to(&data, to)
+                .expect("queue RTP burst at the server");
+        }
+    }
+
+    fn record_packet(&mut self, p: str0m::rtp::RtpPacket) {
+        let mid = self
+            .rtc
+            .direct_api()
+            .stream_rx(&p.header.ssrc)
+            .map(|s| s.mid().to_string())
+            // str0m rewrites `-` to `_` inside a Mid; the wire spelling
+            // is the server's own string.
+            .map(|m| m.replace('_', "-"))
+            .unwrap_or_default();
+        *self.heard.entry(mid).or_default() += 1;
+    }
+
+    async fn drain_output(&mut self) {
         loop {
             match self.rtc.poll_output() {
                 Ok(Output::Timeout(_)) => break,
                 Ok(Output::Transmit(t)) => {
                     let _ = self.sock.send_to(&t.contents, t.destination).await;
                 }
-                Ok(Output::Event(Event::RtpPacket(p))) => {
-                    let mid = self
-                        .rtc
-                        .direct_api()
-                        .stream_rx(&p.header.ssrc)
-                        .map(|s| s.mid().to_string())
-                        // str0m rewrites `-` to `_` inside a Mid; the
-                        // wire spelling is the server's own string.
-                        .map(|m| m.replace('_', "-"))
-                        .unwrap_or_default();
-                    *self.heard.entry(mid).or_default() += 1;
-                }
+                Ok(Output::Event(Event::RtpPacket(p))) => self.record_packet(p),
                 Ok(Output::Event(_)) => {}
                 Err(_) => break,
             }
         }
+    }
+
+    /// One pass: hand str0m the clock, send what it wants sent, and take
+    /// whatever has arrived.
+    async fn step(&mut self, buf: &mut [u8]) {
+        let now = Instant::now();
+        let _ = self.rtc.handle_input(Input::Timeout(now));
+        self.drain_output().await;
         while let Ok((n, from)) = self.sock.try_recv_from(buf) {
             let Ok(contents) = buf[..n].try_into() else {
                 continue;
@@ -296,6 +330,9 @@ impl Media {
             );
             if self.rtc.accepts(&input) {
                 let _ = self.rtc.handle_input(input);
+                // RTP mode has one pending packet slot. Drain it before
+                // accepting another datagram, just as the server must.
+                self.drain_output().await;
             }
         }
     }
@@ -585,6 +622,24 @@ async fn a_legacy_client_and_an_ng_client_hear_each_other() {
     // own microphone mid.
     assert_eq!(old_media.heard.get("send"), None);
     assert_eq!(new_media.heard.get("send"), None);
+
+    // A browser emits the fragments of an encoded video frame back to
+    // back. Queue the same transport shape deliberately: the server must
+    // poll str0m between matched datagrams or RTP mode's single pending
+    // packet slot keeps only the last one from each socket drain.
+    const BURST_PACKETS: usize = 128;
+    new_media.heard.clear();
+    old_media.queue_speech_burst(BURST_PACKETS);
+    drive(
+        &mut [&mut old_media, &mut new_media],
+        Duration::from_millis(500),
+    )
+    .await;
+    assert_eq!(
+        new_media.heard.get(&old_mid).copied().unwrap_or(0),
+        BURST_PACKETS,
+        "the server lost RTP from one queued receive burst"
+    );
 }
 
 async fn ng_reply<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, id: u64) -> Value

@@ -1051,20 +1051,29 @@ pub async fn run(sfu: Arc<Sfu>, socket: tokio::net::UdpSocket) -> std::io::Resul
         tokio::select! {
             r = socket.recv_from(&mut buf) => match r {
                 Ok((n, from)) => {
-                    feed(&sfu, &socket, local, from, &buf[..n], &mut unmatched);
-                    // Drain whatever else is already queued before going
-                    // back round. Polling is O(peers) and the loop polls
-                    // once per iteration, so a burst — a talkative room,
-                    // or a flood — otherwise costs one full pass over
-                    // every session per packet. Taking the burst in one
-                    // go amortises that, and the deadline below is
-                    // recomputed straight after.
-                    for _ in 0..BURST_DRAIN {
-                        match socket.try_recv_from(&mut buf) {
-                            Ok((n, from)) => {
-                                feed(&sfu, &socket, local, from, &buf[..n], &mut unmatched);
+                    let matched = feed(&sfu, local, from, &buf[..n], &mut unmatched);
+                    // In RTP mode str0m exposes one received packet at a
+                    // time. A second `handle_input` before `poll_output`
+                    // replaces that pending packet, so a live session ends
+                    // this receive burst: the next trip around the loop
+                    // polls and forwards it before another datagram can be
+                    // handed to the same `Rtc`.
+                    //
+                    // Unmatched traffic has no pending output and can still
+                    // be drained in bulk. Stop at the first match for the
+                    // same reason as above; this keeps the flood defence
+                    // without turning a camera frame into one surviving RTP
+                    // packet and a run of sequence-number holes.
+                    if !matched {
+                        for _ in 0..BURST_DRAIN {
+                            match socket.try_recv_from(&mut buf) {
+                                Ok((n, from)) => {
+                                    if feed(&sfu, local, from, &buf[..n], &mut unmatched) {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
                             }
-                            Err(_) => break,
                         }
                     }
                 }
@@ -1084,23 +1093,23 @@ const BURST_DRAIN: usize = 64;
 /// for datagrams that match no session.
 fn feed(
     sfu: &Sfu,
-    socket: &tokio::net::UdpSocket,
     local: SocketAddr,
     from: SocketAddr,
     data: &[u8],
     unmatched: &mut UnmatchedLimiter,
-) {
-    let _ = socket;
+) -> bool {
     if !unmatched.allow(from, Instant::now()) {
-        return;
+        return false;
     }
     // With a wildcard bind the socket can't tell us which local address
     // the datagram arrived on, and ICE matches candidates by it — so
     // report the advertised address of the right family.
     let to = local_for(sfu, local, from);
-    if !sfu.handle_datagram(from, to, data, Instant::now()) {
+    let matched = sfu.handle_datagram(from, to, data, Instant::now());
+    if !matched {
         unmatched.miss(from, Instant::now());
     }
+    matched
 }
 
 /// A token bucket over sources whose datagrams match no live session.
