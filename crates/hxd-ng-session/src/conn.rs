@@ -10,9 +10,12 @@ use std::net::SocketAddr;
 
 use futures_util::{SinkExt, StreamExt};
 use hxd_core::access::bit;
+use hxd_core::inbox::MessageGuid;
 use hxd_core::video::VideoKind;
 use hxd_core::voice::IceCandidate;
-use hxd_core::{AccessBits, AttachInfo, AuthError, Proof, Resume, SeqEvent, Uid};
+use hxd_core::{
+    AccessBits, AttachInfo, AuthError, ChatError, MsgOutcome, Proof, Resume, SeqEvent, Uid,
+};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
@@ -26,10 +29,11 @@ use tracing::{debug, info, warn};
 
 use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
-    event_json, parse_streams, participants_json, reply_err, reply_ok, user_json, video_err,
-    video_limits_json, voice_err, ChatParams, LoginParams, MsgParams, NickParams, ReqEnvelope,
-    ResumeParams, VideoStartParams, VideoStateParams, VideoStopParams, VideoSubscribeParams,
-    VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
+    event_json, parse_streams, participants_json, reply_err, reply_ok, stored_msg_json, user_json,
+    video_err, video_limits_json, voice_err, ChatParams, InboxParams, LoginParams, MsgParams,
+    MsgReadParams, NickParams, ReqEnvelope, ResumeParams, VideoStartParams, VideoStateParams,
+    VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams,
+    VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -146,10 +150,18 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                         debug!("unparseable request frame");
                         break Exit::ConnectionLost;
                     };
-                    match dispatch(&ctx, &state, &req, &mut ws_tx).await {
+                    // `sync` is the one request that needs the event
+                    // channel itself; see `handle_sync`.
+                    let flow = if req.req == "sync" {
+                        handle_sync(&ctx, &state, &req, &mut ws_tx, &mut events).await
+                    } else {
+                        dispatch(&ctx, &state, &req, &mut ws_tx).await
+                    };
+                    match flow {
                         Flow::Continue => {}
                         Flow::LoggedOut => break Exit::SessionOver,
                         Flow::Dead => break Exit::ConnectionLost,
+                        Flow::Replaced => break Exit::Replaced,
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => break Exit::ConnectionLost,
@@ -271,6 +283,7 @@ async fn handle_login(
         None => (p.login.clone(), p.password.clone()),
     };
     let ident = identity.cloned();
+    let core = ctx.core.clone();
     let verdict = tokio::task::spawn_blocking(move || {
         let account = if let (Some(i), Some(st)) = (ident.as_ref(), identity_state.as_ref()) {
             match st.account_for(i) {
@@ -290,6 +303,20 @@ async fn handle_login(
             auth.authenticate(&login, Proof::Plain(password.as_bytes()))
                 .map_err(Refused::Auth)
         };
+        // A linked account's mail is claimed onto the fingerprint before
+        // the session starts. `claim` is idempotent, and doing it only
+        // at link time left two windows open: a `msg_login` that read
+        // the directory before the link was written, and an account
+        // linked from another device while a session of it was up. Rows
+        // left on the bare login are invisible after the next login.
+        if let Ok(a) = &account {
+            if let Some(fp) = a.identity.fingerprint {
+                let moved = core.inbox_claim(&a.login, &fp);
+                if moved > 0 {
+                    info!(login = %a.login, moved, "inbox claimed at login");
+                }
+            }
+        }
         account
     })
     .await
@@ -367,6 +394,21 @@ async fn handle_login(
             encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
             identity: identity.map(TransportIdentity::tag),
         },
+        has_inbox: account.has_inbox,
+        // ng has `msg_read`; a client says for itself when it has read
+        // something, and delivery is not that.
+        reads_on_delivery: false,
+        // The account's link first, the socket's identity only where
+        // there is none — see `AttachInfo::identity`. A mailbox belongs
+        // to the account, so it is the same mailbox whether its owner
+        // arrived with a password or with their key; the transport's
+        // fingerprint stands in only for an identity user admitted as a
+        // guest, which gives that session something to be blocked by
+        // without giving it a mailbox it must not have.
+        identity: account
+            .identity
+            .fingerprint
+            .or_else(|| identity.map(|i| i.fingerprint.0)),
     };
     let Some((uid, events)) = ctx.core.attach(attach) else {
         let _ = send_frame(
@@ -452,11 +494,37 @@ async fn handle_login(
     if ctx.core.video_enabled() {
         ok["video"] = video_limits_json(&ctx.core.video_config());
     }
-    if ws_tx
-        .send(Message::Text(reply_ok(req.id, ok)))
-        .await
-        .is_err()
-    {
+    // What is waiting, so a client can render a badge before any of it
+    // arrives. Absent on a server with no inbox, like the video block.
+    if ctx.core.inbox_enabled() {
+        let counts = off_reactor(&ctx.core, move |c| c.inbox_counts(uid))
+            .await
+            // `None` is the blocking task itself failing — a panic in
+            // the store. Same empty badge, and worth the same line in
+            // the log as a store error, or a panicked count is the one
+            // failure here nothing records.
+            .unwrap_or_else(|| {
+                warn!(
+                    uid,
+                    "inbox counts panicked at login; reporting an empty badge"
+                );
+                Ok(Default::default())
+            })
+            .unwrap_or_else(|e| {
+                // A store that would not answer becomes an empty badge:
+                // there is no shape in the login reply for "unknown",
+                // and refusing the login over a count would be worse.
+                // But an empty badge on a full mailbox is a lie, so it
+                // is said here as well as in the domain's own log.
+                warn!(
+                    uid,
+                    "inbox counts unavailable at login: {e:?}; reporting an empty badge"
+                );
+                Default::default()
+            });
+        ok["inbox"] = json!({ "unread": counts.unread, "total": counts.total });
+    }
+    if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
         // The client never learned it was logged in; a ghost session with
         // no transport (and a leaked token) must not linger.
         ctx.core.end_session(uid);
@@ -464,6 +532,9 @@ async fn handle_login(
         return None;
     }
     info!(uid, login = %account.login, "ng logged in");
+    // Mail from before this login, after the client has the roster it
+    // needs to make sense of who sent it.
+    off_reactor(&ctx.core, move |c| c.flush_inbox(uid)).await;
 
     Some((
         SessState {
@@ -574,13 +645,27 @@ async fn handle_resume(
             return Some((state, events));
         }
     }
+    // Anything that arrived while this session had no connection at all
+    // is in the inbox, not the replay buffer — one message, one place.
+    off_reactor(&ctx.core, move |c| c.flush_inbox(uid)).await;
     Some((state, events))
 }
 
-enum Flow {
-    Continue,
-    LoggedOut,
-    Dead,
+/// Run a domain call that touches the message store off the reactor.
+///
+/// `Core` is synchronous all the way down (`hxd_core::inbox` explains
+/// why), so `msg`, `msg_login`, `flush_inbox` and every `inbox_*` call is
+/// rusqlite with a five-second busy timeout and `synchronous = FULL`
+/// fsyncs — plus, for `msg_login`, the accounts-directory read behind
+/// `inbox_account`. On a tokio worker one slow disk, or an external
+/// `sqlite3` holding a write lock, stalls every session that worker is
+/// carrying. This file already does exactly this for `authenticate`.
+async fn off_reactor<T: Send + 'static>(
+    core: &std::sync::Arc<hxd_core::Core>,
+    f: impl FnOnce(&hxd_core::Core) -> T + Send + 'static,
+) -> Option<T> {
+    let core = core.clone();
+    tokio::task::spawn_blocking(move || f(&core)).await.ok()
 }
 
 /// Send one frame and continue, for the handful of places that answer
@@ -590,6 +675,13 @@ async fn finish(ws_tx: &mut WsTx, out: String) -> Flow {
         return Flow::Dead;
     }
     Flow::Continue
+}
+
+enum Flow {
+    Continue,
+    LoggedOut,
+    Dead,
+    Replaced,
 }
 
 /// Write one frame, giving up if the socket will not take it.
@@ -633,25 +725,75 @@ async fn end_kicked(ctx: &NgCtx, state: &SessState, ws_tx: &mut WsTx) {
     .await;
 }
 
+/// `sync` (`docs/hotline-ng.md` §6): the roster snapshot and the seq the
+/// client continues from, then the mail it missed.
+///
+/// It lives here rather than in `dispatch` because it is the one request
+/// that has to reach the event channel. The `seq` this reply reports is
+/// what the client will treat as "everything up to here is accounted
+/// for", so nothing at or below it may arrive afterwards — and events
+/// already handed to this session were sitting in the channel, behind a
+/// reply that shares their sink. Snapshotting the seq and then draining
+/// everything at or below it makes the promise true rather than likely;
+/// whatever is stamped after the snapshot gets a later seq by construction.
+async fn handle_sync(
+    ctx: &NgCtx,
+    state: &SessState,
+    req: &ReqEnvelope,
+    ws_tx: &mut WsTx,
+    events: &mut UnboundedReceiver<SeqEvent>,
+) -> Flow {
+    // `Outbox::push` assigns the seq and sends the event while holding the
+    // same roster lock `current_seq` takes. Therefore every event at or
+    // below this snapshot is already in `events`, and every later enqueue
+    // has a higher seq. Moving that send outside the lock would reopen MS9.
+    let mut seq = ctx.core.current_seq(state.uid).unwrap_or(0);
+    let mut kicked = false;
+    loop {
+        match events.try_recv() {
+            Ok(se) => {
+                seq = seq.max(se.seq);
+                kicked |= matches!(se.event, hxd_core::Event::Kicked);
+                if !send_frame(ws_tx, Message::Text(event_json(&se))).await {
+                    return Flow::Dead;
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                return Flow::Replaced;
+            }
+        }
+    }
+    if kicked {
+        end_kicked(ctx, state, ws_tx).await;
+        return Flow::LoggedOut;
+    }
+    let users: Vec<_> = ctx.core.snapshot().iter().map(user_json).collect();
+    let out = reply_ok(
+        req.id,
+        json!({
+            "server": {
+                "name": ctx.cfg.server_name,
+                "subject": ctx.core.public_subject(),
+            },
+            "users": users,
+            "seq": seq,
+        }),
+    );
+    if !send_frame(ws_tx, Message::Text(out)).await {
+        return Flow::Dead;
+    }
+    // After the seq this reply reports, so the mail arrives as events
+    // the client has not already been told it is past.
+    let uid = state.uid;
+    off_reactor(&ctx.core, move |c| c.flush_inbox(uid)).await;
+    Flow::Continue
+}
+
 async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut WsTx) -> Flow {
     let send = |s: String| Message::Text(s);
     let out = match req.req.as_str() {
         "ping" => reply_ok(req.id, json!({})),
-
-        "sync" => {
-            let users: Vec<_> = ctx.core.snapshot().iter().map(user_json).collect();
-            reply_ok(
-                req.id,
-                json!({
-                    "server": {
-                        "name": ctx.cfg.server_name,
-                        "subject": ctx.core.public_subject(),
-                    },
-                    "users": users,
-                    "seq": ctx.core.current_seq(state.uid).unwrap_or(0),
-                }),
-            )
-        }
 
         "chat" => match serde_json::from_value::<ChatParams>(req.params.clone()) {
             Ok(p) if !state.access.has(bit::SEND_CHAT) => {
@@ -697,12 +839,154 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
             Ok(p) => {
                 let mut text = p.text;
                 text.truncate_to_char_boundary(4096);
-                match ctx.core.msg(state.uid, p.to, text) {
-                    Ok(()) => reply_ok(req.id, json!({})),
-                    Err(_) => reply_err(req.id, "bad_request", "That user is not connected."),
+                // The legacy wire refuses an empty message and so does
+                // this one: it would take a queue slot, notify, and
+                // render as a bare `[queued …]` stamp with nothing
+                // under it.
+                if text.is_empty() {
+                    return finish(
+                        ws_tx,
+                        reply_err(req.id, "bad_request", "A message needs text."),
+                    )
+                    .await;
+                }
+                // Parsed, not stored as it arrived: this indexes a
+                // column, and an index over arbitrary client text is a
+                // place to put anything.
+                let guid = match p.guid.as_deref().map(MessageGuid::parse) {
+                    None => None,
+                    Some(Some(g)) => Some(g),
+                    Some(None) => {
+                        return finish(
+                            ws_tx,
+                            reply_err(req.id, "bad_request", "`guid` is not a UUID."),
+                        )
+                        .await
+                    }
+                };
+                let from = state.uid;
+                let outcome = match (p.to, p.to_login.clone()) {
+                    (Some(uid), None) => {
+                        off_reactor(&ctx.core, move |c| c.msg(from, uid, text, guid)).await
+                    }
+                    (None, Some(login)) => {
+                        off_reactor(&ctx.core, move |c| c.msg_login(from, &login, text, guid)).await
+                    }
+                    // A client that sent both meant something, and
+                    // guessing which is how a message reaches the wrong
+                    // person.
+                    _ => {
+                        return finish(
+                            ws_tx,
+                            reply_err(
+                                req.id,
+                                "bad_request",
+                                "Name exactly one of `to` and `to_login`.",
+                            ),
+                        )
+                        .await
+                    }
+                };
+                let Some(outcome) = outcome else {
+                    return finish(ws_tx, reply_err(req.id, "server_error", "Server error.")).await;
+                };
+                // One mapping for both ways of addressing, so a code
+                // cannot be added to one and forgotten on the other.
+                match outcome {
+                    // The reply says whether it waited, and nothing else:
+                    // the message id is the *recipient's* handle for
+                    // marking read, and handing a monotonic id to the
+                    // sender would tell them how much mail this server
+                    // carries.
+                    Ok(MsgOutcome::Delivered) => reply_ok(req.id, json!({ "queued": false })),
+                    Ok(MsgOutcome::Queued(_)) => reply_ok(req.id, json!({ "queued": true })),
+                    Err(ChatError::MailboxFull) => {
+                        reply_err(req.id, "mailbox_full", "That user's mailbox is full.")
+                    }
+                    // A store that would not answer is our failure, not
+                    // the sender's — telling them their correspondent
+                    // does not exist because the disk is full is a lie
+                    // they will act on.
+                    Err(ChatError::ServerError) => {
+                        reply_err(req.id, "server_error", "Server error.")
+                    }
+                    // One answer for "no such user", "no such account" and
+                    // "that account takes no offline messages", so none of
+                    // them can be told apart from outside.
+                    Err(_) => reply_err(req.id, "no_such_user", "No such user."),
                 }
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed msg."),
+        },
+
+        // --- The inbox (docs/private-messages.md §6) -------------------
+        //
+        // The pull side of the same mail the `msg` event pushes: what a
+        // client that woke to a push, or resynced, or simply opened,
+        // reads to find out where it is.
+        // `params` may be omitted entirely: both fields are optional, so
+        // "the first page" needs nothing said. Serde will not deserialise
+        // a null into a struct, hence the explicit default.
+        "inbox" => match if req.params.is_null() {
+            Ok(InboxParams::default())
+        } else {
+            serde_json::from_value::<InboxParams>(req.params.clone())
+        } {
+            Ok(p) => {
+                let limit = p.limit.unwrap_or(50).clamp(1, 200);
+                let (uid, before) = (state.uid, p.before);
+                let listed = off_reactor(&ctx.core, move |c| {
+                    c.inbox_list(uid, before, limit).map(|m| {
+                        let counts = c.inbox_counts(uid).unwrap_or_else(|e| {
+                            warn!(uid, "inbox counts unavailable: {e:?}; reporting zeros");
+                            Default::default()
+                        });
+                        (m, counts)
+                    })
+                })
+                .await;
+                let Some(listed) = listed else {
+                    return finish(ws_tx, reply_err(req.id, "server_error", "Server error.")).await;
+                };
+                match listed {
+                    Ok((messages, counts)) => reply_ok(
+                        req.id,
+                        json!({
+                            "messages": messages
+                                .iter()
+                                .map(stored_msg_json)
+                                .collect::<Vec<_>>(),
+                            "unread": counts.unread,
+                            "total": counts.total,
+                        }),
+                    ),
+                    Err(ChatError::ServerError) => {
+                        reply_err(req.id, "server_error", "Server error.")
+                    }
+                    Err(_) => reply_err(req.id, "no_inbox", "This account has no inbox."),
+                }
+            }
+            Err(_) => reply_err(req.id, "bad_request", "Malformed inbox."),
+        },
+
+        "msg_read" => match serde_json::from_value::<MsgReadParams>(req.params.clone()) {
+            // A cursor in the caller's own mailbox: the domain scopes
+            // it by account, so no `up_to` can mark another account's
+            // mail read.
+            Ok(p) => {
+                let (uid, up_to) = (state.uid, p.up_to);
+                match off_reactor(&ctx.core, move |c| c.inbox_mark_read(uid, up_to)).await {
+                    None | Some(Err(ChatError::ServerError)) => {
+                        reply_err(req.id, "server_error", "Server error.")
+                    }
+                    Some(Ok(counts)) => reply_ok(
+                        req.id,
+                        json!({ "unread": counts.unread, "total": counts.total }),
+                    ),
+                    Some(Err(_)) => reply_err(req.id, "no_inbox", "This account has no inbox."),
+                }
+            }
+            Err(_) => reply_err(req.id, "bad_request", "Malformed msg_read."),
         },
 
         // --- Voice (docs/voice.md §8) ---------------------------------

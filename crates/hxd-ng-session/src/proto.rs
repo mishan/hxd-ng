@@ -51,10 +51,43 @@ pub struct NickParams {
     pub icon: Option<u16>,
 }
 
+/// A private message names its recipient one of two ways: `to` is a uid
+/// on the roster, `to_login` an account whether or not it holds a session.
+/// Exactly one, and the frontend refuses both or neither rather than
+/// picking — a client that sent both meant something, and guessing which
+/// is how a message reaches the wrong person.
 #[derive(Debug, Deserialize)]
 pub struct MsgParams {
-    pub to: u16,
+    #[serde(default)]
+    pub to: Option<u16>,
+    #[serde(default)]
+    pub to_login: Option<String>,
     pub text: String,
+    /// The client's own id for this message. Sending it again with the
+    /// same guid is the same message — stored once — which is what makes
+    /// a retry safe after a socket died between the send and the reply.
+    /// The answer is as of now, not as of the first send: a recipient
+    /// who has arrived in the meantime gets it, and the retry says
+    /// `queued: false` where the original said `true`.
+    #[serde(default)]
+    pub guid: Option<String>,
+}
+
+/// Both fields are optional, so `inbox` with no `params` at all is a
+/// valid request for the first page — `from_value::<InboxParams>(Null)`
+/// is not, which is why the handler treats a null as `{}`.
+#[derive(Debug, Default, Deserialize)]
+pub struct InboxParams {
+    /// Page backwards from this id, exclusive.
+    #[serde(default)]
+    pub before: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MsgReadParams {
+    pub up_to: u64,
 }
 
 // --- Voice (docs/voice.md §8) -------------------------------------------
@@ -350,11 +383,33 @@ pub fn event_json(se: &SeqEvent) -> String {
         Event::Msg {
             from,
             from_nick,
+            from_login,
             text,
-        } => (
-            "msg",
-            json!({ "from": { "uid": from, "nick": from_nick }, "text": text }),
-        ),
+            id,
+            sent_at,
+            queued,
+        } => {
+            // `uid` is 0 when a queued message's sender has no session
+            // now; `login` is the account that survives either way, and
+            // is *absent* when there is nobody to reply to — a guest, or
+            // a sender whose account has since gone. Absent rather than
+            // null, so a client can test for the key; likewise `id`,
+            // which only exists for a message the store holds.
+            let mut from_obj = json!({ "uid": from, "nick": from_nick });
+            if let Some(login) = from_login {
+                from_obj["login"] = json!(login);
+            }
+            let mut data = json!({
+                "from": from_obj,
+                "text": text,
+                "at": unix(*sent_at),
+                "queued": queued,
+            });
+            if let Some(id) = id {
+                data["id"] = json!(id);
+            }
+            ("msg", data)
+        }
         Event::Broadcast {
             from,
             from_nick,
@@ -386,4 +441,32 @@ pub fn event_json(se: &SeqEvent) -> String {
         _ => ("unsupported", json!({})),
     };
     json!({ "seq": se.seq, "ev": ev, "data": data }).to_string()
+}
+
+/// Unix seconds, the shape every JSON timestamp here takes. Floored at the
+/// epoch: a clock set before 1970 should not produce a negative timestamp
+/// for a client to puzzle over.
+pub fn unix(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// One stored message, as `inbox` lists it.
+///
+/// No uid: a message in the list was sent by a session that may be long
+/// gone, and a uid from then may belong to someone else now. A client that
+/// wants to reply names `from.login`.
+pub fn stored_msg_json(m: &hxd_core::StoredMessage) -> serde_json::Value {
+    let mut from = json!({ "nick": m.sender_nick });
+    if let Some(login) = m.sender.as_ref().map(|s| &s.login) {
+        from["login"] = json!(login);
+    }
+    json!({
+        "id": m.id,
+        "from": from,
+        "text": m.body,
+        "at": unix(m.sent_at),
+        "read": m.read_at.is_some(),
+    })
 }

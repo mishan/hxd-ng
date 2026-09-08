@@ -37,6 +37,8 @@ name = "My Server"
 version = 185          # 0 mimics a pre-1.5 server
 login_timeout = 10
 ban_time = 1800        # seconds a kick-with-ban holds the address
+stamp_queued = true    # stamp a message that waited in the inbox with its send
+                       # time, on the legacy wire (docs/private-messages.md §7)
 # mark_cleartext = false  # set User Flags bit 4 on unencrypted legacy sessions
                           # (identity spec §10); off until that bit is confirmed
                           # free against 1.8/1.9 clients

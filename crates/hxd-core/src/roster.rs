@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -141,10 +141,32 @@ pub enum Event {
     /// Someone left a private chat the recipient is in.
     ChatUserParted { cid: u32, uid: Uid },
     /// A private message to the recipient.
+    ///
+    /// A message out of the inbox ([`crate::inbox`]) carries `queued`,
+    /// and its `from` uid is resolved **at delivery time by login**: the
+    /// sending session is long gone and its uid may now belong to someone
+    /// else, so it is that account's current session's uid if it has one
+    /// and `0` if it does not. `from_login` carries the identity either
+    /// way; a uid never does.
     Msg {
         from: Uid,
         from_nick: String,
+        /// The sender's account, when the sender is someone the recipient
+        /// could reply to by name. `None` for a guest — `guest` is a
+        /// login several people share, not an address.
+        from_login: Option<String>,
         text: String,
+        /// The inbox row this came from, and the handle a client marks
+        /// read. `None` when nothing was stored (the recipient has no
+        /// inbox, or the server has none configured).
+        id: Option<crate::inbox::MessageId>,
+        /// When the sender sent it — not when it arrived.
+        sent_at: std::time::SystemTime,
+        /// It waited in the inbox rather than arriving in the moment.
+        /// Frontends key their presentation on this and not on comparing
+        /// `sent_at` against a threshold, because a threshold is a bug
+        /// waiting for a slow network.
+        queued: bool,
     },
     /// An administrator broadcast. Delivered to everyone, sender included
     /// (the wire push carries the sender, matching the reference server).
@@ -269,6 +291,16 @@ pub(crate) struct UserSession {
     /// Account policy: may this session survive its connection? (The
     /// `[extra] can_detach` flag; guests default to no.)
     pub(crate) can_detach: bool,
+    /// Account policy: may private messages be stored for this account
+    /// and delivered later? (The `[extra] inbox` flag; guests default to
+    /// no.) It doubles as "is this session a repliable identity" — the
+    /// sender of a stored message is recorded only when it is true.
+    pub(crate) has_inbox: bool,
+    /// See [`AttachInfo::reads_on_delivery`].
+    pub(crate) reads_on_delivery: bool,
+    /// This session's identity fingerprint — the durable half of its
+    /// mailbox key. See [`AttachInfo::identity`].
+    pub(crate) identity: Option<[u8; 32]>,
     /// Whether this session has been announced (shows on the user list,
     /// generates events). False between login and login-completion.
     pub(crate) visible: bool,
@@ -286,6 +318,36 @@ pub struct AttachInfo {
     pub addr: Option<IpAddr>,
     pub can_detach: bool,
     pub transport: Transport,
+    /// May private messages be stored for this account and delivered
+    /// later? (The `[extra] inbox` flag; guests default to no.)
+    pub has_inbox: bool,
+    /// This session's wire cannot say it has read a message, so handing
+    /// one over *is* the read (`docs/private-messages.md` §11).
+    ///
+    /// True for the legacy wire, where a private message is a window that
+    /// opens and nothing comes back; false for ng, which has `msg_read`.
+    /// A property of the session rather than of a particular flush,
+    /// because a live delivery is as much a read as a queued one — and
+    /// getting that wrong leaves a 1.5 user's inbox permanently unread,
+    /// their badge wrong on every other client they own, and their mail
+    /// ageing on the 30-day unread clock instead of the 7-day read one.
+    pub reads_on_delivery: bool,
+    /// The identity this session belongs to: **the account's linked
+    /// fingerprint** where there is one, and otherwise the fingerprint
+    /// the transport authenticated with.
+    ///
+    /// The precedence matters. A mailbox belongs to the account link, so
+    /// that it is the same mailbox whether its owner logged in with a
+    /// password or with their key. The transport's fingerprint stands in
+    /// only where there is no link — an identity user admitted as a guest
+    /// — which gives that session something durable to be blocked by and
+    /// to be resolved to at delivery, without giving it a mailbox it must
+    /// not have (the `guest` login is shared; see `has_inbox`).
+    ///
+    /// The two cannot disagree for a linked account: the identity spec
+    /// admits a session to an account only when the account is linked to
+    /// that identity or is unlinked.
+    pub identity: Option<[u8; 32]>,
 }
 
 /// The outcome of a [`Core::resume`].
@@ -412,15 +474,102 @@ impl RosterInner {
     }
 }
 
+/// How the inbox behaves, as far as the domain is concerned. The binary
+/// fills this from the `[inbox]` config block.
+#[derive(Debug, Clone, Copy)]
+pub struct InboxPolicy {
+    /// Messages an account may have *waiting* before further sends to it
+    /// are refused. A full mailbox refuses rather than evicting: a message
+    /// a sender was told was delivered and which then quietly disappeared
+    /// is the failure mode that destroys trust in a messaging system.
+    ///
+    /// Queue depth, not unread count. A message the recipient received
+    /// live and has not marked read is not congestion, and counting it as
+    /// such would let a client that never marks anything read lock its own
+    /// mailbox against everyone. fogWraith's `MaxOfflineQueue` measures
+    /// the same thing; what bounds the rest is retention.
+    pub max_queued: usize,
+    /// How many queued messages one flush hands a client. The cap is for
+    /// the legacy wire, where each private message opens a window; the
+    /// remainder stays pending rather than being dropped.
+    pub deliver_at_flush: usize,
+}
+
+impl Default for InboxPolicy {
+    fn default() -> Self {
+        InboxPolicy {
+            max_queued: 200,
+            deliver_at_flush: 25,
+        }
+    }
+}
+
+impl InboxPolicy {
+    /// Both numbers must be at least 1, and the binary refuses a config
+    /// that says otherwise. Zero is not "unlimited" in either: with
+    /// `max_queued = 0` nothing can be stored at all, and with
+    /// `deliver_at_flush = 0` every flush reads an empty batch, so a
+    /// message to an attached recipient is stored, never delivered live,
+    /// and never flushed afterwards either.
+    pub fn check(&self) -> Result<(), String> {
+        if self.max_queued == 0 {
+            return Err("[inbox] max_queued must be at least 1 (0 stores nothing)".into());
+        }
+        if self.deliver_at_flush == 0 {
+            return Err(
+                "[inbox] deliver_at_flush must be at least 1 (0 never delivers anything)".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// The domain core. One per server; shared across sessions.
 #[derive(Default)]
 pub struct Core {
     pub(crate) roster: Mutex<RosterInner>,
+    /// The durable private-message inbox, or `None` — in which case
+    /// private messaging behaves exactly as it did before the inbox
+    /// existed, which is what a server that configures no database gets.
+    ///
+    /// **It lives on `Core` and not in `RosterInner` on purpose.** Store
+    /// calls are disk I/O and must not happen under the roster lock; a
+    /// field the locked state cannot reach is a structural reminder.
+    pub(crate) inbox: Option<Arc<dyn crate::inbox::MessageStore>>,
+    pub(crate) directory: Option<Arc<dyn crate::account::AccountDirectory>>,
+    pub(crate) inbox_policy: InboxPolicy,
+    /// Serialises inbox flushes.
+    ///
+    /// A flush reads the pending rows, sends them under the roster lock,
+    /// and stamps them delivered after releasing it. Two flushes for one
+    /// mailbox — a sender's post-store flush racing the recipient's login
+    /// flush, or two senders racing each other — both read the same rows
+    /// and both send them, and the recipient sees every message twice.
+    ///
+    /// A lock of its own rather than the roster's, so the no-disk-under-
+    /// the-roster-lock rule survives. Order is always this lock first,
+    /// then the roster's.
+    pub(crate) flushing: Mutex<()>,
 }
 
 impl Core {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Give the domain a durable inbox. Without one, a private message to
+    /// a detached session buffers in its outbox as before and a message to
+    /// an account with no session is refused.
+    pub fn with_inbox(
+        mut self,
+        store: Arc<dyn crate::inbox::MessageStore>,
+        directory: Arc<dyn crate::account::AccountDirectory>,
+        policy: InboxPolicy,
+    ) -> Self {
+        self.inbox = Some(store);
+        self.directory = Some(directory);
+        self.inbox_policy = policy;
+        self
     }
 
     /// Register a new session and allocate its uid. The session is not yet
@@ -454,6 +603,9 @@ impl Core {
                 addr: info.addr,
                 connected_at: Instant::now(),
                 can_detach: info.can_detach,
+                has_inbox: info.has_inbox,
+                reads_on_delivery: info.reads_on_delivery,
+                identity: info.identity,
                 visible: false,
                 outbox: Outbox::live(tx),
             },
@@ -694,9 +846,26 @@ impl Core {
         r.users.get(&uid).map(|s| s.outbox.next_seq - 1)
     }
 
+    /// Is there a durable inbox at all? Frontends advertise the feature
+    /// on this, and it is what a client feature-detects against.
+    pub fn inbox_enabled(&self) -> bool {
+        self.inbox.is_some()
+    }
+
     /// The public chat subject.
     pub fn public_subject(&self) -> String {
         self.roster.lock().unwrap().public_subject.clone()
+    }
+}
+
+impl UserSession {
+    /// This session's mailbox key: its identity fingerprint where it has
+    /// one, its login where it does not. See [`crate::inbox::Mailbox`].
+    pub(crate) fn mailbox(&self) -> crate::inbox::Mailbox {
+        crate::inbox::Mailbox {
+            login: self.login.clone(),
+            fingerprint: self.identity,
+        }
     }
 }
 
@@ -727,6 +896,9 @@ pub(crate) fn test_attach(
             addr: None,
             can_detach: false,
             transport: Transport::default(),
+            has_inbox: false,
+            reads_on_delivery: false,
+            identity: None,
         })
         .unwrap();
     core.announce(uid);
@@ -759,6 +931,9 @@ mod tests {
                 addr: Some(addr.parse().unwrap()),
                 can_detach: true,
                 transport: Transport::default(),
+                has_inbox: true,
+                reads_on_delivery: false,
+                identity: None,
             })
             .unwrap();
         core.announce(uid);
@@ -831,6 +1006,9 @@ mod tests {
                 addr: None,
                 can_detach: false,
                 transport: Transport::default(),
+                has_inbox: false,
+                reads_on_delivery: false,
+                identity: None,
             })
             .unwrap();
 
