@@ -1,11 +1,14 @@
 # Identity enrollment — certifying a device without the paste
 
-Status: draft, for discussion. Not implemented anywhere: not in hxd-ng,
-not in `hlid`, not in hx-ng. Companion to `hotline-ng-identity.md` (the
-objects and the profile), `hotline-ng-auth.md` (the transport), hx-ng's
-`identity-keys.md` (the browser's side of the same problem, whose §7
-describes the paste this document replaces), and the identity threat
-model.
+Status: draft, for discussion. Being built groundwork first: the §5.4
+bundle exists in `hl-identity` and `hlid cert --bundle` writes it, and
+the identity endpoints answer CORS so a browser elsewhere can reach a
+mailbox. The mailbox itself, the enrollment request, and both `hlid`
+commands are not written yet, in hxd-ng or in hx-ng. Companion to
+`hotline-ng-identity.md` (the objects and the profile),
+`hotline-ng-auth.md` (the transport), hx-ng's `identity-keys.md` (the
+browser's side of the same problem, whose §7 describes the paste this
+document replaces), and the identity threat model.
 
 ---
 
@@ -231,8 +234,12 @@ The bundle is a CBOR map, unsigned because both members are:
 | `cert` | bstr | The new device certificate (§3.3) |
 | `card` | bstr | The identity's current card (§3.4) |
 
-This is also the format `hlid cert -o FILE.bundle` writes for the paste
-path, so the enrollee has one thing to verify whichever way it arrived.
+This is also the format `hlid cert --bundle` writes for the paste path,
+so the enrollee has one thing to verify whichever way it arrived. (The
+flag rather than the `-o FILE.bundle` this document first proposed:
+deciding what to write from the name the user chose for the file would
+make `web.bundle` and `web.bin` produce different formats, which is a
+surprise waiting for whoever tidies up their filenames.)
 
 Only the session's secret can answer; the code cannot. That asymmetry is
 deliberate (§9): the code is shown on a screen and typed on another, the
@@ -502,8 +509,8 @@ enrollee and a holder on different servers should see the same clock.
   trait so a registrar binary can mount it alone.
 - **`hlid`** gains the request/bundle codecs in `hl-identity`
   (`EnrollRequest`, `Bundle`), the two commands, and a `Prompt` trait
-  with a terminal implementation. `hlid cert -o FILE.bundle` writes the
-  §5.4 format, so hx-ng's paste path and this path share a verifier.
+  with a terminal implementation. `hlid cert --bundle` writes the §5.4
+  format, so hx-ng's paste path and this path share a verifier.
 - **hx-ng** gains a code entry beside the existing paste box, its own
   device fingerprint next to it, the poll loop, the pinned identity
   fingerprint, the renewal poster, and a reader for the `#enroll=`

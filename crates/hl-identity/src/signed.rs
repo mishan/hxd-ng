@@ -83,6 +83,17 @@ pub(crate) fn opt_uint(v: &Value, key: &'static str) -> Result<Option<u64>, Erro
     }
 }
 
+/// A byte string of any length. Only the bundle needs this — every
+/// signed object's byte fields are keys or signatures, and those are
+/// fixed-width.
+pub(crate) fn bytes(v: &Value, key: &'static str) -> Result<Vec<u8>, Error> {
+    match v.get(key) {
+        Some(Value::Bytes(b)) => Ok(b.clone()),
+        Some(_) => Err(Error::BadField(key)),
+        None => Err(Error::MissingField(key)),
+    }
+}
+
 pub(crate) fn bytes32(v: &Value, key: &'static str) -> Result<[u8; 32], Error> {
     match v.get(key) {
         Some(Value::Bytes(b)) => b.as_slice().try_into().map_err(|_| Error::BadField(key)),

@@ -8,7 +8,7 @@
 //!              identity key, device key, certificate and card in one step
 //! hlid keygen  identity|device|server PATH    make a key (32-byte seed, hex, mode 0600)
 //! hlid cert    [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX)
-//!              [--days N] [--caps all|web|LIST] [--name S] -o FILE
+//!              [--days N] [--caps all|web|LIST] [--name S] [--bundle] -o FILE
 //! hlid card    [--identity K] --name S [--icon N] [--profile S] [--link URL]...
 //!              [--attestation FILE]... [--successor HEX|--successor-key FILE] -o FILE
 //! hlid attest  --registrar-key K --registrar HOST --identity K|--identity-pub HEX --handle S
@@ -49,7 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use hl_identity::{
-    attestation, caps, cbor, cert, Attestation, Card, DeviceCert, DeviceKey, Fingerprint,
+    attestation, caps, cbor, cert, Attestation, Bundle, Card, DeviceCert, DeviceKey, Fingerprint,
     IdentityKey, LoginProof, PublicKey, ServerKey,
 };
 use serde_json::{json, Value};
@@ -83,7 +83,7 @@ fn usage() -> ! {
         "usage:\n",
         "  hlid init --name S [--days N] [--device-name S]\n",
         "  hlid keygen identity|device|server PATH\n",
-        "  hlid cert [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] -o FILE\n",
+        "  hlid cert [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] [--bundle [--card FILE]] -o FILE\n",
         "  hlid card [--identity K] --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n",
         "       [--successor HEX | --successor-key FILE] -o FILE\n",
         "  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n",
@@ -98,6 +98,10 @@ fn usage() -> ! {
         "fall back to them, so a command printed by a web client for you to run\n",
         "can be exact without guessing where you keep your key. `attest` is the\n",
         "exception: a registrar attests somebody else, so its flags stay explicit.\n",
+        "\n",
+        "--bundle writes the certificate and the identity's card as one object\n",
+        "instead of the certificate alone — the same thing enrollment carries, so\n",
+        "a browser has one blob to paste and one format to verify.\n",
         "\n",
         "--device-pub/--device-enc-pub certify a device this tool never held the\n",
         "private key for — a browser's non-extractable WebCrypto key, in\n",
@@ -123,6 +127,7 @@ struct Args {
 /// needed a dummy value nothing documented.
 const BARE: &[&str] = &[
     "allow-remote-listen",
+    "bundle",
     "password-stdin",
     "no-create",
     "create",
@@ -566,7 +571,32 @@ fn make_cert(args: &[String]) -> R<()> {
     c.name = a.opt("name").map(str::to_owned);
     let bytes = c.sign(&id);
     DeviceCert::parse(&bytes).map_err(|e| refuse_unreadable("device certificate", e))?;
-    write_out(&a, &bytes)
+
+    // `--bundle` writes the §5.4 object instead of a bare certificate:
+    // the same bytes the enrollment mailbox carries, so a browser handed
+    // one by a pairing code and a browser handed one by a paste verify
+    // the same thing. Without it the user pastes a certificate and,
+    // separately, a card, and the browser tells the two apart by shape.
+    if !a.has("bundle") {
+        return write_out(&a, &bytes);
+    }
+    let card_path = a.file("card", CARD_FILE)?;
+    let card = read_file(&card_path)?;
+    let parsed = Card::parse(&card).map_err(|e| format!("{}: {e}", card_path.display()))?;
+    // A bundle whose halves name different identities is not one, and
+    // finding that out here beats finding it out in a browser that can
+    // only say the paste was wrong.
+    if parsed.identity != id.public() {
+        return Err(format!(
+            "{} is the card of {}, not of the identity signing this certificate ({})",
+            card_path.display(),
+            Fingerprint::of(&parsed.identity),
+            id.fingerprint()
+        ));
+    }
+    let encoded = Bundle { cert: bytes, card }.encode();
+    Bundle::parse(&encoded).map_err(|e| refuse_unreadable("bundle", e))?;
+    write_out(&a, &encoded)
 }
 
 fn make_card(args: &[String]) -> R<()> {
@@ -674,6 +704,25 @@ fn inspect(args: &[String]) -> R<()> {
             "handle": a.full_handle(), "registrar_key": hex(&a.registrar_key),
             "registered": a.registered, "issued": a.issued, "expires": a.expires, "level": a.level,
         })
+    } else if let Ok(b) = Bundle::parse(&bytes) {
+        // Unsigned, so unlike the others this reports what its members
+        // say *and* whether they hold together — that check is the only
+        // interesting thing about the wrapper.
+        let opened = b.open();
+        json!({
+            "type": "bundle",
+            "cert": DeviceCert::parse(&b.cert).ok().map(|c| json!({
+                "identity_fingerprint": Fingerprint::of(&c.identity).to_string(),
+                "device": hex(&c.device), "device_enc": hex(&c.device_enc),
+                "issued": c.issued, "expires": c.expires, "caps": c.caps, "name": c.name,
+            })),
+            "card": Card::parse(&b.card).ok().map(|c| json!({
+                "identity_fingerprint": Fingerprint::of(&c.identity).to_string(),
+                "name": c.name, "updated": c.updated,
+            })),
+            "ok": opened.is_ok(),
+            "error": opened.err().map(|e| e.to_string()),
+        })
     } else if let Ok(p) = LoginProof::parse(&bytes) {
         json!({
             "type": "login_proof",
@@ -686,6 +735,7 @@ fn inspect(args: &[String]) -> R<()> {
             ("device_cert", DeviceCert::parse(&bytes).err()),
             ("card", Card::parse(&bytes).err()),
             ("attestation", Attestation::parse(&bytes).err()),
+            ("bundle", Bundle::parse(&bytes).err()),
             ("login_proof", LoginProof::parse(&bytes).err()),
         ];
         let mut msg = String::from("not a recognised identity object:");

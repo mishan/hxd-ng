@@ -307,6 +307,11 @@ cargo run --bin hlid -- keygen device dev.key
 hlid cert --identity id.key --device dev.key --caps login,message,manage -o cert.cbor
 hlid card --identity id.key --name Alice -o card.cbor
 
+# Certifying a browser, whose keys never leave it: the two public halves
+# come off the screen, and `--bundle` writes the certificate and your card
+# as the one blob the browser asks you to paste back.
+hlid cert --device-pub 3f2a… --device-enc-pub 91c4… --caps web --bundle -o web.bundle
+
 hlid auth   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
 hlid link   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor \
             --login alice --password-stdin < pw.txt

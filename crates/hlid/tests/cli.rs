@@ -187,3 +187,80 @@ fn the_public_key_form_never_falls_back_to_this_machines_own_device() {
     );
     assert!(err.contains("alternatives"), "{err}");
 }
+
+#[test]
+fn bundle_writes_the_certificate_and_card_as_one_thing_to_paste() {
+    let dir = tempfile::tempdir().unwrap();
+    ok(dir.path(), &["init", "--name", "alice"]);
+
+    let out = dir.path().join("web.bundle");
+    ok(
+        dir.path(),
+        &[
+            "cert",
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "--caps",
+            "web",
+            "--bundle",
+            "-o",
+            out.to_str().unwrap(),
+        ],
+    );
+
+    // `inspect` reads it back as a bundle rather than as an unknown
+    // object, which is the whole of what a user can check by hand.
+    let seen = ok(dir.path(), &["inspect", out.to_str().unwrap()]);
+    assert!(seen.contains("\"type\": \"bundle\""), "{seen}");
+    assert!(seen.contains("\"ok\": true"), "{seen}");
+    assert!(seen.contains("alice"), "{seen}");
+    assert!(seen.contains(&key_hex(DEVICE_PUB)), "{seen}");
+
+    // Without the flag it is still a bare certificate — the paste path
+    // that exists today does not change under anyone.
+    let plain = dir.path().join("web.cert");
+    ok(
+        dir.path(),
+        &[
+            "cert",
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "-o",
+            plain.to_str().unwrap(),
+        ],
+    );
+    let seen = ok(dir.path(), &["inspect", plain.to_str().unwrap()]);
+    assert!(seen.contains("\"type\": \"device_cert\""), "{seen}");
+}
+
+#[test]
+fn a_bundle_will_not_be_built_from_someone_elses_card() {
+    let alice = tempfile::tempdir().unwrap();
+    let mallory = tempfile::tempdir().unwrap();
+    ok(alice.path(), &["init", "--name", "alice"]);
+    ok(mallory.path(), &["init", "--name", "mallory"]);
+
+    // Both halves are real and both signatures verify; only the pairing
+    // is a lie, which is exactly the case a browser cannot diagnose and
+    // would report as a bad paste.
+    let err = fails(
+        alice.path(),
+        &[
+            "cert",
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "--bundle",
+            "--card",
+            mallory.path().join("card.bin").to_str().unwrap(),
+            "-o",
+            "/dev/null",
+        ],
+    );
+    assert!(err.contains("card of"), "{err}");
+}
