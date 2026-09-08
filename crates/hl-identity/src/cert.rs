@@ -55,14 +55,40 @@ impl DeviceCert {
     /// A certificate for `device`, valid from `issued` for `lifetime`
     /// seconds, unrestricted and unnamed. Adjust fields before signing.
     ///
+    /// Requires the device's own [`DeviceKey`] — which is exactly what a
+    /// non-extractable browser key never gives up (hx-ng's
+    /// `docs/identity-keys.md` §9). [`DeviceCert::for_keys`] is the same
+    /// constructor for a caller that holds only the two public keys.
+    pub fn for_device(
+        identity: &IdentityKey,
+        device: &DeviceKey,
+        issued: u64,
+        lifetime: u64,
+    ) -> Result<Self, Error> {
+        Self::for_keys(
+            identity,
+            device.public(),
+            device.public_enc(),
+            issued,
+            lifetime,
+        )
+    }
+
+    /// The same certificate as [`DeviceCert::for_device`], for a caller
+    /// that holds the device's two *public* keys and not its seed — the
+    /// shape a browser's non-extractable `CryptoKey`s are in: it can
+    /// export the public half of each and no more, so there is no seed
+    /// file to hand `for_device`.
+    ///
     /// Refuses a window that doesn't fit in the field rather than
     /// wrapping into one: `issued + lifetime` overflowing would panic a
     /// debug build and, in release, silently produce a certificate that
     /// expired in 1970 — build-dependent bytes for something that gets
     /// signed.
-    pub fn for_device(
+    pub fn for_keys(
         identity: &IdentityKey,
-        device: &DeviceKey,
+        device: PublicKey,
+        device_enc: [u8; 32],
         issued: u64,
         lifetime: u64,
     ) -> Result<Self, Error> {
@@ -71,8 +97,8 @@ impl DeviceCert {
             .ok_or(Error::BadField("expires"))?;
         Ok(DeviceCert {
             identity: identity.public(),
-            device: device.public(),
-            device_enc: device.public_enc(),
+            device,
+            device_enc,
             issued,
             expires,
             caps: None,
@@ -192,6 +218,35 @@ mod tests {
         );
         assert!(DeviceCert::for_device(&id, &dev, 0, u64::MAX).is_ok());
         assert!(DeviceCert::for_device(&id, &dev, 1, u64::MAX).is_err());
+        // `for_device` is `for_keys` plus reading the two public halves
+        // off a `DeviceKey`; the overflow check lives in `for_keys`
+        // alone, so it has to refuse the same way called directly.
+        assert_eq!(
+            DeviceCert::for_keys(&id, dev.public(), dev.public_enc(), u64::MAX - 5, 10),
+            Err(Error::BadField("expires"))
+        );
+    }
+
+    #[test]
+    fn for_keys_matches_for_device_given_the_same_keys() {
+        use super::*;
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = DeviceKey::from_seed(&[2u8; 32]);
+        let via_device =
+            DeviceCert::for_device(&id, &dev, 1_700_000_000, RECOMMENDED_LIFETIME).unwrap();
+        let via_keys = DeviceCert::for_keys(
+            &id,
+            dev.public(),
+            dev.public_enc(),
+            1_700_000_000,
+            RECOMMENDED_LIFETIME,
+        )
+        .unwrap();
+        assert_eq!(via_device, via_keys);
+        // And the signed bytes are identical, not just the struct —
+        // `hlid cert --device-pub` and `hlid cert --device` for the same
+        // key must produce the same certificate.
+        assert_eq!(via_device.sign(&id), via_keys.sign(&id));
     }
 
     #[test]
