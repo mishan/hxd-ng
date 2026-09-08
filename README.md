@@ -277,7 +277,23 @@ With `[identity]` on, the ng listener also answers HTTP: `GET
 `PUT /identity/card`, and `POST /identity/link` and `/identity/unlink` for
 account association.
 
-`hlid` makes the keys and objects and talks to the server:
+`hlid` makes the keys and objects and talks to the server. From nothing:
+
+```sh
+hlid init --name Alice        # identity key, device key, certificate, card
+hlid auth   --server http://127.0.0.1:5700
+hlid link   --server http://127.0.0.1:5700 --login alice --password-stdin < pw.txt
+hlid tunnel --server http://127.0.0.1:5700
+```
+
+`init` writes into `$HLID_HOME` (default `~/.hlid`), and `--identity`,
+`--device`, `--cert` and `--card` fall back to what it wrote, which is why
+none of the lines above name a file. That fallback is what lets a web
+client print a command for you to run — it cannot know where you keep your
+key, and a pre-filled path that guesses is right only by luck.
+
+The long way, when you want the files somewhere specific or the
+certificate to say something other than the default:
 
 ```sh
 cargo run --bin hlid -- keygen identity id.key
@@ -285,7 +301,9 @@ cargo run --bin hlid -- keygen device dev.key
 
 # Anything that writes an account link needs `manage`, and `--caps web`
 # deliberately excludes it. A browser device gets `web`; the device you
-# administer your account from gets this.
+# administer your account from gets this. `hlid init` writes an
+# unrestricted certificate, since its device sits on the same machine as
+# the identity key and a bit withheld there protects nothing.
 hlid cert --identity id.key --device dev.key --caps login,message,manage -o cert.cbor
 hlid card --identity id.key --name Alice -o card.cbor
 

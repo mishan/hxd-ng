@@ -778,6 +778,7 @@ dependencies = [
  "futures-util",
  "hl-identity",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "ureq",

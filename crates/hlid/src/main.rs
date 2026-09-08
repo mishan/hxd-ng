@@ -4,8 +4,10 @@
 //! `docs/hotline-ng-identity.md` from a shell:
 //!
 //! ```text
-//! hlid keygen identity|device|server PATH     make a key (32-byte seed, hex, mode 0600)
-//! hlid cert    --identity K (--device K | --device-pub HEX --device-enc-pub HEX)
+//! hlid init    --name S [--days N] [--device-name S]
+//!              identity key, device key, certificate and card in one step
+//! hlid keygen  identity|device|server PATH    make a key (32-byte seed, hex, mode 0600)
+//! hlid cert    [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX)
 //!              [--days N] [--caps all|web|LIST] [--name S] -o FILE
 //! hlid card    --identity K --name S [--icon N] [--profile S] [--link URL]...
 //!              [--attestation FILE]... [--successor HEX|--successor-key FILE] -o FILE
@@ -26,6 +28,13 @@
 //! machine can read it out of `ps`. `--password-file` and
 //! `--password-stdin` don't; prefer them, and prompt-based entry lands
 //! with the registrar spec's password-wrapped key envelope.
+//!
+//! `--identity`, `--device`, `--cert` and `--card` fall back to fixed
+//! names in `$HLID_HOME` (default `~/.hlid`), which is what `hlid init`
+//! fills. That exists so a command a web client prints for the user to
+//! run can be exact: the browser cannot know where this machine keeps its
+//! identity key, and a pre-filled path that guesses is right only for
+//! whoever followed one particular tutorial.
 //!
 //! Key files are the raw seed in hex. That is the prototype's storage;
 //! the registrar spec's password-wrapped envelope replaces it, and the
@@ -51,6 +60,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else { usage() };
     let r = match cmd.as_str() {
+        "init" => init(&args[1..]),
         "keygen" => keygen(&args[1..]),
         "cert" => make_cert(&args[1..]),
         "card" => make_card(&args[1..]),
@@ -71,20 +81,28 @@ fn main() {
 fn usage() -> ! {
     eprintln!(concat!(
         "usage:\n",
+        "  hlid init --name S [--days N] [--device-name S]\n",
         "  hlid keygen identity|device|server PATH\n",
-        "  hlid cert --identity K (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] -o FILE\n",
-        "  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n",
+        "  hlid cert [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] -o FILE\n",
+        "  hlid card [--identity K] --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n",
         "       [--successor HEX | --successor-key FILE] -o FILE\n",
         "  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n",
         "  hlid inspect FILE\n",
-        "  hlid auth --server URL --device K --card FILE --cert FILE [--login L] [--password P | --password-file F | --password-stdin] [--no-create]\n",
-        "  hlid link --server URL --device K --card FILE --cert FILE --login L [--password P | --password-file F | --password-stdin]\n",
-        "  hlid unlink --server URL --device K --card FILE --cert FILE\n",
-        "  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500] [--allow-remote-listen] [--create]\n",
+        "  hlid auth --server URL [--device K] [--card FILE] [--cert FILE] [--login L] [--password P | --password-file F | --password-stdin] [--no-create]\n",
+        "  hlid link --server URL [--device K] [--card FILE] [--cert FILE] --login L [--password P | --password-file F | --password-stdin]\n",
+        "  hlid unlink --server URL [--device K] [--card FILE] [--cert FILE]\n",
+        "  hlid tunnel --server URL [--device K] [--card FILE] [--cert FILE] [--listen 127.0.0.1:5500] [--allow-remote-listen] [--create]\n",
+        "\n",
+        "`hlid init` writes identity.key, device.key, cert.bin and card.bin into\n",
+        "$HLID_HOME (default ~/.hlid), and --identity, --device, --cert and --card\n",
+        "fall back to them, so a command printed by a web client for you to run\n",
+        "can be exact without guessing where you keep your key. `attest` is the\n",
+        "exception: a registrar attests somebody else, so its flags stay explicit.\n",
         "\n",
         "--device-pub/--device-enc-pub certify a device this tool never held the\n",
         "private key for — a browser's non-extractable WebCrypto key, in\n",
-        "particular.\n",
+        "particular. They do not fall back to the default directory: the point of\n",
+        "them is that the device is somewhere else.\n",
         "\n",
         "Password options: --password puts the secret in `ps` output; prefer\n",
         "--password-file or --password-stdin.",
@@ -183,6 +201,27 @@ impl Args {
             .map(|v| v.iter().map(String::as_str).collect())
             .unwrap_or_default()
     }
+    /// A file this tool keeps for the user: the flag when it was given,
+    /// else the default directory's name for it — but only when that is
+    /// actually there, so that "you have no identity key" and "the one
+    /// you named is missing" stay different errors. `None` means
+    /// neither, which some callers read as "not asked for" rather than
+    /// as a failure.
+    fn file_opt(&self, flag: &str, name: &str) -> Option<PathBuf> {
+        if let Some(p) = self.opt(flag) {
+            return Some(PathBuf::from(p));
+        }
+        let p = hlid_home().ok()?.join(name);
+        p.exists().then_some(p)
+    }
+
+    fn file(&self, flag: &str, name: &str) -> R<PathBuf> {
+        self.file_opt(flag, name).ok_or_else(|| {
+            let home = hlid_home().map_or_else(|e| e, |h| h.display().to_string());
+            format!("--{flag} is required, and there is no {name} in {home} to fall back to (`hlid init` writes one)")
+        })
+    }
+
     fn u64(&self, k: &str, default: u64) -> R<u64> {
         match self.opt(k) {
             Some(s) => s.parse().map_err(|_| format!("--{k}: not a number")),
@@ -239,11 +278,35 @@ fn unhex(s: &str) -> R<Vec<u8>> {
         .collect()
 }
 
-fn read_seed(path: &str) -> R<[u8; 32]> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+/// `$HLID_HOME`, else `~/.hlid`. The directory exists so that a command
+/// printed for a user to run can be exact: hx-ng's identity panel shows
+/// `hlid cert --device-pub …` and has no way to know where this machine
+/// keeps its identity key, so a pre-filled `--identity ~/.hlid/identity.key`
+/// is right only for whoever followed one particular tutorial. A
+/// pre-filled command that is wrong is worse than no command at all.
+fn hlid_home() -> R<PathBuf> {
+    if let Some(h) = std::env::var_os("HLID_HOME") {
+        return Ok(PathBuf::from(h));
+    }
+    let home = std::env::var_os("HOME").ok_or(
+        "neither $HLID_HOME nor $HOME is set, so there is no default \
+         directory to look in; name the file explicitly",
+    )?;
+    Ok(PathBuf::from(home).join(".hlid"))
+}
+
+/// The fixed names inside it: what `hlid init` writes, and what the
+/// corresponding flags fall back to when they are omitted.
+const IDENTITY_KEY: &str = "identity.key";
+const DEVICE_KEY: &str = "device.key";
+const CERT_FILE: &str = "cert.bin";
+const CARD_FILE: &str = "card.bin";
+
+fn read_seed(path: &Path) -> R<[u8; 32]> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     unhex(&text)?
         .try_into()
-        .map_err(|_| format!("{path}: seed must be 32 bytes"))
+        .map_err(|_| format!("{}: seed must be 32 bytes", path.display()))
 }
 
 fn write_private(path: &Path, text: &str) -> R<()> {
@@ -275,8 +338,15 @@ fn refuse_unreadable(kind: &str, e: hl_identity::Error) -> String {
     format!("refusing to write a {kind} this build would reject: {e}")
 }
 
-fn read_file(path: &str) -> R<Vec<u8>> {
-    std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+fn read_file(path: &Path) -> R<Vec<u8>> {
+    std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Write a signed object. Not `write_private`: these are public material
+/// that other people are meant to be given, and `create_new` would make
+/// re-running `hlid cert` after a certificate expires an error.
+fn write_file(path: &Path, bytes: &[u8]) -> R<()> {
+    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn b64(b: &[u8]) -> String {
@@ -328,6 +398,95 @@ fn keygen(args: &[String]) -> R<()> {
     Ok(())
 }
 
+/// `hlid init --name S`: nothing to an identity in one command.
+///
+/// Four objects, written into the default directory under the names
+/// every other command falls back to: an identity key, a device key for
+/// this machine, an unrestricted certificate for that device, and a
+/// card. That is the whole of what a person needs before they can
+/// certify a browser, and doing it in one step is the difference
+/// between hx-ng's panel saying "run this" and it saying "first,
+/// read the identity spec".
+fn init(args: &[String]) -> R<()> {
+    let a = parse(args);
+    let name = a.one("name")?;
+    let home = hlid_home()?;
+    create_private_dir(&home)?;
+
+    // Check all four before writing any: a second `init` over a live
+    // identity that failed half way would leave the directory holding a
+    // device key certified by nothing, which is harder to explain than
+    // refusing outright.
+    for f in [IDENTITY_KEY, DEVICE_KEY, CERT_FILE, CARD_FILE] {
+        let p = home.join(f);
+        if p.exists() {
+            return Err(format!(
+                "{} already exists; hlid init will not write over an identity",
+                p.display()
+            ));
+        }
+    }
+
+    let mut id_seed = [0u8; 32];
+    getrandom_seed(&mut id_seed);
+    write_private(&home.join(IDENTITY_KEY), &hex(&id_seed))?;
+    let id = IdentityKey::from_seed(&id_seed);
+
+    let mut dev_seed = [0u8; 32];
+    getrandom_seed(&mut dev_seed);
+    write_private(&home.join(DEVICE_KEY), &hex(&dev_seed))?;
+    let dev = DeviceKey::from_seed(&dev_seed);
+
+    // Unrestricted caps: this device sits on the same machine as the
+    // identity key, so a capability bit withheld from it protects
+    // nothing — anything it is not allowed to do can be done by reading
+    // the key file next to it. Restricted certificates are for the
+    // devices this one goes on to certify.
+    let days = a.u64("days", cert::RECOMMENDED_LIFETIME / 86_400)?;
+    let mut c = DeviceCert::for_keys(&id, dev.public(), dev.public_enc(), now(), seconds(days)?)
+        .map_err(|e| format!("--days: {e}"))?;
+    c.name = Some(a.opt("device-name").unwrap_or("this machine").to_owned());
+    let cert_bytes = c.sign(&id);
+    DeviceCert::parse(&cert_bytes).map_err(|e| refuse_unreadable("device certificate", e))?;
+    write_file(&home.join(CERT_FILE), &cert_bytes)?;
+
+    let card_bytes = Card::new(&id, name, now())
+        .sign(&id, Vec::new())
+        .map_err(|e| e.to_string())?;
+    Card::parse(&card_bytes).map_err(|e| refuse_unreadable("card", e))?;
+    write_file(&home.join(CARD_FILE), &card_bytes)?;
+
+    println!(
+        "identity written to {}\n\
+         name:        {name}\n\
+         fingerprint: {}\n\
+         \n\
+         Every other hlid command falls back to these files, so --identity,\n\
+         --device, --cert and --card can be left off from here on.",
+        home.display(),
+        id.fingerprint()
+    );
+    Ok(())
+}
+
+/// The directory holds private keys, so it is created 0700 rather than
+/// left to the umask. Existing is not an error — a user may well have
+/// made it themselves — but its mode is then theirs, not ours.
+fn create_private_dir(path: &Path) -> R<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 fn getrandom_seed(seed: &mut [u8; 32]) {
     // Borrow the crate's generator through a throwaway key rather than
     // add a second randomness dependency here.
@@ -336,35 +495,43 @@ fn getrandom_seed(seed: &mut [u8; 32]) {
 
 fn make_cert(args: &[String]) -> R<()> {
     let a = parse(args);
-    let id = IdentityKey::from_seed(&read_seed(a.one("identity")?)?);
+    let id = IdentityKey::from_seed(&read_seed(&a.file("identity", IDENTITY_KEY)?)?);
     // `--device` names a seed file this tool holds; `--device-pub` +
     // `--device-enc-pub` certify a device whose private keys never left
     // wherever they were generated — a browser's non-extractable
     // `CryptoKey`s, which can only ever export their public halves
     // (hx-ng's `docs/identity-keys.md` §9).
-    let (device, device_enc): (PublicKey, [u8; 32]) = match a.opt("device") {
-        Some(seed) => {
-            if a.has("device-pub") || a.has("device-enc-pub") {
+    //
+    // Only the seed form falls back to the default directory. The public
+    // keys are the explicit request; silently certifying this machine's
+    // own device key because `--device-enc-pub` was left off a command
+    // pasted from a browser would hand back a certificate for the wrong
+    // device, which the browser would reject with nothing to say about
+    // why.
+    let (device, device_enc): (PublicKey, [u8; 32]) =
+        if a.has("device-pub") || a.has("device-enc-pub") {
+            if a.has("device") {
                 return Err("--device and --device-pub/--device-enc-pub are alternatives".into());
             }
-            let dev = DeviceKey::from_seed(&read_seed(seed)?);
-            (dev.public(), dev.public_enc())
-        }
-        None => {
-            let pub_hex = a.opt("device-pub").ok_or_else(|| {
-                "--device or --device-pub (with --device-enc-pub) is required".to_string()
-            })?;
-            let enc_hex = a.one("device-enc-pub")?;
             (
-                unhex(pub_hex)?
+                unhex(a.one("device-pub")?)?
                     .try_into()
                     .map_err(|_| "--device-pub: 32 bytes".to_string())?,
-                unhex(enc_hex)?
+                unhex(a.one("device-enc-pub")?)?
                     .try_into()
                     .map_err(|_| "--device-enc-pub: 32 bytes".to_string())?,
             )
-        }
-    };
+        } else {
+            let path = a.file_opt("device", DEVICE_KEY).ok_or_else(|| {
+                let home = hlid_home().map_or_else(|e| e, |h| h.display().to_string());
+                format!(
+                    "--device or --device-pub (with --device-enc-pub) is required, \
+                 and there is no {DEVICE_KEY} in {home} to fall back to"
+                )
+            })?;
+            let dev = DeviceKey::from_seed(&read_seed(&path)?);
+            (dev.public(), dev.public_enc())
+        };
     let days = a.u64("days", cert::RECOMMENDED_LIFETIME / 86_400)?;
     let mut c = DeviceCert::for_keys(&id, device, device_enc, now(), seconds(days)?)
         .map_err(|e| format!("--days: {e}"))?;
@@ -393,7 +560,7 @@ fn make_cert(args: &[String]) -> R<()> {
 
 fn make_card(args: &[String]) -> R<()> {
     let a = parse(args);
-    let id = IdentityKey::from_seed(&read_seed(a.one("identity")?)?);
+    let id = IdentityKey::from_seed(&read_seed(&a.file("identity", IDENTITY_KEY)?)?);
     let mut card = Card::new(&id, a.one("name")?, now());
     card.icon = match a.opt("icon") {
         Some(s) => Some(s.parse().map_err(|_| "--icon: not a number".to_string())?),
@@ -412,7 +579,7 @@ fn make_card(args: &[String]) -> R<()> {
                 .map_err(|_| "--successor: 32 bytes of hex".to_string())?,
         ),
         (None, Some(path)) => {
-            let key = IdentityKey::from_seed(&read_seed(path)?);
+            let key = IdentityKey::from_seed(&read_seed(Path::new(path))?);
             Some(Fingerprint::of(&key.public()).0)
         }
         (None, None) => None,
@@ -421,7 +588,7 @@ fn make_card(args: &[String]) -> R<()> {
         .many("attestation")
         .into_iter()
         .map(|p| {
-            let bytes = read_file(p)?;
+            let bytes = read_file(Path::new(p))?;
             Attestation::parse(&bytes).map_err(|e| format!("{p}: {e}"))?;
             cbor::decode_canonical(&bytes).map_err(|e| format!("{p}: {e}"))
         })
@@ -433,9 +600,12 @@ fn make_card(args: &[String]) -> R<()> {
 
 fn make_attestation(args: &[String]) -> R<()> {
     let a = parse(args);
-    let reg = ServerKey::from_seed(&read_seed(a.one("registrar-key")?)?);
+    let reg = ServerKey::from_seed(&read_seed(Path::new(a.one("registrar-key")?))?);
+    // No default-directory fallback here, unlike `cert` and `card`:
+    // `attest` is run by a registrar about somebody else, so falling back
+    // to the caller's own identity would be attesting the wrong person.
     let identity: [u8; 32] = match (a.opt("identity"), a.opt("identity-pub")) {
-        (Some(seed), _) => IdentityKey::from_seed(&read_seed(seed)?).public(),
+        (Some(seed), _) => IdentityKey::from_seed(&read_seed(Path::new(seed))?).public(),
         (None, Some(pubhex)) => unhex(pubhex)?
             .try_into()
             .map_err(|_| "--identity-pub: 32 bytes".to_string())?,
@@ -466,7 +636,7 @@ fn make_attestation(args: &[String]) -> R<()> {
 
 fn inspect(args: &[String]) -> R<()> {
     let [path] = args else { usage() };
-    let bytes = read_file(path)?;
+    let bytes = read_file(Path::new(path))?;
     let doc = if let Ok(c) = DeviceCert::parse(&bytes) {
         json!({
             "type": "device_cert",
@@ -557,9 +727,9 @@ impl Credentials {
 
 fn credentials(a: &Args) -> R<Credentials> {
     Ok(Credentials {
-        device: DeviceKey::from_seed(&read_seed(a.one("device")?)?),
-        card: read_file(a.one("card")?)?,
-        cert: read_file(a.one("cert")?)?,
+        device: DeviceKey::from_seed(&read_seed(&a.file("device", DEVICE_KEY)?)?),
+        card: read_file(&a.file("card", CARD_FILE)?)?,
+        cert: read_file(&a.file("cert", CERT_FILE)?)?,
         downstream: "local",
         create: false,
     })
