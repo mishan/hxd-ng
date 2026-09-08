@@ -16,6 +16,7 @@ members = [
     "crates/hxd-session",
     "crates/hxd-voice",
     "crates/hxd-ng-session",
+    "crates/hxd-store-sqlite",
     "crates/hxd",
     "crates/hlid",
 ]
@@ -44,6 +45,7 @@ hxd-auth-file = { path = "crates/hxd-auth-file" }
 hxd-session = { path = "crates/hxd-session" }
 hxd-ng-session = { path = "crates/hxd-ng-session" }
 hxd-voice = { path = "crates/hxd-voice" }
+hxd-store-sqlite = { path = "crates/hxd-store-sqlite" }
 
 # External.
 tokio = { version = "1", default-features = false, features = [
