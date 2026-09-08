@@ -10,6 +10,7 @@
 pub mod access;
 pub mod account;
 pub mod chat;
+pub mod inbox;
 pub mod roster;
 pub mod video;
 pub mod voice;
@@ -19,6 +20,10 @@ pub use account::{
     Account, AuthBackend, AuthError, IdentityLink, LinkAuthority, LinkOutcome, Proof, UnlinkOutcome,
 };
 pub use chat::ChatError;
+pub use inbox::{
+    Delivery, InboxCounts, Mailbox, MemoryStore, MessageGuid, MessageId, MessageKind, MessageStore,
+    NewMessage, Pushed, StoreError, StoredMessage,
+};
 pub use roster::{
     AttachInfo, Core, Event, IdentityTag, Resume, SeqEvent, SessionStatus, Transport, Uid,
     UserDetails, UserInfo, OUTBOX_BUFFER_CAP,
