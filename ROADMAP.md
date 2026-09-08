@@ -382,16 +382,40 @@ The pieces:
 2. **Offline delivery.** A durable per-user inbox: DMs and mentions that
    arrive while detached are stored and delivered on reconnect, with read
    state. This is what makes a detached user still meaningfully *targetable*.
+   **Designed 2026-09 in
+   [docs/private-messages.md](docs/private-messages.md)**, which takes the
+   whole private-message story with it. The address is the account, keyed
+   by its identity fingerprint where it has one and its login where it
+   does not — a login is renameable and re-registrable, so keying mail on
+   it alone eventually delivers someone's private message to a stranger,
+   which is the recycled-uid trap one layer up. Every PM to an account
+   with an inbox is persisted before the sender is acked, so a message
+   handed to a dying socket stops being unrecoverable. The ng wire gains
+   `to_login`, `inbox`, `msg_read`, message guids for safe retry, and a
+   block list; the legacy wire
+   receives queued messages but does not address accounts, because a
+   period client's user list is the only place it can name a person.
+   That document's §12 reconciles all of it with fogWraith's
+   Capabilities-Messaging, whose offline queue is the same problem: the
+   two are two callers of one store, and the friend graph is what
+   `to_login` should inherit when it lands.
+
 3. **Push notifications.** A `NotificationGateway` trait (APNs / FCM /
    UnifiedPush / WebPush behind it) plus a device-token registry. DM or
    mention while detached → push. Notification content policy (full text vs.
    "you have a message") is a config knob — self-hosters differ on this.
 4. **The persistence slice arrives here** (moved from the old Phase 7):
-   PostgreSQL via `sqlx` behind `AccountStore` and the new session/token,
-   inbox, and push-registration stores. Detached sessions, offline messages
-   and device tokens must survive a server restart, so durable storage stops
+   durable storage behind `AccountStore` and the new session/token, inbox,
+   and push-registration stores. Detached sessions, offline messages and
+   device tokens must survive a server restart, so durable storage stops
    being optional at exactly this phase. The account-file backend remains
-   supported for legacy-only small servers.
+   supported for legacy-only small servers. **The first durable store is
+   SQLite** (`hxd-store-sqlite`, decided 2026-09 in
+   docs/private-messages.md §4): it needs no daemon, so a small server
+   gains offline messages without gaining an operations problem, and the
+   trait boundary is the same one PostgreSQL arrives behind. Postgres is
+   still where clustering points — Phase 8 needs a store several nodes can
+   share, which SQLite is not.
 5. **Legacy interop rules.** Detached users appear on the 1.x user list
    flagged away (the legacy wire's closest concept; whether to hide them
    instead is a config option). A legacy client's PM to a detached user is
@@ -487,6 +511,9 @@ resist the reorder.
   there is an app to receive them. See docs/push-notifications.md §3.
 - How a mention is defined, given that Hotline nicks are neither unique nor
   stable — and whether mentions are in the first push cut at all, or DMs
-  carry it alone (docs/push-notifications.md §11).
+  carry it alone (docs/push-notifications.md §11). The inbox design assumes
+  DMs alone (docs/private-messages.md §9).
+- Whether an account's inbox stays server-local or follows the portable
+  identity across servers (docs/private-messages.md §13).
 - Where push coalescing lives (domain rate limit, gateway digest window, or
   vendor collapse keys) — twenty chat lines should not be twenty buzzes.
