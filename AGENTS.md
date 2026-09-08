@@ -196,6 +196,17 @@ a client trace and a server trace of the same session line up.
   commits; **don't force-push without asking**.
 - Commits are authored `Misha Nasledov <misha@nasledov.com>`, descriptive
   bodies, no `Author:` line in the body, no `Co-Authored-By` trailer.
+- **No AI attribution anywhere it lands in the tree** — not in commit
+  messages, not in PR bodies, not in code comments or docs. No
+  `Co-Authored-By`, no "generated with", no tool names. The work is the
+  work; who or what typed it is not part of the record.
+- **US spelling** in code, comments, docs and commit messages:
+  *enrollment*, *behavior*, *canceled*, *license* (noun and verb). It is
+  the spelling the specs in `docs/` already use, and a codebase that
+  mixes the two makes `grep` unreliable — `enrolment` and `enrollment`
+  are two different symbols. Existing British spellings get corrected
+  when the line is touched for another reason, not in sweeps of their
+  own.
 - Review feedback comes from bots as well as humans; verify claims before
   acting — this repo has seen confident "won't compile" findings about
   code that compiles.
