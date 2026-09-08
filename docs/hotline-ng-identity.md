@@ -1120,6 +1120,19 @@ to run on a server that also serves the legacy port.
   key can't mint its own renewal. The registrar spec needs a renew-device
   flow that doesn't unwrap the identity key on the device; its shape decides
   whether 90-day certificates are practical.
+- **Web device lifetimes.** §3.3 recommends 90 days for every device.
+  A browser's device key is a non-extractable `CryptoKey` in IndexedDB,
+  which page code cannot read but a copied profile directory can, so
+  against the threat a certificate's lifetime actually bounds — a stolen
+  machine logging in as you until expiry — it is the same container as
+  a key file and the same number applies. hx-ng's plan
+  (`hx-identity-keys.md` §7.2) reads it that way: 90 by default, with
+  longer offered as the user's explicit choice, on the grounds that
+  nothing here caps a lifetime and the spec already permits it. Does the
+  spec agree, or does a web device deserve a carve-out in either
+  direction — shorter because an XSS can mint tokens for as long as the
+  page is open, or longer because four paste ceremonies a year is what
+  will stop people using it?
 - **User Flags bit 4 on 1.8/1.9.** §10's cleartext marker takes value 16
   in field 112 on the strength of "classic clients ignore unknown bits".
   If 1.8/1.9 already means "automatic response" by that value, the marker
