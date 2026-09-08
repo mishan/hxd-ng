@@ -152,6 +152,16 @@ impl Card {
         if chars == 0 || chars > NAME_MAX_CHARS {
             return Err(Error::BadField("name"));
         }
+        // A name is what a person is called, so it has to contain
+        // something: `"   "` passed every other check here — the space is
+        // exempt from the invisible table because "Alice Anderson" needs
+        // it — and became a blank row in every user list, or an account
+        // name on a server with `new_accounts = create`. Leading and
+        // trailing space go for the same reason `admin ` beside `admin`
+        // is a spoof.
+        if self.name.trim() != self.name || self.name.trim().is_empty() {
+            return Err(Error::BadField("name"));
+        }
         // A display name sits next to handles and logins in every
         // client; the same invisible characters that spoof a handle
         // spoof it (§3.4).
@@ -171,11 +181,15 @@ impl Card {
     /// Decode, check size and fields, verify the card signature against
     /// the embedded identity key, then parse each attestation.
     ///
-    /// The card's own envelope is verified *first*. Verifying the
-    /// attestations first meant a card with a garbage signature and ~55
-    /// self-signed attestations cost ~57 Ed25519 verifications to reject,
-    /// which is a cheap way to spend a server's CPU. One signature says
-    /// whether the rest is worth looking at.
+    /// The card's own envelope is verified *first*, and its own fields
+    /// are read and checked before any attestation's signature is.
+    /// Verifying the attestations first meant a card with a garbage
+    /// signature and ~55 self-signed attestations cost ~57 Ed25519
+    /// verifications to reject, which is a cheap way to spend a server's
+    /// CPU; checking them before the name meant a card that fails on its
+    /// name still bought `MAX_ATTESTATIONS` of them. One signature says
+    /// whether the rest is worth looking at, and the free checks come
+    /// before the paid ones.
     ///
     /// An attestation this version can't read is discarded rather than
     /// failing the card (§5.2 step 5): a registrar that starts issuing v2
@@ -194,25 +208,15 @@ impl Card {
         env.verify(&identity, DOMAIN)?;
 
         // Everything that costs no signature check first: the count,
-        // the fields, and (inside `from_value`) whose attestation this
-        // is. A 16 KiB card fits dozens of minimal attestations, so a
-        // card that verifies its own envelope and then fails could
-        // otherwise buy dozens of Ed25519 verifications with one
-        // unauthenticated request.
+        // the card's own required fields, and (inside `from_value`)
+        // whose attestation this is. A 16 KiB card fits dozens of
+        // minimal attestations, so a card that verifies its own envelope
+        // and then fails could otherwise buy an Ed25519 verification per
+        // attestation with one unauthenticated request — and a card with
+        // a 33-character name is going to fail either way.
         let embedded = signed::opt_array(v, "attestations")?;
         if embedded.len() > MAX_ATTESTATIONS {
             return Err(Error::BadField("attestations"));
-        }
-        let mut attestations = Vec::new();
-        for value in embedded {
-            match Attestation::from_value(value, &identity) {
-                Ok(a) => attestations.push(a),
-                Err(Error::UnsupportedVersion(v)) => {
-                    // Not ours to read; the card is still the user's.
-                    let _ = v;
-                }
-                Err(e) => return Err(e),
-            }
         }
         let links = signed::opt_array(v, "links")?
             .into_iter()
@@ -221,18 +225,28 @@ impl Card {
                 _ => Err(Error::BadField("links")),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let card = Card {
+        let mut card = Card {
             identity,
             updated: signed::uint(v, "updated")?,
             name: signed::text(v, "name")?,
             icon: signed::opt_uint(v, "icon")?,
             profile: signed::opt_text(v, "profile")?,
-            attestations,
+            attestations: Vec::new(),
             vouches: signed::opt_array(v, "vouches")?,
             links,
             successor: signed::opt_bytes32(v, "successor")?,
         };
         card.check_fields()?;
+        for value in embedded {
+            match Attestation::from_value(value, &identity) {
+                Ok(a) => card.attestations.push(a),
+                Err(Error::UnsupportedVersion(v)) => {
+                    // Not ours to read; the card is still the user's.
+                    let _ = v;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         Ok(card)
     }
 }
@@ -250,19 +264,19 @@ mod tests {
             identity: id.public(),
             registrar: "hl.example".into(),
             registrar_key: reg.public(),
-            handle: "misha".into(),
+            handle: "alice".into(),
             registered: 1_600_000_000,
             issued: 1_700_000_000,
             expires: 1_800_000_000,
             level: None,
         };
-        let mut card = Card::new(&id, "Misha", 1_700_000_001);
+        let mut card = Card::new(&id, "Alice", 1_700_000_001);
         card.icon = Some(128);
         card.profile = Some("hxd-ng".into());
-        card.links = vec!["https://misha.nasledov.com".into()];
+        card.links = vec!["https://alice.example.com".into()];
         let bytes = card.sign(&id, vec![att.signed_value(&reg)]).unwrap();
         let back = Card::parse(&bytes).unwrap();
-        assert_eq!(back.name, "Misha");
+        assert_eq!(back.name, "Alice");
         assert_eq!(back.icon, Some(128));
         assert_eq!(back.links, card.links);
         assert_eq!(back.attestations, vec![att]);
@@ -272,7 +286,7 @@ mod tests {
     #[test]
     fn successor_round_trips() {
         let id = IdentityKey::from_seed(&[1u8; 32]);
-        let mut card = Card::new(&id, "Misha", 10);
+        let mut card = Card::new(&id, "Alice", 10);
         card.successor = Some([0x5a; 32]);
         let back = Card::parse(&card.sign(&id, vec![]).unwrap()).unwrap();
         assert_eq!(back.successor, Some([0x5a; 32]));
@@ -293,7 +307,7 @@ mod tests {
             expires: 3,
             level: None,
         };
-        let card = Card::new(&id, "Misha", 10);
+        let card = Card::new(&id, "Alice", 10);
         let bytes = card.sign(&id, vec![att.signed_value(&reg)]).unwrap();
         assert_eq!(Card::parse(&bytes), Err(Error::KeyMismatch));
     }
@@ -308,7 +322,7 @@ mod tests {
             identity: id.public(),
             registrar: "hl.example".into(),
             registrar_key: reg.public(),
-            handle: "misha".into(),
+            handle: "alice".into(),
             registered: 1_600_000_000,
             issued: 1_700_000_000,
             expires: 1_800_000_000,
@@ -325,7 +339,7 @@ mod tests {
             }
         }
         let future = crate::cbor::Value::Map(entries);
-        let card = Card::new(&id, "Misha", 10);
+        let card = Card::new(&id, "Alice", 10);
         let bytes = card
             .sign(&id, vec![future, att.signed_value(&reg)])
             .unwrap();
@@ -343,7 +357,7 @@ mod tests {
             identity: id.public(),
             registrar: "hl.example".into(),
             registrar_key: reg.public(),
-            handle: "misha".into(),
+            handle: "alice".into(),
             registered: 1_600_000_000,
             issued: 1_700_000_000,
             expires: 1_800_000_000,
@@ -351,7 +365,7 @@ mod tests {
         };
         // Each embedded attestation is fine; the card's own sig is not.
         let atts: Vec<_> = (0..8).map(|_| att.signed_value(&reg)).collect();
-        let mut bytes = Card::new(&id, "Misha", 10).sign(&id, atts).unwrap();
+        let mut bytes = Card::new(&id, "Alice", 10).sign(&id, atts).unwrap();
         let n = bytes.len();
         bytes[n - 1] ^= 0xff;
         assert_eq!(Card::parse(&bytes), Err(Error::BadSignature));
@@ -370,7 +384,7 @@ mod tests {
             identity: about.public(),
             registrar: "hl.example".into(),
             registrar_key: reg.public(),
-            handle: "misha".into(),
+            handle: "alice".into(),
             registered: 1_600_000_000,
             issued: 1_700_000_000,
             expires: 1_800_000_000,
@@ -380,12 +394,12 @@ mod tests {
             .map(|_| att(&id).signed_value(&reg))
             .collect();
         assert_eq!(
-            Card::new(&id, "Misha", 10).sign(&id, many.clone()).err(),
+            Card::new(&id, "Alice", 10).sign(&id, many.clone()).err(),
             Some(Error::BadField("attestations"))
         );
         // Signing one anyway — an attacker signs their own card — is
         // refused on the way in, which is the side that matters.
-        let over = signed::seal(Card::new(&id, "Misha", 10).unsigned(many), |body| {
+        let over = signed::seal(Card::new(&id, "Alice", 10).unsigned(many), |body| {
             id.sign(DOMAIN, body)
         });
         assert_eq!(
@@ -394,7 +408,7 @@ mod tests {
         );
 
         // Signed by a real registrar, but about someone else.
-        let bytes = Card::new(&id, "Misha", 10)
+        let bytes = Card::new(&id, "Alice", 10)
             .sign(&id, vec![att(&other).signed_value(&reg)])
             .unwrap();
         assert_eq!(Card::parse(&bytes), Err(Error::KeyMismatch));
@@ -405,16 +419,69 @@ mod tests {
         // `admin\u{200b}` renders as `admin` — the card's name sits next
         // to logins and handles in every client that shows one.
         let id = IdentityKey::from_seed(&[1u8; 32]);
-        for name in ["admin\u{200b}", "ad\u{202e}min", "misha\u{feff}"] {
+        // Space is exempt from the table ("Alice Anderson"), so it is
+        // refused separately: a name of nothing but spaces is a blank
+        // row in every user list, and a trailing one is `admin ` next
+        // to `admin`.
+        for name in [
+            "admin\u{200b}",
+            "ad\u{202e}min",
+            "alice\u{feff}",
+            " ",
+            "   ",
+            "admin ",
+            " admin",
+        ] {
             assert_eq!(
                 Card::new(&id, name, 10).sign(&id, vec![]),
                 Err(Error::BadField("name")),
                 "{name:?}"
             );
         }
-        assert!(Card::new(&id, "Misha Nasledov", 10)
+        assert!(Card::new(&id, "Alice Anderson", 10)
             .sign(&id, vec![])
             .is_ok());
+    }
+
+    #[test]
+    fn the_cards_own_fields_are_checked_before_any_attestation() {
+        // Ordering, pinned: a card that fails on its own name must not
+        // first buy `MAX_ATTESTATIONS` signature verifications. The
+        // attestations here are garbage-signed, so *if* they were
+        // verified first the error would be theirs; the name's error is
+        // the assertion.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let reg = ServerKey::from_seed(&[3u8; 32]);
+        let att = Attestation {
+            identity: id.public(),
+            registrar: "hl.example".into(),
+            registrar_key: reg.public(),
+            handle: "alice".into(),
+            registered: 10,
+            issued: 20,
+            expires: 30,
+            level: None,
+        };
+        let mut signed = att.signed_value(&reg);
+        // Corrupt the signature so verifying it would fail.
+        if let Value::Map(entries) = &mut signed {
+            for (k, v) in entries.iter_mut() {
+                if k == &Value::Text("sig".into()) {
+                    *v = Value::Bytes(vec![0u8; 64]);
+                }
+            }
+        }
+        let mut card = Card::new(&id, "x".repeat(NAME_MAX_CHARS + 1), 10);
+        card.updated = 10;
+        let bytes = signed::seal(
+            card.unsigned(vec![signed.clone(), signed.clone()]),
+            |body| id.sign(DOMAIN, body),
+        );
+        assert_eq!(
+            Card::parse(&bytes),
+            Err(Error::BadField("name")),
+            "the free checks come before the paid ones"
+        );
     }
 
     #[test]
@@ -424,10 +491,10 @@ mod tests {
         assert_eq!(card.sign(&id, vec![]), Err(Error::BadField("name")));
         let card = Card::new(&id, "x".repeat(33), 10);
         assert_eq!(card.sign(&id, vec![]), Err(Error::BadField("name")));
-        let mut card = Card::new(&id, "Misha", 10);
+        let mut card = Card::new(&id, "Alice", 10);
         card.profile = Some("p".repeat(PROFILE_MAX_BYTES + 1));
         assert_eq!(card.sign(&id, vec![]), Err(Error::BadField("profile")));
-        let mut card = Card::new(&id, "Misha", 10);
+        let mut card = Card::new(&id, "Alice", 10);
         card.links = (0..600)
             .map(|i| format!("https://example.com/{i:030}"))
             .collect();

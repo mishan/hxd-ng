@@ -149,7 +149,7 @@ mod tests {
         let id = IdentityKey::from_seed(&[1u8; 32]);
         let dev = DeviceKey::from_seed(&[2u8; 32]);
         let srv = ServerKey::from_seed(&[5u8; 32]);
-        let card = Card::new(&id, "Misha", 1_700_000_000)
+        let card = Card::new(&id, "Alice", 1_700_000_000)
             .sign(&id, vec![])
             .unwrap();
         let cert = DeviceCert::for_device(&id, &dev, 1_700_000_000, cert::RECOMMENDED_LIFETIME)

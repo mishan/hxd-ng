@@ -148,8 +148,14 @@ impl Attestation {
         // `min_attestation_age` is measured from: a sloppy registrar
         // writing `registered: 0` would otherwise hand every one of its
         // users infinite standing on every server that trusts it.
-        if a.registered > a.issued || a.issued >= a.expires || a.registered == 0 {
+        if a.registered > a.issued || a.registered == 0 {
             return Err(Error::BadField("registered"));
+        }
+        // A window that is empty or runs backwards names the field it is
+        // about: `registered` for both used to send a registrar looking
+        // at the wrong value.
+        if a.issued >= a.expires {
+            return Err(Error::BadField("expires"));
         }
         env.verify(&a.registrar_key, DOMAIN)?;
         Ok(a)
@@ -179,7 +185,7 @@ mod tests {
             identity: id.public(),
             registrar: "hl.example".into(),
             registrar_key: reg.public(),
-            handle: "misha".into(),
+            handle: "alice".into(),
             registered: 1_600_000_000,
             issued: 1_700_000_000,
             expires: 1_700_000_000 + RECOMMENDED_LIFETIME,
@@ -188,7 +194,7 @@ mod tests {
         let bytes = a.sign(&reg);
         let back = Attestation::parse(&bytes).unwrap();
         assert_eq!(back, a);
-        assert_eq!(back.full_handle(), "misha@hl.example");
+        assert_eq!(back.full_handle(), "alice@hl.example");
         assert!(back
             .verify_registrar(&reg.public(), 1_710_000_000, 300)
             .is_ok());
@@ -207,7 +213,7 @@ mod tests {
             identity: id.public(),
             registrar: "hl.example".into(),
             registrar_key: reg.public(),
-            handle: "misha".into(),
+            handle: "alice".into(),
             registered: 1,
             issued: 2,
             expires: 3,
@@ -222,7 +228,7 @@ mod tests {
             Err(Error::BadField("registrar"))
         );
         let a = Attestation {
-            handle: "misha@x".into(),
+            handle: "alice@x".into(),
             ..base.clone()
         };
         assert_eq!(
@@ -249,11 +255,6 @@ mod tests {
                 issued: 2,
                 ..base.clone()
             },
-            Attestation {
-                issued: 3,
-                expires: 3,
-                ..base.clone()
-            },
         ] {
             assert_eq!(
                 Attestation::parse(&bad.sign(&reg)),
@@ -261,6 +262,18 @@ mod tests {
                 "{bad:?}"
             );
         }
+        // An empty or backwards validity window is about `expires`, and
+        // says so: it used to be reported as `registered`.
+        let bad = Attestation {
+            issued: 3,
+            expires: 3,
+            ..base.clone()
+        };
+        assert_eq!(
+            Attestation::parse(&bad.sign(&reg)),
+            Err(Error::BadField("expires")),
+            "{bad:?}"
+        );
         // Handles and hosts are rendered next to user-chosen names.
         let a = Attestation {
             handle: "mi sha".into(),

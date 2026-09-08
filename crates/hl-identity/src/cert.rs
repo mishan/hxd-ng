@@ -24,6 +24,21 @@ pub mod caps {
 /// The recommended certificate lifetime (§3.3).
 pub const RECOMMENDED_LIFETIME: u64 = 90 * 24 * 3600;
 
+/// Encoded size limit (§3.3). A certificate is three keys, two
+/// timestamps, a capability mask and a short name — a few hundred bytes
+/// signed — so this is room to spare rather than a constraint.
+///
+/// It needs a limit at all because a server caches the bytes of every
+/// certificate it admits, one per device, and the only other bound is
+/// the HTTP request body. Without this, a certificate whose `name` fills
+/// that body made the device cache two orders of magnitude larger than
+/// the card cache it was sized against (identity spec §13).
+pub const MAX_BYTES: usize = 4 * 1024;
+
+/// Device-name length in characters (§3.3). A device name is "Alice's
+/// phone", shown next to the fingerprint.
+pub const NAME_MAX_CHARS: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCert {
     pub identity: PublicKey,
@@ -96,11 +111,41 @@ impl DeviceCert {
     /// Decode and verify the signature against the embedded identity key.
     /// Time validity is a separate step ([`DeviceCert::check_valid`])
     /// because the caller decides the clock and the tolerance.
+    ///
+    /// The size is checked before anything is decoded, and the fields
+    /// before the signature is verified: both are free, and this is the
+    /// one place a certificate is bounded — `sign` stays infallible, and
+    /// `hlid` parses back what it signs so an over-long `--name` is an
+    /// error there rather than a certificate no server will read.
     pub fn parse(bytes: &[u8]) -> Result<DeviceCert, Error> {
+        if bytes.len() > MAX_BYTES {
+            return Err(Error::TooLarge);
+        }
         let env = Envelope::open(bytes)?;
         let cert = Self::from_envelope(&env)?;
+        cert.check_fields()?;
         env.verify(&cert.identity, DOMAIN)?;
         Ok(cert)
+    }
+
+    fn check_fields(&self) -> Result<(), Error> {
+        match &self.name {
+            // A device name is rendered next to a fingerprint, so it
+            // refuses what a card's display name refuses (§3.3, §3.4) —
+            // including a name made of spaces, and the surrounding space
+            // that makes two device names look alike. Absent is fine;
+            // present and empty is not, because that is a name saying
+            // nothing rather than no name.
+            Some(n)
+                if n.chars().count() > NAME_MAX_CHARS
+                    || n.trim() != n
+                    || n.trim().is_empty()
+                    || n.chars().any(crate::names::is_deceptive) =>
+            {
+                Err(Error::BadField("name"))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn from_envelope(env: &Envelope) -> Result<DeviceCert, Error> {
@@ -170,6 +215,39 @@ mod tests {
         let dev = DeviceKey::from_seed(&[2u8; 32]);
         let cert = DeviceCert::for_device(&id, &dev, 1_700_000_000, RECOMMENDED_LIFETIME).unwrap();
         (id, dev, cert)
+    }
+
+    #[test]
+    fn an_oversized_certificate_is_refused_before_it_is_decoded() {
+        // §13's bounded-growth claim: the server caches `cert` bytes per
+        // device, `MAX_DEVICES` of them. Without this the only bound was
+        // the 64 KiB request body, which is ~16x what the card table was
+        // sized for.
+        let (id, _, mut cert) = fixture();
+        cert.name = Some("d".repeat(MAX_BYTES));
+        assert_eq!(DeviceCert::parse(&cert.sign(&id)), Err(Error::TooLarge));
+
+        // Small enough to decode, too long to accept.
+        cert.name = Some("d".repeat(NAME_MAX_CHARS + 1));
+        assert_eq!(
+            DeviceCert::parse(&cert.sign(&id)),
+            Err(Error::BadField("name"))
+        );
+        // And a name that hides, or says nothing, as a card's does
+        // (§3.4).
+        for name in ["phone\u{200b}", "", "   ", "phone "] {
+            cert.name = Some(name.into());
+            assert_eq!(
+                DeviceCert::parse(&cert.sign(&id)),
+                Err(Error::BadField("name")),
+                "{name:?}"
+            );
+        }
+        // No name at all is not a name saying nothing.
+        cert.name = None;
+        assert!(DeviceCert::parse(&cert.sign(&id)).is_ok());
+        cert.name = Some("d".repeat(NAME_MAX_CHARS));
+        assert!(DeviceCert::parse(&cert.sign(&id)).is_ok());
     }
 
     #[test]

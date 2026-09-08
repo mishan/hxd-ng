@@ -51,17 +51,47 @@ async fn start_server_with_proxies(
     start_server_full(dir, cfg, hxd_session::TrtpLogin::Verify, proxies).await
 }
 
+/// Same, for a deployment whose proxy writes RFC 7239 `Forwarded`.
+async fn start_server_forwarded(dir: &Path, proxies: &[&str]) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        proxies,
+        hxd_ng_session::ForwardedHeader::Forwarded,
+    )
+    .await
+}
+
 async fn start_server_full(
     dir: &Path,
     cfg: IdentityConfig,
     trtp_login: hxd_session::TrtpLogin,
     proxies: &[&str],
 ) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_inner(
+        dir,
+        cfg,
+        trtp_login,
+        proxies,
+        hxd_ng_session::ForwardedHeader::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_server_inner(
+    dir: &Path,
+    cfg: IdentityConfig,
+    trtp_login: hxd_session::TrtpLogin,
+    proxies: &[&str],
+    forwarded_header: hxd_ng_session::ForwardedHeader,
+) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     std::fs::write(
-        accounts.join("misha.toml"),
-        "# hand-maintained\nname = \"Misha\"\npassword = \"s3cret\"\n[access]\nread_chat = true\nsend_chat = true\nsend_msgs = true\nuse_any_name = true\ndisconnect_users = true\n",
+        accounts.join("bob.toml"),
+        "# hand-maintained\nname = \"Bob\"\npassword = \"s3cret\"\n[access]\nread_chat = true\nsend_chat = true\nsend_msgs = true\nuse_any_name = true\ndisconnect_users = true\n",
     )
     .unwrap();
     std::fs::write(
@@ -69,8 +99,14 @@ async fn start_server_full(
         "name = \"Locked\"\npassword = \"pw\"\n[identity]\nallow_self_link = false\n",
     )
     .unwrap();
+    std::fs::write(
+        accounts.join("alice.toml"),
+        "name = \"Alice\"\npassword = \"pw\"\n[access]\nread_chat = true\nsend_chat = true\nsend_msgs = true\nuse_any_name = true\n",
+    )
+    .unwrap();
+    let file_auth = Arc::new(hxd_auth_file::FileAuth::new(accounts));
     let core = Arc::new(Core::new());
-    let auth: Arc<dyn hxd_core::AuthBackend> = Arc::new(hxd_auth_file::FileAuth::new(accounts));
+    let auth: Arc<dyn hxd_core::AuthBackend> = file_auth;
     let legacy_ctx = ServerCtx {
         core: core.clone(),
         auth: auth.clone(),
@@ -98,6 +134,7 @@ async fn start_server_full(
             max_detached_per_addr: 2,
             caps: Vec::new(),
             trusted_proxies: hxd_ng_session::TrustedProxies::parse(proxies).unwrap(),
+            forwarded_header,
         }),
         registry: Arc::new(Registry::new()),
         identity: Some(Arc::new(identity)),
@@ -347,7 +384,7 @@ async fn discovery_challenge_auth_and_authenticated_json_login() {
     assert_eq!(disc["ng"]["trtp"], "/trtp");
     assert_eq!(disc["identity"]["bindings"], json!(["challenge"]));
 
-    let p = person(1, "Misha");
+    let p = person(1, "Bob");
     let auth = authenticate(ng, &p).await;
     assert_eq!(auth["outcome"], "unattested_guest");
     assert_eq!(auth["fingerprint"], p.id.fingerprint().to_string());
@@ -372,7 +409,7 @@ async fn discovery_challenge_auth_and_authenticated_json_login() {
         .await
         .unwrap();
     let mut me = Ng::from_ws(ws).await;
-    let ok = me.request("login", json!({ "nick": "Misha" })).await;
+    let ok = me.request("login", json!({ "nick": "Bob" })).await;
     let ok = &ok["ok"];
     assert_eq!(
         ok["self"]["identity"]["fingerprint"],
@@ -414,7 +451,7 @@ async fn discovery_challenge_auth_and_authenticated_json_login() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|u| u["nick"] == "Misha")
+        .find(|u| u["nick"] == "Bob")
         .unwrap()
         .clone();
     assert_eq!(
@@ -707,22 +744,22 @@ async fn plain_tcp_legacy_session_is_marked_cleartext_on_both_wires() {
 async fn linking_at_auth_lands_on_the_account_and_survives_unlink_rules() {
     let dir = tempfile::tempdir().unwrap();
     let (_legacy, ng, _ctx) = start_server(dir.path()).await;
-    let p = person(4, "Misha");
+    let p = person(4, "Bob");
 
     // Wrong password: refused, nothing written.
-    let r = try_authenticate(ng, &p, json!({ "login": "misha", "password": "wrong" })).await;
+    let r = try_authenticate(ng, &p, json!({ "login": "bob", "password": "wrong" })).await;
     assert_eq!(r.status, 401);
     assert_eq!(r.json()["error"], "login_failed");
-    let file = std::fs::read_to_string(dir.path().join("accounts/misha.toml")).unwrap();
+    let file = std::fs::read_to_string(dir.path().join("accounts/bob.toml")).unwrap();
     assert!(!file.contains("fingerprint"));
 
     // Right password: linked in the same step, comments intact.
-    let r = try_authenticate(ng, &p, json!({ "login": "misha", "password": "s3cret" })).await;
+    let r = try_authenticate(ng, &p, json!({ "login": "bob", "password": "s3cret" })).await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let auth = r.json();
     assert_eq!(auth["outcome"], "linked");
-    assert_eq!(auth["account"], "misha");
-    let file = std::fs::read_to_string(dir.path().join("accounts/misha.toml")).unwrap();
+    assert_eq!(auth["account"], "bob");
+    let file = std::fs::read_to_string(dir.path().join("accounts/bob.toml")).unwrap();
     assert!(file.starts_with("# hand-maintained\n"), "{file}");
     assert!(
         file.contains(&format!("fingerprint = \"{}\"", p.id.fingerprint())),
@@ -731,7 +768,7 @@ async fn linking_at_auth_lands_on_the_account_and_survives_unlink_rules() {
 
     // The JSON login lands on the account: admin bit, account name.
     let (_c, ok) = ng_login(ng, auth["token"].as_str().unwrap(), "whatever").await;
-    assert_eq!(ok["self"]["identity"]["account"], "misha");
+    assert_eq!(ok["self"]["identity"]["account"], "bob");
     assert_eq!(ok["self"]["identity"]["outcome"], "linked");
     assert_eq!(ok["self"]["admin"], true);
 
@@ -739,9 +776,9 @@ async fn linking_at_auth_lands_on_the_account_and_survives_unlink_rules() {
     let auth2 = authenticate(ng, &p).await;
     assert_eq!(auth2["outcome"], "linked");
 
-    // Another identity can't take misha: pending, and link() is refused.
+    // Another identity can't take bob: pending, and link() is refused.
     let q = person(5, "Impostor");
-    let r = try_authenticate(ng, &q, json!({ "login": "misha", "password": "s3cret" })).await;
+    let r = try_authenticate(ng, &q, json!({ "login": "bob", "password": "s3cret" })).await;
     assert_eq!(r.status, 200);
     let qa = r.json();
     assert_eq!(qa["outcome"], "classic_pending_link");
@@ -753,7 +790,7 @@ async fn linking_at_auth_lands_on_the_account_and_survives_unlink_rules() {
             "Authorization",
             &format!("Bearer {}", qa["token"].as_str().unwrap()),
         )],
-        json!({ "login": "misha", "password": "s3cret" })
+        json!({ "login": "bob", "password": "s3cret" })
             .to_string()
             .as_bytes(),
     )
@@ -780,7 +817,7 @@ async fn linking_at_auth_lands_on_the_account_and_survives_unlink_rules() {
     )
     .await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["unlinked"], "misha");
+    assert_eq!(r.json()["unlinked"], "bob");
     let auth4 = authenticate(ng, &p).await;
     assert_eq!(auth4["outcome"], "unattested_guest");
 
@@ -799,7 +836,7 @@ async fn linking_at_auth_lands_on_the_account_and_survives_unlink_rules() {
             "Authorization",
             &format!("Bearer {}", wa["token"].as_str().unwrap()),
         )],
-        json!({ "login": "misha", "password": "s3cret" })
+        json!({ "login": "bob", "password": "s3cret" })
             .to_string()
             .as_bytes(),
     )
@@ -820,29 +857,29 @@ async fn new_accounts_create_writes_an_account_file() {
     let (_legacy, ng, _ctx) =
         start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
 
-    let mut p = person(7, "Misha N");
+    let mut p = person(7, "Bob N");
     let att = hl_identity::Attestation {
         identity: p.id.public(),
         registrar: "hl.example".into(),
         registrar_key: reg.public(),
-        handle: "misha".into(),
+        handle: "bob".into(),
         registered: now() - 86_400,
         issued: now() - 5,
         expires: now() + 86_400,
         level: None,
     };
-    p.card = Card::new(&p.id, "Misha N", now())
+    p.card = Card::new(&p.id, "Bob N", now())
         .sign(&p.id, vec![att.signed_value(&reg)])
         .unwrap();
 
     let auth = authenticate(ng, &p).await;
     assert_eq!(auth["outcome"], "created");
-    assert_eq!(auth["handle"], "misha@hl.example");
-    // `misha` is taken by the fixture, so the handle's local part got a suffix.
-    assert_eq!(auth["account"], "misha-2");
-    assert!(dir.path().join("accounts/misha-2.toml").exists());
+    assert_eq!(auth["handle"], "bob@hl.example");
+    // `bob` is taken by the fixture, so the handle's local part got a suffix.
+    assert_eq!(auth["account"], "bob-2");
+    assert!(dir.path().join("accounts/bob-2.toml").exists());
     let (_c, ok) = ng_login(ng, auth["token"].as_str().unwrap(), "x").await;
-    assert_eq!(ok["self"]["identity"]["account"], "misha-2");
+    assert_eq!(ok["self"]["identity"]["account"], "bob-2");
     assert_eq!(ok["self"]["identity"]["outcome"], "created");
     // Guest access was the template, so no admin bit.
     assert_eq!(ok["self"]["admin"], false);
@@ -894,11 +931,11 @@ async fn tunnelled_classic_login_links_under_verify_and_refuses_strangers() {
     }
 
     // A tunnelled classic login with the password links the account.
-    let p = person(8, "Misha");
-    let t = tunnel_login(ng, &p, b"misha", b"s3cret")
+    let p = person(8, "Bob");
+    let t = tunnel_login(ng, &p, b"bob", b"s3cret")
         .await
         .expect("login with password");
-    let file = std::fs::read_to_string(dir.path().join("accounts/misha.toml")).unwrap();
+    let file = std::fs::read_to_string(dir.path().join("accounts/bob.toml")).unwrap();
     assert!(
         file.contains(&format!("fingerprint = \"{}\"", p.id.fingerprint())),
         "{file}"
@@ -909,7 +946,7 @@ async fn tunnelled_classic_login_links_under_verify_and_refuses_strangers() {
     // is refused: verify mode never lets an identity borrow someone
     // else's account.
     let q = person(9, "Stranger");
-    assert!(tunnel_login(ng, &q, b"misha", b"s3cret").await.is_none());
+    assert!(tunnel_login(ng, &q, b"bob", b"s3cret").await.is_none());
 
     // The owner logging in as guest through the tunnel lands on the
     // linked account (admin bit shows on the roster).
@@ -1313,6 +1350,28 @@ async fn an_empty_cert_header_from_a_trusted_proxy_is_no_certificate() {
     let mut c = Ng::from_ws(ws).await;
     let ok = c.request("login", json!({ "nick": "plain" })).await;
     assert!(ok["ok"]["self"].get("identity").is_none(), "{ok}");
+
+    // A template that interpolated nothing between two spaces says the
+    // same thing, and answering it with a 400 and a warning per request
+    // is the log flood the empty case was fixed for.
+    let r = http(
+        ng,
+        "GET",
+        "/.well-known/hotline",
+        &[("X-Hotline-Client-Cert", "   ")],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("X-Hotline-Client-Cert", "   ".parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("whitespace is emptiness, not a broken certificate");
+    let mut c = Ng::from_ws(ws).await;
+    let ok = c.request("login", json!({ "nick": "plain" })).await;
+    assert!(ok["ok"]["self"].get("identity").is_none(), "{ok}");
 }
 
 #[tokio::test]
@@ -1333,7 +1392,7 @@ async fn deny_is_re_decided_when_a_device_on_file_comes_back() {
 
     // Link the classic account at auth; this is also what puts the
     // device on file.
-    let r = try_authenticate(ng, &p, json!({ "login": "misha", "password": "s3cret" })).await;
+    let r = try_authenticate(ng, &p, json!({ "login": "bob", "password": "s3cret" })).await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let auth = r.json();
     assert_eq!(auth["outcome"], "linked");
@@ -1366,6 +1425,20 @@ async fn deny_is_re_decided_when_a_device_on_file_comes_back() {
     let r = try_authenticate(ng, &person(24, "Stranger"), json!({})).await;
     assert_eq!(r.status, 403, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.json()["error"], "denied");
+
+    // And so is the token minted while the account *was* linked. It
+    // lives a minute; the unlink happened inside that, and the login
+    // behind it used to find no account and fall through to a guest —
+    // the same hole one indirection along.
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng?token={token}"))
+        .await
+        .unwrap();
+    let mut c = Ng::from_ws(ws).await;
+    let reply = c.request("login", json!({ "nick": "returning" })).await;
+    // §8.1's word for a policy refusal. Not `login_failed`: this socket
+    // sent no credentials, so nothing about a login failed, and a client
+    // told otherwise retries with a password it does not have.
+    assert_eq!(reply["error"]["code"], "denied", "{reply}");
 }
 
 #[tokio::test]
@@ -1473,6 +1546,7 @@ async fn identity_login_false_denies_and_a_created_account_refuses_the_legacy_po
     let auth = authenticate(ng, &p).await;
     assert_eq!(auth["outcome"], "created");
     let login = auth["account"].as_str().unwrap().to_owned();
+    let token = auth["token"].as_str().unwrap().to_owned();
     let file = dir.path().join(format!("accounts/{login}.toml"));
     assert!(file.exists());
 
@@ -1514,6 +1588,53 @@ async fn identity_login_false_denies_and_a_created_account_refuses_the_legacy_po
     let r = try_authenticate(ng, &p, json!({})).await;
     assert_eq!(r.status, 403);
     assert_eq!(r.json()["error"], "denied");
+
+    // A token minted before the policy edit is re-decided at application
+    // login; it must not turn the same identity into a guest session.
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng?token={token}"))
+        .await
+        .unwrap();
+    let mut c = Ng::from_ws(ws).await;
+    let reply = c.request("login", json!({})).await;
+    assert_eq!(reply["error"]["code"], "denied", "{reply}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_identity_login_reports_an_account_backend_failure_as_server_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(59, "Backend Error");
+    let auth = try_authenticate(ng, &p, json!({ "login": "bob", "password": "s3cret" })).await;
+    let token = auth.json()["token"].as_str().unwrap().to_owned();
+    let accounts = dir.path().join("accounts");
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng?token={token}"))
+        .await
+        .unwrap();
+    let mut c = Ng::from_ws(ws).await;
+    let reply = c.request("login", json!({})).await;
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(reply["error"]["code"], "server_error", "{reply}");
+}
+
+#[tokio::test]
+async fn deny_outranks_a_pending_classic_link_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig {
+        new_accounts: hxd_ng_session::NewAccounts::Deny,
+        unattested: hxd_ng_session::Unattested::Allow,
+        ..Default::default()
+    };
+    let (_legacy, ng, _ctx) =
+        start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+    let p = person(60, "Pending");
+    let auth = try_authenticate(ng, &p, json!({ "login": "locked", "password": "pw" })).await;
+    assert_eq!(auth.status, 403, "{}", String::from_utf8_lossy(&auth.body));
+    assert_eq!(auth.json()["error"], "denied");
 }
 
 #[tokio::test]
@@ -1544,13 +1665,13 @@ async fn create_does_not_make_link_unreachable() {
             "Authorization",
             &format!("Bearer {}", auth["token"].as_str().unwrap()),
         )],
-        json!({ "login": "misha", "password": "s3cret" })
+        json!({ "login": "bob", "password": "s3cret" })
             .to_string()
             .as_bytes(),
     )
     .await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(r.json()["linked"], "misha");
+    assert_eq!(r.json()["linked"], "bob");
     // Credentials on the auth itself imply the same thing.
     let q = person(26, "Direct");
     let auth = try_authenticate(ng, &q, json!({ "login": "locked", "password": "pw" })).await;
@@ -1575,14 +1696,14 @@ async fn a_management_token_still_opens_a_socket() {
         "POST",
         "/identity/link",
         &[("Authorization", &format!("Bearer {token}"))],
-        json!({ "login": "misha", "password": "s3cret" })
+        json!({ "login": "bob", "password": "s3cret" })
             .to_string()
             .as_bytes(),
     )
     .await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     let (_c, ok) = ng_login(ng, &token, "m").await;
-    assert_eq!(ok["self"]["identity"]["account"], "misha");
+    assert_eq!(ok["self"]["identity"]["account"], "bob");
 }
 
 #[tokio::test]
@@ -1723,7 +1844,7 @@ async fn trtp_login_trust_uses_the_linked_account_whatever_the_client_types() {
             ("Authorization", &format!("Bearer {token}")),
             ("Content-Type", "application/json"),
         ],
-        json!({ "login": "misha", "password": "s3cret" })
+        json!({ "login": "bob", "password": "s3cret" })
             .to_string()
             .as_bytes(),
     )
@@ -1757,7 +1878,7 @@ async fn trtp_login_trust_uses_the_linked_account_whatever_the_client_types() {
     assert_eq!(reply.flag, 0, "trust admits on the identity alone");
     t.recv_type(HDR_SELFINFO).await;
 
-    // On the roster it is misha, admin bit and all.
+    // On the roster it is bob, admin bit and all.
     let (ws2, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng"))
         .await
         .unwrap();
@@ -1888,6 +2009,245 @@ async fn an_identity_with_no_standing_here_is_not_anchored() {
 }
 
 #[tokio::test]
+async fn a_handle_too_young_for_the_policy_is_not_anchored() {
+    // Standing is the *accepted* attestation, `min_attestation_age` and
+    // all — the same test the policy in §8.1 applies. A registrar that
+    // registers freely would otherwise let throwaway handles fill the
+    // anchor table, after which the identities the commitment is for
+    // stop being anchored.
+    let dir = tempfile::tempdir().unwrap();
+    let anchors = dir.path().join("successors");
+    let reg = ServerKey::from_seed(&[0x37; 32]);
+    let mut cfg = IdentityConfig {
+        anchors: Some(anchors.clone()),
+        min_attestation_age: 86_400,
+        unattested: hxd_ng_session::Unattested::Guest,
+        ..Default::default()
+    };
+    cfg.registrar_keys.insert("hl.example".into(), reg.public());
+    let (_legacy, ng, _ctx) =
+        start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+
+    let mut p = person(37, "Registered This Morning");
+    let att = |registered: u64| hl_identity::Attestation {
+        identity: p.id.public(),
+        registrar: "hl.example".into(),
+        registrar_key: reg.public(),
+        handle: "fresh".into(),
+        registered,
+        issued: now() - 5,
+        expires: now() + 86_400,
+        level: None,
+    };
+    let mut c = Card::new(&p.id, "Registered This Morning", now());
+    c.successor = Some([0x73; 32]);
+    p.card = c
+        .sign(&p.id, vec![att(now() - 60).signed_value(&reg)])
+        .unwrap();
+
+    let auth = try_authenticate(ng, &p, json!({})).await;
+    assert_eq!(auth.status, 200, "{}", String::from_utf8_lossy(&auth.body));
+    // The handle verified, so it is reported — but it doesn't count.
+    assert_eq!(auth.json()["handle"], "fresh@hl.example");
+    assert_eq!(auth.json()["outcome"], "unattested_guest");
+    assert!(
+        !anchors.exists(),
+        "a handle below the age floor is not standing"
+    );
+
+    // The same identity with a registration old enough to count does
+    // anchor, which is what makes the assertion above about the floor
+    // rather than about attestations in general.
+    let mut old = person(38, "Registered Last Year");
+    let att = hl_identity::Attestation {
+        identity: old.id.public(),
+        registrar: "hl.example".into(),
+        registrar_key: reg.public(),
+        handle: "settled".into(),
+        registered: now() - 86_400 * 365,
+        issued: now() - 5,
+        expires: now() + 86_400,
+        level: None,
+    };
+    let mut c = Card::new(&old.id, "Registered Last Year", now());
+    c.successor = Some([0x74; 32]);
+    old.card = c.sign(&old.id, vec![att.signed_value(&reg)]).unwrap();
+    let auth = try_authenticate(ng, &old, json!({})).await;
+    assert_eq!(auth.status, 200, "{}", String::from_utf8_lossy(&auth.body));
+    assert_eq!(auth.json()["outcome"], "guest");
+    assert!(anchors.exists(), "an accepted attestation is standing");
+}
+
+#[tokio::test]
+async fn a_client_behind_a_proxy_does_not_choose_its_own_address() {
+    // §5.3: the forwarded address is the *rightmost* element that isn't
+    // a trusted proxy. Reading the first element instead let the client
+    // pick: nginx's `$proxy_add_x_forwarded_for` and HAProxy's `option
+    // forwardfor` append what they see to whatever the client sent, so
+    // everything left of the proxy's own entry is the client's own text.
+    // A banned user got a fresh address per connection, and anyone could
+    // be made to inherit someone else's ban.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, ctx) = start_server_with_proxies(
+        dir.path(),
+        IdentityConfig::default(),
+        &["127.0.0.1", "10.0.0.0/8"],
+    )
+    .await;
+
+    /// A `/ng` socket with a forwarded-for header, or `None` if the
+    /// server refused the upgrade.
+    async fn as_addr(ng: SocketAddr, xff: &str) -> Option<Ng> {
+        let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+        req.headers_mut()
+            .insert("X-Forwarded-For", xff.parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.ok()?;
+        Some(Ng::from_ws(ws).await)
+    }
+    async fn login(c: &mut Ng) -> Value {
+        let ok = c
+            .request(
+                "login",
+                json!({ "login": "bob", "password": "s3cret", "nick": "Bob" }),
+            )
+            .await;
+        assert!(ok.get("ok").is_some(), "{ok}");
+        ok["ok"].clone()
+    }
+
+    // One connection through the proxy, banned by uid.
+    let mut c = as_addr(ng, "203.0.113.7, 10.0.0.7")
+        .await
+        .expect("a fresh address behind two trusted proxy hops");
+    let ok = login(&mut c).await;
+    let uid = ok["self"]["uid"].as_u64().unwrap() as u16;
+    ctx.core.kick(uid, Some(Duration::from_secs(60))).unwrap();
+    drop(c);
+
+    // Coming back, whatever the client puts in front of what the proxy
+    // appends.
+    assert!(
+        as_addr(ng, "203.0.113.7, 10.0.0.7").await.is_none(),
+        "the banned address must be refused"
+    );
+    assert!(
+        as_addr(ng, "198.51.100.1, 203.0.113.7, 10.0.0.7")
+            .await
+            .is_none(),
+        "a client-supplied first element must not shed the ban"
+    );
+    // And nobody can hand someone else's ban to a stranger by naming it
+    // in the part of the header they control.
+    let mut c = as_addr(ng, "203.0.113.7, 198.51.100.1, 10.0.0.7")
+        .await
+        .expect("the rightmost element is who the proxy saw");
+    login(&mut c).await;
+    drop(c);
+
+    // The per-address detach cap counts the same address, however many
+    // different values the client writes ahead of it.
+    let mut parked = Vec::new();
+    for i in 0..3 {
+        let mut c = as_addr(ng, &format!("203.0.113.{i}, 198.51.100.9, 10.0.0.7"))
+            .await
+            .expect("not banned");
+        let ok = login(&mut c).await;
+        parked.push((
+            ok["session"].as_str().unwrap().to_owned(),
+            ok["token"].as_str().unwrap().to_owned(),
+        ));
+        // Drop the socket without logging out: the session detaches.
+        drop(c);
+        // Serialised so "oldest first" is unambiguous.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (session, token) = parked[0].clone();
+    let mut c = as_addr(ng, "198.51.100.9, 10.0.0.7")
+        .await
+        .expect("not banned");
+    let reply = c
+        .request(
+            "resume",
+            json!({ "session": session, "token": token, "last_seq": 0 }),
+        )
+        .await;
+    assert!(
+        reply.get("error").is_some(),
+        "max_detached_per_addr = 2 must have ended the oldest: {reply}"
+    );
+    // The newest two are still there.
+    let (session, token) = parked[2].clone();
+    let mut c = as_addr(ng, "198.51.100.9, 10.0.0.7")
+        .await
+        .expect("not banned");
+    let reply = c
+        .request(
+            "resume",
+            json!({ "session": session, "token": token, "last_seq": 0 }),
+        )
+        .await;
+    assert!(reply.get("ok").is_some(), "{reply}");
+}
+
+#[tokio::test]
+async fn the_rfc_7239_header_is_read_only_where_the_operator_says_so() {
+    // `forwarded_header` is a declaration about the proxy, and the two
+    // halves of it both matter end to end: the named header is walked
+    // like the other one, and the header that was *not* named is
+    // ignored however plausible it looks — nginx forwards a
+    // client-supplied `Forwarded:` untouched, so believing it on a
+    // deployment that writes `X-Forwarded-For` would undo the walk.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, ctx) = start_server_forwarded(dir.path(), &["127.0.0.1", "10.0.0.0/8"]).await;
+
+    async fn login_from(ng: SocketAddr, header: &str, value: &str) -> Option<u64> {
+        let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+        req.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::header::HeaderName::from_bytes(header.as_bytes())
+                .unwrap(),
+            value.parse().unwrap(),
+        );
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.ok()?;
+        let mut c = Ng::from_ws(ws).await;
+        let ok = c
+            .request(
+                "login",
+                json!({ "login": "bob", "password": "s3cret", "nick": "Bob" }),
+            )
+            .await;
+        ok["ok"]["self"]["uid"].as_u64()
+    }
+
+    // The rightmost element that isn't ours, over two of our own hops.
+    let uid = login_from(
+        ng,
+        "forwarded",
+        "for=203.0.113.9, for=198.51.100.4;proto=https, for=10.0.0.7",
+    )
+    .await
+    .expect("a fresh address");
+    ctx.core
+        .kick(uid as u16, Some(Duration::from_secs(60)))
+        .unwrap();
+    assert!(
+        login_from(ng, "forwarded", "for=198.51.100.4")
+            .await
+            .is_none(),
+        "the ban is about the element the walk chose"
+    );
+
+    // `X-Forwarded-For` is not this deployment's header, so a client
+    // that writes one is naming nobody: it lands on the proxy's own
+    // address, which is not banned.
+    assert!(
+        login_from(ng, "x-forwarded-for", "198.51.100.4")
+            .await
+            .is_some(),
+        "the header the operator did not name carries no weight"
+    );
+}
+
+#[tokio::test]
 async fn identity_without_ng_is_reported_rather_than_ignored() {
     // `[identity]` is only read when `[ng]` is present, and a config that
     // sets one without the other looks like it works.
@@ -1925,7 +2285,7 @@ async fn a_tunnel_may_not_use_an_account_that_refuses_association() {
     let auth = authenticate(ng, &p).await;
     let token = auth["token"].as_str().unwrap().to_owned();
     assert_eq!(
-        tunnel_login_flag(ng, &token, "misha", "s3cret").await,
+        tunnel_login_flag(ng, &token, "bob", "s3cret").await,
         0,
         "an unlinked, self-linkable account links and logs in"
     );
@@ -1943,9 +2303,9 @@ async fn identity_login_false_denies_a_tunnelled_guest_rather_than_guesting_it()
     let p = person(51, "Refused");
 
     // Link, then the operator turns identity login off for the account.
-    let auth = try_authenticate(ng, &p, json!({ "login": "misha", "password": "s3cret" })).await;
+    let auth = try_authenticate(ng, &p, json!({ "login": "bob", "password": "s3cret" })).await;
     assert_eq!(auth.json()["outcome"], "linked");
-    let path = dir.path().join("accounts/misha.toml");
+    let path = dir.path().join("accounts/bob.toml");
     let text = std::fs::read_to_string(&path).unwrap();
     std::fs::write(
         &path,
@@ -1957,11 +2317,73 @@ async fn identity_login_false_denies_a_tunnelled_guest_rather_than_guesting_it()
     let auth = try_authenticate(ng, &p, json!({})).await;
     assert_eq!(auth.status, 403, "{}", String::from_utf8_lossy(&auth.body));
 
-    // And so must the tunnel: a guest login on that socket used to fall
-    // through to an ordinary guest session, which answers a question
-    // nobody asked.
-    let auth = try_authenticate(ng, &p, json!({ "login": "misha", "password": "s3cret" })).await;
+    // Naming the account with its password is refused at the endpoint
+    // for the same reason.
+    let auth = try_authenticate(ng, &p, json!({ "login": "bob", "password": "s3cret" })).await;
     assert_eq!(auth.status, 403, "{}", String::from_utf8_lossy(&auth.body));
+
+    // And so must the tunnel — which needs a token, so this uses one
+    // minted *before* the operator turned identity login off. A guest
+    // login on that socket used to fall through to an ordinary guest
+    // session, which answers a question nobody asked.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(52, "Refused Too");
+    let auth = try_authenticate(ng, &p, json!({ "login": "bob", "password": "s3cret" })).await;
+    assert_eq!(auth.json()["outcome"], "linked");
+    let token = auth.json()["token"].as_str().unwrap().to_owned();
+    let path = dir.path().join("accounts/bob.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        text.replace("[identity]", "[identity]\nlogin = false"),
+    )
+    .unwrap();
+    assert_ne!(
+        tunnel_login_flag(ng, &token, "", "").await,
+        0,
+        "a guest login on an identity socket the account refuses must fail"
+    );
+}
+
+#[tokio::test]
+async fn deny_reaches_the_tunnel_inside_the_token_window() {
+    // §8.1 `deny` on the wire that cannot read `[identity]`. A token
+    // lives a minute; unlink inside that window, open `/trtp` with it
+    // and log in as guest, and the tunnelled login used to find no
+    // account and hand out a guest session — the JSON wire's hole, one
+    // wire over.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig {
+        new_accounts: hxd_ng_session::NewAccounts::Deny,
+        ..Default::default()
+    };
+    let (_legacy, ng, _ctx) =
+        start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+    let p = person(53, "Tunnelled");
+
+    let auth = try_authenticate(ng, &p, json!({ "login": "bob", "password": "s3cret" })).await;
+    assert_eq!(auth.status, 200, "{}", String::from_utf8_lossy(&auth.body));
+    let auth = auth.json();
+    assert_eq!(auth["outcome"], "linked");
+    let token = auth["token"].as_str().unwrap().to_owned();
+
+    // While that token is still good, the link goes away.
+    let r = http(
+        ng,
+        "POST",
+        "/identity/unlink",
+        &[("Authorization", &format!("Bearer {token}"))],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+
+    assert_ne!(
+        tunnel_login_flag(ng, &token, "", "").await,
+        0,
+        "deny leaves no guest for a tunnelled identity to fall back to"
+    );
 }
 
 /// A tunnelled classic login; returns the login reply's error flag.
@@ -2028,8 +2450,8 @@ async fn malformed_classic_credentials_are_a_400() {
     let p = person(52, "Typed");
     for body in [
         json!({ "login": 7, "password": 7 }),
-        json!({ "login": "misha", "password": ["s3cret"] }),
-        json!({ "login": { "name": "misha" }, "password": "s3cret" }),
+        json!({ "login": "bob", "password": ["s3cret"] }),
+        json!({ "login": { "name": "bob" }, "password": "s3cret" }),
     ] {
         let r = try_authenticate(ng, &p, body.clone()).await;
         assert_eq!(

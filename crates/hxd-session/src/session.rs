@@ -582,7 +582,14 @@ fn reconcile_login(
     link: LinkAuthority,
 ) -> Result<Account, AuthError> {
     let Some(fp) = identity_fp else {
-        return auth.authenticate(login, Proof::Plain(password));
+        // No transport identity — and the claim still belongs here. The
+        // obligation is the *account's*, not the socket's: someone who
+        // linked once through ng and thereafter logs in from GtkHx with
+        // their password has a fingerprint-keyed mailbox, and the rows
+        // those two windows leave on the bare login would sit there
+        // unread forever if the only claim were on the identity paths.
+        let account = auth.authenticate(login, Proof::Plain(password))?;
+        return Ok(account);
     };
     // Unfiltered: "no account links this identity" and "one does but the
     // operator turned identity login off" are different answers, and
@@ -614,6 +621,16 @@ fn reconcile_login(
             Some(a) if identity_admits => Ok(a),
             Some(a) => {
                 info!(login = %a.login, "identity_login is off for the linked account");
+                Err(AuthError::BadProof)
+            }
+            // §8.1 `deny`, decided on this wire as it is on the JSON one:
+            // nothing links this identity, so there is no guest to fall
+            // back to. The token that opened the socket may have been
+            // minted while an account still linked it — it lives a
+            // minute — so this is re-decided here rather than trusted
+            // from the upgrade.
+            None if !link.unlinked_ok => {
+                info!("new_accounts = deny: an identity with no linked account");
                 Err(AuthError::BadProof)
             }
             None => account.ok_or(AuthError::NoSuchAccount),
@@ -785,13 +802,7 @@ async fn login_phase(
     let mut agreement_sent = false;
     if !account.access.has(bit::DONT_SHOW_AGREEMENT) {
         if let Some(text_utf8) = &ctx.cfg.agreement {
-            let mut mac = text::from_utf8(text_utf8);
-            for b in &mut mac {
-                if *b == b'\n' {
-                    *b = b'\r'; // The wire wants classic Mac line endings.
-                }
-            }
-            push(tx, hdr::AGREEMENT, vec![(tag::BODY, mac)]);
+            push(tx, hdr::AGREEMENT, vec![(tag::BODY, mac_text(text_utf8))]);
             agreement_sent = true;
         }
     }
@@ -816,6 +827,39 @@ async fn login_phase(
         complete_login(tx, ctx, &mut sess);
     }
     Some((sess, events))
+}
+
+/// UTF-8 → Mac Roman, with the line endings this wire uses.
+///
+/// The conversion belongs here and not in the stored text: the domain
+/// holds whatever the sender's wire gave it — an ng client's `\n`, a
+/// legacy client's `\r` — and each frontend renders that in its own
+/// terms, exactly as with Mac Roman itself. A 1.x client draws a bare
+/// `\n` as a glyph rather than a line break, so a multi-line private
+/// message from an ng client arrived as one run of text with a symbol in
+/// it, and the queued stamp (which is `\r`) made a body with both. CRLF
+/// collapses to one `\r`, or the pair renders as a blank line.
+fn mac_text(text: &str) -> Vec<u8> {
+    let bytes = text::from_utf8(text);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+                out.push(b'\r');
+                i += 2;
+            }
+            b'\n' => {
+                out.push(b'\r');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// The "loginupdate" moment: hand the client its self-info and make it
@@ -982,7 +1026,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                 hdr::MSG_BROADCAST,
                 vec![
                     (tag::UID, from.to_be_bytes().to_vec()),
-                    (tag::BODY, text::from_utf8(&text)),
+                    (tag::BODY, mac_text(&text)),
                     (tag::NAME, mac_nick(&from_nick)),
                 ],
             );

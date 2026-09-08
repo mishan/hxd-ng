@@ -4,8 +4,8 @@
 //! ROADMAP.md.)
 //!
 //! ```toml
-//! # accounts/misha.toml
-//! name = "Misha"
+//! # accounts/alice.toml
+//! name = "Alice"
 //! password = "secret"     # omit or leave empty for password-less accounts
 //!
 //! [access]
@@ -149,20 +149,16 @@ struct AccessTable {
 impl AccountFile {
     /// Everything but the password check: shared by `authenticate` and
     /// `lookup`.
-    fn into_account(self, login: String, path: &Path) -> Account {
-        let access = self.access_bits(path);
+    fn into_account(self, login: String) -> Account {
+        let access = self.access_bits();
         let stored = self.password.as_deref().unwrap_or("");
         let has_password = !stored.is_empty();
-        let fingerprint = self.identity.fingerprint.as_deref().and_then(|f| {
-            let parsed = hl_identity::Fingerprint::parse(f);
-            if parsed.is_none() {
-                tracing::warn!(
-                    "{}: identity.fingerprint is not a valid fingerprint; ignored",
-                    path.display()
-                );
-            }
-            parsed.map(|fp| fp.0)
-        });
+        let fingerprint = self
+            .identity
+            .fingerprint
+            .as_deref()
+            .and_then(hl_identity::Fingerprint::parse)
+            .map(|fp| fp.0);
         Account {
             name: self.name.clone().unwrap_or_else(|| login.clone()),
             // A password makes an account a person rather than a door,
@@ -189,16 +185,36 @@ impl AccountFile {
         }
     }
 
-    fn access_bits(&self, source: &Path) -> AccessBits {
+    /// Is this a combination that locks everyone out (identity spec
+    /// §8.3)? No password refuses every password login, and
+    /// `identity.login = false` refuses the key that was the other way
+    /// in. `unlink` has `would_orphan` to stop the server writing this
+    /// state; nothing stops an operator typing it.
+    fn unreachable_reason(&self) -> Option<&'static str> {
+        let has_password = !self.password.as_deref().unwrap_or("").is_empty();
+        if has_password {
+            return None;
+        }
+        match self.identity.fingerprint.as_deref() {
+            Some(fp) if hl_identity::Fingerprint::parse(fp).is_none() => Some(
+                "no password and identity.fingerprint is invalid, so neither password nor \
+                 identity login can reach this account; fix the fingerprint or set a password",
+            ),
+            Some(_) if !self.identity.login.unwrap_or(true) => Some(
+                "no password and identity.login = false, so nothing can log into this account; \
+                 set a password or allow identity login",
+            ),
+            _ => None,
+        }
+    }
+
+    fn access_bits(&self) -> AccessBits {
         let mut acc = AccessBits::empty();
         for (key, on) in &self.access.named {
             match NAMED_BITS.iter().find(|(n, _)| n == key) {
                 Some((_, b)) if *on => acc = acc.with(*b),
                 Some(_) => {}
-                None => tracing::warn!(
-                    "{}: unknown access key {key:?} ignored (see hxd-auth-file docs)",
-                    source.display()
-                ),
+                None => {}
             }
         }
         for b in &self.access.raw_bits {
@@ -237,6 +253,74 @@ impl FileAuth {
             assoc: Mutex::new(()),
             index: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Read every account file and report what an operator would want to
+    /// know: files that do not parse, unreachable accounts, filenames that
+    /// lookup canonicalization cannot reach, and ignored identity/access
+    /// fields.
+    ///
+    /// At startup, because that is where an operator looks. Warning from
+    /// the *read* instead put the message where only the locked-out
+    /// device would trigger it — and then repeated it for every flush and
+    /// every inbox page that resolved the account as a mail address.
+    /// Returns what it warned about, so a test can see it without
+    /// installing a tracing subscriber.
+    pub fn audit(&self) -> Vec<String> {
+        let entries = match self.entries() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("{}: {e}", self.dir.display());
+                return Vec::new();
+            }
+        };
+        let mut found = Vec::new();
+        for (login, _) in entries {
+            if login != login.to_ascii_lowercase() {
+                let complaint = format!(
+                    "{login}.toml: account filenames must be lowercase; rename it to {}.toml",
+                    login.to_ascii_lowercase()
+                );
+                tracing::warn!("{complaint}");
+                found.push(complaint);
+            }
+            match self.load(&login) {
+                Ok(f) => {
+                    if let Some(reason) = f.unreachable_reason() {
+                        let complaint = format!("{login}.toml: {reason}");
+                        tracing::warn!("{complaint}");
+                        found.push(complaint);
+                    } else if f
+                        .identity
+                        .fingerprint
+                        .as_deref()
+                        .is_some_and(|fp| hl_identity::Fingerprint::parse(fp).is_none())
+                    {
+                        let complaint = format!(
+                            "{login}.toml: identity.fingerprint is not a valid fingerprint; \
+                             identity login will ignore it"
+                        );
+                        tracing::warn!("{complaint}");
+                        found.push(complaint);
+                    }
+                    for key in f.access.named.keys().filter(|key| named_bit(key).is_none()) {
+                        let complaint = format!(
+                            "{login}.toml: unknown access key {key:?} ignored \
+                             (see hxd-auth-file docs)"
+                        );
+                        tracing::warn!("{complaint}");
+                        found.push(complaint);
+                    }
+                }
+                Err(AuthError::NoSuchAccount) => {}
+                Err(e) => {
+                    let complaint = format!("{e}; this account will be skipped");
+                    tracing::warn!("{complaint}");
+                    found.push(complaint);
+                }
+            }
+        }
+        found
     }
 
     /// Create the accounts directory and a default guest account if the
@@ -345,8 +429,7 @@ impl AuthBackend for FileAuth {
                 }
             }
         }
-        let path = self.dir.join(format!("{login}.toml"));
-        Ok(file.into_account(login, &path))
+        Ok(file.into_account(login))
     }
 
     fn lookup(&self, login: &str) -> Result<Account, AuthError> {
@@ -356,8 +439,7 @@ impl AuthBackend for FileAuth {
             return Err(AuthError::NoSuchAccount);
         }
         let file = self.load(&login)?;
-        let path = self.dir.join(format!("{login}.toml"));
-        Ok(file.into_account(login, &path))
+        Ok(file.into_account(login))
     }
 
     fn find_by_fingerprint(&self, fingerprint: &[u8; 32]) -> Result<Option<Account>, AuthError> {
@@ -544,12 +626,32 @@ impl FileAuth {
         let want = hl_identity::Fingerprint(*fingerprint).to_string();
         let entries = self.entries()?;
         let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
-        index.retain(|login, _| entries.iter().any(|(l, _)| l == login));
+        // `entries` is sorted by login, so this is a binary search per
+        // index key rather than a scan: the prune runs on every identity
+        // auth, under the index mutex, and a directory of any size made
+        // it the most expensive thing in the lookup it was protecting.
+        index.retain(|login, _| {
+            entries
+                .binary_search_by(|(l, _)| l.as_str().cmp(login))
+                .is_ok()
+        });
         let now = SystemTime::now();
         let mut found = None;
         for (login, stamp) in entries {
-            let fresh = settled(&stamp, now) && index.get(&login).is_some_and(|(s, _)| *s == stamp);
-            if !fresh {
+            // A stamp that hasn't settled is used for this lookup and
+            // then forgotten. Remembering it was the same bug the
+            // `settled` gate exists for, one step later: an auth between
+            // two edits inside one mtime tick recorded the *first*
+            // file's fingerprint against a stamp that stops changing as
+            // soon as the tick passes — after which the gate opens and
+            // the stale value is served until something else touches the
+            // file. A fingerprint is always 52 characters, so the length
+            // never gives it away.
+            let settled = settled(&stamp, now);
+            let cached = settled && index.get(&login).is_some_and(|(s, _)| *s == stamp);
+            let fp = if cached {
+                index.get(&login).and_then(|(_, fp)| fp.clone())
+            } else {
                 let fp = match self.load(&login) {
                     Ok(f) => f.identity.fingerprint,
                     Err(AuthError::NoSuchAccount) => continue,
@@ -557,16 +659,17 @@ impl FileAuth {
                     // identity auth on the server a 500. Skip it, loudly.
                     Err(e) => {
                         tracing::warn!("{login}.toml: {e}; skipped in fingerprint lookup");
-                        index.insert(login, (stamp, None));
-                        continue;
+                        None
                     }
                 };
-                index.insert(login.clone(), (stamp, fp));
-            }
+                if settled {
+                    index.insert(login.clone(), (stamp, fp.clone()));
+                }
+                fp
+            };
             if found.is_none()
-                && index
-                    .get(&login)
-                    .and_then(|(_, fp)| fp.as_deref())
+                && fp
+                    .as_deref()
                     .is_some_and(|fp| fp.eq_ignore_ascii_case(&want))
             {
                 found = Some(login);
@@ -705,11 +808,11 @@ mod tests {
         let (td, auth) = backend();
         write(
             td.path(),
-            "misha.toml",
-            "name = \"Misha\"\npassword = \"s3cret\"\n[access]\nuse_any_name = true\ndisconnect_users = true\n",
+            "alice.toml",
+            "name = \"Alice\"\npassword = \"s3cret\"\n[access]\nuse_any_name = true\ndisconnect_users = true\n",
         );
-        let acct = auth.authenticate("misha", Proof::Plain(b"s3cret")).unwrap();
-        assert_eq!(acct.name, "Misha");
+        let acct = auth.authenticate("alice", Proof::Plain(b"s3cret")).unwrap();
+        assert_eq!(acct.name, "Alice");
         assert!(acct.access.has(bit::USE_ANY_NAME));
         assert!(acct.access.has(bit::DISCONNECT_USERS));
         assert!(!acct.access.has(bit::DELETE_FILES));
@@ -718,9 +821,9 @@ mod tests {
     #[test]
     fn wrong_password_and_missing_account_are_distinct() {
         let (td, auth) = backend();
-        write(td.path(), "misha.toml", "password = \"x\"\n");
+        write(td.path(), "alice.toml", "password = \"x\"\n");
         assert_eq!(
-            auth.authenticate("misha", Proof::Plain(b"y")).unwrap_err(),
+            auth.authenticate("alice", Proof::Plain(b"y")).unwrap_err(),
             AuthError::BadProof
         );
         assert_eq!(
@@ -737,10 +840,10 @@ mod tests {
             auth.authenticate("", Proof::Plain(b"")).unwrap().login,
             "guest"
         );
-        write(td.path(), "misha.toml", "");
+        write(td.path(), "alice.toml", "");
         assert_eq!(
-            auth.authenticate("MiSha", Proof::Plain(b"")).unwrap().login,
-            "misha"
+            auth.authenticate("AlIce", Proof::Plain(b"")).unwrap().login,
+            "alice"
         );
     }
 
@@ -839,31 +942,31 @@ mod tests {
         let (td, auth) = backend();
         write(
             td.path(),
-            "misha.toml",
-            "# Misha's account\nname = \"Misha\"\npassword = \"pw\" # keep\n\n[access]\nsend_chat = true\n",
+            "alice.toml",
+            "# Alice's account\nname = \"Alice\"\npassword = \"pw\" # keep\n\n[access]\nsend_chat = true\n",
         );
         let fp = [0xabu8; 32];
         assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
         assert!(matches!(
-            auth.link_identity("misha", &fp).unwrap(),
+            auth.link_identity("alice", &fp).unwrap(),
             LinkOutcome::Linked(_)
         ));
-        let text = std::fs::read_to_string(td.path().join("misha.toml")).unwrap();
-        assert!(text.starts_with("# Misha's account\n"), "{text}");
+        let text = std::fs::read_to_string(td.path().join("alice.toml")).unwrap();
+        assert!(text.starts_with("# Alice's account\n"), "{text}");
         assert!(text.contains("password = \"pw\" # keep"), "{text}");
         assert!(text.contains("[identity]"), "{text}");
         let a = auth.find_by_fingerprint(&fp).unwrap().unwrap();
-        assert_eq!(a.login, "misha");
+        assert_eq!(a.login, "alice");
         assert_eq!(a.identity.fingerprint, Some(fp));
         assert!(
             a.identity.identity_login && a.identity.allow_self_link && !a.identity.reserve_name
         );
         assert!(a.has_password);
         // lookup() agrees and needs no password.
-        assert_eq!(auth.lookup("Misha").unwrap().identity.fingerprint, Some(fp));
+        assert_eq!(auth.lookup("Alice").unwrap().identity.fingerprint, Some(fp));
         // Linking again is a no-op, not an error.
         assert!(matches!(
-            auth.link_identity("misha", &fp).unwrap(),
+            auth.link_identity("alice", &fp).unwrap(),
             LinkOutcome::Already(_)
         ));
         // Unlink removes only the fingerprint.
@@ -871,7 +974,7 @@ mod tests {
             auth.unlink_identity(&fp).unwrap(),
             UnlinkOutcome::Unlinked(_)
         ));
-        let text = std::fs::read_to_string(td.path().join("misha.toml")).unwrap();
+        let text = std::fs::read_to_string(td.path().join("alice.toml")).unwrap();
         assert!(!text.contains("fingerprint"), "{text}");
         assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
         assert_eq!(auth.unlink_identity(&fp).unwrap(), UnlinkOutcome::NotLinked);
@@ -891,16 +994,16 @@ mod tests {
             "password = \"pw\"\nidentity = {{ fingerprint = \"{}\" }}\n",
             hl_identity::Fingerprint(fp)
         );
-        write(td.path(), "misha.toml", &text);
+        write(td.path(), "alice.toml", &text);
         assert_eq!(
             auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
-            "misha"
+            "alice"
         );
         assert!(matches!(
             auth.unlink_identity(&fp).unwrap(),
             UnlinkOutcome::Unlinked(_)
         ));
-        let text = std::fs::read_to_string(td.path().join("misha.toml")).unwrap();
+        let text = std::fs::read_to_string(td.path().join("alice.toml")).unwrap();
         assert!(!text.contains("fingerprint"), "{text}");
         assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
     }
@@ -954,7 +1057,7 @@ mod tests {
     #[test]
     fn linking_enforces_one_account_per_identity() {
         let (td, auth) = backend();
-        write(td.path(), "misha.toml", "password = \"pw\"\n");
+        write(td.path(), "alice.toml", "password = \"pw\"\n");
         write(td.path(), "other.toml", "password = \"pw\"\n");
         write(
             td.path(),
@@ -963,11 +1066,11 @@ mod tests {
         );
         let fp = [1u8; 32];
         assert!(matches!(
-            auth.link_identity("misha", &fp).unwrap(),
+            auth.link_identity("alice", &fp).unwrap(),
             LinkOutcome::Linked(_)
         ));
         match auth.link_identity("other", &fp).unwrap() {
-            LinkOutcome::Taken(a) => assert_eq!(a.login, "misha"),
+            LinkOutcome::Taken(a) => assert_eq!(a.login, "alice"),
             other => panic!("{other:?}"),
         }
         assert!(matches!(
@@ -976,7 +1079,7 @@ mod tests {
         ));
         // An account that already links someone else refuses too.
         assert!(matches!(
-            auth.link_identity("misha", &[2u8; 32]).unwrap(),
+            auth.link_identity("alice", &[2u8; 32]).unwrap(),
             LinkOutcome::Refused(_)
         ));
     }
@@ -1027,7 +1130,7 @@ mod tests {
         write(td.path(), "broken.toml", "name = \"unclosed\n");
         write(
             td.path(),
-            "misha.toml",
+            "alice.toml",
             &format!(
                 "[identity]\nfingerprint = \"{}\"\n",
                 hl_identity::Fingerprint(fp)
@@ -1035,7 +1138,7 @@ mod tests {
         );
         assert_eq!(
             auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
-            "misha"
+            "alice"
         );
     }
 
@@ -1046,19 +1149,148 @@ mod tests {
         let mine = hl_identity::Fingerprint(fp).to_string();
         let other = hl_identity::Fingerprint([9u8; 32]).to_string();
         let file = |f: &str| format!("password = \"pw\"\n[identity]\nfingerprint = \"{f}\"\n");
-        write(td.path(), "misha.toml", &file(&other));
+        write(td.path(), "alice.toml", &file(&other));
         assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
         // A hand edit, not one of ours — and the same length, inside one
         // mtime tick, which is all the stamp has to go on. A file this
         // fresh is re-read rather than trusted.
-        write(td.path(), "misha.toml", &file(&mine));
+        write(td.path(), "alice.toml", &file(&mine));
         assert_eq!(
             auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
-            "misha"
+            "alice"
         );
         // And a deleted account leaves the index.
-        std::fs::remove_file(td.path().join("misha.toml")).unwrap();
+        std::fs::remove_file(td.path().join("alice.toml")).unwrap();
         assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_startup_audit_names_what_an_operator_would_want_told() {
+        let (td, auth) = backend();
+        assert!(auth.audit().is_empty(), "a healthy directory says nothing");
+
+        // §8.3's lockout: no password, a link, and identity login off.
+        // `unlink` refuses to write this state; an operator can type it.
+        write(
+            td.path(),
+            "kiosk.toml",
+            "[identity]\nfingerprint = \"6htgz65xb7yfs53dmhdanfmk7fgn995n1571rjnz8a36a1fks5z0\"\n\
+             login = false\n",
+        );
+        write(td.path(), "broken.toml", "password = [1, 2]\n");
+        // Two sibling lockout shapes: an invalid identity key on a
+        // password-less file, and a filename lookups can never reach after
+        // they canonicalize the login to lowercase.
+        write(
+            td.path(),
+            "orphan.toml",
+            "[identity]\nfingerprint = \"not-a-fingerprint\"\n",
+        );
+        write(td.path(), "Alice.toml", "password = \"pw\"\n");
+        // Access typos are startup warnings, not warnings repeated by every
+        // account lookup.
+        write(
+            td.path(),
+            "typo.toml",
+            "password = \"pw\"\n[access]\nsend_mesgs = true\n",
+        );
+        let said = auth.audit();
+        assert_eq!(said.len(), 5, "{said:?}");
+        assert!(
+            said.iter()
+                .any(|s| s.starts_with("kiosk.toml")
+                    && s.contains("nothing can log into this account")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|s| s.contains("broken.toml") && s.contains("skipped")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|s| s.starts_with("orphan.toml")
+                    && s.contains("identity.fingerprint is invalid")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|s| s.starts_with("Alice.toml") && s.contains("filenames must be lowercase")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|s| s.starts_with("typo.toml") && s.contains("send_mesgs")),
+            "{said:?}"
+        );
+
+        // A password is one way out of it, and allowing identity login
+        // is the other.
+        write(
+            td.path(),
+            "kiosk.toml",
+            "password = \"pw\"\n[identity]\nfingerprint = \"6htgz65xb7yfs53dmhdanfmk7fgn995n1571rjnz8a36a1fks5z0\"\n\
+             login = false\n",
+        );
+        for name in ["broken.toml", "orphan.toml", "Alice.toml", "typo.toml"] {
+            std::fs::remove_file(td.path().join(name)).unwrap();
+        }
+        assert!(auth.audit().is_empty());
+    }
+
+    #[test]
+    fn an_unsettled_stamp_is_not_remembered() {
+        // The `settled` gate stops an unsettled stamp being *believed*;
+        // it also has to stop it being *stored*. Two edits inside one
+        // mtime tick with a lookup between them: the lookup records the
+        // first file's fingerprint against a stamp that never changes
+        // again, and once the tick passes the gate opens on stale data.
+        let (td, auth) = backend();
+        let fp = [8u8; 32];
+        let mine = hl_identity::Fingerprint(fp).to_string();
+        let other = hl_identity::Fingerprint([9u8; 32]).to_string();
+        let file = |f: &str| format!("password = \"pw\"\n[identity]\nfingerprint = \"{f}\"\n");
+        let path = td.path().join("alice.toml");
+        let touch = |at: SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap()
+        };
+        // One mtime for both writes, as a filesystem with one-second
+        // granularity would give them — and the same length either way,
+        // because every fingerprint is 52 characters. `now` leaves the
+        // whole second of slack before it settles, so a stall between
+        // here and the lookup below cannot turn the case being tested
+        // into a different one.
+        let tick = SystemTime::now();
+        write(td.path(), "alice.toml", &file(&other));
+        touch(tick);
+        let stamp = |at: SystemTime| FileStamp {
+            len: std::fs::metadata(&path).unwrap().len(),
+            modified: Some(at),
+        };
+        assert!(
+            !settled(&stamp(tick), SystemTime::now()),
+            "the case is a lookup while the file is still fresh"
+        );
+        assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
+        write(td.path(), "alice.toml", &file(&mine));
+        touch(tick);
+
+        // Wait out the tick rather than guessing at it. The stamp is the
+        // one the lookup above saw, so an index that kept it now answers
+        // from it.
+        while !settled(&stamp(tick), SystemTime::now()) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
+            "alice",
+            "an unsettled stamp must not be cached"
+        );
     }
 
     #[cfg(unix)]
@@ -1067,7 +1299,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (td, auth) = backend();
         let a = auth
-            .find_or_create_linked("misha", "Misha", &[9u8; 32], AccessBits::empty())
+            .find_or_create_linked("alice", "Alice", &[9u8; 32], AccessBits::empty())
             .unwrap()
             .0;
         let mode = std::fs::metadata(td.path().join(format!("{}.toml", a.login)))
@@ -1077,12 +1309,12 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600, "account files hold secrets");
         // And a rewrite keeps whatever the operator set.
         std::fs::set_permissions(
-            td.path().join("misha.toml"),
+            td.path().join("alice.toml"),
             std::fs::Permissions::from_mode(0o640),
         )
         .unwrap();
-        auth.link_identity("misha", &[10u8; 32]).unwrap();
-        let mode = std::fs::metadata(td.path().join("misha.toml"))
+        auth.link_identity("alice", &[10u8; 32]).unwrap();
+        let mode = std::fs::metadata(td.path().join("alice.toml"))
             .unwrap()
             .permissions()
             .mode();
@@ -1094,10 +1326,10 @@ mod tests {
         let (td, auth) = backend();
         write(
             td.path(),
-            "misha.toml",
+            "alice.toml",
             "[identity]\nfingerprint = \"junk\"\nlogin = false\nallow_self_link = false\nreserve_name = true\n",
         );
-        let a = auth.lookup("misha").unwrap();
+        let a = auth.lookup("alice").unwrap();
         assert_eq!(
             a.identity.fingerprint, None,
             "unparseable fingerprint is ignored, not fatal"
@@ -1105,9 +1337,9 @@ mod tests {
         assert!(
             !a.identity.identity_login && !a.identity.allow_self_link && a.identity.reserve_name
         );
-        assert_eq!(auth.reserved_by("MISHA").unwrap(), Some("misha".into()));
+        assert_eq!(auth.reserved_by("ALICE").unwrap(), Some("alice".into()));
         assert_eq!(auth.reserved_by("guest").unwrap(), None);
-        assert_eq!(auth.reserved_by("../misha").unwrap(), None);
+        assert_eq!(auth.reserved_by("../alice").unwrap(), None);
     }
 
     #[test]
@@ -1146,17 +1378,17 @@ mod tests {
     #[test]
     fn create_linked_picks_a_free_login() {
         let (td, auth) = backend();
-        write(td.path(), "misha.toml", "name = \"Misha\"\n");
+        write(td.path(), "alice.toml", "name = \"Alice\"\n");
         let fp = [7u8; 32];
         let access = AccessBits::empty()
             .with(bit::READ_CHAT)
             .with(bit::SEND_CHAT);
         let (a, created) = auth
-            .find_or_create_linked("misha", "Misha", &fp, access)
+            .find_or_create_linked("alice", "Alice", &fp, access)
             .unwrap();
         assert!(created);
-        assert_eq!(a.login, "misha-2");
-        assert_eq!(a.name, "Misha");
+        assert_eq!(a.login, "alice-2");
+        assert_eq!(a.name, "Alice");
         assert_eq!(a.identity.fingerprint, Some(fp));
         assert!(!a.has_password);
         assert!(
@@ -1166,14 +1398,14 @@ mod tests {
         assert!(a.access.has(bit::SEND_CHAT) && !a.access.has(bit::DELETE_FILES));
         assert_eq!(
             auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
-            "misha-2"
+            "alice-2"
         );
         // Called again for the same identity it finds, never creates.
         let (again, created) = auth
-            .find_or_create_linked("misha", "Misha", &fp, access)
+            .find_or_create_linked("alice", "Alice", &fp, access)
             .unwrap();
         assert!(!created);
-        assert_eq!(again.login, "misha-2");
+        assert_eq!(again.login, "alice-2");
         // Hostile proposals are sanitised.
         let b = auth
             .find_or_create_linked("../../etc", "x", &[8u8; 32], AccessBits::empty())

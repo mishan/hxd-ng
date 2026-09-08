@@ -39,12 +39,15 @@ use tracing::{debug, info, warn};
 use crate::identity::{
     b64, unb64, AuthRefused, AuthRequest, ClassicLogin, Downstream, TransportIdentity,
 };
-use crate::{conn, tunnel, NgCtx};
+use crate::{conn, tunnel, ForwardedHeader, NgCtx};
 
 type Resp = Response<Full<Bytes>>;
 
-/// Request bodies on the identity endpoints: a card is at most 16 KiB,
-/// so this bounds any one request at a few cards' worth.
+/// Request bodies on the identity endpoints. The objects inside are
+/// bounded individually — a card at 16 KiB (§3.4), a certificate at 4
+/// KiB (§3.3) — so this is the envelope around them plus the base64 and
+/// JSON they arrive in, and it is what stops a body being read at all
+/// before any of those limits can apply.
 const MAX_BODY: usize = 64 * 1024;
 
 /// Serve one accepted TCP connection: HTTP/1.1 until it upgrades.
@@ -76,14 +79,27 @@ pub(crate) async fn serve_connection(stream: TcpStream, peer: SocketAddr, ctx: N
 async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp {
     let path = req.uri().path().to_owned();
 
+    // Everything keyed on an address — bans, `max_detached_per_addr`,
+    // the roster's `addr` — wants the client's address, not the reverse
+    // proxy's (§2). `serve_connection` checked the socket's peer once at
+    // accept; this checks again per request, so that a ban lands on a
+    // keep-alive connection that is already open as well as on the next
+    // one, and so that it covers the identity endpoints and not only the
+    // upgrade.
+    let client = client_addr(&req, peer, &ctx);
+    if ctx.core.is_banned(client.ip()) {
+        info!(%client, "refusing banned address");
+        return plain(StatusCode::FORBIDDEN, "banned");
+    }
+
     if hyper_tungstenite::is_upgrade_request(&req) {
         return match path.as_str() {
-            "/" | "/ng" => upgrade(&mut req, peer, ctx, Proto::Json).await,
+            "/" | "/ng" => upgrade(&mut req, peer, client, ctx, Proto::Json).await,
             "/trtp"
                 if ctx.identity.as_ref().is_some_and(|i| i.config().trtp)
                     && ctx.tunnel.is_some() =>
             {
-                upgrade(&mut req, peer, ctx, Proto::Trtp).await
+                upgrade(&mut req, peer, client, ctx, Proto::Trtp).await
             }
             _ => plain(StatusCode::NOT_FOUND, "no such WebSocket path"),
         };
@@ -132,18 +148,14 @@ enum Consume {
 async fn upgrade(
     req: &mut Request<Incoming>,
     socket: SocketAddr,
+    // Who the proxy says it is speaking for (`client_addr`); the same as
+    // `socket` when there is no proxy. This is the address the session
+    // layer keys bans, `max_detached_per_addr` and the roster's `addr`
+    // on; `socket` is who the certificate header is believed from.
+    peer: SocketAddr,
     ctx: NgCtx,
     proto: Proto,
 ) -> Resp {
-    // Everything the session layer keys on an address — bans,
-    // `max_detached_per_addr`, the roster's `addr` — wants the client's
-    // address, not the reverse proxy's (§2). `serve_connection` checked
-    // the socket's peer; this checks the one behind it.
-    let peer = client_addr(req, socket, &ctx);
-    if peer != socket && ctx.core.is_banned(peer.ip()) {
-        info!(%peer, "refusing banned address behind the proxy");
-        return plain(StatusCode::FORBIDDEN, "banned");
-    }
     let config = WebSocketConfig {
         max_message_size: Some(256 * 1024),
         max_frame_size: Some(256 * 1024),
@@ -191,11 +203,21 @@ async fn upgrade(
                 };
                 // §8.2: the tunnelled login can self-link, which is a
                 // write of an association — so it needs the same `manage`
-                // capability `/identity/link` asks for.
+                // capability `/identity/link` asks for. And §8.1's
+                // `deny` has to reach this wire too: a token lives a
+                // minute, and an unlink inside that window used to leave
+                // the tunnelled login falling through to a guest, which
+                // is the hole `deny` exists to close. The legacy
+                // frontend cannot read `[identity]`, so the answer
+                // travels with the socket.
                 let link = LinkAuthority {
                     may_link: identity
                         .as_ref()
                         .is_some_and(|i| i.allows(hl_identity::caps::MANAGE)),
+                    unlinked_ok: ctx
+                        .identity
+                        .as_ref()
+                        .is_none_or(|s| s.config().new_accounts != crate::NewAccounts::Deny),
                 };
                 sink.run(
                     Box::new(tunnel::WsByteStream::new(ws)),
@@ -292,40 +314,84 @@ async fn transport_identity(
 
 /// The client's address, as far as this server can tell: the socket's
 /// peer, unless it is a trusted proxy (§2, `[ng] trusted_proxies`) that
-/// named someone else in `Forwarded` or `X-Forwarded-For`.
+/// named someone else in the header it is configured to set
+/// (`[ng] forwarded_header`).
 ///
 /// Behind a proxy every client shares one socket peer, so a ban keyed on
 /// it bans the deployment and `max_detached_per_addr` is a global cap of
 /// two. Only trusted proxies are believed, for the same reason the
 /// certificate header is.
+///
+/// The element taken is the *rightmost* one that isn't itself a trusted
+/// proxy, read across every line of the header in order. Taking the
+/// first element instead let the client choose its own address: the
+/// stock directives (nginx's `$proxy_add_x_forwarded_for`, HAProxy's
+/// `option forwardfor`) *append* the peer they see to whatever the
+/// client sent, so the left of the list is client-supplied and only the
+/// right of it was written by the proxy. The rightmost-untrusted walk is
+/// correct under both those and a proxy that replaces the header
+/// outright. An element that names nothing this server can parse ends
+/// the walk at the socket peer: an unreadable chain is not evidence.
 fn client_addr(req: &Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> SocketAddr {
     if !ctx.cfg.trusted_proxies.contains(peer.ip()) {
         return peer;
     }
-    let header = |name: &str| {
-        req.headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
+    // Which header, if any, this deployment's proxy is documented to
+    // set. `Forwarded` is off by default because nginx passes an unknown
+    // `Forwarded:` line through untouched, so believing it would undo
+    // the walk above on the commonest deployment.
+    let name = match ctx.cfg.forwarded_header {
+        ForwardedHeader::None => return peer,
+        ForwardedHeader::XForwardedFor => "x-forwarded-for",
+        ForwardedHeader::Forwarded => "forwarded",
     };
-    let forwarded = header("forwarded").and_then(|v| forwarded_for(&v).map(str::to_owned));
-    let xff = || {
-        header("x-forwarded-for")
-            .and_then(|v| v.split(',').next().map(|s| s.trim().to_owned()))
-            .filter(|s| !s.is_empty())
-    };
-    match forwarded.or_else(xff).as_deref().and_then(host_ip) {
+    let mut elements = Vec::new();
+    for value in req.headers().get_all(name) {
+        let Ok(text) = value.to_str() else {
+            return peer;
+        };
+        elements.extend(text.split(','));
+    }
+    match forwarded_client(
+        &elements,
+        ctx.cfg.forwarded_header,
+        &ctx.cfg.trusted_proxies,
+    ) {
         Some(ip) => SocketAddr::new(ip, 0),
         None => peer,
     }
 }
 
-/// The first `for=` value of an RFC 7239 `Forwarded` header. The first
-/// element is the client; anything after it is another hop.
-fn forwarded_for(header: &str) -> Option<&str> {
-    let first = header.split(',').next()?;
-    for param in first.split(';') {
-        let (k, v) = param.split_once('=')?;
+/// The rightmost element of a forwarded chain that isn't a trusted
+/// proxy. `None` means "nobody was named": the chain is empty, every
+/// element is our own infrastructure, or one of them is unreadable —
+/// in each case the caller keeps the socket's peer.
+fn forwarded_client(
+    elements: &[&str],
+    header: ForwardedHeader,
+    trusted: &crate::TrustedProxies,
+) -> Option<IpAddr> {
+    for element in elements.iter().rev() {
+        let named = match header {
+            ForwardedHeader::Forwarded => forwarded_for(element).and_then(host_ip),
+            _ => host_ip(element),
+        };
+        match named {
+            // Another hop of our own infrastructure: keep walking left.
+            Some(ip) if trusted.contains(ip) => continue,
+            Some(ip) => return Some(ip),
+            None => return None,
+        }
+    }
+    None
+}
+
+/// The `for=` value of one RFC 7239 `Forwarded` element.
+fn forwarded_for(element: &str) -> Option<&str> {
+    for param in element.split(';') {
+        let Some((k, v)) = param.split_once('=') else {
+            continue;
+        };
         if k.trim().eq_ignore_ascii_case("for") {
             return Some(v.trim().trim_matches('"'));
         }
@@ -384,8 +450,12 @@ fn client_cert_device(
     // HAProxy's `%[ssl_c_der,base64]` sends an empty value when the
     // client offered no certificate, which is "no certificate", not a
     // broken one. Treating it as an error made every plain upgrade
-    // through such a proxy a 400 with a `warn!` per request.
-    if header.as_bytes().is_empty() {
+    // through such a proxy a 400 with a `warn!` per request. Whitespace
+    // is emptiness here too: a proxy template that interpolates nothing
+    // between two spaces says the same thing, and answering it with a
+    // 400 and a warning per request is the log-flood the empty case was
+    // fixed for.
+    if header.as_bytes().iter().all(|b| b.is_ascii_whitespace()) {
         return Ok(None);
     }
     if !ctx.cfg.trusted_proxies.contains(peer) {
@@ -937,16 +1007,14 @@ mod tests {
     }
 
     #[test]
-    fn a_forwarded_header_names_the_first_hop() {
+    fn a_forwarded_element_names_one_hop() {
         assert_eq!(forwarded_for("for=192.0.2.1"), Some("192.0.2.1"));
-        assert_eq!(
-            forwarded_for("for=192.0.2.1;proto=https, for=198.51.100.9"),
-            Some("192.0.2.1")
-        );
         assert_eq!(
             forwarded_for("proto=https;For=\"[2001:db8::1]:4711\""),
             Some("[2001:db8::1]:4711")
         );
+        // A parameter without a value doesn't end the search for `for=`.
+        assert_eq!(forwarded_for("secure;for=192.0.2.1"), Some("192.0.2.1"));
         assert_eq!(forwarded_for("proto=https"), None);
 
         assert_eq!(host_ip("192.0.2.1"), "192.0.2.1".parse().ok());
@@ -956,6 +1024,57 @@ mod tests {
         // RFC 7239's obfuscated identifiers name nobody.
         assert_eq!(host_ip("_hidden"), None);
         assert_eq!(host_ip("unknown"), None);
+    }
+
+    #[test]
+    fn the_forwarded_client_is_the_rightmost_untrusted_element() {
+        let trusted = crate::TrustedProxies::parse(&["127.0.0.1", "10.0.0.0/8"]).unwrap();
+        let xff = ForwardedHeader::XForwardedFor;
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+
+        // What `$proxy_add_x_forwarded_for` writes when the client sent
+        // a value of its own: the client's claim first, the address the
+        // proxy actually saw last. The claim is not believed.
+        assert_eq!(
+            forwarded_client(&["203.0.113.9", " 198.51.100.4"], xff, &trusted),
+            ip("198.51.100.4")
+        );
+        // A proxy that replaces the header: one element, and it is the
+        // client.
+        assert_eq!(
+            forwarded_client(&["198.51.100.4"], xff, &trusted),
+            ip("198.51.100.4")
+        );
+        // Two of our own hops behind the edge; the walk passes over both.
+        assert_eq!(
+            forwarded_client(&["198.51.100.4", "10.0.0.7", "10.0.0.8"], xff, &trusted),
+            ip("198.51.100.4")
+        );
+        // Nobody untrusted is named, so the caller keeps the peer.
+        assert_eq!(forwarded_client(&["10.0.0.7"], xff, &trusted), None);
+        assert_eq!(forwarded_client(&[], xff, &trusted), None);
+        // An element we can't read ends the walk: a chain that isn't
+        // legible is not evidence about who is at the far end.
+        assert_eq!(
+            forwarded_client(&["198.51.100.4", "_hidden"], xff, &trusted),
+            None
+        );
+        assert_eq!(forwarded_client(&[""], xff, &trusted), None);
+
+        // RFC 7239 form, same walk.
+        let fwd = ForwardedHeader::Forwarded;
+        assert_eq!(
+            forwarded_client(
+                &["for=203.0.113.9", "for=198.51.100.4;proto=https"],
+                fwd,
+                &trusted
+            ),
+            ip("198.51.100.4")
+        );
+        assert_eq!(
+            forwarded_client(&["for=198.51.100.4", "proto=https"], fwd, &trusted),
+            None
+        );
     }
 
     /// Encode one TLV with a minimal definite length.

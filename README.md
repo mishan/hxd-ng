@@ -36,6 +36,7 @@ bind = "0.0.0.0:5500"
 name = "My Server"
 version = 185          # 0 mimics a pre-1.5 server
 login_timeout = 10
+ban_time = 1800        # seconds a kick-with-ban holds the address
 # mark_cleartext = false  # set User Flags bit 4 on unencrypted legacy sessions
                           # (identity spec §10); off until that bit is confirmed
                           # free against 1.8/1.9 clients
@@ -49,15 +50,21 @@ bind = "127.0.0.1:5700"   # plaintext; put a WSS-terminating proxy in front
 grace = 300               # detached-session grace window, seconds
 max_detached_per_addr = 2
 # trusted_proxies = ["127.0.0.1"]   # believe X-Hotline-Client-Cert (mTLS binding) and
-                                    # Forwarded/X-Forwarded-For (who a ban is about) from these
+                                    # the forwarded address (who a ban is about) from these.
+                                    # Proxies only: the walk below skips whatever is listed here
+forwarded_header = "x-forwarded-for"  # which header that proxy writes the client address into:
+                                      # x-forwarded-for | forwarded | none. The rightmost element
+                                      # outside trusted_proxies is the client (identity spec §5.3)
 
 [identity]                # portable identity — docs/hotline-ng-identity.md; needs [ng]
 key = "identity-server.key"        # server Ed25519 seed, generated on first run
 new_accounts = "guest"             # deny | guest | create
 unattested = "guest"               # deny | guest | allow
+min_attestation_age = 0            # seconds an attestation must have existed to count
+clock_skew = 300                   # seconds of clock difference tolerated in signed objects
 successors = "identity-successors" # where §3.4 successor commitments live; "" = memory only
 # max_new_accounts_per_hour = 60   # ceiling on what new_accounts = "create" writes
-# allow_list = ["misha@hl.example", "<fingerprint>"]
+# allow_list = ["alice@hl.example", "<fingerprint>"]
 # registrar_keys = { "hl.example" = "<base64url public key>" }
 # [identity.default_access]        # access bits for accounts "create" makes;
 # read_chat = true                 # same key names as an account file's [access].
@@ -123,9 +130,9 @@ hlid keygen identity id.key && hlid keygen device dev.key
 # `manage`, and `--caps web` deliberately excludes it. A browser device
 # gets `web`; the device you administer your account from gets this.
 hlid cert --identity id.key --device dev.key --caps login,message,manage -o cert.cbor
-hlid card --identity id.key --name Misha -o card.cbor
+hlid card --identity id.key --name Alice -o card.cbor
 hlid auth   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
-hlid link   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor --login misha --password-stdin < pw.txt
+hlid link   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor --login alice --password-stdin < pw.txt
 hlid tunnel --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
 # then point any 1.x client at 127.0.0.1:5500 — it logs in through the tunnel with your identity.
 # The tunnelled login can link an account too (§8.3), which is why this
@@ -137,7 +144,7 @@ Try the ng frontend with the bundled client (no install on Node 22+;
 on older Node, `cd tools && npm install` once for the `ws` fallback):
 
 ```sh
-node tools/ng-client.mjs ws://127.0.0.1:5700 --login misha --password pw
+node tools/ng-client.mjs ws://127.0.0.1:5700 --login alice --password pw
 # then type to chat; /drop tests detach+resume; /logout to leave
 ```
 

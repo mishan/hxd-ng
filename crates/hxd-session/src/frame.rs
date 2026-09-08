@@ -139,7 +139,7 @@ mod tests {
             0x0000_006b,
             7,
             0,
-            &[(0x0066, b"misha".to_vec()), (0x0068, vec![0x00, 0x91])],
+            &[(0x0066, b"alice".to_vec()), (0x0068, vec![0x00, 0x91])],
         );
         let mut cur = bytes.as_slice();
         let f = read_frame(&mut cur).await.unwrap();
@@ -147,7 +147,7 @@ mod tests {
         let chunks: Vec<_> = f.chunks().collect();
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].tag, 0x0066);
-        assert_eq!(chunks[0].data, b"misha");
+        assert_eq!(chunks[0].data, b"alice");
         assert_eq!(chunks[1].as_uint(), 0x91);
     }
 

@@ -154,8 +154,10 @@ deviation.
 
 One WebSocket endpoint (config `[ng] bind`, default `127.0.0.1:5700`,
 disabled when absent). Text frames, one JSON object per frame. The server
-sends WS pings; a connection that misses them long enough is treated as
-lost (→ detached). TLS is the proxy's job; the server never speaks it.
+sends WS pings (hxd-ng: every 30 s) and treats a connection that has sent
+nothing at all — pongs included — for three of those periods as lost
+(→ detached), which is what notices a peer that stopped reading rather
+than waiting for TCP to give up. TLS is the proxy's job; the server never speaks it.
 
 Three JSON shapes, discriminated by their first key:
 
@@ -186,19 +188,19 @@ login timeout.
 
 ```jsonc
 { "id": 0, "req": "login", "params": {
-    "login": "misha",        // omit or "" for guest
+    "login": "alice",        // omit or "" for guest
     "password": "…",         // omit for password-less accounts
-    "nick": "Misha",         // honored only with use_any_name
+    "nick": "Alice",         // honored only with use_any_name
     "icon": 128              // legacy icon id; optional
 } }
 
 { "reply": 0, "ok": {
     "session": "s_9f2c44b1",         // public session id
     "token": "…base64url, 32 bytes…",// secret; store for resume
-    "self": { "uid": 3, "nick": "Misha", "icon": 128,
+    "self": { "uid": 3, "nick": "Alice", "icon": 128,
               "admin": true, "status": "active" },
     "server": { "name": "My Server", "subject": "welcome!" },
-    "users": [ { "uid": 1, "nick": "alice", "icon": 2,
+    "users": [ { "uid": 1, "nick": "Alice", "icon": 2,
                  "admin": false, "status": "active" }, … ],
     "detach": { "grace": 300 },      // null when the account can't detach —
                                      // the client then knows a resume will
@@ -212,7 +214,10 @@ login timeout.
 
 The roster snapshot rides in the login reply — a mobile client renders one
 round-trip after connect. Failure codes: `login_failed` (wrong account or
-password — deliberately one code), `banned`, `server_full`.
+password — deliberately one code), `denied` (the server's identity policy
+refused this socket, `hotline-ng-identity.md` §8.1 — nothing about the
+credentials failed, and there is nothing to retry), `banned`,
+`server_full`.
 
 **Resume** (existing session):
 
@@ -268,13 +273,13 @@ A `user` object is:
 
 ```jsonc
 {
-  "uid": 3, "nick": "Misha", "icon": 128,
+  "uid": 3, "nick": "Alice", "icon": 128,
   "admin": false,
   "status": "active",              // active | idle | detached
   "transport": "encrypted",        // encrypted | cleartext — see below
   "identity": {                    // absent unless the socket proved one
     "fingerprint": "6htgz65…",     // 52 characters, Crockford base32
-    "handle": "misha@hl.example"   // null when no attestation was accepted
+    "handle": "alice@hl.example"   // null when no attestation was accepted
   }
 }
 ```
@@ -303,9 +308,14 @@ frames the client ignores, keeping seq accounting gapless.
 ## 8. Text, encoding, limits
 
 The protocol is UTF-8 by construction (it's JSON). Normative limits, chosen
-to keep the legacy bridge sane: nick ≤ 31 bytes *in its Mac Roman form*
-(the server truncates at the legacy edge and reports the ng-side nick
-untruncated), chat text ≤ 4096 bytes per request, subject ≤ 255 bytes.
+to keep the legacy bridge sane: nick ≤ 31 bytes *in its Mac Roman form*,
+which the server enforces as **31 characters** — every character converts
+to exactly one Mac Roman byte, or to `?`, so the two are the same bound
+and characters is the one that can be counted before the conversion. A
+longer nick is truncated once, on the way in, and every viewer sees the
+same one; counting UTF-8 bytes instead would cut a 28-character accented
+nick that a 1.x client carries whole. Chat text ≤ 4096 bytes per request,
+subject ≤ 255 bytes.
 Chat text crossing to legacy clients is converted with `?` for unmappable
 characters — tell your users their emoji become question marks on
 twenty-five-year-old Macs, which is honestly part of the charm.

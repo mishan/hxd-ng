@@ -155,6 +155,7 @@ async fn start_both(dir: &Path, video: bool) -> Server {
             max_detached_per_addr: 2,
             caps: ng_caps,
             trusted_proxies: Default::default(),
+            forwarded_header: Default::default(),
         }),
         registry: Arc::new(Registry::new()),
         identity: None,

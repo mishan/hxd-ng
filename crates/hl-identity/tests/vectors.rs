@@ -13,9 +13,16 @@ use serde_json::Value as Json;
 const VECTORS: &str = include_str!("../../../docs/identity-test-vectors.json");
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+    // Over bytes rather than `&str` slices: a non-ASCII character in a
+    // vector file would panic on a character boundary instead of saying
+    // what was wrong with the file.
+    assert!(s.len() % 2 == 0, "hex string of odd length: {s:?}");
+    s.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("hex is ASCII");
+            u8::from_str_radix(pair, 16).unwrap_or_else(|_| panic!("not hex: {pair:?}"))
+        })
         .collect()
 }
 

@@ -151,7 +151,9 @@ Three layers, all `cargo test --workspace`:
   (chat/PM/moderation over the legacy wire), `ng.rs` (the WebSocket
   frontend, **including cross-frontend scenarios** — a scripted 1.5 client
   and a WS client on one server, chat and PMs crossing both wire eras,
-  detach showing as the away color, resume replay).
+  detach showing as the away color, resume replay) and `identity.rs` (the
+  identity endpoints, linking, the `/trtp` tunnel, anchors — a real
+  server per case with its own accounts directory).
 - The scripted legacy client packs and parses with the same
   `hotline-proto` the real GtkHx uses, so e2e doubles as wire-compat
   checking.

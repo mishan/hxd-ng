@@ -34,8 +34,8 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     std::fs::write(
-        accounts.join("misha.toml"),
-        "name = \"Misha\"\npassword = \"s3cret\"\n[access]\nread_chat = true\nsend_chat = true\n\
+        accounts.join("bob.toml"),
+        "name = \"Bob\"\npassword = \"s3cret\"\n[access]\nread_chat = true\nsend_chat = true\n\
          send_msgs = true\nuse_any_name = true\n",
     )
     .unwrap();
@@ -66,6 +66,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             max_detached_per_addr: 2,
             caps: Vec::new(),
             trusted_proxies: Default::default(),
+            forwarded_header: Default::default(),
         }),
         registry: Arc::new(Registry::new()),
         identity: None,
@@ -258,18 +259,18 @@ async fn one_roster_two_wire_eras() {
     let (legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
 
     let mut alice = Legacy::login(legacy_addr, "alice").await;
-    let (mut app, hello) = Ng::login(ng_addr, "misha", "s3cret", "MobileMisha").await;
+    let (mut app, hello) = Ng::login(ng_addr, "bob", "s3cret", "MobileBob").await;
 
     // The ng hello: roster carries the legacy user; detach granted.
     assert_eq!(hello["server"]["name"], "xover");
     assert!(hello["detach"]["grace"].as_u64().unwrap() > 0);
     let users = hello["users"].as_array().unwrap();
     assert!(users.iter().any(|u| u["nick"] == "alice"));
-    assert!(users.iter().any(|u| u["nick"] == "MobileMisha"));
+    assert!(users.iter().any(|u| u["nick"] == "MobileBob"));
 
     // The legacy side sees the ng join, Mac Roman wire form.
     let join = alice.recv_type(HDR_USER_CHANGE).await;
-    assert_eq!(chunk(&join, tag::NAME).unwrap(), b"MobileMisha".to_vec());
+    assert_eq!(chunk(&join, tag::NAME).unwrap(), b"MobileBob".to_vec());
 
     // ng → legacy: the legacy client receives the server-formatted line.
     app.request_ok("chat", json!({ "text": "hi from the future" }))
@@ -277,7 +278,7 @@ async fn one_roster_two_wire_eras() {
     let line = alice.recv_type(HDR_CHAT).await;
     assert_eq!(
         chunk(&line, tag::BODY).unwrap(),
-        b"\r  MobileMisha:  hi from the future".to_vec()
+        b"\r    MobileBob:  hi from the future".to_vec()
     );
 
     // legacy → ng: the ng client receives the semantic event, unformatted.
@@ -298,7 +299,7 @@ async fn one_roster_two_wire_eras() {
     let line = alice.recv_type(HDR_CHAT).await;
     assert_eq!(
         chunk(&line, tag::BODY).unwrap(),
-        b"\r *** MobileMisha waves".to_vec()
+        b"\r *** MobileBob waves".to_vec()
     );
 }
 
@@ -308,18 +309,18 @@ async fn detach_shows_away_to_legacy_and_resume_replays() {
     let (legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
 
     let mut alice = Legacy::login(legacy_addr, "alice").await;
-    let (app, hello) = Ng::login(ng_addr, "misha", "s3cret", "Misha").await;
+    let (app, hello) = Ng::login(ng_addr, "bob", "s3cret", "Bob").await;
     let (session, token) = (
         hello["session"].as_str().unwrap().to_string(),
         hello["token"].as_str().unwrap().to_string(),
     );
-    let misha_uid = hello["self"]["uid"].as_u64().unwrap() as u16;
+    let bob_uid = hello["self"]["uid"].as_u64().unwrap() as u16;
     alice.recv_type(HDR_USER_CHANGE).await; // the join
 
     // Drop the socket without logout: legacy sees the away bit (color 1).
     drop(app);
     let away = alice.recv_type(HDR_USER_CHANGE).await;
-    assert_eq!(chunk_u16(&away, tag::UID), Some(misha_uid));
+    assert_eq!(chunk_u16(&away, tag::UID), Some(bob_uid));
     assert_eq!(chunk_u16(&away, tag::COLOUR), Some(1));
 
     // Chat happens while the app is away.
@@ -347,7 +348,7 @@ async fn detach_shows_away_to_legacy_and_resume_replays() {
     let line = alice.recv_type(HDR_CHAT).await;
     assert_eq!(
         chunk(&line, tag::BODY).unwrap(),
-        b"\r        Misha:  back!".to_vec()
+        b"\r          Bob:  back!".to_vec()
     );
 }
 
@@ -372,7 +373,7 @@ async fn bad_token_and_stale_gap_paths() {
     let td = tempfile::tempdir().unwrap();
     let (_legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
 
-    let (mut app, hello) = Ng::login(ng_addr, "misha", "s3cret", "Misha").await;
+    let (mut app, hello) = Ng::login(ng_addr, "bob", "s3cret", "Bob").await;
     let session = hello["session"].as_str().unwrap().to_string();
     let token = hello["token"].as_str().unwrap().to_string();
 
@@ -409,7 +410,7 @@ async fn bad_token_and_stale_gap_paths() {
     let ev = other
         .event_matching("chat", |d| d["text"] == "recovered")
         .await;
-    assert_eq!(ev["data"]["from"]["nick"], "Misha");
+    assert_eq!(ev["data"]["from"]["nick"], "Bob");
 }
 
 #[tokio::test]
@@ -418,7 +419,7 @@ async fn private_messages_cross_both_wire_eras() {
     let (legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
 
     let mut alice = Legacy::login(legacy_addr, "alice").await;
-    let (mut app, hello) = Ng::login(ng_addr, "misha", "s3cret", "Misha").await;
+    let (mut app, hello) = Ng::login(ng_addr, "bob", "s3cret", "Bob").await;
     let app_uid = hello["self"]["uid"].as_u64().unwrap();
     let alice_uid = hello["users"]
         .as_array()
@@ -428,14 +429,14 @@ async fn private_messages_cross_both_wire_eras() {
         .unwrap()["uid"]
         .as_u64()
         .unwrap();
-    alice.recv_type(HDR_USER_CHANGE).await; // misha's join
+    alice.recv_type(HDR_USER_CHANGE).await; // bob's join
 
     // ng → legacy: the 1.5 client gets the 0x68 push with uid/text/nick.
     app.request_ok("msg", json!({ "to": alice_uid, "text": "hi alice" }))
         .await;
     let pm = alice.recv_type(HDR_MSG).await;
     assert_eq!(chunk(&pm, tag::BODY).unwrap(), b"hi alice".to_vec());
-    assert_eq!(chunk(&pm, tag::NAME).unwrap(), b"Misha".to_vec());
+    assert_eq!(chunk(&pm, tag::NAME).unwrap(), b"Bob".to_vec());
     assert_eq!(chunk_u16(&pm, tag::UID), Some(app_uid as u16));
 
     // legacy → ng: the ack comes back to alice, the semantic event to the
@@ -445,7 +446,7 @@ async fn private_messages_cross_both_wire_eras() {
             REQ_MSG,
             &[
                 (tag::UID, (app_uid as u32).to_be_bytes().to_vec()),
-                (tag::BODY, b"hi misha".to_vec()),
+                (tag::BODY, b"hi bob".to_vec()),
             ],
         )
         .await;
@@ -453,7 +454,7 @@ async fn private_messages_cross_both_wire_eras() {
     assert_eq!((ack.trans, ack.flag), (t, 0));
     let ev = app.event("msg").await;
     assert_eq!(ev["data"]["from"]["nick"], "alice");
-    assert_eq!(ev["data"]["text"], "hi misha");
+    assert_eq!(ev["data"]["text"], "hi bob");
 }
 
 #[tokio::test]
@@ -462,7 +463,7 @@ async fn private_messages_to_detached_sessions_replay_on_resume() {
     let (legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
 
     let mut alice = Legacy::login(legacy_addr, "alice").await;
-    let (app, hello) = Ng::login(ng_addr, "misha", "s3cret", "Misha").await;
+    let (app, hello) = Ng::login(ng_addr, "bob", "s3cret", "Bob").await;
     let session = hello["session"].as_str().unwrap().to_string();
     let token = hello["token"].as_str().unwrap().to_string();
     let app_uid = hello["self"]["uid"].as_u64().unwrap();
@@ -513,7 +514,7 @@ async fn oversized_private_messages_are_truncated() {
     let td = tempfile::tempdir().unwrap();
     let (_legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
 
-    let (mut a, _) = Ng::login(ng_addr, "misha", "s3cret", "Misha").await;
+    let (mut a, _) = Ng::login(ng_addr, "bob", "s3cret", "Bob").await;
     let (mut b, hello_b) = Ng::login(ng_addr, "", "", "target").await;
     let b_uid = hello_b["self"]["uid"].as_u64().unwrap();
 
@@ -529,7 +530,7 @@ async fn takeover_closes_the_older_connection() {
     let td = tempfile::tempdir().unwrap();
     let (_legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
 
-    let (mut first, hello) = Ng::login(ng_addr, "misha", "s3cret", "Misha").await;
+    let (mut first, hello) = Ng::login(ng_addr, "bob", "s3cret", "Bob").await;
     let session = hello["session"].as_str().unwrap().to_string();
     let token = hello["token"].as_str().unwrap().to_string();
 
