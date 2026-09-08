@@ -12,6 +12,10 @@ One roster, one set of chat rooms, one voice room. A 1.5 client and a phone
 are in the same conversation, and neither can tell which wire the other is
 on.
 
+Two clients already speak to it: [GtkHx](https://github.com/mishan/gtkhx),
+the period client revival, on the legacy wire, and
+[hx-ng](https://github.com/mishan/hx-ng), a browser client, on the ng one.
+
 **Never break old clients** is the hard requirement, and it outranks
 everything else here. Deviations from reference-server behavior are
 deliberate and commented at the site.
@@ -76,25 +80,39 @@ with a guest account; add more as TOML files in that directory.
 
 ### Say hello
 
-The best end-to-end check is a real client. Point [GtkHx](https://github.com/mishan/gtkhx)
-at `127.0.0.1:5500` and you are talking to the legacy wire.
+The best end-to-end check is a real client, and there is one for each wire.
 
-For the ng wire, the repo ships a client — no install on Node 22+; on older
-Node, `cd tools && npm install` once for the `ws` fallback:
+**[GtkHx](https://github.com/mishan/gtkhx)** speaks the legacy wire — point
+it at `127.0.0.1:5500`.
+
+**[hx-ng](https://github.com/mishan/hx-ng)** is the browser client for the ng
+wire: public chat, the user list with the classic icons, private messages,
+and the voice and video the SFU already serves. It never sees the legacy
+wire, and the server cannot tell it apart from any other ng client.
+
+```sh
+git clone https://github.com/mishan/hx-ng && cd hx-ng
+npm install && npm run dev     # http://localhost:5701, bound to every
+                               # interface so a phone on the LAN can reach it
+```
+
+The two clients in the same room, one on each wire, is the check worth
+running before believing any of this.
+
+The repo also ships two deliberately minimal harnesses, for when you want to
+see the protocol rather than use it. `tools/ng-client.mjs` is a terminal ng
+client — no install on Node 22+; on older Node, `cd tools && npm install`
+once for the `ws` fallback:
 
 ```sh
 node tools/ng-client.mjs ws://127.0.0.1:5700 --login alice --password pw
 # then type to chat; /drop tests detach+resume; /logout to leave
 ```
 
-`tools/ng-voice.html` is the voice and video counterpart: open it in a
-browser against a server with `[voice]` configured and it joins the lobby's
-voice room with a real `RTCPeerConnection` — camera, screen share and
-per-stream subscription included when `[voice.video]` is on. No build step,
-one file.
-
-Two browser tabs and a real GtkHx on the legacy port is the check worth
-running before believing any of this.
+`tools/ng-voice.html` is the voice and video counterpart: one file, no build
+step. Open it against a server with `[voice]` configured and it joins the
+lobby's voice room with a real `RTCPeerConnection` — camera, screen share
+and per-stream subscription included when `[voice.video]` is on.
 
 ### Tracing
 
