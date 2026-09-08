@@ -60,9 +60,10 @@ is the only profile defined and the only one hxd-ng implements. Other
 kinds of principal are conceivable — an OIDC subject, a WebAuthn
 credential — and would be new bindings in this document with their own
 profiles. Nothing in the WebSocket paths, the cleartext rules or the
-tunnel and relay roles would change for them; the principal type (§3) is
-shaped so that they need not, and §6.5 sketches what each would look
-like so that nothing here is decided in a way that would shut them out.
+tunnel and relay roles would change for them: a binding's only output is
+a token bound to a principal, the upgrade's only input is that token, and
+neither side of that contract knows what the other did (§6.1). §6.5 says
+what principal each of those methods would produce, and no more.
 
 ---
 
@@ -268,9 +269,20 @@ transport token authenticates a socket whether the application protocol
 on it turns out to be ng JSON or tunnelled TRTP. Nothing application-level
 exists until the application protocol's own login runs.
 
-Two bindings produce a token. Servers advertise which they accept. The
-server ends in the same state either way and nothing above the transport
-can tell them apart.
+**This is the whole interface between a binding and the transport.** A
+binding, whatever it is, ends by minting a token and binding a principal
+(§3) to it server-side; the upgrade (§7.1) redeems the token and reads
+the principal off it. The upgrade never sees a proof, a key, a
+certificate or an assertion, and the binding never sees a socket. A
+server can therefore say "this connection is authenticated as this
+principal" without the part of it that handles WebSockets knowing whether
+the principal came from a signed challenge, a client certificate, or
+something this document does not define. That is what keeps §7–§10
+independent of §6.2 and §6.3.
+
+Two bindings produce a token today. Servers advertise which they accept.
+The server ends in the same state either way and nothing above the
+transport can tell them apart.
 
 ### 6.2 Challenge binding
 
@@ -522,75 +534,33 @@ show they fit, and no further.
 ### 6.5 Other methods
 
 None of these is implemented, and this document does not require any
-implementation to support them. They are here so that the shape of the
-principal (§3), the token model (§6.1) and the upgrade (§7) are checked
-against something other than a key, and so that an implementer who adds
-one later finds the decisions that affect them already made rather than
-foreclosed. Each would get a section of its own when defined; what
-follows is the principal it would produce, how it would reach a transport
-token, and what it would need from the transport that is not already
-here.
+implementation to support them, nor does it say how any of them works —
+each has its own standard. What it does say is the principal (§3) each
+would produce, because that is the only thing about them the transport
+has to be able to carry, and writing it down is how §3 and §7.1 are
+checked against something other than a key.
 
-**OIDC.** `method = "oidc"`; `id` = the issuer URL and the token's `sub`
-claim, together — `sub` is unique only within an issuer. No `key`.
-Default profile: `name` (or `preferred_username`) and whatever claims the
-operator maps, as display material; nothing signed. Two ways to reach a
-token, both ending at the ordinary `auth` endpoint semantics: a client
-that already holds an ID token for this server's `client_id` (a native
-app after its own authorization-code flow) posts it, and the server
-verifies signature, issuer, audience, expiry and nonce and mints a
-transport token; or the server drives the flow itself, redirecting a
-browser to the issuer and receiving the code at a callback route, then
-handing the transport token back through the `?token=` upgrade form of
-§7.1, which is what that form exists for. Discovery would carry an
-`oidc` block with the issuer, the `client_id`, and the `auth` and
-callback paths. Needs from the transport: nothing new. A relay in front
-of a legacy server gated by an identity provider is the deployment that
-would motivate it.
+| Method | `id` | `key` | Default profile |
+|---|---|---|---|
+| `oidc` | issuer URL and `sub`, together — `sub` is unique only within an issuer | none | the display-name claim and whatever the operator maps; nothing signed |
+| `saml` | identity provider `entityID` and `NameID`, together, with the `NameID` format part of the comparison | none | mapped attributes, as for OIDC |
+| `webauthn` | this server's relying-party id and the credential id, together — a credential is scoped to one origin by construction | **absent**: the credential has a public key, but the authenticator signs only its own assertion structure with it, never arbitrary bytes, so a profile can sign nothing with it | the display name given at registration |
 
-**SAML.** `method = "saml"`; `id` = the identity provider's `entityID`
-and the assertion's `NameID`, together, with the `NameID` format part of
-the comparison, since a transient or email-format `NameID` is not the
-same identifier as a persistent one. No `key`. Default profile: mapped
-attributes, as for OIDC. The assertion arrives by browser POST at an
-assertion-consumer route, which is a new route on the listener and the
-only thing SAML needs that OIDC does not; the server verifies the XML
-signature against the provider's metadata, checks audience, conditions
-and the `InResponseTo` of a request it issued, and hands back a transport
-token through `?token=`. The 60-second token life is comfortable for a
-redirect. Discovery would carry a `saml` block with the provider's
-metadata URL and the consumer path. Anyone with SAML also has, or can
-front it with, an OIDC broker, so this is written down to show it fits
-rather than to recommend it.
-
-**WebAuthn.** `method = "webauthn"`; `id` = this server's relying-party
-identifier and the credential ID, together — a credential is scoped to
-one origin by construction, so it can never be presented anywhere else
-and never names the same party on two servers. `key` is *absent*: the
-credential has a public key, but the authenticator signs only its own
-assertion structure with it, never arbitrary bytes, so nothing a profile
-would want to sign can be signed. Default profile: the display name given
-at registration. The flow is the challenge binding's exactly — the
-`challenge` endpoint issues one, the client returns the authenticator's
-assertion instead of a CBOR proof, the server verifies it against the
-credential's registered public key and checks origin, RP ID hash and
-signature counter — so step 1 needs nothing new and step 2 needs a second
-proof format. What it does need is a transport-level *registration*
-step, `POST` to a `register` endpoint carrying the attestation and
-storing the credential's public key against `(rp_id, credential_id)`,
-which is the same "on file" cache §6.3 keeps for client certificates,
-keyed differently. Registration is a management action and needs an
-already-authenticated principal to attach the credential to, so a
-WebAuthn credential would in practice be a second factor or a device of
-some other principal rather than a first one; that is the same shape the
-threat model already proposes for passkeys at the registrar.
+Each would reach a transport token in whatever way its own standard
+provides — a posted token, a redirect that ends at a callback, an
+assertion — and would then be presented at the upgrade exactly as §7.1
+describes, since the upgrade sees only the token. A method that arrives
+by browser redirect is what the `?token=` form of §7.1 exists for.
+Everything else about them — endpoints, verification, registration of
+a WebAuthn credential against a principal that already exists — belongs
+to a section that would define the method, and to the standard it
+implements.
 
 What the three have in common is what §3 is for: an `id` that is a pair
 of namespace and identifier, a `key` that is present only when it can
-sign, a profile that may be no more than a display name, and a token
-that is minted the same way and redeemed at the same upgrade whatever
-produced it. An implementer who finds one of these sketches wrong should
-fix §3 first and the sketch second.
+sign, and a profile that may be no more than a display name. An
+implementer who finds one of these rows wrong should fix §3 first and
+the row second.
 
 ---
 
@@ -618,6 +588,17 @@ An upgrade request is authenticated by one of, in order of preference:
   damage only once someone has used it;
 - a client certificate on the connection for a key on file, forwarded
   under the §6.3 proxy contract, which needs no token at all.
+
+The upgrade request carries nothing about the principal itself: no key,
+no proof, no profile object. It carries a token, or a client certificate
+the server can already map to a key on file. Everything the socket then
+knows about who holds it is read from what the token was bound to (§3),
+and that binding has the same shape whatever minted it. The client
+certificate form is the one exception, and it is an optimisation for
+the `key` method rather than a second model: it works only because that
+method's proof *is* something the TLS handshake can carry. A binding of
+any other method needs nothing from this section beyond "mint a token
+and present it here".
 
 Cookies are not used: they would make every cross-site page a potential
 initiator of an authenticated socket.
