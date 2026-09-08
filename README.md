@@ -140,7 +140,7 @@ ban_time = 1800         # seconds a kick-with-ban holds the address
 stamp_queued = true     # stamp a message that waited in the inbox with its
                         # send time (docs/private-messages.md §7)
 
-# Set User Flags bit 4 on unencrypted legacy sessions (identity spec §10).
+# Set User Flags bit 4 on unencrypted legacy sessions (docs/hotline-ng-auth.md §8).
 # Off until that bit is confirmed free against 1.8/1.9 clients.
 # mark_cleartext = false
 
@@ -167,14 +167,16 @@ max_detached_per_addr = 2
 
 # Which header that proxy writes the client address into:
 # x-forwarded-for | forwarded | none. The rightmost element outside
-# trusted_proxies is the client (identity spec §5.3).
+# trusted_proxies is the client (docs/hotline-ng-auth.md §6.3).
 forwarded_header = "x-forwarded-for"
 ```
 
 ### Portable identity
 
 Needs `[ng]`, because the identity endpoints and the tunnel are served by
-the ng listener. See [docs/hotline-ng-identity.md](docs/hotline-ng-identity.md).
+the ng listener. See [docs/hotline-ng-auth.md](docs/hotline-ng-auth.md) for the
+transport and [docs/hotline-ng-identity.md](docs/hotline-ng-identity.md)
+for what an identity is and how it links to an account.
 
 ```toml
 [identity]
@@ -334,7 +336,8 @@ startup error rather than a promise the build cannot keep.
 | Document | What it covers |
 |---|---|
 | [hotline-ng.md](docs/hotline-ng.md) | The ng protocol: framing, the login/resume/sync handshake, the request and event tables, seq accounting |
-| [hotline-ng-identity.md](docs/hotline-ng-identity.md) | Portable identity: the signed objects, the HTTP layer, account association, the TRTP tunnel |
+| [hotline-ng-auth.md](docs/hotline-ng-auth.md) | Transport authentication: the principal, the challenge and mTLS bindings, transport tokens, the TRTP tunnel, cleartext marking, tunnels and relays |
+| [hotline-ng-identity.md](docs/hotline-ng-identity.md) | Portable identity: the signed objects, the identity profile at authentication, cards, account association |
 | [identity-threat-model.md](docs/identity-threat-model.md) | What identity defends against, and what it deliberately does not |
 | [identity-test-vectors.json](docs/identity-test-vectors.json) | Signed objects and reject cases — the contract a second implementation is checked against |
 | [private-messages.md](docs/private-messages.md) | The offline inbox: the mailbox rule, the store contract, delivery, blocking, retention |

@@ -358,12 +358,12 @@ pub struct NgSection {
     #[serde(default = "default_max_detached")]
     pub max_detached_per_addr: usize,
     /// Reverse-proxy addresses whose `X-Hotline-Client-Cert` header is
-    /// believed (identity spec §5.3). Empty = mTLS binding off.
+    /// believed (docs/hotline-ng-auth.md §6.3). Empty = mTLS binding off.
     /// Single addresses or CIDR blocks, e.g. `["127.0.0.1", "10.0.0.0/8"]`.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
     /// Which header a trusted proxy writes the client's address into
-    /// (identity spec §5.3): `"x-forwarded-for"` (the default),
+    /// (docs/hotline-ng-auth.md §6.3): `"x-forwarded-for"` (the default),
     /// `"forwarded"`, or `"none"` to believe neither.
     #[serde(default = "default_forwarded_header")]
     pub forwarded_header: String,
@@ -403,7 +403,7 @@ pub struct ServerSection {
     #[serde(default = "default_ban_time")]
     pub ban_time: u64,
     /// Set the cleartext marker bit in legacy user flags for unencrypted
-    /// sessions (identity spec §10). Off until proven against every 1.x
+    /// sessions (docs/hotline-ng-auth.md §8). Off until proven against every 1.x
     /// client we care about.
     #[serde(default)]
     pub mark_cleartext: bool,
@@ -539,7 +539,7 @@ fn ng_caps(config: &Config, voice: Option<&Voice>) -> Vec<String> {
 }
 
 /// The TRTP tunnel's other end: the legacy frontend, run on the byte
-/// stream the ng layer hands over (identity spec §6.3).
+/// stream the ng layer hands over (docs/hotline-ng-auth.md §7.3).
 pub struct LegacyTunnel(pub ServerCtx);
 
 impl TunnelSink for LegacyTunnel {

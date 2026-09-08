@@ -55,8 +55,8 @@ pub enum SessionStatus {
 }
 
 /// What the session layer knows about the connection carrying a session,
-/// as far as other users are entitled to see it (`docs/hotline-ng-identity.md`
-/// §6.2, §10). Purely descriptive: the domain never acts on it, it only
+/// as far as other users are entitled to see it (`docs/hotline-ng-auth.md`
+/// §7.2, §8). Purely descriptive: the domain never acts on it, it only
 /// carries it to the roster so frontends can mark sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Transport {

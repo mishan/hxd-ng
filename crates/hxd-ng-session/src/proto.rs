@@ -367,7 +367,7 @@ pub fn user_json(u: &UserInfo) -> Value {
         "icon": u.icon,
         "admin": u.admin,
         "status": status_str(u.status),
-        // `docs/hotline-ng-identity.md` §6.2, §10: what other users may
+        // `docs/hotline-ng-auth.md` §7.2, §8: what other users may
         // know about this session's link.
         "transport": if u.transport.encrypted { "encrypted" } else { "cleartext" },
     });

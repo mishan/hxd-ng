@@ -1,4 +1,4 @@
-//! Identity end-to-end (`docs/hotline-ng-identity.md` §4–§6, §10): the
+//! Identity end-to-end (`docs/hotline-ng-auth.md` §5–§8): the
 //! HTTP endpoints on the ng listener, a transport token redeemed at
 //! upgrade on both WebSocket paths, and what the roster then shows.
 

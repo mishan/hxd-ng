@@ -1,7 +1,7 @@
 # hxd-ng identity: threat model
 
 Status: draft, for discussion. Most of it is still design. What hxd-ng
-implements today is the transport layer of `hotline-ng-identity.md` —
+implements today is the transport of `hotline-ng-auth.md` and the identity profile of `hotline-ng-identity.md` —
 the identity objects, both bindings, account association, and the
 successor commitment described below. Not implemented anywhere yet:
 revocation and freezing, recovery codes, vouches, reserved names, and

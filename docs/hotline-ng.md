@@ -336,10 +336,11 @@ A `user` object is:
 
 Uids remain the 16-bit legacy ids so the two rosters are one roster.
 
-`transport` and `identity` come from
-[`hotline-ng-identity.md`](hotline-ng-identity.md) §6.2 and §10, and are
-present whether or not that spec's endpoints are enabled — a plain TCP
-legacy session reads as `"cleartext"` with no `identity`, so a client can
+`transport` comes from [`hotline-ng-auth.md`](hotline-ng-auth.md) §7.2
+and §8, `identity` from [`hotline-ng-identity.md`](hotline-ng-identity.md)
+§6.1, and both are present whether or not those endpoints are enabled —
+a plain TCP legacy session reads as `"cleartext"` with no `identity`, so a
+client can
 warn before a private message goes somewhere unencrypted without
 feature-detecting anything. A session is `"cleartext"` when the legacy
 client is on plain TCP, or when a tunnel told the server at
@@ -481,7 +482,7 @@ Each lands separately with tests, roughly a branch apiece:
 - **Private chats**: the domain events exist; ng needs a `cid` field on
   `chat`/`subject` events and room-lifecycle requests. Voice already
   carries `cid` on every request and event, so nothing there changes.
-- **Identity** (`docs/hotline-ng-identity.md`): authentication moves to
+- **Authentication and identity** (`docs/hotline-ng-auth.md`, `docs/hotline-ng-identity.md`): authentication moves to
   the HTTP layer before the upgrade, so an authenticated socket arrives
   knowing which device key holds it; `login` then ignores credentials for
   identity users and associates an account. The same design adds a
