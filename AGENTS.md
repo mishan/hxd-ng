@@ -60,6 +60,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it belongs with the `hotline-proto` tier when the shared-crate extraction happens. |
 | `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy + `[identity]` link), first-run guest bootstrap. Identity links are written back with `toml_edit` so hand-edited files keep their comments; fingerprint lookups scan the directory. |
 | `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
+| `hxd-store-sqlite` | The private-message inbox's durable store: one SQLite file, WAL, the schema and migrations of `docs/private-messages.md` §5, and the conformance suite both stores are run against. Behind `hxd-core`'s `MessageStore` trait and the `inbox` Cargo feature; the in-memory store beside it in `hxd-core` is what the domain tests use. |
 | `hlid` | The identity tool: keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1). |
 | `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing. Its `tests/` hold the e2e suites. |
 
@@ -151,9 +152,11 @@ Three layers, all `cargo test --workspace`:
   (chat/PM/moderation over the legacy wire), `ng.rs` (the WebSocket
   frontend, **including cross-frontend scenarios** — a scripted 1.5 client
   and a WS client on one server, chat and PMs crossing both wire eras,
-  detach showing as the away color, resume replay) and `identity.rs` (the
+  detach showing as the away color, resume replay), `identity.rs` (the
   identity endpoints, linking, the `/trtp` tunnel, anchors — a real
-  server per case with its own accounts directory).
+  server per case with its own accounts directory) and `inbox.rs`
+  (offline private messages across both wires: queue, flush at login,
+  resync, blocks, retention).
 - The scripted legacy client packs and parses with the same
   `hotline-proto` the real GtkHx uses, so e2e doubles as wire-compat
   checking.

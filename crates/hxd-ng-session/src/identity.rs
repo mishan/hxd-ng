@@ -756,8 +756,15 @@ impl IdentityState {
         })
     }
 
-    /// One backend call that reads, decides and writes a link, so two
-    /// concurrent auths by one identity cannot both conclude it is free.
+    /// One backend call that reads, decides and writes a link — and the
+    /// obligation that comes with writing one.
+    ///
+    /// §4 of `docs/private-messages.md`: an account's existing mail is
+    /// keyed by its bare login, and the mailbox rule is strict, so
+    /// without `claim` the mail is stranded the instant the account
+    /// gains a fingerprint. Called here rather than at each of the three
+    /// link sites, so there is one place to forget it and it isn't
+    /// forgotten.
     fn link_exclusive(&self, login: &str, fp: &Fingerprint) -> Result<LinkOutcome, AuthRefused> {
         let outcome = self.auth.link_identity(login, &fp.0).map_err(|e| {
             tracing::warn!("link write failed: {e}");
@@ -831,7 +838,18 @@ impl IdentityState {
         }
     }
 
-    /// `POST /identity/unlink` (§8.4).
+    /// `POST /identity/unlink` (§8.4). The `usize` is how many stored
+    /// messages stay with the identity rather than with the account.
+    ///
+    /// Mail is addressed to a person, and under the strict mailbox rule
+    /// (`docs/private-messages.md` §4) the fingerprint *is* the person:
+    /// an account that gives up its link gives up the mailbox that link
+    /// addressed, and that mail travels with the identity to wherever it
+    /// links next. That is deliberate — the alternative hands one
+    /// person's correspondence to whoever links to the account
+    /// afterwards — but it is also invisible from the account's side, so
+    /// say the number out loud rather than letting a user discover their
+    /// inbox has emptied.
     pub fn unlink(&self, ident: &TransportIdentity) -> Result<Account, AuthRefused> {
         if !ident.allows(caps::MANAGE) {
             return Err(AuthRefused::NoManage);

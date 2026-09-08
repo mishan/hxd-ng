@@ -784,6 +784,22 @@ and indistinguishable from a native identity session in the roster.
 operator through account administration. Refused with `would_orphan` if
 the account has no password, until one is set.
 
+**Stored mail belongs to the identity, not to the account it was linked
+to.** A private-message inbox keyed by fingerprint
+(`private-messages.md` §4) addresses the person, and after an unlink the
+account is addressed by its bare login again — so everything stored
+while the link stood stays with the identity and follows it to whatever
+it links next. That is the deliberate choice: the alternative, mail
+following the account, would hand one person's correspondence to whoever
+links to that account afterwards. It is also invisible from the
+account's side, which is why the reply says how much:
+
+```jsonc
+{ "unlinked": "alice", "mail_stays_with_identity": 42 }
+```
+
+Re-linking the same identity to the same account brings it all back.
+
 ### 8.5 Rotation
 
 When a rotation record from the registrar spec is verified — either
