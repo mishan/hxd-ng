@@ -13,8 +13,12 @@
 
 name: CI
 
+# `push` is scoped to main so a branch with an open PR is not built
+# twice for the same commit — `pull_request` already covers every topic
+# branch, and the push build of main is what says a merge landed green.
 on:
   push:
+    branches: [main]
   pull_request:
 
 env:
