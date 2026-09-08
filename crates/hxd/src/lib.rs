@@ -41,6 +41,57 @@ pub struct Config {
     /// Portable identity (`docs/hotline-ng-identity.md`). Absent =
     /// disabled: no identity endpoints, no TRTP tunnel path. Needs `[ng]`.
     pub identity: Option<IdentitySection>,
+    /// The durable private-message inbox. Absent = disabled, and then
+    /// private messaging behaves exactly as it did before there was one.
+    pub inbox: Option<InboxSection>,
+}
+
+/// The private-message inbox (docs/private-messages.md §8).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxSection {
+    /// The SQLite file. Required — naming it is what turns the inbox on.
+    ///
+    /// **It holds every private message on this server in the clear**, so
+    /// give it the same treatment as the accounts directory: readable by
+    /// the server user and nobody else.
+    pub db: PathBuf,
+    /// Messages one account may have *waiting* before further sends to
+    /// it are refused. A full mailbox refuses rather than evicting, so a
+    /// sender is never told a message was delivered that then quietly
+    /// disappeared.
+    ///
+    /// Queue depth, not unread count: a message the recipient already has
+    /// and hasn't marked read is not congestion, and counting it would
+    /// let a client that never marks anything read lock its own mailbox.
+    #[serde(default = "default_max_queued")]
+    pub max_queued: usize,
+    /// How many queued messages one flush hands a client. The cap is for
+    /// the legacy wire, where each private message opens a window; what
+    /// is left waits for the next login rather than being dropped.
+    #[serde(default = "default_deliver_at_flush")]
+    pub deliver_at_flush: usize,
+    /// Seconds an *unread* message is kept, measured from when it was
+    /// sent. Default 30 days.
+    #[serde(default = "default_retain_unread")]
+    pub retain_unread: u64,
+    /// Seconds a *read* message is kept, measured from when it was read.
+    /// Default 7 days.
+    #[serde(default = "default_retain_read")]
+    pub retain_read: u64,
+    /// How hard a commit tries to survive the machine losing power.
+    /// `normal` survives a process crash and not a power cut; `full`
+    /// fsyncs every commit.
+    #[serde(default)]
+    pub sync: InboxSync,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InboxSync {
+    #[default]
+    Normal,
+    Full,
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,6 +407,11 @@ pub struct ServerSection {
     /// client we care about.
     #[serde(default)]
     pub mark_cleartext: bool,
+    /// Mark a private message that waited in the inbox with the time it
+    /// was sent, on the legacy wire (the ng wire carries `at` and
+    /// `queued` as fields and renders them itself).
+    #[serde(default = "default_stamp_queued")]
+    pub stamp_queued: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -387,6 +443,21 @@ fn default_ban_time() -> u64 {
 fn default_accounts() -> PathBuf {
     "accounts".into()
 }
+fn default_stamp_queued() -> bool {
+    true
+}
+fn default_max_queued() -> usize {
+    200
+}
+fn default_deliver_at_flush() -> usize {
+    25
+}
+fn default_retain_unread() -> u64 {
+    30 * 24 * 3600
+}
+fn default_retain_read() -> u64 {
+    7 * 24 * 3600
+}
 
 impl Default for ServerSection {
     fn default() -> Self {
@@ -397,6 +468,7 @@ impl Default for ServerSection {
             login_timeout: default_login_timeout(),
             ban_time: default_ban_time(),
             mark_cleartext: false,
+            stamp_queued: default_stamp_queued(),
         }
     }
 }
@@ -459,6 +531,9 @@ fn ng_caps(config: &Config, voice: Option<&Voice>) -> Vec<String> {
         if video_enabled(config) {
             caps.push("video".to_string());
         }
+    }
+    if config.inbox.is_some() {
+        caps.push("inbox".to_string());
     }
     caps
 }
@@ -618,7 +693,241 @@ pub fn check_config(config: &Config) -> Result<(), String> {
                 .into(),
         );
     }
+    if let Some(inbox) = &config.inbox {
+        hxd_core::InboxPolicy {
+            max_queued: inbox.max_queued,
+            deliver_at_flush: inbox.deliver_at_flush,
+        }
+        .check()?;
+    }
     Ok(())
+}
+
+/// Open the inbox database named by `[inbox]`, if any.
+///
+/// Two shapes, one signature: without the `inbox` feature there is no
+/// store to build, and a config that asks for one is a startup error
+/// rather than a silently ignored promise — an operator who configured
+/// offline messages should not have to discover from a user that they
+/// never happened.
+#[cfg(feature = "inbox")]
+fn open_inbox(config: &Config) -> Result<Option<Arc<dyn hxd_core::MessageStore>>, String> {
+    use hxd_store_sqlite::{SqliteStore, Synchronous};
+    let Some(section) = &config.inbox else {
+        return Ok(None);
+    };
+    let sync = match section.sync {
+        InboxSync::Normal => Synchronous::Normal,
+        InboxSync::Full => Synchronous::Full,
+    };
+    // Every private message on the server, in the clear. The README says
+    // "the same permissions as accounts/"; make that true rather than
+    // leaving it to whatever the process umask happens to be.
+    //
+    // The empty file is created here rather than chmodded after
+    // `migrate`: SQLite creating it under the umask left a window,
+    // however short, in which the file another process could open was
+    // world-readable. An existing database is left alone until the loop
+    // below.
+    #[cfg(unix)]
+    if !section.db.exists() {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&section.db)
+            .map_err(|e| format!("{}: {e}", section.db.display()))?;
+    }
+    let store = SqliteStore::open(&section.db, sync)
+        .map_err(|e| format!("{}: {e}", section.db.display()))?;
+    // WAL adds a `-wal` and a `-shm` beside the file, and they carry the
+    // same data.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = section.db.clone().into_os_string();
+            p.push(suffix);
+            let p = PathBuf::from(p);
+            if p.exists() {
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("{}: {e}", p.display()))?;
+            }
+        }
+    }
+    Ok(Some(Arc::new(store)))
+}
+
+#[cfg(not(feature = "inbox"))]
+fn open_inbox(config: &Config) -> Result<Option<Arc<dyn hxd_core::MessageStore>>, String> {
+    if config.inbox.is_some() {
+        return Err("[inbox] is configured, but this build has no inbox \
+                    (built without the `inbox` feature)"
+            .to_string());
+    }
+    Ok(None)
+}
+
+/// What an operator command finds where the inbox database should be.
+#[cfg(feature = "inbox")]
+enum InboxKind {
+    /// No `[inbox]` section at all.
+    Unconfigured,
+    /// Configured, and no file there yet.
+    Missing(PathBuf),
+    At(PathBuf),
+}
+
+#[cfg(feature = "inbox")]
+fn open_inbox_kind(config: &Config) -> Result<InboxKind, String> {
+    let Some(section) = &config.inbox else {
+        return Ok(InboxKind::Unconfigured);
+    };
+    Ok(if section.db.exists() {
+        InboxKind::At(section.db.clone())
+    } else {
+        InboxKind::Missing(section.db.clone())
+    })
+}
+
+/// A handle that reads and does not write, for `--dry-run`.
+#[cfg(feature = "inbox")]
+fn open_read_only(path: &Path) -> Result<Arc<dyn hxd_core::MessageStore>, String> {
+    let store = hxd_store_sqlite::SqliteStore::open_read_only(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Arc::new(store))
+}
+
+/// `hxd inbox purge <login> [--fingerprint HEX]`: take an account's mail
+/// with it (`docs/private-messages.md` §4).
+///
+/// Deleting an account is `rm accounts/alice.toml`, which leaves the
+/// login free for someone else — and, without this, leaves the previous
+/// holder's mail sitting in a login-keyed mailbox for the next `alice` to
+/// inherit. The store has always had `purge`; nothing called it.
+///
+/// The account file is read when it is still there, so an identity-linked
+/// mailbox is purged by its fingerprint rather than by a login that no
+/// longer addresses it. For an account already deleted, pass
+/// `--fingerprint` — the value from its `[identity]` table, which is the
+/// 52-character form an operator can actually copy from a file or a log.
+#[cfg(feature = "inbox")]
+pub fn inbox_purge(
+    config: &Config,
+    login: &str,
+    fingerprint: Option<&str>,
+    dry_run: bool,
+) -> Result<usize, String> {
+    // `open_inbox` is the startup path: it creates the database when it
+    // is missing and migrates it when it is not. Both are wrong for an
+    // operator command, and `--dry-run`'s whole promise is that it
+    // changes nothing — a dry run against a server one version back was
+    // doing the schema upgrade the operator was still deciding about,
+    // and against a server with no mail yet it left a file behind.
+    //
+    // So: the feature check first (a build without an inbox should say
+    // that, not "no database"), then the file, then a handle that
+    // matches what the command is for.
+    let store = match (dry_run, open_inbox_kind(config)?) {
+        (_, InboxKind::Unconfigured) => {
+            return Err("[inbox] is not configured; there is nothing to purge".into())
+        }
+        (_, InboxKind::Missing(path)) => {
+            return Err(format!(
+                "{}: no inbox database, so there is nothing to purge",
+                path.display()
+            ))
+        }
+        (true, InboxKind::At(path)) => open_read_only(&path)?,
+        (false, InboxKind::At(_)) => match open_inbox(config)? {
+            Some(store) => store,
+            None => return Err("[inbox] is not configured; there is nothing to purge".into()),
+        },
+    };
+    let fingerprint = match fingerprint {
+        Some(text) => Some(parse_fingerprint(text)?),
+        None => None,
+    };
+    let mailbox = match fingerprint {
+        Some(fp) => hxd_core::inbox::Mailbox::identified(login.to_ascii_lowercase(), fp),
+        None => {
+            let auth = FileAuth::new(&config.paths.accounts);
+            // The account's own view of its mailbox where it still
+            // exists, so a linked one is purged by fingerprint.
+            hxd_core::account::AccountDirectory::inbox_account(&auth, login)
+                .unwrap_or_else(|| hxd_core::inbox::Mailbox::login(login.to_ascii_lowercase()))
+        }
+    };
+    if dry_run {
+        // What `purge` would take: everything in the mailbox, read or
+        // not. Deleting mail is not undoable and the operator has just
+        // deleted the account file, so it is worth being able to look
+        // first.
+        return store.purge_count(&mailbox).map_err(|e| e.to_string());
+    }
+    store.purge(&mailbox).map_err(|e| e.to_string())
+}
+
+/// Without the feature there is no store to inspect, and saying so beats
+/// saying "no database" about a build that could not read one anyway.
+#[cfg(not(feature = "inbox"))]
+pub fn inbox_purge(
+    _config: &Config,
+    _login: &str,
+    _fingerprint: Option<&str>,
+    _dry_run: bool,
+) -> Result<usize, String> {
+    Err("this build has no inbox (built without the `inbox` feature)".to_string())
+}
+
+/// A fingerprint as an operator has it: the 52-character Crockford form
+/// the account file's `[identity]` table and the roster both show, or
+/// raw hex for anyone reading it out of a hash. Crockford first — the
+/// tooling that tells the operator to run this prints that form, and
+/// requiring hex meant `rm alice.toml` left the mailbox unpurgeable.
+#[cfg(feature = "inbox")]
+fn parse_fingerprint(text: &str) -> Result<[u8; 32], String> {
+    let text = text.trim();
+    if let Some(fp) = hl_identity::Fingerprint::parse(text) {
+        return Ok(fp.0);
+    }
+    let hex: Option<Vec<u8>> = (text.len() == 64 && text.is_ascii())
+        .then(|| {
+            (0..32)
+                .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok())
+                .collect()
+        })
+        .flatten();
+    hex.and_then(|v| <[u8; 32]>::try_from(v).ok())
+        .ok_or_else(|| {
+            "--fingerprint must be the account file's 52-character form, or 64 hex characters"
+                .to_string()
+        })
+}
+
+/// Retention: drop unread messages older than their window, and read ones
+/// read longer ago than theirs. Runs beside the ng frontend's detached
+/// sweeper, but is not its business — a legacy-only server has inboxes too.
+pub async fn inbox_pruner(core: Arc<Core>, unread: Duration, read: Duration) {
+    // Hourly: retention is measured in days, so anything finer is work
+    // for its own sake.
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        // On the blocking pool like every other store call: this is a
+        // `DELETE` with a five-second busy timeout, and an external
+        // `sqlite3` holding a write lock would otherwise stall every
+        // session the reactor thread is carrying.
+        let core = core.clone();
+        let gone = tokio::task::spawn_blocking(move || core.prune_inbox(unread, read))
+            .await
+            .unwrap_or(0);
+        if gone > 0 {
+            tracing::debug!(gone, "inbox messages pruned");
+        }
+    }
 }
 
 /// Build the ng frontend context sharing the legacy context's core and
@@ -691,16 +1000,35 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
         None => Core::new(),
     };
 
+    let auth = Arc::new(FileAuth::new(&config.paths.accounts));
+    // Say at startup what an operator would otherwise learn from a user:
+    // an account file that does not parse, or one nothing can log in to.
+    auth.audit();
+    let core = match open_inbox(config)? {
+        // The same FileAuth answers both "is this person who they say
+        // they are" and "is there someone by that name to leave a message
+        // for" — two traits, one backend.
+        Some(store) => core.with_inbox(
+            store,
+            auth.clone(),
+            hxd_core::InboxPolicy {
+                max_queued: config.inbox.as_ref().map_or(200, |i| i.max_queued),
+                deliver_at_flush: config.inbox.as_ref().map_or(25, |i| i.deliver_at_flush),
+            },
+        ),
+        None => core,
+    };
+
     Ok(ServerCtx {
         core: Arc::new(core),
-        auth: Arc::new(FileAuth::new(&config.paths.accounts)),
+        auth,
         cfg: Arc::new(ServerConfig {
             name: config.server.name.clone(),
             version: config.server.version,
             agreement,
             login_timeout: Duration::from_secs(config.server.login_timeout),
             ban_time: Duration::from_secs(config.server.ban_time),
-            stamp_queued: true,
+            stamp_queued: config.server.stamp_queued,
             caps: legacy_caps(config, voice),
             mark_cleartext: config.server.mark_cleartext,
             trtp_login: match config.identity.as_ref().map(|i| i.trtp_login.as_str()) {
@@ -719,6 +1047,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_inbox_section_parses_and_refuses_numbers_that_disable_it() {
+        let cfg = parse(
+            r#"
+[inbox]
+db = "messages.db"
+max_queued = 50
+deliver_at_flush = 5
+retain_unread = 100
+retain_read = 10
+sync = "full"
+"#,
+        )
+        .unwrap();
+        let inbox = cfg.inbox.as_ref().unwrap();
+        assert_eq!(inbox.db, PathBuf::from("messages.db"));
+        assert_eq!(inbox.max_queued, 50);
+        assert_eq!(inbox.deliver_at_flush, 5);
+        assert_eq!(inbox.retain_unread, 100);
+        assert_eq!(inbox.retain_read, 10);
+        assert_eq!(inbox.sync, InboxSync::Full);
+        check_config(&cfg).unwrap();
+
+        // The defaults are the documented ones.
+        let cfg = parse("[inbox]\ndb = \"messages.db\"\n").unwrap();
+        let inbox = cfg.inbox.as_ref().unwrap();
+        assert_eq!(inbox.max_queued, 200);
+        assert_eq!(inbox.deliver_at_flush, 25);
+        assert_eq!(inbox.sync, InboxSync::Normal);
+
+        // Zero is not "unlimited" in either: one stores nothing, the
+        // other delivers nothing and never flushes what it stored.
+        for key in ["max_queued", "deliver_at_flush"] {
+            let cfg = parse(&format!("[inbox]\ndb = \"m.db\"\n{key} = 0\n")).unwrap();
+            let err = check_config(&cfg).unwrap_err();
+            assert!(err.contains(key), "{err}");
+        }
+        assert!(
+            parse("[inbox]\nmax_queued = 5\n").is_err(),
+            "db is required"
+        );
+        assert!(
+            parse("[inbox]\ndb = \"m.db\"\nmax_qeued = 5\n").is_err(),
+            "a misspelled key is a startup error, not a silent default"
+        );
+    }
+
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn a_fingerprint_is_accepted_in_the_form_an_operator_has_it() {
+        // The account file's `[identity] fingerprint` and the roster
+        // both carry the 52-character form; requiring hex meant that
+        // after `rm alice.toml` there was no way to purge her mail.
+        let raw = [0x5au8; 32];
+        let text = hl_identity::Fingerprint(raw).to_string();
+        assert_eq!(text.len(), 52);
+        assert_eq!(parse_fingerprint(&text), Ok(raw));
+        assert_eq!(parse_fingerprint(&format!("  {text}  ")), Ok(raw));
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(parse_fingerprint(&hex), Ok(raw));
+        assert!(parse_fingerprint("nonsense").is_err());
+    }
+
+    #[test]
     fn the_ng_sections_forwarded_header_is_optional_and_checked() {
         let cfg = parse("[ng]\nbind = \"127.0.0.1:5700\"\n").unwrap();
         assert_eq!(cfg.ng.as_ref().unwrap().forwarded_header, "x-forwarded-for");
@@ -734,6 +1125,149 @@ mod tests {
         assert!(ForwardedHeader::parse(&cfg.ng.unwrap().forwarded_header).is_err());
     }
 
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn purging_a_server_with_no_database_makes_none() {
+        // `open_inbox` creates the file when it is missing, which is
+        // right at startup and wrong for an operator command —
+        // `--dry-run` in particular, whose whole promise is that it
+        // changes nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("messages.db");
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = db.clone();
+        let err = inbox_purge(&cfg, "alice", None, true).unwrap_err();
+        assert!(err.contains("nothing to purge"), "{err}");
+        assert!(!db.exists(), "a dry run must not create a database");
+        let err = inbox_purge(&cfg, "alice", None, false).unwrap_err();
+        assert!(err.contains("nothing to purge"), "{err}");
+        assert!(!db.exists());
+    }
+
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn a_dry_run_against_a_real_database_leaves_the_database_alone() {
+        // The other half: an existing file was opened the startup way,
+        // which switches it to WAL and *migrates* it — so a dry run
+        // against a server one version back did the upgrade the operator
+        // was still deciding about, and one against a fresh 0-byte file
+        // wrote a whole schema.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("messages.db");
+        std::fs::write(&db, b"").unwrap();
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = db.clone();
+
+        // A file with no schema in it holds no mail, and says so
+        // without writing one.
+        let err = inbox_purge(&cfg, "alice", None, true).unwrap_err();
+        assert!(err.contains("no schema"), "{err}");
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().len(),
+            0,
+            "a dry run must not create a schema"
+        );
+        assert!(
+            !dir.path().join("messages.db-wal").exists(),
+            "nor switch the journal mode"
+        );
+
+        // A real database, as a running server leaves it.
+        inbox_purge(&cfg, "alice", None, false).unwrap();
+        let before = std::fs::read(&db).unwrap();
+        assert!(!before.is_empty());
+
+        // And a dry run over that one reads it and leaves it alone.
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 0);
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "a dry run must not migrate, vacuum or otherwise touch the file"
+        );
+        // What it does not promise is an untouched *directory*: reading a
+        // WAL database creates the `-shm` the format needs, and an empty
+        // `-wal` with it, wherever the directory allows. Asserted rather
+        // than left implied, because the sibling test below asserts the
+        // absence of both for the one case that cannot afford them, and
+        // the difference between the two is the whole contract.
+        assert!(
+            dir.path().join("messages.db-shm").exists(),
+            "the ordinary read takes the sidecar path"
+        );
+    }
+
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn a_dry_run_counts_every_row_the_real_purge_removes() {
+        use hxd_core::inbox::{Mailbox, MessageKind, MessageStore, NewMessage};
+        use std::time::SystemTime;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("messages.db");
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = db.clone();
+        let store = hxd_store_sqlite::SqliteStore::open(&db, hxd_store_sqlite::Synchronous::Normal)
+            .unwrap();
+        let alice = Mailbox::login("alice");
+        let bob = Mailbox::login("bob");
+        let carol = Mailbox::login("carol");
+        let push = |to: &Mailbox, from: &Mailbox, kind| {
+            store
+                .push(
+                    &NewMessage {
+                        recipient: to.clone(),
+                        sender: Some(from.clone()),
+                        sender_nick: from.login.clone(),
+                        body: "row".into(),
+                        sent_at: SystemTime::UNIX_EPOCH,
+                        guid: None,
+                        kind,
+                    },
+                    usize::MAX,
+                )
+                .unwrap();
+        };
+        push(&alice, &bob, MessageKind::Message);
+        push(&alice, &carol, MessageKind::Message);
+        push(&alice, &bob, MessageKind::ReadReceipt);
+        for _ in 0..3 {
+            push(&bob, &alice, MessageKind::Message);
+        }
+        store
+            .set_blocked(&alice, &bob, true, SystemTime::UNIX_EPOCH)
+            .unwrap();
+        store
+            .set_blocked(&carol, &alice, true, SystemTime::UNIX_EPOCH)
+            .unwrap();
+        drop(store);
+
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 8);
+        assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 8);
+    }
+
+    #[cfg(all(feature = "inbox", unix))]
+    #[test]
+    fn a_stopped_inbox_can_be_dry_run_from_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("messages.db");
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = db.clone();
+        drop(
+            hxd_store_sqlite::SqliteStore::open(&db, hxd_store_sqlite::Synchronous::Normal)
+                .unwrap(),
+        );
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = inbox_purge(&cfg, "alice", None, true);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.unwrap(), 0);
+        assert!(!dir.path().join("messages.db-shm").exists());
+        assert!(!dir.path().join("messages.db-wal").exists());
+    }
+
+    /// Parse a config the way [`Config::load`] would, without a file.
     fn parse(toml_text: &str) -> Result<Config, String> {
         toml::from_str(toml_text).map_err(|e| e.to_string())
     }

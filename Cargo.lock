@@ -853,6 +853,7 @@ dependencies = [
  "hxd-core",
  "hxd-ng-session",
  "hxd-session",
+ "hxd-store-sqlite",
  "hxd-voice",
  "serde",
  "serde_json",
