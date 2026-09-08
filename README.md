@@ -74,6 +74,14 @@ successors = "identity-successors" # where §3.4 successor commitments live; "" 
 trtp = true                        # serve TRTP-over-WebSocket at /trtp for tunnelled legacy clients
 trtp_login = "verify"              # verify | trust: how a tunnelled classic login meets the socket's identity
 
+[inbox]                     # absent = no inbox, and that's the default
+db = "messages.db"          # naming it is what turns the inbox on
+max_queued = 200            # messages waiting, per account; a full one refuses
+deliver_at_flush = 25       # queued messages handed over per login
+retain_unread = 2592000     # seconds; 30 days, from when it was sent
+retain_read = 604800        # seconds; 7 days, from when it was read
+sync = "normal"             # or "full": fsync every commit
+
 [voice]                          # absent = voice off, and that's the default
 # bind = "0.0.0.0:5504"          # default: the [server] bind, port + 4 (UDP)
 advertise = ["203.0.113.5:5504"] # what clients are told to send media to;
@@ -95,6 +103,35 @@ screen_max_height = 1080         # frames — a desktop is mostly still
 screen_max_fps = 15
 screen_max_bitrate = 2500000
 ```
+
+Private messages to someone who isn't there are stored and delivered when
+they arrive — across the wires, so a 1.5 client's message reaches a phone
+that was asleep, and an ng client can address an account that holds no
+session at all (`to_login`) which a period client then reads at its next
+login.
+
+An account has an inbox if it has a password or a linked identity — either
+is proof of one person, where a bare `guest` login is shared; `[extra]
+inbox` overrides it either way.
+
+**The database holds every private message on the server in the clear.**
+It is created 0600, as are its `-wal` and `-shm` companions; keep the
+directory to match.
+
+Deleting an account is still `rm accounts/alice.toml`, which leaves its
+mail behind for whoever registers that login next — so take it with the
+account:
+
+```sh
+hxd inbox purge alice                       # while accounts/alice.toml exists
+hxd inbox purge alice --fingerprint <fp>    # after it's gone: the value
+                                           # from its [identity] table
+hxd inbox purge alice --dry-run            # how much would go
+```
+
+The inbox is behind the `inbox` Cargo feature, on by default; without it
+an `[inbox]` section is a startup error rather than a promise the build
+can't keep. See [docs/private-messages.md](docs/private-messages.md).
 
 Voice needs its **UDP** port reachable — the one thing operators most often
 miss. It is behind the `voice` Cargo feature, on by default;

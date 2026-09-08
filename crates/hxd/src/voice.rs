@@ -144,6 +144,7 @@ mod tests {
             ng: None,
             voice,
             identity: None,
+            inbox: None,
         }
     }
 
