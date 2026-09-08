@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, warn};
 
-use crate::identity::{Outcome, TransportIdentity};
+use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
     event_json, parse_streams, participants_json, reply_err, reply_ok, user_json, video_err,
     video_limits_json, voice_err, ChatParams, LoginParams, MsgParams, NickParams, ReqEnvelope,
@@ -32,6 +32,13 @@ use crate::proto::{
     VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
+
+/// How often a quiet connection is pinged, and how long it may stay
+/// silent before the ping is treated as unanswered. The deadline is
+/// three periods so that one lost ping, or one tick delayed behind a
+/// slow handler, is not a disconnection.
+const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+const PONG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// The socket after the HTTP layer upgraded it.
 type Ws = WebSocketStream<TokioIo<Upgraded>>;
@@ -77,27 +84,64 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
             None => return,
         },
         _ => {
-            let _ = ws_tx
-                .send(Message::Text(reply_err(
+            let _ = send_frame(
+                &mut ws_tx,
+                Message::Text(reply_err(
                     first.id,
                     "not_logged_in",
                     "Log in or resume first.",
-                )))
-                .await;
+                )),
+            )
+            .await;
             return;
         }
     };
     info!(uid = state.uid, session = %state.session_id, "ng session attached");
 
     // --- Main loop -------------------------------------------------------
-    let mut ping = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut ping = tokio::time::interval(PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // Consume the immediate first tick.
 
+    // A ping with no deadline behind it asks a question and accepts no
+    // answer: a peer that stops reading — a NAT that dropped the
+    // mapping, a laptop in a bag — leaves the session attached until TCP
+    // gives up, which can be many minutes and on some paths never. Any
+    // inbound frame counts as an answer, pongs included (tungstenite
+    // hands them up), so a client that talks at all never sees this.
+    let mut heard = tokio::time::Instant::now();
+
     let exit = loop {
         tokio::select! {
+            // Biased, events first: a reply must never overtake an event
+            // the session was handed before the request arrived. Without
+            // it the two branches race for one sink, and a `sync` reply
+            // could go out ahead of an event whose seq that reply says
+            // the client is already past — which a client doing the
+            // natural "drop anything at or below my seq" would then
+            // discard, losing a message the store has marked delivered.
+            //
+            // A link slower than a room can keep this arm ready and delay
+            // requests (including the ping tick). Each write is bounded by
+            // the pong deadline, though, so a dead peer still ends after at
+            // most the buffered backlog plus that deadline.
+            biased;
+            ev = events.recv() => match ev {
+                Some(se) => {
+                    let kicked = matches!(se.event, hxd_core::Event::Kicked);
+                    if !send_frame(&mut ws_tx, Message::Text(event_json(&se))).await {
+                        break Exit::ConnectionLost;
+                    }
+                    if kicked {
+                        end_kicked(&ctx, &state, &mut ws_tx).await;
+                        break Exit::SessionOver;
+                    }
+                }
+                None => break Exit::Replaced,
+            },
             msg = ws_rx.next() => match msg {
                 Some(Ok(Message::Text(text))) => {
+                    heard = tokio::time::Instant::now();
                     let Ok(req) = serde_json::from_str::<ReqEnvelope>(&text) else {
                         debug!("unparseable request frame");
                         break Exit::ConnectionLost;
@@ -109,32 +153,21 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => break Exit::ConnectionLost,
-                Some(Ok(_)) => {} // ping/pong/binary — ignored
+                // A pong (or anything else) is the peer answering the
+                // keep-alive; nothing to do with it but note that it
+                // came.
+                Some(Ok(_)) => heard = tokio::time::Instant::now(),
                 Some(Err(e)) => {
                     debug!("ws error: {e}");
                     break Exit::ConnectionLost;
                 }
             },
-            ev = events.recv() => match ev {
-                Some(se) => {
-                    let kicked = matches!(se.event, hxd_core::Event::Kicked);
-                    if ws_tx.send(Message::Text(event_json(&se))).await.is_err() {
-                        break Exit::ConnectionLost;
-                    }
-                    if kicked {
-                        ctx.core.end_session(state.uid);
-                        ctx.registry.remove(&state.session_id);
-                        let _ = ws_tx.send(Message::Close(Some(CloseFrame {
-                            code: CloseCode::Normal,
-                            reason: "kicked".into(),
-                        }))).await;
-                        break Exit::SessionOver;
-                    }
-                }
-                None => break Exit::Replaced,
-            },
             _ = ping.tick() => {
-                if ws_tx.send(Message::Ping(Vec::new())).await.is_err() {
+                if heard.elapsed() >= PONG_DEADLINE {
+                    info!(uid = state.uid, "ng connection silent past the pong deadline");
+                    break Exit::ConnectionLost;
+                }
+                if !send_frame(&mut ws_tx, Message::Ping(Vec::new())).await {
                     break Exit::ConnectionLost;
                 }
             }
@@ -158,12 +191,14 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
         }
         Exit::Replaced => {
             info!(uid = state.uid, "ng connection replaced by a newer one");
-            let _ = ws_tx
-                .send(Message::Close(Some(CloseFrame {
+            let _ = send_frame(
+                &mut ws_tx,
+                Message::Close(Some(CloseFrame {
                     code: CloseCode::Policy,
                     reason: "replaced".into(),
-                })))
-                .await;
+                })),
+            )
+            .await;
         }
     }
 }
@@ -188,6 +223,16 @@ async fn next_request(ws_rx: &mut futures_util::stream::SplitStream<Ws>) -> Opti
 
 type WsTx = futures_util::stream::SplitSink<Ws, Message>;
 
+/// Why a login did not happen. The backend's own answer, or the identity
+/// policy's — which §8.1 calls `denied` and which is not a failed login:
+/// an identity socket sends no credentials, so there was nothing to get
+/// wrong.
+enum Refused {
+    Auth(AuthError),
+    Denied,
+    Backend,
+}
+
 async fn handle_login(
     ctx: &NgCtx,
     peer: SocketAddr,
@@ -203,13 +248,11 @@ async fn handle_login(
         match serde_json::from_value(req.params.clone()) {
             Ok(p) => p,
             Err(_) => {
-                let _ = ws_tx
-                    .send(Message::Text(reply_err(
-                        req.id,
-                        "bad_request",
-                        "Malformed login.",
-                    )))
-                    .await;
+                let _ = send_frame(
+                    ws_tx,
+                    Message::Text(reply_err(req.id, "bad_request", "Malformed login.")),
+                )
+                .await;
                 return None;
             }
         }
@@ -229,48 +272,83 @@ async fn handle_login(
     };
     let ident = identity.cloned();
     let verdict = tokio::task::spawn_blocking(move || {
-        if let (Some(i), Some(st)) = (ident.as_ref(), identity_state.as_ref()) {
+        let account = if let (Some(i), Some(st)) = (ident.as_ref(), identity_state.as_ref()) {
             match st.account_for(i) {
-                Ok(Some(account)) => return Ok(account),
-                Ok(None) => {}
-                Err(_) => return Err(AuthError::BadProof),
+                Ok(Some(account)) => Ok(account),
+                Ok(None) => auth
+                    .authenticate(&login, Proof::Plain(password.as_bytes()))
+                    .map_err(Refused::Auth),
+                // §8.1's own word for this outcome, rather than "login
+                // failed": nothing about a login failed — this socket
+                // sent no credentials — the server's policy refused the
+                // identity, and a client that is told the wrong one
+                // will retry with a password it does not need.
+                Err(AuthRefused::Backend) => Err(Refused::Backend),
+                Err(_) => Err(Refused::Denied),
             }
-        }
-        auth.authenticate(&login, Proof::Plain(password.as_bytes()))
+        } else {
+            auth.authenticate(&login, Proof::Plain(password.as_bytes()))
+                .map_err(Refused::Auth)
+        };
+        account
     })
     .await
     .ok()?;
 
     let account = match verdict {
         Ok(a) => a,
-        Err(e @ (AuthError::NoSuchAccount | AuthError::BadProof)) => {
-            info!(login = %p.login, "ng login refused: {e}");
-            let _ = ws_tx
-                .send(Message::Text(reply_err(
+        Err(Refused::Denied) => {
+            info!("ng login denied by policy");
+            let _ = send_frame(
+                ws_tx,
+                Message::Text(reply_err(
                     req.id,
-                    "login_failed",
-                    "Login failed.",
-                )))
-                .await;
+                    "denied",
+                    "This identity may not log in here.",
+                )),
+            )
+            .await;
             return None;
         }
-        Err(AuthError::Backend(e)) => {
+        Err(Refused::Backend) => {
+            warn!("identity account lookup failed");
+            let _ = send_frame(
+                ws_tx,
+                Message::Text(reply_err(req.id, "server_error", "Server error.")),
+            )
+            .await;
+            return None;
+        }
+        Err(Refused::Auth(e @ (AuthError::NoSuchAccount | AuthError::BadProof))) => {
+            info!(login = %p.login, "ng login refused: {e}");
+            let _ = send_frame(
+                ws_tx,
+                Message::Text(reply_err(req.id, "login_failed", "Login failed.")),
+            )
+            .await;
+            return None;
+        }
+        Err(Refused::Auth(AuthError::Backend(e))) => {
             warn!("auth backend failure: {e}");
-            let _ = ws_tx
-                .send(Message::Text(reply_err(
-                    req.id,
-                    "server_error",
-                    "Server error.",
-                )))
-                .await;
+            let _ = send_frame(
+                ws_tx,
+                Message::Text(reply_err(req.id, "server_error", "Server error.")),
+            )
+            .await;
             return None;
         }
     };
 
-    let nick = match (&p.nick, account.access.has(bit::USE_ANY_NAME)) {
+    let mut nick = match (&p.nick, account.access.has(bit::USE_ANY_NAME)) {
         (Some(n), true) if !n.is_empty() => n.clone(),
         _ => account.name.clone(),
     };
+    // The legacy wire truncates a nick to 31 Mac Roman bytes after
+    // conversion, and this one is copied into every stored message's
+    // `sender_nick` — up to `max_queued` rows per recipient — so it is
+    // bounded here rather than only where it is rendered. In characters,
+    // because that is what one Mac Roman byte is worth (§8).
+    nick.truncate_to_chars(NICK_MAX_CHARS);
     let attach = AttachInfo {
         nick,
         icon: p.icon.unwrap_or(128),
@@ -291,13 +369,11 @@ async fn handle_login(
         },
     };
     let Some((uid, events)) = ctx.core.attach(attach) else {
-        let _ = ws_tx
-            .send(Message::Text(reply_err(
-                req.id,
-                "server_full",
-                "Server full.",
-            )))
-            .await;
+        let _ = send_frame(
+            ws_tx,
+            Message::Text(reply_err(req.id, "server_full", "Server full.")),
+        )
+        .await;
         return None;
     };
     // ng has no agreement dance: announce immediately (the snapshot below
@@ -405,23 +481,23 @@ async fn handle_resume(
     ws_tx: &mut WsTx,
 ) -> Option<(SessState, UnboundedReceiver<SeqEvent>)> {
     let Ok(p) = serde_json::from_value::<ResumeParams>(req.params.clone()) else {
-        let _ = ws_tx
-            .send(Message::Text(reply_err(
-                req.id,
-                "bad_request",
-                "Malformed resume.",
-            )))
-            .await;
+        let _ = send_frame(
+            ws_tx,
+            Message::Text(reply_err(req.id, "bad_request", "Malformed resume.")),
+        )
+        .await;
         return None;
     };
     let Some(uid) = ctx.registry.validate(&ctx.core, &p.session, &p.token) else {
-        let _ = ws_tx
-            .send(Message::Text(reply_err(
+        let _ = send_frame(
+            ws_tx,
+            Message::Text(reply_err(
                 req.id,
                 "session_expired",
                 "Session expired; log in again.",
-            )))
-            .await;
+            )),
+        )
+        .await;
         return None;
     };
 
@@ -430,13 +506,15 @@ async fn handle_resume(
         Resume::ResyncRequired(rx) => (rx, None),
         Resume::Gone => {
             ctx.registry.remove(&p.session);
-            let _ = ws_tx
-                .send(Message::Text(reply_err(
+            let _ = send_frame(
+                ws_tx,
+                Message::Text(reply_err(
                     req.id,
                     "session_expired",
                     "Session expired; log in again.",
-                )))
-                .await;
+                )),
+            )
+            .await;
             return None;
         }
     };
@@ -463,16 +541,12 @@ async fn handle_resume(
                 return None;
             };
             let ok = json!({ "replay": replay.len(), "self": user_json(&me) });
-            if ws_tx
-                .send(Message::Text(reply_ok(req.id, ok)))
-                .await
-                .is_err()
-            {
+            if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
                 lost(ctx);
                 return None;
             }
             for se in &replay {
-                if ws_tx.send(Message::Text(event_json(se))).await.is_err() {
+                if !send_frame(ws_tx, Message::Text(event_json(se))).await {
                     lost(ctx);
                     return None;
                 }
@@ -487,11 +561,17 @@ async fn handle_resume(
                 "resync_required",
                 "Event gap unrecoverable; sync required.",
             );
-            if ws_tx.send(Message::Text(err)).await.is_err() {
+            if !send_frame(ws_tx, Message::Text(err)).await {
                 lost(ctx);
                 return None;
             }
             info!(uid, "ng resumed with resync required");
+            // **No flush here.** The client has been told to `sync`, and
+            // the seq that reply reports is past whatever this flush
+            // would emit — so the events would be marked delivered and
+            // then skipped, which is the one way a stored message can be
+            // lost outright. `sync` flushes, after its own reply.
+            return Some((state, events));
         }
     }
     Some((state, events))
@@ -501,6 +581,56 @@ enum Flow {
     Continue,
     LoggedOut,
     Dead,
+}
+
+/// Send one frame and continue, for the handful of places that answer
+/// before the dispatch table's single exit.
+async fn finish(ws_tx: &mut WsTx, out: String) -> Flow {
+    if !send_frame(ws_tx, Message::Text(out)).await {
+        return Flow::Dead;
+    }
+    Flow::Continue
+}
+
+/// Write one frame, giving up if the socket will not take it.
+///
+/// A send that never completes is the same peer the pong deadline is
+/// about — one that stopped reading — and without a bound on it that
+/// deadline never runs: the loop is parked inside `send`, and the arm
+/// that would notice the silence does not get a turn. In a busy room
+/// that is the ordinary shape of the failure, not an exotic one: the
+/// kernel buffer fills, the next event blocks, and the session lives
+/// until TCP gives up. Same window as a missed pong, for the same peer.
+///
+/// `false` means the connection is gone, which every caller already
+/// treats as the end of it.
+async fn send_frame(ws_tx: &mut WsTx, msg: Message) -> bool {
+    match timeout(PONG_DEADLINE, ws_tx.send(msg)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            debug!("ng send failed: {e}");
+            false
+        }
+        Err(_) => {
+            info!("ng send blocked past the pong deadline");
+            false
+        }
+    }
+}
+
+/// End a session the domain kicked: the event has already gone out, and
+/// this is the teardown that follows it.
+async fn end_kicked(ctx: &NgCtx, state: &SessState, ws_tx: &mut WsTx) {
+    ctx.core.end_session(state.uid);
+    ctx.registry.remove(&state.session_id);
+    let _ = send_frame(
+        ws_tx,
+        Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "kicked".into(),
+        })),
+    )
+    .await;
 }
 
 async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut WsTx) -> Flow {
@@ -547,7 +677,11 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 let nick = p
                     .nick
                     .filter(|_| state.access.has(bit::USE_ANY_NAME))
-                    .filter(|n| !n.is_empty());
+                    .filter(|n| !n.is_empty())
+                    .map(|mut n| {
+                        n.truncate_to_chars(NICK_MAX_CHARS);
+                        n
+                    });
                 ctx.core.update(state.uid, nick, p.icon);
                 reply_ok(req.id, json!({}))
             }
@@ -760,13 +894,23 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         "logout" => {
             ctx.core.end_session(state.uid);
             ctx.registry.remove(&state.session_id);
-            let _ = ws_tx.send(send(reply_ok(req.id, json!({})))).await;
-            let _ = ws_tx
-                .send(Message::Close(Some(CloseFrame {
+            // `LoggedOut`, not `Dead`, if the acknowledgement does not go
+            // out: the session is over either way, and `Dead` routes the
+            // exit through `connection_lost` on a uid `end_session` has
+            // just released — a call that means nothing here and, if the
+            // uid had been handed to someone else in the meantime, would
+            // mean it about them.
+            if !send_frame(ws_tx, send(reply_ok(req.id, json!({})))).await {
+                return Flow::LoggedOut;
+            }
+            let _ = send_frame(
+                ws_tx,
+                Message::Close(Some(CloseFrame {
                     code: CloseCode::Normal,
                     reason: "logout".into(),
-                })))
-                .await;
+                })),
+            )
+            .await;
             return Flow::LoggedOut;
         }
 
@@ -774,15 +918,26 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
 
         _ => reply_err(req.id, "unknown_method", "Unknown request."),
     };
-    if ws_tx.send(send(out)).await.is_err() {
-        return Flow::Dead;
-    }
-    Flow::Continue
+    finish(ws_tx, out).await
 }
 
-/// `String::truncate` panics off char boundaries; chat caps shouldn't.
+/// What a nick may weigh, in *characters*. The legacy wire's field is 31
+/// bytes of Mac Roman and every character converts to exactly one of
+/// those (or to `?`), so 31 characters is that same bound one step
+/// earlier — a truncation the ng client can see coming rather than one
+/// that happens on the way out to a 1.x client.
+///
+/// Counting UTF-8 bytes here instead cut a 28-character accented nick
+/// that a 1.x client would have carried whole, and cut it for every
+/// viewer including the ng ones.
+const NICK_MAX_CHARS: usize = 31;
+
+/// `String::truncate` panics off char boundaries; caps shouldn't.
 trait TruncateToCharBoundary {
+    /// Truncate to at most `max` *bytes*, at a character boundary.
     fn truncate_to_char_boundary(&mut self, max: usize);
+    /// Truncate to at most `max` *characters*.
+    fn truncate_to_chars(&mut self, max: usize);
 }
 
 impl TruncateToCharBoundary for String {
@@ -795,5 +950,36 @@ impl TruncateToCharBoundary for String {
             end -= 1;
         }
         self.truncate(end);
+    }
+
+    fn truncate_to_chars(&mut self, max: usize) {
+        if let Some((end, _)) = self.char_indices().nth(max) {
+            self.truncate(end);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_nick_is_bounded_in_characters_not_utf8_bytes() {
+        // 28 accented characters: 56 UTF-8 bytes, 28 Mac Roman bytes.
+        // The wire's field holds it whole, so the ng side must not cut
+        // it — which counting bytes did, for every viewer at once.
+        let mut nick = "é".repeat(28);
+        nick.truncate_to_chars(NICK_MAX_CHARS);
+        assert_eq!(nick.chars().count(), 28);
+
+        // And a nick that really is too long is cut to the bound.
+        let mut nick = "é".repeat(40);
+        nick.truncate_to_chars(NICK_MAX_CHARS);
+        assert_eq!(nick.chars().count(), NICK_MAX_CHARS);
+
+        // The byte-counting form is still what chat text uses.
+        let mut text = "é".repeat(10);
+        text.truncate_to_char_boundary(5);
+        assert_eq!(text, "éé");
     }
 }

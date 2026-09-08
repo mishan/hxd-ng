@@ -419,10 +419,14 @@ impl IdentityState {
         let now = Instant::now();
         let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         t.since_sweep += 1;
-        // The second condition used to be "the table is full", which
-        // made every request past the ceiling walk all 65 536 entries on
-        // the way to its 503. Once a second is often enough to notice
-        // the minute-long TTL expiring.
+        // Two triggers. The first is the ordinary one, every
+        // `SWEEP_EVERY` inserts — including at a full table, so the walk
+        // there is one request in 256, not every one, which is what it
+        // used to be when the second trigger read "the table is full".
+        // The second adds a sweep for a full table whose counter hasn't
+        // come round yet, at most once a second: often enough to notice
+        // the minute-long TTL expiring, and cheap enough that a caller
+        // who found the table full can retry.
         let full = t.challenges.len() >= MAX_CHALLENGES;
         if t.since_sweep >= SWEEP_EVERY
             || (full && now.duration_since(t.swept) >= Duration::from_secs(1))
@@ -459,7 +463,7 @@ impl IdentityState {
             Err(_) => return Err(AuthRefused::BadProof),
         };
         {
-            let mut t = self.tables.lock().unwrap();
+            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
             match t.challenges.remove(&hash(&challenge)) {
                 Some(issued) if issued.elapsed() < TTL => {}
                 _ => return Err(AuthRefused::UnknownChallenge),
@@ -471,6 +475,13 @@ impl IdentityState {
             now: now_unix(),
             skew: self.cfg.clock_skew,
         };
+        // The certificate's own limit, checked before anything is
+        // parsed: `TooLarge` from inside `verify_login` cannot say which
+        // object it was about, and answering `card_too_large` for a
+        // certificate sends a client to look at the wrong one.
+        if cert.len() > hl_identity::cert::MAX_BYTES {
+            return Err(AuthRefused::BadCert);
+        }
         let v = hl_identity::verify_login(card, cert, proof, ctx).map_err(|e| {
             debug!("identity auth refused: {e}");
             classify(&e, card.len())
@@ -494,6 +505,9 @@ impl IdentityState {
         device: &PublicKey,
         req: AuthRequest<'_>,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
+        if cert.len() > hl_identity::cert::MAX_BYTES {
+            return Err(AuthRefused::BadCert);
+        }
         let (c, dc) =
             hl_identity::verify_presented(card, cert, device, now_unix(), self.cfg.clock_skew)
                 .map_err(|e| classify(&e, card.len()))?;
@@ -607,18 +621,24 @@ impl IdentityState {
                 debug!(login = %a.login, "identity_login is off for the linked account");
                 return Err(AuthRefused::Denied);
             }
+            // §8.1: `deny` is decided before any of the guest fallbacks,
+            // because it has to hold on every path that admits — the
+            // unattested one, the pending-link one, and re-admission of
+            // a device already on file. A device cached while its
+            // account was linked used to be let in as a guest on every
+            // upgrade after the operator removed the link, for the life
+            // of its certificate, which left `deny` no way to lock
+            // anyone out. `classic_pending_link` was the same hole with
+            // a password on it: a `manage` device that could verify an
+            // account but not link it (no self-linking, or a
+            // password-less file) got a token, upgraded, and landed as
+            // an identity-tagged guest — which is the one thing §8.1
+            // says `deny` never gives.
+            None if self.cfg.new_accounts == NewAccounts::Deny => return Err(AuthRefused::Denied),
             // The classic credentials verified against a real account;
             // the link is the only thing that didn't happen, and the
             // operator is who resolves it (§8.2).
             None if pending => (Outcome::ClassicPendingLink, None),
-            // §8.1: `deny` is decided before any of the guest fallbacks,
-            // because it has to hold on every path that admits — the
-            // unattested one, and re-admission of a device already on
-            // file. A device cached while its account was linked used to
-            // be let in as a guest on every upgrade after the operator
-            // removed the link, for the life of its certificate, which
-            // left `deny` no way to lock anyone out.
-            None if self.cfg.new_accounts == NewAccounts::Deny => return Err(AuthRefused::Denied),
             None if !attested && self.cfg.unattested == Unattested::Guest => {
                 (Outcome::UnattestedGuest, None)
             }
@@ -736,12 +756,14 @@ impl IdentityState {
         })
     }
 
-    /// One backend call that reads, decides and writes a link.
+    /// One backend call that reads, decides and writes a link, so two
+    /// concurrent auths by one identity cannot both conclude it is free.
     fn link_exclusive(&self, login: &str, fp: &Fingerprint) -> Result<LinkOutcome, AuthRefused> {
-        self.auth.link_identity(login, &fp.0).map_err(|e| {
+        let outcome = self.auth.link_identity(login, &fp.0).map_err(|e| {
             tracing::warn!("link write failed: {e}");
             AuthRefused::Backend
-        })
+        })?;
+        Ok(outcome)
     }
 
     /// §12 `max_new_accounts_per_hour`: `new_accounts = create` writes an
@@ -749,6 +771,12 @@ impl IdentityState {
     /// any fresh key qualifies. Past the ceiling, identities are still
     /// admitted — as guests — so a flood degrades the feature rather
     /// than the server.
+    ///
+    /// Check and charge are two calls with the account write between
+    /// them, so concurrent creations can overshoot the ceiling by as
+    /// many as are in flight — bounded by the blocking pool's width, and
+    /// the alternative is holding the table lock across a file write.
+    /// The knob is a flood ceiling, not a quota.
     fn creation_allowed(&self) -> bool {
         let Some(limit) = self.cfg.max_new_accounts_per_hour else {
             return true;
@@ -828,10 +856,17 @@ impl IdentityState {
     /// The account an authenticated socket's application login lands on
     /// (§8.1), re-read from the backend so a link made between auth and
     /// upgrade is honoured. `None` = guest.
+    ///
+    /// The policy is re-read with it. A token lives 60 s and an upgrade
+    /// can come at the end of that: `identity_login` turned off, or the
+    /// link removed under `new_accounts = deny`, has to bite here too,
+    /// or a token minted while the account existed carries a guest
+    /// session past the refusal for the rest of its life.
     pub fn account_for(&self, ident: &TransportIdentity) -> Result<Option<Account>, AuthRefused> {
         match self.find_linked(&ident.fingerprint)? {
             Some(a) if a.identity.identity_login => Ok(Some(a)),
             Some(_) => Err(AuthRefused::Denied),
+            None if self.cfg.new_accounts == NewAccounts::Deny => Err(AuthRefused::Denied),
             None => Ok(None),
         }
     }
@@ -961,7 +996,15 @@ impl IdentityState {
         let Some(anchors) = self.anchors.as_ref() else {
             return;
         };
-        if ident.account.is_some() || ident.handle.is_some() {
+        // "Standing" is an account here, or an attestation this server
+        // *accepted* — which is the same `attested` the policy in
+        // `admit` uses, `min_attestation_age` included. A bare handle is
+        // not enough: on a server that trusts a registrar which
+        // registers freely, throwaway registrations would each anchor a
+        // line and fill `MAX_ANCHORS`, after which the people the
+        // commitment is for stop being anchored.
+        let attested = ident.handle.is_some() && ident.age >= self.cfg.min_attestation_age;
+        if ident.account.is_some() || attested {
             anchors.commit(&ident.fingerprint, successor);
         }
     }
@@ -1252,10 +1295,21 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 }
 
 /// Map a verification error to the spec's refusal codes.
+///
+/// `card_len` is what makes `TooLarge` answerable: the error says an
+/// object was over its limit and not which one, and the two objects a
+/// request carries have different limits and different codes. The card's
+/// own length decides, and a caller with no card in hand passes 0 — an
+/// oversized certificate alongside an oversized card used to be reported
+/// as `card_too_large` whichever of them the parser reached first.
 fn classify(e: &hl_identity::Error, card_len: usize) -> AuthRefused {
     use hl_identity::Error as E;
     match e {
         E::TooLarge if card_len > hl_identity::card::MAX_BYTES => AuthRefused::CardTooLarge,
+        // The public auth entry points pre-check certificate size so they
+        // can name it precisely. Keep this as the defensive answer for any
+        // future caller that reaches verification without that pre-check.
+        E::TooLarge => AuthRefused::BadCert,
         E::ChallengeMismatch | E::ClockSkew => AuthRefused::BadProof,
         E::Expired | E::NotYetValid | E::CapabilityMissing => AuthRefused::BadCert,
         // KeyMismatch is "these objects aren't about the same keys";
@@ -1271,7 +1325,7 @@ mod tests {
     use super::*;
     use hl_identity::{cert, Card, DeviceCert, DeviceKey, IdentityKey, LoginProof};
 
-    /// An in-memory backend: `guest` (no password) and `misha` (password
+    /// An in-memory backend: `guest` (no password) and `alice` (password
     /// `pw`), plus whatever `create_linked` adds.
     #[derive(Default)]
     struct MemAuth {
@@ -1299,7 +1353,7 @@ mod tests {
             let m = MemAuth::default();
             let mut a = m.accounts.lock().unwrap();
             a.insert("guest".into(), account("guest", false));
-            a.insert("misha".into(), account("misha", true));
+            a.insert("alice".into(), account("alice", true));
             drop(a);
             Arc::new(m)
         }
@@ -1346,7 +1400,15 @@ mod tests {
             if account.identity.fingerprint == Some(*fp) {
                 return Ok(LinkOutcome::Already(account));
             }
-            if account.identity.fingerprint.is_some() || !account.identity.allow_self_link {
+            // The file backend refuses a password-less account here, in
+            // the one place all three link paths meet (§8.2): it
+            // verifies for anybody, so self-linking one would hand it to
+            // whoever asked. Mirrored so the unit suite sees the same
+            // shape the server does.
+            if account.identity.fingerprint.is_some()
+                || !account.identity.allow_self_link
+                || !account.has_password
+            {
                 return Ok(LinkOutcome::Refused(account));
             }
             if let Some(other) = a.values().find(|x| x.identity.fingerprint == Some(*fp)) {
@@ -1417,7 +1479,7 @@ mod tests {
 
     fn objects(id: &IdentityKey, dev: &DeviceKey) -> (Vec<u8>, Vec<u8>) {
         let now = now_unix();
-        let card = Card::new(id, "Misha", now).sign(id, vec![]).unwrap();
+        let card = Card::new(id, "Alice", now).sign(id, vec![]).unwrap();
         let cert = DeviceCert::for_device(id, dev, now - 10, cert::RECOMMENDED_LIFETIME)
             .unwrap()
             .sign(id);
@@ -1451,6 +1513,20 @@ mod tests {
         );
         // And the card is cached byte-exactly.
         assert_eq!(st.card(&id.fingerprint()).unwrap().1, card);
+    }
+
+    #[test]
+    fn an_oversized_certificate_is_classified_as_a_bad_certificate() {
+        let st = state(IdentityConfig::default());
+        let id = IdentityKey::from_seed(&[11u8; 32]);
+        let dev = DeviceKey::from_seed(&[12u8; 32]);
+        let (card, mut cert) = objects(&id, &dev);
+        cert.resize(cert::MAX_BYTES + 1, 0);
+        let proof = proof_for(&st, &dev);
+        assert_eq!(
+            st.auth_with_proof(&card, &cert, &proof, AuthRequest::default()),
+            Err(AuthRefused::BadCert)
+        );
     }
 
     #[test]
@@ -1504,13 +1580,13 @@ mod tests {
             identity: id.public(),
             registrar: "hl.example".into(),
             registrar_key: reg.public(),
-            handle: "misha".into(),
+            handle: "alice".into(),
             registered: now - 1000,
             issued: now - 10,
             expires: now + 1000,
             level: None,
         };
-        let card = Card::new(&id, "Misha", now)
+        let card = Card::new(&id, "Alice", now)
             .sign(&id, vec![att.signed_value(&reg)])
             .unwrap();
         let cert = DeviceCert::for_device(&id, &dev, now - 10, 1000)
@@ -1528,7 +1604,7 @@ mod tests {
         let (_, ident) = st
             .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
             .unwrap();
-        assert_eq!(ident.handle.as_deref(), Some("misha@hl.example"));
+        assert_eq!(ident.handle.as_deref(), Some("alice@hl.example"));
         assert!(ident.age >= 1000);
         assert_eq!(ident.outcome, Outcome::Guest);
 
@@ -1548,7 +1624,7 @@ mod tests {
             .unwrap();
         // The handle is still reported — it verified — but the identity
         // counts as unattested for policy.
-        assert_eq!(ident.handle.as_deref(), Some("misha@hl.example"));
+        assert_eq!(ident.handle.as_deref(), Some("alice@hl.example"));
         assert_eq!(ident.outcome, Outcome::UnattestedGuest);
 
         // Same card, registrar not trusted: unattested.
@@ -1608,6 +1684,67 @@ mod tests {
     }
 
     #[test]
+    fn deny_outranks_a_pending_classic_link() {
+        // §8.1: `deny` is decided ahead of every fallback that admits an
+        // identity with no linked account, and `classic_pending_link` is
+        // one of those. A `manage` device that can verify an account but
+        // not link it — self-linking off here — used to get a token, and
+        // the ng `login` behind it landed as an identity-tagged guest,
+        // which is what `deny` exists to refuse.
+        let auth = MemAuth::new();
+        auth.accounts
+            .lock()
+            .unwrap()
+            .get_mut("alice")
+            .unwrap()
+            .identity
+            .allow_self_link = false;
+        let st = state_with(
+            IdentityConfig {
+                new_accounts: NewAccounts::Deny,
+                unattested: Unattested::Allow,
+                ..Default::default()
+            },
+            auth.clone(),
+        );
+        let id = IdentityKey::from_seed(&[41u8; 32]);
+        let dev = DeviceKey::from_seed(&[42u8; 32]);
+        let (card, cert) = objects(&id, &dev);
+        let classic = || AuthRequest {
+            classic: Some(ClassicLogin {
+                login: "alice",
+                password: b"pw",
+            }),
+            ..Default::default()
+        };
+        let proof = proof_for(&st, &dev);
+        assert_eq!(
+            st.auth_with_proof(&card, &cert, &proof, classic())
+                .unwrap_err(),
+            AuthRefused::Denied
+        );
+        // Nothing was linked on the way to the refusal.
+        assert!(auth
+            .find_by_fingerprint(&id.fingerprint().0)
+            .unwrap()
+            .is_none());
+
+        // Under `guest` the same auth is the pending-link outcome, so
+        // the assertion above is about `deny` and not about the arm.
+        let st = state_with(
+            IdentityConfig {
+                new_accounts: NewAccounts::Guest,
+                unattested: Unattested::Allow,
+                ..Default::default()
+            },
+            auth,
+        );
+        let proof = proof_for(&st, &dev);
+        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, classic()).unwrap();
+        assert_eq!(ident.outcome, Outcome::ClassicPendingLink);
+    }
+
+    #[test]
     fn linking_at_auth_then_linked_outcome_then_unlink() {
         let auth = MemAuth::new();
         let st = state_with(IdentityConfig::default(), auth.clone());
@@ -1618,7 +1755,7 @@ mod tests {
         // Wrong password: refused, nothing linked.
         let proof = proof_for(&st, &dev);
         let bad = ClassicLogin {
-            login: "misha",
+            login: "alice",
             password: b"nope",
         };
         assert_eq!(
@@ -1642,7 +1779,7 @@ mod tests {
         // Right password: linked in the same step.
         let proof = proof_for(&st, &dev);
         let ok = ClassicLogin {
-            login: "misha",
+            login: "alice",
             password: b"pw",
         };
         let (_, ident) = st
@@ -1657,13 +1794,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ident.outcome, Outcome::Linked);
-        assert_eq!(ident.account.as_deref(), Some("misha"));
+        assert_eq!(ident.account.as_deref(), Some("alice"));
         assert_eq!(
             auth.find_by_fingerprint(&id.fingerprint().0)
                 .unwrap()
                 .unwrap()
                 .login,
-            "misha"
+            "alice"
         );
 
         // Next auth with no credentials finds the link.
@@ -1672,7 +1809,7 @@ mod tests {
             .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
             .unwrap();
         assert_eq!(ident.outcome, Outcome::Linked);
-        assert_eq!(st.account_for(&ident).unwrap().unwrap().login, "misha");
+        assert_eq!(st.account_for(&ident).unwrap().unwrap().login, "alice");
 
         // A second identity can't take the same account.
         let id2 = IdentityKey::from_seed(&[11u8; 32]);
@@ -1686,7 +1823,7 @@ mod tests {
                 &proof,
                 AuthRequest {
                     classic: Some(ClassicLogin {
-                        login: "misha",
+                        login: "alice",
                         password: b"pw",
                     }),
                     ..Default::default()
@@ -1695,7 +1832,7 @@ mod tests {
             .unwrap();
         assert_eq!(ident2.outcome, Outcome::ClassicPendingLink);
         assert_eq!(
-            st.link(&ident2, "misha", b"pw").unwrap_err(),
+            st.link(&ident2, "alice", b"pw").unwrap_err(),
             AuthRefused::Denied
         );
 
@@ -1703,7 +1840,7 @@ mod tests {
         let mut no_manage = ident.clone();
         no_manage.device_caps = Some(caps::WEB);
         assert_eq!(st.unlink(&no_manage).unwrap_err(), AuthRefused::NoManage);
-        assert_eq!(st.unlink(&ident).unwrap().login, "misha");
+        assert_eq!(st.unlink(&ident).unwrap().login, "alice");
         assert_eq!(st.unlink(&ident).unwrap_err(), AuthRefused::NotLinked);
         assert!(auth
             .find_by_fingerprint(&id.fingerprint().0)
@@ -1711,11 +1848,11 @@ mod tests {
             .is_none());
 
         // Link after auth, then a password-less account can't be unlinked.
-        assert_eq!(st.link(&ident, "misha", b"pw").unwrap().login, "misha");
+        assert_eq!(st.link(&ident, "alice", b"pw").unwrap().login, "alice");
         auth.accounts
             .lock()
             .unwrap()
-            .get_mut("misha")
+            .get_mut("alice")
             .unwrap()
             .has_password = false;
         assert_eq!(st.unlink(&ident).unwrap_err(), AuthRefused::WouldOrphan);
@@ -1740,13 +1877,13 @@ mod tests {
             identity: id.public(),
             registrar: "hl.example".into(),
             registrar_key: reg.public(),
-            handle: "misha".into(),
+            handle: "alice".into(),
             registered: now - 1000,
             issued: now - 10,
             expires: now + 1000,
             level: None,
         };
-        let card = Card::new(&id, "Misha N", now)
+        let card = Card::new(&id, "Alice N", now)
             .sign(&id, vec![att.signed_value(&reg)])
             .unwrap();
         let cert = DeviceCert::for_device(&id, &dev, now - 10, 1000)
@@ -1757,13 +1894,13 @@ mod tests {
             .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
             .unwrap();
         assert_eq!(ident.outcome, Outcome::Created);
-        // `misha` exists already, so the handle's local part got a suffix.
-        assert_eq!(ident.account.as_deref(), Some("misha-2"));
+        // `alice` exists already, so the handle's local part got a suffix.
+        assert_eq!(ident.account.as_deref(), Some("alice-2"));
         let a = auth
             .find_by_fingerprint(&id.fingerprint().0)
             .unwrap()
             .unwrap();
-        assert_eq!(a.name, "Misha N");
+        assert_eq!(a.name, "Alice N");
         assert!(a.access.has(hxd_core::access::bit::SEND_CHAT));
 
         // Unattested identities don't get accounts; they're guests.

@@ -90,10 +90,32 @@ pub enum UnlinkOutcome {
 /// certificate's `manage` capability, carried alongside `Transport`
 /// rather than inside it — `Transport` is descriptive and roster-visible,
 /// and this authorizes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkAuthority {
     /// The device certificate grants `manage`.
     pub may_link: bool,
+    /// May an identity with no linked account be admitted at all? This
+    /// is §8.1's `new_accounts` policy, carried to a wire that cannot
+    /// consult it: `false` is `deny`, where a socket that proved an
+    /// identity and turns out to link nothing is refused rather than
+    /// falling through to a guest session. It travels with `may_link`
+    /// because both are what the *socket's* identity is allowed to
+    /// become, and both are decided by the layer that authenticated it.
+    pub unlinked_ok: bool,
+}
+
+impl Default for LinkAuthority {
+    /// What a plain TCP session gets: no identity to link, and no
+    /// identity policy to apply. `unlinked_ok` is `true` so that a wire
+    /// with no identity at all is never refused by a rule about
+    /// identities — the check it guards runs only for a socket that
+    /// proved one.
+    fn default() -> Self {
+        LinkAuthority {
+            may_link: false,
+            unlinked_ok: true,
+        }
+    }
 }
 
 /// The client's proof of identity.

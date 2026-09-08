@@ -28,6 +28,13 @@ use tokio_tungstenite::WebSocketStream;
 /// path uses, for the same reasons.
 const PING_EVERY: Duration = Duration::from_secs(30);
 
+/// How many ping periods of silence end the stream. A ping with no
+/// deadline behind it asks a question and accepts no answer: the peer
+/// that went away is exactly the case it is for, and without this the
+/// tunnel lives until TCP gives up. Three periods so one lost ping, or
+/// one tick delayed behind a busy socket, is not a disconnection.
+const SILENT_PERIODS: u32 = 3;
+
 pub struct WsByteStream<S> {
     ws: WebSocketStream<S>,
     /// Unread tail of the last binary frame.
@@ -36,6 +43,10 @@ pub struct WsByteStream<S> {
     eof: bool,
     /// Server-initiated keep-alive, driven from the read side.
     ping: Interval,
+    /// How long the peer may be silent before the keep-alive counts as
+    /// unanswered, and when it last said anything at all.
+    silence: Duration,
+    heard: Instant,
 }
 
 impl<S> WsByteStream<S> {
@@ -57,6 +68,8 @@ impl<S> WsByteStream<S> {
             pending_at: 0,
             eof: false,
             ping,
+            silence: every * SILENT_PERIODS,
+            heard: Instant::now(),
         }
     }
 }
@@ -97,6 +110,16 @@ where
             // take turns, so the writer cannot be mid-frame while this
             // runs.
             if this.ping.poll_tick(cx).is_ready() {
+                // Nothing at all since the last few pings: the peer is
+                // gone. Any frame counts as an answer — tungstenite
+                // hands pongs up, and a client that is talking is not
+                // the case this is about.
+                if this.heard.elapsed() >= this.silence {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "tunnel silent past the pong deadline",
+                    )));
+                }
                 // Not ready to send is not an error: the socket is
                 // busy, which is the thing a ping is asking about.
                 if let Poll::Ready(Ok(())) = Pin::new(&mut this.ws).poll_ready(cx) {
@@ -107,8 +130,19 @@ where
                         return Poll::Ready(Err(ws_err(e)));
                     }
                 }
+                // Register for the *next* tick before parking. A ready
+                // tick consumed the timer's wake-up, and the only other
+                // one on this task belongs to the WebSocket — so without
+                // this, a peer that says nothing never wakes this task
+                // again and the deadline above is never reached.
+                // `while`, not `if`: `MissedTickBehavior::Delay` cannot
+                // hand back two ready ticks in a row today, and this does
+                // not depend on that staying true.
+                while this.ping.poll_tick(cx).is_ready() {}
             }
-            match ready!(Pin::new(&mut this.ws).poll_next(cx)) {
+            let frame = ready!(Pin::new(&mut this.ws).poll_next(cx));
+            this.heard = Instant::now();
+            match frame {
                 Some(Ok(Message::Binary(data))) => {
                     this.pending = data;
                     this.pending_at = 0;
@@ -245,6 +279,25 @@ mod tests {
             .expect("the read completes")
             .unwrap();
         assert_eq!(n, 5);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_never_answers_ends_the_stream() {
+        // The other half of the keep-alive: without a deadline the ping
+        // asks a question and accepts no answer, and a tunnel whose peer
+        // vanished lives until TCP gives up — minutes, or on a path that
+        // silently blackholes, never.
+        let (a, b) = tokio::io::duplex(4096);
+        let server = WebSocketStream::from_raw_socket(a, Role::Server, None).await;
+        // The client is never polled, so it never pongs and never
+        // closes: a peer that stopped reading.
+        let _client = WebSocketStream::from_raw_socket(b, Role::Client, None).await;
+        let mut stream = WsByteStream::with_ping_period(server, Duration::from_millis(20));
+        let err = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0u8; 8]))
+            .await
+            .expect("the read must end on its own")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]

@@ -100,6 +100,7 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
             max_detached_per_addr: 2,
             caps: vec!["voice".to_string()],
             trusted_proxies: Default::default(),
+            forwarded_header: Default::default(),
         }),
         registry: Arc::new(Registry::new()),
         identity: None,

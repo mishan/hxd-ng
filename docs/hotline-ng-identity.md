@@ -111,7 +111,9 @@ Verifiers check over the bytes as received and reject non-deterministic
 encodings. In JSON contexts an object is carried as base64url (no padding)
 of its CBOR bytes. Every object has an integer `v`; this document defines
 `v = 1`. Unknown keys are ignored on read and covered by the signature; a
-`v` higher than the reader knows is rejected.
+`v` the reader does not know is rejected — higher because it may mean
+something this reader would get wrong, and `0` because it is not a
+version this or any document defines.
 
 Timestamps are Unix seconds, UTC. `bstr(n)` is a byte string of exactly `n`
 bytes.
@@ -124,7 +126,10 @@ full fingerprints.
 
 ### 3.3 Device certificate
 
-Domain `hl-identity/device-cert/v1`, signed by the identity key.
+Domain `hl-identity/device-cert/v1`, signed by the identity key. At most
+4 KiB encoded — a certificate is three keys, two timestamps and a short
+label, and a server caches the bytes of every one it admits (§13), so the
+limit is what bounds that cache.
 
 | Key | Type | Req | Notes |
 |---|---|---|---|
@@ -135,7 +140,7 @@ Domain `hl-identity/device-cert/v1`, signed by the identity key.
 | `issued` | uint | yes | |
 | `expires` | uint | yes | Recommended 90 days; renew at one-third remaining |
 | `caps` | uint | no | Absent = all. Bit 0 login, 1 message, 2 vouch, 3 manage |
-| `name` | tstr | no | Human label, device lists only |
+| `name` | tstr | no | Human label, device lists only. 1–64 characters, no leading or trailing space, and no control or invisible characters (§3.5) — it is rendered next to a fingerprint. Absent is fine; present and blank is not |
 | `sig` | bstr(64) | yes | |
 
 Web-client certificates should omit the vouch and manage bits.
@@ -150,7 +155,7 @@ encoded.
 | `v` | uint | yes | `1` |
 | `identity` | bstr(32) | yes | |
 | `updated` | uint | yes | Servers never replace a cached card with an older one |
-| `name` | tstr | yes | Display name, 1–32 characters. No control or invisible characters (§3.5); signers SHOULD normalise to NFC, but verifiers do not — a verifier re-serves the exact bytes it was given, so it cannot normalise them |
+| `name` | tstr | yes | Display name, 1–32 characters, at least one of them not a space, and none of them leading or trailing space — `"   "` is a blank row in a user list and `"admin "` is a spoof of `admin`. No control or invisible characters (§3.5); signers SHOULD normalise to NFC, but verifiers do not — a verifier re-serves the exact bytes it was given, so it cannot normalise them |
 | `icon` | uint | no | Legacy icon id |
 | `profile` | tstr | no | ≤ 2048 bytes |
 | `attestations` | array | no | Attestation objects, each fully signed; at most 8. The size limit alone allows dozens, and each one an unauthenticated caller embeds is a signature the server verifies |
@@ -167,12 +172,12 @@ Domain `hl-identity/attestation/v1`, signed by a registrar key.
 |---|---|---|---|
 | `v` | uint | yes | `1` |
 | `identity` | bstr(32) | yes | |
-| `registrar` | tstr | yes | Registrar host, lowercase |
+| `registrar` | tstr | yes | Registrar host, lowercase. Hostname syntax (ASCII letters, digits, `-`, `.`), 1–253 bytes — it is rendered as part of the handle, and anything else could read downstream as a different host |
 | `registrar_key` | bstr(32) | yes | Hint only; verifiers confirm against the registrar's published key |
-| `handle` | tstr | yes | Local part; full handle is `handle@registrar`. No `@`, no whitespace, and no control or invisible characters — a handle is rendered next to account logins and display names, so a zero-width space or a bidi override in one is a spoof of another |
-| `registered` | uint | yes | First registration; preserved across reissue; the value used for age |
+| `handle` | tstr | yes | Local part, 1–64 bytes; full handle is `handle@registrar`. No `@`, no whitespace, and no control or invisible characters — a handle is rendered next to account logins and display names, so a zero-width space or a bidi override in one is a spoof of another |
+| `registered` | uint | yes | First registration; preserved across reissue; the value used for age. Non-zero and no later than `issued` — a registrar writing `0` would hand its users infinite standing wherever `min_attestation_age` is set |
 | `issued` | uint | yes | |
-| `expires` | uint | yes | Recommended one year |
+| `expires` | uint | yes | Recommended one year; strictly after `issued` |
 | `level` | uint | no | Registrar-declared signup strictness, 0–3 |
 | `sig` | bstr(64) | yes | |
 
@@ -311,10 +316,10 @@ Success (200):
   "token": "…",
   "expires_in": 60,
   "fingerprint": "…",
-  "handle": "misha@hl.example",            // null if no accepted attestation
+  "handle": "alice@hl.example",            // null if no accepted attestation
   "age": 31536000,                          // seconds; 0 if unattested
   "outcome": "linked",                      // see below
-  "account": "misha"                        // the login, when one is associated
+  "account": "alice"                        // the login, when one is associated
 }
 ```
 
@@ -401,34 +406,76 @@ no client certificate. An empty value means the client offered no
 certificate, which is "none" and not "a broken one" — some proxies send
 the header unconditionally.
 
-A trusted proxy is also believed about *who* it is speaking for:
-`Forwarded: for=…` (RFC 7239) or `X-Forwarded-For`, first element, is the
-address the server keys bans and per-address session limits on. Without
-that, every client behind the proxy shares one address, so banning one of
-them bans the deployment. The same "set it, don't pass it through" rule
-applies: a proxy that forwards a client-supplied `Forwarded` lets a
-client choose whose ban it inherits.
+A trusted proxy is also believed about *who* it is speaking for. The
+address the server keys bans and per-address session limits on is the
+**rightmost element that is not itself in `trusted_proxies`**, read
+across every line of one header — `X-Forwarded-For` or RFC 7239's
+`Forwarded`, whichever `[ng] forwarded_header` says this proxy writes.
+Without any of this, every client behind the proxy shares one address, so
+banning one of them bans the deployment.
 
-nginx has no base64-DER variable. `$ssl_client_escaped_cert` is
-**URL-encoded PEM**, not base64 DER, and a server that can't decode the
-header must answer 400 rather than fall through to an unauthenticated
-request — which is what makes this worth spelling out, since the
-fall-through failure looks like "mTLS silently isn't working". The
-workable nginx form strips the PEM armour and the encoding in one map:
+The rightmost rule is not a stylistic choice. The stock directives
+*append*: nginx's `$proxy_add_x_forwarded_for` and HAProxy's `option
+forwardfor` add the peer they see to whatever the client already sent, so
+the left of the list is client-supplied and only its right end was
+written by the proxy. Reading the first element would let any client pick
+its own address — a fresh one per connection to shed a ban or a
+per-address limit, or someone else's to inherit their ban. Walking from
+the right and stopping at the first element outside `trusted_proxies` is
+correct under an appending proxy *and* under one that replaces the header
+outright; an element the server can't parse ends the walk and leaves the
+socket's peer in place.
+
+**`trusted_proxies` must list proxies and nothing else.** The walk skips
+over every element it finds in that list, so a range that also contains
+client addresses — a `10.0.0.0/8` on a network where clients live too —
+makes it skip the proxy's own element and take the client's, which is the
+bug this rule exists to prevent. List the addresses the proxy speaks
+from, not the network it sits on.
+
+`forwarded_header` names one header rather than trying both because a
+proxy passes through what it doesn't know about: nginx that sets
+`X-Forwarded-For` forwards a client-supplied `Forwarded:` line untouched,
+so a server that read both would read whichever one the *client* filled
+in. The default is `x-forwarded-for`; set `forwarded` only if the proxy
+is configured to write RFC 7239, and `none` to key everything on the
+proxy's own address. Header *lines* are concatenated in order for the
+walk, so a client-supplied line ahead of the proxy's own is to the left
+of it and never wins.
+
+**Stock nginx cannot do this.** `$ssl_client_escaped_cert` is
+URL-encoded PEM and `$ssl_client_raw_cert` is PEM with real newlines; a
+header carries neither, and nginx has no base64-DER variable and no
+string functions to make one. A server that can't decode the header
+answers 400 rather than falling through to an unauthenticated request,
+so a misconfiguration is loud — but it is still a misconfiguration, and
+the fall-through version of this failure is what "mTLS silently isn't
+working" used to mean.
+
+With njs, one function does it:
 
 ```nginx
-map $ssl_client_raw_cert $hotline_client_cert {
-    ""      "";
-    default $ssl_client_raw_cert;   # PEM; see the note below
+# hotline.js
+function client_cert_der(r) {
+    var pem = r.variables.ssl_client_raw_cert;
+    if (!pem) return "";
+    return pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
 }
-proxy_set_header X-Hotline-Client-Cert $hotline_client_cert;
+export default { client_cert_der };
 ```
 
-`$ssl_client_raw_cert` is PEM with real newlines, which a header cannot
-carry, so this needs either an nginx built with njs (a one-line
-`.replace(/\s|-----[^-]+-----/g, '')`) or Lua. Until you have one of
-those, use Caddy for the mTLS binding, or the challenge binding of §5.2,
-which needs no proxy cooperation at all. An operator who lists a proxy in `trusted_proxies` is asserting
+```nginx
+js_import hotline from hotline.js;
+js_set $hotline_client_cert hotline.client_cert_der;
+proxy_set_header X-Hotline-Client-Cert $hotline_client_cert;   # empty when absent
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;   # who it speaks for
+```
+
+The `proxy_set_header` is what drops any copy the client sent, and an
+empty value removes the header — both halves of the contract above. Lua
+works the same way. Without njs or Lua, use Caddy for the mTLS binding,
+or the challenge binding of §5.2, which needs no proxy cooperation at
+all. An operator who lists a proxy in `trusted_proxies` is asserting
 that it is configured this way; the server cannot check it. Operators who
 terminate TLS in the server itself in some future build get the same
 header semantics from the in-process listener, with the same contract
@@ -507,9 +554,9 @@ server associates an account per §8 and replies as usual, with three
 additions to the `ok` object:
 
 ```jsonc
-"self": { "uid": 3, "nick": "Misha", "icon": 128, "admin": false,
+"self": { "uid": 3, "nick": "Alice", "icon": 128, "admin": false,
           "status": "active",
-          "identity": { "fingerprint": "…", "handle": "misha@hl.example",
+          "identity": { "fingerprint": "…", "handle": "alice@hl.example",
                         "age": 31536000, "outcome": "linked" } },
 "caps": [ "identity", … ]
 ```
@@ -551,7 +598,9 @@ protocol inside has no idle traffic of its own — so the server sends a
 WebSocket ping on a quiet socket (hxd-ng: every 30 seconds), which is
 what notices a peer that has gone away and what keeps a NAT mapping
 alive. A tunnel answers with a pong, as any WebSocket library does for
-it, and needs no code for this.
+it, and needs no code for this. A socket that has sent nothing at all for
+three ping periods is dropped: a ping with no deadline behind it asks a
+question and accepts no answer.
 
 ---
 
@@ -615,9 +664,12 @@ Login (107) as guest):
   in particular.
 
 `deny` is decided on every path that admits an identity with no linked
-account — including the unattested one and the re-admission of a device
-already on file (§5.3) — so removing a link locks that device out at its
-next connection rather than at its certificate's expiry.
+account — the unattested one, the `classic_pending_link` one of §8.2, and
+the re-admission of a device already on file (§5.3) — and again when the
+application login re-reads the link (§6.2), so a token minted while the
+account was linked does not outlive it for the rest of its minute.
+Removing a link locks that device out at its next connection rather than
+at its certificate's expiry.
 
 `/identity/auth` reports which of these will happen as `outcome`.
 
@@ -639,9 +691,12 @@ password, and to have no link to a different identity:
   verifies the password as for a normal login. If the identity also
   verifies and the account is linkable, the link is made and `outcome` is
   `linked`. If not linkable, the token is still issued with `outcome`
-  `classic_pending_link`, and a subsequent ng `login` naming that account
-  logs in by identity as a guest of that account's name — the operator
-  resolves the link.
+  `classic_pending_link` and the session that redeems it is an ordinary
+  identity-tagged guest: the credentials verified, so the client is told
+  the difference between "wrong password" and "that account will not take
+  this identity", but nothing about the account is conferred and the
+  operator is who resolves the link. Under `new_accounts = deny` there is
+  no guest to fall back to, so the auth is refused outright.
 - **Inside a tunnel.** A classic Login (107) on a tunnelled socket that
   names a self-linkable account and gives its password links it, exactly
   as "at auth" does (§8.3).
@@ -705,6 +760,21 @@ reconciles the two is the `[identity] trtp_login` setting:
   does not want identity login), but a client has to know to open a plain
   socket for it.
 
+  **A password-less account with `identity_login = false` is reachable by
+  nobody**, on either wire: no password means every password login is
+  refused (the rule above), and the flag refuses the key that was the
+  other way in. §8.4's `would_orphan` stops the *server* writing that
+  state; nothing stops an operator typing it, so the file backend names
+  such accounts in a warning at startup, where an operator is looking.
+  Set a password, or allow identity login.
+
+  A password-less account that is *not* linked has a narrower version of
+  the same shape: the plain TCP port admits it (an empty password matches
+  an empty password), and a tunnelled or ng login cannot, because linking
+  is what would make the key its credential and §8.2 never self-links a
+  password-less account. Such an account stays a plain-port account until
+  an operator writes the link into its file.
+
 Either way the session is identity-aware from the server's point of view
 and indistinguishable from a native identity session in the roster.
 
@@ -744,8 +814,8 @@ the server refuses it. *(hxd-ng reads and stores `reserve_name`; the
 enforcement described in the rest of this section is not wired to the
 name-setting paths yet.)* On ng, `nick` replies `error: name_reserved`. On the
 legacy wire, where Set Client User Info (304) has no reply, the server
-substitutes a discriminated name (`misha~7f3a` for a tunnelled session
-with an identity, `misha (2)` for a plain classic one) and announces the
+substitutes a discriminated name (`alice~7f3a` for a tunnelled session
+with an identity, `alice (2)` for a plain classic one) and announces the
 correction in Notify Change User (301). Legacy behaviour for classic
 sessions is therefore "the name gets a suffix," which some servers already
 do.
@@ -912,7 +982,8 @@ is design, not configuration, and setting it is a startup error —
 | `[identity] trtp` | `true` | Serve the TRTP-over-WebSocket path |
 | `[identity] trtp_login` | `verify` | `verify` or `trust`; see §8.3 |
 | `[identity] successors` | `identity-successors` | Where §3.4 successor commitments are kept, for the identities §13 says get one. `""` keeps them in the card cache only, which a restart forgets — and so does enough traffic to evict the card. Making the caches forget is the attack the commitment exists to stop |
-| `[ng] trusted_proxies` | empty | Addresses whose `X-Hotline-Client-Cert` and `Forwarded`/`X-Forwarded-For` headers are believed (§5.3). Single addresses or CIDR blocks (`["127.0.0.1", "10.0.0.0/8"]`); IPv4-mapped peers on a `[::]` bind match their IPv4 form |
+| `[ng] trusted_proxies` | empty | Addresses whose `X-Hotline-Client-Cert` and forwarded-address headers are believed (§5.3). Single addresses or CIDR blocks (`["127.0.0.1", "10.0.0.0/8"]`); IPv4-mapped peers on a `[::]` bind match their IPv4 form. Also the set the rightmost-element walk skips over, so it must contain proxies and no clients |
+| `[ng] forwarded_header` | `"x-forwarded-for"` | Which header a trusted proxy writes the client's address into: `"x-forwarded-for"`, `"forwarded"` (RFC 7239), or `"none"` (§5.3). Only the named one is read |
 | `[server] mark_cleartext` | `false` | Whether the legacy user list marks unencrypted sessions with User Flags bit 4. Off until that bit is confirmed free against 1.8/1.9 — see §10 |
 | `[identity] bindings` | — | *(not implemented)* Both bindings of §5 are served: challenge always, mTLS whenever `[ng] trusted_proxies` is non-empty |
 | `[identity] revocation_max_age`, `revocation_stale` | — | *(not implemented)* §5.2 step 4 is stubbed; there is no registrar to fetch a list from yet |
@@ -940,8 +1011,12 @@ to run on a server that also serves the legacy port.
 - Verification (card, certificate, proof, attestation) is one function over
   decoded CBOR. Both bindings and the card endpoint call it.
 - Transport tokens, challenges and session tokens share the same storage
-  discipline as `hotline-ng.md` §9: CSPRNG, stored hashed, constant-time
-  compare, never logged.
+  discipline as `hotline-ng.md` §9: CSPRNG, stored hashed, never logged.
+  hxd-ng looks them up in a map keyed by the SHA-256 of the secret, which
+  is not a constant-time compare and does not need to be: what varies
+  with the attacker's input is the hash of their guess, and the timing of
+  a lookup on it says nothing about the secret. A store that compared
+  secrets directly would need one.
 - TRTP over WebSocket is `hxd-session` driven by an adapter that presents
   binary frames as `AsyncRead`/`AsyncWrite`, plus one extra field on the
   session (the transport identity, if any) consulted at Login (107). The
@@ -952,7 +1027,10 @@ to run on a server that also serves the legacy port.
   certificate, and hashing it to look it up buys nothing), with the
   identity public key alongside. Both tables are bounded and evicted:
   they are filled by `/identity/auth`, which any fresh key can reach when
-  `unattested = guest`.
+  `unattested = guest`. Bounding the *count* only bounds the memory if
+  the entries are bounded too — the cached bytes are a card (§3.4, 16
+  KiB) and a certificate (§3.3, 4 KiB), which is what those size limits
+  are for.
 - Re-admitting a device already on file is a *read-only* admission. It
   re-checks the signatures, honours an existing account link, and writes
   nothing — no link, no account creation. Otherwise every upgrade repeats
@@ -985,8 +1063,9 @@ to run on a server that also serves the legacy port.
   bounding storage: a card is an unauthenticated caller's bytes, and
   everything in it that costs a signature check needs a count. hxd-ng
   verifies a card's own envelope before anything it contains, caps the
-  attestations it will look at (§3.4), and checks each one's cheap fields
-  and subject before its signature.
+  attestations it will look at (§3.4), reads and checks the card's own
+  fields before entering the attestation loop at all, and checks each
+  attestation's cheap fields and subject before its signature.
 - Rate limits: `/identity/challenge` and `/identity/auth` per source address
   like login attempts. A forged card costs an attacker nothing and the
   server two signature checks. Not implemented in hxd-ng yet; the growth

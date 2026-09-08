@@ -74,6 +74,45 @@ pub struct NgConfig {
     /// believed (`docs/hotline-ng-identity.md` §5.3). Empty = the mTLS
     /// binding is off.
     pub trusted_proxies: TrustedProxies,
+    /// Which forwarded-address header a trusted proxy is configured to
+    /// write (§5.3). Only this one is read, because a header the proxy
+    /// doesn't write is one the client gets to choose.
+    pub forwarded_header: ForwardedHeader,
+}
+
+/// The header a trusted proxy uses to say who it is speaking for.
+///
+/// The distinction matters because proxies pass headers they don't know
+/// about straight through: nginx configured with
+/// `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` writes
+/// that header and forwards a client-supplied `Forwarded:` untouched, so
+/// believing both would mean believing whichever one the client filled
+/// in. The operator says which one their proxy owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForwardedHeader {
+    /// `X-Forwarded-For`, what the stock nginx and HAProxy directives
+    /// write.
+    #[default]
+    XForwardedFor,
+    /// RFC 7239 `Forwarded`.
+    Forwarded,
+    /// Neither: every client behind the proxy shares its address.
+    None,
+}
+
+impl ForwardedHeader {
+    /// Parse the `[ng] forwarded_header` value. The error names what was
+    /// wrong; it reaches the operator at startup.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "x-forwarded-for" => Ok(ForwardedHeader::XForwardedFor),
+            "forwarded" => Ok(ForwardedHeader::Forwarded),
+            "none" => Ok(ForwardedHeader::None),
+            other => Err(format!(
+                "forwarded_header: {other:?} is not one of \"x-forwarded-for\", \"forwarded\", \"none\""
+            )),
+        }
+    }
 }
 
 /// Addresses whose mTLS header is believed: single addresses or CIDR
@@ -163,6 +202,7 @@ impl Default for NgConfig {
             max_detached_per_addr: 2,
             caps: Vec::new(),
             trusted_proxies: TrustedProxies::default(),
+            forwarded_header: ForwardedHeader::default(),
         }
     }
 }
@@ -215,6 +255,33 @@ pub async fn sweeper(core: Arc<Core>, registry: Arc<Registry>, grace: Duration) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_forwarded_header_is_named_by_the_operator() {
+        assert_eq!(
+            ForwardedHeader::parse("x-forwarded-for").unwrap(),
+            ForwardedHeader::XForwardedFor
+        );
+        // The default is what the stock proxy directives write.
+        assert_eq!(ForwardedHeader::default(), ForwardedHeader::XForwardedFor);
+        // Spelling is the operator's, not ours.
+        assert_eq!(
+            ForwardedHeader::parse(" X_Forwarded_For ").unwrap(),
+            ForwardedHeader::XForwardedFor
+        );
+        assert_eq!(
+            ForwardedHeader::parse("Forwarded").unwrap(),
+            ForwardedHeader::Forwarded
+        );
+        assert_eq!(
+            ForwardedHeader::parse("none").unwrap(),
+            ForwardedHeader::None
+        );
+        // And a typo is a startup error naming the value, not a silent
+        // fallback to believing the wrong header.
+        let e = ForwardedHeader::parse("x-real-ip").unwrap_err();
+        assert!(e.contains("x-real-ip"), "{e}");
+    }
 
     #[test]
     fn trusted_proxies_match_by_prefix_and_across_ipv4_mapping() {

@@ -15,8 +15,8 @@ use hl_identity::ServerKey;
 use hxd_auth_file::FileAuth;
 use hxd_core::{Core, LinkAuthority, Transport};
 use hxd_ng_session::{
-    IdentityConfig, IdentityState, NewAccounts, NgConfig, NgCtx, Registry, TrustedProxies,
-    TunnelSink, TunnelStream, Unattested,
+    ForwardedHeader, IdentityConfig, IdentityState, NewAccounts, NgConfig, NgCtx, Registry,
+    TrustedProxies, TunnelSink, TunnelStream, Unattested,
 };
 use hxd_session::{cap, Caps, ServerConfig, ServerCtx, TrtpLogin};
 use serde::Deserialize;
@@ -311,6 +311,15 @@ pub struct NgSection {
     /// Single addresses or CIDR blocks, e.g. `["127.0.0.1", "10.0.0.0/8"]`.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Which header a trusted proxy writes the client's address into
+    /// (identity spec §5.3): `"x-forwarded-for"` (the default),
+    /// `"forwarded"`, or `"none"` to believe neither.
+    #[serde(default = "default_forwarded_header")]
+    pub forwarded_header: String,
+}
+
+fn default_forwarded_header() -> String {
+    "x-forwarded-for".into()
 }
 
 fn default_ng_bind() -> String {
@@ -593,10 +602,12 @@ fn build_identity(
 }
 
 /// Config-level checks a `Deserialize` can't make: sections whose
-/// meaning depends on another section's presence.
+/// meaning depends on another section's presence, and values whose
+/// validity depends on more than their own type.
 ///
 /// Run before anything is built, so the operator hears about it at
-/// startup rather than wondering why identity does nothing.
+/// startup rather than wondering why identity does nothing, or why
+/// messages never arrive.
 pub fn check_config(config: &Config) -> Result<(), String> {
     if config.identity.is_some() && config.ng.is_none() {
         return Err(
@@ -636,6 +647,7 @@ pub fn build_ng_ctx(
             max_detached_per_addr: ng.max_detached_per_addr,
             caps: ng_caps(config, voice),
             trusted_proxies: TrustedProxies::parse(&ng.trusted_proxies)?,
+            forwarded_header: ForwardedHeader::parse(&ng.forwarded_header)?,
         }),
         registry: Arc::new(Registry::new()),
         identity,
@@ -699,7 +711,22 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
 mod tests {
     use super::*;
 
-    /// Parse a config the way [`Config::load`] would, without a file.
+    #[test]
+    fn the_ng_sections_forwarded_header_is_optional_and_checked() {
+        let cfg = parse("[ng]\nbind = \"127.0.0.1:5700\"\n").unwrap();
+        assert_eq!(cfg.ng.as_ref().unwrap().forwarded_header, "x-forwarded-for");
+        let cfg = parse("[ng]\nforwarded_header = \"none\"\n").unwrap();
+        assert_eq!(
+            ForwardedHeader::parse(&cfg.ng.unwrap().forwarded_header).unwrap(),
+            ForwardedHeader::None
+        );
+        // A header we don't read is a startup error: an operator who
+        // names one is asserting their proxy writes it, and believing
+        // the wrong one is what §5.3 is about.
+        let cfg = parse("[ng]\nforwarded_header = \"x-real-ip\"\n").unwrap();
+        assert!(ForwardedHeader::parse(&cfg.ng.unwrap().forwarded_header).is_err());
+    }
+
     fn parse(toml_text: &str) -> Result<Config, String> {
         toml::from_str(toml_text).map_err(|e| e.to_string())
     }

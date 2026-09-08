@@ -55,6 +55,7 @@ async fn start_server(dir: &Path, supported: Caps, ng_caps: &[&str]) -> (SocketA
             max_detached_per_addr: 2,
             caps: ng_caps.iter().map(|s| s.to_string()).collect(),
             trusted_proxies: Default::default(),
+            forwarded_header: Default::default(),
         }),
         registry: Arc::new(Registry::new()),
         identity: None,

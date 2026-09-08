@@ -75,7 +75,7 @@ The spec's own account-rename rule is the symptom: a rename is a
 key and a client cannot rename a row it identifies by that key". Local
 aliases, unread state and anything else a client hangs on the row go with
 it. The same limitation means a client cannot recognise that
-`misha` on this server and `mnasledov` on another are the same person,
+`alice` on this server and `aanderson` on another are the same person,
 even when both accounts are linked to one identity.
 
 ### Change
@@ -160,7 +160,7 @@ and receipts belong to the account and follow it.
 
 ### Problem
 
-Someone who knows a person as `misha@hl.example` from another server has
+Someone who knows a person as `alice@hl.example` from another server has
 no way to find them here except by guessing the local Login. The identity
 spec makes the handle the thing you tell people; the messaging extension
 should accept it.
