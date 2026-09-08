@@ -336,6 +336,30 @@ pub struct IdentitySection {
     /// making the caches forget is the attack it exists to stop.
     #[serde(default = "default_anchors")]
     pub successors: PathBuf,
+    /// Serve the enrollment mailbox (`docs/identity-enrollment.md` §10).
+    /// Off, the routes 404 and discovery omits the endpoint, so a device
+    /// enrolls by the paste as before.
+    #[serde(default = "default_true")]
+    pub enroll: bool,
+    /// Open enrollment sessions at once, server-wide.
+    #[serde(default = "default_enroll_sessions")]
+    pub enroll_sessions: usize,
+    /// Open sessions and pending requests per source address.
+    #[serde(default = "default_enroll_per_address")]
+    pub enroll_per_address: usize,
+    /// Where a web client for this server lives, advertised in discovery
+    /// so a holder can render a QR code that opens it with the pairing
+    /// code already filled in (§5.6). Absent means the holder prints the
+    /// code alone, which is not a lesser flow, only a slower one.
+    #[serde(default)]
+    pub web: Option<String>,
+}
+
+fn default_enroll_sessions() -> usize {
+    256
+}
+fn default_enroll_per_address() -> usize {
+    4
 }
 
 fn default_identity_key() -> PathBuf {
@@ -1129,11 +1153,23 @@ pub fn build_ng_ctx(
     let tunnel: Option<Arc<dyn TunnelSink>> = identity
         .as_ref()
         .map(|_| Arc::new(LegacyTunnel(legacy.clone())) as Arc<dyn TunnelSink>);
+    // Needs `[identity]` for the same reason the other identity routes
+    // do — it is part of that surface — but nothing inside it: the
+    // mailbox reads no account and holds no key.
+    let enroll = config.identity.as_ref().filter(|s| s.enroll).map(|s| {
+        Arc::new(hxd_ng_session::enroll::Mailbox::new(
+            hxd_ng_session::enroll::MailboxConfig {
+                max_sessions: s.enroll_sessions,
+                per_address: s.enroll_per_address,
+            },
+        ))
+    });
     Ok(Some(NgCtx {
         core: legacy.core.clone(),
         auth: legacy.auth.clone(),
         cfg: Arc::new(NgConfig {
             server_name: config.server.name.clone(),
+            web_client: config.identity.as_ref().and_then(|i| i.web.clone()),
             agreement: legacy.cfg.agreement.clone(),
             login_timeout: Duration::from_secs(config.server.login_timeout),
             grace: Duration::from_secs(ng.grace),
@@ -1145,6 +1181,7 @@ pub fn build_ng_ctx(
         registry: Arc::new(Registry::new()),
         identity,
         tunnel,
+        enroll,
     }))
 }
 

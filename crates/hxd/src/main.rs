@@ -217,6 +217,7 @@ async fn main() {
                 ng_ctx.core.clone(),
                 ng_ctx.registry.clone(),
                 grace,
+                ng_ctx.enroll.clone(),
             ));
             tokio::spawn(hxd_ng_session::serve(ng_listener, ng_ctx));
         }

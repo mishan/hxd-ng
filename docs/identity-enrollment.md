@@ -1,12 +1,13 @@
 # Identity enrollment — certifying a device without the paste
 
-Status: draft, for discussion; being built codecs first. Done: the §4
-request and the §5.4 bundle in `hl-identity`, with test vectors in
-`identity-test-vectors.json`; `hlid cert --bundle`, which writes a
-bundle for the paste path; and CORS on the identity endpoints, so a
-browser elsewhere can reach a mailbox. Not done: the §5 mailbox itself,
-the `hlid enroll` and `hlid agent` commands of §7, and every part of
-hx-ng's side. Companion to
+Status: draft, being built. Done in hxd-ng: the §4 request and the §5.4
+bundle in `hl-identity`, with test vectors; `hlid cert --bundle`, which
+writes a bundle for the paste path; the §5 mailbox, served under
+`/identity/enroll` and advertised in discovery; and CORS on the identity
+endpoints, so a browser elsewhere can reach it. Not done: the `hlid
+enroll` and `hlid agent` commands of §7, so nothing yet holds an
+identity key at the other end of a session; the QR path (§5.6); and
+every part of hx-ng's side. Companion to
 `hotline-ng-identity.md` (the objects and the profile),
 `hotline-ng-auth.md` (the transport), hx-ng's `identity-keys.md` (the
 browser's side of the same problem, whose §7 describes the paste this
@@ -479,7 +480,8 @@ see), and a new one, *hostile mailbox*, which is the table above.
 |---|---|---|
 | `[identity] enroll` | `true` | Serve the mailbox. Needs `[identity]`; the routes 404 without it, and discovery omits `enroll` |
 | `[identity] enroll_sessions` | `256` | Open sessions at once, server-wide; past it, `POST sessions` answers 503 |
-| `[identity] enroll_per_address` | `4` | Open sessions and pending requests per source address |
+| `[identity] enroll_per_address` | `4` | Open sessions and pending requests per source address; past it, `429` |
+| `[identity] web` | — | Where a web client for this server lives (§3, §5.6). Absent, the holder shows the code without a QR |
 
 Session lifetime (600 s), request lifetime (300 s), long-poll deadline
 (30 s) and the code alphabet are protocol constants, not settings: an

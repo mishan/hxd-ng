@@ -60,6 +60,7 @@ async fn start_server_forwarded(dir: &Path, proxies: &[&str]) -> (SocketAddr, So
         proxies,
         false,
         hxd_ng_session::ForwardedHeader::Forwarded,
+        Some(Default::default()),
     )
     .await
 }
@@ -74,6 +75,39 @@ async fn start_server_with_inbox(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) 
         &[],
         true,
         hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+    )
+    .await
+}
+
+/// `[identity] enroll = false`: identity is on, the mailbox is not.
+async fn start_server_without_mailbox(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        None,
+    )
+    .await
+}
+
+/// A mailbox with the ceilings turned down, so the bounded-table
+/// behaviour is reachable without opening hundreds of sessions.
+async fn start_server_with_small_mailbox(
+    dir: &Path,
+    cfg: hxd_ng_session::enroll::MailboxConfig,
+) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(cfg),
     )
     .await
 }
@@ -91,6 +125,7 @@ async fn start_server_full(
         proxies,
         false,
         hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
     )
     .await
 }
@@ -103,6 +138,7 @@ async fn start_server_inner(
     proxies: &[&str],
     inbox: bool,
     forwarded_header: hxd_ng_session::ForwardedHeader,
+    enroll: Option<hxd_ng_session::enroll::MailboxConfig>,
 ) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -167,10 +203,12 @@ async fn start_server_inner(
             caps: Vec::new(),
             trusted_proxies: hxd_ng_session::TrustedProxies::parse(proxies).unwrap(),
             forwarded_header,
+            ..Default::default()
         }),
         registry: Arc::new(Registry::new()),
         identity: Some(Arc::new(identity)),
         tunnel: Some(tunnel),
+        enroll: enroll.map(|c| Arc::new(hxd_ng_session::enroll::Mailbox::new(c))),
     };
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2469,6 +2507,7 @@ async fn a_token_offered_to_a_server_without_identity_is_refused() {
         registry: Arc::new(Registry::new()),
         identity: None,
         tunnel: None,
+        enroll: None,
     };
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = l.local_addr().unwrap();
@@ -2738,4 +2777,378 @@ async fn a_client_certificate_is_not_a_credential_on_a_request_that_carries_orig
     let mut c = Ng::from_ws(ws).await;
     let ok = c.request("login", json!({ "nick": "nobody" })).await;
     assert!(ok["ok"]["self"].get("identity").is_none(), "{ok}");
+}
+
+// --- The enrollment mailbox (`docs/identity-enrollment.md` §5) ---------
+//
+// These live here rather than in a file of their own because the mailbox
+// is one of the identity endpoints, and the harness above — a real
+// server per case, `person()`, the raw `http()` client — is what they
+// need. Splitting them off would mean a second copy of all of it.
+
+/// A signed enrollment request from a device nobody has certified.
+fn enroll_request(seed: u8) -> Vec<u8> {
+    let d = hl_identity::DeviceKey::from_seed(&[seed; 32]);
+    hl_identity::EnrollRequest::new(&d, now()).sign(&d)
+}
+
+/// A renewal: the same, carrying a certificate `identity` signed.
+fn enroll_renewal(seed: u8, identity: &hl_identity::IdentityKey) -> Vec<u8> {
+    let d = hl_identity::DeviceKey::from_seed(&[seed; 32]);
+    let prev = hl_identity::DeviceCert::for_device(identity, &d, now(), 86_400)
+        .unwrap()
+        .sign(identity);
+    let mut r = hl_identity::EnrollRequest::new(&d, now());
+    r.prev = Some(prev);
+    r.sign(&d)
+}
+
+async fn open_session(ng: SocketAddr, body: Value) -> HttpReply {
+    http(
+        ng,
+        "POST",
+        "/identity/enroll/sessions",
+        &[("Content-Type", "application/json")],
+        body.to_string().as_bytes(),
+    )
+    .await
+}
+
+async fn post_request(ng: SocketAddr, body: Value) -> HttpReply {
+    http(
+        ng,
+        "POST",
+        "/identity/enroll/requests",
+        &[("Content-Type", "application/json")],
+        body.to_string().as_bytes(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_device_enrolls_through_the_mailbox_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    // The holder opens a session and shows the user a code.
+    let opened = open_session(ng, json!({})).await;
+    assert_eq!(
+        opened.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&opened.body)
+    );
+    let o = opened.json();
+    let session = o["session"].as_str().unwrap().to_owned();
+    let code = o["code"].as_str().unwrap().to_owned();
+    assert_eq!(o["expires_in"], 600);
+    // Eight characters and a display hyphen, from an alphabet with no
+    // confusable letters in it.
+    assert_eq!(code.len(), 9, "{code}");
+    assert_eq!(&code[4..5], "-", "{code}");
+    assert!(
+        !code.contains(['I', 'L', 'O', 'U']),
+        "{code} has a confusable"
+    );
+
+    // The device posts a request under that code.
+    let request = enroll_request(2);
+    let posted = post_request(ng, json!({ "code": code, "request": b64(&request) })).await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let request_secret = posted.json()["request"].as_str().unwrap().to_owned();
+
+    // The holder sees it, and gets back exactly the bytes that were
+    // posted — the mailbox does not rewrite what it carries.
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(polled.status, 200);
+    let pending = polled.json();
+    let entry = &pending["pending"][0];
+    assert_eq!(unb64(entry["request"].as_str().unwrap()), request);
+    let id = entry["id"].as_str().unwrap().to_owned();
+
+    // It approves, and the device fetches the bundle.
+    let answered = http(
+        ng,
+        "POST",
+        &format!("/identity/enroll/sessions/{session}/answers"),
+        &[("Content-Type", "application/json")],
+        json!({ "id": id, "bundle": b64(b"a bundle") })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        answered.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answered.body)
+    );
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{request_secret}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(fetched.status, 200);
+    assert_eq!(
+        unb64(fetched.json()["bundle"].as_str().unwrap()),
+        b"a bundle"
+    );
+
+    // Consumed. A second fetch cannot tell "already taken" from "never
+    // existed", which is deliberate (§5.5).
+    let again = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{request_secret}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(again.status, 410);
+}
+
+#[tokio::test]
+async fn a_denial_comes_back_as_a_403_with_a_reason_for_the_ui() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    let o = open_session(ng, json!({})).await.json();
+    let (session, code) = (
+        o["session"].as_str().unwrap().to_owned(),
+        o["code"].as_str().unwrap().to_owned(),
+    );
+    let posted = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&enroll_request(2)) }),
+    )
+    .await;
+    let secret = posted.json()["request"].as_str().unwrap().to_owned();
+
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    let id = polled.json()["pending"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    http(
+        ng,
+        "POST",
+        &format!("/identity/enroll/sessions/{session}/answers"),
+        &[("Content-Type", "application/json")],
+        json!({ "id": id, "denied": "not_mine" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{secret}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(fetched.status, 403);
+    assert_eq!(fetched.json()["denied"], "not_mine");
+}
+
+#[tokio::test]
+async fn a_wrong_code_is_a_404_that_says_nothing_useful() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    open_session(ng, json!({})).await;
+
+    let r = post_request(
+        ng,
+        json!({ "code": "AAAA-AAAA", "request": b64(&enroll_request(2)) }),
+    )
+    .await;
+    assert_eq!(r.status, 404);
+    assert_eq!(r.json()["error"], "unknown_code");
+    // The body says a code is not open. It does not say whether any
+    // session exists, how many do, or how close the guess was.
+    let text = r.json()["text"].as_str().unwrap().to_owned();
+    assert!(!text.contains("AAAA"), "{text}");
+}
+
+#[tokio::test]
+async fn a_renewal_finds_a_standing_session_with_no_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let id = hl_identity::IdentityKey::from_seed(&[1u8; 32]);
+
+    // Without a standing session for that identity there is nowhere to
+    // route it, and the browser is told so rather than left waiting.
+    let orphan = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
+    assert_eq!(orphan.status, 404);
+    assert_eq!(orphan.json()["error"], "no_holder");
+
+    // With one — `hlid agent` — the request arrives without the user
+    // typing anything.
+    let o = open_session(ng, json!({ "identity": id.fingerprint().to_string() }))
+        .await
+        .json();
+    let session = o["session"].as_str().unwrap().to_owned();
+    let posted = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(polled.json()["pending"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn only_the_session_secret_can_answer_a_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    let o = open_session(ng, json!({})).await.json();
+    let (session, code) = (
+        o["session"].as_str().unwrap().to_owned(),
+        o["code"].as_str().unwrap().to_owned(),
+    );
+    post_request(
+        ng,
+        json!({ "code": code, "request": b64(&enroll_request(2)) }),
+    )
+    .await;
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    let id = polled.json()["pending"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The code was shown on a screen and typed into another machine. The
+    // session secret never left the holder. Only one of them may sign
+    // off on a certificate (§5.4).
+    let by_code = http(
+        ng,
+        "POST",
+        &format!("/identity/enroll/sessions/{code}/answers"),
+        &[("Content-Type", "application/json")],
+        json!({ "id": id, "bundle": b64(b"x") })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(by_code.status, 404);
+}
+
+#[tokio::test]
+async fn the_mailbox_refuses_what_it_should_not_be_asked_to_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_with_small_mailbox(
+        dir.path(),
+        hxd_ng_session::enroll::MailboxConfig {
+            max_sessions: 2,
+            per_address: 2,
+        },
+    )
+    .await;
+
+    // An oversized request, refused on its size before anything parses it.
+    let o = open_session(ng, json!({})).await.json();
+    let code = o["code"].as_str().unwrap().to_owned();
+    let huge = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&vec![0u8; 8 * 1024 + 1]) }),
+    )
+    .await;
+    assert_eq!(huge.status, 400);
+    assert_eq!(huge.json()["error"], "request_too_large");
+    // And it did not spend the code, since nothing was admitted.
+    let ok = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&enroll_request(2)) }),
+    )
+    .await;
+    assert_eq!(ok.status, 201);
+
+    // Sessions are capped. Everything on this test comes from loopback,
+    // so the per-address limit is what bites.
+    let second = open_session(ng, json!({})).await;
+    assert_eq!(second.status, 200);
+    let third = open_session(ng, json!({})).await;
+    assert!(
+        third.status == 429 || third.status == 503,
+        "expected a limit, got {}",
+        third.status
+    );
+}
+
+#[tokio::test]
+async fn with_no_mailbox_the_routes_are_absent_and_discovery_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_without_mailbox(dir.path()).await;
+
+    // Discovery is how an enrollee decides whether to offer a code box
+    // at all, so the endpoint must be absent rather than present and
+    // broken (§3).
+    let disco = http(ng, "GET", "/.well-known/hotline", &[], b"")
+        .await
+        .json();
+    assert_eq!(disco["identity"]["enabled"], true);
+    assert!(
+        disco["identity"]["endpoints"]["enroll"].is_null(),
+        "{}",
+        disco["identity"]["endpoints"]
+    );
+
+    let r = open_session(ng, json!({})).await;
+    assert_eq!(r.status, 404);
+}
+
+#[tokio::test]
+async fn discovery_advertises_the_mailbox_when_it_is_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let disco = http(ng, "GET", "/.well-known/hotline", &[], b"")
+        .await
+        .json();
+    assert_eq!(
+        disco["identity"]["endpoints"]["enroll"], "/identity/enroll",
+        "{}",
+        disco["identity"]
+    );
 }

@@ -5,6 +5,7 @@
 //! share one roster and one chat.
 
 mod conn;
+pub mod enroll;
 mod http;
 pub mod identity;
 pub mod proto;
@@ -55,6 +56,10 @@ pub trait TunnelSink: Send + Sync {
 pub struct NgConfig {
     /// Advertised server name (shared with the legacy frontend's).
     pub server_name: String,
+    /// Where a web client for this server lives, advertised in discovery
+    /// (`identity-enrollment.md` §3). `None` omits the key, and a holder
+    /// with nowhere to point a QR code prints the pairing code alone.
+    pub web_client: Option<String>,
     /// Agreement text, if any — display-only in ng (no accept round-trip).
     pub agreement: Option<String>,
     /// How long a handshake (first request) may take.
@@ -196,6 +201,7 @@ impl Default for NgConfig {
     fn default() -> Self {
         NgConfig {
             server_name: "hxd-ng".into(),
+            web_client: None,
             agreement: None,
             login_timeout: Duration::from_secs(10),
             grace: Duration::from_secs(300),
@@ -219,6 +225,12 @@ pub struct NgCtx {
     pub identity: Option<Arc<IdentityState>>,
     /// Who runs TRTP tunnels. `None` means the `/trtp` path is off.
     pub tunnel: Option<Arc<dyn TunnelSink>>,
+    /// The enrollment mailbox, when `[identity] enroll` is on. `None`
+    /// means the `/identity/enroll` routes 404 and discovery omits the
+    /// endpoint. It holds no keys and reads nothing else on the server,
+    /// so it is beside `identity` rather than inside it — a registrar
+    /// would mount this and nothing more.
+    pub enroll: Option<Arc<enroll::Mailbox>>,
 }
 
 /// Accept loop: one connection task per socket. Each is HTTP until it
@@ -239,7 +251,12 @@ pub async fn serve(listener: TcpListener, ctx: NgCtx) -> std::io::Result<()> {
 
 /// The periodic maintenance the binary runs: end detached sessions whose
 /// grace lapsed, and drop registry entries whose sessions are gone.
-pub async fn sweeper(core: Arc<Core>, registry: Arc<Registry>, grace: Duration) {
+pub async fn sweeper(
+    core: Arc<Core>,
+    registry: Arc<Registry>,
+    grace: Duration,
+    enroll: Option<Arc<enroll::Mailbox>>,
+) {
     let mut tick = tokio::time::interval(Duration::from_secs(15));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -249,6 +266,15 @@ pub async fn sweeper(core: Arc<Core>, registry: Arc<Registry>, grace: Duration) 
             info!(ended, "detached sessions swept");
         }
         registry.prune(&core);
+        // Every mailbox call sweeps what it touches, so this is only for
+        // a mailbox nobody is using — where the sessions would otherwise
+        // sit until someone happened to open another.
+        if let Some(mb) = enroll.as_ref() {
+            let dropped = mb.sweep();
+            if dropped > 0 {
+                info!(dropped, "enrollment sessions expired");
+            }
+        }
     }
 }
 

@@ -13,6 +13,7 @@
 //! | `PUT  /identity/card` | §7 |
 //! | `POST /identity/link` | §8.2 |
 //! | `POST /identity/unlink` | §8.4 |
+//! | `/identity/enroll/…` | the enrollment mailbox, `identity-enrollment.md` §5 |
 //! | `GET  /ng` (and `/`) | upgrade → the JSON protocol |
 //! | `GET  /trtp` | upgrade → the TRTP tunnel |
 //!
@@ -33,6 +34,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
+use hl_identity::Fingerprint;
 use http_body_util::{BodyExt, Full, Limited};
 use hxd_core::{IdentityTag, LinkAuthority, Transport};
 use hyper::body::Incoming;
@@ -61,6 +63,12 @@ type Resp = Response<Full<Bytes>>;
 /// JSON they arrive in, and it is what stops a body being read at all
 /// before any of those limits can apply.
 const MAX_BODY: usize = 64 * 1024;
+
+/// A bundle the holder posts back (§5.4). Its members are bounded at 4
+/// and 16 KiB by the identity spec, so this is those plus the map around
+/// them — the mailbox forwards it without decoding, so this is the only
+/// thing keeping the answer proportionate to what it answers.
+const MAX_BUNDLE_BYTES: usize = 4 * 1024 + 16 * 1024 + 256;
 
 /// Serve one accepted TCP connection: HTTP/1.1 until it upgrades.
 pub(crate) async fn serve_connection(stream: TcpStream, peer: SocketAddr, ctx: NgCtx) {
@@ -131,6 +139,9 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         (&Method::POST, "/identity/link") => link(req, peer, &ctx).await,
         (&Method::POST, "/identity/unlink") => unlink(req, peer, &ctx).await,
         (&Method::PUT, "/identity/card") => put_card(req, peer, &ctx).await,
+        (_, p) if p.starts_with("/identity/enroll") => {
+            return enroll_route(req, client, &ctx).await;
+        }
         (&Method::GET, p) if p.starts_with("/identity/card/") => {
             let inm = req
                 .headers()
@@ -729,6 +740,19 @@ fn discovery(ctx: &NgCtx) -> Resp {
             if !ctx.cfg.trusted_proxies.is_empty() {
                 bindings.push("mtls");
             }
+            let mut endpoints = json!({
+                "challenge": "/identity/challenge",
+                "auth": "/identity/auth",
+                "card": "/identity/card",
+                "link": "/identity/link",
+                "unlink": "/identity/unlink",
+            });
+            // Absent means no mailbox here, and an enrollee that reads
+            // discovery therefore knows to fall back to the paste
+            // (`identity-enrollment.md` §3).
+            if ctx.enroll.is_some() {
+                endpoints["enroll"] = json!("/identity/enroll");
+            }
             json!({
                 "enabled": true,
                 "bindings": bindings,
@@ -740,13 +764,8 @@ fn discovery(ctx: &NgCtx) -> Resp {
                 "min_attestation_age": cfg.min_attestation_age,
                 "trusted_registrars": cfg.registrar_keys.keys().collect::<Vec<_>>(),
                 "association": "server",
-                "endpoints": {
-                    "challenge": "/identity/challenge",
-                    "auth": "/identity/auth",
-                    "card": "/identity/card",
-                    "link": "/identity/link",
-                    "unlink": "/identity/unlink",
-                },
+                "endpoints": endpoints,
+                "web": ctx.cfg.web_client,
             })
         }
         None => json!({ "enabled": false }),
@@ -764,6 +783,169 @@ fn discovery(ctx: &NgCtx) -> Resp {
         "registrar": Value::Null,
     });
     json_resp(StatusCode::OK, doc)
+}
+
+// --- The enrollment mailbox (`docs/identity-enrollment.md` §5) ---------
+//
+// Five routes under `/identity/enroll`. Two of them carry a secret in
+// the path and one carries a secret and a literal, so they are matched
+// by splitting the path rather than by prefix: `/sessions/<s>` and
+// `/sessions/<s>/answers` differ only in what follows the secret, and a
+// `starts_with` that got that wrong would route an answer to a poll.
+
+async fn enroll_route(req: Request<Incoming>, client: SocketAddr, ctx: &NgCtx) -> Resp {
+    let Some(mb) = ctx.enroll.as_ref() else {
+        return cors(plain(StatusCode::NOT_FOUND, "no enrollment mailbox here"));
+    };
+    let path = req.uri().path().to_owned();
+    let rest: Vec<&str> = path
+        .trim_start_matches("/identity/enroll")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let method = req.method().clone();
+    let resp = match (&method, rest.as_slice()) {
+        (&Method::POST, ["sessions"]) => enroll_open(req, client, ctx, mb).await,
+        (&Method::POST, ["requests"]) => enroll_post(req, client, ctx, mb).await,
+        (&Method::GET, ["sessions", secret]) => enroll_poll(secret, mb).await,
+        (&Method::POST, ["sessions", secret, "answers"]) => {
+            enroll_answer(req, secret, ctx, mb).await
+        }
+        (&Method::GET, ["requests", secret]) => enroll_fetch(secret, mb).await,
+        _ => plain(StatusCode::NOT_FOUND, "not found"),
+    };
+    cors(resp)
+}
+
+fn enroll_refused(e: crate::enroll::Refused) -> Resp {
+    json_resp(
+        StatusCode::from_u16(e.status()).unwrap(),
+        json!({ "error": e.code(), "text": e.text() }),
+    )
+}
+
+/// §5.1. The body is optional, and so is the `identity` in it.
+async fn enroll_open(
+    req: Request<Incoming>,
+    client: SocketAddr,
+    ctx: &NgCtx,
+    mb: &crate::enroll::Mailbox,
+) -> Resp {
+    // An empty body is legal here, unlike everywhere else on this
+    // listener, so a failed parse is "no fields" rather than an error.
+    let body = read_json(req, ctx.cfg.login_timeout).await;
+    let identity = match body.as_ref().and_then(|b| b["identity"].as_str()) {
+        Some(s) => match Fingerprint::parse(s) {
+            Some(fp) => Some(fp),
+            None => return plain(StatusCode::BAD_REQUEST, "identity: not a fingerprint"),
+        },
+        None => None,
+    };
+    match mb.open_session(client.ip(), identity) {
+        Ok(o) => json_resp(
+            StatusCode::OK,
+            json!({ "session": o.session, "code": o.code, "expires_in": o.expires_in }),
+        ),
+        Err(e) => enroll_refused(e),
+    }
+}
+
+/// §5.2. The mailbox decodes the request only far enough to enforce the
+/// size limit and, with no code, to read `prev` for routing.
+async fn enroll_post(
+    req: Request<Incoming>,
+    client: SocketAddr,
+    ctx: &NgCtx,
+    mb: &crate::enroll::Mailbox,
+) -> Resp {
+    let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
+        return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
+    };
+    let Some(request) = body["request"].as_str().and_then(unb64) else {
+        return enroll_refused(crate::enroll::Refused::BadRequest);
+    };
+    let code = body["code"].as_str();
+    match mb.post_request(client.ip(), code, &request) {
+        Ok(p) => json_resp(
+            StatusCode::CREATED,
+            json!({ "request": p.request, "expires_in": p.expires_in }),
+        ),
+        Err(e) => enroll_refused(e),
+    }
+}
+
+/// §5.3, long-polled.
+async fn enroll_poll(secret: &str, mb: &crate::enroll::Mailbox) -> Resp {
+    match mb.poll_session(secret, crate::enroll::LONG_POLL).await {
+        Ok((pending, expires_in)) => json_resp(
+            StatusCode::OK,
+            json!({
+                "pending": pending.iter().map(|p| json!({
+                    "id": p.id,
+                    "request": b64(&p.request),
+                    "received": p.received,
+                })).collect::<Vec<_>>(),
+                "expires_in": expires_in,
+            }),
+        ),
+        Err(e) => enroll_refused(e),
+    }
+}
+
+/// §5.4. Only the session secret reaches this, which is the asymmetry
+/// the whole flow rests on: the code is typed on another machine, the
+/// session secret never leaves the holder.
+async fn enroll_answer(
+    req: Request<Incoming>,
+    secret: &str,
+    ctx: &NgCtx,
+    mb: &crate::enroll::Mailbox,
+) -> Resp {
+    let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
+        return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
+    };
+    let Some(id) = body["id"].as_str() else {
+        return plain(StatusCode::BAD_REQUEST, "id is required");
+    };
+    let answered = match (body["bundle"].as_str(), body["denied"].as_str()) {
+        (Some(_), Some(_)) => {
+            return plain(
+                StatusCode::BAD_REQUEST,
+                "bundle and denied are alternatives",
+            )
+        }
+        (Some(b), None) => match unb64(b) {
+            Some(bytes) if bytes.len() <= MAX_BUNDLE_BYTES => {
+                crate::enroll::Answered::Bundle(bytes)
+            }
+            Some(_) => return plain(StatusCode::BAD_REQUEST, "bundle too large"),
+            None => return plain(StatusCode::BAD_REQUEST, "bundle: not base64url"),
+        },
+        (None, Some(r)) => {
+            // A free string for the enrollee's UI (§12), bounded because
+            // it is echoed back to somebody else.
+            crate::enroll::Answered::Denied(r.chars().take(64).collect())
+        }
+        (None, None) => return plain(StatusCode::BAD_REQUEST, "bundle or denied is required"),
+    };
+    match mb.answer(secret, id, answered) {
+        Ok(()) => json_resp(StatusCode::OK, json!({ "ok": true })),
+        Err(e) => enroll_refused(e),
+    }
+}
+
+/// §5.5, long-polled. The four answers are distinct statuses because the
+/// enrollee does something different with each.
+async fn enroll_fetch(secret: &str, mb: &crate::enroll::Mailbox) -> Resp {
+    use crate::enroll::Fetched;
+    match mb.fetch_answer(secret, crate::enroll::LONG_POLL).await {
+        Fetched::Bundle(b) => json_resp(StatusCode::OK, json!({ "bundle": b64(&b) })),
+        Fetched::Denied(r) => json_resp(StatusCode::FORBIDDEN, json!({ "denied": r })),
+        Fetched::Pending { expires_in } => {
+            json_resp(StatusCode::ACCEPTED, json!({ "expires_in": expires_in }))
+        }
+        Fetched::Gone => plain(StatusCode::GONE, "expired, or already fetched"),
+    }
 }
 
 fn challenge(ctx: &NgCtx) -> Resp {

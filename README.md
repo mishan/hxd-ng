@@ -186,6 +186,17 @@ successors = "identity-successors"  # §3.4 commitments; "" = memory only
 trtp = true                         # serve the tunnel at /trtp
 trtp_login = "verify"               # verify | trust: how a tunnelled classic
                                     # login meets the socket's identity
+enroll = true                       # serve the enrollment mailbox at
+                                    # /identity/enroll; off, a device enrolls
+                                    # by the paste as before
+enroll_sessions = 256               # open sessions at once, server-wide
+enroll_per_address = 4              # open sessions and pending requests, per
+                                    # source address
+
+# web = "https://hl.example/app/"   # where a web client for this server lives.
+                                    # Advertised in discovery so `hlid enroll`
+                                    # can show a QR code that opens it with the
+                                    # pairing code already in it
 
 # max_new_accounts_per_hour = 60    # ceiling on what new_accounts = "create" writes
 # allow_list = ["alice@hl.example", "<fingerprint>"]
