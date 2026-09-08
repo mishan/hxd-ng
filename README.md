@@ -338,6 +338,7 @@ startup error rather than a promise the build cannot keep.
 | [hotline-ng.md](docs/hotline-ng.md) | The ng protocol: framing, the login/resume/sync handshake, the request and event tables, seq accounting |
 | [hotline-ng-auth.md](docs/hotline-ng-auth.md) | Transport authentication: the principal, the challenge and mTLS bindings, transport tokens, the TRTP tunnel, cleartext marking, tunnels and relays |
 | [hotline-ng-identity.md](docs/hotline-ng-identity.md) | Portable identity: the signed objects, the identity profile at authentication, cards, account association |
+| [identity-enrollment.md](docs/identity-enrollment.md) | Certifying a device through a mailbox and a pairing code instead of a paste; renewal; what the mailbox is trusted with |
 | [identity-threat-model.md](docs/identity-threat-model.md) | What identity defends against, and what it deliberately does not |
 | [identity-test-vectors.json](docs/identity-test-vectors.json) | Signed objects and reject cases — the contract a second implementation is checked against |
 | [private-messages.md](docs/private-messages.md) | The offline inbox: the mailbox rule, the store contract, delivery, blocking, retention |

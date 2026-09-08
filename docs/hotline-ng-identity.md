@@ -781,7 +781,11 @@ to run on a server that also serves the legacy port.
 - **Device renewal without the identity key.** A phone holding only a device
   key can't mint its own renewal. The registrar spec needs a renew-device
   flow that doesn't unwrap the identity key on the device; its shape decides
-  whether 90-day certificates are practical.
+  whether 90-day certificates are practical. `identity-enrollment.md` makes
+  renewal a one-key prompt at whichever machine holds the identity key,
+  which is most of the practicality; what it does not do is the case
+  where no such machine exists, which its §12 leaves to the registrar
+  spec.
 - **Web device lifetimes.** §3.3 recommends 90 days for every device.
   A browser's device key is a non-extractable `CryptoKey` in IndexedDB,
   which page code cannot read but a copied profile directory can, so
