@@ -69,9 +69,26 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!(
-        "usage:\n  hlid keygen identity|device|server PATH\n  hlid cert --identity K (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] -o FILE\n  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n       [--successor HEX | --successor-key FILE] -o FILE\n  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n  hlid inspect FILE\n  hlid auth --server URL --device K --card FILE --cert FILE [--login L] [--password P | --password-file F | --password-stdin] [--no-create]\n  hlid link --server URL --device K --card FILE --cert FILE --login L [--password P | --password-file F | --password-stdin]\n  hlid unlink --server URL --device K --card FILE --cert FILE\n  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500] [--allow-remote-listen] [--create]\n\n--device-pub/--device-enc-pub certify a device this tool never held the\nprivate key for — a browser's non-extractable WebCrypto key, in\nparticular.\n\nPassword options: --password puts the secret in `ps` output; prefer\n--password-file or --password-stdin."
-    );
+    eprintln!(concat!(
+        "usage:\n",
+        "  hlid keygen identity|device|server PATH\n",
+        "  hlid cert --identity K (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] -o FILE\n",
+        "  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n",
+        "       [--successor HEX | --successor-key FILE] -o FILE\n",
+        "  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n",
+        "  hlid inspect FILE\n",
+        "  hlid auth --server URL --device K --card FILE --cert FILE [--login L] [--password P | --password-file F | --password-stdin] [--no-create]\n",
+        "  hlid link --server URL --device K --card FILE --cert FILE --login L [--password P | --password-file F | --password-stdin]\n",
+        "  hlid unlink --server URL --device K --card FILE --cert FILE\n",
+        "  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500] [--allow-remote-listen] [--create]\n",
+        "\n",
+        "--device-pub/--device-enc-pub certify a device this tool never held the\n",
+        "private key for — a browser's non-extractable WebCrypto key, in\n",
+        "particular.\n",
+        "\n",
+        "Password options: --password puts the secret in `ps` output; prefer\n",
+        "--password-file or --password-stdin.",
+    ));
     exit(2)
 }
 
