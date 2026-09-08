@@ -21,6 +21,15 @@ on:
     branches: [main]
   pull_request:
 
+# One run per ref at a time. Re-pushing a branch — which a stacked series
+# does to every branch above the one that changed — leaves the earlier
+# run building a commit nobody is waiting on any more. main is exempt:
+# its build is the record that a merge landed green, so it finishes even
+# when the next merge is already going.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
 
