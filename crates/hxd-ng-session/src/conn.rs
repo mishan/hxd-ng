@@ -29,11 +29,11 @@ use tracing::{debug, info, warn};
 
 use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
-    blocked_json, event_json, parse_streams, participants_json, reply_err, reply_ok,
-    stored_msg_json, user_json, video_err, video_limits_json, voice_err, BlockParams, ChatParams,
-    InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams, ReqEnvelope, ResumeParams,
-    VideoStartParams, VideoStateParams, VideoStopParams, VideoSubscribeParams, VoiceAnswerParams,
-    VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
+    blocked_json, event_json, history_line_json, parse_streams, participants_json, reply_err,
+    reply_ok, stored_msg_json, user_json, video_err, video_limits_json, voice_err, BlockParams,
+    ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams,
+    ReqEnvelope, ResumeParams, VideoStartParams, VideoStateParams, VideoStopParams,
+    VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -524,6 +524,12 @@ async fn handle_login(
             });
         ok["inbox"] = json!({ "unread": counts.unread, "total": counts.total });
     }
+    if let Some(history) = ctx.core.history_policy() {
+        ok["history"] = json!({
+            "max_lines": history.max_lines,
+            "max_days": history.max_days,
+        });
+    }
     if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
         // The client never learned it was logged in; a ghost session with
         // no transport (and a leaked token) must not linger.
@@ -808,11 +814,64 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 };
                 let mut text = p.text;
                 text.truncate_to_char_boundary(4096);
-                ctx.core.chat_public(state.uid, text, style);
-                reply_ok(req.id, json!({}))
+                let uid = state.uid;
+                match off_reactor(&ctx.core, move |c| c.chat_public(uid, text, style)).await {
+                    Some(Ok(_)) => reply_ok(req.id, json!({})),
+                    _ => reply_err(req.id, "server_error", "Server error."),
+                }
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed chat."),
         },
+
+        "history" => {
+            let Some(policy) = ctx.core.history_policy() else {
+                return finish(
+                    ws_tx,
+                    reply_err(req.id, "not_available", "Chat history is not available."),
+                )
+                .await;
+            };
+            if !state.access.has(bit::CHAT_HISTORY) {
+                reply_err(
+                    req.id,
+                    "access_denied",
+                    "You are not allowed to read chat history.",
+                )
+            } else if !ctx.core.allow_history_request(state.uid).unwrap_or(false) {
+                reply_err(req.id, "rate_limited", "Slow down.")
+            } else {
+                let parsed = if req.params.is_null() {
+                    Ok(HistoryParams::default())
+                } else {
+                    serde_json::from_value::<HistoryParams>(req.params.clone())
+                };
+                match parsed {
+                    Ok(p)
+                        if !(p.before.is_some() && p.after.is_some())
+                            && p.limit.is_none_or(|n| n != 0) =>
+                    {
+                        let query = hxd_core::HistoryQuery {
+                            channel: 0,
+                            before: p.before.filter(|id| *id != 0),
+                            after: p.after.filter(|id| *id != 0),
+                            limit: p.limit.unwrap_or(50).min(policy.max_page),
+                        };
+                        let uid = state.uid;
+                        match off_reactor(&ctx.core, move |c| c.history(uid, query)).await {
+                            Some(Ok(page)) => reply_ok(
+                                req.id,
+                                json!({
+                                    "lines": page.lines.iter().map(history_line_json).collect::<Vec<_>>(),
+                                    "has_more": page.has_more,
+                                }),
+                            ),
+                            _ => reply_err(req.id, "server_error", "Server error."),
+                        }
+                    }
+                    _ => reply_err(req.id, "bad_request", "Malformed history request."),
+                }
+            }
+        }
 
         "nick" => match serde_json::from_value::<NickParams>(req.params.clone()) {
             Ok(p) => {

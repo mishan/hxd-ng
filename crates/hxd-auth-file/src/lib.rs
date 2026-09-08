@@ -84,7 +84,7 @@ const NAMED_BITS: &[(&str, u8)] = &[
     ("download_folders", bit::DOWNLOAD_FOLDERS),
     ("send_msgs", bit::SEND_MSGS),
     ("voice_chat", bit::VOICE_CHAT),
-    ("chat_history", bit::CHAT_HISTORY),
+    ("read_chat_history", bit::CHAT_HISTORY),
     ("video_chat", bit::VIDEO_CHAT),
     // Off for guests by default, per the video spec: a screen share can
     // leak documents, credentials and other people's messages in a way a
@@ -96,6 +96,11 @@ const NAMED_BITS: &[(&str, u8)] = &[
 /// binary can validate `[identity.default_access]` against the same
 /// table an account file is read with, rather than a second copy of it.
 pub fn named_bit(key: &str) -> Option<u8> {
+    // Accepted for account files written while the capability bit existed
+    // but the server side did not. New files use the spec's access name.
+    if key == "chat_history" {
+        return Some(bit::CHAT_HISTORY);
+    }
     NAMED_BITS.iter().find(|(n, _)| *n == key).map(|(_, b)| *b)
 }
 
@@ -232,14 +237,23 @@ impl AccountFile {
     fn access_bits(&self) -> AccessBits {
         let mut acc = AccessBits::empty();
         for (key, on) in &self.access.named {
-            match NAMED_BITS.iter().find(|(n, _)| n == key) {
-                Some((_, b)) if *on => acc = acc.with(*b),
+            match named_bit(key) {
+                Some(b) if *on => acc = acc.with(b),
                 Some(_) => {}
                 None => {}
             }
         }
         for b in &self.access.raw_bits {
             acc = acc.with(*b);
+        }
+        // fogWraith's fallback: on an access system where bit 56 has not
+        // been assigned explicitly, history follows ordinary read-chat.
+        // Resolve it here so SELFINFO and request policy report one truth.
+        if !self.access.named.contains_key("read_chat_history")
+            && !self.access.named.contains_key("chat_history")
+            && acc.has(bit::READ_CHAT)
+        {
+            acc = acc.with(bit::CHAT_HISTORY);
         }
         acc
     }
@@ -363,6 +377,7 @@ impl FileAuth {
              name = \"guest\"\n\n\
              [access]\n\
              read_chat = true\n\
+             read_chat_history = true\n\
              send_chat = true\n\
              create_pchats = true\n\
              send_msgs = true\n\
@@ -974,10 +989,40 @@ mod tests {
         let auth2 = FileAuth::new(&sub);
         let guest = auth2.authenticate("", Proof::Plain(b"")).unwrap();
         assert!(guest.access.has(bit::READ_CHAT));
+        assert!(guest.access.has(bit::CHAT_HISTORY));
         // Never overwrites an existing dir.
         std::fs::remove_file(sub.join("guest.toml")).unwrap();
         FileAuth::bootstrap(&sub).unwrap();
         assert!(!sub.join("guest.toml").exists());
+    }
+
+    #[test]
+    fn chat_history_defaults_to_read_chat_but_an_explicit_key_wins() {
+        let (td, auth) = backend();
+        write(td.path(), "reader.toml", "[access]\nread_chat = true\n");
+        assert!(auth.lookup("reader").unwrap().access.has(bit::CHAT_HISTORY));
+
+        write(
+            td.path(),
+            "private.toml",
+            "[access]\nread_chat = true\nread_chat_history = false\n",
+        );
+        assert!(!auth
+            .lookup("private")
+            .unwrap()
+            .access
+            .has(bit::CHAT_HISTORY));
+
+        write(
+            td.path(),
+            "old-name.toml",
+            "[access]\nread_chat = true\nchat_history = false\n",
+        );
+        assert!(!auth
+            .lookup("old-name")
+            .unwrap()
+            .access
+            .has(bit::CHAT_HISTORY));
     }
 
     #[test]

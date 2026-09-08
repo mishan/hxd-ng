@@ -563,6 +563,7 @@ struct Session {
     /// gated on these: a client that didn't negotiate a capability must
     /// never be sent its transactions.
     caps: Caps,
+    history_replayed: bool,
 }
 
 impl Session {
@@ -921,6 +922,22 @@ async fn login_phase(
     if caps.has(cap::VIDEO) {
         login_reply.extend(video::limits_chunks(&ctx.core.video_config()));
     }
+    if caps.has(cap::CHAT_HISTORY) {
+        if let Some(history) = ctx.core.history_policy() {
+            if history.max_lines != 0 {
+                login_reply.push((
+                    tag::HISTORY_MAX_MSGS,
+                    history.max_lines.to_be_bytes().to_vec(),
+                ));
+            }
+            if history.max_days != 0 {
+                login_reply.push((
+                    tag::HISTORY_MAX_DAYS,
+                    history.max_days.to_be_bytes().to_vec(),
+                ));
+            }
+        }
+    }
     reply(tx, f.trans, login_reply);
 
     // Agreement dance (1.5 flow).
@@ -944,6 +961,7 @@ async fn login_phase(
         account,
         announced: false,
         caps,
+        history_replayed: false,
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -1029,6 +1047,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
             from,
             text,
             style,
+            ..
         } => {
             // Format at the edge, in Mac Roman, so the 13-column name
             // alignment stays byte-correct for legacy renderers.
@@ -1288,6 +1307,52 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 text::from_utf8(&ctx.core.public_subject()),
             ));
             reply(tx, f.trans, chunks);
+            // Optional compatibility replay, only for clients that did
+            // not negotiate history and only after their first user list.
+            if !sess.history_replayed
+                && !sess.has_cap(cap::CHAT_HISTORY)
+                && sess.can(bit::CHAT_HISTORY)
+            {
+                sess.history_replayed = true;
+                if let Some(policy) = ctx.core.history_policy() {
+                    if policy.replay > 0 {
+                        let uid = sess.uid;
+                        let query = hxd_core::HistoryQuery {
+                            channel: 0,
+                            before: None,
+                            after: None,
+                            limit: policy.replay.min(policy.max_page),
+                        };
+                        if let Some(Ok(page)) =
+                            off_reactor(&ctx.core, move |c| c.history(uid, query)).await
+                        {
+                            for line in page.lines {
+                                let seconds = line
+                                    .at
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_secs());
+                                let day = seconds % 86_400;
+                                let prefix = format!(
+                                    "\r[{hour:02}:{minute:02}] ",
+                                    hour = day / 3600,
+                                    minute = day / 60 % 60
+                                );
+                                let mut rendered = text::from_utf8(&prefix);
+                                if line.flags.contains(hxd_core::LineFlags::ACTION) {
+                                    rendered.extend_from_slice(b"*** ");
+                                    rendered.extend(mac_nick(&line.from_nick));
+                                    rendered.push(b' ');
+                                } else {
+                                    rendered.extend(mac_nick(&line.from_nick));
+                                    rendered.extend_from_slice(b":  ");
+                                }
+                                rendered.extend(text::from_utf8(&line.text));
+                                push(tx, hdr::CHAT, vec![(tag::BODY, rendered)]);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         t if t == ClientHdr::UserChange.as_u32() => {
@@ -1350,9 +1415,119 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 return;
             }
             if cid == 0 {
-                ctx.core.chat_public(sess.uid, body, style);
+                let from = sess.uid;
+                if let Some(Err(e)) =
+                    off_reactor(&ctx.core, move |c| c.chat_public(from, body, style)).await
+                {
+                    warn!(uid = sess.uid, "public chat store failed: {e:?}");
+                }
             } else if let Err(e) = ctx.core.chat_private(cid, sess.uid, body, style) {
                 debug!(uid = sess.uid, cid, "private chat dropped: {e:?}");
+            }
+        }
+
+        t if t == ClientHdr::GetChatHistory.as_u32() => {
+            if !sess.has_cap(cap::CHAT_HISTORY) {
+                reply_error(tx, f.trans, "Chat history was not negotiated.");
+                return;
+            }
+            if !sess.can(bit::CHAT_HISTORY) {
+                reply_error(tx, f.trans, "You are not allowed to read chat history.");
+                return;
+            }
+            if !ctx.core.allow_history_request(sess.uid).unwrap_or(false) {
+                reply_error(tx, f.trans, "Slow down.");
+                return;
+            }
+
+            let (mut channel, mut before, mut after, mut limit) = (None, None, None, None);
+            let mut malformed = false;
+            for chunk in f.chunks() {
+                match chunk.tag {
+                    tag::CHANNEL_ID if chunk.data.len() == 4 => {
+                        channel = Some(u32::from_be_bytes(chunk.data.try_into().unwrap()))
+                    }
+                    tag::HISTORY_BEFORE if chunk.data.len() == 8 => {
+                        let id = u64::from_be_bytes(chunk.data.try_into().unwrap());
+                        before = (id != 0).then_some(id);
+                    }
+                    tag::HISTORY_AFTER if chunk.data.len() == 8 => {
+                        let id = u64::from_be_bytes(chunk.data.try_into().unwrap());
+                        after = (id != 0).then_some(id);
+                    }
+                    tag::HISTORY_LIMIT if chunk.data.len() == 2 => {
+                        limit = Some(u16::from_be_bytes(chunk.data.try_into().unwrap()))
+                    }
+                    tag::CHANNEL_ID
+                    | tag::HISTORY_BEFORE
+                    | tag::HISTORY_AFTER
+                    | tag::HISTORY_LIMIT => malformed = true,
+                    _ => {}
+                }
+            }
+            if malformed || channel.is_none() || (before.is_some() && after.is_some()) {
+                reply_error(tx, f.trans, "Malformed chat history request.");
+                return;
+            }
+            if channel != Some(0) {
+                reply_error(tx, f.trans, "No such channel.");
+                return;
+            }
+            let policy = ctx
+                .core
+                .history_policy()
+                .expect("negotiated history implies a configured log");
+            let requested = limit.filter(|n| *n != 0).map_or(50, usize::from);
+            let query = hxd_core::HistoryQuery {
+                channel: 0,
+                before,
+                after,
+                limit: requested.min(policy.max_page),
+            };
+            let uid = sess.uid;
+            match off_reactor(&ctx.core, move |c| c.history(uid, query)).await {
+                Some(Ok(page)) => {
+                    let mut chunks = Vec::with_capacity(page.lines.len() + 2);
+                    chunks.push((tag::CHANNEL_ID, 0u32.to_be_bytes().to_vec()));
+                    for line in page.lines {
+                        let deleted = line.flags.contains(hxd_core::LineFlags::DELETED);
+                        let nick = if deleted {
+                            Vec::new()
+                        } else {
+                            text::from_utf8(&line.from_nick)
+                        };
+                        let body = if deleted {
+                            Vec::new()
+                        } else {
+                            text::from_utf8(&line.text)
+                        };
+                        let timestamp = line
+                            .at
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs().min(i64::MAX as u64) as i64);
+                        let Some(entry) = hotline_proto::build::build_history_entry(
+                            line.id,
+                            timestamp,
+                            line.flags.bits(),
+                            line.icon,
+                            &nick,
+                            &body,
+                            &[],
+                        ) else {
+                            warn!(id = line.id, "chat history entry exceeds the wire chunk");
+                            reply_error(tx, f.trans, "Server error.");
+                            return;
+                        };
+                        chunks.push((tag::HISTORY_ENTRY, entry));
+                    }
+                    chunks.push((tag::HISTORY_HAS_MORE, vec![u8::from(page.has_more)]));
+                    reply(tx, f.trans, chunks);
+                }
+                Some(Err(e)) => {
+                    warn!(uid = sess.uid, "chat history query failed: {e:?}");
+                    reply_error(tx, f.trans, "Server error.");
+                }
+                None => reply_error(tx, f.trans, "Server error."),
             }
         }
 

@@ -1103,7 +1103,9 @@ async fn mail_that_arrives_during_an_unreplayable_gap_survives_the_resync() {
     // `resync_required`. Without this the test resumed cleanly and never
     // touched the path it exists for.
     for i in 0..(hxd_core::roster::OUTBOX_BUFFER_CAP + 10) {
-        srv.core.chat_public(alice_uid, format!("line {i}"), 0);
+        srv.core
+            .chat_public(alice_uid, format!("line {i}"), 0)
+            .unwrap();
     }
 
     let mut back = Ng::connect(srv.ng).await;

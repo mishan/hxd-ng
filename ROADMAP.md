@@ -305,10 +305,17 @@ compat reference for an importer, not the native format.
 
 In rough order of value-for-effort:
 
-1. **Chat history** — server-held scrollback replay. As of mid-2026 no public
+1. **Chat history — implemented 2026-09.** Server-held scrollback replay. As of mid-2026 no public
    server implements the spec (GtkHx tests against a mock); hxd-ng becoming
    the **first real implementation — and thus the reference** — is a strong
-   motivator and instantly useful to GtkHx's own test matrix.
+   motivator and instantly useful to GtkHx's own test matrix. **Designed
+   2026-09 in [docs/chat-history.md](docs/chat-history.md)**: public chat
+   becomes a log behind a `ChatLog` trait, stored as a second table in
+   the inbox's SQLite file, with a line's id assigned before fan-out so
+   the live event and the history entry are one fact on both wires; the
+   ng wire gets a `history` request and ids on `chat` events. The first three
+   stages are implemented and cross-wire tested; pointing GtkHx's history
+   suite at the real server remains the client-side follow-up.
 2. **Text-Encoding** (fogWraith `Capabilities-Text-Encoding.md`) — a
    legacy-wire client advertising bit 1 of `DATA_CAPABILITIES` speaks UTF-8
    in every text field; Mac Roman becomes the non-negotiating fallback.
@@ -320,6 +327,17 @@ In rough order of value-for-effort:
    / Latin-1 legacy communities) and HOPE `app_id` sniffing can follow.
 3. **GIF icons, inline media, colored nicknames, emoji shortcodes** — mostly
    relay + capability bits, cheap once the capability negotiation exists.
+   Inline media is the exception: the relay is cheap, the server-side
+   decode-and-re-encode pipeline the spec mandates is not. **Designed
+   2026-09 in [docs/inline-media.md](docs/inline-media.md)**: an
+   `hxd-media` crate behind a `MediaCodec` trait and a Cargo feature, an
+   in-memory handle store with relay-time authorisation sets, 750/751 on
+   the legacy wire and `POST`/`GET /media` over HTTP on the ng port.
+   Both bring the first durable *content*, so
+   [docs/moderation.md](docs/moderation.md) (same date) adds redaction,
+   revocation, purges and reports with an audit trail; the legacy wire
+   receives reports as server messages and is moderated from ng or the
+   CLI until fogWraith allocates the transactions.
 4. **Voice** — an SFU, a genuinely large subsystem (this is where Janus has
    two known server-side bugs, both written up in the "Open" section of
    gtkhx's `docs/voice.md` — read them as a spec of what not to do).

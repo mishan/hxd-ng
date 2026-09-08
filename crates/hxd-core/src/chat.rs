@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tracing::warn;
 
+use crate::history::{HistoryPage, HistoryQuery, LineFlags, NewLine};
 use crate::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
     StoreError, StoredMessage,
@@ -204,18 +205,56 @@ impl Core {
 
     /// A public chat line. Delivered (sender included) to every visible
     /// session allowed to read chat.
-    pub fn chat_public(&self, from: Uid, text: String, style: u16) {
-        let mut r = self.roster.lock().unwrap();
-        let Some(info) = r.users.get(&from).map(|s| s.info.clone()) else {
-            return;
+    pub fn chat_public(
+        &self,
+        from: Uid,
+        text: String,
+        style: u16,
+    ) -> Result<Option<crate::history::LineId>, ChatError> {
+        let _serial = self.log_serial.lock().unwrap();
+        let (info, login, fingerprint) = {
+            let r = self.roster.lock().unwrap();
+            let Some(sess) = r.users.get(&from) else {
+                return Err(ChatError::NoSuchUser);
+            };
+            (
+                sess.info.clone(),
+                (sess.login != "guest").then(|| sess.login.clone()),
+                sess.identity,
+            )
+        };
+        let at = SystemTime::now();
+        let id = match self.history.as_ref() {
+            Some(log) => Some(
+                log.append(&NewLine {
+                    channel: 0,
+                    from_nick: info.nick.clone(),
+                    from_login: login,
+                    from_fingerprint: fingerprint,
+                    icon: info.icon,
+                    text: text.clone(),
+                    flags: if style == 1 {
+                        LineFlags::ACTION
+                    } else {
+                        LineFlags::default()
+                    },
+                    at,
+                })
+                .map_err(store_failed)?,
+            ),
+            None => None,
         };
         let ev = Event::Chat {
             cid: 0,
             from: info,
             text,
             style,
+            id,
+            at,
         };
+        let mut r = self.roster.lock().unwrap();
         r.broadcast_where(&ev, None, reads_public_chat);
+        Ok(id)
     }
 
     /// A private chat line; membership is the only gate.
@@ -242,11 +281,59 @@ impl Core {
             from: info,
             text,
             style,
+            id: None,
+            at: SystemTime::now(),
         };
         for uid in members {
             r.send_to(uid, ev.clone());
         }
         Ok(())
+    }
+
+    /// Page the durable public log. Policy is checked by the frontend; the
+    /// uid check prevents a stale transport from reading after teardown.
+    pub fn history(&self, uid: Uid, query: HistoryQuery) -> Result<HistoryPage, ChatError> {
+        if !self.roster.lock().unwrap().users.contains_key(&uid) {
+            return Err(ChatError::NoSuchUser);
+        }
+        self.history
+            .as_ref()
+            .ok_or(ChatError::ServerError)?
+            .query(&query)
+            .map_err(store_failed)
+    }
+
+    /// Ten history pages per second, scoped to the logical user session.
+    /// Keeping this beside the roster means an ng reconnect cannot reset it.
+    pub fn allow_history_request(&self, uid: Uid) -> Result<bool, ChatError> {
+        let mut roster = self.roster.lock().unwrap();
+        let session = roster.users.get_mut(&uid).ok_or(ChatError::NoSuchUser)?;
+        let now = Instant::now();
+        session.history_tokens = (session.history_tokens
+            + now.duration_since(session.history_refill).as_secs_f64() * 10.0)
+            .min(10.0);
+        session.history_refill = now;
+        if session.history_tokens < 1.0 {
+            return Ok(false);
+        }
+        session.history_tokens -= 1.0;
+        Ok(true)
+    }
+
+    /// Retention work for the binary's hourly sweeper.
+    pub fn prune_history(&self, max_lines: usize, max_age: Option<Duration>) -> usize {
+        self.history
+            .as_ref()
+            .and_then(
+                |log| match log.prune(max_lines, max_age, SystemTime::now()) {
+                    Ok(gone) => Some(gone),
+                    Err(e) => {
+                        warn!("history retention: {e}");
+                        None
+                    }
+                },
+            )
+            .unwrap_or(0)
     }
 
     /// A server notice into a chat (kick announcements and the like).
@@ -1304,7 +1391,7 @@ mod tests {
         drain(&mut rx_a);
         drain(&mut rx_b);
 
-        core.chat_public(a, "hi".into(), 0);
+        core.chat_public(a, "hi".into(), 0).unwrap();
         assert!(
             matches!(&drain(&mut rx_a)[..], [Event::Chat { cid: 0, text, .. }] if text == "hi")
         );

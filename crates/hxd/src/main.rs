@@ -176,6 +176,23 @@ async fn main() {
             ));
         }
 
+        if let Some(history) = &config.history {
+            let db = history
+                .db
+                .as_ref()
+                .or_else(|| config.inbox.as_ref().map(|i| &i.db))
+                .expect("configuration validation requires a history database");
+            tracing::info!(
+                "public-chat history at {} — it holds chat bodies in the clear",
+                db.display()
+            );
+            tokio::spawn(hxd::history_pruner(
+                ctx.core.clone(),
+                history.max_lines,
+                history.max_days,
+            ));
+        }
+
         // The Hotline-ng WebSocket frontend, when configured: its accept
         // loop plus the detached-session sweeper.
         if let Some(ng_ctx) = ng_ctx {

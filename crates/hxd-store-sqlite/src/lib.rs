@@ -1,4 +1,4 @@
-//! The private-message inbox on SQLite.
+//! The private-message inbox and public-chat history on SQLite.
 //!
 //! A [`MessageStore`] backed by one file, so a server gains offline
 //! messages without gaining an operations problem. Design and the
@@ -21,6 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use hxd_core::history::{
+    ChatLog, HistoryPage, HistoryQuery, LineFlags, LineId, LogLine, MediaMeta, NewLine,
+};
 use hxd_core::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
     Pushed, StoreError, StoredMessage,
@@ -51,7 +54,7 @@ impl Synchronous {
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -114,6 +117,80 @@ CREATE INDEX block_by_owner ON block (owner_fp, owner, id);
 CREATE INDEX block_by_other ON block (other_fp, other, id);
 ";
 
+// History, media persistence seams, and moderation share one additive
+// migration. Some tables are not called until their later stages land, but
+// reserving their exact schema now prevents a build that already stamped v2
+// from having to pretend the same version means two different databases.
+const SCHEMA_V2: &str = "
+ALTER TABLE message ADD COLUMN media_id BLOB;
+ALTER TABLE message ADD COLUMN media_type TEXT;
+ALTER TABLE message ADD COLUMN media_w INTEGER;
+ALTER TABLE message ADD COLUMN media_h INTEGER;
+ALTER TABLE message ADD COLUMN media_bytes INTEGER;
+
+CREATE TABLE chat_line (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel     INTEGER NOT NULL DEFAULT 0,
+  nick        TEXT    NOT NULL,
+  login       TEXT,
+  login_fp    TEXT,
+  icon        INTEGER NOT NULL DEFAULT 0,
+  flags       INTEGER NOT NULL DEFAULT 0,
+  body        TEXT    NOT NULL,
+  at          INTEGER NOT NULL,
+  deleted_at  INTEGER,
+  deleted_by  TEXT,
+  media_id    BLOB,
+  media_type  TEXT,
+  media_w     INTEGER,
+  media_h     INTEGER,
+  media_bytes INTEGER
+);
+CREATE INDEX chat_line_by_channel ON chat_line (channel, id);
+CREATE INDEX chat_line_at ON chat_line (at);
+
+CREATE TABLE moderation (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind         INTEGER NOT NULL,
+  actor        TEXT    NOT NULL,
+  actor_fp     TEXT,
+  target_line  INTEGER,
+  target_media BLOB,
+  target_login TEXT,
+  target_fp    TEXT,
+  reason       TEXT    NOT NULL,
+  evidence     TEXT,
+  media_hash   BLOB,
+  at           INTEGER NOT NULL
+);
+CREATE TABLE report (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind         INTEGER NOT NULL,
+  reporter     TEXT,
+  reporter_fp  TEXT,
+  target_line  INTEGER,
+  target_media BLOB,
+  target_msg   INTEGER,
+  target_login TEXT,
+  target_fp    TEXT,
+  reason       TEXT    NOT NULL,
+  evidence     TEXT,
+  verified     INTEGER NOT NULL DEFAULT 1,
+  at           INTEGER NOT NULL,
+  closed_at    INTEGER,
+  closed_by    TEXT,
+  outcome      INTEGER,
+  note         TEXT,
+  duplicate_of INTEGER
+);
+CREATE INDEX report_open ON report (id) WHERE closed_at IS NULL;
+CREATE TABLE media_block (
+  hash BLOB PRIMARY KEY,
+  at   INTEGER NOT NULL,
+  by   TEXT NOT NULL
+);
+";
+
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL
 /// predicate over a `(<col>, <col>_fp)` pair — **one shape per kind of
 /// mailbox**, and one bind either way ([`bind`] supplies it).
@@ -151,7 +228,7 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// Open (creating if absent) the inbox database at `path`.
+    /// Open (creating if absent) the store database at `path`.
     pub fn open(path: impl AsRef<Path>, sync: Synchronous) -> Result<Self, StoreError> {
         Self::open_inner(path, sync, false)
     }
@@ -335,8 +412,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version == 0 {
         steps.push_str(SCHEMA_V1);
     }
-    // Future versions add their steps here, each guarded by the version it
-    // upgrades from, so a database can walk forward from any of them.
+    if version < 2 {
+        steps.push_str(SCHEMA_V2);
+    }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
     ));
@@ -1073,6 +1151,214 @@ fn clamp_id(id: MessageId) -> i64 {
     id.min(i64::MAX as u64) as i64
 }
 
+const HISTORY_COLUMNS: &str = "id, channel, nick, login, login_fp, icon, flags, body, at, \
+                               media_id, media_type, media_w, media_h, media_bytes";
+
+fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
+    let id: i64 = r.get(0)?;
+    let channel: i64 = r.get(1)?;
+    let nick: String = r.get(2)?;
+    let login: Option<String> = r.get(3)?;
+    let login_fp: Option<String> = r.get(4)?;
+    let icon: i64 = r.get(5)?;
+    let flags: i64 = r.get(6)?;
+    let body: String = r.get(7)?;
+    let at: i64 = r.get(8)?;
+    let media_id: Option<Vec<u8>> = r.get(9)?;
+    let media_type: Option<String> = r.get(10)?;
+    let media_w: Option<i64> = r.get(11)?;
+    let media_h: Option<i64> = r.get(12)?;
+    let media_bytes: Option<i64> = r.get(13)?;
+    Ok((|| {
+        let media = match (media_id, media_type, media_w, media_h, media_bytes) {
+            (None, None, None, None, None) => None,
+            (Some(id), Some(mime), Some(width), Some(height), Some(bytes)) => Some(MediaMeta {
+                id,
+                mime,
+                width: u32::try_from(width)
+                    .map_err(|_| StoreError::new("stored media width is not a u32"))?,
+                height: u32::try_from(height)
+                    .map_err(|_| StoreError::new("stored media height is not a u32"))?,
+                bytes: u32::try_from(bytes)
+                    .map_err(|_| StoreError::new("stored media size is not a u32"))?,
+            }),
+            _ => return Err(StoreError::new("stored chat media metadata is incomplete")),
+        };
+        Ok(LogLine {
+            id: LineId::try_from(id)
+                .map_err(|_| StoreError::new(format!("chat line id {id} is not an id")))?,
+            channel: u32::try_from(channel)
+                .map_err(|_| StoreError::new(format!("chat channel {channel} is not a u32")))?,
+            from_nick: nick,
+            from_login: login,
+            from_fingerprint: login_fp.as_deref().map(fp_from_hex).transpose()?,
+            icon: u16::try_from(icon)
+                .map_err(|_| StoreError::new(format!("chat icon {icon} is not a u16")))?,
+            text: body,
+            flags: LineFlags::from_bits(
+                u16::try_from(flags)
+                    .map_err(|_| StoreError::new(format!("chat flags {flags} are not a u16")))?,
+            ),
+            at: from_unix(at),
+            media,
+        })
+    })())
+}
+
+fn collect_history(
+    rows: impl Iterator<Item = rusqlite::Result<Result<LogLine, StoreError>>>,
+) -> Result<Vec<LogLine>, StoreError> {
+    rows.map(|r| r.map_err(StoreError::new).and_then(|inner| inner))
+        .collect()
+}
+
+impl ChatLog for SqliteStore {
+    fn append(&self, line: &NewLine) -> Result<LineId, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO chat_line
+               (channel, nick, login, login_fp, icon, flags, body, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                i64::from(line.channel),
+                line.from_nick,
+                line.from_login,
+                line.from_fingerprint.as_ref().map(fp_hex),
+                i64::from(line.icon),
+                i64::from(line.flags.bits()),
+                line.text,
+                unix(line.at),
+            ],
+        )
+        .map_err(StoreError::new)?;
+        LineId::try_from(conn.last_insert_rowid())
+            .map_err(|_| StoreError::new("SQLite issued a negative chat line id"))
+    }
+
+    fn query(&self, query: &HistoryQuery) -> Result<HistoryPage, StoreError> {
+        let query = query.check()?;
+        let conn = self.conn.lock().unwrap();
+        let take = query.limit.saturating_add(1).min(i64::MAX as usize) as i64;
+        let mut lines = if let Some(after) = query.after {
+            let sql = format!(
+                "SELECT {HISTORY_COLUMNS} FROM chat_line
+                  WHERE channel = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3"
+            );
+            let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
+            let rows = stmt
+                .query_map(
+                    params![i64::from(query.channel), clamp_id(after), take],
+                    history_row,
+                )
+                .map_err(StoreError::new)?;
+            collect_history(rows)?
+        } else {
+            let sql = if query.before.is_some() {
+                format!(
+                    "SELECT {HISTORY_COLUMNS} FROM chat_line
+                      WHERE channel = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
+                )
+            } else {
+                format!(
+                    "SELECT {HISTORY_COLUMNS} FROM chat_line
+                      WHERE channel = ?1 ORDER BY id DESC LIMIT ?2"
+                )
+            };
+            let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
+            let rows = match query.before {
+                Some(before) => stmt
+                    .query_map(
+                        params![i64::from(query.channel), clamp_id(before), take],
+                        history_row,
+                    )
+                    .map_err(StoreError::new)?,
+                None => stmt
+                    .query_map(params![i64::from(query.channel), take], history_row)
+                    .map_err(StoreError::new)?,
+            };
+            let mut rows = collect_history(rows)?;
+            rows.reverse();
+            rows
+        };
+        let has_more = lines.len() > query.limit;
+        if has_more {
+            if query.after.is_some() {
+                lines.truncate(query.limit);
+            } else {
+                lines.remove(0);
+            }
+        }
+        Ok(HistoryPage { lines, has_more })
+    }
+
+    fn tombstone(&self, id: LineId, at: SystemTime) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE chat_line
+                    SET nick = '', body = '', flags = flags | ?1, deleted_at = ?2
+                  WHERE id = ?3",
+                params![i64::from(LineFlags::DELETED.bits()), unix(at), clamp_id(id)],
+            )
+            .map_err(StoreError::new)?;
+        Ok(changed != 0)
+    }
+
+    fn prune(
+        &self,
+        max_lines: usize,
+        max_age: Option<Duration>,
+        now: SystemTime,
+    ) -> Result<usize, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(StoreError::new)?;
+        let mut gone = 0;
+        if let Some(age) = max_age {
+            gone += tx
+                .execute(
+                    "DELETE FROM chat_line WHERE at < ?1",
+                    params![cutoff(now, age)],
+                )
+                .map_err(StoreError::new)?;
+        }
+        if max_lines > 0 {
+            gone += tx
+                .execute(
+                    "DELETE FROM chat_line WHERE id IN (
+                       SELECT id FROM chat_line ORDER BY id DESC LIMIT -1 OFFSET ?1
+                     )",
+                    params![max_lines.min(i64::MAX as usize) as i64],
+                )
+                .map_err(StoreError::new)?;
+        }
+        tx.commit().map_err(StoreError::new)?;
+        Ok(gone)
+    }
+
+    fn attach_media(&self, id: LineId, media: &MediaMeta) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE chat_line SET media_id = ?1, media_type = ?2,
+                                      media_w = ?3, media_h = ?4, media_bytes = ?5
+                  WHERE id = ?6",
+                params![
+                    media.id,
+                    media.mime,
+                    i64::from(media.width),
+                    i64::from(media.height),
+                    i64::from(media.bytes),
+                    clamp_id(id),
+                ],
+            )
+            .map_err(StoreError::new)?;
+        if changed == 0 {
+            return Err(StoreError::new("no such chat line"));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1081,6 +1367,11 @@ mod tests {
     #[test]
     fn passes_the_conformance_suite() {
         conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+    }
+
+    #[test]
+    fn chat_log_passes_the_conformance_suite() {
+        hxd_core::history::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
     #[test]
@@ -1111,6 +1402,56 @@ mod tests {
         assert!(s.is_blocked(&dave, &Mailbox::login("spammer")).unwrap());
         // Reopening migrates to a no-op, rather than a second CREATE TABLE.
         assert_eq!(s.counts(&dave).unwrap().total, 1);
+    }
+
+    #[test]
+    fn version_one_migrates_without_losing_inbox_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute(
+                "INSERT INTO message
+                   (recipient, sender_nick, body, sent_at)
+                 VALUES ('dave', 'alice', 'before history', 1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let pending = store.pending(&Mailbox::login("dave"), 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].body, "before history");
+        assert!(store
+            .query(&HistoryQuery {
+                channel: 0,
+                before: None,
+                after: None,
+                limit: 10,
+            })
+            .unwrap()
+            .lines
+            .is_empty());
+
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        for table in ["chat_line", "moderation", "report", "media_block"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                                    WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "schema v2 must reserve {table}");
+        }
     }
 
     #[test]
