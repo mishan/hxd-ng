@@ -5,7 +5,8 @@
 //!
 //! ```text
 //! hlid keygen identity|device|server PATH     make a key (32-byte seed, hex, mode 0600)
-//! hlid cert    --identity K --device K [--days N] [--caps all|web|LIST] [--name S] -o FILE
+//! hlid cert    --identity K (--device K | --device-pub HEX --device-enc-pub HEX)
+//!              [--days N] [--caps all|web|LIST] [--name S] -o FILE
 //! hlid card    --identity K --name S [--icon N] [--profile S] [--link URL]...
 //!              [--attestation FILE]... [--successor HEX|--successor-key FILE] -o FILE
 //! hlid attest  --registrar-key K --registrar HOST --identity K|--identity-pub HEX --handle S
@@ -40,7 +41,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use hl_identity::{
     attestation, caps, cbor, cert, Attestation, Card, DeviceCert, DeviceKey, Fingerprint,
-    IdentityKey, LoginProof, ServerKey,
+    IdentityKey, LoginProof, PublicKey, ServerKey,
 };
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -68,9 +69,26 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!(
-        "usage:\n  hlid keygen identity|device|server PATH\n  hlid cert --identity K --device K [--days N] [--caps all|web|LIST] [--name S] -o FILE\n  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n       [--successor HEX | --successor-key FILE] -o FILE\n  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n  hlid inspect FILE\n  hlid auth --server URL --device K --card FILE --cert FILE [--login L] [--password P | --password-file F | --password-stdin] [--no-create]\n  hlid link --server URL --device K --card FILE --cert FILE --login L [--password P | --password-file F | --password-stdin]\n  hlid unlink --server URL --device K --card FILE --cert FILE\n  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500] [--allow-remote-listen] [--create]\n\nPassword options: --password puts the secret in `ps` output; prefer\n--password-file or --password-stdin."
-    );
+    eprintln!(concat!(
+        "usage:\n",
+        "  hlid keygen identity|device|server PATH\n",
+        "  hlid cert --identity K (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] -o FILE\n",
+        "  hlid card --identity K --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n",
+        "       [--successor HEX | --successor-key FILE] -o FILE\n",
+        "  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n",
+        "  hlid inspect FILE\n",
+        "  hlid auth --server URL --device K --card FILE --cert FILE [--login L] [--password P | --password-file F | --password-stdin] [--no-create]\n",
+        "  hlid link --server URL --device K --card FILE --cert FILE --login L [--password P | --password-file F | --password-stdin]\n",
+        "  hlid unlink --server URL --device K --card FILE --cert FILE\n",
+        "  hlid tunnel --server URL --device K --card FILE --cert FILE [--listen 127.0.0.1:5500] [--allow-remote-listen] [--create]\n",
+        "\n",
+        "--device-pub/--device-enc-pub certify a device this tool never held the\n",
+        "private key for — a browser's non-extractable WebCrypto key, in\n",
+        "particular.\n",
+        "\n",
+        "Password options: --password puts the secret in `ps` output; prefer\n",
+        "--password-file or --password-stdin.",
+    ));
     exit(2)
 }
 
@@ -319,9 +337,36 @@ fn getrandom_seed(seed: &mut [u8; 32]) {
 fn make_cert(args: &[String]) -> R<()> {
     let a = parse(args);
     let id = IdentityKey::from_seed(&read_seed(a.one("identity")?)?);
-    let dev = DeviceKey::from_seed(&read_seed(a.one("device")?)?);
+    // `--device` names a seed file this tool holds; `--device-pub` +
+    // `--device-enc-pub` certify a device whose private keys never left
+    // wherever they were generated — a browser's non-extractable
+    // `CryptoKey`s, which can only ever export their public halves
+    // (hx-ng's `docs/identity-keys.md` §9).
+    let (device, device_enc): (PublicKey, [u8; 32]) = match a.opt("device") {
+        Some(seed) => {
+            if a.has("device-pub") || a.has("device-enc-pub") {
+                return Err("--device and --device-pub/--device-enc-pub are alternatives".into());
+            }
+            let dev = DeviceKey::from_seed(&read_seed(seed)?);
+            (dev.public(), dev.public_enc())
+        }
+        None => {
+            let pub_hex = a.opt("device-pub").ok_or_else(|| {
+                "--device or --device-pub (with --device-enc-pub) is required".to_string()
+            })?;
+            let enc_hex = a.one("device-enc-pub")?;
+            (
+                unhex(pub_hex)?
+                    .try_into()
+                    .map_err(|_| "--device-pub: 32 bytes".to_string())?,
+                unhex(enc_hex)?
+                    .try_into()
+                    .map_err(|_| "--device-enc-pub: 32 bytes".to_string())?,
+            )
+        }
+    };
     let days = a.u64("days", cert::RECOMMENDED_LIFETIME / 86_400)?;
-    let mut c = DeviceCert::for_device(&id, &dev, now(), seconds(days)?)
+    let mut c = DeviceCert::for_keys(&id, device, device_enc, now(), seconds(days)?)
         .map_err(|e| format!("--days: {e}"))?;
     c.caps = match a.opt("caps") {
         None | Some("all") => None,
