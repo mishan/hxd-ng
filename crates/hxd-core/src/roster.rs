@@ -538,6 +538,9 @@ pub struct Core {
     pub(crate) inbox: Option<Arc<dyn crate::inbox::MessageStore>>,
     pub(crate) directory: Option<Arc<dyn crate::account::AccountDirectory>>,
     pub(crate) inbox_policy: InboxPolicy,
+    /// Where push notifications go, or `None` — which is the no-op, and
+    /// the default. See [`crate::notify`].
+    pub(crate) gateway: Option<Arc<dyn crate::notify::NotificationGateway>>,
     /// Serialises inbox flushes.
     ///
     /// A flush reads the pending rows, sends them under the roster lock,
@@ -569,6 +572,21 @@ impl Core {
         self.inbox = Some(store);
         self.directory = Some(directory);
         self.inbox_policy = policy;
+        self
+    }
+
+    /// Send push notifications for private messages that arrive for
+    /// someone who isn't watching. Without a gateway nothing is sent,
+    /// which is what a server that has configured no push gets.
+    ///
+    /// It does nothing useful without an inbox: the rule is computed on
+    /// the stored-message path, and a push about a message that was never
+    /// stored is a notification about nothing.
+    pub fn with_notifications(
+        mut self,
+        gateway: Arc<dyn crate::notify::NotificationGateway>,
+    ) -> Self {
+        self.gateway = Some(gateway);
         self
     }
 
@@ -787,6 +805,13 @@ impl Core {
             r.end_session(uid);
         }
         n
+    }
+
+    /// One session's presence state, or `None` when no session holds the
+    /// uid. The notify decision reads it (see [`crate::notify`]).
+    pub fn status_of(&self, uid: Uid) -> Option<SessionStatus> {
+        let r = self.roster.lock().unwrap();
+        r.users.get(&uid).map(|s| s.info.status)
     }
 
     /// Is this session currently detached? (Moderation and tests.)
