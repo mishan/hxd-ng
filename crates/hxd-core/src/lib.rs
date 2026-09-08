@@ -11,6 +11,7 @@ pub mod access;
 pub mod account;
 pub mod chat;
 pub mod inbox;
+pub mod notify;
 pub mod roster;
 pub mod video;
 pub mod voice;
@@ -25,6 +26,7 @@ pub use inbox::{
     Delivery, InboxCounts, MemoryStore, MessageId, MessageStore, NewMessage, Pushed, StoreError,
     StoredMessage,
 };
+pub use notify::{Notification, NotificationGateway};
 pub use roster::{
     AttachInfo, Core, Event, IdentityTag, InboxPolicy, Resume, SeqEvent, SessionStatus, Transport,
     Uid, UserDetails, UserInfo, OUTBOX_BUFFER_CAP,

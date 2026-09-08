@@ -628,6 +628,8 @@ impl Core {
             return Ok(MsgOutcome::Delivered);
         };
 
+        let from_mailbox = sender.mailbox.clone().expect("checked by `durable`");
+
         // The store decides both of the questions that used to be asked
         // here and answered a moment later: whether this guid is already
         // stored, and whether the mailbox is at its cap. Both were
@@ -638,13 +640,14 @@ impl Core {
         // A retry of a message we already have is that message, not a
         // second one. Answering it what the first send was answered is
         // what makes a client safe to retry after a socket died mid-ack.
+        let (sender_nick, body) = (sender.nick.clone(), text);
         let id = match store
             .push(
                 &NewMessage {
                     recipient: to.mailbox.clone(),
                     sender: sender.mailbox,
                     sender_nick: sender.nick,
-                    body: text,
+                    body: body.clone(),
                     sent_at: now,
                     guid,
                     kind: MessageKind::Message,
@@ -709,6 +712,44 @@ impl Core {
                 .is_pending(&to.mailbox, id)
                 .map_err(store_failed)
                 .unwrap_or(true);
+
+        // The notify decision (docs/push-notifications.md §6), computed
+        // here so that both wires reach it — the legacy path skipping it
+        // by being written somewhere else is the failure that document
+        // calls out by name.
+        //
+        // Anything but an *attentive* session earns a notification:
+        // detached, or no session at all, plainly; and `idle` too, even
+        // though a connection is attached and got the event, because the
+        // app is backgrounded and the OS is the one that decides whether
+        // to make noise. (Nothing sets `idle` yet — hotline-ng.md §12
+        // still owes it a definition — but the rule is the rule.)
+        //
+        // Across *every* session that owns the mailbox, not one chosen
+        // uid: an account reading on its laptop with a sleeping phone is
+        // attentive, and the phone should not buzz.
+        let attentive = {
+            let r = self.roster.lock().unwrap();
+            sessions_of(&r, &to.mailbox).into_iter().any(|uid| {
+                r.users.get(&uid).map(|s| s.info.status) == Some(crate::SessionStatus::Active)
+            })
+        };
+        // A message to yourself from your own other session is not news.
+        let to_self = from_mailbox == to.mailbox;
+        if !attentive && !to_self {
+            if let Some(gateway) = &self.gateway {
+                let unread = store.counts(&to.mailbox).map(|c| c.unread).unwrap_or(0);
+                gateway.notify(&crate::notify::Notification {
+                    to: &to.mailbox,
+                    from: Some(&from_mailbox),
+                    from_nick: &sender_nick,
+                    text: &body,
+                    id,
+                    unread,
+                });
+            }
+        }
+
         if delivered {
             return Ok(MsgOutcome::Delivered);
         }
@@ -1358,11 +1399,24 @@ mod inbox_tests {
         }
     }
 
-    fn server_with(policy: InboxPolicy, logins: &[&str]) -> (Arc<Core>, Arc<MemoryStore>) {
+    /// A core with an inbox, and optionally somewhere to send
+    /// notifications. Shared with `super::notify_tests`.
+    pub(super) fn server_arc(
+        policy: InboxPolicy,
+        logins: &[&str],
+        gateway: Option<Arc<dyn crate::NotificationGateway>>,
+    ) -> (Arc<Core>, Arc<MemoryStore>) {
         let store = Arc::new(MemoryStore::new());
         let dir = Arc::new(Directory::of(logins));
-        let core = Core::new().with_inbox(store.clone(), dir, policy);
+        let mut core = Core::new().with_inbox(store.clone(), dir, policy);
+        if let Some(gw) = gateway {
+            core = core.with_notifications(gw);
+        }
         (Arc::new(core), store)
+    }
+
+    fn server_with(policy: InboxPolicy, logins: &[&str]) -> (Arc<Core>, Arc<MemoryStore>) {
+        server_arc(policy, logins, None)
     }
 
     fn server(logins: &[&str]) -> (Arc<Core>, Arc<MemoryStore>) {
@@ -1370,7 +1424,7 @@ mod inbox_tests {
     }
 
     /// Attach a session whose account is linked to an identity.
-    fn attach_identified(
+    pub(super) fn attach_identified(
         core: &Core,
         login: &str,
         fingerprint: [u8; 32],
@@ -1396,7 +1450,11 @@ mod inbox_tests {
         (uid, rx)
     }
 
-    fn attach(core: &Core, login: &str, has_inbox: bool) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    pub(super) fn attach(
+        core: &Core,
+        login: &str,
+        has_inbox: bool,
+    ) -> (Uid, UnboundedReceiver<SeqEvent>) {
         let (uid, rx) = core
             .attach(AttachInfo {
                 nick: login.to_string(),
@@ -2221,5 +2279,138 @@ mod inbox_tests {
         assert!(
             matches!(&msgs(drain(&mut rx))[..], [Event::Msg { text, .. }] if text == "still up?")
         );
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    //! The notify decision — which arriving message earns a push, and
+    //! which does not. See docs/push-notifications.md §6 and §11: the rule
+    //! lives here rather than in a frontend precisely so that neither wire
+    //! can skip it, and these are the cases that would go quietly wrong.
+
+    use std::sync::{Arc, Mutex};
+
+    use super::inbox_tests::{attach, server_arc};
+    use super::*;
+    use crate::notify::{Notification, NotificationGateway};
+    use crate::{Core, InboxPolicy};
+
+    /// A gateway that records what it was asked to send. No network, no
+    /// runtime, nothing to wait for — the decision is the whole subject.
+    #[derive(Default)]
+    struct Recorder {
+        sent: Mutex<Vec<(String, String, usize)>>,
+    }
+
+    impl Recorder {
+        /// `(recipient login, text, unread)`, in order.
+        fn sent(&self) -> Vec<(String, String, usize)> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl NotificationGateway for Recorder {
+        fn notify(&self, n: &Notification<'_>) {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((n.to.login.clone(), n.text.to_string(), n.unread));
+        }
+    }
+
+    fn server(logins: &[&str]) -> (Arc<Core>, Arc<Recorder>) {
+        let gw = Arc::new(Recorder::default());
+        let (core, _store) = server_arc(InboxPolicy::default(), logins, Some(gw.clone()));
+        (core, gw)
+    }
+
+    #[test]
+    fn nobody_there_earns_a_notification() {
+        let (core, gw) = server(&["alice", "dave"]);
+        let (a, _ra) = attach(&core, "alice", true);
+        core.msg_login(a, "dave", "wake up".into(), None).unwrap();
+        assert_eq!(
+            gw.sent(),
+            vec![("dave".to_string(), "wake up".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_detached_session_earns_one_too() {
+        let (core, gw) = server(&["alice", "dave"]);
+        let (a, _ra) = attach(&core, "alice", true);
+        let (m, _rm) = attach(&core, "dave", true);
+        assert!(core.connection_lost(m, 8));
+
+        core.msg(a, m, "still asleep?".into(), None).unwrap();
+        assert_eq!(gw.sent().len(), 1, "the phone is what the push is for");
+        assert_eq!(gw.sent()[0].2, 1, "and it carries the badge number");
+    }
+
+    #[test]
+    fn someone_watching_the_screen_earns_nothing() {
+        let (core, gw) = server(&["alice", "dave"]);
+        let (a, _ra) = attach(&core, "alice", true);
+        let (m, _rm) = attach(&core, "dave", true);
+
+        assert_eq!(
+            core.msg(a, m, "hi".into(), None).unwrap(),
+            MsgOutcome::Delivered
+        );
+        assert!(
+            gw.sent().is_empty(),
+            "a connection is attached and it got the event"
+        );
+    }
+
+    #[test]
+    fn a_message_to_your_own_account_is_not_news() {
+        let (core, gw) = server(&["dave"]);
+        let (m, _rm) = attach(&core, "dave", true);
+        core.msg_login(m, "dave", "note to self".into(), None)
+            .unwrap();
+        // Stored, so a second device finds it; not pushed, because the
+        // person who wrote it does not need telling.
+        assert_eq!(core.inbox_counts(m).unwrap().unread, 1);
+        assert!(gw.sent().is_empty());
+    }
+
+    #[test]
+    fn a_recipient_with_no_inbox_earns_nothing() {
+        let (core, gw) = server(&["alice"]);
+        let (a, _ra) = attach(&core, "alice", true);
+        let (g, _rg) = attach(&core, "guest", false);
+        core.msg(a, g, "hi".into(), None).unwrap();
+        assert!(
+            gw.sent().is_empty(),
+            "a push about a message that was never stored is a doorbell for nothing"
+        );
+    }
+
+    #[test]
+    fn the_badge_counts_everything_unread_not_just_this_one() {
+        let (core, gw) = server(&["alice", "dave"]);
+        let (a, _ra) = attach(&core, "alice", true);
+        for i in 0..3 {
+            core.msg_login(a, "dave", format!("m{i}"), None).unwrap();
+        }
+        assert_eq!(
+            gw.sent().iter().map(|s| s.2).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn no_gateway_means_no_calls_and_no_difference() {
+        let (core, _store) =
+            super::inbox_tests::server_arc(InboxPolicy::default(), &["alice", "dave"], None);
+        let (a, _ra) = attach(&core, "alice", true);
+        // The only assertion available is that nothing panics and the
+        // message still lands — which is the point: push is optional.
+        assert!(matches!(
+            core.msg_login(a, "dave", "hi".into(), None).unwrap(),
+            MsgOutcome::Queued(_)
+        ));
     }
 }
