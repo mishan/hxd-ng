@@ -29,11 +29,11 @@ use tracing::{debug, info, warn};
 
 use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
-    event_json, parse_streams, participants_json, reply_err, reply_ok, stored_msg_json, user_json,
-    video_err, video_limits_json, voice_err, ChatParams, InboxParams, LoginParams, MsgParams,
-    MsgReadParams, NickParams, ReqEnvelope, ResumeParams, VideoStartParams, VideoStateParams,
-    VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams,
-    VoiceRoomParams,
+    blocked_json, event_json, parse_streams, participants_json, reply_err, reply_ok,
+    stored_msg_json, user_json, video_err, video_limits_json, voice_err, BlockParams, ChatParams,
+    InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams, ReqEnvelope, ResumeParams,
+    VideoStartParams, VideoStateParams, VideoStopParams, VideoSubscribeParams, VoiceAnswerParams,
+    VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -903,6 +903,11 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     Err(ChatError::MailboxFull) => {
                         reply_err(req.id, "mailbox_full", "That user's mailbox is full.")
                     }
+                    Err(ChatError::Blocked) => reply_err(
+                        req.id,
+                        "blocked",
+                        "That user is not accepting messages from you.",
+                    ),
                     // A store that would not answer is our failure, not
                     // the sender's — telling them their correspondent
                     // does not exist because the disk is full is a lie
@@ -968,6 +973,104 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed inbox."),
         },
+
+        // Blocking: a minimum viable fogWraith Block User (806), here
+        // because account addressing means anyone can put mail in anyone's
+        // queue and a queue has a cap. See docs/private-messages.md §9.
+        "block" | "unblock" => match serde_json::from_value::<BlockParams>(req.params.clone()) {
+            Ok(p) => {
+                let on = req.req == "block";
+                let me = state.uid;
+                let named = [p.uid.is_some(), p.login.is_some(), p.fingerprint.is_some()]
+                    .iter()
+                    .filter(|x| **x)
+                    .count();
+                let fingerprint = p
+                    .fingerprint
+                    .as_deref()
+                    .and_then(hl_identity::Fingerprint::parse);
+                let done = match (p.uid, p.login.clone(), fingerprint) {
+                    _ if named != 1 => {
+                        return finish(
+                            ws_tx,
+                            reply_err(
+                                req.id,
+                                "bad_request",
+                                "Name exactly one of `uid`, `login` and `fingerprint`.",
+                            ),
+                        )
+                        .await
+                    }
+                    (Some(uid), _, _) => {
+                        off_reactor(&ctx.core, move |c| c.inbox_block_uid(me, uid, on)).await
+                    }
+                    (_, Some(login), _) => {
+                        off_reactor(&ctx.core, move |c| c.inbox_block(me, &login, on)).await
+                    }
+                    // A fingerprint names a block, not a person: the
+                    // guest who left has no roster row and no login of
+                    // their own, so `blocks` reports the fingerprint and
+                    // `unblock` takes it back. Blocking still needs
+                    // someone you can see.
+                    (_, _, Some(fp)) if !on => {
+                        off_reactor(&ctx.core, move |c| c.inbox_unblock_fingerprint(me, &fp.0))
+                            .await
+                    }
+                    (_, _, Some(_)) => {
+                        return finish(
+                            ws_tx,
+                            reply_err(
+                                req.id,
+                                "bad_request",
+                                "Block by `uid` or `login`; `fingerprint` unblocks.",
+                            ),
+                        )
+                        .await
+                    }
+                    (None, None, None) => {
+                        return finish(
+                            ws_tx,
+                            reply_err(req.id, "bad_request", "Malformed fingerprint."),
+                        )
+                        .await
+                    }
+                };
+                match done {
+                    None | Some(Err(ChatError::ServerError)) => {
+                        reply_err(req.id, "server_error", "Server error.")
+                    }
+                    Some(Ok(())) => reply_ok(req.id, json!({})),
+                    // A session with no mailbox of its own has nowhere to
+                    // keep a block, and that is a different thing from
+                    // the target not existing — the same `no_inbox` the
+                    // other inbox requests answer.
+                    Some(Err(ChatError::NoInbox)) => {
+                        reply_err(req.id, "no_inbox", "This account has no inbox.")
+                    }
+                    // Otherwise the same one answer msg_login gives, so
+                    // this cannot be used to find out which accounts
+                    // exist either.
+                    Some(Err(_)) => reply_err(req.id, "no_such_user", "No such user."),
+                }
+            }
+            Err(_) => reply_err(req.id, "bad_request", "Malformed block."),
+        },
+
+        "blocks" => {
+            let uid = state.uid;
+            match off_reactor(&ctx.core, move |c| c.inbox_blocked(uid)).await {
+                None | Some(Err(ChatError::ServerError)) => {
+                    reply_err(req.id, "server_error", "Server error.")
+                }
+                Some(Ok(who)) => reply_ok(
+                    req.id,
+                    json!({
+                        "blocked": who.iter().map(blocked_json).collect::<Vec<_>>(),
+                    }),
+                ),
+                Some(Err(_)) => reply_err(req.id, "no_inbox", "This account has no inbox."),
+            }
+        }
 
         "msg_read" => match serde_json::from_value::<MsgReadParams>(req.params.clone()) {
             // A cursor in the caller's own mailbox: the domain scopes

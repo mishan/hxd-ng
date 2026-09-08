@@ -90,6 +90,33 @@ pub struct MsgReadParams {
     pub up_to: u64,
 }
 
+/// Who to block. A login names an account; a uid names whoever is on the
+/// roster under it, which is the only way to name an identity user
+/// admitted as a guest — they have a fingerprint to hold a block against
+/// but no account login of their own.
+///
+/// `unblock` may instead take a `fingerprint`, which `blocks` reports: once
+/// that guest has left, the roster cannot answer for their uid and their
+/// login is `guest`, so the fingerprint is the only name left.
+#[derive(Debug, Deserialize)]
+pub struct BlockParams {
+    #[serde(default)]
+    pub login: Option<String>,
+    #[serde(default)]
+    pub uid: Option<u16>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+/// One entry of the `blocks` list.
+pub fn blocked_json(m: &hxd_core::inbox::Mailbox) -> serde_json::Value {
+    let mut v = json!({ "login": m.login });
+    if let Some(fp) = m.fingerprint {
+        v["fingerprint"] = json!(hl_identity::Fingerprint(fp).to_string());
+    }
+    v
+}
+
 // --- Voice (docs/voice.md §8) -------------------------------------------
 //
 // A transliteration of the same six messages the legacy wire carries as
