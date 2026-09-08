@@ -17,16 +17,17 @@ pub mod voice;
 
 pub use access::AccessBits;
 pub use account::{
-    Account, AuthBackend, AuthError, IdentityLink, LinkAuthority, LinkOutcome, Proof, UnlinkOutcome,
+    Account, AccountDirectory, AuthBackend, AuthError, IdentityLink, LinkAuthority, LinkOutcome,
+    Proof, UnlinkOutcome,
 };
-pub use chat::ChatError;
+pub use chat::{ChatError, MsgOutcome};
 pub use inbox::{
-    Delivery, InboxCounts, Mailbox, MemoryStore, MessageGuid, MessageId, MessageKind, MessageStore,
-    NewMessage, Pushed, StoreError, StoredMessage,
+    Delivery, InboxCounts, MemoryStore, MessageId, MessageStore, NewMessage, Pushed, StoreError,
+    StoredMessage,
 };
 pub use roster::{
-    AttachInfo, Core, Event, IdentityTag, Resume, SeqEvent, SessionStatus, Transport, Uid,
-    UserDetails, UserInfo, OUTBOX_BUFFER_CAP,
+    AttachInfo, Core, Event, IdentityTag, InboxPolicy, Resume, SeqEvent, SessionStatus, Transport,
+    Uid, UserDetails, UserInfo, OUTBOX_BUFFER_CAP,
 };
 pub use video::{VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream};
 pub use voice::{

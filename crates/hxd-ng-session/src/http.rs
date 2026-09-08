@@ -846,7 +846,14 @@ async fn unlink(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     let st = st.clone();
     let result = tokio::task::spawn_blocking(move || st.unlink(&ident)).await;
     match result {
-        Ok(Ok(account)) => json_resp(StatusCode::OK, json!({ "unlinked": account.login })),
+        Ok(Ok((account, stays))) => json_resp(
+            StatusCode::OK,
+            // §8.4: mail stored while the account was linked belongs to
+            // the identity, and goes wherever it links next. Say so —
+            // from the account's side it just looks like the inbox
+            // emptied.
+            json!({ "unlinked": account.login, "mail_stays_with_identity": stays }),
+        ),
         Ok(Err(e)) => refused(e),
         Err(_) => plain(StatusCode::INTERNAL_SERVER_ERROR, "unlink task failed"),
     }

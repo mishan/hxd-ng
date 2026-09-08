@@ -288,6 +288,12 @@ pub struct IdentityState {
     key: ServerKey,
     cfg: IdentityConfig,
     auth: Arc<dyn AuthBackend>,
+    /// The domain, for the obligations a link carries with it —
+    /// `docs/private-messages.md` §4. Every write of a link has to tell
+    /// the inbox, or the account's mail is stranded the moment it gains
+    /// an identity; going through `Core` rather than the store is what
+    /// keeps that call on the right side of the locking discipline.
+    core: Arc<hxd_core::Core>,
     tables: Mutex<Tables>,
     /// Persisted successor commitments (§3.4), by fingerprint. `None`
     /// when the operator configured no path, in which case anchoring is
@@ -382,12 +388,18 @@ pub fn unb64(s: &str) -> Option<Vec<u8>> {
 }
 
 impl IdentityState {
-    pub fn new(key: ServerKey, cfg: IdentityConfig, auth: Arc<dyn AuthBackend>) -> Self {
+    pub fn new(
+        key: ServerKey,
+        cfg: IdentityConfig,
+        auth: Arc<dyn AuthBackend>,
+        core: Arc<hxd_core::Core>,
+    ) -> Self {
         let anchors = cfg.anchors.clone().map(Anchors::load);
         IdentityState {
             key,
             cfg,
             auth,
+            core,
             tables: Mutex::new(Tables {
                 challenges: HashMap::new(),
                 tokens: HashMap::new(),
@@ -687,6 +699,10 @@ impl IdentityState {
                             // shouldn't cost the next caller its slot.
                             self.charge_creation();
                             info!(login = %created.login, fingerprint = %fingerprint.short(), "account created for identity");
+                            // Nothing to claim — the account is new — but
+                            // called anyway so "linking claims" has no
+                            // exception anyone has to remember (§4).
+                            self.core.inbox_claim(&created.login, &fingerprint.0);
                         }
                         (
                             if is_new {
@@ -770,6 +786,12 @@ impl IdentityState {
             tracing::warn!("link write failed: {e}");
             AuthRefused::Backend
         })?;
+        if let LinkOutcome::Linked(a) = &outcome {
+            let moved = self.core.inbox_claim(&a.login, &fp.0);
+            if moved > 0 {
+                info!(login = %a.login, moved, "inbox claimed by the new identity link");
+            }
+        }
         Ok(outcome)
     }
 
@@ -850,7 +872,7 @@ impl IdentityState {
     /// afterwards — but it is also invisible from the account's side, so
     /// say the number out loud rather than letting a user discover their
     /// inbox has emptied.
-    pub fn unlink(&self, ident: &TransportIdentity) -> Result<Account, AuthRefused> {
+    pub fn unlink(&self, ident: &TransportIdentity) -> Result<(Account, usize), AuthRefused> {
         if !ident.allows(caps::MANAGE) {
             return Err(AuthRefused::NoManage);
         }
@@ -863,8 +885,15 @@ impl IdentityState {
             })?;
         match outcome {
             UnlinkOutcome::Unlinked(a) => {
-                info!(login = %a.login, fingerprint = %ident.fingerprint.short(), "identity unlinked");
-                Ok(a)
+                let stays = self
+                    .core
+                    .inbox_counts_of(&hxd_core::inbox::Mailbox::identified(
+                        a.login.clone(),
+                        ident.fingerprint.0,
+                    ))
+                    .total;
+                info!(login = %a.login, fingerprint = %ident.fingerprint.short(), stays, "identity unlinked");
+                Ok((a, stays))
             }
             UnlinkOutcome::NotLinked => Err(AuthRefused::NotLinked),
             UnlinkOutcome::WouldOrphan(_) => Err(AuthRefused::WouldOrphan),
@@ -1358,6 +1387,7 @@ mod tests {
             can_detach: password,
             set_subject: false,
             has_password: password,
+            has_inbox: password,
             identity: hxd_core::IdentityLink {
                 identity_login: true,
                 allow_self_link: true,
@@ -1488,11 +1518,21 @@ mod tests {
     }
 
     fn state(cfg: IdentityConfig) -> IdentityState {
-        IdentityState::new(ServerKey::from_seed(&[5u8; 32]), cfg, MemAuth::new())
+        IdentityState::new(
+            ServerKey::from_seed(&[5u8; 32]),
+            cfg,
+            MemAuth::new(),
+            Arc::new(hxd_core::Core::new()),
+        )
     }
 
     fn state_with(cfg: IdentityConfig, auth: Arc<MemAuth>) -> IdentityState {
-        IdentityState::new(ServerKey::from_seed(&[5u8; 32]), cfg, auth)
+        IdentityState::new(
+            ServerKey::from_seed(&[5u8; 32]),
+            cfg,
+            auth,
+            Arc::new(hxd_core::Core::new()),
+        )
     }
 
     fn objects(id: &IdentityKey, dev: &DeviceKey) -> (Vec<u8>, Vec<u8>) {
@@ -1858,7 +1898,7 @@ mod tests {
         let mut no_manage = ident.clone();
         no_manage.device_caps = Some(caps::WEB);
         assert_eq!(st.unlink(&no_manage).unwrap_err(), AuthRefused::NoManage);
-        assert_eq!(st.unlink(&ident).unwrap().login, "alice");
+        assert_eq!(st.unlink(&ident).unwrap().0.login, "alice");
         assert_eq!(st.unlink(&ident).unwrap_err(), AuthRefused::NotLinked);
         assert!(auth
             .find_by_fingerprint(&id.fingerprint().0)

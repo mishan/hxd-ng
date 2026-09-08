@@ -36,7 +36,11 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use hxd_core::access::{bit, AccessBits};
-use hxd_core::{Account, AuthBackend, AuthError, IdentityLink, LinkOutcome, Proof, UnlinkOutcome};
+use hxd_core::inbox::Mailbox;
+use hxd_core::{
+    Account, AccountDirectory, AuthBackend, AuthError, IdentityLink, LinkOutcome, Proof,
+    UnlinkOutcome,
+};
 use serde::Deserialize;
 
 /// Named access keys, mapped to protocol bit numbers. Names mirror
@@ -133,6 +137,12 @@ struct ExtraTable {
     /// disconnect_users (admin) bit, preserving the reference server's
     /// spirit (a config-granted privilege, not a wire access bit).
     set_subject: Option<bool>,
+    /// May private messages be stored for this account and delivered
+    /// later? Default: a password *or* a linked identity — either is
+    /// proof of one person, where a bare `guest` login is shared by
+    /// everyone who walks through it and queuing mail there hands it to
+    /// whoever logs in next.
+    inbox: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -174,6 +184,17 @@ impl AccountFile {
                 .set_subject
                 .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
             has_password,
+            // The same rule `can_detach` derives by, and for the same
+            // reason: what disqualifies an account is not the absence of
+            // a password but the absence of a person behind it. Everyone
+            // who walks through `guest` shares one login, so queuing mail
+            // there hands it to whoever logs in next; a linked identity
+            // is proof of exactly one person, which is what makes
+            // `new_accounts = create`'s password-less accounts mailable.
+            has_inbox: self
+                .extra
+                .inbox
+                .unwrap_or(has_password || fingerprint.is_some()),
             identity: IdentityLink {
                 fingerprint,
                 identity_login: self.identity.login.unwrap_or(true),
@@ -787,6 +808,28 @@ fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
     let mut f = opts.open(path)?;
     f.write_all(text.as_bytes())?;
     f.sync_all()
+}
+
+impl AccountDirectory for FileAuth {
+    fn inbox_account(&self, login: &str) -> Option<Mailbox> {
+        // No guest fallback here, deliberately: an empty login means
+        // "guest" when someone is logging in, and means nothing at all
+        // when someone is addressing a message.
+        let login = login.to_ascii_lowercase();
+        if !valid_login(&login) {
+            return None;
+        }
+        // Through `into_account`, so the mailbox key and the account's
+        // own view of its identity cannot drift apart: this is the one
+        // place a fingerprint is parsed.
+        let account = self.load(&login).ok()?.into_account(login);
+        account
+            .has_inbox
+            .then(|| match account.identity.fingerprint {
+                Some(fp) => Mailbox::identified(account.login, fp),
+                None => Mailbox::login(account.login),
+            })
+    }
 }
 
 #[cfg(test)]
@@ -1472,5 +1515,45 @@ mod tests {
         let logins: std::collections::HashSet<_> =
             made.iter().map(|(a, _)| a.login.clone()).collect();
         assert_eq!(logins.len(), 1, "{logins:?}");
+    }
+
+    #[test]
+    fn an_inbox_follows_having_a_password_unless_told_otherwise() {
+        let (td, auth) = backend();
+        write(td.path(), "plain.toml", "password = \"pw\"\n");
+        write(td.path(), "open.toml", "");
+        write(
+            td.path(),
+            "quiet.toml",
+            "password = \"pw\"\n[extra]\ninbox = false\n",
+        );
+        write(td.path(), "kiosk.toml", "[extra]\ninbox = true\n");
+
+        let has = |l: &str, pw: &[u8]| auth.authenticate(l, Proof::Plain(pw)).unwrap().has_inbox;
+        assert!(has("plain", b"pw"));
+        assert!(!has("open", b""), "a shared door is not an address");
+        assert!(!has("quiet", b"pw"));
+        assert!(has("kiosk", b""));
+    }
+
+    #[test]
+    fn the_directory_canonicalises_and_answers_one_none_for_two_questions() {
+        let (td, auth) = backend();
+        write(td.path(), "alice.toml", "password = \"pw\"\n");
+        write(
+            td.path(),
+            "quiet.toml",
+            "password = \"pw\"\n[extra]\ninbox = false\n",
+        );
+
+        assert_eq!(auth.inbox_account("AlIce"), Some(Mailbox::login("alice")));
+        // "No such account" and "that account takes no mail" are the same
+        // answer: the message path must not tell them apart.
+        assert_eq!(auth.inbox_account("nobody"), None);
+        assert_eq!(auth.inbox_account("quiet"), None);
+        // A login that could never name a file is refused before the
+        // filesystem is touched at all.
+        assert_eq!(auth.inbox_account("../../etc/passwd"), None);
+        assert_eq!(auth.inbox_account(""), None);
     }
 }

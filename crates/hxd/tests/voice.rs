@@ -82,6 +82,7 @@ async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<Rec
             agreement: None,
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
+            stamp_queued: true,
             caps: if voice {
                 Caps::empty().with(cap::VOICE)
             } else {

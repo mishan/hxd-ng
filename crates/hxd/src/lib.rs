@@ -531,6 +531,7 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 fn build_identity(
     section: &IdentitySection,
     auth: Arc<dyn hxd_core::AuthBackend>,
+    core: Arc<Core>,
 ) -> Result<IdentityState, String> {
     use base64::Engine;
     let key = load_server_key(&section.key)?;
@@ -598,6 +599,7 @@ fn build_identity(
             },
         },
         auth,
+        core,
     ))
 }
 
@@ -630,7 +632,11 @@ pub fn build_ng_ctx(
         return Ok(None);
     };
     let identity = match config.identity.as_ref() {
-        Some(section) => Some(Arc::new(build_identity(section, legacy.auth.clone())?)),
+        Some(section) => Some(Arc::new(build_identity(
+            section,
+            legacy.auth.clone(),
+            legacy.core.clone(),
+        )?)),
         None => None,
     };
     let tunnel: Option<Arc<dyn TunnelSink>> = identity
@@ -694,6 +700,7 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
             agreement,
             login_timeout: Duration::from_secs(config.server.login_timeout),
             ban_time: Duration::from_secs(config.server.ban_time),
+            stamp_queued: true,
             caps: legacy_caps(config, voice),
             mark_cleartext: config.server.mark_cleartext,
             trtp_login: match config.identity.as_ref().map(|i| i.trtp_login.as_str()) {

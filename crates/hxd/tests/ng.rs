@@ -50,6 +50,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             agreement: None,
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
+            stamp_queued: true,
             caps: hxd_session::Caps::empty(),
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,

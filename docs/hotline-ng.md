@@ -243,6 +243,36 @@ is the mobile-friendly answer.
 { "reply": 1, "ok": { "server": { … }, "users": [ … ], "seq": 977 } }
 ```
 
+Stored mail follows a `resume` or a `sync` reply as **ordinary events
+with later seqs** — never inside the reply, and never before it. `seq`
+is what the client says it is at, so anything the server emits ahead of
+that number is something the client has just been told it is past. A
+`resume` answered `resync_required` therefore flushes nothing itself: the
+flush comes after `sync`, whose seq the client will honour.
+
+That is a statement about the *flush*, not about the socket. A session
+answered `resync_required` is live again from that moment, so traffic
+addressed to it — someone sending it a message, which delivers rather
+than queues once the session is attached — arrives in the window between
+that reply and the `sync` one, carrying seqs below the number `sync` will
+report. **A client must not discard events it has already received when
+it applies `sync`'s seq**: that number says where to *continue* from, not
+which of the frames already in hand to throw away.
+
+**Nothing at or below `sync`'s seq arrives after its reply.** The server
+owes the client that, and it is a real obligation rather than a
+likelihood: a reply and an event share one socket, so a server whose
+reply can overtake an event the session was already handed reports a
+number the client is not in fact past — and a client doing the natural
+thing, dropping what it has already seen by seq, would drop a message the
+store has marked delivered. hxd-ng reads the session's seq and drains its
+pending events ahead of the reply. Seq assignment and channel enqueue are
+one atomic operation, so everything at or below the snapshot is already
+there to drain and anything enqueued later has a higher seq. A server that
+cannot make this promise must
+say so, because the alternative rule for clients — never discard an event
+by seq — is weaker and has to be stated somewhere.
+
 ## 7. Requests and events — the MVP set
 
 Requests:
@@ -251,10 +281,29 @@ Requests:
 |---|---|---|---|
 | `login` / `resume` / `sync` | above | above | handshake only |
 | `chat` | `text`, `style?` (`"normal"`\|`"action"`) | `{}` | needs send-chat access; multi-line allowed, server relays as one event |
-| `msg` | `to` (uid), `text` | `{}` | needs send-msgs access; same 4096-byte cap as chat; a detached recipient buffers it for replay |
+| `msg` | exactly one of `to` (uid) / `to_login`, plus `text`, `guid?` | `{ "queued": bool }` | needs send-msgs access; same 4096-byte cap as chat. See §7.1 |
+| `inbox` | `before?` (id), `limit?` (1–200, default 50) | `{ messages, unread, total }` | newest first, paging backwards. `params` may be omitted |
+| `msg_read` | `up_to` (id) | `{ unread, total }` | marks everything of yours up to that id read |
+| `block` / `unblock` | exactly one of `uid` / `login`, or for `unblock` `fingerprint` | `{}` | refuse or accept mail from that account |
+| `blocks` | — | `{ "blocked": [{ "login", "fingerprint"? }] }` | who you have blocked |
 | `nick` | `nick?`, `icon?` | `{}` | nick honored only with use_any_name |
 | `ping` | — | `{}` | keepalive for clients that want RTT |
 | `logout` | — | `{}` | ends the session *now* (no grace) |
+
+`blocks` lists objects rather than logins because a block can be held
+against an identity that logged in as a guest: its login is `guest` and
+the fingerprint is what tells it apart, so a list of logins would name
+something `unblock` could not resolve once that guest had left. The
+`fingerprint` is present exactly when the block is keyed on one, and is
+the 52-character form. Blocking still needs someone the caller can see
+(a `uid` on the roster or a `login`); `fingerprint` only lifts a block
+that already exists.
+
+Errors from the message requests: `access_denied`, `no_such_user` (one
+answer for "no such account", "that account takes no offline messages"
+and "no such uid", so none can be told from the others), `no_inbox`
+(*your* account has none, which is a different thing), `mailbox_full`,
+`blocked`, `server_error`.
 
 Events (all carry `seq`):
 
@@ -267,6 +316,7 @@ Events (all carry `seq`):
 | `notice` | `{ "text" }` | `Notice` |
 | `subject` | `{ "subject" }` | `ChatSubject` (cid 0) |
 | `broadcast` | `{ "from": {uid, nick}, "text" }` | `Broadcast` |
+| `msg` | `{ from: {uid, nick, login?}, text, id?, at, queued }` | `Msg` — see §7.1 |
 | `kicked` | `{}` | `Kicked`; server then closes, session ends |
 
 A `user` object is:
@@ -304,6 +354,47 @@ The login reply's `self` object carries the same fields, plus `age` and
 Events that exist in the domain but have no ng mapping yet (the
 private-chat room family) are delivered to ng sessions as placeholder
 frames the client ignores, keeping seq accounting gapless.
+
+### 7.1 Private messages
+
+Design and rationale: [private-messages.md](private-messages.md). What a
+client has to know:
+
+- **Addressing.** `to` names a uid on the roster; `to_login` names an
+  account, whether or not it holds a session. Exactly one — a request
+  with both is `bad_request`, because guessing which was meant is how a
+  message reaches the wrong person.
+- **`guid`** is the client's own id for the message, a UUID in either
+  spelling. Two sends of the same guid between the same pair are one
+  message — stored once, never refused — which is what makes a retry safe
+  after a socket died between the send and the reply; without it a retry
+  is a second message. The *reply* to a retry describes the message as it
+  stands now, not as it stood then: a recipient who was away for the
+  original send and is here for the retry gets it, and the retry is
+  answered `queued: false` where the original said `true`. A client that
+  treats a changed answer as an error has it backwards — that is the
+  message being delivered.
+- **The reply** says `queued: true` when the message waited rather than
+  going straight to a live session, and nothing else. The message id is
+  the *recipient's* handle for marking read; handing a monotonic id to
+  the sender would tell them how much mail the server carries.
+- **The `msg` event** carries `id` (absent when nothing durable was
+  stored — a message between sessions on a server with no inbox, or from
+  a guest), `at` (unix seconds, when it was sent, not when it arrived),
+  `queued` (true when it had been waiting), and `from.login` — absent
+  when there is nobody to reply to, which is the case for a guest.
+- **The login reply's `inbox`** block (`{ unread, total }`) is present
+  whenever the server has an inbox, so a client can render a badge before
+  any mail arrives.
+
+**A client that resyncs must pull `inbox`.** When `resume` answers
+`resync_required`, the events in the gap are gone, and any `msg` among
+them was already marked delivered — the store is the only remaining copy.
+So the recovery is `sync`, and then `inbox` to see what the gap held. §3's
+"a dropped socket stops losing messages" is true of the store and true of
+the wire only for a client that does this. Mail that arrived while the
+socket was gone was never in the buffer at all: it is still pending, and
+`sync` flushes it as events after its own reply (§6).
 
 ## 8. Text, encoding, limits
 

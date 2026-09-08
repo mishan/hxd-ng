@@ -37,7 +37,24 @@ pub struct Account {
     /// Whether a non-empty password is set. Identity unlinking refuses
     /// to orphan an account that has no other way in.
     pub has_password: bool,
+    /// May private messages be stored for this account and delivered
+    /// later ([`crate::inbox`])?
+    ///
+    /// Backend default: **a password or a linked identity**, and for the
+    /// same reason `can_detach` derives that way. What disqualifies an
+    /// account is not the absence of a password but the absence of a
+    /// person behind it: everyone who walks through `guest` shares one
+    /// login, so queuing mail there hands it to whoever logs in next. A
+    /// linked identity is proof of exactly one person, the same way a
+    /// password is — which matters because the identity work creates
+    /// password-less accounts on purpose (`new_accounts = create`, and
+    /// linked accounts with `identity_login`), and those are precisely
+    /// the accounts the fingerprint keying exists for.
+    pub has_inbox: bool,
     /// Portable-identity association (`docs/hotline-ng-identity.md` §8).
+    /// Its `fingerprint` is the durable half of a
+    /// [`crate::inbox::Mailbox`]: a login can be renamed and
+    /// re-registered, a fingerprint cannot.
     pub identity: IdentityLink,
 }
 
@@ -224,4 +241,24 @@ pub trait AuthBackend: Send + Sync + 'static {
     /// an account with `reserve_name` whose login equals `name`,
     /// case-insensitively. Returns the login.
     fn reserved_by(&self, name: &str) -> Result<Option<String>, AuthError>;
+}
+
+/// A read-only look at accounts nobody is logged into.
+///
+/// Authentication answers "is this person who they say they are"; this
+/// answers "is there someone by that name, and may I leave a message for
+/// them" — which the private-message path needs precisely when there is no
+/// session to ask. Separate from [`AuthBackend`] because it takes no proof
+/// and grants nothing.
+pub trait AccountDirectory: Send + Sync + 'static {
+    /// The mailbox `login` names, if it names an account that accepts
+    /// offline messages — canonical login, plus the identity fingerprint
+    /// when the account has one. `None` otherwise.
+    ///
+    /// **One answer for two questions on purpose.** "No such account" and
+    /// "that account takes no offline messages" are the same `None`, so
+    /// the private-message path cannot be used to find out which — the
+    /// same reason the login flow answers `login_failed` to both a wrong
+    /// name and a wrong password.
+    fn inbox_account(&self, login: &str) -> Option<crate::inbox::Mailbox>;
 }

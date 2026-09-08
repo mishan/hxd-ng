@@ -58,7 +58,22 @@ async fn start_server_forwarded(dir: &Path, proxies: &[&str]) -> (SocketAddr, So
         IdentityConfig::default(),
         hxd_session::TrtpLogin::Verify,
         proxies,
+        false,
         hxd_ng_session::ForwardedHeader::Forwarded,
+    )
+    .await
+}
+
+/// Same, with a durable inbox, so the obligations a link carries
+/// (`docs/private-messages.md` §4) have something to act on.
+async fn start_server_with_inbox(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        true,
+        hxd_ng_session::ForwardedHeader::default(),
     )
     .await
 }
@@ -74,6 +89,7 @@ async fn start_server_full(
         cfg,
         trtp_login,
         proxies,
+        false,
         hxd_ng_session::ForwardedHeader::default(),
     )
     .await
@@ -85,6 +101,7 @@ async fn start_server_inner(
     cfg: IdentityConfig,
     trtp_login: hxd_session::TrtpLogin,
     proxies: &[&str],
+    inbox: bool,
     forwarded_header: hxd_ng_session::ForwardedHeader,
 ) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
@@ -105,7 +122,16 @@ async fn start_server_inner(
     )
     .unwrap();
     let file_auth = Arc::new(hxd_auth_file::FileAuth::new(accounts));
-    let core = Arc::new(Core::new());
+    let core = if inbox {
+        Core::new().with_inbox(
+            Arc::new(hxd_core::MemoryStore::new()),
+            file_auth.clone(),
+            hxd_core::InboxPolicy::default(),
+        )
+    } else {
+        Core::new()
+    };
+    let core = Arc::new(core);
     let auth: Arc<dyn hxd_core::AuthBackend> = file_auth;
     let legacy_ctx = ServerCtx {
         core: core.clone(),
@@ -118,10 +144,16 @@ async fn start_server_inner(
             ban_time: Duration::from_secs(60),
             caps: hxd_session::Caps::empty(),
             mark_cleartext: true,
+            stamp_queued: true,
             trtp_login,
         }),
     };
-    let identity = IdentityState::new(ServerKey::from_seed(&[0x55; 32]), cfg, auth.clone());
+    let identity = IdentityState::new(
+        ServerKey::from_seed(&[0x55; 32]),
+        cfg,
+        auth.clone(),
+        core.clone(),
+    );
     let tunnel: Arc<dyn TunnelSink> = Arc::new(hxd::LegacyTunnel(legacy_ctx.clone()));
     let ng_ctx = NgCtx {
         core,
@@ -291,6 +323,20 @@ async fn try_authenticate(ng: SocketAddr, p: &Person, extra: Value) -> HttpReply
         body.to_string().as_bytes(),
     )
     .await
+}
+
+/// An ordinary password login on the ng port — no identity involved.
+async fn ng_password_login(ng: SocketAddr, login: &str) -> (Ng, Value) {
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng"))
+        .await
+        .unwrap();
+    let mut c = Ng::from_ws(ws).await;
+    let ok = c
+        .request("login", json!({ "login": login, "password": "pw" }))
+        .await;
+    assert!(ok.get("ok").is_some(), "{ok}");
+    let ok = ok["ok"].clone();
+    (c, ok)
 }
 
 async fn ng_login(ng: SocketAddr, token: &str, nick: &str) -> (Ng, Value) {
@@ -2464,4 +2510,53 @@ async fn malformed_classic_credentials_are_a_400() {
     // A null is an absence, which is what a JSON encoder emits for None.
     let r = try_authenticate(ng, &p, json!({ "login": null, "password": null })).await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+}
+
+/// §4 of `docs/private-messages.md`: linking an identity must claim the
+/// account's existing mail, or the mailbox key changes under it and
+/// everything already queued is stranded in a mailbox nobody can open.
+#[tokio::test]
+async fn linking_an_identity_takes_the_accounts_mail_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, ctx) = start_server_with_inbox(dir.path()).await;
+
+    // Alice writes to bob while bob is offline and unlinked, so the
+    // mail is keyed by the bare login.
+    let (mut alice, _) = ng_password_login(ng, "alice").await;
+    let ok = alice
+        .request(
+            "msg",
+            json!({ "to_login": "bob", "text": "before you linked" }),
+        )
+        .await;
+    assert!(ok.get("ok").is_some(), "{ok}");
+    let bare = hxd_core::inbox::Mailbox::login("bob");
+    assert_eq!(ctx.core.inbox_counts_of(&bare).total, 1);
+
+    // Bob links an identity to that account.
+    let p = person(40, "Bob");
+    let auth = try_authenticate(ng, &p, json!({ "login": "bob", "password": "s3cret" })).await;
+    assert_eq!(auth.status, 200, "{}", String::from_utf8_lossy(&auth.body));
+    assert_eq!(auth.json()["outcome"], "linked");
+
+    // The mailbox moved with the link; nothing is left under the login.
+    let linked = hxd_core::inbox::Mailbox::identified("bob", p.id.fingerprint().0);
+    assert_eq!(
+        ctx.core.inbox_counts_of(&linked).total,
+        1,
+        "the mail followed the identity"
+    );
+    assert_eq!(
+        ctx.core.inbox_counts_of(&bare).total,
+        0,
+        "and none was left where the next holder of `bob` would find it"
+    );
+
+    // And bob reads it, on the identity-authenticated socket.
+    let token = auth.json()["token"].as_str().unwrap().to_owned();
+    let (mut bob, hello) = ng_login(ng, &token, "Bob").await;
+    assert_eq!(hello["inbox"]["unread"], 1, "{hello}");
+    let m = bob.event("msg").await;
+    assert_eq!(m["data"]["text"], "before you linked", "{m}");
+    assert_eq!(m["data"]["queued"], true, "it had been waiting");
 }

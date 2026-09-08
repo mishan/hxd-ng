@@ -10,5 +10,7 @@ publish = false
 [dependencies]
 # tokio::sync only — the domain layer schedules nothing itself.
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# Store failures are an operator's problem, so the domain says so.
+tracing = "0.1"
 # The OS CSPRNG, for chat ids (which are also voice-room addresses).
 getrandom = "0.2"
