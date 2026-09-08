@@ -48,13 +48,10 @@ working in the code: [AGENTS.md](AGENTS.md).
 
 ### Prerequisites
 
-The protocol crates are shared with
-[GtkHx](https://github.com/mishan/gtkhx), vendored as a submodule pinned to
-a known-good revision:
-
-```sh
-git submodule update --init
-```
+The `hxproto` wire crate is shared with
+[GtkHx](https://github.com/mishan/gtkhx) through the
+[hx-libs](https://github.com/mishan/hx-libs) workspace. Cargo fetches the
+pinned revision automatically.
 
 Building the voice SFU needs a C/assembly toolchain and **cmake** — the
 WebRTC stack's DTLS certificate generation reaches aws-lc-sys whichever

@@ -18,8 +18,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use hotline_proto::messages::{tag, ClientHdr, ServerHdr};
-use hotline_proto::text;
 use hxd_core::access::bit;
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
@@ -27,6 +25,8 @@ use hxd_core::{
     Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, LinkAuthority,
     LinkOutcome, Proof, SeqEvent, SessionStatus, Transport, Uid, UserInfo,
 };
+use hxproto::messages::{tag, ClientHdr, ServerHdr};
+use hxproto::text;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
@@ -39,7 +39,7 @@ use crate::video;
 use crate::voice;
 
 /// Server → client transaction opcodes not covered by
-/// `hotline_proto::messages::ServerHdr` (which only carries what the gtkhx
+/// `hxproto::messages::ServerHdr` (which only carries what the gtkhx
 /// client routes on). Values from `hotline.h`.
 mod hdr {
     pub const TASK: u32 = 0x0001_0000;
@@ -56,7 +56,7 @@ mod hdr {
     pub const CHAT_SUBJECT: u32 = 0x0000_0077;
 }
 
-/// Data tags hotline-proto has no constants for (the gtkhx client ignores
+/// Data tags hxproto has no constants for (the gtkhx client ignores
 /// or hand-rolls them).
 const TAG_BANNERID: u16 = 0x00a1;
 /// `HTLC_DATA_CHAT_AWAY` — away-toggle rider on a chat send. Parsed and
@@ -1505,7 +1505,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             .at
                             .duration_since(SystemTime::UNIX_EPOCH)
                             .map_or(0, |d| d.as_secs().min(i64::MAX as u64) as i64);
-                        let Some(entry) = hotline_proto::build::build_history_entry(
+                        let Some(entry) = hxproto::build::build_history_entry(
                             line.id,
                             timestamp,
                             line.flags.bits(),

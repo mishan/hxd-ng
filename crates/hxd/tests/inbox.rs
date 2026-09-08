@@ -13,12 +13,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hotline_proto::messages::tag;
 use hxd_core::{Core, InboxPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{ServerConfig, ServerCtx};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
+use hxproto::messages::tag;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;

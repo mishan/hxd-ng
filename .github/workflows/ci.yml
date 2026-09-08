@@ -4,8 +4,8 @@
 # clients against live servers on ephemeral ports), and a syntax check of
 # the Node test client.
 #
-# The gtkhx submodule pin is fetched over https; advancing it is a
-# deliberate act that this workflow then validates.
+# The shared hxproto revision is fetched from hx-libs over https; advancing
+# the pin is a deliberate act that this workflow then validates.
 #
 # TODO: add an MSRV (1.85) job once the lockfile is verified to resolve at
 # that toolchain — the pin is inherited from gtkhx's Debian-stable floor
@@ -38,8 +38,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:

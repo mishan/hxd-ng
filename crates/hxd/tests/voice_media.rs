@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use hotline_proto::messages::tag;
 use hxd_core::video::VideoConfig;
 use hxd_core::Core;
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
@@ -28,6 +27,7 @@ use hxd_session::caps::{cap, Caps};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{ServerConfig, ServerCtx};
 use hxd_voice::Sfu;
+use hxproto::messages::tag;
 use serde_json::{json, Value};
 use str0m::config::Fingerprint;
 use str0m::media::MediaKind;

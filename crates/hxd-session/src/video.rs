@@ -13,18 +13,18 @@
 //! server-initiated notification carrying **task id 0**, not the push
 //! counter the rest of this frontend uses.
 //!
-//! **The opcodes and field ids live here rather than in `hotline-proto`.**
+//! **The opcodes and field ids live here rather than in `hxproto`.**
 //! The shared crate carries the voice extension's because GtkHx speaks
 //! it; nothing in the gtkhx tree speaks video yet, and inventing the
-//! constants there would mean a submodule pin bump ahead of any client
-//! that could use them. They move to `hotline_proto::messages` in the
+//! constants there would mean advancing a shared-crate pin ahead of any client
+//! that could use them. They move to `hxproto::messages` in the
 //! same change that teaches GtkHx to render video, which is where the
 //! two halves get tested against each other.
 
-use hotline_proto::messages::tag;
 use hxd_core::video::{
     VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,
 };
+use hxproto::messages::tag;
 
 /// Client → server transaction opcodes.
 ///

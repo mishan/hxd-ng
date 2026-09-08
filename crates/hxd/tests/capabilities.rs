@@ -2,7 +2,7 @@
 //! `DATA_CAPABILITIES` (`0x01F0`) bitmask exchange at LOGIN, and the ng
 //! login reply's `caps` list. A live server on an ephemeral port, driven
 //! by scripted clients — the legacy one packs with the same
-//! `hotline-proto` a real client uses.
+//! `hxproto` a real client uses.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hotline_proto::messages::tag;
 use hxd_core::Core;
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::{cap, Caps};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{ServerConfig, ServerCtx};
+use hxproto::messages::tag;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;

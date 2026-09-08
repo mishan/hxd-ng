@@ -13,7 +13,7 @@ Spec: fogWraith
 read at `main` = `75d4485` (2026-09-05). GtkHx's implementation pins
 `525e94e`; the two should be diffed once before V3 (§9) and the pin
 recorded here. GtkHx's own write-up,
-[`gtkhx/docs/voice.md`](../gtkhx/docs/voice.md), is the client-side
+[`gtkhx/docs/voice.md`](https://github.com/mishan/gtkhx/blob/main/docs/voice.md), is the client-side
 counterpart of this document and its "Open" section is the list of
 server bugs we are here to not repeat (§6).
 
@@ -287,10 +287,10 @@ a template, deterministic per (peer, room state), and it is what makes
 "the current offer for this peer" cheap to produce on demand (§4). Answer
 parsing needs `ice-ufrag`, `ice-pwd`, `fingerprint`, `setup`, each
 section's mid and direction, PCMU's presence, and the `send` section's
-`a=ssrc` — `hotline_proto::voice::sdp::summarize` already parses the
+`a=ssrc` — `hxproto::voice::sdp::summarize` already parses the
 shape (mids, BUNDLE, directions) for the client and can be extended for
 the rest, or `str0m-proto`'s parser used for just this. `hxd-voice` may
-depend on `hotline-proto`; it is not the domain.
+depend on `hxproto`; it is not the domain.
 
 **Forwarding** is the SFU's whole job and it is small: on
 `Event::RtpPacket` from peer A in room R, for each other peer B in R that
@@ -313,7 +313,7 @@ out.
 ## 6. The Janus bugs we are here to not repeat
 
 Both are documented from the client side in
-[`gtkhx/docs/voice.md`](../gtkhx/docs/voice.md) § Open, with scripted
+[`gtkhx/docs/voice.md`](https://github.com/mishan/gtkhx/blob/main/docs/voice.md) § Open, with scripted
 reproductions. Both are avoided by construction in this design, and the
 staging (§9) tests for both explicitly.
 
@@ -350,7 +350,7 @@ bits in the login reply, and expose `Session::has_cap`. Voice sets bit 2
 in the supported set iff a `VoiceMedia` is wired. Text-Encoding then
 lands as bit 1 on the same plumbing.
 
-**Transactions** (`hotline-proto` has the client's builders and parsers;
+**Transactions** (`hxproto` has the client's builders and parsers;
 the server side mirrors them):
 
 | Opcode | Direction | Server does |
@@ -372,15 +372,14 @@ care; Janus sends 0; we send 0 for the three voice notifications and
 leave the rest as they are, with the deviation commented at the site.
 
 The `VOICE_PARTICIPANTS` blob (u16 uid, u16 flags, u16 codec id, all
-big-endian, six bytes per entry) has a parser in `hotline-proto::voice`
+big-endian, six bytes per entry) has a parser in `hxproto::voice`
 and needs the matching builder. **It stays in `hxd-session` for now**, not
-in the shared crate: advancing the submodule pin needs the gtkhx side
-merged first, and six bytes an entry does not earn a coordinated bump
+in the shared crate: six bytes an entry does not earn a coordinated release
 across two trees when the check that matters is available without one —
 the round-trip test here runs our encoder against
-`hotline_proto::voice::parse_voice_participants`, the decoder GtkHx
+`hxproto::voice::parse_voice_participants`, the decoder GtkHx
 actually uses, and pins the bytes besides. It moves next door to its
-parser when Phase 0's shared-crate extraction gives them a home together.
+parser when the shared API next needs a coordinated change.
 Everything else on this wire is plain chunk assembly.
 
 ## 8. The ng wire (`hxd-ng-session`)
@@ -493,7 +492,7 @@ V5 is what remains: real clients, real microphones, one room.
 | An unauthenticated UDP port on the internet | Medium — answered | str0m drops anything that doesn't match a live ICE credential or an established peer; the pump rate-limits `accepts()` misses per source, because *deciding* a datagram matches nothing means offering it to every live `Rtc` under one mutex, and a spoofed flood would otherwise cost the room its forwarding latency. Only misses are charged, so a peer sending real media is never throttled. Document the port in the firewall notes; voice is off by default |
 | Bandwidth: PCMU has no DTX, 64 kbps per stream each way, N−1 downstream per client | Low for Hotline-sized rooms, real at 16 | The per-room cap is the knob; the spec's bandwidth table goes in the operator docs |
 | Sequential cids are guessable, and the spec's room-membership rules say a guessed cid is a joinable private room | **High if membership isn't checked; Low once it is** | Membership check in V1 is the real defence; random cids (§11) are defence in depth and cheap |
-| ~~`hotline-proto` changes coordinated by hand across two trees~~ | Avoided | Nothing crossed. The participants encoder stayed server-side (§7), round-tripped against the shared parser. |
+| ~~`hxproto` changes coordinated by hand across two trees~~ | Avoided | Nothing crossed. The participants encoder stayed server-side (§7), round-tripped against the shared parser. |
 | The mute-debounce timer has no natural home in a domain that "schedules nothing" | Low | Ship without it (it's a SHOULD); if PTT flapping is noisy in practice, the `hxd-voice` task owns the timer and calls `core.voice_flush_status(cid)` |
 
 ## 11. Open questions

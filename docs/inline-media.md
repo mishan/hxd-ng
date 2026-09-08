@@ -563,7 +563,7 @@ default so CI covers the pipeline.
 3. **M3 — the legacy wire.** LOGIN advert, 750 single and chunked, 751
    sliced, the chat/msg field handling in both directions, error codes.
    E2E in `crates/hxd/tests/media.rs` with a scripted client that packs
-   with `hotline_proto::inline_media` — the same builders GtkHx uses —
+   with `hxproto::inline_media` — the same builders GtkHx uses —
    covering: single-shot round trip; chunked upload and multi-part
    download; a capable and a non-capable client in one room, one
    seeing fields and the other not; a non-recipient's download refused

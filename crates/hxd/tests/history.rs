@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hotline_proto::messages::tag;
 use hxd_core::{Core, HistoryPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::{cap, Caps};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{ServerConfig, ServerCtx};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
+use hxproto::messages::tag;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -194,11 +194,8 @@ fn history_entries(frame: &Frame) -> Vec<(u64, String)> {
         .chunks()
         .filter(|chunk| chunk.tag == tag::HISTORY_ENTRY)
         .map(|chunk| {
-            let entry = hotline_proto::parse::parse_history_entry(chunk.data).unwrap();
-            (
-                entry.message_id,
-                hotline_proto::text::to_utf8(entry.message),
-            )
+            let entry = hxproto::parse::parse_history_entry(chunk.data).unwrap();
+            (entry.message_id, hxproto::text::to_utf8(entry.message))
         })
         .collect()
 }
@@ -411,7 +408,7 @@ async fn compatibility_replay_waits_for_user_list_and_capable_clients_do_not_get
     let first = old.recv_type(HDR_CHAT).await;
     let second = old.recv_type(HDR_CHAT).await;
     let bodies = [first, second].map(|frame| {
-        hotline_proto::text::to_utf8(frame.chunks().find(|c| c.tag == tag::BODY).unwrap().data)
+        hxproto::text::to_utf8(frame.chunks().find(|c| c.tag == tag::BODY).unwrap().data)
     });
     assert!(bodies[0].contains("second"), "{}", bodies[0]);
     assert!(bodies[1].contains("third"), "{}", bodies[1]);

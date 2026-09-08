@@ -39,7 +39,7 @@ serde = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
-hotline-proto = { workspace = true }
+hxproto = { workspace = true }
 # The media e2e stands real WebRTC clients up against the real SFU.
 hxd-voice = { workspace = true }
 # The inbox e2e uses the real store on a real file, not a fake.

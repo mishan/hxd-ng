@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, Stream, StreamExt};
 use hl_identity::{cert, Card, DeviceCert, DeviceKey, IdentityKey, LoginProof, ServerKey};
-use hotline_proto::messages::tag;
 use hxd_core::Core;
 use hxd_ng_session::{IdentityConfig, IdentityState, NgConfig, NgCtx, Registry, TunnelSink};
 use hxd_session::frame::{pack_frame, Frame};
 use hxd_session::{ServerConfig, ServerCtx};
+use hxproto::messages::tag;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;

@@ -43,7 +43,7 @@ The pieces the design needs already exist:
   arm per bump.
 - **The hourly sweeper** in the binary that runs inbox retention.
 - **The client side**: GtkHx parses `DATA_HISTORY_ENTRY` with
-  `hotline_proto::parse::parse_history_entry`, fetches an initial batch
+  `hxproto::parse::parse_history_entry`, fetches an initial batch
   after USER_GETLIST, uses `BEFORE` for "Load older" and `AFTER` for a
   reconnect catch-up, and renders the action / server-message / deleted
   flags. Its tests run against a mock; this server replaces the mock.
@@ -323,7 +323,7 @@ suggested figure) or "Slow down."; `off_reactor` into
 `Core::history(uid, query)`; encode.
 
 Encoding an entry is the mirror of `parse_history_entry` in the shared
-crate, and lands beside it in `hotline-proto` as `build_history_entry`
+crate, and lands beside it in `hxproto` as `build_history_entry`
 so the two cannot disagree about a byte. Nick and body pass through the
 session's text conversion — Mac Roman today, UTF-8 once Text-Encoding
 lands — with the lengths taken **after** conversion; the nick was
@@ -493,8 +493,8 @@ H5 belongs to the moderation implementation.
    semantics in every combination, `has_more` in each direction,
    tombstones surviving prune until aged) and the conformance suite run
    against both stores, like the inbox's.
-2. **H2 — the legacy wire.** `build_history_entry` in `hotline-proto`
-   (submodule bump, coordinated by hand as `AGENTS.md` says), LOGIN
+2. **H2 — the legacy wire.** `build_history_entry` in `hxproto`
+   (landed in `hx-libs` before advancing hxd-ng's exact git pin), LOGIN
    advertisement, 700 dispatch with the clamps and gates, replay behind
    its config. E2E in `crates/hxd/tests/history.rs`: a scripted client
    negotiating bit 4, initial page, `before` paging to the beginning,

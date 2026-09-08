@@ -106,7 +106,7 @@ MVP is the payoff.
 chat text as raw Mac Roman bytes. It flips to `String`: the legacy frontend
 converts Mac Roman → UTF-8 on ingest and UTF-8 → Mac Roman (lossy `?` for
 unmappable, truncate nicks to 31 bytes *after* conversion) on egress, via
-`hotline_proto::text`. This is lossless for all legacy-origin text — Mac
+`hxproto::text`. This is lossless for all legacy-origin text — Mac
 Roman → UTF-8 is injective and round-trips exactly — and lossy only for
 ng-origin text shown to legacy clients, which is unavoidable. The
 kick-announcement `ChatLine` event becomes a semantic `Notice { cid, text }`
