@@ -10,12 +10,15 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/hl-identity",
     "crates/hxd-core",
     "crates/hxd-auth-file",
     "crates/hxd-session",
     "crates/hxd-voice",
     "crates/hxd-ng-session",
+    "crates/hxd-store-sqlite",
     "crates/hxd",
+    "crates/hlid",
 ]
 # Without this, cargo auto-adopts the submodule's crates as workspace
 # members (path deps living under the workspace root), and `--workspace`
@@ -36,11 +39,13 @@ rust-version = "1.85"
 hotline-proto = { path = "gtkhx/rust/crates/hotline-proto" }
 
 # Internal.
+hl-identity = { path = "crates/hl-identity" }
 hxd-core = { path = "crates/hxd-core" }
 hxd-auth-file = { path = "crates/hxd-auth-file" }
 hxd-session = { path = "crates/hxd-session" }
 hxd-ng-session = { path = "crates/hxd-ng-session" }
 hxd-voice = { path = "crates/hxd-voice" }
+hxd-store-sqlite = { path = "crates/hxd-store-sqlite" }
 
 # External.
 tokio = { version = "1", default-features = false, features = [

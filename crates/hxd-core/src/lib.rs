@@ -10,16 +10,26 @@
 pub mod access;
 pub mod account;
 pub mod chat;
+pub mod inbox;
+pub mod notify;
 pub mod roster;
 pub mod video;
 pub mod voice;
 
 pub use access::AccessBits;
-pub use account::{Account, AuthBackend, AuthError, Proof};
-pub use chat::ChatError;
+pub use account::{
+    Account, AccountDirectory, AuthBackend, AuthError, IdentityLink, LinkAuthority, LinkOutcome,
+    Proof, UnlinkOutcome,
+};
+pub use chat::{ChatError, MsgOutcome};
+pub use inbox::{
+    Delivery, InboxCounts, MemoryStore, MessageId, MessageStore, NewMessage, Pushed, StoreError,
+    StoredMessage,
+};
+pub use notify::{Notification, NotificationGateway};
 pub use roster::{
-    AttachInfo, Core, Event, Resume, SeqEvent, SessionStatus, Uid, UserDetails, UserInfo,
-    OUTBOX_BUFFER_CAP,
+    AttachInfo, Core, Event, IdentityTag, InboxPolicy, Resume, SeqEvent, SessionStatus, Transport,
+    Uid, UserDetails, UserInfo, OUTBOX_BUFFER_CAP,
 };
 pub use video::{VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream};
 pub use voice::{

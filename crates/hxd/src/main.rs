@@ -39,8 +39,31 @@ fn init_tracing() {
         .init();
 }
 
-fn parse_args() -> Result<PathBuf, String> {
+/// What the command line asked for.
+enum Command {
+    Serve,
+    /// `inbox purge <login> [--fingerprint FP] [--dry-run]`.
+    InboxPurge {
+        login: String,
+        fingerprint: Option<String>,
+        dry_run: bool,
+    },
+}
+
+const USAGE: &str = "usage:\n  \
+hxd [--config hxd-ng.toml]\n  \
+hxd [--config …] inbox purge <login> [--fingerprint FP] [--dry-run]\n\n\
+`inbox purge` takes an account's mail with it when the account is\n\
+deleted — otherwise the freed login's next holder inherits it.\n\
+Pass --fingerprint (the value in the account's [identity] table, or\n\
+its hex) when the account file is already gone. --dry-run says how\n\
+much would go without taking it.";
+
+fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut config = PathBuf::from("hxd-ng.toml");
+    let mut rest = Vec::new();
+    let mut fingerprint = None;
+    let mut dry_run = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -50,14 +73,38 @@ fn parse_args() -> Result<PathBuf, String> {
                     .map(PathBuf::from)
                     .ok_or_else(|| "--config needs a path".to_string())?;
             }
+            "--fingerprint" => {
+                fingerprint = Some(
+                    args.next()
+                        .ok_or_else(|| "--fingerprint needs a value".to_string())?,
+                );
+            }
+            "--dry-run" => dry_run = true,
             "--help" | "-h" => {
-                println!("usage: hxd [--config hxd-ng.toml]");
+                println!("{USAGE}");
                 std::process::exit(0);
             }
-            other => return Err(format!("unknown argument {other:?}")),
+            other if other.starts_with('-') => return Err(format!("unknown argument {other:?}")),
+            other => rest.push(other.to_string()),
         }
     }
-    Ok(config)
+    let command = match rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        // A flag that belongs to a subcommand is an error on the way to
+        // serving, not something to accept and ignore: an operator who
+        // typed `hxd --fingerprint … inbox purge` with a typo in the
+        // subcommand would otherwise get a running server.
+        [] if fingerprint.is_some() || dry_run => {
+            return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
+        }
+        [] => Command::Serve,
+        ["inbox", "purge", login] => Command::InboxPurge {
+            login: login.to_string(),
+            fingerprint,
+            dry_run,
+        },
+        _ => return Err(USAGE.to_string()),
+    };
+    Ok((config, command))
 }
 
 #[tokio::main]
@@ -65,8 +112,23 @@ async fn main() {
     init_tracing();
 
     let result = async {
-        let config_path = parse_args()?;
+        let (config_path, command) = parse_args()?;
         let config = Config::load(&config_path)?;
+        hxd::check_config(&config)?;
+        if let Command::InboxPurge {
+            login,
+            fingerprint,
+            dry_run,
+        } = &command
+        {
+            let n = hxd::inbox_purge(&config, login, fingerprint.as_deref(), *dry_run)?;
+            if *dry_run {
+                println!("{n} rows belonging to {login} would be purged");
+            } else {
+                println!("purged {n} rows belonging to {login}");
+            }
+            return Ok(());
+        }
         let voice = hxd::voice::build(&config)?;
         let ctx = build_ctx(&config, voice.as_ref())?;
 
@@ -82,7 +144,7 @@ async fn main() {
 
         // The ng context is built before voice is consumed below, so its
         // capability list can see it.
-        let ng_ctx = hxd::build_ng_ctx(&config, &ctx, voice.as_ref());
+        let ng_ctx = hxd::build_ng_ctx(&config, &ctx, voice.as_ref())?;
 
         // Voice: the UDP media socket and the pump that drives it. Both
         // wires advertise the capability only because building this
@@ -100,6 +162,20 @@ async fn main() {
             });
         }
 
+        // Inbox retention, when there is an inbox. Not the ng frontend's
+        // business: a legacy-only server has inboxes too.
+        if let Some(inbox) = &config.inbox {
+            tracing::info!(
+                "private-message inbox at {} — it holds message bodies in the clear",
+                inbox.db.display()
+            );
+            tokio::spawn(hxd::inbox_pruner(
+                ctx.core.clone(),
+                std::time::Duration::from_secs(inbox.retain_unread),
+                std::time::Duration::from_secs(inbox.retain_read),
+            ));
+        }
+
         // The Hotline-ng WebSocket frontend, when configured: its accept
         // loop plus the detached-session sweeper.
         if let Some(ng_ctx) = ng_ctx {
@@ -112,6 +188,13 @@ async fn main() {
                 ng.bind,
                 ng.grace
             );
+            if let Some(id) = ng_ctx.identity.as_ref() {
+                tracing::info!(
+                    "identity enabled (server key {}, TRTP tunnel {})",
+                    hl_identity::Fingerprint::of(&id.server_key()).short(),
+                    if id.config().trtp { "on" } else { "off" }
+                );
+            }
             let grace = ng_ctx.cfg.grace;
             tokio::spawn(hxd_ng_session::sweeper(
                 ng_ctx.core.clone(),

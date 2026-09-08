@@ -143,6 +143,8 @@ mod tests {
             paths: Default::default(),
             ng: None,
             voice,
+            identity: None,
+            inbox: None,
         }
     }
 

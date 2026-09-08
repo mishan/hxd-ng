@@ -16,7 +16,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use hotline_proto::messages::{tag, ClientHdr, ServerHdr};
 use hotline_proto::text;
@@ -24,12 +24,11 @@ use hxd_core::access::bit;
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Proof, SeqEvent,
-    SessionStatus, Uid, UserInfo,
+    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, LinkAuthority,
+    LinkOutcome, Proof, SeqEvent, SessionStatus, Transport, Uid, UserInfo,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
@@ -93,6 +92,31 @@ pub struct ServerConfig {
     /// configured, so a bit is never advertised by a build that can't
     /// serve it.
     pub caps: Caps,
+    /// Set the cleartext marker bit in user flags for unencrypted
+    /// sessions (`docs/hotline-ng-identity.md` §10). Off by default: see
+    /// [`wire_color`].
+    pub mark_cleartext: bool,
+    /// How a tunnelled session's classic login reconciles with the
+    /// socket's transport identity (`docs/hotline-ng-identity.md` §8.3).
+    pub trtp_login: TrtpLogin,
+    /// Mark a private message that waited in the inbox with the time it
+    /// was sent. A message that arrives three days late and looks like it
+    /// arrived this second is a worse experience than a slightly ugly
+    /// one; an operator who disagrees turns it off.
+    pub stamp_queued: bool,
+}
+
+/// See [`ServerConfig::trtp_login`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrtpLogin {
+    /// Classic credentials are checked as on the TCP port; a named
+    /// account must be the linked one or self-linkable (then it gets
+    /// linked). Identity adds marking and admission, never replaces a
+    /// password.
+    #[default]
+    Verify,
+    /// A linked account is used and the classic credentials ignored.
+    Trust,
 }
 
 impl Default for ServerConfig {
@@ -104,6 +128,9 @@ impl Default for ServerConfig {
             login_timeout: Duration::from_secs(10),
             ban_time: Duration::from_secs(1800),
             caps: Caps::empty(),
+            mark_cleartext: false,
+            trtp_login: TrtpLogin::Verify,
+            stamp_queued: true,
         }
     }
 }
@@ -116,14 +143,24 @@ pub struct ServerCtx {
     pub cfg: Arc<ServerConfig>,
 }
 
-/// Accept loop: one [`run_session`] task per connection.
+/// Accept loop: one [`run_session`] task per connection. Plain TCP, so
+/// the transport is cleartext and carries no identity.
 pub async fn serve(listener: TcpListener, ctx: ServerCtx) -> std::io::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let span = tracing::info_span!("session", %peer);
-            run_session(stream, peer, ctx).instrument(span).await;
+            run_session(
+                stream,
+                peer,
+                ctx,
+                Transport::default(),
+                LinkAuthority::default(),
+            )
+            .instrument(span)
+            .await;
         });
     }
 }
@@ -157,7 +194,7 @@ enum Outbound {
 
 type Tx = UnboundedSender<Outbound>;
 
-async fn writer_task(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Outbound>) {
+async fn writer_task<W: AsyncWrite + Unpin>(mut wr: W, mut rx: UnboundedReceiver<Outbound>) {
     // Server pushes count their own transactions, starting at 1 (mhxd's
     // convention; clients ignore the value everywhere but task replies).
     let mut push_trans: u32 = 1;
@@ -182,7 +219,7 @@ async fn writer_task(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Outbound>
                 pack_frame(ty, 0, 0, &chunks)
             }
         };
-        if wr.write_all(&bytes).await.is_err() {
+        if wr.write_all(&bytes).await.is_err() || wr.flush().await.is_err() {
             break; // Reader will observe the dead socket and clean up.
         }
     }
@@ -191,7 +228,7 @@ async fn writer_task(mut wr: OwnedWriteHalf, mut rx: UnboundedReceiver<Outbound>
 
 /// Reader task: frames the socket into a bounded channel (backpressure for
 /// a flooding client). Exits on EOF, error, or a malformed frame.
-async fn reader_task(mut rd: OwnedReadHalf, frames: Sender<Frame>) {
+async fn reader_task<R: AsyncRead + Unpin>(mut rd: R, frames: Sender<Frame>) {
     loop {
         match read_frame(&mut rd).await {
             Ok(f) => {
@@ -273,33 +310,48 @@ fn mac_nick(nick: &str) -> Vec<u8> {
 /// The legacy color field is a bitfield in practice: bit 1 away, bit 2
 /// admin. The domain stores `admin` + status; the wire form is derived
 /// here and only here.
-fn wire_color(u: &UserInfo) -> u16 {
+///
+/// Bit 4 (value 16) marks a session whose link is cleartext
+/// (`docs/hotline-ng-identity.md` §10): a plain TCP legacy session. Old
+/// clients ignore flag bits they don't know, but the reference server
+/// never set one, so this is a deliberate deviation behind
+/// `ServerConfig::mark_cleartext` (default off) until it has been seen
+/// against every 1.x client we care about.
+fn wire_color(u: &UserInfo, mark_cleartext: bool) -> u16 {
     (if u.admin { 2 } else { 0 })
         | (if u.status == SessionStatus::Active {
             0
         } else {
             1
         })
+        | (if mark_cleartext && !u.transport.encrypted {
+            16
+        } else {
+            0
+        })
 }
 
 /// The `HTLS_DATA_USER_LIST` payload: uid, icon, color, nlen (all u16 BE),
 /// then the name bytes. `struct hl_userlist_hdr` minus the chunk header.
-fn userlist_payload(u: &UserInfo) -> Vec<u8> {
+fn userlist_payload(u: &UserInfo, mark_cleartext: bool) -> Vec<u8> {
     let nick = mac_nick(&u.nick);
     let mut v = Vec::with_capacity(8 + nick.len());
     v.extend_from_slice(&u.uid.to_be_bytes());
     v.extend_from_slice(&u.icon.to_be_bytes());
-    v.extend_from_slice(&wire_color(u).to_be_bytes());
+    v.extend_from_slice(&wire_color(u, mark_cleartext).to_be_bytes());
     v.extend_from_slice(&(nick.len() as u16).to_be_bytes());
     v.extend_from_slice(&nick);
     v
 }
 
-fn user_change_chunks(u: &UserInfo) -> Vec<(u16, Vec<u8>)> {
+fn user_change_chunks(u: &UserInfo, mark_cleartext: bool) -> Vec<(u16, Vec<u8>)> {
     vec![
         (tag::UID, u.uid.to_be_bytes().to_vec()),
         (tag::ICON, u.icon.to_be_bytes().to_vec()),
-        (tag::COLOUR, wire_color(u).to_be_bytes().to_vec()),
+        (
+            tag::COLOUR,
+            wire_color(u, mark_cleartext).to_be_bytes().to_vec(),
+        ),
         (tag::NAME, mac_nick(&u.nick)),
     ]
 }
@@ -345,8 +397,74 @@ fn err_text(e: ChatError) -> &'static str {
         ChatError::NotAMember => "You are not in that chat.",
         ChatError::AlreadyThere => "Already there.",
         ChatError::WrongPassword => "Wrong chat password.",
+        ChatError::MailboxFull => "That user's mailbox is full.",
+        ChatError::Blocked => "That user is not accepting messages from you.",
+        ChatError::NoInbox => "This account has no message inbox.",
         ChatError::ServerError => "Server error.",
     }
+}
+
+/// `YYYY-MM-DD HH:MM UTC`, for the queued-message stamp.
+///
+/// UTC, and said so in the text: the server knows nothing about where the
+/// reader is, and the legacy wire has no way for a client to tell it. A
+/// stamp in an unstated zone would be worse than one in a stated one.
+///
+/// Hand-rolled rather than pulling in a calendar crate for one line of
+/// presentation — this is Howard Hinnant's `civil_from_days`, which is
+/// exact for every date this server will ever format.
+fn stamp(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (hour, minute) = (rem / 3600, (rem % 3600) / 60);
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+/// UTF-8 → Mac Roman, with the line endings this wire uses.
+///
+/// The conversion belongs here and not in the stored text: the domain
+/// holds whatever the sender's wire gave it — an ng client's `\n`, a
+/// legacy client's `\r` — and each frontend renders that in its own
+/// terms, exactly as with Mac Roman itself. A 1.x client draws a bare
+/// `\n` as a glyph rather than a line break, so a multi-line private
+/// message from an ng client arrived as one run of text with a symbol in
+/// it, and the queued stamp (which is `\r`) made a body with both. CRLF
+/// collapses to one `\r`, or the pair renders as a blank line.
+fn mac_text(text: &str) -> Vec<u8> {
+    let bytes = text::from_utf8(text);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+                out.push(b'\r');
+                i += 2;
+            }
+            b'\n' => {
+                out.push(b'\r');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 // --- Chat line formatting ----------------------------------------------
@@ -458,13 +576,26 @@ impl Session {
     }
 }
 
-pub async fn run_session(stream: TcpStream, peer: SocketAddr, ctx: ServerCtx) {
+/// Run one legacy session over any byte stream: a TCP socket from
+/// [`serve`], or a TRTP-over-WebSocket tunnel handed over by the ng
+/// frontend (`docs/hotline-ng-identity.md` §6.3). `transport` says what
+/// the caller knows about the link — encrypted or not, and the transport
+/// identity if the caller authenticated one — and is carried to the
+/// roster untouched. The protocol inside doesn't know which it got.
+pub async fn run_session<S>(
+    stream: S,
+    peer: SocketAddr,
+    ctx: ServerCtx,
+    transport: Transport,
+    link: LinkAuthority,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     if ctx.core.is_banned(peer.ip()) {
         info!("refusing banned address");
         return;
     }
-    let _ = stream.set_nodelay(true);
-    let (mut rd, wr) = stream.into_split();
+    let (mut rd, wr): (ReadHalf<S>, WriteHalf<S>) = tokio::io::split(stream);
 
     // --- Magic exchange -------------------------------------------------
     // Read exactly the 12 client-hello bytes; anything the client pipelined
@@ -482,7 +613,9 @@ pub async fn run_session(stream: TcpStream, peer: SocketAddr, ctx: ServerCtx) {
 
     let (tx, out_rx) = mpsc::unbounded_channel();
     let mut wr_for_magic = wr;
-    if wr_for_magic.write_all(&SERVER_MAGIC).await.is_err() {
+    // TCP needs no flush; a tunnelled stream buffers frames until one
+    // (`WsByteStream`), so flush after every write on the generic path.
+    if wr_for_magic.write_all(&SERVER_MAGIC).await.is_err() || wr_for_magic.flush().await.is_err() {
         return;
     }
     let writer = tokio::spawn(writer_task(wr_for_magic, out_rx));
@@ -490,7 +623,7 @@ pub async fn run_session(stream: TcpStream, peer: SocketAddr, ctx: ServerCtx) {
     let reader = tokio::spawn(reader_task(rd, frames_tx));
 
     // --- Login, then the session loop -----------------------------------
-    let outcome = login_phase(&mut frames, &tx, &ctx, peer).await;
+    let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport, link).await;
     if let Some((mut sess, mut events)) = outcome {
         let uid = sess.uid;
         info!(uid, login = %sess.account.login, "logged in");
@@ -503,12 +636,162 @@ pub async fn run_session(stream: TcpStream, peer: SocketAddr, ctx: ServerCtx) {
     let _ = writer.await;
 }
 
+/// Does this login name the guest account? Empty is guest by convention
+/// (`AuthBackend::authenticate`), and so is the name itself.
+fn names_guest(login: &str) -> bool {
+    login.is_empty() || login.eq_ignore_ascii_case("guest")
+}
+
+/// The classic login, reconciled with the socket's transport identity
+/// when it has one (`docs/hotline-ng-identity.md` §8.3). Without an
+/// identity this is just `authenticate`.
+fn reconcile_login(
+    auth: &dyn AuthBackend,
+    core: &Core,
+    login: &str,
+    password: &[u8],
+    identity_fp: Option<[u8; 32]>,
+    policy: TrtpLogin,
+    link: LinkAuthority,
+) -> Result<Account, AuthError> {
+    // Whatever this login resolves to, an account that links an identity
+    // has its mail claimed onto the fingerprint before it is handed a
+    // session. `claim` is idempotent and does nothing on a mailbox that
+    // has already moved; running it here closes the two windows a
+    // link-time-only claim leaves — a `msg_login` that read the
+    // directory before the link was written, and an account linked from
+    // another device while a session of it was already up, both of which
+    // leave rows on the bare login that nobody would look at again.
+    let claim = |a: &Account| {
+        if let Some(f) = a.identity.fingerprint {
+            let moved = core.inbox_claim(&a.login, &f);
+            if moved > 0 {
+                info!(login = %a.login, moved, "inbox claimed at login");
+            }
+        }
+    };
+    let Some(fp) = identity_fp else {
+        // No transport identity — and the claim still belongs here. The
+        // obligation is the *account's*, not the socket's: someone who
+        // linked once through ng and thereafter logs in from GtkHx with
+        // their password has a fingerprint-keyed mailbox, and the rows
+        // those two windows leave on the bare login would sit there
+        // unread forever if the only claim were on the identity paths.
+        let account = auth.authenticate(login, Proof::Plain(password))?;
+        claim(&account);
+        return Ok(account);
+    };
+    // Unfiltered: "no account links this identity" and "one does but the
+    // operator turned identity login off" are different answers, and
+    // §8.1 gives them different outcomes. Collapsing them here turned the
+    // second into a silent guest session, where the ng path denies it.
+    let linked = auth.find_by_fingerprint(&fp)?;
+    let identity_admits = linked.as_ref().is_some_and(|a| a.identity.identity_login);
+    if policy == TrtpLogin::Trust && identity_admits {
+        let a = linked.expect("identity_admits implies a linked account");
+        debug!(login = %a.login, "trtp_login = trust: using the linked account");
+        claim(&a);
+        return Ok(a);
+    }
+    let account = match auth.authenticate(login, Proof::Plain(password)) {
+        Ok(a) => Some(a),
+        // Deleting `guest.toml` is the documented way to turn guests
+        // off, and it used to refuse a linked identity's guest login on
+        // this wire while the JSON wire admitted the same identity on
+        // the link alone. Naming no account is a question about the
+        // identity; only a linked account that may log in answers it.
+        Err(AuthError::NoSuchAccount) if names_guest(login) && identity_admits => None,
+        Err(e) => return Err(e),
+    };
+    if account.as_ref().is_none_or(|a| a.login == "guest") {
+        // §8.1: naming no account on an identity socket associates by
+        // identity. A link the operator has disabled is a refusal, not a
+        // fallback to guest — the account said no, and handing out a
+        // guest session instead is answering a different question.
+        return match linked {
+            Some(a) if identity_admits => {
+                claim(&a);
+                Ok(a)
+            }
+            Some(a) => {
+                info!(login = %a.login, "identity_login is off for the linked account");
+                Err(AuthError::BadProof)
+            }
+            // §8.1 `deny`, decided on this wire as it is on the JSON one:
+            // nothing links this identity, so there is no guest to fall
+            // back to. The token that opened the socket may have been
+            // minted while an account still linked it — it lives a
+            // minute — so this is re-decided here rather than trusted
+            // from the upgrade.
+            None if !link.unlinked_ok => {
+                info!("new_accounts = deny: an identity with no linked account");
+                Err(AuthError::BadProof)
+            }
+            None => account.ok_or(AuthError::NoSuchAccount),
+        };
+    }
+    let account = account.expect("a named account was authenticated");
+    match account.identity.fingerprint {
+        Some(f) if f == fp => {
+            claim(&account);
+            Ok(account)
+        }
+        Some(_) => {
+            info!(login = %account.login, "tunnelled login names an account linked to another identity");
+            Err(AuthError::BadProof)
+        }
+        // Self-linking here writes an association exactly as
+        // `/identity/link` does, so it needs the same `manage`
+        // capability (identity spec §8.2) — and it goes through the
+        // backend's exclusive op, so two tunnelled logins by one
+        // identity can't both decide the identity is free.
+        None if account.identity.allow_self_link && link.may_link => {
+            match auth.link_identity(&account.login, &fp)? {
+                LinkOutcome::Linked(a) => {
+                    info!(login = %a.login, "identity linked by tunnelled login");
+                    // §4 of docs/private-messages.md: a link that doesn't
+                    // claim strands the account's existing mail.
+                    let moved = core.inbox_claim(&a.login, &fp);
+                    if moved > 0 {
+                        info!(login = %a.login, moved, "inbox claimed by the new identity link");
+                    }
+                    Ok(a)
+                }
+                LinkOutcome::Already(a) => Ok(a),
+                // The identity already links someone else's account, or
+                // this one refused. §8.3 `verify` allows exactly two
+                // shapes — the account linked to this identity, or an
+                // unlinked self-linkable one — so this is neither.
+                LinkOutcome::Taken(_) | LinkOutcome::Refused(_) => {
+                    info!(login = %account.login, "tunnelled login names an account this identity may not have");
+                    Err(AuthError::BadProof)
+                }
+            }
+        }
+        // Unlinked, and either not self-linkable or this socket's
+        // certificate lacks `manage`. §8.3 `verify`: an identity socket
+        // may land on the account linked to it, or on an unlinked
+        // account it is allowed to link — nothing else. Admitting it
+        // anyway would put an account that refused association on the
+        // roster as identity-bound, which is the state `allow_self_link
+        // = false` exists to prevent. The password still works on the
+        // plain TCP port, which is where an account that wants nothing
+        // to do with identities belongs.
+        None => {
+            info!(login = %account.login, "tunnelled login names an account that refuses self-linking");
+            Err(AuthError::BadProof)
+        }
+    }
+}
+
 /// Wait for the LOGIN transaction and run the login flow. `None` = close.
 async fn login_phase(
     frames: &mut Receiver<Frame>,
     tx: &Tx,
     ctx: &ServerCtx,
     peer: SocketAddr,
+    transport: Transport,
+    link: LinkAuthority,
 ) -> Option<(Session, UnboundedReceiver<SeqEvent>)> {
     let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
         Ok(Some(f)) => f,
@@ -533,12 +816,24 @@ async fn login_phase(
     // them, so an accented password typed on a legacy client matches the
     // UTF-8 account file. (HOPE proofs will need this same canonical form.)
     let auth = ctx.auth.clone();
+    let core = ctx.core.clone();
     let login_str = text::to_utf8(&req.login);
     let password = text::to_utf8(&req.password).into_bytes();
-    let verdict =
-        tokio::task::spawn_blocking(move || auth.authenticate(&login_str, Proof::Plain(&password)))
-            .await
-            .ok()?;
+    let identity_fp = transport.identity.as_ref().map(|t| t.fingerprint);
+    let policy = ctx.cfg.trtp_login;
+    let verdict = tokio::task::spawn_blocking(move || {
+        reconcile_login(
+            &*auth,
+            &core,
+            &login_str,
+            &password,
+            identity_fp,
+            policy,
+            link,
+        )
+    })
+    .await
+    .ok()?;
 
     let account = match verdict {
         Ok(a) => a,
@@ -572,6 +867,20 @@ async fn login_phase(
         login: account.login.clone(),
         addr: Some(peer.ip()),
         can_detach: account.can_detach,
+        has_inbox: account.has_inbox,
+        // This wire has no `msg_read` and never will — a private message
+        // is a window that opens and nothing comes back — so handing one
+        // over is as much as it will ever say about reading it
+        // (`docs/private-messages.md` §11).
+        reads_on_delivery: true,
+        // The account's link first, the socket's identity only where
+        // there is none — see `AttachInfo::identity`. On this wire the
+        // socket's identity arrives through the TRTP tunnel.
+        identity: account
+            .identity
+            .fingerprint
+            .or_else(|| transport.identity.as_ref().map(|t| t.fingerprint)),
+        transport,
     };
     let Some((uid, events)) = ctx.core.attach(attach) else {
         reply_error(tx, f.trans, "Server full.");
@@ -618,13 +927,7 @@ async fn login_phase(
     let mut agreement_sent = false;
     if !account.access.has(bit::DONT_SHOW_AGREEMENT) {
         if let Some(text_utf8) = &ctx.cfg.agreement {
-            let mut mac = text::from_utf8(text_utf8);
-            for b in &mut mac {
-                if *b == b'\n' {
-                    *b = b'\r'; // The wire wants classic Mac line endings.
-                }
-            }
-            push(tx, hdr::AGREEMENT, vec![(tag::BODY, mac)]);
+            push(tx, hdr::AGREEMENT, vec![(tag::BODY, mac_text(text_utf8))]);
             agreement_sent = true;
         }
     }
@@ -646,14 +949,29 @@ async fn login_phase(
     // A 1.5+ client that sent no name finishes its login via
     // AGREEMENTAGREE or USER_CHANGE; everyone else is done now.
     if req.clientversion < 150 || got_name {
-        complete_login(tx, ctx, &mut sess);
+        complete_login(tx, ctx, &mut sess).await;
     }
     Some((sess, events))
 }
 
+/// Run a domain call that touches the message store off the reactor.
+///
+/// `Core` is synchronous all the way down (`hxd_core::inbox` explains
+/// why), so a flush or a `msg` is rusqlite with a five-second busy
+/// timeout and `synchronous = FULL` fsyncs. On a tokio worker one slow
+/// disk stalls every session that worker carries. This file already does
+/// exactly this for `authenticate`.
+async fn off_reactor<T: Send + 'static>(
+    core: &Arc<hxd_core::Core>,
+    f: impl FnOnce(&hxd_core::Core) -> T + Send + 'static,
+) -> Option<T> {
+    let core = core.clone();
+    tokio::task::spawn_blocking(move || f(&core)).await.ok()
+}
+
 /// The "loginupdate" moment: hand the client its self-info and make it
 /// visible (which broadcasts the join to everyone else).
-fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
+async fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
     if sess.announced {
         return;
     }
@@ -667,13 +985,25 @@ fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 hdr::USER_SELFINFO,
                 vec![
                     (tag::ACCESS, sess.account.access.to_wire().to_vec()),
-                    (tag::USER_LIST, userlist_payload(&me)),
+                    (
+                        tag::USER_LIST,
+                        userlist_payload(&me, ctx.cfg.mark_cleartext),
+                    ),
                 ],
             );
         }
     }
     ctx.core.announce(sess.uid);
     sess.announced = true;
+    // Mail waiting from before this login, now that the roster is
+    // coherent. On this wire each one opens a window, which is why the
+    // domain caps a single flush and leaves the rest for next time.
+    //
+    // Whether this counts as reading them is the session's own property
+    // (`AttachInfo::reads_on_delivery`), so it applies to a message that
+    // arrives live just as much as to one waiting here.
+    let uid = sess.uid;
+    off_reactor(&ctx.core, move |c| c.flush_inbox(uid)).await;
 }
 
 /// Encode one domain event onto the wire. Returns `false` when the session
@@ -681,7 +1011,11 @@ fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
 fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
     match ev {
         Event::Joined(u) | Event::Changed(u) => {
-            push(tx, hdr::USER_CHANGE, user_change_chunks(&u));
+            push(
+                tx,
+                hdr::USER_CHANGE,
+                user_change_chunks(&u, ctx.cfg.mark_cleartext),
+            );
         }
         Event::Parted(uid) => {
             push(
@@ -763,7 +1097,12 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
                     (tag::UID, user.uid.to_be_bytes().to_vec()),
                     (tag::ICON, user.icon.to_be_bytes().to_vec()),
-                    (tag::COLOUR, wire_color(&user).to_be_bytes().to_vec()),
+                    (
+                        tag::COLOUR,
+                        wire_color(&user, ctx.cfg.mark_cleartext)
+                            .to_be_bytes()
+                            .to_vec(),
+                    ),
                     (tag::NAME, mac_nick(&user.nick)),
                 ],
             );
@@ -782,13 +1121,33 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
             from,
             from_nick,
             text,
+            sent_at,
+            queued,
+            ..
         } => {
+            let body = if queued && ctx.cfg.stamp_queued {
+                format!("[queued {}]\r{text}", stamp(sent_at))
+            } else {
+                text
+            };
+            // `from` is 0 when a queued message's sender has no session
+            // now — and a 104 with UID 0 is not a private message to a
+            // 1.x client. GtkHx dispatches on the uid (`is_pm = uid > 0`,
+            // `rcv.c`), so a uid-0 frame lands in the chat pane as a
+            // broadcast line with the `[queued …]` stamp inline: no PM
+            // window, nothing to reply to. Send the recipient's own uid
+            // instead, which is the shape mhxd uses for its own server
+            // messages and which renders through the PM path with the
+            // wire NAME — the sender's — as the name. Replying goes to
+            // yourself rather than to nobody, which is the better of the
+            // two answers a wire with no "from an absent user" has.
+            let uid = if from == 0 { sess.uid } else { from };
             push(
                 tx,
                 hdr::MSG,
                 vec![
-                    (tag::UID, from.to_be_bytes().to_vec()),
-                    (tag::BODY, text::from_utf8(&text)),
+                    (tag::UID, uid.to_be_bytes().to_vec()),
+                    (tag::BODY, mac_text(&body)),
                     (tag::NAME, mac_nick(&from_nick)),
                 ],
             );
@@ -803,7 +1162,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                 hdr::MSG_BROADCAST,
                 vec![
                     (tag::UID, from.to_be_bytes().to_vec()),
-                    (tag::BODY, text::from_utf8(&text)),
+                    (tag::BODY, mac_text(&text)),
                     (tag::NAME, mac_nick(&from_nick)),
                 ],
             );
@@ -896,7 +1255,7 @@ async fn session_loop(
             maybe = frames.recv() => match maybe {
                 Some(f) => {
                     trace_in(&f);
-                    dispatch(&f, tx, ctx, sess);
+                    dispatch(&f, tx, ctx, sess).await;
                 }
                 None => return, // Reader exited: EOF, error, or bad frame.
             },
@@ -913,7 +1272,7 @@ async fn session_loop(
     }
 }
 
-fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
+async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
     match f.ty {
         t if t == ClientHdr::Ping.as_u32() => reply(tx, f.trans, vec![]),
 
@@ -922,7 +1281,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .core
                 .snapshot()
                 .iter()
-                .map(|u| (tag::USER_LIST, userlist_payload(u)))
+                .map(|u| (tag::USER_LIST, userlist_payload(u, ctx.cfg.mark_cleartext)))
                 .collect();
             chunks.push((
                 tag::CHAT_SUBJECT,
@@ -944,7 +1303,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             ctx.core.update(sess.uid, nick, icon);
             if !sess.announced {
-                complete_login(tx, ctx, sess);
+                complete_login(tx, ctx, sess).await;
             }
             // No reply — USER_CHANGE is fire-and-forget on the wire.
         }
@@ -968,7 +1327,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             reply(tx, f.trans, vec![]); // ack first, like the reference
             ctx.core.update(sess.uid, nick, icon);
             if !sess.announced {
-                complete_login(tx, ctx, sess);
+                complete_login(tx, ctx, sess).await;
             }
         }
 
@@ -1052,7 +1411,12 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
                         (tag::UID, me.uid.to_be_bytes().to_vec()),
                         (tag::ICON, me.icon.to_be_bytes().to_vec()),
-                        (tag::COLOUR, wire_color(&me).to_be_bytes().to_vec()),
+                        (
+                            tag::COLOUR,
+                            wire_color(&me, ctx.cfg.mark_cleartext)
+                                .to_be_bytes()
+                                .to_vec(),
+                        ),
                         (tag::NAME, mac_nick(&me.nick)),
                     ],
                 ),
@@ -1099,7 +1463,7 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 Ok((rows, subject)) => {
                     let mut chunks: Vec<(u16, Vec<u8>)> = rows
                         .iter()
-                        .map(|u| (tag::USER_LIST, userlist_payload(u)))
+                        .map(|u| (tag::USER_LIST, userlist_payload(u, ctx.cfg.mark_cleartext)))
                         .collect();
                     chunks.push((tag::CHAT_SUBJECT, text::from_utf8(&subject)));
                     reply(tx, f.trans, chunks);
@@ -1137,9 +1501,13 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "Empty message or no recipient.");
                 return;
             }
-            match ctx.core.msg(sess.uid, to, body) {
-                Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, err_text(e)),
+            // No guid: the legacy wire has no way to carry one, so every
+            // send from it is its own message and a retry is a resend.
+            let from = sess.uid;
+            match off_reactor(&ctx.core, move |c| c.msg(from, to, body, None)).await {
+                Some(Ok(_)) => reply(tx, f.trans, vec![]),
+                Some(Err(e)) => reply_error(tx, f.trans, err_text(e)),
+                None => reply_error(tx, f.trans, "Server error."),
             }
         }
 
@@ -1495,5 +1863,55 @@ fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             debug!("unimplemented transaction {other:#x}");
             reply_error(tx, f.trans, "Not implemented.");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn a_body_leaves_this_wire_with_one_kind_of_line_ending() {
+        // The domain holds what the sender's wire gave it. A 1.x client
+        // draws a bare `\n` as a glyph, so an ng client's multi-line
+        // message arrived as one run of text with a symbol in it — and
+        // the queued stamp is a `\r`, so a stamped one had both.
+        assert_eq!(mac_text("one\ntwo"), b"one\rtwo");
+        assert_eq!(mac_text("one\r\ntwo"), b"one\rtwo");
+        assert_eq!(mac_text("one\rtwo"), b"one\rtwo", "already this wire's");
+        assert_eq!(mac_text("[queued …]\rbody\nmore"), {
+            let mut want = b"[queued ".to_vec();
+            want.extend_from_slice(&text::from_utf8("…"));
+            want.extend_from_slice(b"]\rbody\rmore");
+            want
+        });
+        // Trailing and consecutive delimiters are left as they are: a
+        // blank line is the sender's, not ours to remove.
+        assert_eq!(mac_text("a\n\nb\n"), b"a\r\rb\r");
+        // And the rest of the conversion is unchanged.
+        assert_eq!(mac_text("caf\u{e9}"), text::from_utf8("caf\u{e9}"));
+    }
+
+    #[test]
+    fn the_queued_stamp_reads_as_a_date_a_person_recognises() {
+        assert_eq!(stamp(at(0)), "1970-01-01 00:00 UTC");
+        assert_eq!(stamp(at(1_788_704_520)), "2026-09-06 14:22 UTC");
+        // Leap day, and the year boundary either side of it — the two
+        // places a hand-rolled calendar goes wrong.
+        assert_eq!(stamp(at(1_709_164_800)), "2024-02-29 00:00 UTC");
+        assert_eq!(stamp(at(1_735_689_540)), "2024-12-31 23:59 UTC");
+        assert_eq!(stamp(at(1_735_689_600)), "2025-01-01 00:00 UTC");
+        // 2000 was a leap year and 1900 was not; the algorithm has to
+        // know the difference.
+        assert_eq!(stamp(at(951_782_400)), "2000-02-29 00:00 UTC");
+        // A clock before the epoch stamps the epoch rather than wrapping.
+        assert_eq!(
+            stamp(SystemTime::UNIX_EPOCH - Duration::from_secs(60)),
+            "1970-01-01 00:00 UTC"
+        );
     }
 }

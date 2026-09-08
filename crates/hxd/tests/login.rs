@@ -38,7 +38,10 @@ async fn start_server(accounts: &Path, agreement: Option<&str>) -> SocketAddr {
             agreement: agreement.map(String::from),
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
+            stamp_queued: true,
             caps: hxd_session::Caps::empty(),
+            mark_cleartext: false,
+            trtp_login: hxd_session::TrtpLogin::Verify,
         }),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -231,8 +234,8 @@ async fn account_login_wrong_password_and_name_policy() {
     let td = tempfile::tempdir().unwrap();
     std::fs::create_dir(td.path().join("accounts")).unwrap();
     std::fs::write(
-        td.path().join("accounts/misha.toml"),
-        "name = \"Misha\"\npassword = \"s3cret\"\n[access]\ndisconnect_users = true\n",
+        td.path().join("accounts/dave.toml"),
+        "name = \"Dave\"\npassword = \"s3cret\"\n[access]\ndisconnect_users = true\n",
     )
     .unwrap();
     let addr = start_server(td.path(), None).await;
@@ -243,7 +246,7 @@ async fn account_login_wrong_password_and_name_policy() {
         .send(
             HDR_LOGIN,
             &[
-                (tag::LOGIN, xor(b"misha")),
+                (tag::LOGIN, xor(b"dave")),
                 (tag::PASSWORD, xor(b"wrong")),
                 (tag::VERSION, 150u16.to_be_bytes().to_vec()),
             ],
@@ -262,7 +265,7 @@ async fn account_login_wrong_password_and_name_policy() {
             HDR_LOGIN,
             &[
                 (tag::NAME, b"l33t".to_vec()),
-                (tag::LOGIN, xor(b"misha")),
+                (tag::LOGIN, xor(b"dave")),
                 (tag::PASSWORD, xor(b"s3cret")),
                 (tag::VERSION, 150u16.to_be_bytes().to_vec()),
             ],
@@ -272,7 +275,7 @@ async fn account_login_wrong_password_and_name_policy() {
     assert_eq!((f.trans, f.flag), (t, 0));
     let selfinfo = c.recv_type(HDR_SELFINFO).await;
     let (_, _, color, nick) = parse_userlist(&chunk(&selfinfo, tag::USER_LIST).unwrap());
-    assert_eq!(nick, b"Misha");
+    assert_eq!(nick, b"Dave");
     assert_eq!(color, 2);
 }
 

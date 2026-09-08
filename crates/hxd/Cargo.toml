@@ -11,8 +11,13 @@ default-run = "hxd"
 [features]
 # Voice chat. On by default so CI covers it; a server that doesn't want
 # a WebRTC stack in its binary builds with --no-default-features.
-default = ["voice"]
+default = ["voice", "inbox"]
 voice = ["dep:hxd-voice"]
+# The durable private-message inbox. On by default so CI covers it; a
+# server that wants neither offline messages nor a bundled SQLite in its
+# binary builds without it, and then an `[inbox]` config section is a
+# startup error rather than a silently ignored promise.
+inbox = ["dep:hxd-store-sqlite"]
 
 [[bin]]
 name = "hxd"
@@ -24,6 +29,9 @@ hxd-auth-file = { workspace = true }
 hxd-session = { workspace = true }
 hxd-ng-session = { workspace = true }
 hxd-voice = { workspace = true, optional = true }
+hl-identity = { workspace = true }
+base64 = "0.22"
+hxd-store-sqlite = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -34,6 +42,8 @@ toml = { workspace = true }
 hotline-proto = { workspace = true }
 # The media e2e stands real WebRTC clients up against the real SFU.
 hxd-voice = { workspace = true }
+# The inbox e2e uses the real store on a real file, not a fake.
+hxd-store-sqlite = { workspace = true }
 str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false }

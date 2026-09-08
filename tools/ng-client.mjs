@@ -14,6 +14,11 @@
 //
 // Once connected, type to chat. Commands:
 //   /msg <who> <txt> private message (nick or uid)
+//   /msgl <login> <txt> private message to an account, online or not
+//   /inbox [n]       list stored messages, newest first
+//   /read <id>       mark everything up to that message id read
+//   /block <login>   refuse private messages from an account (/unblock to undo)
+//   /blocks          who you have blocked
 //   /me <text>       action-style chat
 //   /nick <nick>     change nickname
 //   /icon <n>        change icon
@@ -63,6 +68,16 @@ let session = null; // { session, token }
 let lastSeq = 0;
 let detachInfo = null; // { grace } | null
 const roster = new Map(); // uid -> user object, kept fresh from events
+// Stored-message ids already printed. A resync pulls the inbox *and*
+// gets `sync`'s flush as events, so the same message can arrive twice.
+// Trimmed rather than kept forever: this is a long-running process, and
+// only the recent end of it can still arrive twice.
+const shown = new Set();
+const SHOWN_MAX = 1000;
+function remember(id) {
+  shown.add(id);
+  while (shown.size > SHOWN_MAX) shown.delete(shown.values().next().value);
+}
 let intentionalClose = false;
 let reloginOnClose = false;
 let resumeDelayMs = 1000;
@@ -129,9 +144,13 @@ function handleEvent({ seq, ev, data }) {
     case "subject":
       say(`-!- subject: ${data.subject}`);
       break;
-    case "msg":
-      say(`[PM] <${data.from.nick}> ${data.text}`);
+    case "msg": {
+      if (data.id != null && shown.has(data.id)) break;
+      if (data.id != null) remember(data.id);
+      const when = data.queued ? ` (queued ${new Date(data.at * 1000).toISOString()})` : "";
+      say(`[PM] <${data.from.nick}>${when} ${data.text}`);
       break;
+    }
     case "kicked":
       say(`-!- you were kicked`);
       intentionalClose = true;
@@ -168,6 +187,26 @@ function connect(kind) {
         lastSeq = r.seq;
         rosterReset(r.users);
         say(`users: ${r.users.map(showUser).join(", ")}`);
+        // The events in the gap are gone, and any private message among
+        // them was already marked delivered — the inbox is the only
+        // remaining copy. A client that skips this loses them (see
+        // docs/hotline-ng.md §7.1).
+        //
+        // `sync` also flushes what is still *pending*, as events after
+        // its reply, so the two sources overlap: `shown` is what keeps a
+        // message that arrived both ways from being printed twice,
+        // whichever of them lands first.
+        try {
+          const inbox = await request("inbox", { limit: 50 });
+          for (const m of inbox.messages.slice().reverse()) {
+            if (m.id != null && shown.has(m.id)) continue;
+            if (m.id != null) remember(m.id);
+            say(`[missed] ${m.from.nick}: ${m.text}`);
+          }
+          if (inbox.unread) say(`inbox: ${inbox.unread} unread of ${inbox.total}`);
+        } catch (err) {
+          if (err?.code !== "no_inbox") throw err;
+        }
       } else if (e?.code === "session_expired") {
         // Route the reconnect through the close handler — closing fires a
         // close event on THIS socket, and reconnecting before it lands
@@ -253,9 +292,42 @@ rl.on("line", async (line) => {
       }
       const to = resolveTarget(rest.slice(0, space));
       if (to !== null) {
-        await request("msg", { to, text: rest.slice(space + 1) });
-        say(`[PM to ${to}] sent`);
+        const r = await request("msg", { to, text: rest.slice(space + 1) });
+        say(`[PM to ${to}] ${r.queued ? "queued" : "delivered"}`);
       }
+    } else if (line.startsWith("/msgl ")) {
+      const rest = line.slice(6).trim();
+      const space = rest.indexOf(" ");
+      if (space < 0) {
+        say("usage: /msgl <login> <text>");
+        return;
+      }
+      const toLogin = rest.slice(0, space);
+      const r = await request("msg", { to_login: toLogin, text: rest.slice(space + 1) });
+      say(`[PM to ${toLogin}] ${r.queued ? "queued" : "delivered"}`);
+    } else if (line.startsWith("/inbox")) {
+      const n = Number(line.slice(6).trim()) || 20;
+      const r = await request("inbox", { limit: n });
+      say(`inbox: ${r.unread} unread of ${r.total}`);
+      for (const m of r.messages.reverse()) {
+        const when = new Date(m.at * 1000).toISOString();
+        say(`  #${m.id} ${m.read ? " " : "*"} <${m.from.login ?? m.from.nick}> ${when} ${m.text}`);
+      }
+    } else if (line.startsWith("/block ") || line.startsWith("/unblock ")) {
+      const on = line.startsWith("/block ");
+      const who = line.slice(on ? 7 : 9).trim();
+      // A 52-character fingerprint unblocks an identity guest, who has
+      // no login of their own to name — `/blocks` prints it.
+      const params = !on && who.length === 52 ? { fingerprint: who } : { login: who };
+      await request(on ? "block" : "unblock", params);
+      say(`${on ? "blocked" : "unblocked"} ${who}`);
+    } else if (line.startsWith("/blocks")) {
+      const r = await request("blocks", {});
+      const names = r.blocked.map((b) => (b.fingerprint ? `${b.login} (${b.fingerprint})` : b.login));
+      say(names.length ? `blocked: ${names.join(", ")}` : "nobody blocked");
+    } else if (line.startsWith("/read ")) {
+      const r = await request("msg_read", { up_to: Number(line.slice(6).trim()) });
+      say(`${r.unread} unread of ${r.total}`);
     } else if (line.startsWith("/me ")) {
       await request("chat", { text: line.slice(4), style: "action" });
     } else if (line.startsWith("/nick ")) {

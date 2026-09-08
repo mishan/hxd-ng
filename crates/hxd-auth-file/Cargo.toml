@@ -11,6 +11,10 @@ publish = false
 hxd-core = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+# Writing identity links back into hand-maintained files without losing
+# their comments.
+toml_edit = "0.22"
+hl-identity = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

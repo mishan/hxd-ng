@@ -169,27 +169,44 @@ hxd-core                       hxd-push-uniqush          uniqush-push
 The trait lives in `hxd-core` next to `AuthBackend` and the store traits;
 it names domain concepts only, no HTTP, no vendor vocabulary:
 
+**Shipped 2026-09** in `hxd-core`'s `notify` module, with four departures
+from the sketch this section carried, all forced and all smaller than
+they look:
+
 ```rust
-#[async_trait]
-pub trait NotificationGateway: Send + Sync {
-    /// Register one device for an account. Idempotent.
-    async fn register(&self, acct: &AccountId, dev: &DeviceRegistration)
-        -> Result<(), GatewayError>;
-
-    /// Drop one device, or all devices for an account (logout-everywhere).
-    async fn unregister(&self, acct: &AccountId, dev: Option<&DeviceId>)
-        -> Result<(), GatewayError>;
-
-    /// Best-effort delivery. Never blocks a chat or PM path.
-    async fn notify(&self, acct: &AccountId, n: &Notification)
-        -> Result<NotifyOutcome, GatewayError>;
+pub trait NotificationGateway: Send + Sync + 'static {
+    /// Best effort, and MUST NOT block: implementations spawn and return.
+    fn notify(&self, n: &Notification<'_>);
 }
 ```
 
-A `NoopGateway` is the default. `UniqushGateway` lives in its own crate
-(`hxd-push-uniqush`) so that a build without push pulls in no HTTP client
-at all, and so a future `hxd-push-webpush` is a sibling rather than a
-rewrite.
+**Not `async_trait`.** `Core` is sync all the way down and its state sits
+behind a `std::sync::Mutex`; one async call in the domain would make the
+whole domain async. But `notify` was never going to be awaited on the
+message path anyway — the paragraph below says so, and says why — so the
+spawn happens either way. This puts it on the implementation's side of
+the trait, where the runtime handle lives.
+
+**No `NoopGateway`.** A gateway that does nothing, plus an `Option` that
+means the same thing, is one state too many; `Core` holds
+`Option<Arc<dyn NotificationGateway>>` and `None` is the default.
+
+**No registration methods, yet.** `register` and `unregister` answer the
+ng protocol requests in §8, which arrive with the gateway crate; the
+domain has nothing to say about a device. The message path is what had to
+exist first, and it is what §11's "the notify decision must live in the
+domain" is about.
+
+**And the notification carries a mailbox, not a login.** §5 refuses to
+let uids near a device registry because they recycle; a login recycles
+too, on a rename, so a gateway keys its subscriber id on the identity
+fingerprint where there is one and the login only where there is not.
+See private-messages.md §4 — it is the same rule the mailbox itself uses,
+and the same failure if it is broken.
+
+`UniqushGateway` lives in its own crate (`hxd-push-uniqush`) so that a
+build without push pulls in no HTTP client at all, and so that a future
+`hxd-push-webpush` is a sibling rather than a rewrite.
 
 **`notify` is fire-and-forget from the domain's point of view, and this is
 not a stylistic preference.** uniqush's `/push` answers only after the *first
@@ -420,14 +437,24 @@ Nothing about this touches the legacy wire. A 1.x client has no devices.
 Each stage is a branch with tests, in the house style. P1 and P2 are
 Phase 7 item 2 and are listed because item 3 is worthless without them.
 
-1. **P1 — durable inbox.** DMs and mentions for non-active sessions persist
-   with read state. Postgres arrives here (Phase 7 item 4). No push yet.
-2. **P2 — the notify decision.** The domain computes "this event should
-   notify account X," calls a `NotificationGateway`, and the only
-   implementation is `NoopGateway`. Unit-testable in `hxd-core` with a
-   recording fake and no network at all. **This is where the interesting
-   bugs are** — idle/detached/absent transitions, mention parsing,
-   self-notification suppression, dedup across a user's own devices.
+1. **P1 — durable inbox.** ✅ **Done 2026-09**, designed in
+   [private-messages.md](private-messages.md) and staged there as M1–M4.
+   DMs for non-active sessions persist with read state, addressed by
+   account login rather than the recycling uid, on **SQLite** rather than
+   Postgres — a server that wants offline messages should not have to gain
+   a database daemon, and the trait is the seam Postgres arrives behind
+   when clustering needs a store several nodes can share. Mentions are not
+   in it (§11).
+2. **P2 — the notify decision.** ✅ **Done 2026-09.** The domain computes
+   "this message should notify account X" on the stored-message path that
+   both wires call, and hands it to a `NotificationGateway`; with none
+   configured, nothing is sent. Unit-tested in `hxd-core` with a recording
+   fake and no network at all: detached and absent notify, an attentive
+   session does not, a message to your own account is not news, and a
+   recipient with no inbox earns nothing because a push about a message
+   that was never stored is a doorbell for nothing. Idle notifies too, by
+   the rule, though nothing sets idle yet (hotline-ng.md §12). Mention
+   parsing and cross-device dedup remain open.
 3. **P3 — `hxd-push-uniqush`.** The HTTP client: subscriber-id mapping,
    the device index (§5), `/subscribe`, `/unsubscribe`, `/push`, payload
    construction per content policy (minding the reserved field names and
@@ -475,12 +502,12 @@ on a different PSP.
   keeps duplicates legal) and nicks change freely. A mention that
   notifies the wrong person is worse than one that misses. Possibly
   mentions are out of scope for the first cut and DMs alone carry P1–P5.
-- **Do legacy-originated PMs push?** Phase 7 item 5 says a legacy client's
-  PM to a detached user is "accepted, queued, and pushed" — so yes, and
-  the notify decision must live in the domain rather than in
-  `hxd-ng-session`, or the legacy path silently skips it. The staging
-  above assumes the domain placement; it's called out here because it's
-  the kind of thing that gets implemented in the wrong crate by accident.
+- ~~**Do legacy-originated PMs push?**~~ — **answered 2026-09: yes, and
+  the decision is in the domain.** Phase 7 item 5 says a legacy client's
+  PM to a detached user is "accepted, queued, and pushed", so both wires
+  reach the same rule by calling the same function; the legacy path
+  silently skipping it was the failure to avoid, and placing the decision
+  in `hxd-core::chat` is what avoids it.
 - **Coalescing.** Twenty chat lines in a busy room shouldn't be twenty
   buzzes. A per-account rate limit or a digest window is needed before
   P5 is pleasant to live with; where it lives (domain, gateway, or the

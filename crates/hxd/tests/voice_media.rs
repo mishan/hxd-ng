@@ -84,7 +84,10 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
             agreement: None,
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
+            stamp_queued: true,
             caps: Caps::empty().with(cap::VOICE),
+            mark_cleartext: false,
+            trtp_login: hxd_session::TrtpLogin::Verify,
         }),
     };
     let ng_ctx = NgCtx {
@@ -97,8 +100,12 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
             grace: Duration::from_secs(60),
             max_detached_per_addr: 2,
             caps: vec!["voice".to_string()],
+            trusted_proxies: Default::default(),
+            forwarded_header: Default::default(),
         }),
         registry: Arc::new(Registry::new()),
+        identity: None,
+        tunnel: None,
     };
 
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -36,6 +36,12 @@ bind = "0.0.0.0:5500"
 name = "My Server"
 version = 185          # 0 mimics a pre-1.5 server
 login_timeout = 10
+ban_time = 1800        # seconds a kick-with-ban holds the address
+stamp_queued = true    # stamp a message that waited in the inbox with its send
+                       # time, on the legacy wire (docs/private-messages.md §7)
+# mark_cleartext = false  # set User Flags bit 4 on unencrypted legacy sessions
+                          # (identity spec §10); off until that bit is confirmed
+                          # free against 1.8/1.9 clients
 
 [paths]
 accounts = "accounts"
@@ -45,6 +51,36 @@ agreement = "agreement.txt"
 bind = "127.0.0.1:5700"   # plaintext; put a WSS-terminating proxy in front
 grace = 300               # detached-session grace window, seconds
 max_detached_per_addr = 2
+# trusted_proxies = ["127.0.0.1"]   # believe X-Hotline-Client-Cert (mTLS binding) and
+                                    # the forwarded address (who a ban is about) from these.
+                                    # Proxies only: the walk below skips whatever is listed here
+forwarded_header = "x-forwarded-for"  # which header that proxy writes the client address into:
+                                      # x-forwarded-for | forwarded | none. The rightmost element
+                                      # outside trusted_proxies is the client (identity spec §5.3)
+
+[identity]                # portable identity — docs/hotline-ng-identity.md; needs [ng]
+key = "identity-server.key"        # server Ed25519 seed, generated on first run
+new_accounts = "guest"             # deny | guest | create
+unattested = "guest"               # deny | guest | allow
+min_attestation_age = 0            # seconds an attestation must have existed to count
+clock_skew = 300                   # seconds of clock difference tolerated in signed objects
+successors = "identity-successors" # where §3.4 successor commitments live; "" = memory only
+# max_new_accounts_per_hour = 60   # ceiling on what new_accounts = "create" writes
+# allow_list = ["alice@hl.example", "<fingerprint>"]
+# registrar_keys = { "hl.example" = "<base64url public key>" }
+# [identity.default_access]        # access bits for accounts "create" makes;
+# read_chat = true                 # same key names as an account file's [access].
+# send_chat = true                 # Absent = whatever guest has, which is rarely right.
+trtp = true                        # serve TRTP-over-WebSocket at /trtp for tunnelled legacy clients
+trtp_login = "verify"              # verify | trust: how a tunnelled classic login meets the socket's identity
+
+[inbox]                     # absent = no inbox, and that's the default
+db = "messages.db"          # naming it is what turns the inbox on
+max_queued = 200            # messages waiting, per account; a full one refuses
+deliver_at_flush = 25       # queued messages handed over per login
+retain_unread = 2592000     # seconds; 30 days, from when it was sent
+retain_read = 604800        # seconds; 7 days, from when it was read
+sync = "normal"             # or "full": fsync every commit
 
 [voice]                          # absent = voice off, and that's the default
 # bind = "0.0.0.0:5504"          # default: the [server] bind, port + 4 (UDP)
@@ -68,6 +104,39 @@ screen_max_fps = 15
 screen_max_bitrate = 2500000
 ```
 
+Private messages to someone who isn't there are stored and delivered when
+they arrive — across the wires, so a 1.5 client's message reaches a phone
+that was asleep, and an ng client can address an account that holds no
+session at all (`to_login`) which a period client then reads at its next
+login.
+
+An account has an inbox if it has a password or a linked identity — either
+is proof of one person, where a bare `guest` login is shared; `[extra]
+inbox` overrides it either way. A guest can send to whoever is on the
+roster and cannot queue anything: it has no account, so nothing can be
+blocked, and a sender that cannot be blocked must not be able to fill a
+mailbox. `block`/`unblock` keep an account addressable without making it
+reachable by everyone.
+
+**The database holds every private message on the server in the clear.**
+It is created 0600, as are its `-wal` and `-shm` companions; keep the
+directory to match.
+
+Deleting an account is still `rm accounts/alice.toml`, which leaves its
+mail behind for whoever registers that login next — so take it with the
+account:
+
+```sh
+hxd inbox purge alice                       # while accounts/alice.toml exists
+hxd inbox purge alice --fingerprint <fp>    # after it's gone: the value
+                                           # from its [identity] table
+hxd inbox purge alice --dry-run            # how much would go
+```
+
+The inbox is behind the `inbox` Cargo feature, on by default; without it
+an `[inbox]` section is a startup error rather than a promise the build
+can't keep. See [docs/private-messages.md](docs/private-messages.md).
+
 Voice needs its **UDP** port reachable — the one thing operators most often
 miss. It is behind the `voice` Cargo feature, on by default;
 `cargo build --no-default-features` leaves the WebRTC stack out of the
@@ -80,11 +149,45 @@ nobody receives a stream until they ask for that stream in particular, so
 a room with video in it costs a voice-only participant nothing. See
 [docs/capabilities-video.md](docs/capabilities-video.md).
 
+An account links to an identity through an `[identity]` table in its file
+(written by linking, or by hand): `fingerprint`, `login = true` (identity
+may log in without the password), `allow_self_link = true`, `reserve_name`.
+An account with a fingerprint and no password is reachable *only* by
+proving the identity — the password path refuses it, empty password
+included — which is what makes `new_accounts = "create"` safe alongside
+the legacy port. (`reserve_name` is read but not yet enforced: §9's
+reserved-name rules are still unimplemented on both wires.)
+
+With `[identity]` on, the ng listener also answers HTTP: `GET
+/.well-known/hotline` for discovery, `POST /identity/challenge` and
+`/identity/auth` for the challenge binding, `GET /identity/card/<fp>` and
+`PUT /identity/card`, and `POST /identity/link` and `/identity/unlink`
+for account association.
+
+`hlid` (`cargo run --bin hlid`) makes the keys and objects and talks to
+the server:
+
+```sh
+hlid keygen identity id.key && hlid keygen device dev.key
+# `login,message,manage` — anything that writes an account link needs
+# `manage`, and `--caps web` deliberately excludes it. A browser device
+# gets `web`; the device you administer your account from gets this.
+hlid cert --identity id.key --device dev.key --caps login,message,manage -o cert.cbor
+hlid card --identity id.key --name Alice -o card.cbor
+hlid auth   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
+hlid link   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor --login alice --password-stdin < pw.txt
+hlid tunnel --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
+# then point any 1.x client at 127.0.0.1:5500 — it logs in through the tunnel with your identity.
+# The tunnelled login can link an account too (§8.3), which is why this
+# certificate carries `manage`; a tunnel used with an account that is
+# already linked wants `--caps login,message` instead.
+```
+
 Try the ng frontend with the bundled client (no install on Node 22+;
 on older Node, `cd tools && npm install` once for the `ws` fallback):
 
 ```sh
-node tools/ng-client.mjs ws://127.0.0.1:5700 --login misha --password pw
+node tools/ng-client.mjs ws://127.0.0.1:5700 --login alice --password pw
 # then type to chat; /drop tests detach+resume; /logout to leave
 ```
 
