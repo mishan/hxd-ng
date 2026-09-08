@@ -28,7 +28,7 @@ pub use identity::{
 pub use registry::Registry;
 
 /// A byte stream handed to the legacy frontend by the TRTP-over-WebSocket
-/// path (`docs/hotline-ng-identity.md` §6.3).
+/// path (`docs/hotline-ng-auth.md` §7.3).
 pub trait ByteStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> ByteStream for T {}
 pub type TunnelStream = Box<dyn ByteStream>;
@@ -71,11 +71,11 @@ pub struct NgConfig {
     /// allocation.
     pub caps: Vec<String>,
     /// Reverse-proxy addresses whose `X-Hotline-Client-Cert` header is
-    /// believed (`docs/hotline-ng-identity.md` §5.3). Empty = the mTLS
+    /// believed (`docs/hotline-ng-auth.md` §6.3). Empty = the mTLS
     /// binding is off.
     pub trusted_proxies: TrustedProxies,
     /// Which forwarded-address header a trusted proxy is configured to
-    /// write (§5.3). Only this one is read, because a header the proxy
+    /// write (§6.3). Only this one is read, because a header the proxy
     /// doesn't write is one the client gets to choose.
     pub forwarded_header: ForwardedHeader,
 }

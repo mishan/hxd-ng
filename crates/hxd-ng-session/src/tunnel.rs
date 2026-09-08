@@ -1,4 +1,4 @@
-//! The TRTP-over-WebSocket transport (`docs/hotline-ng-identity.md` §6.3):
+//! The TRTP-over-WebSocket transport (`docs/hotline-ng-auth.md` §7.3):
 //! a WebSocket whose binary frames, concatenated, are the byte stream a
 //! TCP connection to the legacy port would carry. This adapter presents
 //! such a socket as `AsyncRead + AsyncWrite` so the legacy frontend can

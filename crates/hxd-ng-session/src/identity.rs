@@ -1,4 +1,4 @@
-//! Server-side identity state (`docs/hotline-ng-identity.md` §4–§7):
+//! Server-side identity state (`docs/hotline-ng-auth.md` §5–§6, `docs/hotline-ng-identity.md` §4–§7):
 //! the server key, outstanding challenges, transport tokens, and the
 //! per-device certificate and per-identity card caches.
 //!

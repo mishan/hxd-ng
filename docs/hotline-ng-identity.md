@@ -1,27 +1,30 @@
-# Hotline-ng identity — HTTP-layer authentication and portable identity
+# Hotline identity — portable identity, and the identity profile for hotline-ng
 
 Status: draft, for discussion. Implemented in hxd-ng: the identity
 objects (§3, `crates/hl-identity`, with test vectors in
-`identity-test-vectors.json`), discovery and the endpoints of §4–§8, both
-WebSocket paths of §6, account association including `trtp_login`, and
-the `hlid` tool. Not yet: revocation, reserved-name enforcement, the
-mTLS binding beyond the header contract, and everything in the registrar
-and federation specs. Supersedes the earlier `Capabilities-Identity`
-draft, which put authentication inside the legacy transaction protocol;
-this version keeps TRTP unchanged and does authentication where the ng
-transport already lives, in HTTP.
+`identity-test-vectors.json`), the profile's part of authentication (§5),
+cards (§7), account association including `trtp_login` (§8), and the
+`hlid` tool. Not yet: revocation, reserved-name enforcement, and
+everything in the registrar and federation specs.
 
-Revision note: the relay and tunnel sections and the account rules were
-reworked after review to separate *transport identity* (who holds the
-socket, which any relay or tunnel can establish) from *account
-association* (which only a server that terminates the socket can do), and
-to add TRTP-over-WebSocket as a transport so legacy clients get identity
-through a plain tunnel.
+This revision splits the earlier single document in two, after review
+pointed out that the transport's authentication and the definition of a
+Hotline identity have different owners and can each be used without the
+other. `hotline-ng-auth.md` is now the transport: discovery, the
+challenge and mTLS bindings, transport tokens, the WebSocket paths, the
+TRTP tunnel, cleartext marking, and the tunnel and relay roles. This
+document is what a key *means* when Hotline identity is the profile in
+use: the signed objects, how they are verified at authentication, what
+the roster shows, cards, and account association. Section numbers for
+the objects (§3), cards (§7), account association (§8), settings (§12)
+and implementation notes (§13) are unchanged from the single document,
+since code and other documents cite them.
 
-Companion documents: the identity threat model (what this protects and from
-whom), `hotline-ng.md` (the WebSocket protocol this extends), and the
-registrar and federation specs (handles, key storage, revocation, presence,
-vouches — referenced but not defined here).
+Companion documents: `hotline-ng-auth.md` (the transport this profiles),
+`identity-threat-model.md` (what this protects and from whom),
+`hotline-ng.md` (the WebSocket protocol), and the registrar and
+federation specs (handles, key storage, revocation, presence, vouches —
+referenced but not defined here).
 
 ---
 
@@ -31,34 +34,25 @@ A user's identity is an Ed25519 keypair. Each device holds its own keypair,
 certified by the identity key. A signed, versioned *user card* carries the
 public profile and any registrar attestations.
 
-None of that depends on a transport. What this document adds is two
-layers with different owners:
+None of that depends on a transport. The objects (§3) are what a client, a
+registrar, a relay and a server all agree on, and `hl-identity` is the one
+implementation of them.
 
-**Transport identity** — who holds this socket. A small set of HTTP
-endpoints, served by the same listener that accepts WebSocket upgrades,
-through which a client proves it holds a device key and registers its card
-and certificate. Two ways to do the proof — a challenge signed by the
-device key, or a TLS client certificate presented to the reverse proxy —
-end in the same state: *this connection belongs to device key D of
-identity I*. Anything that terminates the HTTP handshake can establish
-this, including a relay that only forwards the bytes it carries. It is
-enough, on its own, for admission (allow lists, bans by fingerprint) and
-rate limits — decisions a transport can make about a connection.
+What this document adds is the **identity profile** of the transport's
+`key` principal (`hotline-ng-auth.md` §3): when a socket has proved it
+holds a key, this profile says the key is a *device* of an *identity*,
+requires the device certificate and card that establish that, sets the
+principal's subject to the identity's fingerprint so every device of one
+person is one subject, and derives a handle and an age from whatever
+attestations the server trusts. It is enough, together with the
+transport, for admission and for what other users see.
 
-Roster marking and presence are *not* in that set, though they are
-downstream of it: they are things the application protocol says about a
-session, so only a server that terminates that protocol can do them. A
-relay that forwards opaque TRTP establishes the transport identity and
-then has no way to tell the legacy server behind it (§11.2), which is why
-a relayed session shows no identity to other users while a tunnelled one
-(§6.3, where the identity-aware server *is* the endpoint) does.
-
-**Account association** — which local account, if any, this identity is.
-Only a server that also implements the application protocol on the socket
-can do this, because only it has the transport identity and the account
-table in one place. hxd-ng does, for both application protocols it
-speaks over WebSocket: the ng JSON protocol and, new in this revision,
-TRTP itself in binary frames.
+**Account association** — which local account, if any, this identity is —
+is the second thing this document defines (§8). Only a server that
+terminates the socket and implements the application protocol on it can
+do this, because only it has the principal and the account table in one
+place. hxd-ng does, for both application protocols it speaks over
+WebSocket: the ng JSON protocol and TRTP in binary frames.
 
 The legacy wire (TRTP on :5500) is not changed. A legacy client reaches a
 linked account with the account's name and password, or through a local
@@ -68,34 +62,33 @@ it is and treats it like any other identity session.
 
 ---
 
-## 2. Why HTTP and not the chat protocol
+## 2. Layering
 
-Authentication is a transport concern. The ng transport is a WebSocket,
-which begins as an HTTP request, and hxd-ng already assumes a TLS-terminating
-reverse proxy in front of it. Doing authentication in that HTTP exchange
-means:
+The transport document defines the exchange; this document fills in the
+profile's part of it. The hooks, in the order a connection meets them:
 
-- the WebSocket session arrives already bound to a key, and the JSON protocol
-  never carries credentials for identity users;
-- a tunnel in front of a *legacy client* can authenticate upstream with the
-  user's key using plain HTTP client code and then forward bytes, without
-  knowing anything about TRTP;
-- a relay in front of a *legacy server* (hxd 0.x, Mobius, HLServer) can
-  establish who is on each socket and gatekeep accordingly, without that
-  server changing and without the relay reading the tunnelled protocol;
-- mTLS becomes a first-class option rather than a special case, since it is
-  an HTTP-layer mechanism already.
+| Transport hook (`hotline-ng-auth.md`) | What this profile supplies |
+|---|---|
+| Discovery §5 | The rest of the `identity` block: `new_accounts`, `min_attestation_age`, `trusted_registrars`, and the `card`, `link`, `unlink` endpoints (§4) |
+| The `auth` request §6.2, §6.3 | `card` and `device_cert`; optionally `login`, `password`, `create` (§5.1). The proof's `device` must be the certificate's `device` |
+| Verification §6.2 | Steps 2–6 of §5.2, after the transport's proof check |
+| The `auth` response §6.2 | `fingerprint`, `handle`, `age`, `outcome`, `account` (§5.3) and the profile's error codes |
+| The principal §3 | `subject` = identity fingerprint; `profile` = the verified card, certificate and accepted attestations |
+| Key on file §6.3 | What is cached per device and what is re-checked on a certificate-only upgrade (§5.5) |
+| The ng login §7.2 | Credentials ignored; `self.identity`; the roster's `identity` sub-object; `caps` gains `"identity"` (§6.1) |
+| The TRTP tunnel §7.3 | How the classic Login (107) inside is reconciled with the identity (§8.3) |
+| Account association §9 | All of §8 |
+| Tunnels and relays §10 | Device capabilities for a tunnel; what a relay's profile endpoints return (§10) |
 
-The cost is that hxd-ng grows a small HTTP router on the ng listener, which
-`hotline-ng.md` deferred "until media/history/push need one." Identity needs
-one. It is a handful of routes.
+Nothing else in the transport document changes for this profile, and
+nothing here is needed to run the transport with a different one.
 
 ---
 
 ## 3. Identity objects
 
-These are unchanged from the earlier draft and are defined here in full so
-this document stands alone.
+These are transport-independent and are defined here in full so this
+document stands alone.
 
 ### 3.1 Encoding and signatures
 
@@ -118,11 +111,16 @@ version this or any document defines.
 Timestamps are Unix seconds, UTC. `bstr(n)` is a byte string of exactly `n`
 bytes.
 
+These are the same rules as `hotline-ng-auth.md` §4.1, which the login
+proof follows; the two must not drift.
+
 ### 3.2 Fingerprint
 
 `SHA-256(pubkey)`, 32 bytes. Displayed as lowercase Crockford base32, no
 padding; may be shortened to 8 characters in UI. Servers store and compare
-full fingerprints.
+full fingerprints. Unqualified, "fingerprint" in this document means the
+fingerprint of the *identity* key; a device has one too, and it is the
+transport principal's `id`.
 
 ### 3.3 Device certificate
 
@@ -183,133 +181,94 @@ Domain `hl-identity/attestation/v1`, signed by a registrar key.
 
 ### 3.6 Login proof
 
-Domain `hl-identity/login/v1`, signed by the device key. Used only by the
-challenge binding (§5.2).
-
-| Key | Type | Req | Notes |
-|---|---|---|---|
-| `v` | uint | yes | `1` |
-| `challenge` | bstr(32) | yes | Echoed from the server |
-| `server_key` | bstr(32) | yes | Echoed from the server; binds the proof to this server |
-| `device` | bstr(32) | yes | |
-| `time` | uint | yes | Rejected outside the server's clock-skew tolerance |
-| `sig` | bstr(64) | yes | |
+Defined by the transport, `hotline-ng-auth.md` §6.2 (domain
+`hl-identity/login/v1`). Under this profile it is signed by the device
+key, and its `device` must equal the device certificate's `device`
+(§5.2). `hl-identity` implements it beside the objects above because a
+client that makes one needs the other three.
 
 ### 3.7 Server key
 
-A server implementing this document has an Ed25519 keypair generated on
-first start. It is published in discovery (§4), bound into login proofs, and
-used by the federation spec to sign ban lists and vouches. It is not a TLS
-key.
+Defined by the transport, `hotline-ng-auth.md` §4.3. This profile uses it
+for nothing the transport does not; the federation spec signs ban lists
+and vouches with it.
 
 ---
 
 ## 4. Discovery
 
-`GET /.well-known/hotline` on the ng listener, served without
-authentication, with `Content-Type: application/json`:
+Inside the `identity` block of `GET /.well-known/hotline`
+(`hotline-ng-auth.md` §5), the profile's fields:
 
 ```jsonc
-{
-  "v": 1,
-  "name": "My Server",
-  "server_key": "…base64url 32 bytes…",
-  "ng": { "ws": "/ng", "trtp": "/trtp" },  // WebSocket paths: JSON protocol, TRTP tunnel
-  "identity": {
-    "enabled": true,
-    "bindings": [ "challenge", "mtls" ],    // which of §5 this server accepts
-    "new_accounts": "guest",                // deny | guest | create
-    "association": "server",                // or "none" on a relay (§11.2)
-    "min_attestation_age": 0,
-    "trusted_registrars": [],               // hosts whose attestations are accepted;
-                                            // empty accepts none — every identity is unattested
-    "endpoints": {
-      "challenge": "/identity/challenge",
-      "auth":      "/identity/auth",
-      "card":      "/identity/card",
-      "link":      "/identity/link",
-      "unlink":    "/identity/unlink"
-    }
-  },
-  "registrar": null                         // or the registrar spec's block
+"identity": {
+  // "enabled", "bindings", "association", and the "challenge" and "auth"
+  // endpoints are the transport's
+  "new_accounts": "guest",                // deny | guest | create (§8.1)
+  "min_attestation_age": 0,               // seconds (§11)
+  "trusted_registrars": [],               // hosts whose attestations are accepted;
+                                          // empty accepts none — every identity is unattested
+  "endpoints": {
+    "card":   "/identity/card",           // §7
+    "link":   "/identity/link",           // §8.2
+    "unlink": "/identity/unlink"          // §8.4
+  }
 }
 ```
 
-The same document is where a registrar advertises its own endpoints and key,
-so one discovery format serves servers, registrars, relays and tunnels.
-Clients cache it for the connection's lifetime; relays cache it per
-upstream.
+A relay (`association: "none"`) serves `card` and answers 404 on `link`
+and `unlink` (§10).
 
 ---
 
 ## 5. Authentication
 
-### 5.1 Model
+The transport's `auth` request (`hotline-ng-auth.md` §6.2 by challenge,
+§6.3 by client certificate) proves a key. This section is what the same
+request carries and what the server checks so that the key is a device
+of an identity.
 
-Authentication produces a short-lived *transport token*: an opaque bearer
-token, 32 bytes base64url, valid for 60 seconds, bound server-side to a
-device key, its identity, and the verified card and certificate. The client
-presents it when opening a WebSocket (§6), and the socket is thereafter
-known to belong to that device. Tokens are single-use.
-
-The token is deliberately not a session token. A session is an
-application-layer object — it has a uid and a roster row — and the same
-transport token authenticates a socket whether the application protocol
-on it turns out to be ng JSON or tunnelled TRTP. Nothing application-level
-exists until the application protocol's own login runs.
-
-Two bindings produce a token. Servers advertise which they accept. The
-server ends in the same state either way and nothing above the transport
-can tell them apart.
-
-### 5.2 Challenge binding
-
-Works everywhere, including browsers.
-
-**Step 1.** `POST /identity/challenge` with an empty body. Response:
-
-```jsonc
-{ "challenge": "…base64url 32 bytes…", "server_key": "…", "expires_in": 60 }
-```
-
-The challenge is stored server-side for 60 seconds and consumed on use.
-Servers rate-limit this endpoint per source address as they do login
-attempts; it is free to call and costs the server a random draw.
-
-**Step 2.** `POST /identity/auth`:
+### 5.1 The request
 
 ```jsonc
 {
-  "card":        "…base64url CBOR…",
-  "device_cert": "…base64url CBOR…",
-  "proof":       "…base64url CBOR…",
-  "downstream":  "local"                 // optional: local | cleartext
+  "proof":       "…",                    // transport: challenge binding only
+  "downstream":  "local",                // transport
+  "card":        "…base64url CBOR…",     // §3.4
+  "device_cert": "…base64url CBOR…",     // §3.3
+  "create":      false,                  // optional, see §5.3
+  "login":       "alice",                // optional, see §5.4
+  "password":    "…"
 }
 ```
 
-`downstream` is what the client declares about the hop *behind* it. A
-client that is the endpoint, or a tunnel forwarding only over loopback,
-says `local` (the default). A tunnel forwarding over a cleartext network
-hop (§11.1) MUST say `cleartext`; the server then marks the session
-`cleartext` on the roster (§10) so other users get the PM warning, TLS on
-the WebSocket notwithstanding. The server has no way to verify the claim
-and takes the conservative direction at face value: a client may make a
-session look less safe than it is, never more.
+`card` and `device_cert` are required. A request without them is not a
+request this profile can admit, and hxd-ng has no other profile, so it is
+refused (`bad_cert`).
 
-The server verifies in this order and fails on the first error:
+### 5.2 Verification
 
-1. proof signature with `device`; `challenge` known and unexpired;
-   `server_key` matches; `time` within tolerance;
+After the transport has verified the proof (its step 1), the server
+continues in this order and fails on the first error:
+
 2. `device_cert` signature with its `identity`; `device` matches the
-   proof; within validity; login capability set;
+   proof — or, on the mTLS binding, the client certificate's key; within
+   validity; login capability set;
 3. `card` signature; `identity` matches the certificate;
 4. neither key revoked (cached revocation list; behaviour on a stale cache
    is a setting);
 5. attestations verified against trusted registrars, expired or untrusted
    ones discarded, age computed from the oldest surviving `registered`;
-6. allow list, minimum attestation age, unattested policy.
+6. admission policy (§11): allow list, minimum attestation age, unattested
+   policy.
 
-Success (200):
+On success the principal's `subject` is the identity fingerprint and its
+`profile` is the card, the certificate and the accepted attestations, all
+as received.
+
+### 5.3 The response
+
+Success (200) adds to the transport's `token` and `expires_in`:
 
 ```jsonc
 {
@@ -339,15 +298,18 @@ means to link an *existing* classic account should send it: otherwise the
 first auth creates a new account, and `/identity/link` afterwards can only
 answer `already_linked`. Sending credentials implies it.
 
-Failure with `{ "error": code, "text": "…" }`:
+Failure with `{ "error": code, "text": "…" }`, in addition to the
+transport's codes:
 
 | code | status | |
 |---|---|---|
-| `bad_card`, `bad_cert`, `bad_proof`, `card_too_large`, `unknown_challenge` | 401 | prove it again |
+| `bad_card`, `bad_cert`, `card_too_large` | 401 | prove it again |
 | `login_failed` | 401 | the `login`/`password` of §5.4 didn't verify |
-| `denied`, `revoked`, `no_manage` | 403 | policy, or the device certificate lacks `manage` |
+| `revoked`, `no_manage` | 403 | policy, or the device certificate lacks `manage` |
 | `already_linked`, `would_orphan`, `not_linked` | 409 | conflicts with the account's state (§8.2, §8.4) |
-| `server_error` | 500 | ours, logged, not explained |
+
+`denied` (403) is the transport's code and is what admission policy (§11)
+answers with.
 
 `outcome` tells the client what account association will happen when an
 application login runs on a socket carrying this token *and presents no
@@ -357,8 +319,8 @@ information rather than discovered as a surprise.
 That qualifier matters because the token is path-agnostic: the same token
 admits an ng `login` and a tunnelled TRTP Login (107), and only the ng path
 is fully decided at auth time. A tunnelled classic login under
-`trtp_login = verify` (§8.3) carries a name and password that
-`/identity/auth` never saw, so it can land on — and link — an account this
+`trtp_login = verify` (§8.3) carries a name and password that the `auth`
+request never saw, so it can land on — and link — an account this
 response could not have named. `outcome` is therefore a prediction, not a
 commitment, and a client MUST take the association the application login
 actually reports (the ng `self` event, or the classic Login reply) as
@@ -366,187 +328,38 @@ authoritative. A client that intends to send classic credentials later
 should treat `guest` as "unless my credentials say otherwise" rather than
 displaying it as settled.
 
-### 5.3 mTLS binding
-
-For clients that can present a TLS client certificate: native apps, tunnels
-and relays. Not browsers.
-
-The client certificate is a self-signed X.509 certificate whose
-SubjectPublicKeyInfo is the device's Ed25519 public key (RFC 8410). Nothing
-else in the certificate is examined; validity dates, subject and extensions
-are ignored, since the device certificate (§3.3) is the authority on all of
-that.
-
-Ignoring the rest is not the same as not parsing it. The key MUST be taken
-from the SubjectPublicKeyInfo by position — walk `Certificate` →
-`TBSCertificate`, skip `version`, `serialNumber`, `signature`, `issuer`,
-`validity` and `subject`, and read the seventh field. Everything ahead of
-the SPKI is chosen by whoever requested the certificate (`serialNumber` is
-an arbitrary INTEGER; a `Name` attribute value is `ANY`), so an
-implementation that *searches* the DER for RFC 8410's algorithm identifier
-will find whatever bytes the subject planted there. A certificate whose own
-SPKI is the attacker's key — which is what the proxy's handshake validates
-— carrying a victim's device key inside its subject would then be read as
-the victim's device.
-
-hxd-ng does not terminate TLS. The reverse proxy requests (but must not
-require) a client certificate and forwards it on the upstream request as
-`X-Hotline-Client-Cert` (base64 DER). The server honours that header only
-from addresses listed in `[ng] trusted_proxies`; from anywhere else it is
-stripped.
-
-Trusting the proxy's address is necessary but not sufficient. The proxy
-MUST set `X-Hotline-Client-Cert` from the certificate that took part in
-*its own* TLS handshake, and MUST drop any copy of the header the client
-sent — otherwise a client can send the header through the proxy carrying
-any device's public certificate and impersonate that device. In Caddy,
-`header_up X-Hotline-Client-Cert {http.request.tls.client.certificate_der_base64}`
-does both: it replaces any inbound value, and sets nothing when there was
-no client certificate. An empty value means the client offered no
-certificate, which is "none" and not "a broken one" — some proxies send
-the header unconditionally.
-
-A trusted proxy is also believed about *who* it is speaking for. The
-address the server keys bans and per-address session limits on is the
-**rightmost element that is not itself in `trusted_proxies`**, read
-across every line of one header — `X-Forwarded-For` or RFC 7239's
-`Forwarded`, whichever `[ng] forwarded_header` says this proxy writes.
-Without any of this, every client behind the proxy shares one address, so
-banning one of them bans the deployment.
-
-The rightmost rule is not a stylistic choice. The stock directives
-*append*: nginx's `$proxy_add_x_forwarded_for` and HAProxy's `option
-forwardfor` add the peer they see to whatever the client already sent, so
-the left of the list is client-supplied and only its right end was
-written by the proxy. Reading the first element would let any client pick
-its own address — a fresh one per connection to shed a ban or a
-per-address limit, or someone else's to inherit their ban. Walking from
-the right and stopping at the first element outside `trusted_proxies` is
-correct under an appending proxy *and* under one that replaces the header
-outright; an element the server can't parse ends the walk and leaves the
-socket's peer in place.
-
-**`trusted_proxies` must list proxies and nothing else.** The walk skips
-over every element it finds in that list, so a range that also contains
-client addresses — a `10.0.0.0/8` on a network where clients live too —
-makes it skip the proxy's own element and take the client's, which is the
-bug this rule exists to prevent. List the addresses the proxy speaks
-from, not the network it sits on.
-
-`forwarded_header` names one header rather than trying both because a
-proxy passes through what it doesn't know about: nginx that sets
-`X-Forwarded-For` forwards a client-supplied `Forwarded:` line untouched,
-so a server that read both would read whichever one the *client* filled
-in. The default is `x-forwarded-for`; set `forwarded` only if the proxy
-is configured to write RFC 7239, and `none` to key everything on the
-proxy's own address. Header *lines* are concatenated in order for the
-walk, so a client-supplied line ahead of the proxy's own is to the left
-of it and never wins.
-
-**Stock nginx cannot do this.** `$ssl_client_escaped_cert` is
-URL-encoded PEM and `$ssl_client_raw_cert` is PEM with real newlines; a
-header carries neither, and nginx has no base64-DER variable and no
-string functions to make one. A server that can't decode the header
-answers 400 rather than falling through to an unauthenticated request,
-so a misconfiguration is loud — but it is still a misconfiguration, and
-the fall-through version of this failure is what "mTLS silently isn't
-working" used to mean.
-
-With njs, one function does it:
-
-```nginx
-# hotline.js
-function client_cert_der(r) {
-    var pem = r.variables.ssl_client_raw_cert;
-    if (!pem) return "";
-    return pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
-}
-export default { client_cert_der };
-```
-
-```nginx
-js_import hotline from hotline.js;
-js_set $hotline_client_cert hotline.client_cert_der;
-proxy_set_header X-Hotline-Client-Cert $hotline_client_cert;   # empty when absent
-proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;   # who it speaks for
-```
-
-The `proxy_set_header` is what drops any copy the client sent, and an
-empty value removes the header — both halves of the contract above. Lua
-works the same way. Without njs or Lua, use Caddy for the mTLS binding,
-or the challenge binding of §5.2, which needs no proxy cooperation at
-all. An operator who lists a proxy in `trusted_proxies` is asserting
-that it is configured this way; the server cannot check it. Operators who
-terminate TLS in the server itself in some future build get the same
-header semantics from the in-process listener, with the same contract
-satisfied by construction.
-
-With a client certificate on the connection, `POST /identity/auth` omits
-`proof`:
-
-```jsonc
-{ "card": "…", "device_cert": "…" }
-```
-
-The server checks that the certificate's public key equals `device_cert.device`
-and continues from step 2 above. Response and failure codes are the same.
-
-Once a device has a card and certificate on file, a WebSocket upgrade that
-carries a client certificate for that device key is authenticated without a
-token (§6), for as long as the stored device certificate is valid. This is
-the "the connection is the credential" path mTLS users expect; the
-`/identity/auth` call is needed once per device, and again when the card or
-certificate changes.
-
 ### 5.4 Registering with a password
 
-Either binding may add `"login"` and `"password"` to `/identity/auth` to
+Either binding may add `"login"` and `"password"` to the `auth` request to
 verify an existing classic account and, if permitted, link it in the same
 step. See §8.2. For ng JSON sessions this is the only place a password
 travels; it must never appear in a JSON frame for identity users. A
 tunnelled TRTP session carries its classic login inside the tunnel as it
 always has, encrypted by the WebSocket's TLS.
 
+### 5.5 A device on file
+
+The transport's "connection is the credential" path
+(`hotline-ng-auth.md` §6.3, §7.1) admits a WebSocket upgrade that carries
+a client certificate for a key already on file, without a token. Under
+this profile, "on file" means the server has cached a card and a device
+certificate for that device key from an earlier `auth` call, and the
+upgrade is admitted for as long as the stored device certificate is
+valid.
+
+Re-admitting a device this way is a *read-only* admission. It re-checks
+the signatures, honours an existing account link, and writes nothing —
+no link, no account creation. Read-only is about *writes*, not about
+policy: `new_accounts = deny`, the allow list and the attestation rules
+(§11) are decided again on every admission. A device cached while its
+account was linked must not keep being admitted as a guest after the
+operator removes the link.
+
 ---
 
-## 6. Opening a WebSocket
+## 6. Sessions
 
-Two WebSocket paths are advertised in discovery. Both are authenticated
-the same way; they differ only in what flows after the upgrade.
-
-### 6.1 Presenting the transport token
-
-An upgrade request is authenticated by one of, in order of preference:
-
-- `Authorization: Bearer <token>` — any client that can set request
-  headers (native apps, tunnels, relays);
-- `?token=<token>` in the upgrade URL — browsers, whose `WebSocket` API
-  takes a URL and a protocol list and nothing else. The token is
-  single-use and expires in 60 seconds, which is what makes a value in
-  the URL tolerable at all.
-
-  A deployment that serves this form **MUST** keep the query string out
-  of its logs on these paths — access logs, error logs, and any redirect
-  or upgrade-failure log — because common reverse-proxy defaults record
-  it, and an upgrade that fails or is abandoned leaves the token
-  unredeemed and live for its remaining seconds. "Single-use" bounds the
-  damage only once someone has used it;
-- a client certificate on the connection for a device key on file,
-  forwarded under the §5.3 proxy contract, which needs no token at all.
-
-Cookies are not used: they would make every cross-site page a potential
-initiator of an authenticated socket.
-
-An upgrade with an invalid or expired token is refused with HTTP 401. It
-is not downgraded to an unauthenticated socket, so a client cannot silently
-end up as a guest because a token expired in flight.
-
-An upgrade with none of these is an unauthenticated socket and proceeds
-exactly as it does today: the ng JSON handshake of `hotline-ng.md` §6, or
-a classic TRTP handshake in the tunnel. Nothing changes for clients that
-don't use identity.
-
-### 6.2 The ng JSON protocol (`ng.ws`)
+### 6.1 The ng JSON protocol
 
 On an authenticated socket the first frame is still `login`, but its
 `login` and `password` params are ignored (and should be omitted). The
@@ -563,44 +376,21 @@ additions to the `ok` object:
 
 Each `user` object in the roster and in `user_joined` / `user_changed`
 gains an optional `identity` sub-object with `fingerprint` and `handle`
-(never `age` or `outcome`, which are the server's business), and a
-required `transport` field: `"encrypted"` or `"cleartext"` (§10). Clients
-that predate this ignore both.
+(never `age` or `outcome`, which are the server's business), beside the
+transport's required `transport` field (`hotline-ng-auth.md` §7.2, §8).
+Clients that predate this ignore both.
 
-`resume` is unaffected: the session token already proves continuity, and
-the identity binding is a property of the session once the session
-exists, not of the connection.
+The identity is copied to the session at login and is a property of the
+session from then on: `resume` on a new socket keeps it.
 
-### 6.3 TRTP over WebSocket (`ng.trtp`)
+### 6.2 Tunnelled TRTP sessions
 
-The socket carries the classic protocol unchanged: binary frames, whose
-payloads concatenated in order are exactly the byte stream a TCP
-connection to the legacy port would carry, in both directions. Frame
-boundaries carry no meaning; a client may send one transaction per frame
-or split however it likes, and the server may do the same. Text frames on
-this path are a protocol error and close the socket.
-
-Inside the tunnel the client performs the ordinary TRTP handshake and
-Login (107) with whatever classic credentials it has. What the server
-does with those, given that it also knows the transport identity, is §8.3.
-The server treats the session as encrypted for §10, since the WebSocket
-is TLS.
-
-This path needs no TRTP-aware code in the tunnel or in any relay. In
-hxd-ng it is the existing legacy frontend fed from a WebSocket instead of
-a TCP socket, plus the identity annotation on the session. HOPE transport
-encryption is unnecessary inside the tunnel and a server may refuse to
-negotiate it there.
-
-**Keep-alive is the server's job here, as on the JSON path.** A classic
-session says nothing for as long as its user is only watching, and the
-protocol inside has no idle traffic of its own — so the server sends a
-WebSocket ping on a quiet socket (hxd-ng: every 30 seconds), which is
-what notices a peer that has gone away and what keeps a NAT mapping
-alive. A tunnel answers with a pong, as any WebSocket library does for
-it, and needs no code for this. A socket that has sent nothing at all for
-three ping periods is dropped: a ping with no deadline behind it asks a
-question and accepts no answer.
+Inside the tunnel (`hotline-ng-auth.md` §7.3) the client performs the
+ordinary TRTP handshake and Login (107) with whatever classic credentials
+it has. The server holds an identity for the socket as well; how it
+reconciles the two is §8.3. Either way the session is identity-aware
+from the server's point of view and indistinguishable from a native
+identity session in the roster.
 
 ---
 
@@ -638,7 +428,8 @@ legacy session.
 
 Everything in this section is for a server that terminates the socket and
 implements the application protocol — hxd-ng, or another server that
-adopts this document natively. A relay or tunnel does none of it (§11).
+adopts this document natively. A relay or tunnel does none of it
+(`hotline-ng-auth.md` §9, §10).
 
 An account may carry one identity fingerprint; an identity may be linked
 to one account per server. The link is what gives an identity user
@@ -647,9 +438,9 @@ account tools.
 
 ### 8.1 Association at login
 
-When an application login runs on a socket with a transport identity and
-names no classic account (an ng `login` with no `login` param; a TRTP
-Login (107) as guest):
+When an application login runs on a socket with an identity and names no
+classic account (an ng `login` with no `login` param; a TRTP Login (107)
+as guest):
 
 - if an account links this fingerprint, the session is that account, with
   its access bitmap and everything else; if the operator has set
@@ -665,13 +456,14 @@ Login (107) as guest):
 
 `deny` is decided on every path that admits an identity with no linked
 account — the unattested one, the `classic_pending_link` one of §8.2, and
-the re-admission of a device already on file (§5.3) — and again when the
-application login re-reads the link (§6.2), so a token minted while the
+the re-admission of a device already on file (§5.5) — and again when the
+application login re-reads the link (§6.1), so a token minted while the
 account was linked does not outlive it for the rest of its minute.
 Removing a link locks that device out at its next connection rather than
 at its certificate's expiry.
 
-`/identity/auth` reports which of these will happen as `outcome`.
+The `auth` response reports which of these will happen as `outcome`
+(§5.3).
 
 ### 8.2 Linking an existing classic account
 
@@ -679,7 +471,7 @@ at its certificate's expiry.
 requires the device certificate's `manage` capability** — at auth, after
 auth, and inside a tunnel (§8.3). A certificate without it can still log
 in and use the server; it cannot bind an account to the key. Note what
-this means for a tunnel that will self-link: §11.1's advice to carry only
+this means for a tunnel that will self-link: §10's advice to carry only
 the login and message bits is right for a tunnel used with an
 already-linked account, and a tunnel that is expected to make the link
 needs `manage` as well.
@@ -687,8 +479,8 @@ needs `manage` as well.
 Three ways, all requiring the account to allow self-linking, to have a
 password, and to have no link to a different identity:
 
-- **At auth.** `/identity/auth` includes `login` and `password`. The server
-  verifies the password as for a normal login. If the identity also
+- **At auth.** The `auth` request includes `login` and `password`. The
+  server verifies the password as for a normal login. If the identity also
   verifies and the account is linkable, the link is made and `outcome` is
   `linked`. If not linkable, the token is still issued with `outcome`
   `classic_pending_link` and the session that redeems it is an ordinary
@@ -723,8 +515,8 @@ from.
 
 A legacy client inside a tunnel sends a classic Login (107) with a name
 and password, or as guest, and expects the reply a 1.9 server would give.
-The server has a transport identity for the socket as well. How it
-reconciles the two is the `[identity] trtp_login` setting:
+The server has an identity for the socket as well. How it reconciles the
+two is the `[identity] trtp_login` setting:
 
 - `verify` (default) — classic credentials are checked exactly as on the
   TCP port. If they name an account, that account must be the one linked
@@ -753,12 +545,12 @@ reconciles the two is the `[identity] trtp_login` setting:
   on that socket fails with `denied` per §8.1.
 
   "Still needs its password" is a TRTP-path statement. On the ng JSON
-  path an identity socket ignores credentials entirely (§6.2) — there is
+  path an identity socket ignores credentials entirely (§6.1) — there is
   nowhere to put a password that the server will read — so an account
   with `identity_login = false` is reachable only from a socket with no
-  transport identity. That is the intended shape (the account has said it
-  does not want identity login), but a client has to know to open a plain
-  socket for it.
+  identity. That is the intended shape (the account has said it does not
+  want identity login), but a client has to know to open a plain socket
+  for it.
 
   **A password-less account with `identity_login = false` is reachable by
   nobody**, on either wire: no password means every password login is
@@ -812,7 +604,7 @@ reserved names with the account.
 
 A legacy client on the plain TCP port logs into a linked account with the
 account's name and password exactly as before, gets the same permissions
-and reserved name, and has no transport identity. Its card is whatever the
+and reserved name, and has no identity. Its card is whatever the
 identity last set. Nothing in TRTP changes.
 
 ---
@@ -842,138 +634,50 @@ suspended and logged for the operator.
 
 ---
 
-## 10. Cleartext sessions and the legacy wire
+## 10. Tunnels and relays
 
-Nothing in this document adds fields or transactions to TRTP. The legacy
-wire is affected in two ways only, both optional and both about what a
-classic session *sees*, not about authentication:
+The roles are the transport's (`hotline-ng-auth.md` §10). What this
+profile adds to each:
 
-- **Transport marking.** So that ng users can be warned before PMing a
-  session whose link is readable in transit, every roster entry on ng
-  carries `transport`. On the legacy wire, servers *may* set bit 4 (value
-  16) of User Flags (112) for cleartext sessions; 1.2/1.5 clients ignore
-  unknown flag bits, and clients that know it render a marker. This is the
-  one TRTP-visible change and a server may omit it.
+**A tunnel** (legacy client → identity-aware server) holds one device
+key and is a device like any other: it appears in the user's device list
+as one. Its device certificate should carry only the login and message
+bits, unless the user means to link an account through it — writing a
+link needs `manage` on every path (§8.2), the tunnelled classic login
+included, so a tunnel that will self-link needs that bit too and should
+lose it once the link is made. It presents the identity's current card,
+cached from wherever the user last set it; it does not synthesise cards.
 
-  **The bit is not settled.** Hotline 1.8/1.9 may already allocate value
-  16 in field 112 as "automatic response", in which case setting it makes
-  every cleartext session look auto-responding to those clients, and this
-  document has to move the marker to a bit nothing has claimed. Nothing
-  in the tree the reference implementation was written from confirms
-  either reading, so hxd-ng ships the marking **off by default**
-  (`[server] mark_cleartext`) until it has been checked against a real
-  1.8.5 or 1.9 client. An implementation that turns it on by default is
-  betting on the reading that has not been verified, which the "never
-  break old clients" rule does not allow.
-- **Cleartext policy.** A three-position setting: `off` (legacy port
-  refuses sessions that don't negotiate HOPE transport encryption, or is
-  behind a TLS wrapper), `restricted` (cleartext sessions have their access
-  ANDed with an operator mask whose recommended default allows public chat
-  and news reading only), `on` (legacy behaviour, with a warning in
-  operator tooling).
-
-A tunnelled TRTP session (§6.3) is `encrypted` **when the tunnel's own
-local hop is**. The hop the server can see — tunnel to server — is TLS,
-and the server never sees those bytes in the clear. The other hop, the
-classic client to the tunnel, is cleartext by construction (§11.1): the
-tunnel exists because the client cannot speak TLS. On loopback that hop
-crosses nothing, and the session is `encrypted`. Off loopback — which
-§11.1 permits, deliberately and opt-in — it crosses a network, and the
-session is `cleartext`.
-
-The server cannot observe which, so the tunnel declares it: `downstream`
-at `/identity/auth` (§5.2), `cleartext` when the tunnel listens anywhere
-but loopback. A client may declare itself less safe than it looks and
-never more, so a tunnel that lies can only cost its own user a warning
-they didn't need. `hlid tunnel` sets it from its own `--listen`.
-
-With that hop on loopback this is, rather than HOPE transport
-encryption, the recommended way for a legacy client to get an encrypted
-session — it also gets an identity.
-
-An ng client must warn before sending a private message to a `cleartext`
-session.
+**A relay** (identity-aware front for a legacy server) serves cards from
+its own cache (§7) and applies this profile's admission policy (§11) at
+the HTTP layer. It does not associate accounts: its `auth` endpoint
+accepts no `login`/`password`; `/identity/link` and `/identity/unlink`
+return 404; `outcome` is always `guest` in the sense of "the legacy
+server decides". Clients connecting through the relay see identity
+information only via the relay's own discovery and card endpoints.
 
 ---
 
-## 11. Tunnels and relays
+## 11. Admission policy
 
-Neither needs to *parse* the protocol it carries. That is the point:
-everything in this section is possible with an HTTP client library, a
-WebSocket library, and `hl-identity`, and nothing here requires TRTP
-knowledge.
+The profile's policy is decided at step 6 of §5.2 and again on every
+admission that follows — a certificate-only upgrade (§5.5) and the
+application login that re-reads the account link (§8.1) — so nothing a
+token or a cache remembers outlives the operator's current settings for
+longer than a socket. Refusal is the transport's `denied`.
 
-It is not a confidentiality claim. Both processes handle the payload
-bytes in the clear and can read or alter them at will; the threat model
-says so of their operators explicitly. What they are spared is
-understanding those bytes, not seeing them.
+| Knob | Decides |
+|---|---|
+| `allow_list` | Non-empty: only these fingerprints or handles are admitted |
+| `trusted_registrars` / `[identity.registrar_keys]` | Whose attestations count. Empty accepts none; there is no "empty means any" |
+| `min_attestation_age` | The oldest accepted `registered` must be at least this many seconds ago |
+| `unattested` | What an identity with no accepted attestation gets: `deny`, `guest`, `allow` |
+| `new_accounts` | What an admitted identity with no linked account gets (§8.1) |
+| `identity_login` (per account) | Whether the linked account accepts identity login at all (§8.1, §8.3) |
 
-### 11.1 Tunnel: legacy client → identity-aware server
-
-Runs on the user's machine (or somewhere they trust), holds one device
-key, listens on a local TCP port for the classic client, and forwards
-bytes over a TRTP-over-WebSocket connection (§6.3) to the server.
-
-- It authenticates upstream with its own device key by either binding. Its
-  device certificate should carry only the login and message bits, unless
-  the user means to link an account through it: writing a link needs
-  `manage` on every path (§8.2), the tunnelled classic login included, so
-  a tunnel that will self-link needs that bit too and should lose it once
-  the link is made. It is a device like any other and appears in the
-  user's device list as one.
-- It presents the identity's current card, cached from wherever the user
-  last set it; it does not synthesise cards.
-- It forwards bytes verbatim in both directions and does nothing else. In
-  particular it does not touch the classic login: the server sees it
-  inside the tunnel and applies §8.3.
-- Its local hop is cleartext on loopback. It must not be configured to
-  listen on a non-loopback address without the user opting in, since that
-  would re-create exactly the exposure the tunnel exists to remove — and
-  when the user does opt in, the tunnel MUST say `"downstream":
-  "cleartext"` at `/identity/auth` (§5.2) so the session is marked and
-  other users are warned before PMing it. A tunnel has no other way to
-  tell the server, and the server has no other way to know.
-
-This is stunnel with an identity. A relay (§11.2) can also act as one
-downstream, and a native client can embed one.
-
-### 11.2 Relay: identity-aware front for a legacy server
-
-Runs in front of a server that speaks only TRTP (hxd 0.x, Mobius,
-HLServer). Implements discovery, the identity endpoints and the WebSocket
-paths, and forwards each socket's bytes to a TCP connection to the legacy
-server. It has a transport identity for every socket and no account table.
-
-- It holds its own server key and is, for identity purposes, the server:
-  its allow list, ban list and registrar policy apply at the HTTP layer,
-  and the federation spec treats its signatures as the operator's.
-- It gatekeeps: refuses sockets whose identity is banned, unattested
-  beyond policy, or not on an allow list, before any bytes reach the
-  legacy server. This is where a relay earns its keep, and it needs no
-  cooperation from the server behind it.
-- It does not associate accounts. The classic login inside the tunnel is
-  the legacy server's business; the relay never sees a password it needs
-  to check and never holds one. `/identity/auth` on a relay accepts no
-  `login`/`password`; `/identity/link` and `/identity/unlink` return 404;
-  `outcome` is always `guest` in the sense of "the legacy server decides".
-- It serves cards from its own cache and may annotate nothing on the
-  legacy wire, since it doesn't speak it. Clients connecting through the
-  relay see identity information only via the relay's own discovery and
-  card endpoints. Discovery says so: `"identity": { "association":
-  "none" }`, so clients don't expect reserved names or auto-login.
-- It can offer the ng JSON path only if it implements the JSON protocol
-  itself against TRTP downstream, which is a full client implementation
-  and out of scope here; a relay that offers only `ng.trtp` is complete.
-
-### 11.3 What the server guarantees them
-
-Discovery is stable, cards are byte-exact, tokens and challenges are
-single-use, the mTLS header contract is honoured only from trusted
-proxies, and the TRTP-over-WebSocket path carries exactly the bytes the
-TCP port would and pings a quiet socket (§6.3). A tunnel or relay that follows this section is
-indistinguishable from a native client to the server and to other users,
-except that a relay-fronted legacy server has no account association to
-offer.
+The defaults are arranged so that an attested identity is never treated
+worse than an unattested one: `new_accounts = guest` beside
+`unattested = guest`.
 
 ---
 
@@ -981,12 +685,13 @@ offer.
 
 The table is what `hxd-ng` reads today; a row marked *(not implemented)*
 is design, not configuration, and setting it is a startup error —
-`[identity]` uses `deny_unknown_fields`.
+`[identity]` uses `deny_unknown_fields`. The transport's rows —
+`[identity]` as the master switch, `key`, `clock_skew`, `trtp`, and the
+`[ng]` proxy settings — are in `hotline-ng-auth.md` §11; they share the
+section because hxd-ng has one profile and one switch.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `[identity]` present | absent | The section's presence is the master switch. Absent, discovery reports `enabled: false` and the endpoints 404. It needs `[ng]`: without an ng listener there is nothing to serve the endpoints from, so `[identity]` without `[ng]` is a startup error rather than a section quietly ignored |
-| `[identity] key` | `identity-server.key` | The server's Ed25519 seed, hex, mode 0600; generated on first run |
 | `[identity] new_accounts` | `guest` | `deny`, `guest`, `create`. The default is `guest` rather than `deny` so that, with `unattested = guest`, an attested identity is never treated worse than an unattested one |
 | `[identity.default_access]` | guest access | Access bits for accounts `create` writes, keyed exactly as an account file's `[access]` table. The guest fallback is convenient but wrong for anything guests may not have — the messaging extension's `AccessMessaging`, for one — so operators using `create` should set it explicitly |
 | `[identity] max_new_accounts_per_hour` | `60` | Ceiling on accounts `create` may write per hour; `0` turns creation off while leaving the rest of `create` in place. Past the ceiling, identities are still admitted, as guests. `create` writes a file per never-seen key, and with `unattested = guest` any fresh key qualifies |
@@ -994,16 +699,9 @@ is design, not configuration, and setting it is a startup error —
 | `[identity] min_attestation_age` | `0` | Seconds |
 | `[identity] unattested` | `guest` | `deny`, `guest`, `allow` |
 | `[identity.registrar_keys]` | empty | Registrar host → base64url public key. **Empty accepts no attestation at all**, so every identity is unattested; there is no "empty means any". Static until the registrar spec's discovery fetch exists |
-| `[identity] clock_skew` | `300` | Seconds |
-| `[identity] trtp` | `true` | Serve the TRTP-over-WebSocket path |
 | `[identity] trtp_login` | `verify` | `verify` or `trust`; see §8.3 |
 | `[identity] successors` | `identity-successors` | Where §3.4 successor commitments are kept, for the identities §13 says get one. `""` keeps them in the card cache only, which a restart forgets — and so does enough traffic to evict the card. Making the caches forget is the attack the commitment exists to stop |
-| `[ng] trusted_proxies` | empty | Addresses whose `X-Hotline-Client-Cert` and forwarded-address headers are believed (§5.3). Single addresses or CIDR blocks (`["127.0.0.1", "10.0.0.0/8"]`); IPv4-mapped peers on a `[::]` bind match their IPv4 form. Also the set the rightmost-element walk skips over, so it must contain proxies and no clients |
-| `[ng] forwarded_header` | `"x-forwarded-for"` | Which header a trusted proxy writes the client's address into: `"x-forwarded-for"`, `"forwarded"` (RFC 7239), or `"none"` (§5.3). Only the named one is read |
-| `[server] mark_cleartext` | `false` | Whether the legacy user list marks unencrypted sessions with User Flags bit 4. Off until that bit is confirmed free against 1.8/1.9 — see §10 |
-| `[identity] bindings` | — | *(not implemented)* Both bindings of §5 are served: challenge always, mTLS whenever `[ng] trusted_proxies` is non-empty |
 | `[identity] revocation_max_age`, `revocation_stale` | — | *(not implemented)* §5.2 step 4 is stubbed; there is no registrar to fetch a list from yet |
-| `[legacy] cleartext`, `cleartext_mask` | — | *(not implemented)* §10 marks cleartext sessions; it does not restrict them |
 
 Account files gain an `[identity]` table: `fingerprint` (the 52-character
 form), `login` (bool, default true), `allow_self_link` (bool, default
@@ -1019,42 +717,16 @@ to run on a server that also serves the legacy port.
 
 ## 13. Implementation notes
 
-- The ng listener needs to route a few HTTP paths before the upgrade. Any
-  minimal HTTP layer over the existing `tokio-tungstenite` accept works;
-  this is the point at which `hotline-ng.md`'s "no HTTP framework yet"
-  decision expires, and it should be revisited with media and history in
-  mind rather than solved just for identity.
 - Verification (card, certificate, proof, attestation) is one function over
   decoded CBOR. Both bindings and the card endpoint call it.
-- Transport tokens, challenges and session tokens share the same storage
-  discipline as `hotline-ng.md` §9: CSPRNG, stored hashed, never logged.
-  hxd-ng looks them up in a map keyed by the SHA-256 of the secret, which
-  is not a constant-time compare and does not need to be: what varies
-  with the attacker's input is the hash of their guess, and the timing of
-  a lookup on it says nothing about the secret. A store that compared
-  secrets directly would need one.
-- TRTP over WebSocket is `hxd-session` driven by an adapter that presents
-  binary frames as `AsyncRead`/`AsyncWrite`, plus one extra field on the
-  session (the transport identity, if any) consulted at Login (107). The
-  legacy frontend otherwise doesn't know it isn't on TCP.
 - The cached card and device certificate are what make the mTLS
-  "connection is the credential" path work. hxd-ng keys them by device
-  public key (not its fingerprint — the key is what arrives in the
-  certificate, and hashing it to look it up buys nothing), with the
-  identity public key alongside. Both tables are bounded and evicted:
-  they are filled by `/identity/auth`, which any fresh key can reach when
-  `unattested = guest`. Bounding the *count* only bounds the memory if
-  the entries are bounded too — the cached bytes are a card (§3.4, 16
-  KiB) and a certificate (§3.3, 4 KiB), which is what those size limits
-  are for.
-- Re-admitting a device already on file is a *read-only* admission. It
-  re-checks the signatures, honours an existing account link, and writes
-  nothing — no link, no account creation. Otherwise every upgrade repeats
-  the side effects of the `/identity/auth` that first recorded the device.
-  Read-only is about *writes*, not about policy: `new_accounts = deny`,
-  the allow list and the attestation rules are decided again on every
-  admission. A device cached while its account was linked must not keep
-  being admitted as a guest after the operator removes the link.
+  "connection is the credential" path work (§5.5). hxd-ng keys them by
+  device public key with the identity public key alongside. Both tables
+  are bounded and evicted: they are filled by the `auth` endpoint, which
+  any fresh key can reach when `unattested = guest`. Bounding the *count*
+  only bounds the memory if the entries are bounded too — the cached
+  bytes are a card (§3.4, 16 KiB) and a certificate (§3.3, 4 KiB), which
+  is what those size limits are for.
 - The successor commitment of §3.4 must outlive the process. A server that
   holds it only in memory hands an attacker "restart the server" as the
   way to move it, which is exactly the attack the commitment exists to
@@ -1063,8 +735,8 @@ to run on a server that also serves the legacy port.
 - **Who gets anchored.** Only an identity with *standing* on this server:
   one with an account here (linked or created) or an attestation the
   server accepted. Anchoring every card that ever authenticated
-  contradicts the bounded-growth rule below — with `unattested = guest`
-  any fresh key can reach `/identity/auth`, and each one would leave a
+  contradicts the bounded-growth rule above — with `unattested = guest`
+  any fresh key can reach the `auth` endpoint, and each one would leave a
   durable line behind. What a commitment protects is a relationship
   people on the server have with an identity; a key nobody here knows has
   none yet, and gets its anchor on the login that gives it one. A server
@@ -1082,12 +754,10 @@ to run on a server that also serves the legacy port.
   attestations it will look at (§3.4), reads and checks the card's own
   fields before entering the attestation loop at all, and checks each
   attestation's cheap fields and subject before its signature.
-- Rate limits: `/identity/challenge` and `/identity/auth` per source address
-  like login attempts. A forged card costs an attacker nothing and the
-  server two signature checks. Not implemented in hxd-ng yet; the growth
-  of every table an unauthenticated caller can touch is bounded
-  independently, so the limiter is a refinement rather than a load-bearing
-  part of the design.
+- The session carries the identity as part of its transport description
+  (`hxd-core`'s `Transport`), consulted at the ng login and at the
+  classic Login (107) inside a tunnel; the legacy frontend otherwise
+  doesn't know which wire it is on.
 - **Interaction with `CAPABILITY_MESSAGING`.** fogWraith's messaging
   extension keys everything on the account Login; a linked identity is an
   account, so the two compose without change. The seams — a durable key
@@ -1099,17 +769,9 @@ to run on a server that also serves the legacy port.
 
 ## 14. Open questions
 
-- **Transport token vs session token.** Reviewed and kept separate (§5.1):
-  the token authenticates a socket before any application protocol has
-  run, and the same token serves both WebSocket paths. If the ng JSON
-  path ever wanted `resume` to double as first attach, that would be a
-  session-layer change and could be made without touching this layer.
 - **`trtp_login = trust` and legacy client UX.** A 1.5 client will still
   show a login box. Is "type anything" acceptable, or should tunnels
   advertise a fixed placeholder login the user is told to use?
-- **HOPE inside the tunnel.** Refusing it is simplest; allowing it is
-  harmless but doubles encryption. Should the server advertise it as
-  unsupported on the tunnel path so clients don't try?
 - **Reserved name as login name.** Simple and matches how operators think,
   but a user can't reserve a display name that differs from their login.
   Is a separate `reserved_name` field worth the schema change?
@@ -1133,11 +795,15 @@ to run on a server that also serves the legacy port.
   direction — shorter because an XSS can mint tokens for as long as the
   page is open, or longer because four paste ceremonies a year is what
   will stop people using it?
-- **User Flags bit 4 on 1.8/1.9.** §10's cleartext marker takes value 16
-  in field 112 on the strength of "classic clients ignore unknown bits".
-  If 1.8/1.9 already means "automatic response" by that value, the marker
-  has to move to a bit nothing has claimed. Needs testing against a real
-  client before any server turns marking on by default.
+- **SSO through a registrar.** The transport's open questions
+  (`hotline-ng-auth.md` §13) weigh OIDC as a transport binding. The
+  alternative that keeps users on keys is an OIDC-backed registrar that
+  issues attestations after the IdP login; the server then trusts it
+  through `[identity.registrar_keys]` and `min_attestation_age` with no
+  transport change, and those users keep cards and E2E. It needs the
+  registrar spec, and a client that generates a key without a ceremony —
+  which the web client already does. Worth writing up once the registrar
+  spec exists.
 - **Multiple sessions per identity on one server.** `hotline-ng.md` §12
   already asks whether the roster should group same-user sessions. Identity
   gives it a reliable key to group on; this document doesn't require it.

@@ -1,11 +1,11 @@
 //! Hotline identity objects.
 //!
-//! The transport-independent half of `docs/hotline-ng-identity.md`: keys,
-//! device certificates, user cards, registrar attestations and login
-//! proofs, with their deterministic CBOR encoding and domain-separated
-//! Ed25519 signatures. No HTTP, no sockets, no storage — a server, a
-//! registrar, a proxy, a relay and a client all use this crate and nothing
-//! in it knows which one it is.
+//! The objects of `docs/hotline-ng-identity.md` §3 and the login proof of
+//! `docs/hotline-ng-auth.md` §6.2: keys, device certificates, user cards,
+//! registrar attestations and login proofs, with their deterministic CBOR
+//! encoding and domain-separated Ed25519 signatures. No HTTP, no sockets,
+//! no storage — a server, a registrar, a proxy, a relay and a client all
+//! use this crate and nothing in it knows which one it is.
 //!
 //! Every object is built as a struct, signed to bytes, and parsed back
 //! from bytes with its signature verified in the same call. Parsing checks

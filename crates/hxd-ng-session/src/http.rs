@@ -1,4 +1,4 @@
-//! The HTTP layer on the ng listener (`docs/hotline-ng-identity.md` §4–§6).
+//! The HTTP layer on the ng listener (`docs/hotline-ng-auth.md` §5–§7).
 //!
 //! Every connection to the ng port is HTTP first. Most of them upgrade to
 //! a WebSocket in their first request and never come back here; the rest

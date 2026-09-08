@@ -67,7 +67,7 @@ enum Exit {
 
 /// Run the JSON protocol on an upgraded socket. `identity` is the
 /// transport identity the HTTP layer authenticated, if any
-/// (`docs/hotline-ng-identity.md` §6.2); the ban check happened before
+/// (`docs/hotline-ng-auth.md` §7.2); the ban check happened before
 /// the upgrade.
 pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<TransportIdentity>) {
     let (mut ws_tx, mut ws_rx) = ws.split();

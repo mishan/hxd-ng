@@ -1,4 +1,4 @@
-//! The login proof (`docs/hotline-ng-identity.md` §3.6): the device key's
+//! The login proof (`docs/hotline-ng-auth.md` §6.2): the device key's
 //! answer to a server challenge, bound to that server's key so a challenge
 //! relayed from elsewhere is useless.
 

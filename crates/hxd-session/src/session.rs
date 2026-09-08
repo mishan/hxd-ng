@@ -93,7 +93,7 @@ pub struct ServerConfig {
     /// serve it.
     pub caps: Caps,
     /// Set the cleartext marker bit in user flags for unencrypted
-    /// sessions (`docs/hotline-ng-identity.md` §10). Off by default: see
+    /// sessions (`docs/hotline-ng-auth.md` §8). Off by default: see
     /// [`wire_color`].
     pub mark_cleartext: bool,
     /// How a tunnelled session's classic login reconciles with the
@@ -312,7 +312,7 @@ fn mac_nick(nick: &str) -> Vec<u8> {
 /// here and only here.
 ///
 /// Bit 4 (value 16) marks a session whose link is cleartext
-/// (`docs/hotline-ng-identity.md` §10): a plain TCP legacy session. Old
+/// (`docs/hotline-ng-auth.md` §8): a plain TCP legacy session. Old
 /// clients ignore flag bits they don't know, but the reference server
 /// never set one, so this is a deliberate deviation behind
 /// `ServerConfig::mark_cleartext` (default off) until it has been seen
@@ -578,7 +578,7 @@ impl Session {
 
 /// Run one legacy session over any byte stream: a TCP socket from
 /// [`serve`], or a TRTP-over-WebSocket tunnel handed over by the ng
-/// frontend (`docs/hotline-ng-identity.md` §6.3). `transport` says what
+/// frontend (`docs/hotline-ng-auth.md` §7.3). `transport` says what
 /// the caller knows about the link — encrypted or not, and the transport
 /// identity if the caller authenticated one — and is carried to the
 /// roster untouched. The protocol inside doesn't know which it got.
