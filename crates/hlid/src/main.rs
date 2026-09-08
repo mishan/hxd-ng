@@ -6,6 +6,8 @@
 //! ```text
 //! hlid init    --name S [--days N] [--device-name S]
 //!              identity key, device key, certificate and card in one step
+//! hlid enroll  --server URL [--caps web|LIST] [--days N]
+//!              show a pairing code, wait for one device, prompt, certify
 //! hlid keygen  identity|device|server PATH    make a key (32-byte seed, hex, mode 0600)
 //! hlid cert    [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX)
 //!              [--days N] [--caps all|web|LIST] [--name S] [--bundle] -o FILE
@@ -41,6 +43,8 @@
 //! seed format is what that envelope will wrap, so nothing here is
 //! thrown away.
 
+mod enroll;
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -61,6 +65,7 @@ fn main() {
     let Some(cmd) = args.first() else { usage() };
     let r = match cmd.as_str() {
         "init" => init(&args[1..]),
+        "enroll" => enroll::enroll_cmd(&args[1..]),
         "keygen" => keygen(&args[1..]),
         "cert" => make_cert(&args[1..]),
         "card" => make_card(&args[1..]),
@@ -82,6 +87,7 @@ fn usage() -> ! {
     eprintln!(concat!(
         "usage:\n",
         "  hlid init --name S [--days N] [--device-name S]\n",
+        "  hlid enroll --server URL [--caps web|LIST] [--days N] [--identity K] [--card FILE]\n",
         "  hlid keygen identity|device|server PATH\n",
         "  hlid cert [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] [--bundle [--card FILE]] -o FILE\n",
         "  hlid card [--identity K] --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n",
@@ -99,6 +105,12 @@ fn usage() -> ! {
         "can be exact without guessing where you keep your key. `attest` is the\n",
         "exception: a registrar attests somebody else, so its flags stay explicit.\n",
         "\n",
+        "`hlid enroll` replaces the paste: it opens a session at the server's\n",
+        "enrollment mailbox, shows a code to type into the browser, and asks\n",
+        "before it certifies anything. --caps defaults to `web` — login and\n",
+        "message, never vouch or manage — and nothing a request asks for can\n",
+        "widen that.\n",
+        "\n",
         "--bundle writes the certificate and the identity's card as one object\n",
         "instead of the certificate alone — the same thing enrollment carries, so\n",
         "a browser has one blob to paste and one format to verify.\n",
@@ -114,11 +126,11 @@ fn usage() -> ! {
     exit(2)
 }
 
-type R<T> = Result<T, String>;
+pub(crate) type R<T> = Result<T, String>;
 
 // --- Argument parsing: `--key value` pairs, repeated keys collected ------
 
-struct Args {
+pub(crate) struct Args {
     flags: HashMap<String, Vec<String>>,
 }
 
@@ -133,7 +145,7 @@ const BARE: &[&str] = &[
     "create",
 ];
 
-fn parse(args: &[String]) -> Args {
+pub(crate) fn parse(args: &[String]) -> Args {
     let mut flags: HashMap<String, Vec<String>> = HashMap::new();
     let mut i = 0;
     while i < args.len() {
@@ -161,20 +173,20 @@ fn parse(args: &[String]) -> Args {
 }
 
 impl Args {
-    fn one(&self, k: &str) -> R<&str> {
+    pub(crate) fn one(&self, k: &str) -> R<&str> {
         self.flags
             .get(k)
             .and_then(|v| v.first())
             .map(String::as_str)
             .ok_or_else(|| format!("--{k} is required"))
     }
-    fn opt(&self, k: &str) -> Option<&str> {
+    pub(crate) fn opt(&self, k: &str) -> Option<&str> {
         self.flags
             .get(k)
             .and_then(|v| v.first())
             .map(String::as_str)
     }
-    fn has(&self, k: &str) -> bool {
+    pub(crate) fn has(&self, k: &str) -> bool {
         self.flags.contains_key(k)
     }
     /// A password from the least-bad source the user offered.
@@ -212,7 +224,7 @@ impl Args {
     /// you named is missing" stay different errors. `None` means
     /// neither, which some callers read as "not asked for" rather than
     /// as a failure.
-    fn file_opt(&self, flag: &str, name: &str) -> Option<PathBuf> {
+    pub(crate) fn file_opt(&self, flag: &str, name: &str) -> Option<PathBuf> {
         if let Some(p) = self.opt(flag) {
             return Some(PathBuf::from(p));
         }
@@ -224,7 +236,7 @@ impl Args {
         p.is_file().then_some(p)
     }
 
-    fn file(&self, flag: &str, name: &str) -> R<PathBuf> {
+    pub(crate) fn file(&self, flag: &str, name: &str) -> R<PathBuf> {
         if let Some(p) = self.file_opt(flag, name) {
             return Ok(p);
         }
@@ -238,7 +250,7 @@ impl Args {
         ))
     }
 
-    fn u64(&self, k: &str, default: u64) -> R<u64> {
+    pub(crate) fn u64(&self, k: &str, default: u64) -> R<u64> {
         match self.opt(k) {
             Some(s) => s.parse().map_err(|_| format!("--{k}: not a number")),
             None => Ok(default),
@@ -251,7 +263,7 @@ impl Args {
 /// Days as seconds, refusing a number that cannot be one. `days * 86_400`
 /// wraps silently in release for anything past ~2^44, which would produce
 /// a signed object with an expiry in the past.
-fn seconds(days: u64) -> R<u64> {
+pub(crate) fn seconds(days: u64) -> R<u64> {
     if days == 0 {
         // Issued and expiring at the same second: every verifier refuses
         // it, so writing it only wastes the user's next command.
@@ -262,14 +274,14 @@ fn seconds(days: u64) -> R<u64> {
         .ok_or_else(|| "--days: must be 36500 or fewer (100 years)".to_string())
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
@@ -300,7 +312,7 @@ fn unhex(s: &str) -> R<Vec<u8>> {
 /// keeps its identity key, so a pre-filled `--identity ~/.hlid/identity.key`
 /// is right only for whoever followed one particular tutorial. A
 /// pre-filled command that is wrong is worse than no command at all.
-fn hlid_home() -> R<PathBuf> {
+pub(crate) fn hlid_home() -> R<PathBuf> {
     if let Some(h) = std::env::var_os("HLID_HOME") {
         return Ok(PathBuf::from(h));
     }
@@ -313,12 +325,12 @@ fn hlid_home() -> R<PathBuf> {
 
 /// The fixed names inside it: what `hlid init` writes, and what the
 /// corresponding flags fall back to when they are omitted.
-const IDENTITY_KEY: &str = "identity.key";
+pub(crate) const IDENTITY_KEY: &str = "identity.key";
 const DEVICE_KEY: &str = "device.key";
 const CERT_FILE: &str = "cert.bin";
-const CARD_FILE: &str = "card.bin";
+pub(crate) const CARD_FILE: &str = "card.bin";
 
-fn read_seed(path: &Path) -> R<[u8; 32]> {
+pub(crate) fn read_seed(path: &Path) -> R<[u8; 32]> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     unhex(&text)?
         .try_into()
@@ -350,11 +362,11 @@ fn write_out(a: &Args, bytes: &[u8]) -> R<()> {
 /// checks live in `hl-identity`'s parsers, so this is the one place that
 /// has to know they exist: `--level 7`, an attestation about someone
 /// else, a name with an invisible character in it.
-fn refuse_unreadable(kind: &str, e: hl_identity::Error) -> String {
+pub(crate) fn refuse_unreadable(kind: &str, e: hl_identity::Error) -> String {
     format!("refusing to write a {kind} this build would reject: {e}")
 }
 
-fn read_file(path: &Path) -> R<Vec<u8>> {
+pub(crate) fn read_file(path: &Path) -> R<Vec<u8>> {
     std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -365,12 +377,12 @@ fn write_file(path: &Path, bytes: &[u8]) -> R<()> {
     std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn b64(b: &[u8]) -> String {
+pub(crate) fn b64(b: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
-fn unb64(s: &str) -> R<Vec<u8>> {
+pub(crate) fn unb64(s: &str) -> R<Vec<u8>> {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
@@ -551,23 +563,7 @@ fn make_cert(args: &[String]) -> R<()> {
     let days = a.u64("days", cert::RECOMMENDED_LIFETIME / 86_400)?;
     let mut c = DeviceCert::for_keys(&id, device, device_enc, now(), seconds(days)?)
         .map_err(|e| format!("--days: {e}"))?;
-    c.caps = match a.opt("caps") {
-        None | Some("all") => None,
-        Some("web") => Some(caps::WEB),
-        Some(list) => Some(
-            list.split(',')
-                .map(|s| match s.trim() {
-                    "login" => Ok(caps::LOGIN),
-                    "message" => Ok(caps::MESSAGE),
-                    "vouch" => Ok(caps::VOUCH),
-                    "manage" => Ok(caps::MANAGE),
-                    other => Err(format!("unknown capability {other:?}")),
-                })
-                .collect::<R<Vec<u64>>>()?
-                .into_iter()
-                .fold(0, |acc, b| acc | b),
-        ),
-    };
+    c.caps = parse_caps(a.opt("caps"))?;
     c.name = a.opt("name").map(str::to_owned);
     let bytes = c.sign(&id);
     DeviceCert::parse(&bytes).map_err(|e| refuse_unreadable("device certificate", e))?;
@@ -597,6 +593,61 @@ fn make_cert(args: &[String]) -> R<()> {
     let encoded = Bundle { cert: bytes, card }.encode();
     Bundle::parse(&encoded).map_err(|e| refuse_unreadable("bundle", e))?;
     write_out(&a, &encoded)
+}
+
+/// `--caps`: `all` (or absent) for unrestricted, `web` for what a
+/// browser should get, or a comma-separated list. `None` on the way out
+/// means unrestricted, which is what an absent `caps` means on the wire.
+pub(crate) fn parse_caps(spec: Option<&str>) -> R<Option<u64>> {
+    Ok(match spec {
+        None | Some("all") => None,
+        Some("web") => Some(caps::WEB),
+        Some(list) => Some(
+            list.split(',')
+                .map(|s| match s.trim() {
+                    "login" => Ok(caps::LOGIN),
+                    "message" => Ok(caps::MESSAGE),
+                    "vouch" => Ok(caps::VOUCH),
+                    "manage" => Ok(caps::MANAGE),
+                    other => Err(format!("unknown capability {other:?}")),
+                })
+                .collect::<R<Vec<u64>>>()?
+                .into_iter()
+                .fold(0, |acc, b| acc | b),
+        ),
+    })
+}
+
+/// Capability bits as the words `--caps` takes, for a prompt that has to
+/// show what is being asked for and what will be granted.
+pub(crate) fn caps_words(caps: Option<u64>) -> String {
+    let Some(bits) = caps else {
+        return "everything".into();
+    };
+    if bits == 0 {
+        return "nothing".into();
+    }
+    let named = [
+        (caps::LOGIN, "login"),
+        (caps::MESSAGE, "message"),
+        (caps::VOUCH, "vouch"),
+        (caps::MANAGE, "manage"),
+    ];
+    let mut out: Vec<&str> = named
+        .iter()
+        .filter(|(b, _)| bits & b == *b)
+        .map(|(_, n)| *n)
+        .collect();
+    // A bit this build has no word for still has to appear, or a prompt
+    // would understate what it is about to grant.
+    let known: u64 = named.iter().map(|(b, _)| b).sum();
+    let unknown = bits & !known;
+    let extra;
+    if unknown != 0 {
+        extra = format!("+{unknown:#x}");
+        out.push(&extra);
+    }
+    out.join(", ")
 }
 
 fn make_card(args: &[String]) -> R<()> {
@@ -797,7 +848,7 @@ fn credentials(a: &Args) -> R<Credentials> {
 }
 
 /// `http(s)://host[:port]` → the same with no trailing slash.
-fn server_base(a: &Args) -> R<String> {
+pub(crate) fn server_base(a: &Args) -> R<String> {
     let s = a.one("server")?.trim_end_matches('/').to_owned();
     if !(s.starts_with("http://") || s.starts_with("https://")) {
         return Err("--server must start with http:// or https://".into());

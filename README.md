@@ -292,6 +292,8 @@ account association.
 
 ```sh
 hlid init --name Alice        # identity key, device key, certificate, card
+hlid enroll --server http://127.0.0.1:5700   # certify a browser: show a code,
+                                             # wait, ask, sign
 hlid auth   --server http://127.0.0.1:5700
 hlid link   --server http://127.0.0.1:5700 --login alice --password-stdin < pw.txt
 hlid tunnel --server http://127.0.0.1:5700

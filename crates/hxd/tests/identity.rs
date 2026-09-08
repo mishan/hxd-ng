@@ -3197,3 +3197,187 @@ async fn opening_a_session_takes_an_empty_body_but_not_a_broken_one() {
     .await;
     assert_eq!(bad_fp.status, 400);
 }
+
+// --- `hlid enroll` driven as a user would ------------------------------
+//
+// The mailbox tests above exercise the routes, and `hlid`'s own unit
+// tests exercise the policy intersection and the prompt's wording. What
+// neither covers is the holder's client: discovery finding the mailbox,
+// the long poll, and a bundle that comes back and actually verifies.
+
+/// The `hlid` binary. `CARGO_BIN_EXE_*` exists only for the crate that
+/// declares the binary and this is not that crate, so it is found beside
+/// this test's own executable — and built if it is missing, rather than
+/// skipped, since an unbuilt sibling is a stale target directory and not
+/// a reason to pass quietly.
+fn hlid_binary() -> std::path::PathBuf {
+    let mut dir = std::env::current_exe().expect("the test binary has a path");
+    dir.pop(); // deps/
+    dir.pop(); // debug/ or release/
+    let bin = dir.join(if cfg!(windows) { "hlid.exe" } else { "hlid" });
+    if !bin.exists() {
+        let ok = std::process::Command::new(env!("CARGO"))
+            .args(["build", "-p", "hlid"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .expect("cargo build -p hlid")
+            .success();
+        assert!(ok, "cargo build -p hlid failed");
+    }
+    assert!(bin.exists(), "no hlid binary at {}", bin.display());
+    bin
+}
+
+/// The pairing code out of a line of `hlid`'s output — the same thing a
+/// user's eye does with it.
+fn code_in(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .find(|t| {
+            let b = t.as_bytes();
+            b.len() == 9
+                && b[4] == b'-'
+                && b.iter()
+                    .enumerate()
+                    .all(|(i, c)| i == 4 || c.is_ascii_alphanumeric())
+        })
+        .map(str::to_owned)
+}
+
+#[tokio::test]
+async fn hlid_enroll_certifies_a_browser_that_it_never_holds_a_key_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+
+    let init = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "hlid init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // The device being enrolled. `hlid` is never given this key — only
+    // the two public halves, inside the request — which is the whole
+    // point of the flow.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+
+    let mut child = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args([
+            "enroll",
+            "--server",
+            &format!("http://{ng}"),
+            "--days",
+            "30",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // The answer goes in before the question is asked; it waits in the
+    // pipe until `hlid` reaches its prompt, which is the only moment it
+    // reads stdin.
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"y\n").unwrap();
+    }
+
+    // Drain stderr on a thread, forwarding the code as soon as it
+    // appears — waiting for the process to exit first would deadlock,
+    // since it does not exit until a device asks.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Some(c) = code_in(&line) {
+                let _ = tx.send(c);
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+
+    let code = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("hlid should have shown a pairing code");
+
+    // The browser asks for more than the holder gives, so the answer
+    // proves the intersection happened rather than the request being
+    // rubber-stamped.
+    let mut request = hl_identity::EnrollRequest::new(&browser, now());
+    request.name = Some("Firefox on the laptop".into());
+    request.caps = Some(cert::caps::WEB | cert::caps::MANAGE);
+    request.days = Some(3650);
+    let posted = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&request.sign(&browser)) }),
+    )
+    .await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let secret = posted.json()["request"].as_str().unwrap().to_owned();
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{secret}"),
+        &[],
+        b"",
+    )
+    .await;
+    let stderr = reader.join().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "hlid enroll failed:\n{stderr}");
+    assert_eq!(fetched.status, 200, "no bundle came back:\n{stderr}");
+
+    // What came back is a bundle, and it verifies the way the browser
+    // will verify it.
+    let bundle = hl_identity::Bundle::parse(&unb64(fetched.json()["bundle"].as_str().unwrap()))
+        .expect("a bundle");
+    let (cert, card) = bundle.open().expect("both halves verify and agree");
+
+    assert_eq!(cert.device, browser.public(), "certified the wrong device");
+    assert_eq!(cert.device_enc, browser.public_enc());
+    assert_eq!(card.name, "Alice");
+    assert_eq!(cert.name.as_deref(), Some("Firefox on the laptop"));
+
+    // The policy, not the request: `--caps` defaults to web, so `manage`
+    // was asked for and not granted, and 3650 days was asked for and
+    // capped at the --days 30 this holder was run with.
+    assert_eq!(
+        cert.caps,
+        Some(cert::caps::WEB),
+        "a request must not be able to widen what the holder gives"
+    );
+    let days = (cert.expires - cert.issued) / 86_400;
+    assert_eq!(days, 30, "the lifetime is the holder's, not the request's");
+
+    // And the human was shown the comparison the whole flow rests on.
+    assert!(stderr.contains("enter code"), "{stderr}");
+    assert!(
+        stderr.contains("Compare the device fingerprint"),
+        "the prompt must ask for the one check only a human can make:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&hl_identity::Fingerprint::of(&browser.public()).short()),
+        "the prompt must show the device fingerprint:\n{stderr}"
+    );
+}
