@@ -14,6 +14,11 @@
 //
 // Once connected, type to chat. Commands:
 //   /msg <who> <txt> private message (nick or uid)
+//   /msgl <login> <txt> private message to an account, online or not
+//   /inbox [n]       list stored messages, newest first
+//   /read <id>       mark everything up to that message id read
+//   /block <login>   refuse private messages from an account (/unblock to undo)
+//   /blocks          who you have blocked
 //   /me <text>       action-style chat
 //   /nick <nick>     change nickname
 //   /icon <n>        change icon
@@ -287,8 +292,8 @@ rl.on("line", async (line) => {
       }
       const to = resolveTarget(rest.slice(0, space));
       if (to !== null) {
-        await request("msg", { to, text: rest.slice(space + 1) });
-        say(`[PM to ${to}] sent`);
+        const r = await request("msg", { to, text: rest.slice(space + 1) });
+        say(`[PM to ${to}] ${r.queued ? "queued" : "delivered"}`);
       }
     } else if (line.startsWith("/msgl ")) {
       const rest = line.slice(6).trim();
@@ -308,6 +313,18 @@ rl.on("line", async (line) => {
         const when = new Date(m.at * 1000).toISOString();
         say(`  #${m.id} ${m.read ? " " : "*"} <${m.from.login ?? m.from.nick}> ${when} ${m.text}`);
       }
+    } else if (line.startsWith("/block ") || line.startsWith("/unblock ")) {
+      const on = line.startsWith("/block ");
+      const who = line.slice(on ? 7 : 9).trim();
+      // A 52-character fingerprint unblocks an identity guest, who has
+      // no login of their own to name — `/blocks` prints it.
+      const params = !on && who.length === 52 ? { fingerprint: who } : { login: who };
+      await request(on ? "block" : "unblock", params);
+      say(`${on ? "blocked" : "unblocked"} ${who}`);
+    } else if (line.startsWith("/blocks")) {
+      const r = await request("blocks", {});
+      const names = r.blocked.map((b) => (b.fingerprint ? `${b.login} (${b.fingerprint})` : b.login));
+      say(names.length ? `blocked: ${names.join(", ")}` : "nobody blocked");
     } else if (line.startsWith("/read ")) {
       const r = await request("msg_read", { up_to: Number(line.slice(6).trim()) });
       say(`${r.unread} unread of ${r.total}`);

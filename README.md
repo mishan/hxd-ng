@@ -112,7 +112,11 @@ login.
 
 An account has an inbox if it has a password or a linked identity — either
 is proof of one person, where a bare `guest` login is shared; `[extra]
-inbox` overrides it either way.
+inbox` overrides it either way. A guest can send to whoever is on the
+roster and cannot queue anything: it has no account, so nothing can be
+blocked, and a sender that cannot be blocked must not be able to fill a
+mailbox. `block`/`unblock` keep an account addressable without making it
+reachable by everyone.
 
 **The database holds every private message on the server in the clear.**
 It is created 0600, as are its `-wal` and `-shm` companions; keep the

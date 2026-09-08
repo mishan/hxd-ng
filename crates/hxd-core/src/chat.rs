@@ -174,6 +174,11 @@ pub enum ChatError {
     /// delivered and which then quietly disappeared is the failure mode
     /// that destroys trust in a messaging system.
     MailboxFull,
+    /// The recipient has blocked the sender. Named rather than hidden,
+    /// matching fogWraith's `Blocked` (reason 3) so the two subsystems
+    /// answer alike — see docs/private-messages.md §14 for the argument
+    /// against, which is real and which interoperability outweighs.
+    Blocked,
     /// This session has no mailbox of its own, so there is nowhere to
     /// keep a block or a read mark. Distinct from `NoSuchUser`, which is
     /// about whoever was named: telling a guest "no such user" when the
@@ -628,7 +633,17 @@ impl Core {
             return Ok(MsgOutcome::Delivered);
         };
 
+        // Blocking, before anything is written. It applies to a message
+        // named by uid exactly as to one named by login: a block a
+        // recipient can sidestep by clicking a name in the user list is
+        // not a block.
         let from_mailbox = sender.mailbox.clone().expect("checked by `durable`");
+        if store
+            .is_blocked(&to.mailbox, &from_mailbox)
+            .map_err(store_failed)?
+        {
+            return Err(ChatError::Blocked);
+        }
 
         // The store decides both of the questions that used to be asked
         // here and answered a moment later: whether this guid is already
@@ -1029,6 +1044,88 @@ impl Core {
             .mark_read(&mailbox, up_to, SystemTime::now())
             .map_err(store_failed)?;
         store.counts(&mailbox).map_err(store_failed)
+    }
+
+    /// Block or unblock an account, by login.
+    ///
+    /// Blocking works between accounts that have inboxes, because that is
+    /// what a durable block can be about: an account with no inbox cannot
+    /// queue anything for you and has no identity to hold the block
+    /// against. Naming anything else answers `NoSuchUser`, the same one
+    /// answer `msg_login` gives.
+    pub fn inbox_block(&self, uid: Uid, other: &str, blocked: bool) -> Result<(), ChatError> {
+        let (store, mailbox) = self.inbox_of(uid)?;
+        let directory = self.directory.as_ref().ok_or(ChatError::NoSuchUser)?;
+        let other = directory
+            .inbox_account(other)
+            .ok_or(ChatError::NoSuchUser)?;
+        if other == mailbox {
+            // Blocking yourself is not a thing worth storing, and a
+            // mailbox that cannot receive its own mail is a support
+            // question waiting to happen.
+            return Err(ChatError::NoSuchUser);
+        }
+        store
+            .set_blocked(&mailbox, &other, blocked, SystemTime::now())
+            .map_err(store_failed)
+    }
+
+    /// Block or unblock whoever holds `uid` on the roster.
+    ///
+    /// The uid form exists for the sender a login cannot name: an
+    /// identity user admitted as a guest has a fingerprint to hold a
+    /// block against but no account of its own, and a recipient who just
+    /// received a message from one can only point at the roster row.
+    pub fn inbox_block_uid(&self, uid: Uid, other: Uid, blocked: bool) -> Result<(), ChatError> {
+        let (store, mailbox) = self.inbox_of(uid)?;
+        let other = {
+            let r = self.roster.lock().unwrap();
+            let sess = r
+                .users
+                .get(&other)
+                .filter(|s| s.visible && (s.has_inbox || s.identity.is_some()))
+                .ok_or(ChatError::NoSuchUser)?;
+            sess.mailbox()
+        };
+        if other == mailbox {
+            return Err(ChatError::NoSuchUser);
+        }
+        store
+            .set_blocked(&mailbox, &other, blocked, SystemTime::now())
+            .map_err(store_failed)
+    }
+
+    /// Who this session has blocked.
+    ///
+    /// Mailboxes, not logins: an identity guest is blocked as
+    /// `{guest, fingerprint}`, and a list of logins showed `guest` — a
+    /// name `unblock` then couldn't resolve and the roster couldn't
+    /// answer for once they left. The fingerprint is what identifies
+    /// that block, so it is what the list carries.
+    pub fn inbox_blocked(&self, uid: Uid) -> Result<Vec<Mailbox>, ChatError> {
+        let (store, mailbox) = self.inbox_of(uid)?;
+        store.blocked(&mailbox).map_err(store_failed)
+    }
+
+    /// Unblock by fingerprint: the form that works for a sender who has
+    /// left and has no account to name — the identity guest of
+    /// `inbox_block_uid`. Blocking still needs a login or a roster row;
+    /// you cannot block someone you have never seen.
+    pub fn inbox_unblock_fingerprint(
+        &self,
+        uid: Uid,
+        fingerprint: &[u8; 32],
+    ) -> Result<(), ChatError> {
+        let (store, mailbox) = self.inbox_of(uid)?;
+        let other = store
+            .blocked(&mailbox)
+            .map_err(store_failed)?
+            .into_iter()
+            .find(|m| m.fingerprint.as_ref() == Some(fingerprint))
+            .ok_or(ChatError::NoSuchUser)?;
+        store
+            .set_blocked(&mailbox, &other, false, SystemTime::now())
+            .map_err(store_failed)
     }
 
     /// An account has linked an identity: move its mail onto the
@@ -2099,6 +2196,160 @@ mod inbox_tests {
             "a reply must not be addressed to whoever holds the name now"
         );
         let _ = impostor;
+    }
+
+    // --- Blocking (docs/private-messages.md §9) --------------------------
+
+    #[test]
+    fn a_block_refuses_the_message_however_it_is_addressed() {
+        let (core, store) = server(&["dave", "spammer"]);
+        let (m, _rm) = attach(&core, "dave", true);
+        let (sp, _rsp) = attach(&core, "spammer", true);
+        core.inbox_block(m, "spammer", true).unwrap();
+
+        assert_eq!(
+            core.msg_login(sp, "dave", "buy this".into(), None),
+            Err(ChatError::Blocked)
+        );
+        // And naming the roster row instead does not get round it: a
+        // block a recipient can sidestep by clicking a name is no block.
+        assert_eq!(
+            core.msg(sp, m, "buy this".into(), None),
+            Err(ChatError::Blocked)
+        );
+        assert!(store.all().is_empty(), "and nothing was stored either way");
+
+        core.inbox_block(m, "spammer", false).unwrap();
+        assert!(core.msg(sp, m, "sorry".into(), None).is_ok());
+    }
+
+    #[test]
+    fn mail_from_an_identity_guest_is_listed_with_no_one_to_reply_to() {
+        // Their mailbox is keyed by fingerprint and named `guest`, which
+        // is a login several people share and one a reply would answer
+        // `no_such_user` for. The delivered event has applied that rule
+        // since the flush learned it; the stored list used to print the
+        // login verbatim, so `inbox` offered a reply address that
+        // couldn't be used.
+        let (core, _store) = server(&["dave"]);
+        let (m, _rm) = attach(&core, "dave", true);
+        let (g, _rg) = core
+            .attach(AttachInfo {
+                nick: "drifter".into(),
+                icon: 1,
+                admin: false,
+                access: AccessBits::empty().with(bit::SEND_MSGS),
+                login: "guest".into(),
+                addr: Some("10.0.0.9".parse().unwrap()),
+                can_detach: false,
+                transport: crate::Transport::default(),
+                has_inbox: false,
+                reads_on_delivery: false,
+                identity: Some(fp(3)),
+            })
+            .unwrap();
+        core.announce(g);
+
+        core.msg(g, m, "from a passer-by".into(), None).unwrap();
+        let listed = core.inbox_list(m, None, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].sender_nick, "drifter", "the nick still shows");
+        assert!(
+            listed[0].sender.is_none(),
+            "and there is no login to reply to"
+        );
+    }
+
+    #[test]
+    fn a_block_on_an_identity_guest_outlives_them_and_can_still_be_lifted() {
+        // An identity user admitted as a guest has a fingerprint to hold
+        // a block against and no account of its own. The list used to
+        // report the login — `guest` — which `unblock` could not resolve
+        // and which the roster could not answer for once they left, so
+        // the block was permanent.
+        let (core, _store) = server(&["dave"]);
+        let (m, _rm) = attach(&core, "dave", true);
+        let (g, _rg) = core
+            .attach(AttachInfo {
+                nick: "drifter".into(),
+                icon: 1,
+                admin: false,
+                access: AccessBits::empty().with(bit::SEND_MSGS),
+                login: "guest".into(),
+                addr: Some("10.0.0.9".parse().unwrap()),
+                can_detach: false,
+                transport: crate::Transport::default(),
+                has_inbox: false,
+                reads_on_delivery: false,
+                identity: Some(fp(7)),
+            })
+            .unwrap();
+        core.announce(g);
+
+        core.inbox_block_uid(m, g, true).unwrap();
+        let blocked = core.inbox_blocked(m).unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].login, "guest");
+        assert_eq!(blocked[0].fingerprint, Some(fp(7)), "keyed by the key");
+
+        // They leave. There is no roster row to name, and `guest` names
+        // no mailbox — the fingerprint is all that is left.
+        core.end_session(g);
+        assert!(core.inbox_block(m, "guest", false).is_err());
+        core.inbox_unblock_fingerprint(m, &fp(7)).unwrap();
+        assert!(core.inbox_blocked(m).unwrap().is_empty());
+        assert_eq!(
+            core.inbox_unblock_fingerprint(m, &fp(7)),
+            Err(ChatError::NoSuchUser),
+            "and a fingerprint that holds no block is not a block"
+        );
+    }
+
+    #[test]
+    fn a_block_is_one_way_and_listed_and_says_nothing_about_who_exists() {
+        let (core, _store) = server(&["dave", "spammer"]);
+        let (m, _rm) = attach(&core, "dave", true);
+        let (sp, _rsp) = attach(&core, "spammer", true);
+
+        core.inbox_block(m, "spammer", true).unwrap();
+        assert_eq!(
+            core.inbox_blocked(m).unwrap(),
+            vec![Mailbox::login("spammer")]
+        );
+        assert!(
+            core.inbox_blocked(sp).unwrap().is_empty(),
+            "blocking is one-way, and the blocked account is not told"
+        );
+        assert!(core.msg(m, sp, "you are blocked".into(), None).is_ok());
+
+        // Blocking a name that names no mailbox is the same one answer
+        // msg_login gives, so this cannot enumerate accounts either.
+        assert_eq!(
+            core.inbox_block(m, "nobody", true),
+            Err(ChatError::NoSuchUser)
+        );
+        assert_eq!(
+            core.inbox_block(m, "dave", true),
+            Err(ChatError::NoSuchUser),
+            "and blocking yourself is not a thing"
+        );
+    }
+
+    #[test]
+    fn a_guest_cannot_be_blocked_because_there_is_nothing_to_block() {
+        let (core, _store) = server(&["dave"]);
+        let (m, mut rm) = attach(&core, "dave", true);
+        let (g, _rg) = attach(&core, "guest", false);
+        drain(&mut rm);
+
+        assert_eq!(
+            core.inbox_block(m, "guest", true),
+            Err(ChatError::NoSuchUser)
+        );
+        // A guest reaches the mailbox as before; what bounds it is the
+        // roster, where it can be kicked and banned.
+        assert!(core.msg(g, m, "hello".into(), None).is_ok());
+        assert_eq!(msgs(drain(&mut rm)).len(), 1);
     }
 
     // --- The store-then-re-check window (docs/private-messages.md §5.2) --

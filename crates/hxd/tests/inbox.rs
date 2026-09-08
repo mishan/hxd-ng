@@ -616,6 +616,65 @@ async fn the_inbox_pages_backwards_and_read_state_is_scoped_to_its_owner() {
         "and marks nothing of the mailbox the id belongs to"
     );
 }
+
+/// A live private message on the legacy wire is refused when the sender
+/// is blocked — the block is not an inbox feature.
+#[tokio::test]
+async fn a_blocked_sender_is_refused_on_the_legacy_wire_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start(dir.path(), InboxPolicy::default()).await;
+
+    let (mut bob, hello) = Ng::login(srv.ng, "bob").await;
+    let bob_uid = hello["self"]["uid"].as_u64().unwrap() as u16;
+    bob.request_ok("block", json!({ "login": "alice" })).await;
+
+    let mut alice = Legacy::login(srv.legacy, "alice").await;
+    let reply = alice.msg(bob_uid, "let me in").await;
+    assert_ne!(reply.flag, 0, "a blocked sender is told, on this wire too");
+    // A round-trip first: replies are in order, so anything the server
+    // sent before this one is in hand by the time it arrives. Without
+    // it, "nothing arrived" is a statement about a queue nothing has
+    // been read into.
+    bob.request_ok("ping", json!({})).await;
+    assert!(
+        bob.queued.iter().all(|v| v["ev"] != "msg"),
+        "and nothing reached the recipient"
+    );
+}
+
+/// Blocking, over the wire and across the two addressing modes.
+#[tokio::test]
+async fn a_block_holds_against_both_ways_of_naming_someone() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start(dir.path(), InboxPolicy::default()).await;
+
+    let (mut bob, hello) = Ng::login(srv.ng, "bob").await;
+    let bob_uid = hello["self"]["uid"].as_u64().unwrap() as u16;
+    let (mut alice, _) = Ng::login(srv.ng, "alice").await;
+
+    bob.request_ok("block", json!({ "login": "alice" })).await;
+    assert_eq!(
+        bob.request_ok("blocks", json!({})).await["blocked"][0]["login"],
+        "alice"
+    );
+
+    let by_login = alice
+        .request("msg", json!({ "to_login": "bob", "text": "hi" }))
+        .await;
+    assert_eq!(by_login["error"]["code"], "blocked");
+    // And clicking the name in the user list gets no further.
+    let by_uid = alice
+        .request("msg", json!({ "to": bob_uid, "text": "hi" }))
+        .await;
+    assert_eq!(by_uid["error"]["code"], "blocked");
+
+    bob.request_ok("unblock", json!({ "login": "alice" })).await;
+    let after = alice
+        .request_ok("msg", json!({ "to_login": "bob", "text": "hi" }))
+        .await;
+    assert_eq!(after["queued"], false);
+}
+
 /// A retry after a lost reply must not arrive twice.
 #[tokio::test]
 async fn the_same_guid_sent_twice_is_one_message() {
@@ -658,6 +717,35 @@ async fn the_same_guid_sent_twice_is_one_message() {
         )
         .await;
     assert_eq!(junk["error"]["code"], "bad_request");
+}
+
+/// Blocking by uid, which is the only way to name a sender that has no
+/// account login of its own.
+#[tokio::test]
+async fn a_block_can_name_a_roster_row_rather_than_a_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start(dir.path(), InboxPolicy::default()).await;
+
+    let (mut bob, _) = Ng::login(srv.ng, "bob").await;
+    let (mut alice, hello) = Ng::login(srv.ng, "alice").await;
+    let alice_uid = hello["self"]["uid"].as_u64().unwrap();
+
+    bob.request_ok("block", json!({ "uid": alice_uid })).await;
+    let refused = alice
+        .request("msg", json!({ "to_login": "bob", "text": "hi" }))
+        .await;
+    assert_eq!(refused["error"]["code"], "blocked");
+    assert_eq!(
+        bob.request_ok("blocks", json!({})).await["blocked"][0]["login"],
+        "alice",
+        "and it is listed under the account it resolved to"
+    );
+
+    // Naming both, or neither, is refused rather than guessed at.
+    for params in [json!({ "uid": alice_uid, "login": "alice" }), json!({})] {
+        let bad = bob.request("block", params).await;
+        assert_eq!(bad["error"]["code"], "bad_request");
+    }
 }
 
 /// The store is a file, and the point of a file is that it outlives the
@@ -1132,7 +1220,8 @@ async fn a_server_with_no_store_says_so_and_still_carries_a_live_message() {
         "and the capability is not offered: {hello}"
     );
 
-    let (mut alice, _ahello) = Ng::login(srv.ng, "alice").await;
+    let (mut alice, ahello) = Ng::login(srv.ng, "alice").await;
+    let alice_uid = ahello["self"]["uid"].as_u64().unwrap();
     let bob_uid = hello["self"]["uid"].as_u64().unwrap();
     // By uid: addressing an account by login is a directory lookup, and
     // the directory arrives with the store.
@@ -1152,7 +1241,12 @@ async fn a_server_with_no_store_says_so_and_still_carries_a_live_message() {
     assert!(m.get("id").is_none(), "nothing was stored to mark read");
 
     // And the requests that need a store say which one is missing.
-    for (req, params) in [("inbox", json!({})), ("msg_read", json!({ "up_to": 1 }))] {
+    for (req, params) in [
+        ("inbox", json!({})),
+        ("blocks", json!({})),
+        ("msg_read", json!({ "up_to": 1 })),
+        ("block", json!({ "uid": alice_uid })),
+    ] {
         let v = bob.request(req, params).await;
         assert_eq!(v["error"]["code"], "no_inbox", "{req}: {v}");
     }
@@ -1177,7 +1271,12 @@ async fn an_account_with_no_inbox_of_its_own_hears_no_inbox() {
         hello.get("inbox").is_some(),
         "the server has an inbox even if this account does not"
     );
-    for (req, params) in [("inbox", json!({})), ("msg_read", json!({ "up_to": 1 }))] {
+    for (req, params) in [
+        ("inbox", json!({})),
+        ("blocks", json!({})),
+        ("msg_read", json!({ "up_to": 1 })),
+        ("block", json!({ "login": "bob" })),
+    ] {
         let v = c.request(req, params).await;
         assert_eq!(
             v["error"]["code"], "no_inbox",
