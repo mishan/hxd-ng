@@ -848,6 +848,18 @@ the `[identity]` section because hxd-ng has one profile and one switch.
   decision expires, and it should be revisited with media and history in
   mind rather than solved just for authentication. hxd-ng uses hyper
   directly.
+- **The HTTP routes answer CORS**, with `Access-Control-Allow-Origin: *`
+  and an `OPTIONS` handler for the preflight that `PUT /identity/card`
+  triggers by sending `application/cbor`. A wildcard is safe here for a
+  reason worth stating rather than assuming: every one of these routes is
+  authenticated by a token in the body or the URL and none by a cookie,
+  so a hostile page has no ambient credential to ride and an allow-list
+  would protect nothing. Without it a browser client can only ever talk
+  to the server that served it, which rules out both a client offering a
+  choice of servers and a device following an enrollment link to a mailbox
+  somewhere else (`identity-enrollment.md` §5.6). `ETag` is named in
+  `Access-Control-Expose-Headers` so the card fetch can still be
+  revalidated.
 - Transport tokens, challenges and session tokens share the same storage
   discipline as `hotline-ng.md` §9: CSPRNG, stored hashed, never logged.
   hxd-ng looks them up in a map keyed by the SHA-256 of the secret, which

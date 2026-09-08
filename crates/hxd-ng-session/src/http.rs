@@ -20,6 +20,14 @@
 //! the proxy is the mTLS header contract (§5.3): `X-Hotline-Client-Cert`
 //! is believed only from `NgConfig::trusted_proxies`, and stripped from
 //! everyone else.
+//!
+//! Everything above the upgrades answers CORS. These routes are
+//! authenticated by a token in the body or the URL and never by a cookie,
+//! so a wildcard origin gives away nothing a `curl` would not — and
+//! without it a browser client served from anywhere but this host cannot
+//! read one of them. That case is not exotic: hx-ng's `allowCustomServer`
+//! points a page at a server other than the one that served it, and the
+//! enrollment mailbox is reached by a phone that followed a QR code.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -28,7 +36,11 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hxd_core::{IdentityTag, LinkAuthority, Transport};
 use hyper::body::Incoming;
-use hyper::header::{AUTHORIZATION, CONTENT_TYPE, ETAG};
+use hyper::header::{
+    HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
+    AUTHORIZATION, CONTENT_TYPE, ETAG,
+};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
@@ -105,7 +117,14 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         };
     }
 
-    match (req.method(), path.as_str()) {
+    // Preflight comes before the table: a browser sends `OPTIONS` to a
+    // path whose real method it has not used yet, so this cannot be one
+    // more arm of it.
+    if req.method() == Method::OPTIONS && cors_route(&path) {
+        return preflight();
+    }
+
+    let resp = match (req.method(), path.as_str()) {
         (&Method::GET, "/.well-known/hotline") => discovery(&ctx),
         (&Method::POST, "/identity/challenge") => challenge(&ctx),
         (&Method::POST, "/identity/auth") => auth(req, peer, &ctx).await,
@@ -121,7 +140,46 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
             get_card(&p["/identity/card/".len()..], inm.as_deref(), &ctx)
         }
         _ => plain(StatusCode::NOT_FOUND, "not found"),
-    }
+    };
+    cors(resp)
+}
+
+/// The routes a page fetches. An upgrade is not subject to CORS and has
+/// returned above by the time this is asked.
+fn cors_route(path: &str) -> bool {
+    path == "/.well-known/hotline" || path.starts_with("/identity/")
+}
+
+/// `*` rather than an echo of `Origin`: there is no cookie or other
+/// ambient credential on these routes for a hostile page to ride, so an
+/// allow-list would protect nothing. `ETag` is exposed because
+/// `GET /identity/card/<fp>` is worth revalidating rather than refetching,
+/// and a cross-origin page cannot read the header to do it otherwise.
+fn cors(mut resp: Resp) -> Resp {
+    let h = resp.headers_mut();
+    h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(
+        ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("ETag"),
+    );
+    resp
+}
+
+fn preflight() -> Resp {
+    let resp = Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, PUT, OPTIONS")
+        // `PUT /identity/card` sends `application/cbor`, which is not a
+        // safelisted content type, so these are the headers that make the
+        // preflight it triggers succeed.
+        .header(
+            ACCESS_CONTROL_ALLOW_HEADERS,
+            "content-type, authorization, if-none-match",
+        )
+        .header(ACCESS_CONTROL_MAX_AGE, "86400")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    cors(resp)
 }
 
 enum Proto {

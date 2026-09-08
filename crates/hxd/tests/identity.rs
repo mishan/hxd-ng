@@ -2560,3 +2560,83 @@ async fn linking_an_identity_takes_the_accounts_mail_with_it() {
     assert_eq!(m["data"]["text"], "before you linked", "{m}");
     assert_eq!(m["data"]["queued"], true, "it had been waiting");
 }
+
+#[tokio::test]
+async fn the_identity_routes_answer_cors_so_a_page_elsewhere_can_read_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    // The preflight `PUT /identity/card` triggers by sending
+    // `application/cbor`, which is not a safelisted content type.
+    let pre = http(
+        ng,
+        "OPTIONS",
+        "/identity/card",
+        &[
+            ("Origin", "https://elsewhere.example"),
+            ("Access-Control-Request-Method", "PUT"),
+            ("Access-Control-Request-Headers", "content-type"),
+        ],
+        b"",
+    )
+    .await;
+    assert_eq!(pre.status, 204);
+    assert_eq!(pre.header("access-control-allow-origin"), Some("*"));
+    assert!(
+        pre.header("access-control-allow-methods")
+            .is_some_and(|m| m.contains("PUT")),
+        "{:?}",
+        pre.headers
+    );
+    assert!(
+        pre.header("access-control-allow-headers")
+            .is_some_and(|h| h.contains("content-type")),
+        "{:?}",
+        pre.headers
+    );
+
+    // And the real answers carry the origin header, or the browser
+    // discards a body it already fetched.
+    for (method, path) in [
+        ("GET", "/.well-known/hotline"),
+        ("POST", "/identity/challenge"),
+    ] {
+        let r = http(
+            ng,
+            method,
+            path,
+            &[("Origin", "https://elsewhere.example")],
+            b"",
+        )
+        .await;
+        assert_eq!(r.status, 200, "{method} {path}");
+        assert_eq!(
+            r.header("access-control-allow-origin"),
+            Some("*"),
+            "{method} {path}"
+        );
+    }
+
+    // `ETag` has to be exposed by name: cross-origin, a page cannot read
+    // a header that is not on that list, and the card fetch is built to
+    // be revalidated rather than refetched.
+    let card = http(ng, "GET", "/identity/card/nope", &[], b"").await;
+    assert_eq!(
+        card.header("access-control-expose-headers"),
+        Some("ETag"),
+        "{:?}",
+        card.headers
+    );
+
+    // The upgrade paths are not part of this: CORS does not govern a
+    // WebSocket, and answering preflight there would only be confusing.
+    let ws = http(
+        ng,
+        "OPTIONS",
+        "/ng",
+        &[("Origin", "https://elsewhere.example")],
+        b"",
+    )
+    .await;
+    assert_eq!(ws.status, 404);
+}
