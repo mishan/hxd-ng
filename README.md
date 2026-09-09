@@ -186,6 +186,21 @@ successors = "identity-successors"  # §3.4 commitments; "" = memory only
 trtp = true                         # serve the tunnel at /trtp
 trtp_login = "verify"               # verify | trust: how a tunnelled classic
                                     # login meets the socket's identity
+enroll = true                       # serve the enrollment mailbox at
+                                    # /identity/enroll; off, a device enrolls
+                                    # by the paste as before
+enroll_sessions = 256               # open sessions at once, server-wide
+enroll_per_address = 4              # open sessions and pending requests, per
+                                    # source address
+
+# web = "https://hl.example/app/"   # where a web client for this server lives.
+                                    # Advertised in discovery so `hlid enroll`
+                                    # can show a QR code that opens it with the
+                                    # pairing code already in it. Must be on
+                                    # this server's own origin to be drawn: the
+                                    # QR's fragment carries the pairing secret,
+                                    # so a client hosted elsewhere is one the
+                                    # user names with `hlid enroll --web`
 
 # max_new_accounts_per_hour = 60    # ceiling on what new_accounts = "create" writes
 # allow_list = ["alice@hl.example", "<fingerprint>"]
@@ -277,7 +292,29 @@ With `[identity]` on, the ng listener also answers HTTP: `GET
 `PUT /identity/card`, and `POST /identity/link` and `/identity/unlink` for
 account association.
 
-`hlid` makes the keys and objects and talks to the server:
+`hlid` makes the keys and objects and talks to the server. From nothing:
+
+```sh
+hlid init --name Alice        # identity key, device key, certificate, card
+hlid agent  --server http://127.0.0.1:5700   # stay open: hand out codes, and
+                                             # take renewals without one
+hlid enroll --server http://127.0.0.1:5700   # certify a browser: show a code
+                                             # (and a QR, if the server names a
+                                             # web client on its own origin),
+                                             # wait, ask, sign
+hlid auth   --server http://127.0.0.1:5700
+hlid link   --server http://127.0.0.1:5700 --login alice --password-stdin < pw.txt
+hlid tunnel --server http://127.0.0.1:5700
+```
+
+`init` writes into `$HLID_HOME` (default `~/.hlid`), and `--identity`,
+`--device`, `--cert` and `--card` fall back to what it wrote, which is why
+none of the lines above name a file. That fallback is what lets a web
+client print a command for you to run — it cannot know where you keep your
+key, and a pre-filled path that guesses is right only by luck.
+
+The long way, when you want the files somewhere specific or the
+certificate to say something other than the default:
 
 ```sh
 cargo run --bin hlid -- keygen identity id.key
@@ -285,9 +322,16 @@ cargo run --bin hlid -- keygen device dev.key
 
 # Anything that writes an account link needs `manage`, and `--caps web`
 # deliberately excludes it. A browser device gets `web`; the device you
-# administer your account from gets this.
+# administer your account from gets this. `hlid init` writes an
+# unrestricted certificate, since its device sits on the same machine as
+# the identity key and a bit withheld there protects nothing.
 hlid cert --identity id.key --device dev.key --caps login,message,manage -o cert.cbor
 hlid card --identity id.key --name Alice -o card.cbor
+
+# Certifying a browser, whose keys never leave it: the two public halves
+# come off the screen, and `--bundle` writes the certificate and your card
+# as the one blob the browser asks you to paste back.
+hlid cert --device-pub 3f2a… --device-enc-pub 91c4… --caps web --bundle -o web.bundle
 
 hlid auth   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor
 hlid link   --server http://127.0.0.1:5700 --device dev.key --card card.cbor --cert cert.cbor \

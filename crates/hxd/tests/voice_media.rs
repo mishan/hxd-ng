@@ -102,10 +102,12 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
             caps: vec!["voice".to_string()],
             trusted_proxies: Default::default(),
             forwarded_header: Default::default(),
+            ..Default::default()
         }),
         registry: Arc::new(Registry::new()),
         identity: None,
         tunnel: None,
+        enroll: None,
     };
 
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

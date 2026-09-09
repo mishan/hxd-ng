@@ -68,10 +68,12 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             caps: Vec::new(),
             trusted_proxies: Default::default(),
             forwarded_header: Default::default(),
+            ..Default::default()
         }),
         registry: Arc::new(Registry::new()),
         identity: None,
         tunnel: None,
+        enroll: None,
     };
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

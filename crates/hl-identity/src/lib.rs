@@ -19,9 +19,11 @@
 //! same file.
 
 pub mod attestation;
+pub mod bundle;
 pub mod card;
 pub mod cbor;
 pub mod cert;
+pub mod enroll;
 mod error;
 pub mod keys;
 mod names;
@@ -29,8 +31,10 @@ pub mod proof;
 mod signed;
 
 pub use attestation::Attestation;
+pub use bundle::Bundle;
 pub use card::Card;
 pub use cert::{caps, DeviceCert};
+pub use enroll::{EnrollRequest, SessionClaim};
 pub use error::Error;
 pub use keys::{DeviceKey, Fingerprint, IdentityKey, PublicKey, ServerKey};
 pub use proof::LoginProof;

@@ -5,8 +5,8 @@
 //! reject fails with the named error.
 
 use hl_identity::{
-    attestation, card, cert, proof, Attestation, Card, DeviceCert, DeviceKey, IdentityKey,
-    LoginContext, LoginProof, ServerKey,
+    attestation, card, cert, enroll, proof, Attestation, Bundle, Card, DeviceCert, DeviceKey,
+    EnrollRequest, IdentityKey, LoginContext, LoginProof, ServerKey, SessionClaim,
 };
 use serde_json::Value as Json;
 
@@ -290,4 +290,113 @@ fn rejects() {
             str_of(r, "name")
         );
     }
+}
+
+#[test]
+fn enroll_request_vector() {
+    let v = vectors();
+    let k = keys(&v);
+    let e = &v["enroll_request"];
+    let f = &e["fields"];
+    assert_eq!(str_of(e, "domain"), enroll::DOMAIN);
+
+    // `prev` is the device certificate published above rather than a
+    // second copy of one: a renewal is about a certificate that already
+    // exists, and a vector that invented its own would not say that.
+    let prev = unhex(str_of(&v["device_cert"], "signed_hex"));
+    let secret: [u8; enroll::PAIRING_SECRET_BYTES] = unhex(str_of(e, "pairing_secret_hex"))
+        .try_into()
+        .expect("16-byte pairing secret");
+
+    let r = EnrollRequest {
+        device: unhex32(str_of(f, "device")),
+        device_enc: unhex32(str_of(f, "device_enc")),
+        name: f["name"].as_str().map(str::to_owned),
+        caps: f["caps"].as_u64(),
+        days: f["days"].as_u64(),
+        time: u64_of(f, "time"),
+        prev: Some(prev.clone()),
+        pair: Some(unhex32(str_of(f, "pair"))),
+    };
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(
+        r.sign(&k.dev),
+        signed,
+        "enrollment request re-signs to the vector bytes"
+    );
+    let back = EnrollRequest::parse(&signed).unwrap();
+    assert_eq!(back, r);
+
+    // Signed by the device key, not the identity key: this is the one
+    // object in the file whose signer is the subject.
+    check_signed(e, enroll::DOMAIN, &k.dev.public(), &signed);
+
+    // The two derived fields the file publishes, recomputed rather than
+    // trusted: the pairing tag and the certificate `prev` resolves to.
+    assert_eq!(
+        enroll::pair_tag(&secret, &k.dev.public()),
+        unhex32(str_of(f, "pair")),
+        "pair is HMAC-SHA-256(pairing secret, device)"
+    );
+    assert!(back.pair_matches(&secret));
+    assert_eq!(
+        back.prev_cert().expect("prev is present").unwrap(),
+        DeviceCert::parse(&prev).unwrap()
+    );
+}
+
+#[test]
+fn enroll_session_claim_vector() {
+    let v = vectors();
+    let k = keys(&v);
+    let e = &v["enroll_session_claim"];
+    let f = &e["fields"];
+    assert_eq!(str_of(e, "domain"), enroll::CLAIM_DOMAIN);
+
+    // The session is published as a hash *and* as the secret it came
+    // from, so a reimplementation can check it derived the key the same
+    // way rather than copying the digest across.
+    let session = enroll::session_key(str_of(e, "session_secret"));
+    assert_eq!(
+        session,
+        unhex32(str_of(f, "session")),
+        "session is SHA-256 of the session secret"
+    );
+
+    let claim = SessionClaim::new(unhex32(str_of(f, "identity")), session);
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(
+        claim.sign(&k.id),
+        signed,
+        "session claim re-signs to the vector bytes"
+    );
+    assert_eq!(SessionClaim::parse(&signed, &session).unwrap(), claim);
+
+    // Signed by the identity key, and only good for this session.
+    check_signed(e, enroll::CLAIM_DOMAIN, &k.id.public(), &signed);
+    assert!(SessionClaim::parse(&signed, &enroll::session_key("another")).is_err());
+}
+
+#[test]
+fn bundle_vector() {
+    let v = vectors();
+    let e = &v["bundle"];
+
+    let cert = unhex(str_of(&v["device_cert"], "signed_hex"));
+    let card = unhex(str_of(&v["card"], "signed_hex"));
+    let b = Bundle {
+        cert: cert.clone(),
+        card: card.clone(),
+    };
+
+    let encoded = unhex(str_of(e, "encoded_hex"));
+    assert_eq!(b.encode(), encoded, "bundle re-encodes to the vector bytes");
+    assert_eq!(Bundle::parse(&encoded).unwrap(), b);
+
+    // Unsigned, so the thing to pin is that opening it does the check
+    // the format exists for: both members verify, and the card belongs
+    // to the identity the certificate names.
+    let (opened_cert, opened_card) = Bundle::parse(&encoded).unwrap().open().unwrap();
+    assert_eq!(opened_cert, DeviceCert::parse(&cert).unwrap());
+    assert_eq!(opened_card.identity, opened_cert.identity);
 }

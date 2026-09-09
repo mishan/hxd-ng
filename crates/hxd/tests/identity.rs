@@ -60,6 +60,8 @@ async fn start_server_forwarded(dir: &Path, proxies: &[&str]) -> (SocketAddr, So
         proxies,
         false,
         hxd_ng_session::ForwardedHeader::Forwarded,
+        Some(Default::default()),
+        None,
     )
     .await
 }
@@ -74,6 +76,58 @@ async fn start_server_with_inbox(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) 
         &[],
         true,
         hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        None,
+    )
+    .await
+}
+
+/// `[identity] enroll = false`: identity is on, the mailbox is not.
+async fn start_server_without_mailbox(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        None,
+        None,
+    )
+    .await
+}
+
+/// A server that advertises a web client, which is what makes `hlid`
+/// draw a QR code and therefore draw a pairing secret (§5.6).
+async fn start_server_with_web_client(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        Some("http://{ng}/app/"),
+    )
+    .await
+}
+
+/// A mailbox with the ceilings turned down, so the bounded-table
+/// behaviour is reachable without opening hundreds of sessions.
+async fn start_server_with_small_mailbox(
+    dir: &Path,
+    cfg: hxd_ng_session::enroll::MailboxConfig,
+) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(cfg),
+        None,
     )
     .await
 }
@@ -91,6 +145,8 @@ async fn start_server_full(
         proxies,
         false,
         hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        None,
     )
     .await
 }
@@ -103,6 +159,8 @@ async fn start_server_inner(
     proxies: &[&str],
     inbox: bool,
     forwarded_header: hxd_ng_session::ForwardedHeader,
+    enroll: Option<hxd_ng_session::enroll::MailboxConfig>,
+    web_client: Option<&str>,
 ) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -148,6 +206,15 @@ async fn start_server_inner(
             trtp_login,
         }),
     };
+    let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (legacy_addr, ng_addr) = (l1.local_addr().unwrap(), l2.local_addr().unwrap());
+    // `{ng}` in a web-client URL is the ng listener's own address, which
+    // is only knowable once it is bound. An operator's web client is
+    // normally on the server's own origin, and since `hlid enroll` draws
+    // a QR only for one that is, the harness has to be able to say so.
+    let web_client = web_client.map(|w| w.replace("{ng}", &ng_addr.to_string()));
+
     let identity = IdentityState::new(
         ServerKey::from_seed(&[0x55; 32]),
         cfg,
@@ -167,14 +234,13 @@ async fn start_server_inner(
             caps: Vec::new(),
             trusted_proxies: hxd_ng_session::TrustedProxies::parse(proxies).unwrap(),
             forwarded_header,
+            web_client,
         }),
         registry: Arc::new(Registry::new()),
         identity: Some(Arc::new(identity)),
         tunnel: Some(tunnel),
+        enroll: enroll.map(|c| Arc::new(hxd_ng_session::enroll::Mailbox::new(c))),
     };
-    let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (legacy_addr, ng_addr) = (l1.local_addr().unwrap(), l2.local_addr().unwrap());
     tokio::spawn(hxd_session::serve(l1, legacy_ctx));
     tokio::spawn(hxd_ng_session::serve(l2, ng_ctx.clone()));
     (legacy_addr, ng_addr, ng_ctx)
@@ -1228,6 +1294,81 @@ async fn mtls_header_is_ignored_from_an_untrusted_peer() {
     let mut c = Ng::from_ws(ws).await;
     let ok = c.request("login", json!({ "nick": "nobody" })).await;
     assert!(ok["ok"]["self"].get("identity").is_none(), "{ok}");
+}
+
+#[tokio::test]
+async fn a_client_certificate_is_not_a_credential_a_page_may_ride() {
+    // The identity routes answer `Access-Control-Allow-Origin: *`,
+    // which is safe exactly as long as nothing on them is *ambient*. A
+    // proxy-forwarded TLS client certificate is: the browser attaches it
+    // to whatever a page fetches, including a hostile page's
+    // cross-origin POST, which could then read the token back out of the
+    // wildcard-CORS response. So on a request that carries `Origin`, the
+    // certificate no longer stands in for `proof`.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig::default();
+    let (_legacy, ng, _ctx) = start_server_with_proxies(dir.path(), cfg, &["127.0.0.1"]).await;
+
+    let p = person(23, "Certified");
+    authenticate(ng, &p).await;
+    let hdr = cert_header(&p.dev.public(), None);
+    let body = json!({ "card": b64(&p.card), "device_cert": b64(&p.cert) }).to_string();
+
+    let from_page = http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hotline-Client-Cert", &hdr),
+            ("Origin", "https://evil.example"),
+        ],
+        body.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        from_page.status,
+        400,
+        "a page rode the client certificate: {}",
+        String::from_utf8_lossy(&from_page.body)
+    );
+
+    // A same-origin page gets the same answer, and for the same reason:
+    // a browser never *chose* to present the certificate, so there is no
+    // origin for which riding it is intended. Signing a proof still
+    // works, from any origin.
+    let same_origin = http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hotline-Client-Cert", &hdr),
+            ("Origin", &format!("http://{ng}")),
+        ],
+        body.as_bytes(),
+    )
+    .await;
+    assert_eq!(same_origin.status, 400);
+
+    // And a native client — no `Origin` — keeps the mTLS binding.
+    let native = http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hotline-Client-Cert", &hdr),
+        ],
+        body.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        native.status,
+        200,
+        "the mTLS binding broke for the callers it is for: {}",
+        String::from_utf8_lossy(&native.body)
+    );
 }
 
 #[tokio::test]
@@ -2469,6 +2610,7 @@ async fn a_token_offered_to_a_server_without_identity_is_refused() {
         registry: Arc::new(Registry::new()),
         identity: None,
         tunnel: None,
+        enroll: None,
     };
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = l.local_addr().unwrap();
@@ -2559,4 +2701,1574 @@ async fn linking_an_identity_takes_the_accounts_mail_with_it() {
     let m = bob.event("msg").await;
     assert_eq!(m["data"]["text"], "before you linked", "{m}");
     assert_eq!(m["data"]["queued"], true, "it had been waiting");
+}
+
+#[tokio::test]
+async fn the_identity_routes_answer_cors_so_a_page_elsewhere_can_read_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    // The preflight `PUT /identity/card` triggers by sending
+    // `application/cbor`, which is not a safelisted content type.
+    let pre = http(
+        ng,
+        "OPTIONS",
+        "/identity/card",
+        &[
+            ("Origin", "https://elsewhere.example"),
+            ("Access-Control-Request-Method", "PUT"),
+            ("Access-Control-Request-Headers", "content-type"),
+        ],
+        b"",
+    )
+    .await;
+    assert_eq!(pre.status, 204);
+    assert_eq!(pre.header("access-control-allow-origin"), Some("*"));
+    assert!(
+        pre.header("access-control-allow-methods")
+            .is_some_and(|m| m.contains("PUT")),
+        "{:?}",
+        pre.headers
+    );
+    assert!(
+        pre.header("access-control-allow-headers")
+            .is_some_and(|h| h.contains("content-type")),
+        "{:?}",
+        pre.headers
+    );
+
+    // And the real answers carry the origin header, or the browser
+    // discards a body it already fetched.
+    for (method, path) in [
+        ("GET", "/.well-known/hotline"),
+        ("POST", "/identity/challenge"),
+    ] {
+        let r = http(
+            ng,
+            method,
+            path,
+            &[("Origin", "https://elsewhere.example")],
+            b"",
+        )
+        .await;
+        assert_eq!(r.status, 200, "{method} {path}");
+        assert_eq!(
+            r.header("access-control-allow-origin"),
+            Some("*"),
+            "{method} {path}"
+        );
+    }
+
+    // `ETag` has to be exposed by name: cross-origin, a page cannot read
+    // a header that is not on that list, and the card fetch is built to
+    // be revalidated rather than refetched.
+    let card = http(ng, "GET", "/identity/card/nope", &[], b"").await;
+    assert_eq!(
+        card.header("access-control-expose-headers"),
+        Some("ETag"),
+        "{:?}",
+        card.headers
+    );
+
+    // The upgrade paths are not part of this: CORS does not govern a
+    // WebSocket, and answering preflight there would only be confusing.
+    // Nor does their 404 carry the headers — saying a WebSocket path is
+    // cross-origin-readable means nothing this layer intends.
+    for path in ["/ng", "/nothing-here"] {
+        let other = http(
+            ng,
+            "OPTIONS",
+            path,
+            &[("Origin", "https://elsewhere.example")],
+            b"",
+        )
+        .await;
+        assert_eq!(other.status, 404, "{path}");
+        assert_eq!(
+            other.header("access-control-allow-origin"),
+            None,
+            "{path} should not be labelled cross-origin-readable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_client_certificate_is_not_a_credential_on_a_request_that_carries_origin() {
+    // These routes answer `Access-Control-Allow-Origin: *`, so whatever
+    // authenticates them is readable cross-origin. A proxy-forwarded TLS
+    // client certificate is ambient — the browser attaches it to whatever
+    // a page fetches — so a hostile page could drive `/identity/unlink`
+    // with the victim's certificate and read the answer.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig::default();
+    let (_legacy, ng, _ctx) = start_server_with_proxies(dir.path(), cfg, &["127.0.0.1"]).await;
+
+    let p = person(60, "Certified");
+    authenticate(ng, &p).await;
+    let hdr = cert_header(&p.dev.public(), None);
+
+    // The certificate alone still authenticates: this is the mTLS
+    // binding for native callers, and it is not being withdrawn.
+    let r = http(
+        ng,
+        "POST",
+        "/identity/unlink",
+        &[("X-Hotline-Client-Cert", &hdr)],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        409,
+        "the certificate should have authenticated: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["error"], "not_linked");
+
+    // The same request from a page is refused rather than silently
+    // downgraded — a caller that presented a certificate believes it
+    // authenticated, and 401 says otherwise out loud.
+    let r = http(
+        ng,
+        "POST",
+        "/identity/unlink",
+        &[
+            ("X-Hotline-Client-Cert", &hdr),
+            ("Origin", "https://evil.example"),
+        ],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        401,
+        "a page must not ride the certificate: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // `PUT /identity/card` and the upgrade go through the same door.
+    let r = http(
+        ng,
+        "PUT",
+        "/identity/card",
+        &[
+            ("X-Hotline-Client-Cert", &hdr),
+            ("Content-Type", "application/cbor"),
+            ("Origin", "https://evil.example"),
+        ],
+        &p.card,
+    )
+    .await;
+    assert_eq!(r.status, 401, "{}", String::from_utf8_lossy(&r.body));
+
+    let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("X-Hotline-Client-Cert", hdr.parse().unwrap());
+    req.headers_mut()
+        .insert("Origin", "https://evil.example".parse().unwrap());
+    assert!(
+        tokio_tungstenite::connect_async(req).await.is_err(),
+        "a WebSocket upgrade is not subject to CORS and would ride it just as well"
+    );
+
+    // A page that presents no certificate is untouched: it was never
+    // authenticated, and it still connects as an ordinary guest.
+    let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Origin", "https://app.example".parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let mut c = Ng::from_ws(ws).await;
+    let ok = c.request("login", json!({ "nick": "nobody" })).await;
+    assert!(ok["ok"]["self"].get("identity").is_none(), "{ok}");
+}
+
+// --- The enrollment mailbox (`docs/identity-enrollment.md` §5) ---------
+//
+// These live here rather than in a file of their own because the mailbox
+// is one of the identity endpoints, and the harness above — a real
+// server per case, `person()`, the raw `http()` client — is what they
+// need. Splitting them off would mean a second copy of all of it.
+
+/// A signed enrollment request from a device nobody has certified.
+fn enroll_request(seed: u8) -> Vec<u8> {
+    let d = hl_identity::DeviceKey::from_seed(&[seed; 32]);
+    hl_identity::EnrollRequest::new(&d, now()).sign(&d)
+}
+
+/// A renewal: the same, carrying a certificate `identity` signed.
+fn enroll_renewal(seed: u8, identity: &hl_identity::IdentityKey) -> Vec<u8> {
+    let d = hl_identity::DeviceKey::from_seed(&[seed; 32]);
+    let prev = hl_identity::DeviceCert::for_device(identity, &d, now(), 86_400)
+        .unwrap()
+        .sign(identity);
+    let mut r = hl_identity::EnrollRequest::new(&d, now());
+    r.prev = Some(prev);
+    r.sign(&d)
+}
+
+async fn open_session(ng: SocketAddr, body: Value) -> HttpReply {
+    http(
+        ng,
+        "POST",
+        "/identity/enroll/sessions",
+        &[("Content-Type", "application/json")],
+        body.to_string().as_bytes(),
+    )
+    .await
+}
+
+/// Open a session and claim `id` for it, which is what `hlid agent`
+/// does: the fingerprint alone buys nothing now, so a test that wants
+/// codeless renewal routing has to prove the key like the holder does.
+async fn open_standing(ng: SocketAddr, id: &hl_identity::IdentityKey) -> String {
+    let session = open_session(ng, json!({})).await.json()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let claim =
+        hl_identity::SessionClaim::new(id.public(), hl_identity::enroll::session_key(&session))
+            .sign(id);
+    let r = claim_identity(ng, &session, json!({ "claim": b64(&claim) })).await;
+    assert_eq!(r.status, 204, "{}", String::from_utf8_lossy(&r.body));
+    session
+}
+
+async fn claim_identity(ng: SocketAddr, session: &str, body: Value) -> HttpReply {
+    http(
+        ng,
+        "POST",
+        &format!("/identity/enroll/sessions/{session}/identity"),
+        &[("Content-Type", "application/json")],
+        body.to_string().as_bytes(),
+    )
+    .await
+}
+
+async fn post_request(ng: SocketAddr, body: Value) -> HttpReply {
+    http(
+        ng,
+        "POST",
+        "/identity/enroll/requests",
+        &[("Content-Type", "application/json")],
+        body.to_string().as_bytes(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_device_enrolls_through_the_mailbox_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    // The holder opens a session and shows the user a code.
+    let opened = open_session(ng, json!({})).await;
+    assert_eq!(
+        opened.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&opened.body)
+    );
+    let o = opened.json();
+    let session = o["session"].as_str().unwrap().to_owned();
+    let code = o["code"].as_str().unwrap().to_owned();
+    assert_eq!(o["expires_in"], 600);
+    // Eight characters and a display hyphen, from an alphabet with no
+    // confusable letters in it.
+    assert_eq!(code.len(), 9, "{code}");
+    assert_eq!(&code[4..5], "-", "{code}");
+    assert!(
+        !code.contains(['I', 'L', 'O', 'U']),
+        "{code} has a confusable"
+    );
+
+    // The device posts a request under that code.
+    let request = enroll_request(2);
+    let posted = post_request(ng, json!({ "code": code, "request": b64(&request) })).await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let request_secret = posted.json()["request"].as_str().unwrap().to_owned();
+
+    // The holder sees it, and gets back exactly the bytes that were
+    // posted — the mailbox does not rewrite what it carries.
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(polled.status, 200);
+    let pending = polled.json();
+    let entry = &pending["pending"][0];
+    assert_eq!(unb64(entry["request"].as_str().unwrap()), request);
+    let id = entry["id"].as_str().unwrap().to_owned();
+
+    // It approves, and the device fetches the bundle.
+    let answered = http(
+        ng,
+        "POST",
+        &format!("/identity/enroll/sessions/{session}/answers"),
+        &[("Content-Type", "application/json")],
+        json!({ "id": id, "bundle": b64(b"a bundle") })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        answered.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answered.body)
+    );
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{request_secret}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(fetched.status, 200);
+    assert_eq!(
+        unb64(fetched.json()["bundle"].as_str().unwrap()),
+        b"a bundle"
+    );
+
+    // Consumed. A second fetch cannot tell "already taken" from "never
+    // existed", which is deliberate (§5.5).
+    let again = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{request_secret}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(again.status, 410);
+}
+
+#[tokio::test]
+async fn a_denial_comes_back_as_a_403_with_a_reason_for_the_ui() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    let o = open_session(ng, json!({})).await.json();
+    let (session, code) = (
+        o["session"].as_str().unwrap().to_owned(),
+        o["code"].as_str().unwrap().to_owned(),
+    );
+    let posted = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&enroll_request(2)) }),
+    )
+    .await;
+    let secret = posted.json()["request"].as_str().unwrap().to_owned();
+
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    let id = polled.json()["pending"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    http(
+        ng,
+        "POST",
+        &format!("/identity/enroll/sessions/{session}/answers"),
+        &[("Content-Type", "application/json")],
+        json!({ "id": id, "denied": "not_mine" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{secret}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(fetched.status, 403);
+    assert_eq!(fetched.json()["denied"], "not_mine");
+}
+
+#[tokio::test]
+async fn a_wrong_code_is_a_404_that_says_nothing_useful() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    open_session(ng, json!({})).await;
+
+    let r = post_request(
+        ng,
+        json!({ "code": "AAAA-AAAA", "request": b64(&enroll_request(2)) }),
+    )
+    .await;
+    assert_eq!(r.status, 404);
+    assert_eq!(r.json()["error"], "unknown_code");
+    // The body says a code is not open. It does not say whether any
+    // session exists, how many do, or how close the guess was.
+    let text = r.json()["text"].as_str().unwrap().to_owned();
+    assert!(!text.contains("AAAA"), "{text}");
+}
+
+#[tokio::test]
+async fn a_renewal_finds_a_standing_session_with_no_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let id = hl_identity::IdentityKey::from_seed(&[1u8; 32]);
+
+    // Without a standing session for that identity there is nowhere to
+    // route it, and the browser is told so rather than left waiting.
+    let orphan = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
+    assert_eq!(orphan.status, 404);
+    assert_eq!(orphan.json()["error"], "no_holder");
+
+    // With one — `hlid agent` — the request arrives without the user
+    // typing anything.
+    let session = open_standing(ng, &id).await;
+    let posted = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(polled.json()["pending"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_fingerprint_alone_no_longer_stands_by_for_an_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let id = hl_identity::IdentityKey::from_seed(&[1u8; 32]);
+
+    // The shape the mailbox used to accept. It is refused rather than
+    // ignored, so a holder built against it learns its claim went
+    // nowhere instead of waiting forever for a renewal that routes
+    // somewhere else.
+    let r = open_session(ng, json!({ "identity": id.fingerprint().to_string() })).await;
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+
+    // An unclaimed session collects no renewals, however many sessions
+    // are open.
+    let session = open_session(ng, json!({})).await.json()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let orphan = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
+    assert_eq!(orphan.status, 404);
+    assert_eq!(orphan.json()["error"], "no_holder");
+
+    // A claim for a different session does not count as one for this.
+    let elsewhere = hl_identity::SessionClaim::new(
+        id.public(),
+        hl_identity::enroll::session_key("some-other-session"),
+    )
+    .sign(&id);
+    let r = claim_identity(ng, &session, json!({ "claim": b64(&elsewhere) })).await;
+    assert_eq!(r.status, 400);
+    assert_eq!(r.json()["error"], "bad_claim");
+
+    // The real thing does.
+    let claimed = open_standing(ng, &id).await;
+    let posted = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{claimed}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(polled.json()["pending"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_holder_can_hand_a_session_back_before_it_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let id = hl_identity::IdentityKey::from_seed(&[1u8; 32]);
+    let session = open_standing(ng, &id).await;
+
+    let closed = http(
+        ng,
+        "DELETE",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        closed.status,
+        204,
+        "{}",
+        String::from_utf8_lossy(&closed.body)
+    );
+
+    // Gone: it polls as unknown and stands by for nothing.
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(polled.status, 404);
+    let orphan = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
+    assert_eq!(orphan.json()["error"], "no_holder");
+}
+
+#[tokio::test]
+async fn only_the_session_secret_can_answer_a_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    let o = open_session(ng, json!({})).await.json();
+    let (session, code) = (
+        o["session"].as_str().unwrap().to_owned(),
+        o["code"].as_str().unwrap().to_owned(),
+    );
+    post_request(
+        ng,
+        json!({ "code": code, "request": b64(&enroll_request(2)) }),
+    )
+    .await;
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    let id = polled.json()["pending"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The code was shown on a screen and typed into another machine. The
+    // session secret never left the holder. Only one of them may sign
+    // off on a certificate (§5.4).
+    let by_code = http(
+        ng,
+        "POST",
+        &format!("/identity/enroll/sessions/{code}/answers"),
+        &[("Content-Type", "application/json")],
+        json!({ "id": id, "bundle": b64(b"x") })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(by_code.status, 404);
+}
+
+#[tokio::test]
+async fn the_mailbox_refuses_what_it_should_not_be_asked_to_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_with_small_mailbox(
+        dir.path(),
+        hxd_ng_session::enroll::MailboxConfig {
+            max_sessions: 2,
+            per_address: 2,
+        },
+    )
+    .await;
+
+    // An oversized request, refused on its size before anything parses it.
+    let o = open_session(ng, json!({})).await.json();
+    let code = o["code"].as_str().unwrap().to_owned();
+    let huge = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&vec![0u8; 8 * 1024 + 1]) }),
+    )
+    .await;
+    assert_eq!(huge.status, 400);
+    assert_eq!(huge.json()["error"], "request_too_large");
+    // And it did not spend the code, since nothing was admitted.
+    let ok = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&enroll_request(2)) }),
+    )
+    .await;
+    assert_eq!(ok.status, 201);
+
+    // Sessions are capped. Everything on this test comes from loopback,
+    // so the per-address limit is what bites.
+    let second = open_session(ng, json!({})).await;
+    assert_eq!(second.status, 200);
+    let third = open_session(ng, json!({})).await;
+    assert!(
+        third.status == 429 || third.status == 503,
+        "expected a limit, got {}",
+        third.status
+    );
+}
+
+#[tokio::test]
+async fn with_no_mailbox_the_routes_are_absent_and_discovery_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_without_mailbox(dir.path()).await;
+
+    // Discovery is how an enrollee decides whether to offer a code box
+    // at all, so the endpoint must be absent rather than present and
+    // broken (§3).
+    let disco = http(ng, "GET", "/.well-known/hotline", &[], b"")
+        .await
+        .json();
+    assert_eq!(disco["identity"]["enabled"], true);
+    assert!(
+        disco["identity"]["endpoints"]["enroll"].is_null(),
+        "{}",
+        disco["identity"]["endpoints"]
+    );
+
+    let r = open_session(ng, json!({})).await;
+    assert_eq!(r.status, 404);
+}
+
+#[tokio::test]
+async fn discovery_advertises_the_mailbox_when_it_is_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let disco = http(ng, "GET", "/.well-known/hotline", &[], b"")
+        .await
+        .json();
+    assert_eq!(
+        disco["identity"]["endpoints"]["enroll"], "/identity/enroll",
+        "{}",
+        disco["identity"]
+    );
+    // With no web client configured the key is absent, not null: a
+    // reader should have one thing to test rather than two.
+    assert!(
+        !disco["identity"].as_object().unwrap().contains_key("web"),
+        "{}",
+        disco["identity"]
+    );
+}
+
+#[tokio::test]
+async fn opening_a_session_takes_an_empty_body_but_not_a_broken_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    // No body at all is how a holder that wants no standing session
+    // opens one, so it has to work.
+    let bare = http(ng, "POST", "/identity/enroll/sessions", &[], b"").await;
+    assert_eq!(bare.status, 200, "{}", String::from_utf8_lossy(&bare.body));
+
+    // Malformed is not the same as absent. Reading a parse failure as
+    // "no fields" would accept this — and a body-read timeout — as a
+    // request to open a session.
+    for body in ["{{{", "[]not json", "\"a string\"x"] {
+        let broken = http(
+            ng,
+            "POST",
+            "/identity/enroll/sessions",
+            &[("Content-Type", "application/json")],
+            body.as_bytes(),
+        )
+        .await;
+        assert_eq!(broken.status, 400, "accepted {body:?}");
+    }
+
+    // And a well-formed body naming something that is not a fingerprint
+    // is still refused.
+    let bad_fp = http(
+        ng,
+        "POST",
+        "/identity/enroll/sessions",
+        &[("Content-Type", "application/json")],
+        br#"{"identity": "not-a-fingerprint"}"#,
+    )
+    .await;
+    assert_eq!(bad_fp.status, 400);
+}
+
+// --- `hlid enroll` driven as a user would ------------------------------
+//
+// The mailbox tests above exercise the routes, and `hlid`'s own unit
+// tests exercise the policy intersection and the prompt's wording. What
+// neither covers is the holder's client: discovery finding the mailbox,
+// the long poll, and a bundle that comes back and actually verifies.
+
+/// The `hlid` binary. `CARGO_BIN_EXE_*` exists only for the crate that
+/// declares the binary and this is not that crate, so it is found beside
+/// this test's own executable.
+///
+/// The build always runs rather than only when the file is missing.
+/// `cargo build` is a no-op the moment nothing has changed, and the
+/// alternative is worse than slow: an `hlid` left over from an earlier
+/// branch is *present*, so a missing-file check passes and the test
+/// silently exercises code that is not the code under test. This cost
+/// an afternoon before it was written down.
+fn hlid_binary() -> std::path::PathBuf {
+    let ok = std::process::Command::new(env!("CARGO"))
+        .args(["build", "-p", "hlid"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("cargo build -p hlid")
+        .success();
+    assert!(ok, "cargo build -p hlid failed");
+
+    let mut dir = std::env::current_exe().expect("the test binary has a path");
+    dir.pop(); // deps/
+    dir.pop(); // debug/ or release/
+    let bin = dir.join(if cfg!(windows) { "hlid.exe" } else { "hlid" });
+    assert!(bin.exists(), "no hlid binary at {}", bin.display());
+    bin
+}
+
+/// The pairing code out of a line of `hlid`'s output — the same thing a
+/// user's eye does with it.
+fn code_in(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .find(|t| {
+            let b = t.as_bytes();
+            b.len() == 9
+                && b[4] == b'-'
+                && b.iter()
+                    .enumerate()
+                    .all(|(i, c)| i == 4 || c.is_ascii_alphanumeric())
+        })
+        .map(str::to_owned)
+}
+
+#[tokio::test]
+async fn hlid_enroll_certifies_a_browser_that_it_never_holds_a_key_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+
+    let init = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "hlid init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // The device being enrolled. `hlid` is never given this key — only
+    // the two public halves, inside the request — which is the whole
+    // point of the flow.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+
+    let mut child = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args([
+            "enroll",
+            "--server",
+            &format!("http://{ng}"),
+            "--days",
+            "30",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // The answer goes in before the question is asked; it waits in the
+    // pipe until `hlid` reaches its prompt, which is the only moment it
+    // reads stdin.
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"y\n").unwrap();
+    }
+
+    // Drain stderr on a thread, forwarding the code as soon as it
+    // appears — waiting for the process to exit first would deadlock,
+    // since it does not exit until a device asks.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Some(c) = code_in(&line) {
+                let _ = tx.send(c);
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+
+    let code = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("hlid should have shown a pairing code");
+
+    // The browser asks for more than the holder gives, so the answer
+    // proves the intersection happened rather than the request being
+    // rubber-stamped.
+    let mut request = hl_identity::EnrollRequest::new(&browser, now());
+    request.name = Some("Firefox on the laptop".into());
+    request.caps = Some(cert::caps::WEB | cert::caps::MANAGE);
+    request.days = Some(3650);
+    let posted = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&request.sign(&browser)) }),
+    )
+    .await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let secret = posted.json()["request"].as_str().unwrap().to_owned();
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{secret}"),
+        &[],
+        b"",
+    )
+    .await;
+    let stderr = reader.join().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "hlid enroll failed:\n{stderr}");
+    assert_eq!(fetched.status, 200, "no bundle came back:\n{stderr}");
+
+    // What came back is a bundle, and it verifies the way the browser
+    // will verify it.
+    let bundle = hl_identity::Bundle::parse(&unb64(fetched.json()["bundle"].as_str().unwrap()))
+        .expect("a bundle");
+    let (cert, card) = bundle.open().expect("both halves verify and agree");
+
+    assert_eq!(cert.device, browser.public(), "certified the wrong device");
+    assert_eq!(cert.device_enc, browser.public_enc());
+    assert_eq!(card.name, "Alice");
+    assert_eq!(cert.name.as_deref(), Some("Firefox on the laptop"));
+
+    // The policy, not the request: `--caps` defaults to web, so `manage`
+    // was asked for and not granted, and 3650 days was asked for and
+    // capped at the --days 30 this holder was run with.
+    assert_eq!(
+        cert.caps,
+        Some(cert::caps::WEB),
+        "a request must not be able to widen what the holder gives"
+    );
+    let days = (cert.expires - cert.issued) / 86_400;
+    assert_eq!(days, 30, "the lifetime is the holder's, not the request's");
+
+    // And the human was shown the comparison the whole flow rests on.
+    assert!(stderr.contains("enter code"), "{stderr}");
+    assert!(
+        stderr.contains("Compare the device fingerprint"),
+        "the prompt must ask for the one check only a human can make:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&hl_identity::Fingerprint::of(&browser.public()).short()),
+        "the prompt must show the device fingerprint:\n{stderr}"
+    );
+}
+
+/// The `#enroll=…&mailbox=…&identity=…&pair=…` fragment `--show-url`
+/// prints.
+///
+/// Split on `&` and `=` and no more: none of the four fields can
+/// currently contain a character that needs escaping — base64url, a
+/// Crockford fingerprint, a code from a 32-symbol alphabet, and a
+/// host:port — so there is nothing here to percent-decode. If that ever
+/// stops being true this will read the escape as literal text, and the
+/// assertions below are what will notice.
+fn scan_fields(output: &str) -> std::collections::HashMap<String, String> {
+    let url = output
+        .lines()
+        .find(|l| l.contains("#enroll="))
+        .expect("hlid should have printed the scan URL");
+    let (_, fragment) = url.trim().split_once('#').unwrap();
+    fragment
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+}
+
+/// Run `hlid enroll --show-url` and hand back its code, its scan
+/// fields, and a handle on the still-running process.
+struct Holder {
+    child: std::process::Child,
+    reader: std::thread::JoinHandle<String>,
+    fields: std::collections::HashMap<String, String>,
+}
+
+async fn start_holder(ng: SocketAddr, home: &Path, hlid: &Path, answer: &[u8]) -> Holder {
+    let mut child = std::process::Command::new(hlid)
+        .env("HLID_HOME", home)
+        .args(["enroll", "--server", &format!("http://{ng}"), "--show-url"])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(answer).unwrap();
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.contains("#enroll=") {
+                let _ = tx.send(line.clone());
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+    let url = match tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30)))
+        .await
+        .unwrap()
+    {
+        Ok(u) => u,
+        Err(e) => {
+            let _ = child.kill();
+            panic!(
+                "hlid printed no scan URL ({e}); it said:\n{}",
+                reader.join().unwrap()
+            )
+        }
+    };
+
+    Holder {
+        child,
+        reader,
+        fields: scan_fields(&url),
+    }
+}
+
+/// A long-running `hlid` whose codes arrive one after another, so a test
+/// can watch it hand out a fresh one when the last is spent.
+struct Agent {
+    child: std::process::Child,
+    reader: std::thread::JoinHandle<String>,
+    codes: std::sync::mpsc::Receiver<String>,
+}
+
+impl Agent {
+    async fn next_code(&mut self) -> String {
+        // Polled rather than blocked on: `recv` would hold this thread,
+        // and the runtime has the server on it. The bounded loop is the
+        // timeout, so a code that never arrives fails here rather than
+        // hanging.
+        let rx = &self.codes;
+        for _ in 0..300 {
+            match rx.try_recv() {
+                Ok(c) => return c,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("hlid agent stopped: {e}"),
+            }
+        }
+        panic!("hlid agent showed no further code");
+    }
+}
+
+fn start_agent(ng: SocketAddr, home: &Path, hlid: &Path, extra: &[&str]) -> Agent {
+    let mut child = std::process::Command::new(hlid)
+        .env("HLID_HOME", home)
+        .arg("agent")
+        .args(["--server", &format!("http://{ng}")])
+        .args(extra)
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        // Enough approvals for every prompt any of these tests will
+        // produce; they wait in the pipe until each one is asked. Past
+        // the end the pipe is at EOF, which `confirm` reads as "nobody
+        // is there" and answers no — so an over-supply is safe and an
+        // under-supply would look like a refusal.
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"y\n".repeat(16).as_slice())
+            .unwrap();
+    }
+
+    let (tx, codes) = std::sync::mpsc::channel::<String>();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.contains("enter code") {
+                if let Some(c) = code_in(&line) {
+                    let _ = tx.send(c);
+                }
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+
+    Agent {
+        child,
+        reader,
+        codes,
+    }
+}
+
+/// The identity `hlid init` wrote into a home, so a test can build
+/// something addressed to the agent holding it.
+fn identity_of(home: &Path) -> hl_identity::IdentityKey {
+    let hex = std::fs::read_to_string(home.join("identity.key")).unwrap();
+    let seed: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&hex.trim()[i * 2..i * 2 + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    hl_identity::IdentityKey::from_seed(&seed)
+}
+
+/// Post a request and collect the answer, which is what a browser does.
+async fn enroll_through(ng: SocketAddr, code: Option<&str>, request: &[u8]) -> HttpReply {
+    let mut body = json!({ "request": b64(request) });
+    if let Some(c) = code {
+        body["code"] = json!(c);
+    }
+    let posted = post_request(ng, body).await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let handle = posted.json()["request"].as_str().unwrap().to_owned();
+    http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{handle}"),
+        &[],
+        b"",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn hlid_agent_hands_out_a_fresh_code_and_renews_without_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let mut agent = start_agent(ng, &home, &hlid, &["--renew", "auto"]);
+    let first_code = agent.next_code().await;
+
+    // A browser enrolls with the code it was shown.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+    let mut req = hl_identity::EnrollRequest::new(&browser, now());
+    req.name = Some("Firefox".into());
+    let answer = enroll_through(ng, Some(&first_code), &req.sign(&browser)).await;
+    assert_eq!(answer.status, 200);
+    let bundle =
+        hl_identity::Bundle::parse(&unb64(answer.json()["bundle"].as_str().unwrap())).unwrap();
+    let (cert, _) = bundle.open().unwrap();
+    assert_eq!(cert.device, browser.public());
+
+    // A code admits one request, so the agent must show another rather
+    // than go on displaying one that no longer works.
+    let second_code = agent.next_code().await;
+    assert_ne!(second_code, first_code, "the agent reused a spent code");
+
+    // And the renewal, which is the point of a standing session: no code
+    // is typed anywhere. The mailbox routes it by the identity in `prev`.
+    let mut renewal = hl_identity::EnrollRequest::new(&browser, now());
+    renewal.prev = Some(bundle.cert.clone());
+    renewal.name = Some("Firefox".into());
+    let renewed = enroll_through(ng, None, &renewal.sign(&browser)).await;
+    assert_eq!(
+        renewed.status, 200,
+        "a standing agent should have taken this without a code"
+    );
+    let fresh = hl_identity::Bundle::parse(&unb64(renewed.json()["bundle"].as_str().unwrap()))
+        .unwrap()
+        .open()
+        .unwrap()
+        .0;
+    assert_eq!(fresh.device, browser.public());
+    assert!(
+        fresh.issued >= cert.issued,
+        "the renewal should be a newer certificate"
+    );
+
+    let _ = agent.child.kill();
+    let output = agent.reader.join().unwrap();
+    let _ = agent.child.wait();
+    assert!(
+        output.contains("--renew auto"),
+        "the renewal should say it was not asked about:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn a_request_the_agent_cannot_parse_is_refused_rather_than_left_pending() {
+    // The wedge: a request that the mailbox routes but `EnrollRequest`
+    // rejects. Answering it is what takes it out of `pending`, and a
+    // request left pending is what the next long poll returns
+    // *immediately* — so an agent that returned without answering span
+    // at full tilt for the request's whole five minutes, refreshable by
+    // anyone who could post.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let id = identity_of(&home);
+
+    let mut agent = start_agent(ng, &home, &hlid, &["--renew", "auto"]);
+    let code = agent.next_code().await;
+
+    // Shaped just enough to route by identity — `prev` is a CBOR map
+    // with an `identity` — and not a signed request at all.
+    let junk = {
+        use hl_identity::cbor::{encode, Value};
+        let prev = encode(&Value::Map(vec![(
+            Value::Text("identity".into()),
+            Value::Bytes(id.public().to_vec()),
+        )]));
+        encode(&Value::Map(vec![
+            (Value::Text("prev".into()), Value::Bytes(prev)),
+            (Value::Text("sig".into()), Value::Bytes(vec![0u8; 64])),
+            (Value::Text("v".into()), Value::Uint(1)),
+        ]))
+    };
+    let refused = enroll_through(ng, None, &junk).await;
+    assert_eq!(
+        refused.status,
+        403,
+        "the agent should have answered, not ignored: {}",
+        String::from_utf8_lossy(&refused.body)
+    );
+    assert_eq!(refused.json()["denied"], "bad_request");
+
+    // Still standing, and still able to do its job.
+    let browser = DeviceKey::from_seed(&[0x5b; 32]);
+    let mut req = hl_identity::EnrollRequest::new(&browser, now());
+    req.name = Some("Firefox".into());
+    let answer = enroll_through(ng, Some(&code), &req.sign(&browser)).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "one bad request took the agent down: {}",
+        String::from_utf8_lossy(&answer.body)
+    );
+
+    let _ = agent.child.kill();
+    let output = agent.reader.join().unwrap();
+    let _ = agent.child.wait();
+    assert!(
+        output.contains("not a request"),
+        "the refusal should be reported:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_rotates_past_its_own_per_address_limit() {
+    // `enroll_per_address` is 4 and a session lives ten minutes, so an
+    // agent that abandons a session on every spent code used to spend
+    // its whole allowance on sessions it had finished with, and exit
+    // with a 429 on the fourth enrollment. Handing each one back is what
+    // makes rotation unbounded.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let mut agent = start_agent(ng, &home, &hlid, &["--renew", "auto"]);
+    let mut code = agent.next_code().await;
+    // One more than `enroll_per_address`, which is where it used to
+    // stop.
+    for n in 0..6u8 {
+        let browser = DeviceKey::from_seed(&[0x60 + n; 32]);
+        let mut req = hl_identity::EnrollRequest::new(&browser, now());
+        req.name = Some(format!("Browser {n}"));
+        let answer = enroll_through(ng, Some(&code), &req.sign(&browser)).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "enrollment {n} failed; the agent ran out of its own allowance: {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        let next = agent.next_code().await;
+        assert_ne!(next, code, "the agent reused a spent code");
+        code = next;
+    }
+
+    let _ = agent.child.kill();
+    let output = agent.reader.join().unwrap();
+    let _ = agent.child.wait();
+    assert!(
+        !output.contains("rate_limited") && !output.contains("429"),
+        "the agent rate-limited itself out of its own mailbox:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn a_renewal_posted_during_a_rotation_is_still_answered() {
+    // A renewal posted the instant an enrollment completes, while the
+    // agent is rotating to a fresh code.
+    //
+    // Honest about what this does and does not prove: it exercises the
+    // rotation path end to end, but it cannot *force* the window the
+    // ordering fix exists for — on loopback the agent has usually opened
+    // the replacement before this test can post, so it passes with the
+    // fix reverted too. What pins the ordering is
+    // `opening_a_session_moves_the_standing_identity_at_once` in
+    // hxd-ng-session, which tests the property the fix rests on.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let mut agent = start_agent(ng, &home, &hlid, &["--renew", "auto"]);
+    let first_code = agent.next_code().await;
+
+    // Enroll, which spends the code and starts the rotation.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+    let req = hl_identity::EnrollRequest::new(&browser, now());
+    let answer = enroll_through(ng, Some(&first_code), &req.sign(&browser)).await;
+    assert_eq!(answer.status, 200);
+    let bundle =
+        hl_identity::Bundle::parse(&unb64(answer.json()["bundle"].as_str().unwrap())).unwrap();
+
+    // Post the renewal immediately, without waiting to see the new code:
+    // this is the window, and whichever session it lands on the agent
+    // has to answer it.
+    let mut renewal = hl_identity::EnrollRequest::new(&browser, now());
+    renewal.prev = Some(bundle.cert.clone());
+    let renewed = enroll_through(ng, None, &renewal.sign(&browser)).await;
+    assert_eq!(
+        renewed.status, 200,
+        "a renewal posted during the rotation was stranded"
+    );
+
+    let _ = agent.child.kill();
+    let _ = agent.reader.join();
+    let _ = agent.child.wait();
+}
+
+#[tokio::test]
+async fn renew_deny_holds_no_standing_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+
+    let mut agent = start_agent(ng, &home, &hlid, &["--renew", "deny"]);
+    let code = agent.next_code().await;
+
+    // Enroll first, so there is a certificate to renew.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+    let req = hl_identity::EnrollRequest::new(&browser, now());
+    let answer = enroll_through(ng, Some(&code), &req.sign(&browser)).await;
+    assert_eq!(answer.status, 200);
+    let bundle =
+        hl_identity::Bundle::parse(&unb64(answer.json()["bundle"].as_str().unwrap())).unwrap();
+    agent.next_code().await; // it reopens, but still without an identity
+
+    // A codeless renewal has nowhere to go: that is what `deny` means —
+    // renewals come through a code like a first enrollment (§8).
+    let mut renewal = hl_identity::EnrollRequest::new(&browser, now());
+    renewal.prev = Some(bundle.cert.clone());
+    let orphan = post_request(ng, json!({ "request": b64(&renewal.sign(&browser)) })).await;
+    assert_eq!(orphan.status, 404);
+    assert_eq!(orphan.json()["error"], "no_holder");
+
+    let _ = agent.child.kill();
+    let _ = agent.reader.join();
+    let _ = agent.child.wait();
+}
+
+#[tokio::test]
+async fn a_scanned_request_skips_the_comparison_the_typed_one_asks_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_with_web_client(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    let init = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+
+    let holder = start_holder(ng, &home, &hlid, b"y\n").await;
+    let mut holder = holder;
+
+    // The QR carries four things, and each does a different job (§5.6).
+    let code = holder.fields.remove("enroll").expect("enroll=");
+    let pair_b64 = holder.fields.remove("pair").expect("pair=");
+    assert!(
+        holder.fields.contains_key("mailbox"),
+        "so the phone cannot pick the wrong server"
+    );
+    assert!(
+        holder.fields.contains_key("identity"),
+        "so the enrollee pins the fingerprint before it asks, not after"
+    );
+    let secret: [u8; 16] = unb64(&pair_b64).try_into().expect("16-byte pairing secret");
+
+    // A phone that scanned the code folds the tag into its request.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+    let mut request = hl_identity::EnrollRequest::new(&browser, now());
+    request.name = Some("Safari on the phone".into());
+    request.pair = Some(hl_identity::enroll::pair_tag(&secret, &browser.public()));
+
+    let posted = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&request.sign(&browser)) }),
+    )
+    .await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let secret_handle = posted.json()["request"].as_str().unwrap().to_owned();
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{secret_handle}"),
+        &[],
+        b"",
+    )
+    .await;
+    let stderr = holder.reader.join().unwrap();
+    assert!(
+        holder.child.wait().unwrap().success(),
+        "hlid failed:\n{stderr}"
+    );
+    assert_eq!(fetched.status, 200, "no bundle came back:\n{stderr}");
+
+    let bundle =
+        hl_identity::Bundle::parse(&unb64(fetched.json()["bundle"].as_str().unwrap())).unwrap();
+    let (cert, _) = bundle.open().unwrap();
+    assert_eq!(cert.device, browser.public());
+
+    // The whole point of the scanned path: the check the typed path asks
+    // a human to make has already been made in software, so the prompt
+    // stops asking for it.
+    assert!(stderr.contains("(scanned)"), "{stderr}");
+    assert!(
+        !stderr.contains("Compare the device fingerprint"),
+        "a scanned request should not ask for the comparison:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_pairing_proof_that_does_not_verify_is_never_shown_to_the_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_with_web_client(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+
+    // "y" on stdin, so that if the prompt were shown at all it would be
+    // approved — the test would fail loudly rather than pass for the
+    // wrong reason.
+    let mut holder = start_holder(ng, &home, &hlid, b"y\n").await;
+    let code = holder.fields.remove("enroll").expect("enroll=");
+
+    // A guessed tag. The only way to produce a real one is to have seen
+    // the QR code, and the mailbox never saw the secret either.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+    let mut request = hl_identity::EnrollRequest::new(&browser, now());
+    request.pair = Some(hl_identity::enroll::pair_tag(
+        &[0xff; 16],
+        &browser.public(),
+    ));
+
+    let posted = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&request.sign(&browser)) }),
+    )
+    .await;
+    let handle = posted.json()["request"].as_str().unwrap().to_owned();
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{handle}"),
+        &[],
+        b"",
+    )
+    .await;
+    let stderr = holder.reader.join().unwrap();
+    let _ = holder.child.wait();
+
+    // Refused outright, and refused *without* asking: a guess is not
+    // something to put in front of a user (§6).
+    assert_eq!(fetched.status, 403, "{stderr}");
+    assert_eq!(fetched.json()["denied"], "bad_pair");
+    assert!(
+        !stderr.contains("Certify?"),
+        "the user should never have been asked:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_web_client_the_server_names_off_its_own_origin_gets_no_qr_code() {
+    // Discovery is answered by the mailbox, and the QR's fragment carries
+    // the pairing secret — so a mailbox free to point `web` anywhere
+    // could send the phone to a page of its own, read the secret off the
+    // fragment, and mint a `pair` for a device key it holds. That is the
+    // substituted request §9 says a scanned enrollment cannot suffer.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_inner(
+        dir.path(),
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        Some("https://evil.test/app/"),
+    )
+    .await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    let init = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+
+    // The QR and the `--show-url` line are both printed before the
+    // "enter code" line, so reading to that line has seen everything the
+    // scan path would have emitted. Nothing sends a request here, so the
+    // process is killed rather than waited on.
+    let mut child = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["enroll", "--server", &format!("http://{ng}"), "--show-url"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let said = tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            all.push_str(&line);
+            all.push('\n');
+            if line.contains("enter code") {
+                break;
+            }
+        }
+        all
+    })
+    .await
+    .unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        said.contains("enter code"),
+        "the typed path is untouched and still shows a code:\n{said}"
+    );
+    assert!(
+        !said.contains("#enroll="),
+        "the pairing secret must not be drawn for an origin the server chose:\n{said}"
+    );
+    assert!(
+        !said.contains("Scan this"),
+        "and no QR code either:\n{said}"
+    );
 }

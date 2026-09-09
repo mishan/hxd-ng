@@ -83,6 +83,26 @@ pub(crate) fn opt_uint(v: &Value, key: &'static str) -> Result<Option<u64>, Erro
     }
 }
 
+/// A byte string of any length, required. Most byte fields here are keys
+/// or signatures and so are fixed-width; the exceptions are the ones
+/// carrying another object whole — the bundle's `cert` and `card`, and
+/// (through [`opt_bytes`]) an enrollment request's `prev`.
+pub(crate) fn bytes(v: &Value, key: &'static str) -> Result<Vec<u8>, Error> {
+    match v.get(key) {
+        Some(Value::Bytes(b)) => Ok(b.clone()),
+        Some(_) => Err(Error::BadField(key)),
+        None => Err(Error::MissingField(key)),
+    }
+}
+
+pub(crate) fn opt_bytes(v: &Value, key: &'static str) -> Result<Option<Vec<u8>>, Error> {
+    match v.get(key) {
+        Some(Value::Bytes(b)) => Ok(Some(b.clone())),
+        Some(_) => Err(Error::BadField(key)),
+        None => Ok(None),
+    }
+}
+
 pub(crate) fn bytes32(v: &Value, key: &'static str) -> Result<[u8; 32], Error> {
     match v.get(key) {
         Some(Value::Bytes(b)) => b.as_slice().try_into().map_err(|_| Error::BadField(key)),

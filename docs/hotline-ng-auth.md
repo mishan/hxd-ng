@@ -490,6 +490,15 @@ profile's objects name (under Hotline identity, `device_cert.device`);
 the profile's verification then runs as for the challenge binding.
 Response and failure codes are the same.
 
+A request carrying an `Origin` header is excluded from this binding and
+must send `proof` like any other. A client certificate is ambient in a
+browser — the TLS layer attaches it to whatever a page fetches, including
+a hostile page's cross-origin request — and the identity routes answer
+`Access-Control-Allow-Origin: *`, so accepting one there would let a
+page it does not belong to read back a token. This costs the binding
+nothing: it is for native apps and tunnels, which send no `Origin`, and
+a browser that is entitled to log in still can by signing a proof.
+
 Once a key has the profile's objects on file, a WebSocket upgrade that
 carries a client certificate for that key is authenticated without a
 token (§7.1), for as long as the profile says those objects are valid.
@@ -848,6 +857,28 @@ the `[identity]` section because hxd-ng has one profile and one switch.
   decision expires, and it should be revisited with media and history in
   mind rather than solved just for authentication. hxd-ng uses hyper
   directly.
+- **The HTTP routes answer CORS**, with `Access-Control-Allow-Origin: *`
+  and an `OPTIONS` handler for the preflight that `PUT /identity/card`
+  triggers by sending `application/cbor`. A wildcard is safe here for a
+  reason worth stating rather than assuming: every one of these routes is
+  authenticated by a token in the body or the URL and none by a cookie,
+  so a hostile page has no ambient credential to ride and an allow-list
+  would protect nothing. Without it a browser client can only ever talk
+  to the server that served it, which rules out both a client offering a
+  choice of servers and a device following an enrollment link to a mailbox
+  somewhere else (`identity-enrollment.md` §5.6). `ETag` is named in
+  `Access-Control-Expose-Headers` so the card fetch can still be
+  revalidated.
+
+  That "no ambient credential" is a property the routes have to *keep*,
+  not one the CORS layer can assume. The mTLS binding (§6.3) is the case
+  that breaks it: a TLS client certificate is attached by the browser to
+  whatever a page fetches, so on a server behind an mTLS proxy a hostile
+  page could POST to `auth` cross-origin, ride a certificate it never
+  saw, and read the token back out of the wildcard response. So `auth`
+  refuses to accept a certificate in place of `proof` on any request
+  carrying `Origin`. Browsers set it on every request that could be that
+  attack; the native clients the binding is for set it on none.
 - Transport tokens, challenges and session tokens share the same storage
   discipline as `hotline-ng.md` §9: CSPRNG, stored hashed, never logged.
   hxd-ng looks them up in a map keyed by the SHA-256 of the secret, which

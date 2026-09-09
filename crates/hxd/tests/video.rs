@@ -157,10 +157,12 @@ async fn start_both(dir: &Path, video: bool) -> Server {
             caps: ng_caps,
             trusted_proxies: Default::default(),
             forwarded_header: Default::default(),
+            ..Default::default()
         }),
         registry: Arc::new(Registry::new()),
         identity: None,
         tunnel: None,
+        enroll: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

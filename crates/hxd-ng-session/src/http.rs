@@ -13,6 +13,7 @@
 //! | `PUT  /identity/card` | §7 |
 //! | `POST /identity/link` | §8.2 |
 //! | `POST /identity/unlink` | §8.4 |
+//! | `/identity/enroll/…` | the enrollment mailbox, `identity-enrollment.md` §5 |
 //! | `GET  /ng` (and `/`) | upgrade → the JSON protocol |
 //! | `GET  /trtp` | upgrade → the TRTP tunnel |
 //!
@@ -20,6 +21,14 @@
 //! the proxy is the mTLS header contract (§5.3): `X-Hotline-Client-Cert`
 //! is believed only from `NgConfig::trusted_proxies`, and stripped from
 //! everyone else.
+//!
+//! Everything above the upgrades answers CORS. These routes are
+//! authenticated by a token in the body or the URL and never by a cookie,
+//! so a wildcard origin gives away nothing a `curl` would not — and
+//! without it a browser client served from anywhere but this host cannot
+//! read one of them. That case is not exotic: hx-ng's `allowCustomServer`
+//! points a page at a server other than the one that served it, and the
+//! enrollment mailbox is reached by a phone that followed a QR code.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -28,7 +37,11 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hxd_core::{IdentityTag, LinkAuthority, Transport};
 use hyper::body::Incoming;
-use hyper::header::{AUTHORIZATION, CONTENT_TYPE, ETAG};
+use hyper::header::{
+    HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
+    AUTHORIZATION, CONTENT_TYPE, ETAG, ORIGIN,
+};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
@@ -49,6 +62,12 @@ type Resp = Response<Full<Bytes>>;
 /// JSON they arrive in, and it is what stops a body being read at all
 /// before any of those limits can apply.
 const MAX_BODY: usize = 64 * 1024;
+
+/// A bundle the holder posts back (§5.4). Its members are bounded at 4
+/// and 16 KiB by the identity spec, so this is those plus the map around
+/// them — the mailbox forwards it without decoding, so this is the only
+/// thing keeping the answer proportionate to what it answers.
+const MAX_BUNDLE_BYTES: usize = 4 * 1024 + 16 * 1024 + 256;
 
 /// Serve one accepted TCP connection: HTTP/1.1 until it upgrades.
 pub(crate) async fn serve_connection(stream: TcpStream, peer: SocketAddr, ctx: NgCtx) {
@@ -105,13 +124,23 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         };
     }
 
-    match (req.method(), path.as_str()) {
+    // Preflight comes before the table: a browser sends `OPTIONS` to a
+    // path whose real method it has not used yet, so this cannot be one
+    // more arm of it.
+    if req.method() == Method::OPTIONS && cors_route(&path) {
+        return preflight();
+    }
+
+    let resp = match (req.method(), path.as_str()) {
         (&Method::GET, "/.well-known/hotline") => discovery(&ctx),
         (&Method::POST, "/identity/challenge") => challenge(&ctx),
         (&Method::POST, "/identity/auth") => auth(req, peer, &ctx).await,
         (&Method::POST, "/identity/link") => link(req, peer, &ctx).await,
         (&Method::POST, "/identity/unlink") => unlink(req, peer, &ctx).await,
         (&Method::PUT, "/identity/card") => put_card(req, peer, &ctx).await,
+        (_, p) if p.starts_with("/identity/enroll") => {
+            return enroll_route(req, client, &ctx).await;
+        }
         (&Method::GET, p) if p.starts_with("/identity/card/") => {
             let inm = req
                 .headers()
@@ -121,7 +150,67 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
             get_card(&p["/identity/card/".len()..], inm.as_deref(), &ctx)
         }
         _ => plain(StatusCode::NOT_FOUND, "not found"),
+    };
+    // Only the routes a page fetches, rather than everything that
+    // reaches here. A 404 for `/ng` is about a WebSocket path, and
+    // labelling it cross-origin-readable says something this layer does
+    // not mean — as would doing the same for whatever non-CORS route is
+    // added to this table next.
+    if cors_route(&path) {
+        return cors(resp);
     }
+    resp
+}
+
+/// The routes a page fetches. An upgrade is not subject to CORS and has
+/// returned above by the time this is asked.
+fn cors_route(path: &str) -> bool {
+    path == "/.well-known/hotline" || path.starts_with("/identity/")
+}
+
+/// `*` rather than an echo of `Origin`: there is no cookie or other
+/// ambient credential on these routes for a hostile page to ride, so an
+/// allow-list would protect nothing. That is a property the routes have
+/// to keep rather than one this layer can assume — a proxy-forwarded TLS
+/// client certificate *is* ambient, which is why `transport_identity`
+/// refuses to authenticate by certificate on a request that carries
+/// `Origin`. `ETag` is exposed because `GET /identity/card/<fp>` is worth
+/// revalidating rather than refetching, and a cross-origin page cannot
+/// read the header to do it otherwise.
+fn cors(mut resp: Resp) -> Resp {
+    let h = resp.headers_mut();
+    h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(
+        ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("ETag"),
+    );
+    resp
+}
+
+fn preflight() -> Resp {
+    let resp = Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        // `DELETE` is `DELETE /identity/enroll/sessions/<secret>`, which
+        // is how a browser holder closes a session it is done with. Left
+        // out of the list, the preflight failed and the browser could
+        // not call it — so its sessions sat out their full ten minutes
+        // against `enroll_per_address`, which is the self-inflicted
+        // problem `close_session` was added to fix.
+        .header(
+            ACCESS_CONTROL_ALLOW_METHODS,
+            "GET, POST, PUT, DELETE, OPTIONS",
+        )
+        // `PUT /identity/card` sends `application/cbor`, which is not a
+        // safelisted content type, so these are the headers that make the
+        // preflight it triggers succeed.
+        .header(
+            ACCESS_CONTROL_ALLOW_HEADERS,
+            "content-type, authorization, if-none-match",
+        )
+        .header(ACCESS_CONTROL_MAX_AGE, "86400")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    cors(resp)
 }
 
 enum Proto {
@@ -291,7 +380,36 @@ async fn transport_identity(
             ))),
         };
     }
+    // A client certificate stands in for a token (§6.1) — but only for a
+    // caller that chose to present it. A browser does not: the TLS layer
+    // attaches the certificate to whatever the page fetches, so on a
+    // deployment behind an mTLS proxy a *hostile* page could call
+    // `/identity/link`, `/identity/unlink` or `PUT /identity/card`
+    // cross-origin, ride the certificate it never saw, and read the
+    // answer back through these routes' `Access-Control-Allow-Origin: *`.
+    // A WebSocket upgrade is not subject to CORS at all and would ride it
+    // just as well.
+    //
+    // `Origin` is the tell. Browsers set it on every request that could
+    // be that attack and native clients — hlid, the desktop client, a
+    // relay — set it on none, so requiring a token when it is present
+    // costs the mTLS binding nothing and closes the ambient path. A page
+    // that is entitled to be here can still get in, by redeeming a
+    // transport token like everyone else.
+    //
+    // Refused rather than ignored: a caller that presented a certificate
+    // believes it authenticated, and treating it as an anonymous guest
+    // would be exactly the silent downgrade the token path above refuses.
+    // A browser that presents *no* certificate is untouched and still
+    // arrives here as an ordinary unauthenticated request.
     if let Some(device) = client_cert_device(req, peer.ip(), ctx)? {
+        if req.headers().contains_key(ORIGIN) {
+            return Err(Box::new(plain(
+                StatusCode::UNAUTHORIZED,
+                "a transport token is required: a client certificate is not \
+                 accepted in place of one on a request that carries Origin",
+            )));
+        }
         let state = state.clone();
         let found = tokio::task::spawn_blocking(move || state.identity_for_device(&device))
             .await
@@ -630,7 +748,20 @@ fn discovery(ctx: &NgCtx) -> Resp {
             if !ctx.cfg.trusted_proxies.is_empty() {
                 bindings.push("mtls");
             }
-            json!({
+            let mut endpoints = json!({
+                "challenge": "/identity/challenge",
+                "auth": "/identity/auth",
+                "card": "/identity/card",
+                "link": "/identity/link",
+                "unlink": "/identity/unlink",
+            });
+            // Absent means no mailbox here, and an enrollee that reads
+            // discovery therefore knows to fall back to the paste
+            // (`identity-enrollment.md` §3).
+            if ctx.enroll.is_some() {
+                endpoints["enroll"] = json!("/identity/enroll");
+            }
+            let mut identity = json!({
                 "enabled": true,
                 "bindings": bindings,
                 "new_accounts": match cfg.new_accounts {
@@ -641,14 +772,16 @@ fn discovery(ctx: &NgCtx) -> Resp {
                 "min_attestation_age": cfg.min_attestation_age,
                 "trusted_registrars": cfg.registrar_keys.keys().collect::<Vec<_>>(),
                 "association": "server",
-                "endpoints": {
-                    "challenge": "/identity/challenge",
-                    "auth": "/identity/auth",
-                    "card": "/identity/card",
-                    "link": "/identity/link",
-                    "unlink": "/identity/unlink",
-                },
-            })
+                "endpoints": endpoints,
+            });
+            // Omitted rather than null when no web client is configured.
+            // Absence is what "there is nowhere to point a QR code"
+            // means on this wire, and emitting a null would make every
+            // reader test for two things instead of one.
+            if let Some(web) = ctx.cfg.web_client.as_deref() {
+                identity["web"] = json!(web);
+            }
+            identity
         }
         None => json!({ "enabled": false }),
     };
@@ -665,6 +798,245 @@ fn discovery(ctx: &NgCtx) -> Resp {
         "registrar": Value::Null,
     });
     json_resp(StatusCode::OK, doc)
+}
+
+// --- The enrollment mailbox (`docs/identity-enrollment.md` §5) ---------
+//
+// Seven routes under `/identity/enroll`. Three of them carry a secret in
+// the path and two carry a secret and a literal, so they are matched by
+// splitting the path rather than by prefix: `/sessions/<s>` and
+// `/sessions/<s>/answers` differ only in what follows the secret, and a
+// `starts_with` that got that wrong would route an answer to a poll.
+
+async fn enroll_route(req: Request<Incoming>, client: SocketAddr, ctx: &NgCtx) -> Resp {
+    let Some(mb) = ctx.enroll.as_ref() else {
+        return cors(plain(StatusCode::NOT_FOUND, "no enrollment mailbox here"));
+    };
+    let path = req.uri().path().to_owned();
+    // `strip_prefix`, not `trim_start_matches`, which strips the prefix as
+    // many times as it appears: `/identity/enroll/identity/enroll/sessions`
+    // would have opened a session. Both 404 today, since the router only
+    // sends a path that starts with the prefix here, but only one of them
+    // says what it means.
+    let rest: Vec<&str> = path
+        .strip_prefix("/identity/enroll")
+        .unwrap_or_default()
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let method = req.method().clone();
+    let resp = match (&method, rest.as_slice()) {
+        (&Method::POST, ["sessions"]) => enroll_open(req, client, ctx, mb).await,
+        (&Method::POST, ["requests"]) => enroll_post(req, client, ctx, mb).await,
+        (&Method::GET, ["sessions", secret]) => enroll_poll(secret, req.uri().query(), mb).await,
+        (&Method::DELETE, ["sessions", secret]) => match mb.close_session(secret) {
+            Ok(()) => plain(StatusCode::NO_CONTENT, ""),
+            Err(e) => enroll_refused(e),
+        },
+        (&Method::POST, ["sessions", secret, "answers"]) => {
+            enroll_answer(req, secret, ctx, mb).await
+        }
+        (&Method::POST, ["sessions", secret, "identity"]) => {
+            enroll_claim(req, secret, ctx, mb).await
+        }
+        (&Method::GET, ["requests", secret]) => enroll_fetch(secret, mb).await,
+        _ => plain(StatusCode::NOT_FOUND, "not found"),
+    };
+    cors(resp)
+}
+
+/// `?wait=N` seconds, clamped to the long-poll deadline. Absent is the
+/// full deadline, which is what an ordinary holder wants.
+///
+/// `wait=0` exists for one job: a holder rotating to a new session has
+/// to sweep the old one for anything that arrived while the rotation was
+/// in flight, and blocking thirty seconds to find nothing would stall
+/// the session it just opened. Nothing here is weakened by asking for a
+/// shorter wait — it is the same answer, sooner.
+fn poll_wait(query: Option<&str>) -> Duration {
+    let secs = query
+        .and_then(|q| {
+            q.split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == "wait")
+                .and_then(|(_, v)| v.parse::<u64>().ok())
+        })
+        .map(Duration::from_secs);
+    match secs {
+        Some(d) if d <= crate::enroll::LONG_POLL => d,
+        _ => crate::enroll::LONG_POLL,
+    }
+}
+
+fn enroll_refused(e: crate::enroll::Refused) -> Resp {
+    json_resp(
+        StatusCode::from_u16(e.status()).unwrap(),
+        json!({ "error": e.code(), "text": e.text() }),
+    )
+}
+
+/// §5.1. The body is optional and, now that standing by for an identity
+/// is its own authenticated call, empty. It is still read rather than
+/// ignored, so that a holder built against the older shape — which put
+/// an unauthenticated `identity` fingerprint here — is told its claim
+/// went nowhere instead of silently never receiving a renewal.
+async fn enroll_open(
+    req: Request<Incoming>,
+    client: SocketAddr,
+    ctx: &NgCtx,
+    mb: &crate::enroll::Mailbox,
+) -> Resp {
+    // An empty body is legal here, unlike everywhere else on this
+    // listener. That is not the same as a *malformed* one: reading any
+    // parse failure as "no fields" would accept `{{{` — and a body-read
+    // timeout — as a valid request to open a session.
+    let Some(bytes) = read_body(req, ctx.cfg.login_timeout).await else {
+        return plain(StatusCode::BAD_REQUEST, "could not read the request body");
+    };
+    let body: Value = if bytes.iter().all(u8::is_ascii_whitespace) {
+        Value::Null
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return plain(StatusCode::BAD_REQUEST, "expected a JSON body, or none"),
+        }
+    };
+    if !body["identity"].is_null() {
+        return plain(
+            StatusCode::BAD_REQUEST,
+            "identity: opening a session no longer claims one; POST a signed \
+             claim to /sessions/<secret>/identity instead (§5.1)",
+        );
+    }
+    match mb.open_session(client.ip()) {
+        Ok(o) => json_resp(
+            StatusCode::OK,
+            json!({ "session": o.session, "code": o.code, "expires_in": o.expires_in }),
+        ),
+        Err(e) => enroll_refused(e),
+    }
+}
+
+/// §5.1. Stand by for an identity's renewals, with a signed claim over
+/// this session's key.
+async fn enroll_claim(
+    req: Request<Incoming>,
+    secret: &str,
+    ctx: &NgCtx,
+    mb: &crate::enroll::Mailbox,
+) -> Resp {
+    let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
+        return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
+    };
+    let Some(claim) = body["claim"].as_str().and_then(unb64) else {
+        return enroll_refused(crate::enroll::Refused::BadClaim);
+    };
+    match mb.claim_identity(secret, &claim) {
+        Ok(()) => plain(StatusCode::NO_CONTENT, ""),
+        Err(e) => enroll_refused(e),
+    }
+}
+
+/// §5.2. The mailbox decodes the request only far enough to enforce the
+/// size limit and, with no code, to read `prev` for routing.
+async fn enroll_post(
+    req: Request<Incoming>,
+    client: SocketAddr,
+    ctx: &NgCtx,
+    mb: &crate::enroll::Mailbox,
+) -> Resp {
+    let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
+        return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
+    };
+    let Some(request) = body["request"].as_str().and_then(unb64) else {
+        return enroll_refused(crate::enroll::Refused::BadRequest);
+    };
+    let code = body["code"].as_str();
+    match mb.post_request(client.ip(), code, &request) {
+        Ok(p) => json_resp(
+            StatusCode::CREATED,
+            json!({ "request": p.request, "expires_in": p.expires_in }),
+        ),
+        Err(e) => enroll_refused(e),
+    }
+}
+
+/// §5.3, long-polled.
+async fn enroll_poll(secret: &str, query: Option<&str>, mb: &crate::enroll::Mailbox) -> Resp {
+    match mb.poll_session(secret, poll_wait(query)).await {
+        Ok(p) => json_resp(
+            StatusCode::OK,
+            json!({
+                "pending": p.pending.iter().map(|r| json!({
+                    "id": r.id,
+                    "request": b64(&r.request),
+                    "received": r.received,
+                })).collect::<Vec<_>>(),
+                "expires_in": p.expires_in,
+                // False once the code has admitted its one request, so
+                // a standing holder knows to open a new session rather
+                // than keep showing a code that no longer works.
+                "code_live": p.code_live,
+            }),
+        ),
+        Err(e) => enroll_refused(e),
+    }
+}
+
+/// §5.4. Only the session secret reaches this, which is the asymmetry
+/// the whole flow rests on: the code is typed on another machine, the
+/// session secret never leaves the holder.
+async fn enroll_answer(
+    req: Request<Incoming>,
+    secret: &str,
+    ctx: &NgCtx,
+    mb: &crate::enroll::Mailbox,
+) -> Resp {
+    let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
+        return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
+    };
+    let Some(id) = body["id"].as_str() else {
+        return plain(StatusCode::BAD_REQUEST, "id is required");
+    };
+    let answered = match (body["bundle"].as_str(), body["denied"].as_str()) {
+        (Some(_), Some(_)) => {
+            return plain(
+                StatusCode::BAD_REQUEST,
+                "bundle and denied are alternatives",
+            )
+        }
+        (Some(b), None) => match unb64(b) {
+            Some(bytes) if bytes.len() <= MAX_BUNDLE_BYTES => {
+                crate::enroll::Answered::Bundle(bytes)
+            }
+            Some(_) => return plain(StatusCode::BAD_REQUEST, "bundle too large"),
+            None => return plain(StatusCode::BAD_REQUEST, "bundle: not base64url"),
+        },
+        (None, Some(r)) => {
+            // A free string for the enrollee's UI (§12), bounded because
+            // it is echoed back to somebody else.
+            crate::enroll::Answered::Denied(r.chars().take(64).collect())
+        }
+        (None, None) => return plain(StatusCode::BAD_REQUEST, "bundle or denied is required"),
+    };
+    match mb.answer(secret, id, answered) {
+        Ok(()) => json_resp(StatusCode::OK, json!({ "ok": true })),
+        Err(e) => enroll_refused(e),
+    }
+}
+
+/// §5.5, long-polled. The four answers are distinct statuses because the
+/// enrollee does something different with each.
+async fn enroll_fetch(secret: &str, mb: &crate::enroll::Mailbox) -> Resp {
+    use crate::enroll::Fetched;
+    match mb.fetch_answer(secret, crate::enroll::LONG_POLL).await {
+        Fetched::Bundle(b) => json_resp(StatusCode::OK, json!({ "bundle": b64(&b) })),
+        Fetched::Denied(r) => json_resp(StatusCode::FORBIDDEN, json!({ "denied": r })),
+        Fetched::Pending { expires_in } => {
+            json_resp(StatusCode::ACCEPTED, json!({ "expires_in": expires_in }))
+        }
+        Fetched::Gone => plain(StatusCode::GONE, "expired, or already fetched"),
+    }
 }
 
 fn challenge(ctx: &NgCtx) -> Resp {
@@ -695,6 +1067,8 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
         Ok(d) => d,
         Err(resp) => return *resp,
     };
+    // Read before `req` is consumed by the body.
+    let req_origin = req.headers().get(hyper::header::ORIGIN).cloned();
     let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
         return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
     };
@@ -734,10 +1108,29 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     // first and then refuse the link as `already_linked`.
     let create = body.get("create").and_then(Value::as_bool).unwrap_or(true);
     let proof = field("proof");
-    if proof.is_none() && device_from_cert.is_none() {
+    // A client certificate stands in for `proof` (§5.3) — but only for a
+    // caller that chose to present it. A browser does not: the TLS layer
+    // attaches the certificate to whatever the page fetches, so on a
+    // deployment behind an mTLS proxy a *hostile* page could POST here
+    // cross-origin, ride the certificate it never saw, and read the
+    // answer back through this route's `Access-Control-Allow-Origin: *`.
+    //
+    // `Origin` is the tell. Browsers set it on every request that could
+    // be that attack and native clients — hlid, the desktop client, a
+    // relay — set it on none, so requiring `proof` when it is present
+    // costs the mTLS binding nothing and closes the ambient path. It is
+    // deliberately not an allow-list: an origin that is entitled to log
+    // in can still do it, by signing a proof like everyone else.
+    let from_browser = req_origin.is_some();
+    if proof.is_none() && (device_from_cert.is_none() || from_browser) {
         return plain(
             StatusCode::BAD_REQUEST,
-            "proof is required without a client certificate",
+            if from_browser {
+                "proof is required: a client certificate is not accepted \
+                 in place of one on a request that carries Origin"
+            } else {
+                "proof is required without a client certificate"
+            },
         );
     }
     // The state does signature checks and, with credentials or a

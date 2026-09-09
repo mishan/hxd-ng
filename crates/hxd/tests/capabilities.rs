@@ -57,10 +57,12 @@ async fn start_server(dir: &Path, supported: Caps, ng_caps: &[&str]) -> (SocketA
             caps: ng_caps.iter().map(|s| s.to_string()).collect(),
             trusted_proxies: Default::default(),
             forwarded_header: Default::default(),
+            ..Default::default()
         }),
         registry: Arc::new(Registry::new()),
         identity: None,
         tunnel: None,
+        enroll: None,
     };
 
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
