@@ -6,7 +6,8 @@ writes a bundle for the paste path; the §5 mailbox, served under
 `/identity/enroll` and advertised in discovery; CORS on the identity
 endpoints, so a browser elsewhere can reach it; `hlid enroll` (§7), with
 the QR code and pairing proof of §5.6; and `hlid agent`, which holds a
-standing session and takes renewals with no code. Not done: every part
+standing session — claimed with a signed §5.1 claim — and takes renewals
+with no code. Not done: every part
 of hx-ng's side. Companion to
 `hotline-ng-identity.md` (the objects and the profile),
 `hotline-ng-auth.md` (the transport), hx-ng's `identity-keys.md` (the
@@ -125,11 +126,7 @@ CSPRNG, stored hashed, never logged.
 
 ### 5.1 The holder opens a session
 
-`POST <enroll>/sessions`, body optional:
-
-```jsonc
-{ "identity": "…fingerprint…" }      // optional: accept renewals for this identity without a code (§8)
-```
+`POST <enroll>/sessions`, with an empty body:
 
 Response:
 
@@ -159,10 +156,58 @@ This identity: alice  3f2a8c1d…
 ```
 
 Unauthenticated, rate-limited per source address, and the number of open
-sessions is bounded (§11). The holder is not asked to prove it holds an
-identity key: the mailbox has nothing to protect with that proof, since
-a session opened by someone with no key can answer nothing an enrollee
-would accept (§9).
+sessions is bounded (§11). Opening a session asks for no proof of key
+possession: the mailbox has nothing to protect with one, since a session
+opened by someone with no key can answer nothing an enrollee would
+accept (§9).
+
+**Standing by for an identity**, which is what lets §8's renewals arrive
+with no code, is the exception, and it is a second call:
+
+`POST <enroll>/sessions/<session>/identity`
+
+```jsonc
+{ "claim": "…base64url CBOR…" }      // a session claim, signed by the identity key
+```
+
+Answers 204, or `bad_claim` (400) if the claim does not verify or is for
+another session. The claim is a signed object like every other, under
+`hl-identity/enroll-session/v1`:
+
+```jsonc
+{
+  "v":        1,
+  "identity": "…32 bytes…",          // the identity public key; the key that signs this
+  "session":  "…32 bytes…",          // SHA-256 of the session secret above
+  "sig":      "…64 bytes…"
+}
+```
+
+This one *is* worth a proof, and the reasoning that excused the open
+does not reach it. The mailbox keeps an index from identity fingerprint
+to session, and a fingerprint is public — it is printed on the holder's
+own screen. Without a claim, anyone could name anyone's fingerprint and
+have that identity's renewals delivered to them and to nobody else. They
+still could not certify anything; they could switch renewal off for an
+identity they do not hold, which is the one thing the mailbox is trusted
+with (§9).
+
+It signs the *session* rather than a timestamp. A session key is the
+SHA-256 of a secret only the mailbox and the holder that opened it ever
+see, so a captured claim is worth nothing against any other session:
+there is no window to replay inside and no clock for the two ends to
+disagree about. Last writer wins, safely, now that only the key holder
+can be the writer — a holder that restarts its agent takes its own
+renewals back rather than being shut out by the session it abandoned.
+
+**Giving a session back.** `DELETE <enroll>/sessions/<session>` answers
+204 and drops it, along with its code and its standing identity. Only
+the session secret can do this. It exists because a holder that rotates
+— `hlid agent` opens a replacement the moment its code is spent —
+otherwise leaves each abandoned session in the table for the full ten
+minutes, where it goes on counting against `enroll_per_address`. Four
+rotations inside the TTL and the holder is rate-limited out of its own
+mailbox.
 
 ### 5.2 The enrollee posts a request
 
@@ -192,6 +237,7 @@ Errors, `{ "error": code, "text": "…" }`:
 | code | status | |
 |---|---|---|
 | `unknown_code` | 404 | no open session has it, or it was used |
+| `bad_claim` | 400 | §5.1's claim does not verify, or is for another session |
 | `no_holder` | 404 | `prev`-routed and no standing session for that identity |
 | `request_too_large`, `bad_request` | 400 | |
 | `rate_limited` | 429 | |
@@ -403,7 +449,7 @@ into.
 hlid enroll --server URL [--caps web|LIST] [--days N] [--identity K]
     open one session, show the code, wait for one request, prompt, answer, exit
 hlid agent --server URL [--caps …] [--days …] [--renew ask|auto|deny]
-    keep a standing session open (§5.1 with `identity`), handle any number
+    keep a standing session open (§5.1's claim), handle any number
     of requests and renewals until stopped
 ```
 
@@ -429,9 +475,11 @@ protocol changing, and `agent` is written as a library call with a
 A certificate near expiry is renewed by the same flow with `prev` set.
 Two things change.
 
-**No code is needed.** A holder running `agent` opened its session with
-`identity`, so the mailbox routes a request whose `prev.identity` matches
-straight to it (§5.2). The browser can do this on its own from
+**No code is needed.** A holder running `agent` has claimed its identity
+on its session (§5.1), so the mailbox routes a request whose
+`prev.identity` matches straight to it (§5.2). The claim is what makes
+that routing trustworthy: without it, the fingerprint alone would let
+anyone divert an identity's renewals. The browser can do this on its own from
 one-third remaining (`hotline-ng-identity.md` §3.3) without the user
 typing anything: post, wait, store. If no standing session exists it
 gets `no_holder` and falls back to asking the user for a code, and
@@ -441,7 +489,13 @@ failing that to the paste.
 `prev`: signed by this identity, `prev.device` equal to the request's
 `device`, and the requested `caps` a subset of `prev.caps` with `days` no
 longer than `prev`'s lifetime — "the same device asking for the same or
-less". Then:
+less". It also checks two clocks, both of which matter only because
+`--renew auto` grants without a human: the request's `time` must be
+within the holder's skew tolerance (§4), or it is a replay; and `prev`
+must not have expired already. A lapsed certificate has spent the bound
+the lifetime exists to impose, so renewing it silently would hand that
+bound back — an expired device enrolls afresh, with a code and a person.
+Then:
 
 ```
 Renew  "Firefox on the laptop"  9c41e7b2  (expires in 27 days)?  [Y/n]
@@ -477,6 +531,7 @@ who is not the mailbox.
 | Substitute the **request** — feed the holder its own device key under the user's code | The holder shows the device fingerprint; the enrollee shows its own; they do not match. This is why §6 puts the fingerprint on both screens and why the prompt defaults to no |
 | Substitute the **answer** — hand the enrollee a bundle for a different identity | The enrollee shows who it has become, and pins the fingerprint after the first enrollment (§5.5). Also a bundle for a different identity does not help the mailbox log in as anyone: the browser would authenticate as *the mailbox's* identity, which the mailbox could do already |
 | Open sessions and post requests itself | It can prompt the holder with its own device key, which is the substituted-request case, and it can fill its own tables |
+| Claim an identity it does not hold, and collect that identity's renewals | Nothing it could do with them — it cannot certify — but it *is* an availability attack, which is the one thing this table cannot wave away. So the claim of §5.1 is signed, and a third party against an honest mailbox cannot do it at all |
 | Any of the above against a **scanned** enrollment | Nothing: the pinned identity rejects a substituted answer, the pairing secret it never saw rejects a substituted request (§5.6) |
 | Advertise a `web` of its own choosing, so the phone hands *it* the pairing secret | The holder draws a QR only for a `web` on the origin the user typed, or one the user named with `--web`, and shows that origin beside the code. A mailbox whose own web client you chose to use is not a hostile mailbox this defends you against — it is a server you trusted with the browser as well; type the code into a client you picked instead |
 
@@ -520,9 +575,9 @@ enrollee and a holder on different servers should see the same clock.
 ## 11. Implementation notes
 
 - **State is one table of sessions**, keyed by the SHA-256 of the
-  session secret, each holding its code (until used), its optional
-  identity fingerprint, and up to a handful of pending requests keyed by
-  the SHA-256 of their secrets. A second index maps live codes and
+  session secret, each holding its code (until used), the identity
+  fingerprint it has claimed (§5.1) if any, and up to a handful of
+  pending requests keyed by the SHA-256 of their secrets. A second index maps live codes and
   standing identities to sessions. Everything has a deadline and a sweep
   removes what is past it. No persistence: a mailbox restart loses
   sessions, and the holder re-opens.

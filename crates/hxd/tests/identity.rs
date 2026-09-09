@@ -1297,6 +1297,81 @@ async fn mtls_header_is_ignored_from_an_untrusted_peer() {
 }
 
 #[tokio::test]
+async fn a_client_certificate_is_not_a_credential_a_page_may_ride() {
+    // The identity routes answer `Access-Control-Allow-Origin: *`,
+    // which is safe exactly as long as nothing on them is *ambient*. A
+    // proxy-forwarded TLS client certificate is: the browser attaches it
+    // to whatever a page fetches, including a hostile page's
+    // cross-origin POST, which could then read the token back out of the
+    // wildcard-CORS response. So on a request that carries `Origin`, the
+    // certificate no longer stands in for `proof`.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig::default();
+    let (_legacy, ng, _ctx) = start_server_with_proxies(dir.path(), cfg, &["127.0.0.1"]).await;
+
+    let p = person(23, "Certified");
+    authenticate(ng, &p).await;
+    let hdr = cert_header(&p.dev.public(), None);
+    let body = json!({ "card": b64(&p.card), "device_cert": b64(&p.cert) }).to_string();
+
+    let from_page = http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hotline-Client-Cert", &hdr),
+            ("Origin", "https://evil.example"),
+        ],
+        body.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        from_page.status,
+        400,
+        "a page rode the client certificate: {}",
+        String::from_utf8_lossy(&from_page.body)
+    );
+
+    // A same-origin page gets the same answer, and for the same reason:
+    // a browser never *chose* to present the certificate, so there is no
+    // origin for which riding it is intended. Signing a proof still
+    // works, from any origin.
+    let same_origin = http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hotline-Client-Cert", &hdr),
+            ("Origin", &format!("http://{ng}")),
+        ],
+        body.as_bytes(),
+    )
+    .await;
+    assert_eq!(same_origin.status, 400);
+
+    // And a native client — no `Origin` — keeps the mTLS binding.
+    let native = http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hotline-Client-Cert", &hdr),
+        ],
+        body.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        native.status,
+        200,
+        "the mTLS binding broke for the callers it is for: {}",
+        String::from_utf8_lossy(&native.body)
+    );
+}
+
+#[tokio::test]
 async fn mtls_takes_the_key_from_the_spki_not_from_the_subject() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = IdentityConfig::default();
@@ -2842,6 +2917,33 @@ async fn open_session(ng: SocketAddr, body: Value) -> HttpReply {
     .await
 }
 
+/// Open a session and claim `id` for it, which is what `hlid agent`
+/// does: the fingerprint alone buys nothing now, so a test that wants
+/// codeless renewal routing has to prove the key like the holder does.
+async fn open_standing(ng: SocketAddr, id: &hl_identity::IdentityKey) -> String {
+    let session = open_session(ng, json!({})).await.json()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let claim =
+        hl_identity::SessionClaim::new(id.public(), hl_identity::enroll::session_key(&session))
+            .sign(id);
+    let r = claim_identity(ng, &session, json!({ "claim": b64(&claim) })).await;
+    assert_eq!(r.status, 204, "{}", String::from_utf8_lossy(&r.body));
+    session
+}
+
+async fn claim_identity(ng: SocketAddr, session: &str, body: Value) -> HttpReply {
+    http(
+        ng,
+        "POST",
+        &format!("/identity/enroll/sessions/{session}/identity"),
+        &[("Content-Type", "application/json")],
+        body.to_string().as_bytes(),
+    )
+    .await
+}
+
 async fn post_request(ng: SocketAddr, body: Value) -> HttpReply {
     http(
         ng,
@@ -3036,10 +3138,7 @@ async fn a_renewal_finds_a_standing_session_with_no_code() {
 
     // With one — `hlid agent` — the request arrives without the user
     // typing anything.
-    let o = open_session(ng, json!({ "identity": id.fingerprint().to_string() }))
-        .await
-        .json();
-    let session = o["session"].as_str().unwrap().to_owned();
+    let session = open_standing(ng, &id).await;
     let posted = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
     assert_eq!(
         posted.status,
@@ -3057,6 +3156,95 @@ async fn a_renewal_finds_a_standing_session_with_no_code() {
     )
     .await;
     assert_eq!(polled.json()["pending"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_fingerprint_alone_no_longer_stands_by_for_an_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let id = hl_identity::IdentityKey::from_seed(&[1u8; 32]);
+
+    // The shape the mailbox used to accept. It is refused rather than
+    // ignored, so a holder built against it learns its claim went
+    // nowhere instead of waiting forever for a renewal that routes
+    // somewhere else.
+    let r = open_session(ng, json!({ "identity": id.fingerprint().to_string() })).await;
+    assert_eq!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+
+    // An unclaimed session collects no renewals, however many sessions
+    // are open.
+    let session = open_session(ng, json!({})).await.json()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let orphan = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
+    assert_eq!(orphan.status, 404);
+    assert_eq!(orphan.json()["error"], "no_holder");
+
+    // A claim for a different session does not count as one for this.
+    let elsewhere = hl_identity::SessionClaim::new(
+        id.public(),
+        hl_identity::enroll::session_key("some-other-session"),
+    )
+    .sign(&id);
+    let r = claim_identity(ng, &session, json!({ "claim": b64(&elsewhere) })).await;
+    assert_eq!(r.status, 400);
+    assert_eq!(r.json()["error"], "bad_claim");
+
+    // The real thing does.
+    let claimed = open_standing(ng, &id).await;
+    let posted = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{claimed}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(polled.json()["pending"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_holder_can_hand_a_session_back_before_it_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let id = hl_identity::IdentityKey::from_seed(&[1u8; 32]);
+    let session = open_standing(ng, &id).await;
+
+    let closed = http(
+        ng,
+        "DELETE",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        closed.status,
+        204,
+        "{}",
+        String::from_utf8_lossy(&closed.body)
+    );
+
+    // Gone: it polls as unknown and stands by for nothing.
+    let polled = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/sessions/{session}"),
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(polled.status, 404);
+    let orphan = post_request(ng, json!({ "request": b64(&enroll_renewal(2, &id)) })).await;
+    assert_eq!(orphan.json()["error"], "no_holder");
 }
 
 #[tokio::test]
@@ -3535,9 +3723,17 @@ fn start_agent(ng: SocketAddr, home: &Path, hlid: &Path, extra: &[&str]) -> Agen
         .unwrap();
     {
         use std::io::Write;
-        // Enough approvals for every prompt this test will produce; they
-        // wait in the pipe until each one is asked.
-        child.stdin.take().unwrap().write_all(b"y\ny\ny\n").unwrap();
+        // Enough approvals for every prompt any of these tests will
+        // produce; they wait in the pipe until each one is asked. Past
+        // the end the pipe is at EOF, which `confirm` reads as "nobody
+        // is there" and answers no — so an over-supply is safe and an
+        // under-supply would look like a refusal.
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"y\n".repeat(16).as_slice())
+            .unwrap();
     }
 
     let (tx, codes) = std::sync::mpsc::channel::<String>();
@@ -3565,6 +3761,18 @@ fn start_agent(ng: SocketAddr, home: &Path, hlid: &Path, extra: &[&str]) -> Agen
         reader,
         codes,
     }
+}
+
+/// The identity `hlid init` wrote into a home, so a test can build
+/// something addressed to the agent holding it.
+fn identity_of(home: &Path) -> hl_identity::IdentityKey {
+    let hex = std::fs::read_to_string(home.join("identity.key")).unwrap();
+    let seed: [u8; 32] = (0..32)
+        .map(|i| u8::from_str_radix(&hex.trim()[i * 2..i * 2 + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    hl_identity::IdentityKey::from_seed(&seed)
 }
 
 /// Post a request and collect the answer, which is what a browser does.
@@ -3651,6 +3859,122 @@ async fn hlid_agent_hands_out_a_fresh_code_and_renews_without_one() {
     assert!(
         output.contains("--renew auto"),
         "the renewal should say it was not asked about:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn a_request_the_agent_cannot_parse_is_refused_rather_than_left_pending() {
+    // The wedge: a request that the mailbox routes but `EnrollRequest`
+    // rejects. Answering it is what takes it out of `pending`, and a
+    // request left pending is what the next long poll returns
+    // *immediately* — so an agent that returned without answering span
+    // at full tilt for the request's whole five minutes, refreshable by
+    // anyone who could post.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let id = identity_of(&home);
+
+    let mut agent = start_agent(ng, &home, &hlid, &["--renew", "auto"]);
+    let code = agent.next_code().await;
+
+    // Shaped just enough to route by identity — `prev` is a CBOR map
+    // with an `identity` — and not a signed request at all.
+    let junk = {
+        use hl_identity::cbor::{encode, Value};
+        let prev = encode(&Value::Map(vec![(
+            Value::Text("identity".into()),
+            Value::Bytes(id.public().to_vec()),
+        )]));
+        encode(&Value::Map(vec![
+            (Value::Text("prev".into()), Value::Bytes(prev)),
+            (Value::Text("sig".into()), Value::Bytes(vec![0u8; 64])),
+            (Value::Text("v".into()), Value::Uint(1)),
+        ]))
+    };
+    let refused = enroll_through(ng, None, &junk).await;
+    assert_eq!(
+        refused.status,
+        403,
+        "the agent should have answered, not ignored: {}",
+        String::from_utf8_lossy(&refused.body)
+    );
+    assert_eq!(refused.json()["denied"], "bad_request");
+
+    // Still standing, and still able to do its job.
+    let browser = DeviceKey::from_seed(&[0x5b; 32]);
+    let mut req = hl_identity::EnrollRequest::new(&browser, now());
+    req.name = Some("Firefox".into());
+    let answer = enroll_through(ng, Some(&code), &req.sign(&browser)).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "one bad request took the agent down: {}",
+        String::from_utf8_lossy(&answer.body)
+    );
+
+    let _ = agent.child.kill();
+    let output = agent.reader.join().unwrap();
+    let _ = agent.child.wait();
+    assert!(
+        output.contains("not a request"),
+        "the refusal should be reported:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_rotates_past_its_own_per_address_limit() {
+    // `enroll_per_address` is 4 and a session lives ten minutes, so an
+    // agent that abandons a session on every spent code used to spend
+    // its whole allowance on sessions it had finished with, and exit
+    // with a 429 on the fourth enrollment. Handing each one back is what
+    // makes rotation unbounded.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let mut agent = start_agent(ng, &home, &hlid, &["--renew", "auto"]);
+    let mut code = agent.next_code().await;
+    // One more than `enroll_per_address`, which is where it used to
+    // stop.
+    for n in 0..6u8 {
+        let browser = DeviceKey::from_seed(&[0x60 + n; 32]);
+        let mut req = hl_identity::EnrollRequest::new(&browser, now());
+        req.name = Some(format!("Browser {n}"));
+        let answer = enroll_through(ng, Some(&code), &req.sign(&browser)).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "enrollment {n} failed; the agent ran out of its own allowance: {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        let next = agent.next_code().await;
+        assert_ne!(next, code, "the agent reused a spent code");
+        code = next;
+    }
+
+    let _ = agent.child.kill();
+    let output = agent.reader.join().unwrap();
+    let _ = agent.child.wait();
+    assert!(
+        !output.contains("rate_limited") && !output.contains("429"),
+        "the agent rate-limited itself out of its own mailbox:\n{output}"
     );
 }
 

@@ -22,12 +22,12 @@
 //! to grant less.
 
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::cbor::{map, Value};
 use crate::cert;
 use crate::error::Error;
-use crate::keys::{DeviceKey, PublicKey};
+use crate::keys::{DeviceKey, IdentityKey, PublicKey};
 use crate::signed::{self, Envelope, VERSION};
 
 pub const DOMAIN: &str = "hl-identity/enroll-request/v1";
@@ -230,10 +230,116 @@ impl EnrollRequest {
     }
 }
 
+/// The domain of a [`SessionClaim`]. Distinct from [`DOMAIN`], so a
+/// signature made over one object can never be read as the other.
+pub const CLAIM_DOMAIN: &str = "hl-identity/enroll-session/v1";
+
+/// A holder proving, to a mailbox, that it holds the identity key whose
+/// renewals it is asking to be sent (§5.1).
+///
+/// §5.1 originally asked for no proof here, and the reasoning was sound
+/// for what the mailbox held at the time: a session opened by someone
+/// with no identity key can answer nothing an enrollee would accept, so
+/// there was nothing a proof would protect. §8's codeless renewal
+/// changed that. The mailbox now keeps an index from identity
+/// fingerprint to session, and a fingerprint is public — so without this
+/// object, anyone could claim anyone's fingerprint and have every
+/// renewal for that identity delivered to them instead of to its holder.
+/// They still cannot certify anything. They can make renewals silently
+/// stop working, which is the one thing the mailbox *is* trusted with
+/// (§9).
+///
+/// The claim signs the session it is for, not a timestamp. A session key
+/// is the SHA-256 of a secret that only the mailbox and the holder that
+/// opened it ever see, so a captured claim is worth nothing against any
+/// other session: there is no window to replay inside, and no clock for
+/// the two ends to disagree about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionClaim {
+    /// The identity public key being claimed. The key that signs this,
+    /// and the key whose fingerprint the mailbox will index by.
+    pub identity: PublicKey,
+    /// SHA-256 of the session secret — the mailbox's own key for the
+    /// session, which the holder computes from the secret it was given.
+    pub session: [u8; 32],
+}
+
+impl SessionClaim {
+    pub fn new(identity: PublicKey, session: [u8; 32]) -> SessionClaim {
+        SessionClaim { identity, session }
+    }
+
+    fn unsigned(&self) -> Value {
+        map(vec![
+            ("v", Some(Value::Uint(VERSION))),
+            ("identity", Some(Value::Bytes(self.identity.to_vec()))),
+            ("session", Some(Value::Bytes(self.session.to_vec()))),
+        ])
+    }
+
+    /// Sign with the identity key, which must be the one named in
+    /// `identity`.
+    ///
+    /// `assert!` for the reason [`EnrollRequest::sign`] uses one: a
+    /// release build that skipped it would produce a claim that cannot
+    /// verify, and the mailbox would refuse it a long way from here.
+    pub fn sign(&self, identity: &IdentityKey) -> Vec<u8> {
+        assert_eq!(
+            identity.public(),
+            self.identity,
+            "signing a session claim with a key that is not the one it names"
+        );
+        signed::seal(self.unsigned(), |body| identity.sign(CLAIM_DOMAIN, body))
+    }
+
+    /// Decode and verify against the `identity` key the claim names, and
+    /// check that it is for `session`.
+    ///
+    /// The session is a parameter rather than something the caller
+    /// compares afterwards, because forgetting that comparison is the
+    /// whole vulnerability: a claim that verifies but names a different
+    /// session proves possession of a key and nothing about *this*
+    /// session.
+    pub fn parse(bytes: &[u8], session: &[u8; 32]) -> Result<SessionClaim, Error> {
+        if bytes.len() > MAX_CLAIM_BYTES {
+            return Err(Error::TooLarge);
+        }
+        let env = Envelope::open(bytes)?;
+        let claim = SessionClaim {
+            identity: signed::bytes32(&env.value, "identity")?,
+            session: signed::bytes32(&env.value, "session")?,
+        };
+        if &claim.session != session {
+            return Err(Error::BadField("session"));
+        }
+        env.verify(&claim.identity, CLAIM_DOMAIN)?;
+        Ok(claim)
+    }
+
+    pub fn fingerprint(&self) -> crate::Fingerprint {
+        crate::Fingerprint::of(&self.identity)
+    }
+}
+
+/// A claim is three fixed-width fields and a signature; nothing in it
+/// varies. Generous enough for the CBOR around them and no more.
+pub const MAX_CLAIM_BYTES: usize = 256;
+
+/// The mailbox's key for a session, from the secret it handed out:
+/// `SHA-256(secret)`.
+///
+/// Here rather than at either end, because both ends have to agree on it
+/// exactly — the holder signs this value and the mailbox compares
+/// against the key it already stores the session under. It is the same
+/// hashed-token discipline every other secret in the listener uses; this
+/// only gives it a name the holder can call.
+pub fn session_key(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.as_bytes()).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::IdentityKey;
     use crate::DeviceCert;
 
     fn device() -> DeviceKey {
@@ -338,6 +444,60 @@ mod tests {
         let back = EnrollRequest::parse(&r.sign(&d)).unwrap();
         assert!(!back.pair_matches(&secret));
         assert!(back.pair.is_none());
+    }
+
+    #[test]
+    fn a_claim_round_trips_for_the_session_it_names() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let session = session_key("a-session-secret");
+        let claim = SessionClaim::new(id.public(), session);
+        let signed = claim.sign(&id);
+        assert_eq!(SessionClaim::parse(&signed, &session).unwrap(), claim);
+        assert_eq!(claim.fingerprint(), id.fingerprint());
+    }
+
+    #[test]
+    fn a_claim_is_worth_nothing_against_another_session() {
+        // The whole reason the claim signs a session rather than a
+        // timestamp: a mailbox that captured this one — or anyone who
+        // did — cannot present it for a session of their own.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let mine = session_key("mine");
+        let theirs = session_key("theirs");
+        let signed = SessionClaim::new(id.public(), mine).sign(&id);
+        assert_eq!(
+            SessionClaim::parse(&signed, &theirs),
+            Err(Error::BadField("session"))
+        );
+    }
+
+    #[test]
+    fn a_claim_may_only_be_signed_by_the_identity_it_names() {
+        // A fingerprint is public, so this is the check that stops a
+        // stranger standing by for somebody else's renewals.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let attacker = IdentityKey::from_seed(&[9u8; 32]);
+        let session = session_key("s");
+        let honest = SessionClaim::new(id.public(), session);
+        let forged = signed::seal(honest.unsigned(), |body| attacker.sign(CLAIM_DOMAIN, body));
+        assert_eq!(
+            SessionClaim::parse(&forged, &session),
+            Err(Error::BadSignature)
+        );
+    }
+
+    #[test]
+    fn a_claim_is_not_a_request_and_a_request_is_not_a_claim() {
+        // Distinct domains, so neither object's signature can be
+        // replayed as the other's.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let session = session_key("s");
+        let claim = SessionClaim::new(id.public(), session);
+        let wrong_domain = signed::seal(claim.unsigned(), |body| id.sign(DOMAIN, body));
+        assert_eq!(
+            SessionClaim::parse(&wrong_domain, &session),
+            Err(Error::BadSignature)
+        );
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub use attestation::Attestation;
 pub use bundle::Bundle;
 pub use card::Card;
 pub use cert::{caps, DeviceCert};
-pub use enroll::EnrollRequest;
+pub use enroll::{EnrollRequest, SessionClaim};
 pub use error::Error;
 pub use keys::{DeviceKey, Fingerprint, IdentityKey, PublicKey, ServerKey};
 pub use proof::LoginProof;

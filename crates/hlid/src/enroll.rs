@@ -21,8 +21,10 @@
 use std::io::Write;
 use std::time::Duration;
 
-use hl_identity::enroll::PAIRING_SECRET_BYTES;
-use hl_identity::{Bundle, Card, DeviceCert, EnrollRequest, Fingerprint, IdentityKey};
+use hl_identity::enroll::{session_key, PAIRING_SECRET_BYTES};
+use hl_identity::{
+    Bundle, Card, DeviceCert, EnrollRequest, Fingerprint, IdentityKey, SessionClaim,
+};
 use serde_json::{json, Value};
 
 use crate::{
@@ -33,6 +35,11 @@ use crate::{
 /// Longer than the mailbox's 30-second long poll, so a poll that comes
 /// back empty is the server answering rather than this giving up.
 const POLL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long to wait after a poll that returned work this holder could
+/// not answer. The mailbox's own long poll, so a stuck request costs the
+/// same as an idle one and no more.
+const IDLE_BACKOFF: Duration = Duration::from_secs(30);
 
 /// What a holder asks a human. A trait because the point of putting this
 /// flow behind a mailbox rather than a clipboard is that the prompt can
@@ -117,6 +124,11 @@ fn renewed_caps(granted: Option<u64>, prev: &DeviceCert) -> Option<u64> {
     }
 }
 
+/// Clock-skew tolerance for a renewal's `time` and its certificate's
+/// expiry, matching `[identity] clock_skew`'s default. Both ends are
+/// checked against a wall clock nobody synchronizes for them.
+const RENEWAL_SKEW: u64 = 300;
+
 /// A renewal is "the same device asking for the same or less" (§8). What
 /// can be checked without the holder's policy is checked here; what the
 /// device gets is still `grant`'s answer, narrowed by `renewed_caps`.
@@ -124,12 +136,34 @@ fn renewal_is_sane(
     prev: &DeviceCert,
     req: &EnrollRequest,
     identity: &IdentityKey,
+    now: u64,
 ) -> Result<(), String> {
     if prev.identity != identity.public() {
         return Err("the certificate it wants renewed was signed by a different identity".into());
     }
     if prev.device != req.device {
         return Err("the certificate it wants renewed is for a different device".into());
+    }
+    // §4 says a holder outside its skew tolerance treats a request as a
+    // replay, and until this was here, none did: `time` was carried,
+    // documented and never read. A renewal is the one shape where that
+    // matters, because a renewal under `--renew auto` is granted with no
+    // human in the loop, and a request replayed out of a log or a proxy
+    // would be granted again.
+    if req.time > now.saturating_add(RENEWAL_SKEW) {
+        return Err("it is dated in the future".into());
+    }
+    if req.time.saturating_add(RENEWAL_SKEW) < now {
+        return Err("it is too old to still be the request it claims to be".into());
+    }
+    // The lifetime exists to bound how long a copied profile keeps
+    // logging in as you (§8). A certificate that has already run out has
+    // spent that bound, so renewing it hands the bound back — silently,
+    // under `--renew auto`, which is exactly the case the prompt was
+    // there to cover. Expired means a fresh enrollment, with a code and
+    // a human.
+    if prev.expires.saturating_add(RENEWAL_SKEW) < now {
+        return Err("the certificate it wants renewed has already expired".into());
     }
     // `caps` means different things in the two objects, and conflating
     // them is easy: absent in a *certificate* is unrestricted, absent in
@@ -409,15 +443,10 @@ impl Holder<'_> {
     /// §5.1. `standing` offers to hold renewals for this identity, which
     /// is what lets a browser renew without anybody typing anything.
     fn open(&self, standing: bool) -> R<Session> {
-        let body = if standing {
-            json!({ "identity": self.id.fingerprint().to_string() })
-        } else {
-            json!({})
-        };
         let opened: Value = self
             .http
             .post(&format!("{}/sessions", self.mailbox()))
-            .send_json(body)
+            .send_json(json!({}))
             .map_err(|e| format!("opening a session: {e}"))?
             .into_json()
             .map_err(|e| format!("opening a session: {e}"))?;
@@ -434,7 +463,7 @@ impl Holder<'_> {
         let mut pairing = [0u8; PAIRING_SECRET_BYTES];
         pairing.copy_from_slice(&seed[..PAIRING_SECRET_BYTES]);
 
-        Ok(Session {
+        let session = Session {
             secret: opened["session"]
                 .as_str()
                 .ok_or("the mailbox returned no session")?
@@ -445,7 +474,52 @@ impl Holder<'_> {
                 .to_owned(),
             pairing,
             expires_in: opened["expires_in"].as_u64().unwrap_or(600),
-        })
+        };
+        if standing {
+            self.claim(&session)?;
+        }
+        Ok(session)
+    }
+
+    /// §5.1. Ask the mailbox to route this identity's renewals here, and
+    /// prove the identity key is held.
+    ///
+    /// A separate call rather than a field in the open, because the
+    /// proof has to name the session and the session does not exist
+    /// until the open returns. Signing the session — rather than a
+    /// timestamp — is what makes a captured claim worthless: it is for
+    /// one session key, which only this process and the mailbox ever
+    /// saw.
+    ///
+    /// A failure here is fatal to the standing session rather than
+    /// something to carry on past. An agent whose claim did not land
+    /// looks exactly like an agent that is working, right up until the
+    /// renewal that silently never arrives.
+    fn claim(&self, s: &Session) -> R<()> {
+        let claim = SessionClaim::new(self.id.public(), session_key(&s.secret)).sign(self.id);
+        self.http
+            .post(&format!(
+                "{}/sessions/{}/identity",
+                self.mailbox(),
+                s.secret
+            ))
+            .send_json(json!({ "claim": b64(&claim) }))
+            .map_err(|e| format!("standing by for renewals: {e}"))?;
+        Ok(())
+    }
+
+    /// Give a session back before its ten minutes are out (§5.1).
+    ///
+    /// Best effort, and deliberately: this runs when the holder has
+    /// already opened a replacement, so the only thing a failure costs
+    /// is the old session sitting in the mailbox until it expires.
+    /// Turning that into an error would take an agent down over
+    /// housekeeping.
+    fn close(&self, s: &Session, ui: &mut dyn Prompt) {
+        let url = format!("{}/sessions/{}", self.mailbox(), s.secret);
+        if let Err(e) = self.http.request("DELETE", &url).call() {
+            ui.tell(&format!("(Could not close the previous session: {e})"));
+        }
     }
 
     fn show(&self, s: &Session, ui: &mut dyn Prompt) {
@@ -523,13 +597,28 @@ impl Holder<'_> {
     fn handle(&self, s: &Session, id_of_request: &str, raw: &[u8], ui: &mut dyn Prompt) -> R<()> {
         // Everything shown below is computed from this, and never from
         // anything the mailbox said about it.
-        let request = EnrollRequest::parse(raw)
-            .map_err(|e| format!("the mailbox delivered something that is not a request: {e}"))?;
+        //
+        // Answered before it is reported, like every other refusal here.
+        // Returning without answering would leave the request pending,
+        // and a pending request is what the next poll returns —
+        // instantly, since there is something to return. Anyone who can
+        // post a request the mailbox routes but this cannot parse could
+        // otherwise spin a standing agent at full tilt for the request's
+        // whole lifetime, and refresh it for as long as they liked.
+        let request = match EnrollRequest::parse(raw) {
+            Ok(r) => r,
+            Err(e) => {
+                self.answer(s, json!({ "id": id_of_request, "denied": "bad_request" }))?;
+                return Err(format!(
+                    "the mailbox delivered something that is not a request: {e}"
+                ));
+            }
+        };
         let device_fp = Fingerprint::of(&request.device);
         let named = request.name.clone().unwrap_or_else(|| "unnamed".into());
 
         let renewal = match request.prev_cert() {
-            Some(Ok(prev)) => match renewal_is_sane(&prev, &request, self.id) {
+            Some(Ok(prev)) => match renewal_is_sane(&prev, &request, self.id, now()) {
                 Ok(()) => Some(prev),
                 Err(why) => {
                     self.answer(s, json!({ "id": id_of_request, "denied": "bad_renewal" }))?;
@@ -651,8 +740,19 @@ fn run(holder: &Holder, budget: Option<usize>, ui: &mut dyn Prompt) -> R<()> {
             continue;
         };
 
-        if take(holder, &session, &answer, budget, &mut handled, ui)? {
+        let took = take(holder, &session, &answer, budget, &mut handled, ui)?;
+        if took.done {
             return Ok(());
+        }
+        // A poll that came back with work and answered none of it will
+        // come back with the same work immediately, since a pending
+        // request is what makes the long poll return early. Only a
+        // mailbox that is malfunctioning or hostile produces that, and
+        // the answer to both is to stop asking so fast rather than to
+        // exit: waiting out the long poll turns a spin into the same
+        // once-every-thirty-seconds this loop does when idle.
+        if !answer["pending"].as_array().is_none_or(|p| p.is_empty()) && !took.progress {
+            std::thread::sleep(IDLE_BACKOFF);
         }
 
         // A code is single-use, so once it has admitted its request this
@@ -671,17 +771,47 @@ fn run(holder: &Holder, budget: Option<usize>, ui: &mut dyn Prompt) -> R<()> {
             // it sits until it expires.
             let previous = std::mem::replace(&mut session, holder.open(standing)?);
             holder.show(&session, ui);
-            if let Some(last) = holder.poll_once(&previous, Some(0))? {
-                if take(holder, &previous, &last, budget, &mut handled, ui)? {
-                    return Ok(());
-                }
+            // Swept, *then* closed. Answering a request is a call on
+            // the session that holds it, so closing first would 404 the
+            // answer to whatever the sweep just found — the same
+            // dropped renewal the reopen-first ordering above exists to
+            // prevent, reintroduced two lines later.
+            let swept = match holder.poll_once(&previous, Some(0))? {
+                Some(last) => take(holder, &previous, &last, budget, &mut handled, ui)?,
+                None => Took::NOTHING,
+            };
+            // Handing the session back keeps a rotating agent from
+            // filling its own `enroll_per_address` allowance with
+            // sessions it has finished with: four rotations inside the
+            // ten-minute TTL and the mailbox starts refusing to open the
+            // next one, which is a holder rate-limiting itself out of
+            // its own mailbox.
+            holder.close(&previous, ui);
+            if swept.done {
+                return Ok(());
             }
         }
     }
 }
 
-/// Handle every request in one poll's answer. `true` means the budget is
-/// spent and the caller should stop.
+/// What one poll's answer came to.
+struct Took {
+    /// The budget is spent and the caller should stop.
+    done: bool,
+    /// At least one request was answered, so the next poll will not be
+    /// handed the same work again.
+    progress: bool,
+}
+
+impl Took {
+    /// A session that was gone by the time it was swept.
+    const NOTHING: Took = Took {
+        done: false,
+        progress: false,
+    };
+}
+
+/// Handle every request in one poll's answer.
 fn take(
     holder: &Holder,
     session: &Session,
@@ -689,30 +819,64 @@ fn take(
     budget: Option<usize>,
     handled: &mut usize,
     ui: &mut dyn Prompt,
-) -> R<bool> {
+) -> R<Took> {
+    let mut progress = false;
     for pending in answer["pending"].as_array().cloned().unwrap_or_default() {
         // No id, no answer: everything after this identifies the request
         // being certified or refused, and an empty name would mean
-        // answering something the mailbox never described.
+        // answering something the mailbox never described. So this one
+        // cannot be refused on the wire, only skipped — and a skipped
+        // request stays pending, which is why `run` treats a poll that
+        // answered nothing as a reason to wait rather than to poll again.
         let id_of_request = pending["id"].as_str().unwrap_or_default().to_owned();
         if id_of_request.is_empty() {
-            return Err("the mailbox delivered a request with no id".into());
+            unanswerable(ui, budget, "the mailbox delivered a request with no id")?;
+            continue;
         }
-        let raw = unb64(pending["request"].as_str().unwrap_or(""))?;
+        let raw = match unb64(pending["request"].as_str().unwrap_or("")) {
+            Ok(raw) => raw,
+            Err(why) => {
+                unanswerable(ui, budget, &why)?;
+                continue;
+            }
+        };
         match holder.handle(session, &id_of_request, &raw, ui) {
             Ok(()) => {}
             // One bad request is not a reason to stop holding the key:
             // an agent that exits on the first stranger is an agent a
-            // stranger can turn off.
+            // stranger can turn off. `handle` answers before it returns
+            // an error, so the request is spent either way.
             Err(why) if budget.is_none() => ui.tell(&format!("Refused: {why}")),
             Err(why) => return Err(why),
         }
+        progress = true;
         *handled += 1;
         if budget.is_some_and(|b| *handled >= b) {
-            return Ok(true);
+            return Ok(Took {
+                done: true,
+                progress,
+            });
         }
     }
-    Ok(false)
+    Ok(Took {
+        done: false,
+        progress,
+    })
+}
+
+/// A pending entry this holder cannot answer, because the mailbox did
+/// not describe it well enough to name in an answer.
+///
+/// Fatal to a one-shot `enroll`, which has a person waiting on exactly
+/// one request and nothing useful to do with a mailbox talking nonsense.
+/// Reported and survived by a standing `agent`, which is the same rule
+/// the refusal path above follows and for the same reason.
+fn unanswerable(ui: &mut dyn Prompt, budget: Option<usize>, why: &str) -> R<()> {
+    if budget.is_some() {
+        return Err(why.to_owned());
+    }
+    ui.tell(&format!("Ignored: {why}"));
+    Ok(())
 }
 
 /// §6's prompt. Everything that matters and nothing else: what is
@@ -822,11 +986,11 @@ mod tests {
 
         let mut req = EnrollRequest::new(&dev, 2_000);
         req.caps = Some(caps::WEB);
-        assert!(renewal_is_sane(&prev, &req, &id).is_ok());
+        assert!(renewal_is_sane(&prev, &req, &id, 2_000).is_ok());
 
         // Asking for more than the old certificate carried.
         req.caps = Some(caps::WEB | caps::MANAGE);
-        assert!(renewal_is_sane(&prev, &req, &id).is_err());
+        assert!(renewal_is_sane(&prev, &req, &id, 2_000).is_err());
 
         // Asking for nothing in particular is *not* asking for
         // everything: absent `caps` in a request means "whatever your
@@ -835,13 +999,45 @@ mod tests {
         // capabilities is the ordinary case, and refusing it here made
         // every renewal fail.
         req.caps = None;
-        assert!(renewal_is_sane(&prev, &req, &id).is_ok());
+        assert!(renewal_is_sane(&prev, &req, &id, 2_000).is_ok());
 
         // Somebody else's certificate, and somebody else's device.
         req.caps = Some(caps::WEB);
-        assert!(renewal_is_sane(&prev, &req, &other).is_err());
+        assert!(renewal_is_sane(&prev, &req, &other, 2_000).is_err());
         let theirs = DeviceCert::for_device(&id, &stranger, 1_000, 86_400).unwrap();
-        assert!(renewal_is_sane(&theirs, &req, &id).is_err());
+        assert!(renewal_is_sane(&theirs, &req, &id, 2_000).is_err());
+    }
+
+    #[test]
+    fn a_lapsed_certificate_is_not_renewed() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = hl_identity::DeviceKey::from_seed(&[3u8; 32]);
+        // Issued at 1_000 and good for a day, so it lapses at 87_400.
+        let prev = DeviceCert::for_device(&id, &dev, 1_000, 86_400).unwrap();
+
+        // The last moment it still renews, and the first it does not.
+        // Skew applies to both, since the two clocks are nobody's job to
+        // agree.
+        let inside = EnrollRequest::new(&dev, 87_400 + RENEWAL_SKEW);
+        assert!(renewal_is_sane(&prev, &inside, &id, 87_400 + RENEWAL_SKEW).is_ok());
+        let outside = EnrollRequest::new(&dev, 87_401 + RENEWAL_SKEW);
+        assert!(renewal_is_sane(&prev, &outside, &id, 87_401 + RENEWAL_SKEW).is_err());
+    }
+
+    #[test]
+    fn a_stale_or_post_dated_request_is_a_replay() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = hl_identity::DeviceKey::from_seed(&[3u8; 32]);
+        let prev = DeviceCert::for_device(&id, &dev, 1_000, 86_400).unwrap();
+
+        // The certificate is live throughout; it is the request's own
+        // `time` that decides these. Signed once and replayed an hour
+        // later is the case `--renew auto` would otherwise grant again.
+        let req = EnrollRequest::new(&dev, 40_000);
+        assert!(renewal_is_sane(&prev, &req, &id, 40_000).is_ok());
+        assert!(renewal_is_sane(&prev, &req, &id, 40_000 + RENEWAL_SKEW).is_ok());
+        assert!(renewal_is_sane(&prev, &req, &id, 40_000 + RENEWAL_SKEW + 1).is_err());
+        assert!(renewal_is_sane(&prev, &req, &id, 40_000 - RENEWAL_SKEW - 1).is_err());
     }
 
     #[test]

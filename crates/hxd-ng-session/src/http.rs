@@ -34,7 +34,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
-use hl_identity::Fingerprint;
 use http_body_util::{BodyExt, Full, Limited};
 use hxd_core::{IdentityTag, LinkAuthority, Transport};
 use hyper::body::Incoming;
@@ -794,9 +793,9 @@ fn discovery(ctx: &NgCtx) -> Resp {
 
 // --- The enrollment mailbox (`docs/identity-enrollment.md` §5) ---------
 //
-// Five routes under `/identity/enroll`. Two of them carry a secret in
-// the path and one carries a secret and a literal, so they are matched
-// by splitting the path rather than by prefix: `/sessions/<s>` and
+// Seven routes under `/identity/enroll`. Three of them carry a secret in
+// the path and two carry a secret and a literal, so they are matched by
+// splitting the path rather than by prefix: `/sessions/<s>` and
 // `/sessions/<s>/answers` differ only in what follows the secret, and a
 // `starts_with` that got that wrong would route an answer to a poll.
 
@@ -821,8 +820,15 @@ async fn enroll_route(req: Request<Incoming>, client: SocketAddr, ctx: &NgCtx) -
         (&Method::POST, ["sessions"]) => enroll_open(req, client, ctx, mb).await,
         (&Method::POST, ["requests"]) => enroll_post(req, client, ctx, mb).await,
         (&Method::GET, ["sessions", secret]) => enroll_poll(secret, req.uri().query(), mb).await,
+        (&Method::DELETE, ["sessions", secret]) => match mb.close_session(secret) {
+            Ok(()) => plain(StatusCode::NO_CONTENT, ""),
+            Err(e) => enroll_refused(e),
+        },
         (&Method::POST, ["sessions", secret, "answers"]) => {
             enroll_answer(req, secret, ctx, mb).await
+        }
+        (&Method::POST, ["sessions", secret, "identity"]) => {
+            enroll_claim(req, secret, ctx, mb).await
         }
         (&Method::GET, ["requests", secret]) => enroll_fetch(secret, mb).await,
         _ => plain(StatusCode::NOT_FOUND, "not found"),
@@ -860,7 +866,11 @@ fn enroll_refused(e: crate::enroll::Refused) -> Resp {
     )
 }
 
-/// §5.1. The body is optional, and so is the `identity` in it.
+/// §5.1. The body is optional and, now that standing by for an identity
+/// is its own authenticated call, empty. It is still read rather than
+/// ignored, so that a holder built against the older shape — which put
+/// an unauthenticated `identity` fingerprint here — is told its claim
+/// went nowhere instead of silently never receiving a renewal.
 async fn enroll_open(
     req: Request<Incoming>,
     client: SocketAddr,
@@ -882,18 +892,38 @@ async fn enroll_open(
             Err(_) => return plain(StatusCode::BAD_REQUEST, "expected a JSON body, or none"),
         }
     };
-    let identity = match body["identity"].as_str() {
-        Some(s) => match Fingerprint::parse(s) {
-            Some(fp) => Some(fp),
-            None => return plain(StatusCode::BAD_REQUEST, "identity: not a fingerprint"),
-        },
-        None => None,
-    };
-    match mb.open_session(client.ip(), identity) {
+    if !body["identity"].is_null() {
+        return plain(
+            StatusCode::BAD_REQUEST,
+            "identity: opening a session no longer claims one; POST a signed \
+             claim to /sessions/<secret>/identity instead (§5.1)",
+        );
+    }
+    match mb.open_session(client.ip()) {
         Ok(o) => json_resp(
             StatusCode::OK,
             json!({ "session": o.session, "code": o.code, "expires_in": o.expires_in }),
         ),
+        Err(e) => enroll_refused(e),
+    }
+}
+
+/// §5.1. Stand by for an identity's renewals, with a signed claim over
+/// this session's key.
+async fn enroll_claim(
+    req: Request<Incoming>,
+    secret: &str,
+    ctx: &NgCtx,
+    mb: &crate::enroll::Mailbox,
+) -> Resp {
+    let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
+        return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
+    };
+    let Some(claim) = body["claim"].as_str().and_then(unb64) else {
+        return enroll_refused(crate::enroll::Refused::BadClaim);
+    };
+    match mb.claim_identity(secret, &claim) {
+        Ok(()) => plain(StatusCode::NO_CONTENT, ""),
         Err(e) => enroll_refused(e),
     }
 }
@@ -1028,6 +1058,8 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
         Ok(d) => d,
         Err(resp) => return *resp,
     };
+    // Read before `req` is consumed by the body.
+    let req_origin = req.headers().get(hyper::header::ORIGIN).cloned();
     let Some(body) = read_json(req, ctx.cfg.login_timeout).await else {
         return plain(StatusCode::BAD_REQUEST, "expected a JSON body");
     };
@@ -1067,10 +1099,29 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     // first and then refuse the link as `already_linked`.
     let create = body.get("create").and_then(Value::as_bool).unwrap_or(true);
     let proof = field("proof");
-    if proof.is_none() && device_from_cert.is_none() {
+    // A client certificate stands in for `proof` (§5.3) — but only for a
+    // caller that chose to present it. A browser does not: the TLS layer
+    // attaches the certificate to whatever the page fetches, so on a
+    // deployment behind an mTLS proxy a *hostile* page could POST here
+    // cross-origin, ride the certificate it never saw, and read the
+    // answer back through this route's `Access-Control-Allow-Origin: *`.
+    //
+    // `Origin` is the tell. Browsers set it on every request that could
+    // be that attack and native clients — hlid, the desktop client, a
+    // relay — set it on none, so requiring `proof` when it is present
+    // costs the mTLS binding nothing and closes the ambient path. It is
+    // deliberately not an allow-list: an origin that is entitled to log
+    // in can still do it, by signing a proof like everyone else.
+    let from_browser = req_origin.is_some();
+    if proof.is_none() && (device_from_cert.is_none() || from_browser) {
         return plain(
             StatusCode::BAD_REQUEST,
-            "proof is required without a client certificate",
+            if from_browser {
+                "proof is required: a client certificate is not accepted \
+                 in place of one on a request that carries Origin"
+            } else {
+                "proof is required without a client certificate"
+            },
         );
     }
     // The state does signature checks and, with credentials or a

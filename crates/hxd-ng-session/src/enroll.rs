@@ -24,7 +24,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hl_identity::Fingerprint;
+use hl_identity::{Fingerprint, SessionClaim};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
@@ -150,6 +150,7 @@ pub enum Refused {
     RateLimited,
     UnknownSession,
     UnknownRequest,
+    BadClaim,
 }
 
 impl Refused {
@@ -162,6 +163,7 @@ impl Refused {
             Refused::TooManySessions => "too_many_sessions",
             Refused::RateLimited => "rate_limited",
             Refused::UnknownSession | Refused::UnknownRequest => "not_found",
+            Refused::BadClaim => "bad_claim",
         }
     }
 
@@ -171,7 +173,7 @@ impl Refused {
             | Refused::NoHolder
             | Refused::UnknownSession
             | Refused::UnknownRequest => 404,
-            Refused::RequestTooLarge | Refused::BadRequest => 400,
+            Refused::RequestTooLarge | Refused::BadRequest | Refused::BadClaim => 400,
             Refused::RateLimited => 429,
             Refused::TooManySessions => 503,
         }
@@ -190,6 +192,7 @@ impl Refused {
             Refused::RateLimited => "too many enrollment attempts from this address; retry shortly",
             Refused::UnknownSession => "no such enrollment session",
             Refused::UnknownRequest => "no such enrollment request",
+            Refused::BadClaim => "the session claim does not verify for this session",
         }
     }
 }
@@ -214,12 +217,22 @@ enum Answer {
 struct Session {
     /// `None` once the code has admitted its one request (§5.1).
     code: Option<String>,
+    /// The identity this session has proved it holds, and so stands by
+    /// for (§5.1). Kept so that a second claim, or a close, can take the
+    /// first one back out of `by_identity` — sweeping by liveness alone
+    /// would leave a live session indexed under an identity it no longer
+    /// claims.
+    identity: Option<Fingerprint>,
     addr: IpAddr,
     expires: Instant,
     /// Keyed by the SHA-256 of the request secret, as everything else
     /// here is.
     pending: HashMap<[u8; 32], Pending>,
     next_id: u64,
+    /// Given up by its holder (§5.1). It routes nothing and counts
+    /// against nobody; it exists only until the answers it has already
+    /// made have been collected.
+    closed: bool,
     /// Woken when a request arrives.
     notify: Arc<Notify>,
 }
@@ -258,15 +271,14 @@ impl Mailbox {
         }
     }
 
-    /// §5.1. Unauthenticated on purpose: the mailbox has nothing to
-    /// protect with a proof of key possession, since a session opened by
-    /// someone with no identity key can answer nothing an enrollee would
-    /// accept.
-    pub fn open_session(
-        &self,
-        addr: IpAddr,
-        identity: Option<Fingerprint>,
-    ) -> Result<Opened, Refused> {
+    /// §5.1. Unauthenticated: a session opened by someone with no
+    /// identity key can answer nothing an enrollee would accept, so
+    /// there is nothing here a proof would protect.
+    ///
+    /// Standing by for an identity's renewals is the exception, and it
+    /// is a separate call — [`Mailbox::claim_identity`] — because that
+    /// one *is* worth protecting.
+    pub fn open_session(&self, addr: IpAddr) -> Result<Opened, Refused> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
         inner.sweep(now);
@@ -274,7 +286,17 @@ impl Mailbox {
         if inner.sessions.len() >= self.cfg.max_sessions {
             return Err(Refused::TooManySessions);
         }
-        if inner.sessions.values().filter(|s| s.addr == addr).count() >= self.cfg.per_address {
+        // Closed sessions do not count: they route nothing and are only
+        // still here so an enrollee can collect an answer already made.
+        // Charging a holder for them is what made a rotating agent
+        // rate-limit itself out of its own mailbox.
+        if inner
+            .sessions
+            .values()
+            .filter(|s| s.addr == addr && !s.closed)
+            .count()
+            >= self.cfg.per_address
+        {
             return Err(Refused::RateLimited);
         }
 
@@ -297,16 +319,12 @@ impl Mailbox {
         let key = hash(secret.as_bytes());
 
         inner.by_code.insert(normalize_code(&code), key);
-        // Last writer wins: a holder that restarts its agent should take
-        // over its own identity's renewals rather than be shut out by
-        // the session it just abandoned.
-        if let Some(fp) = identity {
-            inner.by_identity.insert(fp, key);
-        }
         inner.sessions.insert(
             key,
             Session {
                 code: Some(normalize_code(&code)),
+                identity: None,
+                closed: false,
                 addr,
                 expires: now + SESSION_TTL,
                 pending: HashMap::new(),
@@ -319,6 +337,92 @@ impl Mailbox {
             code,
             expires_in: SESSION_TTL.as_secs(),
         })
+    }
+
+    /// §5.1. Stand by for an identity's renewals, having proved the
+    /// identity key is held.
+    ///
+    /// The proof is a [`SessionClaim`] over this session's key, so the
+    /// mailbox learns nothing it could replay and the holder signs
+    /// nothing that means anything anywhere else. Without it, anyone
+    /// could name anyone's fingerprint — fingerprints are public — and
+    /// have `by_identity` route that identity's renewals to them, which
+    /// is a stranger switching off renewal for an identity they do not
+    /// hold.
+    ///
+    /// Last writer wins, which it can safely be now that only the key
+    /// holder can write: a holder that restarts its agent takes its own
+    /// identity's renewals back rather than being shut out by the
+    /// session it just abandoned.
+    pub fn claim_identity(&self, secret: &str, claim: &[u8]) -> Result<(), Refused> {
+        // The same value the session is stored under: `hash` here and
+        // `session_key` there are one function with two callers.
+        let key = hash(secret.as_bytes());
+        let claim = SessionClaim::parse(claim, &key).map_err(|_| Refused::BadClaim)?;
+        let fp = claim.fingerprint();
+
+        let mut inner = self.inner.lock().unwrap();
+        inner.sweep(Instant::now());
+        // Looked up before anything is written, so a claim for a session
+        // that has expired is a 404 and not a stray index entry.
+        let session = inner
+            .sessions
+            .get_mut(&key)
+            .filter(|s| !s.closed)
+            .ok_or(Refused::UnknownSession)?;
+        let previous = session.identity.replace(fp);
+        if let Some(old) = previous {
+            if old != fp {
+                inner.by_identity.remove(&old);
+            }
+        }
+        inner.by_identity.insert(fp, key);
+        Ok(())
+    }
+
+    /// Give a session up before its ten minutes are out.
+    ///
+    /// Not in §5, and it should be. A holder that rotates — `hlid agent`
+    /// opens a replacement the moment its code is spent — otherwise
+    /// leaves the session it abandoned sitting in the table until the
+    /// TTL, where it goes on counting against `enroll_per_address`. Four
+    /// rotations inside ten minutes and the holder is rate-limited out
+    /// of its own mailbox.
+    ///
+    /// Only the session secret can do this, as with answering: the code
+    /// cannot, and neither can anyone who has only seen one.
+    pub fn close_session(&self, secret: &str) -> Result<(), Refused> {
+        let key = hash(secret.as_bytes());
+        let mut inner = self.inner.lock().unwrap();
+        inner.sweep(Instant::now());
+        let session = inner
+            .sessions
+            .get_mut(&key)
+            .filter(|s| !s.closed)
+            .ok_or(Refused::UnknownSession)?;
+
+        // Closed rather than dropped, and this is the whole subtlety.
+        // The holder is done with the session the moment it has answered
+        // — but the *enrollee* has not collected that answer yet, and it
+        // is parked on a long poll waiting for it. Dropping the session
+        // would take the bundle with it and the browser would be told
+        // its request expired, seconds after a human approved it.
+        //
+        // So closing stops the session receiving anything new and stops
+        // it counting against the address, and leaves answers already
+        // made to be collected. `sweep` removes it once they have been.
+        session.closed = true;
+        session.code = None;
+        session.identity = None;
+        session.pending.retain(|_, p| p.answer.is_some());
+        let empty = session.pending.is_empty();
+        if empty {
+            inner.sessions.remove(&key);
+        }
+        // Drops the code and identity indexes that pointed at it, and
+        // the request index for anything just discarded.
+        inner.sweep(Instant::now());
+        Ok(())
     }
 
     /// §5.2. `code` routes to the session that owns it; without one, the
@@ -467,7 +571,11 @@ impl Mailbox {
             {
                 let mut inner = self.inner.lock().unwrap();
                 inner.sweep(Instant::now());
-                let session = inner.sessions.get(&key).ok_or(Refused::UnknownSession)?;
+                let session = inner
+                    .sessions
+                    .get(&key)
+                    .filter(|s| !s.closed)
+                    .ok_or(Refused::UnknownSession)?;
                 let expires_in = remaining(session.expires);
                 let code_live = session.code.is_some();
                 let waiting: Vec<PendingView> = session
@@ -513,6 +621,7 @@ impl Mailbox {
         let session = inner
             .sessions
             .get_mut(&key)
+            .filter(|s| !s.closed)
             .ok_or(Refused::UnknownSession)?;
         let pending = session
             .pending
@@ -616,7 +725,9 @@ impl Inner {
                 return false;
             }
             s.pending.retain(|_, p| p.expires > now);
-            true
+            // A closed session is only still here to be collected from.
+            // Once there is nothing left to collect, it goes.
+            !(s.closed && s.pending.is_empty())
         });
         let live: std::collections::HashSet<[u8; 32]> = self.sessions.keys().copied().collect();
         self.by_code
@@ -761,6 +872,7 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hl_identity::enroll::session_key;
     use hl_identity::{DeviceCert, DeviceKey, EnrollRequest, IdentityKey};
 
     const QUICK: Duration = Duration::from_millis(50);
@@ -780,6 +892,16 @@ mod tests {
         EnrollRequest::new(&d, unix_now()).sign(&d)
     }
 
+    /// Open a session and claim `identity` for it, which is what a
+    /// standing holder does and the only way into `by_identity`.
+    fn standing(m: &Mailbox, addr: IpAddr, identity: &IdentityKey) -> Opened {
+        let opened = m.open_session(addr).unwrap();
+        let claim =
+            SessionClaim::new(identity.public(), session_key(&opened.session)).sign(identity);
+        m.claim_identity(&opened.session, &claim).unwrap();
+        opened
+    }
+
     /// A renewal for `identity`, which routes without a code.
     fn renewal(seed: u8, identity: &IdentityKey) -> Vec<u8> {
         let d = DeviceKey::from_seed(&[seed; 32]);
@@ -794,7 +916,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_reaches_the_holder_and_the_answer_reaches_the_device() {
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         let posted = m
             .post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
@@ -829,7 +951,7 @@ mod tests {
     #[tokio::test]
     async fn a_denial_reaches_the_device_too() {
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         let posted = m
             .post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
@@ -873,7 +995,7 @@ mod tests {
         // a standing agent would otherwise go on displaying one that is
         // dead, with the user finding out by typing it.
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         assert!(
             m.poll_session(&opened.session, QUICK)
                 .await
@@ -902,7 +1024,7 @@ mod tests {
         // one, and never falls between them.
         let m = mailbox();
         let id = IdentityKey::from_seed(&[1u8; 32]);
-        let a = m.open_session(addr(1), Some(id.fingerprint())).unwrap();
+        let a = standing(&m, addr(1), &id);
         m.post_request(addr(2), None, &renewal(2, &id)).unwrap();
         assert_eq!(
             m.poll_session(&a.session, QUICK)
@@ -915,7 +1037,7 @@ mod tests {
 
         // Rotate. From here the index names B, so nothing further can
         // arrive on A.
-        let b = m.open_session(addr(1), Some(id.fingerprint())).unwrap();
+        let b = standing(&m, addr(1), &id);
         m.post_request(addr(3), None, &renewal(3, &id)).unwrap();
         assert_eq!(
             m.poll_session(&b.session, QUICK)
@@ -946,7 +1068,7 @@ mod tests {
         // the rotation was in flight. Blocking the full deadline to find
         // nothing would stall the session it just opened.
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         let started = Instant::now();
         let polled = m
             .poll_session(&opened.session, Duration::ZERO)
@@ -975,7 +1097,7 @@ mod tests {
         // it while renewals come and go.
         let m = mailbox();
         let id = IdentityKey::from_seed(&[1u8; 32]);
-        let opened = m.open_session(addr(1), Some(id.fingerprint())).unwrap();
+        let opened = standing(&m, addr(1), &id);
         m.post_request(addr(2), None, &renewal(2, &id)).unwrap();
         assert!(
             m.poll_session(&opened.session, QUICK)
@@ -988,7 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn a_code_admits_one_request_and_is_then_dead() {
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         m.post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
         // A holder meaning to enroll two devices opens two sessions
@@ -1003,7 +1125,7 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_code_is_a_404_and_not_a_hint() {
         let m = mailbox();
-        m.open_session(addr(1), None).unwrap();
+        m.open_session(addr(1)).unwrap();
         assert_eq!(
             m.post_request(addr(2), Some("AAAA-AAAA"), &request(2))
                 .err(),
@@ -1018,7 +1140,7 @@ mod tests {
         // wrong code is refused before any table is touched, so without
         // this an address could try as fast as it could open sockets.
         let m = mailbox();
-        m.open_session(addr(1), None).unwrap();
+        m.open_session(addr(1)).unwrap();
         for i in 0..WRONG_CODES_PER_WINDOW {
             assert_eq!(
                 m.post_request(addr(2), Some(&draw_code()), &request(2))
@@ -1041,7 +1163,7 @@ mod tests {
         // stop anybody else enrolling. If it were global, filling it
         // would be a cheaper attack than the one it prevents.
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         for _ in 0..WRONG_CODES_PER_WINDOW + 5 {
             let _ = m.post_request(addr(2), Some(&draw_code()), &request(2));
         }
@@ -1063,7 +1185,7 @@ mod tests {
             per_address: 64,
         });
         for i in 0..WRONG_CODES_PER_WINDOW + 5 {
-            let opened = m.open_session(addr(1), None).unwrap();
+            let opened = m.open_session(addr(1)).unwrap();
             assert!(
                 m.post_request(addr(2), Some(&opened.code), &request(2))
                     .is_ok(),
@@ -1119,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn a_code_survives_being_read_off_a_screen_and_typed_back() {
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         // Lower case, no hyphen, and Crockford's confusables: whoever
         // typed `l` for `1` or `O` for `0` should not be told their code
         // is wrong.
@@ -1128,11 +1250,216 @@ mod tests {
         assert!(m.post_request(addr(2), Some(&typed), &request(2)).is_ok());
     }
 
+    #[test]
+    fn a_stranger_may_not_stand_by_for_an_identity_it_does_not_hold() {
+        // Fingerprints are public — they are printed on the holder's own
+        // screen — so without a proof this is all it would take to have
+        // every renewal for an identity delivered to somebody else, and
+        // none to its holder.
+        let m = mailbox();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let attacker = IdentityKey::from_seed(&[9u8; 32]);
+
+        let theirs = m.open_session(addr(9)).unwrap();
+        // The victim's fingerprint, signed by the key the attacker
+        // actually has. It verifies; it is just not a claim on this
+        // identity, because the identity is taken from the key.
+        let wrong_key =
+            SessionClaim::new(attacker.public(), session_key(&theirs.session)).sign(&attacker);
+        m.claim_identity(&theirs.session, &wrong_key).unwrap();
+
+        // A renewal for the victim still has nowhere to go.
+        assert_eq!(
+            m.post_request(addr(2), None, &renewal(2, &id)).err(),
+            Some(Refused::NoHolder),
+            "a stranger's session collected the victim's renewals"
+        );
+
+        // Naming the victim's key and signing with the attacker's is the
+        // other half, and it cannot even be built here: `SessionClaim`
+        // will not sign for a key it does not hold, and
+        // `a_claim_may_only_be_signed_by_the_identity_it_names` in
+        // `hl-identity` checks that such bytes do not verify.
+    }
+
+    #[test]
+    fn a_claim_is_only_good_for_the_session_it_names() {
+        // A claim overheard from one session — by the mailbox, which is
+        // the party §9 already treats as hostile — is not a claim on
+        // another.
+        let m = mailbox();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let first = m.open_session(addr(1)).unwrap();
+        let second = m.open_session(addr(1)).unwrap();
+
+        let for_first = SessionClaim::new(id.public(), session_key(&first.session)).sign(&id);
+        assert_eq!(
+            m.claim_identity(&second.session, &for_first).err(),
+            Some(Refused::BadClaim)
+        );
+    }
+
+    #[test]
+    fn a_claim_needs_a_session_that_is_still_open() {
+        let m = mailbox();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let claim = SessionClaim::new(id.public(), session_key("never-opened")).sign(&id);
+        assert_eq!(
+            m.claim_identity("never-opened", &claim).err(),
+            Some(Refused::UnknownSession)
+        );
+    }
+
+    #[test]
+    fn reclaiming_moves_the_identity_and_leaves_nothing_behind() {
+        // A holder that restarts its agent takes its own renewals back,
+        // which is what last-writer-wins is for and is safe now that
+        // only the key holder can be the writer.
+        let m = mailbox();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let other = IdentityKey::from_seed(&[2u8; 32]);
+        let s = m.open_session(addr(1)).unwrap();
+
+        let first = SessionClaim::new(id.public(), session_key(&s.session)).sign(&id);
+        m.claim_identity(&s.session, &first).unwrap();
+        // The same session claiming a second identity releases the
+        // first, rather than leaving a live session indexed under an
+        // identity it no longer stands by for.
+        let second = SessionClaim::new(other.public(), session_key(&s.session)).sign(&other);
+        m.claim_identity(&s.session, &second).unwrap();
+
+        assert!(m.post_request(addr(2), None, &renewal(2, &other)).is_ok());
+        assert_eq!(
+            m.post_request(addr(3), None, &renewal(3, &id)).err(),
+            Some(Refused::NoHolder)
+        );
+    }
+
+    #[test]
+    fn closing_a_session_gives_the_address_its_allowance_back() {
+        // What a rotating agent depends on. `per_address` is 4 by
+        // default, and a holder that abandons a session on every spent
+        // code used to spend its whole allowance on sessions it had
+        // finished with — four rotations inside the ten-minute TTL and
+        // it was locked out of its own mailbox.
+        let cfg = MailboxConfig {
+            per_address: 2,
+            ..MailboxConfig::default()
+        };
+        let m = Mailbox::new(cfg);
+
+        let first = m.open_session(addr(1)).unwrap();
+        let second = m.open_session(addr(1)).unwrap();
+        assert_eq!(m.open_session(addr(1)).err(), Some(Refused::RateLimited));
+
+        m.close_session(&first.session).unwrap();
+        assert!(
+            m.open_session(addr(1)).is_ok(),
+            "closing did not free the allowance"
+        );
+
+        // Only the session secret can do it, and only once.
+        assert_eq!(
+            m.close_session("not-a-session").err(),
+            Some(Refused::UnknownSession)
+        );
+        m.close_session(&second.session).unwrap();
+        assert_eq!(
+            m.close_session(&second.session).err(),
+            Some(Refused::UnknownSession)
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_does_not_throw_away_an_answer_nobody_has_collected() {
+        // The holder is done the moment it has answered; the enrollee is
+        // not. It is parked on a long poll waiting for the bundle, and a
+        // rotating agent closes the session it just answered on within
+        // milliseconds. Dropping the session there would tell a browser
+        // its request expired seconds after a human approved it.
+        let m = mailbox();
+        let opened = m.open_session(addr(1)).unwrap();
+        let posted = m
+            .post_request(addr(2), Some(&opened.code), &request(2))
+            .unwrap();
+        let pending = m.poll_session(&opened.session, QUICK).await.unwrap();
+        m.answer(
+            &opened.session,
+            &pending.pending[0].id,
+            Answered::Bundle(b"the bundle".to_vec()),
+        )
+        .unwrap();
+
+        m.close_session(&opened.session).unwrap();
+
+        match m.fetch_answer(&posted.request, QUICK).await {
+            Fetched::Bundle(b) => assert_eq!(b, b"the bundle"),
+            _ => panic!("closing the session lost an answered request"),
+        }
+        // And once collected, the session really is gone.
+        m.sweep();
+        assert_eq!(m.session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_routes_nothing_and_costs_nothing() {
+        let cfg = MailboxConfig {
+            per_address: 1,
+            ..MailboxConfig::default()
+        };
+        let m = Mailbox::new(cfg);
+        let opened = m.open_session(addr(1)).unwrap();
+        let posted = m
+            .post_request(addr(2), Some(&opened.code), &request(2))
+            .unwrap();
+        let pending = m.poll_session(&opened.session, QUICK).await.unwrap();
+        m.answer(
+            &opened.session,
+            &pending.pending[0].id,
+            Answered::Denied("declined".into()),
+        )
+        .unwrap();
+        m.close_session(&opened.session).unwrap();
+
+        // Still holding an answer, and still not costing the holder its
+        // allowance — which is the whole point of closing.
+        assert!(m.open_session(addr(1)).is_ok());
+        // Nothing else works on it: it cannot be polled, answered on,
+        // claimed, or closed twice.
+        assert_eq!(
+            m.poll_session(&opened.session, QUICK).await.err(),
+            Some(Refused::UnknownSession)
+        );
+        assert_eq!(
+            m.close_session(&opened.session).err(),
+            Some(Refused::UnknownSession)
+        );
+        assert!(matches!(
+            m.fetch_answer(&posted.request, QUICK).await,
+            Fetched::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn closing_a_session_takes_its_identity_out_of_the_index() {
+        let m = mailbox();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let s = standing(&m, addr(1), &id);
+        assert!(m.post_request(addr(2), None, &renewal(2, &id)).is_ok());
+
+        m.close_session(&s.session).unwrap();
+        assert_eq!(
+            m.post_request(addr(3), None, &renewal(3, &id)).err(),
+            Some(Refused::NoHolder)
+        );
+        assert!(m.inner.lock().unwrap().by_identity.is_empty());
+    }
+
     #[tokio::test]
     async fn a_renewal_routes_by_identity_with_no_code_at_all() {
         let m = mailbox();
         let id = IdentityKey::from_seed(&[1u8; 32]);
-        let opened = m.open_session(addr(1), Some(id.fingerprint())).unwrap();
+        let opened = standing(&m, addr(1), &id);
 
         let posted = m.post_request(addr(2), None, &renewal(2, &id)).unwrap();
         let pending = m
@@ -1156,7 +1483,7 @@ mod tests {
         let stranger = IdentityKey::from_seed(&[9u8; 32]);
         // A session with no identity does not collect renewals, even
         // though it is open and has a live code.
-        m.open_session(addr(1), None).unwrap();
+        m.open_session(addr(1)).unwrap();
         assert_eq!(
             m.post_request(addr(2), None, &renewal(2, &stranger)).err(),
             Some(Refused::NoHolder)
@@ -1167,7 +1494,7 @@ mod tests {
     async fn a_first_enrollment_cannot_route_itself() {
         let m = mailbox();
         let id = IdentityKey::from_seed(&[1u8; 32]);
-        m.open_session(addr(1), Some(id.fingerprint())).unwrap();
+        standing(&m, addr(1), &id);
         // No code and no `prev`: there is nothing to route on, and
         // guessing is not one of the options.
         assert_eq!(
@@ -1179,7 +1506,7 @@ mod tests {
     #[tokio::test]
     async fn only_the_session_secret_can_answer() {
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         m.post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
         let pending = m
@@ -1204,7 +1531,7 @@ mod tests {
     #[tokio::test]
     async fn answering_the_same_request_twice_is_refused() {
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         m.post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
         let pending = m
@@ -1226,7 +1553,7 @@ mod tests {
     #[tokio::test]
     async fn the_holder_is_woken_by_a_request_rather_than_waiting_out_the_poll() {
         let m = Arc::new(mailbox());
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         let code = opened.code.clone();
 
         let poller = {
@@ -1250,7 +1577,7 @@ mod tests {
     #[tokio::test]
     async fn a_poll_with_nothing_waiting_comes_back_empty_at_the_deadline() {
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         let polled = m.poll_session(&opened.session, QUICK).await.unwrap();
         assert!(polled.pending.is_empty());
         assert!(polled.expires_in > 0, "the session is still open");
@@ -1260,7 +1587,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_nobody_has_answered_is_still_pending_at_the_deadline() {
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         let posted = m
             .post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
@@ -1273,7 +1600,7 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_request_is_refused_before_anything_looks_at_it() {
         let m = mailbox();
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
         assert_eq!(
             m.post_request(
                 addr(2),
@@ -1295,18 +1622,15 @@ mod tests {
             max_sessions: 3,
             per_address: 2,
         });
-        assert!(m.open_session(addr(1), None).is_ok());
-        assert!(m.open_session(addr(1), None).is_ok());
+        assert!(m.open_session(addr(1)).is_ok());
+        assert!(m.open_session(addr(1)).is_ok());
         // Third from the same address: the per-address limit bites first.
-        assert_eq!(
-            m.open_session(addr(1), None).err(),
-            Some(Refused::RateLimited)
-        );
+        assert_eq!(m.open_session(addr(1)).err(), Some(Refused::RateLimited));
 
-        assert!(m.open_session(addr(2), None).is_ok());
+        assert!(m.open_session(addr(2)).is_ok());
         // Server-wide ceiling, reached from a fresh address.
         assert_eq!(
-            m.open_session(addr(3), None).err(),
+            m.open_session(addr(3)).err(),
             Some(Refused::TooManySessions)
         );
         assert_eq!(m.session_count(), 3);
@@ -1321,7 +1645,7 @@ mod tests {
         // One caller, several sessions: the allowance is theirs, not
         // each session's, so reaching more sessions buys nothing.
         let codes: Vec<String> = (0..3)
-            .map(|i| m.open_session(addr(10 + i), None).unwrap().code)
+            .map(|i| m.open_session(addr(10 + i)).unwrap().code)
             .collect();
         assert!(m
             .post_request(addr(2), Some(&codes[0]), &request(2))
@@ -1345,13 +1669,13 @@ mod tests {
             max_sessions: 16,
             per_address: 1,
         });
-        let opened = m.open_session(addr(1), None).unwrap();
+        let opened = m.open_session(addr(1)).unwrap();
 
         // Somebody else uses up their own allowance elsewhere, and then
         // this address is refused. The user's code must survive that:
         // burning it would send them back to a terminal for a code that
         // no longer works, for a reason that was never about them.
-        let other = m.open_session(addr(9), None).unwrap();
+        let other = m.open_session(addr(9)).unwrap();
         assert!(m
             .post_request(addr(2), Some(&other.code), &request(9))
             .is_ok());
@@ -1393,7 +1717,7 @@ mod tests {
     fn expiry_drops_a_session_and_everything_indexed_on_it() {
         let m = mailbox();
         let id = IdentityKey::from_seed(&[1u8; 32]);
-        let opened = m.open_session(addr(1), Some(id.fingerprint())).unwrap();
+        let opened = standing(&m, addr(1), &id);
         m.post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
 
