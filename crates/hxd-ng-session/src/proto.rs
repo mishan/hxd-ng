@@ -6,7 +6,7 @@ use hxd_core::video::{
     VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,
 };
 use hxd_core::voice::{IceCandidate, VoiceError, VoiceParticipant};
-use hxd_core::{Event, SeqEvent, SessionStatus, UserInfo};
+use hxd_core::{Event, LineFlags, LogLine, SeqEvent, SessionStatus, UserInfo};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -81,6 +81,16 @@ pub struct InboxParams {
     /// Page backwards from this id, exclusive.
     #[serde(default)]
     pub before: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct HistoryParams {
+    #[serde(default)]
+    pub before: Option<u64>,
+    #[serde(default)]
+    pub after: Option<u64>,
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -397,14 +407,20 @@ pub fn event_json(se: &SeqEvent) -> String {
             from,
             text,
             style,
-        } => (
-            "chat",
-            json!({
+            id,
+            at,
+        } => {
+            let mut data = json!({
                 "from": { "uid": from.uid, "nick": from.nick },
                 "text": text,
                 "style": if *style == 1 { "action" } else { "normal" },
-            }),
-        ),
+                "at": unix(*at),
+            });
+            if let Some(id) = id {
+                data["id"] = json!(id);
+            }
+            ("chat", data)
+        }
         Event::Notice { cid: 0, text, .. } => ("notice", json!({ "text": text })),
         Event::ChatSubject { cid: 0, subject } => ("subject", json!({ "subject": subject })),
         Event::Msg {
@@ -477,6 +493,53 @@ pub fn unix(t: std::time::SystemTime) -> u64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// A durable history row. Deliberately no uid: it may have been recycled
+/// since the line was written.
+pub fn history_line_json(line: &LogLine) -> Value {
+    let deleted = line.flags.contains(LineFlags::DELETED);
+    let mut value = json!({
+        "id": line.id,
+        "at": unix(line.at),
+        "from": if deleted {
+            json!({ "icon": line.icon })
+        } else {
+            json!({ "nick": line.from_nick, "icon": line.icon })
+        },
+        "text": if deleted { "" } else { &line.text },
+        "style": if line.flags.contains(LineFlags::ACTION) { "action" } else { "normal" },
+    });
+    if deleted {
+        value["deleted"] = json!(true);
+    }
+    if let Some(media) = &line.media {
+        value["media"] = if deleted {
+            json!({
+                "type": media.mime,
+                "width": media.width,
+                "height": media.height,
+                "bytes": media.bytes,
+                "removed": true,
+            })
+        } else {
+            // M5 will decide whether an expired handle omits `id`; until
+            // the media store exists every persisted handle is metadata.
+            json!({
+                "id": media_handle(&media.id),
+                "type": media.mime,
+                "width": media.width,
+                "height": media.height,
+                "bytes": media.bytes,
+            })
+        };
+    }
+    value
+}
+
+fn media_handle(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// One stored message, as `inbox` lists it.

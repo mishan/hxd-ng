@@ -793,10 +793,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hotline-proto"
-version = "0.1.0"
-
-[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -848,13 +844,13 @@ dependencies = [
  "base64",
  "futures-util",
  "hl-identity",
- "hotline-proto",
  "hxd-auth-file",
  "hxd-core",
  "hxd-ng-session",
  "hxd-session",
  "hxd-store-sqlite",
  "hxd-voice",
+ "hxproto",
  "serde",
  "serde_json",
  "str0m",
@@ -914,8 +910,8 @@ dependencies = [
 name = "hxd-session"
 version = "0.1.0"
 dependencies = [
- "hotline-proto",
  "hxd-core",
+ "hxproto",
  "tokio",
  "tracing",
 ]
@@ -939,6 +935,11 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "hxproto"
+version = "0.1.0"
+source = "git+https://github.com/mishan/hx-libs.git?rev=784c4d3e095588ac20546fedf0f8f8cdb15da1e9#784c4d3e095588ac20546fedf0f8f8cdb15da1e9"
 
 [[package]]
 name = "hyper"

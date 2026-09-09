@@ -106,7 +106,7 @@ MVP is the payoff.
 chat text as raw Mac Roman bytes. It flips to `String`: the legacy frontend
 converts Mac Roman → UTF-8 on ingest and UTF-8 → Mac Roman (lossy `?` for
 unmappable, truncate nicks to 31 bytes *after* conversion) on egress, via
-`hotline_proto::text`. This is lossless for all legacy-origin text — Mac
+`hxproto::text`. This is lossless for all legacy-origin text — Mac
 Roman → UTF-8 is injective and round-trips exactly — and lossy only for
 ng-origin text shown to legacy clients, which is unavoidable. The
 kick-announcement `ChatLine` event becomes a semantic `Notice { cid, text }`
@@ -205,9 +205,10 @@ login timeout.
     "detach": { "grace": 300 },      // null when the account can't detach —
                                      // the client then knows a resume will
                                      // never succeed and re-logins instead
-    "caps": [ "voice" ],             // optional extensions this server
+    "caps": [ "voice", "history" ], // optional extensions this server
                                      // offers; always present, empty when
                                      // the build offers none (§11)
+    "history": { "max_lines": 10000, "max_days": 0 }, // when enabled
     "seq": 0                          // events start at seq 1
 } }
 ```
@@ -281,6 +282,7 @@ Requests:
 |---|---|---|---|
 | `login` / `resume` / `sync` | above | above | handshake only |
 | `chat` | `text`, `style?` (`"normal"`\|`"action"`) | `{}` | needs send-chat access; multi-line allowed, server relays as one event |
+| `history` | `before?` / `after?` (line id), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | needs chat-history access; rows ascend by id; both cursors mean the exclusive range `after < id < before`, paged forward; `params` may be omitted |
 | `msg` | exactly one of `to` (uid) / `to_login`, plus `text`, `guid?` | `{ "queued": bool }` | needs send-msgs access; same 4096-byte cap as chat. See §7.1 |
 | `inbox` | `before?` (id), `limit?` (1–200, default 50) | `{ messages, unread, total }` | newest first, paging backwards. `params` may be omitted |
 | `msg_read` | `up_to` (id) | `{ unread, total }` | marks everything of yours up to that id read |
@@ -312,7 +314,7 @@ Events (all carry `seq`):
 | `user_joined` | `{ user }` | `Joined` |
 | `user_changed` | `{ user }` | `Changed` (includes status transitions) |
 | `user_parted` | `{ "uid": n }` | `Parted` |
-| `chat` | `{ "from": {uid, nick}, "text", "style" }` | `Chat` (cid 0 only in MVP) |
+| `chat` | `{ "from": {uid, nick}, "text", "style", "id"?, "at" }` | `Chat` (cid 0 only in MVP); `id` exists when persisted |
 | `notice` | `{ "text" }` | `Notice` |
 | `subject` | `{ "subject" }` | `ChatSubject` (cid 0) |
 | `broadcast` | `{ "from": {uid, nick}, "text" }` | `Broadcast` |
@@ -391,7 +393,10 @@ client has to know:
 **A client that resyncs must pull `inbox`.** When `resume` answers
 `resync_required`, the events in the gap are gone, and any `msg` among
 them was already marked delivered — the store is the only remaining copy.
-So the recovery is `sync`, and then `inbox` to see what the gap held. §3's
+So the recovery is `sync`, then `inbox` to see what private-message traffic
+the gap held, then `history { after: last_id }` (looping while `has_more`) to
+recover its public chat. A line returned by history has the same id as its
+live event, so a client deduplicates by id. §3's
 "a dropped socket stops losing messages" is true of the store and true of
 the wire only for a client that does this. Mail that arrived while the
 socket was gone was never in the buffer at all: it is still pending, and
@@ -477,8 +482,13 @@ Each lands separately with tests, roughly a branch apiece:
 - **Push + offline inbox** (the rest of Phase 7): a `NotificationGateway`
   registration request, and the outbox growing a durable tail in Postgres —
   the seq/replay model is already the right substrate.
-- **History**: `{ "req": "history", "params": { "before_seq", "limit" } }`
-  once chat lines persist; the event shape doesn't change.
+- **Inline media**: designed in [inline-media.md](inline-media.md) §8 —
+  bytes over HTTP on the ng port, a `media` handle on `chat`/`msg`
+  requests and a `media` object on their events.
+- **Moderation**: designed in [moderation.md](moderation.md) §5 — a
+  `report` request for anyone, `redact`/`revoke`/`purge`/`kick` and
+  the report queue for moderators, and `chat_redacted`/`media_revoked`
+  events so a client can blank what it already drew.
 - **Private chats**: the domain events exist; ng needs a `cid` field on
   `chat`/`subject` events and room-lifecycle requests. Voice already
   carries `cid` on every request and event, so nothing there changes.

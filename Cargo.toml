@@ -1,11 +1,8 @@
 # hxd-ng — a new Hotline server in Rust. See ROADMAP.md.
 #
-# The protocol crates are consumed from the gtkhx submodule (Phase 0 of the
-# roadmap — a shared-crate extraction — is deferred). After cloning:
-#
-#     git submodule update --init
-#
-# Bumping the shared crates = advancing the submodule pin, deliberately.
+# Shared protocol crates are consumed from hx-libs at pinned git revisions.
+# Bumping a pin is deliberate and gets a full workspace test run in both
+# applications.
 
 [workspace]
 resolver = "2"
@@ -20,13 +17,6 @@ members = [
     "crates/hxd",
     "crates/hlid",
 ]
-# Without this, cargo auto-adopts the submodule's crates as workspace
-# members (path deps living under the workspace root), and `--workspace`
-# test/lint runs start covering gtkhx's code with hxd-ng's settings. The
-# submodule crates stay governed by their own workspace; the pin's health
-# is gtkhx CI's job.
-exclude = ["gtkhx"]
-
 [workspace.package]
 edition = "2021"
 license = "GPL-2.0-or-later"
@@ -35,8 +25,8 @@ license = "GPL-2.0-or-later"
 rust-version = "1.85"
 
 [workspace.dependencies]
-# Shared with gtkhx (see the note at the top of this file).
-hotline-proto = { path = "gtkhx/rust/crates/hotline-proto" }
+# Shared with GtkHx (see the note at the top of this file).
+hxproto = { git = "https://github.com/mishan/hx-libs.git", rev = "784c4d3e095588ac20546fedf0f8f8cdb15da1e9" }
 
 # Internal.
 hl-identity = { path = "crates/hl-identity" }

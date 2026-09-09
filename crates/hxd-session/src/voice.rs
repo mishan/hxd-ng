@@ -14,9 +14,9 @@
 //! id 0**, not the push counter the rest of this frontend uses; see
 //! [`crate::session`]'s writer.
 
-use hotline_proto::messages::tag;
-use hotline_proto::voice::ice as wire_ice;
 use hxd_core::voice::{IceCandidate, VoiceError, VoiceParticipant};
+use hxproto::messages::tag;
+use hxproto::voice::ice as wire_ice;
 
 /// PCMU's id in the participants blob's codec field. The only codec the
 /// spec defines, and the only one a room can be using.
@@ -28,13 +28,12 @@ const FLAG_MUTED: u16 = 0x0001;
 /// The `DATA_VOICE_PARTICIPANTS` (`0x01F9`) payload: a packed array of
 /// six-byte entries, `uid | flags | codec id`, all big-endian.
 ///
-/// `hotline_proto::voice::parse_voice_participants` is the client-side
+/// `hxproto::voice::parse_voice_participants` is the client-side
 /// half of this and the round-trip test in this module runs against it,
 /// which is the check that actually matters — our encoder against the
 /// decoder GtkHx really uses. The encoder itself stays here rather than
-/// in the shared crate until the shared-crate extraction gives the two
-/// halves a home together; six bytes an entry is not worth a coordinated
-/// submodule bump.
+/// in the shared crate until its API next needs a coordinated change; six
+/// bytes an entry is not worth advancing two projects' exact git pins.
 pub fn participants_payload(ps: &[VoiceParticipant]) -> Vec<u8> {
     let mut v = Vec::with_capacity(ps.len() * 6);
     for p in ps {
@@ -82,8 +81,8 @@ const MAX_ICE_DEPTH: usize = 8;
 /// on both wires. One pass over bytes we are about to parse anyway is a
 /// cheap price for closing it here.
 ///
-/// The real fix belongs upstream in `hotline-proto`, which is a read-only
-/// submodule to us: GtkHx runs the same parser on server-supplied 604s
+/// The real fix belongs upstream in `hxproto`, which is an independently
+/// pinned dependency: GtkHx runs the same parser on server-supplied 604s
 /// and has the mirror-image exposure, which nothing on this side can help
 /// with. Drop this guard once the shared parser carries its own depth
 /// limit.
@@ -168,7 +167,7 @@ pub fn chat_id(cid: u32) -> (u16, Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hotline_proto::voice::parse_voice_participants;
+    use hxproto::voice::parse_voice_participants;
 
     #[test]
     fn the_participants_blob_round_trips_through_the_clients_parser() {

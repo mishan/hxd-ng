@@ -48,13 +48,10 @@ working in the code: [AGENTS.md](AGENTS.md).
 
 ### Prerequisites
 
-The protocol crates are shared with
-[GtkHx](https://github.com/mishan/gtkhx), vendored as a submodule pinned to
-a known-good revision:
-
-```sh
-git submodule update --init
-```
+The `hxproto` wire crate is shared with
+[GtkHx](https://github.com/mishan/gtkhx) through the
+[hx-libs](https://github.com/mishan/hx-libs) workspace. Cargo fetches the
+pinned revision automatically.
 
 Building the voice SFU needs a C/assembly toolchain and **cmake** — the
 WebRTC stack's DTLS certificate generation reaches aws-lc-sys whichever
@@ -216,6 +213,21 @@ retain_read = 604800     # seconds; 7 days, from when it was read
 sync = "normal"          # or "full": fsync every commit
 ```
 
+### Chat history
+
+Absent means no server-held scrollback. When `db` is omitted, history uses
+the inbox database and shares its SQLite connection; without an inbox it is
+required. See [docs/chat-history.md](docs/chat-history.md).
+
+```toml
+[history]
+# db = "messages.db"      # required only without [inbox]
+max_lines = 10000         # 0 = unlimited
+max_days = 0              # 0 = unlimited
+max_page = 200            # maximum rows in one request
+replay = 0                # plain chat lines replayed to old legacy clients
+```
+
 ### Voice and video
 
 Both absent by default. Video rides the voice session, so `[voice.video]`
@@ -326,7 +338,8 @@ nothing.
 
 ### Cargo features
 
-`voice` and `inbox` are both on by default, so CI covers them. Building
+`voice` and `inbox` are both on by default, so CI covers them. The `inbox`
+feature supplies the shared SQLite store for both inbox and history. Building
 without one leaves its dependency out of the binary entirely — no WebRTC
 stack, no bundled SQLite — and the matching config section then becomes a
 startup error rather than a promise the build cannot keep.
@@ -342,6 +355,9 @@ startup error rather than a promise the build cannot keep.
 | [identity-threat-model.md](docs/identity-threat-model.md) | What identity defends against, and what it deliberately does not |
 | [identity-test-vectors.json](docs/identity-test-vectors.json) | Signed objects and reject cases — the contract a second implementation is checked against |
 | [private-messages.md](docs/private-messages.md) | The offline inbox: the mailbox rule, the store contract, delivery, blocking, retention |
+| [chat-history.md](docs/chat-history.md) | Scrollback: the chat log, cursor paging on both wires, retention, fogWraith's `Get Chat History` |
+| [inline-media.md](docs/inline-media.md) | Images in chat: the re-encode pipeline, handles and relay-time authorisation, 750/751 and the HTTP routes |
+| [moderation.md](docs/moderation.md) | Redaction, revocation, purges and reports: the acts, the audit trail, and what each wire can do |
 | [voice.md](docs/voice.md) | The SFU: hand-written SDP, RTP forwarding, and one room across both signalling wires |
 | [capabilities-video.md](docs/capabilities-video.md) | Video: publications, subscriptions, limits, and the renegotiation path |
 | [push-notifications.md](docs/push-notifications.md) | Push: the notify decision in the domain, and delegating the device registry |

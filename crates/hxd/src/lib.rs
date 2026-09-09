@@ -44,6 +44,25 @@ pub struct Config {
     /// The durable private-message inbox. Absent = disabled, and then
     /// private messaging behaves exactly as it did before there was one.
     pub inbox: Option<InboxSection>,
+    /// Server-held public-chat scrollback. Absent = disabled.
+    pub history: Option<HistorySection>,
+}
+
+/// Public chat history (`docs/chat-history.md` §9).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistorySection {
+    /// SQLite file. May be omitted when `[inbox]` exists; both then share
+    /// the inbox database and one connection.
+    pub db: Option<PathBuf>,
+    #[serde(default = "default_history_max_lines")]
+    pub max_lines: u32,
+    #[serde(default)]
+    pub max_days: u32,
+    #[serde(default = "default_history_max_page")]
+    pub max_page: usize,
+    #[serde(default)]
+    pub replay: usize,
 }
 
 /// The private-message inbox (docs/private-messages.md §8).
@@ -458,6 +477,12 @@ fn default_retain_unread() -> u64 {
 fn default_retain_read() -> u64 {
     7 * 24 * 3600
 }
+fn default_history_max_lines() -> u32 {
+    10_000
+}
+fn default_history_max_page() -> usize {
+    200
+}
 
 impl Default for ServerSection {
     fn default() -> Self {
@@ -500,6 +525,9 @@ impl Config {
 /// is a promise that the extension's transactions will work.
 fn legacy_caps(config: &Config, voice: Option<&Voice>) -> Caps {
     let mut caps = Caps::empty();
+    if config.history.is_some() {
+        caps = caps.with(cap::CHAT_HISTORY);
+    }
     if voice.is_some() {
         caps = caps.with(cap::VOICE);
         // Bit 10 never without bit 2, and never from a config key alone:
@@ -523,6 +551,9 @@ fn video_enabled(config: &Config) -> bool {
 /// into advertising different things.
 fn ng_caps(config: &Config, voice: Option<&Voice>) -> Vec<String> {
     let mut caps = Vec::new();
+    if config.history.is_some() {
+        caps.push("history".to_string());
+    }
     if voice.is_some() {
         caps.push("voice".to_string());
         // As on the classic wire, `"video"` never appears without
@@ -700,16 +731,155 @@ pub fn check_config(config: &Config) -> Result<(), String> {
         }
         .check()?;
     }
+    if let Some(history) = &config.history {
+        if history.db.is_none() && config.inbox.is_none() {
+            return Err("[history] needs db unless [inbox] names the shared database".into());
+        }
+        if !(1..=200).contains(&history.max_page) {
+            return Err("[history] max_page must be between 1 and 200".into());
+        }
+    }
     Ok(())
 }
 
-/// Open the inbox database named by `[inbox]`, if any.
+#[cfg(feature = "inbox")]
+fn open_sqlite(
+    path: &Path,
+    sync: hxd_store_sqlite::Synchronous,
+) -> Result<Arc<hxd_store_sqlite::SqliteStore>, String> {
+    // History and inbox bodies are both cleartext. Create the main file
+    // private before SQLite opens it, then apply the same mode to WAL
+    // sidecars after migration.
+    #[cfg(unix)]
+    if !path.exists() {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    let store = Arc::new(
+        hxd_store_sqlite::SqliteStore::open(path, sync)
+            .map_err(|e| format!("{}: {e}", path.display()))?,
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(suffix);
+            let p = PathBuf::from(p);
+            if p.exists() {
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("{}: {e}", p.display()))?;
+            }
+        }
+    }
+    Ok(store)
+}
+
+#[cfg(feature = "inbox")]
+struct RuntimeStores {
+    inbox: Option<Arc<dyn hxd_core::MessageStore>>,
+    history: Option<Arc<dyn hxd_core::ChatLog>>,
+}
+
+#[cfg(feature = "inbox")]
+fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
+    use hxd_store_sqlite::Synchronous;
+    let inbox_path = config.inbox.as_ref().map(|i| i.db.clone());
+    let history_path = config
+        .history
+        .as_ref()
+        .and_then(|h| h.db.clone().or_else(|| inbox_path.clone()));
+    let inbox_sync = config
+        .inbox
+        .as_ref()
+        .map_or(Synchronous::Normal, |i| match i.sync {
+            InboxSync::Normal => Synchronous::Normal,
+            InboxSync::Full => Synchronous::Full,
+        });
+
+    let shared = match (inbox_path.as_ref(), history_path.as_ref()) {
+        (Some(inbox), Some(history)) => database_path(inbox)? == database_path(history)?,
+        _ => false,
+    };
+    if shared {
+        let store = open_sqlite(inbox_path.as_ref().unwrap(), inbox_sync)?;
+        let inbox: Arc<dyn hxd_core::MessageStore> = store.clone();
+        let history: Arc<dyn hxd_core::ChatLog> = store;
+        return Ok(RuntimeStores {
+            inbox: Some(inbox),
+            history: Some(history),
+        });
+    }
+    let inbox = match inbox_path {
+        Some(path) => Some(open_sqlite(&path, inbox_sync)? as Arc<dyn hxd_core::MessageStore>),
+        None => None,
+    };
+    let history = match history_path {
+        Some(path) => Some(open_sqlite(&path, Synchronous::Normal)? as Arc<dyn hxd_core::ChatLog>),
+        None => None,
+    };
+    Ok(RuntimeStores { inbox, history })
+}
+
+/// Resolve enough of a possibly-new database path to compare two spellings.
 ///
-/// Two shapes, one signature: without the `inbox` feature there is no
-/// store to build, and a config that asks for one is a startup error
-/// rather than a silently ignored promise — an operator who configured
-/// offline messages should not have to discover from a user that they
-/// never happened.
+/// The database itself need not exist yet, so canonicalise its parent and
+/// put the final component back. This catches `db` versus `./db` and a
+/// symlinked directory without creating either file just to compare them.
+#[cfg(feature = "inbox")]
+fn database_path(path: &Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", path.display()));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{} is not a database filename", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent
+        .canonicalize()
+        .map(|parent| parent.join(name))
+        .map_err(|e| format!("{}: {e}", parent.display()))
+}
+
+#[cfg(not(feature = "inbox"))]
+struct RuntimeStores {
+    inbox: Option<Arc<dyn hxd_core::MessageStore>>,
+    history: Option<Arc<dyn hxd_core::ChatLog>>,
+}
+
+#[cfg(not(feature = "inbox"))]
+fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
+    if config.inbox.is_some() || config.history.is_some() {
+        return Err(
+            "[inbox] or [history] is configured, but this build has no SQLite store \
+                    (built without the `inbox` feature)"
+                .into(),
+        );
+    }
+    Ok(RuntimeStores {
+        inbox: None,
+        history: None,
+    })
+}
+
+/// Open the inbox database named by `[inbox]`, if any, creating and
+/// migrating it the way startup does.
+///
+/// Startup itself goes through [`open_runtime_stores`], which opens the
+/// one file the inbox and the chat log may share; this is what
+/// `inbox purge` needs when it is about to write. A build without the
+/// feature refuses a config that asks for a store in
+/// `open_runtime_stores`, so there is no second shape of this to keep.
 #[cfg(feature = "inbox")]
 fn open_inbox(config: &Config) -> Result<Option<Arc<dyn hxd_core::MessageStore>>, String> {
     use hxd_store_sqlite::{SqliteStore, Synchronous};
@@ -757,16 +927,6 @@ fn open_inbox(config: &Config) -> Result<Option<Arc<dyn hxd_core::MessageStore>>
         }
     }
     Ok(Some(Arc::new(store)))
-}
-
-#[cfg(not(feature = "inbox"))]
-fn open_inbox(config: &Config) -> Result<Option<Arc<dyn hxd_core::MessageStore>>, String> {
-    if config.inbox.is_some() {
-        return Err("[inbox] is configured, but this build has no inbox \
-                    (built without the `inbox` feature)"
-            .to_string());
-    }
-    Ok(None)
 }
 
 /// What an operator command finds where the inbox database should be.
@@ -819,8 +979,8 @@ pub fn inbox_purge(
     fingerprint: Option<&str>,
     dry_run: bool,
 ) -> Result<usize, String> {
-    // `open_inbox` is the startup path: it creates the database when it
-    // is missing and migrates it when it is not. Both are wrong for an
+    // `open_inbox` creates the database when it is missing and migrates
+    // it when it is not, the way startup does. Both are wrong for an
     // operator command, and `--dry-run`'s whole promise is that it
     // changes nothing — a dry run against a server one version back was
     // doing the schema upgrade the operator was still deciding about,
@@ -930,6 +1090,24 @@ pub async fn inbox_pruner(core: Arc<Core>, unread: Duration, read: Duration) {
     }
 }
 
+/// Public-chat retention, kept off the request and append paths.
+pub async fn history_pruner(core: Arc<Core>, max_lines: u32, max_days: u32) {
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let core = core.clone();
+        let max_age = (max_days != 0).then(|| Duration::from_secs(u64::from(max_days) * 24 * 3600));
+        let gone =
+            tokio::task::spawn_blocking(move || core.prune_history(max_lines as usize, max_age))
+                .await
+                .unwrap_or(0);
+        if gone > 0 {
+            tracing::debug!(gone, "chat-history lines pruned");
+        }
+    }
+}
+
 /// Build the ng frontend context sharing the legacy context's core and
 /// auth. `None` when the config has no `[ng]` section.
 pub fn build_ng_ctx(
@@ -1004,7 +1182,8 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
     // Say at startup what an operator would otherwise learn from a user:
     // an account file that does not parse, or one nothing can log in to.
     auth.audit();
-    let core = match open_inbox(config)? {
+    let stores = open_runtime_stores(config)?;
+    let core = match stores.inbox {
         // The same FileAuth answers both "is this person who they say
         // they are" and "is there someone by that name to leave a message
         // for" — two traits, one backend.
@@ -1017,6 +1196,19 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
             },
         ),
         None => core,
+    };
+    let core = match (stores.history, config.history.as_ref()) {
+        (Some(log), Some(history)) => core.with_history(
+            log,
+            hxd_core::history::HistoryPolicy {
+                max_lines: history.max_lines,
+                max_days: history.max_days,
+                max_page: history.max_page,
+                replay: history.replay,
+            },
+        ),
+        (None, None) => core,
+        _ => return Err("[history] store was not opened".into()),
     };
 
     Ok(ServerCtx {
@@ -1090,6 +1282,76 @@ sync = "full"
         assert!(
             parse("[inbox]\ndb = \"m.db\"\nmax_qeued = 5\n").is_err(),
             "a misspelled key is a startup error, not a silent default"
+        );
+    }
+
+    #[test]
+    fn history_defaults_validates_and_is_advertised_on_both_wires() {
+        let cfg = parse("[inbox]\ndb = \"server.sqlite\"\n[history]\n").unwrap();
+        check_config(&cfg).unwrap();
+        let history = cfg.history.as_ref().unwrap();
+        assert_eq!(history.db, None);
+        assert_eq!(history.max_lines, 10_000);
+        assert_eq!(history.max_days, 0);
+        assert_eq!(history.max_page, 200);
+        assert_eq!(history.replay, 0);
+        assert!(legacy_caps(&cfg, None).has(cap::CHAT_HISTORY));
+        assert_eq!(
+            ng_caps(&cfg, None),
+            vec!["history".to_string(), "inbox".to_string()]
+        );
+
+        let no_db = parse("[history]\n").unwrap();
+        assert!(check_config(&no_db).unwrap_err().contains("needs db"));
+        let zero_page = parse("[history]\ndb = \"h.sqlite\"\nmax_page = 0\n").unwrap();
+        assert!(check_config(&zero_page).unwrap_err().contains("max_page"));
+        let huge_page = parse("[history]\ndb = \"h.sqlite\"\nmax_page = 201\n").unwrap();
+        assert!(check_config(&huge_page).unwrap_err().contains("max_page"));
+    }
+
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn inbox_and_history_share_one_store_when_their_path_is_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sqlite");
+        let cfg = parse(&format!(
+            "[inbox]\ndb = {:?}\n[history]\n",
+            path.to_string_lossy()
+        ))
+        .unwrap();
+        let stores = open_runtime_stores(&cfg).unwrap();
+        let inbox = stores.inbox.unwrap();
+        let history = stores.history.unwrap();
+        assert_eq!(
+            Arc::as_ptr(&inbox) as *const (),
+            Arc::as_ptr(&history) as *const (),
+            "one SQLite object must own the shared schema and connection"
+        );
+    }
+
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn equivalent_database_paths_share_one_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("server.sqlite");
+        let dotted = dir.path().join(".").join("server.sqlite");
+        let cfg = parse(&format!(
+            "[inbox]\ndb = {:?}\n[history]\ndb = {:?}\n",
+            plain.to_string_lossy(),
+            dotted.to_string_lossy()
+        ))
+        .unwrap();
+        let stores = open_runtime_stores(&cfg).unwrap();
+        let inbox = stores.inbox.unwrap();
+        let history = stores.history.unwrap();
+        assert_eq!(
+            Arc::as_ptr(&inbox) as *const (),
+            Arc::as_ptr(&history) as *const (),
+            "equivalent paths must not create two schema owners"
+        );
+        assert_eq!(
+            database_path(Path::new("server.sqlite")).unwrap(),
+            std::env::current_dir().unwrap().join("server.sqlite")
         );
     }
 

@@ -13,12 +13,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hotline_proto::messages::tag;
 use hxd_core::{Core, InboxPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{ServerConfig, ServerCtx};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
+use hxproto::messages::tag;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -1103,7 +1103,9 @@ async fn mail_that_arrives_during_an_unreplayable_gap_survives_the_resync() {
     // `resync_required`. Without this the test resumed cleanly and never
     // touched the path it exists for.
     for i in 0..(hxd_core::roster::OUTBOX_BUFFER_CAP + 10) {
-        srv.core.chat_public(alice_uid, format!("line {i}"), 0);
+        srv.core
+            .chat_public(alice_uid, format!("line {i}"), 0)
+            .unwrap();
     }
 
     let mut back = Ng::connect(srv.ng).await;

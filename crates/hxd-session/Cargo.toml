@@ -8,7 +8,7 @@ description = "hxd-ng session layer: framing, handshake, dispatch, wire trace"
 publish = false
 
 [dependencies]
-hotline-proto = { workspace = true }
+hxproto = { workspace = true }
 hxd-core = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

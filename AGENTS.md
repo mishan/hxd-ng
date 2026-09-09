@@ -25,27 +25,23 @@ never-break-old-servers rule and outranks every other consideration.
 Deviations from reference-server behavior are deliberate and commented at
 the site.
 
-License is **GPL-2.0-or-later** — forced by `hotline-proto`'s hxd ancestry,
+License is **GPL-2.0-or-later** — forced by `hxproto`'s hxd ancestry,
 and kept.
 
 ## Build and run
 
 ```sh
-git submodule update --init   # once; the shared crates live in gtkhx/
 cargo build --workspace
 cargo run --bin hxd           # config: hxd-ng.toml (all keys optional)
 ```
 
-The **gtkhx submodule** provides `hotline-proto` (and, later, hxcrypto and
-friends) via path deps. Rules:
+The [hx-libs](https://github.com/mishan/hx-libs) workspace provides
+`hxproto` as a pinned git dependency shared with GtkHx. Rules:
 
-- `exclude = ["gtkhx"]` in the workspace Cargo.toml is load-bearing:
-  without it cargo auto-adopts the submodule's crates as workspace members
-  and `--workspace` runs start linting gtkhx's code with our settings.
 - Advancing the pin is a deliberate act with a full test run behind it.
-- API changes in the shared crates are coordinated across both trees by
-  hand. The eventual extraction (and the third-party hotline-rs org that
-  may host it) is ROADMAP.md Phase 0.
+- API changes in shared crates land in hx-libs first, then each consumer
+  advances to the validated revision. The unrelated third-party hotline-rs
+  implementation can be evaluated when its source is public.
 
 MSRV is pinned to gtkhx's floor (`rust-version` in Cargo.toml) but has only
 been exercised on newer toolchains; CI runs stable.
@@ -57,7 +53,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation, access bits, auth traits. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman ↔ UTF-8 at its edges. `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket. |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the WebSocket-as-byte-stream adapter (`tunnel.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
-| `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it belongs with the `hotline-proto` tier when the shared-crate extraction happens. |
+| `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
 | `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy + `[identity]` link), first-run guest bootstrap. Identity links are written back with `toml_edit` so hand-edited files keep their comments; fingerprint lookups scan the directory. |
 | `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
 | `hxd-store-sqlite` | The private-message inbox's durable store: one SQLite file, WAL, the schema and migrations of `docs/private-messages.md` §5, and the conformance suite both stores are run against. Behind `hxd-core`'s `MessageStore` trait and the `inbox` Cargo feature; the in-memory store beside it in `hxd-core` is what the domain tests use. |
@@ -103,8 +99,8 @@ mirror mhxd's.
 observe: the login/agreement dance, server-side chat formatting (the
 `\r%13.13s:  %s` and `\r *** %s %s` forms, byte for byte, empty tokens
 skipped), user-list payloads, task-reply conventions (replies echo the
-request trans; pushes count their own). It is vendored for cross-reading
-at `gtkhx/mhxd/`. Where we deviate on purpose — real access bits in
+request trans; pushes count their own). GtkHx vendors it for cross-reading
+in its development tree. Where we deviate on purpose — real access bits in
 SELFINFO, readable task errors, acked broadcasts — the site says so.
 
 **Video is layered on voice, never beside it.** One peer connection, one
@@ -157,8 +153,8 @@ Three layers, all `cargo test --workspace`:
   server per case with its own accounts directory) and `inbox.rs`
   (offline private messages across both wires: queue, flush at login,
   resync, blocks, retention).
-- The scripted legacy client packs and parses with the same
-  `hotline-proto` the real GtkHx uses, so e2e doubles as wire-compat
+- The scripted legacy client packs and parses with the same pinned
+  `hxproto` revision GtkHx uses, so e2e doubles as wire-compat
   checking.
 
 House rules: **tests fail loudly** — never skip around something broken.
@@ -224,7 +220,7 @@ presence, chat, private chats, PMs, broadcast, and moderation; the
 Hotline-ng MVP (roster + chat + PMs with detach/resume) is complete and
 cross-tested; voice and video are implemented on both wires, sharing one
 room and one SFU. The large open fronts, in rough order: HOPE + ciphers on the
-legacy wire (`hxcrypto` sits ready in the submodule), the ng rate-limit and
+legacy wire (`hxcrypto` currently lives in GtkHx), the ng rate-limit and
 client-quickstart polish, the fogWraith Text-Encoding capability (cheap —
 the UTF-8 interior already satisfies its core mandate), files/HTXF, news,
 and eventually the persistence/clustering phases. The mobile app the ng

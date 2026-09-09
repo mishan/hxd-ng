@@ -4,8 +4,8 @@
 # clients against live servers on ephemeral ports), and a syntax check of
 # the Node test client.
 #
-# The gtkhx submodule pin is fetched over https; advancing it is a
-# deliberate act that this workflow then validates.
+# The shared hxproto revision is fetched from hx-libs over https; advancing
+# the pin is a deliberate act that this workflow then validates.
 #
 # TODO: add an MSRV (1.85) job once the lockfile is verified to resolve at
 # that toolchain — the pin is inherited from gtkhx's Debian-stable floor
@@ -38,8 +38,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,6 +50,12 @@ jobs:
 
       - name: Clippy (warnings denied)
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The optional stores are cfg'd out rather than stubbed, so a build
+      # without them compiles different code — which has been broken by a
+      # refactor that only the default build ever saw.
+      - name: Clippy without default features
+        run: cargo clippy -p hxd --no-default-features -- -D warnings
 
       - name: Tests
         run: cargo test --workspace

@@ -15,14 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hotline_proto::messages::tag;
-use hotline_proto::voice::{ice as wire_ice, parse_voice_participants};
 use hxd_core::voice::fake::RecordingMedia;
 use hxd_core::Core;
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::{cap, Caps};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{ServerConfig, ServerCtx};
+use hxproto::messages::tag;
+use hxproto::voice::{ice as wire_ice, parse_voice_participants};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;

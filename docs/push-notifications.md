@@ -128,7 +128,7 @@ follow when there is an app to receive them. **This resolves the open
 question rather than colliding with it.**
 
 **Process separation solves a license problem we'd otherwise have.**
-hxd-ng is GPL-2.0-or-later, forced by `hotline-proto`'s hxd ancestry.
+hxd-ng is GPL-2.0-or-later, forced by `hxproto`'s hxd ancestry.
 uniqush is Apache-2.0, which is *incompatible with GPLv2* — linking an
 Apache-2.0 library into a GPLv2 binary is the classic patent-clause
 conflict. Talking to a separate daemon over HTTP raises none of it. A
@@ -517,7 +517,7 @@ on a different PSP.
   mobile app talking to several servers wants distinct VAPID keys per
   server anyway. Probably per-server, but it interacts with how the app
   handles multi-server accounts, which nobody has designed yet.
-- Whether uniqush should be vendored as a submodule (as gtkhx is) for
+- Whether uniqush should be vendored for
   version-pinning and reproducible deployment, or simply documented as an
   external dependency with a minimum version — which is **2.8.0** either
   way, and which needs Go 1.25+ to build.

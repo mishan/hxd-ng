@@ -28,7 +28,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -121,6 +121,12 @@ pub enum Event {
         from: UserInfo,
         text: String,
         style: u16,
+        /// The durable public-log row. Private chats and servers with no
+        /// history configured carry `None`.
+        id: Option<crate::history::LineId>,
+        /// Server receive time. Unlike `id`, every chat event has one so
+        /// the ng wire can render live timestamps without enabling history.
+        at: SystemTime,
     },
     /// A server notice into a chat (kick announcements and the like).
     /// Semantic text; each frontend formats it (legacy: `\r<text>`).
@@ -301,6 +307,10 @@ pub(crate) struct UserSession {
     /// This session's identity fingerprint — the durable half of its
     /// mailbox key. See [`AttachInfo::identity`].
     pub(crate) identity: Option<[u8; 32]>,
+    /// History request throttling is session state, so it survives an ng
+    /// transport detach/resume instead of resetting on every WebSocket.
+    pub(crate) history_refill: Instant,
+    pub(crate) history_tokens: f64,
     /// Whether this session has been announced (shows on the user list,
     /// generates events). False between login and login-completion.
     pub(crate) visible: bool,
@@ -536,6 +546,10 @@ pub struct Core {
     /// calls are disk I/O and must not happen under the roster lock; a
     /// field the locked state cannot reach is a structural reminder.
     pub(crate) inbox: Option<Arc<dyn crate::inbox::MessageStore>>,
+    /// Durable public-chat scrollback, or `None` when history is off.
+    /// Store calls never happen under `roster`.
+    pub(crate) history: Option<Arc<dyn crate::history::ChatLog>>,
+    pub(crate) history_policy: crate::history::HistoryPolicy,
     pub(crate) directory: Option<Arc<dyn crate::account::AccountDirectory>>,
     pub(crate) inbox_policy: InboxPolicy,
     /// Where push notifications go, or `None` — which is the no-op, and
@@ -553,6 +567,10 @@ pub struct Core {
     /// the-roster-lock rule survives. Order is always this lock first,
     /// then the roster's.
     pub(crate) flushing: Mutex<()>,
+    /// Makes persisted id order and live fan-out order the same fact.
+    /// Nothing but public chat takes this lock; order is it first, then
+    /// (briefly) `roster`.
+    pub(crate) log_serial: Mutex<()>,
 }
 
 impl Core {
@@ -572,6 +590,19 @@ impl Core {
         self.inbox = Some(store);
         self.directory = Some(directory);
         self.inbox_policy = policy;
+        self
+    }
+
+    /// Give the domain a durable public-chat log. The same store object may
+    /// also implement the inbox; the binary shares it when both sections
+    /// name the same SQLite file.
+    pub fn with_history(
+        mut self,
+        log: Arc<dyn crate::history::ChatLog>,
+        policy: crate::history::HistoryPolicy,
+    ) -> Self {
+        self.history = Some(log);
+        self.history_policy = policy;
         self
     }
 
@@ -624,6 +655,8 @@ impl Core {
                 has_inbox: info.has_inbox,
                 reads_on_delivery: info.reads_on_delivery,
                 identity: info.identity,
+                history_refill: Instant::now(),
+                history_tokens: 10.0,
                 visible: false,
                 outbox: Outbox::live(tx),
             },
@@ -877,6 +910,14 @@ impl Core {
         self.inbox.is_some()
     }
 
+    pub fn history_enabled(&self) -> bool {
+        self.history.is_some()
+    }
+
+    pub fn history_policy(&self) -> Option<crate::history::HistoryPolicy> {
+        self.history.as_ref().map(|_| self.history_policy)
+    }
+
     /// The public chat subject.
     pub fn public_subject(&self) -> String {
         self.roster.lock().unwrap().public_subject.clone()
@@ -1094,8 +1135,8 @@ mod tests {
         ));
 
         // Traffic while detached buffers.
-        core.chat_public(b, "you there?".into(), 0);
-        core.chat_public(b, "hello?".into(), 0);
+        core.chat_public(b, "you there?".into(), 0).unwrap();
+        core.chat_public(b, "hello?".into(), 0).unwrap();
 
         let Resume::Replayed(mut rx_a2, replay) = core.resume(a, last_seq) else {
             panic!("resume should replay");
@@ -1122,7 +1163,7 @@ mod tests {
             evs.last(),
             Some(Event::Changed(u)) if u.status == SessionStatus::Active
         ));
-        core.chat_public(b, "welcome back".into(), 0);
+        core.chat_public(b, "welcome back".into(), 0).unwrap();
         assert!(drain(&mut rx_a2)
             .iter()
             .any(|e| matches!(e, Event::Chat { text, .. } if text == "welcome back")));
@@ -1151,7 +1192,7 @@ mod tests {
         assert!(core.connection_lost(a, 8));
 
         for i in 0..(OUTBOX_BUFFER_CAP + 10) {
-            core.chat_public(b, format!("spam {i}"), 0);
+            core.chat_public(b, format!("spam {i}"), 0).unwrap();
         }
         match core.resume(a, last_seq) {
             Resume::ResyncRequired(_rx) => {}
@@ -1216,7 +1257,7 @@ mod tests {
         };
         assert!(replay.is_empty());
         // The old channel is dead; the new one gets traffic.
-        core.chat_public(b, "hi".into(), 0);
+        core.chat_public(b, "hi".into(), 0).unwrap();
         assert!(rx_old.try_recv().is_err());
         assert_eq!(drain(&mut rx_new).len(), 1);
     }

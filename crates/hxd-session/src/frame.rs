@@ -1,7 +1,7 @@
 //! Transaction framing over a byte stream.
 //!
 //! The 22-byte header layout (`type`/`trans`/`flag`/`len`/`len2`/`hc`) and
-//! all chunk encoding come from `hotline-proto` — the same code gtkhx frames
+//! all chunk encoding come from `hxproto` — the same code gtkhx frames
 //! with, so the two ends can never disagree by drift.
 //!
 //! The read side frames by **`len2` (DataSize), not `len` (TotalSize)** —
@@ -10,9 +10,9 @@
 //! client fragments requests; a frame whose `len` disagrees with `len2` is
 //! rejected rather than half-understood.
 
-use hotline_proto::build::pack_header;
-use hotline_proto::wire::ChunkIter;
-use hotline_proto::{HL_DATA_HDR_LEN, HL_HDR_LEN};
+use hxproto::build::pack_header;
+use hxproto::wire::ChunkIter;
+use hxproto::{HL_DATA_HDR_LEN, HL_HDR_LEN};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Hard cap on a transaction's data size — mhxd's `MAX_HOTLINE_PACKET_LEN`.
@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 pub const MAX_FRAME_DATA: u32 = 0x40000;
 
 /// A received transaction. `buf` holds header + body contiguously so
-/// `hotline-proto`'s [`ChunkIter`] can walk it in place.
+/// `hxproto`'s [`ChunkIter`] can walk it in place.
 #[derive(Debug)]
 pub struct Frame {
     pub ty: u32,

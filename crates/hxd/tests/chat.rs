@@ -6,10 +6,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hotline_proto::messages::tag;
 use hxd_core::Core;
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{ServerConfig, ServerCtx};
+use hxproto::messages::tag;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;

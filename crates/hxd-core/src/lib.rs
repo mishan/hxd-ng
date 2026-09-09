@@ -10,6 +10,7 @@
 pub mod access;
 pub mod account;
 pub mod chat;
+pub mod history;
 pub mod inbox;
 pub mod notify;
 pub mod roster;
@@ -22,6 +23,10 @@ pub use account::{
     Proof, UnlinkOutcome,
 };
 pub use chat::{ChatError, MsgOutcome};
+pub use history::{
+    ChatLog, HistoryPage, HistoryPolicy, HistoryQuery, LineFlags, LineId, LogLine, MediaMeta,
+    MemoryLog, NewLine,
+};
 pub use inbox::{
     Delivery, InboxCounts, MemoryStore, MessageId, MessageStore, NewMessage, Pushed, StoreError,
     StoredMessage,

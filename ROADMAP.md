@@ -12,43 +12,38 @@ never break old servers; hxd-ng must never break old clients. Hotline 1.2 and
 files against hxd-ng with no changes. Extensions follow the same rule as on the
 client side: capability-negotiated or probed, never degrading the legacy path.
 
-**License: GPL-2.0-or-later.** Forced and fine — `hotline-proto` is
+**License: GPL-2.0-or-later.** Forced and fine — `hxproto` is
 hxd-derived and stays GPL (see gtkhx `docs/rust/crate-layout.md` §4), and a
 Hotline server is exactly the audience that section says is already GPL.
 
 ---
 
-## Phase 0 — Extract the shared crates into `hotline-rs` *(punted, 2026-08)*
+## Phase 0 — Extract shared protocol code into `hx-libs` *(implemented, 2026-09)*
 
-**Status: deferred.** For now hxd-ng consumes the crates from a **gtkhx git
-submodule** (`gtkhx/`, pinned to a rev; path deps into
-`gtkhx/rust/crates/...`). The crates are `publish = false` anyway, and Cargo
-resolves their workspace-inherited fields against the submodule's own
-workspace, so this works with zero gtkhx changes — and a clone of hxd-ng is
-self-contained (`git submodule update --init`). Advancing the pin is a
-deliberate act with a test run behind it. The extraction below remains the
-candidate end state; everything in it is still accurate when the time comes.
-Until then, API changes in the shared crates get coordinated across the two
-trees by hand.
+`hxproto` now lives in the independent
+[`hx-libs`](https://github.com/mishan/hx-libs) Cargo workspace. GtkHx and
+hxd-ng both use exact git revisions, so advancing the pin remains a deliberate
+act with a full test run behind it. hxd-ng no longer carries the GtkHx
+submodule just to reach one crate.
 
-**And the target may not be ours to create.** A third-party
+**This need not be the final shared implementation.** A third-party
 [github.com/hotline-rs](https://github.com/hotline-rs) org exists (August
 2026) — "Rust implementations of the Hotline protocol", hotline.rs domain,
-code still private but described as hotline-proto → hotline-codec →
+code still private but described as hxproto → hotline-codec →
 hotline-{client,server,tracker}, maintainer open to being a community
 integration point and to accepting contributions. Misha is a member. That is
-a *better* shape than a gtkhx-satellite extraction — a shared seam nobody's
-client owns — so the working plan is:
+a promising shape — a shared seam nobody's client owns — so the working plan
+is:
 
-- **Don't extract, don't stall.** Keep building on the path-dep crates;
-  revisit when his code is public and readable.
+- **Don't stall on convergence.** Keep building against the pinned `hx-libs`
+  crate; revisit when his code is public and readable.
 - **Share knowledge and fixtures first, code later if ever.** The durable
   protocol findings (DataSize framing, the HOPE rekey marker, the Mobius
   options-field drop, Mac Roman fidelity, tracker v3 probe-fallback) and the
   Tier 2 wire-fixture corpus are facts, license-thin, and worth months to
   anyone implementing this protocol. A shared conformance corpus both stacks
   pass *is* interoperability, without either adopting the other's code.
-- **Mind the license asymmetry.** Our `hotline-proto` is hxd-derived and
+- **Mind the license asymmetry.** Our `hxproto` is hxd-derived and
   permanently GPL; if the org's crates are permissive and independently
   written, code flows one way only — we can build on his, ours can't merge
   into his. Realistic convergence is hxd-ng/gtkhx eventually sitting on the
@@ -57,7 +52,7 @@ client owns — so the working plan is:
   and MSRV when the code posts.
 - Crate-boundary differences (his codec split vs. our proto-with-framing)
   are cosmetic next to wire-truth coverage; don't weigh them heavily.
-- His architecture sketch (August 2026): hotline-proto → hotline-codec →
+- His architecture sketch (August 2026): hxproto → hotline-codec →
   hotline-{client,server,tracker}, with binaries on top — hotline-cli /
   hotline-gui over the client crate, a hotline-daemon that injects Account
   and Files *providers* into the server crate, and a tracker daemon. The
@@ -69,21 +64,16 @@ client owns — so the working plan is:
   ours. Also unknowns: where HOPE/ciphers live, extension scope, tests,
   license. His tracker daemon covers a component we lack entirely.
 
-The original decision: the protocol crates move out of the gtkhx tree into a
-shared repo (working name **`hotline-rs`**) that both gtkhx and hxd-ng depend
-on. This deliberately reverses gtkhx's "no reusable libhotline" stance, and
-per its own roadmap, updating that paragraph (and `crate-layout.md` §5) is
-part of this phase, not an afterthought.
-
-**What moves** (all currently pure — no glib/gtk/gio in their dependency
-graphs, verified against their Cargo.tomls):
+The initial extraction deliberately moved only the crate both projects use.
+Other pure Rust crates should move when a second consumer needs them, rather
+than speculatively:
 
 | Crate | Why the server needs it |
 |---|---|
-| `hotline-proto` | The core win. Symmetric parse **and** build for every opcode, 1.0–1.9, plus framing (header + chunk), Mac Roman ↔ UTF-8, HL dates, login, sanitize, dispatch tables. A server is just the other end of the same builders and parsers. |
-| `hxcrypto` | Hash/stream/AEAD/compress primitives — the server side of HOPE, Blowfish OFB-64, ChaCha20-Poly1305, zlib. |
-| `hxhfs` | CAP/AppleDouble/Netatalk resource-fork sidecars for the file area. |
-| `hxfiles-xfer` | The FFO+FILP fork-header codec HTXF speaks. |
+| `hxproto` | **Moved.** Symmetric parse and build, framing, Mac Roman ↔ UTF-8, HL dates, login, sanitising and dispatch tables. |
+| `hxcrypto` | Candidate when hxd-ng implements HOPE and legacy ciphers. |
+| `hxhfs` | Candidate when the server's file area needs shared resource-fork sidecars. |
+| `hxfiles-xfer` | Candidate when the server implements HTXF. |
 
 **What stays behind, and why:**
 
@@ -94,36 +84,17 @@ graphs, verified against their Cargo.tomls):
   `hotline-hope` / `hotline-htxf` crate is an option — but extract on demand,
   not speculatively.
 - `hxtext`, `hxmacres` — glib-coupled; and the Mac Roman table the server
-  needs already lives in `hotline-proto::text`.
+  needs already lives in `hxproto::text`.
 - `hxtls-trust` — client-side TOFU. The server's TLS story is a rustls server
   config and a certificate, not a known-hosts store.
 - `hxconfig` — gtkhx's settings schema, not generic.
 
-**Mechanics** (this is the `crate-layout.md` §5 checklist, now actually due):
-
-1. New repo, Cargo workspace, the four crates moved with history if
-   convenient (`git filter-repo`) or flat-imported if not.
-2. **Gate the C ABI behind a Cargo feature** (`capi`, default off). gtkhx
-   enables it; hxd-ng and any other pure-Rust consumer never compiles the
-   `#[no_mangle]` surface.
-3. gtkhx switches to git dependencies pinned to a rev. Bumping the pin is a
-   deliberate act with a CI run behind it.
-4. **MSRV of the shared repo = gtkhx's Debian-stable pin.** hxd-ng itself can
-   float newer, but the shared crates must keep building for gtkhx.
-5. The Tier 1/Tier 2 tests that exercise these crates travel with them (the
-   wire fixtures especially — they are the conformance corpus both projects
-   now share). gtkhx keeps its integration tiers.
-6. CI: `cargo fmt --check`, `clippy -D warnings`, tests, at both MSRV and
-   stable.
-7. Naming: keep the `hx*` / `hotline-proto` names for now; a rename is
-   cosmetic churn while everything is `publish = false`. Publishing to
-   crates.io is a separate later decision.
-8. Update gtkhx's `docs/rust/ROADMAP.md` motivation paragraph and
-   `crate-layout.md` §5, per their own instructions.
-
-**Exit criteria:** gtkhx builds green against the pinned `hotline-rs` repo
-with the four crates deleted from its tree; hxd-ng's empty workspace depends
-on the same pin.
+`hxproto` remains `publish = false`; pinning a git revision and publishing a
+crate to crates.io are separate decisions. The third-party `hotline-rs`
+project is still worth evaluating once its implementation is public. Avoiding
+duplicated protocol stacks is desirable, but adoption should follow evidence
+about coverage, interoperability, licensing and MSRV rather than the name of
+the crate.
 
 ---
 
@@ -153,7 +124,7 @@ implementation of everything at first: in-memory, single process.
 
 One tokio task per client connection — the **session actor** — owns the
 socket, the negotiated cipher/compression state, the transaction counter, and
-the write half. It frames the read stream with `hotline-proto` (**by
+the write half. It frames the read stream with `hxproto` (**by
 `DataSize`, not `TotalSize`** — the same lesson gtkhx paid for), decodes the
 transaction, and calls into domain services. Replies and server-push events
 come back through the actor's mailbox, so all writes to one socket are
@@ -203,7 +174,7 @@ later.
 - News, bans, and file-area metadata get the same treatment: an in-memory /
   flat-file implementation now, a trait boundary a DB backend can slot into.
 
-The access bitmap definitions come from `hotline-proto` / mhxd's headers —
+The access bitmap definitions come from `hxproto` / mhxd's headers —
 one definition, shared with the client world, never re-typed by hand.
 
 ### Workspace layout
@@ -219,7 +190,7 @@ hxd-ng/
   tests/             integration harness (see Testing)
 ```
 
-`hxd-core` must stay free of `hotline-proto` types in its public API where
+`hxd-core` must stay free of `hxproto` types in its public API where
 practical — the domain model (a chat line, a member, an account) is not a
 wire struct. That's what keeps the HTTP frontend honest later.
 
@@ -237,7 +208,7 @@ control socket for reload can come later.
 ## Phase 1 — Skeleton: a server you can log into
 
 **Status: implemented** (branch `claude/phase1-skeleton`) and green against
-a scripted hotline-proto client — the guest and account login flows, the
+a scripted hxproto client — the guest and account login flows, the
 parked 1.5 agreement dance, presence fan-out, ping, and the refusal paths.
 What remains before calling the exit criteria met: a session with real
 clients (GtkHx, and a period 1.5 client) against a running instance.
@@ -305,10 +276,17 @@ compat reference for an importer, not the native format.
 
 In rough order of value-for-effort:
 
-1. **Chat history** — server-held scrollback replay. As of mid-2026 no public
+1. **Chat history — implemented 2026-09.** Server-held scrollback replay. As of mid-2026 no public
    server implements the spec (GtkHx tests against a mock); hxd-ng becoming
    the **first real implementation — and thus the reference** — is a strong
-   motivator and instantly useful to GtkHx's own test matrix.
+   motivator and instantly useful to GtkHx's own test matrix. **Designed
+   2026-09 in [docs/chat-history.md](docs/chat-history.md)**: public chat
+   becomes a log behind a `ChatLog` trait, stored as a second table in
+   the inbox's SQLite file, with a line's id assigned before fan-out so
+   the live event and the history entry are one fact on both wires; the
+   ng wire gets a `history` request and ids on `chat` events. The first three
+   stages are implemented and cross-wire tested; pointing GtkHx's history
+   suite at the real server remains the client-side follow-up.
 2. **Text-Encoding** (fogWraith `Capabilities-Text-Encoding.md`) — a
    legacy-wire client advertising bit 1 of `DATA_CAPABILITIES` speaks UTF-8
    in every text field; Mac Roman becomes the non-negotiating fallback.
@@ -320,10 +298,21 @@ In rough order of value-for-effort:
    / Latin-1 legacy communities) and HOPE `app_id` sniffing can follow.
 3. **GIF icons, inline media, colored nicknames, emoji shortcodes** — mostly
    relay + capability bits, cheap once the capability negotiation exists.
+   Inline media is the exception: the relay is cheap, the server-side
+   decode-and-re-encode pipeline the spec mandates is not. **Designed
+   2026-09 in [docs/inline-media.md](docs/inline-media.md)**: an
+   `hxd-media` crate behind a `MediaCodec` trait and a Cargo feature, an
+   in-memory handle store with relay-time authorisation sets, 750/751 on
+   the legacy wire and `POST`/`GET /media` over HTTP on the ng port.
+   Both bring the first durable *content*, so
+   [docs/moderation.md](docs/moderation.md) (same date) adds redaction,
+   revocation, purges and reports with an audit trail; the legacy wire
+   receives reports as server messages and is moderated from ng or the
+   CLI until fogWraith allocates the transactions.
 4. **Voice** — an SFU, a genuinely large subsystem (this is where Janus has
    two known server-side bugs, both written up in the "Open" section of
    gtkhx's `docs/voice.md` — read them as a spec of what not to do).
-   `hotline-proto::voice` (ICE/SDP JSON, participants blob) is shared
+   `hxproto::voice` (ICE/SDP JSON, participants blob) is shared
    already. **Pulled forward and designed 2026-09 in
    [docs/voice.md](docs/voice.md)**: the room state and policy live in
    `hxd-core` behind a `VoiceMedia` trait, the SFU is a separate
@@ -459,7 +448,7 @@ resist the reorder.
   targets. Add an `hxd-ng` container to that matrix and every green run is a
   conformance statement from a real client. Do this as soon as Phase 1
   stands.
-- **Headless client harness** in `tests/`: a thin driver over `hotline-proto`
+- **Headless client harness** in `tests/`: a thin driver over `hxproto`
   (build requests, parse replies — no glib needed) for server-initiated
   scenario tests the client suite can't express (N clients, kick during
   transfer, flood limits).

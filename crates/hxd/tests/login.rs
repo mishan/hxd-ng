@@ -1,6 +1,6 @@
 //! Legacy login and presence end-to-end tests: a scripted client against
 //! a live server on an ephemeral port. The client side packs and parses with the
-//! same `hotline-proto` the real gtkhx client uses, so these double as
+//! same `hxproto` the real gtkhx client uses, so these double as
 //! wire-compat checks, not just self-consistency.
 
 use std::net::SocketAddr;
@@ -8,11 +8,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hotline_proto::messages::tag;
 use hxd_core::access::bit;
 use hxd_core::Core;
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{ServerConfig, ServerCtx};
+use hxproto::messages::tag;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
