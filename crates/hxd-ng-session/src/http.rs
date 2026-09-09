@@ -39,7 +39,7 @@ use hyper::body::Incoming;
 use hyper::header::{
     HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
     ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
-    AUTHORIZATION, CONTENT_TYPE, ETAG,
+    AUTHORIZATION, CONTENT_TYPE, ETAG, ORIGIN,
 };
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -160,9 +160,13 @@ fn cors_route(path: &str) -> bool {
 
 /// `*` rather than an echo of `Origin`: there is no cookie or other
 /// ambient credential on these routes for a hostile page to ride, so an
-/// allow-list would protect nothing. `ETag` is exposed because
-/// `GET /identity/card/<fp>` is worth revalidating rather than refetching,
-/// and a cross-origin page cannot read the header to do it otherwise.
+/// allow-list would protect nothing. That is a property the routes have
+/// to keep rather than one this layer can assume — a proxy-forwarded TLS
+/// client certificate *is* ambient, which is why `transport_identity`
+/// refuses to authenticate by certificate on a request that carries
+/// `Origin`. `ETag` is exposed because `GET /identity/card/<fp>` is worth
+/// revalidating rather than refetching, and a cross-origin page cannot
+/// read the header to do it otherwise.
 fn cors(mut resp: Resp) -> Resp {
     let h = resp.headers_mut();
     h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
@@ -357,7 +361,36 @@ async fn transport_identity(
             ))),
         };
     }
+    // A client certificate stands in for a token (§6.1) — but only for a
+    // caller that chose to present it. A browser does not: the TLS layer
+    // attaches the certificate to whatever the page fetches, so on a
+    // deployment behind an mTLS proxy a *hostile* page could call
+    // `/identity/link`, `/identity/unlink` or `PUT /identity/card`
+    // cross-origin, ride the certificate it never saw, and read the
+    // answer back through these routes' `Access-Control-Allow-Origin: *`.
+    // A WebSocket upgrade is not subject to CORS at all and would ride it
+    // just as well.
+    //
+    // `Origin` is the tell. Browsers set it on every request that could
+    // be that attack and native clients — hlid, the desktop client, a
+    // relay — set it on none, so requiring a token when it is present
+    // costs the mTLS binding nothing and closes the ambient path. A page
+    // that is entitled to be here can still get in, by redeeming a
+    // transport token like everyone else.
+    //
+    // Refused rather than ignored: a caller that presented a certificate
+    // believes it authenticated, and treating it as an anonymous guest
+    // would be exactly the silent downgrade the token path above refuses.
+    // A browser that presents *no* certificate is untouched and still
+    // arrives here as an ordinary unauthenticated request.
     if let Some(device) = client_cert_device(req, peer.ip(), ctx)? {
+        if req.headers().contains_key(ORIGIN) {
+            return Err(Box::new(plain(
+                StatusCode::UNAUTHORIZED,
+                "a transport token is required: a client certificate is not \
+                 accepted in place of one on a request that carries Origin",
+            )));
+        }
         let state = state.clone();
         let found = tokio::task::spawn_blocking(move || state.identity_for_device(&device))
             .await

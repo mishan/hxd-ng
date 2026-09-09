@@ -2649,3 +2649,93 @@ async fn the_identity_routes_answer_cors_so_a_page_elsewhere_can_read_them() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_client_certificate_is_not_a_credential_on_a_request_that_carries_origin() {
+    // These routes answer `Access-Control-Allow-Origin: *`, so whatever
+    // authenticates them is readable cross-origin. A proxy-forwarded TLS
+    // client certificate is ambient — the browser attaches it to whatever
+    // a page fetches — so a hostile page could drive `/identity/unlink`
+    // with the victim's certificate and read the answer.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig::default();
+    let (_legacy, ng, _ctx) = start_server_with_proxies(dir.path(), cfg, &["127.0.0.1"]).await;
+
+    let p = person(60, "Certified");
+    authenticate(ng, &p).await;
+    let hdr = cert_header(&p.dev.public(), None);
+
+    // The certificate alone still authenticates: this is the mTLS
+    // binding for native callers, and it is not being withdrawn.
+    let r = http(
+        ng,
+        "POST",
+        "/identity/unlink",
+        &[("X-Hotline-Client-Cert", &hdr)],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        409,
+        "the certificate should have authenticated: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+    assert_eq!(r.json()["error"], "not_linked");
+
+    // The same request from a page is refused rather than silently
+    // downgraded — a caller that presented a certificate believes it
+    // authenticated, and 401 says otherwise out loud.
+    let r = http(
+        ng,
+        "POST",
+        "/identity/unlink",
+        &[
+            ("X-Hotline-Client-Cert", &hdr),
+            ("Origin", "https://evil.example"),
+        ],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        401,
+        "a page must not ride the certificate: {}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // `PUT /identity/card` and the upgrade go through the same door.
+    let r = http(
+        ng,
+        "PUT",
+        "/identity/card",
+        &[
+            ("X-Hotline-Client-Cert", &hdr),
+            ("Content-Type", "application/cbor"),
+            ("Origin", "https://evil.example"),
+        ],
+        &p.card,
+    )
+    .await;
+    assert_eq!(r.status, 401, "{}", String::from_utf8_lossy(&r.body));
+
+    let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("X-Hotline-Client-Cert", hdr.parse().unwrap());
+    req.headers_mut()
+        .insert("Origin", "https://evil.example".parse().unwrap());
+    assert!(
+        tokio_tungstenite::connect_async(req).await.is_err(),
+        "a WebSocket upgrade is not subject to CORS and would ride it just as well"
+    );
+
+    // A page that presents no certificate is untouched: it was never
+    // authenticated, and it still connects as an ordinary guest.
+    let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Origin", "https://app.example".parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let mut c = Ng::from_ws(ws).await;
+    let ok = c.request("login", json!({ "nick": "nobody" })).await;
+    assert!(ok["ok"]["self"].get("identity").is_none(), "{ok}");
+}
