@@ -3405,7 +3405,14 @@ async fn hlid_enroll_certifies_a_browser_that_it_never_holds_a_key_for() {
 }
 
 /// The `#enroll=…&mailbox=…&identity=…&pair=…` fragment `--show-url`
-/// prints, parsed the way the browser parses it.
+/// prints.
+///
+/// Split on `&` and `=` and no more: none of the four fields can
+/// currently contain a character that needs escaping — base64url, a
+/// Crockford fingerprint, a code from a 32-symbol alphabet, and a
+/// host:port — so there is nothing here to percent-decode. If that ever
+/// stops being true this will read the escape as literal text, and the
+/// assertions below are what will notice.
 fn scan_fields(output: &str) -> std::collections::HashMap<String, String> {
     let url = output
         .lines()
