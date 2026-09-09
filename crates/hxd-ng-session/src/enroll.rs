@@ -236,9 +236,15 @@ impl Mailbox {
         // Drawn until it is unused rather than assumed unique: forty bits
         // is plenty against guessing and says nothing about collisions
         // among a few hundred live codes.
+        //
+        // Compared in the normalized form, which is what `by_code` is
+        // keyed by. Checking the display form — which carries the
+        // hyphen — could never match anything, so this loop ran exactly
+        // once and a collision would have overwritten the index and
+        // misrouted the earlier session's requests.
         let code = loop {
             let c = draw_code();
-            if !inner.by_code.contains_key(&c) {
+            if !inner.by_code.contains_key(&normalize_code(&c)) {
                 break c;
             }
         };
@@ -688,6 +694,23 @@ mod tests {
             Fetched::Denied(r) => assert_eq!(r, "not_mine"),
             _ => panic!("expected a denial"),
         }
+    }
+
+    #[test]
+    fn a_drawn_code_is_looked_up_in_the_form_the_index_uses() {
+        // The bug this guards: `by_code` is keyed by the normalized
+        // code, and the collision check compared the display form. A
+        // hyphen made the two always different, so the check never matched and
+        // a collision would have silently rebound a live code to a new
+        // session.
+        let drawn = draw_code();
+        assert!(drawn.contains('-'), "the display form carries a hyphen");
+        assert!(!normalize_code(&drawn).contains('-'));
+        assert_ne!(
+            drawn,
+            normalize_code(&drawn),
+            "if these were ever equal the collision check would be untested"
+        );
     }
 
     #[tokio::test]

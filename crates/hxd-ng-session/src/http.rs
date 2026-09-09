@@ -753,7 +753,7 @@ fn discovery(ctx: &NgCtx) -> Resp {
             if ctx.enroll.is_some() {
                 endpoints["enroll"] = json!("/identity/enroll");
             }
-            json!({
+            let mut identity = json!({
                 "enabled": true,
                 "bindings": bindings,
                 "new_accounts": match cfg.new_accounts {
@@ -765,8 +765,15 @@ fn discovery(ctx: &NgCtx) -> Resp {
                 "trusted_registrars": cfg.registrar_keys.keys().collect::<Vec<_>>(),
                 "association": "server",
                 "endpoints": endpoints,
-                "web": ctx.cfg.web_client,
-            })
+            });
+            // Omitted rather than null when no web client is configured.
+            // Absence is what "there is nowhere to point a QR code"
+            // means on this wire, and emitting a null would make every
+            // reader test for two things instead of one.
+            if let Some(web) = ctx.cfg.web_client.as_deref() {
+                identity["web"] = json!(web);
+            }
+            identity
         }
         None => json!({ "enabled": false }),
     };
@@ -832,9 +839,21 @@ async fn enroll_open(
     mb: &crate::enroll::Mailbox,
 ) -> Resp {
     // An empty body is legal here, unlike everywhere else on this
-    // listener, so a failed parse is "no fields" rather than an error.
-    let body = read_json(req, ctx.cfg.login_timeout).await;
-    let identity = match body.as_ref().and_then(|b| b["identity"].as_str()) {
+    // listener. That is not the same as a *malformed* one: reading any
+    // parse failure as "no fields" would accept `{{{` — and a body-read
+    // timeout — as a valid request to open a session.
+    let Some(bytes) = read_body(req, ctx.cfg.login_timeout).await else {
+        return plain(StatusCode::BAD_REQUEST, "could not read the request body");
+    };
+    let body: Value = if bytes.iter().all(u8::is_ascii_whitespace) {
+        Value::Null
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return plain(StatusCode::BAD_REQUEST, "expected a JSON body, or none"),
+        }
+    };
+    let identity = match body["identity"].as_str() {
         Some(s) => match Fingerprint::parse(s) {
             Some(fp) => Some(fp),
             None => return plain(StatusCode::BAD_REQUEST, "identity: not a fingerprint"),

@@ -3151,4 +3151,49 @@ async fn discovery_advertises_the_mailbox_when_it_is_served() {
         "{}",
         disco["identity"]
     );
+    // With no web client configured the key is absent, not null: a
+    // reader should have one thing to test rather than two.
+    assert!(
+        !disco["identity"].as_object().unwrap().contains_key("web"),
+        "{}",
+        disco["identity"]
+    );
+}
+
+#[tokio::test]
+async fn opening_a_session_takes_an_empty_body_but_not_a_broken_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+
+    // No body at all is how a holder that wants no standing session
+    // opens one, so it has to work.
+    let bare = http(ng, "POST", "/identity/enroll/sessions", &[], b"").await;
+    assert_eq!(bare.status, 200, "{}", String::from_utf8_lossy(&bare.body));
+
+    // Malformed is not the same as absent. Reading a parse failure as
+    // "no fields" would accept this — and a body-read timeout — as a
+    // request to open a session.
+    for body in ["{{{", "[]not json", "\"a string\"x"] {
+        let broken = http(
+            ng,
+            "POST",
+            "/identity/enroll/sessions",
+            &[("Content-Type", "application/json")],
+            body.as_bytes(),
+        )
+        .await;
+        assert_eq!(broken.status, 400, "accepted {body:?}");
+    }
+
+    // And a well-formed body naming something that is not a fingerprint
+    // is still refused.
+    let bad_fp = http(
+        ng,
+        "POST",
+        "/identity/enroll/sessions",
+        &[("Content-Type", "application/json")],
+        br#"{"identity": "not-a-fingerprint"}"#,
+    )
+    .await;
+    assert_eq!(bad_fp.status, 400);
 }
