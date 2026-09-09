@@ -372,7 +372,15 @@ impl Mailbox {
             .ok_or(Refused::UnknownSession)?;
         let previous = session.identity.replace(fp);
         if let Some(old) = previous {
-            if old != fp {
+            // Only when the index still names *this* session. Last writer
+            // wins, so another session may have claimed `old` since — and
+            // removing by key alone took that session's entry out from
+            // under it, leaving a holder that had claimed nothing wrong
+            // receiving no renewals at all. `close_session` never had the
+            // bug because it clears `identity` and lets the sweep decide,
+            // and the sweep checks the value; this is the same rule
+            // written out.
+            if old != fp && inner.by_identity.get(&old) == Some(&key) {
                 inner.by_identity.remove(&old);
             }
         }
@@ -1338,6 +1346,41 @@ mod tests {
         assert_eq!(
             m.post_request(addr(3), None, &renewal(3, &id)).err(),
             Some(Refused::NoHolder)
+        );
+    }
+
+    #[test]
+    fn a_session_that_moves_on_does_not_evict_whoever_took_its_identity() {
+        // The other half of last-writer-wins, and the half that was
+        // wrong. A holder restarts its agent, so session B claims the
+        // identity session A held — B wins, which is the point. If A then
+        // claims something else, the release of its old claim must not
+        // take B's index entry with it: B claimed correctly, is being
+        // polled, and would simply stop receiving renewals.
+        let m = mailbox();
+        let x = IdentityKey::from_seed(&[1u8; 32]);
+        let y = IdentityKey::from_seed(&[2u8; 32]);
+        let a = m.open_session(addr(1)).unwrap();
+        let b = m.open_session(addr(2)).unwrap();
+
+        for (s, id) in [(&a, &x), (&b, &x)] {
+            let claim = SessionClaim::new(id.public(), session_key(&s.session)).sign(id);
+            m.claim_identity(&s.session, &claim).unwrap();
+        }
+        assert!(
+            m.post_request(addr(3), None, &renewal(3, &x)).is_ok(),
+            "B took the identity, as last-writer-wins says it should"
+        );
+
+        let claim = SessionClaim::new(y.public(), session_key(&a.session)).sign(&y);
+        m.claim_identity(&a.session, &claim).unwrap();
+        assert!(
+            m.post_request(addr(4), None, &renewal(4, &x)).is_ok(),
+            "and A moving on leaves B holding it"
+        );
+        assert!(
+            m.post_request(addr(5), None, &renewal(5, &y)).is_ok(),
+            "while A now holds what it actually claimed"
         );
     }
 
