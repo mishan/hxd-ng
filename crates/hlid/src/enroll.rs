@@ -53,15 +53,20 @@ impl Prompt for Terminal {
         );
         let _ = std::io::stderr().flush();
         let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() {
-            // No terminal, or it went away. An agent left running that
-            // cannot ask must not answer on the user's behalf (§6).
-            return false;
-        }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => true,
-            "" => default_yes,
-            _ => false,
+        match std::io::stdin().read_line(&mut line) {
+            // End of input: there is nobody there to answer. That is not
+            // an empty line — an empty line is somebody pressing Return
+            // and meaning the default — and reading it as one would
+            // auto-approve every renewal for a holder whose stdin has
+            // closed, which is exactly what §6 says must not happen.
+            Ok(0) => false,
+            // No terminal, or it went away mid-read. Same answer.
+            Err(_) => false,
+            Ok(_) => match line.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => true,
+                "" => default_yes,
+                _ => false,
+            },
         }
     }
 
@@ -226,13 +231,21 @@ fn run(
             .map_err(|e| format!("waiting for a device: {e}"))?;
         let pending = answer["pending"].as_array().cloned().unwrap_or_default();
         if let Some(first) = pending.first() {
+            // No id, no answer: everything after this identifies the
+            // request being certified or refused, and an empty name
+            // would mean answering something the mailbox never
+            // described.
+            let id = first["id"].as_str().unwrap_or_default();
+            if id.is_empty() {
+                return Err("the mailbox delivered a request with no id".into());
+            }
             let raw = unb64(first["request"].as_str().unwrap_or(""))?;
             // Verified here, and everything shown below is computed from
             // this rather than from anything the mailbox said.
             let req = EnrollRequest::parse(&raw).map_err(|e| {
                 format!("the mailbox delivered something that is not a request: {e}")
             })?;
-            break (first["id"].as_str().unwrap_or("").to_owned(), req);
+            break (id.to_owned(), req);
         }
         if answer["expires_in"].as_u64() == Some(0) {
             return Err("the session expired before a device asked".into());
@@ -339,7 +352,14 @@ fn screen(
     caps: Option<u64>,
     days: u64,
 ) -> String {
-    let asked_caps = caps_words(request.caps);
+    // `None` in a *request* means "whatever your policy gives" (§4),
+    // unlike `None` in a certificate, which is unrestricted. Rendering
+    // it as "everything" would have the prompt report a device asking
+    // for far more than it did — on the one screen where being
+    // misleading is the whole risk.
+    let asked_caps = request
+        .caps
+        .map_or("the default".to_string(), |c| caps_words(Some(c)));
     let asked_days = request
         .days
         .map_or("the default".to_string(), |d| format!("{d} days"));
@@ -458,6 +478,34 @@ mod tests {
         // it has to be on the screen (§9).
         assert!(s.contains("Compare the device fingerprint"), "{s}");
         assert!(s.contains(&Fingerprint::of(&req.device).short()), "{s}");
+    }
+
+    #[test]
+    fn the_prompt_does_not_report_an_unstated_ask_as_everything() {
+        // The bug this guards is on the one screen where being
+        // misleading is the whole risk: `None` in a request means
+        // "whatever your policy gives" (§4), and rendering it with the
+        // certificate's meaning would show a browser asking for
+        // everything when it asked for nothing in particular.
+        let dev = hl_identity::DeviceKey::from_seed(&[3u8; 32]);
+        let req = EnrollRequest::new(&dev, 1_000);
+        assert_eq!(req.caps, None);
+
+        let (caps, days) = grant(&web(), req.caps, req.days);
+        let s = screen(
+            "hl.example",
+            "K7PM-4XWE",
+            &Fingerprint::of(&req.device),
+            "unnamed",
+            &req,
+            caps,
+            days,
+        );
+        assert!(s.contains("asks for    the default"), "{s}");
+        assert!(!s.contains("asks for    everything"), "{s}");
+        // The grant is still shown with the certificate's meaning,
+        // because that is the object it is going into.
+        assert!(s.contains("will get    login, message"), "{s}");
     }
 
     #[test]

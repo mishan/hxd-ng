@@ -640,7 +640,10 @@ pub(crate) fn caps_words(caps: Option<u64>) -> String {
         .collect();
     // A bit this build has no word for still has to appear, or a prompt
     // would understate what it is about to grant.
-    let known: u64 = named.iter().map(|(b, _)| b).sum();
+    // Fold with OR, not sum: these happen to be disjoint powers of two,
+    // and a sum would quietly stop meaning "the union" the day one of
+    // them is not.
+    let known: u64 = named.iter().fold(0, |acc, (b, _)| acc | b);
     let unknown = bits & !known;
     let extra;
     if unknown != 0 {
