@@ -8,6 +8,8 @@
 //!              identity key, device key, certificate and card in one step
 //! hlid enroll  --server URL [--caps web|LIST] [--days N]
 //!              show a pairing code, wait for one device, prompt, certify
+//! hlid agent    --server URL [--caps …] [--days N] [--renew ask|auto|deny]
+//!              the same, without a budget, plus renewals with no code
 //! hlid keygen  identity|device|server PATH    make a key (32-byte seed, hex, mode 0600)
 //! hlid cert    [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX)
 //!              [--days N] [--caps all|web|LIST] [--name S] [--bundle] -o FILE
@@ -66,6 +68,7 @@ fn main() {
     let r = match cmd.as_str() {
         "init" => init(&args[1..]),
         "enroll" => enroll::enroll_cmd(&args[1..]),
+        "agent" => enroll::agent_cmd(&args[1..]),
         "keygen" => keygen(&args[1..]),
         "cert" => make_cert(&args[1..]),
         "card" => make_card(&args[1..]),
@@ -88,6 +91,7 @@ fn usage() -> ! {
         "usage:\n",
         "  hlid init --name S [--days N] [--device-name S]\n",
         "  hlid enroll --server URL [--caps web|LIST] [--days N] [--identity K] [--card FILE] [--web URL] [--show-url]\n",
+        "  hlid agent  --server URL [--caps web|LIST] [--days N] [--renew ask|auto|deny] [--web URL] [--show-url]\n",
         "  hlid keygen identity|device|server PATH\n",
         "  hlid cert [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] [--bundle [--card FILE]] -o FILE\n",
         "  hlid card [--identity K] --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n",
@@ -115,6 +119,15 @@ fn usage() -> ! {
         "to be named by you with --web rather than by the server. --show-url\n",
         "prints the link beneath the code, which puts that secret in your\n",
         "scrollback.\n",
+        "\n",
+        "`hlid agent` is the same thing without a budget: it stays open, shows a\n",
+        "fresh code whenever the last one is used, and holds a standing session so\n",
+        "that a browser renewing its certificate needs no code at all. Renewals\n",
+        "still prompt by default -- what the 90-day lifetime bounds is how long a\n",
+        "copied browser profile keeps logging in as you, and a holder that renews\n",
+        "silently renews the copy too. --renew auto is for someone who has read\n",
+        "that and owns the machine; --renew deny holds no standing session, so\n",
+        "renewals arrive through a code like a first enrollment.\n",
         "\n",
         "--bundle writes the certificate and the identity's card as one object\n",
         "instead of the certificate alone — the same thing enrollment carries, so\n",

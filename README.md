@@ -296,6 +296,8 @@ account association.
 
 ```sh
 hlid init --name Alice        # identity key, device key, certificate, card
+hlid agent  --server http://127.0.0.1:5700   # stay open: hand out codes, and
+                                             # take renewals without one
 hlid enroll --server http://127.0.0.1:5700   # certify a browser: show a code
                                              # (and a QR, if the server names a
                                              # web client on its own origin),

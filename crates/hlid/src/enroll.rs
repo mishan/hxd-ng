@@ -104,9 +104,22 @@ pub(crate) fn grant(
     (caps, days)
 }
 
+/// "The same or less" (§8), applied to what the holder would otherwise
+/// grant. A renewal must not widen what the old certificate carried,
+/// even when the holder's policy has grown since it was issued.
+///
+/// `None` on either side is unrestricted, as it is in a certificate.
+fn renewed_caps(granted: Option<u64>, prev: &DeviceCert) -> Option<u64> {
+    match (granted, prev.caps) {
+        (g, None) => g,
+        (None, Some(had)) => Some(had),
+        (Some(g), Some(had)) => Some(g & had),
+    }
+}
+
 /// A renewal is "the same device asking for the same or less" (§8). What
 /// can be checked without the holder's policy is checked here; what the
-/// device gets is still `grant`'s answer.
+/// device gets is still `grant`'s answer, narrowed by `renewed_caps`.
 fn renewal_is_sane(
     prev: &DeviceCert,
     req: &EnrollRequest,
@@ -118,15 +131,17 @@ fn renewal_is_sane(
     if prev.device != req.device {
         return Err("the certificate it wants renewed is for a different device".into());
     }
-    // `None` is unrestricted, so an old certificate with `None` bounds
-    // nothing and a request for `None` against a bounded old one is a
-    // widening.
-    match (prev.caps, req.caps) {
-        (Some(_), None) => return Err("it asks for more capabilities than it has".into()),
-        (Some(had), Some(asked)) if asked & !had != 0 => {
-            return Err("it asks for capabilities its certificate does not have".into())
+    // `caps` means different things in the two objects, and conflating
+    // them is easy: absent in a *certificate* is unrestricted, absent in
+    // a *request* is "whatever your policy gives" (§4). So only an
+    // explicit ask can be a widening. An absent one is not a request for
+    // everything — it is a request for the holder's default, which
+    // `grant` bounds, and which `renewed_caps` bounds again against what
+    // the old certificate carried.
+    if let (Some(had), Some(asked)) = (prev.caps, req.caps) {
+        if asked & !had != 0 {
+            return Err("it asks for capabilities its certificate does not have".into());
         }
-        _ => {}
     }
     Ok(())
 }
@@ -272,6 +287,16 @@ fn qr_block(url: &str) -> R<String> {
 }
 
 pub(crate) fn enroll_cmd(args: &[String]) -> R<()> {
+    with_holder(args, Some(1))
+}
+
+/// `hlid agent`: the same loop with no budget, and a standing session so
+/// renewals arrive without a code (§7, §8).
+pub(crate) fn agent_cmd(args: &[String]) -> R<()> {
+    with_holder(args, None)
+}
+
+fn with_holder(args: &[String], budget: Option<usize>) -> R<()> {
     let a = crate::parse(args);
     let id = IdentityKey::from_seed(&read_seed(&a.file("identity", IDENTITY_KEY)?)?);
     let card_path = a.file("card", CARD_FILE)?;
@@ -291,8 +316,11 @@ pub(crate) fn enroll_cmd(args: &[String]) -> R<()> {
         caps: parse_caps(Some(a.opt("caps").unwrap_or("web")))?,
         days: a.u64("days", 90)?,
     };
-    let show_url = a.has("show-url");
     let base = server_base(&a)?;
+    // `--web` survives the agent rewrite: the QR's fragment carries the
+    // pairing secret, so which origin the phone is sent to is the user's
+    // statement or the server's own, never a third one the mailbox named
+    // (see `discover`).
     let web = a.opt("web");
     if let Some(w) = web {
         if !(w.starts_with("http://") || w.starts_with("https://")) {
@@ -300,224 +328,361 @@ pub(crate) fn enroll_cmd(args: &[String]) -> R<()> {
         }
     }
     let found = discover(&base, web)?;
-
-    run(
-        &id,
-        &card,
-        &parsed_card,
-        &policy,
-        &found,
-        show_url,
-        &mut Terminal,
-    )
+    let holder = Holder {
+        id: &id,
+        card: &card,
+        card_name: &parsed_card.name,
+        policy: &policy,
+        found: &found,
+        show_url: a.has("show-url"),
+        renew: Renew::parse(a.opt("renew"))?,
+        http: agent(Duration::from_secs(10)),
+        poll: agent(POLL_TIMEOUT),
+    };
+    run(&holder, budget, &mut Terminal)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(
-    id: &IdentityKey,
-    card: &[u8],
-    parsed_card: &Card,
-    policy: &Policy,
-    found: &Discovered,
+/// What to do about a renewal (§8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Renew {
+    /// Prompt, defaulting to yes. One keypress a quarter, and the user
+    /// sees it.
+    Ask,
+    /// Approve without asking. For someone who has read §8's argument
+    /// and owns the machine outright.
+    Auto,
+    /// Refuse to hold a standing session at all, so renewals arrive
+    /// through a code like a first enrollment.
+    Deny,
+}
+
+impl Renew {
+    fn parse(s: Option<&str>) -> R<Renew> {
+        match s {
+            None | Some("ask") => Ok(Renew::Ask),
+            Some("auto") => Ok(Renew::Auto),
+            Some("deny") => Ok(Renew::Deny),
+            Some(other) => Err(format!(
+                "--renew: unknown value {other:?}; ask, auto or deny"
+            )),        }
+    }
+}
+
+/// One open session: what the mailbox gave back, plus the pairing secret
+/// this end drew and never sent.
+struct Session {
+    secret: String,
+    code: String,
+    pairing: [u8; PAIRING_SECRET_BYTES],
+    expires_in: u64,
+}
+
+/// Everything the loop needs that does not change between sessions.
+struct Holder<'a> {
+    id: &'a IdentityKey,
+    card: &'a [u8],
+    card_name: &'a str,
+    policy: &'a Policy,
+    found: &'a Discovered,
     show_url: bool,
-    ui: &mut dyn Prompt,
-) -> R<()> {
-    let mailbox = found.mailbox.as_str();
-    let http = agent(Duration::from_secs(10));
-    let opened: Value = http
-        .post(&format!("{mailbox}/sessions"))
-        .send_json(json!({}))
-        .map_err(|e| format!("opening a session: {e}"))?
-        .into_json()
-        .map_err(|e| format!("opening a session: {e}"))?;
-    let session = opened["session"]
-        .as_str()
-        .ok_or("the mailbox returned no session")?
-        .to_owned();
-    let code = opened["code"]
-        .as_str()
-        .ok_or("the mailbox returned no code")?
-        .to_owned();
-    let minutes = opened["expires_in"].as_u64().unwrap_or(600) / 60;
+    renew: Renew,
+    http: ureq::Agent,
+    poll: ureq::Agent,
+}
 
-    // The host beside the code, because the enrollee has to use the same
-    // mailbox and there is nothing else on the screen that says which.
-    let host = mailbox
-        .split("://")
-        .nth(1)
-        .and_then(|r| r.split('/').next())
-        .unwrap_or(mailbox);
-    // The pairing secret is drawn here and never sent to the mailbox
-    // (§5.1). It reaches the enrollee only by being photographed off
-    // this screen — which is exactly the property that makes the scanned
-    // path safe without a human comparing fingerprints.
-    //
-    // Drawn through a throwaway key, as `keygen` does, rather than by
-    // adding a second randomness dependency to this crate.
-    let mut seed = [0u8; 32];
-    crate::getrandom_seed(&mut seed);
-    let mut secret = [0u8; PAIRING_SECRET_BYTES];
-    secret.copy_from_slice(&seed[..PAIRING_SECRET_BYTES]);
+impl Holder<'_> {
+    fn mailbox(&self) -> &str {
+        &self.found.mailbox
+    }
 
-    if let Some(web) = found.web.as_deref() {
-        let url = scan_url(web, &code, host, &id.fingerprint(), &secret);
-        // The origin, above the code it is drawn from: scanning hands
-        // the pairing secret to whatever is served there, and that is
-        // part of the ceremony rather than a detail. Same-origin with
-        // `--server` unless the user passed `--web`, so this is a line
-        // the user can recognize — and notice when it is not what they
-        // expected.
-        match qr_block(&url) {
-            Ok(block) => ui.tell(&format!(
-                "\nScan this to open {}, or type the code below:\n\n{block}",
-                origin(web)
-            )),
-            // A URL too long for a QR code is a reason to fall back to
-            // typing, not a reason to fail: the typed path is complete
-            // on its own.
-            Err(why) => ui.tell(&format!("\n(No QR code: {why})")),
+    /// The mailbox's host, shown beside the code: the enrollee has to
+    /// use the same one, and nothing else on the screen says which.
+    fn host(&self) -> &str {
+        self.mailbox()
+            .split("://")
+            .nth(1)
+            .and_then(|r| r.split('/').next())
+            .unwrap_or(self.mailbox())
+    }
+
+    /// §5.1. `standing` offers to hold renewals for this identity, which
+    /// is what lets a browser renew without anybody typing anything.
+    fn open(&self, standing: bool) -> R<Session> {
+        let body = if standing {
+            json!({ "identity": self.id.fingerprint().to_string() })
+        } else {
+            json!({})
+        };
+        let opened: Value = self
+            .http
+            .post(&format!("{}/sessions", self.mailbox()))
+            .send_json(body)
+            .map_err(|e| format!("opening a session: {e}"))?
+            .into_json()
+            .map_err(|e| format!("opening a session: {e}"))?;
+
+        // Drawn here and never sent to the mailbox (§5.1). It reaches
+        // the enrollee only by being photographed off this screen, which
+        // is exactly the property that makes the scanned path safe
+        // without a human comparing fingerprints.
+        //
+        // Through a throwaway key, as `keygen` does, rather than adding
+        // a second randomness dependency to this crate.
+        let mut seed = [0u8; 32];
+        crate::getrandom_seed(&mut seed);
+        let mut pairing = [0u8; PAIRING_SECRET_BYTES];
+        pairing.copy_from_slice(&seed[..PAIRING_SECRET_BYTES]);
+
+        Ok(Session {
+            secret: opened["session"]
+                .as_str()
+                .ok_or("the mailbox returned no session")?
+                .to_owned(),
+            code: opened["code"]
+                .as_str()
+                .ok_or("the mailbox returned no code")?
+                .to_owned(),
+            pairing,
+            expires_in: opened["expires_in"].as_u64().unwrap_or(600),
+        })
+    }
+
+    fn show(&self, s: &Session, ui: &mut dyn Prompt) {
+        if let Some(web) = self.found.web.as_deref() {
+            let url = scan_url(
+                web,
+                &s.code,
+                self.host(),
+                &self.id.fingerprint(),
+                &s.pairing,
+            );
+            // The origin, above the code it is drawn from: scanning hands
+            // the pairing secret to whatever is served there, and that is
+            // part of the ceremony rather than a detail. Same-origin with
+            // `--server` unless the user passed `--web`, so this is a line
+            // the user can recognize — and notice when it is not what they
+            // expected.
+            match qr_block(&url) {
+                Ok(block) => ui.tell(&format!(
+                    "\nScan this to open {}, or type the code below:\n\n{block}",
+                    origin(web)
+                )),
+                // A URL too long for a QR code is a reason to fall back
+                // to typing, not a reason to fail: the typed path is
+                // complete on its own.
+                Err(why) => ui.tell(&format!("\n(No QR code: {why})")),
+            }
+            // Not by default: the URL carries the pairing secret, and
+            // unlike the QR code — on screen for ten minutes and then
+            // gone — a line of text lives in the scrollback and in
+            // whatever is logging it.
+            if self.show_url {
+                ui.tell(&format!("\n{url}\n"));
+            }
         }
-        // Not by default: the URL carries the pairing secret, and unlike
-        // the QR code — which is on screen for ten minutes and then gone
-        // — a line of text lives in the scrollback and in whatever is
-        // logging it. Worth having for a terminal that mangles block
-        // characters, worth asking for.
-        if show_url {
-            ui.tell(&format!("\n{url}\n"));
+        ui.tell(&format!(
+            "\nEnroll a device at {}: enter code  {}  (expires in {}:00)\nThis identity: {}  {}\n",
+            self.host(),
+            s.code,
+            s.expires_in / 60,
+            self.card_name,
+            self.id.fingerprint().short(),
+        ));
+    }
+
+    /// One long poll. `None` means the session is gone — expired, or
+    /// swept — and the caller decides whether to open another.
+    fn poll_once(&self, s: &Session) -> R<Option<Value>> {
+        let res = self
+            .poll
+            .get(&format!("{}/sessions/{}", self.mailbox(), s.secret))
+            .call();
+        match res {
+            Ok(r) => Ok(Some(
+                r.into_json()
+                    .map_err(|e| format!("waiting for a device: {e}"))?,
+            )),
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(e) => Err(format!("waiting for a device: {e}")),
         }
     }
 
-    ui.tell(&format!(
-        "\nEnroll a device at {host}: enter code  {code}  (expires in {minutes}:00)\n\
-         This identity: {}  {}\n",
-        parsed_card.name,
-        id.fingerprint().short(),
-    ));
+    fn answer(&self, s: &Session, body: Value) -> R<()> {
+        self.http
+            .post(&format!("{}/sessions/{}/answers", self.mailbox(), s.secret))
+            .send_json(body)
+            .map_err(|e| format!("answering: {e}"))?;
+        Ok(())
+    }
 
-    // One request, then exit: `enroll` is `agent` with a budget of one.
-    let poll = agent(POLL_TIMEOUT);
-    let (id_of_request, request) = loop {
-        let answer: Value = poll
-            .get(&format!("{mailbox}/sessions/{session}"))
-            .call()
-            .map_err(|e| format!("waiting for a device: {e}"))?
-            .into_json()
-            .map_err(|e| format!("waiting for a device: {e}"))?;
-        let pending = answer["pending"].as_array().cloned().unwrap_or_default();
-        if let Some(first) = pending.first() {
+    /// Verify one request, ask about it, and answer. Errors here are
+    /// about *this* request; a standing agent reports them and carries
+    /// on rather than exiting.
+    fn handle(&self, s: &Session, id_of_request: &str, raw: &[u8], ui: &mut dyn Prompt) -> R<()> {
+        // Everything shown below is computed from this, and never from
+        // anything the mailbox said about it.
+        let request = EnrollRequest::parse(raw)
+            .map_err(|e| format!("the mailbox delivered something that is not a request: {e}"))?;
+        let device_fp = Fingerprint::of(&request.device);
+        let named = request.name.clone().unwrap_or_else(|| "unnamed".into());
+
+        let renewal = match request.prev_cert() {
+            Some(Ok(prev)) => match renewal_is_sane(&prev, &request, self.id) {
+                Ok(()) => Some(prev),
+                Err(why) => {
+                    self.answer(s, json!({ "id": id_of_request, "denied": "bad_renewal" }))?;
+                    return Err(format!("refused a renewal: {why}"));
+                }
+            },
+            Some(Err(e)) => {
+                self.answer(s, json!({ "id": id_of_request, "denied": "bad_renewal" }))?;
+                return Err(format!(
+                    "refused a renewal whose certificate is not usable: {e}"
+                ));
+            }
+            None => None,
+        };
+
+        // A `pair` that does not verify is refused outright and never
+        // shown (§6): the only way to produce one is to have guessed,
+        // and a guess is not something to put in front of a user.
+        let scanned = match request.pair {
+            None => false,
+            Some(_) if request.pair_matches(&s.pairing) => true,
+            Some(_) => {
+                self.answer(s, json!({ "id": id_of_request, "denied": "bad_pair" }))?;
+                return Err("refused a request whose pairing proof does not verify".into());
+            }
+        };
+
+        let (mut caps, days) = grant(self.policy, request.caps, request.days);
+        if let Some(prev) = &renewal {
+            caps = renewed_caps(caps, prev);
+        }
+        let approved = match &renewal {
+            Some(prev) => {
+                let left = prev.expires.saturating_sub(now()) / 86_400;
+                let ask = format!(
+                    "Renew  {named:?}  {}  (expires in {left} days)?",
+                    device_fp.short()
+                );
+                match self.renew {
+                    // Not silent, and this is the decision in the flow
+                    // worth defending. The lifetime exists to bound how
+                    // long a *copied profile* keeps logging in as you; a
+                    // holder that renews any correctly-signed request
+                    // without asking renews the copy too, forever, and
+                    // the lifetime bounds nothing. Asking turns the
+                    // copy's renewal into something the user sees.
+                    Renew::Ask | Renew::Deny => ui.confirm(&ask, true),
+                    Renew::Auto => {
+                        ui.tell(&format!("{ask} yes (--renew auto)"));
+                        true
+                    }
+                }
+            }
+            None => ui.confirm(
+                &screen(
+                    self.host(),
+                    &s.code,
+                    &device_fp,
+                    &named,
+                    &request,
+                    caps,
+                    days,
+                    scanned,
+                ),
+                false,
+            ),
+        };
+        if !approved {
+            self.answer(s, json!({ "id": id_of_request, "denied": "declined" }))?;
+            ui.tell("Declined; nothing was signed.");
+            return Ok(());
+        }
+
+        let mut cert = DeviceCert::for_keys(
+            self.id,
+            request.device,
+            request.device_enc,
+            now(),
+            seconds(days)?,
+        )
+        .map_err(|e| format!("--days: {e}"))?;
+        cert.caps = caps;
+        cert.name = request.name.clone();
+        let cert_bytes = cert.sign(self.id);
+        DeviceCert::parse(&cert_bytes).map_err(|e| refuse_unreadable("device certificate", e))?;
+        let bundle = Bundle {
+            cert: cert_bytes,
+            card: self.card.to_vec(),
+        }
+        .encode();
+
+        self.answer(s, json!({ "id": id_of_request, "bundle": b64(&bundle) }))?;
+        ui.tell(&format!(
+            "Certified {named:?} {} for {days} days.",
+            device_fp.short()
+        ));
+        Ok(())
+    }
+}
+
+/// The loop both commands are. `budget` is how many requests to handle
+/// before returning: `Some(1)` is `enroll`, `None` is `agent`.
+fn run(holder: &Holder, budget: Option<usize>, ui: &mut dyn Prompt) -> R<()> {
+    // A standing session is what lets the mailbox route a renewal here
+    // with no code typed (§8). `--renew deny` declines to hold one, so
+    // renewals have to come through a code like anything else.
+    let standing = budget.is_none() && holder.renew != Renew::Deny;
+    let mut session = holder.open(standing)?;
+    holder.show(&session, ui);
+
+    let mut handled = 0usize;
+    loop {
+        let Some(answer) = holder.poll_once(&session)? else {
+            if budget.is_some() {
+                return Err("the session expired before a device asked".into());
+            }
+            session = holder.open(standing)?;
+            holder.show(&session, ui);
+            continue;
+        };
+
+        for pending in answer["pending"].as_array().cloned().unwrap_or_default() {
             // No id, no answer: everything after this identifies the
             // request being certified or refused, and an empty name
             // would mean answering something the mailbox never
             // described.
-            let id = first["id"].as_str().unwrap_or_default();
-            if id.is_empty() {
+            let id_of_request = pending["id"].as_str().unwrap_or_default().to_owned();
+            if id_of_request.is_empty() {
                 return Err("the mailbox delivered a request with no id".into());
             }
-            let raw = unb64(first["request"].as_str().unwrap_or(""))?;
-            // Verified here, and everything shown below is computed from
-            // this rather than from anything the mailbox said.
-            let req = EnrollRequest::parse(&raw).map_err(|e| {
-                format!("the mailbox delivered something that is not a request: {e}")
-            })?;
-            break (id.to_owned(), req);
-        }
-        if answer["expires_in"].as_u64() == Some(0) {
-            return Err("the session expired before a device asked".into());
-        }
-    };
-
-    let device_fp = Fingerprint::of(&request.device);
-    let named = request.name.clone().unwrap_or_else(|| "unnamed".into());
-
-    // A renewal is a different question, and gets a different default.
-    let renewal = match request.prev_cert() {
-        Some(Ok(prev)) => match renewal_is_sane(&prev, &request, id) {
-            Ok(()) => Some(prev),
-            Err(why) => {
-                deny(&http, mailbox, &session, &id_of_request, "bad_renewal")?;
-                return Err(format!("refused a renewal: {why}"));
+            let raw = unb64(pending["request"].as_str().unwrap_or(""))?;
+            match holder.handle(&session, &id_of_request, &raw, ui) {
+                Ok(()) => {}
+                // One bad request is not a reason to stop holding the
+                // key: an agent that exits on the first stranger is an
+                // agent a stranger can turn off.
+                Err(why) if budget.is_none() => ui.tell(&format!("Refused: {why}")),
+                Err(why) => return Err(why),
             }
-        },
-        Some(Err(e)) => {
-            deny(&http, mailbox, &session, &id_of_request, "bad_renewal")?;
-            return Err(format!(
-                "refused a renewal whose certificate is not usable: {e}"
-            ));
+            handled += 1;
+            if budget.is_some_and(|b| handled >= b) {
+                return Ok(());
+            }
         }
-        None => None,
-    };
 
-    // A request with a `pair` that does not verify is refused outright
-    // and never shown (§6): the only way to produce one is to have
-    // guessed, and a guess is not something to put in front of a user.
-    // A request with none is the typed path, and gets the comparison.
-    let scanned = match request.pair {
-        None => false,
-        Some(_) if request.pair_matches(&secret) => true,
-        Some(_) => {
-            deny(&http, mailbox, &session, &id_of_request, "bad_pair")?;
-            return Err("refused a request whose pairing proof does not verify".into());
+        // A code is single-use, so once it has admitted its request this
+        // session can still collect renewals but can no longer enroll
+        // anything. Rather than go on displaying a code that does not
+        // work, open another.
+        if answer["code_live"] == json!(false) {
+            session = holder.open(standing)?;
+            holder.show(&session, ui);
         }
-    };
-
-    let (caps, days) = grant(policy, request.caps, request.days);
-    let approved = match &renewal {
-        Some(prev) => {
-            let left = prev.expires.saturating_sub(now()) / 86_400;
-            ui.confirm(
-                &format!(
-                    "Renew  {named:?}  {}  (expires in {left} days)?",
-                    device_fp.short()
-                ),
-                true,
-            )
-        }
-        None => ui.confirm(
-            &screen(
-                host, &code, &device_fp, &named, &request, caps, days, scanned,
-            ),
-            false,
-        ),
-    };
-    if !approved {
-        deny(&http, mailbox, &session, &id_of_request, "declined")?;
-        ui.tell("Declined; nothing was signed.");
-        return Ok(());
     }
-
-    let mut cert = DeviceCert::for_keys(
-        id,
-        request.device,
-        request.device_enc,
-        now(),
-        seconds(days)?,
-    )
-    .map_err(|e| format!("--days: {e}"))?;
-    cert.caps = caps;
-    cert.name = request.name.clone();
-    let cert_bytes = cert.sign(id);
-    DeviceCert::parse(&cert_bytes).map_err(|e| refuse_unreadable("device certificate", e))?;
-    let bundle = Bundle {
-        cert: cert_bytes,
-        card: card.to_vec(),
-    }
-    .encode();
-
-    http.post(&format!("{mailbox}/sessions/{session}/answers"))
-        .send_json(json!({ "id": id_of_request, "bundle": b64(&bundle) }))
-        .map_err(|e| format!("answering: {e}"))?;
-    ui.tell(&format!(
-        "Certified {named:?} {} for {days} days.",
-        device_fp.short()
-    ));
-    Ok(())
-}
-
-fn deny(http: &ureq::Agent, mailbox: &str, session: &str, id: &str, reason: &str) -> R<()> {
-    http.post(&format!("{mailbox}/sessions/{session}/answers"))
-        .send_json(json!({ "id": id, "denied": reason }))
-        .map_err(|e| format!("answering: {e}"))?;
-    Ok(())
 }
 
 /// §6's prompt. Everything that matters and nothing else: what is
@@ -633,9 +798,14 @@ mod tests {
         req.caps = Some(caps::WEB | caps::MANAGE);
         assert!(renewal_is_sane(&prev, &req, &id).is_err());
 
-        // Asking for unrestricted, which is more than any mask.
+        // Asking for nothing in particular is *not* asking for
+        // everything: absent `caps` in a request means "whatever your
+        // policy gives" (§4), unlike absent `caps` in a certificate,
+        // which is unrestricted. A browser renewing without naming
+        // capabilities is the ordinary case, and refusing it here made
+        // every renewal fail.
         req.caps = None;
-        assert!(renewal_is_sane(&prev, &req, &id).is_err());
+        assert!(renewal_is_sane(&prev, &req, &id).is_ok());
 
         // Somebody else's certificate, and somebody else's device.
         req.caps = Some(caps::WEB);
@@ -843,6 +1013,47 @@ mod tests {
     }
 
     #[test]
+    fn a_renewal_is_narrowed_by_the_certificate_it_replaces() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = hl_identity::DeviceKey::from_seed(&[3u8; 32]);
+        let mut prev = DeviceCert::for_device(&id, &dev, 1_000, 86_400).unwrap();
+        prev.caps = Some(caps::LOGIN);
+
+        // The holder's policy has grown since the old certificate was
+        // issued. "The same or less" means the renewal does not inherit
+        // that: it stays what it was.
+        assert_eq!(renewed_caps(Some(caps::WEB), &prev), Some(caps::LOGIN));
+        assert_eq!(renewed_caps(None, &prev), Some(caps::LOGIN));
+
+        // An unrestricted old certificate bounds nothing, so the
+        // holder's answer stands.
+        prev.caps = None;
+        assert_eq!(renewed_caps(Some(caps::WEB), &prev), Some(caps::WEB));
+        assert_eq!(renewed_caps(None, &prev), None);
+    }
+
+    #[test]
+    fn renew_modes_parse_and_only_deny_declines_to_stand_by() {
+        assert_eq!(Renew::parse(None).unwrap(), Renew::Ask);
+        assert_eq!(Renew::parse(Some("ask")).unwrap(), Renew::Ask);
+        assert_eq!(Renew::parse(Some("auto")).unwrap(), Renew::Auto);
+        assert_eq!(Renew::parse(Some("deny")).unwrap(), Renew::Deny);
+        assert!(Renew::parse(Some("sometimes")).is_err());
+
+        // `deny` means no standing session, so the mailbox has nowhere
+        // to route a codeless renewal and the browser is told
+        // `no_holder` — which is how a renewal ends up coming through a
+        // code like a first enrollment (§8).
+        for (renew, standing) in [
+            (Renew::Ask, true),
+            (Renew::Auto, true),
+            (Renew::Deny, false),
+        ] {
+            assert_eq!(renew != Renew::Deny, standing, "{renew:?}");
+        }
+    }
+
+    #[test]
     fn the_scan_url_keeps_everything_in_the_fragment() {
         let id = IdentityKey::from_seed(&[1u8; 32]);
         let secret = [0x5au8; PAIRING_SECRET_BYTES];
@@ -889,35 +1100,6 @@ mod tests {
             "the quiet zone should be blank, got {:?}",
             without_escapes(lines[1])
         );
-    }
-
-    #[test]
-    fn the_prompt_does_not_report_an_unstated_ask_as_everything() {
-        // The bug this guards is on the one screen where being
-        // misleading is the whole risk: `None` in a request means
-        // "whatever your policy gives" (§4), and rendering it with the
-        // certificate's meaning would show a browser asking for
-        // everything when it asked for nothing in particular.
-        let dev = hl_identity::DeviceKey::from_seed(&[3u8; 32]);
-        let req = EnrollRequest::new(&dev, 1_000);
-        assert_eq!(req.caps, None);
-
-        let (caps, days) = grant(&web(), req.caps, req.days);
-        let s = screen(
-            "hl.example",
-            "K7PM-4XWE",
-            &Fingerprint::of(&req.device),
-            "unnamed",
-            &req,
-            caps,
-            days,
-            false,
-        );
-        assert!(s.contains("asks for    the default"), "{s}");
-        assert!(!s.contains("asks for    everything"), "{s}");
-        // The grant is still shown with the certificate's meaning,
-        // because that is the object it is going into.
-        assert!(s.contains("will get    login, message"), "{s}");
     }
 
     #[test]

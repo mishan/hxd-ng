@@ -4,12 +4,10 @@ Status: draft, being built. Done in hxd-ng: the §4 request and the §5.4
 bundle in `hl-identity`, with test vectors; `hlid cert --bundle`, which
 writes a bundle for the paste path; the §5 mailbox, served under
 `/identity/enroll` and advertised in discovery; CORS on the identity
-endpoints, so a browser elsewhere can reach it; and `hlid enroll` (§7),
-which shows a code and — when discovery advertises a web client — a QR
-code, prompts, and certifies, verifying a scanned request's `pair` and
-refusing one that does not verify without showing it. Not done: `hlid
-agent` and standing sessions, so renewals still need a code; and every
-part of hx-ng's side. Companion to
+endpoints, so a browser elsewhere can reach it; `hlid enroll` (§7), with
+the QR code and pairing proof of §5.6; and `hlid agent`, which holds a
+standing session and takes renewals with no code. Not done: every part
+of hx-ng's side. Companion to
 `hotline-ng-identity.md` (the objects and the profile),
 `hotline-ng-auth.md` (the transport), hx-ng's `identity-keys.md` (the
 browser's side of the same problem, whose §7 describes the paste this
@@ -218,9 +216,17 @@ or with an empty list at the deadline. Response:
   "pending": [
     { "id": "r1", "request": "…base64url CBOR…", "received": 1757116860 }
   ],
-  "expires_in": 412
+  "expires_in": 412,
+  "code_live": true                    // false once the code has admitted its one request
 }
 ```
+
+`code_live` says whether this session's code still admits a request. It
+is not in the original sketch of this response and it needs to be: a code
+is single-use, so a holder that stays open (`hlid agent`) would otherwise
+go on displaying one that is dead, and the user would find out by typing
+it. The server already tracks this — §11 keeps the code "until used" —
+so this only reports it.
 
 `id` is a short mailbox-assigned name for answering, not the enrollee's
 secret. A session opened with `identity` sees renewals routed by

@@ -3495,6 +3495,201 @@ async fn start_holder(ng: SocketAddr, home: &Path, hlid: &Path, answer: &[u8]) -
     }
 }
 
+/// A long-running `hlid` whose codes arrive one after another, so a test
+/// can watch it hand out a fresh one when the last is spent.
+struct Agent {
+    child: std::process::Child,
+    reader: std::thread::JoinHandle<String>,
+    codes: std::sync::mpsc::Receiver<String>,
+}
+
+impl Agent {
+    async fn next_code(&mut self) -> String {
+        // `recv` blocks, so it goes on a blocking thread; a channel that
+        // never delivers is a hung test rather than a wrong one, which
+        // the outer timeout catches.
+        let rx = &self.codes;
+        for _ in 0..300 {
+            match rx.try_recv() {
+                Ok(c) => return c,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("hlid agent stopped: {e}"),
+            }
+        }
+        panic!("hlid agent showed no further code");
+    }
+}
+
+fn start_agent(ng: SocketAddr, home: &Path, hlid: &Path, extra: &[&str]) -> Agent {
+    let mut child = std::process::Command::new(hlid)
+        .env("HLID_HOME", home)
+        .arg("agent")
+        .args(["--server", &format!("http://{ng}")])
+        .args(extra)
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        // Enough approvals for every prompt this test will produce; they
+        // wait in the pipe until each one is asked.
+        child.stdin.take().unwrap().write_all(b"y\ny\ny\n").unwrap();
+    }
+
+    let (tx, codes) = std::sync::mpsc::channel::<String>();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.contains("enter code") {
+                if let Some(c) = code_in(&line) {
+                    let _ = tx.send(c);
+                }
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+
+    Agent {
+        child,
+        reader,
+        codes,
+    }
+}
+
+/// Post a request and collect the answer, which is what a browser does.
+async fn enroll_through(ng: SocketAddr, code: Option<&str>, request: &[u8]) -> HttpReply {
+    let mut body = json!({ "request": b64(request) });
+    if let Some(c) = code {
+        body["code"] = json!(c);
+    }
+    let posted = post_request(ng, body).await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let handle = posted.json()["request"].as_str().unwrap().to_owned();
+    http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{handle}"),
+        &[],
+        b"",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn hlid_agent_hands_out_a_fresh_code_and_renews_without_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let mut agent = start_agent(ng, &home, &hlid, &["--renew", "auto"]);
+    let first_code = agent.next_code().await;
+
+    // A browser enrolls with the code it was shown.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+    let mut req = hl_identity::EnrollRequest::new(&browser, now());
+    req.name = Some("Firefox".into());
+    let answer = enroll_through(ng, Some(&first_code), &req.sign(&browser)).await;
+    assert_eq!(answer.status, 200);
+    let bundle =
+        hl_identity::Bundle::parse(&unb64(answer.json()["bundle"].as_str().unwrap())).unwrap();
+    let (cert, _) = bundle.open().unwrap();
+    assert_eq!(cert.device, browser.public());
+
+    // A code admits one request, so the agent must show another rather
+    // than go on displaying one that no longer works.
+    let second_code = agent.next_code().await;
+    assert_ne!(second_code, first_code, "the agent reused a spent code");
+
+    // And the renewal, which is the point of a standing session: no code
+    // is typed anywhere. The mailbox routes it by the identity in `prev`.
+    let mut renewal = hl_identity::EnrollRequest::new(&browser, now());
+    renewal.prev = Some(bundle.cert.clone());
+    renewal.name = Some("Firefox".into());
+    let renewed = enroll_through(ng, None, &renewal.sign(&browser)).await;
+    assert_eq!(
+        renewed.status, 200,
+        "a standing agent should have taken this without a code"
+    );
+    let fresh = hl_identity::Bundle::parse(&unb64(renewed.json()["bundle"].as_str().unwrap()))
+        .unwrap()
+        .open()
+        .unwrap()
+        .0;
+    assert_eq!(fresh.device, browser.public());
+    assert!(
+        fresh.issued >= cert.issued,
+        "the renewal should be a newer certificate"
+    );
+
+    let _ = agent.child.kill();
+    let output = agent.reader.join().unwrap();
+    let _ = agent.child.wait();
+    assert!(
+        output.contains("--renew auto"),
+        "the renewal should say it was not asked about:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn renew_deny_holds_no_standing_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+
+    let mut agent = start_agent(ng, &home, &hlid, &["--renew", "deny"]);
+    let code = agent.next_code().await;
+
+    // Enroll first, so there is a certificate to renew.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+    let req = hl_identity::EnrollRequest::new(&browser, now());
+    let answer = enroll_through(ng, Some(&code), &req.sign(&browser)).await;
+    assert_eq!(answer.status, 200);
+    let bundle =
+        hl_identity::Bundle::parse(&unb64(answer.json()["bundle"].as_str().unwrap())).unwrap();
+    agent.next_code().await; // it reopens, but still without an identity
+
+    // A codeless renewal has nowhere to go: that is what `deny` means —
+    // renewals come through a code like a first enrollment (§8).
+    let mut renewal = hl_identity::EnrollRequest::new(&browser, now());
+    renewal.prev = Some(bundle.cert.clone());
+    let orphan = post_request(ng, json!({ "request": b64(&renewal.sign(&browser)) })).await;
+    assert_eq!(orphan.status, 404);
+    assert_eq!(orphan.json()["error"], "no_holder");
+
+    let _ = agent.child.kill();
+    let _ = agent.reader.join();
+    let _ = agent.child.wait();
+}
+
 #[tokio::test]
 async fn a_scanned_request_skips_the_comparison_the_typed_one_asks_for() {
     let dir = tempfile::tempdir().unwrap();

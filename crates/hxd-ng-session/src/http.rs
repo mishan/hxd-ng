@@ -902,15 +902,19 @@ async fn enroll_post(
 /// §5.3, long-polled.
 async fn enroll_poll(secret: &str, mb: &crate::enroll::Mailbox) -> Resp {
     match mb.poll_session(secret, crate::enroll::LONG_POLL).await {
-        Ok((pending, expires_in)) => json_resp(
+        Ok(p) => json_resp(
             StatusCode::OK,
             json!({
-                "pending": pending.iter().map(|p| json!({
-                    "id": p.id,
-                    "request": b64(&p.request),
-                    "received": p.received,
+                "pending": p.pending.iter().map(|r| json!({
+                    "id": r.id,
+                    "request": b64(&r.request),
+                    "received": r.received,
                 })).collect::<Vec<_>>(),
-                "expires_in": expires_in,
+                "expires_in": p.expires_in,
+                // Absent once the code has admitted its one request, so
+                // a standing holder knows to open a new session rather
+                // than keep showing a code that no longer works.
+                "code_live": p.code_live,
             }),
         ),
         Err(e) => enroll_refused(e),

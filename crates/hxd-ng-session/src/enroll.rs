@@ -102,6 +102,21 @@ pub struct Posted {
     pub expires_in: u64,
 }
 
+/// What one poll of a session found (§5.3).
+pub struct Polled {
+    pub pending: Vec<PendingView>,
+    pub expires_in: u64,
+    /// Whether this session's code still admits a request.
+    ///
+    /// Not in the spec's §5.3 table, and it should be: a code is
+    /// single-use, so a holder that stays open — `hlid agent` — is
+    /// otherwise displaying a code it has no way of knowing is dead, and
+    /// the user finds out by typing it and being told it is unknown.
+    /// The server already tracks this (§11 keeps the code "until used");
+    /// this is only reporting it.
+    pub code_live: bool,
+}
+
 /// A request waiting for the holder to look at it (§5.3).
 pub struct PendingView {
     pub id: String,
@@ -428,11 +443,7 @@ impl Mailbox {
     /// test can exercise the deadline without spending thirty seconds on
     /// it, which is the only thing that would otherwise stop the
     /// timed-out branch from being tested at all.
-    pub async fn poll_session(
-        &self,
-        secret: &str,
-        wait: Duration,
-    ) -> Result<(Vec<PendingView>, u64), Refused> {
+    pub async fn poll_session(&self, secret: &str, wait: Duration) -> Result<Polled, Refused> {
         let key = hash(secret.as_bytes());
         let deadline = Instant::now() + wait;
         // Resolved once: a session's `Notify` outlives every poll of it,
@@ -458,6 +469,7 @@ impl Mailbox {
                 inner.sweep(Instant::now());
                 let session = inner.sessions.get(&key).ok_or(Refused::UnknownSession)?;
                 let expires_in = remaining(session.expires);
+                let code_live = session.code.is_some();
                 let waiting: Vec<PendingView> = session
                     .pending
                     .values()
@@ -469,10 +481,18 @@ impl Mailbox {
                     })
                     .collect();
                 if !waiting.is_empty() {
-                    return Ok((waiting, expires_in));
+                    return Ok(Polled {
+                        pending: waiting,
+                        expires_in,
+                        code_live,
+                    });
                 }
                 if Instant::now() >= deadline {
-                    return Ok((Vec::new(), expires_in));
+                    return Ok(Polled {
+                        pending: Vec::new(),
+                        expires_in,
+                        code_live,
+                    });
                 }
             }
             // Timing out here rather than sleeping to the deadline in one
@@ -779,7 +799,11 @@ mod tests {
             .post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
 
-        let (pending, _) = m.poll_session(&opened.session, QUICK).await.unwrap();
+        let pending = m
+            .poll_session(&opened.session, QUICK)
+            .await
+            .unwrap()
+            .pending;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].request, request(2));
 
@@ -809,7 +833,11 @@ mod tests {
         let posted = m
             .post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
-        let (pending, _) = m.poll_session(&opened.session, QUICK).await.unwrap();
+        let pending = m
+            .poll_session(&opened.session, QUICK)
+            .await
+            .unwrap()
+            .pending;
         m.answer(
             &opened.session,
             &pending[0].id,
@@ -836,6 +864,48 @@ mod tests {
             drawn,
             normalize_code(&drawn),
             "if these were ever equal the collision check would be untested"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_poll_says_whether_the_code_still_works() {
+        // A holder that stays open needs this: a code is single-use, and
+        // a standing agent would otherwise go on displaying one that is
+        // dead, with the user finding out by typing it.
+        let m = mailbox();
+        let opened = m.open_session(addr(1), None).unwrap();
+        assert!(
+            m.poll_session(&opened.session, QUICK)
+                .await
+                .unwrap()
+                .code_live
+        );
+
+        m.post_request(addr(2), Some(&opened.code), &request(2))
+            .unwrap();
+        assert!(
+            !m.poll_session(&opened.session, QUICK)
+                .await
+                .unwrap()
+                .code_live,
+            "the code was spent by that request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_renewal_leaves_the_code_alone() {
+        // A standing session collects renewals by identity, and those do
+        // not touch the code — so an agent showing one can keep showing
+        // it while renewals come and go.
+        let m = mailbox();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let opened = m.open_session(addr(1), Some(id.fingerprint())).unwrap();
+        m.post_request(addr(2), None, &renewal(2, &id)).unwrap();
+        assert!(
+            m.poll_session(&opened.session, QUICK)
+                .await
+                .unwrap()
+                .code_live
         );
     }
 
@@ -989,7 +1059,11 @@ mod tests {
         let opened = m.open_session(addr(1), Some(id.fingerprint())).unwrap();
 
         let posted = m.post_request(addr(2), None, &renewal(2, &id)).unwrap();
-        let (pending, _) = m.poll_session(&opened.session, QUICK).await.unwrap();
+        let pending = m
+            .poll_session(&opened.session, QUICK)
+            .await
+            .unwrap()
+            .pending;
         assert_eq!(pending.len(), 1, "the standing session saw it");
 
         m.answer(&opened.session, &pending[0].id, Answered::Bundle(vec![7]))
@@ -1032,7 +1106,11 @@ mod tests {
         let opened = m.open_session(addr(1), None).unwrap();
         m.post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
-        let (pending, _) = m.poll_session(&opened.session, QUICK).await.unwrap();
+        let pending = m
+            .poll_session(&opened.session, QUICK)
+            .await
+            .unwrap()
+            .pending;
 
         // The code is shown on a screen and typed into another machine;
         // the session secret never leaves the holder's process. Only one
@@ -1053,7 +1131,11 @@ mod tests {
         let opened = m.open_session(addr(1), None).unwrap();
         m.post_request(addr(2), Some(&opened.code), &request(2))
             .unwrap();
-        let (pending, _) = m.poll_session(&opened.session, QUICK).await.unwrap();
+        let pending = m
+            .poll_session(&opened.session, QUICK)
+            .await
+            .unwrap()
+            .pending;
         let id = pending[0].id.clone();
         assert!(m
             .answer(&opened.session, &id, Answered::Bundle(vec![1]))
@@ -1081,21 +1163,22 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         m.post_request(addr(2), Some(&code), &request(2)).unwrap();
 
-        let (pending, _) = tokio::time::timeout(Duration::from_secs(2), poller)
+        let polled = tokio::time::timeout(Duration::from_secs(2), poller)
             .await
             .expect("the poll should have been woken, not timed out")
             .unwrap()
             .unwrap();
-        assert_eq!(pending.len(), 1);
+        assert_eq!(polled.pending.len(), 1);
     }
 
     #[tokio::test]
     async fn a_poll_with_nothing_waiting_comes_back_empty_at_the_deadline() {
         let m = mailbox();
         let opened = m.open_session(addr(1), None).unwrap();
-        let (pending, expires_in) = m.poll_session(&opened.session, QUICK).await.unwrap();
-        assert!(pending.is_empty());
-        assert!(expires_in > 0, "the session is still open");
+        let polled = m.poll_session(&opened.session, QUICK).await.unwrap();
+        assert!(polled.pending.is_empty());
+        assert!(polled.expires_in > 0, "the session is still open");
+        assert!(polled.code_live, "nothing has used the code yet");
     }
 
     #[tokio::test]
