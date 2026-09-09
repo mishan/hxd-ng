@@ -524,7 +524,10 @@ what the ceremony was supposed to cost.
 
 `--renew auto` exists for a user who has read that paragraph and owns
 the machine outright. `--renew deny` exists for a holder that wants
-renewals to come through a code like a first enrollment.
+renewals to come through a code like a first enrollment — and to be
+answered like one, defaulting to no rather than to yes. A user who said
+renewals should cost a code did not say they should cost a code and one
+Return.
 
 ---
 

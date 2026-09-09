@@ -409,7 +409,6 @@ fn with_holder(args: &[String], budget: Option<usize>) -> R<()> {
     run(&holder, budget, &mut Terminal)
 }
 
-#[allow(clippy::too_many_arguments)]
 /// What to do about a renewal (§8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Renew {
@@ -419,8 +418,10 @@ pub(crate) enum Renew {
     /// Approve without asking. For someone who has read §8's argument
     /// and owns the machine outright.
     Auto,
-    /// Refuse to hold a standing session at all, so renewals arrive
-    /// through a code like a first enrollment.
+    /// Hold no standing session, so renewals arrive through a code like
+    /// a first enrollment — and are answered like one too, defaulting to
+    /// no rather than to yes. Somebody who asked for renewals to cost a
+    /// code did not ask for them to cost a code and one Return.
     Deny,
 }
 
@@ -432,7 +433,22 @@ impl Renew {
             Some("deny") => Ok(Renew::Deny),
             Some(other) => Err(format!(
                 "--renew: unknown value {other:?}; ask, auto or deny"
-            )),        }
+            )),
+        }
+    }
+
+    /// What the renewal prompt defaults to, for the two settings that
+    /// reach a prompt at all.
+    ///
+    /// `ask` defaults to yes: it is one keypress a quarter, and §8's whole
+    /// argument is that the user should *see* it, not that they should
+    /// have to fight it. `deny` holds no standing session, so a renewal
+    /// only ever reaches it through a code somebody typed — which §8 calls
+    /// "like a first enrollment", and a first enrollment defaults to no.
+    /// Defaulting to yes there handed back most of what the flag turned
+    /// off.
+    fn prompt_default_yes(self) -> bool {
+        matches!(self, Renew::Ask)
     }
 }
 
@@ -588,11 +604,15 @@ impl Holder<'_> {
                 ui.tell(&format!("\n{url}\n"));
             }
         }
+        // Minutes *and* seconds. `expires_in` is 600 at every open today,
+        // so `{}:00` was right by luck; a mailbox that answered 412 would
+        // have had it printing "6:00" for six minutes fifty-two.
         ui.tell(&format!(
-            "\nEnroll a device at {}: enter code  {}  (expires in {}:00)\nThis identity: {}  {}\n",
+            "\nEnroll a device at {}: enter code  {}  (expires in {}:{:02})\nThis identity: {}  {}\n",
             self.host(),
             s.code,
             s.expires_in / 60,
+            s.expires_in % 60,
             self.card_name,
             self.id.fingerprint().short(),
         ));
@@ -699,7 +719,7 @@ impl Holder<'_> {
                     // without asking renews the copy too, forever, and
                     // the lifetime bounds nothing. Asking turns the
                     // copy's renewal into something the user sees.
-                    Renew::Ask | Renew::Deny => ui.confirm(&ask, true),
+                    Renew::Ask | Renew::Deny => ui.confirm(&ask, self.renew.prompt_default_yes()),
                     Renew::Auto => {
                         ui.tell(&format!("{ask} yes (--renew auto)"));
                         true
@@ -1358,6 +1378,13 @@ mod tests {
         ] {
             assert_eq!(renew != Renew::Deny, standing, "{renew:?}");
         }
+
+        // And when one does arrive through a code, `deny` answers it like
+        // a first enrollment rather than like a renewal: the default is
+        // no. A user who said renewals should cost a code did not say
+        // they should cost a code and one Return.
+        assert!(Renew::Ask.prompt_default_yes());
+        assert!(!Renew::Deny.prompt_default_yes());
     }
 
     #[test]
