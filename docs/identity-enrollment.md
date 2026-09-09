@@ -292,7 +292,14 @@ https://hl.example/app/#enroll=K7PM-4XWE&mailbox=hl.example&identity=3f2a…&pai
 ```
 
 Everything is in the fragment, which browsers do not send to the
-server, so nothing here reaches an access log. A phone camera opens the
+server, so nothing here reaches an access log — but the page named by
+`web` can read it, which is why the holder draws a QR only for a `web`
+on the same origin as the server the user typed, or one the user named
+itself (`hlid enroll --web`). Discovery is answered by the mailbox, and
+a mailbox free to point `web` anywhere would be a mailbox that could
+read the pairing secret off the fragment of its own page and mint a
+`pair` with it. The holder prints the origin beside the code, because
+scanning is what hands the secret over. A phone camera opens the
 web client with all four filled in: the code and mailbox, so the user
 types nothing and cannot pick the wrong server; the identity
 fingerprint, so the enrollee *pins it before it asks* rather than
@@ -459,6 +466,7 @@ who is not the mailbox.
 | Substitute the **answer** — hand the enrollee a bundle for a different identity | The enrollee shows who it has become, and pins the fingerprint after the first enrollment (§5.5). Also a bundle for a different identity does not help the mailbox log in as anyone: the browser would authenticate as *the mailbox's* identity, which the mailbox could do already |
 | Open sessions and post requests itself | It can prompt the holder with its own device key, which is the substituted-request case, and it can fill its own tables |
 | Any of the above against a **scanned** enrollment | Nothing: the pinned identity rejects a substituted answer, the pairing secret it never saw rejects a substituted request (§5.6) |
+| Advertise a `web` of its own choosing, so the phone hands *it* the pairing secret | The holder draws a QR only for a `web` on the origin the user typed, or one the user named with `--web`, and shows that origin beside the code. A mailbox whose own web client you chose to use is not a hostile mailbox this defends you against — it is a server you trusted with the browser as well; type the code into a client you picked instead |
 
 What the **code** protects is delivery: that the request lands at the
 session the user meant, and that nobody who did not see the terminal

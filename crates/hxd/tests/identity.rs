@@ -108,7 +108,7 @@ async fn start_server_with_web_client(dir: &Path) -> (SocketAddr, SocketAddr, Ng
         false,
         hxd_ng_session::ForwardedHeader::default(),
         Some(Default::default()),
-        Some("https://hl.example/app/"),
+        Some("http://{ng}/app/"),
     )
     .await
 }
@@ -206,6 +206,15 @@ async fn start_server_inner(
             trtp_login,
         }),
     };
+    let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (legacy_addr, ng_addr) = (l1.local_addr().unwrap(), l2.local_addr().unwrap());
+    // `{ng}` in a web-client URL is the ng listener's own address, which
+    // is only knowable once it is bound. An operator's web client is
+    // normally on the server's own origin, and since `hlid enroll` draws
+    // a QR only for one that is, the harness has to be able to say so.
+    let web_client = web_client.map(|w| w.replace("{ng}", &ng_addr.to_string()));
+
     let identity = IdentityState::new(
         ServerKey::from_seed(&[0x55; 32]),
         cfg,
@@ -225,16 +234,13 @@ async fn start_server_inner(
             caps: Vec::new(),
             trusted_proxies: hxd_ng_session::TrustedProxies::parse(proxies).unwrap(),
             forwarded_header,
-            web_client: web_client.map(str::to_owned),
+            web_client,
         }),
         registry: Arc::new(Registry::new()),
         identity: Some(Arc::new(identity)),
         tunnel: Some(tunnel),
         enroll: enroll.map(|c| Arc::new(hxd_ng_session::enroll::Mailbox::new(c))),
     };
-    let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (legacy_addr, ng_addr) = (l1.local_addr().unwrap(), l2.local_addr().unwrap());
     tokio::spawn(hxd_session::serve(l1, legacy_ctx));
     tokio::spawn(hxd_ng_session::serve(l2, ng_ctx.clone()));
     (legacy_addr, ng_addr, ng_ctx)
@@ -3619,5 +3625,79 @@ async fn a_pairing_proof_that_does_not_verify_is_never_shown_to_the_user() {
     assert!(
         !stderr.contains("Certify?"),
         "the user should never have been asked:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_web_client_the_server_names_off_its_own_origin_gets_no_qr_code() {
+    // Discovery is answered by the mailbox, and the QR's fragment carries
+    // the pairing secret — so a mailbox free to point `web` anywhere
+    // could send the phone to a page of its own, read the secret off the
+    // fragment, and mint a `pair` for a device key it holds. That is the
+    // substituted request §9 says a scanned enrollment cannot suffer.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_inner(
+        dir.path(),
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        Some("https://evil.test/app/"),
+    )
+    .await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    let init = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+
+    // The QR and the `--show-url` line are both printed before the
+    // "enter code" line, so reading to that line has seen everything the
+    // scan path would have emitted. Nothing sends a request here, so the
+    // process is killed rather than waited on.
+    let mut child = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["enroll", "--server", &format!("http://{ng}"), "--show-url"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let said = tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            all.push_str(&line);
+            all.push('\n');
+            if line.contains("enter code") {
+                break;
+            }
+        }
+        all
+    })
+    .await
+    .unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        said.contains("enter code"),
+        "the typed path is untouched and still shows a code:\n{said}"
+    );
+    assert!(
+        !said.contains("#enroll="),
+        "the pairing secret must not be drawn for an origin the server chose:\n{said}"
+    );
+    assert!(
+        !said.contains("Scan this"),
+        "and no QR code either:\n{said}"
     );
 }

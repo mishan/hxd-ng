@@ -196,7 +196,11 @@ enroll_per_address = 4              # open sessions and pending requests, per
 # web = "https://hl.example/app/"   # where a web client for this server lives.
                                     # Advertised in discovery so `hlid enroll`
                                     # can show a QR code that opens it with the
-                                    # pairing code already in it
+                                    # pairing code already in it. Must be on
+                                    # this server's own origin to be drawn: the
+                                    # QR's fragment carries the pairing secret,
+                                    # so a client hosted elsewhere is one the
+                                    # user names with `hlid enroll --web`
 
 # max_new_accounts_per_hour = 60    # ceiling on what new_accounts = "create" writes
 # allow_list = ["alice@hl.example", "<fingerprint>"]
@@ -294,7 +298,8 @@ account association.
 hlid init --name Alice        # identity key, device key, certificate, card
 hlid enroll --server http://127.0.0.1:5700   # certify a browser: show a code
                                              # (and a QR, if the server names a
-                                             # web client), wait, ask, sign
+                                             # web client on its own origin),
+                                             # wait, ask, sign
 hlid auth   --server http://127.0.0.1:5700
 hlid link   --server http://127.0.0.1:5700 --login alice --password-stdin < pw.txt
 hlid tunnel --server http://127.0.0.1:5700

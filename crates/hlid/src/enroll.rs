@@ -140,15 +140,36 @@ struct Discovered {
     /// The mailbox's absolute base.
     mailbox: String,
     /// Where a web client for this server lives (§3), if the operator
-    /// said. Absent means no QR code: there is nowhere to point a phone,
-    /// and the code gets typed.
+    /// said and the user did not say otherwise. Absent means no QR code:
+    /// there is nowhere to point a phone, and the code gets typed.
     web: Option<String>,
+}
+
+/// `scheme://host[:port]`, or the whole string if it does not look like a
+/// URL. Compared rather than parsed: the two inputs are `--server`, which
+/// `server_base` has already checked, and a discovery field.
+fn origin(url: &str) -> &str {
+    match url.split_once("://") {
+        Some((_, rest)) => &url[..url.len() - rest.len() + rest.find('/').unwrap_or(rest.len())],
+        None => url,
+    }
 }
 
 /// Read `identity.endpoints.enroll` out of discovery. Absent means this
 /// server hosts no mailbox, which is not a failure of anything — it is
 /// the case the paste still exists for.
-fn discover(base: &str) -> R<Discovered> {
+///
+/// `web` is taken only when it is on the same origin as `base` — the
+/// address the user typed. It is the mailbox that answers discovery, and
+/// the QR built from `web` carries the pairing secret in its fragment, so
+/// a mailbox free to name any origin could send the phone to a page of
+/// its own, read the secret off the fragment, and mint a `pair` for a
+/// device key of its own — which is precisely the substituted request
+/// §9 claims a scanned enrollment cannot suffer. Same-origin does not
+/// make the page trustworthy, but it does mean the phone only ever goes
+/// where the user already chose to go; a client hosted elsewhere is a
+/// `--web` away, and that is the user saying it, not the server.
+fn discover(base: &str, web_override: Option<&str>) -> R<Discovered> {
     let doc: Value = agent(Duration::from_secs(10))
         .get(&format!("{base}/.well-known/hotline"))
         .call()
@@ -165,8 +186,21 @@ fn discover(base: &str) -> R<Discovered> {
         })?;
     Ok(Discovered {
         mailbox: format!("{base}{endpoint}"),
-        web: doc["identity"]["web"].as_str().map(str::to_owned),
+        web: web_client(base, doc["identity"]["web"].as_str(), web_override),
     })
+}
+
+/// Which web client the QR code points at, if any: what the user named,
+/// else what discovery advertised — but only on the origin of the server
+/// the user typed. See `discover` for why the second is not enough on its
+/// own.
+fn web_client(base: &str, advertised: Option<&str>, chosen: Option<&str>) -> Option<String> {
+    match chosen {
+        Some(w) => Some(w.to_owned()),
+        None => advertised
+            .filter(|w| origin(w) == origin(base))
+            .map(str::to_owned),
+    }
 }
 
 /// The URL a QR code carries (§5.6).
@@ -259,7 +293,13 @@ pub(crate) fn enroll_cmd(args: &[String]) -> R<()> {
     };
     let show_url = a.has("show-url");
     let base = server_base(&a)?;
-    let found = discover(&base)?;
+    let web = a.opt("web");
+    if let Some(w) = web {
+        if !(w.starts_with("http://") || w.starts_with("https://")) {
+            return Err("--web must start with http:// or https://".into());
+        }
+    }
+    let found = discover(&base, web)?;
 
     run(
         &id,
@@ -321,8 +361,17 @@ fn run(
 
     if let Some(web) = found.web.as_deref() {
         let url = scan_url(web, &code, host, &id.fingerprint(), &secret);
+        // The origin, above the code it is drawn from: scanning hands
+        // the pairing secret to whatever is served there, and that is
+        // part of the ceremony rather than a detail. Same-origin with
+        // `--server` unless the user passed `--web`, so this is a line
+        // the user can recognize — and notice when it is not what they
+        // expected.
         match qr_block(&url) {
-            Ok(block) => ui.tell(&format!("\nScan this, or type the code below:\n\n{block}")),
+            Ok(block) => ui.tell(&format!(
+                "\nScan this to open {}, or type the code below:\n\n{block}",
+                origin(web)
+            )),
             // A URL too long for a QR code is a reason to fall back to
             // typing, not a reason to fail: the typed path is complete
             // on its own.
@@ -734,6 +783,63 @@ mod tests {
                 "right quiet zone"
             );
         }
+    }
+
+    #[test]
+    fn the_origin_is_the_scheme_host_and_port_only() {
+        assert_eq!(origin("https://hl.example/app/"), "https://hl.example");
+        assert_eq!(origin("https://hl.example"), "https://hl.example");
+        assert_eq!(
+            origin("http://hl.example:5700/app/#x"),
+            "http://hl.example:5700"
+        );
+        // A different port or scheme is a different origin, as it is to
+        // a browser — the QR would open somewhere else.
+        assert_ne!(
+            origin("https://hl.example:5700/"),
+            origin("https://hl.example/")
+        );
+        assert_ne!(origin("http://hl.example/"), origin("https://hl.example/"));
+        // Prefix matching would call these equal; they are not.
+        assert_ne!(
+            origin("https://hl.example.evil.test/app/"),
+            origin("https://hl.example/")
+        );
+    }
+
+    #[test]
+    fn a_web_client_on_another_origin_is_only_taken_from_the_user() {
+        // The mailbox answers discovery, and the QR's fragment carries
+        // the pairing secret. A `web` the mailbox can point anywhere is
+        // a `web` that hands it the secret, and with the secret it can
+        // mint a `pair` for a device key of its own — the substituted
+        // request §9 says a scanned enrollment does not suffer.
+        let base = "https://hl.example";
+        assert_eq!(
+            web_client(base, Some("https://hl.example/app/"), None).as_deref(),
+            Some("https://hl.example/app/"),
+            "the operator's own client, on the origin the user typed"
+        );
+        assert_eq!(
+            web_client(base, Some("https://evil.test/app/"), None),
+            None,
+            "a third-party origin the server named is no QR code at all"
+        );
+        assert_eq!(
+            web_client(
+                base,
+                Some("https://evil.test/app/"),
+                Some("https://mine.test/app/")
+            )
+            .as_deref(),
+            Some("https://mine.test/app/"),
+            "--web is the user saying it, and outranks discovery"
+        );
+        assert_eq!(
+            web_client(base, None, None),
+            None,
+            "no client advertised is no QR code, and the code gets typed"
+        );
     }
 
     #[test]
