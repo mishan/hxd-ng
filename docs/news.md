@@ -68,6 +68,13 @@ locks the legacy wire out.
   has FTS5 compiled in, so a full-text index is a table and a query
   compiler, not a dependency. The query grammar is ours and closed — a
   malformed search returns results, never an error.
+- **1.2 flat news is a rendering of one category, not a second store.**
+  The operator names the category a 1.2 client reads and posts into; a
+  post from that wire becomes a reply in it, with its subject and its
+  parent read out of a leading `Subject:` / `Re: #398` block in the body
+  — the only place this wire has to put them. Both are optional and both
+  have defaults, because a post must never be refused for lacking
+  metadata the client cannot send.
 - **Off unless configured**, like the inbox, the chat log and media. A
   server with no `[news]` section answers every news request the way a
   server without the feature does.
@@ -89,10 +96,11 @@ this is a design document and not a research one.
   `build_news_delete_thread_chunks`. They exist because GtkHx is a news
   client; the server side is the same tables read the other way.
   **One gap:** `ClientHdr` enumerates only `GetThread` (`0x190`) and
-  `PostThread` (`0x19a`) — the five directory opcodes (`0x172`, `0x173`,
-  `0x17c`–`0x17e`) have builders but no enum variants, so W8 opens with
-  an hx-libs change and a pin bump, which is a deliberate act with a
-  full test run behind it in both consumers.
+  `PostThread` (`0x19a`) — the directory opcodes (`0x172`, `0x173`,
+  `0x17c`–`0x17e`) have builders but no enum variants, and `ServerHdr`
+  does not name `NEWSFILE_POST` (`0x0066`), the flat-news push. So W8
+  opens with an hx-libs change and a pin bump, which is a deliberate act
+  with a full test run behind it in both consumers.
 - **The access bits are already allocated and already parsed**:
   `READ_NEWS` (20), `POST_NEWS` (21), `DELETE_ARTICLES` (33),
   `CREATE_CATEGORIES` (34), `DELETE_CATEGORIES` (35),
@@ -1201,24 +1209,156 @@ the same distinction `build_news_post_thread_chunks` documents on its
 `is_body` flag). A client that negotiated the Text-Encoding capability
 skips the conversion, as it does everywhere else.
 
-### 11.5 Flat 1.2 news
+### 11.5 Flat 1.2 news: one category, flattened
 
 A 1.2 client speaks `NEWSFILE_GET` (`0x0065`) and `NEWSFILE_POST`
-(`0x0067`)
-and knows nothing about a tree. It gets a **rendered view**: the most
-recent `[news] flat_articles` (default 100) articles across every
-category, newest first, each as a header line and a body, in the
-`HTLS_DATA_NEWS` chunks the client expects. A post from a 1.2 client
-lands in `[news] flat_category` as a top-level article; when no such
-category is configured, the post is refused with a readable task error
-rather than vanishing.
+(`0x0067`) and knows nothing about a tree. It does not get a second news
+system. **The operator names one category, and that category is what a
+1.2 client reads and writes** — `[news] flat_category`. One place to
+read, one place to post, and no flat file anywhere: the document is
+rendered on demand from the same rows the other two wires serve. mhxd
+keeps a flat file and a threaded tree as two disjoint stores that know
+nothing about each other; one rendered from the other cannot drift from
+it, and cannot be half of a server's news.
 
-A markdown article contributes its downgrade to the flat view, never its
-source: a 1.2 client is the last place to send raw syntax.
+#### The reference format, which we keep
 
-This is a synthesis, not a second store — there is no flat news file to
-keep in sync, which is exactly the mhxd bug class we are not
-inheriting.
+mhxd renders each post as `news_format` and `news_time_format` applied to
+the poster, then `\r\r`, the body, `\r`, `news_divider`, `\r`
+(`rcv.c:rcv_news_post`). `news_save_post` **prepends** it to the file and
+gtkhx's `output_news_post` **prepends** it to the pane, so flat news is
+newest-first on both sides. `news_send_file` caps the whole document at
+`MAX_NEWS_SIZE` — `0xffff` — and `snd_news_file` takes a `u_int16_t`,
+so it is **one `HTLS_DATA_NEWS` chunk and never more**.
+
+We keep that frame and put the article's id and two headers inside it:
+
+```
+From Alice - alice
+[Wed Sep  9 12:00:00 2026]  #412
+Subject: The derivative and the u16
+Re: #398
+
+The part size is a u16, so the full-size PNG cannot ride this wire.
+
+[image: screenshot.png]
+_________________________________________________________
+```
+
+`#412` is the article id. `Subject:` and `Re:` are present exactly when
+the article has a subject and a parent — which is nearly always, since
+the posting rules below give every article both.
+
+**The read format is the write format's documentation.** A 1.2 user sees
+`Subject:` and `Re: #398` in every entry they read, and those are
+literally the lines they type to set a subject and reply to something.
+Nothing has to be explained in a manual nobody has.
+
+`[news] flat_masthead` puts one line and a divider at the top of the
+document for the case where that inference does not land. Left out, it
+is a built-in sentence naming the category and the two headers; set to a
+string, it is that string; set to `""`, there is no masthead.
+
+#### Reading
+
+Newest first, an entry at a time, until `[news] flat_articles` (default
+100) or the byte budget runs out — and the budget is what usually
+decides, because 65 535 bytes is a few dozen real posts. When
+articles are left over, the document ends with a line saying so and
+naming the oldest id it carried, so a reader knows the archive did not
+stop there.
+
+- A markdown article contributes its **downgrade**, never its source
+  (§5.4): a 1.2 client is the last place to send raw syntax.
+- Attachments become a `[image: <name>]` line. A 1.2 client cannot fetch
+  them — `NEWS_GETTHREAD` does not exist in its vocabulary — and naming
+  what it cannot see is better than showing it a post that reads as if
+  something is missing.
+- A tombstoned article renders as its header block with an empty body,
+  keeping its id and its place.
+- Text converts UTF-8 → Mac Roman with `?` for unmappable and LF → CR at
+  `hxd-session`'s existing edge; the headers and the divider are ASCII.
+
+When `[news]` is configured but `flat_category` is not, `NEWSFILE_GET`
+answers with a **short document explaining that news on this server is
+threaded and needs a 1.5 client**, not a task error. A person running a
+1.2 client deserves to learn why the pane is empty. A task error is for
+when `[news]` is off entirely, because then there is no news at all.
+
+#### Posting
+
+`NEWSFILE_POST` carries one `HTLC_DATA_NEWSFILE_POST` chunk: a body, and
+nothing else. There is no subject field and no parent field on this wire
+and there never will be, so both are read **out of the body**, from a
+leading header block:
+
+```
+Subject: The derivative and the u16
+Re: #398
+
+The part size is a u16, so the full-size PNG cannot ride this wire.
+```
+
+The rules are small on purpose:
+
+- Leading lines are consumed while they match a recognized header, case
+  insensitively (`subject:` is what someone will actually type). The
+  first line that does not is where the body starts, and one blank line
+  between the two is consumed if present.
+- `Subject: <text>` sets the subject, trimmed and capped at
+  `max_subject`. `Re: <id>` sets the parent and accepts `#398` or `398`.
+- A second `Subject:` or `Re:` is body. So is a header nobody
+  recognizes — `Note: this is broken` as a first line makes the block
+  empty and the whole thing body, which is the behavior that keeps this
+  convention from eating people's prose.
+
+**Neither is required, and a post is never refused for lacking them.**
+
+- **No `Subject:`** — the subject is derived from the body's first
+  non-empty line, trimmed to a readable length at a word boundary with
+  `…` when it was cut. The line **stays in the body**: in flat news the
+  body is the whole message, and a client that silently ate its first
+  line would be mangling what the person wrote. An empty body gets
+  `[news] flat_default_subject`, default `(no subject)`.
+- **No `Re:`** — the post becomes a reply to **the root of the most
+  recent live thread in the flat category**, which is the conversation
+  the poster was just reading. When the category is empty, or its newest
+  root is tombstoned and no live one remains, the post starts a thread.
+- **A `Re:` naming an article that is missing, deleted, or in another
+  category** falls back to that same default — and **leaves the `Re:`
+  line in the body**, so what the person meant survives in what everyone
+  reads. A mis-threaded post is recoverable; a silently swallowed
+  intention is not.
+
+Replying to the newest thread's *root* rather than to the newest
+*article* is not an aesthetic choice. A chain of replies-to-the-last-reply
+would deepen by one per post and walk into `max_depth` (§3.3) within a
+few weeks of ordinary use; hanging every 1.2 post off the root keeps them
+all at depth 1, which is also the truest picture of what flat news is —
+one conversation everyone is talking into.
+
+`[news] flat_reply = "newest_thread" | "new_thread"` moves the default
+for an operator whose flat category is an announcements feed, where each
+post standing alone is the point.
+
+Posting needs `POST_NEWS` (21) like any other post. Attachments are not
+reachable from this wire; a 1.2 post is text.
+
+#### The push
+
+mhxd pushes `HTLS_HDR_NEWSFILE_POST` (`0x0066`) carrying **only the new
+entry** to every connection with `read_news`, and gtkhx prepends it. We
+do the same, and extend it in one direction mhxd cannot: the push fires
+when anything lands in the flat category, **whoever posted it** — a 1.2
+client, a 1.5 client through `NEWS_POSTTHREAD`, or a phone over ng.
+mhxd's flat and threaded news are two disjoint stores and neither
+notifies the other; here they are one category, so a post from any wire
+grows the 1996 pane. The entry pushed is rendered exactly as the read
+format renders it, so a client that prepends the delta and a client that
+refetches the document see the same text.
+
+`HTLS_HDR_NEWSFILE_POST` is the third opcode `hxproto`'s `ServerHdr`
+does not yet name (§1); it goes into the same hx-libs change.
 
 ### 11.6 Importing an mhxd tree
 
@@ -1255,8 +1395,14 @@ max_page = 200
 retain_days = 0                 # 0 = forever
 self_delete = true              # authors may delete their own; false = period behavior
 legacy_catlist_max = 2000       # articles in one 1.5 category reply
-flat_articles = 100             # articles in the synthesized 1.2 flat view
-flat_category = "General"       # where 1.2 posts land; absent = refuse them
+
+# 1.2 flat news (§11.5) — one category, read and written by 1.2 clients.
+flat_category = "General"       # absent = 1.2 clients are told news is threaded
+flat_articles = 100             # ceiling; 65 535 bytes usually decides first
+flat_reply = "newest_thread"    # or "new_thread": every 1.2 post stands alone
+flat_default_subject = "(no subject)"
+# flat_masthead = "…"           # absent = a built-in line naming the category
+                                # and the two headers; "" = no masthead at all
 
 [news.attach]                   # absent = news without attachments
 max_bytes = 2097152             # per attachment, as uploaded
@@ -1327,11 +1473,25 @@ builds.
   non-`READ_NEWS` session refused everything, tombstone semantics, the
   blob cap, a markdown post whose `refs` resolve, and a search that
   finds it.
+- **Flat-news tests**, which are mostly a parser and a renderer and
+  belong with them: a header block consumed and stripped; `subject:` in
+  lower case; an unrecognized first header leaving the body whole; a
+  second `Subject:` staying body; a derived subject cut at a word
+  boundary with the line still in the body; an empty body; `Re: #398`
+  and `Re: 398` both resolving; a `Re:` naming a deleted article, an
+  article in another category, and nothing at all — each falling back
+  and each leaving its line in the body; a run of posts with no `Re:`
+  all landing at depth 1 rather than deepening; the document truncated
+  at the byte budget with the notice and the oldest id it carried; a
+  markdown article contributing its downgrade; an attachment rendered as
+  its name.
 - **Cross-wire e2e**, once W8 lands: a markdown article posted from ng
   read by a scripted 1.5 client as the right two parts with the right
   thread parentage, and a plain `see #51` posted from the legacy client
-  arriving at an ng client as a resolved reference; a 1.2 client's flat
-  view of both.
+  arriving at an ng client as a resolved reference; a 1.2 client reading
+  both in its flat pane, posting a `Subject:`/`Re:` reply that lands as a
+  threaded article the ng client sees in the right place, and receiving
+  the `NEWSFILE_POST` push when the phone posts next.
 - **GtkHx Tier 3.** Its `test_news15.c`, `test_news_catlist.c`,
   `test_news_fetch.c` and `test_news_post.c` already exist and already
   run against real servers. Pointing them at an hxd-ng container is the
@@ -1371,7 +1531,8 @@ Each lands separately with tests, roughly a branch apiece.
    the pin bump (§1), path resolution, the transactions of §11.1,
    `CATEGORYITEM` with guid and serials, `CATLIST` with its body and
    attachment parts, `NEWS_GETTHREAD` by MIME type, the Mac Roman
-   edges, the 1.2 flat view, and `hxd import-mhxd-news`.
+   edges, the 1.2 flat view of §11.5 — renderer, header-block parser,
+   defaults and the push — and `hxd import-mhxd-news`.
 
 W1–W2 is threaded news with plain bodies — small, and worth landing on
 its own. W1–W6 is the whole thing for the ng wire and a mobile client.
@@ -1394,8 +1555,10 @@ arrived on. Nobody on the legacy wire can search, and that is the one
 thing this design does not give both populations. A screenshot attached
 from a phone is a 60 KB `image/png` part a 1.5 client can ask for by
 MIME type and a 412 KB canonical PNG the phone fetches over HTTP. A
-1.2 client with no tree at all sees the last hundred articles as a text
-file and can post into one category. An article deleted by a moderator
+1.2 client with no tree at all reads one category as a text file, newest
+first, and posts back into it by typing `Subject:` and `Re: #398` — the
+two lines it has been reading in every entry — with sane answers filled
+in when it types neither. An article deleted by a moderator
 is a tombstone in every thread on every wire, its bytes unlinked and
 its hash remembered.
 
@@ -1452,6 +1615,21 @@ its hash remembered.
   cannot see. The fix is to resolve references against the reader's
   visibility rather than the author's, which costs a join and is the
   right answer to write down before the ACL arrives, not after.
+- **The flat category is a single point of contact.** Everything a 1.2
+  client can see or say goes through one category, which is the right
+  default and a real limit: there is no way for that client to reach a
+  second one, and no wire vocabulary to offer it a choice. A server
+  whose news lives in six categories is a server where 1.2 users see one
+  sixth of it. Whether that wants an answer — rotating the flat category,
+  or a virtual "everything" view assembled across categories at the cost
+  of an unambiguous post destination — is worth deciding once someone is
+  actually running a 1.2 client against this.
+- **The header block is a convention, not a protocol.** `Subject:` and
+  `Re:` in a body are a thing this server reads and no other server does,
+  so a 1.2 user who learns the habit here will type it into someone
+  else's server and have it show up as prose. That is a small harm and a
+  real one, and it is the argument for the read format teaching it
+  rather than a manual: the habit is scoped to servers that display it.
 - **Search scope.** `news_fts` indexes news. `chat_line` is a table in
   the same database with the same shape of text in it, and one more
   external-content index would make scrollback searchable too. Whether

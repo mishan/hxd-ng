@@ -296,6 +296,14 @@ with per-part MIME types since it was written. The design:
   their own rather than inline media's 24-hour handles: a chat image is a
   moment, a news article is a record. Legacy clients fetch a re-encoded
   derivative because the wire's per-part size is a u16.
+- **1.2 flat news is a rendering of one category**, not a second store.
+  The operator names the category a 1.2 client reads and posts into; a
+  post from that wire becomes a reply in it, with its subject and parent
+  read out of a leading `Subject:` / `Re: #398` block in the body, which
+  is the only place that wire has to put them. Both are optional and both
+  have defaults — a post is never refused for lacking metadata the client
+  cannot send — and the read format shows the same two headers, so it
+  teaches the convention without a manual.
 
 Not started. `hxd-session` dispatches no news opcode and `hxd-core` has no
 `news` module; the access bits it needs (20, 21, 33–37) have been parsed
