@@ -296,6 +296,19 @@ with per-part MIME types since it was written. The design:
   their own rather than inline media's 24-hour handles: a chat image is a
   moment, a news article is a record. Legacy clients fetch a re-encoded
   derivative because the wire's per-part size is a u16.
+- **Subscriptions and push notifications close the loop.** A reply to
+  your article, a reference to it, or a post in a thread you follow
+  reaches you when you are not there — which is the thing that makes a
+  forum worth returning to rather than worth remembering to check. It
+  needs no notification queue: the article is already durable, so the
+  stored state is a subscription and a read cursor, and unread is a
+  query. That cursor also settles the coalescing question Phase 7 leaves
+  open, at least for news — **a scope rings only when its subscriber is
+  caught up with it**, so a forty-reply thread buzzes once per visit
+  with no timer, no digest window and nothing to sweep. It also answers,
+  by construction, the question of what a mention is: a reference names
+  an article and an article has exactly one author, so none of the
+  nicks-are-not-unique difficulty applies.
 - **1.2 flat news is a rendering of one category**, not a second store.
   The operator names the category a 1.2 client reads and posts into; a
   post from that wire becomes a reply in it, with its subject and parent
@@ -549,8 +562,17 @@ resist the reorder.
 - How a mention is defined, given that Hotline nicks are neither unique nor
   stable — and whether mentions are in the first push cut at all, or DMs
   carry it alone (docs/push-notifications.md §11). The inbox design assumes
-  DMs alone (docs/private-messages.md §9).
+  DMs alone (docs/private-messages.md §9). **Still open for chat**, but
+  news has answered it for itself: docs/news.md §10.5 notifies on a
+  *reference*, which names an article rather than a nick, so the
+  ambiguity never arises. "Cite the thing, not the person" is the shape
+  to reach for if chat ever wants one.
 - Whether an account's inbox stays server-local or follows the portable
   identity across servers (docs/private-messages.md §13).
 - Where push coalescing lives (domain rate limit, gateway digest window, or
   vendor collapse keys) — twenty chat lines should not be twenty buzzes.
+  **Answered for news** in docs/news.md §10.7: a scope rings only when
+  its subscriber is caught up with it, which needs no timer because the
+  read cursor already exists for the badge, with the vendor collapse key
+  underneath it rather than instead of it. Chat has no per-scope cursor
+  and no subscription, so it still wants the time-based answer.

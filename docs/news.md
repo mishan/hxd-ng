@@ -22,7 +22,7 @@ is the one Phase 4 subsystem where the ng wire is not a second frontend
 onto an existing feature — it is where the feature arrives. Building ng
 first means the domain model is shaped by what news actually *is*
 (a tree of threads with authors and bodies) rather than by what a 1996
-directory walker could express, and §11 is the proof that nothing in it
+directory walker could express, and §12 is the proof that nothing in it
 locks the legacy wire out.
 
 **Decisions (2026-09):**
@@ -68,6 +68,14 @@ locks the legacy wire out.
   has FTS5 compiled in, so a full-text index is a table and a query
   compiler, not a dependency. The query grammar is ours and closed — a
   malformed search returns results, never an error.
+- **Notifications need a subscription and a cursor, not a queue.** A
+  push for a private message must be backed by the inbox, because the
+  message lives nowhere else; a news article already lives in the thread
+  it was posted to. So `news_sub` stores who follows what and how far
+  they have read, unread is a query rather than a column, and the
+  catch-up rule that falls out of it — a scope rings only when its
+  subscriber is caught up — is the whole coalescing answer, with no
+  timer and no digest window.
 - **1.2 flat news is a rendering of one category, not a second store.**
   The operator names the category a 1.2 client reads and posts into; a
   post from that wire becomes a reply in it, with its subject and its
@@ -98,7 +106,7 @@ this is a design document and not a research one.
   **One gap:** `ClientHdr` enumerates only `GetThread` (`0x190`) and
   `PostThread` (`0x19a`) — the directory opcodes (`0x172`, `0x173`,
   `0x17c`–`0x17e`) have builders but no enum variants, and `ServerHdr`
-  does not name `NEWSFILE_POST` (`0x0066`), the flat-news push. So W8
+  does not name `NEWSFILE_POST` (`0x0066`), the flat-news push. So W9
   opens with an hx-libs change and a pin bump, which is a deliberate act
   with a full test run behind it in both consumers.
 - **The access bits are already allocated and already parsed**:
@@ -153,7 +161,7 @@ because they cost ng nothing and keep the two wires isomorphic:
   replies.
 
 Enforcing "articles only in categories" and "a reply is in its parent's
-category" in the domain is what makes §11 a mapping and not a
+category" in the domain is what makes §12 a mapping and not a
 translation.
 
 ## 3. The domain: `hxd-core/src/news.rs`
@@ -254,7 +262,7 @@ needs — there, an id is only ever interpreted relative to a `NEWSPATH`
 then needs no category alongside it.
 
 The ceiling is 4 294 967 295 articles over the life of a server. A
-server that reaches it has problems this document is not about; §17
+server that reaches it has problems this document is not about; §18
 keeps the question of a wider id for an ng-only future.
 
 ### 3.3 Threading, and why there is a `path` column
@@ -275,7 +283,7 @@ it to 128 bytes.
 
 The alternative — sending a flat list of `(id, parent)` and letting the
 client build the tree, which is what CATLIST does — is what the legacy
-wire will keep doing (§11.3), because it has to. The ng wire should not
+wire will keep doing (§12.3), because it has to. The ng wire should not
 inherit a 1996 client's job.
 
 ### 3.4 The trait
@@ -357,6 +365,20 @@ pub trait NewsStore: Send + Sync + 'static {
     // Search (§6)
     fn search(&self, q: &SearchQuery) -> Result<SearchPage, StoreError>;
     fn reindex(&self) -> Result<u64, StoreError>;
+
+    // Subscriptions (§10) — the cursor is the badge and the coalescer
+    fn subscribe(&self, who: &Mailbox, scope: SubScope, auto: bool)
+        -> Result<(), StoreError>;
+    fn unsubscribe(&self, who: &Mailbox, scope: SubScope) -> Result<bool, StoreError>;
+    fn set_muted(&self, who: &Mailbox, scope: SubScope, muted: bool)
+        -> Result<bool, StoreError>;
+    fn subscriptions(&self, who: &Mailbox) -> Result<Vec<Subscription>, StoreError>;
+    /// Everyone following a scope, minus the muted. The audience side of §10.5.
+    fn subscribers(&self, scope: SubScope) -> Result<Vec<Subscription>, StoreError>;
+    /// Advance the cursor; the returned count is what the badge shows.
+    fn mark_seen(&self, who: &Mailbox, scope: SubScope, up_to: ArticleId)
+        -> Result<usize, StoreError>;
+    fn unread(&self, who: &Mailbox) -> Result<usize, StoreError>;
 
     // Retention
     fn prune(&self, max_age: Option<Duration>, now: SystemTime)
@@ -479,6 +501,9 @@ both of its columns and never by a rowid; the primary key doubles as the
 forward index and `news_ref_dst` is the reverse one, which is what makes
 `referenced_by` a lookup rather than a scan.
 
+`news_sub` (§10.4) is written out there rather than here, because its
+columns only make sense beside the rule that reads them.
+
 `news_fts` is an external-content table over `news_article`, so it stores
 no text of its own (§6.1). Because FTS5 external content trusts the
 content table to stay in step, every write that touches `subject`,
@@ -502,7 +527,7 @@ became visible once references and search were on the table.
 
 1. **A 1.5 client would see the source.** `**bold**` is survivable;
    `[the sizes thread](news:51)` is not. The multipart article the legacy
-   wire already has (§11.3) exists for exactly this: ship `text/markdown`
+   wire already has (§12.3) exists for exactly this: ship `text/markdown`
    and `text/plain` as two parts and let each client take the one it
    understands. That is the same move as the image derivative in §7.3,
    and it needs the server able to produce the plain part.
@@ -595,7 +620,8 @@ article; past that they stay as text.
 
 Whether referencing someone's article should notify them is the mention
 problem push-notifications.md §11 already has open, and it gets the same
-answer for now: no. §17.
+answer for now: no — but §10.5 revisits it, because a reference is
+not the ambiguous kind of mention.
 
 ### 5.4 The plain-text downgrade
 
@@ -713,13 +739,13 @@ endpoint faces phones on the open internet.
 ### 6.4 The memory store, and reindexing
 
 `MemoryNews` implements search as a naive tokenized scan so the
-conformance suite (§14) can assert *which* articles a query returns
+conformance suite (§15) can assert *which* articles a query returns
 against both implementations. It does not implement ranking, and the
 conformance suite therefore asserts result sets and never order; ranking
 is asserted in the SQLite store's own tests.
 
 `hxd news-reindex` rebuilds `news_fts` from `news_article`. It is needed
-after an mhxd import (§11.6), after a `markdown` mode change that alters
+after an mhxd import (§12.6), after a `markdown` mode change that alters
 every downgrade, and as the repair for an index that has drifted.
 
 ### 6.5 The legacy wire cannot search
@@ -727,7 +753,7 @@ every downgrade, and as the repair for an index that has drifted.
 There is no 1.5 transaction for it and none to borrow. A GtkHx user
 browses; an ng user searches. This is the one place in the design where
 the two wires are not equivalent, and synthesizing a "search results"
-category to paper over it would be a lie about what a category is. §17
+category to paper over it would be a lie about what a category is. §18
 has what an extension would need to look like.
 
 ## 7. Attachments
@@ -829,7 +855,7 @@ line of text about it.
 | Staged handle lifetime | 30 min | store, swept hourly |
 | Uploads per account | 20 / hour | domain |
 | Total blob bytes | 8 GiB | store; a post over it is refused, never evicted |
-| Article body | 65 535 bytes | domain — §11.4 says why that number |
+| Article body | 65 535 bytes | domain — §12.4 says why that number |
 | Plain downgrade | 65 535 bytes | renderer, truncated at a char boundary (§5.4) |
 | References per article | 32 | domain, at extraction |
 | Search terms per query | 16, 64 B each | query compiler (§6.2) |
@@ -848,7 +874,7 @@ carry more — the 1.5 article part carries a MIME type precisely so it
 can — but because "validate and re-encode" is a property we can only
 offer for formats `hxd-media` understands, and serving opaque bytes
 someone uploaded is the file area's problem, with the file area's
-design. §17 keeps the question.
+design. §18 keeps the question.
 
 ## 8. Access
 
@@ -983,7 +1009,7 @@ counting a round trip per row is what a mobile client cannot afford.
 
 **The `plain` downgrade never crosses the ng wire.** An ng client is
 told the body's type and handed the source; rendering markdown is what
-it is for. The downgrade exists for the legacy wire (§11.3) and for the
+it is for. The downgrade exists for the legacy wire (§12.3) and for the
 index (§6.1), and shipping it would be handing every client a second
 copy of every body to ignore.
 
@@ -1017,7 +1043,8 @@ gapless.
 `news_posted` is what makes a badge possible, and it is deliberately
 not a push notification: push is for messages addressed to you
 (push-notifications.md §11), and a busy category would be a buzz a
-minute. §17 keeps the question of per-category subscription.
+minute — which is what §10 is for: a targeted notification is a
+different event with a different audience.
 
 ### 9.4 Attachment bytes over HTTP
 
@@ -1067,7 +1094,309 @@ Two differences from `/media`, both following from §7.1:
   article's attachments stop resolving at once, which is what makes
   `news_delete` a real deletion on every wire.
 
-## 10. Moderation and retention
+## 10. Subscriptions and push notifications
+
+### 10.1 The loop this closes
+
+Every other part of this design assumes someone goes and looks. That is
+the wrong assumption for the one thing a forum is for: you post a
+question, and the answer arrives when you are not there. Without a
+notification the author has to poll their own thread, which is exactly
+the chore the ng protocol's whole presence model exists to abolish.
+
+Two cases carry almost all of the value, and they are different:
+
+1. **Someone replied to your article.** High signal, always wanted,
+   needs no configuration. This is the one that closes the loop.
+2. **Something happened in a thread you follow.** Lower signal, wanted
+   often enough that every forum has it, and it needs an explicit act.
+
+A third falls out of §5.3 for free, and is discussed in §10.5.
+
+### 10.2 The subscriber is an account
+
+Keyed exactly as the inbox keys a mailbox — the identity fingerprint
+where there is one, the login where there is not
+(private-messages.md §3). Not a uid, which recycles in minutes; not a
+session, which dies when a phone goes into a tunnel. The subscriber
+outlives both, because the entire point is to reach someone who is not
+here.
+
+**A guest has no mailbox, so a guest cannot subscribe and is never
+notified.** Same rule as the inbox, for the same reason: there is nobody
+durable to address.
+
+### 10.3 What can be subscribed to
+
+Two scopes, and deliberately not a third:
+
+```rust
+pub enum SubScope {
+    Thread(ArticleId),   // the thread root
+    Category(NodeId),
+}
+```
+
+There is no "all news" subscription. A client that is attached already
+receives `news_posted` for everything it may read (§9.3); a push for
+every post on the server is a setting nobody leaves on, and offering it
+is how a notification system teaches people to mute it.
+
+**Posting subscribes you.** `[news.notify] auto_subscribe` is
+`"participated"` by default: writing an article subscribes its author to
+that thread, so case 1 of §10.1 needs no interaction at all — you asked
+a question, you are subscribed to its answers. `"own_thread"` narrows it
+to threads you started; `"off"` makes every subscription explicit. An
+auto-subscription is marked as such, so a client can offer "stop
+following threads I reply to" as one switch rather than a list.
+
+### 10.4 There is no notification table, and that is the point
+
+A private message needs the inbox because the message exists nowhere
+else: push-notifications.md §2 puts it plainly — "a push is a doorbell,
+and the message must still be in the inbox when the user opens the app."
+
+News inverts that. **The article is already the durable artifact.** When
+the doorbell rings and you open the app, the reply is in the thread
+where it will still be next year. There is nothing to queue, nothing to
+deliver-and-mark-delivered, and nothing to expire.
+
+So the durable state is not a list of notifications. It is the
+subscription and a cursor:
+
+```sql
+CREATE TABLE news_sub (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner     TEXT    NOT NULL,          -- mailbox login
+  owner_fp  TEXT,                      -- mailbox fingerprint, NULL when unidentified
+  scope     INTEGER NOT NULL,          -- 0 thread, 1 category
+  target    INTEGER NOT NULL,          -- thread root, or node id
+  auto      INTEGER NOT NULL DEFAULT 0,
+  last_seen INTEGER NOT NULL DEFAULT 0,-- highest article id acknowledged
+  muted     INTEGER NOT NULL DEFAULT 0,
+  at        INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX news_sub_one
+  ON news_sub (owner, IFNULL(owner_fp, ''), scope, target);
+CREATE INDEX news_sub_target ON news_sub (scope, target) WHERE muted = 0;
+```
+
+The `IFNULL` in the unique index is not decoration: SQLite treats NULLs
+as distinct in a unique index, so a plain `(owner, owner_fp, …)` index
+would let an unidentified mailbox subscribe to one thread any number of
+times. `news_node_sibling` (§4) has the same shape for the same reason.
+
+**Unread is a query, not a column**: articles in the scope with
+`id > last_seen`, which is one range scan on `news_article_thread` or
+`news_article_roots`. A badge that is computed cannot drift from what it
+counts.
+
+### 10.5 Who gets notified, and why
+
+At post time the domain computes an audience of mailboxes, each with the
+reason that put it there. Precedence, highest first, because the reason
+is what the notification's text says:
+
+| Reason | Who |
+|---|---|
+| `reply` | the author of the article this one replies to |
+| `reference` | the author of every article this one references (§5.3) |
+| `subscription` | thread subscribers, then category subscribers |
+
+Deduplicated by mailbox, highest reason winning. Then filtered:
+
+- **Never the poster.** You are not notified about your own article,
+  whichever of the three reasons would otherwise apply.
+- **Never a muted scope**, and never a subscription whose owner no
+  longer holds `READ_NEWS` — resolved through `AccountDirectory`, the
+  same seam the inbox uses, so revoking the bit stops the pushes.
+- **Never someone who has blocked the poster.** The inbox's block list
+  already exists and already means "I do not want this person reaching
+  me". It suppresses the notification and not the article: a public
+  forum is public, so they can still read the post if they go and look,
+  but a blocked account cannot ring their phone.
+
+**`reference` is the mention feature, and news gets it for free.** The
+roadmap's open question — "how a mention is defined, given that Hotline
+nicks are neither unique nor stable" — is hard because a nick is a
+guess. A reference is not a guess: `[text](news:51)` names an article,
+and an article has exactly one author with exactly one mailbox. None of
+the ambiguity applies, so the thing that was blocked for chat is
+already decided here. That is worth saying upstream (§18).
+
+### 10.6 Delivery: an event when attentive, a push when not
+
+The rule is the inbox's, unchanged: a session that is attached is
+reached over the wire; an account with no attentive session is reached
+through the gateway. The decision lives in `hxd-core`, never in a
+frontend — `notify.rs`'s module documentation names that hazard
+exactly, and news would trip over it the same way.
+
+Attached ng sessions get a **targeted** event:
+
+```jsonc
+{ "seq": 88, "ev": "news_notify", "data": {
+    "reason": "reply",                    // reply | reference | subscription
+    "article": 412, "root": 398, "category": 7,
+    "subject": "The derivative and the u16",
+    "excerpt": "The part size is a u16, so the full-size PNG…",
+    "from": { "nick": "Bob", "login": "bob" },
+    "at": 1789000000,
+    "unread": 3                           // in that scope, after this one
+} }
+```
+
+**This is not `news_posted`, and the difference is the audience.**
+`news_posted` (§9.3) is a broadcast to everyone holding `READ_NEWS`,
+carrying a header so a client can update a list it happens to be
+showing. `news_notify` goes only to the accounts §10.5 selected, and it
+means *this one is yours*. A client raises a badge on the second and not
+the first. Merging them would put per-recipient content in a broadcast,
+which is the shape fan-out is built to avoid.
+
+### 10.7 Coalescing: the catch-up rule
+
+A hot thread produces forty replies in an evening. Forty buzzes is not
+a notification system, it is a reason to uninstall the app.
+push-notifications.md §11 leaves this open — "a per-account rate limit or
+a digest window is needed… where it lives (domain, gateway, or the
+vendor's own collapse keys) is undecided." For news, the answer falls
+out of the cursor that is already there:
+
+> **A scope pushes only when its subscriber is caught up with it.** If
+> `last_seen` is behind the newest article in the scope, they have
+> already been told and have not looked yet; the new post advances the
+> unread count and rings nothing.
+
+What that buys, in order of how much it saves us writing:
+
+- **One ring per thread per visit**, which is the behavior every mailing
+  list and forum converged on, arrived at without a timer.
+- **No scheduler, no digest window, no pending-notification state.** The
+  rule reads a column the badge needs anyway.
+- **It re-arms itself.** The moment a client calls `news_seen`, the next
+  post in that scope rings again. Nothing decays, nothing expires,
+  nothing has to be swept.
+- **It is per scope, not global**, so a quiet thread you care about is
+  not silenced by a loud one you also follow.
+
+Two floors sit under it:
+
+- `[news.notify] max_per_hour` per account across every news push
+  (default 12), because a subscriber to forty scopes can be rung forty
+  times by the rule above. Exceeding it drops the push, never the event
+  and never the unread count.
+- **The gateway's collapse key**: `msggroup` is set to the scope —
+  `thread:398` — so two pushes for one scope that are somehow both in
+  flight collapse on the device. This is the "vendor collapse keys"
+  option from that open question used *underneath* the domain rule
+  rather than instead of it, and it is a concrete reason to make the
+  upstream RFC 8030 `Topic` change push-notifications.md §6 mentions.
+
+**This answers the coalescing question for news and not for chat.** Chat
+has no per-scope cursor and no subscription, so twenty lines in a busy
+room still want the time-based answer that document is looking for. The
+two are different problems and it is better to solve one properly than
+both vaguely.
+
+### 10.8 Marking seen
+
+```
+news_seen { thread? | category?, up_to }  ->  { unread }
+```
+
+Mirrors `msg_read`, and is **explicit for the same reason**: serving a
+thread through `news_thread` must not advance the cursor, because a
+client may prefetch, may render nothing, or may be a search result
+preview. The client says when it has shown someone something.
+
+### 10.9 Requests
+
+| `req` | params | ok |
+|---|---|---|
+| `news_subscribe` | exactly one of `thread` / `category` | `{ "unread": 3 }` |
+| `news_unsubscribe` | exactly one of `thread` / `category` | `{}` |
+| `news_mute` | exactly one of `thread` / `category`, plus `muted` | `{}` |
+| `news_subs` | — | `{ "subs": [ … ] }` — scope, target, subject or name, `auto`, `muted`, `unread` |
+| `news_seen` | exactly one of `thread` / `category`, plus `up_to` | `{ "unread": 0 }` |
+
+Error codes on top of §9.2's: `no_mailbox` (a guest tried to subscribe —
+the same shape as `no_inbox`, and about *you* rather than about the
+target), `too_many_subs`.
+
+The login reply's `news` block (§9.1) gains `unread` — the total across
+subscribed scopes — so a client can draw a badge on the first frame,
+the way `inbox` already lets it.
+
+### 10.10 The gateway seam
+
+`Notification` becomes a sum, because there are now two kinds and a
+gateway builds a different payload for each:
+
+```rust
+pub enum Notification<'a> {
+    Message(MessageNotice<'a>),      // today's struct, renamed
+    News(NewsNotice<'a>),
+}
+
+pub struct NewsNotice<'a> {
+    pub to: &'a Mailbox,
+    pub reason: NotifyReason,        // Reply | Reference | Subscription
+    pub from_nick: &'a str,
+    pub subject: &'a str,
+    /// The opening of the plain body (§5.4), capped. Whether it is sent
+    /// is the gateway's call, not ours — the same content-policy split
+    /// `notify.rs` already documents for a message's text.
+    pub excerpt: &'a str,
+    pub article: ArticleId,
+    pub root: ArticleId,
+    pub category: NodeId,
+    /// The collapse key: "thread:398" or "category:7".
+    pub scope_key: &'a str,
+    pub unread: usize,
+}
+```
+
+`NotificationGateway` keeps its single method and its single hard
+contract — **`notify` must not block** — and the subscriber id is
+push-notifications.md §5's `hx-<hex>` mapping, unchanged. Nothing about
+news makes the gateway a different shape; it makes it a wider one.
+
+### 10.11 The legacy wire
+
+There is no push transaction on the legacy wire and there is nothing to
+borrow, so a 1.5 client is not notified. Two things soften that:
+
+- **The 1.2 flat category already has one.** `NEWSFILE_POST` (§12.5)
+  fires for every post into the flat category, from any wire. It is
+  untargeted — everyone reading flat news gets it — but for the one
+  category a 1.2 client can see, the loop is closed by the period
+  protocol itself.
+- `[news.notify] legacy = "off" | "message"`. Set to `"message"`, a
+  notification for a legacy-wire account becomes a private message from
+  the server, the way moderation.md delivers reports. **Default off**,
+  and the reason is not squeamishness: a legacy client has no request
+  that can unsubscribe, and `auto_subscribe` means posting once opts you
+  in. Turning it on for a busy server mails everybody with no way for
+  them to stop it except asking the operator.
+
+### 10.12 Abuse, briefly
+
+Notifications are a way to reach someone who is not there, which makes
+them worth attacking.
+
+- **Reply-spam to ring a phone** is answered by §10.7: the second reply
+  rings nothing, because the target has not caught up from the first.
+- **Reference-spam** — naming forty of someone's old articles to notify
+  them forty times — collapses to one, because all forty resolve to one
+  mailbox and the audience is deduplicated per post, and then to nothing
+  under the catch-up rule.
+- **Subscription flooding** is capped: `[news.notify] max_subs` per
+  account, default 200.
+- **A blocked account cannot notify at all** (§10.5), which is the
+  escape hatch for a person rather than a thread.
+
+## 11. Moderation and retention
 
 News is durable content, so [moderation.md](moderation.md) extends to
 it rather than being re-invented:
@@ -1096,12 +1425,12 @@ Retention is `[news] retain_days` (default 0, forever) and runs off the
 hourly sweeper with the stage expiry and the orphan scan, never on the
 request path — the rule chat history already follows.
 
-## 11. The legacy 1.5 binding
+## 12. The legacy 1.5 binding
 
-Built last (§15, W8), specced now, because a domain model that cannot
+Built last (§16, W9), specced now, because a domain model that cannot
 serve this wire is the wrong model and this is where that gets checked.
 
-### 11.1 The transactions
+### 12.1 The transactions
 
 Opcode names and values are mhxd's `hotline.h`, which AGENTS.md makes the
 behavioral reference for anything a 1.2/1.5 client can observe:
@@ -1137,7 +1466,7 @@ the legacy wire addresses them by name, and the ng wire is simply held
 to the same rule rather than allowing duplicates it would then have to
 explain.
 
-### 11.2 The directory listing
+### 12.2 The directory listing
 
 `NEWS_LISTDIR` replies with one `CATEGORYITEM` (`0x0143`) per child:
 `ntype 2` for a bundle with its child count, `ntype 3` for a category
@@ -1146,7 +1475,7 @@ columns (§4). `NEWSFOLDERITEM` (`0x0140`) is the older, thinner
 encoding, and `parse_news_folderitem` shows clients accept either; we
 send the richer one, which is what lets a client skip a refetch.
 
-### 11.3 The article listing, and its parts
+### 12.3 The article listing, and its parts
 
 `NEWS_LISTCATEGORY` replies with one `CATLIST` chunk: a `post_count` header,
 then per post `postid`, an 8-byte Mac date, `parentid`, flags,
@@ -1184,9 +1513,9 @@ for `text/plain` and shows text — so this is a capability waiting for a
 client rather than one in use. It is still the right shape: it is what
 the wire was designed for, it costs one extra part in a listing, and
 it means the client work is a client change and not a protocol
-negotiation. §17 has what to raise upstream.
+negotiation. §18 has what to raise upstream.
 
-### 11.4 Sizes, and the 65 535 that shows up twice
+### 12.4 Sizes, and the 65 535 that shows up twice
 
 `NEWSDATA` is a chunk, chunk lengths are u16, and mhxd's own
 `read_newsfile` caps an article body at `0xffff`. That is where
@@ -1209,7 +1538,7 @@ the same distinction `build_news_post_thread_chunks` documents on its
 `is_body` flag). A client that negotiated the Text-Encoding capability
 skips the conversion, as it does everywhere else.
 
-### 11.5 Flat 1.2 news: one category, flattened
+### 12.5 Flat 1.2 news: one category, flattened
 
 A 1.2 client speaks `NEWSFILE_GET` (`0x0065`) and `NEWSFILE_POST`
 (`0x0067`) and knows nothing about a tree. It does not get a second news
@@ -1360,7 +1689,7 @@ refetches the document see the same text.
 `HTLS_HDR_NEWSFILE_POST` is the third opcode `hxproto`'s `ServerHdr`
 does not yet name (§1); it goes into the same hx-libs change.
 
-### 11.6 Importing an mhxd tree
+### 12.6 Importing an mhxd tree
 
 `hxd import-mhxd-news <dir>` walks a period news directory: `cat_`-
 prefixed directories are categories, others are bundles, and each file
@@ -1376,7 +1705,7 @@ the remapped ids, so an mhxd archive that cross-referenced by number
 arrives with its references live. The import ends by running
 `news-reindex` (§6.4).
 
-## 12. Configuration
+## 13. Configuration
 
 ```toml
 [news]                          # presence turns news on
@@ -1396,13 +1725,19 @@ retain_days = 0                 # 0 = forever
 self_delete = true              # authors may delete their own; false = period behavior
 legacy_catlist_max = 2000       # articles in one 1.5 category reply
 
-# 1.2 flat news (§11.5) — one category, read and written by 1.2 clients.
+# 1.2 flat news (§12.5) — one category, read and written by 1.2 clients.
 flat_category = "General"       # absent = 1.2 clients are told news is threaded
 flat_articles = 100             # ceiling; 65 535 bytes usually decides first
 flat_reply = "newest_thread"    # or "new_thread": every 1.2 post stands alone
 flat_default_subject = "(no subject)"
 # flat_masthead = "…"           # absent = a built-in line naming the category
                                 # and the two headers; "" = no masthead at all
+
+[news.notify]                   # absent = no subscriptions, no notifications
+auto_subscribe = "participated" # or "own_thread", or "off"
+max_subs = 200                  # subscribed scopes per account
+max_per_hour = 12               # news pushes per account, all scopes
+legacy = "off"                  # or "message": a server PM to a legacy account
 
 [news.attach]                   # absent = news without attachments
 max_bytes = 2097152             # per attachment, as uploaded
@@ -1413,6 +1748,12 @@ per_hour = 20                   # uploads per account
 legacy_derivative = true        # generate the ≤60 000 B version at post time
 ```
 
+`[news.notify]` needs no feature — subscriptions and the `news_notify`
+event work with no gateway configured at all, which is the useful
+degradation: an attached client still gets its badge, and only the
+doorbell for an absent one is missing. A gateway is `[push]`'s business,
+not news's.
+
 `[news.attach]` without the `media` feature is a startup error, the way
 `[media]` and `[inbox]` already are, and `markdown = "render"` without
 the `markdown` feature is the same error for the same reason: a config
@@ -1422,7 +1763,7 @@ is a legitimate server; `markdown = "off"` with `search = false` is
 plain-text news with no index, which is the smallest thing this design
 builds.
 
-## 13. What this does not change
+## 14. What this does not change
 
 - **`hxd-core` stays wire-free.** No `NEWSPATH`, no chunk tags, no Mac
   Roman. Paths are resolved in `hxd-session`, ids are the domain's
@@ -1441,7 +1782,7 @@ builds.
   browser to interpret, which is why a rich-text feature adds no
   injection surface.
 
-## 14. Testing
+## 15. Testing
 
 - **Domain unit tests** in `hxd-core`: containment rules, path
   construction and preorder ordering, depth caps, tombstone-with-
@@ -1473,6 +1814,17 @@ builds.
   non-`READ_NEWS` session refused everything, tombstone semantics, the
   blob cap, a markdown post whose `refs` resolve, and a search that
   finds it.
+- **Notification tests**, which are audience selection and one rule:
+  a reply notifying the parent's author and not the poster; a reference
+  notifying the referenced author once however many times it is
+  referenced; precedence when a post is a reply *and* a reference to the
+  same person; a muted scope, a blocked poster and a revoked `READ_NEWS`
+  each suppressing it; a guest neither subscribing nor being notified;
+  auto-subscription under each `auto_subscribe` value. Then the
+  catch-up rule: a second post in an unread scope ringing nothing while
+  still advancing unread, `news_seen` re-arming it, two scopes staying
+  independent, and `max_per_hour` dropping the push without touching the
+  event or the count.
 - **Flat-news tests**, which are mostly a parser and a renderer and
   belong with them: a header block consumed and stripped; `subject:` in
   lower case; an unrecognized first header leaving the body whole; a
@@ -1485,7 +1837,7 @@ builds.
   at the byte budget with the notice and the oldest id it carried; a
   markdown article contributing its downgrade; an attachment rendered as
   its name.
-- **Cross-wire e2e**, once W8 lands: a markdown article posted from ng
+- **Cross-wire e2e**, once W9 lands: a markdown article posted from ng
   read by a scripted 1.5 client as the right two parts with the right
   thread parentage, and a plain `see #51` posted from the legacy client
   arriving at an ng client as a resolved reference; a 1.2 client reading
@@ -1498,7 +1850,7 @@ builds.
   conformance statement this design is aiming at, and it is the same
   payoff chat history got.
 
-## 15. Staging
+## 16. Staging
 
 Each lands separately with tests, roughly a branch apiece.
 
@@ -1524,25 +1876,35 @@ Each lands separately with tests, roughly a branch apiece.
 6. **W6 — the ng wire.** The request set of §9.2, the events of §9.3,
    the login block, `POST /news/blob` and `GET /news/blob/{id}`, config
    and wiring.
-7. **W7 — moderation and retention.** The audit kind, the report
+7. **W7 — subscriptions and notifications.** `news_sub`, the audience
+   computation of §10.5, the catch-up rule, the five requests, the
+   `news_notify` event, the `Notification` enum and the `NewsNotice`
+   payload. The gateway itself is push-notifications.md's work; this
+   step ends at the trait, and everything in it is testable with no
+   gateway configured.
+8. **W8 — moderation and retention.** The audit kind, the report
    target, the purge arm, index and reference cleanup on tombstone, the
    sweeper's jobs, the CLI surface.
-8. **W8 — the legacy 1.5 binding.** The hx-libs opcode additions and
-   the pin bump (§1), path resolution, the transactions of §11.1,
+9. **W9 — the legacy 1.5 binding.** The hx-libs opcode additions and
+   the pin bump (§1), path resolution, the transactions of §12.1,
    `CATEGORYITEM` with guid and serials, `CATLIST` with its body and
    attachment parts, `NEWS_GETTHREAD` by MIME type, the Mac Roman
-   edges, the 1.2 flat view of §11.5 — renderer, header-block parser,
+   edges, the 1.2 flat view of §12.5 — renderer, header-block parser,
    defaults and the push — and `hxd import-mhxd-news`.
 
 W1–W2 is threaded news with plain bodies — small, and worth landing on
-its own. W1–W6 is the whole thing for the ng wire and a mobile client.
-W8 is what closes ROADMAP Phase 4.
+its own. W1–W7 is the whole thing for the ng wire and a mobile client,
+and W7 is the one that makes it a place people come back to rather than
+one they remember to check. W9 is what closes ROADMAP Phase 4.
 
 **W3 and W4 are independent of W5** and of each other: markdown, search
 and attachments touch different columns and different crates, so they
 can land in whatever order they get written. Only W6 needs all of them.
+**W7 needs W6**, because a notification with no wire to arrive on is
+hard to believe in — but it needs nothing from W3–W5, so a server with
+plain bodies and no pictures can still tell you someone answered.
 
-## 16. Cross-wire, in one sentence each
+## 17. Cross-wire, in one sentence each
 
 A thread started in a mobile client is a thread in GtkHx's news browser
 with the same subject, the same author and the same replies underneath
@@ -1558,11 +1920,13 @@ MIME type and a 412 KB canonical PNG the phone fetches over HTTP. A
 1.2 client with no tree at all reads one category as a text file, newest
 first, and posts back into it by typing `Subject:` and `Re: #398` — the
 two lines it has been reading in every entry — with sane answers filled
-in when it types neither. An article deleted by a moderator
-is a tombstone in every thread on every wire, its bytes unlinked and
-its hash remembered.
+in when it types neither. Ask a question from a laptop, close it,
+and the phone buzzes once when someone answers — once, however many
+people answer, until you have read them. An article deleted by a
+moderator is a tombstone in every thread on every wire, its bytes
+unlinked and its hash remembered.
 
-## 17. Open questions
+## 18. Open questions
 
 - **Per-category read permission.** The bitmap has one `read_news` bit
   for the whole tree, which is what every period client assumes. A
@@ -1574,15 +1938,28 @@ its hash remembered.
   whole-category, and a client sorts it). Cheap to add — one index —
   but it makes the two wires' default views differ, which is worth
   deciding rather than discovering.
-- **Read state.** "Which articles are new to me" wants a per-mailbox,
-  per-category cursor — one small table, keyed the way the inbox keys a
-  mailbox. The 1.5 wire's `add_sn`/`delete_sn` are the client-side
-  version of the same idea. Not in v1; the columns it needs already
-  exist.
-- **Notification.** Should a post into a category you have read before
-  produce a push? push-notifications.md §11 leaves mentions open for
-  the same reason: a rule that buzzes for a busy category is worse than
-  no rule. Per-category subscription is the shape if it lands.
+- **Read state for scopes nobody follows.** §10.4's cursor answers
+  "what is new to me" for a subscribed thread or category and says
+  nothing about the rest of the tree. A reader who follows nothing still
+  wants unread marks on a category list. The same table shape covers it
+  — a row with `muted` set is a cursor without a doorbell — but whether
+  a client should be creating those rows by browsing is a different
+  question from whether it should by subscribing, and the answer decides
+  how big `news_sub` gets on a busy server.
+- **Notifying a legacy 1.5 user** has no wire to use, and §10.11's
+  `legacy = "message"` is a workaround with a real flaw: nothing on that
+  wire can unsubscribe. Either a capability transaction (which nobody
+  has specified) or a convention — a reply to the server's notification
+  message meaning "stop" — would fix it. The second is ugly and would
+  work today.
+- **Whether a reference should notify at all.** §10.5 says yes and
+  argues that news escapes the mention problem because a reference names
+  an article rather than a nick. The counter-argument is social rather
+  than technical: citing someone's old post to make a point about it is
+  not obviously an invitation to them, and a forum where quoting someone
+  always summons them is a forum where people quote less. A
+  `[news.notify] reference = true|false` knob would settle it per
+  server, and the default is the question.
 - **Non-image attachments.** PDFs and archives are what people actually
   attach to a forum post, and the 1.5 part encoding was built for
   arbitrary MIME types. Serving them means serving bytes we cannot
@@ -1657,3 +2034,10 @@ its hash remembered.
   treatment: it is a convention two implementations could agree on in a
   paragraph, and it is the difference between rich text in news being a
   hxd-ng feature and being a Hotline one.
+- **Mentions, resolved by construction.** The roadmap asks how a mention
+  can be defined when Hotline nicks are neither unique nor stable, and
+  news answers it without meaning to: a reference names an article id,
+  and an article has exactly one author. If a mention feature ever
+  arrives for chat, "cite the thing, not the person" is the shape that
+  worked here, and it is worth saying before someone specifies nick
+  matching.
