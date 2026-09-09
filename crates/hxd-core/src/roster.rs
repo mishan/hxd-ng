@@ -67,6 +67,17 @@ pub struct Transport {
     /// The transport identity, when the connection was authenticated
     /// with one. Never inferred — set only by a frontend that verified it.
     pub identity: Option<IdentityTag>,
+    /// This link can carry an inline-media reference
+    /// (`docs/inline-media.md` §5.2).
+    ///
+    /// The one thing the domain learns about what a session negotiated,
+    /// and it exists because the authorization set has to be captured
+    /// during fan-out, which happens here. The legacy frontend sets it
+    /// from capability bit 3; the ng frontend sets it true, because an
+    /// ng client is told what it may ignore rather than asked what it
+    /// supports. Everything else about per-recipient capability stays in
+    /// the frontends, where each connection's encoder already lives.
+    pub inline_media: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and
@@ -127,6 +138,12 @@ pub enum Event {
         /// Server receive time. Unlike `id`, every chat event has one so
         /// the ng wire can render live timestamps without enabling history.
         at: SystemTime,
+        /// The image this line carried, canonical metadata and all
+        /// (`docs/inline-media.md` §7.4). Each frontend emits the
+        /// reference to the connections that negotiated the capability
+        /// and strips it for the rest, which is where per-recipient
+        /// capability already lives.
+        media: Option<crate::media::MediaRef>,
     },
     /// A server notice into a chat (kick announcements and the like).
     /// Semantic text; each frontend formats it (legacy: `\r<text>`).
@@ -173,6 +190,11 @@ pub enum Event {
         /// `sent_at` against a threshold, because a threshold is a bug
         /// waiting for a slow network.
         queued: bool,
+        /// The image that came with it. A message read within the
+        /// handle's life carries one with an `id` the recipient can
+        /// fetch; one read after it carries the metadata alone, and the
+        /// client renders the placeholder (`docs/inline-media.md` §9).
+        media: Option<crate::media::MediaRef>,
     },
     /// An administrator broadcast. Delivered to everyone, sender included
     /// (the wire push carries the sender, matching the reference server).
@@ -183,6 +205,13 @@ pub enum Event {
     },
     /// The recipient has been kicked; its transport should close.
     Kicked,
+    /// An image the recipient could fetch has been revoked by a
+    /// moderator (moderation.md §3.2). Delivered to everyone in the
+    /// handle's authorization set that still holds a session — the
+    /// people who may have it on screen. The line or message that
+    /// carried it keeps its metadata, so a client drops the image and
+    /// keeps the placeholder.
+    MediaRevoked { id: crate::media::Handle },
 
     // --- Voice (see [`crate::voice`]) ---------------------------------
     /// An SDP offer for the recipient's own peer connection: the initial
@@ -453,6 +482,43 @@ impl RosterInner {
         self.broadcast_where(ev, skip, |_| true);
     }
 
+    /// Who a fan-out just showed an image to: the same sessions
+    /// [`Self::broadcast_where`] reached, narrowed to the ones whose
+    /// wire can carry a media reference. The narrowing is the point —
+    /// a session that was sent the line with its media fields stripped
+    /// was not shown the image and has no business fetching it.
+    pub(crate) fn media_audience<F: Fn(&UserSession) -> bool>(
+        &self,
+        skip: Option<Uid>,
+        pred: F,
+    ) -> Vec<crate::media::Principal> {
+        self.users
+            .iter()
+            .filter(|(uid, sess)| {
+                Some(**uid) != skip
+                    && sess.visible
+                    && sess.info.transport.inline_media
+                    && pred(sess)
+            })
+            .map(|(uid, sess)| crate::media::Principal::Session {
+                uid: *uid,
+                serial: sess.serial,
+            })
+            .collect()
+    }
+
+    /// The same, for a named set of sessions (a private room's members).
+    pub(crate) fn media_audience_of(&self, uids: &[Uid]) -> Vec<crate::media::Principal> {
+        uids.iter()
+            .filter_map(|uid| self.users.get(uid).map(|s| (uid, s)))
+            .filter(|(_, sess)| sess.info.transport.inline_media)
+            .map(|(uid, sess)| crate::media::Principal::Session {
+                uid: *uid,
+                serial: sess.serial,
+            })
+            .collect()
+    }
+
     /// Full teardown: leave voice and chats, remove, announce the part.
     pub(crate) fn end_session(&mut self, uid: Uid) {
         // Voice first, while the session is still on the roster: the
@@ -567,6 +633,11 @@ pub struct Core {
     /// the-roster-lock rule survives. Order is always this lock first,
     /// then the roster's.
     pub(crate) flushing: Mutex<()>,
+    /// The image pipeline and its handles, or `None` when no `[media]`
+    /// section configured one — in which case neither wire ever offers
+    /// the capability. It carries its own mutex; the roster's may be
+    /// taken before it and never after (`crate::media`).
+    pub(crate) media: Option<crate::media::MediaStore>,
     /// Makes persisted id order and live fan-out order the same fact.
     /// Nothing but public chat takes this lock; order is it first, then
     /// (briefly) `roster`.
@@ -1135,8 +1206,8 @@ mod tests {
         ));
 
         // Traffic while detached buffers.
-        core.chat_public(b, "you there?".into(), 0).unwrap();
-        core.chat_public(b, "hello?".into(), 0).unwrap();
+        core.chat_public(b, "you there?".into(), 0, None).unwrap();
+        core.chat_public(b, "hello?".into(), 0, None).unwrap();
 
         let Resume::Replayed(mut rx_a2, replay) = core.resume(a, last_seq) else {
             panic!("resume should replay");
@@ -1163,7 +1234,7 @@ mod tests {
             evs.last(),
             Some(Event::Changed(u)) if u.status == SessionStatus::Active
         ));
-        core.chat_public(b, "welcome back".into(), 0).unwrap();
+        core.chat_public(b, "welcome back".into(), 0, None).unwrap();
         assert!(drain(&mut rx_a2)
             .iter()
             .any(|e| matches!(e, Event::Chat { text, .. } if text == "welcome back")));
@@ -1192,7 +1263,7 @@ mod tests {
         assert!(core.connection_lost(a, 8));
 
         for i in 0..(OUTBOX_BUFFER_CAP + 10) {
-            core.chat_public(b, format!("spam {i}"), 0).unwrap();
+            core.chat_public(b, format!("spam {i}"), 0, None).unwrap();
         }
         match core.resume(a, last_seq) {
             Resume::ResyncRequired(_rx) => {}
@@ -1257,7 +1328,7 @@ mod tests {
         };
         assert!(replay.is_empty());
         // The old channel is dead; the new one gets traffic.
-        core.chat_public(b, "hi".into(), 0).unwrap();
+        core.chat_public(b, "hi".into(), 0, None).unwrap();
         assert!(rx_old.try_recv().is_err());
         assert_eq!(drain(&mut rx_new).len(), 1);
     }

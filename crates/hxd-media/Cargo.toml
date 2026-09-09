@@ -1,0 +1,27 @@
+[package]
+name = "hxd-media"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "hxd-ng's inline-media pipeline: sniff, walk, bounded decode, re-encode"
+publish = false
+
+[dependencies]
+hxd-core = { workspace = true }
+tracing = { workspace = true }
+# The decoders and encoders. Default features off: this crate opens
+# exactly the three formats the inline-media capability allows, and a
+# codec that is not compiled in is one that cannot be reached by a
+# hostile file claiming to be it.
+#
+# Pinned below 0.25.10, which started using APIs stabilised after our
+# 1.85 floor without raising its own declared `rust-version` — so the
+# MSRV-aware resolver does not avoid it and the build simply fails.
+# Revisit when the floor rises. (GtkHx pins the same ceiling for the
+# same reason; the two trees decode the same three formats.)
+image = { version = ">=0.25.5, <0.25.10", default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+] }

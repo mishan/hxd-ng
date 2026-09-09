@@ -371,10 +371,13 @@ In rough order of value-for-effort:
    relay + capability bits, cheap once the capability negotiation exists.
    Inline media is the exception: the relay is cheap, the server-side
    decode-and-re-encode pipeline the spec mandates is not. **Designed
-   2026-09 in [docs/inline-media.md](docs/inline-media.md)**: an
-   `hxd-media` crate behind a `MediaCodec` trait and a Cargo feature, an
-   in-memory handle store with relay-time authorisation sets, 750/751 on
-   the legacy wire and `POST`/`GET /media` over HTTP on the ng port.
+   and implemented 2026-09** ([docs/inline-media.md](docs/inline-media.md)):
+   an `hxd-media` crate behind a `MediaCodec` trait and a Cargo feature,
+   an in-memory handle store with relay-time authorization sets, 750/751
+   on the legacy wire and `POST`/`GET /media` over HTTP on the ng port.
+   A photo attached in GtkHx renders in hx-ng and the other way round,
+   because the handle is the same sixteen bytes and only its spelling
+   differs.
    Both bring the first durable *content*, so
    [docs/moderation.md](docs/moderation.md) (same date) adds redaction,
    revocation, purges and reports with an audit trail; the legacy wire

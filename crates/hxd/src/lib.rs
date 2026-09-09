@@ -46,6 +46,184 @@ pub struct Config {
     pub inbox: Option<InboxSection>,
     /// Server-held public-chat scrollback. Absent = disabled.
     pub history: Option<HistorySection>,
+    /// Inline media (`docs/inline-media.md` §11). Absent = disabled: no
+    /// capability bit 3 on the legacy wire, no `media` cap on the ng
+    /// one, and no `/media` routes.
+    pub media: Option<MediaSection>,
+}
+
+/// Inline media (`docs/inline-media.md` §11).
+///
+/// Every figure here is the spec's recommended default. Tightening any
+/// of them is free; relaxing one is the operator saying they know what
+/// it costs, which is why the comments name the direction rather than
+/// just the number.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaSection {
+    /// The largest upload accepted, before canonicalization. ↓ freely.
+    #[serde(default = "default_media_max_bytes")]
+    pub max_bytes: usize,
+    #[serde(default = "default_media_max_dimension")]
+    pub max_dimension: u32,
+    #[serde(default = "default_media_max_pixels")]
+    pub max_pixels: u64,
+    #[serde(default = "default_media_max_frames")]
+    pub max_frames: u32,
+    #[serde(default = "default_media_max_duration")]
+    pub max_duration_ms: u32,
+    /// How many images may be decoded at once. A decode holds a blocking
+    /// thread and cannot be interrupted, so this is what bounds the
+    /// damage a slow one does.
+    #[serde(default = "default_media_decodes")]
+    pub max_concurrent_decodes: usize,
+    /// How long a handle answers, in seconds. The spec's clients are
+    /// told not to cache handles across sessions, so this is a ceiling
+    /// rather than a promise.
+    #[serde(default = "default_media_ttl")]
+    pub handle_ttl: u64,
+    /// Canonical bytes held across every live handle. When an upload
+    /// would cross it the oldest handles go, because evicting an old
+    /// image beats refusing a new one.
+    #[serde(default = "default_media_total")]
+    pub max_total_bytes: usize,
+    /// Whether reading a line out of the chat log grants the reader the
+    /// image that line carried: `"recipients"` (the spec's answer, and
+    /// the default) or `"readers"` (public chat only). See
+    /// `docs/inline-media.md` §5.4.
+    #[serde(default = "default_history_access")]
+    pub history_access: String,
+    #[serde(default)]
+    pub rate: MediaRateSection,
+}
+
+/// `[media.rate]` — the quotas, all of them per hour except where the
+/// name says otherwise.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaRateSection {
+    /// Seconds between one account's uploads.
+    #[serde(default = "default_upload_interval")]
+    pub upload_interval: u64,
+    #[serde(default = "default_upload_per_hour")]
+    pub upload_per_hour: u32,
+    /// Every guest shares the `guest` account's bucket, so this is what
+    /// tells two guests apart.
+    #[serde(default = "default_upload_per_hour_per_addr")]
+    pub upload_per_hour_per_addr: u32,
+    /// Downloads per minute, per session.
+    #[serde(default = "default_download_per_minute")]
+    pub download_per_minute: u32,
+    /// Chunked uploads one account may have in flight at once.
+    #[serde(default = "default_upload_sessions")]
+    pub upload_sessions: usize,
+}
+
+impl Default for MediaRateSection {
+    fn default() -> Self {
+        MediaRateSection {
+            upload_interval: default_upload_interval(),
+            upload_per_hour: default_upload_per_hour(),
+            upload_per_hour_per_addr: default_upload_per_hour_per_addr(),
+            download_per_minute: default_download_per_minute(),
+            upload_sessions: default_upload_sessions(),
+        }
+    }
+}
+
+impl MediaSection {
+    /// The domain's view of this section, with the two halves — what the
+    /// store enforces and what the codec does — filled from one place so
+    /// no wire can advertise a number the pipeline does not hold.
+    pub fn to_media_config(&self) -> Result<hxd_core::MediaConfig, String> {
+        let history_access = match self.history_access.as_str() {
+            "recipients" => hxd_core::HistoryAccess::Recipients,
+            "readers" => hxd_core::HistoryAccess::Readers,
+            other => {
+                return Err(format!(
+                    "[media] history_access: {other:?} is not one of \"recipients\", \"readers\""
+                ))
+            }
+        };
+        let defaults = hxd_core::CodecLimits::default();
+        Ok(hxd_core::MediaConfig {
+            max_bytes: self.max_bytes,
+            handle_ttl: Duration::from_secs(self.handle_ttl),
+            max_total_bytes: self.max_total_bytes,
+            upload_interval: Duration::from_secs(self.rate.upload_interval),
+            upload_per_hour: self.rate.upload_per_hour,
+            upload_per_hour_per_addr: self.rate.upload_per_hour_per_addr,
+            download_per_minute: self.rate.download_per_minute,
+            upload_sessions: self.rate.upload_sessions,
+            upload_idle: Duration::from_secs(30),
+            history_access,
+            codec: hxd_core::CodecLimits {
+                max_bytes: self.max_bytes,
+                max_dimension: self.max_dimension,
+                max_pixels: self.max_pixels,
+                max_frames: self.max_frames,
+                max_duration_ms: self.max_duration_ms,
+                max_concurrent_decodes: self.max_concurrent_decodes,
+                ..defaults
+            },
+        })
+    }
+}
+
+fn default_media_max_bytes() -> usize {
+    256 * 1024
+}
+
+fn default_media_max_dimension() -> u32 {
+    2048
+}
+
+fn default_media_max_pixels() -> u64 {
+    2048 * 2048
+}
+
+fn default_media_max_frames() -> u32 {
+    150
+}
+
+fn default_media_max_duration() -> u32 {
+    15_000
+}
+
+fn default_media_decodes() -> usize {
+    2
+}
+
+fn default_media_ttl() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_media_total() -> usize {
+    256 * 1024 * 1024
+}
+
+fn default_history_access() -> String {
+    "recipients".into()
+}
+
+fn default_upload_interval() -> u64 {
+    10
+}
+
+fn default_upload_per_hour() -> u32 {
+    30
+}
+
+fn default_upload_per_hour_per_addr() -> u32 {
+    100
+}
+
+fn default_download_per_minute() -> u32 {
+    60
+}
+
+fn default_upload_sessions() -> usize {
+    2
 }
 
 /// Public chat history (`docs/chat-history.md` §9).
@@ -552,6 +730,9 @@ fn legacy_caps(config: &Config, voice: Option<&Voice>) -> Caps {
     if config.history.is_some() {
         caps = caps.with(cap::CHAT_HISTORY);
     }
+    if config.media.is_some() && cfg!(feature = "media") {
+        caps = caps.with(cap::INLINE_MEDIA);
+    }
     if voice.is_some() {
         caps = caps.with(cap::VOICE);
         // Bit 10 never without bit 2, and never from a config key alone:
@@ -590,7 +771,38 @@ fn ng_caps(config: &Config, voice: Option<&Voice>) -> Vec<String> {
     if config.inbox.is_some() {
         caps.push("inbox".to_string());
     }
+    // `media` is also pushed by the login reply when a pipeline is
+    // configured, which is what a server built without the feature
+    // relies on; naming it here keeps the two wires' lists side by side.
+    if config.media.is_some() && cfg!(feature = "media") {
+        caps.push("media".to_string());
+    }
     caps
+}
+
+/// Give the domain an image pipeline when `[media]` asks for one.
+#[cfg(feature = "media")]
+fn with_media(core: Core, config: &Config) -> Result<Core, String> {
+    let Some(media) = config.media.as_ref() else {
+        return Ok(core);
+    };
+    let cfg = media.to_media_config()?;
+    Ok(core.with_media(Arc::new(hxd_media::Codec::new(cfg.codec)), cfg))
+}
+
+/// Without the feature there is no pipeline to give it, and a `[media]`
+/// section is an operator promising their users something this binary
+/// cannot do. Say so at startup rather than at the first upload.
+#[cfg(not(feature = "media"))]
+fn with_media(core: Core, config: &Config) -> Result<Core, String> {
+    if config.media.is_some() {
+        return Err(
+            "[media] is configured, but this build has no image pipeline \
+                    (built without the `media` feature)"
+                .into(),
+        );
+    }
+    Ok(core)
 }
 
 /// The TRTP tunnel's other end: the legacy frontend, run on the byte
@@ -1132,6 +1344,24 @@ pub async fn history_pruner(core: Arc<Core>, max_lines: u32, max_days: u32) {
     }
 }
 
+/// Media retention: expired handles and abandoned upload sessions.
+///
+/// Hourly, like the other two, because a handle lives a day. Every
+/// access re-checks expiry itself, so this is housekeeping — it frees
+/// memory rather than deciding what is servable, and nothing is served
+/// between sweeps that a sweep would have taken.
+pub async fn media_sweeper(core: Arc<Core>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let gone = core.media_sweep();
+        if gone > 0 {
+            tracing::debug!(gone, "media handles expired");
+        }
+    }
+}
+
 /// Build the ng frontend context sharing the legacy context's core and
 /// auth. `None` when the config has no `[ng]` section.
 pub fn build_ng_ctx(
@@ -1247,6 +1477,7 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
         (None, None) => core,
         _ => return Err("[history] store was not opened".into()),
     };
+    let core = with_media(core, config)?;
 
     Ok(ServerCtx {
         core: Arc::new(core),
@@ -1521,6 +1752,7 @@ sync = "full"
                         sent_at: SystemTime::UNIX_EPOCH,
                         guid: None,
                         kind,
+                        media: None,
                     },
                     usize::MAX,
                 )

@@ -12,5 +12,9 @@ publish = false
 tokio = { version = "1", default-features = false, features = ["sync"] }
 # Store failures are an operator's problem, so the domain says so.
 tracing = "0.1"
-# The OS CSPRNG, for chat ids (which are also voice-room addresses).
+# The OS CSPRNG, for chat ids (which are also voice-room addresses) and
+# for media handles.
 getrandom = "0.2"
+# Canonical media hashes, which is what a moderator's re-upload block is
+# keyed on. Same version the identity crates use.
+sha2 = "0.10"

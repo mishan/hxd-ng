@@ -16,7 +16,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use hxd_core::access::bit;
 use hxd_core::video::VideoKind;
@@ -36,6 +36,7 @@ use tracing::{debug, info, warn, Instrument};
 
 use crate::caps::{cap, Caps};
 use crate::frame::{pack_frame, read_frame, Frame, ReadError, MAX_FRAME_DATA};
+use crate::media;
 use crate::video;
 use crate::voice;
 
@@ -288,6 +289,19 @@ fn reply_error(tx: &Tx, trans: u32, msg: &str) {
     });
 }
 
+/// A task error carrying extra fields beside its text — the shape the
+/// inline-media extension's optional error code needs
+/// (`docs/inline-media.md` §7.2).
+fn reply_error_with(tx: &Tx, trans: u32, msg: &str, extra: Vec<(u16, Vec<u8>)>) {
+    let mut chunks = vec![(tag::TASK_ERROR, text::from_utf8(msg))];
+    chunks.extend(extra);
+    let _ = tx.send(Outbound::Reply {
+        trans,
+        error: true,
+        chunks,
+    });
+}
+
 fn push(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
     let _ = tx.send(Outbound::Push { ty, chunks });
 }
@@ -401,6 +415,9 @@ fn err_text(e: ChatError) -> &'static str {
         ChatError::MailboxFull => "That user's mailbox is full.",
         ChatError::Blocked => "That user is not accepting messages from you.",
         ChatError::NoInbox => "This account has no message inbox.",
+        // Not theirs, expired, or revoked — one answer for all three, so
+        // a send cannot be used to test whether a handle exists.
+        ChatError::NoSuchMedia => "Media rejected",
         ChatError::ServerError => "Server error.",
     }
 }
@@ -665,11 +682,35 @@ struct Session {
     /// never be sent its transactions.
     caps: Caps,
     history_replayed: bool,
+    /// Download budget for 751, refilled continuously. Per connection
+    /// rather than per account, because it bounds this socket's writes:
+    /// an image is the largest thing this wire hands back outside a file
+    /// transfer, and a client in a loop is the case it exists for.
+    media_tokens: f64,
+    media_refill: Instant,
 }
 
 impl Session {
     fn can(&self, b: u8) -> bool {
         self.account.access.has(b)
+    }
+
+    /// Take a download token, refilling at `per_minute`. A burst of the
+    /// full minute's worth is allowed and then the rate is the rate,
+    /// which is what a client fetching every image in a busy room needs
+    /// and a client in a loop does not get more of.
+    fn allow_download(&mut self, per_minute: u32) -> bool {
+        let cap = per_minute.max(1) as f64;
+        let now = Instant::now();
+        self.media_tokens = (self.media_tokens
+            + now.duration_since(self.media_refill).as_secs_f64() * cap / 60.0)
+            .min(cap);
+        self.media_refill = now;
+        if self.media_tokens < 1.0 {
+            return false;
+        }
+        self.media_tokens -= 1.0;
+        true
     }
 
     /// Did this session negotiate capability bit `n`?
@@ -961,6 +1002,30 @@ async fn login_phase(
         _ => account.name.clone(),
     };
 
+    // The capability negotiation happens *before* the attach, because
+    // one of its bits is something the domain needs: the authorization
+    // set for an image is captured during fan-out, and fan-out has to
+    // know which recipients can carry the reference at all
+    // (`docs/inline-media.md` §5.2).
+    let mut caps = req.caps.intersect(ctx.cfg.caps);
+    // Bit 10 depends on bit 2. A client that asked for video without
+    // voice gets neither the bit nor a video transaction that works,
+    // because there is no voice room for video to live in — and echoing
+    // a bit whose transactions would all fail is the one thing the
+    // capability handshake must never do.
+    if caps.has(cap::VIDEO) && !caps.has(cap::VOICE) {
+        caps = Caps::from_bits(caps.bits() & !(1u64 << cap::VIDEO));
+    }
+    // Bit 3 the same way: without a configured pipeline there are no
+    // handles to issue and 750 would answer nothing but errors.
+    if caps.has(cap::INLINE_MEDIA) && !ctx.core.media_enabled() {
+        caps = Caps::from_bits(caps.bits() & !(1u64 << cap::INLINE_MEDIA));
+    }
+    let transport = Transport {
+        inline_media: caps.has(cap::INLINE_MEDIA),
+        ..transport
+    };
+
     let attach = AttachInfo {
         nick,
         icon: req.icon,
@@ -1001,19 +1066,11 @@ async fn login_phase(
             (tag::SERVERNAME, text::from_utf8(&ctx.cfg.name)),
         ]
     };
-    // The capability echo: the bits we agreed to, and nothing when we
-    // agreed to none (the spec's "omit it and the session is standard
-    // mode"). It rides even a version-0 reply — only a modern client
-    // asks the question, and one that asked deserves the answer.
-    let mut caps = req.caps.intersect(ctx.cfg.caps);
-    // Bit 10 depends on bit 2. A client that asked for video without
-    // voice gets neither the bit nor a video transaction that works,
-    // because there is no voice room for video to live in — and echoing
-    // a bit whose transactions would all fail is the one thing the
-    // capability handshake must never do.
-    if caps.has(cap::VIDEO) && !caps.has(cap::VOICE) {
-        caps = Caps::from_bits(caps.bits() & !(1u64 << cap::VIDEO));
-    }
+    // The capability echo: the bits we agreed to (settled above, before
+    // the attach), and nothing when we agreed to none — the spec's "omit
+    // it and the session is standard mode". It rides even a version-0
+    // reply: only a modern client asks the question, and one that asked
+    // deserves the answer.
     if !caps.is_empty() {
         login_reply.push((tag::CAPABILITIES, caps.to_wire()));
     }
@@ -1022,6 +1079,14 @@ async fn login_phase(
     // rejection.
     if caps.has(cap::VIDEO) {
         login_reply.extend(video::limits_chunks(&ctx.core.video_config()));
+    }
+    // The six advisory limits, which the spec makes a MUST beside a
+    // confirmed bit 3: a client configures its own pre-flight from them
+    // instead of discovering them by rejection.
+    if caps.has(cap::INLINE_MEDIA) {
+        if let Some(cfg) = ctx.core.media_config() {
+            login_reply.extend(media::limits_chunks(cfg));
+        }
     }
     if caps.has(cap::CHAT_HISTORY) {
         if let Some(history) = ctx.core.history_policy() {
@@ -1063,6 +1128,12 @@ async fn login_phase(
         announced: false,
         caps,
         history_replayed: false,
+        media_tokens: ctx
+            .core
+            .media_config()
+            .map(|c| c.download_per_minute as f64)
+            .unwrap_or(0.0),
+        media_refill: Instant::now(),
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -1148,6 +1219,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
             from,
             text,
             style,
+            media,
             ..
         } => {
             // Format at the edge, in Mac Roman, so the 13-column name
@@ -1158,6 +1230,14 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                 chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
             }
             chunks.push((tag::UID, from.uid.to_be_bytes().to_vec()));
+            // Per connection, not per event: the same relayed line is
+            // two different frames for a capable and a classic client in
+            // one room, and neither knows about the other. A client that
+            // did not negotiate the bit sees the text and nothing else,
+            // which is the spec's own fallback.
+            if let Some(media) = media.filter(|_| sess.caps.has(cap::INLINE_MEDIA)) {
+                chunks.extend(media::companion_chunks(&media));
+            }
             push(tx, hdr::CHAT, chunks);
         }
         Event::Notice { cid, from, text } => {
@@ -1243,6 +1323,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
             text,
             sent_at,
             queued,
+            media,
             ..
         } => {
             let body = if queued && ctx.cfg.stamp_queued {
@@ -1262,15 +1343,15 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
             // yourself rather than to nobody, which is the better of the
             // two answers a wire with no "from an absent user" has.
             let uid = if from == 0 { sess.uid } else { from };
-            push(
-                tx,
-                hdr::MSG,
-                vec![
-                    (tag::UID, uid.to_be_bytes().to_vec()),
-                    (tag::BODY, mac_text(&body)),
-                    (tag::NAME, mac_nick(&from_nick)),
-                ],
-            );
+            let mut chunks = vec![
+                (tag::UID, uid.to_be_bytes().to_vec()),
+                (tag::BODY, mac_text(&body)),
+                (tag::NAME, mac_nick(&from_nick)),
+            ];
+            if let Some(media) = media.filter(|_| sess.caps.has(cap::INLINE_MEDIA)) {
+                chunks.extend(media::companion_chunks(&media));
+            }
+            push(tx, hdr::MSG, chunks);
         }
         Event::Broadcast {
             from,
@@ -1358,6 +1439,12 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
             );
         }
 
+        // Nothing to send. A 106 was pushed and this wire has no
+        // transaction to unsend it, so a rendered line keeps its image
+        // until the window scrolls; what the revocation does reach is
+        // the next 751, which now answers "not found"
+        // (moderation.md §6).
+        Event::MediaRevoked { .. } => {}
         Event::Kicked => return false,
     }
     true
@@ -1480,11 +1567,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         // --- Chat -----------------------------------------------------
         t if t == ClientHdr::Chat.as_u32() => {
             let (mut cid, mut style, mut body) = (0u32, 0u16, String::new());
+            let (mut handle, mut declared) = (None, false);
             for c in f.chunks() {
                 match c.tag {
                     tag::CHAT_ID => cid = c.as_uint(),
                     tag::STYLE => style = c.as_uint() as u16,
                     tag::BODY => body = text::to_utf8(&c.data[..c.data.len().min(MAX_CHAT_INPUT)]),
+                    tag::CHAT_MEDIA_ID => handle = media::parse_handle(c.data),
+                    tag::CHAT_MEDIA_TYPE => declared = true,
                     TAG_CHAT_AWAY => {} // No away state yet; rider ignored.
                     _ => {}
                 }
@@ -1495,14 +1585,35 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 debug!(uid = sess.uid, "chat dropped: no send_chat access");
                 return;
             }
+            // "Servers MUST drop these fields from any inbound
+            // transaction whose sender did not negotiate the
+            // capability" — the text still goes through as plain chat.
+            let media = match (handle, declared) {
+                _ if !sess.has_cap(cap::INLINE_MEDIA) => None,
+                // The two travel together or not at all. One without
+                // the other is a malformed send, and this transaction
+                // has no task reply to refuse it with, so it goes the
+                // way an unpermitted chat goes.
+                (Some(_), false) | (None, true) => {
+                    debug!(uid = sess.uid, "chat dropped: media fields are unpaired");
+                    return;
+                }
+                (handle, _) => handle,
+            };
             if cid == 0 {
                 let from = sess.uid;
-                if let Some(Err(e)) =
-                    off_reactor(&ctx.core, move |c| c.chat_public(from, body, style)).await
+                match off_reactor(&ctx.core, move |c| c.chat_public(from, body, style, media)).await
                 {
-                    warn!(uid = sess.uid, "public chat store failed: {e:?}");
+                    Some(Err(ChatError::NoSuchMedia)) => {
+                        debug!(
+                            uid = sess.uid,
+                            "chat dropped: media handle is not this sender's"
+                        )
+                    }
+                    Some(Err(e)) => warn!(uid = sess.uid, "public chat store failed: {e:?}"),
+                    _ => {}
                 }
-            } else if let Err(e) = ctx.core.chat_private(cid, sess.uid, body, style) {
+            } else if let Err(e) = ctx.core.chat_private(cid, sess.uid, body, style, media) {
                 debug!(uid = sess.uid, cid, "private chat dropped: {e:?}");
             }
         }
@@ -1753,21 +1864,38 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 return;
             }
             let (mut to, mut body) = (0 as Uid, String::new());
+            let (mut handle, mut declared) = (None, false);
             for c in f.chunks() {
                 match c.tag {
                     tag::UID => to = c.as_uint() as Uid,
                     tag::BODY => body = text::to_utf8(&c.data[..c.data.len().min(MAX_CHAT_INPUT)]),
+                    tag::CHAT_MEDIA_ID => handle = media::parse_handle(c.data),
+                    tag::CHAT_MEDIA_TYPE => declared = true,
                     _ => {}
                 }
             }
-            if to == 0 || body.is_empty() {
+            // Same rule as chat: dropped outright from a sender that did
+            // not negotiate the bit. This transaction *does* have a task
+            // reply, so an unpaired field is refused rather than
+            // silently dropped.
+            let media = match (handle, declared) {
+                _ if !sess.has_cap(cap::INLINE_MEDIA) => None,
+                (Some(_), false) | (None, true) => {
+                    reply_error(tx, f.trans, "Media rejected");
+                    return;
+                }
+                (handle, _) => handle,
+            };
+            // A message with an image may have no text at all: the image
+            // is the message. Without one the old rule stands.
+            if to == 0 || (body.is_empty() && media.is_none()) {
                 reply_error(tx, f.trans, "Empty message or no recipient.");
                 return;
             }
             // No guid: the legacy wire has no way to carry one, so every
             // send from it is its own message and a retry is a resend.
             let from = sess.uid;
-            match off_reactor(&ctx.core, move |c| c.msg(from, to, body, None)).await {
+            match off_reactor(&ctx.core, move |c| c.msg(from, to, body, None, media)).await {
                 Some(Ok(_)) => reply(tx, f.trans, vec![]),
                 Some(Err(e)) => reply_error(tx, f.trans, err_text(e)),
                 None => reply_error(tx, f.trans, "Server error."),
@@ -1875,6 +2003,122 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         // every arm, and a task error is a base-protocol reply rather
         // than a voice transaction, so answering one doesn't break that
         // rule.
+        // --- Inline media (docs/inline-media.md §7.2, §7.3) ----------
+        t if t == media::trans::UPLOAD_MEDIA => {
+            if !sess.has_cap(cap::INLINE_MEDIA) {
+                reply_error(tx, f.trans, "Inline media was not negotiated.");
+                return;
+            }
+            let (mut payload, mut declared, mut token) = (Vec::new(), None, None);
+            let (mut index, mut count, mut last) = (0u16, None, false);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_MEDIA_PAYLOAD => payload = c.data.to_vec(),
+                    tag::CHAT_MEDIA_DECLARED_TYPE => {
+                        declared = Some(String::from_utf8_lossy(c.data).into_owned())
+                    }
+                    tag::CHAT_MEDIA_UPLOAD_TOKEN => token = media::parse_handle(c.data),
+                    tag::CHAT_MEDIA_PART_INDEX => index = media::uint(c.data) as u16,
+                    tag::CHAT_MEDIA_PART_COUNT => count = Some(media::uint(c.data) as u16),
+                    tag::CHAT_MEDIA_PART_FINAL => last = media::flag(c.data),
+                    _ => {}
+                }
+            }
+            let uid = sess.uid;
+            // The pipeline decodes and re-encodes an image, so it runs on
+            // a blocking thread — and the awaiting side gives up before
+            // the client does. A decode that outlives the budget is
+            // abandoned to finish on its thread while its sender is told
+            // to try again: a Rust decoder cannot be killed from
+            // outside, and the dimension and allocation caps are what
+            // bound the work in the first place.
+            let budget = ctx
+                .core
+                .media_config()
+                .map(|c| c.codec.permit_wait * 2)
+                .unwrap_or(Duration::from_secs(4));
+            let outcome = tokio::time::timeout(
+                budget,
+                off_reactor(&ctx.core, move |c| {
+                    c.media_upload_part(
+                        uid,
+                        hxd_core::media::UploadPart {
+                            payload: &payload,
+                            declared: declared.as_deref(),
+                            token,
+                            index,
+                            count,
+                            last,
+                        },
+                    )
+                }),
+            )
+            .await;
+            match outcome {
+                Ok(Some(Ok(hxd_core::media::UploadOutcome::Done(reference)))) => {
+                    reply(tx, f.trans, media::upload_reply_chunks(&reference))
+                }
+                // An intermediate reply carries the token and nothing
+                // else. Echoing it on every part (rather than only the
+                // first) is what the spec calls safe and what GtkHx
+                // tolerates.
+                Ok(Some(Ok(hxd_core::media::UploadOutcome::Token(token)))) => reply(
+                    tx,
+                    f.trans,
+                    vec![(tag::CHAT_MEDIA_UPLOAD_TOKEN, token.to_vec())],
+                ),
+                Ok(Some(Err(reject))) => {
+                    debug!(target: "media", uid, code = reject.code(), "upload refused");
+                    reply_error_with(tx, f.trans, reject.text(), media::error_chunks(reject))
+                }
+                Ok(None) | Err(_) => {
+                    let busy = hxd_core::media::MediaReject::Busy;
+                    reply_error_with(tx, f.trans, busy.text(), media::error_chunks(busy))
+                }
+            }
+        }
+
+        t if t == media::trans::DOWNLOAD_MEDIA => {
+            if !sess.has_cap(cap::INLINE_MEDIA) {
+                reply_error(tx, f.trans, "Inline media was not negotiated.");
+                return;
+            }
+            let (mut handle, mut index) = (None, 0u16);
+            for c in f.chunks() {
+                match c.tag {
+                    tag::CHAT_MEDIA_ID => handle = media::parse_handle(c.data),
+                    tag::CHAT_MEDIA_PART_INDEX => index = media::uint(c.data) as u16,
+                    _ => {}
+                }
+            }
+            let per_minute = ctx
+                .core
+                .media_config()
+                .map(|c| c.download_per_minute)
+                .unwrap_or(0);
+            if !sess.allow_download(per_minute) {
+                let slow = hxd_core::media::MediaReject::RateLimited;
+                reply_error_with(tx, f.trans, slow.text(), media::error_chunks(slow));
+                return;
+            }
+            // Authorization is re-checked on every part, because a set
+            // can only shrink: a session kicked between parts is exactly
+            // the one that should stop receiving.
+            let fetched = handle.and_then(|h| ctx.core.media_fetch(sess.uid, &h));
+            match fetched.and_then(|f2| {
+                media::download_chunks(&f2.bytes, f2.mime.mime(), index).map(|(c, _)| c)
+            }) {
+                Some(chunks) => reply(tx, f.trans, chunks),
+                // "Not found", "expired", "revoked", "not yours" and "a
+                // part past the end" are one answer, so none of them can
+                // be told from the others.
+                None => {
+                    let no = hxd_core::media::MediaReject::NotAuthorized;
+                    reply_error_with(tx, f.trans, "Media not found", media::error_chunks(no))
+                }
+            }
+        }
+
         t if t == ClientHdr::VoiceJoin.as_u32() => {
             if !sess.has_cap(cap::VOICE) {
                 reply_error(tx, f.trans, "Voice chat is not available on this server.");

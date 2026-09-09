@@ -193,6 +193,16 @@ async fn main() {
             ));
         }
 
+        if let Some(media) = &config.media {
+            tracing::info!(
+                "inline media on: up to {} KiB per image, handles live {}h, {} MiB held at most",
+                media.max_bytes / 1024,
+                media.handle_ttl / 3600,
+                media.max_total_bytes / (1024 * 1024),
+            );
+            tokio::spawn(hxd::media_sweeper(ctx.core.clone()));
+        }
+
         // The Hotline-ng WebSocket frontend, when configured: its accept
         // loop plus the detached-session sweeper.
         if let Some(ng_ctx) = ng_ctx {

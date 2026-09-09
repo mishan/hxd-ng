@@ -29,6 +29,12 @@ deliberate and commented at the site.
   one room shared across both wires. Video adds media sections to the voice
   session rather than standing up anything of its own, and nothing is
   delivered to a peer that has not subscribed to it.
+- **Images in chat**, on both wires. A photo attached in a 1.5 client
+  renders in the browser and the other way round: the server validates,
+  re-encodes and strips every byte of metadata, hands back an opaque
+  handle, and decides who may fetch it from who was in the room when the
+  line was sent. Clients that never negotiated the capability see the
+  caption and nothing else.
 - **Portable identity** — an Ed25519 keypair is who you are, independent of
   any one server's account table. A client proves it over HTTP, links it to
   an account, and can carry it to another server. Legacy clients reach it
@@ -61,8 +67,8 @@ crypto provider is selected. On Debian/Ubuntu:
 apt install build-essential cmake
 ```
 
-A build with `--no-default-features` leaves voice (and the inbox) out and
-needs neither.
+A build with `--no-default-features` leaves voice, the inbox and the
+image pipeline out and needs none of them.
 
 ### Build and run
 
@@ -243,6 +249,39 @@ max_page = 200            # maximum rows in one request
 replay = 0                # plain chat lines replayed to old legacy clients
 ```
 
+### Inline media
+
+Absent means no images: the legacy wire never confirms capability bit 3
+and the ng wire never offers the `media` cap or its HTTP routes. The
+send permission is off in every account file that does not name it —
+including the bootstrap guest — because an image is the one thing a
+stranger can put on everyone else's screen. See
+[docs/inline-media.md](docs/inline-media.md).
+
+```toml
+[media]                      # presence turns it on
+max_bytes = 262144           # per image, before canonicalization
+max_dimension = 2048         # per axis
+max_pixels = 4194304
+max_frames = 150             # animated GIFs
+max_duration_ms = 15000
+max_concurrent_decodes = 2
+handle_ttl = 86400           # seconds a handle answers
+max_total_bytes = 268435456  # held across all live handles; oldest evicted
+history_access = "recipients" # or "readers": may a scrollback reader fetch?
+
+[media.rate]
+upload_interval = 10          # seconds between one account's uploads
+upload_per_hour = 30          # per account
+upload_per_hour_per_addr = 100
+download_per_minute = 60      # per session
+upload_sessions = 2           # chunked uploads in flight, per account
+```
+
+Nothing touches disk: handles live in memory for their day and go with a
+restart, which the extension's own spec allows for — clients are told
+not to cache them across sessions.
+
 ### Voice and video
 
 Both absent by default. Video rides the voice session, so `[voice.video]`
@@ -382,11 +421,12 @@ nothing.
 
 ### Cargo features
 
-`voice` and `inbox` are both on by default, so CI covers them. The `inbox`
-feature supplies the shared SQLite store for both inbox and history. Building
-without one leaves its dependency out of the binary entirely — no WebRTC
-stack, no bundled SQLite — and the matching config section then becomes a
-startup error rather than a promise the build cannot keep.
+`voice`, `inbox` and `media` are all on by default, so CI covers them. The
+`inbox` feature supplies the shared SQLite store for both inbox and history;
+`media` supplies the image pipeline. Building without one leaves its
+dependency out of the binary entirely — no WebRTC stack, no bundled SQLite,
+no image decoder — and the matching config section then becomes a startup
+error rather than a promise the build cannot keep.
 
 ## Documentation
 

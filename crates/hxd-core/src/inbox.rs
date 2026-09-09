@@ -215,6 +215,11 @@ pub struct NewMessage {
     /// of the same guid between the same pair are one message.
     pub guid: Option<MessageGuid>,
     pub kind: MessageKind,
+    /// The image that came with it, as canonical metadata rather than as
+    /// bytes: the store holds the record, the media store holds the
+    /// image, and the handle may well die first
+    /// (`docs/inline-media.md` §9).
+    pub media: Option<crate::history::MediaMeta>,
 }
 
 /// A message as the store holds it.
@@ -228,6 +233,10 @@ pub struct StoredMessage {
     pub sent_at: SystemTime,
     pub guid: Option<MessageGuid>,
     pub kind: MessageKind,
+    /// The image it was sent with, if any. Present whether or not the
+    /// handle still resolves — a reference whose bytes have gone still
+    /// renders as a placeholder.
+    pub media: Option<crate::history::MediaMeta>,
     /// When the server handed this to a live connection — *not* when a
     /// client rendered it. A stronger guarantee needs per-message client
     /// acks, which is what fogWraith's `IM Acknowledge (812)` is for and

@@ -14,6 +14,8 @@
 //! | `POST /identity/link` | §8.2 |
 //! | `POST /identity/unlink` | §8.4 |
 //! | `/identity/enroll/…` | the enrollment mailbox, `identity-enrollment.md` §5 |
+//! | `POST /media` | inline media, `inline-media.md` §8.2 |
+//! | `GET  /media/<id>` | the canonical bytes |
 //! | `GET  /ng` (and `/`) | upgrade → the JSON protocol |
 //! | `GET  /trtp` | upgrade → the TRTP tunnel |
 //!
@@ -121,6 +123,20 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
                 upgrade(&mut req, peer, client, ctx, Proto::Trtp).await
             }
             _ => plain(StatusCode::NOT_FOUND, "no such WebSocket path"),
+        };
+    }
+
+    // The media routes come before the table proper: one of them has a
+    // handle in its path, and a browser sends `OPTIONS` to both before
+    // it sends anything carrying an `Authorization` header.
+    if path == "/media" || path.starts_with("/media/") {
+        return match (req.method(), path.strip_prefix("/media/")) {
+            (&Method::OPTIONS, _) => crate::media::preflight(),
+            (&Method::POST, None) => crate::media::upload(req, &ctx).await,
+            (&Method::GET, Some(id)) if !id.is_empty() && !id.contains('/') => {
+                crate::media::download(id, req, &ctx).await
+            }
+            _ => plain(StatusCode::NOT_FOUND, "not found"),
         };
     }
 
@@ -289,6 +305,11 @@ async fn upgrade(
                 let transport = Transport {
                     encrypted: !identity.as_ref().is_some_and(|i| i.downstream_cleartext),
                     identity: identity.as_ref().map(TransportIdentity::tag),
+                    // The tunnel is transport and knows nothing about
+                    // what it carries: the legacy client inside it
+                    // negotiates bit 3 for itself, and the legacy
+                    // frontend sets this from that negotiation.
+                    inline_media: false,
                 };
                 // §8.2: the tunnelled login can self-link, which is a
                 // write of an association — so it needs the same `manage`

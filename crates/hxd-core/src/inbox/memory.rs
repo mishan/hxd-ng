@@ -227,6 +227,7 @@ impl MessageStore for MemoryStore {
             sent_at: m.sent_at,
             guid: m.guid.clone(),
             kind: m.kind,
+            media: m.media.clone(),
             delivered_at: None,
             // A receipt is not something anyone reads; stamping it here
             // keeps it out of unread counts and ages it on the read clock
@@ -558,6 +559,7 @@ mod tests {
                     sent_at: SystemTime::UNIX_EPOCH,
                     guid: None,
                     kind: MessageKind::Message,
+                    media: None,
                 },
                 usize::MAX,
             )

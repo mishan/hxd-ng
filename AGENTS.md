@@ -55,6 +55,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the WebSocket-as-byte-stream adapter (`tunnel.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
 | `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy + `[identity]` link), first-run guest bootstrap. Identity links are written back with `toml_edit` so hand-edited files keep their comments; fingerprint lookups scan the directory. |
+| `hxd-media` | The inline-media pipeline (`docs/inline-media.md`): magic-byte sniff, hand-written JPEG/PNG/GIF container walkers that refuse polyglots, a bounded decode and a re-encode that strips every byte of metadata by construction. Behind `hxd-core`'s `MediaCodec` trait and the `media` Cargo feature, and knows nothing about Hotline. |
 | `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
 | `hxd-store-sqlite` | The private-message inbox's durable store: one SQLite file, WAL, the schema and migrations of `docs/private-messages.md` §5, and the conformance suite both stores are run against. Behind `hxd-core`'s `MessageStore` trait and the `inbox` Cargo feature; the in-memory store beside it in `hxd-core` is what the domain tests use. |
 | `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1). |
@@ -118,6 +119,20 @@ bundled transport, so there is nothing else to tell them apart and an
 answer that omits `a=ssrc` costs that publication rather than being
 guessed at.
 
+**An image is a handle, and a handle is an authorization.** Bytes never
+travel inside a chat transaction on either wire: an upload is
+canonicalized — decoded and re-encoded by this server, so stripping
+metadata is a property of the construction rather than of a filter that
+could miss a chunk type — and what a chat line carries is an opaque
+handle. Who may fetch it is **fixed when the line is relayed**, as
+principals rather than uids (a `(uid, serial)` session for chat, a
+mailbox for a private message, so mail read tomorrow still resolves),
+and the set may narrow but never widen — the one exception being a
+moderator judging a reported image. Attaching a handle asks whether
+*this session* uploaded it; fetching one asks whether this principal was
+shown it. Getting those two questions confused is how an image reaches
+someone who was not in the room.
+
 **The access bitmap is shared wire vocabulary; don't squat on bits.**
 Reserved bits stay reserved (fogWraith allocates upward from 55).
 Server-local policy that never crosses the wire goes in the account files'
@@ -150,9 +165,12 @@ Three layers, all `cargo test --workspace`:
   and a WS client on one server, chat and PMs crossing both wire eras,
   detach showing as the away color, resume replay), `identity.rs` (the
   identity endpoints, linking, the `/trtp` tunnel, anchors — a real
-  server per case with its own accounts directory) and `inbox.rs`
-  (offline private messages across both wires: queue, flush at login,
-  resync, blocks, retention).
+  server per case with its own accounts directory), `media.rs` (inline
+  media on both wires: the capability echo and its limits, single-shot
+  and chunked upload, sliced downloads, a capable and a classic client
+  in one room, a photo crossing each way, and a revocation) and
+  `inbox.rs` (offline private messages across both wires: queue, flush
+  at login, resync, blocks, retention).
 - The scripted legacy client packs and parses with the same pinned
   `hxproto` revision GtkHx uses, so e2e doubles as wire-compat
   checking.

@@ -8,6 +8,7 @@ mod conn;
 pub mod enroll;
 mod http;
 pub mod identity;
+pub mod media;
 pub mod proto;
 mod registry;
 mod tunnel;

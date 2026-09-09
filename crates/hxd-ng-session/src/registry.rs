@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use hxd_core::{Core, Uid};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,12 @@ struct Entry {
     token_hash: [u8; 32],
     uid: Uid,
     serial: u64,
+    /// The session's media-download budget (`docs/inline-media.md` §6),
+    /// which lives here because it is the one piece of per-session state
+    /// the HTTP routes can reach: they hold a bearer token and a `Core`,
+    /// and nothing else about the socket the session belongs to.
+    media_tokens: f64,
+    media_refill: Instant,
 }
 
 /// See the module docs.
@@ -57,6 +64,13 @@ impl Registry {
                 token_hash: hash(&token),
                 uid,
                 serial,
+                // Full, not empty: a client that opens a room full of
+                // images fetches them all at once, and the budget is
+                // there to bound a loop rather than to make the first
+                // download wait for a refill. The cap is applied on use,
+                // where the configured rate is known.
+                media_tokens: f64::MAX,
+                media_refill: Instant::now(),
             },
         );
         Some((session_id, token))
@@ -89,6 +103,32 @@ impl Registry {
             return None;
         }
         Some(uid)
+    }
+
+    /// Take one media-download token for this session, refilling at
+    /// `per_minute`. A session may burst a minute's worth — a client
+    /// opening a room full of images fetches them all at once — and is
+    /// then held to the rate.
+    ///
+    /// An unknown session id answers `false`: the download routes check
+    /// the bearer first, so the only way to reach this with one is a
+    /// session that ended in between.
+    pub fn allow_download(&self, session_id: &str, per_minute: u32) -> bool {
+        let cap = per_minute.max(1) as f64;
+        let mut entries = self.entries.lock().unwrap();
+        let Some(entry) = entries.get_mut(session_id) else {
+            return false;
+        };
+        let now = Instant::now();
+        entry.media_tokens = (entry.media_tokens
+            + now.duration_since(entry.media_refill).as_secs_f64() * cap / 60.0)
+            .min(cap);
+        entry.media_refill = now;
+        if entry.media_tokens < 1.0 {
+            return false;
+        }
+        entry.media_tokens -= 1.0;
+        true
     }
 
     /// Forget a session (logout, kick, denial-of-detach).

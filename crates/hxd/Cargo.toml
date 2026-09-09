@@ -11,13 +11,18 @@ default-run = "hxd"
 [features]
 # Voice chat. On by default so CI covers it; a server that doesn't want
 # a WebRTC stack in its binary builds with --no-default-features.
-default = ["voice", "inbox"]
+default = ["voice", "inbox", "media"]
 voice = ["dep:hxd-voice"]
 # The durable private-message inbox. On by default so CI covers it; a
 # server that wants neither offline messages nor a bundled SQLite in its
 # binary builds without it, and then an `[inbox]` config section is a
 # startup error rather than a silently ignored promise.
 inbox = ["dep:hxd-store-sqlite"]
+# The inline-media pipeline. On by default so CI covers it; a server
+# that wants no image decoder in its binary builds without it, and then
+# a `[media]` config section is a startup error rather than a silently
+# ignored promise.
+media = ["dep:hxd-media"]
 
 [[bin]]
 name = "hxd"
@@ -28,6 +33,7 @@ hxd-core = { workspace = true }
 hxd-auth-file = { workspace = true }
 hxd-session = { workspace = true }
 hxd-ng-session = { workspace = true }
+hxd-media = { workspace = true, optional = true }
 hxd-voice = { workspace = true, optional = true }
 hl-identity = { workspace = true }
 base64 = "0.22"
@@ -44,6 +50,12 @@ hxproto = { workspace = true }
 hxd-voice = { workspace = true }
 # The inbox e2e uses the real store on a real file, not a fake.
 hxd-store-sqlite = { workspace = true }
+# The media e2e uploads real images through the real pipeline, so it
+# needs an encoder to make one with. Same pin as `hxd-media`'s.
+hxd-media = { workspace = true }
+image = { version = ">=0.25.5, <0.25.10", default-features = false, features = [
+    "png",
+] }
 str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false }

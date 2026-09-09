@@ -146,6 +146,7 @@ mod tests {
             identity: None,
             inbox: None,
             history: None,
+            media: None,
         }
     }
 

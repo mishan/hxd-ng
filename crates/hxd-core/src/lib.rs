@@ -12,6 +12,7 @@ pub mod account;
 pub mod chat;
 pub mod history;
 pub mod inbox;
+pub mod media;
 pub mod notify;
 pub mod roster;
 pub mod video;
@@ -30,6 +31,10 @@ pub use history::{
 pub use inbox::{
     Delivery, InboxCounts, MemoryStore, MessageId, MessageStore, NewMessage, Pushed, StoreError,
     StoredMessage,
+};
+pub use media::{
+    Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRef,
+    MediaReject, MediaType, Principal, UploadOutcome, UploadPart,
 };
 pub use notify::{Notification, NotificationGateway};
 pub use roster::{

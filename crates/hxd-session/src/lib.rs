@@ -5,6 +5,7 @@
 
 pub mod caps;
 pub mod frame;
+pub mod media;
 pub mod session;
 pub mod video;
 pub mod voice;

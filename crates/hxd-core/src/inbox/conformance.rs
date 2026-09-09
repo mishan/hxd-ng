@@ -85,6 +85,7 @@ fn msg(to: &Mailbox, from: &Mailbox, body: &str, sent_at: SystemTime) -> NewMess
         sent_at,
         guid: None,
         kind: MessageKind::Message,
+        media: None,
     }
 }
 
@@ -115,6 +116,17 @@ fn a_message_round_trips_whole(s: &dyn MessageStore) {
             sent_at: at(1_700_000_000),
             guid: None,
             kind: MessageKind::Message,
+            // An image rides as canonical metadata, not as bytes: the
+            // store holds the record and the media store holds the
+            // image, which may well die first
+            // (`docs/inline-media.md` §9).
+            media: Some(crate::history::MediaMeta {
+                id: vec![7; 16],
+                mime: "image/png".into(),
+                width: 800,
+                height: 600,
+                bytes: 124_000,
+            }),
         },
     );
     let got = &s.pending(&Mailbox::identified("dave", fp(1)), 10).unwrap()[0];
@@ -131,6 +143,14 @@ fn a_message_round_trips_whole(s: &dyn MessageStore) {
     assert_eq!(got.sent_at, at(1_700_000_000), "{case}: sent_at");
     assert_eq!(got.delivered_at, None, "{case}: not delivered yet");
     assert_eq!(got.read_at, None, "{case}: not read yet");
+    let media = got.media.as_ref().expect("{case}: media survived");
+    assert_eq!(media.id, vec![7; 16], "{case}: handle bytes");
+    assert_eq!(media.mime, "image/png", "{case}: canonical mime");
+    assert_eq!(
+        (media.width, media.height, media.bytes),
+        (800, 600, 124_000),
+        "{case}: canonical dimensions and size"
+    );
 }
 
 fn pending_is_oldest_first_and_bounded(s: &dyn MessageStore) {

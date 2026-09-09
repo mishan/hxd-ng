@@ -1106,7 +1106,7 @@ async fn mail_that_arrives_during_an_unreplayable_gap_survives_the_resync() {
     // touched the path it exists for.
     for i in 0..(hxd_core::roster::OUTBOX_BUFFER_CAP + 10) {
         srv.core
-            .chat_public(alice_uid, format!("line {i}"), 0)
+            .chat_public(alice_uid, format!("line {i}"), 0, None)
             .unwrap();
     }
 
