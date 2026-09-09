@@ -27,6 +27,7 @@ use hxd_core::{
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::text;
+use hxproto::HL_DATA_HDR_LEN;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
@@ -34,7 +35,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
 use crate::caps::{cap, Caps};
-use crate::frame::{pack_frame, read_frame, Frame, ReadError};
+use crate::frame::{pack_frame, read_frame, Frame, ReadError, MAX_FRAME_DATA};
 use crate::video;
 use crate::voice;
 
@@ -510,6 +511,106 @@ fn format_chat(nick: &[u8], text: &[u8], style: u16) -> Vec<u8> {
         format_chat_line(&mut out, nick, b"", style);
     }
     out
+}
+
+/// Render one stored line for the legacy compatibility replay: a
+/// timestamp, then the attribution, then the text.
+///
+/// Like [`format_chat`], the body is split on CR/LF and each segment is
+/// attributed again. Appending it verbatim would let a line that
+/// contains a carriage return replay as an unattributed line in every
+/// non-capable client's scrollback — a forgery live delivery does not
+/// allow, and the store keeps the body as it was said. The split is on
+/// the encoded bytes so nothing the encoding produces can slip through
+/// either.
+fn format_replay(line: &hxd_core::LogLine) -> Vec<u8> {
+    let seconds = line
+        .at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let day = seconds % 86_400;
+    let prefix = format!(
+        "\r[{hour:02}:{minute:02}] ",
+        hour = day / 3600,
+        minute = day / 60 % 60
+    );
+    let mut attribution = text::from_utf8(&prefix);
+    if line.flags.contains(hxd_core::LineFlags::ACTION) {
+        attribution.extend_from_slice(b"*** ");
+        attribution.extend(mac_nick(&line.from_nick));
+        attribution.push(b' ');
+    } else {
+        attribution.extend(mac_nick(&line.from_nick));
+        attribution.extend_from_slice(b":  ");
+    }
+    let body = text::from_utf8(&line.text);
+    let mut out = Vec::with_capacity(body.len() + attribution.len());
+    let mut wrote = false;
+    for segment in body.split(|b| *b == b'\r' || *b == b'\n') {
+        if segment.is_empty() {
+            continue;
+        }
+        out.extend_from_slice(&attribution);
+        out.extend_from_slice(segment);
+        wrote = true;
+    }
+    // A tombstone, or a body that is only delimiters: one empty line,
+    // the same "no token found" path `format_chat` takes.
+    if !wrote {
+        out.extend_from_slice(&attribution);
+    }
+    out
+}
+
+/// Trim a page of history entries to what one transaction can carry,
+/// returning what fits and whether anything was dropped.
+///
+/// The spec bounds a single entry — its lengths are u16 — but says
+/// nothing about the reply, and a full page of long lines overruns
+/// [`MAX_FRAME_DATA`]. A client clamps an oversized header rather than
+/// refusing it, so the reply would arrive truncated and the rest of the
+/// connection mis-framed. Dropping whole entries keeps the framing
+/// honest.
+///
+/// Entries arrive and leave oldest-first, and are dropped from the end
+/// the client is paging *away* from: an `after` query continues from the
+/// newest id it was handed, so the newest go; every other query
+/// continues from the oldest, so the oldest go. What is left is still
+/// contiguous with the cursor the client will send next, and the caller
+/// turns a drop into `has_more`, which means "more in the direction of
+/// the query".
+fn fit_history_entries(mut entries: Vec<Vec<u8>>, paging_newer: bool) -> (Vec<Vec<u8>>, bool) {
+    // CHANNEL_ID and HAS_MORE ride along in the same transaction, and
+    // the chunk count sits inside the counted data size.
+    const FIXED: usize = 2 * HL_DATA_HDR_LEN + 4 + 1 + size_of::<u16>();
+    let budget = MAX_FRAME_DATA as usize - FIXED;
+    let cost = |entry: &Vec<u8>| HL_DATA_HDR_LEN + entry.len();
+    if entries.iter().map(cost).sum::<usize>() <= budget {
+        return (entries, false);
+    }
+    // One entry is at most `u16::MAX` plus its chunk header, which is
+    // far inside the budget, so at least one always survives and the
+    // client's cursor always advances.
+    let mut used = 0;
+    let mut kept = 0;
+    let ordered: Box<dyn Iterator<Item = &Vec<u8>>> = if paging_newer {
+        Box::new(entries.iter())
+    } else {
+        Box::new(entries.iter().rev())
+    };
+    for entry in ordered {
+        if used + cost(entry) > budget {
+            break;
+        }
+        used += cost(entry);
+        kept += 1;
+    }
+    if paging_newer {
+        entries.truncate(kept);
+    } else {
+        entries.drain(..entries.len() - kept);
+    }
+    (entries, true)
 }
 
 /// What the login chunk-walk yielded.
@@ -1327,27 +1428,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             off_reactor(&ctx.core, move |c| c.history(uid, query)).await
                         {
                             for line in page.lines {
-                                let seconds = line
-                                    .at
-                                    .duration_since(SystemTime::UNIX_EPOCH)
-                                    .map_or(0, |d| d.as_secs());
-                                let day = seconds % 86_400;
-                                let prefix = format!(
-                                    "\r[{hour:02}:{minute:02}] ",
-                                    hour = day / 3600,
-                                    minute = day / 60 % 60
-                                );
-                                let mut rendered = text::from_utf8(&prefix);
-                                if line.flags.contains(hxd_core::LineFlags::ACTION) {
-                                    rendered.extend_from_slice(b"*** ");
-                                    rendered.extend(mac_nick(&line.from_nick));
-                                    rendered.push(b' ');
-                                } else {
-                                    rendered.extend(mac_nick(&line.from_nick));
-                                    rendered.extend_from_slice(b":  ");
-                                }
-                                rendered.extend(text::from_utf8(&line.text));
-                                push(tx, hdr::CHAT, vec![(tag::BODY, rendered)]);
+                                push(tx, hdr::CHAT, vec![(tag::BODY, format_replay(&line))]);
                             }
                         }
                     }
@@ -1473,10 +1554,13 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "No such channel.");
                 return;
             }
-            let policy = ctx
-                .core
-                .history_policy()
-                .expect("negotiated history implies a configured log");
+            // The capability and the log come from the same config, but
+            // `ServerConfig` is public and nothing makes the two agree,
+            // so answer the way the ng wire does rather than panic.
+            let Some(policy) = ctx.core.history_policy() else {
+                reply_error(tx, f.trans, "Chat history is not available.");
+                return;
+            };
             let requested = limit.filter(|n| *n != 0).map_or(50, usize::from);
             let query = hxd_core::HistoryQuery {
                 channel: 0,
@@ -1487,8 +1571,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             let uid = sess.uid;
             match off_reactor(&ctx.core, move |c| c.history(uid, query)).await {
                 Some(Ok(page)) => {
-                    let mut chunks = Vec::with_capacity(page.lines.len() + 2);
-                    chunks.push((tag::CHANNEL_ID, 0u32.to_be_bytes().to_vec()));
+                    let mut entries = Vec::with_capacity(page.lines.len());
                     for line in page.lines {
                         let deleted = line.flags.contains(hxd_core::LineFlags::DELETED);
                         let nick = if deleted {
@@ -1518,9 +1601,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             reply_error(tx, f.trans, "Server error.");
                             return;
                         };
-                        chunks.push((tag::HISTORY_ENTRY, entry));
+                        entries.push(entry);
                     }
-                    chunks.push((tag::HISTORY_HAS_MORE, vec![u8::from(page.has_more)]));
+                    let (entries, trimmed) = fit_history_entries(entries, after.is_some());
+                    let mut chunks = Vec::with_capacity(entries.len() + 2);
+                    chunks.push((tag::CHANNEL_ID, 0u32.to_be_bytes().to_vec()));
+                    chunks.extend(entries.into_iter().map(|e| (tag::HISTORY_ENTRY, e)));
+                    let has_more = page.has_more || trimmed;
+                    chunks.push((tag::HISTORY_HAS_MORE, vec![u8::from(has_more)]));
                     reply(tx, f.trans, chunks);
                 }
                 Some(Err(e)) => {

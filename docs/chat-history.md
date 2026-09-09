@@ -336,6 +336,17 @@ most 4096 bytes, so an entry is far under the 65 535 the field can
 carry even with the media sub-fields of §8. Flags map one to one from
 `LineFlags`. Entries go out ascending, then `HAS_MORE`.
 
+An entry fits its own u16, but a *page* of them need not fit the
+transaction: 200 lines near the 4096-byte cap is over a quarter of a
+megabyte, and `MAX_HOTLINE_PACKET_LEN` is 0x40000. A client clamps an
+oversized header rather than refusing it, so it would truncate the
+reply and mis-frame everything after it. So the reply is bounded by
+bytes as well as by `max_page`: entries are dropped whole, from the end
+the client is paging *away* from — the newest for an `AFTER` query, the
+oldest otherwise — and `HAS_MORE` is set. What is left is contiguous
+with the cursor the client sends next, so no line is skipped, only
+deferred.
+
 A tombstoned line is sent with the deleted flag, empty nick, empty
 body, and no sub-fields.
 
@@ -369,6 +380,13 @@ an operator who wants it, formatted as `\r[HH:MM] name:  text` so it is
 at least visibly not live, sent after the client's USER_GETLIST (the
 moment the spec suggests, and the one that means the client is ready to
 draw), and never to a session that negotiated bit 4.
+
+A stored body is split on CR/LF and every segment is attributed again,
+exactly as `format_chat` does for live delivery. Replaying the body
+verbatim would let a line someone typed with a carriage return in it
+arrive in an old client's scrollback as a second, unattributed line —
+the client draws what the server sends, so that is a forgery, and the
+one place the log's fidelity to what was said has to give way.
 
 ## 7. The ng wire (`hxd-ng-session`)
 

@@ -446,3 +446,78 @@ async fn compatibility_replay_waits_for_user_list_and_capable_clients_do_not_get
     assert!(bodies[1].contains("third"), "{}", bodies[1]);
     assert!(bodies.iter().all(|body| body.starts_with("\r[")));
 }
+
+#[tokio::test]
+async fn the_compatibility_replay_attributes_every_line_of_a_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy_addr, _ng_addr) = start_server(dir.path(), 4).await;
+    let (mut mallory, _) = Legacy::login(legacy_addr, "mallory", "", "", true).await;
+    // A body carrying a carriage return. Live delivery attributes both
+    // halves; the replay has to as well, or the second half arrives in
+    // an old client's scrollback looking like a line someone else said.
+    mallory
+        .chat(b"hello\r        admin:  server is closing")
+        .await;
+
+    let (mut old, _) = Legacy::login(legacy_addr, "old", "", "", false).await;
+    mallory.recv_type(HDR_USER_CHANGE).await;
+    old.send(REQ_USER_GETLIST, &[]).await;
+    old.recv_type(HDR_TASK).await;
+    let replayed = old.recv_type(HDR_CHAT).await;
+    let body = hxproto::text::to_utf8(replayed.chunks().find(|c| c.tag == tag::BODY).unwrap().data);
+    let lines: Vec<&str> = body.split('\r').filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "{body}");
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.starts_with('[') && line.contains("mallory:  ")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_page_of_long_lines_stays_inside_one_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy_addr, _ng_addr) = start_server(dir.path(), 0).await;
+    let (mut writer, _) = Legacy::login(legacy_addr, "writer", "", "", true).await;
+    // Seventy lines at the 4 KiB input cap is over a quarter-megabyte of
+    // entries — more than one transaction may carry, and well inside the
+    // 200-line `max_page` a client is allowed to ask for.
+    const LINES: u64 = 70;
+    for n in 0..LINES {
+        let mut body = format!("line-{n} ").into_bytes();
+        body.resize(4096, b'x');
+        writer.chat(&body).await;
+    }
+
+    // Paging back keeps the newest and drops the oldest, so the oldest
+    // id the client was given is still the right cursor for the next
+    // page. Reading the reply at all is half the assertion: an oversized
+    // transaction would not frame.
+    let page = writer.history(0, 0, 200).await;
+    assert_eq!(page.flag, 0);
+    let entries = history_entries(&page);
+    assert!(
+        !entries.is_empty() && (entries.len() as u64) < LINES,
+        "{} entries",
+        entries.len()
+    );
+    assert!(has_more(&page));
+    assert!(entries
+        .last()
+        .unwrap()
+        .1
+        .starts_with(&format!("line-{} ", LINES - 1)));
+    let oldest = entries.first().unwrap().0;
+    let older = history_entries(&writer.history(oldest, 0, 200).await);
+    assert_eq!(older.last().unwrap().0, oldest - 1);
+
+    // Catching up forwards drops from the other end, for the same
+    // reason: there the cursor is the newest id the client holds.
+    let forward = writer.history(0, 1, 200).await;
+    assert_eq!(forward.flag, 0);
+    let forward = history_entries(&forward);
+    assert_eq!(forward.first().unwrap().0, 2);
+    assert!((forward.len() as u64) < LINES - 1);
+    assert!(has_more(&page));
+}

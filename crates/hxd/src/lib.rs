@@ -872,13 +872,14 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
     })
 }
 
-/// Open the inbox database named by `[inbox]`, if any.
+/// Open the inbox database named by `[inbox]`, if any, creating and
+/// migrating it the way startup does.
 ///
-/// Two shapes, one signature: without the `inbox` feature there is no
-/// store to build, and a config that asks for one is a startup error
-/// rather than a silently ignored promise — an operator who configured
-/// offline messages should not have to discover from a user that they
-/// never happened.
+/// Startup itself goes through [`open_runtime_stores`], which opens the
+/// one file the inbox and the chat log may share; this is what
+/// `inbox purge` needs when it is about to write. A build without the
+/// feature refuses a config that asks for a store in
+/// `open_runtime_stores`, so there is no second shape of this to keep.
 #[cfg(feature = "inbox")]
 fn open_inbox(config: &Config) -> Result<Option<Arc<dyn hxd_core::MessageStore>>, String> {
     use hxd_store_sqlite::{SqliteStore, Synchronous};
@@ -926,16 +927,6 @@ fn open_inbox(config: &Config) -> Result<Option<Arc<dyn hxd_core::MessageStore>>
         }
     }
     Ok(Some(Arc::new(store)))
-}
-
-#[cfg(not(feature = "inbox"))]
-fn open_inbox(config: &Config) -> Result<Option<Arc<dyn hxd_core::MessageStore>>, String> {
-    if config.inbox.is_some() {
-        return Err("[inbox] is configured, but this build has no inbox \
-                    (built without the `inbox` feature)"
-            .to_string());
-    }
-    Ok(None)
 }
 
 /// What an operator command finds where the inbox database should be.
@@ -988,8 +979,8 @@ pub fn inbox_purge(
     fingerprint: Option<&str>,
     dry_run: bool,
 ) -> Result<usize, String> {
-    // `open_inbox` is the startup path: it creates the database when it
-    // is missing and migrates it when it is not. Both are wrong for an
+    // `open_inbox` creates the database when it is missing and migrates
+    // it when it is not, the way startup does. Both are wrong for an
     // operator command, and `--dry-run`'s whole promise is that it
     // changes nothing — a dry run against a server one version back was
     // doing the schema upgrade the operator was still deciding about,
