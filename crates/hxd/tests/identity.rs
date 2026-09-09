@@ -3229,23 +3229,27 @@ async fn opening_a_session_takes_an_empty_body_but_not_a_broken_one() {
 
 /// The `hlid` binary. `CARGO_BIN_EXE_*` exists only for the crate that
 /// declares the binary and this is not that crate, so it is found beside
-/// this test's own executable — and built if it is missing, rather than
-/// skipped, since an unbuilt sibling is a stale target directory and not
-/// a reason to pass quietly.
+/// this test's own executable.
+///
+/// The build always runs rather than only when the file is missing.
+/// `cargo build` is a no-op the moment nothing has changed, and the
+/// alternative is worse than slow: an `hlid` left over from an earlier
+/// branch is *present*, so a missing-file check passes and the test
+/// silently exercises code that is not the code under test. This cost
+/// an afternoon before it was written down.
 fn hlid_binary() -> std::path::PathBuf {
+    let ok = std::process::Command::new(env!("CARGO"))
+        .args(["build", "-p", "hlid"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("cargo build -p hlid")
+        .success();
+    assert!(ok, "cargo build -p hlid failed");
+
     let mut dir = std::env::current_exe().expect("the test binary has a path");
     dir.pop(); // deps/
     dir.pop(); // debug/ or release/
     let bin = dir.join(if cfg!(windows) { "hlid.exe" } else { "hlid" });
-    if !bin.exists() {
-        let ok = std::process::Command::new(env!("CARGO"))
-            .args(["build", "-p", "hlid"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .status()
-            .expect("cargo build -p hlid")
-            .success();
-        assert!(ok, "cargo build -p hlid failed");
-    }
     assert!(bin.exists(), "no hlid binary at {}", bin.display());
     bin
 }
@@ -3464,10 +3468,19 @@ async fn start_holder(ng: SocketAddr, home: &Path, hlid: &Path, answer: &[u8]) -
         }
         all
     });
-    let url = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30)))
+    let url = match tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30)))
         .await
         .unwrap()
-        .expect("hlid should have printed a scan URL");
+    {
+        Ok(u) => u,
+        Err(e) => {
+            let _ = child.kill();
+            panic!(
+                "hlid printed no scan URL ({e}); it said:\n{}",
+                reader.join().unwrap()
+            )
+        }
+    };
 
     Holder {
         child,

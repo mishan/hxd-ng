@@ -805,6 +805,7 @@ mod tests {
             &req,
             caps,
             days,
+            false,
         );
         assert!(s.contains("asks for    the default"), "{s}");
         assert!(!s.contains("asks for    everything"), "{s}");
