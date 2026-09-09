@@ -893,6 +893,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_a_session_moves_the_standing_identity_at_once() {
+        // The property a rotating holder depends on. It opens the
+        // replacement before letting go of the old session and then
+        // sweeps the old one, which is only correct if opening is what
+        // moves the identity index — under this lock — so that a renewal
+        // is either already on the outgoing session or lands on the new
+        // one, and never falls between them.
+        let m = mailbox();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let a = m.open_session(addr(1), Some(id.fingerprint())).unwrap();
+        m.post_request(addr(2), None, &renewal(2, &id)).unwrap();
+        assert_eq!(
+            m.poll_session(&a.session, QUICK)
+                .await
+                .unwrap()
+                .pending
+                .len(),
+            1
+        );
+
+        // Rotate. From here the index names B, so nothing further can
+        // arrive on A.
+        let b = m.open_session(addr(1), Some(id.fingerprint())).unwrap();
+        m.post_request(addr(3), None, &renewal(3, &id)).unwrap();
+        assert_eq!(
+            m.poll_session(&b.session, QUICK)
+                .await
+                .unwrap()
+                .pending
+                .len(),
+            1,
+            "the new session collects renewals"
+        );
+        // And what was already on A is still there to be swept, rather
+        // than moved or dropped.
+        assert_eq!(
+            m.poll_session(&a.session, Duration::ZERO)
+                .await
+                .unwrap()
+                .pending
+                .len(),
+            1,
+            "the outgoing session still holds what it was given"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_wait_poll_answers_at_once() {
+        // What a rotating holder needs: it has just opened a new session
+        // and has to sweep the old one for anything that arrived while
+        // the rotation was in flight. Blocking the full deadline to find
+        // nothing would stall the session it just opened.
+        let m = mailbox();
+        let opened = m.open_session(addr(1), None).unwrap();
+        let started = Instant::now();
+        let polled = m
+            .poll_session(&opened.session, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(polled.pending.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a zero wait should not block"
+        );
+
+        // And it still returns what is there, which is the point.
+        m.post_request(addr(2), Some(&opened.code), &request(2))
+            .unwrap();
+        let polled = m
+            .poll_session(&opened.session, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(polled.pending.len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_renewal_leaves_the_code_alone() {
         // A standing session collects renewals by identity, and those do
         // not touch the code — so an agent showing one can keep showing

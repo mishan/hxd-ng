@@ -3505,9 +3505,10 @@ struct Agent {
 
 impl Agent {
     async fn next_code(&mut self) -> String {
-        // `recv` blocks, so it goes on a blocking thread; a channel that
-        // never delivers is a hung test rather than a wrong one, which
-        // the outer timeout catches.
+        // Polled rather than blocked on: `recv` would hold this thread,
+        // and the runtime has the server on it. The bounded loop is the
+        // timeout, so a code that never arrives fails here rather than
+        // hanging.
         let rx = &self.codes;
         for _ in 0..300 {
             match rx.try_recv() {
@@ -3651,6 +3652,57 @@ async fn hlid_agent_hands_out_a_fresh_code_and_renews_without_one() {
         output.contains("--renew auto"),
         "the renewal should say it was not asked about:\n{output}"
     );
+}
+
+#[tokio::test]
+async fn a_renewal_posted_during_a_rotation_is_still_answered() {
+    // A renewal posted the instant an enrollment completes, while the
+    // agent is rotating to a fresh code.
+    //
+    // Honest about what this does and does not prove: it exercises the
+    // rotation path end to end, but it cannot *force* the window the
+    // ordering fix exists for — on loopback the agent has usually opened
+    // the replacement before this test can post, so it passes with the
+    // fix reverted too. What pins the ordering is
+    // `opening_a_session_moves_the_standing_identity_at_once` in
+    // hxd-ng-session, which tests the property the fix rests on.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let mut agent = start_agent(ng, &home, &hlid, &["--renew", "auto"]);
+    let first_code = agent.next_code().await;
+
+    // Enroll, which spends the code and starts the rotation.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+    let req = hl_identity::EnrollRequest::new(&browser, now());
+    let answer = enroll_through(ng, Some(&first_code), &req.sign(&browser)).await;
+    assert_eq!(answer.status, 200);
+    let bundle =
+        hl_identity::Bundle::parse(&unb64(answer.json()["bundle"].as_str().unwrap())).unwrap();
+
+    // Post the renewal immediately, without waiting to see the new code:
+    // this is the window, and whichever session it lands on the agent
+    // has to answer it.
+    let mut renewal = hl_identity::EnrollRequest::new(&browser, now());
+    renewal.prev = Some(bundle.cert.clone());
+    let renewed = enroll_through(ng, None, &renewal.sign(&browser)).await;
+    assert_eq!(
+        renewed.status, 200,
+        "a renewal posted during the rotation was stranded"
+    );
+
+    let _ = agent.child.kill();
+    let _ = agent.reader.join();
+    let _ = agent.child.wait();
 }
 
 #[tokio::test]

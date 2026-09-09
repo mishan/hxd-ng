@@ -221,6 +221,12 @@ or with an empty list at the deadline. Response:
 }
 ```
 
+`?wait=N` seconds shortens the long poll, clamped to the deadline;
+absent is the full deadline. It exists for one job: a holder rotating to
+a new session has to sweep the old one for anything that arrived while
+the rotation was in flight, and blocking thirty seconds to find nothing
+would stall the session it just opened.
+
 `code_live` says whether this session's code still admits a request. It
 is not in the original sketch of this response and it needs to be: a code
 is single-use, so a holder that stays open (`hlid agent`) would otherwise

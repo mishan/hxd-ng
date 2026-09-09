@@ -820,7 +820,7 @@ async fn enroll_route(req: Request<Incoming>, client: SocketAddr, ctx: &NgCtx) -
     let resp = match (&method, rest.as_slice()) {
         (&Method::POST, ["sessions"]) => enroll_open(req, client, ctx, mb).await,
         (&Method::POST, ["requests"]) => enroll_post(req, client, ctx, mb).await,
-        (&Method::GET, ["sessions", secret]) => enroll_poll(secret, mb).await,
+        (&Method::GET, ["sessions", secret]) => enroll_poll(secret, req.uri().query(), mb).await,
         (&Method::POST, ["sessions", secret, "answers"]) => {
             enroll_answer(req, secret, ctx, mb).await
         }
@@ -828,6 +828,29 @@ async fn enroll_route(req: Request<Incoming>, client: SocketAddr, ctx: &NgCtx) -
         _ => plain(StatusCode::NOT_FOUND, "not found"),
     };
     cors(resp)
+}
+
+/// `?wait=N` seconds, clamped to the long-poll deadline. Absent is the
+/// full deadline, which is what an ordinary holder wants.
+///
+/// `wait=0` exists for one job: a holder rotating to a new session has
+/// to sweep the old one for anything that arrived while the rotation was
+/// in flight, and blocking thirty seconds to find nothing would stall
+/// the session it just opened. Nothing here is weakened by asking for a
+/// shorter wait — it is the same answer, sooner.
+fn poll_wait(query: Option<&str>) -> Duration {
+    let secs = query
+        .and_then(|q| {
+            q.split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == "wait")
+                .and_then(|(_, v)| v.parse::<u64>().ok())
+        })
+        .map(Duration::from_secs);
+    match secs {
+        Some(d) if d <= crate::enroll::LONG_POLL => d,
+        _ => crate::enroll::LONG_POLL,
+    }
 }
 
 fn enroll_refused(e: crate::enroll::Refused) -> Resp {
@@ -900,8 +923,8 @@ async fn enroll_post(
 }
 
 /// §5.3, long-polled.
-async fn enroll_poll(secret: &str, mb: &crate::enroll::Mailbox) -> Resp {
-    match mb.poll_session(secret, crate::enroll::LONG_POLL).await {
+async fn enroll_poll(secret: &str, query: Option<&str>, mb: &crate::enroll::Mailbox) -> Resp {
+    match mb.poll_session(secret, poll_wait(query)).await {
         Ok(p) => json_resp(
             StatusCode::OK,
             json!({
@@ -911,7 +934,7 @@ async fn enroll_poll(secret: &str, mb: &crate::enroll::Mailbox) -> Resp {
                     "received": r.received,
                 })).collect::<Vec<_>>(),
                 "expires_in": p.expires_in,
-                // Absent once the code has admitted its one request, so
+                // False once the code has admitted its one request, so
                 // a standing holder knows to open a new session rather
                 // than keep showing a code that no longer works.
                 "code_live": p.code_live,

@@ -493,11 +493,12 @@ impl Holder<'_> {
 
     /// One long poll. `None` means the session is gone — expired, or
     /// swept — and the caller decides whether to open another.
-    fn poll_once(&self, s: &Session) -> R<Option<Value>> {
-        let res = self
-            .poll
-            .get(&format!("{}/sessions/{}", self.mailbox(), s.secret))
-            .call();
+    fn poll_once(&self, s: &Session, wait: Option<u64>) -> R<Option<Value>> {
+        let url = match wait {
+            Some(w) => format!("{}/sessions/{}?wait={w}", self.mailbox(), s.secret),
+            None => format!("{}/sessions/{}", self.mailbox(), s.secret),
+        };
+        let res = self.poll.get(&url).call();
         match res {
             Ok(r) => Ok(Some(
                 r.into_json()
@@ -641,7 +642,7 @@ fn run(holder: &Holder, budget: Option<usize>, ui: &mut dyn Prompt) -> R<()> {
 
     let mut handled = 0usize;
     loop {
-        let Some(answer) = holder.poll_once(&session)? else {
+        let Some(answer) = holder.poll_once(&session, None)? else {
             if budget.is_some() {
                 return Err("the session expired before a device asked".into());
             }
@@ -650,28 +651,8 @@ fn run(holder: &Holder, budget: Option<usize>, ui: &mut dyn Prompt) -> R<()> {
             continue;
         };
 
-        for pending in answer["pending"].as_array().cloned().unwrap_or_default() {
-            // No id, no answer: everything after this identifies the
-            // request being certified or refused, and an empty name
-            // would mean answering something the mailbox never
-            // described.
-            let id_of_request = pending["id"].as_str().unwrap_or_default().to_owned();
-            if id_of_request.is_empty() {
-                return Err("the mailbox delivered a request with no id".into());
-            }
-            let raw = unb64(pending["request"].as_str().unwrap_or(""))?;
-            match holder.handle(&session, &id_of_request, &raw, ui) {
-                Ok(()) => {}
-                // One bad request is not a reason to stop holding the
-                // key: an agent that exits on the first stranger is an
-                // agent a stranger can turn off.
-                Err(why) if budget.is_none() => ui.tell(&format!("Refused: {why}")),
-                Err(why) => return Err(why),
-            }
-            handled += 1;
-            if budget.is_some_and(|b| handled >= b) {
-                return Ok(());
-            }
+        if take(holder, &session, &answer, budget, &mut handled, ui)? {
+            return Ok(());
         }
 
         // A code is single-use, so once it has admitted its request this
@@ -679,10 +660,59 @@ fn run(holder: &Holder, budget: Option<usize>, ui: &mut dyn Prompt) -> R<()> {
         // anything. Rather than go on displaying a code that does not
         // work, open another.
         if answer["code_live"] == json!(false) {
-            session = holder.open(standing)?;
+            // Open the replacement *before* letting go of this session.
+            // Opening is what moves the mailbox's identity index to the
+            // new session, and it does that under the mailbox's own
+            // lock — so once it returns, every renewal either already
+            // landed here (and the sweep below finds it) or lands there.
+            // Reopening first and sweeping after is the whole fix:
+            // doing it the other way round leaves a window in which a
+            // renewal arrives on a session nobody will poll again, and
+            // it sits until it expires.
+            let previous = std::mem::replace(&mut session, holder.open(standing)?);
             holder.show(&session, ui);
+            if let Some(last) = holder.poll_once(&previous, Some(0))? {
+                if take(holder, &previous, &last, budget, &mut handled, ui)? {
+                    return Ok(());
+                }
+            }
         }
     }
+}
+
+/// Handle every request in one poll's answer. `true` means the budget is
+/// spent and the caller should stop.
+fn take(
+    holder: &Holder,
+    session: &Session,
+    answer: &Value,
+    budget: Option<usize>,
+    handled: &mut usize,
+    ui: &mut dyn Prompt,
+) -> R<bool> {
+    for pending in answer["pending"].as_array().cloned().unwrap_or_default() {
+        // No id, no answer: everything after this identifies the request
+        // being certified or refused, and an empty name would mean
+        // answering something the mailbox never described.
+        let id_of_request = pending["id"].as_str().unwrap_or_default().to_owned();
+        if id_of_request.is_empty() {
+            return Err("the mailbox delivered a request with no id".into());
+        }
+        let raw = unb64(pending["request"].as_str().unwrap_or(""))?;
+        match holder.handle(session, &id_of_request, &raw, ui) {
+            Ok(()) => {}
+            // One bad request is not a reason to stop holding the key:
+            // an agent that exits on the first stranger is an agent a
+            // stranger can turn off.
+            Err(why) if budget.is_none() => ui.tell(&format!("Refused: {why}")),
+            Err(why) => return Err(why),
+        }
+        *handled += 1;
+        if budget.is_some_and(|b| *handled >= b) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// §6's prompt. Everything that matters and nothing else: what is
