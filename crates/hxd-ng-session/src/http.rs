@@ -141,7 +141,15 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         }
         _ => plain(StatusCode::NOT_FOUND, "not found"),
     };
-    cors(resp)
+    // Only the routes a page fetches, rather than everything that
+    // reaches here. A 404 for `/ng` is about a WebSocket path, and
+    // labelling it cross-origin-readable says something this layer does
+    // not mean — as would doing the same for whatever non-CORS route is
+    // added to this table next.
+    if cors_route(&path) {
+        return cors(resp);
+    }
+    resp
 }
 
 /// The routes a page fetches. An upgrade is not subject to CORS and has

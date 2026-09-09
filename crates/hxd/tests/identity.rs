@@ -2630,13 +2630,22 @@ async fn the_identity_routes_answer_cors_so_a_page_elsewhere_can_read_them() {
 
     // The upgrade paths are not part of this: CORS does not govern a
     // WebSocket, and answering preflight there would only be confusing.
-    let ws = http(
-        ng,
-        "OPTIONS",
-        "/ng",
-        &[("Origin", "https://elsewhere.example")],
-        b"",
-    )
-    .await;
-    assert_eq!(ws.status, 404);
+    // Nor does their 404 carry the headers — saying a WebSocket path is
+    // cross-origin-readable means nothing this layer intends.
+    for path in ["/ng", "/nothing-here"] {
+        let other = http(
+            ng,
+            "OPTIONS",
+            path,
+            &[("Origin", "https://elsewhere.example")],
+            b"",
+        )
+        .await;
+        assert_eq!(other.status, 404, "{path}");
+        assert_eq!(
+            other.header("access-control-allow-origin"),
+            None,
+            "{path} should not be labelled cross-origin-readable"
+        );
+    }
 }
