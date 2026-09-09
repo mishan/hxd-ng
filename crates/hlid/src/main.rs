@@ -9,17 +9,17 @@
 //! hlid keygen  identity|device|server PATH    make a key (32-byte seed, hex, mode 0600)
 //! hlid cert    [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX)
 //!              [--days N] [--caps all|web|LIST] [--name S] -o FILE
-//! hlid card    --identity K --name S [--icon N] [--profile S] [--link URL]...
+//! hlid card    [--identity K] --name S [--icon N] [--profile S] [--link URL]...
 //!              [--attestation FILE]... [--successor HEX|--successor-key FILE] -o FILE
 //! hlid attest  --registrar-key K --registrar HOST --identity K|--identity-pub HEX --handle S
 //!              [--registered UNIX] [--days N] [--level N] -o FILE
 //! hlid inspect FILE                           print any signed object
-//! hlid auth    --server URL --device K --card FILE --cert FILE [--login L]
+//! hlid auth    --server URL [--device K] [--card FILE] [--cert FILE] [--login L]
 //!              [--password P | --password-file F | --password-stdin] [--no-create]
 //!              challenge binding → token; with credentials, links the account (§8.2)
-//! hlid link    --server URL --device K --card FILE --cert FILE --login L --password P
-//! hlid unlink  --server URL --device K --card FILE --cert FILE
-//! hlid tunnel  --server URL --device K --card FILE --cert FILE [--listen ADDR]
+//! hlid link    --server URL [--device K] [--card FILE] [--cert FILE] --login L --password P
+//! hlid unlink  --server URL [--device K] [--card FILE] [--cert FILE]
+//! hlid tunnel  --server URL [--device K] [--card FILE] [--cert FILE] [--listen ADDR]
 //!              [--allow-remote-listen] [--create]
 //!              local TCP port for a classic client, TRTP over WebSocket upstream
 //! ```
@@ -212,14 +212,25 @@ impl Args {
             return Some(PathBuf::from(p));
         }
         let p = hlid_home().ok()?.join(name);
-        p.exists().then_some(p)
+        // `is_file`, not `exists`: a directory of that name would be
+        // taken as the default and then fail on read with "Is a
+        // directory", which is exactly the unhelpful error the fallback
+        // exists to avoid.
+        p.is_file().then_some(p)
     }
 
     fn file(&self, flag: &str, name: &str) -> R<PathBuf> {
-        self.file_opt(flag, name).ok_or_else(|| {
-            let home = hlid_home().map_or_else(|e| e, |h| h.display().to_string());
-            format!("--{flag} is required, and there is no {name} in {home} to fall back to (`hlid init` writes one)")
-        })
+        if let Some(p) = self.file_opt(flag, name) {
+            return Ok(p);
+        }
+        // Two different failures, and splicing one into the other's
+        // sentence made nonsense of both: with no home directory there
+        // is no "{name} in {home}" to talk about, so say that instead.
+        let home = hlid_home()?;
+        Err(format!(
+            "--{flag} is required, and there is no {name} in {} to fall back to (`hlid init` writes one)",
+            home.display()
+        ))
     }
 
     fn u64(&self, k: &str, default: u64) -> R<u64> {

@@ -119,6 +119,34 @@ fn a_missing_default_names_both_the_flag_and_the_file_it_looked_for() {
     assert!(err.contains("--identity"), "{err}");
     assert!(err.contains("identity.key"), "{err}");
     assert!(err.contains("hlid init"), "{err}");
+
+    // A *directory* where the key should be is not a key to fall back
+    // to. Taking it would swap this message for "Is a directory" from
+    // the read, one layer further from the cause.
+    std::fs::create_dir(dir.path().join("identity.key")).unwrap();
+    let err = fails(dir.path(), &["card", "--name", "alice", "-o", "/dev/null"]);
+    assert!(err.contains("--identity"), "{err}");
+    assert!(!err.contains("Is a directory"), "{err}");
+}
+
+#[test]
+fn with_no_home_at_all_the_error_is_about_the_home_and_not_the_file() {
+    // Neither $HLID_HOME nor $HOME. There is no directory to name, so a
+    // message shaped "there is no identity.key in <the reason there is
+    // no directory>" is nonsense; it should say the one true thing.
+    let out = Command::new(env!("CARGO_BIN_EXE_hlid"))
+        .env_remove("HLID_HOME")
+        .env_remove("HOME")
+        .args(["card", "--name", "alice", "-o", "/dev/null"])
+        .output()
+        .expect("hlid did not start");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("HLID_HOME"), "{err}");
+    assert!(
+        !err.contains("there is no identity.key in neither"),
+        "one error spliced into another: {err}"
+    );
 }
 
 #[test]
