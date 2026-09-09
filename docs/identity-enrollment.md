@@ -201,13 +201,22 @@ can be the writer — a holder that restarts its agent takes its own
 renewals back rather than being shut out by the session it abandoned.
 
 **Giving a session back.** `DELETE <enroll>/sessions/<session>` answers
-204 and drops it, along with its code and its standing identity. Only
-the session secret can do this. It exists because a holder that rotates
-— `hlid agent` opens a replacement the moment its code is spent —
-otherwise leaves each abandoned session in the table for the full ten
-minutes, where it goes on counting against `enroll_per_address`. Four
-rotations inside the TTL and the holder is rate-limited out of its own
-mailbox.
+204. Only the session secret can do this. It exists because a holder
+that rotates — `hlid agent` opens a replacement the moment its code is
+spent — otherwise leaves each abandoned session in the table for the
+full ten minutes, where it goes on counting against
+`enroll_per_address`. Four rotations inside the TTL and the holder is
+rate-limited out of its own mailbox.
+
+A closed session stops routing and stops counting: its code and its
+standing identity go, it cannot be polled or answered on, and a request
+can no longer reach it. What it keeps is any answer it has already made
+and the enrollee has not yet collected. The holder is finished the
+moment it has answered; the enrollee is still parked on the §5.5 long
+poll, and a rotating holder closes within milliseconds of answering, so
+discarding those would tell a browser its request expired seconds after
+a human approved it. The session goes when the last of them is fetched,
+or at its deadline, whichever comes first.
 
 ### 5.2 The enrollee posts a request
 

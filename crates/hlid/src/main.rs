@@ -12,7 +12,7 @@
 //!              the same, without a budget, plus renewals with no code
 //! hlid keygen  identity|device|server PATH    make a key (32-byte seed, hex, mode 0600)
 //! hlid cert    [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX)
-//!              [--days N] [--caps all|web|LIST] [--name S] [--bundle] -o FILE
+//!              [--days N] [--issued UNIX] [--caps all|web|LIST] [--name S] [--bundle] -o FILE
 //! hlid card    [--identity K] --name S [--icon N] [--profile S] [--link URL]...
 //!              [--attestation FILE]... [--successor HEX|--successor-key FILE] -o FILE
 //! hlid attest  --registrar-key K --registrar HOST --identity K|--identity-pub HEX --handle S
@@ -93,7 +93,7 @@ fn usage() -> ! {
         "  hlid enroll --server URL [--caps web|LIST] [--days N] [--identity K] [--card FILE] [--web URL] [--show-url]\n",
         "  hlid agent  --server URL [--caps web|LIST] [--days N] [--renew ask|auto|deny] [--web URL] [--show-url]\n",
         "  hlid keygen identity|device|server PATH\n",
-        "  hlid cert [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] [--bundle [--card FILE]] -o FILE\n",
+        "  hlid cert [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--issued UNIX] [--caps all|web|LIST] [--name S] [--bundle [--card FILE]] -o FILE\n",
         "  hlid card [--identity K] --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n",
         "       [--successor HEX | --successor-key FILE] -o FILE\n",
         "  hlid attest --registrar-key K --registrar HOST (--identity K | --identity-pub HEX) --handle S [--registered UNIX] [--days N] [--level N] -o FILE\n",
@@ -580,7 +580,13 @@ fn make_cert(args: &[String]) -> R<()> {
             (dev.public(), dev.public_enc())
         };
     let days = a.u64("days", cert::RECOMMENDED_LIFETIME / 86_400)?;
-    let mut c = DeviceCert::for_keys(&id, device, device_enc, now(), seconds(days)?)
+    // `--issued` reissues with a specific `issued`, the way `attest`
+    // takes `--registered`: for replacing a certificate whose window
+    // should line up with the one it succeeds rather than with the
+    // moment the command was run. Defaults to now, which is what
+    // reissuing usually means.
+    let issued = a.u64("issued", now())?;
+    let mut c = DeviceCert::for_keys(&id, device, device_enc, issued, seconds(days)?)
         .map_err(|e| format!("--days: {e}"))?;
     c.caps = parse_caps(a.opt("caps"))?;
     c.name = a.opt("name").map(str::to_owned);
