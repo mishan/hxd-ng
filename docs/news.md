@@ -68,6 +68,13 @@ locks the legacy wire out.
   has FTS5 compiled in, so a full-text index is a table and a query
   compiler, not a dependency. The query grammar is ours and closed — a
   malformed search returns results, never an error.
+- **"The news changed" and "someone answered you" are different
+  signals.** The first is what `NEWSFILE_POST` has always been — cache
+  invalidation, sent to everyone reading, so an open pane does not rot —
+  and the ng wire carries it forward as `news_posted` for clients
+  holding a view. The second is targeted, has a rule about when it may
+  ring, and is `news_notify`. Conflating them gives every reader a badge
+  that means nothing.
 - **Notifications need a subscription and a cursor, not a queue.** A
   push for a private message must be backed by the inbox, because the
   message lives nowhere else; a news article already lives in the thread
@@ -1021,11 +1028,20 @@ where they are: a tombstone in the middle of a thread is what keeps the
 conversation legible, and dropping it would reparent four replies onto
 nothing.
 
-### 9.3 Events
+### 9.3 Events: your copy is stale
 
-News is not chat, and most clients are not looking at it. Events are
-therefore small — a header, never a body — and a client that cares
-fetches.
+These events exist for one reason, and it is a 1.2-era reason.
+
+Flat news was a file. A client read it once and held it, and the only
+thing standing between a user and a stale copy was the server saying
+"it changed" — which is precisely what `HTLS_HDR_NEWSFILE_POST`
+(§12.5) is for. It is not a notification and never was. It is cache
+invalidation, sent to everyone reading, so a pane that is already open
+does not quietly rot.
+
+**The ng events are that signal, carried forward.** A client with a
+category list or a thread on screen has the same staleness problem a
+1996 client had, and solves it the same way.
 
 | `ev` | data |
 |---|---|
@@ -1040,11 +1056,21 @@ they buffer like anything else. A client with no interest in news
 ignores them by hotline-ng.md §5's rule and its seq accounting stays
 gapless.
 
-`news_posted` is what makes a badge possible, and it is deliberately
-not a push notification: push is for messages addressed to you
-(push-notifications.md §11), and a busy category would be a buzz a
-minute — which is what §10 is for: a targeted notification is a
-different event with a different audience.
+They carry a header rather than a bare "something changed" because the
+cheap refresh is usually no refetch at all: a client showing the
+category can splice one row in and a client showing something else can
+drop it. That is an optimization on invalidation, not a promise that
+the event is worth showing anyone.
+
+**None of this is the notification path.** `news_posted` fires for every
+post on the server that you may read, which is a buzz a minute on a busy
+category and a badge that means nothing. What is addressed to *you* —
+a reply to your article, a reference to it, a thread you follow — is
+§10's `news_notify`, a different event with a different audience and a
+rule about when it is allowed to ring. A client that treats
+`news_posted` as a notification has rebuilt the thing §10 exists to
+avoid; a client that ignores `news_posted` entirely and refetches on
+`news_notify` is merely doing more work than it needs to.
 
 ### 9.4 Attachment bytes over HTTP
 
@@ -1224,6 +1250,17 @@ and an article has exactly one author with exactly one mailbox. None of
 the ambiguity applies, so the thing that was blocked for chat is
 already decided here. That is worth saying upstream (§18).
 
+**Whether it should notify is `[news.notify] reference`, default on.**
+There is a real argument for off: citing someone's old article to make a
+point *about* it is not obviously an invitation to them, and a forum
+where quoting always summons the quoted is a forum where people quote
+less. What decides the default the other way is that a reference is
+deliberate — you typed `#51`, or picked the article out of a list — and
+that is much closer to an `@` than to a footnote. The catch-up rule
+(§10.7) bounds the cost of being wrong: someone cited in forty articles
+is rung once. An operator who disagrees flips one key, and the
+subscription and reply paths are untouched by it.
+
 ### 10.6 Delivery: an event when attentive, a push when not
 
 The rule is the inbox's, unchanged: a session that is attached is
@@ -1247,12 +1284,14 @@ Attached ng sessions get a **targeted** event:
 ```
 
 **This is not `news_posted`, and the difference is the audience.**
-`news_posted` (§9.3) is a broadcast to everyone holding `READ_NEWS`,
-carrying a header so a client can update a list it happens to be
-showing. `news_notify` goes only to the accounts §10.5 selected, and it
-means *this one is yours*. A client raises a badge on the second and not
-the first. Merging them would put per-recipient content in a broadcast,
-which is the shape fan-out is built to avoid.
+`news_posted` (§9.3) is cache invalidation inherited from
+`NEWSFILE_POST` — a broadcast to everyone holding `READ_NEWS`, saying
+that a view they may be holding is stale. `news_notify` goes only to the
+accounts §10.5 selected, and it means *this one is yours*. A client
+raises a badge on the second and never on the first. Merging them would
+put per-recipient content in a broadcast, which is the shape fan-out is
+built to avoid — and would hand every reader of a busy category a badge
+that means nothing.
 
 ### 10.7 Coalescing: the catch-up rule
 
@@ -1362,23 +1401,53 @@ contract — **`notify` must not block** — and the subscriber id is
 push-notifications.md §5's `hx-<hex>` mapping, unchanged. Nothing about
 news makes the gateway a different shape; it makes it a wider one.
 
-### 10.11 The legacy wire
+### 10.11 The legacy wire is not notified, yet
 
-There is no push transaction on the legacy wire and there is nothing to
-borrow, so a 1.5 client is not notified. Two things soften that:
+There is no push transaction on the legacy wire and nothing to borrow,
+so **v1 does not notify legacy-wire accounts at all.** Subscriptions
+still accrue — a 1.5 client posting an article is auto-subscribed like
+anyone else — and they are waiting for the session that reads them,
+which may well be the same person's phone.
 
-- **The 1.2 flat category already has one.** `NEWSFILE_POST` (§12.5)
-  fires for every post into the flat category, from any wire. It is
-  untargeted — everyone reading flat news gets it — but for the one
-  category a 1.2 client can see, the loop is closed by the period
-  protocol itself.
-- `[news.notify] legacy = "off" | "message"`. Set to `"message"`, a
-  notification for a legacy-wire account becomes a private message from
-  the server, the way moderation.md delivers reports. **Default off**,
-  and the reason is not squeamishness: a legacy client has no request
-  that can unsubscribe, and `auto_subscribe` means posting once opts you
-  in. Turning it on for a busy server mails everybody with no way for
-  them to stop it except asking the operator.
+One thing is already true, and it is the part that matters most: **the
+1.2 flat category closes its own loop.** `NEWSFILE_POST` (§12.5) fires
+for every post into it, from any wire, and a 1.2 client refreshes. It is
+untargeted and it is not a notification, but for the one category that
+client can see, the period protocol solves the staleness problem it
+actually has.
+
+**The shape when we do build it**, so the decision is deferred rather
+than unmade: a notification becomes a private message from a **system
+mailbox**, and that mailbox can be replied to with `stop`.
+
+The unsubscribe is the whole reason this is not in v1. `auto_subscribe`
+means posting once opts you in, and nothing on the legacy wire can
+express `news_unsubscribe`, so shipping the delivery without the
+unsubscribe would mail everybody on a busy server with no way out but
+asking the operator. Replying `stop` is not pretty — it is a 1980s
+mailing-list convention wearing a Hotline private message — but it works
+on an unmodified 1.2 client, which no capability transaction does.
+
+What it needs that does not exist yet:
+
+- **A real mailbox for the server.** `Notification.from` is
+  `Option<&Mailbox>` and is `None` when there is nobody to reply to,
+  which is exactly today's state: moderation.md's server messages go out
+  and nothing comes back. A repliable system identity is a reserved
+  account with a mailbox of its own, and reserving it is a decision
+  about the account namespace, not about news.
+- **A parser for the reply**, with the same forgiving posture as
+  §12.5's header block: `stop` on a line by itself, case insensitive,
+  and anything else answered with a short message saying what the word
+  is. Scoped by which notification is being replied to, so `stop` means
+  this thread rather than everything.
+- **A digest, probably.** One private message per reply is too many even
+  under the catch-up rule, because a legacy client has no badge to
+  quiet — every notification is an interruption. The catch-up rule needs
+  a companion here, and the honest version is a periodic digest rather
+  than a live message.
+
+That last point is the reason this is a feature and not a switch.
 
 ### 10.12 Abuse, briefly
 
@@ -1735,9 +1804,9 @@ flat_default_subject = "(no subject)"
 
 [news.notify]                   # absent = no subscriptions, no notifications
 auto_subscribe = "participated" # or "own_thread", or "off"
+reference = true                # does citing someone's article notify them
 max_subs = 200                  # subscribed scopes per account
 max_per_hour = 12               # news pushes per account, all scopes
-legacy = "off"                  # or "message": a server PM to a legacy account
 
 [news.attach]                   # absent = news without attachments
 max_bytes = 2097152             # per attachment, as uploaded
@@ -1824,7 +1893,12 @@ builds.
   catch-up rule: a second post in an unread scope ringing nothing while
   still advancing unread, `news_seen` re-arming it, two scopes staying
   independent, and `max_per_hour` dropping the push without touching the
-  event or the count.
+  event or the count. And the audiences, which are the thing most likely
+  to be wired together by accident: one post producing `news_posted` for
+  every `READ_NEWS` session and `news_notify` for only the selected
+  mailboxes, with a session that is both getting one of each.
+- **`reference = false`** suppressing the reference reason and leaving
+  reply and subscription notifications untouched.
 - **Flat-news tests**, which are mostly a parser and a renderer and
   belong with them: a header block consumed and stripped; `subject:` in
   lower case; an unrecognized first header leaving the body whole; a
@@ -1877,11 +1951,13 @@ Each lands separately with tests, roughly a branch apiece.
    the login block, `POST /news/blob` and `GET /news/blob/{id}`, config
    and wiring.
 7. **W7 — subscriptions and notifications.** `news_sub`, the audience
-   computation of §10.5, the catch-up rule, the five requests, the
+   computation of §10.5, the catch-up rule, the requests of §10.9, the
    `news_notify` event, the `Notification` enum and the `NewsNotice`
    payload. The gateway itself is push-notifications.md's work; this
    step ends at the trait, and everything in it is testable with no
-   gateway configured.
+   gateway configured. Notifying legacy-wire accounts (§10.11) is
+   explicitly *not* in it — that wants a system mailbox, a reply parser
+   and a digest, and it is a feature of its own.
 8. **W8 — moderation and retention.** The audit kind, the report
    target, the purge arm, index and reference cleanup on tombstone, the
    sweeper's jobs, the CLI surface.
@@ -1946,20 +2022,12 @@ unlinked and its hash remembered.
   a client should be creating those rows by browsing is a different
   question from whether it should by subscribing, and the answer decides
   how big `news_sub` gets on a busy server.
-- **Notifying a legacy 1.5 user** has no wire to use, and §10.11's
-  `legacy = "message"` is a workaround with a real flaw: nothing on that
-  wire can unsubscribe. Either a capability transaction (which nobody
-  has specified) or a convention — a reply to the server's notification
-  message meaning "stop" — would fix it. The second is ugly and would
-  work today.
-- **Whether a reference should notify at all.** §10.5 says yes and
-  argues that news escapes the mention problem because a reference names
-  an article rather than a nick. The counter-argument is social rather
-  than technical: citing someone's old post to make a point about it is
-  not obviously an invitation to them, and a forum where quoting someone
-  always summons them is a forum where people quote less. A
-  `[news.notify] reference = true|false` knob would settle it per
-  server, and the default is the question.
+- **A system mailbox that can be replied to.** §10.11 needs one and so
+  does moderation.md, whose server messages go out today with nothing
+  coming back. Reserving an account name for the server is a decision
+  about the account namespace rather than about news, and it is the
+  first thing standing between legacy-wire notifications and being
+  built.
 - **Non-image attachments.** PDFs and archives are what people actually
   attach to a forum post, and the 1.5 part encoding was built for
   arbitrary MIME types. Serving them means serving bytes we cannot

@@ -296,6 +296,12 @@ with per-part MIME types since it was written. The design:
   their own rather than inline media's 24-hour handles: a chat image is a
   moment, a news article is a record. Legacy clients fetch a re-encoded
   derivative because the wire's per-part size is a u16.
+- **"The news changed" and "someone answered you" are different
+  signals**, and the design keeps them apart. The first is what
+  `NEWSFILE_POST` has always been — cache invalidation broadcast to
+  everyone reading, so a 1.2 client's open pane does not hold a stale
+  copy — and the ng wire carries it forward for clients holding a view.
+  The second is targeted and has a rule about when it may ring.
 - **Subscriptions and push notifications close the loop.** A reply to
   your article, a reference to it, or a post in a thread you follow
   reaches you when you are not there — which is the thing that makes a
@@ -308,7 +314,11 @@ with per-part MIME types since it was written. The design:
   with no timer, no digest window and nothing to sweep. It also answers,
   by construction, the question of what a mention is: a reference names
   an article and an article has exactly one author, so none of the
-  nicks-are-not-unique difficulty applies.
+  nicks-are-not-unique difficulty applies — on by default, behind a knob
+  for operators who think citing someone should not summon them.
+  Notifying legacy-wire accounts is deliberately left for later: it
+  needs a repliable system mailbox and a digest, because nothing on that
+  wire can unsubscribe.
 - **1.2 flat news is a rendering of one category**, not a second store.
   The operator names the category a 1.2 client reads and posts into; a
   post from that wire becomes a reply in it, with its subject and parent
