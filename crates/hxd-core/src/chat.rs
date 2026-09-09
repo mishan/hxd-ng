@@ -144,6 +144,11 @@ fn store_failed(e: StoreError) -> ChatError {
     ChatError::ServerError
 }
 
+fn history_store_failed(e: StoreError) -> ChatError {
+    warn!("history: {e}");
+    ChatError::ServerError
+}
+
 /// A private chat room. (`cid` 0 — the public chat — is represented by the
 /// roster itself, not an entry here.)
 #[derive(Default)]
@@ -240,7 +245,7 @@ impl Core {
                     },
                     at,
                 })
-                .map_err(store_failed)?,
+                .map_err(history_store_failed)?,
             ),
             None => None,
         };
@@ -300,7 +305,7 @@ impl Core {
             .as_ref()
             .ok_or(ChatError::ServerError)?
             .query(&query)
-            .map_err(store_failed)
+            .map_err(history_store_failed)
     }
 
     /// Ten history pages per second, scoped to the logical user session.

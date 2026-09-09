@@ -215,6 +215,10 @@ struct Ng {
 
 impl Ng {
     async fn login(addr: SocketAddr) -> (Self, Value) {
+        Self::login_as(addr, "bob", "pw", "Bob").await
+    }
+
+    async fn login_as(addr: SocketAddr, login: &str, password: &str, nick: &str) -> (Self, Value) {
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
@@ -226,7 +230,7 @@ impl Ng {
         let reply = client
             .request(
                 "login",
-                json!({ "login": "bob", "password": "pw", "nick": "Bob" }),
+                json!({ "login": login, "password": password, "nick": nick }),
             )
             .await;
         assert!(reply.get("ok").is_some(), "{reply}");
@@ -347,12 +351,33 @@ async fn both_wires_page_the_same_public_log() {
     );
     assert!(!has_more(&catchup));
 
+    let bounded = legacy.history(6, 2, 2).await;
+    assert_eq!(
+        history_entries(&bounded),
+        [(3, "three".into()), (4, "four".into())]
+    );
+    assert!(has_more(&bounded));
+
     let reply = ng.request("history", json!({ "after": 3 })).await;
     assert_eq!(reply["ok"]["lines"][0]["id"], 4);
     assert_eq!(reply["ok"]["lines"][0]["text"], "four");
     assert!(reply["ok"]["lines"][0]["from"].get("uid").is_none());
     assert_eq!(reply["ok"]["lines"][1]["id"], 5);
     assert_eq!(reply["ok"]["has_more"], false);
+
+    let bounded = ng
+        .request("history", json!({ "after": 2, "before": 6, "limit": 3 }))
+        .await;
+    assert_eq!(
+        bounded["ok"]["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line["id"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [3, 4, 5]
+    );
+    assert_eq!(bounded["ok"]["has_more"], false);
 }
 
 #[tokio::test]
@@ -386,10 +411,9 @@ async fn negotiation_access_channel_and_encoding_are_enforced() {
     let (mut denied, _) = Legacy::login(legacy_addr, "denied", "nohistory", "pw", true).await;
     let reply = denied.history(0, 0, 10).await;
     assert_ne!(reply.flag, 0);
-    let denied_ng = ng
-        .request("history", json!({ "before": 2, "after": 1 }))
-        .await;
-    assert_eq!(denied_ng["error"]["code"], "bad_request");
+    let (mut denied_ng, _) = Ng::login_as(ng_addr, "nohistory", "pw", "Denied").await;
+    let reply = denied_ng.request("history", json!({})).await;
+    assert_eq!(reply["error"]["code"], "access_denied");
 }
 
 #[tokio::test]
@@ -400,6 +424,14 @@ async fn compatibility_replay_waits_for_user_list_and_capable_clients_do_not_get
     for line in [b"first".as_slice(), b"second", b"third"] {
         writer.chat(line).await;
     }
+    writer.send(REQ_USER_GETLIST, &[]).await;
+    writer.recv_type(HDR_TASK).await;
+    assert!(
+        timeout(Duration::from_millis(200), read_frame(&mut writer.stream))
+            .await
+            .is_err(),
+        "history-capable client received compatibility replay"
+    );
 
     let (mut old, _) = Legacy::login(legacy_addr, "old", "", "", false).await;
     writer.recv_type(HDR_USER_CHANGE).await;

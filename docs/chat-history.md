@@ -131,6 +131,9 @@ the store — fetch `limit + 1`, return `limit` — so a client never learns
 it from a count that a concurrent insert could make stale.
 
 `query` returns ascending id order always, whichever cursor was used.
+When both cursors are present they define the exclusive range
+`after < id < before`, paged forward from `after`; `has_more` only reports
+additional rows inside that range.
 For a `before`-only or no-cursor query the store selects descending with
 `LIMIT n+1` and reverses, which is what makes "the most recent 50" one
 indexed seek rather than a table scan.
@@ -313,7 +316,8 @@ either; an error is the one a client author can debug).
 
 Parse: `CHANNEL_ID` required, u32, must be 0 — anything else answers
 "No such channel."; `BEFORE` and `AFTER` u64, absent when zero on the
-wire as GtkHx sends them; `LIMIT` u16, absent or 0 means the default 50,
+wire as GtkHx sends them; when both are present they define the exclusive
+range `AFTER < id < BEFORE`, paged forward; `LIMIT` u16, absent or 0 means the default 50,
 anything above `[history] max_page` (default 200) is clamped silently,
 as the spec says.
 
@@ -386,6 +390,10 @@ survives a re-login, a second device, and a lapsed grace window.
 | `req` | params | ok | errors |
 |---|---|---|---|
 | `history` | `before?` (id), `after?` (id), `limit?` (1–200, default 50) | `{ "lines": [ … ], "has_more": bool }` | `access_denied`, `not_available` (no `[history]`), `bad_request`, `rate_limited`, `server_error` |
+
+Supplying both cursors requests the exclusive range `after < id < before`.
+It pages forward from `after`, and `has_more` refers only to more rows before
+the upper bound.
 
 `lines` ascend by id. Each is the live `chat` event's data plus its
 id and time, and a `deleted` flag when tombstoned:

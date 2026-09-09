@@ -846,10 +846,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     serde_json::from_value::<HistoryParams>(req.params.clone())
                 };
                 match parsed {
-                    Ok(p)
-                        if !(p.before.is_some() && p.after.is_some())
-                            && p.limit.is_none_or(|n| n != 0) =>
-                    {
+                    Ok(p) if p.limit.is_none_or(|n| n != 0) => {
                         let query = hxd_core::HistoryQuery {
                             channel: 0,
                             before: p.before.filter(|id| *id != 0),

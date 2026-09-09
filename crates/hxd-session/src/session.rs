@@ -1465,7 +1465,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     _ => {}
                 }
             }
-            if malformed || channel.is_none() || (before.is_some() && after.is_some()) {
+            if malformed || channel.is_none() {
                 reply_error(tx, f.trans, "Malformed chat history request.");
                 return;
             }

@@ -102,9 +102,6 @@ pub struct HistoryQuery {
 
 impl HistoryQuery {
     pub fn check(self) -> Result<Self, StoreError> {
-        if self.before.is_some() && self.after.is_some() {
-            return Err(StoreError::new("history query has both before and after"));
-        }
         if self.limit == 0 {
             return Err(StoreError::new("history query limit is zero"));
         }
@@ -322,6 +319,38 @@ pub mod conformance {
             .unwrap();
         assert_eq!(newer.lines.iter().map(|l| l.id).collect::<Vec<_>>(), [3, 4]);
         assert!(newer.has_more);
+
+        let bounded = log
+            .query(&HistoryQuery {
+                channel: 0,
+                before: Some(6),
+                after: Some(2),
+                limit: 2,
+            })
+            .unwrap();
+        assert_eq!(
+            bounded.lines.iter().map(|line| line.id).collect::<Vec<_>>(),
+            [3, 4]
+        );
+        assert!(bounded.has_more);
+
+        let bounded_tail = log
+            .query(&HistoryQuery {
+                channel: 0,
+                before: Some(6),
+                after: Some(2),
+                limit: 3,
+            })
+            .unwrap();
+        assert_eq!(
+            bounded_tail
+                .lines
+                .iter()
+                .map(|line| line.id)
+                .collect::<Vec<_>>(),
+            [3, 4, 5]
+        );
+        assert!(!bounded_tail.has_more);
     }
 
     fn channels_do_not_mix(log: Box<dyn ChatLog>) {

@@ -1240,17 +1240,38 @@ impl ChatLog for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let take = query.limit.saturating_add(1).min(i64::MAX as usize) as i64;
         let mut lines = if let Some(after) = query.after {
-            let sql = format!(
-                "SELECT {HISTORY_COLUMNS} FROM chat_line
-                  WHERE channel = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3"
-            );
-            let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
-            let rows = stmt
-                .query_map(
-                    params![i64::from(query.channel), clamp_id(after), take],
-                    history_row,
+            let sql = if query.before.is_some() {
+                format!(
+                    "SELECT {HISTORY_COLUMNS} FROM chat_line
+                      WHERE channel = ?1 AND id > ?2 AND id < ?3
+                      ORDER BY id ASC LIMIT ?4"
                 )
-                .map_err(StoreError::new)?;
+            } else {
+                format!(
+                    "SELECT {HISTORY_COLUMNS} FROM chat_line
+                      WHERE channel = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3"
+                )
+            };
+            let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
+            let rows = match query.before {
+                Some(before) => stmt
+                    .query_map(
+                        params![
+                            i64::from(query.channel),
+                            clamp_id(after),
+                            clamp_id(before),
+                            take
+                        ],
+                        history_row,
+                    )
+                    .map_err(StoreError::new)?,
+                None => stmt
+                    .query_map(
+                        params![i64::from(query.channel), clamp_id(after), take],
+                        history_row,
+                    )
+                    .map_err(StoreError::new)?,
+            };
             collect_history(rows)?
         } else {
             let sql = if query.before.is_some() {

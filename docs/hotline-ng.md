@@ -282,7 +282,7 @@ Requests:
 |---|---|---|---|
 | `login` / `resume` / `sync` | above | above | handshake only |
 | `chat` | `text`, `style?` (`"normal"`\|`"action"`) | `{}` | needs send-chat access; multi-line allowed, server relays as one event |
-| `history` | `before?` / `after?` (line id), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | needs chat-history access; rows ascend by id; `params` may be omitted |
+| `history` | `before?` / `after?` (line id), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | needs chat-history access; rows ascend by id; both cursors mean the exclusive range `after < id < before`, paged forward; `params` may be omitted |
 | `msg` | exactly one of `to` (uid) / `to_login`, plus `text`, `guid?` | `{ "queued": bool }` | needs send-msgs access; same 4096-byte cap as chat. See §7.1 |
 | `inbox` | `before?` (id), `limit?` (1–200, default 50) | `{ messages, unread, total }` | newest first, paging backwards. `params` may be omitted |
 | `msg_read` | `up_to` (id) | `{ unread, total }` | marks everything of yours up to that id read |
