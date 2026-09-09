@@ -390,8 +390,25 @@ impl Mailbox {
     ) -> Result<(Vec<PendingView>, u64), Refused> {
         let key = hash(secret.as_bytes());
         let deadline = Instant::now() + wait;
+        // Resolved once: a session's `Notify` outlives every poll of it,
+        // and the loop below has to register against it *before* it reads
+        // the state it is waiting on.
+        let notify = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.sweep(Instant::now());
+            let session = inner.sessions.get(&key).ok_or(Refused::UnknownSession)?;
+            session.notify.clone()
+        };
         loop {
-            let notify = {
+            // `notify_waiters()` stores no permit, so a request arriving
+            // between the read below and the registration of this waiter
+            // used to be lost outright — the poll then sat out its full
+            // wait with an answer already on the table. `enable()`
+            // registers now, before the read, so that arrival wakes it.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
                 let mut inner = self.inner.lock().unwrap();
                 inner.sweep(Instant::now());
                 let session = inner.sessions.get(&key).ok_or(Refused::UnknownSession)?;
@@ -412,15 +429,12 @@ impl Mailbox {
                 if Instant::now() >= deadline {
                     return Ok((Vec::new(), expires_in));
                 }
-                session.notify.clone()
-            };
+            }
             // Timing out here rather than sleeping to the deadline in one
             // go so that a session which expires mid-poll is noticed.
-            let _ = tokio::time::timeout(
-                deadline.saturating_duration_since(Instant::now()),
-                notify.notified(),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), notified)
+                    .await;
         }
     }
 
@@ -455,8 +469,26 @@ impl Mailbox {
     pub async fn fetch_answer(&self, secret: &str, wait: Duration) -> Fetched {
         let key = hash(secret.as_bytes());
         let deadline = Instant::now() + wait;
+        // As in `poll_session`: registered against before the state is
+        // read, so an answer landing in between is not lost. A pending
+        // request's `Notify` outlives every fetch of it, and a request
+        // that is gone is caught by the read itself.
+        let notify = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.sweep(Instant::now());
+            let Some(&skey) = inner.by_request.get(&key) else {
+                return Fetched::Gone;
+            };
+            let Some(pending) = inner.sessions.get(&skey).and_then(|s| s.pending.get(&key)) else {
+                return Fetched::Gone;
+            };
+            pending.notify.clone()
+        };
         loop {
-            let notify = {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
                 let mut inner = self.inner.lock().unwrap();
                 inner.sweep(Instant::now());
                 let Some(&skey) = inner.by_request.get(&key) else {
@@ -482,14 +514,12 @@ impl Mailbox {
                             expires_in: remaining(pending.expires),
                         }
                     }
-                    None => pending.notify.clone(),
+                    None => {}
                 }
-            };
-            let _ = tokio::time::timeout(
-                deadline.saturating_duration_since(Instant::now()),
-                notify.notified(),
-            )
-            .await;
+            }
+            let _ =
+                tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), notified)
+                    .await;
         }
     }
 
