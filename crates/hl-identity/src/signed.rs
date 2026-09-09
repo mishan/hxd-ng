@@ -83,9 +83,10 @@ pub(crate) fn opt_uint(v: &Value, key: &'static str) -> Result<Option<u64>, Erro
     }
 }
 
-/// A byte string of any length. Only the bundle needs this — every
-/// signed object's byte fields are keys or signatures, and those are
-/// fixed-width.
+/// A byte string of any length, required. Most byte fields here are keys
+/// or signatures and so are fixed-width; the exceptions are the ones
+/// carrying another object whole — the bundle's `cert` and `card`, and
+/// (through [`opt_bytes`]) an enrollment request's `prev`.
 pub(crate) fn bytes(v: &Value, key: &'static str) -> Result<Vec<u8>, Error> {
     match v.get(key) {
         Some(Value::Bytes(b)) => Ok(b.clone()),

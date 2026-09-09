@@ -1,11 +1,12 @@
 # Identity enrollment — certifying a device without the paste
 
-Status: draft, for discussion. Being built codecs first: the §4 request
-and the §5.4 bundle exist in `hl-identity`, with test vectors in
-`identity-test-vectors.json`; `hlid cert --bundle` writes a bundle; and
-the identity endpoints answer CORS so a browser elsewhere can reach a
-mailbox. The mailbox itself and both `hlid` commands are not written
-yet, in hxd-ng or in hx-ng. Companion to
+Status: draft, for discussion; being built codecs first. Done: the §4
+request and the §5.4 bundle in `hl-identity`, with test vectors in
+`identity-test-vectors.json`; `hlid cert --bundle`, which writes a
+bundle for the paste path; and CORS on the identity endpoints, so a
+browser elsewhere can reach a mailbox. Not done: the §5 mailbox itself,
+the `hlid enroll` and `hlid agent` commands of §7, and every part of
+hx-ng's side. Companion to
 `hotline-ng-identity.md` (the objects and the profile),
 `hotline-ng-auth.md` (the transport), hx-ng's `identity-keys.md` (the
 browser's side of the same problem, whose §7 describes the paste this
