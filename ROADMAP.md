@@ -258,8 +258,69 @@ administered entirely from GtkHx. This is the dogfooding point.
 ## Phase 4 — News
 
 1.2 flat news post/read, and the 1.5 threaded news tree (categories, bundles,
-threads). Flat-file storage behind the store trait; mhxd's format is the
-compat reference for an importer, not the native format.
+threads). mhxd's format is the compat reference for an importer, not the
+native format.
+
+**Designed 2026-09 in [docs/news.md](docs/news.md)**, which takes the scope
+past the line above. What a modern client wants from a forum is rich text,
+links between posts and a search box, and none of the three needs anything
+the 1.5 wire cannot be told about — that wire has carried multipart articles
+with per-part MIME types since it was written. The design:
+
+- **Storage is SQLite, not flat files.** `news_node` and `news_article`
+  behind a `NewsStore` trait, as more tables in the file that already holds
+  the inbox and the chat log. The flat-file plan predates the store crate;
+  the trait boundary it wanted is the one that arrived with `MessageStore`.
+- **The domain is designed once and the ng wire is bound first**, because
+  news is the Phase 4 subsystem where the ng protocol is not a second
+  frontend onto an existing feature — it is where the feature arrives. The
+  legacy binding is specced in full and staged last, so the model is checked
+  against the wire it must serve without being shaped by it.
+- **Threading is a materialized preorder path**, so a thread comes back in
+  display order from one indexed range scan rather than a recursive query or
+  a client-side reconstruction.
+- **Bodies are markdown, with a server-rendered plain-text part** — a 1.5
+  client reads prose where an ng client reads formatting, which is what the
+  multipart article was always for. The server parses markdown and never
+  renders HTML, so rich text adds no injection surface.
+- **References between articles** — `[text](news:51)`, plus a `#51`
+  shorthand that works on plain bodies typed in a period client — are
+  extracted into an edge table at post time and indexed both ways, so
+  backlinks cost nothing.
+- **Full-text search over FTS5**, which the pinned rusqlite build already
+  compiles in: a table and a query compiler, not a dependency. The query
+  grammar is ours and closed, so a malformed search returns results rather
+  than an error. It is also the one place the two wires are not equivalent —
+  there is no 1.5 transaction to search with.
+- **Attachments are durable and content-addressed**, in a blob store of
+  their own rather than inline media's 24-hour handles: a chat image is a
+  moment, a news article is a record. Legacy clients fetch a re-encoded
+  derivative because the wire's per-part size is a u16.
+- **Subscriptions and push notifications close the loop.** A reply to
+  your article, a reference to it, or a post in a thread you follow
+  reaches you when you are not there — which is the thing that makes a
+  forum worth returning to rather than worth remembering to check. It
+  needs no notification queue: the article is already durable, so the
+  stored state is a subscription and a read cursor, and unread is a
+  query. That cursor also settles the coalescing question Phase 7 leaves
+  open, at least for news — **a scope rings only when its subscriber is
+  caught up with it**, so a forty-reply thread buzzes once per visit
+  with no timer, no digest window and nothing to sweep. It also answers,
+  by construction, the question of what a mention is: a reference names
+  an article and an article has exactly one author, so none of the
+  nicks-are-not-unique difficulty applies.
+- **1.2 flat news is a rendering of one category**, not a second store.
+  The operator names the category a 1.2 client reads and posts into; a
+  post from that wire becomes a reply in it, with its subject and parent
+  read out of a leading `Subject:` / `Re: #398` block in the body, which
+  is the only place that wire has to put them. Both are optional and both
+  have defaults — a post is never refused for lacking metadata the client
+  cannot send — and the read format shows the same two headers, so it
+  teaches the convention without a manual.
+
+Not started. `hxd-session` dispatches no news opcode and `hxd-core` has no
+`news` module; the access bits it needs (20, 21, 33–37) have been parsed
+since Phase 1.
 
 ## Phase 5 — Hardening and parity extras
 
@@ -501,8 +562,17 @@ resist the reorder.
 - How a mention is defined, given that Hotline nicks are neither unique nor
   stable — and whether mentions are in the first push cut at all, or DMs
   carry it alone (docs/push-notifications.md §11). The inbox design assumes
-  DMs alone (docs/private-messages.md §9).
+  DMs alone (docs/private-messages.md §9). **Still open for chat**, but
+  news has answered it for itself: docs/news.md §10.5 notifies on a
+  *reference*, which names an article rather than a nick, so the
+  ambiguity never arises. "Cite the thing, not the person" is the shape
+  to reach for if chat ever wants one.
 - Whether an account's inbox stays server-local or follows the portable
   identity across servers (docs/private-messages.md §13).
 - Where push coalescing lives (domain rate limit, gateway digest window, or
   vendor collapse keys) — twenty chat lines should not be twenty buzzes.
+  **Answered for news** in docs/news.md §10.7: a scope rings only when
+  its subscriber is caught up with it, which needs no timer because the
+  read cursor already exists for the badge, with the vendor collapse key
+  underneath it rather than instead of it. Chat has no per-scope cursor
+  and no subscription, so it still wants the time-based answer.
