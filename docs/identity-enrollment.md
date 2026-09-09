@@ -197,7 +197,13 @@ Errors, `{ "error": code, "text": "…" }`:
 | `rate_limited` | 429 | |
 
 A wrong code is a 404, not a hint. Codes are single-use and short-lived
-and guesses are rate-limited per address, which is what forty bits needs.
+and guesses are rate-limited per address, which is what forty bits needs:
+ten wrong codes a minute from one address, after which it is `429` until
+the minute is out. Ten is far more than a human retyping off a screen
+needs, and it holds a guesser to a hundred tries inside the ten minutes a
+code exists. A *live* code is never charged against that budget — only
+getting one wrong spends it — so the limit cannot be used to keep anybody
+else from enrolling.
 
 ### 5.3 The holder waits
 
@@ -503,7 +509,9 @@ enrollee and a holder on different servers should see the same clock.
   decodes CBOR only to read `prev.identity` for routing, which is a
   fixed-depth walk, not a general parse. Every table an unauthenticated
   caller can grow has a ceiling, as with every other table in the ng
-  listener.
+  listener — including §5.2's wrong-code counters, which live a minute
+  each and evict the entry nearest its own expiry when full, so that
+  filling that table is never a way out of being counted.
 - **Long-poll** is a `tokio::sync::Notify` per session and per request,
   awaited with a 30-second timeout. The HTTP layer in `hxd-ng-session`
   already handles requests that outlive a keepalive.

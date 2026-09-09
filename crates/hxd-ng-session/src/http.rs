@@ -805,8 +805,14 @@ async fn enroll_route(req: Request<Incoming>, client: SocketAddr, ctx: &NgCtx) -
         return cors(plain(StatusCode::NOT_FOUND, "no enrollment mailbox here"));
     };
     let path = req.uri().path().to_owned();
+    // `strip_prefix`, not `trim_start_matches`, which strips the prefix as
+    // many times as it appears: `/identity/enroll/identity/enroll/sessions`
+    // would have opened a session. Both 404 today, since the router only
+    // sends a path that starts with the prefix here, but only one of them
+    // says what it means.
     let rest: Vec<&str> = path
-        .trim_start_matches("/identity/enroll")
+        .strip_prefix("/identity/enroll")
+        .unwrap_or_default()
         .split('/')
         .filter(|s| !s.is_empty())
         .collect();

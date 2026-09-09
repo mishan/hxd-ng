@@ -47,6 +47,26 @@ pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const CODE_CHARS: usize = 8;
 
+/// Wrong codes one address may offer inside [`GUESS_WINDOW`] before it is
+/// refused outright.
+///
+/// §5.2 and §9 both rest on this — "guesses are rate-limited per address,
+/// which is what forty bits needs" — and until it was here, nothing
+/// counted them: a wrong code is refused before any table is touched, so
+/// an address could try as fast as it could open sockets. Ten a minute is
+/// far more than a human retyping off a screen needs, and it holds a
+/// guesser to a hundred tries inside the ten minutes a code exists, which
+/// is what makes forty bits the right size rather than a hope.
+const WRONG_CODES_PER_WINDOW: u32 = 10;
+const GUESS_WINDOW: Duration = Duration::from_secs(60);
+
+/// Addresses whose wrong guesses are being counted at once. Another table
+/// an unauthenticated caller can grow, so it has a ceiling like the rest.
+/// Entries live [`GUESS_WINDOW`] and the sweep drops them; past the
+/// ceiling, the entry nearest its own expiry is evicted to make room, so
+/// that filling the table is never a way to get out of being counted.
+const MAX_GUESSERS: usize = 4096;
+
 #[derive(Debug, Clone)]
 pub struct MailboxConfig {
     /// Open sessions at once, server-wide.
@@ -150,7 +170,9 @@ impl Refused {
             Refused::RequestTooLarge => "the enrollment request exceeds 8 KiB",
             Refused::BadRequest => "malformed enrollment request",
             Refused::TooManySessions => "too many open enrollment sessions; retry shortly",
-            Refused::RateLimited => "too many enrollment sessions from this address",
+            // Three things reach this now — open sessions, pending
+            // requests, and wrong codes — so it no longer names one.
+            Refused::RateLimited => "too many enrollment attempts from this address; retry shortly",
             Refused::UnknownSession => "no such enrollment session",
             Refused::UnknownRequest => "no such enrollment request",
         }
@@ -198,6 +220,14 @@ struct Inner {
     /// Request secret hash to the session holding it, so that
     /// `GET /requests/<secret>` is one lookup rather than a scan.
     by_request: HashMap<[u8; 32], [u8; 32]>,
+    /// Wrong codes lately, per source address (§5.2).
+    wrong_codes: HashMap<IpAddr, Guesses>,
+}
+
+/// Wrong codes from one address, and when the window holding them opened.
+struct Guesses {
+    count: u32,
+    since: Instant,
 }
 
 pub struct Mailbox {
@@ -319,7 +349,22 @@ impl Mailbox {
         let key = match code {
             Some(c) => {
                 normalized = normalize_code(c);
-                *inner.by_code.get(&normalized).ok_or(Refused::UnknownCode)?
+                // Checked before the lookup, not after it, so an address
+                // that has spent its budget cannot go on probing and
+                // reading the answers. A caller with a *live* code pays
+                // nothing here beyond the check itself: nothing is
+                // recorded, and the budget it is checked against is only
+                // ever spent by getting the code wrong.
+                if inner.out_of_guesses(addr, now) {
+                    return Err(Refused::RateLimited);
+                }
+                match inner.by_code.get(&normalized) {
+                    Some(k) => *k,
+                    None => {
+                        inner.note_wrong_code(addr, now);
+                        return Err(Refused::UnknownCode);
+                    }
+                }
             }
             None => {
                 // Routing by renewal: read `prev`'s identity out of the
@@ -562,7 +607,58 @@ impl Inner {
                 .get(sk)
                 .is_some_and(|s| s.pending.contains_key(rk))
         });
+        self.wrong_codes
+            .retain(|_, g| now.duration_since(g.since) < GUESS_WINDOW);
         dropped
+    }
+
+    /// Whether this address has used up its wrong codes for the moment
+    /// (§5.2). A window that has run out is forgotten here rather than
+    /// waiting for the next sweep, so the budget is genuinely per window
+    /// and not per sweep.
+    fn out_of_guesses(&mut self, addr: IpAddr, now: Instant) -> bool {
+        match self.wrong_codes.get(&addr) {
+            Some(g) if now.duration_since(g.since) >= GUESS_WINDOW => {
+                self.wrong_codes.remove(&addr);
+                false
+            }
+            Some(g) => g.count >= WRONG_CODES_PER_WINDOW,
+            None => false,
+        }
+    }
+
+    /// Charge one wrong code to this address.
+    ///
+    /// A full table evicts rather than declining to record, and that is
+    /// the whole reason this is not three lines. An address with no entry
+    /// has no budget, so simply refusing to insert would hand unlimited
+    /// guesses to whoever arrived after the table filled — which is a
+    /// bypass anyone able to fill it can also walk through. Evicting the
+    /// entry nearest its own expiry keeps every caller counted; the worst
+    /// it costs a bystander is their counter reset to the honest budget
+    /// they started with, and it costs the guesser a guess to do it.
+    fn note_wrong_code(&mut self, addr: IpAddr, now: Instant) {
+        if let Some(g) = self.wrong_codes.get_mut(&addr) {
+            g.count = g.count.saturating_add(1);
+            return;
+        }
+        if self.wrong_codes.len() >= MAX_GUESSERS {
+            let oldest = self
+                .wrong_codes
+                .iter()
+                .min_by_key(|(_, g)| g.since)
+                .map(|(a, _)| *a);
+            if let Some(a) = oldest {
+                self.wrong_codes.remove(&a);
+            }
+        }
+        self.wrong_codes.insert(
+            addr,
+            Guesses {
+                count: 1,
+                since: now,
+            },
+        );
     }
 }
 
@@ -766,6 +862,111 @@ mod tests {
             m.post_request(addr(2), Some("AAAA-AAAA"), &request(2))
                 .err(),
             Some(Refused::UnknownCode)
+        );
+    }
+
+    #[tokio::test]
+    async fn guessing_codes_is_bounded_per_address() {
+        // What §5.2 and §9 both claim and nothing enforced: "guesses are
+        // rate-limited per address, which is what forty bits needs". A
+        // wrong code is refused before any table is touched, so without
+        // this an address could try as fast as it could open sockets.
+        let m = mailbox();
+        m.open_session(addr(1), None).unwrap();
+        for i in 0..WRONG_CODES_PER_WINDOW {
+            assert_eq!(
+                m.post_request(addr(2), Some(&draw_code()), &request(2))
+                    .err(),
+                Some(Refused::UnknownCode),
+                "guess {i} is still just a wrong code"
+            );
+        }
+        assert_eq!(
+            m.post_request(addr(2), Some(&draw_code()), &request(2))
+                .err(),
+            Some(Refused::RateLimited),
+            "past the budget the address is refused rather than answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_address_guessing_does_not_lock_out_another() {
+        // The limit is per address precisely so that a guesser cannot
+        // stop anybody else enrolling. If it were global, filling it
+        // would be a cheaper attack than the one it prevents.
+        let m = mailbox();
+        let opened = m.open_session(addr(1), None).unwrap();
+        for _ in 0..WRONG_CODES_PER_WINDOW + 5 {
+            let _ = m.post_request(addr(2), Some(&draw_code()), &request(2));
+        }
+        assert!(
+            m.post_request(addr(3), Some(&opened.code), &request(3))
+                .is_ok(),
+            "a different address types the live code and gets in"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_code_is_not_charged_against_the_guess_budget() {
+        // The budget is only ever spent by getting a code wrong. A user
+        // who types live codes — several devices, several sessions —
+        // must never run into it. `per_address` is raised so that the
+        // *other* limit, on pending requests, is not what this measures.
+        let m = Mailbox::new(MailboxConfig {
+            max_sessions: 256,
+            per_address: 64,
+        });
+        for i in 0..WRONG_CODES_PER_WINDOW + 5 {
+            let opened = m.open_session(addr(1), None).unwrap();
+            assert!(
+                m.post_request(addr(2), Some(&opened.code), &request(2))
+                    .is_ok(),
+                "live code {i} should not be charged to the guess budget"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_guess_table_still_counts_the_next_address() {
+        // Declining to record once the table is full would hand unlimited
+        // guesses to whoever arrived after it filled — a bypass anyone
+        // able to fill it can also walk through. Eviction keeps everyone
+        // counted.
+        let mut inner = Inner::default();
+        let now = Instant::now();
+        for i in 0..MAX_GUESSERS {
+            let a = IpAddr::from(std::net::Ipv6Addr::from(i as u128));
+            inner.note_wrong_code(a, now);
+        }
+        assert_eq!(inner.wrong_codes.len(), MAX_GUESSERS);
+
+        let late = IpAddr::from([203, 0, 113, 7]);
+        for _ in 0..WRONG_CODES_PER_WINDOW {
+            assert!(!inner.out_of_guesses(late, now));
+            inner.note_wrong_code(late, now);
+        }
+        assert!(
+            inner.out_of_guesses(late, now),
+            "an address that arrived after the table filled is counted like any other"
+        );
+        assert!(
+            inner.wrong_codes.len() <= MAX_GUESSERS,
+            "and it stays bounded"
+        );
+    }
+
+    #[test]
+    fn a_guess_budget_refills_when_its_window_passes() {
+        let mut inner = Inner::default();
+        let a = addr(2);
+        let start = Instant::now();
+        for _ in 0..WRONG_CODES_PER_WINDOW {
+            inner.note_wrong_code(a, start);
+        }
+        assert!(inner.out_of_guesses(a, start));
+        assert!(
+            !inner.out_of_guesses(a, start + GUESS_WINDOW),
+            "a mistyped code should not cost the window after it"
         );
     }
 
