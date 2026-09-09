@@ -5,10 +5,11 @@ bundle in `hl-identity`, with test vectors; `hlid cert --bundle`, which
 writes a bundle for the paste path; the §5 mailbox, served under
 `/identity/enroll` and advertised in discovery; CORS on the identity
 endpoints, so a browser elsewhere can reach it; and `hlid enroll` (§7),
-which opens a session, shows a code, prompts and certifies. Not done:
-`hlid agent` and standing sessions, so renewals still need a code; the
-QR path (§5.6), so `pair` is refused rather than checked; and every part
-of hx-ng's side. Companion to
+which shows a code and — when discovery advertises a web client — a QR
+code, prompts, and certifies, verifying a scanned request's `pair` and
+refusing one that does not verify without showing it. Not done: `hlid
+agent` and standing sessions, so renewals still need a code; and every
+part of hx-ng's side. Companion to
 `hotline-ng-identity.md` (the objects and the profile),
 `hotline-ng-auth.md` (the transport), hx-ng's `identity-keys.md` (the
 browser's side of the same problem, whose §7 describes the paste this

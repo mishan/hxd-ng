@@ -87,7 +87,7 @@ fn usage() -> ! {
     eprintln!(concat!(
         "usage:\n",
         "  hlid init --name S [--days N] [--device-name S]\n",
-        "  hlid enroll --server URL [--caps web|LIST] [--days N] [--identity K] [--card FILE]\n",
+        "  hlid enroll --server URL [--caps web|LIST] [--days N] [--identity K] [--card FILE] [--show-url]\n",
         "  hlid keygen identity|device|server PATH\n",
         "  hlid cert [--identity K] (--device K | --device-pub HEX --device-enc-pub HEX) [--days N] [--caps all|web|LIST] [--name S] [--bundle [--card FILE]] -o FILE\n",
         "  hlid card [--identity K] --name S [--icon N] [--profile S] [--link URL]... [--attestation FILE]...\n",
@@ -109,7 +109,9 @@ fn usage() -> ! {
         "enrollment mailbox, shows a code to type into the browser, and asks\n",
         "before it certifies anything. --caps defaults to `web` — login and\n",
         "message, never vouch or manage — and nothing a request asks for can\n",
-        "widen that.\n",
+        "widen that. When the server advertises a web client it also draws a QR\n",
+        "code; --show-url prints the link beneath it, which carries the pairing\n",
+        "secret and therefore lands in your scrollback.\n",
         "\n",
         "--bundle writes the certificate and the identity's card as one object\n",
         "instead of the certificate alone — the same thing enrollment carries, so\n",
@@ -140,6 +142,7 @@ pub(crate) struct Args {
 const BARE: &[&str] = &[
     "allow-remote-listen",
     "bundle",
+    "show-url",
     "password-stdin",
     "no-create",
     "create",
@@ -515,7 +518,7 @@ fn create_private_dir(path: &Path) -> R<()> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn getrandom_seed(seed: &mut [u8; 32]) {
+pub(crate) fn getrandom_seed(seed: &mut [u8; 32]) {
     // Borrow the crate's generator through a throwaway key rather than
     // add a second randomness dependency here.
     *seed = *IdentityKey::generate().seed();

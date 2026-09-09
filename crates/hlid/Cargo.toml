@@ -19,6 +19,10 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 serde_json = "1"
 base64 = "0.22"
+# The QR code `hlid enroll` shows (identity-enrollment.md §5.6). Project
+# Nayuki's encoder: no dependencies of its own, and the only new one this
+# feature asks for.
+qrcodegen = "1.8"
 
 [dev-dependencies]
 tempfile = "3"

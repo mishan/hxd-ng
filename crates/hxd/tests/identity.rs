@@ -61,6 +61,7 @@ async fn start_server_forwarded(dir: &Path, proxies: &[&str]) -> (SocketAddr, So
         false,
         hxd_ng_session::ForwardedHeader::Forwarded,
         Some(Default::default()),
+        None,
     )
     .await
 }
@@ -76,6 +77,7 @@ async fn start_server_with_inbox(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) 
         true,
         hxd_ng_session::ForwardedHeader::default(),
         Some(Default::default()),
+        None,
     )
     .await
 }
@@ -90,6 +92,23 @@ async fn start_server_without_mailbox(dir: &Path) -> (SocketAddr, SocketAddr, Ng
         false,
         hxd_ng_session::ForwardedHeader::default(),
         None,
+        None,
+    )
+    .await
+}
+
+/// A server that advertises a web client, which is what makes `hlid`
+/// draw a QR code and therefore draw a pairing secret (§5.6).
+async fn start_server_with_web_client(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
+    start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        Some("https://hl.example/app/"),
     )
     .await
 }
@@ -108,6 +127,7 @@ async fn start_server_with_small_mailbox(
         false,
         hxd_ng_session::ForwardedHeader::default(),
         Some(cfg),
+        None,
     )
     .await
 }
@@ -126,6 +146,7 @@ async fn start_server_full(
         false,
         hxd_ng_session::ForwardedHeader::default(),
         Some(Default::default()),
+        None,
     )
     .await
 }
@@ -139,6 +160,7 @@ async fn start_server_inner(
     inbox: bool,
     forwarded_header: hxd_ng_session::ForwardedHeader,
     enroll: Option<hxd_ng_session::enroll::MailboxConfig>,
+    web_client: Option<&str>,
 ) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -203,7 +225,7 @@ async fn start_server_inner(
             caps: Vec::new(),
             trusted_proxies: hxd_ng_session::TrustedProxies::parse(proxies).unwrap(),
             forwarded_header,
-            ..Default::default()
+            web_client: web_client.map(str::to_owned),
         }),
         registry: Arc::new(Registry::new()),
         identity: Some(Arc::new(identity)),
@@ -3379,5 +3401,203 @@ async fn hlid_enroll_certifies_a_browser_that_it_never_holds_a_key_for() {
     assert!(
         stderr.contains(&hl_identity::Fingerprint::of(&browser.public()).short()),
         "the prompt must show the device fingerprint:\n{stderr}"
+    );
+}
+
+/// The `#enroll=…&mailbox=…&identity=…&pair=…` fragment `--show-url`
+/// prints, parsed the way the browser parses it.
+fn scan_fields(output: &str) -> std::collections::HashMap<String, String> {
+    let url = output
+        .lines()
+        .find(|l| l.contains("#enroll="))
+        .expect("hlid should have printed the scan URL");
+    let (_, fragment) = url.trim().split_once('#').unwrap();
+    fragment
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+}
+
+/// Run `hlid enroll --show-url` and hand back its code, its scan
+/// fields, and a handle on the still-running process.
+struct Holder {
+    child: std::process::Child,
+    reader: std::thread::JoinHandle<String>,
+    fields: std::collections::HashMap<String, String>,
+}
+
+async fn start_holder(ng: SocketAddr, home: &Path, hlid: &Path, answer: &[u8]) -> Holder {
+    let mut child = std::process::Command::new(hlid)
+        .env("HLID_HOME", home)
+        .args(["enroll", "--server", &format!("http://{ng}"), "--show-url"])
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(answer).unwrap();
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.contains("#enroll=") {
+                let _ = tx.send(line.clone());
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+    let url = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("hlid should have printed a scan URL");
+
+    Holder {
+        child,
+        reader,
+        fields: scan_fields(&url),
+    }
+}
+
+#[tokio::test]
+async fn a_scanned_request_skips_the_comparison_the_typed_one_asks_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_with_web_client(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    let init = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+
+    let holder = start_holder(ng, &home, &hlid, b"y\n").await;
+    let mut holder = holder;
+
+    // The QR carries four things, and each does a different job (§5.6).
+    let code = holder.fields.remove("enroll").expect("enroll=");
+    let pair_b64 = holder.fields.remove("pair").expect("pair=");
+    assert!(
+        holder.fields.contains_key("mailbox"),
+        "so the phone cannot pick the wrong server"
+    );
+    assert!(
+        holder.fields.contains_key("identity"),
+        "so the enrollee pins the fingerprint before it asks, not after"
+    );
+    let secret: [u8; 16] = unb64(&pair_b64).try_into().expect("16-byte pairing secret");
+
+    // A phone that scanned the code folds the tag into its request.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+    let mut request = hl_identity::EnrollRequest::new(&browser, now());
+    request.name = Some("Safari on the phone".into());
+    request.pair = Some(hl_identity::enroll::pair_tag(&secret, &browser.public()));
+
+    let posted = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&request.sign(&browser)) }),
+    )
+    .await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let secret_handle = posted.json()["request"].as_str().unwrap().to_owned();
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{secret_handle}"),
+        &[],
+        b"",
+    )
+    .await;
+    let stderr = holder.reader.join().unwrap();
+    assert!(
+        holder.child.wait().unwrap().success(),
+        "hlid failed:\n{stderr}"
+    );
+    assert_eq!(fetched.status, 200, "no bundle came back:\n{stderr}");
+
+    let bundle =
+        hl_identity::Bundle::parse(&unb64(fetched.json()["bundle"].as_str().unwrap())).unwrap();
+    let (cert, _) = bundle.open().unwrap();
+    assert_eq!(cert.device, browser.public());
+
+    // The whole point of the scanned path: the check the typed path asks
+    // a human to make has already been made in software, so the prompt
+    // stops asking for it.
+    assert!(stderr.contains("(scanned)"), "{stderr}");
+    assert!(
+        !stderr.contains("Compare the device fingerprint"),
+        "a scanned request should not ask for the comparison:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_pairing_proof_that_does_not_verify_is_never_shown_to_the_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_with_web_client(dir.path()).await;
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+
+    // "y" on stdin, so that if the prompt were shown at all it would be
+    // approved — the test would fail loudly rather than pass for the
+    // wrong reason.
+    let mut holder = start_holder(ng, &home, &hlid, b"y\n").await;
+    let code = holder.fields.remove("enroll").expect("enroll=");
+
+    // A guessed tag. The only way to produce a real one is to have seen
+    // the QR code, and the mailbox never saw the secret either.
+    let browser = DeviceKey::from_seed(&[0x5a; 32]);
+    let mut request = hl_identity::EnrollRequest::new(&browser, now());
+    request.pair = Some(hl_identity::enroll::pair_tag(
+        &[0xff; 16],
+        &browser.public(),
+    ));
+
+    let posted = post_request(
+        ng,
+        json!({ "code": code, "request": b64(&request.sign(&browser)) }),
+    )
+    .await;
+    let handle = posted.json()["request"].as_str().unwrap().to_owned();
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/identity/enroll/requests/{handle}"),
+        &[],
+        b"",
+    )
+    .await;
+    let stderr = holder.reader.join().unwrap();
+    let _ = holder.child.wait();
+
+    // Refused outright, and refused *without* asking: a guess is not
+    // something to put in front of a user (§6).
+    assert_eq!(fetched.status, 403, "{stderr}");
+    assert_eq!(fetched.json()["denied"], "bad_pair");
+    assert!(
+        !stderr.contains("Certify?"),
+        "the user should never have been asked:\n{stderr}"
     );
 }
