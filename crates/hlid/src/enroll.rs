@@ -124,6 +124,27 @@ fn renewed_caps(granted: Option<u64>, prev: &DeviceCert) -> Option<u64> {
     }
 }
 
+/// The lifetime the old certificate was issued for, in whole days —
+/// what a renewal may ask for again and not exceed (§8).
+///
+/// Rounded up, so a certificate issued for less than a day renews to a
+/// day rather than to nothing; rounding down would hand back a
+/// certificate that had already expired.
+fn prev_days(prev: &DeviceCert) -> u64 {
+    prev.expires
+        .saturating_sub(prev.issued)
+        .div_ceil(86_400)
+        .max(1)
+}
+
+/// "The same or less" again, for the lifetime. `grant` has already
+/// bounded the ask by the holder's policy; this bounds it by what the
+/// certificate being renewed actually carried, so a device that holds a
+/// seven-day certificate cannot come back for the holder's ninety.
+fn renewed_days(granted: u64, prev: &DeviceCert) -> u64 {
+    granted.min(prev_days(prev))
+}
+
 /// Clock-skew tolerance for a renewal's `time` and its certificate's
 /// expiry, matching `[identity] clock_skew`'s default. Both ends are
 /// checked against a wall clock nobody synchronizes for them.
@@ -175,6 +196,18 @@ fn renewal_is_sane(
     if let (Some(had), Some(asked)) = (prev.caps, req.caps) {
         if asked & !had != 0 {
             return Err("it asks for capabilities its certificate does not have".into());
+        }
+    }
+    // And the same for the lifetime, which had no check at all: §8's rule
+    // is `days` no longer than `prev`'s lifetime. Without it a device
+    // holding a seven-day certificate renewed straight to the holder's
+    // ninety — under `--renew auto`, with nobody watching, which is the
+    // one path where a silent widening costs the most. An *absent* ask is
+    // not a widening, as with caps: it means the holder's default, which
+    // `renewed_days` then bounds.
+    if let Some(asked) = req.days {
+        if asked > prev_days(prev) {
+            return Err("it asks for a longer lifetime than its certificate has".into());
         }
     }
     Ok(())
@@ -646,9 +679,10 @@ impl Holder<'_> {
             }
         };
 
-        let (mut caps, days) = grant(self.policy, request.caps, request.days);
+        let (mut caps, mut days) = grant(self.policy, request.caps, request.days);
         if let Some(prev) = &renewal {
             caps = renewed_caps(caps, prev);
+            days = renewed_days(days, prev);
         }
         let approved = match &renewal {
             Some(prev) => {
@@ -1256,6 +1290,53 @@ mod tests {
         prev.caps = None;
         assert_eq!(renewed_caps(Some(caps::WEB), &prev), Some(caps::WEB));
         assert_eq!(renewed_caps(None, &prev), None);
+
+        // And the lifetime, which is the half that had no bound at all.
+        // A seven-day certificate renews to seven days even when the
+        // holder's policy would have given ninety.
+        let week = DeviceCert::for_device(&id, &dev, 1_000, 7 * 86_400).unwrap();
+        assert_eq!(prev_days(&week), 7);
+        assert_eq!(renewed_days(90, &week), 7);
+        assert_eq!(
+            renewed_days(3, &week),
+            3,
+            "and asking for less still gets less"
+        );
+
+        // A certificate shorter than a day renews to a day: rounding
+        // down would hand back one that had already expired.
+        let hour = DeviceCert::for_device(&id, &dev, 1_000, 3_600).unwrap();
+        assert_eq!(prev_days(&hour), 1);
+        assert_eq!(renewed_days(90, &hour), 1);
+    }
+
+    #[test]
+    fn a_renewal_may_not_ask_for_a_longer_life_than_it_has() {
+        // The client that renews by pressing a button sends the days it
+        // has in a field, and one that defaults that field to ninety
+        // would walk a short-lived certificate up to the holder's full
+        // policy — under `--renew auto`, with nobody watching.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = hl_identity::DeviceKey::from_seed(&[3u8; 32]);
+        let prev = DeviceCert::for_device(&id, &dev, 1_000, 7 * 86_400).unwrap();
+
+        let mut req = EnrollRequest::new(&dev, 2_000);
+        req.days = Some(7);
+        assert!(renewal_is_sane(&prev, &req, &id, 2_000).is_ok());
+        req.days = Some(3);
+        assert!(renewal_is_sane(&prev, &req, &id, 2_000).is_ok());
+        req.days = Some(90);
+        assert!(
+            renewal_is_sane(&prev, &req, &id, 2_000).is_err(),
+            "a renewal asking for more than its certificate's lifetime"
+        );
+
+        // Absent is the holder's default, not a demand for everything —
+        // the same asymmetry `caps` has. `renewed_days` bounds it.
+        req.days = None;
+        assert!(renewal_is_sane(&prev, &req, &id, 2_000).is_ok());
+        let (_, days) = grant(&web(), req.caps, req.days);
+        assert_eq!(renewed_days(days, &prev), 7);
     }
 
     #[test]

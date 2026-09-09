@@ -190,7 +190,16 @@ fn cors(mut resp: Resp) -> Resp {
 fn preflight() -> Resp {
     let resp = Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .header(ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, PUT, OPTIONS")
+        // `DELETE` is `DELETE /identity/enroll/sessions/<secret>`, which
+        // is how a browser holder closes a session it is done with. Left
+        // out of the list, the preflight failed and the browser could
+        // not call it — so its sessions sat out their full ten minutes
+        // against `enroll_per_address`, which is the self-inflicted
+        // problem `close_session` was added to fix.
+        .header(
+            ACCESS_CONTROL_ALLOW_METHODS,
+            "GET, POST, PUT, DELETE, OPTIONS",
+        )
         // `PUT /identity/card` sends `application/cbor`, which is not a
         // safelisted content type, so these are the headers that make the
         // preflight it triggers succeed.

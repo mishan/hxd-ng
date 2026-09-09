@@ -729,10 +729,16 @@ impl Inner {
             // Once there is nothing left to collect, it goes.
             !(s.closed && s.pending.is_empty())
         });
-        let live: std::collections::HashSet<[u8; 32]> = self.sessions.keys().copied().collect();
         self.by_code
             .retain(|_, k| self.sessions.get(k).is_some_and(|s| s.code.is_some()));
-        self.by_identity.retain(|_, k| live.contains(k));
+        // Keyed on the claim, not on the session merely still existing —
+        // the same shape as `by_code` above, and for the same reason. A
+        // closed session stays in `sessions` until its answers are
+        // collected, but `close_session` has cleared its `identity`, and
+        // routing a renewal to a session no holder is polling any more
+        // parks the browser until the request expires.
+        self.by_identity
+            .retain(|_, k| self.sessions.get(k).is_some_and(|s| s.identity.is_some()));
         self.by_request.retain(|rk, sk| {
             self.sessions
                 .get(sk)
@@ -1448,6 +1454,47 @@ mod tests {
         assert!(m.post_request(addr(2), None, &renewal(2, &id)).is_ok());
 
         m.close_session(&s.session).unwrap();
+        assert_eq!(
+            m.post_request(addr(3), None, &renewal(3, &id)).err(),
+            Some(Refused::NoHolder)
+        );
+        assert!(m.inner.lock().unwrap().by_identity.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_holding_an_answer_still_routes_no_renewals() {
+        // The case the test above cannot reach: its pending request was
+        // unanswered, so closing dropped the session outright and took
+        // the index with it. Answer first and the session survives the
+        // close — it is still there to be collected from — and the
+        // identity index used to survive with it, keyed on the session
+        // merely existing rather than on the claim. Renewals then routed
+        // to a session no holder can poll any more, and the browser sat
+        // there until its request expired.
+        let m = mailbox();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let opened = standing(&m, addr(1), &id);
+
+        let posted = m.post_request(addr(2), None, &renewal(2, &id)).unwrap();
+        let pending = m
+            .poll_session(&opened.session, QUICK)
+            .await
+            .unwrap()
+            .pending;
+        m.answer(&opened.session, &pending[0].id, Answered::Bundle(vec![7]))
+            .unwrap();
+        m.close_session(&opened.session).unwrap();
+
+        // Still holding the answer, so the session is still there.
+        assert_eq!(m.session_count(), 1);
+        assert!(matches!(
+            m.fetch_answer(&posted.request, QUICK).await,
+            Fetched::Bundle(_)
+        ));
+
+        // But it holds no identity: a renewal is told there is no
+        // holder, and falls back to a code, rather than being parked on
+        // a session nobody is listening to.
         assert_eq!(
             m.post_request(addr(3), None, &renewal(3, &id)).err(),
             Some(Refused::NoHolder)
