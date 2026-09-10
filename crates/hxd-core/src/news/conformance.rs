@@ -44,6 +44,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     search_never_finds_what_is_gone(&*new_store());
     a_long_query_finds_what_it_was_pasted_from(&*new_store());
     a_downgrade_is_what_search_reads(&*new_store());
+    a_downgrade_is_indexed_whole(&*new_store());
     // Subscriptions: what unread counts, what a row may and may not be
     // made into, and the mailbox rule holding for them as for mail.
     a_subscription_starts_caught_up_and_counts_what_follows(&*new_store());
@@ -846,6 +847,20 @@ fn a_downgrade_is_what_search_reads(s: &dyn NewsStore) {
         found(s, &query("reader")).is_empty(),
         "a tombstone takes it too"
     );
+}
+
+/// A downgrade may be longer than any body (§5.4): the store keeps and
+/// indexes all of it, and a word far past `max_body` is found.
+fn a_downgrade_is_indexed_whole(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let long = NewPost {
+        mime: BodyType::Markdown,
+        plain: Some(format!("{}farthest", "filler ".repeat(30_000))),
+        ..new_post(cat, None, "[r] [r] [r]\n\n[r]: https://hl.example/", 100)
+    };
+    assert!(long.plain.as_ref().unwrap().len() > 3 * 65_535);
+    let id = s.post(&long, 32, 32).unwrap().id;
+    assert_eq!(found(s, &query("farthest")), [id]);
 }
 
 fn post(

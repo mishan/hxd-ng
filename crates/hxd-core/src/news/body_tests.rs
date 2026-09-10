@@ -16,14 +16,27 @@ struct Fake(Mutex<Vec<(String, usize)>>);
 impl BodyRenderer for Fake {
     fn render(&self, source: &str, limit: usize) -> Rendered {
         self.0.lock().unwrap().push((source.to_string(), limit));
+        // Kept to its limit, as the trait asks; ASCII in every case here.
+        let mut plain = format!("downgraded {}", source.replace('*', ""));
+        plain.truncate(limit);
         Rendered {
-            plain: format!("downgraded {}", source.replace('*', "")),
+            plain,
             refs: vec![1],
         }
     }
 }
 
 fn server(mode: MarkdownMode, renderer: Option<Arc<Fake>>) -> (Core, Uid, NodeId) {
+    server_with(
+        NewsPolicy {
+            markdown: mode,
+            ..NewsPolicy::default()
+        },
+        renderer,
+    )
+}
+
+fn server_with(policy: NewsPolicy, renderer: Option<Arc<Fake>>) -> (Core, Uid, NodeId) {
     let news = Arc::new(MemoryNews::new());
     let cat = news
         .create_node(
@@ -38,13 +51,7 @@ fn server(mode: MarkdownMode, renderer: Option<Arc<Fake>>) -> (Core, Uid, NodeId
         )
         .unwrap()
         .id;
-    let mut core = Core::new().with_news(
-        news,
-        NewsPolicy {
-            markdown: mode,
-            ..NewsPolicy::default()
-        },
-    );
+    let mut core = Core::new().with_news(news, policy);
     if let Some(renderer) = renderer {
         core = core.with_body_renderer(renderer);
     }
@@ -137,8 +144,8 @@ fn render_keeps_the_source_and_indexes_the_downgrade() {
     );
     assert_eq!(
         *fake.0.lock().unwrap(),
-        [("some **bold** words".to_string(), 65_535)],
-        "once, with the body's own ceiling as the limit"
+        [("some **bold** words".to_string(), 65_535 * DOWNGRADE_ROOM)],
+        "once, with room past the body's own ceiling"
     );
     assert_eq!(found(&core, uid, "downgraded"), [id]);
     assert!(
@@ -150,6 +157,30 @@ fn render_keeps_the_source_and_indexes_the_downgrade() {
         fake.0.lock().unwrap().len(),
         1,
         "a plain body is not parsed"
+    );
+}
+
+#[test]
+fn search_reads_a_downgrade_longer_than_a_body_may_be() {
+    // A downgrade can outgrow its source (§5.4). Cutting it to `max_body`
+    // is for the legacy edge to do; the index reads all of it.
+    let fake = Arc::new(Fake::default());
+    let (core, uid, cat) = server_with(
+        NewsPolicy {
+            markdown: MarkdownMode::Render,
+            max_body: 32,
+            ..NewsPolicy::default()
+        },
+        Some(fake.clone()),
+    );
+    let body = "**a** body that ends with a tail";
+    assert_eq!(body.len(), 32, "exactly as long as a body may be");
+    let id = post(&core, uid, cat, body, BodyType::Markdown).unwrap();
+    assert_eq!(fake.0.lock().unwrap()[0].1, 32 * DOWNGRADE_ROOM);
+    assert_eq!(
+        found(&core, uid, "tail"),
+        [id],
+        "a word the downgrade puts past max_body"
     );
 }
 

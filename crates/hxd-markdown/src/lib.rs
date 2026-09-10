@@ -13,23 +13,24 @@
 //!
 //! **The dialect** is CommonMark with GitHub's tables and strikethrough,
 //! minus two things (§5.2). Raw HTML is literal text, in the downgrade as
-//! in any client. And an image by URL is never an image: an article's
+//! in any client, and opaque: never prose, so never scanned for a
+//! reference. And an image by URL is never an image: an article's
 //! pictures are its attachments, and a body that makes a reader fetch
 //! `https://tracker.example/pixel.gif` reports that reader's address to a
 //! stranger. Here it becomes a link to where it would have been fetched
 //! from, which is exactly what it is.
 //!
-//! **References** are the `news:` scheme — `[the sizes thread](news:51)` —
-//! and the `#51` shorthand, found by `hxd-core`'s scanner in the prose and
-//! never in code: an article quoting a shell prompt or a C preprocessor
-//! line is not citing anything.
+//! **References** are the `news:` scheme — `[the sizes thread](news:51)`,
+//! in any case, as a URI scheme is — and the `#51` shorthand, found by
+//! `hxd-core`'s scanner in the prose and never in code: an article quoting
+//! a shell prompt or a C preprocessor line is not citing anything.
 //!
 //! Behind `hxd-core`'s [`BodyRenderer`], in its own crate and behind the
 //! `markdown` feature — the `hxd-media` shape, for the same reason: a
 //! server that wants no parser does not link one.
 
 use hxd_core::news::{scan_refs, ArticleId, BodyRenderer, Rendered};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 /// The renderer `hxd` gives the domain when `[news] markdown = "render"`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -56,6 +57,26 @@ enum Container {
     Code,
 }
 
+/// A list open around the text.
+struct List {
+    /// The next number, for an ordered list.
+    next: Option<u64>,
+    /// Whether an item has begun yet.
+    begun: bool,
+    /// Its items hold paragraphs, which a loose list's do and a tight
+    /// list's never do.
+    loose: bool,
+}
+
+/// A link or image open around the text.
+struct Frame {
+    dest: String,
+    /// Where its label begins in the output, once it does: one opened at
+    /// the start of a line begins after what the line's containers put
+    /// there.
+    start: Option<usize>,
+}
+
 /// The plain text as it is written, and the references found on the way.
 struct Writer {
     out: String,
@@ -67,17 +88,15 @@ struct Writer {
     stack: Vec<Container>,
     /// A list item's marker, waiting for the item's first line.
     marker: Option<String>,
-    /// Lists open, innermost last: `None` for bullets, the next number
-    /// for an ordered list.
-    lists: Vec<Option<u64>>,
+    /// Lists open, innermost last.
+    lists: Vec<List>,
     at_line_start: bool,
     /// A blank line is owed before the next block.
     blank: bool,
-    /// The links and images open around the text, innermost last: where
-    /// each goes, and its text so far. A stack, because an image may sit
-    /// inside a link — `[![alt](img)](news:51)` — and each end closes its
-    /// own.
-    links: Vec<(String, String)>,
+    /// The links and images open around the text, innermost last. A
+    /// stack, because an image may sit inside a link —
+    /// `[![alt](img)](news:51)` — and each end closes its own.
+    links: Vec<Frame>,
     /// Inside a table row, and whether a cell has been written in it yet.
     cells: Option<bool>,
     /// Prose waiting to be scanned for the `#51` shorthand. Scanned
@@ -117,10 +136,13 @@ pub fn render(source: &str, limit: usize) -> Rendered {
     }
 }
 
-/// The article a `news:` destination names, if it names one: digits only,
-/// nonzero, and an id the legacy wire can carry.
+/// The article a `news:` destination names, if it names one: the scheme
+/// in any case, as a URI's is, then digits only, nonzero, and an id the
+/// legacy wire can carry.
 fn news_target(dest: &str) -> Option<ArticleId> {
-    let digits = dest.strip_prefix("news:")?;
+    let digits = dest
+        .get(5..)
+        .filter(|_| dest[..5].eq_ignore_ascii_case("news:"))?;
     if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -149,7 +171,9 @@ impl Writer {
                 self.text("`");
             }
             // Literal, never interpreted, on the way in and on the way
-            // out (§5.2).
+            // out (§5.2). And opaque: a tag or an HTML block, by every
+            // start condition CommonMark has, is not prose, so a `#51`
+            // inside one cites nothing. hx-ng draws it the same way.
             Event::Html(html) | Event::InlineHtml(html) => self.text(&html),
             Event::SoftBreak | Event::HardBreak => self.newline(),
             Event::Rule => {
@@ -171,17 +195,26 @@ impl Writer {
 
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
-            Tag::Paragraph | Tag::Heading { .. } | Tag::HtmlBlock => self.open_block(),
+            Tag::Paragraph => {
+                // Only a loose list's items hold paragraphs; a tight
+                // list's text sits in the item itself.
+                if matches!(self.stack.last(), Some(Container::Item { .. })) {
+                    if let Some(list) = self.lists.last_mut() {
+                        list.loose = true;
+                    }
+                }
+                self.open_block();
+            }
+            Tag::Heading { .. } | Tag::HtmlBlock => self.open_block(),
             Tag::BlockQuote(_) => {
                 self.open_block();
                 self.stack.push(Container::Quote);
             }
-            Tag::CodeBlock(kind) => {
+            Tag::CodeBlock(_) => {
                 self.open_block();
                 // An indented block is already indented in the source and
                 // arrives without it; a fenced one never had it. Both
                 // come out four spaces in, the fences gone.
-                let _ = matches!(kind, CodeBlockKind::Fenced(_));
                 self.stack.push(Container::Code);
             }
             Tag::List(first) => {
@@ -191,30 +224,48 @@ impl Writer {
                 } else {
                     self.open_block();
                 }
-                self.lists.push(first);
+                self.lists.push(List {
+                    next: first,
+                    begun: false,
+                    loose: false,
+                });
             }
             Tag::Item => {
                 // An item whose first thing is a list has not written its
                 // own marker yet; it goes on a line of its own, or the
                 // nested marker would take its place.
                 if self.marker.is_some() {
-                    self.prefix();
-                    let kept = self.out.trim_end_matches(' ').len();
-                    self.out.truncate(kept);
+                    self.bare_marker();
                     self.newline();
                 }
                 self.newline_if_needed();
-                if self.blank {
+                // A quote or a code block ends by asking for a blank line.
+                // Between items it is owed only in a loose list: in a
+                // tight one it would read as the list coming apart. A
+                // first item is not between items, so it asks the list
+                // around it.
+                let between = match self.lists.as_slice() {
+                    [.., list] if list.begun => Some(list),
+                    [.., outer, _] => Some(outer),
+                    _ => None,
+                };
+                if self.blank && between.is_some_and(|list| list.loose) {
                     self.blank_line();
-                    self.blank = false;
                 }
+                self.blank = false;
                 let marker = match self.lists.last_mut() {
-                    Some(Some(n)) => {
-                        let m = format!("{n}. ");
-                        *n = n.saturating_add(1);
-                        m
+                    Some(list) => {
+                        list.begun = true;
+                        match &mut list.next {
+                            Some(n) => {
+                                let m = format!("{n}. ");
+                                *n = n.saturating_add(1);
+                                m
+                            }
+                            None => "- ".to_string(),
+                        }
                     }
-                    _ => "- ".to_string(),
+                    None => "- ".to_string(),
                 };
                 self.stack.push(Container::Item {
                     width: marker.chars().count(),
@@ -236,7 +287,11 @@ impl Writer {
             // the label's prose has been scanned, so references come out
             // in the order they appear in the source.
             Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
-                self.links.push((dest_url.to_string(), String::new()));
+                let start = (!self.at_line_start).then_some(self.out.len());
+                self.links.push(Frame {
+                    dest: dest_url.to_string(),
+                    start,
+                });
             }
             // Emphasis, strong and strikethrough lose their markers and
             // keep their words; nothing else here is enabled.
@@ -264,7 +319,11 @@ impl Writer {
                 }
             }
             TagEnd::Item => {
-                self.marker = None;
+                // An empty item is still an item: its marker, and nothing
+                // after it.
+                if self.marker.is_some() {
+                    self.bare_marker();
+                }
                 self.stack.pop();
                 self.newline_if_needed();
             }
@@ -273,22 +332,49 @@ impl Writer {
                 self.newline_if_needed();
             }
             TagEnd::Link | TagEnd::Image => {
-                let Some((dest, text)) = self.links.pop() else {
+                let Some(Frame { dest, start }) = self.links.pop() else {
                     return;
                 };
-                if let Some(id) = news_target(&dest) {
+                let target = news_target(&dest);
+                if let Some(id) = target {
                     self.reference(id);
                 }
-                let text = text.trim();
-                let shown = match news_target(&dest) {
+                // Past the limit there is nowhere to write, and nothing
+                // whole to compare a label against.
+                if self.cut {
+                    return;
+                }
+                let shown = match target {
                     Some(id) => format!("news #{id}"),
                     None => dest.clone(),
                 };
+                // The label is what was written since the link opened,
+                // measured rather than copied: a copy into every open
+                // frame is quadratic in nested images. A line break in it
+                // leaves a newline there, so it is never taken for a
+                // destination.
+                let start = start.map_or(self.out.len(), |s| s.min(self.out.len()));
+                let written = &self.out[start..];
+                let label = written.trim();
+                let from = start + (written.len() - written.trim_start().len());
+                let to = from + label.len();
                 // An autolink's text is its destination; saying it twice
                 // helps nobody.
-                let same = text == dest || dest.strip_prefix("mailto:") == Some(text);
-                if !same && !dest.is_empty() {
-                    if text.is_empty() {
+                let same = label == dest
+                    || dest.strip_prefix("mailto:") == Some(label)
+                    || (target.is_some() && label.eq_ignore_ascii_case(&dest));
+                if same {
+                    // A news link that says only where it goes says it the
+                    // way every other one does: `<news:51>` is `news #51`,
+                    // as `[the sizes](news:51)` is `the sizes (news #51)`.
+                    if target.is_some() {
+                        let tail = self.out.split_off(to);
+                        self.out.truncate(from);
+                        self.raw(&shown);
+                        self.raw(&tail);
+                    }
+                } else if !dest.is_empty() {
+                    if label.is_empty() {
                         self.text(&shown);
                     } else {
                         self.text(" (");
@@ -354,19 +440,23 @@ impl Writer {
         self.at_line_start = true;
     }
 
-    /// A blank line inside whatever is open: a quote's is `>`, anything
-    /// else's is empty, and none of them carries trailing spaces.
+    /// A blank line inside whatever is open: the quotes' marks and the
+    /// indentation before them, and no trailing spaces.
     fn blank_line(&mut self) {
-        let prefix: String = self
+        // As in `text`: a line nothing is written to is not built.
+        if self.cut {
+            return;
+        }
+        // Only a quote puts anything visible at the start of a line, so
+        // what the containers inside the innermost one would add is
+        // spaces the trim takes off anyway, and is never built.
+        let depth = self
             .stack
             .iter()
-            .map(|c| match c {
-                Container::Quote => "> ",
-                _ => "",
-            })
-            .collect();
-        let prefix = prefix.trim_end().to_string();
-        self.raw(&prefix);
+            .rposition(|c| *c == Container::Quote)
+            .map_or(0, |i| i + 1);
+        let prefix = self.line_prefix(depth, false);
+        self.raw(prefix.trim_end());
         self.raw("\n");
         self.at_line_start = true;
     }
@@ -379,42 +469,86 @@ impl Writer {
         if self.cut {
             return;
         }
-        for (_, shown) in &mut self.links {
-            shown.push_str(text);
-        }
         let mut lines = text.split('\n').peekable();
         while let Some(line) = lines.next() {
+            let more = lines.peek().is_some();
             if !line.is_empty() {
                 if self.at_line_start {
                     self.prefix();
+                    self.begin_labels();
                 }
                 self.raw(line);
                 self.at_line_start = false;
+            } else if more && self.at_line_start {
+                // An empty line inside a code block or an HTML block keeps
+                // its quote's `>`, or a legacy reader sees the quote end
+                // there and another begin.
+                self.blank_line();
+                continue;
             }
-            if lines.peek().is_some() {
+            if more {
                 self.newline();
             }
         }
     }
 
+    /// Links opened at the start of a line begin where their first text
+    /// does, after the line's prefix. They are the innermost frames, and
+    /// each is set once.
+    fn begin_labels(&mut self) {
+        let at = self.out.len();
+        for frame in self.links.iter_mut().rev() {
+            if frame.start.is_some() {
+                break;
+            }
+            frame.start = Some(at);
+        }
+    }
+
     fn prefix(&mut self) {
+        // As in `text`: a prefix nesting has made long is not built for
+        // a line nothing is written to.
+        if self.cut {
+            self.marker = None;
+            return;
+        }
+        let prefix = self.line_prefix(self.stack.len(), true);
+        self.marker = None;
+        self.raw(&prefix);
+    }
+
+    /// What the outermost `depth` containers begin a line with. An item is
+    /// its width in spaces, or the marker it is waiting to write when it
+    /// is the innermost and `marker` asks for it.
+    fn line_prefix(&self, depth: usize, marker: bool) -> String {
         let mut prefix = String::new();
         let innermost_item = self
             .stack
             .iter()
             .rposition(|c| matches!(c, Container::Item { .. }));
-        for (i, c) in self.stack.iter().enumerate() {
+        for (i, c) in self.stack[..depth].iter().enumerate() {
             match c {
                 Container::Quote => prefix.push_str("> "),
                 Container::Code => prefix.push_str("    "),
-                Container::Item { width } => match (&self.marker, Some(i) == innermost_item) {
-                    (Some(marker), true) => prefix.push_str(marker),
-                    _ => prefix.extend(std::iter::repeat_n(' ', *width)),
-                },
+                Container::Item { width } => {
+                    match (&self.marker, marker && Some(i) == innermost_item) {
+                        (Some(marker), true) => prefix.push_str(marker),
+                        _ => prefix.extend(std::iter::repeat_n(' ', *width)),
+                    }
+                }
             }
         }
-        self.marker = None;
-        self.raw(&prefix);
+        prefix
+    }
+
+    /// An item's marker alone on its line: `-`, never `- `.
+    fn bare_marker(&mut self) {
+        self.prefix();
+        if !self.cut {
+            let kept = self.out.trim_end_matches(' ').len();
+            self.out.truncate(kept);
+        }
+        self.at_line_start = false;
     }
 
     /// The one place bytes are written, and the one place the limit is
@@ -610,5 +744,110 @@ mod tests {
         // business, so it sits in prose here.)
         let stars = format!("a {} b", "*".repeat(5_000));
         assert_eq!(plain(&stars), stars);
+        // Lists nested thousands deep reach the limit within their first
+        // few hundred lines. What follows is written nowhere, and must
+        // not be built either: a prefix rebuilt per item after the cut is
+        // seconds of work here where the linear writer takes a blink.
+        for (unit, what) in [("- ", "bullets"), ("1. ", "numbers"), ("> - ", "quoted")] {
+            let body = format!("{}x", unit.repeat(30_000));
+            let started = std::time::Instant::now();
+            let r = render(&body, 65_535);
+            let took = started.elapsed();
+            assert!(r.plain.len() <= 65_535, "{what}");
+            assert!(r.plain.ends_with('…'), "{what}");
+            assert!(took < std::time::Duration::from_secs(2), "{what}: {took:?}");
+        }
+    }
+
+    #[test]
+    fn nested_links_and_images_cost_what_they_write() {
+        // Each label is measured in the output when its link closes, not
+        // copied into every frame open around it as it is written.
+        let n = 20_000;
+        for (open, what) in [("![", "images"), ("[", "links")] {
+            let body = format!("{}a{}", open.repeat(n), "](u)".repeat(n));
+            let started = std::time::Instant::now();
+            let r = render(&body, 65_535);
+            let took = started.elapsed();
+            // Images nest; a link cannot hold one, so the outer brackets
+            // of the links are literal and only the innermost is a link.
+            assert!(r.plain.contains("a (u)"), "{what}");
+            assert!(took < std::time::Duration::from_secs(2), "{what}: {took:?}");
+        }
+        assert_eq!(plain("![![a](u)](v)"), "a (u) (v)");
+    }
+
+    #[test]
+    fn a_blank_line_in_quoted_code_is_still_quoted() {
+        assert_eq!(plain("> ```\n> a\n>\n> b\n> ```"), ">     a\n>\n>     b");
+        assert_eq!(
+            plain("- item\n\n  > q\n  >\n  >     code\n  >\n  >     more"),
+            "- item\n\n  > q\n  >\n  >     code\n  >\n  >     more",
+            "and keeps the indentation in front of its `>`"
+        );
+    }
+
+    #[test]
+    fn a_tight_list_stays_tight_around_a_quote_or_code() {
+        assert_eq!(plain("- a\n  > q\n- b"), "- a\n  > q\n- b");
+        assert_eq!(plain("- a\n  ```\n  x\n  ```\n- b"), "- a\n      x\n- b");
+        assert_eq!(
+            plain("- a\n\n  > q\n\n- b"),
+            "- a\n\n  > q\n\n- b",
+            "a loose one keeps its blank lines"
+        );
+    }
+
+    #[test]
+    fn an_empty_item_keeps_its_marker() {
+        assert_eq!(plain("-\n- b"), "-\n- b");
+        assert_eq!(plain("1.\n2. b"), "1.\n2. b");
+        assert_eq!(plain("- a\n-\n- c"), "- a\n-\n- c");
+    }
+
+    #[test]
+    fn raw_html_is_never_prose() {
+        // Every kind of HTML block CommonMark has, and inline tags: their
+        // text is the author's markup, not their words, and a `#51` in it
+        // cites nothing. hx-ng's renderer draws raw HTML the same way.
+        for body in [
+            "<br>\nFixed in #51.",
+            "<div>\n#51\n</div>",
+            "<!-- #51 -->",
+            "<pre>\n#51\n</pre>",
+            "<?php #51 ?>",
+            "<!X #51>",
+            "<![CDATA[ #51 ]]>",
+            "see <a title=\"#51\">this</a>",
+        ] {
+            let r = render(body, 100);
+            assert!(r.refs.is_empty(), "{body:?} gave {:?}", r.refs);
+            assert!(r.plain.contains("#51"), "kept as written: {:?}", r.plain);
+        }
+        assert_eq!(
+            render("<b>#51</b>", 100).refs,
+            [51],
+            "the words between tags are prose"
+        );
+    }
+
+    #[test]
+    fn the_news_scheme_is_any_case() {
+        let r = render("[x](NEWS:51) and <News:52>", 100);
+        assert_eq!(r.refs, [51, 52]);
+        assert_eq!(r.plain, "x (news #51) and news #52");
+    }
+
+    #[test]
+    fn a_news_autolink_says_which_article_as_other_news_links_do() {
+        assert_eq!(plain("see <news:51>."), "see news #51.");
+        assert_eq!(plain("[news:51](news:51)"), "news #51");
+        assert_eq!(plain("> <news:51>"), "> news #51");
+        assert_eq!(render("<news:51>", 100).refs, [51]);
+        assert_eq!(
+            plain("<https://hl.example>"),
+            "https://hl.example",
+            "and any other autolink is still its destination, once"
+        );
     }
 }

@@ -577,6 +577,25 @@ async fn a_markdown_article_is_kept_as_written_and_read_as_text() {
         "{snippet}"
     );
 
+    // A reference definition cited over and over repeats its destination
+    // each time, so this downgrade runs past what a body may be. Search
+    // still reads all of it; cutting it to size is the legacy edge's job.
+    let url = format!("https://hl.example/{}", "a".repeat(1_000));
+    let long = format!("{} farthest\n\n[r]: {url}\n", "[r] ".repeat(100));
+    assert!(long.len() < 65_535 && 100 * url.len() > 65_535);
+    let expanded = alice
+        .ok(
+            "news_post",
+            json!({ "category": cat, "subject": "Long", "body": long, "mime": "text/markdown" }),
+        )
+        .await["id"]
+        .as_u64()
+        .unwrap();
+    let found = alice
+        .ok("news_search", json!({ "q": "farthest", "order": "recent" }))
+        .await;
+    assert_eq!(ids(&found["hits"], ""), [expanded]);
+
     // A server that takes plain text only says so up front and refuses
     // the rest.
     let plain = tempfile::tempdir().unwrap();

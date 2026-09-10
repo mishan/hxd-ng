@@ -958,6 +958,16 @@ pub const MAX_NODE_NAME: usize = 255;
 /// thousands of lookups for a cap of 32.
 const MAX_REF_CANDIDATES: usize = 256;
 
+/// How many times `max_body` a downgrade may run to before the renderer
+/// stops writing it (§5.4). What a person writes downgrades to about its
+/// own size — a link loses its brackets and gains a space, a nested list
+/// line gains the indentation its source already had — so this is room
+/// no ordinary article reaches, and search reads all of it. Only a body
+/// built to expand meets it: a reference definition cited over and over,
+/// a quote nested thousands deep and continued lazily. Cutting to
+/// `max_body` for a legacy client is that edge's business, not this one.
+const DOWNGRADE_ROOM: usize = 4;
+
 /// The `#51` shorthand, found in a body (§5.3).
 ///
 /// Recognized when the `#` starts the text or follows whitespace or
@@ -1114,7 +1124,8 @@ impl Core {
     ) -> (Option<String>, Vec<ArticleId>) {
         match (mime, policy.markdown, self.body_renderer.as_ref()) {
             (BodyType::Markdown, MarkdownMode::Render, Some(renderer)) => {
-                let Rendered { plain, mut refs } = renderer.render(body, policy.max_body);
+                let limit = policy.max_body.saturating_mul(DOWNGRADE_ROOM);
+                let Rendered { plain, mut refs } = renderer.render(body, limit);
                 refs.truncate(MAX_REF_CANDIDATES);
                 (Some(plain), refs)
             }

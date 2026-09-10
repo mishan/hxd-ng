@@ -611,7 +611,11 @@ The limit is a parameter because it cannot be a caller's afterthought. A
 downgrade can outgrow its source, and the worst case is not linear: a
 quote opened thousands deep and then continued lazily repeats its prefix
 on every line after it. That is quadratic output from a body that passed
-every size check, and it has to stop where it is written.
+every size check, and it has to stop where it is written. Past the limit
+the renderer builds nothing more either — no prefix, no blank line — so
+the limit bounds the work as well as the output, and the work before it
+is linear: a link's label is measured in the output when the link
+closes, never copied into every link and image open around it.
 
 Implemented on [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark):
 pure Rust, CommonMark, and an event stream — so the plain-text render is
@@ -619,7 +623,10 @@ a fold over events and the reference scan is one match arm on
 `Tag::Link`. The dialect is CommonMark minus two things:
 
 - **Raw HTML is literal text**, never interpreted, on the way in and on
-  the way out.
+  the way out. It is also opaque: an inline tag, or an HTML block by any
+  of CommonMark's start conditions, is not prose, so a `#51` inside one
+  is not a reference. `<br>` on a line of its own starts a block that
+  runs to the next blank line, so `Fixed in #51.` under it cites nothing.
 - **No images by URL.** An article's pictures are its attachments. A body
   that can fetch `https://tracker.example/pixel.gif` is a body that
   reports every reader's address to a stranger, and news is read by more
@@ -657,6 +664,9 @@ scheme:
 ```markdown
 This was settled in [the sizes thread](news:51), and #47 has the numbers.
 ```
+
+The scheme matches in any case, as a URI scheme does, so `NEWS:51` is
+the same reference.
 
 `#<digits>` is the shorthand, recognized by a scanner in `hxd-core` — not
 by the markdown parser — when it is delimited by whitespace or
@@ -704,18 +714,29 @@ not the ambiguous kind of mention.
 - Emphasis and strong markers are dropped; the words stay.
 - A heading becomes its text followed by a blank line.
 - A bullet list becomes `- ` lines, an ordered list `1. ` lines —
-  markdown's plain-text ancestry doing the work for us.
+  markdown's plain-text ancestry doing the work for us. An empty item
+  keeps its bare marker. A tight list stays tight, even around an item
+  holding a quote or a code block; a loose one keeps its blank lines.
 - A fenced code block becomes its contents indented four spaces, fences
-  gone. A block quote becomes `> ` lines.
+  gone. A block quote becomes `> ` lines, its blank lines included — one
+  inside quoted code is still `>`, so the quote does not come apart.
 - `[text](news:51)` becomes `text (news #51)`; `[text](https://…)`
-  becomes `text (https://…)`; a bare `#51` is left exactly as typed.
+  becomes `text (https://…)`; a bare `#51` is left exactly as typed. A
+  link whose text is its destination says it once: `<https://…>` is
+  `https://…`, and `<news:51>` is `news #51`.
 - A table becomes its cells, tab-separated, one row per line. Nobody is
   happy about this and nobody has a better answer for a 1996 text view.
 
-**The downgrade can be longer than the source** — every link grows — so
-it is capped independently at `max_body` and truncated at a character
-boundary with a trailing `…`. The truncation affects the legacy part
-only; the source is untouched and an ng client sees all of it.
+**The downgrade can be longer than the source**, and the domain gives
+the renderer room for that: a small multiple of `max_body`, which no
+article a person writes comes near, because a link or a list line
+downgrades to about its own length. Only a body built to expand — a
+reference definition cited over and over, a quote nested thousands
+deep — reaches it, and is cut there at a character boundary with a
+trailing `…`. So the downgrade stored, and the index over it, is whole
+for any ordinary article, and the source is untouched either way: an ng
+client sees all of it. Cutting to `max_body` for a legacy client happens
+at the legacy edge, when that binding lands (§12.4, §16).
 
 ### 5.5 The knob
 
@@ -873,9 +894,12 @@ SQLite store puts each term through its own tokenizer before building
 the expression and drops one that comes out empty, as the grammar drops
 a term with no words, so no term can sink the rest of a query.
 
-`hxd news-reindex` rebuilds `news_fts` from `news_article`. It is needed
-after an mhxd import (§12.6), after a `markdown` mode change that alters
-every downgrade, and as the repair for an index that has drifted.
+`hxd news-reindex` rebuilds `news_fts` from `news_article`, from what
+is stored and nothing else. It is needed after an mhxd import (§12.6)
+and as the repair for an index that has drifted. It re-renders nothing:
+a downgrade is fixed when its article is posted, so a `markdown` mode
+change applies to articles posted after it, and reindexing does not
+reach back.
 
 ### 6.5 The legacy wire cannot search
 
@@ -1875,11 +1899,12 @@ wire enforces up front is better than a lossy conversion at the edge.
 Subjects are pstrings, hence 255. Both are enforced in the domain, so
 neither wire can create something the other cannot show.
 
-The plain downgrade is capped at the same 65 535 **independently of the
-source**, because rendering grows text: every `[label](news:51)` becomes
-`label (news #51)`. A body that fits and a downgrade that does not is an
-ordinary case, not an edge one, and it is why §5.4 truncates rather than
-refusing the post.
+The plain part a 1.5 client is served is cut to the same 65 535
+**independently of the source**, because rendering can grow text. A
+body that fits and a downgrade that does not is a case to handle, not
+refuse, so the cut happens here, at the edge, with a trailing `…` at a
+character boundary. The stored downgrade is not cut to it, so search
+reads past it (§5.4).
 
 Text conversion is `hxd-session`'s existing edge: UTF-8 → Mac Roman
 with `?` for unmappable on the way out, Mac Roman → UTF-8 on the way
@@ -2146,8 +2171,9 @@ builds.
 - **`hxd-markdown` unit tests**: each downgrade rule of §5.4 with its
   expected plain text; raw HTML surviving as literal text; an image by
   URL downgraded to the link it is; a link to `news:51` yielding both the rendered form and
-  the reference; a downgrade that outgrows `max_body` truncated at a
-  character boundary and not mid-codepoint.
+  the reference; a downgrade that outgrows its limit truncated at a
+  character boundary and not mid-codepoint; deep nesting and nested
+  links costing linear time.
 - **Reference tests**: the `#51` shorthand recognized after whitespace
   and punctuation and *not* as an ATX heading; extraction from a plain
   body with the `markdown` feature off; an id naming nothing staying
