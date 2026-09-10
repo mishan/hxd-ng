@@ -2110,7 +2110,7 @@ sync = "full"
     #[cfg(feature = "inbox")]
     #[test]
     fn a_purge_takes_the_news_subscriptions_too() {
-        use hxd_core::news::{Follow, NewNode, NodeKind, SubScope};
+        use hxd_core::news::{NewNode, NodeKind, SubScope};
         use hxd_core::NewsStore;
 
         // No `db` of its own: news shares the inbox's file, as the design
@@ -2137,7 +2137,6 @@ sync = "full"
                 .subscribe(
                     &alice,
                     SubScope::Category(cat),
-                    Follow::Asked,
                     10,
                     std::time::SystemTime::now(),
                 )
@@ -2174,7 +2173,6 @@ sync = "full"
                 .subscribe(
                     &hxd_core::inbox::Mailbox::login("alice"),
                     SubScope::Category(cat),
-                    Follow::Asked,
                     10,
                     std::time::SystemTime::now(),
                 )

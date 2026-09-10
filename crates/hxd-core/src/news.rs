@@ -247,6 +247,26 @@ pub struct NewPost {
     /// deduplicated. The store keeps the ones that name an article.
     pub refs: Vec<ArticleId>,
     pub at: SystemTime,
+    /// Who posting subscribes to the thread, when `auto_subscribe` says
+    /// it does (§10.3).
+    pub follow: Option<AutoFollow>,
+}
+
+/// The subscription a post makes for its poster, **in the post's own
+/// write**. Made afterwards, a reply stored in between would be counted
+/// unread against the new row without anyone having been told of it —
+/// nobody followed the thread when that reply named its audience — and
+/// under the catch-up rule the row would then never ring (§10.7).
+///
+/// On the post's thread, automatic, and caught up: the article just
+/// written is the scope's newest. An existing row is never touched, muted
+/// or not. At `max_subs` there is no row, and the article still posts:
+/// the subscription is a courtesy, and refusing the post over it would be
+/// the wrong way round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoFollow {
+    pub owner: Mailbox,
+    pub max_subs: usize,
 }
 
 /// What the store made of a post.
@@ -470,20 +490,6 @@ pub struct Subscription {
     pub at: SystemTime,
 }
 
-/// How a subscription came to be asked for (§10.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Follow {
-    /// Someone asked. Explicit, and it unmutes: asking to follow is asking
-    /// to hear about it.
-    Asked,
-    /// Posting this article made it. Automatic, it never touches a row
-    /// that already exists, and a new row's cursor starts **at this
-    /// article** rather than at the scope's newest: the subscription is
-    /// made after the post commits, and a reply stored in between is one
-    /// the poster has not seen.
-    Posted(ArticleId),
-}
-
 /// A subscription row as a post's audience sees it (§10.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscriber {
@@ -598,7 +604,8 @@ pub trait NewsStore: Send + Sync + 'static {
     /// category, no deeper than `max_depth`, with at most `max_refs` of
     /// its candidate references kept — only the ones that name an
     /// article, since an id naming nothing is the digits someone typed.
-    /// Bumps the category's `add_sn`.
+    /// Bumps the category's `add_sn`, and makes `p.follow`'s subscription
+    /// in the same write ([`AutoFollow`]).
     fn post(&self, p: &NewPost, max_depth: u16, max_refs: usize) -> Result<Posted, NewsError>;
 
     fn article(&self, id: ArticleId) -> Result<Option<Article>, StoreError>;
@@ -663,16 +670,14 @@ pub trait NewsStore: Send + Sync + 'static {
     // category. A deletion, a retention pass or a category going takes
     // the rows that pointed at what went.
 
-    /// Subscribe `owner` to `scope` and answer its unread count.
+    /// Subscribe `owner` to `scope`, because they asked, and answer its
+    /// unread count. The automatic kind is made by [`Self::post`].
     ///
-    /// A new row starts **caught up**: under the catch-up rule a
-    /// subscription that starts behind would never ring. Asked for, its
-    /// cursor is the newest article in the scope; made by posting, it is
-    /// the posted article ([`Follow::Posted`]). An existing row keeps its
-    /// cursor; asking turns an automatic row explicit, and an automatic
-    /// subscribe never touches an existing row at all, muted or not —
-    /// muting is how its owner said no, and posting again is not taking
-    /// that back.
+    /// A new row starts **caught up**, its cursor at the newest article in
+    /// the scope: under the catch-up rule a subscription that starts
+    /// behind would never ring. An existing row keeps its cursor, and
+    /// asking turns it explicit and unmutes it — asking to follow is
+    /// asking to hear about it.
     ///
     /// `NoSuchArticle` for a thread id that is not a thread starter,
     /// `NoSuchNode` and `NotACategory` for a category that is not one,
@@ -681,7 +686,6 @@ pub trait NewsStore: Send + Sync + 'static {
         &self,
         owner: &Mailbox,
         scope: SubScope,
-        how: Follow,
         max_subs: usize,
         at: SystemTime,
     ) -> Result<usize, NewsError>;
@@ -1189,6 +1193,7 @@ impl Core {
             body,
             mime: req.mime,
             at: SystemTime::now(),
+            follow: subs::auto_follow(&asker, req.parent.is_none(), policy.notify),
         };
         let posted = store
             .post(&post, policy.max_depth, policy.max_refs)

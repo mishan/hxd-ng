@@ -1524,17 +1524,28 @@ and neither would ring. Asked instead as "was anything older than this
 article unread", the earlier of the two rings and the later does not,
 whatever order their notifications run in.
 
-**An automatic subscription starts at the post that made it**, for the
-same reason. It is made after the post commits, so starting it at the
-scope's newest article would treat a reply stored in between as already
-seen.
+**An automatic subscription is made in the post's own write.** Made
+after the post commits, it has no right place to start. At the scope's
+newest article, it would count a reply stored in between as already
+seen. At the post, it would count that reply as unread even though
+nobody was told about it: no row existed when the reply chose its
+audience. So the scope would not ring again until `news_seen`. Made in
+the same transaction as the article, the row exists before any later
+article gets an id, and it starts caught up at the post, which is the
+thread's newest.
 
 Two floors sit under it:
 
 - `[news.notify] max_per_hour` per account across every news push
   (default 12), because a subscriber to forty scopes can be rung forty
   times by the rule above. Exceeding it drops the push, never the event
-  and never the unread count.
+  and never the unread count. The budget lives in the server's memory,
+  kept under the mailbox rule, and a restart forgets it. Linking an
+  identity forgets the budget under the old key. `hxd inbox purge`, though,
+  runs in a process of its own and cannot reach it. So a login that is
+  deleted and taken again within the hour can start with the previous
+  holder's partly spent budget. The cost is a push delayed until the
+  bucket refills.
 - **The gateway's collapse key**: `msggroup` is set to the scope —
   `thread:398` — so two pushes for one scope that are somehow both in
   flight collapse on the device. This is the "vendor collapse keys"

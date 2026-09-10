@@ -1585,6 +1585,7 @@ mod tests {
                     mime: BodyType::Plain,
                     refs: Vec::new(),
                     at: UNIX_EPOCH,
+                    follow: None,
                 },
                 32,
                 32,

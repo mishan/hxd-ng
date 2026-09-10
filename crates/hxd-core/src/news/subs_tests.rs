@@ -291,7 +291,9 @@ fn no_pushes_an_hour_keeps_nothing() {
 }
 
 #[test]
-fn a_purged_account_leaves_no_budget_behind() {
+fn a_purge_in_the_servers_own_process_forgets_the_push_budget() {
+    // Only there: `hxd inbox purge` runs in a process of its own and
+    // never reaches these, which `news_subs_rotate` says out loud.
     let s = Server::new(NotifyPolicy {
         max_per_hour: 1,
         ..NotifyPolicy::default()
@@ -304,6 +306,23 @@ fn a_purged_account_leaves_no_budget_behind() {
     assert!(
         s.core.news_push.lock().unwrap().is_empty(),
         "the next alice starts with a full hour, not this one's spent one"
+    );
+}
+
+#[test]
+fn a_replier_hears_the_next_reply() {
+    // Posting's subscription is made in the post's own write, so it
+    // exists before the next article does and starts at the post: the
+    // next reply by someone else is the first thing it has not seen, and
+    // rings.
+    let s = Server::new(NotifyPolicy::default());
+    let root = s.post_as("alice", None, "a question");
+    s.post_as("bob", Some(root), "an answer");
+    s.post_as("carol", Some(root), "another answer");
+    let to_bob: Vec<_> = s.gw.sent().into_iter().filter(|n| n.0 == "bob").collect();
+    assert_eq!(
+        to_bob,
+        vec![("bob".into(), NotifyReason::Subscription, thread(root), 1)]
     );
 }
 

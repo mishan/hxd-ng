@@ -10,7 +10,6 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use super::query::{words, Field, Term};
-use super::Follow;
 use super::{
     Article, ArticleId, ArticlePage, Author, BodyType, Hit, NewNode, NewPost, NewsError, NewsStore,
     Node, NodeId, NodeKind, Posted, Reference, SearchPage, SearchQuery, SubScope, Subscriber,
@@ -352,7 +351,7 @@ impl Inner {
         &mut self,
         owner: &Mailbox,
         scope: SubScope,
-        how: Follow,
+        auto: bool,
         muted: bool,
         max_subs: usize,
         at: SystemTime,
@@ -362,10 +361,7 @@ impl Inner {
             return Err(NewsError::TooManySubs);
         }
         self.last_sub += 1;
-        let (auto, last_seen) = match how {
-            Follow::Asked => (false, self.newest(scope)),
-            Follow::Posted(article) => (true, article),
-        };
+        let last_seen = self.newest(scope);
         self.subs.push(SubRow {
             id: self.last_sub,
             owner: owner.clone(),
@@ -530,6 +526,18 @@ impl NewsStore for MemoryNews {
         });
         let cat = inner.node_mut(p.category).expect("checked above");
         cat.add_sn = cat.add_sn.wrapping_add(1);
+        // Under the same lock as the article, so no later article is
+        // given an id before the row exists. It starts at this one, the
+        // thread's newest.
+        if let Some(f) = &p.follow {
+            let thread = SubScope::Thread(root);
+            if inner.sub_mut(&f.owner, thread).is_none() {
+                match inner.add_sub(&f.owner, thread, true, false, f.max_subs, p.at) {
+                    Ok(_) | Err(NewsError::TooManySubs) => {}
+                    Err(e) => panic!("following a thread just written: {e:?}"),
+                }
+            }
+        }
         Ok(Posted { id, root })
     }
 
@@ -774,7 +782,6 @@ impl NewsStore for MemoryNews {
         &self,
         owner: &Mailbox,
         scope: SubScope,
-        how: Follow,
         max_subs: usize,
         at: SystemTime,
     ) -> Result<usize, NewsError> {
@@ -784,13 +791,11 @@ impl NewsStore for MemoryNews {
             Some(row) => {
                 // Asking is explicit, and asking to hear about something
                 // is not asking for it muted.
-                if how == Follow::Asked {
-                    row.auto = false;
-                    row.muted = false;
-                }
+                row.auto = false;
+                row.muted = false;
                 row.last_seen
             }
-            None => inner.add_sub(owner, scope, how, false, max_subs, at)?,
+            None => inner.add_sub(owner, scope, false, false, max_subs, at)?,
         };
         Ok(inner.unread(owner, scope, last_seen))
     }
@@ -819,7 +824,7 @@ impl NewsStore for MemoryNews {
                 Ok(())
             }
             None if muted => inner
-                .add_sub(owner, scope, Follow::Asked, true, max_subs, at)
+                .add_sub(owner, scope, false, true, max_subs, at)
                 .map(|_| ()),
             None => Ok(()),
         }

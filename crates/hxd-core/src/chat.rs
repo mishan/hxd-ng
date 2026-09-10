@@ -1460,7 +1460,10 @@ impl Core {
 
     /// An account has been deleted: take its mail and its news
     /// subscriptions with it, so a later holder of the freed login
-    /// inherits nothing. Returns how much mail went.
+    /// inherits neither. Its news push budget goes too, but that is
+    /// memory, and only a purge in the server's own process reaches it —
+    /// `hxd inbox purge` purges the stores from a process of its own (see
+    /// `news_subs_rotate`). Returns how much mail went.
     pub fn inbox_purge(&self, of: &Mailbox) -> usize {
         self.news_subs_purge(of);
         let Some(store) = self.inbox.as_ref() else {

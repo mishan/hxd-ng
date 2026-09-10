@@ -9,7 +9,9 @@
 //! What a post does, in order:
 //!
 //! 1. **It subscribes its poster** (`auto_subscribe`), so whoever asked a
-//!    question is subscribed to the answers with nothing to click.
+//!    question is subscribed to the answers with nothing to click. The
+//!    store does that in the post's own write ([`AutoFollow`]), so the
+//!    row exists before any later article is given an id.
 //! 2. **It names an audience**: the parent's author (`reply`), the authors
 //!    of what the body cited (`reference`), and the thread's subscribers
 //!    and — for a new thread — the category's (`subscription`),
@@ -32,10 +34,9 @@ use std::time::{Instant, SystemTime};
 
 use tracing::warn;
 
-use super::Follow;
 use super::{
-    store_failed, ArticleId, Asker, AutoSubscribe, NewPost, NewsError, NewsStore, Notified,
-    NotifyPolicy, NotifyReason, Posted, SubScope, Subscription,
+    store_failed, ArticleId, Asker, AutoFollow, AutoSubscribe, NewPost, NewsError, NewsStore,
+    Notified, NotifyPolicy, NotifyReason, Posted, SubScope, Subscription,
 };
 use crate::access::bit;
 use crate::inbox::Mailbox;
@@ -79,6 +80,27 @@ fn excerpt(body: &str) -> String {
         _ => &cut[..],
     };
     format!("{}…", cut.trim_end())
+}
+
+/// The subscription posting owes its poster, if any: none on a server
+/// that keeps no subscriptions, none for a guest, and otherwise as
+/// `auto_subscribe` says.
+pub(super) fn auto_follow(
+    asker: &Asker,
+    starter: bool,
+    notify: Option<NotifyPolicy>,
+) -> Option<AutoFollow> {
+    let notify = notify?;
+    let auto = match notify.auto_subscribe {
+        AutoSubscribe::Participated => true,
+        AutoSubscribe::OwnThread => starter,
+        AutoSubscribe::Off => false,
+    };
+    let owner = asker.mailbox.clone().filter(|_| auto)?;
+    Some(AutoFollow {
+        owner,
+        max_subs: notify.max_subs,
+    })
 }
 
 impl Core {
@@ -126,13 +148,7 @@ impl Core {
     pub fn news_subscribe(&self, uid: Uid, scope: SubScope) -> Result<usize, NewsError> {
         let (store, mailbox, notify) = self.news_subscriber(uid)?;
         store
-            .subscribe(
-                &mailbox,
-                scope,
-                Follow::Asked,
-                notify.max_subs,
-                SystemTime::now(),
-            )
+            .subscribe(&mailbox, scope, notify.max_subs, SystemTime::now())
             .map_err(store_failed)
     }
 
@@ -181,11 +197,11 @@ impl Core {
     /// The news half of `inbox_claim`: subscriptions are keyed the way a
     /// mailbox is, so linking an identity owes them the same stamp.
     ///
-    /// The push budget kept under the old key goes too, as it does on a
-    /// rotation and a purge. The new key starts with a full hour's worth,
-    /// which is at most one hour's extra pushes; the other way round, a
-    /// later holder of a freed login would start out with the previous
-    /// holder's spent budget.
+    /// The push budget kept under the old key goes too. The new key starts
+    /// with a full hour's worth, which is at most one hour's extra pushes;
+    /// the other way round, a later holder of a freed login would start
+    /// out with the previous holder's spent budget. Every link site is in
+    /// the running server, so this one always reaches the budgets.
     pub(crate) fn news_subs_claim(&self, login: &str, fingerprint: &[u8; 32]) {
         self.forget_news_budget(&Mailbox::login(login));
         if let Some(store) = self.news.as_ref() {
@@ -195,6 +211,13 @@ impl Core {
         }
     }
 
+    /// A rotation and a purge forget the budget too, but only in the
+    /// process they run in. Nothing rotates yet, and a purge is
+    /// `hxd inbox purge`, a process of its own that never reaches a
+    /// running server's memory: there, a login deleted and taken again
+    /// within the hour can start with the previous holder's partly spent
+    /// budget. That costs a push delayed until the bucket refills — never
+    /// an event and never a count — and a restart forgets it.
     pub(crate) fn news_subs_rotate(&self, from: &[u8; 32], to: &[u8; 32]) {
         self.forget_news_budget(&Mailbox::identified("", *from));
         if let Some(store) = self.news.as_ref() {
@@ -213,8 +236,9 @@ impl Core {
         }
     }
 
-    /// Everything a post owes after it is stored: the poster's own
-    /// subscription, then everyone it is addressed to.
+    /// Everything a post owes after it is stored: telling everyone it is
+    /// addressed to. The poster's own subscription is already made, in
+    /// the post's write.
     pub(super) fn news_after_post(
         &self,
         asker: &Asker,
@@ -227,26 +251,6 @@ impl Core {
         };
         let starter = post.parent.is_none();
         let thread = SubScope::Thread(posted.root);
-
-        if let Some(me) = &asker.mailbox {
-            let auto = match notify.auto_subscribe {
-                AutoSubscribe::Participated => true,
-                AutoSubscribe::OwnThread => starter,
-                AutoSubscribe::Off => false,
-            };
-            // At the cap the article still posts: the subscription is a
-            // courtesy, and refusing the post over it would be the wrong
-            // way round.
-            if auto {
-                let how = Follow::Posted(posted.id);
-                match store.subscribe(me, thread, how, notify.max_subs, post.at) {
-                    Ok(_) | Err(NewsError::TooManySubs) => {}
-                    Err(e) => {
-                        store_failed(e);
-                    }
-                }
-            }
-        }
 
         // A tombstone has no author, and a guest's article has no login;
         // either way there is nobody to tell.
@@ -459,7 +463,7 @@ impl Core {
     }
 
     /// Drop the push budget kept for a mailbox that is going, or moving
-    /// to another key.
+    /// to another key — in this process; see [`Self::news_subs_rotate`].
     fn forget_news_budget(&self, who: &Mailbox) {
         self.news_push.lock().unwrap().remove(&budget_key(who));
     }
