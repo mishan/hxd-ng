@@ -50,7 +50,7 @@ impl Searchable {
     fn of(a: &ArticleRow) -> Self {
         Searchable {
             subject: words(&a.subject),
-            body: words(&a.body),
+            body: words(a.searched_body()),
             author: words(&format!(
                 "{} {}",
                 a.author.nick,
@@ -128,8 +128,18 @@ struct ArticleRow {
     subject: String,
     body: String,
     mime: BodyType,
+    /// The downgrade, where there is one: what search reads in the body's
+    /// place, as the SQLite store's `search_body` does.
+    plain: Option<String>,
     at: SystemTime,
     deleted: bool,
+}
+
+impl ArticleRow {
+    /// The text search reads: the downgrade where there is one.
+    fn searched_body(&self) -> &str {
+        self.plain.as_deref().unwrap_or(&self.body)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -521,6 +531,7 @@ impl NewsStore for MemoryNews {
             subject: p.subject.clone(),
             body: p.body.clone(),
             mime: p.mime,
+            plain: p.plain.clone(),
             at: whole_seconds(p.at),
             deleted: false,
         });
@@ -656,6 +667,7 @@ impl NewsStore for MemoryNews {
         row.deleted = true;
         row.subject.clear();
         row.body.clear();
+        row.plain = None;
         row.author = Author {
             nick: String::new(),
             login: None,
@@ -752,7 +764,7 @@ impl NewsStore for MemoryNews {
             .skip(q.offset)
             .take(q.limit)
             .map(|a| {
-                let (snippet, marks) = snippet(&a.body, &q.terms.terms);
+                let (snippet, marks) = snippet(a.searched_body(), &q.terms.terms);
                 Hit {
                     article: a.id,
                     root: a.root,

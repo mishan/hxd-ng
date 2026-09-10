@@ -69,7 +69,8 @@ describe('threaded news', () => {
     assert.ok(alice.conn.hasCap('news'));
     assert.equal(alice.conn.news.post, true);
     assert.equal(alice.conn.news.max_depth, 2, 'the value from the config file');
-    assert.equal(alice.conn.news.markdown, 'off');
+    assert.equal(alice.conn.news.markdown, 'render', 'the default in a build with a parser');
+    assert.deepEqual(alice.conn.news.body_types, ['text/plain', 'text/markdown']);
     const reader = await login('reader');
     assert.equal(reader.conn.news.post, false, 'a reader who may not post is told so');
   });
@@ -158,8 +159,8 @@ describe('threaded news', () => {
       );
     assert.equal(await code(editor.conn.newsPost({ category: node.id, parent: two, subject: 's', body: 'b' })), 'too_deep');
     assert.equal(
-      await code(editor.conn.newsPost({ category: node.id, subject: 's', body: 'b', mime: 'text/markdown' })),
-      'bad_body_type',
+      await code(editor.conn.newsPost({ category: node.id, subject: 's', body: 'b', mime: 'text/html' })),
+      'bad_request',
     );
     assert.equal(await code(editor.conn.newsNodeCreate({ kind: 'category', name: 'Rules' })), 'name_taken');
     assert.equal(await code(outsider.conn.newsTree()), 'access_denied');
@@ -213,6 +214,29 @@ describe('threaded news', () => {
     assert.equal((await reader.conn.newsSearch({ q: 'derivative' })).total, 0, 'a deletion reaches the index');
   });
 
+  test('a markdown article comes back as written, and search reads it as text', async () => {
+    const editor = await login('editor');
+    const { node } = await editor.conn.newsNodeCreate({ kind: 'category', name: 'Marked' });
+    const { id: target } = await editor.conn.newsPost({ category: node.id, subject: 'Target', body: 'Here.' });
+    const body = `## Findings\n\nSee [the target](news:${target}), **carefully**.\n\n    #${target} in code is only code\n`;
+    const { id } = await editor.conn.newsPost({ category: node.id, subject: 'Marked up', body, mime: 'text/markdown' });
+
+    const article = await editor.conn.newsArticle(id);
+    assert.equal(article.mime, 'text/markdown');
+    assert.equal(article.body, body, 'the server never rewrites what was typed');
+    assert.deepEqual(
+      article.refs.map((r) => r.id),
+      [target],
+    );
+
+    const page = await editor.conn.newsSearch({ q: 'carefully', category: node.id });
+    assert.deepEqual(
+      page.hits.map((h) => h.id),
+      [id],
+    );
+    assert.ok(!page.hits[0].snippet.includes('**'), page.hits[0].snippet);
+  });
+
   test('an answer reaches whoever asked, and following a category hears what starts there', async () => {
     const editor = await login('editor');
     const asker = await login('asker');
@@ -259,7 +283,7 @@ describe('threaded news', () => {
 
 describe('a news section the server cannot honor', () => {
   test('refuses to start rather than doing less than it says', async () => {
-    const { output } = await startFailing({ config: { news: { db: 'news.sqlite', markdown: 'render' } } });
+    const { output } = await startFailing({ config: { news: { db: 'news.sqlite', markdown: 'html' } } });
     assert.match(output, /markdown/);
     const alone = await startFailing({ config: { news: {} } });
     assert.match(alone.output, /\[news\] needs db/);

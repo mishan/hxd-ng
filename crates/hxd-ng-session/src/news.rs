@@ -7,9 +7,9 @@
 //! off the reactor, and writes the answer down.
 
 use hxd_core::news::{
-    Article, ArticleId, BodyType, Hit, NewsError, Node, NodeId, NodeKind, NodeTree, Notified,
-    PostRequest, Reference, SearchOrder, SearchRequest, SubScope, Subscription, ThreadHead,
-    ThreadQuery,
+    Article, ArticleId, BodyType, Hit, MarkdownMode, NewsError, Node, NodeId, NodeKind, NodeTree,
+    Notified, PostRequest, Reference, SearchOrder, SearchRequest, SubScope, Subscription,
+    ThreadHead, ThreadQuery,
 };
 use hxd_core::{Core, Uid};
 use serde::de::DeserializeOwned;
@@ -190,8 +190,15 @@ pub fn login_json(core: &Core, uid: Uid) -> Option<Value> {
         "max_body": p.max_body,
         "max_subject": p.max_subject,
         "max_depth": p.max_depth,
-        "markdown": "off",
-        "body_types": ["text/plain"],
+        // `render` and `source` are one thing to an ng client: either way
+        // it is handed the source to draw (§9.2). They differ only in
+        // what the server makes for search and for the legacy wire.
+        "markdown": p.markdown.name(),
+        "body_types": if p.markdown == MarkdownMode::Off {
+            json!(["text/plain"])
+        } else {
+            json!(["text/plain", "text/markdown"])
+        },
         "max_refs": p.max_refs,
         "search": p.search,
         "search_max_results": p.search_max_results,

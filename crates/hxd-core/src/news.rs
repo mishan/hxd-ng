@@ -40,6 +40,8 @@ use crate::roster::{Core, Event, Uid, UserSession};
 pub mod conformance;
 pub mod memory;
 
+#[cfg(test)]
+mod body_tests;
 pub mod query;
 #[cfg(test)]
 mod search_tests;
@@ -156,8 +158,8 @@ impl Author {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyType {
     Plain,
-    /// Accepted once the markdown stage (§5, W3) lands. The column and the
-    /// wire field exist now so that stage is not a migration.
+    /// Accepted unless `[news] markdown = "off"`, and stored exactly as
+    /// typed either way (§5).
     Markdown,
 }
 
@@ -176,6 +178,67 @@ impl BodyType {
             _ => None,
         }
     }
+}
+
+/// `[news] markdown` (§5.5). References and search work under all three;
+/// only their quality differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownMode {
+    /// Markdown is accepted, and a parser writes the plain-text downgrade
+    /// the index and a legacy client read.
+    Render,
+    /// Markdown is accepted and stored, and nothing parses it: the pure
+    /// client-side reading, for a server that wants no parser.
+    Source,
+    /// Every body is plain text.
+    Off,
+}
+
+impl MarkdownMode {
+    /// The config's and the ng wire's spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            MarkdownMode::Render => "render",
+            MarkdownMode::Source => "source",
+            MarkdownMode::Off => "off",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "render" => Some(MarkdownMode::Render),
+            "source" => Some(MarkdownMode::Source),
+            "off" => Some(MarkdownMode::Off),
+            _ => None,
+        }
+    }
+}
+
+/// What a markdown body reads as without markdown, and what it points at
+/// (§5.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rendered {
+    /// What the search index reads, and what a legacy client will be
+    /// served. Text, never markup.
+    pub plain: String,
+    /// Candidate references in order of appearance, once each: the
+    /// `news:` links, and the `#51` shorthand in prose but never in code.
+    /// The store keeps the ones that name an article, as for a plain body.
+    pub refs: Vec<ArticleId>,
+}
+
+/// The seam `hxd-markdown` implements, so a server that wants no parser
+/// links none — the `MediaCodec` shape.
+pub trait BodyRenderer: Send + Sync + 'static {
+    /// Render `source` to plain text no longer than `limit` bytes.
+    ///
+    /// **The limit is the implementation's to keep, not the caller's to
+    /// trim afterwards.** A downgrade can outgrow its source — every link
+    /// grows — and a lazily continued quote nested thousands deep would
+    /// repeat its prefix on every line, which is quadratic output from a
+    /// body that passed every size check. Called once, at post time, off
+    /// the reactor; never on a read.
+    fn render(&self, source: &str, limit: usize) -> Rendered;
 }
 
 /// One article.
@@ -243,6 +306,9 @@ pub struct NewPost {
     pub subject: String,
     pub body: String,
     pub mime: BodyType,
+    /// The plain-text downgrade of a markdown body under `render` (§5.4),
+    /// and `None` for everything else, whose body is its own plain text.
+    pub plain: Option<String>,
     /// Candidate ids from [`scan_refs`], in order of appearance and
     /// deduplicated. The store keeps the ones that name an article.
     pub refs: Vec<ArticleId>,
@@ -846,6 +912,10 @@ pub struct NewsPolicy {
     /// Subscriptions and notifications, or `None` for a server that keeps
     /// neither (§10).
     pub notify: Option<NotifyPolicy>,
+    /// Whether markdown bodies are taken, and whether they are parsed.
+    /// `Off` by default here, because a domain with no parser cannot
+    /// render; the binary's default is `render` when it has one.
+    pub markdown: MarkdownMode,
 }
 
 impl Default for NewsPolicy {
@@ -863,6 +933,7 @@ impl Default for NewsPolicy {
             search_max_results: 500,
             search_per_minute: 30,
             notify: None,
+            markdown: MarkdownMode::Off,
         }
     }
 }
@@ -1024,6 +1095,35 @@ impl Core {
         self
     }
 
+    /// Give the domain a markdown parser, for `[news] markdown =
+    /// "render"`. Without one a markdown body is stored and served as its
+    /// source, which is `"source"`'s behavior; the binary never pairs
+    /// `"render"` with no parser.
+    pub fn with_body_renderer(mut self, renderer: Arc<dyn BodyRenderer>) -> Self {
+        self.body_renderer = Some(renderer);
+        self
+    }
+
+    /// What a body resolves to and, for markdown under `render`, what it
+    /// reads as without markdown (§5.3, §5.4). Once, here, at post time.
+    fn news_render(
+        &self,
+        body: &str,
+        mime: BodyType,
+        policy: NewsPolicy,
+    ) -> (Option<String>, Vec<ArticleId>) {
+        match (mime, policy.markdown, self.body_renderer.as_ref()) {
+            (BodyType::Markdown, MarkdownMode::Render, Some(renderer)) => {
+                let Rendered { plain, mut refs } = renderer.render(body, policy.max_body);
+                refs.truncate(MAX_REF_CANDIDATES);
+                (Some(plain), refs)
+            }
+            // Plain text, or markdown nothing parses: the shorthand is
+            // found in what was typed, as it always has been.
+            _ => (None, scan_refs(body)),
+        }
+    }
+
     pub fn news_enabled(&self) -> bool {
         self.news.is_some()
     }
@@ -1164,12 +1264,10 @@ impl Core {
         if !asker.access.has(bit::POST_NEWS) {
             return Err(NewsError::AccessDenied);
         }
-        // `markdown = "off"` is the only mode this build has: the parser
-        // and the plain-text downgrade are the markdown stage's (§5).
-        if req.mime != BodyType::Plain {
+        let policy = self.news_policy;
+        if req.mime == BodyType::Markdown && policy.markdown == MarkdownMode::Off {
             return Err(NewsError::BadBodyType);
         }
-        let policy = self.news_policy;
         let subject = clean_subject(&req.subject);
         if subject.is_empty() {
             return Err(NewsError::BadRequest("An article needs a subject."));
@@ -1184,14 +1282,16 @@ impl Core {
         if body.len() > policy.max_body {
             return Err(NewsError::BadRequest("That article is too long."));
         }
+        let (plain, refs) = self.news_render(&body, req.mime, policy);
         let post = NewPost {
             category: req.category,
             parent: req.parent,
-            refs: scan_refs(&body),
+            refs,
             author: asker.author.clone(),
             subject,
             body,
             mime: req.mime,
+            plain,
             at: SystemTime::now(),
             follow: subs::auto_follow(&asker, req.parent.is_none(), policy.notify),
         };

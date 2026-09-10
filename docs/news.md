@@ -602,9 +602,16 @@ pub struct Rendered {
 }
 
 pub trait BodyRenderer: Send + Sync + 'static {
-    fn render(&self, source: &str) -> Rendered;
+    /// `plain` no longer than `limit` bytes — the renderer's to keep.
+    fn render(&self, source: &str, limit: usize) -> Rendered;
 }
 ```
+
+The limit is a parameter because it cannot be a caller's afterthought. A
+downgrade can outgrow its source, and the worst case is not linear: a
+quote opened thousands deep and then continued lazily repeats its prefix
+on every line after it. That is quadratic output from a body that passed
+every size check, and it has to stop where it is written.
 
 Implemented on [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark):
 pure Rust, CommonMark, and an event stream — so the plain-text render is
@@ -619,6 +626,28 @@ a fold over events and the reference scan is one match arm on
   people over more time than anything else on this server.
 
 Rendering happens once, at post time, off the reactor. Never on a read.
+
+GitHub's tables and strikethrough are on, because authors type them and
+GtkHx's chat dialect already has `~~strike~~`. pulldown-cmark is built
+without its `html` feature, so there is no HTML writer in the binary to
+call by mistake.
+
+**What that dialect means for each construct.** Written down once the
+renderer existed, because each is a choice a client has to make the same
+way:
+
+- **An image by URL is a link to where it would have been fetched from.**
+  In the downgrade it is `alt (url)`, and no client draws it as a picture,
+  so the tracking-pixel risk above never reaches a reader.
+- **The shorthand is prose.** In a markdown body `#51` is a reference in
+  text and never inside a code span or block. An article quoting a
+  shell prompt or a C preprocessor line is not citing anything. A plain
+  body has no code to exclude, so the whole of it is scanned, and so is
+  a markdown body under `"source"`, where nothing parses it.
+- **A code span keeps its backticks** in the downgrade: a backticked
+  command is not decoration, and a text view reads it better with them.
+- **A line break the author typed is kept.** Chat-era authors expect it,
+  and a text view has no reflow to lose it to.
 
 ### 5.3 References
 
@@ -697,7 +726,13 @@ under all three — only their quality varies.
 |---|---|
 | `"render"` (default) | Bodies may declare `text/markdown`; the downgrade is generated; the index is built over it. |
 | `"source"` | Markdown is accepted and stored, no downgrade is generated, a legacy client is served the source. The `markdown` feature is not required. This is the pure client-side reading, for an operator who does not want a parser in their server. |
-| `"off"` | `text/markdown` is refused with `bad_request`. Every body is `text/plain`. |
+| `"off"` | `text/markdown` is refused with `bad_body_type`. Every body is `text/plain`. |
+
+`"render"` is the default in a build with the `markdown` feature, and
+`"off"` in one without, where asking for `"render"` is a startup error.
+To an ng client `"render"` and `"source"` are the same thing: either way
+it is handed the source, and the login block lists `text/markdown` in
+`body_types`.
 
 ## 6. Search and the news index
 
@@ -2110,7 +2145,7 @@ builds.
   at all, and an animated GIF whose derivative is a still frame.
 - **`hxd-markdown` unit tests**: each downgrade rule of §5.4 with its
   expected plain text; raw HTML surviving as literal text; an image by
-  URL rejected; a link to `news:51` yielding both the rendered form and
+  URL downgraded to the link it is; a link to `news:51` yielding both the rendered form and
   the reference; a downgrade that outgrows `max_body` truncated at a
   character boundary and not mid-codepoint.
 - **Reference tests**: the `#51` shorthand recognized after whitespace
@@ -2214,9 +2249,14 @@ Each lands separately with tests, roughly a branch apiece.
    edges, the 1.2 flat view of §12.5 — renderer, header-block parser,
    defaults and the push — and `hxd import-mhxd-news`.
 
-**Landed:** W1, W2, W4 and W7, and the part of W6 that needs neither
-markdown nor attachments — the requests of §9.2, the events of §9.3 and
-the login block, with `markdown = "off"` as the only mode. Search is
+**Landed:** W1, W2, W3, W4 and W7, and the part of W6 that needs no
+attachments — the requests of §9.2, the events of §9.3 and the login
+block. Markdown is `hxd-markdown` on pulldown-cmark behind
+`BodyRenderer` and the `markdown` feature. It has the three modes of
+§5.5, the downgrade stored in `plain` (which the index and the
+notification excerpt read instead of the source), and references from
+`news:` links and prose shorthand. Chat markdown is not the server's
+business at all (hotline-ng.md §8). Search is
 schema version 4: the index over the columns version 3 put there for it,
 `hxd news-reindex`, and a conformance suite that asserts which articles
 each row of the grammar finds. Subscriptions are schema version 5:

@@ -74,9 +74,11 @@ pub struct NewsSection {
     /// The 1.5 pstring: 255 at most.
     #[serde(default = "default_news_max_subject")]
     pub max_subject: usize,
-    /// `"off"`, the only mode this build has. `"render"` and `"source"`
-    /// are the markdown stage's (§5.5), and asking for them now is
-    /// refused at startup.
+    /// `"render"` (markdown accepted, and parsed for the plain-text
+    /// downgrade), `"source"` (accepted and stored, nothing parsed) or
+    /// `"off"` (§5.5). The default is `"render"` in a build with the
+    /// `markdown` feature and `"off"` in one without, where asking for
+    /// `"render"` is a startup error.
     #[serde(default = "default_news_markdown")]
     pub markdown: String,
     /// References recorded per article; past that they stay as text.
@@ -173,6 +175,8 @@ impl NewsSection {
                 max_subs: n.max_subs,
                 max_per_hour: n.max_per_hour,
             }),
+            markdown: hxd_core::MarkdownMode::from_name(&self.markdown)
+                .unwrap_or(hxd_core::MarkdownMode::Off),
         }
     }
 
@@ -180,12 +184,22 @@ impl NewsSection {
     /// a body or subject past the legacy one is an article a 1.5 client
     /// truncates, and a page past the ng one is a request nobody sends.
     fn check(&self) -> Result<(), String> {
-        if self.markdown != "off" {
-            return Err(format!(
-                "[news] markdown = {:?}: this build has no markdown support yet, \
-                 so \"off\" is the only mode it can honor",
-                self.markdown
-            ));
+        match self.markdown.as_str() {
+            "off" | "source" => {}
+            "render" if cfg!(feature = "markdown") => {}
+            "render" => {
+                return Err(
+                    "[news] markdown = \"render\": this build has no markdown parser \
+                     (built without the `markdown` feature); \"source\" stores markdown \
+                     without one"
+                        .into(),
+                )
+            }
+            other => {
+                return Err(format!(
+                    "[news] markdown = {other:?}: it is \"render\", \"source\" or \"off\""
+                ))
+            }
         }
         if !(1..=65_535).contains(&self.max_body) {
             return Err("[news] max_body must be between 1 and 65535".into());
@@ -248,7 +262,12 @@ fn default_news_max_subject() -> usize {
     hxd_core::NewsPolicy::default().max_subject
 }
 fn default_news_markdown() -> String {
-    "off".into()
+    if cfg!(feature = "markdown") {
+        "render"
+    } else {
+        "off"
+    }
+    .into()
 }
 fn default_news_max_refs() -> usize {
     hxd_core::NewsPolicy::default().max_refs
@@ -1004,6 +1023,23 @@ fn with_media(core: Core, config: &Config) -> Result<Core, String> {
     };
     let cfg = media.to_media_config()?;
     Ok(core.with_media(Arc::new(hxd_media::Codec::new(cfg.codec)), cfg))
+}
+
+/// The parser behind `[news] markdown = "render"`. Only then: `"source"`
+/// is the reading for an operator who does not want one running.
+#[cfg(feature = "markdown")]
+fn with_markdown(core: Core, config: &Config) -> Core {
+    match config.news.as_ref().map(|n| n.markdown.as_str()) {
+        Some("render") => core.with_body_renderer(Arc::new(hxd_markdown::Markdown)),
+        _ => core,
+    }
+}
+
+/// Without the feature there is nothing to give it, and `check` has
+/// already refused a config that asked for `"render"`.
+#[cfg(not(feature = "markdown"))]
+fn with_markdown(core: Core, _config: &Config) -> Core {
+    core
 }
 
 /// Without the feature there is no pipeline to give it, and a `[media]`
@@ -1839,6 +1875,7 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
         (None, None) => core,
         _ => return Err("[news] store was not opened".into()),
     };
+    let core = with_markdown(core, config);
     let core = with_media(core, config)?;
 
     Ok(ServerCtx {
@@ -1965,8 +2002,19 @@ sync = "full"
         check_config(&cfg).unwrap();
         let news = cfg.news.as_ref().unwrap();
         assert_eq!(news.db, None);
-        assert_eq!(news.to_policy(), hxd_core::NewsPolicy::default());
-        assert_eq!(news.markdown, "off");
+        let markdown = if cfg!(feature = "markdown") {
+            hxd_core::MarkdownMode::Render
+        } else {
+            hxd_core::MarkdownMode::Off
+        };
+        assert_eq!(
+            news.to_policy(),
+            hxd_core::NewsPolicy {
+                markdown,
+                ..hxd_core::NewsPolicy::default()
+            },
+            "render wherever there is a parser to render with"
+        );
         #[cfg(feature = "inbox")]
         assert!(ng_caps(&cfg, None).contains(&"news".to_string()));
         assert!(
@@ -1989,7 +2037,7 @@ sync = "full"
             ("max_node_depth", "33"),
             ("max_page", "201"),
             ("max_refs", "1000"),
-            ("markdown", "\"render\""),
+            ("markdown", "\"html\""),
             ("search_max_results", "0"),
             ("search_per_minute", "0"),
             ("search_per_minute", "601"),

@@ -685,6 +685,8 @@ pub struct Core {
     /// store calls are disk I/O and never happen under the roster lock.
     pub(crate) news: Option<Arc<dyn crate::news::NewsStore>>,
     pub(crate) news_policy: crate::news::NewsPolicy,
+    /// The markdown parser behind `[news] markdown = "render"`, or `None`.
+    pub(crate) body_renderer: Option<Arc<dyn crate::news::BodyRenderer>>,
     pub(crate) directory: Option<Arc<dyn crate::account::AccountDirectory>>,
     pub(crate) inbox_policy: InboxPolicy,
     /// Where push notifications go, or `None` — which is the no-op, and

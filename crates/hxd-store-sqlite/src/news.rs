@@ -848,8 +848,8 @@ impl NewsStore for SqliteStore {
         sql(tx.execute(
             "INSERT INTO news_article
                (category, parent, root, path, depth, nick, login, login_fp,
-                subject, body, mime, at)
-             VALUES (?1, ?2, 0, X'', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                subject, body, mime, plain, at)
+             VALUES (?1, ?2, 0, X'', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 clamp_node(p.category),
                 p.parent.map(i64::from),
@@ -860,6 +860,7 @@ impl NewsStore for SqliteStore {
                 p.subject,
                 p.body,
                 p.mime.mime(),
+                p.plain,
                 unix(p.at),
             ],
         ))?;

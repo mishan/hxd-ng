@@ -1583,6 +1583,7 @@ mod tests {
                     subject: subject.into(),
                     body: body.into(),
                     mime: BodyType::Plain,
+                    plain: None,
                     refs: Vec::new(),
                     at: UNIX_EPOCH,
                     follow: None,

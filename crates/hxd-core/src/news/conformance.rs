@@ -43,6 +43,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     search_scopes_and_pages(&*new_store());
     search_never_finds_what_is_gone(&*new_store());
     a_long_query_finds_what_it_was_pasted_from(&*new_store());
+    a_downgrade_is_what_search_reads(&*new_store());
     // Subscriptions: what unread counts, what a row may and may not be
     // made into, and the mailbox rule holding for them as for mail.
     a_subscription_starts_caught_up_and_counts_what_follows(&*new_store());
@@ -86,6 +87,7 @@ fn corpus(s: &dyn NewsStore) -> Corpus {
                 subject: subject.into(),
                 body: body.into(),
                 mime: BodyType::Plain,
+                plain: None,
                 refs: Vec::new(),
                 at: t(at),
                 follow: None,
@@ -806,10 +808,44 @@ fn new_post(category: NodeId, parent: Option<ArticleId>, body: &str, at: u64) ->
         subject: format!("about {body}"),
         body: body.into(),
         mime: BodyType::Plain,
+        plain: None,
         refs: Vec::new(),
         at: t(at),
         follow: None,
     }
+}
+
+fn a_downgrade_is_what_search_reads(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    // A subject of its own: `new_post` makes one from the body, and the
+    // subject is searched too.
+    let marked = NewPost {
+        subject: "Findings".into(),
+        mime: BodyType::Markdown,
+        plain: Some("the words a reader sees".into()),
+        ..new_post(
+            cat,
+            None,
+            "**asterisks** and [a link](https://hl.example/path)",
+            100,
+        )
+    };
+    let id = s.post(&marked, 32, 32).unwrap().id;
+    assert_eq!(
+        s.article(id).unwrap().unwrap().body,
+        "**asterisks** and [a link](https://hl.example/path)",
+        "the source is what is stored and served"
+    );
+    assert_eq!(found(s, &query("reader")), [id], "the downgrade is indexed");
+    assert!(
+        found(s, &query("asterisks")).is_empty(),
+        "and the source is not, where there is a downgrade"
+    );
+    s.tombstone(id, "mod", t(101)).unwrap();
+    assert!(
+        found(s, &query("reader")).is_empty(),
+        "a tombstone takes it too"
+    );
 }
 
 fn post(

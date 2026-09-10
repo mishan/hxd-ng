@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hxd_core::{Core, NewsPolicy, NotifyPolicy};
+use hxd_core::{Core, MarkdownMode, NewsPolicy, NotifyPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::Caps;
 use hxd_session::frame::{pack_frame, read_frame, Frame};
@@ -53,9 +53,15 @@ async fn start_server(dir: &Path, news: Option<NewsPolicy>) -> (SocketAddr, Sock
         // notify is a question about accounts nobody is logged into.
         Some(policy) => {
             let store = SqliteStore::open(dir.join("server.sqlite"), Synchronous::Normal).unwrap();
-            Core::new()
+            let core = Core::new()
                 .with_news(Arc::new(store), policy)
-                .with_accounts(files.clone())
+                .with_accounts(files.clone());
+            // The parser `render` asks for, as `hxd` gives it one.
+            if policy.markdown == MarkdownMode::Render {
+                core.with_body_renderer(Arc::new(hxd_markdown::Markdown))
+            } else {
+                core
+            }
         }
         None => Core::new(),
     };
@@ -105,6 +111,7 @@ fn news_server() -> NewsPolicy {
     NewsPolicy {
         max_depth: 3,
         notify: Some(NotifyPolicy::default()),
+        markdown: MarkdownMode::Render,
         ..NewsPolicy::default()
     }
 }
@@ -292,8 +299,8 @@ async fn the_login_reply_says_what_this_session_may_do() {
     assert_eq!(news["max_body"], 65_535);
     assert_eq!(news["max_subject"], 255);
     assert_eq!(news["max_depth"], 3);
-    assert_eq!(news["markdown"], "off");
-    assert_eq!(news["body_types"], json!(["text/plain"]));
+    assert_eq!(news["markdown"], "render");
+    assert_eq!(news["body_types"], json!(["text/plain", "text/markdown"]));
     assert_eq!(news["search"], true);
     assert_eq!(news["search_max_results"], 500);
 
@@ -510,6 +517,90 @@ async fn subscribing_says_why_not() {
     assert_eq!(hello["news"]["subscribe"], false);
     assert!(hello["news"].get("auto_subscribe").is_none());
     assert_eq!(alice.refused("news_subs", json!({})).await, "not_available");
+}
+
+#[tokio::test]
+async fn a_markdown_article_is_kept_as_written_and_read_as_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let (mut bob, _) = Ng::login(ng, "bob").await;
+    let cat = category(&mut admin, None, "General").await;
+    let sizes = post(&mut bob, cat, None, "Sizes", "The numbers.").await;
+    let other = post(&mut bob, cat, None, "Other", "More numbers.").await;
+    let quoted = post(&mut bob, cat, None, "Quoted", "Only ever in code.").await;
+
+    let body = format!(
+        "# Settled\n\nIn [the sizes thread](news:{sizes}) and **#{other}**, \
+         not `#{quoted}`:\n\n```\n#{quoted}\n```\n"
+    );
+    let summary = alice
+        .ok(
+            "news_post",
+            json!({ "category": cat, "parent": sizes, "subject": "Re: Sizes",
+                    "body": body, "mime": "text/markdown" }),
+        )
+        .await["id"]
+        .as_u64()
+        .unwrap();
+
+    let article = alice.ok("news_article", json!({ "id": summary })).await["article"].clone();
+    assert_eq!(article["mime"], "text/markdown");
+    assert_eq!(article["body"], body, "kept exactly as typed");
+    assert_eq!(
+        ids(&article["refs"], ""),
+        [sizes, other],
+        "a news: link and the shorthand, and nothing quoted as code"
+    );
+
+    // What the replied-to author is told is text, not syntax.
+    let notice = bob.event("news_notify", |d| d["article"] == summary).await;
+    let excerpt = notice["data"]["excerpt"].as_str().unwrap().to_string();
+    assert!(
+        excerpt.starts_with(&format!(
+            "Settled In the sizes thread (news #{sizes}) and #{other}"
+        )),
+        "{excerpt}"
+    );
+    assert!(!excerpt.contains("**"), "{excerpt}");
+
+    // And what search reads is the downgrade: found by its words, and
+    // snipped without its asterisks.
+    let found = alice
+        .ok("news_search", json!({ "q": "settled", "order": "recent" }))
+        .await;
+    assert_eq!(ids(&found["hits"], ""), [summary]);
+    let snippet = found["hits"][0]["snippet"].as_str().unwrap();
+    assert!(
+        !snippet.contains("**") && !snippet.contains("# "),
+        "{snippet}"
+    );
+
+    // A server that takes plain text only says so up front and refuses
+    // the rest.
+    let plain = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(
+        plain.path(),
+        Some(NewsPolicy {
+            markdown: MarkdownMode::Off,
+            ..news_server()
+        }),
+    )
+    .await;
+    let (mut admin, hello) = Ng::login(ng, "admin").await;
+    assert_eq!(hello["news"]["markdown"], "off");
+    assert_eq!(hello["news"]["body_types"], json!(["text/plain"]));
+    let cat = category(&mut admin, None, "General").await;
+    assert_eq!(
+        admin
+            .refused(
+                "news_post",
+                json!({ "category": cat, "subject": "s", "body": "**x**", "mime": "text/markdown" }),
+            )
+            .await,
+        "bad_body_type"
+    );
 }
 
 #[tokio::test]
@@ -1035,11 +1126,6 @@ async fn malformed_requests_are_answered_not_dropped() {
             "news_post",
             json!({ "category": cat, "subject": " ", "body": "x" }),
             "bad_request",
-        ),
-        (
-            "news_post",
-            json!({ "category": cat, "subject": "s", "body": "x", "mime": "text/markdown" }),
-            "bad_body_type",
         ),
         (
             "news_post",

@@ -426,6 +426,17 @@ Chat text crossing to legacy clients is converted with `?` for unmappable
 characters — tell your users their emoji become question marks on
 twenty-five-year-old Macs, which is honestly part of the charm.
 
+**Chat text is plain text, and a client may draw a closed markdown
+dialect in it.** GtkHx renders a conservative subset on receipt — bold,
+italic, code, strikethrough, links with a scheme allowlist, fenced code
+and quotes, and nothing else (GtkHx's `docs/chat-view.md` §4) — and
+hx-ng renders the same one, ported from the same scanner with the same
+tests, so a line reads the same in both. None of it is on the wire.
+What is sent is the literal text, a legacy client sees the asterisks,
+and the server neither parses nor rewrites it. A news article is
+different: its body says what it is (`mime`), and markdown there is the
+fuller dialect of news.md §5.
+
 **The legacy wire itself can negotiate UTF-8.** fogWraith's
 [Text-Encoding extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Text-Encoding.md)
 defines `CAPABILITY_TEXT_ENCODING` (bit 1 of `DATA_CAPABILITIES`, field

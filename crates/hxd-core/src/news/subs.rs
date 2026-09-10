@@ -336,7 +336,8 @@ impl Core {
             add(row.owner.clone(), NotifyReason::Subscription);
         }
 
-        let excerpt = excerpt(&post.body);
+        // The downgrade where there is one: a lock screen is a text view.
+        let excerpt = excerpt(post.plain.as_deref().unwrap_or(&post.body));
         for (to, reason) in audience {
             // You are not news to yourself, whichever reason would apply.
             if asker.mailbox.as_ref().is_some_and(|me| same(me, &to)) {
