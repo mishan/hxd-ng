@@ -318,6 +318,7 @@ fn thread_end(root: ArticleId) -> Vec<u8> {
 /// `news_article`, binding `?1`), with every reference either side of
 /// them. Returns how many articles went.
 fn remove_articles(conn: &Connection, which: &str, arg: i64) -> Result<u64, StoreError> {
+    unindex(conn, which, arg)?;
     sql(conn.execute(
         &format!(
             "DELETE FROM news_ref
@@ -339,6 +340,121 @@ fn bump_delete_sn(conn: &Connection, category: i64) -> Result<(), StoreError> {
         params![category, WRAP],
     ))?;
     Ok(())
+}
+
+// --- The search index (docs/news.md §6) ---------------------------------
+//
+// **It holds live articles and only those.** An external-content index
+// trusts the table to stay in step with it, so every write that makes or
+// unmakes a live article writes the index in the same transaction: a post
+// adds its row, and a tombstone, a category deletion and retention take
+// theirs out — with the values it was indexed under, read off the row
+// itself before the row changes. Tombstones are never in it, which is why
+// every removal skips them.
+
+/// Every live article, as the index reads it.
+const INDEX_LIVE: &str = "INSERT INTO news_fts (rowid, subject, search_body, author)
+  SELECT id, subject, search_body, author FROM news_article WHERE deleted_at IS NULL";
+
+fn index_article(conn: &Connection, id: ArticleId) -> Result<(), StoreError> {
+    sql(conn.execute(
+        "INSERT INTO news_fts (rowid, subject, search_body, author)
+         SELECT id, subject, search_body, author FROM news_article WHERE id = ?1",
+        params![i64::from(id)],
+    ))?;
+    Ok(())
+}
+
+/// Take every live article matching `which` (binding `?1`) out of the
+/// index. Called before the rows change, so what it reads is what was
+/// indexed.
+fn unindex(conn: &Connection, which: &str, arg: i64) -> Result<(), StoreError> {
+    sql(conn.execute(
+        &format!(
+            "INSERT INTO news_fts (news_fts, rowid, subject, search_body, author)
+             SELECT 'delete', id, subject, search_body, author FROM news_article
+              WHERE ({which}) AND deleted_at IS NULL"
+        ),
+        params![arg],
+    ))?;
+    Ok(())
+}
+
+/// The compiled query as an FTS5 expression. Every word is letters and
+/// digits (the grammar made sure of it), so a word inside quotes needs no
+/// escaping and nothing here can be a syntax error. `None` when there is
+/// nothing to look for — exclusions alone are not something FTS5 accepts,
+/// and not something worth asking it.
+fn fts_expression(q: &hxd_core::news::CompiledQuery) -> Option<String> {
+    use hxd_core::news::{Field, Term};
+    let render = |t: &Term| {
+        let mut phrase = format!("\"{}\"", t.words.join(" "));
+        if t.prefix {
+            phrase.push_str(" *");
+        }
+        match t.field {
+            Field::Any => phrase,
+            Field::Subject => format!("subject : {phrase}"),
+            Field::Author => format!("author : {phrase}"),
+        }
+    };
+    let wanted: Vec<String> = q.terms.iter().filter(|t| !t.negated).map(render).collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut expr = format!("({})", wanted.join(" AND "));
+    for t in q.terms.iter().filter(|t| t.negated) {
+        expr.push_str(&format!(" NOT ({})", render(t)));
+    }
+    Some(expr)
+}
+
+/// Where `snippet()` puts its marks: two private-use characters, taken
+/// back out here and turned into byte ranges, so what leaves the store is
+/// text and offsets rather than markup.
+const MARK_OPEN: char = '\u{e000}';
+const MARK_CLOSE: char = '\u{e001}';
+
+/// A snippet without its markers, and the ranges they bracketed. A body
+/// may carry these characters itself; they are dropped like the real
+/// ones, an unmatched close is ignored and an unclosed open runs to the
+/// end — a stray mark on the author's own words, never a range outside
+/// the text.
+fn unmark(marked: &str) -> (String, Vec<(u32, u32)>) {
+    let mut text = String::with_capacity(marked.len());
+    let mut marks = Vec::new();
+    let mut open: Option<usize> = None;
+    for c in marked.chars() {
+        match c {
+            MARK_OPEN => {
+                open.get_or_insert(text.len());
+            }
+            MARK_CLOSE => {
+                if let Some(start) = open.take() {
+                    if start < text.len() {
+                        marks.push((start as u32, text.len() as u32));
+                    }
+                }
+            }
+            c => text.push(c),
+        }
+    }
+    if let Some(start) = open {
+        if start < text.len() {
+            marks.push((start as u32, text.len() as u32));
+        }
+    }
+    (text, marks)
+}
+
+struct RawHit {
+    id: i64,
+    subject: String,
+    nick: String,
+    category: i64,
+    root: i64,
+    at: i64,
+    snippet: Option<String>,
 }
 
 impl NewsStore for SqliteStore {
@@ -500,6 +616,7 @@ impl NewsStore for SqliteStore {
             "UPDATE news_article SET root = ?1, path = ?2 WHERE id = ?3",
             params![i64::from(root), path, i64::from(id)],
         ))?;
+        index_article(&tx, id)?;
 
         let mut kept: Vec<ArticleId> = Vec::new();
         for &dst in &p.refs {
@@ -704,6 +821,9 @@ impl NewsStore for SqliteStore {
             "DELETE FROM news_ref WHERE src = ?1",
             params![i64::from(id)],
         ))?;
+        // Out of the index before its words go: a deletion that left the
+        // body findable would not be one (§11).
+        unindex(&tx, "id = ?1", i64::from(id))?;
         sql(tx.execute(
             "UPDATE news_article
                 SET subject = '', body = '', plain = NULL, attach_names = NULL, nick = '',
@@ -758,5 +878,104 @@ impl NewsStore for SqliteStore {
         }
         sql(tx.commit())?;
         Ok(gone)
+    }
+
+    fn search(
+        &self,
+        q: &hxd_core::news::SearchQuery,
+    ) -> Result<hxd_core::news::SearchPage, StoreError> {
+        use hxd_core::news::{Hit, SearchOrder, SearchPage};
+        use rusqlite::types::Value;
+        let Some(expr) = fts_expression(&q.terms) else {
+            return Ok(SearchPage::default());
+        };
+        // Built from the query's shape, never its text: every value the
+        // user chose is a bound parameter.
+        let mut filter = String::new();
+        let mut binds: Vec<Value> = vec![Value::Text(expr)];
+        if let Some(categories) = &q.categories {
+            if categories.is_empty() {
+                return Ok(SearchPage::default());
+            }
+            filter.push_str(" AND a.category IN (");
+            filter.push_str(&vec!["?"; categories.len()].join(", "));
+            filter.push(')');
+            binds.extend(categories.iter().map(|c| Value::Integer(clamp_node(*c))));
+        }
+        if let Some(t) = q.before {
+            filter.push_str(" AND a.at < ?");
+            binds.push(Value::Integer(unix(t)));
+        }
+        if let Some(t) = q.after {
+            filter.push_str(" AND a.at > ?");
+            binds.push(Value::Integer(unix(t)));
+        }
+        let from = format!(
+            "FROM news_fts JOIN news_article a ON a.id = news_fts.rowid
+             WHERE news_fts MATCH ?{filter}"
+        );
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = sql(conn.query_row(
+            &format!("SELECT COUNT(*) {from}"),
+            rusqlite::params_from_iter(binds.iter()),
+            |r| r.get(0),
+        ))?;
+        let mut hits = Vec::new();
+        if q.limit > 0 {
+            // BM25 with the subject weighted ten to the body's one and the
+            // author three (§6.3); ties, and the recent order, newest first.
+            let order = match q.order {
+                SearchOrder::Relevance => "bm25(news_fts, 10.0, 1.0, 3.0), a.id DESC",
+                SearchOrder::Recent => "a.id DESC",
+            };
+            let sql_text = format!(
+                "SELECT a.id, a.subject, a.nick, a.category, a.root, a.at,
+                        snippet(news_fts, 1, char(57344), char(57345), '…', 16)
+                 {from} ORDER BY {order} LIMIT ? OFFSET ?"
+            );
+            let mut all = binds.clone();
+            all.push(Value::Integer(q.limit.min(i64::MAX as usize) as i64));
+            all.push(Value::Integer(q.offset.min(i64::MAX as usize) as i64));
+            let mut stmt = sql(conn.prepare(&sql_text))?;
+            let rows = sql(stmt.query_map(rusqlite::params_from_iter(all.iter()), |r| {
+                Ok(RawHit {
+                    id: r.get(0)?,
+                    subject: r.get(1)?,
+                    nick: r.get(2)?,
+                    category: r.get(3)?,
+                    root: r.get(4)?,
+                    at: r.get(5)?,
+                    snippet: r.get(6)?,
+                })
+            }))?;
+            for row in rows {
+                let raw = sql(row)?;
+                let (snippet, marks) = unmark(raw.snippet.as_deref().unwrap_or(""));
+                hits.push(Hit {
+                    article: article_id(raw.id)?,
+                    root: article_id(raw.root)?,
+                    category: node_id(raw.category)?,
+                    subject: raw.subject,
+                    author_nick: raw.nick,
+                    at: from_unix(raw.at),
+                    snippet,
+                    marks,
+                });
+            }
+        }
+        Ok(SearchPage {
+            hits,
+            total: u32::try_from(total).unwrap_or(u32::MAX),
+            capped: false,
+        })
+    }
+
+    fn reindex(&self) -> Result<u64, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        sql(tx.execute("INSERT INTO news_fts (news_fts) VALUES ('delete-all')", []))?;
+        let indexed = sql(tx.execute(INDEX_LIVE, []))?;
+        sql(tx.commit())?;
+        Ok(indexed as u64)
     }
 }

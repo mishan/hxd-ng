@@ -802,6 +802,23 @@ is what a person means by narrowing a search.
 full-text query is a different unit of work from a keyed read, and this
 endpoint faces phones on the open internet.
 
+As built, a few things the paragraphs above leave open are settled:
+
+- **`recent` is offset-paged too**, for now. It is id-ordered and so
+  stable enough that an offset only drifts by what was posted since; a
+  cursor form is worth adding when a client needs one.
+- **`category` may name a bundle**, and then means every category
+  anywhere under it — which is what "that category and its descendants"
+  can only mean in a tree where categories hold no nodes.
+- **A hit carries its thread's `root`**, so opening one costs no second
+  request.
+- **`from` is `from:` as a parameter**: an author term added to the
+  query, so "everything by alice" is a search with no words in `q`.
+- **The index holds live articles and only those.** A post adds its row
+  and a tombstone, a category deletion and retention take theirs out, in
+  the transaction that changes the article; FTS5's own `rebuild` is not
+  used, because it would index tombstones.
+
 ### 6.4 The memory store, and reindexing
 
 `MemoryNews` implements search as a naive tokenized scan so the
@@ -1046,6 +1063,16 @@ as `chat` already does), `attachments_full`, `news_full` (the blob cap),
 There is deliberately **no error code for a bad search query**: §6.2
 compiles anything into something, so `news_search` answers with results
 or with an empty list.
+
+A `hit` is `{ "id", "root", "category", "subject", "from", "at",
+"snippet", "marks" }`: `from` the author's nick, `snippet` plain text
+from around what matched, and `marks` a list of `[start, end)` pairs in
+the snippet **counted in UTF-16 code units** — what a JSON client's
+strings index by, in JavaScript and Swift's `NSString` and Java alike —
+so a client slices the match straight out of the string it received.
+`news_search` also takes `order?` (`"relevance"`, the default, or
+`"recent"`). A server with `search = false` answers it `not_available`,
+and too many searches answer `rate_limited`.
 
 Pagination follows the `history` request where its ordering permits:
 cursors are ids, `before`/`after` are exclusive, `has_more` is computed
@@ -1871,7 +1898,7 @@ max_body = 65535                # the legacy NEWSDATA ceiling; ↓ freely, ↑ n
 max_subject = 255
 markdown = "render"             # render | source | off — §5.5
 max_refs = 32                   # references recorded per article
-search = true                   # false disables news_search and skips the index
+search = true                   # false disables news_search; the index is kept regardless
 search_max_results = 500        # deepest reachable offset
 search_per_minute = 30          # per session
 max_depth = 32                  # reply nesting
@@ -2055,9 +2082,12 @@ Each lands separately with tests, roughly a branch apiece.
    edges, the 1.2 flat view of §12.5 — renderer, header-block parser,
    defaults and the push — and `hxd import-mhxd-news`.
 
-**Landed:** W1 and W2, and the part of W6 that needs none of W3–W5 —
-the requests of §9.2 other than `news_search`, the events of §9.3 and
-the login block, with `markdown = "off"` as the only mode. `[news]`
+**Landed:** W1, W2 and W4, and the part of W6 that needs neither
+markdown nor attachments — the requests of §9.2, the events of §9.3 and
+the login block, with `markdown = "off"` as the only mode. Search is
+schema version 4: the index over the columns version 3 put there for it,
+`hxd news-reindex`, and a conformance suite that asserts which articles
+each row of the grammar finds. `[news]`
 accepts only the keys those honor; naming another, or another markdown
 mode, is a startup error until its stage lands. Not in it: §8's
 moderation ladder (W8), `order: "recent"` (§18), and the login

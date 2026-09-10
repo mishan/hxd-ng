@@ -7,8 +7,8 @@
 //! off the reactor, and writes the answer down.
 
 use hxd_core::news::{
-    Article, ArticleId, BodyType, NewsError, Node, NodeId, NodeKind, NodeTree, PostRequest,
-    Reference, ThreadHead, ThreadQuery,
+    Article, ArticleId, BodyType, Hit, NewsError, Node, NodeId, NodeKind, NodeTree, PostRequest,
+    Reference, SearchOrder, SearchRequest, ThreadHead, ThreadQuery,
 };
 use hxd_core::{Core, Uid};
 use serde::de::DeserializeOwned;
@@ -43,6 +43,8 @@ pub fn news_err(e: &NewsError) -> (&'static str, &'static str) {
             "This server takes plain-text articles only.",
         ),
         NewsError::BadRequest(text) => ("bad_request", text),
+        NewsError::SearchOff => ("not_available", "This server does not search its news."),
+        NewsError::RateLimited => ("rate_limited", "Slow down."),
         NewsError::NoSession | NewsError::Store(_) => ("server_error", "Server error."),
     }
 }
@@ -137,8 +139,63 @@ pub fn login_json(core: &Core, uid: Uid) -> Option<Value> {
         "markdown": "off",
         "body_types": ["text/plain"],
         "max_refs": p.max_refs,
-        "search": false,
+        "search": p.search,
+        "search_max_results": p.search_max_results,
     }))
+}
+
+/// Byte offsets in `s` as UTF-16 code units: what a JSON client's strings
+/// index by — JavaScript's, and NSString's and Java's with it — so a mark
+/// can be sliced out of the snippet as it arrived. An offset that is not
+/// on a character boundary is moved back to one rather than trusted.
+fn utf16_marks(s: &str, marks: &[(u32, u32)]) -> Vec<[usize; 2]> {
+    let at = |byte: u32| {
+        let mut b = (byte as usize).min(s.len());
+        while !s.is_char_boundary(b) {
+            b -= 1;
+        }
+        s[..b].encode_utf16().count()
+    };
+    marks
+        .iter()
+        .map(|&(a, b)| [at(a), at(b)])
+        .filter(|[a, b]| a < b)
+        .collect()
+}
+
+/// One search hit (§9.2).
+fn hit_json(h: &Hit) -> Value {
+    json!({
+        "id": h.article,
+        "root": h.root,
+        "category": h.category,
+        "subject": h.subject,
+        "from": h.author_nick,
+        "at": unix(h.at),
+        "snippet": h.snippet,
+        "marks": utf16_marks(&h.snippet, &h.marks),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchParams {
+    q: String,
+    #[serde(default)]
+    category: Option<NodeId>,
+    #[serde(default)]
+    from: Option<String>,
+    /// Unix seconds, like every time on this wire — a date range is what
+    /// a person means by narrowing a search (§6.3).
+    #[serde(default)]
+    before: Option<u64>,
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    order: Option<String>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -355,6 +412,47 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
                 off_reactor(core, move |c| {
                     c.news_refs(uid, p.id, limit).map(|refs| {
                         json!({ "referenced_by": refs.iter().map(ref_json).collect::<Vec<_>>() })
+                    })
+                })
+                .await,
+            )
+        }
+
+        // There is deliberately no error for a bad query (§9.2): the
+        // grammar makes something of anything, so what comes back is
+        // results or none.
+        "news_search" => {
+            let Some(p) = parse::<SearchParams>(params) else {
+                return malformed();
+            };
+            let order = match p.order.as_deref() {
+                None | Some("relevance") => SearchOrder::Relevance,
+                Some("recent") => SearchOrder::Recent,
+                Some(_) => return bad("`order` is relevance or recent."),
+            };
+            let limit = match page_size(p.limit, 20, 50) {
+                Ok(n) => n,
+                Err(text) => return bad(&text),
+            };
+            let when = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            let req = SearchRequest {
+                q: p.q,
+                category: p.category,
+                from: p.from,
+                before: p.before.map(when),
+                after: p.after.map(when),
+                order,
+                offset: p.offset.unwrap_or(0),
+                limit,
+            };
+            answer(
+                off_reactor(core, move |c| {
+                    c.news_search(uid, req).map(|page| {
+                        json!({
+                            "hits": page.hits.iter().map(hit_json).collect::<Vec<_>>(),
+                            "total": page.total,
+                            "capped": page.capped,
+                        })
                     })
                 })
                 .await,

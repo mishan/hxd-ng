@@ -56,7 +56,7 @@ mod news;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -257,6 +257,25 @@ CREATE TABLE news_ref (
   PRIMARY KEY (src, dst)
 ) WITHOUT ROWID;
 CREATE INDEX news_ref_dst ON news_ref (dst, src);
+";
+
+// News search (`docs/news.md` §6). External content over `news_article`,
+// reading the columns version 3 put there for it by name, so the text is
+// stored once. The index holds live articles and only those — the
+// invariant every write in `news.rs` keeps — so it is filled from them
+// here rather than with FTS5's own `rebuild`, which would index
+// tombstones too. `secure-delete` is what makes a removal overwrite the
+// removed tokens instead of leaving them for a merge.
+const SCHEMA_V4: &str = "
+CREATE VIRTUAL TABLE news_fts USING fts5(
+  subject, search_body, author,
+  content = 'news_article',
+  content_rowid = 'id',
+  tokenize = 'unicode61 remove_diacritics 2'
+);
+INSERT INTO news_fts (news_fts, rank) VALUES ('secure-delete', 1);
+INSERT INTO news_fts (rowid, subject, search_body, author)
+  SELECT id, subject, search_body, author FROM news_article WHERE deleted_at IS NULL;
 ";
 
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL
@@ -485,6 +504,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 3 {
         steps.push_str(SCHEMA_V3);
+    }
+    if version < 4 {
+        steps.push_str(SCHEMA_V4);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -1491,14 +1513,9 @@ mod tests {
         hxd_core::news::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
-    #[test]
-    fn the_article_table_is_ready_for_its_search_index() {
-        // The index is the search stage's, and this is its precondition:
-        // an external-content FTS5 table reads `subject`, `search_body`
-        // and `author` from `news_article` by name, so they must exist,
-        // hold the right text, and serve a snippet — on the bundled
-        // SQLite this crate actually ships.
-        use hxd_core::news::{Author, BodyType, NewNode, NewPost, NewsStore, NodeKind};
+    /// A category and a way to post into it, for the search tests.
+    fn news_fixture() -> (SqliteStore, hxd_core::news::NodeId) {
+        use hxd_core::news::{NewNode, NewsStore, NodeKind};
         let store = SqliteStore::in_memory().unwrap();
         let cat = store
             .create_node(
@@ -1512,31 +1529,185 @@ mod tests {
                 16,
             )
             .unwrap();
-        let post = |body: &str, nick: &str, login: Option<&str>| {
-            store
-                .post(
-                    &NewPost {
-                        category: cat.id,
-                        parent: None,
-                        author: Author {
-                            nick: nick.into(),
-                            login: login.map(str::to_string),
-                            fingerprint: None,
-                        },
-                        subject: "Attachment sizes".into(),
-                        body: body.into(),
-                        mime: BodyType::Plain,
-                        refs: Vec::new(),
-                        at: UNIX_EPOCH,
+        (store, cat.id)
+    }
+
+    fn news_post(
+        store: &SqliteStore,
+        cat: hxd_core::news::NodeId,
+        subject: &str,
+        body: &str,
+        nick: &str,
+        login: Option<&str>,
+    ) -> u32 {
+        use hxd_core::news::{Author, BodyType, NewPost, NewsStore};
+        store
+            .post(
+                &NewPost {
+                    category: cat,
+                    parent: None,
+                    author: Author {
+                        nick: nick.into(),
+                        login: login.map(str::to_string),
+                        fingerprint: None,
                     },
-                    32,
-                    32,
-                )
-                .unwrap()
-                .id
-        };
-        let id = post("the derivative is a u16", "Alice", Some("alice"));
-        let guest = post("a guest says the same derivative", "guest", None);
+                    subject: subject.into(),
+                    body: body.into(),
+                    mime: BodyType::Plain,
+                    refs: Vec::new(),
+                    at: UNIX_EPOCH,
+                },
+                32,
+                32,
+            )
+            .unwrap()
+            .id
+    }
+
+    fn news_search(store: &SqliteStore, q: &str) -> hxd_core::news::SearchPage {
+        use hxd_core::news::{CompiledQuery, NewsStore, SearchOrder, SearchQuery};
+        store
+            .search(&SearchQuery {
+                terms: CompiledQuery::parse(q),
+                categories: None,
+                before: None,
+                after: None,
+                order: SearchOrder::Relevance,
+                offset: 0,
+                limit: 50,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_subject_match_outranks_a_body_match_and_accents_fold() {
+        let (store, cat) = news_fixture();
+        let body = news_post(
+            &store,
+            cat,
+            "Unrelated",
+            "the café sizes are fine",
+            "Bob",
+            Some("bob"),
+        );
+        let subject = news_post(
+            &store,
+            cat,
+            "Attachment sizes",
+            "nothing to see",
+            "Bob",
+            Some("bob"),
+        );
+        let page = news_search(&store, "sizes");
+        assert_eq!(
+            page.hits.iter().map(|h| h.article).collect::<Vec<_>>(),
+            [subject, body],
+            "the subject is weighted over the body"
+        );
+        // `remove_diacritics 2`: the index folds what a person typed.
+        assert_eq!(news_search(&store, "cafe").hits[0].article, body);
+        assert_eq!(news_search(&store, "CAFÉ").hits[0].article, body);
+    }
+
+    #[test]
+    fn a_snippet_is_text_with_its_matches_marked() {
+        let (store, cat) = news_fixture();
+        news_post(
+            &store,
+            cat,
+            "Sizes",
+            "the derivative is a u16, and the derivative is small",
+            "Alice",
+            Some("alice"),
+        );
+        let hit = news_search(&store, "derivative").hits.remove(0);
+        assert!(!hit.snippet.contains('\u{e000}') && !hit.snippet.contains('\u{e001}'));
+        let marked: Vec<&str> = hit
+            .marks
+            .iter()
+            .map(|&(a, b)| &hit.snippet[a as usize..b as usize])
+            .collect();
+        assert_eq!(marked, ["derivative", "derivative"]);
+
+        // A body that carries the marker characters itself cannot make
+        // the parse fall over or reach outside the snippet: it may mark a
+        // stray word of its author's own text, and nothing worse.
+        news_post(
+            &store,
+            cat,
+            "Tricks",
+            "\u{e001}sneaky\u{e000} derivative \u{e000}unclosed",
+            "Mallory",
+            None,
+        );
+        for hit in news_search(&store, "derivative").hits {
+            for &(a, b) in &hit.marks {
+                assert!(a < b && (b as usize) <= hit.snippet.len());
+                assert!(hit.snippet.is_char_boundary(a as usize));
+                assert!(hit.snippet.is_char_boundary(b as usize));
+            }
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_index_answers_as_the_live_one_did() {
+        use hxd_core::news::NewsStore;
+        let (store, cat) = news_fixture();
+        let a = news_post(&store, cat, "One", "phase four", "Alice", Some("alice"));
+        news_post(&store, cat, "Two", "phase five", "Bob", Some("bob"));
+        // Named, because `ChatLog` has a `tombstone` too.
+        NewsStore::tombstone(&store, a, "moderator", UNIX_EPOCH).unwrap();
+        let before = news_search(&store, "phase");
+        assert_eq!(store.reindex().unwrap(), 1, "live articles only");
+        assert_eq!(news_search(&store, "phase"), before);
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch("INSERT INTO news_fts (news_fts) VALUES ('integrity-check')")
+            .unwrap_or_else(|e| panic!("the index disagrees with its articles: {e}"));
+    }
+
+    #[test]
+    fn version_three_migrates_into_a_searchable_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO news_node (kind, name, guid, created_at) VALUES (1, 'General', X'00', 1);
+                 INSERT INTO news_article (category, root, path, depth, nick, subject, body, at)
+                   VALUES (1, 1, X'00000001', 0, 'alice', 'Before search', 'findable words', 1);
+                 INSERT INTO news_article (category, root, path, depth, nick, subject, body, at,
+                                           deleted_at)
+                   VALUES (1, 2, X'00000002', 0, '', '', '', 1, 2);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let page = news_search(&store, "findable");
+        assert_eq!(page.hits.iter().map(|h| h.article).collect::<Vec<_>>(), [1]);
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch("INSERT INTO news_fts (news_fts) VALUES ('integrity-check')")
+            .unwrap_or_else(|e| panic!("the migration left the index inconsistent: {e}"));
+    }
+
+    #[test]
+    fn the_article_table_feeds_the_index_the_right_text() {
+        // `author` and `search_body` are what the index reads by name, so
+        // they must hold the right text: the downgrade in place of the
+        // body where there is one, and attachment names after it.
+        let (store, cat) = news_fixture();
+        let id = news_post(
+            &store,
+            cat,
+            "Sizes",
+            "the derivative is a u16",
+            "Alice",
+            Some("alice"),
+        );
+        let guest = news_post(&store, cat, "Sizes", "a guest says so too", "guest", None);
 
         let conn = store.conn.lock().unwrap();
         let computed = |id: u32| -> (String, String) {
@@ -1562,50 +1733,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(computed(id).1, "the plain text\ncrash.png");
-        conn.execute(
-            "UPDATE news_article SET plain = NULL, attach_names = NULL WHERE id = ?1",
-            [id],
-        )
-        .unwrap();
-
-        // Built as §6.1 has the search stage build it, secure-delete
-        // included, so the tombstone below overwrites what it removes.
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE fts USING fts5(
-               subject, search_body, author,
-               content = 'news_article', content_rowid = 'id',
-               tokenize = 'unicode61 remove_diacritics 2');
-             INSERT INTO fts(fts, rank) VALUES ('secure-delete', 1);
-             INSERT INTO fts(fts) VALUES ('rebuild');",
-        )
-        .unwrap();
-        let hits: Vec<(u32, String)> = conn
-            .prepare("SELECT rowid, snippet(fts, 1, '[', ']', '…', 8) FROM fts WHERE fts MATCH ?1")
-            .unwrap()
-            .query_map(["derivative AND author:alice"], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(hits, [(id, "the [derivative] is a u16".to_string())]);
-
-        // A tombstone leaves the index with the values it was indexed
-        // under, read off the row itself before the row is blanked.
-        conn.execute(
-            "INSERT INTO fts (fts, rowid, subject, search_body, author)
-             SELECT 'delete', id, subject, search_body, author FROM news_article WHERE id = ?1",
-            [id],
-        )
-        .unwrap();
-        let left: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM fts WHERE fts MATCH 'derivative'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(left, 1, "only the guest's article still matches");
     }
 
     #[test]

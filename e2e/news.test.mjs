@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 
-import { referenceSpans } from '@hotline-ng/client';
+import { markedSpans, referenceSpans } from '@hotline-ng/client';
 
 import { fleet } from './harness/client.mjs';
 import { startFailing, startServer } from './harness/server.mjs';
@@ -170,6 +170,41 @@ describe('threaded news', () => {
     );
     const { articles } = await editor.conn.newsNodeDelete(node.id);
     assert.equal(articles, 3);
+  });
+
+  test('a search finds what was posted, and the client marks what matched', async () => {
+    const editor = await login('editor');
+    const reader = await login('reader');
+    assert.equal(reader.conn.news.search, true);
+    const { node } = await editor.conn.newsNodeCreate({ kind: 'category', name: 'Searchable' });
+    const { id } = await editor.conn.newsPost({
+      category: node.id,
+      subject: 'Attachment sizes',
+      body: 'Ünïcødé 🎈 first: the derivative is a u16.',
+    });
+
+    const page = await reader.conn.newsSearch({ q: 'derivative', category: node.id });
+    assert.equal(page.total, 1);
+    const [hit] = page.hits;
+    assert.equal(hit.id, id);
+    assert.equal(hit.root, id);
+    assert.equal(hit.from, 'editor');
+    // The server counts marks in UTF-16 and the client slices in UTF-16:
+    // past the accents and the balloon, two implementations have to agree
+    // to the code unit for this to come out as one word.
+    assert.deepEqual(
+      markedSpans(hit.snippet, hit.marks)
+        .filter((s) => s.mark)
+        .map((s) => s.text),
+      ['derivative'],
+    );
+    assert.equal((await reader.conn.newsSearch({ q: '"the derivative"' })).total, 1);
+    assert.equal((await reader.conn.newsSearch({ q: '"derivative the"' })).total, 0, 'a phrase is in order');
+    assert.equal((await reader.conn.newsSearch({ q: 'deriv*', from: 'editor' })).total, 1);
+    assert.equal((await reader.conn.newsSearch({ q: '(OR "' })).total, 0, 'no query is an error');
+
+    await editor.conn.newsDelete(id);
+    assert.equal((await reader.conn.newsSearch({ q: 'derivative' })).total, 0, 'a deletion reaches the index');
   });
 });
 

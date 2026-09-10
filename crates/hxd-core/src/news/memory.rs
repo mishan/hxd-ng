@@ -9,11 +9,98 @@
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
+use super::query::{words, Field, Term};
 use super::{
-    Article, ArticleId, ArticlePage, Author, BodyType, NewNode, NewPost, NewsError, NewsStore,
-    Node, NodeId, NodeKind, Posted, Reference, ThreadHead, ThreadPage, ThreadQuery,
+    Article, ArticleId, ArticlePage, Author, BodyType, Hit, NewNode, NewPost, NewsError, NewsStore,
+    Node, NodeId, NodeKind, Posted, Reference, SearchPage, SearchQuery, ThreadHead, ThreadPage,
+    ThreadQuery,
 };
 use crate::inbox::StoreError;
+
+/// How much of a body a memory store's snippet shows.
+const SNIPPET_CHARS: usize = 160;
+
+/// Where `words` occurs in `col` as a phrase, the last word as a prefix
+/// when `prefix` says so.
+fn phrase_in(col: &[String], words: &[String], prefix: bool) -> bool {
+    if words.is_empty() || words.len() > col.len() {
+        return false;
+    }
+    (0..=col.len() - words.len()).any(|start| {
+        words.iter().enumerate().all(|(k, w)| {
+            let here = &col[start + k];
+            if prefix && k == words.len() - 1 {
+                here.starts_with(w.as_str())
+            } else {
+                here == w
+            }
+        })
+    })
+}
+
+/// A naive scan in place of an index: subject, body and author as words,
+/// and a term matched against the ones its field names.
+struct Searchable {
+    subject: Vec<String>,
+    body: Vec<String>,
+    author: Vec<String>,
+}
+
+impl Searchable {
+    fn of(a: &ArticleRow) -> Self {
+        Searchable {
+            subject: words(&a.subject),
+            body: words(&a.body),
+            author: words(&format!(
+                "{} {}",
+                a.author.nick,
+                a.author.login.as_deref().unwrap_or("")
+            )),
+        }
+    }
+
+    fn has(&self, t: &Term) -> bool {
+        let found = |col: &[String]| phrase_in(col, &t.words, t.prefix);
+        match t.field {
+            Field::Any => found(&self.subject) || found(&self.body) || found(&self.author),
+            Field::Subject => found(&self.subject),
+            Field::Author => found(&self.author),
+        }
+    }
+}
+
+/// The start of a body, with the words that matched marked. No ranking
+/// and no windowing: enough for a store that exists for tests, and the
+/// conformance suite asserts nothing about snippets.
+fn snippet(body: &str, terms: &[Term]) -> (String, Vec<(u32, u32)>) {
+    let text: String = body.chars().take(SNIPPET_CHARS).collect();
+    let wanted: Vec<&Term> = terms
+        .iter()
+        .filter(|t| !t.negated && t.field == Field::Any)
+        .collect();
+    let mut marks = Vec::new();
+    let mut start = None;
+    for (i, c) in text.char_indices().chain([(text.len(), ' ')]) {
+        match (c.is_alphanumeric(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                let word = text[s..i].to_lowercase();
+                let hit = wanted.iter().any(|t| {
+                    t.words.iter().enumerate().any(|(k, w)| {
+                        word == *w
+                            || (t.prefix && k == t.words.len() - 1 && word.starts_with(w.as_str()))
+                    })
+                });
+                if hit {
+                    marks.push((s as u32, i as u32));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    (text, marks)
+}
 
 #[derive(Debug, Clone)]
 struct NodeRow {
@@ -505,6 +592,63 @@ impl NewsStore for MemoryNews {
             }
         }
         Ok(gone.len() as u64)
+    }
+
+    fn search(&self, q: &SearchQuery) -> Result<SearchPage, StoreError> {
+        if q.terms.matches_nothing() {
+            return Ok(SearchPage::default());
+        }
+        let inner = self.inner.lock().unwrap();
+        let mut found: Vec<&ArticleRow> = inner
+            .articles
+            .iter()
+            .filter(|a| !a.deleted)
+            .filter(|a| {
+                q.categories
+                    .as_ref()
+                    .is_none_or(|c| c.contains(&a.category))
+            })
+            .filter(|a| q.before.is_none_or(|t| a.at < t))
+            .filter(|a| q.after.is_none_or(|t| a.at > t))
+            .filter(|a| {
+                let s = Searchable::of(a);
+                q.terms.terms.iter().all(|t| s.has(t) != t.negated)
+            })
+            .collect();
+        // No ranking here: both orders come back newest first, and the
+        // conformance suite asserts relevance's result set, never its
+        // order.
+        found.sort_by_key(|a| std::cmp::Reverse(a.id));
+        let total = found.len() as u32;
+        let hits = found
+            .into_iter()
+            .skip(q.offset)
+            .take(q.limit)
+            .map(|a| {
+                let (snippet, marks) = snippet(&a.body, &q.terms.terms);
+                Hit {
+                    article: a.id,
+                    root: a.root,
+                    category: a.category,
+                    subject: a.subject.clone(),
+                    author_nick: a.author.nick.clone(),
+                    at: a.at,
+                    snippet,
+                    marks,
+                }
+            })
+            .collect();
+        Ok(SearchPage {
+            hits,
+            total,
+            capped: false,
+        })
+    }
+
+    /// There is no index to rebuild; the answer is what one would hold.
+    fn reindex(&self) -> Result<u64, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.articles.iter().filter(|a| !a.deleted).count() as u64)
     }
 }
 

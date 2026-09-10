@@ -288,7 +288,8 @@ async fn the_login_reply_says_what_this_session_may_do() {
     assert_eq!(news["max_depth"], 3);
     assert_eq!(news["markdown"], "off");
     assert_eq!(news["body_types"], json!(["text/plain"]));
-    assert_eq!(news["search"], false);
+    assert_eq!(news["search"], true);
+    assert_eq!(news["search_max_results"], 500);
 
     let (_lurker, hello) = Ng::login(ng, "lurker").await;
     assert_eq!(
@@ -876,6 +877,188 @@ async fn malformed_requests_are_answered_not_dropped() {
             "{method} {params}"
         );
     }
+}
+
+/// The text a mark covers, sliced the way a JSON client slices: in UTF-16
+/// code units, which is what the wire promises the offsets are.
+fn marked(hit: &Value) -> Vec<String> {
+    let units: Vec<u16> = hit["snippet"].as_str().unwrap().encode_utf16().collect();
+    hit["marks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            let (a, b) = (
+                m[0].as_u64().unwrap() as usize,
+                m[1].as_u64().unwrap() as usize,
+            );
+            String::from_utf16(&units[a..b]).unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_search_finds_what_was_posted_and_says_where() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let (mut bob, _) = Ng::login(ng, "bob").await;
+    let bundle = admin
+        .ok(
+            "news_node_create",
+            json!({ "kind": "bundle", "name": "Projects" }),
+        )
+        .await["node"]["id"]
+        .as_u64()
+        .unwrap();
+    let inside = category(&mut admin, Some(bundle), "hxd-ng").await;
+    let outside = category(&mut admin, None, "Elsewhere").await;
+
+    let sizes = post(
+        &mut alice,
+        inside,
+        None,
+        "Attachment sizes",
+        "Ünïcødé 🎈 first: the derivative is a u16.",
+    )
+    .await;
+    let reply = post(
+        &mut bob,
+        inside,
+        Some(sizes),
+        "Re: Attachment sizes",
+        "A derivative of a derivative.",
+    )
+    .await;
+    let away = post(&mut bob, outside, None, "Derivative works", "Licensing.").await;
+
+    let page = bob.ok("news_search", json!({ "q": "derivative" })).await;
+    assert_eq!(page["total"], 3);
+    assert_eq!(page["capped"], false);
+    assert_eq!(
+        ids(&page["hits"], "").first(),
+        Some(&away),
+        "a match in the subject outranks one in the body"
+    );
+    let hit = page["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == sizes)
+        .unwrap()
+        .clone();
+    assert_eq!(hit["root"], sizes);
+    assert_eq!(hit["category"], inside);
+    assert_eq!(hit["subject"], "Attachment sizes");
+    assert_eq!(hit["from"], "alice");
+    assert!(hit["at"].as_u64().is_some());
+    assert_eq!(
+        marked(&hit),
+        ["derivative"],
+        "marks are UTF-16 offsets, past the accents and the balloon"
+    );
+    let the_reply = page["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == reply)
+        .unwrap()
+        .clone();
+    assert_eq!(the_reply["root"], sizes, "a hit says which thread to open");
+
+    let scoped = bob
+        .ok(
+            "news_search",
+            json!({ "q": "derivative", "category": bundle }),
+        )
+        .await;
+    let mut in_bundle = ids(&scoped["hits"], "");
+    in_bundle.sort_unstable();
+    assert_eq!(
+        in_bundle,
+        [sizes, reply],
+        "a bundle is every category under it"
+    );
+    let by = bob
+        .ok("news_search", json!({ "q": "", "from": "alice" }))
+        .await;
+    assert_eq!(ids(&by["hits"], ""), [sizes]);
+    let recent = bob
+        .ok(
+            "news_search",
+            json!({ "q": "derivative", "order": "recent", "limit": 2 }),
+        )
+        .await;
+    assert_eq!(ids(&recent["hits"], ""), [away, reply]);
+    let next = bob
+        .ok(
+            "news_search",
+            json!({ "q": "derivative", "order": "recent", "limit": 2, "offset": 2 }),
+        )
+        .await;
+    assert_eq!(ids(&next["hits"], ""), [sizes]);
+
+    // Nothing anyone types is an error.
+    for q in ["\"", "(OR", "-", "subject:", "NEAR/3 *", "💥"] {
+        bob.ok("news_search", json!({ "q": q })).await;
+    }
+
+    alice.ok("news_delete", json!({ "id": sizes })).await;
+    let after = bob.ok("news_search", json!({ "q": "u16" })).await;
+    assert_eq!(
+        after["total"], 0,
+        "a deleted article cannot be found by its words"
+    );
+}
+
+#[tokio::test]
+async fn search_is_rationed_and_can_be_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(
+        dir.path(),
+        Some(NewsPolicy {
+            search_per_minute: 2,
+            ..news_server()
+        }),
+    )
+    .await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    alice.ok("news_search", json!({ "q": "x" })).await;
+    alice.ok("news_search", json!({ "q": "x" })).await;
+    assert_eq!(
+        alice.refused("news_search", json!({ "q": "x" })).await,
+        "rate_limited"
+    );
+    assert_eq!(
+        alice
+            .refused("news_search", json!({ "q": "x", "order": "sideways" }))
+            .await,
+        "bad_request"
+    );
+    assert_eq!(
+        alice
+            .refused("news_search", json!({ "q": "x", "limit": 0 }))
+            .await,
+        "bad_request"
+    );
+    assert_eq!(alice.refused("news_search", json!({})).await, "bad_request");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(
+        dir.path(),
+        Some(NewsPolicy {
+            search: false,
+            ..news_server()
+        }),
+    )
+    .await;
+    let (mut alice, hello) = Ng::login(ng, "alice").await;
+    assert_eq!(hello["news"]["search"], false);
+    assert_eq!(
+        alice.refused("news_search", json!({ "q": "x" })).await,
+        "not_available"
+    );
 }
 
 /// Just enough of a 1.5 client to be in the room.

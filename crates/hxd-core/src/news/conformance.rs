@@ -14,8 +14,8 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    ArticleId, Author, BodyType, NewNode, NewPost, NewsError, NewsStore, NodeId, NodeKind, Posted,
-    ThreadQuery,
+    ArticleId, Author, BodyType, CompiledQuery, NewNode, NewPost, NewsError, NewsStore, NodeId,
+    NodeKind, Posted, SearchOrder, SearchQuery, ThreadQuery,
 };
 
 /// Run every case against a freshly built store. `new_store` is called
@@ -35,6 +35,261 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     a_thread_of_nothing_but_tombstones_is_not_listed(&*new_store());
     deleting_a_category_takes_its_articles_and_a_bundle_must_be_empty(&*new_store());
     pruning_takes_whole_threads_by_their_last_post(&*new_store());
+    // Search: which articles a query finds. Never the order a relevance
+    // search puts them in — the memory store does not rank — and never
+    // snippets, which only an index can make well.
+    search_follows_the_grammar(&*new_store());
+    search_scopes_and_pages(&*new_store());
+    search_never_finds_what_is_gone(&*new_store());
+}
+
+/// The corpus the search cases share: two categories, three authors, and
+/// words chosen so every row of the grammar tells something apart.
+struct Corpus {
+    general: NodeId,
+    other: NodeId,
+    open: ArticleId,
+    sizes: ArticleId,
+    reply: ArticleId,
+    change: ArticleId,
+}
+
+fn corpus(s: &dyn NewsStore) -> Corpus {
+    let general = category(s, "General");
+    let other = category(s, "Other");
+    let by = |nick: &str, login: &str| Author {
+        nick: nick.into(),
+        login: Some(login.into()),
+        fingerprint: None,
+    };
+    let put = |category, parent, author, subject: &str, body: &str, at| {
+        s.post(
+            &NewPost {
+                category,
+                parent,
+                author,
+                subject: subject.into(),
+                body: body.into(),
+                mime: BodyType::Plain,
+                refs: Vec::new(),
+                at: t(at),
+            },
+            32,
+            32,
+        )
+        .unwrap()
+        .id
+    };
+    let open = put(
+        general,
+        None,
+        by("Alice", "alice"),
+        "Phase 4 is open",
+        "News, finally. The legacy binding comes last.",
+        100,
+    );
+    let sizes = put(
+        general,
+        None,
+        by("Bob", "bob"),
+        "Attachment sizes",
+        "The derivative is a u16, phase one of 4.",
+        200,
+    );
+    let reply = put(
+        general,
+        Some(sizes),
+        by("Alice", "alice"),
+        "Re: Attachment sizes",
+        "Sizeable concerns about phase 4.",
+        300,
+    );
+    let change = put(
+        other,
+        None,
+        by("Carol", "carol"),
+        "Unrelated",
+        "Phase change materials.",
+        400,
+    );
+    Corpus {
+        general,
+        other,
+        open,
+        sizes,
+        reply,
+        change,
+    }
+}
+
+fn query(q: &str) -> SearchQuery {
+    SearchQuery {
+        terms: CompiledQuery::parse(q),
+        categories: None,
+        before: None,
+        after: None,
+        order: SearchOrder::Recent,
+        offset: 0,
+        limit: 50,
+    }
+}
+
+fn found(s: &dyn NewsStore, q: &SearchQuery) -> Vec<ArticleId> {
+    s.search(q)
+        .unwrap_or_else(|e| panic!("searching {:?}: {e}", q.terms))
+        .hits
+        .iter()
+        .map(|h| h.article)
+        .collect()
+}
+
+fn search_follows_the_grammar(s: &dyn NewsStore) {
+    let c = corpus(s);
+    let find = |q: &str| found(s, &query(q));
+    assert_eq!(find("phase"), [c.change, c.reply, c.sizes, c.open]);
+    assert_eq!(
+        find("Phase 4"),
+        [c.reply, c.sizes, c.open],
+        "both terms, anywhere"
+    );
+    assert_eq!(find("\"phase 4\""), [c.reply, c.open], "the words together");
+    assert_eq!(find("phase -legacy"), [c.change, c.reply, c.sizes]);
+    assert_eq!(
+        find("subject:sizes"),
+        [c.reply, c.sizes],
+        "not the body's 'Sizeable'"
+    );
+    assert_eq!(find("siz*"), [c.reply, c.sizes]);
+    assert_eq!(find("from:alice"), [c.reply, c.open]);
+    assert_eq!(find("from:bob phase"), [c.sizes]);
+    assert_eq!(
+        find("alice"),
+        [c.reply, c.open],
+        "a bare word looks at the author too"
+    );
+    assert!(find("-phase").is_empty(), "exclusions alone find nothing");
+
+    // Relevance finds the same articles; its order is the store's own.
+    let mut relevant = found(
+        s,
+        &SearchQuery {
+            order: SearchOrder::Relevance,
+            ..query("phase")
+        },
+    );
+    relevant.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(relevant, [c.change, c.reply, c.sizes, c.open]);
+
+    // Nothing anyone can type is an error.
+    for q in [
+        "phase\" OR (NEAR -",
+        "\"\"\"",
+        "subject:\"",
+        "* - :",
+        "{subject}: x",
+        "'; DROP TABLE news_article; --",
+    ] {
+        assert!(s.search(&query(q)).is_ok(), "{q:?}");
+    }
+
+    let hit = s.search(&query("sizeable")).unwrap().hits.remove(0);
+    assert_eq!(hit.article, c.reply);
+    assert_eq!(hit.root, c.sizes);
+    assert_eq!(hit.category, c.general);
+    assert_eq!(hit.subject, "Re: Attachment sizes");
+    assert_eq!(hit.author_nick, "Alice");
+    assert_eq!(hit.at, t(300));
+}
+
+fn search_scopes_and_pages(s: &dyn NewsStore) {
+    let c = corpus(s);
+    let scoped = |categories: Vec<NodeId>| {
+        found(
+            s,
+            &SearchQuery {
+                categories: Some(categories),
+                ..query("phase")
+            },
+        )
+    };
+    assert_eq!(scoped(vec![c.other]), [c.change]);
+    assert_eq!(scoped(vec![c.general, c.other]).len(), 4);
+    assert!(scoped(vec![]).is_empty(), "no categories is nowhere");
+
+    let dated = |before: Option<u64>, after: Option<u64>| {
+        found(
+            s,
+            &SearchQuery {
+                before: before.map(t),
+                after: after.map(t),
+                ..query("phase")
+            },
+        )
+    };
+    assert_eq!(dated(Some(250), None), [c.sizes, c.open]);
+    assert_eq!(dated(None, Some(250)), [c.change, c.reply]);
+    assert_eq!(dated(Some(350), Some(150)), [c.reply, c.sizes]);
+
+    let page = |offset, limit| {
+        s.search(&SearchQuery {
+            offset,
+            limit,
+            ..query("phase")
+        })
+        .unwrap()
+    };
+    let first = page(0, 2);
+    assert_eq!(
+        first.hits.iter().map(|h| h.article).collect::<Vec<_>>(),
+        [c.change, c.reply]
+    );
+    assert_eq!(first.total, 4, "the total is every match, not the page");
+    let second = page(2, 2);
+    assert_eq!(
+        second.hits.iter().map(|h| h.article).collect::<Vec<_>>(),
+        [c.sizes, c.open]
+    );
+    let beyond = page(10, 2);
+    assert!(beyond.hits.is_empty());
+    assert_eq!(beyond.total, 4);
+    let counted = page(0, 0);
+    assert!(counted.hits.is_empty(), "a limit of 0 is the count alone");
+    assert_eq!(counted.total, 4);
+}
+
+fn search_never_finds_what_is_gone(s: &dyn NewsStore) {
+    let c = corpus(s);
+    s.tombstone(c.open, "moderator", t(500)).unwrap();
+    assert!(
+        found(s, &query("legacy")).is_empty(),
+        "a tombstone is not found"
+    );
+    assert_eq!(found(s, &query("phase")), [c.change, c.reply, c.sizes]);
+
+    s.delete_node(c.other).unwrap();
+    assert!(
+        found(s, &query("materials")).is_empty(),
+        "nor a deleted category's"
+    );
+
+    s.prune(Duration::from_secs(1000), t(1250)).unwrap();
+    assert_eq!(
+        found(s, &query("phase")),
+        [c.reply, c.sizes],
+        "a thread with a post inside the window stays findable"
+    );
+    s.prune(Duration::from_secs(10), t(1250)).unwrap();
+    assert!(
+        found(s, &query("phase")).is_empty(),
+        "nor a pruned thread's"
+    );
+
+    // A rebuild holds what the live index held: nothing is left, and
+    // nothing comes back.
+    assert_eq!(s.reindex().unwrap(), 0);
+    let fresh = post(s, c.general, None, "phase anew", 2000);
+    assert_eq!(s.reindex().unwrap(), 1);
+    assert_eq!(found(s, &query("phase")), [fresh]);
 }
 
 fn t(secs: u64) -> SystemTime {

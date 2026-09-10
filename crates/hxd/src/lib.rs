@@ -57,8 +57,8 @@ pub struct Config {
 
 /// Threaded news (`docs/news.md` §13).
 ///
-/// Only the keys this build acts on. The design's others — search,
-/// attachments, the 1.2 flat category, notifications — arrive with the
+/// Only the keys this build acts on. The design's others — attachments,
+/// the 1.2 flat category, notifications — arrive with the
 /// stages that honor them, and until then naming one is a startup error
 /// rather than a promise the server quietly does not keep.
 #[derive(Debug, Deserialize)]
@@ -98,6 +98,18 @@ pub struct NewsSection {
     /// behavior, where only `delete_articles` can.
     #[serde(default = "default_true")]
     pub self_delete: bool,
+    /// Answer `news_search`. `false` turns the request off and leaves the
+    /// index alone — it is kept either way, so turning search back on
+    /// needs no rebuild.
+    #[serde(default = "default_true")]
+    pub search: bool,
+    /// The deepest a search pages, and the count past which a total is
+    /// reported as capped.
+    #[serde(default = "default_news_search_max_results")]
+    pub search_max_results: usize,
+    /// Searches per session per minute.
+    #[serde(default = "default_news_search_per_minute")]
+    pub search_per_minute: u32,
 }
 
 impl NewsSection {
@@ -111,6 +123,9 @@ impl NewsSection {
             max_page: self.max_page,
             self_delete: self.self_delete,
             retain_days: self.retain_days,
+            search: self.search,
+            search_max_results: self.search_max_results,
+            search_per_minute: self.search_per_minute,
         }
     }
 
@@ -143,8 +158,23 @@ impl NewsSection {
         if !(1..=200).contains(&self.max_page) {
             return Err("[news] max_page must be between 1 and 200".into());
         }
+        // Zero is not "unlimited" in either: one reaches no result at all,
+        // the other answers no search ever.
+        if !(1..=10_000).contains(&self.search_max_results) {
+            return Err("[news] search_max_results must be between 1 and 10000".into());
+        }
+        if !(1..=600).contains(&self.search_per_minute) {
+            return Err("[news] search_per_minute must be between 1 and 600".into());
+        }
         Ok(())
     }
+}
+
+fn default_news_search_max_results() -> usize {
+    hxd_core::NewsPolicy::default().search_max_results
+}
+fn default_news_search_per_minute() -> u32 {
+    hxd_core::NewsPolicy::default().search_per_minute
 }
 
 fn default_news_max_body() -> usize {
@@ -1442,6 +1472,39 @@ pub fn inbox_purge(
     Err("this build has no inbox (built without the `inbox` feature)".to_string())
 }
 
+/// `hxd news-reindex`: rebuild the news search index from the articles
+/// (`docs/news.md` §6.4) — the repair for an index that has drifted.
+///
+/// It opens the database the way startup does, migration included: an
+/// index is only rebuilt on a schema that has one. The database must
+/// already exist, though; a reindex that created an empty one would be
+/// an operator's typo answered with a new file.
+#[cfg(feature = "inbox")]
+pub fn news_reindex(config: &Config) -> Result<u64, String> {
+    let Some(news) = &config.news else {
+        return Err("[news] is not configured; there is no index to rebuild".into());
+    };
+    let path = news
+        .db
+        .clone()
+        .or_else(|| config.inbox.as_ref().map(|i| i.db.clone()))
+        .or_else(|| config.history.as_ref().and_then(|h| h.db.clone()))
+        .ok_or("[news] names no database")?;
+    if !path.exists() {
+        return Err(format!(
+            "{}: no news database, so there is nothing to index",
+            path.display()
+        ));
+    }
+    let store = open_sqlite(&path, hxd_store_sqlite::Synchronous::Normal)?;
+    hxd_core::NewsStore::reindex(&*store).map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "inbox"))]
+pub fn news_reindex(_config: &Config) -> Result<u64, String> {
+    Err("this build has no news store (built without the `inbox` feature)".to_string())
+}
+
 /// A fingerprint as an operator has it: the 52-character Crockford form
 /// the account file's `[identity]` table and the roster both show, or
 /// raw hex for anyone reading it out of a hash. Crockford first — the
@@ -1816,13 +1879,19 @@ sync = "full"
             ("max_page", "201"),
             ("max_refs", "1000"),
             ("markdown", "\"render\""),
+            ("search_max_results", "0"),
+            ("search_per_minute", "0"),
+            ("search_per_minute", "601"),
         ] {
             let cfg = parse(&format!("[news]\ndb = \"n.sqlite\"\n{key} = {value}\n")).unwrap();
             let err = check_config(&cfg).unwrap_err();
             assert!(err.contains(key), "{key} = {value}: {err}");
         }
+        let searchless = parse("[news]\ndb = \"n.sqlite\"\nsearch = false\n").unwrap();
+        check_config(&searchless).unwrap();
+        assert!(!searchless.news.unwrap().to_policy().search);
         assert!(
-            parse("[news]\ndb = \"n.sqlite\"\nsearch = true\n").is_err(),
+            parse("[news]\ndb = \"n.sqlite\"\nflat_category = \"General\"\n").is_err(),
             "a key for a stage this build does not have is refused, not ignored"
         );
     }

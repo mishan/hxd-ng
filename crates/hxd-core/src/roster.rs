@@ -391,6 +391,9 @@ pub(crate) struct UserSession {
     /// transport detach/resume instead of resetting on every WebSocket.
     pub(crate) history_refill: Instant,
     pub(crate) history_tokens: f64,
+    /// News search's ration, kept the same way and for the same reason.
+    pub(crate) search_refill: Instant,
+    pub(crate) search_tokens: f64,
     /// Whether this session has been announced (shows on the user list,
     /// generates events). False between login and login-completion.
     pub(crate) visible: bool,
@@ -790,6 +793,8 @@ impl Core {
                 identity: info.identity,
                 history_refill: Instant::now(),
                 history_tokens: 10.0,
+                search_refill: Instant::now(),
+                search_tokens: f64::from(self.news_policy.search_per_minute),
                 visible: false,
                 outbox: Outbox::live(tx),
             },

@@ -39,7 +39,12 @@ use crate::roster::{Core, Event, Uid, UserSession};
 pub mod conformance;
 pub mod memory;
 
+pub mod query;
+#[cfg(test)]
+mod search_tests;
+
 pub use memory::MemoryNews;
+pub use query::{CompiledQuery, Field, Term};
 
 /// A bundle or a category. A rowid, never reused.
 pub type NodeId = u64;
@@ -324,6 +329,10 @@ pub enum NewsError {
     BadRequest(&'static str),
     /// The session asking has gone.
     NoSession,
+    /// This server answers no searches (`[news] search = false`).
+    SearchOff,
+    /// Too many searches from this session; wait and ask again.
+    RateLimited,
     Store(StoreError),
 }
 
@@ -401,6 +410,85 @@ pub trait NewsStore: Send + Sync + 'static {
     /// replies would leave them hanging off nothing. References into what
     /// went go with it. Returns how many articles went.
     fn prune(&self, max_age: Duration, now: SystemTime) -> Result<u64, StoreError>;
+
+    /// Full-text search (§6). Tombstones are never found: what is
+    /// searched is live articles, and nothing else. `total` counts every
+    /// match whatever `offset` and `limit` say; a `limit` of 0 asks for
+    /// the count alone.
+    fn search(&self, q: &SearchQuery) -> Result<SearchPage, StoreError>;
+
+    /// Rebuild the search index from the articles, answering how many
+    /// were indexed. The repair for an index that has drifted, and what
+    /// an import or a change in how bodies render ends with (§6.4).
+    fn reindex(&self) -> Result<u64, StoreError>;
+}
+
+/// How a search's hits are ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchOrder {
+    /// Best match first — BM25 with the subject weighted over the body
+    /// (§6.3). Paged by offset, because one post landing between two
+    /// pages reorders everything after it and a cursor would lie.
+    Relevance,
+    /// Newest first, by id.
+    Recent,
+}
+
+/// A search as a store runs it: every field decided, nothing left to a
+/// user's spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchQuery {
+    pub terms: CompiledQuery,
+    /// Only articles in these categories; `None` for all of them.
+    pub categories: Option<Vec<NodeId>>,
+    pub before: Option<SystemTime>,
+    pub after: Option<SystemTime>,
+    pub order: SearchOrder,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+/// One article a search found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub article: ArticleId,
+    /// Its thread, so opening a hit costs no second request.
+    pub root: ArticleId,
+    pub category: NodeId,
+    pub subject: String,
+    pub author_nick: String,
+    pub at: SystemTime,
+    /// A stretch of the body around what matched. Text, never markup.
+    pub snippet: String,
+    /// Byte ranges in `snippet` that matched, in order. A client
+    /// highlights them in its own style.
+    pub marks: Vec<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchPage {
+    pub hits: Vec<Hit>,
+    /// Every match, not only the reachable ones.
+    pub total: u32,
+    /// More matched than a search may reach (§6.3), so a client can say
+    /// "500+" honestly.
+    pub capped: bool,
+}
+
+/// What a frontend hands [`Core::news_search`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRequest {
+    /// As typed. The grammar makes something of anything.
+    pub q: String,
+    /// A category, or a bundle standing for every category under it.
+    pub category: Option<NodeId>,
+    /// Only this author: `from:` as a parameter rather than typed.
+    pub from: Option<String>,
+    pub before: Option<SystemTime>,
+    pub after: Option<SystemTime>,
+    pub order: SearchOrder,
+    pub offset: usize,
+    pub limit: usize,
 }
 
 /// The numbers the domain enforces, filled from `[news]`.
@@ -423,6 +511,16 @@ pub struct NewsPolicy {
     pub self_delete: bool,
     /// Days a thread survives its last post; 0 keeps everything.
     pub retain_days: u32,
+    /// Is `news_search` answered? The index is kept either way, so
+    /// turning search back on needs no rebuild.
+    pub search: bool,
+    /// The deepest a search may page, and the count past which `total`
+    /// is reported as capped (§6.3).
+    pub search_max_results: usize,
+    /// Searches per session per minute. A full-text query is a different
+    /// unit of work from a keyed read, and this faces phones on the open
+    /// internet.
+    pub search_per_minute: u32,
 }
 
 impl Default for NewsPolicy {
@@ -436,6 +534,9 @@ impl Default for NewsPolicy {
             max_page: 200,
             self_delete: true,
             retain_days: 0,
+            search: true,
+            search_max_results: 500,
+            search_per_minute: 30,
         }
     }
 }
@@ -873,6 +974,110 @@ impl Core {
         let gone = store.delete_node(id).map_err(store_failed)?;
         self.news_fan_out(Event::NewsNodeDeleted { id });
         Ok(gone)
+    }
+
+    /// Full-text search (§6). A malformed query is not an error — the
+    /// grammar makes something of anything — and one that asks for
+    /// nothing, only exclusions or no words at all, is an empty page.
+    pub fn news_search(&self, uid: Uid, req: SearchRequest) -> Result<SearchPage, NewsError> {
+        let store = self.news_store()?;
+        self.news_reader(uid)?;
+        let policy = self.news_policy;
+        if !policy.search {
+            return Err(NewsError::SearchOff);
+        }
+        if req.limit == 0 {
+            return Err(NewsError::BadRequest("A page needs a limit of at least 1."));
+        }
+        if !self.allow_news_search(uid)? {
+            return Err(NewsError::RateLimited);
+        }
+        let mut terms = CompiledQuery::parse(&req.q);
+        if let Some(who) = req.from.as_deref() {
+            terms.push_author(who);
+        }
+        if terms.matches_nothing() {
+            return Ok(SearchPage::default());
+        }
+        let categories = match req.category {
+            None => None,
+            Some(id) => Some(self.categories_under(&**store, id)?),
+        };
+        // Past the deepest reachable result the page is empty, but the
+        // total is still worth having: it is what says "500+".
+        let limit = req
+            .limit
+            .min(policy.search_max_results.saturating_sub(req.offset));
+        let mut page = store
+            .search(&SearchQuery {
+                terms,
+                categories,
+                before: req.before,
+                after: req.after,
+                order: req.order,
+                offset: req.offset,
+                limit,
+            })
+            .map_err(|e| store_failed(e.into()))?;
+        page.capped = page.total as usize > policy.search_max_results;
+        Ok(page)
+    }
+
+    /// The categories a search scope names: the category itself, or
+    /// every category anywhere under a bundle.
+    fn categories_under(
+        &self,
+        store: &dyn NewsStore,
+        id: NodeId,
+    ) -> Result<Vec<NodeId>, NewsError> {
+        let node = store
+            .node(id)
+            .map_err(|e| store_failed(e.into()))?
+            .ok_or(NewsError::NoSuchNode)?;
+        if node.kind == NodeKind::Category {
+            return Ok(vec![id]);
+        }
+        let mut out = Vec::new();
+        let mut bundles = vec![id];
+        while let Some(bundle) = bundles.pop() {
+            for child in store
+                .nodes(Some(bundle))
+                .map_err(|e| store_failed(e.into()))?
+            {
+                match child.kind {
+                    NodeKind::Category => out.push(child.id),
+                    NodeKind::Bundle => bundles.push(child.id),
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `search_per_minute` per session, as a bucket that refills
+    /// continuously: a burst up to the whole minute's worth, then one as
+    /// each comes due. Session state, like history's, so a reconnect does
+    /// not refill it.
+    fn allow_news_search(&self, uid: Uid) -> Result<bool, NewsError> {
+        let per_minute = f64::from(self.news_policy.search_per_minute);
+        let mut r = self.roster.lock().unwrap();
+        let sess = r.users.get_mut(&uid).ok_or(NewsError::NoSession)?;
+        let now = std::time::Instant::now();
+        let refilled = now.duration_since(sess.search_refill).as_secs_f64() * per_minute / 60.0;
+        sess.search_tokens = (sess.search_tokens + refilled).min(per_minute);
+        sess.search_refill = now;
+        if sess.search_tokens < 1.0 {
+            return Ok(false);
+        }
+        sess.search_tokens -= 1.0;
+        Ok(true)
+    }
+
+    /// Rebuild the search index, for `hxd news-reindex` and anything else
+    /// that holds a `Core`.
+    pub fn news_reindex(&self) -> Result<u64, NewsError> {
+        self.news_store()?
+            .reindex()
+            .map_err(|e| store_failed(e.into()))
     }
 
     /// Retention, off the request path like chat history's. Nothing is

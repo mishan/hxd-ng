@@ -264,8 +264,8 @@ room and one SFU. The large open fronts, in rough order: HOPE + ciphers on the
 legacy wire (`hxcrypto` currently lives in GtkHx), the ng rate-limit and
 client-quickstart polish, the fogWraith Text-Encoding capability (cheap —
 the UTF-8 interior already satisfies its core mandate), files/HTXF, the
-rest of news (the domain, store and ng wire have landed with plain
-bodies; markdown, search, attachments, notifications and the legacy
+rest of news (the domain, store, search and ng wire have landed with
+plain bodies; markdown, attachments, notifications and the legacy
 binding are staged in `docs/news.md` §16), and eventually the
 persistence/clustering phases. The mobile app the ng
 protocol exists for has not been started.
