@@ -1586,14 +1586,14 @@ mod tests {
     /// what they would that it lacks. Empty is the invariant every write
     /// in news.rs keeps.
     ///
-    /// FTS5's own `integrity-check` is not asked. The form that compares
-    /// content counts the tombstones the index leaves out on purpose as
-    /// damage, and the structural form, on the SQLite the pinned rusqlite
-    /// bundles, reports an index "malformed" after a secure-delete removes
-    /// a row from an older segment, which is every tombstone of an article
-    /// posted in its own transaction. That report is false: SQLite 3.46.1
-    /// fixed it ("fix false-positive integrity-check reports about corrupt
-    /// indexes" in secure-delete mode), and the same writes pass on it.
+    /// FTS5's own `integrity-check` cannot say this. Its structural form
+    /// passes an index gone stale against its content, and the form that
+    /// does compare content counts the tombstones the index leaves out on
+    /// purpose as damage. The structural form is asked as well, for what
+    /// it can see: a secure-delete from an older segment, which is every
+    /// tombstone of an article posted in its own transaction, drew a false
+    /// "malformed" from it until SQLite 3.46.1, so a store that stops
+    /// passing it is a store bundling an SQLite from before then.
     fn index_drift(conn: &Connection) -> Vec<String> {
         conn.execute_batch(&format!(
             "CREATE VIRTUAL TABLE temp.fresh USING fts5(
@@ -1634,6 +1634,11 @@ mod tests {
             "DROP TABLE temp.live_tokens; DROP TABLE temp.fresh_tokens; DROP TABLE temp.fresh;",
         )
         .unwrap();
+        if let Err(e) =
+            conn.execute_batch("INSERT INTO news_fts (news_fts) VALUES ('integrity-check')")
+        {
+            drift.push(format!("integrity-check: {e}"));
+        }
         drift
     }
 

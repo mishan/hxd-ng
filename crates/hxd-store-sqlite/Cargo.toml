@@ -12,7 +12,7 @@ hxd-core = { workspace = true }
 # `bundled` compiles SQLite in: a build needs no libsqlite3-dev and cannot
 # skew against whatever version the host happens to ship. See
 # docs/private-messages.md §4 for why rusqlite rather than sqlx.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
