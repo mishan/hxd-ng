@@ -1483,6 +1483,14 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
         // the next 751, which now answers "not found"
         // (moderation.md §6).
         Event::MediaRevoked { .. } => {}
+        // Nothing yet: the legacy news binding is `docs/news.md` W9, and
+        // until it lands this wire has no news to be stale about. The
+        // flat category's `NEWSFILE_POST` push is where the first of
+        // these arms will go.
+        Event::NewsPosted { .. }
+        | Event::NewsDeleted { .. }
+        | Event::NewsNode(_)
+        | Event::NewsNodeDeleted { .. } => {}
         Event::Kicked => return false,
     }
     true

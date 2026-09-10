@@ -1,0 +1,183 @@
+/**
+ * Threaded news, from a real config file, through the real binary, read
+ * by the browser client's library.
+ *
+ * `crates/hxd/tests/news.rs` covers the wire in depth with hand-rolled
+ * JSON. What only this suite reaches is `[news]` read out of a file by
+ * `Config::load`, the database it shares with `[inbox]` because the file
+ * says so, and a second implementation of §9 — one the client wrote from
+ * the spec — agreeing with the server about what an article is.
+ */
+
+import assert from 'node:assert/strict';
+import { after, before, describe, test } from 'node:test';
+
+import { referenceSpans } from '@hotline-ng/client';
+
+import { fleet } from './harness/client.mjs';
+import { startFailing, startServer } from './harness/server.mjs';
+
+const account = (name, access) => `name = "${name}"
+password = "pw-${name}"
+[access]
+read_chat = true
+send_chat = true
+${access}`;
+
+const EDITOR = `read_news = true
+post_news = true
+delete_articles = true
+create_categories = true
+delete_categories = true
+create_news_bundles = true
+delete_news_bundles = true
+`;
+
+describe('threaded news', () => {
+  let server;
+  const crew = fleet(() => server);
+
+  before(async () => {
+    server = await startServer({
+      // No `db` of its own: it shares the inbox's file, which is the
+      // configuration the design recommends and the one only this layer
+      // can see being honored.
+      config: { inbox: { db: 'server.sqlite' }, news: { max_depth: 2 } },
+      accounts: {
+        editor: account('editor', EDITOR),
+        alice: account('alice', 'read_news = true\npost_news = true\n'),
+        reader: account('reader', 'read_news = true\n'),
+        outsider: account('outsider', ''),
+      },
+    });
+  });
+  after(async () => {
+    await crew.closeAll();
+    await server?.stop();
+  });
+
+  const login = (who) => crew.connect({ login: who, password: `pw-${who}`, nick: who });
+
+  test('the login reply says what each session may do', async () => {
+    const alice = await login('alice');
+    assert.ok(alice.conn.hasCap('news'));
+    assert.equal(alice.conn.news.post, true);
+    assert.equal(alice.conn.news.max_depth, 2, 'the value from the config file');
+    assert.equal(alice.conn.news.markdown, 'off');
+    const reader = await login('reader');
+    assert.equal(reader.conn.news.post, false, 'a reader who may not post is told so');
+  });
+
+  test('a thread comes back in reading order, with references the client finds again', async () => {
+    const editor = await login('editor');
+    const alice = await login('alice');
+    const reader = await login('reader');
+
+    const { node: bundle } = await editor.conn.newsNodeCreate({ kind: 'bundle', name: 'Projects' });
+    const { node } = await editor.conn.newsNodeCreate({ kind: 'category', name: 'hxd-ng', parent: bundle.id });
+    await reader.waitFor('news_node', { 'node.id': node.id });
+
+    const { id: root } = await alice.conn.newsPost({ category: node.id, subject: 'Phase 4 is open', body: 'News, finally.' });
+    const posted = await reader.waitFor('news_posted', { id: root });
+    assert.equal(posted.data.root, root);
+    assert.equal(posted.data.parent, null);
+    assert.equal(posted.data.from.nick, 'alice');
+
+    const { id: first } = await editor.conn.newsPost({
+      category: node.id,
+      parent: root,
+      subject: 'Re: Phase 4 is open',
+      body: `About time — see #${root}, and #99999 which is nothing.`,
+    });
+    const { id: second } = await alice.conn.newsPost({ category: node.id, parent: root, subject: 'Re: Phase 4 is open', body: 'Two' });
+    const { id: under } = await reader.conn
+      .newsPost({ category: node.id, parent: first, subject: 'x', body: 'x' })
+      .then(
+        () => assert.fail('a reader may not post'),
+        (e) => {
+          assert.equal(e.wire.code, 'access_denied');
+          return alice.conn.newsPost({ category: node.id, parent: first, subject: 'Re: Re', body: 'Under the first' });
+        },
+      );
+
+    const thread = await reader.conn.newsThread({ root });
+    assert.deepEqual(
+      thread.articles.map((a) => [a.id, a.depth]),
+      [
+        [root, 0],
+        [first, 1],
+        [under, 2],
+        [second, 1],
+      ],
+      'every reply under the article it answers',
+    );
+
+    const cited = thread.articles[1];
+    assert.deepEqual(
+      cited.refs.map((r) => r.id),
+      [root],
+      'only the id that named an article',
+    );
+    const links = referenceSpans(cited.body, cited.refs).filter((s) => 'ref' in s);
+    assert.deepEqual(
+      links.map((s) => s.text),
+      [`#${root}`],
+      'the client finds the reference where the server did, and nothing else',
+    );
+    assert.equal(referenceSpans(cited.body, cited.refs).map((s) => s.text).join(''), cited.body);
+    assert.equal((await reader.conn.newsArticle(root)).referenced_by, 1);
+
+    const listing = await reader.conn.newsThreads({ category: node.id });
+    assert.equal(listing.threads[0].article.id, root);
+    assert.equal(listing.threads[0].replies, 3);
+
+    const tree = await reader.conn.newsTree({ depth: 2 });
+    const projects = tree.nodes.find((n) => n.id === bundle.id);
+    assert.equal(projects.children[0].name, 'hxd-ng');
+    assert.equal(projects.children[0].count, 4);
+  });
+
+  test('a refusal comes back as the code the client has words for', async () => {
+    const editor = await login('editor');
+    const outsider = await login('outsider');
+    const { node } = await editor.conn.newsNodeCreate({ kind: 'category', name: 'Rules' });
+    const { id: root } = await editor.conn.newsPost({ category: node.id, subject: 's', body: 'b' });
+    const { id: one } = await editor.conn.newsPost({ category: node.id, parent: root, subject: 's', body: 'b' });
+    const { id: two } = await editor.conn.newsPost({ category: node.id, parent: one, subject: 's', body: 'b' });
+
+    const code = (p) =>
+      p.then(
+        () => 'ok',
+        (e) => e.wire?.code ?? String(e),
+      );
+    assert.equal(await code(editor.conn.newsPost({ category: node.id, parent: two, subject: 's', body: 'b' })), 'too_deep');
+    assert.equal(
+      await code(editor.conn.newsPost({ category: node.id, subject: 's', body: 'b', mime: 'text/markdown' })),
+      'bad_body_type',
+    );
+    assert.equal(await code(editor.conn.newsNodeCreate({ kind: 'category', name: 'Rules' })), 'name_taken');
+    assert.equal(await code(outsider.conn.newsTree()), 'access_denied');
+    assert.equal(outsider.conn.news.post, false);
+
+    await editor.conn.newsDelete(root);
+    const stone = await editor.conn.newsArticle(root);
+    assert.equal(stone.deleted, true);
+    assert.equal(stone.body, '');
+    assert.deepEqual(
+      (await editor.conn.newsThread({ root })).articles.map((a) => a.id),
+      [root, one, two],
+      'the tombstone keeps its place, and its replies keep theirs',
+    );
+    const { articles } = await editor.conn.newsNodeDelete(node.id);
+    assert.equal(articles, 3);
+  });
+});
+
+describe('a news section the server cannot honor', () => {
+  test('refuses to start rather than doing less than it says', async () => {
+    const { output } = await startFailing({ config: { news: { db: 'news.sqlite', markdown: 'render' } } });
+    assert.match(output, /markdown/);
+    const alone = await startFailing({ config: { news: {} } });
+    assert.match(alone.output, /\[news\] needs db/);
+  });
+});

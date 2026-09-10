@@ -52,9 +52,11 @@ impl Synchronous {
     }
 }
 
+mod news;
+
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -189,6 +191,63 @@ CREATE TABLE media_block (
   at   INTEGER NOT NULL,
   by   TEXT NOT NULL
 );
+";
+
+// The news tree (`docs/news.md` §4): what threaded news with plain bodies
+// needs, and nothing its later stages have not settled yet. The search
+// index, the attachment tables and subscriptions are further additive
+// versions when they land, each with the code that fills them — a table
+// nothing writes is a table whose contents a later build has to guess at.
+//
+// `news_article_root` is not in the design's list. It is what makes a
+// thread's aggregates (reply count, last post) and retention's grouping a
+// lookup by root rather than a scan, and it costs one index.
+const SCHEMA_V3: &str = "
+CREATE TABLE news_node (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent     INTEGER REFERENCES news_node(id),
+  kind       INTEGER NOT NULL,
+  name       TEXT    NOT NULL,
+  guid       BLOB    NOT NULL,
+  add_sn     INTEGER NOT NULL DEFAULT 1,
+  delete_sn  INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+-- IFNULL because SQLite treats NULLs as distinct in a unique index, and
+-- two root-level nodes named alike must collide like any other siblings.
+CREATE UNIQUE INDEX news_node_sibling ON news_node (IFNULL(parent, 0), name);
+
+CREATE TABLE news_article (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  category   INTEGER NOT NULL REFERENCES news_node(id),
+  parent     INTEGER REFERENCES news_article(id),
+  root       INTEGER NOT NULL,
+  path       BLOB    NOT NULL,
+  depth      INTEGER NOT NULL,
+  nick       TEXT    NOT NULL,
+  login      TEXT,
+  login_fp   TEXT,
+  subject    TEXT    NOT NULL,
+  body       TEXT    NOT NULL,
+  mime       TEXT    NOT NULL DEFAULT 'text/plain',
+  plain      TEXT,
+  at         INTEGER NOT NULL,
+  deleted_at INTEGER,
+  deleted_by TEXT
+);
+CREATE INDEX news_article_thread ON news_article (category, path);
+CREATE INDEX news_article_roots  ON news_article (category, id) WHERE parent IS NULL;
+CREATE INDEX news_article_root   ON news_article (root, id);
+CREATE INDEX news_article_author ON news_article (login_fp, login, id);
+CREATE INDEX news_article_at     ON news_article (at);
+
+CREATE TABLE news_ref (
+  src  INTEGER NOT NULL REFERENCES news_article(id),
+  dst  INTEGER NOT NULL REFERENCES news_article(id),
+  ord  INTEGER NOT NULL,
+  PRIMARY KEY (src, dst)
+) WITHOUT ROWID;
+CREATE INDEX news_ref_dst ON news_ref (dst, src);
 ";
 
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL
@@ -414,6 +473,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 2 {
         steps.push_str(SCHEMA_V2);
+    }
+    if version < 3 {
+        steps.push_str(SCHEMA_V3);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -1413,6 +1475,55 @@ mod tests {
     #[test]
     fn chat_log_passes_the_conformance_suite() {
         hxd_core::history::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+    }
+
+    #[test]
+    fn news_passes_the_conformance_suite() {
+        hxd_core::news::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+    }
+
+    #[test]
+    fn version_two_migrates_without_losing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute(
+                "INSERT INTO message (recipient, sender_nick, body, sent_at)
+                 VALUES ('dave', 'alice', 'before news', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_line (nick, body, at) VALUES ('alice', 'a line', 1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        assert_eq!(
+            store.pending(&Mailbox::login("dave"), 10).unwrap()[0].body,
+            "before news"
+        );
+        let page = store
+            .query(&HistoryQuery {
+                channel: 0,
+                before: None,
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(page.lines[0].text, "a line");
+        use hxd_core::news::NewsStore;
+        assert!(store.nodes(None).unwrap().is_empty(), "news starts empty");
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

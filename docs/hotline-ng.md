@@ -292,6 +292,11 @@ Requests:
 | `ping` | — | `{}` | keepalive for clients that want RTT |
 | `logout` | — | `{}` | ends the session *now* (no grace) |
 
+News is a request family of its own — `news_tree`, `news_threads`,
+`news_thread`, `news_article`, `news_post` and the rest — with four
+events and a `news` block in the login reply. It is specified in
+[news.md](news.md) §9 rather than repeated here.
+
 `blocks` lists objects rather than logins because a block can be held
 against an identity that logged in as a guest: its login is `guest` and
 the fingerprint is what tells it apart, so a list of logins would name

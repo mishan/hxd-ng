@@ -193,6 +193,19 @@ async fn main() {
             ));
         }
 
+        if let Some(news) = &config.news {
+            let db = news
+                .db
+                .as_ref()
+                .or_else(|| config.inbox.as_ref().map(|i| &i.db))
+                .or_else(|| config.history.as_ref().and_then(|h| h.db.as_ref()))
+                .expect("configuration validation requires a news database");
+            tracing::info!("threaded news at {}", db.display());
+            if news.retain_days > 0 {
+                tokio::spawn(hxd::news_pruner(ctx.core.clone()));
+            }
+        }
+
         if let Some(media) = &config.media {
             tracing::info!(
                 "inline media on: up to {} KiB per image, handles live {}h, {} MiB held at most",

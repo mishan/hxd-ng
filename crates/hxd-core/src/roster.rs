@@ -147,12 +147,22 @@ pub enum Event {
     },
     /// A server notice into a chat (kick announcements and the like).
     /// Semantic text; each frontend formats it (legacy: `\r<text>`).
-    Notice { cid: u32, from: Uid, text: String },
+    Notice {
+        cid: u32,
+        from: Uid,
+        text: String,
+    },
     /// A chat (or, for cid 0, server) subject change.
-    ChatSubject { cid: u32, subject: String },
+    ChatSubject {
+        cid: u32,
+        subject: String,
+    },
     /// A private chat's password change, announced to its members
     /// (reference-server behavior).
-    ChatPassword { cid: u32, password: String },
+    ChatPassword {
+        cid: u32,
+        password: String,
+    },
     /// An invitation to a private chat.
     ChatInvite {
         cid: u32,
@@ -160,9 +170,15 @@ pub enum Event {
         from_nick: String,
     },
     /// Someone joined a private chat the recipient is in.
-    ChatUserJoined { cid: u32, user: UserInfo },
+    ChatUserJoined {
+        cid: u32,
+        user: UserInfo,
+    },
     /// Someone left a private chat the recipient is in.
-    ChatUserParted { cid: u32, uid: Uid },
+    ChatUserParted {
+        cid: u32,
+        uid: Uid,
+    },
     /// A private message to the recipient.
     ///
     /// A message out of the inbox ([`crate::inbox`]) carries `queued`,
@@ -211,13 +227,18 @@ pub enum Event {
     /// people who may have it on screen. The line or message that
     /// carried it keeps its metadata, so a client drops the image and
     /// keeps the placeholder.
-    MediaRevoked { id: crate::media::Handle },
+    MediaRevoked {
+        id: crate::media::Handle,
+    },
 
     // --- Voice (see [`crate::voice`]) ---------------------------------
     /// An SDP offer for the recipient's own peer connection: the initial
     /// one answering a join, or a renegotiation. Opaque to the domain —
     /// both frontends carry the string verbatim.
-    VoiceOffer { cid: u32, sdp: String },
+    VoiceOffer {
+        cid: u32,
+        sdp: String,
+    },
     /// A server ICE candidate, or (empty candidate) end-of-candidates.
     VoiceIce {
         cid: u32,
@@ -244,6 +265,34 @@ pub enum Event {
     VideoStatus {
         cid: u32,
         publications: Vec<crate::video::VideoPublication>,
+    },
+
+    // --- News (see [`crate::news`]) -----------------------------------
+    //
+    // "Your copy is stale", sent to every session holding read-news —
+    // what `NEWSFILE_POST` has always been, carried forward
+    // (`docs/news.md` §9.3). Never a notification: what is addressed to
+    // one person is a different event with a different audience.
+    /// An article was posted. A header rather than the article, because
+    /// the cheap refresh is usually no refetch at all.
+    NewsPosted {
+        id: crate::news::ArticleId,
+        category: crate::news::NodeId,
+        root: crate::news::ArticleId,
+        parent: Option<crate::news::ArticleId>,
+        subject: String,
+        from_nick: String,
+        at: SystemTime,
+    },
+    /// An article became a tombstone.
+    NewsDeleted {
+        id: crate::news::ArticleId,
+        category: crate::news::NodeId,
+    },
+    /// A node was created or renamed.
+    NewsNode(crate::news::Node),
+    NewsNodeDeleted {
+        id: crate::news::NodeId,
     },
 }
 
@@ -616,6 +665,11 @@ pub struct Core {
     /// Store calls never happen under `roster`.
     pub(crate) history: Option<Arc<dyn crate::history::ChatLog>>,
     pub(crate) history_policy: crate::history::HistoryPolicy,
+    /// The news tree, or `None` when no `[news]` section asked for one.
+    /// On `Core` rather than in `RosterInner` for the reason `inbox` is:
+    /// store calls are disk I/O and never happen under the roster lock.
+    pub(crate) news: Option<Arc<dyn crate::news::NewsStore>>,
+    pub(crate) news_policy: crate::news::NewsPolicy,
     pub(crate) directory: Option<Arc<dyn crate::account::AccountDirectory>>,
     pub(crate) inbox_policy: InboxPolicy,
     /// Where push notifications go, or `None` — which is the no-op, and

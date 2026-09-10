@@ -147,6 +147,7 @@ mod tests {
             inbox: None,
             history: None,
             media: None,
+            news: None,
         }
     }
 

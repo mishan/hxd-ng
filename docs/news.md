@@ -397,6 +397,17 @@ Synchronous, like `MessageStore` and `ChatLog`, for the reason their
 module docs give: `Core` is sync all the way down, and the frontends
 already know to call through `off_reactor`.
 
+As built, the methods that write answer a `NewsError` rather than a
+`StoreError`: containment, reply depth, sibling names and which
+referenced ids name an article are decided inside the store's own
+transaction, for the reason `MessageStore::push` gives — a check made
+outside it is one a concurrent write can invalidate. `create_node` takes
+a `NewNode` whose guid is the caller's, so both stores stay deterministic
+under test, and `post` answers the new id together with its root, which
+the `news_posted` event needs. The trait grows with the stages:
+`category_all`, `by_author`, search, subscriptions and `reindex` arrive
+with the stages that call them rather than ahead of them as stubs.
+
 `category_all` exists because the 1.5 wire has no pagination — a
 `NEWSCATLIST` reply is the whole category — and a trait that could not
 express that would push the legacy binding into looping over a
@@ -452,6 +463,7 @@ CREATE TABLE news_article (
 );
 CREATE INDEX news_article_thread ON news_article (category, path);
 CREATE INDEX news_article_roots  ON news_article (category, id) WHERE parent IS NULL;
+CREATE INDEX news_article_root   ON news_article (root, id);
 CREATE INDEX news_article_author ON news_article (login_fp, login, id);
 CREATE INDEX news_article_at     ON news_article (at);
 
@@ -521,6 +533,16 @@ best-effort after a commit.
 The migration from version 2 is additive: the new tables, the virtual
 table, and their indexes. No `ALTER` on an existing table — the shape
 the version-2 arm already established.
+
+**The schema lands in steps.** Version 3 is `news_node`, `news_article`
+and `news_ref`: what threaded news with plain bodies writes.
+`news_fts`, `news_blob`, `news_attach` and `news_sub` arrive as further
+additive versions with the stages that fill them (W4, W5, W7), because a
+table nothing writes is a table whose contents a later build has to
+guess at. `news_article_root` is not in the list above for a reason
+worth keeping: a thread's aggregates — its reply count and last post —
+and retention's grouping are all "every article with this root", and
+that index makes each a lookup.
 
 ## 5. Body text: markdown, references, and the plain-text downgrade
 
@@ -680,7 +702,15 @@ CREATE VIRTUAL TABLE news_fts USING fts5(
 ```
 
 An **external-content** table: the text is not stored twice, FTS5 reads
-it from `news_article` through the rowid. The index is written in the
+it from `news_article` through the rowid.
+
+**To settle when W4 lands:** external content reads each indexed column
+*by name* from the content table, and `news_article` has no `author`
+column — nor any one column that is "the downgrade where there is one,
+the body otherwise". As written, the first `snippet()` would fail. The
+content table wants to be a view that computes both (`nick || ' ' ||
+IFNULL(login, '')` and `COALESCE(plain, body)`), or the index wants to
+be contentless with snippets made some other way. The index is written in the
 same transaction as the article — on post, on tombstone, and on a
 moderation purge. A tombstoned article is *deleted from the index*, not
 blanked in it, which is what makes a deletion real for search as well as
@@ -931,6 +961,7 @@ unless they hold `delete_users` (15).
   "attach": true,                // …and may attach
   "max_body": 65535,
   "max_subject": 255,
+  "max_depth": 32,               // reply nesting: past it, do not offer Reply
   "max_attachments": 8,
   "max_attachment_bytes": 2097152,
   "types": ["image/jpeg", "image/png", "image/gif"],
@@ -1013,6 +1044,17 @@ A `thread` object in `news_threads` is `{ "article": <article>,
 "replies": 3, "last_at": …, "last_id": 51 }` — the starter in full,
 because a listing that shows the first paragraph needs the body, and
 counting a round trip per row is what a mobile client cannot afford.
+`news_threads` lists **newest first**; `before` pages toward older
+threads and `after` toward newer ones, and a page read with `after` is
+the threads nearest the cursor, still newest first. A thread whose every
+article is a tombstone is not listed: there is nothing left in it to
+read.
+
+A `node` object is `{ "id", "parent", "kind", "name", "count",
+"created_at" }` — `parent` null at the root, `count` the sub-nodes of a
+bundle or the live articles of a category — with `children` on a bundle
+that a `news_tree` of `depth` above 1 reached into. An article's
+`parent` is likewise null for a thread's starter.
 
 **The `plain` downgrade never crosses the ng wire.** An ng client is
 told the body's type and handed the source; rendering markdown is what
@@ -1967,6 +2009,14 @@ Each lands separately with tests, roughly a branch apiece.
    attachment parts, `NEWS_GETTHREAD` by MIME type, the Mac Roman
    edges, the 1.2 flat view of §12.5 — renderer, header-block parser,
    defaults and the push — and `hxd import-mhxd-news`.
+
+**Landed:** W1 and W2, and the part of W6 that needs none of W3–W5 —
+the requests of §9.2 other than `news_search`, the events of §9.3 and
+the login block, with `markdown = "off"` as the only mode. `[news]`
+accepts only the keys those honor; naming another, or another markdown
+mode, is a startup error until its stage lands. The ng e2e is
+`crates/hxd/tests/news.rs`, the out-of-process one `e2e/news.test.mjs`,
+and the first client is hx-ng's News view.
 
 W1–W2 is threaded news with plain bodies — small, and worth landing on
 its own. W1–W7 is the whole thing for the ng wire and a mobile client,

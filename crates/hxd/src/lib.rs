@@ -50,6 +50,123 @@ pub struct Config {
     /// capability bit 3 on the legacy wire, no `media` cap on the ng
     /// one, and no `/media` routes.
     pub media: Option<MediaSection>,
+    /// Threaded news (`docs/news.md` §13). Absent = no news on either
+    /// wire, answered the way a server without the feature answers.
+    pub news: Option<NewsSection>,
+}
+
+/// Threaded news (`docs/news.md` §13).
+///
+/// Only the keys this build acts on. The design's others — search,
+/// attachments, the 1.2 flat category, notifications — arrive with the
+/// stages that honor them, and until then naming one is a startup error
+/// rather than a promise the server quietly does not keep.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewsSection {
+    /// The SQLite file. May be omitted when `[inbox]` or `[history]`
+    /// names one; the sections then share it and one connection.
+    pub db: Option<PathBuf>,
+    /// The legacy `NEWSDATA` ceiling. ↓ freely, ↑ never: 65 535 is what
+    /// the 1.5 wire can carry in one chunk (§12.4).
+    #[serde(default = "default_news_max_body")]
+    pub max_body: usize,
+    /// The 1.5 pstring: 255 at most.
+    #[serde(default = "default_news_max_subject")]
+    pub max_subject: usize,
+    /// `"off"`, the only mode this build has. `"render"` and `"source"`
+    /// are the markdown stage's (§5.5), and asking for them now is
+    /// refused at startup.
+    #[serde(default = "default_news_markdown")]
+    pub markdown: String,
+    /// References recorded per article; past that they stay as text.
+    #[serde(default = "default_news_max_refs")]
+    pub max_refs: usize,
+    /// Reply nesting.
+    #[serde(default = "default_news_max_depth")]
+    pub max_depth: u16,
+    /// Bundle nesting.
+    #[serde(default = "default_news_max_node_depth")]
+    pub max_node_depth: u16,
+    /// The largest page of threads one request may ask for.
+    #[serde(default = "default_news_max_page")]
+    pub max_page: usize,
+    /// Days a thread survives its last post. 0 keeps everything.
+    #[serde(default)]
+    pub retain_days: u32,
+    /// May an author delete their own article? `false` is the period
+    /// behavior, where only `delete_articles` can.
+    #[serde(default = "default_true")]
+    pub self_delete: bool,
+}
+
+impl NewsSection {
+    pub fn to_policy(&self) -> hxd_core::NewsPolicy {
+        hxd_core::NewsPolicy {
+            max_body: self.max_body,
+            max_subject: self.max_subject,
+            max_refs: self.max_refs,
+            max_depth: self.max_depth,
+            max_node_depth: self.max_node_depth,
+            max_page: self.max_page,
+            self_delete: self.self_delete,
+            retain_days: self.retain_days,
+        }
+    }
+
+    /// The numbers a `Deserialize` cannot check. Each bound is a wire's:
+    /// a body or subject past the legacy one is an article a 1.5 client
+    /// truncates, and a page past the ng one is a request nobody sends.
+    fn check(&self) -> Result<(), String> {
+        if self.markdown != "off" {
+            return Err(format!(
+                "[news] markdown = {:?}: this build has no markdown support yet, \
+                 so \"off\" is the only mode it can honor",
+                self.markdown
+            ));
+        }
+        if !(1..=65_535).contains(&self.max_body) {
+            return Err("[news] max_body must be between 1 and 65535".into());
+        }
+        if !(1..=255).contains(&self.max_subject) {
+            return Err("[news] max_subject must be between 1 and 255".into());
+        }
+        if self.max_refs > 256 {
+            return Err("[news] max_refs must be at most 256".into());
+        }
+        if !(1..=64).contains(&self.max_depth) {
+            return Err("[news] max_depth must be between 1 and 64".into());
+        }
+        if !(1..=32).contains(&self.max_node_depth) {
+            return Err("[news] max_node_depth must be between 1 and 32".into());
+        }
+        if !(1..=200).contains(&self.max_page) {
+            return Err("[news] max_page must be between 1 and 200".into());
+        }
+        Ok(())
+    }
+}
+
+fn default_news_max_body() -> usize {
+    hxd_core::NewsPolicy::default().max_body
+}
+fn default_news_max_subject() -> usize {
+    hxd_core::NewsPolicy::default().max_subject
+}
+fn default_news_markdown() -> String {
+    "off".into()
+}
+fn default_news_max_refs() -> usize {
+    hxd_core::NewsPolicy::default().max_refs
+}
+fn default_news_max_depth() -> u16 {
+    hxd_core::NewsPolicy::default().max_depth
+}
+fn default_news_max_node_depth() -> u16 {
+    hxd_core::NewsPolicy::default().max_node_depth
+}
+fn default_news_max_page() -> usize {
+    hxd_core::NewsPolicy::default().max_page
 }
 
 /// Inline media (`docs/inline-media.md` §11).
@@ -777,6 +894,11 @@ fn ng_caps(config: &Config, voice: Option<&Voice>) -> Vec<String> {
     if config.media.is_some() && cfg!(feature = "media") {
         caps.push("media".to_string());
     }
+    // ng only for now: the legacy news transactions are `docs/news.md`
+    // W9, and 1.5 clients have never needed a capability bit for news.
+    if config.news.is_some() && cfg!(feature = "inbox") {
+        caps.push("news".to_string());
+    }
     caps
 }
 
@@ -975,6 +1097,16 @@ pub fn check_config(config: &Config) -> Result<(), String> {
             return Err("[history] max_page must be between 1 and 200".into());
         }
     }
+    if let Some(news) = &config.news {
+        let shared =
+            config.inbox.is_some() || config.history.as_ref().is_some_and(|h| h.db.is_some());
+        if news.db.is_none() && !shared {
+            return Err(
+                "[news] needs db unless [inbox] or [history] names the shared database".into(),
+            );
+        }
+        news.check()?;
+    }
     Ok(())
 }
 
@@ -1020,16 +1152,27 @@ fn open_sqlite(
 struct RuntimeStores {
     inbox: Option<Arc<dyn hxd_core::MessageStore>>,
     history: Option<Arc<dyn hxd_core::ChatLog>>,
+    news: Option<Arc<dyn hxd_core::NewsStore>>,
 }
 
+/// Open the databases the config names, **one store object per file**
+/// however many sections name it. Two objects on one file would be two
+/// schema owners, each migrating on open and each holding its own
+/// connection mutex — the one-writer design the store rests on, undone
+/// by a config that spelled a path twice.
 #[cfg(feature = "inbox")]
 fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
-    use hxd_store_sqlite::Synchronous;
+    use hxd_store_sqlite::{SqliteStore, Synchronous};
     let inbox_path = config.inbox.as_ref().map(|i| i.db.clone());
     let history_path = config
         .history
         .as_ref()
         .and_then(|h| h.db.clone().or_else(|| inbox_path.clone()));
+    let news_path = config.news.as_ref().and_then(|n| {
+        n.db.clone()
+            .or_else(|| inbox_path.clone())
+            .or_else(|| history_path.clone())
+    });
     let inbox_sync = config
         .inbox
         .as_ref()
@@ -1038,28 +1181,48 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
             InboxSync::Full => Synchronous::Full,
         });
 
-    let shared = match (inbox_path.as_ref(), history_path.as_ref()) {
-        (Some(inbox), Some(history)) => database_path(inbox)? == database_path(history)?,
-        _ => false,
+    // Every path is resolved before any file is opened: opening creates
+    // the file, and a path compared before and after its file exists is
+    // resolved two different ways.
+    let keyed = |p: &Option<PathBuf>| -> Result<Option<(PathBuf, PathBuf)>, String> {
+        p.as_ref()
+            .map(|p| Ok((p.clone(), database_path(p)?)))
+            .transpose()
     };
-    if shared {
-        let store = open_sqlite(inbox_path.as_ref().unwrap(), inbox_sync)?;
-        let inbox: Arc<dyn hxd_core::MessageStore> = store.clone();
-        let history: Arc<dyn hxd_core::ChatLog> = store;
-        return Ok(RuntimeStores {
-            inbox: Some(inbox),
-            history: Some(history),
-        });
-    }
-    let inbox = match inbox_path {
-        Some(path) => Some(open_sqlite(&path, inbox_sync)? as Arc<dyn hxd_core::MessageStore>),
+    let (inbox_path, history_path, news_path) = (
+        keyed(&inbox_path)?,
+        keyed(&history_path)?,
+        keyed(&news_path)?,
+    );
+
+    let mut opened: Vec<(PathBuf, Arc<SqliteStore>)> = Vec::new();
+    let mut open = |(path, key): &(PathBuf, PathBuf), sync| -> Result<Arc<SqliteStore>, String> {
+        if let Some((_, store)) = opened.iter().find(|(k, _)| k == key) {
+            return Ok(store.clone());
+        }
+        let store = open_sqlite(path, sync)?;
+        opened.push((key.clone(), store.clone()));
+        Ok(store)
+    };
+    // The inbox first, so a shared file gets the inbox's `sync`: it is
+    // the section that asked for durability.
+    let inbox = match &inbox_path {
+        Some(p) => Some(open(p, inbox_sync)? as Arc<dyn hxd_core::MessageStore>),
         None => None,
     };
-    let history = match history_path {
-        Some(path) => Some(open_sqlite(&path, Synchronous::Normal)? as Arc<dyn hxd_core::ChatLog>),
+    let history = match &history_path {
+        Some(p) => Some(open(p, Synchronous::Normal)? as Arc<dyn hxd_core::ChatLog>),
         None => None,
     };
-    Ok(RuntimeStores { inbox, history })
+    let news = match &news_path {
+        Some(p) => Some(open(p, Synchronous::Normal)? as Arc<dyn hxd_core::NewsStore>),
+        None => None,
+    };
+    Ok(RuntimeStores {
+        inbox,
+        history,
+        news,
+    })
 }
 
 /// Resolve enough of a possibly-new database path to compare two spellings.
@@ -1091,20 +1254,22 @@ fn database_path(path: &Path) -> Result<PathBuf, String> {
 struct RuntimeStores {
     inbox: Option<Arc<dyn hxd_core::MessageStore>>,
     history: Option<Arc<dyn hxd_core::ChatLog>>,
+    news: Option<Arc<dyn hxd_core::NewsStore>>,
 }
 
 #[cfg(not(feature = "inbox"))]
 fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
-    if config.inbox.is_some() || config.history.is_some() {
+    if config.inbox.is_some() || config.history.is_some() || config.news.is_some() {
         return Err(
-            "[inbox] or [history] is configured, but this build has no SQLite store \
-                    (built without the `inbox` feature)"
+            "[inbox], [history] or [news] is configured, but this build has no SQLite \
+                    store (built without the `inbox` feature)"
                 .into(),
         );
     }
     Ok(RuntimeStores {
         inbox: None,
         history: None,
+        news: None,
     })
 }
 
@@ -1344,6 +1509,24 @@ pub async fn history_pruner(core: Arc<Core>, max_lines: u32, max_days: u32) {
     }
 }
 
+/// News retention: whole threads whose last post is older than `[news]
+/// retain_days`. Hourly and on the blocking pool, like the other two —
+/// never on the request path.
+pub async fn news_pruner(core: Arc<Core>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let core = core.clone();
+        let gone = tokio::task::spawn_blocking(move || core.prune_news())
+            .await
+            .unwrap_or(0);
+        if gone > 0 {
+            tracing::debug!(gone, "news articles pruned");
+        }
+    }
+}
+
 /// Media retention: expired handles and abandoned upload sessions.
 ///
 /// Hourly, like the other two, because a handle lives a day. Every
@@ -1477,6 +1660,11 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
         (None, None) => core,
         _ => return Err("[history] store was not opened".into()),
     };
+    let core = match (stores.news, config.news.as_ref()) {
+        (Some(store), Some(news)) => core.with_news(store, news.to_policy()),
+        (None, None) => core,
+        _ => return Err("[news] store was not opened".into()),
+    };
     let core = with_media(core, config)?;
 
     Ok(ServerCtx {
@@ -1594,6 +1782,78 @@ sync = "full"
             Arc::as_ptr(&inbox) as *const (),
             Arc::as_ptr(&history) as *const (),
             "one SQLite object must own the shared schema and connection"
+        );
+    }
+
+    #[test]
+    fn the_news_section_defaults_validates_and_is_advertised() {
+        let cfg = parse("[inbox]\ndb = \"server.sqlite\"\n[news]\n").unwrap();
+        check_config(&cfg).unwrap();
+        let news = cfg.news.as_ref().unwrap();
+        assert_eq!(news.db, None);
+        assert_eq!(news.to_policy(), hxd_core::NewsPolicy::default());
+        assert_eq!(news.markdown, "off");
+        #[cfg(feature = "inbox")]
+        assert!(ng_caps(&cfg, None).contains(&"news".to_string()));
+        assert!(
+            !legacy_caps(&cfg, None).has(cap::CHAT_HISTORY),
+            "news claims no legacy capability bit"
+        );
+
+        let alone = parse("[news]\n").unwrap();
+        assert!(check_config(&alone).unwrap_err().contains("needs db"));
+        let own = parse("[news]\ndb = \"news.sqlite\"\n").unwrap();
+        check_config(&own).unwrap();
+        let beside_history = parse("[history]\ndb = \"h.sqlite\"\n[news]\n").unwrap();
+        check_config(&beside_history).unwrap();
+
+        for (key, value) in [
+            ("max_body", "65536"),
+            ("max_body", "0"),
+            ("max_subject", "256"),
+            ("max_depth", "0"),
+            ("max_node_depth", "33"),
+            ("max_page", "201"),
+            ("max_refs", "1000"),
+            ("markdown", "\"render\""),
+        ] {
+            let cfg = parse(&format!("[news]\ndb = \"n.sqlite\"\n{key} = {value}\n")).unwrap();
+            let err = check_config(&cfg).unwrap_err();
+            assert!(err.contains(key), "{key} = {value}: {err}");
+        }
+        assert!(
+            parse("[news]\ndb = \"n.sqlite\"\nsearch = true\n").is_err(),
+            "a key for a stage this build does not have is refused, not ignored"
+        );
+    }
+
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn every_section_naming_one_file_shares_one_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sqlite");
+        let cfg = parse(&format!(
+            "[inbox]\ndb = {:?}\n[history]\n[news]\n",
+            path.to_string_lossy()
+        ))
+        .unwrap();
+        let stores = open_runtime_stores(&cfg).unwrap();
+        let inbox = Arc::as_ptr(&stores.inbox.unwrap()) as *const ();
+        assert_eq!(inbox, Arc::as_ptr(&stores.history.unwrap()) as *const ());
+        assert_eq!(inbox, Arc::as_ptr(&stores.news.unwrap()) as *const ());
+
+        let apart = dir.path().join("news.sqlite");
+        let cfg = parse(&format!(
+            "[inbox]\ndb = {:?}\n[news]\ndb = {:?}\n",
+            path.to_string_lossy(),
+            apart.to_string_lossy()
+        ))
+        .unwrap();
+        let stores = open_runtime_stores(&cfg).unwrap();
+        assert_ne!(
+            Arc::as_ptr(&stores.inbox.unwrap()) as *const (),
+            Arc::as_ptr(&stores.news.unwrap()) as *const (),
+            "a section naming its own file gets its own store"
         );
     }
 
