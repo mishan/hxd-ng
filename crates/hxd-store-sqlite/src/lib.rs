@@ -231,9 +231,18 @@ CREATE TABLE news_article (
   body       TEXT    NOT NULL,
   mime       TEXT    NOT NULL DEFAULT 'text/plain',
   plain      TEXT,
+  attach_names TEXT,
   at         INTEGER NOT NULL,
   deleted_at INTEGER,
-  deleted_by TEXT
+  deleted_by TEXT,
+  -- What the search index reads, by name (docs/news.md §6.1). Computed
+  -- on read and stored nowhere, so the text exists once. Here from the
+  -- start, with `attach_names` in the expression before anything writes
+  -- it, because a generated column's expression cannot be changed
+  -- without rebuilding the table.
+  author      TEXT GENERATED ALWAYS AS (nick || ' ' || IFNULL(login, '')) VIRTUAL,
+  search_body TEXT GENERATED ALWAYS AS
+    (COALESCE(plain, body) || IFNULL(char(10) || attach_names, '')) VIRTUAL
 );
 CREATE INDEX news_article_thread ON news_article (category, path);
 CREATE INDEX news_article_roots  ON news_article (category, id) WHERE parent IS NULL;
@@ -1480,6 +1489,120 @@ mod tests {
     #[test]
     fn news_passes_the_conformance_suite() {
         hxd_core::news::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+    }
+
+    #[test]
+    fn the_article_table_is_ready_for_its_search_index() {
+        // The index is the search stage's, and this is its precondition:
+        // an external-content FTS5 table reads `subject`, `search_body`
+        // and `author` from `news_article` by name, so they must exist,
+        // hold the right text, and serve a snippet — on the bundled
+        // SQLite this crate actually ships.
+        use hxd_core::news::{Author, BodyType, NewNode, NewPost, NewsStore, NodeKind};
+        let store = SqliteStore::in_memory().unwrap();
+        let cat = store
+            .create_node(
+                &NewNode {
+                    parent: None,
+                    kind: NodeKind::Category,
+                    name: "General".into(),
+                    guid: [0; 16],
+                    at: UNIX_EPOCH,
+                },
+                16,
+            )
+            .unwrap();
+        let post = |body: &str, nick: &str, login: Option<&str>| {
+            store
+                .post(
+                    &NewPost {
+                        category: cat.id,
+                        parent: None,
+                        author: Author {
+                            nick: nick.into(),
+                            login: login.map(str::to_string),
+                            fingerprint: None,
+                        },
+                        subject: "Attachment sizes".into(),
+                        body: body.into(),
+                        mime: BodyType::Plain,
+                        refs: Vec::new(),
+                        at: UNIX_EPOCH,
+                    },
+                    32,
+                    32,
+                )
+                .unwrap()
+                .id
+        };
+        let id = post("the derivative is a u16", "Alice", Some("alice"));
+        let guest = post("a guest says the same derivative", "guest", None);
+
+        let conn = store.conn.lock().unwrap();
+        let computed = |id: u32| -> (String, String) {
+            conn.query_row(
+                "SELECT author, search_body FROM news_article WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            computed(id),
+            ("Alice alice".into(), "the derivative is a u16".into())
+        );
+        assert_eq!(computed(guest).0, "guest ");
+
+        // The downgrade stands in for the body where there is one, and
+        // attachment names follow it on their own line.
+        conn.execute(
+            "UPDATE news_article SET plain = 'the plain text', attach_names = 'crash.png'
+              WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        assert_eq!(computed(id).1, "the plain text\ncrash.png");
+        conn.execute(
+            "UPDATE news_article SET plain = NULL, attach_names = NULL WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE fts USING fts5(
+               subject, search_body, author,
+               content = 'news_article', content_rowid = 'id',
+               tokenize = 'unicode61 remove_diacritics 2');
+             INSERT INTO fts(fts) VALUES ('rebuild');",
+        )
+        .unwrap();
+        let hits: Vec<(u32, String)> = conn
+            .prepare("SELECT rowid, snippet(fts, 1, '[', ']', '…', 8) FROM fts WHERE fts MATCH ?1")
+            .unwrap()
+            .query_map(["derivative AND author:alice"], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(hits, [(id, "the [derivative] is a u16".to_string())]);
+
+        // A tombstone leaves the index with the values it was indexed
+        // under, read off the row itself before the row is blanked.
+        conn.execute(
+            "INSERT INTO fts (fts, rowid, subject, search_body, author)
+             SELECT 'delete', id, subject, search_body, author FROM news_article WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts WHERE fts MATCH 'derivative'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1, "only the guest's article still matches");
     }
 
     #[test]

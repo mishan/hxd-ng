@@ -457,9 +457,14 @@ CREATE TABLE news_article (
   body       TEXT    NOT NULL,             -- verbatim as typed
   mime       TEXT    NOT NULL DEFAULT 'text/plain',
   plain      TEXT,                         -- the §5.4 downgrade; NULL when body is plain
+  attach_names TEXT,                       -- attachment file names, one per line (W5)
   at         INTEGER NOT NULL,
   deleted_at INTEGER,
-  deleted_by TEXT
+  deleted_by TEXT,
+  -- What news_fts reads by name (§6.1): computed on read, stored nowhere.
+  author      TEXT GENERATED ALWAYS AS (nick || ' ' || IFNULL(login, '')) VIRTUAL,
+  search_body TEXT GENERATED ALWAYS AS
+    (COALESCE(plain, body) || IFNULL(char(10) || attach_names, '')) VIRTUAL
 );
 CREATE INDEX news_article_thread ON news_article (category, path);
 CREATE INDEX news_article_roots  ON news_article (category, id) WHERE parent IS NULL;
@@ -476,7 +481,7 @@ CREATE TABLE news_ref (
 CREATE INDEX news_ref_dst ON news_ref (dst, src);
 
 CREATE VIRTUAL TABLE news_fts USING fts5(
-  subject, body, author,
+  subject, search_body, author,
   content = 'news_article',
   content_rowid = 'id',
   tokenize = 'unicode61 remove_diacritics 2'
@@ -539,8 +544,12 @@ and `news_ref`: what threaded news with plain bodies writes.
 `news_fts`, `news_blob`, `news_attach` and `news_sub` arrive as further
 additive versions with the stages that fill them (W4, W5, W7), because a
 table nothing writes is a table whose contents a later build has to
-guess at. `news_article_root` is not in the list above for a reason
-worth keeping: a thread's aggregates — its reply count and last post —
+guess at. The columns the index reads are the exception, and are in
+version 3 already: `author` and `search_body` are generated columns, and
+a generated column's expression cannot be changed without rebuilding the
+table — so `attach_names` is in `search_body`'s expression before
+anything writes it, and W4 and W5 are purely additive. `news_article_root`
+is there for a reason worth keeping: a thread's aggregates — its reply count and last post —
 and retention's grouping are all "every article with this root", and
 that index makes each a lookup.
 
@@ -694,7 +703,7 @@ therefore costs a table and some care, not a search engine.
 
 ```sql
 CREATE VIRTUAL TABLE news_fts USING fts5(
-  subject, body, author,
+  subject, search_body, author,
   content = 'news_article',
   content_rowid = 'id',
   tokenize = 'unicode61 remove_diacritics 2'
@@ -704,13 +713,24 @@ CREATE VIRTUAL TABLE news_fts USING fts5(
 An **external-content** table: the text is not stored twice, FTS5 reads
 it from `news_article` through the rowid.
 
-**To settle when W4 lands:** external content reads each indexed column
-*by name* from the content table, and `news_article` has no `author`
-column — nor any one column that is "the downgrade where there is one,
-the body otherwise". As written, the first `snippet()` would fail. The
-content table wants to be a view that computes both (`nick || ' ' ||
-IFNULL(login, '')` and `COALESCE(plain, body)`), or the index wants to
-be contentless with snippets made some other way. The index is written in the
+External content reads each indexed column **by name** from the content
+table, so the columns it indexes are columns `news_article` has:
+`author` and `search_body` are virtual generated columns (§4), computed
+when read and stored nowhere, so the text still exists once and
+`snippet()` reads it through them. The alternatives were weighed and
+lost: a view as the content table works the same way at the cost of a
+second object to keep in step; FTS5's own copy of the text doubles it
+and gives moderation two copies to remove; a contentless index has no
+`snippet()` at all, and match offsets computed outside FTS5 could
+disagree with what it matched.
+
+A tombstone leaves the index with the values it was indexed under, read
+off the row itself — `INSERT INTO news_fts(news_fts, rowid, …) SELECT
+'delete', id, subject, search_body, author FROM news_article` — before
+the row is blanked, in the same transaction. The index is created with
+`secure-delete` on, so a removed article's tokens are overwritten when
+it leaves rather than lingering until a merge: a moderation act that
+left a body recoverable from the index file would not be one. The index is written in the
 same transaction as the article — on post, on tombstone, and on a
 moderation purge. A tombstoned article is *deleted from the index*, not
 blanked in it, which is what makes a deletion real for search as well as
@@ -719,13 +739,14 @@ for reads.
 What is indexed:
 
 - `subject`, weighted heaviest.
-- `body` — **the plain-text downgrade where there is one**, the body
-  otherwise. This is the second job that column does, and half the
+- `search_body` — **the plain-text downgrade where there is one**, the
+  body otherwise. This is the second job the downgrade does, and half the
   argument for computing it.
 - `author` — nick and login, so `from:alice` is a query rather than a
   separate filter.
-- Attachment file names, appended to `body`. A
-  `screenshot-of-the-crash.png` is a searchable fact about an article.
+- Attachment file names, which `search_body` appends from
+  `attach_names`. A `screenshot-of-the-crash.png` is a searchable fact
+  about an article.
 
 ### 6.2 The query language is ours, not FTS5's
 
