@@ -24,6 +24,12 @@ impl BodyRenderer for Fake {
             refs: vec![1],
         }
     }
+
+    fn refuses(&self, source: &str) -> Option<&'static str> {
+        source
+            .starts_with("too deep")
+            .then_some("That article nests too deeply.")
+    }
 }
 
 fn server(mode: MarkdownMode, renderer: Option<Arc<Fake>>) -> (Core, Uid, NodeId) {
@@ -221,4 +227,20 @@ fn render_with_no_parser_is_source() {
     );
     let (parsed, _, _) = server(MarkdownMode::Render, Some(Arc::new(Fake::default())));
     assert_eq!(parsed.news_markdown(), Some(MarkdownMode::Render));
+}
+
+#[test]
+fn a_body_the_renderer_refuses_is_refused_unparsed() {
+    let fake = Arc::new(Fake::default());
+    let (core, uid, cat) = server(MarkdownMode::Render, Some(fake.clone()));
+    assert_eq!(
+        post(&core, uid, cat, "too deep", BodyType::Markdown),
+        Err(NewsError::BadRequest("That article nests too deeply."))
+    );
+    assert!(fake.0.lock().unwrap().is_empty(), "and nothing was parsed");
+
+    // Only a body that would be parsed is asked about.
+    assert!(post(&core, uid, cat, "too deep", BodyType::Plain).is_ok());
+    let (source, uid, cat) = server(MarkdownMode::Source, Some(Arc::new(Fake::default())));
+    assert!(post(&source, uid, cat, "too deep", BodyType::Markdown).is_ok());
 }

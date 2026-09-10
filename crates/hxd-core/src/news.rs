@@ -239,6 +239,15 @@ pub trait BodyRenderer: Send + Sync + 'static {
     /// body that passed every size check. Called once, at post time, off
     /// the reactor; never on a read.
     fn render(&self, source: &str, limit: usize) -> Rendered;
+
+    /// Why `source` is refused before it is rendered, if it is: a body
+    /// whose parse would cost far more than its size says. The article is
+    /// refused with this as its reason, as one too long is (§5.4). Asked
+    /// only of a body that would be rendered.
+    fn refuses(&self, source: &str) -> Option<&'static str> {
+        let _ = source;
+        None
+    }
 }
 
 /// One article.
@@ -1115,23 +1124,27 @@ impl Core {
     }
 
     /// What a body resolves to and, for markdown under `render`, what it
-    /// reads as without markdown (§5.3, §5.4). Once, here, at post time.
+    /// reads as without markdown (§5.3, §5.4). Once, here, at post time,
+    /// and not at all for a body the renderer will not take.
     fn news_render(
         &self,
         body: &str,
         mime: BodyType,
         policy: NewsPolicy,
-    ) -> (Option<String>, Vec<ArticleId>) {
+    ) -> Result<(Option<String>, Vec<ArticleId>), NewsError> {
         match (mime, policy.markdown, self.body_renderer.as_ref()) {
             (BodyType::Markdown, MarkdownMode::Render, Some(renderer)) => {
+                if let Some(why) = renderer.refuses(body) {
+                    return Err(NewsError::BadRequest(why));
+                }
                 let limit = policy.max_body.saturating_mul(DOWNGRADE_ROOM);
                 let Rendered { plain, mut refs } = renderer.render(body, limit);
                 refs.truncate(MAX_REF_CANDIDATES);
-                (Some(plain), refs)
+                Ok((Some(plain), refs))
             }
             // Plain text, or markdown nothing parses: the shorthand is
             // found in what was typed, as it always has been.
-            _ => (None, scan_refs(body)),
+            _ => Ok((None, scan_refs(body))),
         }
     }
 
@@ -1307,7 +1320,7 @@ impl Core {
         if body.len() > policy.max_body {
             return Err(NewsError::BadRequest("That article is too long."));
         }
-        let (plain, refs) = self.news_render(&body, req.mime, policy);
+        let (plain, refs) = self.news_render(&body, req.mime, policy)?;
         let post = NewPost {
             category: req.category,
             parent: req.parent,

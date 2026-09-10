@@ -40,6 +40,99 @@ impl BodyRenderer for Markdown {
     fn render(&self, source: &str, limit: usize) -> Rendered {
         render(source, limit)
     }
+
+    fn refuses(&self, source: &str) -> Option<&'static str> {
+        (nesting_width(source) > MAX_NESTING_WIDTH).then_some("That article nests too deeply.")
+    }
+}
+
+/// The most columns of list and quote syntax a line may open with
+/// (§5.4).
+///
+/// pulldown-cmark matches every line against every block still open
+/// around it, and a list item stays open across a blank line, which
+/// costs one byte. So a body that opens thousands of levels and then
+/// runs blank lines costs levels times lines — seconds, from one that
+/// fits in `max_body`. Every open block takes at least a column of the
+/// line that opened it, so capping the columns caps the depth, and the
+/// parse with it, at milliseconds. It admits lists far deeper than any
+/// client draws.
+pub const MAX_NESTING_WIDTH: usize = 64;
+
+/// How far into its line the widest run of list and quote syntax
+/// reaches, in columns, over the lines that have any: an upper bound on
+/// how deep the body nests. Indentation that continues an open block, a
+/// `>`, and a list marker each take at least a column per level, and a
+/// block opens only on a line with a marker.
+pub fn nesting_width(source: &str) -> usize {
+    source.split('\n').map(line_width).max().unwrap_or(0)
+}
+
+/// The container syntax a line opens with, in columns, or nothing when
+/// it has no marker: indentation alone deepens nothing, and neither does
+/// a thematic break, however many dashes it has.
+fn line_width(line: &str) -> usize {
+    let b = line.as_bytes();
+    if thematic_break(b) {
+        return 0;
+    }
+    let (mut i, mut col, mut marked) = (0, 0, false);
+    while let Some(&c) = b.get(i) {
+        match c {
+            b' ' => col += 1,
+            b'\t' => col += 4 - col % 4,
+            b'>' => {
+                col += 1;
+                marked = true;
+            }
+            b'-' | b'*' | b'+' if spaced(b, i + 1) => {
+                col += 1;
+                marked = true;
+            }
+            b'0'..=b'9' => {
+                let digits = b[i..].iter().take_while(|d| d.is_ascii_digit()).count();
+                let end = i + digits;
+                if digits > 9 || !matches!(b.get(end), Some(b'.' | b')')) || !spaced(b, end + 1) {
+                    break;
+                }
+                col += digits + 1;
+                marked = true;
+                i = end;
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    if marked {
+        col
+    } else {
+        0
+    }
+}
+
+/// Whether what ends before `i` is a list marker: one needs a space, a
+/// tab or the end of the line after it.
+fn spaced(b: &[u8], i: usize) -> bool {
+    matches!(b.get(i), None | Some(b' ' | b'\t' | b'\r'))
+}
+
+/// `---`, `* * *`, `_ _ _`: three or more of one of them and nothing but
+/// spaces besides, which CommonMark reads as a rule before it reads a
+/// list, so it opens no block.
+fn thematic_break(b: &[u8]) -> bool {
+    let mut mark = None;
+    let mut n = 0;
+    for &c in b {
+        match c {
+            b' ' | b'\t' | b'\r' => {}
+            b'-' | b'*' | b'_' if mark.is_none_or(|m| m == c) => {
+                mark = Some(c);
+                n += 1;
+            }
+            _ => return false,
+        }
+    }
+    n >= 3
 }
 
 /// How a truncated downgrade ends. Three bytes, and counted inside the
@@ -757,6 +850,82 @@ mod tests {
             assert!(r.plain.ends_with('…'), "{what}");
             assert!(took < std::time::Duration::from_secs(2), "{what}: {took:?}");
         }
+    }
+
+    #[test]
+    fn nesting_is_measured_in_columns_of_container_syntax() {
+        assert_eq!(nesting_width("plain\n\ntext"), 0);
+        assert_eq!(nesting_width("        indented, but no marker"), 0);
+        assert_eq!(
+            nesting_width("-x\n1.5\n#1\n+1"),
+            0,
+            "none of these is a marker"
+        );
+        assert_eq!(nesting_width("- a"), 2);
+        assert_eq!(
+            nesting_width("-"),
+            1,
+            "an empty item at the end of the line"
+        );
+        assert_eq!(nesting_width(">quote"), 1);
+        assert_eq!(nesting_width("> > - a"), 6);
+        assert_eq!(nesting_width("- a\n  - b\n    - c"), 6);
+        assert_eq!(nesting_width("\t- a"), 6, "a tab reaches its tab stop");
+        assert_eq!(nesting_width("10. a\n1) b"), 4);
+        assert_eq!(
+            nesting_width("1234567890. a"),
+            0,
+            "ten digits are not a marker"
+        );
+    }
+
+    #[test]
+    fn a_thematic_break_opens_nothing_however_long() {
+        assert_eq!(nesting_width(&"- ".repeat(200)), 0);
+        assert_eq!(nesting_width(&"* ".repeat(200)), 0);
+        assert_eq!(nesting_width(&"_".repeat(200)), 0);
+        // With anything else on the line it is a list after all.
+        assert_eq!(nesting_width(&format!("{}a", "- ".repeat(200))), 400);
+    }
+
+    #[test]
+    fn nesting_deeper_than_a_parse_can_afford_is_refused() {
+        let admitted = format!("{}a", "- ".repeat(MAX_NESTING_WIDTH / 2));
+        assert_eq!(Markdown.refuses(&admitted), None);
+        let deeper = format!("{}a", "- ".repeat(MAX_NESTING_WIDTH / 2 + 1));
+        assert_eq!(
+            Markdown.refuses(&deeper),
+            Some("That article nests too deeply.")
+        );
+        assert!(Markdown
+            .refuses(&format!("{}a", "> ".repeat(MAX_NESTING_WIDTH)))
+            .is_some());
+        assert_eq!(
+            Markdown.refuses("an ordinary\n\n- list\n  - nested\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn what_the_cap_admits_parses_in_linear_time() {
+        // The shape that made the parse quadratic: every level the cap
+        // admits, then blank lines up to the most a body may hold, each of
+        // which the parser matches against every level still open.
+        let levels = "- ".repeat(MAX_NESTING_WIDTH / 2);
+        let body = format!("{levels}a\n{}", "\n".repeat(65_535 - levels.len() - 2));
+        assert_eq!(Markdown.refuses(&body), None);
+        let started = std::time::Instant::now();
+        render(&body, 4 * 65_535);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+
+        // Uncapped, the same shape costs seconds to parse; refused, it
+        // costs one pass over its bytes.
+        let deep = format!("{}a\n{}", "- ".repeat(16_384), "\n".repeat(32_767));
+        let started = std::time::Instant::now();
+        assert!(Markdown.refuses(&deep).is_some());
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
     }
 
     #[test]

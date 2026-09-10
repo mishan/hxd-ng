@@ -596,6 +596,19 @@ async fn a_markdown_article_is_kept_as_written_and_read_as_text() {
         .await;
     assert_eq!(ids(&found["hits"], ""), [expanded]);
 
+    // A body nested past what a parse can afford is refused before it is
+    // parsed, however small it is.
+    let deep = format!("{}a\n{}", "- ".repeat(1_000), "\n".repeat(1_000));
+    assert_eq!(
+        alice
+            .refused(
+                "news_post",
+                json!({ "category": cat, "subject": "Deep", "body": deep, "mime": "text/markdown" }),
+            )
+            .await,
+        "bad_request"
+    );
+
     // A server that takes plain text only says so up front and refuses
     // the rest.
     let plain = tempfile::tempdir().unwrap();

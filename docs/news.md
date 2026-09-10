@@ -738,6 +738,20 @@ for any ordinary article, and the source is untouched either way: an ng
 client sees all of it. Cutting to `max_body` for a legacy client happens
 at the legacy edge, when that binding lands (§12.4, §16).
 
+**A body nested too deeply is refused**, before it is parsed. A
+CommonMark parser matches each line against every block still open
+around it, and a list item stays open across a blank line, which costs
+one byte: a body that opens thousands of levels and then runs blank
+lines costs levels times lines, seconds of CPU from one that passes
+every size check. So a line may open with at most 64 columns of list
+and quote syntax — indentation, `>`, list markers — and an article past
+that is `bad_request`, "That article nests too deeply.", as one too long
+is. Every open block takes at least a column of the line that opened
+it, so the cap bounds the depth and the parse with it, and it admits
+lists far deeper than any client draws. A thematic break is not
+counted, however many dashes it has. A plain body, and markdown under
+`source`, is never parsed and never refused for this.
+
 ### 5.5 The knob
 
 `[news] markdown` takes three values, and references and search work
