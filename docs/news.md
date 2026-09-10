@@ -285,8 +285,8 @@ its reply 44 has `[41, 44]`; 47's reply 51 has `[41, 47, 51]`. Ordering
 a category's articles by `path` **is** preorder, byte comparison does
 it, and one index (`category, path`) serves both "the whole thread" and
 "the thread's next page". The path is built at insert from the parent's,
-which is one indexed read, and `[news] max_depth` (default 32) bounds
-it to 128 bytes.
+which is one indexed read, and `[news] max_depth` bounds it at four
+bytes a level.
 
 The alternative — sending a flat list of `(id, parent)` and letting the
 client build the tree, which is what CATLIST does — is what the legacy
@@ -948,17 +948,20 @@ Every bit this needs is already allocated and already parsed:
 | Create a bundle | `CREATE_NEWS_BUNDLES` (36) |
 | Delete a bundle | `DELETE_NEWS_BUNDLES` (37) |
 
-Two things the bitmap does not cover, both `[extra]` keys rather than
-squatted bits, for the reason hotline-ng.md §4/D5 gives:
+Two things the bitmap does not cover, both config rather than squatted
+bits, for the reason hotline-ng.md §4/D5 gives:
 
 - **`[extra] attach_news`**, defaulting to the account's `SEND_MEDIA`
   (57). Someone trusted to put an image in chat is trusted to put one
   in an article; an operator can say otherwise either way.
-- **`[extra] news_self_delete`**, default `true`: an author may delete
-  their own article without bit 33. This is a **deliberate deviation**
-  from period behavior, where deletion is bit 33 or nothing. It is
+- **`[news] self_delete`**, default `true`: an author may delete their
+  own article without bit 33. This is a **deliberate deviation** from
+  period behavior, where deletion is bit 33 or nothing. It is
   server-local policy, it never crosses either wire as a bit, and a
-  server that wants the period answer sets it `false`.
+  server that wants the period answer sets it `false`. It is a
+  server-wide key (§13) rather than a per-account one: whether an
+  author owns what they wrote is a rule of the place, not a privilege
+  of the person.
 
 Deleting a category deletes its articles, which decrements every blob
 refcount underneath it; deleting a bundle requires it to be empty,
@@ -967,7 +970,10 @@ be four hundred audit rows or a refusal, not one click.
 
 Moderation follows moderation.md's ladder unchanged: a moderator may
 not delete an article by a session holding `cant_be_disconnected` (23)
-unless they hold `delete_users` (15).
+unless they hold `delete_users` (15). That asks about the author's
+privileges, which an article does not record yet, so it arrives with
+the rest of moderation in W8 (§16); until then `delete_articles` is
+enough whoever the author is.
 
 ## 9. The ng wire
 
@@ -999,12 +1005,16 @@ server's ceiling — the same courtesy `moderator` does in
 moderation.md §2, so a client can gray out a compose button instead of
 discovering the refusal after the user has typed.
 
+Until attachments land (W5), `attach` is always `false` and the block
+leaves out `max_attachments`, `max_attachment_bytes` and `types` rather
+than sending limits for something that cannot be done.
+
 ### 9.2 Requests
 
 | `req` | params | ok |
 |---|---|---|
 | `news_tree` | `parent?` (node id; absent = root), `depth?` (1–4, default 1) | `{ "nodes": [ … ] }` |
-| `news_threads` | `category`, `before?` / `after?` (thread root id), `order?` (`"created"` \| `"recent"`, default `"created"`), `limit?` (1–200, default 50) | `{ "threads": [ … ], "has_more": bool }` |
+| `news_threads` | `category`, `before?` / `after?` (thread root id), `order?` (`"created"`, the default and so far the only one: `"recent"` is an open question, §18, and asking for it is `bad_request`), `limit?` (1–200, default 50) | `{ "threads": [ … ], "has_more": bool }` |
 | `news_thread` | `root`, `after?` (article id), `limit?` (1–100, default 25) | `{ "articles": [ … ], "has_more": bool }` |
 | `news_article` | `id` | `{ "article": { … } }` |
 | `news_post` | `category`, `parent?`, `subject`, `body`, `mime?` (`"text/plain"` \| `"text/markdown"`, default plain), `attach?` (handles) | `{ "id": 51 }` |
@@ -2023,7 +2033,7 @@ Each lands separately with tests, roughly a branch apiece.
    and a digest, and it is a feature of its own.
 8. **W8 — moderation and retention.** The audit kind, the report
    target, the purge arm, index and reference cleanup on tombstone, the
-   sweeper's jobs, the CLI surface.
+   sweeper's jobs, the CLI surface, and §8's ladder on `news_delete`.
 9. **W9 — the legacy 1.5 binding.** The hx-libs opcode additions and
    the pin bump (§1), path resolution, the transactions of §12.1,
    `CATEGORYITEM` with guid and serials, `CATLIST` with its body and
@@ -2035,7 +2045,9 @@ Each lands separately with tests, roughly a branch apiece.
 the requests of §9.2 other than `news_search`, the events of §9.3 and
 the login block, with `markdown = "off"` as the only mode. `[news]`
 accepts only the keys those honor; naming another, or another markdown
-mode, is a startup error until its stage lands. The ng e2e is
+mode, is a startup error until its stage lands. Not in it: §8's
+moderation ladder (W8), `order: "recent"` (§18), and the login
+block's attachment keys (W5). The ng e2e is
 `crates/hxd/tests/news.rs`, the out-of-process one `e2e/news.test.mjs`,
 and the first client is hx-ng's News view.
 

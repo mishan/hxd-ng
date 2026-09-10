@@ -230,7 +230,7 @@ impl NewsStore for MemoryNews {
             guid: n.guid,
             add_sn: 1,
             delete_sn: 1,
-            created_at: n.at,
+            created_at: whole_seconds(n.at),
         };
         let node = inner.view_node(&row);
         inner.nodes.push(row);
@@ -320,7 +320,7 @@ impl NewsStore for MemoryNews {
             subject: p.subject.clone(),
             body: p.body.clone(),
             mime: p.mime,
-            at: p.at,
+            at: whole_seconds(p.at),
             deleted: false,
         });
         let cat = inner.node_mut(p.category).expect("checked above");
@@ -455,7 +455,7 @@ impl NewsStore for MemoryNews {
     }
 
     fn prune(&self, max_age: Duration, now: SystemTime) -> Result<u64, StoreError> {
-        let cutoff = now.checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+        let cutoff = whole_seconds(now.checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH));
         let mut inner = self.inner.lock().unwrap();
         let mut stale: Vec<(ArticleId, NodeId)> = Vec::new();
         for root in inner.articles.iter().filter(|a| a.parent.is_none()) {
@@ -478,6 +478,7 @@ impl NewsStore for MemoryNews {
             .collect();
         inner.remove_articles(&gone);
         let mut touched: Vec<NodeId> = stale.into_iter().map(|(_, c)| c).collect();
+        touched.sort_unstable();
         touched.dedup();
         for c in touched {
             if let Some(cat) = inner.node_mut(c) {
@@ -486,4 +487,14 @@ impl NewsStore for MemoryNews {
         }
         Ok(gone.len() as u64)
     }
+}
+
+/// A time as a store that keeps Unix seconds holds it. The SQLite store
+/// does, so this one does too: an article posted at T.7 is at T in both,
+/// and a window that ends at T answers the same about it in both.
+pub(crate) fn whole_seconds(t: SystemTime) -> SystemTime {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
 }

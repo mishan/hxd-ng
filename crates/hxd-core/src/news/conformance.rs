@@ -244,6 +244,14 @@ fn an_article_round_trips_whole(s: &dyn NewsStore) {
     assert_eq!(n.children, 2, "a category counts its articles");
     assert_eq!(n.add_sn, 3, "every post bumps the add serial");
     assert!(s.article(9999).unwrap().is_none());
+
+    // A store keeps whole seconds, so a post's fraction of one is not in
+    // what comes back — from either store, or a window ending on that
+    // second would answer differently about it in each.
+    let mut late = new_post(cat, None, "half past", 7);
+    late.at += Duration::from_millis(500);
+    let late = s.post(&late, 32, 32).unwrap().id;
+    assert_eq!(s.article(late).unwrap().unwrap().at, t(7));
 }
 
 fn a_thread_comes_back_in_preorder(s: &dyn NewsStore) {
@@ -536,18 +544,29 @@ fn pruning_takes_whole_threads_by_their_last_post(s: &dyn NewsStore) {
     post(s, cat, Some(alive), "recent", 1000);
     let stale = post(s, cat, None, "old and quiet", 100);
     post(s, cat, Some(stale), "also old", 200);
+    // Stale threads that take turns between two categories: each
+    // category's serial moves once for the prune, however its threads
+    // interleave with another's.
+    let elsewhere = category(s, "Elsewhere");
+    post(s, elsewhere, None, "old, somewhere else", 100);
+    post(s, cat, None, "old again", 100);
     let mut citing = new_post(cat, None, "cites the stale one", 1100);
     citing.refs = vec![stale];
     let citing = s.post(&citing, 32, 32).unwrap().id;
     let before = s.node(cat).unwrap().unwrap().delete_sn;
+    let before_elsewhere = s.node(elsewhere).unwrap().unwrap().delete_sn;
 
     let gone = s.prune(Duration::from_secs(500), t(1200)).unwrap();
-    assert_eq!(gone, 2);
+    assert_eq!(gone, 4);
     assert!(s.article(stale).unwrap().is_none());
     assert!(s.article(alive).unwrap().is_some());
     assert_eq!(s.thread(alive, None, 10).unwrap().articles.len(), 2);
     assert!(s.article(citing).unwrap().unwrap().refs.is_empty());
     assert_eq!(s.node(cat).unwrap().unwrap().delete_sn, before + 1);
+    assert_eq!(
+        s.node(elsewhere).unwrap().unwrap().delete_sn,
+        before_elsewhere + 1
+    );
 
     assert_eq!(
         s.prune(Duration::from_secs(10_000), t(1200)).unwrap(),

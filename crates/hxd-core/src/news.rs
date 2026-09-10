@@ -134,7 +134,7 @@ pub struct Author {
 impl Author {
     /// Did the account behind `who` write this? The mailbox rule
     /// ([`Mailbox::matches`]) over the author's two columns, so an
-    /// identity-linked account is recognised across a rename and a login
+    /// identity-linked account is recognized across a rename and a login
     /// someone else has since taken is not.
     pub fn is(&self, who: &Mailbox) -> bool {
         self.login
@@ -757,6 +757,11 @@ impl Core {
 
     /// Delete an article: its author's own (unless `self_delete` is off),
     /// or anyone's with `delete_articles`. What is left is a tombstone.
+    ///
+    /// Not yet here: §8's moderation ladder, which spares an author
+    /// holding `cant_be_disconnected` from anyone without `delete_users`.
+    /// It asks about the author's privileges, which an article does not
+    /// record, and it lands with the rest of moderation in W8.
     pub fn news_delete(&self, uid: Uid, id: ArticleId) -> Result<(), NewsError> {
         let store = self.news_store()?;
         let asker = self.news_reader(uid)?;

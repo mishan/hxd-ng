@@ -126,6 +126,25 @@ impl Ng {
         (client, reply["ok"].clone())
     }
 
+    /// Come back to a detached session on a fresh socket.
+    async fn resume(addr: SocketAddr, session: &str, token: &str, last_seq: u64) -> Self {
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let mut client = Self {
+            ws,
+            next: 1,
+            events: Vec::new(),
+        };
+        client
+            .ok(
+                "resume",
+                json!({ "session": session, "token": token, "last_seq": last_seq }),
+            )
+            .await;
+        client
+    }
+
     async fn frame(&mut self) -> Value {
         loop {
             let message = timeout(Duration::from_secs(5), self.ws.next())
@@ -504,7 +523,56 @@ async fn readers_hear_that_the_news_changed_and_nobody_else_does() {
         "access_denied"
     );
 
+    // The echo is the fence: the classic client's writer sends in order,
+    // so anything the news had made it send is already passed over.
     classic.chat(b"still here").await;
+    // The agreement and access bits that follow a login, and the user
+    // list: nothing else.
+    let about_the_room = [0x006d, 0x0162, 0x012d, 0x012e];
+    assert!(
+        classic.passed.iter().all(|ty| about_the_room.contains(ty)),
+        "the legacy wire heard something besides the room: {:#x?}",
+        classic.passed
+    );
+}
+
+#[tokio::test]
+async fn a_detached_reader_hears_the_news_on_resume_with_no_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    // The classic client is the fence: it sees the reader arrive, and
+    // then go away.
+    let mut classic = Classic::login(legacy, "classic").await;
+    let (lurker, hello) = Ng::login(ng, "lurker").await;
+    let session = hello["session"].as_str().unwrap().to_string();
+    let token = hello["token"].as_str().unwrap().to_string();
+    let last_seq = hello["seq"].as_u64().unwrap();
+    classic.recv(0x012d).await;
+
+    // An account with a password detaches rather than leaving, so the
+    // news goes on into its outbox while nobody is reading it. Only once
+    // the server has noticed, though: until then an event is handed to
+    // the dead socket, and a resume rightly calls that a gap.
+    drop(lurker);
+    classic.recv(0x012d).await;
+    let cat = category(&mut admin, None, "General").await;
+    let root = post(&mut admin, cat, None, "While you were out", "hello").await;
+
+    let mut lurker = Ng::resume(ng, &session, &token, last_seq).await;
+    let node = lurker.event("news_node", |d| d["node"]["id"] == cat).await;
+    let posted = lurker.event("news_posted", |d| d["id"] == root).await;
+    lurker.request("ping", json!({})).await;
+    // Everything replayed, the news and whatever else there was, is one
+    // unbroken run of seqs from where the reader left off.
+    let mut seqs: Vec<u64> = [&node, &posted]
+        .into_iter()
+        .chain(&lurker.events)
+        .map(|e| e["seq"].as_u64().unwrap())
+        .collect();
+    seqs.sort_unstable();
+    let run: Vec<u64> = (last_seq + 1..).take(seqs.len()).collect();
+    assert_eq!(seqs, run);
 }
 
 #[tokio::test]
@@ -800,6 +868,9 @@ async fn malformed_requests_are_answered_not_dropped() {
 struct Classic {
     stream: TcpStream,
     trans: u32,
+    /// The type of every frame `recv` passed over on its way to the one
+    /// it was waiting for, so a test can say what else arrived.
+    passed: Vec<u32>,
 }
 
 impl Classic {
@@ -817,7 +888,11 @@ impl Classic {
             .write_all(&pack_frame(0x6b, 1, 0, &chunks))
             .await
             .unwrap();
-        let mut client = Self { stream, trans: 1 };
+        let mut client = Self {
+            stream,
+            trans: 1,
+            passed: Vec::new(),
+        };
         let reply = client.recv(0x0001_0000).await;
         assert_eq!(reply.flag, 0);
         client
@@ -832,6 +907,7 @@ impl Classic {
             if frame.ty == ty {
                 return frame;
             }
+            self.passed.push(frame.ty);
         }
         panic!("legacy frame {ty:#x} did not arrive");
     }

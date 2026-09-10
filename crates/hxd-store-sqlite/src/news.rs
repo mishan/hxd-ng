@@ -303,8 +303,15 @@ fn unique_or(e: rusqlite::Error) -> NewsError {
 
 /// The first byte string past every path in root `r`'s thread, or `None`
 /// for the last possible root, whose range runs to the end.
-fn thread_end(root: ArticleId) -> Option<Vec<u8>> {
-    root.checked_add(1).map(|n| n.to_be_bytes().to_vec())
+fn thread_end(root: ArticleId) -> Vec<u8> {
+    match root.checked_add(1) {
+        Some(n) => n.to_be_bytes().to_vec(),
+        // The last id there is. Nothing can reply to it, since a reply's
+        // id is higher than its parent's, so its thread is its own path
+        // and a fifth byte of 0xFF is past it — and still a bound SQLite
+        // can seek to, which `OR ?3 IS NULL` would not be.
+        None => vec![0xFF; 5],
+    }
 }
 
 /// Remove every article matching `which` (a predicate over
@@ -544,10 +551,14 @@ impl NewsStore for SqliteStore {
         // nearest the cursor; descending otherwise. Reversed afterwards,
         // so either way a page reads newest first.
         let order = if q.after.is_some() { "ASC" } else { "DESC" };
+        // Both cursors are always bound, an absent one as the end of the
+        // id space, so the roots index is a range scan either way. An
+        // `?2 IS NULL OR` bound is one SQLite cannot seek to, and a deep
+        // page would walk every newer thread to reach its own.
         let sql_text = format!(
             "SELECT {ARTICLE_COLUMNS} FROM news_article a
               WHERE a.category = ?1 AND a.parent IS NULL
-                AND (?2 IS NULL OR a.id < ?2) AND (?3 IS NULL OR a.id > ?3)
+                AND a.id < ?2 AND a.id > ?3
                 AND EXISTS (SELECT 1 FROM news_article d
                              WHERE d.root = a.id AND d.deleted_at IS NULL)
               ORDER BY a.id {order} LIMIT ?4"
@@ -558,8 +569,8 @@ impl NewsStore for SqliteStore {
             let rows = sql(stmt.query_map(
                 params![
                     clamp_node(q.category),
-                    q.before.map(i64::from),
-                    q.after.map(i64::from),
+                    q.before.map_or(i64::MAX, i64::from),
+                    q.after.map_or(0, i64::from),
                     take
                 ],
                 raw_article,
@@ -634,7 +645,7 @@ impl NewsStore for SqliteStore {
         let take = limit.saturating_add(1).min(i64::MAX as usize) as i64;
         let sql_text = format!(
             "SELECT {ARTICLE_COLUMNS} FROM news_article
-              WHERE category = ?1 AND path >= ?2 AND (?3 IS NULL OR path < ?3) AND path > ?4
+              WHERE category = ?1 AND path >= ?2 AND path < ?3 AND path > ?4
               ORDER BY path LIMIT ?5"
         );
         let raws: Vec<RawArticle> = {
@@ -678,7 +689,7 @@ impl NewsStore for SqliteStore {
         ))?;
         sql(tx.execute(
             "UPDATE news_article
-                SET subject = '', body = '', plain = NULL, nick = '',
+                SET subject = '', body = '', plain = NULL, attach_names = NULL, nick = '',
                     login = NULL, login_fp = NULL, deleted_at = ?1, deleted_by = ?2
               WHERE id = ?3",
             params![unix(at), by, i64::from(id)],
