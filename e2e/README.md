@@ -11,13 +11,24 @@ lives in `main.rs`, and until this suite existed nothing ran `main.rs`.
 So these tests start the real binary, with a real config file it parses
 itself, in a temp directory it bootstraps for itself, on real sockets.
 
-They are also driven by a **different implementation**.
+They are driven from **both ends by different implementations**.
 [`@hotline-ng/client`](https://github.com/mishan/hx-ng) is written from
 `docs/hotline-ng.md` by the client, not by the server. Where it and hxd-ng
 agree, the agreement is evidence; the hand-rolled JSON in
 `crates/hxd/tests/ng.rs` can only ever agree with the person who wrote
 both sides of it. Where they disagree, the spec says which is wrong, and
 that conversation is the point.
+
+The legacy side is the same argument, made locally: `harness/legacy.mjs`
+is a Hotline 1.5 client written from the wire format, and every legacy
+test in `crates/hxd/tests/` packs with `pack_frame` and parses with
+`read_frame` — the server's own functions, from the `hxproto` the server
+unpacks with. A framing bug symmetric between those two is invisible to
+all of them. This one frames by `len2` because the format says so, and
+gets its Mac Roman table out of Node's own `TextDecoder`.
+
+So `crosswire.test.mjs` puts a 1997 client and a browser client in one
+room with neither of them sharing a line with the server.
 
 ## Running them
 
