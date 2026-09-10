@@ -10,3 +10,16 @@ Cargo.lock.orig
 /config.toml
 /hxd-ng.toml
 /agreement.txt
+
+# The SQLite store such a server writes (the inbox, chat history and
+# news), with the rollback journal, write-ahead log and shared-memory
+# files SQLite keeps beside it. Tests make theirs in temporary
+# directories, so no database belongs in the tree.
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
