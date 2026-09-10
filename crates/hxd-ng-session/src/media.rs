@@ -19,6 +19,12 @@
 //! a `fetch` caller branches on the status before it parses anything. A
 //! download that fails for *any* reason is 404 — the spec's
 //! "never distinguish expired from unauthorized", in HTTP's own words.
+//!
+//! CORS is not stated here. Every response this module builds leaves
+//! through `http.rs`'s shared wrapper, which is the one place the ng HTTP
+//! surface says what a page from another origin may do with these
+//! routes; a second copy beside them would be a second policy the day
+//! either changed.
 
 use std::time::Duration;
 
@@ -27,9 +33,8 @@ use http_body_util::{BodyExt, Full, Limited};
 use hxd_core::media::{MediaRef, MediaReject, UploadOutcome, UploadPart};
 use hyper::body::Incoming;
 use hyper::header::{
-    HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
-    ACCESS_CONTROL_ALLOW_ORIGIN, AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION,
-    CONTENT_SECURITY_POLICY, CONTENT_TYPE, RETRY_AFTER,
+    HeaderValue, AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY,
+    CONTENT_TYPE, RETRY_AFTER,
 };
 use hyper::{Request, Response, StatusCode};
 use serde_json::json;
@@ -141,10 +146,10 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
     )
     .await;
     match outcome {
-        Ok(Ok(Ok(UploadOutcome::Done(reference)))) => cors(json_resp(
+        Ok(Ok(Ok(UploadOutcome::Done(reference)))) => json_resp(
             StatusCode::CREATED,
             json!({ "media": media_json(&reference) }),
-        )),
+        ),
         // The HTTP route is single-shot, so a token is not an answer it
         // can produce; treating it as one would leave a session open
         // that nothing will ever finish.
@@ -197,40 +202,15 @@ pub async fn download(id: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
     // something a stranger uploaded, and a browser should render them as
     // an image or not at all. `private` keeps a shared cache from
     // holding an image whose authorization set it knows nothing about.
-    cors(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, fetched.mime.mime())
-            .header(CACHE_CONTROL, "private, max-age=86400")
-            .header("x-content-type-options", "nosniff")
-            .header(CONTENT_DISPOSITION, "inline")
-            .header(CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'")
-            .body(Full::new(Bytes::from(fetched.bytes.as_ref().clone())))
-            .unwrap(),
-    )
-}
-
-/// The preflight a browser sends before a cross-origin `fetch` that
-/// carries an `Authorization` header — which is every fetch this module
-/// answers, since hx-ng is served from wherever its operator put it.
-pub fn preflight() -> Resp {
-    cors(
-        Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .header(ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
-            .header(ACCESS_CONTROL_ALLOW_HEADERS, "authorization, content-type")
-            .body(Full::new(Bytes::new()))
-            .unwrap(),
-    )
-}
-
-/// A wildcard origin gives away nothing a `curl` would not: these routes
-/// are authenticated by a bearer token and never by a cookie, so a
-/// browser that omits the header gets the same 401 from any origin.
-fn cors(mut resp: Resp) -> Resp {
-    resp.headers_mut()
-        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    resp
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, fetched.mime.mime())
+        .header(CACHE_CONTROL, "private, max-age=86400")
+        .header("x-content-type-options", "nosniff")
+        .header(CONTENT_DISPOSITION, "inline")
+        .header(CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'")
+        .body(Full::new(Bytes::from(fetched.bytes.as_ref().clone())))
+        .unwrap()
 }
 
 /// `Bearer <session>.<token>` → the uid it belongs to.
@@ -270,11 +250,11 @@ fn reject(e: MediaReject) -> Resp {
         status,
         json!({ "error": { "code": code, "text": e.text() } }),
     );
-    cors(if e == MediaReject::RateLimited {
+    if e == MediaReject::RateLimited {
         retry_after(resp)
     } else {
         resp
-    })
+    }
 }
 
 fn retry_after(mut resp: Resp) -> Resp {
@@ -284,17 +264,17 @@ fn retry_after(mut resp: Resp) -> Resp {
 }
 
 fn not_found() -> Resp {
-    cors(json_resp(
+    json_resp(
         StatusCode::NOT_FOUND,
         json!({ "error": { "code": "no_such_media", "text": "Media not found" } }),
-    ))
+    )
 }
 
 fn unauthorized() -> Resp {
-    cors(json_resp(
+    json_resp(
         StatusCode::UNAUTHORIZED,
         json!({ "error": { "code": "not_logged_in", "text": "Media needs a session." } }),
-    ))
+    )
 }
 
 fn json_resp(status: StatusCode, v: serde_json::Value) -> Resp {

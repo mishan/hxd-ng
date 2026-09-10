@@ -126,25 +126,26 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         };
     }
 
-    // The media routes come before the table proper: one of them has a
-    // handle in its path, and a browser sends `OPTIONS` to both before
-    // it sends anything carrying an `Authorization` header.
+    // Preflight comes before everything else: a browser sends `OPTIONS`
+    // to a path whose real method it has not used yet, so this cannot be
+    // one more arm of a table keyed on the method.
+    if req.method() == Method::OPTIONS && cors_route(&path) {
+        return preflight();
+    }
+
+    // The media routes come before the table proper, because one of them
+    // carries a handle in its path and so cannot be an arm of a match on
+    // the whole of it. Their CORS is the shared wrapper's, like every
+    // other route a page fetches.
     if path == "/media" || path.starts_with("/media/") {
-        return match (req.method(), path.strip_prefix("/media/")) {
-            (&Method::OPTIONS, _) => crate::media::preflight(),
+        let resp = match (req.method(), path.strip_prefix("/media/")) {
             (&Method::POST, None) => crate::media::upload(req, &ctx).await,
             (&Method::GET, Some(id)) if !id.is_empty() && !id.contains('/') => {
                 crate::media::download(id, req, &ctx).await
             }
             _ => plain(StatusCode::NOT_FOUND, "not found"),
         };
-    }
-
-    // Preflight comes before the table: a browser sends `OPTIONS` to a
-    // path whose real method it has not used yet, so this cannot be one
-    // more arm of it.
-    if req.method() == Method::OPTIONS && cors_route(&path) {
-        return preflight();
+        return cors(resp);
     }
 
     let resp = match (req.method(), path.as_str()) {
@@ -181,7 +182,10 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
 /// The routes a page fetches. An upgrade is not subject to CORS and has
 /// returned above by the time this is asked.
 fn cors_route(path: &str) -> bool {
-    path == "/.well-known/hotline" || path.starts_with("/identity/")
+    path == "/.well-known/hotline"
+        || path.starts_with("/identity/")
+        || path == "/media"
+        || path.starts_with("/media/")
 }
 
 /// `*` rather than an echo of `Origin`: there is no cookie or other

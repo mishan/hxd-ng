@@ -1384,3 +1384,67 @@ async fn paging_a_deleted_line_grants_its_image_to_nobody() {
         "the handle resolved for a reader who was shown nothing"
     );
 }
+
+#[tokio::test]
+async fn the_media_routes_carry_the_shared_cors_policy() {
+    // hx-ng is served from wherever its operator put it, so every fetch
+    // here is potentially cross-origin and carries `Authorization` —
+    // which means a preflight. The policy is `http.rs`'s one wrapper
+    // rather than a copy beside these routes, and this is what says the
+    // routes are actually inside it.
+    let dir = tempfile::tempdir().unwrap();
+    let (_, ng) = start_server(dir.path(), media_config()).await;
+    let (alice, _) = Ng::login(ng, "alice").await;
+
+    for path in ["/media", "/media/AAAAAAAAAAAAAAAAAAAAAA"] {
+        let pre = http(ng, "OPTIONS", path, &[], b"").await;
+        assert_eq!(pre.status, 204, "{path}");
+        assert_eq!(
+            pre.header("access-control-allow-origin"),
+            Some("*"),
+            "{path}"
+        );
+        let methods = pre
+            .header("access-control-allow-methods")
+            .unwrap_or_default();
+        assert!(
+            methods.contains("GET") && methods.contains("POST"),
+            "{methods}"
+        );
+        let headers = pre
+            .header("access-control-allow-headers")
+            .unwrap_or_default();
+        assert!(headers.contains("authorization"), "{headers}");
+    }
+
+    // And the answers themselves, or a page could send the request and
+    // not be allowed to read what came back.
+    let uploaded = ng_upload(ng, &alice.bearer, &png(8, 8)).await;
+    assert_eq!(uploaded.status, 201);
+    assert_eq!(uploaded.header("access-control-allow-origin"), Some("*"));
+    let id = uploaded.json()["media"]["id"].as_str().unwrap().to_owned();
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/media/{id}"),
+        &[("Authorization", &alice.bearer)],
+        b"",
+    )
+    .await;
+    assert_eq!(fetched.status, 200);
+    assert_eq!(fetched.header("access-control-allow-origin"), Some("*"));
+
+    // A refusal too: a `fetch` that cannot read the 404 body cannot tell
+    // a refusal from a network error.
+    let refused = http(
+        ng,
+        "GET",
+        "/media/AAAAAAAAAAAAAAAAAAAAAA",
+        &[("Authorization", &alice.bearer)],
+        b"",
+    )
+    .await;
+    assert_eq!(refused.status, 404);
+    assert_eq!(refused.header("access-control-allow-origin"), Some("*"));
+}
