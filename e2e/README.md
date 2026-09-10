@@ -58,7 +58,19 @@ arriving at the same answer.
 
 ## The client dependency
 
-Currently a `file:` path to a sibling `../../hx-ng` checkout. It becomes
-`@hotline-ng/client@^0.1.0` from the registry the moment that version is
-published — one line in `package.json`, and CI stops needing the sibling
-checkout.
+A `file:` path to a sibling `../../hx-ng` checkout, **pinned** in CI to
+the commit `hx-ng.rev` names. Locally the suite runs whatever the sibling
+holds; `npm test` says so first when that is not the pinned commit, or
+when `packages/hotline-ng` there has uncommitted changes, and then runs
+anyway — a newer client beside you is the usual state mid-change.
+
+Advancing the pin is a one-line commit, and a deliberate one, like the
+`hxproto` pin: it moves when a test here needs something the client has
+landed. A wire change goes server first — the feature with its Rust
+suites, which need no client — then the client, then the pin moves here
+together with the e2e cases for the feature. hx-ng's CI runs this suite
+from our `main` against its own tree, so a client change that breaks it
+is caught there, pin or no pin.
+
+Once `@hotline-ng/client` is published, `package.json` names a version
+instead, and CI stops needing the sibling checkout.

@@ -82,19 +82,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The suite consumes @hotline-ng/client. Until that package is
-      # published this is a path dependency on a sibling checkout —
-      # which is also the arrangement hx-ng already uses in reverse for
-      # `hxd` and `hlid`. `main` for now, deliberately: the point of the
-      # arrangement is that a client change and a server change are
-      # tested against each other. Once the package is on npm this whole
-      # step goes away and `e2e/package.json` names a version, which is
-      # a pin in the ordinary sense.
+      # The suite consumes @hotline-ng/client from a sibling checkout, at
+      # the commit `e2e/hx-ng.rev` names. A pin rather than `main`, so a
+      # server change that needs a client change is not red until the
+      # client merges: the server lands first with the Rust suites
+      # covering the new wire, the client follows, and the pin advances
+      # with the e2e cases that use it. hx-ng's CI runs this suite from
+      # our `main` against its own working tree, so a client change that
+      # breaks it is still caught on that side without waiting for the
+      # pin. Once the package is on npm, `e2e/package.json` names a
+      # version instead and these steps go away.
+      - name: Read the client pin
+        id: pin
+        run: echo "rev=$(tr -d '[:space:]' < e2e/hx-ng.rev)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           repository: mishan/hx-ng
           path: hx-ng-checkout
-          ref: main
+          ref: ${{ steps.pin.outputs.rev }}
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

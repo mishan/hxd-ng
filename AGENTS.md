@@ -185,7 +185,13 @@ Three layers, all `cargo test --workspace`:
   written from the spec by the client rather than by us, so where the
   two agree the agreement is evidence rather than a tautology. Node
   only, so voice and video stay in the Rust suites where the real SFU
-  is.
+  is. The client is **pinned**: CI checks hx-ng out at the commit
+  `e2e/hx-ng.rev` names, and a local run notes when `../hx-ng` is
+  elsewhere. A wire change lands server first, covered by the Rust
+  suites; the client follows; then the pin advances in the commit that
+  adds the e2e cases using it. Advancing it is deliberate, like the
+  `hxproto` pin — and in a stack, each branch pins the client commit
+  its own e2e cases need.
 
 House rules: **tests fail loudly** — never skip around something broken.
 A chat sender receives its own echo, so tests must match events by
@@ -200,7 +206,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 node --check tools/ng-client.mjs
-cd e2e && npm install && npm test   # needs a sibling ../hx-ng checkout
+cd e2e && npm install && npm test   # needs a sibling ../hx-ng; CI pins it
 ```
 
 The best end-to-end check of all: point a real GtkHx at the legacy port
