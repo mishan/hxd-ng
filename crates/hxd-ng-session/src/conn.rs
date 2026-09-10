@@ -393,6 +393,13 @@ async fn handle_login(
         transport: hxd_core::Transport {
             encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
             identity: identity.map(TransportIdentity::tag),
+            // Always, when the server has a pipeline at all: an ng
+            // client is told what it may ignore rather than asked what
+            // it supports, so an event with a `media` object is safe to
+            // send to any of them (`docs/inline-media.md` §5.2). A
+            // client that renders nothing for it is a client that
+            // renders the text, which is what a classic one does too.
+            inline_media: ctx.core.media_enabled(),
         },
         has_inbox: account.has_inbox,
         // ng has `msg_read`; a client says for itself when it has read
@@ -474,6 +481,11 @@ async fn handle_login(
     if ctx.identity.is_some() && !caps.iter().any(|c| c == "identity") {
         caps.push("identity".into());
     }
+    // Likewise `media`: it is on whenever a pipeline is configured, and
+    // a client that sees it knows `POST /media` will answer.
+    if ctx.core.media_enabled() && !caps.iter().any(|c| c == "media") {
+        caps.push("media".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
@@ -529,6 +541,12 @@ async fn handle_login(
             "max_lines": history.max_lines,
             "max_days": history.max_days,
         });
+    }
+    // The pipeline's ceilings, so a file picker can filter and a
+    // pre-flight can refuse locally instead of spending an upload to
+    // find out (`docs/inline-media.md` §8.1).
+    if let Some(cfg) = ctx.core.media_config() {
+        ok["media"] = crate::media::limits_json(cfg);
     }
     if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
         // The client never learned it was logged in; a ghost session with
@@ -796,6 +814,63 @@ async fn handle_sync(
     Flow::Continue
 }
 
+/// A stored reference as the media store has it *now*: the live handle
+/// where the bytes are still there, and the row's own metadata without
+/// one where they are not (`docs/inline-media.md` §9).
+fn media_now(
+    core: &hxd_core::Core,
+    meta: &hxd_core::history::MediaMeta,
+) -> Option<hxd_core::media::MediaRef> {
+    let handle = <hxd_core::media::Handle>::try_from(meta.id.as_slice()).ok();
+    handle.and_then(|h| core.media_meta(&h)).or_else(|| {
+        hxd_core::media::MediaRef::from_meta(meta)
+            .map(|r| hxd_core::media::MediaRef { id: None, ..r })
+    })
+}
+
+/// Whether a history reader may fetch the image on a line it was just
+/// served, and — under `history_access = "readers"` — the act of
+/// granting it.
+///
+/// The default is the spec's: gaining read access does not grant
+/// retroactive download rights, so a line carries its metadata and a
+/// download resolves only for the principals captured when it was
+/// relayed. `readers` is the operator's other answer, for public chat
+/// only, on the argument that a public line's audience is everyone
+/// holding read-chat (§5.4).
+fn media_for_reader(ctx: &NgCtx, uid: hxd_core::Uid, line: &hxd_core::LogLine) -> bool {
+    let Some(meta) = line.media.as_ref() else {
+        return false;
+    };
+    // A redacted line's image went with it. `history_line_json` already
+    // withholds the handle here and stamps `removed`, but this function
+    // *grants* under the `readers` policy, and a grant nobody was shown
+    // the handle for is still a grant that never expires.
+    if line.flags.contains(hxd_core::LineFlags::DELETED) {
+        return false;
+    }
+    let Ok(handle) = <hxd_core::media::Handle>::try_from(meta.id.as_slice()) else {
+        return false;
+    };
+    // Gone is gone, whatever the policy says.
+    if ctx.core.media_meta(&handle).and_then(|m| m.id).is_none() {
+        return false;
+    }
+    let readers = ctx
+        .core
+        .media_config()
+        .is_some_and(|c| c.history_access == hxd_core::HistoryAccess::Readers);
+    if readers {
+        if let Some(who) = ctx.core.principal_of(uid) {
+            ctx.core.media_grant(&handle, who);
+        }
+        return true;
+    }
+    // Otherwise the handle is only worth naming to someone the relay
+    // captured — anyone else would fetch it and be told no.
+    ctx.core.media_fetch(uid, &handle).is_some()
+}
+
 async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut WsTx) -> Flow {
     let send = |s: String| Message::Text(s);
     let out = match req.req.as_str() {
@@ -812,11 +887,30 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 } else {
                     0
                 };
+                // A handle that does not parse is refused rather than
+                // dropped: the client asked for an image to go with this
+                // line, and a line that quietly arrives without one is
+                // worse than a refusal it can act on.
+                let media = match p.media.as_deref().map(hxd_core::media::handle_from_str) {
+                    None => None,
+                    Some(Some(h)) => Some(h),
+                    Some(None) => {
+                        return finish(ws_tx, reply_err(req.id, "bad_request", "No such media."))
+                            .await
+                    }
+                };
                 let mut text = p.text;
                 text.truncate_to_char_boundary(4096);
                 let uid = state.uid;
-                match off_reactor(&ctx.core, move |c| c.chat_public(uid, text, style)).await {
+                match off_reactor(&ctx.core, move |c| c.chat_public(uid, text, style, media)).await
+                {
                     Some(Ok(_)) => reply_ok(req.id, json!({})),
+                    // Not this session's upload, or its bytes have gone.
+                    // One answer for both, so a send cannot be used to
+                    // test whether someone else's handle exists.
+                    Some(Err(ChatError::NoSuchMedia)) => {
+                        reply_err(req.id, "bad_request", "No such media.")
+                    }
                     _ => reply_err(req.id, "server_error", "Server error."),
                 }
             }
@@ -855,13 +949,20 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                         };
                         let uid = state.uid;
                         match off_reactor(&ctx.core, move |c| c.history(uid, query)).await {
-                            Some(Ok(page)) => reply_ok(
-                                req.id,
-                                json!({
-                                    "lines": page.lines.iter().map(history_line_json).collect::<Vec<_>>(),
-                                    "has_more": page.has_more,
-                                }),
-                            ),
+                            Some(Ok(page)) => {
+                                let lines: Vec<_> = page
+                                    .lines
+                                    .iter()
+                                    .map(|line| {
+                                        let fetchable = media_for_reader(ctx, uid, line);
+                                        history_line_json(line, fetchable)
+                                    })
+                                    .collect();
+                                reply_ok(
+                                    req.id,
+                                    json!({ "lines": lines, "has_more": page.has_more }),
+                                )
+                            }
                             _ => reply_err(req.id, "server_error", "Server error."),
                         }
                     }
@@ -895,14 +996,23 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
             Ok(p) => {
                 let mut text = p.text;
                 text.truncate_to_char_boundary(4096);
+                let media = match p.media.as_deref().map(hxd_core::media::handle_from_str) {
+                    None => None,
+                    Some(Some(h)) => Some(h),
+                    Some(None) => {
+                        return finish(ws_tx, reply_err(req.id, "bad_request", "No such media."))
+                            .await
+                    }
+                };
                 // The legacy wire refuses an empty message and so does
                 // this one: it would take a queue slot, notify, and
                 // render as a bare `[queued …]` stamp with nothing
-                // under it.
-                if text.is_empty() {
+                // under it. An image *is* something under it, so a
+                // message carrying one needs no text.
+                if text.is_empty() && media.is_none() {
                     return finish(
                         ws_tx,
-                        reply_err(req.id, "bad_request", "A message needs text."),
+                        reply_err(req.id, "bad_request", "A message needs text or media."),
                     )
                     .await;
                 }
@@ -923,10 +1033,13 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 let from = state.uid;
                 let outcome = match (p.to, p.to_login.clone()) {
                     (Some(uid), None) => {
-                        off_reactor(&ctx.core, move |c| c.msg(from, uid, text, guid)).await
+                        off_reactor(&ctx.core, move |c| c.msg(from, uid, text, guid, media)).await
                     }
                     (None, Some(login)) => {
-                        off_reactor(&ctx.core, move |c| c.msg_login(from, &login, text, guid)).await
+                        off_reactor(&ctx.core, move |c| {
+                            c.msg_login(from, &login, text, guid, media)
+                        })
+                        .await
                     }
                     // A client that sent both meant something, and
                     // guessing which is how a message reaches the wrong
@@ -970,6 +1083,11 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     // they will act on.
                     Err(ChatError::ServerError) => {
                         reply_err(req.id, "server_error", "Server error.")
+                    }
+                    // The handle was not this session's, or its bytes
+                    // have gone. Nothing was sent.
+                    Err(ChatError::NoSuchMedia) => {
+                        reply_err(req.id, "bad_request", "No such media.")
                     }
                     // One answer for "no such user", "no such account" and
                     // "that account takes no offline messages", so none of
@@ -1015,7 +1133,13 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                         json!({
                             "messages": messages
                                 .iter()
-                                .map(stored_msg_json)
+                                .map(|m| {
+                                    let media = m
+                                        .media
+                                        .as_ref()
+                                        .and_then(|meta| media_now(&ctx.core, meta));
+                                    stored_msg_json(m, media.as_ref())
+                                })
                                 .collect::<Vec<_>>(),
                             "unread": counts.unread,
                             "total": counts.total,

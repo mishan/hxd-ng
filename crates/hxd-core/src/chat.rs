@@ -56,19 +56,48 @@ struct Sender {
     /// answers `no_such_user`. Handing that login to a client as the
     /// sender is handing it a reply button that cannot work.
     reply_login: Option<String>,
+    /// What this sender's uploads are held under, and half of the set a
+    /// message with an image captures: the sender's mailbox where there
+    /// is one, and the session itself for a plain guest
+    /// (`docs/inline-media.md` §5.1).
+    principal: crate::media::Principal,
 }
 
 impl Sender {
     fn resolve(r: &RosterInner, uid: Uid) -> Result<Sender, ChatError> {
         let sess = r.users.get(&uid).ok_or(ChatError::NoSuchUser)?;
         let durable = sess.has_inbox || sess.identity.is_some();
+        let mailbox = durable.then(|| sess.mailbox());
         Ok(Sender {
             uid,
             nick: sess.info.nick.clone(),
-            mailbox: durable.then(|| sess.mailbox()),
+            // A sender with a mailbox keeps its images across a
+            // reconnect; a plain guest's are its session's, and go when
+            // the session does.
+            principal: match mailbox.clone() {
+                Some(m) => crate::media::Principal::Mailbox(m),
+                None => crate::media::Principal::Session {
+                    uid,
+                    serial: sess.serial,
+                },
+            },
+            mailbox,
             reply_login: sess.has_inbox.then(|| sess.login.clone()),
         })
     }
+}
+
+/// A stored message's image as it stands at delivery: the live handle
+/// where the store still has one, and the row's own metadata with no
+/// handle where it does not. Never `None` for a row that had an image —
+/// "[an image was here]" is worth rendering and an empty message is not.
+fn media_now(
+    handles: &HashMap<Vec<u8>, crate::media::MediaRef>,
+    meta: &crate::history::MediaMeta,
+) -> Option<crate::media::MediaRef> {
+    handles.get(&meta.id).cloned().or_else(|| {
+        crate::media::MediaRef::from_meta(meta).map(|r| crate::media::MediaRef { id: None, ..r })
+    })
 }
 
 /// Who it is for: a mailbox, and its session if it has one.
@@ -76,6 +105,9 @@ struct Recipient {
     uid: Option<Uid>,
     mailbox: Mailbox,
     has_inbox: bool,
+    /// The other half of a media set: this account's mailbox, or the
+    /// session where there is no mailbox to hold a grant.
+    principal: crate::media::Principal,
 }
 
 /// Which of a mailbox's sessions a flush should hand its mail to.
@@ -190,6 +222,10 @@ pub enum ChatError {
     /// about whoever was named: telling a guest "no such user" when the
     /// answer is "you have no inbox" sends them looking for a typo.
     NoInbox,
+    /// The handle a sender attached is not theirs, has expired, or was
+    /// revoked. One answer for all three, so a sender cannot use a chat
+    /// send to test whether someone else's handle exists.
+    NoSuchMedia,
     /// The server couldn't complete the operation — a chat id the OS
     /// CSPRNG refused to produce, or an inbox that would not write. Not
     /// the client's fault and not something it can retry usefully.
@@ -215,9 +251,10 @@ impl Core {
         from: Uid,
         text: String,
         style: u16,
+        media: Option<crate::media::Handle>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
         let _serial = self.log_serial.lock().unwrap();
-        let (info, login, fingerprint) = {
+        let (info, login, fingerprint, principal) = {
             let r = self.roster.lock().unwrap();
             let Some(sess) = r.users.get(&from) else {
                 return Err(ChatError::NoSuchUser);
@@ -226,7 +263,22 @@ impl Core {
                 sess.info.clone(),
                 (sess.login != "guest").then(|| sess.login.clone()),
                 sess.identity,
+                crate::media::Principal::Session {
+                    uid: from,
+                    serial: sess.serial,
+                },
             )
+        };
+        // Before the line is logged: a handle that is not this sender's,
+        // or whose bytes have gone, means no line at all rather than a
+        // line whose reference resolves for nobody.
+        let media = match media {
+            Some(handle) => Some((
+                handle,
+                self.media_for_send(from, &handle)
+                    .map_err(|_| ChatError::NoSuchMedia)?,
+            )),
+            None => None,
         };
         let at = SystemTime::now();
         let id = match self.history.as_ref() {
@@ -249,6 +301,14 @@ impl Core {
             ),
             None => None,
         };
+        // The log keeps the canonical metadata beside the line, so a
+        // history entry can still render a placeholder once the bytes
+        // are gone (docs/inline-media.md §9, chat-history.md §8).
+        if let (Some(log), Some(id), Some((_, reference))) = (self.history.as_ref(), id, &media) {
+            if let Err(e) = log.attach_media(id, &reference.to_meta()) {
+                warn!("chat log would not record media: {e}");
+            }
+        }
         let ev = Event::Chat {
             cid: 0,
             from: info,
@@ -256,9 +316,19 @@ impl Core {
             style,
             id,
             at,
+            media: media.as_ref().map(|(_, r)| r.clone()),
         };
         let mut r = self.roster.lock().unwrap();
         r.broadcast_where(&ev, None, reads_public_chat);
+        // The authorization set, fixed at relay time: the sender, and
+        // every session this line just went to whose wire can carry the
+        // reference. Captured under the roster's lock and stored under
+        // the media store's, which is the one order those two are ever
+        // taken in.
+        if let Some((handle, _)) = &media {
+            let audience = r.media_audience(None, reads_public_chat);
+            self.media_capture(handle, audience.into_iter().chain([principal]));
+        }
         Ok(id)
     }
 
@@ -269,7 +339,35 @@ impl Core {
         from: Uid,
         text: String,
         style: u16,
+        media: Option<crate::media::Handle>,
     ) -> Result<(), ChatError> {
+        // Membership is checked before the handle is resolved, and the
+        // handle before anything is sent: a non-member learns nothing
+        // about a room from the order of these refusals.
+        let principal = {
+            let r = self.roster.lock().unwrap();
+            let Some(chat) = r.chats.get(&cid) else {
+                return Err(ChatError::NoSuchChat);
+            };
+            if !chat.members.contains(&from) {
+                return Err(ChatError::NotAMember);
+            }
+            let Some(sess) = r.users.get(&from) else {
+                return Err(ChatError::NoSuchUser);
+            };
+            crate::media::Principal::Session {
+                uid: from,
+                serial: sess.serial,
+            }
+        };
+        let media = match media {
+            Some(handle) => Some((
+                handle,
+                self.media_for_send(from, &handle)
+                    .map_err(|_| ChatError::NoSuchMedia)?,
+            )),
+            None => None,
+        };
         let mut r = self.roster.lock().unwrap();
         let Some(chat) = r.chats.get(&cid) else {
             return Err(ChatError::NoSuchChat);
@@ -288,9 +386,17 @@ impl Core {
             style,
             id: None,
             at: SystemTime::now(),
+            media: media.as_ref().map(|(_, r)| r.clone()),
         };
-        for uid in members {
-            r.send_to(uid, ev.clone());
+        for uid in &members {
+            r.send_to(*uid, ev.clone());
+        }
+        // A room's set is its membership at this moment, media-capable
+        // members only, and nothing is added to it afterwards — someone
+        // who joins the room later did not receive this line.
+        if let Some((handle, _)) = &media {
+            let audience = r.media_audience_of(&members);
+            self.media_capture(handle, audience.into_iter().chain([principal]));
         }
         Ok(())
     }
@@ -323,6 +429,27 @@ impl Core {
         }
         session.history_tokens -= 1.0;
         Ok(true)
+    }
+
+    /// Each stored reference in a batch, as the media store has it now.
+    /// Keyed by the stored handle bytes, which is what the row carries.
+    fn media_states(
+        &self,
+        batch: &[crate::inbox::StoredMessage],
+    ) -> HashMap<Vec<u8>, crate::media::MediaRef> {
+        let mut out = HashMap::new();
+        for m in batch {
+            let Some(meta) = m.media.as_ref() else {
+                continue;
+            };
+            let Ok(handle) = <crate::media::Handle>::try_from(meta.id.as_slice()) else {
+                continue;
+            };
+            if let Some(reference) = self.media_meta(&handle) {
+                out.insert(meta.id.clone(), reference);
+            }
+        }
+        out
     }
 
     /// Retention work for the binary's hourly sweeper.
@@ -586,6 +713,7 @@ impl Core {
         to: Uid,
         text: String,
         guid: Option<MessageGuid>,
+        media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
         let (sender, recipient) = {
             let r = self.roster.lock().unwrap();
@@ -601,10 +729,19 @@ impl Core {
                     uid: Some(to),
                     mailbox: sess.mailbox(),
                     has_inbox: sess.has_inbox,
+                    // A guest has no mailbox to hold the grant, so the
+                    // session it is sitting in is the address.
+                    principal: match (sess.has_inbox, sess.mailbox()) {
+                        (true, mailbox) => crate::media::Principal::Mailbox(mailbox),
+                        (false, _) => crate::media::Principal::Session {
+                            uid: to,
+                            serial: sess.serial,
+                        },
+                    },
                 },
             )
         };
-        self.deliver(sender, recipient, text, guid)
+        self.deliver(sender, recipient, text, guid, media)
     }
 
     /// A private message to an *account*, whether or not it holds a
@@ -617,6 +754,7 @@ impl Core {
         to: &str,
         text: String,
         guid: Option<MessageGuid>,
+        media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
         let directory = self.directory.as_ref().ok_or(ChatError::NoSuchUser)?;
         // One `None` for "no such account" and "that account takes no
@@ -637,12 +775,14 @@ impl Core {
         self.deliver(
             sender,
             Recipient {
+                principal: crate::media::Principal::Mailbox(mailbox.clone()),
                 uid,
                 mailbox,
                 has_inbox: true,
             },
             text,
             guid,
+            media,
         )
     }
 
@@ -652,8 +792,31 @@ impl Core {
         to: Recipient,
         text: String,
         guid: Option<MessageGuid>,
+        media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
         let now = SystemTime::now();
+
+        // The handle resolves before anything is delivered or stored: a
+        // message carrying an image this sender may not attach is
+        // refused outright rather than sent without it.
+        //
+        // The *audience* is a separate act, and it happens at each point
+        // below where the message actually goes out — never here. The
+        // set is what a relay showed someone, and a send that comes back
+        // `Blocked`, `MailboxFull` or `NoSuchUser` relayed nothing;
+        // capturing up here would leave the refused recipient a
+        // permanent grant on an image they were never sent, and the set
+        // is only ever extended. Both principals are taken now because
+        // `sender` is consumed on the way down.
+        let image = media;
+        let audience = [sender.principal.clone(), to.principal.clone()];
+        let media = match image.as_ref() {
+            Some(handle) => Some(
+                self.media_for_send(sender.uid, handle)
+                    .map_err(|_| ChatError::NoSuchMedia)?,
+            ),
+            None => None,
+        };
 
         // Two reasons not to touch the store, and the same consequence.
         //
@@ -710,6 +873,13 @@ impl Core {
                 to.uid
             }
             .ok_or(ChatError::NoSuchUser)?;
+            // There is a recipient and the event is about to go out, so
+            // now the image has been shown. Under the roster lock, which
+            // is why `media_capture` takes principals rather than
+            // looking them up.
+            if let Some(handle) = &image {
+                self.media_capture(handle, audience.clone());
+            }
             r.send_to(
                 uid,
                 Event::Msg {
@@ -720,6 +890,7 @@ impl Core {
                     id: None,
                     sent_at: now,
                     queued: false,
+                    media,
                 },
             );
             return Ok(MsgOutcome::Delivered);
@@ -758,12 +929,23 @@ impl Core {
                     sent_at: now,
                     guid,
                     kind: MessageKind::Message,
+                    media: media.as_ref().map(|m| m.to_meta()),
                 },
                 self.inbox_policy.max_queued,
             )
             .map_err(store_failed)?
         {
-            crate::inbox::Pushed::Stored(id) => id,
+            // Stored: the row is durable and carries the image's
+            // metadata, so whoever eventually reads it must be able to
+            // fetch the bytes. A retry (`Existing`) captured on its
+            // original send, and re-capturing here would grant the
+            // recipient a *different* handle if the retry named one.
+            crate::inbox::Pushed::Stored(id) => {
+                if let Some(handle) = &image {
+                    self.media_capture(handle, audience.clone());
+                }
+                id
+            }
             crate::inbox::Pushed::Existing(m) => {
                 // A retry is that same message, and it gets the answer
                 // the first send would get *now* rather than the one it
@@ -980,6 +1162,11 @@ impl Core {
         // operation on the server waits behind (roster.rs, §6.2). A
         // 25-message login flush was 25 file reads under it.
         let from_logins = self.reply_addresses(&batch);
+        // And which of the batch's images are still fetchable, resolved
+        // in the same breath and for the same reason: a handle from
+        // yesterday may have expired, and the answer belongs to the
+        // event this flush is about to build.
+        let handles = self.media_states(&batch);
 
         let mut delivered = Vec::with_capacity(batch.len());
         let (uid, what) = {
@@ -1037,6 +1224,7 @@ impl Core {
                         id: Some(m.id),
                         sent_at: m.sent_at,
                         queued: Some(m.id) != fresh,
+                        media: m.media.as_ref().and_then(|meta| media_now(&handles, meta)),
                     },
                 );
                 delivered.push(m.id);
@@ -1396,7 +1584,7 @@ mod tests {
         drain(&mut rx_a);
         drain(&mut rx_b);
 
-        core.chat_public(a, "hi".into(), 0).unwrap();
+        core.chat_public(a, "hi".into(), 0, None).unwrap();
         assert!(
             matches!(&drain(&mut rx_a)[..], [Event::Chat { cid: 0, text, .. }] if text == "hi")
         );
@@ -1420,7 +1608,7 @@ mod tests {
         // Chatting before joining is refused; joining via invite skips the
         // password.
         assert_eq!(
-            core.chat_private(cid, b, "early".into(), 0),
+            core.chat_private(cid, b, "early".into(), 0, None),
             Err(ChatError::NotAMember)
         );
         let (rows, _subject) = core.chat_join(cid, b, "").unwrap();
@@ -1429,7 +1617,7 @@ mod tests {
             matches!(&drain(&mut rx_a)[..], [Event::ChatUserJoined { user, .. }] if user.uid == b)
         );
 
-        core.chat_private(cid, b, "hello".into(), 0).unwrap();
+        core.chat_private(cid, b, "hello".into(), 0, None).unwrap();
         assert_eq!(drain(&mut rx_a).len(), 1);
         assert_eq!(drain(&mut rx_b).len(), 1);
 
@@ -1527,12 +1715,12 @@ mod tests {
         let (b, mut rx_b) = test_attach(&core, "bob", chatter());
         drain(&mut rx_a);
 
-        core.msg(a, b, "psst".into(), None).unwrap();
+        core.msg(a, b, "psst".into(), None, None).unwrap();
         assert!(
             matches!(&drain(&mut rx_b)[..], [Event::Msg { from, text, .. }] if *from == a && text == "psst")
         );
         assert_eq!(
-            core.msg(a, 999, "x".into(), None),
+            core.msg(a, 999, "x".into(), None, None),
             Err(ChatError::NoSuchUser)
         );
 
@@ -1684,7 +1872,7 @@ mod inbox_tests {
         drain(&mut rm);
 
         assert_eq!(
-            core.msg(a, m, "hi".into(), None).unwrap(),
+            core.msg(a, m, "hi".into(), None, None).unwrap(),
             MsgOutcome::Delivered,
             "a recipient who is there gets it now"
         );
@@ -1724,7 +1912,7 @@ mod inbox_tests {
         assert!(core.connection_lost(m, 8));
 
         assert!(matches!(
-            core.msg(a, m, "you there?".into(), None).unwrap(),
+            core.msg(a, m, "you there?".into(), None, None).unwrap(),
             MsgOutcome::Queued(_)
         ));
         assert_eq!(store.all().len(), 1);
@@ -1763,7 +1951,8 @@ mod inbox_tests {
         assert!(core.user(m).is_none());
 
         assert!(matches!(
-            core.msg_login(a, "dave", "call me".into(), None).unwrap(),
+            core.msg_login(a, "dave", "call me".into(), None, None)
+                .unwrap(),
             MsgOutcome::Queued(_)
         ));
 
@@ -1787,7 +1976,7 @@ mod inbox_tests {
         drain(&mut rg);
 
         assert_eq!(
-            core.msg(a, g, "hi".into(), None).unwrap(),
+            core.msg(a, g, "hi".into(), None, None).unwrap(),
             MsgOutcome::Delivered
         );
         assert!(
@@ -1814,7 +2003,7 @@ mod inbox_tests {
         // Live delivery to a session that is right there: fine, and the
         // nick shows, as it always did.
         assert_eq!(
-            core.msg(g, m, "hello".into(), None).unwrap(),
+            core.msg(g, m, "hello".into(), None, None).unwrap(),
             MsgOutcome::Delivered
         );
         match &msgs(drain(&mut rm))[..] {
@@ -1834,7 +2023,7 @@ mod inbox_tests {
         // With nobody there, there is nothing a guest can do.
         core.end_session(m);
         assert_eq!(
-            core.msg_login(g, "dave", "still here?".into(), None),
+            core.msg_login(g, "dave", "still here?".into(), None, None),
             Err(ChatError::NoSuchUser)
         );
         assert!(store.all().is_empty());
@@ -1849,14 +2038,14 @@ mod inbox_tests {
         // Dave is offline. The guest tries the whole cap and more.
         for i in 0..policy.max_queued + 5 {
             assert_eq!(
-                core.msg_login(g, "dave", format!("flood {i}"), None),
+                core.msg_login(g, "dave", format!("flood {i}"), None, None),
                 Err(ChatError::NoSuchUser)
             );
         }
         assert!(store.all().is_empty());
         // An account can still reach him, which is the point.
         assert!(matches!(
-            core.msg_login(a, "dave", "dinner?".into(), None),
+            core.msg_login(a, "dave", "dinner?".into(), None, None),
             Ok(MsgOutcome::Queued(_))
         ));
         assert_eq!(store.all().len(), 1);
@@ -1884,7 +2073,7 @@ mod inbox_tests {
                 let core: Arc<Core> = core.clone();
                 std::thread::spawn(move || {
                     for j in 0..10 {
-                        core.msg(from, m, format!("s{i}-{j}"), None).unwrap();
+                        core.msg(from, m, format!("s{i}-{j}"), None, None).unwrap();
                     }
                 })
             })
@@ -1930,7 +2119,7 @@ mod inbox_tests {
         let g = crate::inbox::MessageGuid::parse("00000001-0000-4000-8000-000000000000").unwrap();
 
         assert!(matches!(
-            core.msg_login(a, "dave", "you there?".into(), Some(g.clone()))
+            core.msg_login(a, "dave", "you there?".into(), Some(g.clone()), None)
                 .unwrap(),
             MsgOutcome::Queued(_)
         ));
@@ -1939,7 +2128,7 @@ mod inbox_tests {
         let (_m, mut rm) = attach(&core, "dave", true);
         drain(&mut rm);
         assert_eq!(
-            core.msg_login(a, "dave", "you there?".into(), Some(g))
+            core.msg_login(a, "dave", "you there?".into(), Some(g), None)
                 .unwrap(),
             MsgOutcome::Delivered,
             "the retry is answered as of now, not as of the first send"
@@ -1969,7 +2158,8 @@ mod inbox_tests {
         assert!(core.connection_lost(phone, 8));
 
         assert_eq!(
-            core.msg_login(a, "dave", "dinner?".into(), None).unwrap(),
+            core.msg_login(a, "dave", "dinner?".into(), None, None)
+                .unwrap(),
             MsgOutcome::Delivered,
             "the laptop is right there"
         );
@@ -2000,7 +2190,8 @@ mod inbox_tests {
             drain(&mut rl);
 
             assert_eq!(
-                core.msg(guest, laptop, "over here".into(), None).unwrap(),
+                core.msg(guest, laptop, "over here".into(), None, None)
+                    .unwrap(),
                 MsgOutcome::Delivered,
                 "{what}"
             );
@@ -2011,7 +2202,8 @@ mod inbox_tests {
             assert!(msgs(drain(&mut rp)).is_empty(), "{what}: not the other one");
 
             // And naming the phone still reaches the phone.
-            core.msg(guest, phone, "and here".into(), None).unwrap();
+            core.msg(guest, phone, "and here".into(), None, None)
+                .unwrap();
             assert!(
                 matches!(&msgs(drain(&mut rp))[..], [Event::Msg { text, .. }] if text == "and here"),
                 "{what}"
@@ -2021,7 +2213,8 @@ mod inbox_tests {
             // A named session that is *detached* still falls back to one
             // that can hear it: this path has nowhere to queue.
             assert!(core.connection_lost(laptop, 8));
-            core.msg(guest, laptop, "anyone".into(), None).unwrap();
+            core.msg(guest, laptop, "anyone".into(), None, None)
+                .unwrap();
             assert!(
                 matches!(&msgs(drain(&mut rp))[..], [Event::Msg { text, .. }] if text == "anyone"),
                 "{what}: a detached named session is not an address"
@@ -2034,15 +2227,15 @@ mod inbox_tests {
         let (core, _store) = server(&["alice", "dave"]);
         let (a, _ra) = attach(&core, "alice", true);
         assert_eq!(
-            core.msg_login(a, "nobody", "hi".into(), None),
+            core.msg_login(a, "nobody", "hi".into(), None, None),
             Err(ChatError::NoSuchUser)
         );
         assert_eq!(
-            core.msg_login(a, "guest", "hi".into(), None),
+            core.msg_login(a, "guest", "hi".into(), None, None),
             Err(ChatError::NoSuchUser)
         );
         // And the canonical form is the directory's, not the client's.
-        assert!(core.msg_login(a, "DaVe", "hi".into(), None).is_ok());
+        assert!(core.msg_login(a, "DaVe", "hi".into(), None, None).is_ok());
     }
 
     #[test]
@@ -2053,7 +2246,7 @@ mod inbox_tests {
         drain(&mut rm);
 
         assert_eq!(
-            core.msg_login(a, "dave", "hi".into(), None).unwrap(),
+            core.msg_login(a, "dave", "hi".into(), None, None).unwrap(),
             MsgOutcome::Delivered
         );
         assert!(matches!(
@@ -2077,7 +2270,8 @@ mod inbox_tests {
         let (m, _rm) = attach(&core, "dave", true);
         core.end_session(m);
 
-        core.msg_login(a, "dave", "first".into(), None).unwrap();
+        core.msg_login(a, "dave", "first".into(), None, None)
+            .unwrap();
         core.end_session(a); // the sender leaves before it is delivered
 
         let (m2, mut rm2) = attach(&core, "dave", true);
@@ -2096,7 +2290,8 @@ mod inbox_tests {
         // delivered — on a *different* uid, which is the one a reply
         // should reach, because it is the same account.
         let (a2, _ra2) = attach(&core, "alice", true);
-        core.msg_login(a2, "dave", "second".into(), None).unwrap();
+        core.msg_login(a2, "dave", "second".into(), None, None)
+            .unwrap();
         core.end_session(a2);
         let (a3, _ra3) = attach(&core, "alice", true);
         assert_ne!(a3, a2, "a fresh session, a fresh uid");
@@ -2119,10 +2314,10 @@ mod inbox_tests {
             &["alice", "dave"],
         );
         let (a, _ra) = attach(&core, "alice", true);
-        core.msg_login(a, "dave", "one".into(), None).unwrap();
-        core.msg_login(a, "dave", "two".into(), None).unwrap();
+        core.msg_login(a, "dave", "one".into(), None, None).unwrap();
+        core.msg_login(a, "dave", "two".into(), None, None).unwrap();
         assert_eq!(
-            core.msg_login(a, "dave", "three".into(), None),
+            core.msg_login(a, "dave", "three".into(), None, None),
             Err(ChatError::MailboxFull),
             "the sender is told, rather than the message vanishing"
         );
@@ -2138,7 +2333,9 @@ mod inbox_tests {
             2,
             "still unread, and no longer in the way"
         );
-        assert!(core.msg_login(a, "dave", "three".into(), None).is_ok());
+        assert!(core
+            .msg_login(a, "dave", "three".into(), None, None)
+            .is_ok());
     }
 
     #[test]
@@ -2152,7 +2349,8 @@ mod inbox_tests {
         );
         let (a, _ra) = attach(&core, "alice", true);
         for i in 0..5 {
-            core.msg_login(a, "dave", format!("m{i}"), None).unwrap();
+            core.msg_login(a, "dave", format!("m{i}"), None, None)
+                .unwrap();
         }
 
         let (m, mut rm) = attach(&core, "dave", true);
@@ -2173,8 +2371,8 @@ mod inbox_tests {
     fn counts_and_marking_read_are_scoped_to_the_callers_own_account() {
         let (core, store) = server(&["alice", "dave"]);
         let (a, _ra) = attach(&core, "alice", true);
-        core.msg_login(a, "dave", "one".into(), None).unwrap();
-        core.msg_login(a, "alice", "to myself".into(), None)
+        core.msg_login(a, "dave", "one".into(), None, None).unwrap();
+        core.msg_login(a, "alice", "to myself".into(), None, None)
             .unwrap();
         let dave_msg = store.all()[0].id;
         let alice_msg = store.all()[1].id;
@@ -2199,7 +2397,7 @@ mod inbox_tests {
         drain(&mut rm);
 
         assert_eq!(
-            core.msg(a, m, "hi".into(), None).unwrap(),
+            core.msg(a, m, "hi".into(), None, None).unwrap(),
             MsgOutcome::Delivered
         );
         assert!(matches!(
@@ -2212,7 +2410,7 @@ mod inbox_tests {
         ));
         // Addressing an account is an inbox feature and is simply absent.
         assert_eq!(
-            core.msg_login(a, "dave", "hi".into(), None),
+            core.msg_login(a, "dave", "hi".into(), None, None),
             Err(ChatError::NoSuchUser)
         );
         assert_eq!(core.flush_inbox(m), 0);
@@ -2221,7 +2419,7 @@ mod inbox_tests {
         // And a detached session still buffers in its outbox, as before.
         let last_seq = core.current_seq(m).unwrap();
         assert!(core.connection_lost(m, 8));
-        core.msg(a, m, "still there?".into(), None).unwrap();
+        core.msg(a, m, "still there?".into(), None, None).unwrap();
         let Resume::Replayed(_rm2, replay) = core.resume(m, last_seq) else {
             panic!("resume should replay");
         };
@@ -2241,7 +2439,8 @@ mod inbox_tests {
         ]));
         let core = Arc::new(Core::new().with_inbox(store.clone(), dir, InboxPolicy::default()));
         let (s, _rs) = attach(&core, "sender", true);
-        core.msg_login(s, "alice", "private".into(), None).unwrap();
+        core.msg_login(s, "alice", "private".into(), None, None)
+            .unwrap();
 
         // She renames. Same identity, new login, same mail.
         let (alicia, mut r_alicia) = attach_identified(&core, "alicia", fp(10));
@@ -2274,7 +2473,7 @@ mod inbox_tests {
 
         // Alice, identity A, sends while dave is away, then leaves.
         let (a, _ra) = attach_identified(&core, "alice", fp(10));
-        core.msg_login(a, "dave", "from the real alice".into(), None)
+        core.msg_login(a, "dave", "from the real alice".into(), None, None)
             .unwrap();
         core.end_session(a);
 
@@ -2300,19 +2499,19 @@ mod inbox_tests {
         core.inbox_block(m, "spammer", true).unwrap();
 
         assert_eq!(
-            core.msg_login(sp, "dave", "buy this".into(), None),
+            core.msg_login(sp, "dave", "buy this".into(), None, None),
             Err(ChatError::Blocked)
         );
         // And naming the roster row instead does not get round it: a
         // block a recipient can sidestep by clicking a name is no block.
         assert_eq!(
-            core.msg(sp, m, "buy this".into(), None),
+            core.msg(sp, m, "buy this".into(), None, None),
             Err(ChatError::Blocked)
         );
         assert!(store.all().is_empty(), "and nothing was stored either way");
 
         core.inbox_block(m, "spammer", false).unwrap();
-        assert!(core.msg(sp, m, "sorry".into(), None).is_ok());
+        assert!(core.msg(sp, m, "sorry".into(), None, None).is_ok());
     }
 
     #[test]
@@ -2342,7 +2541,8 @@ mod inbox_tests {
             .unwrap();
         core.announce(g);
 
-        core.msg(g, m, "from a passer-by".into(), None).unwrap();
+        core.msg(g, m, "from a passer-by".into(), None, None)
+            .unwrap();
         let listed = core.inbox_list(m, None, 10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].sender_nick, "drifter", "the nick still shows");
@@ -2412,7 +2612,9 @@ mod inbox_tests {
             core.inbox_blocked(sp).unwrap().is_empty(),
             "blocking is one-way, and the blocked account is not told"
         );
-        assert!(core.msg(m, sp, "you are blocked".into(), None).is_ok());
+        assert!(core
+            .msg(m, sp, "you are blocked".into(), None, None)
+            .is_ok());
 
         // Blocking a name that names no mailbox is the same one answer
         // msg_login gives, so this cannot enumerate accounts either.
@@ -2440,7 +2642,7 @@ mod inbox_tests {
         );
         // A guest reaches the mailbox as before; what bounds it is the
         // roster, where it can be kicked and banned.
-        assert!(core.msg(g, m, "hello".into(), None).is_ok());
+        assert!(core.msg(g, m, "hello".into(), None, None).is_ok());
         assert_eq!(msgs(drain(&mut rm)).len(), 1);
     }
 
@@ -2578,7 +2780,7 @@ mod inbox_tests {
         }));
 
         assert_eq!(
-            core.msg(a, m, "are you there".into(), None).unwrap(),
+            core.msg(a, m, "are you there".into(), None, None).unwrap(),
             MsgOutcome::Delivered,
             "the re-check after the write is what catches this"
         );
@@ -2614,7 +2816,8 @@ mod inbox_tests {
         }));
 
         assert_eq!(
-            core.msg_login(a, "dave", "still up?".into(), None).unwrap(),
+            core.msg_login(a, "dave", "still up?".into(), None, None)
+                .unwrap(),
             MsgOutcome::Delivered,
             "they were there by the time the row existed"
         );
@@ -2672,7 +2875,8 @@ mod notify_tests {
     fn nobody_there_earns_a_notification() {
         let (core, gw) = server(&["alice", "dave"]);
         let (a, _ra) = attach(&core, "alice", true);
-        core.msg_login(a, "dave", "wake up".into(), None).unwrap();
+        core.msg_login(a, "dave", "wake up".into(), None, None)
+            .unwrap();
         assert_eq!(
             gw.sent(),
             vec![("dave".to_string(), "wake up".to_string(), 1)]
@@ -2686,7 +2890,7 @@ mod notify_tests {
         let (m, _rm) = attach(&core, "dave", true);
         assert!(core.connection_lost(m, 8));
 
-        core.msg(a, m, "still asleep?".into(), None).unwrap();
+        core.msg(a, m, "still asleep?".into(), None, None).unwrap();
         assert_eq!(gw.sent().len(), 1, "the phone is what the push is for");
         assert_eq!(gw.sent()[0].2, 1, "and it carries the badge number");
     }
@@ -2698,7 +2902,7 @@ mod notify_tests {
         let (m, _rm) = attach(&core, "dave", true);
 
         assert_eq!(
-            core.msg(a, m, "hi".into(), None).unwrap(),
+            core.msg(a, m, "hi".into(), None, None).unwrap(),
             MsgOutcome::Delivered
         );
         assert!(
@@ -2711,7 +2915,7 @@ mod notify_tests {
     fn a_message_to_your_own_account_is_not_news() {
         let (core, gw) = server(&["dave"]);
         let (m, _rm) = attach(&core, "dave", true);
-        core.msg_login(m, "dave", "note to self".into(), None)
+        core.msg_login(m, "dave", "note to self".into(), None, None)
             .unwrap();
         // Stored, so a second device finds it; not pushed, because the
         // person who wrote it does not need telling.
@@ -2724,7 +2928,7 @@ mod notify_tests {
         let (core, gw) = server(&["alice"]);
         let (a, _ra) = attach(&core, "alice", true);
         let (g, _rg) = attach(&core, "guest", false);
-        core.msg(a, g, "hi".into(), None).unwrap();
+        core.msg(a, g, "hi".into(), None, None).unwrap();
         assert!(
             gw.sent().is_empty(),
             "a push about a message that was never stored is a doorbell for nothing"
@@ -2736,7 +2940,8 @@ mod notify_tests {
         let (core, gw) = server(&["alice", "dave"]);
         let (a, _ra) = attach(&core, "alice", true);
         for i in 0..3 {
-            core.msg_login(a, "dave", format!("m{i}"), None).unwrap();
+            core.msg_login(a, "dave", format!("m{i}"), None, None)
+                .unwrap();
         }
         assert_eq!(
             gw.sent().iter().map(|s| s.2).collect::<Vec<_>>(),
@@ -2752,7 +2957,7 @@ mod notify_tests {
         // The only assertion available is that nothing panics and the
         // message still lands — which is the point: push is optional.
         assert!(matches!(
-            core.msg_login(a, "dave", "hi".into(), None).unwrap(),
+            core.msg_login(a, "dave", "hi".into(), None, None).unwrap(),
             MsgOutcome::Queued(_)
         ));
     }

@@ -85,6 +85,11 @@ const NAMED_BITS: &[(&str, u8)] = &[
     ("send_msgs", bit::SEND_MSGS),
     ("voice_chat", bit::VOICE_CHAT),
     ("read_chat_history", bit::CHAT_HISTORY),
+    // Off unless an account file says otherwise, which the inline-media
+    // spec asks for by name: an image is the one thing a user can put on
+    // everyone else's screen without their asking, so an operator grants
+    // it rather than inheriting it. Bootstrap's guest does not get it.
+    ("send_media", bit::SEND_MEDIA),
     ("video_chat", bit::VIDEO_CHAT),
     // Off for guests by default, per the video spec: a screen share can
     // leak documents, credentials and other people's messages in a way a
@@ -382,7 +387,11 @@ impl FileAuth {
              create_pchats = true\n\
              send_msgs = true\n\
              get_user_info = true\n\
-             use_any_name = true\n",
+             use_any_name = true\n\
+             # Guests may not post images. Uncomment to let them, and\n\
+             # read docs/inline-media.md first — this is the one bit\n\
+             # that lets a stranger put a picture on everyone's screen.\n\
+             # send_media = true\n",
         )?;
         Ok(())
     }

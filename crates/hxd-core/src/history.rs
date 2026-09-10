@@ -457,7 +457,7 @@ mod core_tests {
         for n in 0..32 {
             let core = core.clone();
             sends.push(std::thread::spawn(move || {
-                core.chat_public(uid, format!("line-{n}"), 0).unwrap();
+                core.chat_public(uid, format!("line-{n}"), 0, None).unwrap();
             }));
         }
         for send in sends {
@@ -499,7 +499,7 @@ mod core_tests {
         let (b, _) = test_attach(&core, "bob", access);
         let (cid, _) = core.chat_create(a, b).unwrap();
         core.chat_join(cid, b, "").unwrap();
-        core.chat_private(cid, a, "secret".into(), 0).unwrap();
+        core.chat_private(cid, a, "secret".into(), 0, None).unwrap();
         assert!(log
             .query(&HistoryQuery {
                 channel: 0,

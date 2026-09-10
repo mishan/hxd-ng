@@ -33,6 +33,12 @@ log of [chat-history.md](chat-history.md).
 - **The media gateway is not implemented.** The spec requires it off by
   default; a legacy recipient sees the text the sender typed.
 
+**Implemented 2026-09**, stages M1–M5 of §12 plus the media half of M6;
+what is still open is marked in place and summarized at §12. The
+sections below describe the server as it is, with the two places its
+behavior differs from what this document first specified called out as
+they arise (§5.1's ownership rule, and §5.4 on the legacy wire).
+
 ---
 
 ## 1. What the spec asks
@@ -49,10 +55,10 @@ extension's; advisory limits `0x020C`–`0x0211` ride the LOGIN reply
 beside the echoed bit 3; `0x0212` is an optional coarse error code.
 
 What the server owes, as the spec's own summary lists it: validate,
-canonicalise and re-encode every upload before anyone sees it; strip
+canonicalize and re-encode every upload before anyone sees it; strip
 every byte of metadata; issue handles with 128 bits of entropy;
-authorise every download against a set fixed at relay time; never relay
-original bytes; never distinguish "expired" from "unauthorised"; never
+authorize every download against a set fixed at relay time; never relay
+original bytes; never distinguish "expired" from "unauthorized"; never
 gateway a private context; default the gateway and the send permission
 off; drop media fields from senders and recipients that did not
 negotiate the bit.
@@ -68,7 +74,7 @@ those. SVG, WebP, AVIF, HEIC, TIFF and ICO are forbidden by name.
                    Knows nothing about Hotline.
         ▲
         │ trait
-  hxd-core         MediaStore: handles, canonical bytes, authorisation
+  hxd-core         MediaStore: handles, canonical bytes, authorization
                    sets, upload sessions, quotas, expiry. The chat and
                    message paths attach a MediaRef to their events.
         ▲
@@ -107,6 +113,12 @@ The spec's ten steps, in its order, with what each one is here.
    shared door is the one that needs the throttle most. Refused with
    code 3, or 5 for the concurrent-session cap.
 
+   The interval is charged when an upload *starts*, so a chunked upload
+   costs what a single-shot one costs rather than one per chunk. The
+   download budget is a bucket a session may burst a full minute of and
+   is then held to the rate: a client opening a room full of images
+   fetches them all at once, and a client in a loop does not get more.
+
 ### 3.2 The bytes
 
 3. **Size.** Assembled payload between 64 bytes and `max_bytes`
@@ -125,13 +137,19 @@ The spec's ten steps, in its order, with what each one is here.
    piece of parsing the `image` crate does not do, about a hundred
    lines each, and they are also the first line against a decoder
    being handed something structurally strange. Code 2.
+
+   The extension's own fields are read at whatever width they arrive in
+   — `PART_FINAL` is a u8, the indices u16, the limits u32, and
+   `Chunk::as_uint` knows only the middle two. A `PART_FINAL` read as
+   zero is a chunked upload that never finishes, so this one is worth
+   being liberal about.
 6. **Probe.** The header alone, through `image`'s `ImageReader::into_dimensions`
    with `Limits` set: either dimension outside `1..=max_dimension`
    (default 2048) or the product over `max_pixels` (default 2048²) is
    refused before a pixel is allocated. Code 1.
 7. **Bounded decode.** The full decode under `image::Limits` with
    `max_alloc` at 64 MiB, on a `spawn_blocking` thread, with the
-   awaiting side holding a 2-second timeout. A Rust decoder cannot be
+   awaiting side holding a timeout. A Rust decoder cannot be
    killed from outside, so the time budget is honest only because the
    dimension and allocation caps above bound the work first — the
    timeout is the backstop for a pathological-but-legal file, and a
@@ -139,11 +157,18 @@ The spec's ten steps, in its order, with what each one is here.
    the client is told code 5. A semaphore of `max_concurrent_decodes`
    (default 2) bounds how many such threads exist at once; a request
    that cannot take a permit within the budget is code 5 as well.
-8. **Animation.** For a GIF, frames are collected with a running count
-   and a running sum of delays; over `max_frames` (default 150) or
-   `max_duration_ms` (default 15 000) stops the collection and refuses
-   with code 1. Decoded frame bytes count against the same allocation
-   budget as a still.
+8. **Animation.** For a GIF, the walk of step 5 has already counted the
+   frames and summed the delays, so `max_frames` (default 150) and
+   `max_duration_ms` (default 15 000) are enforced before a frame is
+   decoded, with code 1.
+
+   **Frames × pixels is the bomb this format has**, and it is its own
+   check: every other cap can pass and a hundred and fifty frames of two
+   thousand pixels square still decodes to gigabytes. The walk's own
+   numbers bound it against the same 64 MiB allocation budget a still
+   gets. The re-encode then streams — one frame decoded, one frame
+   encoded, one frame alive — so an animation's cost in memory is its
+   largest frame and not its length.
 
 ### 3.3 The re-encode, and one deliberate departure
 
@@ -171,16 +196,22 @@ The spec's ten steps, in its order, with what each one is here.
 
    The canonical size is whatever the encoder produced. It is usually
    smaller than the input; it can be larger for a PNG that was
-   aggressively optimised, and that is fine — the input cap is what
+   aggressively optimized, and that is fine — the input cap is what
    bounds work, and the canonical size is reported in
    `DATA_CHAT_MEDIA_BYTES` so a client can plan.
+
+   Every number a client is given is **measured from the canonical
+   bytes**, never copied from the upload: a header that lies about its
+   own dimensions is a file whose placeholder would be sized wrong on
+   everyone's screen, and it costs nothing to read them back off the
+   image this server encoded.
 
 10. **Handle.** 16 bytes from the OS CSPRNG. On the legacy wire they
     are the raw bytes of `DATA_CHAT_MEDIA_ID`; on the ng wire the
     base64url spelling, 22 characters, which is also the path segment
     of `GET /media/{handle}`. The store keeps, per handle: canonical
     bytes, MIME type, width, height, the uploader's principal, creation
-    time, and the authorisation set of §5.
+    time, and the authorization set of §5.
 
 **Every rejection is one of six coarse codes and a generic text.** The
 text is `"Media rejected"`, `"Media too large"`, `"Unsupported media"`
@@ -224,7 +255,7 @@ placeholder it would have rendered for an expired handle. The
 arrive when clustering needs one; the memory implementation is what a
 single node wants.
 
-## 5. Authorisation
+## 5. Authorization
 
 ### 5.1 Principals, not uids
 
@@ -238,6 +269,16 @@ pub enum Principal {
     Mailbox(Mailbox),                    // an account, keyed as the inbox keys it
 }
 ```
+
+**Ownership and audience are different questions, and they are answered
+in different terms.** Attaching a handle to a line asks "did *this
+session* upload it", because an upload happened in a session and a
+handle is not something an account inherits from a login it made
+yesterday. Being able to fetch one asks "was this principal shown it",
+which for a private message is a mailbox — so a session presents
+*both* when it downloads: itself, and its mailbox where it has one. A
+guest offers only its session; `guest` is a login several people share,
+and a mailbox principal there would let any guest fetch another's mail.
 
 A public-chat or private-room relay captures every media-capable
 recipient as a `Session`, plus the sender. A private message captures
@@ -260,7 +301,7 @@ gains one boolean, `inline_media`. The legacy frontend sets it from bit
 3 of the negotiated caps; the ng frontend sets it true, because an ng
 client is told what it can ignore rather than asked what it supports
 (hotline-ng.md §5: unknown fields in event data are ignored). The
-domain then computes the authorisation set as *recipients with the
+domain then computes the authorization set as *recipients with the
 flag* and leaves the rest of fan-out untouched; each frontend's encoder
 strips or emits the fields according to its own connection, which is
 where per-recipient capability already lives.
@@ -300,6 +341,17 @@ everyone who could have been in the room. The argument against is the
 spec's, and it is the reference implementation's job to ship the
 spec's answer and raise the question upstream (§14).
 
+**On the ng wire both settings work as described**: a history line
+carries the metadata always and the handle only when the reader can
+actually fetch it, so a client never renders a fetch button that would
+answer 404. **On the legacy wire a history entry carries no media at
+all**, because 700's entries have no allocated sub-fields for it — that
+allocation is chat-history.md §11's open upstream question, and
+inventing numbers for it here would put two implementations on
+different ones. A 1.5 client therefore sees scrollback text where a
+capable ng client sees the image; live lines are unaffected, which is
+where nearly all of the images are.
+
 ## 6. Rate limits and the numbers
 
 Every figure is the spec's recommended default and every one is
@@ -312,7 +364,8 @@ turns.
 | Encoded payload | 64 B – 256 KiB | store, on assembly |
 | Dimension | 1 – 2048 px per axis | codec, header probe |
 | Pixels | 2048 × 2048 | codec, header probe |
-| Animation | 150 frames, 15 s | codec, frame collection |
+| Animation | 150 frames, 15 s | codec, from the walk |
+| Animation raster | frames × pixels ≤ the decode budget | codec, from the walk |
 | Decode budget | 2 s, 64 MiB, 2 concurrent | codec + the awaiting task |
 | Upload rate | 1 / 10 s, 30 / h per account; 100 / h per address | store |
 | Upload sessions | 2 per account, 30 s idle | store |
@@ -364,7 +417,7 @@ the per-session download rate gate it, then `Core::media_fetch(principal,
 handle)` answers bytes-and-type or nothing. The reply is one slice:
 `PAYLOAD` (this chunk, ≤ 60 000 bytes), `MEDIA_TYPE`, `PART_COUNT`,
 `PART_FINAL`. A `PART_INDEX` past the count is "Media not found" like
-any other bad request; the store re-checks authorisation on every part,
+any other bad request; the store re-checks authorization on every part,
 because the set can only shrink and a session that was kicked between
 parts is exactly the one that should stop receiving.
 
@@ -381,7 +434,7 @@ with a debug log, as an unpermitted chat is today); both present go to
 handle to a `MediaRef { id, mime, width, height, bytes }` — the
 sender's declared `MEDIA_TYPE` is discarded in favour of the canonical
 one — refuses a handle the sender did not upload or that has expired,
-and otherwise relays with the reference attached and the authorisation
+and otherwise relays with the reference attached and the authorization
 set captured. The `msg` path does the same with `Core::msg`.
 
 **Outbound** (106, 104): the encoder for `Event::Chat` and `Event::Msg`
@@ -395,6 +448,14 @@ formats as the sender's name and no text.
 A mixed private room is two encodings of one event, produced by two
 sessions' encoders from one `Event`, which is what the frontend design
 already gives for free.
+
+Two smaller rules fell out of building it. A chat send carrying exactly
+one of the two companion fields is **dropped**, as an unpermitted chat
+is — the pair is the unit, and this transaction has no task reply to
+refuse with; a private message, which does have one, is refused
+instead. And a reference whose bytes have gone carries **neither**
+field rather than a handle that would 404: the spec pairs `ID` and
+`TYPE`, and a client given a handle it cannot fetch would fetch it.
 
 ## 8. The ng wire (`hxd-ng-session`)
 
@@ -458,6 +519,14 @@ where someone navigates to the URL directly. Nothing about the response
 is cacheable by a shared cache, and the handle is not in any log line
 the proxy writes by default (§10).
 
+Both routes answer CORS, and `OPTIONS` on either is a preflight —
+which a browser sends before any request carrying an `Authorization`
+header, and hx-ng is served from wherever its operator put it rather
+than from this port. A wildcard origin gives away nothing a `curl`
+would not: these routes are authenticated by a bearer token and never
+by a cookie, so a browser that omits the header gets the same 401 from
+any origin at all.
+
 ### 8.3 Requests and events
 
 | `req` | change |
@@ -492,6 +561,12 @@ life. Two cases:
   event carries the metadata without a handle, the client renders the
   placeholder, the text stands. The bytes are gone.
 
+Both cases are one code path: a flush resolves each row's stored handle
+against the media store as it stands at delivery, so the event carries
+`media` with an `id` when the bytes are there and without one when they
+are not. The `inbox` listing resolves it the same way, so the pull side
+and the push side describe the same message.
+
 Pinning a handle while an undelivered row references it would close the
 second case at the cost of letting the inbox extend a handle's life
 indefinitely — a mailbox is capped at `cap` waiting messages, so the
@@ -501,10 +576,12 @@ Not in v1; §14 keeps it.
 ## 10. Privacy and logging
 
 - Canonical and original bytes are never written to a log. The `proto`
-  trace category prints `PAYLOAD` chunks as `<n bytes>`; the `media`
-  category (new) logs `[image: <mime>, <bytes> bytes, <w>x<h>]` and a
-  handle **prefix** of six characters, enough to correlate an upload
-  with a download in one operator's log and not enough to fetch with.
+  trace prints every chunk as tag and length and never its payload, so
+  an image reads as `0x0203/60000`; the `media` category (new, and a
+  tracing target like the others — `HXD_DEBUG=media`) logs
+  `[image: <mime>, <bytes> bytes, <w>x<h>]` and a handle **prefix** of
+  six characters, enough to correlate an upload with a download in one
+  operator's log and not enough to fetch with.
 - Handles do not appear in the discovery document, in any unauthenticated
   response, or in the HTTP access log at info level (the path is
   logged as `/media/…`).
@@ -532,8 +609,16 @@ history_access = "recipients"  # or "readers" — §5.4
 upload_interval = 10           # seconds between uploads, per account
 upload_per_hour = 30           # per account
 upload_per_hour_per_addr = 100
-download_per_minute = 60       # per session
+download_per_minute = 60       # images per session, not requests
+upload_sessions = 2            # chunked uploads in flight, per account
 ```
+
+`download_per_minute` counts **images, not requests**, so that the one
+number means the same thing on both wires: the ng wire hands an image
+back in a single `GET`, and a 751 sliced into parts costs one token for
+the sequence rather than one per part. Restarting a download, or asking
+again for a part already served, is a fresh image and pays again — the
+client this bound exists for is the one in a loop.
 
 A `[media]` section in a build without the `media` feature is a startup
 error, like `[inbox]` without its feature. The `media` feature is on by
@@ -541,45 +626,63 @@ default so CI covers the pipeline.
 
 ## 12. Staging
 
-1. **M1 — `hxd-media`.** The crate, the trait, the three walkers, the
-   probe/decode/re-encode with limits, orientation, animation limits.
-   Tests on a corpus committed under `crates/hxd-media/tests/fixtures`:
-   each format's minimal valid file; a JPEG with EXIF orientation 6
-   that must come out rotated and tag-free; a PNG with `tEXt`, `iCCP`
-   and `eXIf` chunks that must all be gone; a GIF with a comment
+All of it landed in one branch rather than six, which is the one thing
+this plan got wrong: the domain and the two wires are a single
+authorization model, and splitting them would have meant landing a store
+nothing could reach. The stages survive as the shape of the work, and
+as what each one is tested by.
+
+1. **M1 — `hxd-media`.** Done. The crate, the trait, the three walkers,
+   the probe/decode/re-encode with limits, orientation, animation
+   limits. Tested in `crates/hxd-media/tests` against a corpus built in
+   the test rather than committed as binaries — the awkward cases are
+   all *edits* to a valid file (a tag-carrying JPEG, a polyglot, a
+   header that lies), and a directory of opaque blobs cannot say which
+   is which. It covers: each format's round trip; a JPEG with EXIF
+   orientation 6 that comes out rotated and tag-free; a PNG with
+   `tEXt`, `iCCP` and `eXIf` that come out gone; a GIF with a comment
    extension; a PNG-then-ZIP polyglot and a JPEG with trailing bytes,
-   both refused by the walker; a 1×1 PNG claiming 20 000×20 000 in its
-   header, refused at the probe; a decompression bomb refused by
-   allocation; an animated GIF over the frame cap and one over the
-   duration cap; SVG, WebP, AVIF, BMP and ICO, each refused at the
-   sniff. Every canonical output re-walked and asserted structural
-   chunks only.
-2. **M2 — the domain.** `MediaStore`, principals, quotas, upload
+   both refused by the walker; a PNG claiming 20 000 × 20 000, refused
+   at the probe; an animation over the frame cap, over the duration cap,
+   and over the raster budget; an arithmetic-coded JPEG refused at the
+   walk; SVG, WebP, AVIF, HEIC, BMP and ICO each refused at the sniff
+   and *named* in the refusal; and every canonical output re-walked to
+   its exact last byte.
+2. **M2 — the domain.** Done. `MediaStore`, principals, quotas, upload
    sessions, expiry and eviction, `Transport.inline_media`, `MediaRef`
-   on `Event::Chat` and `Event::Msg`, `chat_public` / `chat_private` /
-   `msg` taking a handle and capturing sets. Unit-tested with a fake
-   codec that returns fixed bytes, so the domain tests never decode
-   anything.
-3. **M3 — the legacy wire.** LOGIN advert, 750 single and chunked, 751
-   sliced, the chat/msg field handling in both directions, error codes.
-   E2E in `crates/hxd/tests/media.rs` with a scripted client that packs
-   with `hxproto::inline_media` — the same builders GtkHx uses —
-   covering: single-shot round trip; chunked upload and multi-part
-   download; a capable and a non-capable client in one room, one
-   seeing fields and the other not; a non-recipient's download refused
-   with the same answer as a bogus handle; expiry; the private-room
-   membership check; each error code.
-4. **M4 — the ng wire.** The HTTP routes, the bearer, the params and
-   event fields, the login block. E2E: an ng upload rendered by a legacy
-   client's download and the reverse; a PM with media queued for a
-   detached ng session and fetched after resume; the 404-for-everything
-   rule.
-5. **M5 — the two stores.** Schema v2 media columns on `message` and
-   `chat_line`, the flush and the history entry carrying metadata, the
-   `history_access` knob. E2E: an image sent, read back through 700
-   with sub-fields, downloadable or not according to the knob.
-6. **M6 — moderation** (moderation.md §8): revoke, the hash block,
-   pinning, and the `media_revoked` event.
+   on `Event::Chat` and `Event::Msg`, the three relay paths capturing
+   sets. Unit-tested in `hxd-core` against a fake codec that decodes
+   nothing, so the domain tests never touch an image.
+3. **M3 — the legacy wire.** Done. LOGIN advert, 750 single and chunked,
+   751 sliced, the chat/msg field handling in both directions, the error
+   codes.
+4. **M4 — the ng wire.** Done. The HTTP routes, the bearer, the params
+   and event fields, the login block.
+5. **M5 — the two stores.** Done for the inbox (schema v2's `message`
+   columns, the flush and the `inbox` listing resolving each handle) and
+   for the log's own record (`attach_media` on relay, the ng `history`
+   entry carrying metadata and the `history_access` knob). **Not** the
+   legacy 700 entry, which has no allocated sub-field to carry it —
+   §5.4 and chat-history.md §11.
+6. **M6 — moderation.** The media half is here: `media_revoke` drops the
+   bytes at once and keeps the metadata, the canonical hash goes on a
+   block list that refuses the same file's re-upload, `media_pin` and
+   `media_grant` are what a report needs to outlive a TTL and reach a
+   moderator, and `Event::MediaRevoked` tells everyone who could have it
+   on screen. The acts' *wire surface* — `revoke`, `report`, the audit
+   table, the CLI — is moderation.md §5's own branch, and lands with the
+   redaction and reporting it shares a table with.
+
+E2E lives in `crates/hxd/tests/media.rs`, against real servers on both
+ports: the capability echo and its six limits; single-shot and chunked
+upload; a sliced multi-part download; a capable and a classic client in
+one room, one seeing the fields and the other the line; a non-recipient
+refused in the same words as a bogus handle; a sender without the bit
+having its fields dropped; a private message carrying an image; the ng
+login block; upload over HTTP and download with the right headers; each
+refusal's status; a photo crossing each way between the wires; and a
+revocation stopping the next download, telling the browser, and
+refusing the same file's re-upload.
 
 ## 13. Cross-wire, in one sentence each
 

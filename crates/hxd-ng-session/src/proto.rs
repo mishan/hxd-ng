@@ -2,6 +2,7 @@
 //! encoding. The normative description is `docs/hotline-ng.md` §5–§7; this
 //! module is its executable form.
 
+use hxd_core::media::MediaRef;
 use hxd_core::video::{
     VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,
 };
@@ -43,6 +44,11 @@ pub struct ChatParams {
     pub text: String,
     #[serde(default)]
     pub style: Option<String>,
+    /// A handle from `POST /media`, which must be this session's own
+    /// upload and still live. The text may be empty when one is
+    /// present: the image is the message.
+    #[serde(default)]
+    pub media: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -71,6 +77,11 @@ pub struct MsgParams {
     /// `queued: false` where the original said `true`.
     #[serde(default)]
     pub guid: Option<String>,
+    /// The same handle rule as `chat`: this session's own upload, still
+    /// live. A retry with the same guid is the same message, image and
+    /// all.
+    #[serde(default)]
+    pub media: Option<String>,
 }
 
 /// Both fields are optional, so `inbox` with no `params` at all is a
@@ -409,6 +420,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             style,
             id,
             at,
+            media,
         } => {
             let mut data = json!({
                 "from": { "uid": from.uid, "nick": from.nick },
@@ -418,6 +430,9 @@ pub fn event_json(se: &SeqEvent) -> String {
             });
             if let Some(id) = id {
                 data["id"] = json!(id);
+            }
+            if let Some(media) = media {
+                data["media"] = crate::media::media_json(media);
             }
             ("chat", data)
         }
@@ -431,6 +446,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             id,
             sent_at,
             queued,
+            media,
         } => {
             // `uid` is 0 when a queued message's sender has no session
             // now; `login` is the account that survives either way, and
@@ -451,6 +467,12 @@ pub fn event_json(se: &SeqEvent) -> String {
             if let Some(id) = id {
                 data["id"] = json!(id);
             }
+            // Present without an `id` for a message whose handle died
+            // while it waited: the placeholder is still worth rendering
+            // (`docs/inline-media.md` §9).
+            if let Some(media) = media {
+                data["media"] = crate::media::media_json(media);
+            }
             ("msg", data)
         }
         Event::Broadcast {
@@ -462,6 +484,12 @@ pub fn event_json(se: &SeqEvent) -> String {
             json!({ "from": { "uid": from, "nick": from_nick }, "text": text }),
         ),
         Event::Kicked => ("kicked", json!({})),
+        // A client drops the image and keeps the placeholder the line or
+        // message already carries (moderation.md §5).
+        Event::MediaRevoked { id } => (
+            "media_revoked",
+            json!({ "id": hxd_core::media::handle_str(id) }),
+        ),
         Event::VoiceOffer { cid, sdp } => ("voice_offer", json!({ "cid": cid, "sdp": sdp })),
         Event::VoiceIce { cid, candidate } => (
             "voice_ice",
@@ -497,7 +525,14 @@ pub fn unix(t: std::time::SystemTime) -> u64 {
 
 /// A durable history row. Deliberately no uid: it may have been recycled
 /// since the line was written.
-pub fn history_line_json(line: &LogLine) -> Value {
+/// One logged line, as `history` pages it.
+///
+/// `fetchable` is what the media store says *now*: a line keeps the
+/// metadata of the image it carried forever, and the handle only while
+/// the bytes are still there. A client renders the placeholder either
+/// way and fetches only when there is something to fetch
+/// (`docs/inline-media.md` §5.4, §9).
+pub fn history_line_json(line: &LogLine, fetchable: bool) -> Value {
     let deleted = line.flags.contains(LineFlags::DELETED);
     let mut value = json!({
         "id": line.id,
@@ -523,15 +558,20 @@ pub fn history_line_json(line: &LogLine) -> Value {
                 "removed": true,
             })
         } else {
-            // M5 will decide whether an expired handle omits `id`; until
-            // the media store exists every persisted handle is metadata.
-            json!({
-                "id": media_handle(&media.id),
+            let mut m = json!({
                 "type": media.mime,
                 "width": media.width,
                 "height": media.height,
                 "bytes": media.bytes,
-            })
+            });
+            // Absent rather than null when the bytes have gone — expired,
+            // evicted, revoked — so a client can test for the key. The
+            // metadata stands on its own: "[an image was here]" is worth
+            // rendering and an empty line is not.
+            if fetchable {
+                m["id"] = json!(media_handle(&media.id));
+            }
+            m
         };
     }
     value
@@ -547,16 +587,22 @@ fn media_handle(bytes: &[u8]) -> String {
 /// No uid: a message in the list was sent by a session that may be long
 /// gone, and a uid from then may belong to someone else now. A client that
 /// wants to reply names `from.login`.
-pub fn stored_msg_json(m: &hxd_core::StoredMessage) -> serde_json::Value {
+pub fn stored_msg_json(m: &hxd_core::StoredMessage, media: Option<&MediaRef>) -> serde_json::Value {
     let mut from = json!({ "nick": m.sender_nick });
     if let Some(login) = m.sender.as_ref().map(|s| &s.login) {
         from["login"] = json!(login);
     }
-    json!({
+    let mut value = json!({
         "id": m.id,
         "from": from,
         "text": m.body,
         "at": unix(m.sent_at),
         "read": m.read_at.is_some(),
-    })
+    });
+    // The same shape the `msg` event carries, resolved the same way: the
+    // handle while there is one, the metadata either way.
+    if let Some(media) = media {
+        value["media"] = crate::media::media_json(media);
+    }
+    value
 }

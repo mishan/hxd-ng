@@ -9,6 +9,7 @@ resolver = "2"
 members = [
     "crates/hl-identity",
     "crates/hxd-core",
+    "crates/hxd-media",
     "crates/hxd-auth-file",
     "crates/hxd-session",
     "crates/hxd-voice",
@@ -34,6 +35,7 @@ hxd-core = { path = "crates/hxd-core" }
 hxd-auth-file = { path = "crates/hxd-auth-file" }
 hxd-session = { path = "crates/hxd-session" }
 hxd-ng-session = { path = "crates/hxd-ng-session" }
+hxd-media = { path = "crates/hxd-media" }
 hxd-voice = { path = "crates/hxd-voice" }
 hxd-store-sqlite = { path = "crates/hxd-store-sqlite" }
 

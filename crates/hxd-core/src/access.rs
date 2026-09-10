@@ -108,9 +108,15 @@ pub mod bit {
     // Extensions (fogWraith allocations)
     pub const VOICE_CHAT: u8 = 55;
     pub const CHAT_HISTORY: u8 = 56;
-    // 57 AccessSendMedia and 58 AccessMessaging are allocated by the
-    // inline-media and messaging extensions; neither is implemented here
-    // yet, and the numbers stay reserved so video's don't drift.
+    /// May upload an image and reference it from a chat line or a
+    /// private message (`docs/inline-media.md` §3.1, fogWraith's
+    /// `AccessSendMedia`). **Off unless an account file says otherwise**
+    /// — the spec has operators grant it explicitly, and the bootstrap
+    /// guest does not get it.
+    pub const SEND_MEDIA: u8 = 57;
+    // 58 AccessMessaging is allocated by the messaging extension, which
+    // is not implemented here; the number stays reserved so video's
+    // don't drift.
     /// May publish camera video in a voice room
     /// (`docs/capabilities-video.md` §"Access Privileges").
     pub const VIDEO_CHAT: u8 = 59;
@@ -153,9 +159,11 @@ mod tests {
         // Bit 55 is `accessVoiceChat` (fogWraith `Capabilities-Voice.md`
         // §"Access Privileges"). Bits 59 and 60 are `accessVideoChat`
         // and `accessScreenShare` (`docs/capabilities-video.md`
-        // §"Access Privileges"), which follow the inline-media (57) and
-        // messaging (58) allocations this server does not implement.
+        // §"Access Privileges"), which follow the inline-media (57)
+        // allocation and the messaging (58) one this server does not
+        // implement.
         assert_eq!(bit::VOICE_CHAT, 55);
+        assert_eq!(bit::SEND_MEDIA, 57);
         assert_eq!(bit::VIDEO_CHAT, 59);
         assert_eq!(bit::SCREEN_SHARE, 60);
 
@@ -165,6 +173,12 @@ mod tests {
         assert_eq!(
             AccessBits::empty().with(bit::VOICE_CHAT).to_wire(),
             [0, 0, 0, 0, 0, 0, 0x01, 0x00]
+        );
+        // Bit 57 is 0x40 of byte 7 — the bit GtkHx and Janus read to
+        // decide whether to show a paperclip.
+        assert_eq!(
+            AccessBits::empty().with(bit::SEND_MEDIA).to_wire(),
+            [0, 0, 0, 0, 0, 0, 0, 0x40]
         );
         assert_eq!(
             AccessBits::empty().with(bit::VIDEO_CHAT).to_wire(),

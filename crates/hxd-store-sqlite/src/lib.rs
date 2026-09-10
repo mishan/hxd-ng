@@ -596,7 +596,8 @@ fn fp_from_hex(s: &str) -> Result<[u8; 32], StoreError> {
 }
 
 const COLUMNS: &str = "id, kind, recipient, recipient_fp, sender, sender_fp, \
-                       sender_nick, body, guid, sent_at, delivered_at, read_at";
+                       sender_nick, body, guid, sent_at, delivered_at, read_at, \
+                       media_id, media_type, media_w, media_h, media_bytes";
 
 /// Every read path the inbox exposes is mail only — a kind the wire
 /// cannot carry must not be listed, counted, or handed to a flush.
@@ -614,6 +615,34 @@ fn mailbox(login: String, fingerprint: Option<String>) -> Result<Mailbox, StoreE
 /// anything unreadable in them means the database was edited by hand or
 /// damaged, and guessing at a mailbox key is how mail reaches the wrong
 /// person.
+/// The five media columns, which `message` and `chat_line` both carry
+/// in the same order and the same types. All five or none: a row with
+/// some of them is a row this file did not write.
+fn media_columns(
+    r: &Row<'_>,
+    first: usize,
+) -> rusqlite::Result<Result<Option<MediaMeta>, StoreError>> {
+    let id: Option<Vec<u8>> = r.get(first)?;
+    let mime: Option<String> = r.get(first + 1)?;
+    let width: Option<i64> = r.get(first + 2)?;
+    let height: Option<i64> = r.get(first + 3)?;
+    let bytes: Option<i64> = r.get(first + 4)?;
+    Ok((|| match (id, mime, width, height, bytes) {
+        (None, None, None, None, None) => Ok(None),
+        (Some(id), Some(mime), Some(width), Some(height), Some(bytes)) => Ok(Some(MediaMeta {
+            id,
+            mime,
+            width: u32::try_from(width)
+                .map_err(|_| StoreError::new("stored media width is not a u32"))?,
+            height: u32::try_from(height)
+                .map_err(|_| StoreError::new("stored media height is not a u32"))?,
+            bytes: u32::try_from(bytes)
+                .map_err(|_| StoreError::new("stored media size is not a u32"))?,
+        })),
+        _ => Err(StoreError::new("stored media metadata is incomplete")),
+    })())
+}
+
 fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
     let sender_login: Option<String> = r.get(4)?;
     let (id, kind): (i64, i64) = (r.get(0)?, r.get(1)?);
@@ -623,6 +652,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
     let sent_at: i64 = r.get(9)?;
     let delivered: Option<i64> = r.get(10)?;
     let read: Option<i64> = r.get(11)?;
+    let media = media_columns(r, 12)?;
     Ok((|| {
         Ok(StoredMessage {
             // `INTEGER PRIMARY KEY` is signed and `MessageId` is not, so
@@ -650,6 +680,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
             sent_at: from_unix(sent_at),
             delivered_at: delivered.map(from_unix),
             read_at: read.map(from_unix),
+            media: media?,
         })
     })())
 }
@@ -693,8 +724,9 @@ impl MessageStore for SqliteStore {
         tx.execute(
             "INSERT INTO message
                (kind, recipient, recipient_fp, sender, sender_fp, sender_nick,
-                body, guid, sent_at, read_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                body, guid, sent_at, read_at,
+                media_id, media_type, media_w, media_h, media_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 m.kind.as_i64(),
                 m.recipient.login,
@@ -712,6 +744,11 @@ impl MessageStore for SqliteStore {
                 // arrival keeps it out of unread counts and ages it on the
                 // read clock without prune needing to know what kinds are.
                 (m.kind != MessageKind::Message).then(|| unix(m.sent_at)),
+                m.media.as_ref().map(|x| &x.id),
+                m.media.as_ref().map(|x| &x.mime),
+                m.media.as_ref().map(|x| x.width),
+                m.media.as_ref().map(|x| x.height),
+                m.media.as_ref().map(|x| x.bytes),
             ],
         )
         .map_err(StoreError::new)?;
@@ -1164,26 +1201,9 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
     let flags: i64 = r.get(6)?;
     let body: String = r.get(7)?;
     let at: i64 = r.get(8)?;
-    let media_id: Option<Vec<u8>> = r.get(9)?;
-    let media_type: Option<String> = r.get(10)?;
-    let media_w: Option<i64> = r.get(11)?;
-    let media_h: Option<i64> = r.get(12)?;
-    let media_bytes: Option<i64> = r.get(13)?;
+    let media = media_columns(r, 9)?;
     Ok((|| {
-        let media = match (media_id, media_type, media_w, media_h, media_bytes) {
-            (None, None, None, None, None) => None,
-            (Some(id), Some(mime), Some(width), Some(height), Some(bytes)) => Some(MediaMeta {
-                id,
-                mime,
-                width: u32::try_from(width)
-                    .map_err(|_| StoreError::new("stored media width is not a u32"))?,
-                height: u32::try_from(height)
-                    .map_err(|_| StoreError::new("stored media height is not a u32"))?,
-                bytes: u32::try_from(bytes)
-                    .map_err(|_| StoreError::new("stored media size is not a u32"))?,
-            }),
-            _ => return Err(StoreError::new("stored chat media metadata is incomplete")),
-        };
+        let media = media?;
         Ok(LogLine {
             id: LineId::try_from(id)
                 .map_err(|_| StoreError::new(format!("chat line id {id} is not an id")))?,
@@ -1411,6 +1431,7 @@ mod tests {
                     sent_at: UNIX_EPOCH + Duration::from_secs(1),
                     guid: None,
                     kind: hxd_core::inbox::MessageKind::Message,
+                    media: None,
                 },
                 100,
             )
@@ -1541,6 +1562,7 @@ mod tests {
                     sent_at: UNIX_EPOCH + Duration::from_secs(1),
                     guid: None,
                     kind: MessageKind::Message,
+                    media: None,
                 },
                 100,
             )
@@ -1586,6 +1608,7 @@ mod tests {
                     sent_at: UNIX_EPOCH + Duration::from_secs(1),
                     guid: None,
                     kind: MessageKind::Message,
+                    media: None,
                 },
                 100,
             )
@@ -1609,6 +1632,7 @@ mod tests {
             sent_at: UNIX_EPOCH + Duration::from_secs(2),
             guid: MessageGuid::parse("11111111-2222-4333-8444-555555555555"),
             kind: MessageKind::Message,
+            media: None,
         };
         assert!(matches!(a.push(&m, 100).unwrap(), Pushed::Stored(_)));
         m.body = "twice".into();
@@ -1637,6 +1661,7 @@ mod tests {
             sent_at: UNIX_EPOCH + Duration::from_secs(1),
             guid: Some(g.clone()),
             kind: MessageKind::Message,
+            media: None,
         };
         // While alice was linked, then after she unlinked: same guid,
         // two mailboxes as far as the store is concerned.
@@ -1693,6 +1718,7 @@ mod tests {
                     sent_at: UNIX_EPOCH + Duration::from_secs(1),
                     guid: None,
                     kind: MessageKind::Message,
+                    media: None,
                 },
                 100,
             )
