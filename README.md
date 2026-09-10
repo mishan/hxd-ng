@@ -315,6 +315,14 @@ screen_max_bitrate = 2500000
 
 ### Accounts and identity
 
+An account is one TOML file: an `[access]` table of named permission bits,
+an `[extra]` table of server-local policy that never crosses the wire, and
+an `[identity]` table linking it to a key. Every bit, key and switch —
+what each one gates, which of them this server enforces today, and which
+numbers are reserved — is in
+[docs/access-bits.md](docs/access-bits.md). First run writes a `guest.toml`
+with the bits a stranger can be trusted with; delete it to turn guests off.
+
 An account links to an identity through an `[identity]` table in its file,
 written by linking or by hand: `fingerprint`, `login = true` (the identity
 may log in without the password), `allow_self_link = true`, `reserve_name`.
@@ -438,6 +446,7 @@ error rather than a promise the build cannot keep.
 | [identity-enrollment.md](docs/identity-enrollment.md) | Certifying a device through a mailbox and a pairing code instead of a paste; renewal; what the mailbox is trusted with |
 | [identity-threat-model.md](docs/identity-threat-model.md) | What identity defends against, and what it deliberately does not |
 | [identity-test-vectors.json](docs/identity-test-vectors.json) | Signed objects and reject cases — the contract a second implementation is checked against |
+| [access-bits.md](docs/access-bits.md) | Account permissions: every access bit and its `[access]` key, the reserved numbers, `[extra]` policy, and what a new server starts with |
 | [private-messages.md](docs/private-messages.md) | The offline inbox: the mailbox rule, the store contract, delivery, blocking, retention |
 | [chat-history.md](docs/chat-history.md) | Scrollback: the chat log, cursor paging on both wires, retention, fogWraith's `Get Chat History` |
 | [inline-media.md](docs/inline-media.md) | Images in chat: the re-encode pipeline, handles and relay-time authorisation, 750/751 and the HTTP routes |
