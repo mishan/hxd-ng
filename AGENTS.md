@@ -174,6 +174,18 @@ Three layers, all `cargo test --workspace`:
 - The scripted legacy client packs and parses with the same pinned
   `hxproto` revision GtkHx uses, so e2e doubles as wire-compat
   checking.
+- **End-to-end, out of process**, in `e2e/` — `cd e2e && npm test`.
+  These start the *binary*: a real config file `hxd` parses itself, a
+  real directory it bootstraps into, real sockets. That is a layer the
+  suites above deliberately do not reach, since they build `Core` /
+  `ServerCtx` / `NgCtx` by hand — so `Config::load`, `check_config`, the
+  feature-gated section errors, the ng sweeper and the pruners have no
+  other coverage anywhere. They are driven by `@hotline-ng/client`, the
+  browser client's library: a second implementation of the ng wire
+  written from the spec by the client rather than by us, so where the
+  two agree the agreement is evidence rather than a tautology. Node
+  only, so voice and video stay in the Rust suites where the real SFU
+  is.
 
 House rules: **tests fail loudly** — never skip around something broken.
 A chat sender receives its own echo, so tests must match events by
@@ -188,6 +200,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 node --check tools/ng-client.mjs
+cd e2e && npm install && npm test   # needs a sibling ../hx-ng checkout
 ```
 
 The best end-to-end check of all: point a real GtkHx at the legacy port

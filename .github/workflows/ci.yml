@@ -69,3 +69,46 @@ jobs:
           node-version: 22
       - name: Syntax-check the ng test client
         run: node --check tools/ng-client.mjs
+      - name: Syntax-check the e2e suite
+        run: for f in e2e/*.mjs e2e/harness/*.mjs; do node --check "$f"; done
+
+  # The end-to-end suite: the real binary, started from a real config
+  # file, driven by the real @hotline-ng/client. Its own job because it
+  # needs a release build and a checkout of the client — and because
+  # what it covers is a layer the Rust suites deliberately do not reach
+  # (main.rs, Config::load, the sweeper, the pruners).
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The suite consumes @hotline-ng/client. Until that package is
+      # published this is a path dependency on a sibling checkout —
+      # which is also the arrangement hx-ng already uses in reverse for
+      # `hxd` and `hlid`. `main` for now, deliberately: the point of the
+      # arrangement is that a client change and a server change are
+      # tested against each other. Once the package is on npm this whole
+      # step goes away and `e2e/package.json` names a version, which is
+      # a pin in the ordinary sense.
+      - uses: actions/checkout@v4
+        with:
+          repository: mishan/hx-ng
+          path: hx-ng-checkout
+          ref: main
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Position the client where e2e/package.json expects it
+        run: mv hx-ng-checkout ../hx-ng
+
+      - name: Build the client
+        run: npm ci && npm run build:lib
+        working-directory: ../hx-ng
+
+      - name: Run the suite
+        run: npm install && npm test
+        working-directory: e2e

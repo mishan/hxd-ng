@@ -1,0 +1,13 @@
+{
+  "name": "hxd-ng-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests: a real hxd binary, driven by the real @hotline-ng/client.",
+  "scripts": {
+    "pretest": "cargo build --release -p hxd -p hlid --manifest-path ../Cargo.toml",
+    "test": "node --test --test-timeout=120000"
+  },
+  "dependencies": {
+    "@hotline-ng/client": "file:../../hx-ng/packages/hotline-ng"
+  }
+}
