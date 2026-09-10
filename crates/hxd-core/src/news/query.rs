@@ -8,10 +8,15 @@
 //! split into words like the rest of it.
 //!
 //! A word is a run of letters and digits, lowercased: the split the
-//! index's `unicode61` tokenizer makes, give or take the corners of
-//! Unicode (the index also folds diacritics, which the in-memory store
-//! does not). Because a compiled term holds only such words, no store
-//! ever has anything to escape.
+//! index's `unicode61` tokenizer makes for ASCII, and near it elsewhere.
+//! Not the same, though. The index folds diacritics, and splits at
+//! combining marks and at vowel signs Rust counts as letters, so the
+//! SQLite store asks its own tokenizer about each term and drops one it
+//! finds nothing in, as the grammar drops a term with no words. The
+//! in-memory store matches these words as they are, so outside ASCII the
+//! two can disagree, and the conformance suite keeps to ASCII (§6.4).
+//! Because a compiled term holds only such words, no store ever has
+//! anything to escape.
 
 /// Terms past this many are dropped, so the expression a store builds is
 /// bounded before anything sees it.
@@ -64,6 +69,24 @@ fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// A term's words, bounded to [`MAX_TERM_BYTES`], and whether the last of
+/// them is a prefix. A cut that lands inside a word keeps what it has of
+/// that word as a prefix of it: half a word matched whole finds nothing,
+/// where as a prefix it still finds the word that was typed. A cut between
+/// words takes a typed `*` away with the word it belonged to.
+fn bounded(text: &str, typed_prefix: bool) -> (Vec<String>, bool) {
+    let cut = truncate(text, MAX_TERM_BYTES);
+    if cut.len() == text.len() {
+        return (words(text), typed_prefix);
+    }
+    let inside_a_word = cut.chars().next_back().is_some_and(char::is_alphanumeric)
+        && text[cut.len()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric);
+    (words(cut), inside_a_word)
 }
 
 impl CompiledQuery {
@@ -129,7 +152,7 @@ impl CompiledQuery {
                 let bare = raw.trim_end_matches('*');
                 (bare, bare.len() < raw.len())
             };
-            let words = words(truncate(text, MAX_TERM_BYTES));
+            let (words, prefix) = bounded(text, prefix);
             if words.is_empty() {
                 continue;
             }
@@ -146,13 +169,13 @@ impl CompiledQuery {
     /// Add "by this author" — the `from` parameter, which is `from:` said
     /// as a field rather than typed.
     pub fn push_author(&mut self, who: &str) {
-        let words = words(truncate(who, MAX_TERM_BYTES));
+        let (words, prefix) = bounded(who, false);
         if !words.is_empty() {
             self.terms.push(Term {
                 words,
                 field: Field::Author,
                 negated: false,
-                prefix: false,
+                prefix,
             });
         }
     }
@@ -281,13 +304,42 @@ mod tests {
         let many: String = (0..40).map(|n| format!("w{n} ")).collect();
         assert_eq!(parsed(&many).len(), MAX_TERMS);
         let long = "é".repeat(100);
-        let cut = &parsed(&long)[0].words[0];
+        let term = &parsed(&long)[0];
+        let cut = &term.words[0];
         assert!(cut.len() <= MAX_TERM_BYTES);
         assert_eq!(
             cut.chars().count(),
             MAX_TERM_BYTES / 2,
             "cut at a character"
         );
+        assert!(term.prefix, "and what is left of the word is a prefix");
+    }
+
+    #[test]
+    fn a_term_cut_inside_a_word_keeps_it_as_a_prefix() {
+        // A pasted sentence: the cut lands in the middle of a word, and
+        // an exact match on that half would find nothing.
+        let sentence = "the legacy binding comes last and then everything else follows it";
+        assert!(sentence.len() > MAX_TERM_BYTES);
+        let term = &parsed(&format!("\"{sentence}\""))[0];
+        let whole = words(sentence);
+        let (last, rest) = term.words.split_last().unwrap();
+        assert_eq!(rest, &whole[..rest.len()]);
+        assert!(whole[rest.len()].starts_with(last.as_str()));
+        assert!(term.prefix);
+
+        // A pasted hash is one word, and a prefix of itself once cut.
+        let hash = "0123456789abcdef".repeat(6);
+        let term = &parsed(&hash)[0];
+        assert_eq!(term.words, [&hash[..MAX_TERM_BYTES]]);
+        assert!(term.prefix);
+
+        // A cut between words keeps the words it kept whole, and a star
+        // typed at the end went with the word it belonged to.
+        let spaced = format!("\"{} tail\"*", "a".repeat(MAX_TERM_BYTES - 1));
+        let term = &parsed(&spaced)[0];
+        assert_eq!(term.words, ["a".repeat(MAX_TERM_BYTES - 1)]);
+        assert!(!term.prefix);
     }
 
     #[test]

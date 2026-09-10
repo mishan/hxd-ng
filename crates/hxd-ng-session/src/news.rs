@@ -434,13 +434,24 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
                 Ok(n) => n,
                 Err(text) => return bad(&text),
             };
-            let when = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            // A time past what the clock can hold is a mistake to answer,
+            // not a sum to overflow: a panic here would take the connection
+            // task down with the session still on the roster.
+            let when = |secs: Option<u64>| match secs {
+                None => Some(None),
+                Some(secs) => std::time::UNIX_EPOCH
+                    .checked_add(std::time::Duration::from_secs(secs))
+                    .map(Some),
+            };
+            let (Some(before), Some(after)) = (when(p.before), when(p.after)) else {
+                return bad("`before` and `after` are Unix seconds.");
+            };
             let req = SearchRequest {
                 q: p.q,
                 category: p.category,
                 from: p.from,
-                before: p.before.map(when),
-                after: p.after.map(when),
+                before,
+                after,
                 order,
                 offset: p.offset.unwrap_or(0),
                 limit,

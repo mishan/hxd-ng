@@ -774,7 +774,9 @@ server compiles it into an FTS5 expression from a closed grammar:
 Everything else — every FTS5 operator, every stray quote or paren — is
 escaped into a literal term. **A malformed query returns results, never
 an error.** Terms are capped at 16 per query and 64 bytes each, so the
-compiled expression is bounded before SQLite sees it.
+compiled expression is bounded before SQLite sees it. A term cut inside
+a word keeps what it has of that word as a prefix, so a pasted sentence
+longer than the cap still finds the article it came from.
 
 ### 6.3 Results, ranking and paging
 
@@ -826,6 +828,15 @@ conformance suite (§15) can assert *which* articles a query returns
 against both implementations. It does not implement ranking, and the
 conformance suite therefore asserts result sets and never order; ranking
 is asserted in the SQLite store's own tests.
+
+Nor does it tokenize the way the index does. It splits on what Rust
+calls letters and digits and matches the words as they are, where
+`unicode61` folds diacritics and splits at combining marks and at some
+vowel signs. The two agree on ASCII, and the suite's corpus keeps to
+it: outside ASCII the memory store is a stand-in, not a model. The
+SQLite store puts each term through its own tokenizer before building
+the expression and drops one that comes out empty, as the grammar drops
+a term with no words, so no term can sink the rest of a query.
 
 `hxd news-reindex` rebuilds `news_fts` from `news_article`. It is needed
 after an mhxd import (§12.6), after a `markdown` mode change that alters

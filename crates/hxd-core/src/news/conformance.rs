@@ -41,6 +41,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     search_follows_the_grammar(&*new_store());
     search_scopes_and_pages(&*new_store());
     search_never_finds_what_is_gone(&*new_store());
+    a_long_query_finds_what_it_was_pasted_from(&*new_store());
 }
 
 /// The corpus the search cases share: two categories, three authors, and
@@ -290,6 +291,15 @@ fn search_never_finds_what_is_gone(s: &dyn NewsStore) {
     let fresh = post(s, c.general, None, "phase anew", 2000);
     assert_eq!(s.reindex().unwrap(), 1);
     assert_eq!(found(s, &query("phase")), [fresh]);
+}
+
+fn a_long_query_finds_what_it_was_pasted_from(s: &dyn NewsStore) {
+    // Longer than a term may be, so the grammar cuts it, inside a word
+    // that then has to match as the prefix it now is.
+    let cat = category(s, "General");
+    let said = "the legacy binding comes last and then everything else follows it";
+    let id = post(s, cat, None, &format!("{said}, eventually"), 100);
+    assert_eq!(found(s, &query(&format!("\"{said}\""))), [id]);
 }
 
 fn t(secs: u64) -> SystemTime {

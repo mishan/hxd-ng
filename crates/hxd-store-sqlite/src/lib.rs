@@ -1579,6 +1579,144 @@ mod tests {
             .unwrap()
     }
 
+    const NO_DRIFT: Vec<String> = Vec::new();
+
+    /// How the index differs from indexing the live articles afresh,
+    /// token by token: what it holds that they would not put there, and
+    /// what they would that it lacks. Empty is the invariant every write
+    /// in news.rs keeps.
+    ///
+    /// FTS5's own `integrity-check` is not asked. The form that compares
+    /// content counts the tombstones the index leaves out on purpose as
+    /// damage, and the structural form, on the SQLite the pinned rusqlite
+    /// bundles, reports an index "malformed" after a secure-delete removes
+    /// a row from an older segment, which is every tombstone of an article
+    /// posted in its own transaction. That report is false: SQLite 3.46.1
+    /// fixed it ("fix false-positive integrity-check reports about corrupt
+    /// indexes" in secure-delete mode), and the same writes pass on it.
+    fn index_drift(conn: &Connection) -> Vec<String> {
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE temp.fresh USING fts5(
+               subject, search_body, author, tokenize = '{}');
+             INSERT INTO temp.fresh (rowid, subject, search_body, author)
+               SELECT id, subject, search_body, author FROM news_article
+                WHERE deleted_at IS NULL;
+             CREATE VIRTUAL TABLE temp.fresh_tokens USING fts5vocab(temp, fresh, instance);
+             CREATE VIRTUAL TABLE temp.live_tokens USING fts5vocab(main, news_fts, instance);",
+            news::TOKENIZER
+        ))
+        .unwrap();
+        let mut drift = Vec::new();
+        for (has, lacks, what) in [
+            ("live_tokens", "fresh_tokens", "stale"),
+            ("fresh_tokens", "live_tokens", "missing"),
+        ] {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT term, doc, col, offset FROM temp.{has}
+                     EXCEPT SELECT term, doc, col, offset FROM temp.{lacks}"
+                ))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{what}: {:?} in {} {} at {}",
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?
+                    ))
+                })
+                .unwrap();
+            drift.extend(rows.map(Result::unwrap));
+        }
+        conn.execute_batch(
+            "DROP TABLE temp.live_tokens; DROP TABLE temp.fresh_tokens; DROP TABLE temp.fresh;",
+        )
+        .unwrap();
+        drift
+    }
+
+    #[test]
+    fn every_write_keeps_the_index_to_the_live_articles() {
+        use hxd_core::news::{NewNode, NewsStore, NodeKind};
+        let (store, cat) = news_fixture();
+        let drift = |store: &SqliteStore| index_drift(&store.conn.lock().unwrap());
+        let a = news_post(&store, cat, "One", "phase four", "Alice", Some("alice"));
+        news_post(&store, cat, "Two", "phase five", "Bob", Some("bob"));
+        assert_eq!(drift(&store), NO_DRIFT, "posts");
+        NewsStore::tombstone(&store, a, "moderator", UNIX_EPOCH).unwrap();
+        assert_eq!(drift(&store), NO_DRIFT, "a tombstone");
+        let other = store
+            .create_node(
+                &NewNode {
+                    parent: None,
+                    kind: NodeKind::Category,
+                    name: "Other".into(),
+                    guid: [1; 16],
+                    at: UNIX_EPOCH,
+                },
+                16,
+            )
+            .unwrap()
+            .id;
+        news_post(&store, other, "Three", "phase six", "Carol", None);
+        NewsStore::delete_node(&store, other).unwrap();
+        assert_eq!(drift(&store), NO_DRIFT, "a category deleted");
+        NewsStore::prune(
+            &store,
+            Duration::from_secs(1),
+            UNIX_EPOCH + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(drift(&store), NO_DRIFT, "a prune");
+
+        // And it is a check that can fail: text changed under the index.
+        let b = news_post(&store, cat, "Four", "phase seven", "Dave", None);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE news_article SET subject = 'changed' WHERE id = ?1",
+                [b],
+            )
+            .unwrap();
+        assert!(!drift(&store).is_empty());
+    }
+
+    #[test]
+    fn the_query_is_put_through_the_tokenizer_the_index_was_made_with() {
+        assert!(SCHEMA_V4.contains(&format!("tokenize = '{}'", news::TOKENIZER)));
+        let (store, cat) = news_fixture();
+        let id = news_post(
+            &store,
+            cat,
+            "Sizes",
+            "the derivative is a u16",
+            "Alice",
+            Some("alice"),
+        );
+        // U+093E, a vowel sign: a letter to Rust, a separator to
+        // unicode61. A phrase of nothing must not sink the rest.
+        assert!(
+            !hxd_core::news::CompiledQuery::parse("\u{93e}")
+                .terms
+                .is_empty(),
+            "the grammar keeps it, so it is the store that has to drop it"
+        );
+        let found = |q: &str| {
+            news_search(&store, q)
+                .hits
+                .iter()
+                .map(|h| h.article)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(found("derivative \u{93e}"), [id]);
+        assert_eq!(found("derivative -\u{93e}"), [id]);
+        assert!(found("\u{93e}").is_empty(), "alone it is nothing to find");
+    }
+
     #[test]
     fn a_subject_match_outranks_a_body_match_and_accents_fold() {
         let (store, cat) = news_fixture();
@@ -1660,9 +1798,7 @@ mod tests {
         let before = news_search(&store, "phase");
         assert_eq!(store.reindex().unwrap(), 1, "live articles only");
         assert_eq!(news_search(&store, "phase"), before);
-        let conn = store.conn.lock().unwrap();
-        conn.execute_batch("INSERT INTO news_fts (news_fts) VALUES ('integrity-check')")
-            .unwrap_or_else(|e| panic!("the index disagrees with its articles: {e}"));
+        assert_eq!(index_drift(&store.conn.lock().unwrap()), NO_DRIFT);
     }
 
     #[test]
@@ -1688,9 +1824,7 @@ mod tests {
         let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
         let page = news_search(&store, "findable");
         assert_eq!(page.hits.iter().map(|h| h.article).collect::<Vec<_>>(), [1]);
-        let conn = store.conn.lock().unwrap();
-        conn.execute_batch("INSERT INTO news_fts (news_fts) VALUES ('integrity-check')")
-            .unwrap_or_else(|e| panic!("the migration left the index inconsistent: {e}"));
+        assert_eq!(index_drift(&store.conn.lock().unwrap()), NO_DRIFT);
     }
 
     #[test]

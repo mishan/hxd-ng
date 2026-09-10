@@ -1043,6 +1043,18 @@ async fn search_is_rationed_and_can_be_off() {
         "bad_request"
     );
     assert_eq!(alice.refused("news_search", json!({})).await, "bad_request");
+    // A date past what the clock can hold is answered, and the session
+    // is still there to ask again.
+    for field in ["before", "after"] {
+        let mut params = json!({ "q": "x" });
+        params[field] = json!(u64::MAX);
+        assert_eq!(
+            alice.refused("news_search", params).await,
+            "bad_request",
+            "{field}"
+        );
+    }
+    alice.request("ping", json!({})).await;
 
     let dir = tempfile::tempdir().unwrap();
     let (_legacy, ng) = start_server(

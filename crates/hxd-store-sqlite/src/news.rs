@@ -409,6 +409,53 @@ fn fts_expression(q: &hxd_core::news::CompiledQuery) -> Option<String> {
     Some(expr)
 }
 
+/// The tokenizer `news_fts` was made with (lib.rs, schema version 4).
+pub(crate) const TOKENIZER: &str = "unicode61 remove_diacritics 2";
+
+/// The query without the terms the index's tokenizer finds nothing in.
+/// The grammar's words are letters and digits by Rust's reckoning, and
+/// `unicode61` disagrees at the edges: a lone vowel sign or combining
+/// mark is a word to one and a separator to the other. A phrase of
+/// nothing matches nothing, and ANDed with the rest it would take the
+/// whole query down with it; dropped, it is what the grammar does with a
+/// term that has no words at all.
+///
+/// The tokenizer is asked directly, through a temporary table it is the
+/// tokenizer of, so what counts as a token here is what counts in the
+/// index, and nothing about it lives in the database file.
+fn searchable(
+    conn: &Connection,
+    q: &hxd_core::news::CompiledQuery,
+) -> Result<hxd_core::news::CompiledQuery, StoreError> {
+    sql(conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.news_query
+           USING fts5(words, tokenize = '{TOKENIZER}');
+         CREATE VIRTUAL TABLE IF NOT EXISTS temp.news_query_tokens
+           USING fts5vocab(temp, news_query, instance);
+         DELETE FROM temp.news_query;"
+    )))?;
+    for (i, t) in (1i64..).zip(&q.terms) {
+        sql(conn.execute(
+            "INSERT INTO temp.news_query (rowid, words) VALUES (?1, ?2)",
+            params![i, t.words.join(" ")],
+        ))?;
+    }
+    let tokened: std::collections::HashSet<i64> = {
+        let mut stmt = sql(conn.prepare_cached("SELECT DISTINCT doc FROM temp.news_query_tokens"))?;
+        let rows = sql(stmt.query_map([], |r| r.get(0)))?;
+        rows.collect::<rusqlite::Result<_>>()
+            .map_err(StoreError::new)?
+    };
+    sql(conn.execute("DELETE FROM temp.news_query", []))?;
+    Ok(hxd_core::news::CompiledQuery {
+        terms: (1i64..)
+            .zip(&q.terms)
+            .filter(|(i, _)| tokened.contains(i))
+            .map(|(_, t)| t.clone())
+            .collect(),
+    })
+}
+
 /// Where `snippet()` puts its marks: two private-use characters, taken
 /// back out here and turned into byte ranges, so what leaves the store is
 /// text and offsets rather than markup.
@@ -886,7 +933,9 @@ impl NewsStore for SqliteStore {
     ) -> Result<hxd_core::news::SearchPage, StoreError> {
         use hxd_core::news::{Hit, SearchOrder, SearchPage};
         use rusqlite::types::Value;
-        let Some(expr) = fts_expression(&q.terms) else {
+        let conn = self.conn.lock().unwrap();
+        let terms = searchable(&conn, &q.terms)?;
+        let Some(expr) = fts_expression(&terms) else {
             return Ok(SearchPage::default());
         };
         // Built from the query's shape, never its text: every value the
@@ -914,7 +963,6 @@ impl NewsStore for SqliteStore {
             "FROM news_fts JOIN news_article a ON a.id = news_fts.rowid
              WHERE news_fts MATCH ?{filter}"
         );
-        let conn = self.conn.lock().unwrap();
         let total: i64 = sql(conn.query_row(
             &format!("SELECT COUNT(*) {from}"),
             rusqlite::params_from_iter(binds.iter()),
