@@ -290,7 +290,15 @@ fn walk_jpeg(data: &[u8]) -> Result<Walked, WalkError> {
                 }
                 match data.get(at + 1) {
                     None => return Err(WalkError::Truncated),
-                    Some(0x00) | Some(0xff) => at += 2,
+                    // A stuffed zero is a pair and is skipped as one. A
+                    // second `0xff` is a *fill* byte, and a marker may
+                    // be preceded by any number of them, so only one
+                    // byte is consumed here: the next pass reads this
+                    // one as the marker's own `0xff`. Taking two would
+                    // desynchronize the walk on an odd-length run and
+                    // eat the first byte of the marker that follows.
+                    Some(0x00) => at += 2,
+                    Some(0xff) => at += 1,
                     Some(0xd0..=0xd7) => at += 2,
                     Some(_) => break,
                 }

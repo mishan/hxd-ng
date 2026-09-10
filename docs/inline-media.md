@@ -609,9 +609,16 @@ history_access = "recipients"  # or "readers" — §5.4
 upload_interval = 10           # seconds between uploads, per account
 upload_per_hour = 30           # per account
 upload_per_hour_per_addr = 100
-download_per_minute = 60       # per session
+download_per_minute = 60       # images per session, not requests
 upload_sessions = 2            # chunked uploads in flight, per account
 ```
+
+`download_per_minute` counts **images, not requests**, so that the one
+number means the same thing on both wires: the ng wire hands an image
+back in a single `GET`, and a 751 sliced into parts costs one token for
+the sequence rather than one per part. Restarting a download, or asking
+again for a part already served, is a fresh image and pays again — the
+client this bound exists for is the one in a loop.
 
 A `[media]` section in a build without the `media` feature is a startup
 error, like `[inbox]` without its feature. The `media` feature is on by

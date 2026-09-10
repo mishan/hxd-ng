@@ -179,10 +179,11 @@ pub async fn download(id: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
         .registry
         .allow_download(&session_of(&req).unwrap_or_default(), per_minute)
     {
-        return cors(retry_after(plain(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Slow down",
-        )));
+        // Through `reject`, not a bare string: this module promises one
+        // parseable error shape for every failure it produces, and a
+        // `fetch` caller that has to special-case one status is exactly
+        // what that promise is against.
+        return reject(MediaReject::RateLimited);
     }
     let Some(handle) = hxd_core::media::handle_from_str(id) else {
         return not_found();
@@ -301,13 +302,5 @@ fn json_resp(status: StatusCode, v: serde_json::Value) -> Resp {
         .status(status)
         .header(CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(v.to_string())))
-        .unwrap()
-}
-
-fn plain(status: StatusCode, text: &str) -> Resp {
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(text.to_owned())))
         .unwrap()
 }

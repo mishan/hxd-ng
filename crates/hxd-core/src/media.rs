@@ -458,9 +458,11 @@ struct Window {
 }
 
 impl Window {
-    /// Would one more fit? Prunes what has aged out, then answers, then
-    /// records — so a refused attempt does not count against the next.
-    fn admit(&mut self, now: Instant, span: Duration, max: u32) -> bool {
+    /// Would one more fit? Prunes what has aged out, then answers, and
+    /// records nothing — so a refused attempt does not count against the
+    /// next, and a caller holding two of these can ask both before it
+    /// charges either.
+    fn would_admit(&mut self, now: Instant, span: Duration, max: u32) -> bool {
         while let Some(&front) = self.hits.front() {
             if now.duration_since(front) >= span {
                 self.hits.pop_front();
@@ -468,11 +470,21 @@ impl Window {
                 break;
             }
         }
-        if self.hits.len() as u32 >= max {
-            return false;
-        }
+        (self.hits.len() as u32) < max
+    }
+
+    /// Spend the slot `would_admit` just said was there. Pruning already
+    /// happened there, so this only records.
+    fn charge(&mut self, now: Instant) {
         self.hits.push_back(now);
-        true
+    }
+
+    /// Nothing left inside the window, so the whole bucket is
+    /// indistinguishable from a fresh one and the sweep may drop it.
+    fn stale(&self, now: Instant, span: Duration) -> bool {
+        self.hits
+            .back()
+            .is_none_or(|&last| now.duration_since(last) >= span)
     }
 }
 
@@ -898,7 +910,7 @@ impl MediaStore {
         // server drop handles early, and the per-account and per-address
         // quotas are the real bound on a hostile uploader. This cap is
         // what keeps the process alive when those are set generously.
-        inner.evict_to_fit(size, self.cfg.max_total_bytes);
+        inner.evict_to_fit(size, self.cfg.max_total_bytes, now);
         let entry = Entry {
             mime: canonical.mime,
             width: canonical.width,
@@ -1048,6 +1060,11 @@ impl MediaStore {
         now: Instant,
     ) -> Result<(), MediaReject> {
         let hour = Duration::from_secs(3600);
+        // Both buckets are *asked* before either is charged. Charging as
+        // we go would let a refusal from the second one still spend the
+        // first's allowance, so two guests behind one address could
+        // drain the shared `guest` account's hour without a single
+        // upload landing — the opposite of what a quota is for.
         let account = inner.per_account.entry(who.login.clone()).or_default();
         if account
             .last_upload
@@ -1055,18 +1072,27 @@ impl MediaStore {
         {
             return Err(MediaReject::RateLimited);
         }
-        if !account.hour.admit(now, hour, self.cfg.upload_per_hour) {
+        if !account
+            .hour
+            .would_admit(now, hour, self.cfg.upload_per_hour)
+        {
             return Err(MediaReject::RateLimited);
         }
-        account.last_upload = Some(now);
         // Every guest shares the `guest` account's bucket, deliberately:
         // the shared door is the one that needs the throttle most. The
         // address bucket is what tells two guests apart.
         if let Some(addr) = who.addr {
             let per_addr = inner.per_addr.entry(addr).or_default();
-            if !per_addr.admit(now, hour, self.cfg.upload_per_hour_per_addr) {
+            if !per_addr.would_admit(now, hour, self.cfg.upload_per_hour_per_addr) {
                 return Err(MediaReject::RateLimited);
             }
+        }
+        // Nothing can refuse it now, so both buckets pay.
+        let account = inner.per_account.entry(who.login.clone()).or_default();
+        account.hour.charge(now);
+        account.last_upload = Some(now);
+        if let Some(addr) = who.addr {
+            inner.per_addr.entry(addr).or_default().charge(now);
         }
         Ok(())
     }
@@ -1076,6 +1102,15 @@ impl StoreInner {
     fn sweep(&mut self, now: Instant, idle: Duration) {
         self.uploads
             .retain(|_, u| now.duration_since(u.last_seen) < idle);
+        // The rate-limit maps too, or they are a slow leak keyed on
+        // whatever address ever uploaded: an entry with no hits inside
+        // the window and no interval left to enforce says nothing a
+        // fresh default would not.
+        let hour = Duration::from_secs(3600);
+        self.per_addr.retain(|_, w| !w.stale(now, hour));
+        self.per_account.retain(|_, a| {
+            !a.hour.stale(now, hour) || a.last_upload.is_some_and(|t| now.duration_since(t) < hour)
+        });
         let dead: Vec<Handle> = self
             .items
             .iter()
@@ -1087,11 +1122,31 @@ impl StoreInner {
         }
     }
 
-    fn evict_to_fit(&mut self, incoming: usize, cap: usize) {
+    /// Drop oldest-first until the incoming image fits, **skipping
+    /// anything a report has pinned**.
+    ///
+    /// A pin exists so a handle outlives its TTL while a moderator
+    /// judges it (`moderation.md` §4.3), and a pinned handle is by
+    /// definition an old one — so it sits at the front of `order`, which
+    /// is exactly where a plain oldest-first eviction reaches first. The
+    /// next upload after a report would otherwise drop the evidence.
+    /// Falling short of the cap is the right failure here: the pinned
+    /// set is bounded by what moderators have asked for, and refusing to
+    /// evict is recoverable where losing a report is not.
+    fn evict_to_fit(&mut self, incoming: usize, cap: usize, now: Instant) {
+        let mut skipped = 0;
         while self.total_bytes + incoming > cap {
-            let Some(oldest) = self.order.front().copied() else {
+            let Some(&oldest) = self.order.get(skipped) else {
                 return;
             };
+            if self
+                .items
+                .get(&oldest)
+                .is_some_and(|e| e.pinned_until.is_some_and(|pin| pin > now))
+            {
+                skipped += 1;
+                continue;
+            }
             self.remove(&oldest);
         }
     }

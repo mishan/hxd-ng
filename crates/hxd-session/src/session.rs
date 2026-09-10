@@ -688,6 +688,10 @@ struct Session {
     /// transfer, and a client in a loop is the case it exists for.
     media_tokens: f64,
     media_refill: Instant,
+    /// The sliced download in progress: the handle, and the next part
+    /// index that continues it. One image costs one token however many
+    /// 751s carry it — see `allow_download`.
+    media_stream: Option<(hxd_core::media::Handle, u16)>,
 }
 
 impl Session {
@@ -699,7 +703,40 @@ impl Session {
     /// full minute's worth is allowed and then the rate is the rate,
     /// which is what a client fetching every image in a busy room needs
     /// and a client in a loop does not get more of.
-    fn allow_download(&mut self, per_minute: u32) -> bool {
+    ///
+    /// **One image, one token**, however many parts it is sliced into.
+    /// The ng wire hands an image back in a single `GET` and charges
+    /// once for it, and `download_per_minute` is one knob with one
+    /// meaning — charging per 751 part would quietly give a legacy
+    /// client a fraction of the advertised budget, the fraction being
+    /// whatever chunk size this server happens to advertise.
+    ///
+    /// So a part that *continues* the download just paid for is free,
+    /// and anything else — a new handle, a restart, a part already
+    /// served — is a fresh download and costs. Sequential fetching is
+    /// therefore one token per image and re-asking for the same part in
+    /// a loop is one token per request, which is the client this bound
+    /// exists for.
+    fn allow_download(
+        &mut self,
+        per_minute: u32,
+        of: Option<hxd_core::media::Handle>,
+        index: u16,
+    ) -> bool {
+        if let (Some(handle), Some((streaming, next))) = (of, self.media_stream) {
+            if handle == streaming && index == next {
+                self.media_stream = Some((handle, index.saturating_add(1)));
+                return true;
+            }
+        }
+        if !self.take_download_token(per_minute) {
+            return false;
+        }
+        self.media_stream = of.map(|h| (h, index.saturating_add(1)));
+        true
+    }
+
+    fn take_download_token(&mut self, per_minute: u32) -> bool {
         let cap = per_minute.max(1) as f64;
         let now = Instant::now();
         self.media_tokens = (self.media_tokens
@@ -1134,6 +1171,7 @@ async fn login_phase(
             .map(|c| c.download_per_minute as f64)
             .unwrap_or(0.0),
         media_refill: Instant::now(),
+        media_stream: None,
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -2096,7 +2134,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .media_config()
                 .map(|c| c.download_per_minute)
                 .unwrap_or(0);
-            if !sess.allow_download(per_minute) {
+            if !sess.allow_download(per_minute, handle, index) {
                 let slow = hxd_core::media::MediaReject::RateLimited;
                 reply_error_with(tx, f.trans, slow.text(), media::error_chunks(slow));
                 return;

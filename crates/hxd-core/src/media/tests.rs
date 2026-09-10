@@ -51,6 +51,35 @@ fn attach(core: &Core, nick: &str, addr: Ipv4Addr) -> (Uid, UnboundedReceiver<Se
     attach_with(core, nick, addr, true, true)
 }
 
+/// The same, for an account that has a mailbox — which is what makes a
+/// private message take the durable path.
+fn attach_boxed(core: &Core, nick: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    let (uid, rx) = core
+        .attach(AttachInfo {
+            nick: nick.into(),
+            icon: 1,
+            admin: false,
+            access: AccessBits::empty()
+                .with(bit::READ_CHAT)
+                .with(bit::SEND_CHAT)
+                .with(bit::SEND_MSGS)
+                .with(bit::SEND_MEDIA),
+            login: nick.into(),
+            addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            can_detach: false,
+            transport: Transport {
+                inline_media: true,
+                ..Default::default()
+            },
+            has_inbox: true,
+            reads_on_delivery: false,
+            identity: None,
+        })
+        .unwrap();
+    core.announce(uid);
+    (uid, rx)
+}
+
 fn attach_with(
     core: &Core,
     nick: &str,
@@ -508,4 +537,132 @@ fn handles_spell_the_same_both_ways() {
     assert_eq!(handle_from_str(""), None);
     assert_eq!(handle_from_str("!!!"), None);
     assert_eq!(handle_prefix(&raw), spelled[..6]);
+}
+
+/// A directory that knows a fixed set of logins, so `msg_login` can find
+/// a mailbox for one of them.
+struct Directory(Vec<crate::inbox::Mailbox>);
+
+impl crate::AccountDirectory for Directory {
+    fn inbox_account(&self, login: &str) -> Option<crate::inbox::Mailbox> {
+        let l = login.to_ascii_lowercase();
+        self.0.iter().find(|m| m.login == l).cloned()
+    }
+}
+
+/// A core that has both an inbox and media, which is what a refused
+/// private message needs to be one.
+fn core_with_inbox(logins: &[&str], policy: crate::InboxPolicy) -> Core {
+    let dir = Arc::new(Directory(
+        logins
+            .iter()
+            .map(|l| crate::inbox::Mailbox::login(*l))
+            .collect(),
+    ));
+    Core::new()
+        .with_inbox(
+            Arc::new(crate::inbox::memory::MemoryStore::new()),
+            dir,
+            policy,
+        )
+        .with_media(
+            Arc::new(FakeCodec),
+            MediaConfig {
+                upload_interval: Duration::ZERO,
+                ..Default::default()
+            },
+        )
+}
+
+#[test]
+fn a_refused_message_captures_nobody() {
+    // The audience is what a *relay* showed someone, and a send that
+    // came back an error relayed nothing. Capturing before the store
+    // could refuse left the recipient a grant on an image they were
+    // never sent — and the set is only ever extended, so it never went
+    // away again.
+    let core = core_with_inbox(
+        &["alice", "dave"],
+        crate::InboxPolicy {
+            max_queued: 1,
+            ..Default::default()
+        },
+    );
+    let (alice, _ra) = attach_boxed(&core, "alice");
+    let dave = Principal::Mailbox(crate::inbox::Mailbox::login("dave"));
+
+    let first = upload(&core, alice, b"one").unwrap().id.unwrap();
+    core.msg_login(alice, "dave", "look".into(), None, Some(first))
+        .expect("the mailbox has room for one");
+    assert!(
+        core.media_fetch_as(&dave, &first).is_some(),
+        "a message that was stored grants the mailbox that will read it"
+    );
+
+    let second = upload(&core, alice, b"two").unwrap().id.unwrap();
+    assert_eq!(
+        core.msg_login(alice, "dave", "and this".into(), None, Some(second)),
+        Err(crate::chat::ChatError::MailboxFull),
+    );
+    assert!(
+        core.media_fetch_as(&dave, &second).is_none(),
+        "the message was refused, so its image was never shown to anyone"
+    );
+}
+
+#[test]
+fn a_pinned_handle_is_not_what_eviction_reaches_for() {
+    // A pin is old by construction — a report on an image posted a while
+    // ago — so it sits at the front of the eviction order, which is
+    // exactly where oldest-first looks first. The next upload would drop
+    // the evidence the pin exists to keep.
+    let core = core_with(MediaConfig {
+        upload_interval: Duration::ZERO,
+        // Room for two of the three-byte canonical images below.
+        max_total_bytes: 7,
+        ..Default::default()
+    });
+    let (alice, _ra) = attach(&core, "alice", Ipv4Addr::LOCALHOST);
+    let reported = upload(&core, alice, b"one").unwrap().id.unwrap();
+    assert!(core.media_pin(&reported, Duration::from_secs(600)));
+    let second = upload(&core, alice, b"two").unwrap().id.unwrap();
+    let third = upload(&core, alice, b"six").unwrap().id.unwrap();
+
+    assert!(
+        core.media_meta(&reported).and_then(|m| m.id).is_some(),
+        "the pinned handle kept its bytes"
+    );
+    assert!(
+        core.media_meta(&second).and_then(|m| m.id).is_none(),
+        "the oldest unpinned one went instead"
+    );
+    assert!(core.media_meta(&third).and_then(|m| m.id).is_some());
+}
+
+#[test]
+fn a_quota_refused_by_the_address_does_not_spend_the_account() {
+    // The two buckets are asked before either is charged. Charging the
+    // account first meant two guests behind one address could drain the
+    // shared `guest` hour without a single upload landing.
+    let core = core_with(MediaConfig {
+        upload_interval: Duration::ZERO,
+        // One apiece, so the slot a refused attempt used to spend is the
+        // only slot there was.
+        upload_per_hour: 1,
+        upload_per_hour_per_addr: 1,
+        ..Default::default()
+    });
+    let here = Ipv4Addr::new(10, 0, 0, 7);
+    let (alice, _ra) = attach(&core, "alice", here);
+    let (bob, _rb) = attach(&core, "bob", here);
+    upload(&core, alice, b"one").unwrap();
+    assert_eq!(
+        upload(&core, bob, b"two"),
+        Err(MediaReject::RateLimited),
+        "the address is full"
+    );
+    // Bob's own hour is untouched by the attempt the address refused, so
+    // he can still upload from somewhere else.
+    let (bob_elsewhere, _rb2) = attach(&core, "bob", Ipv4Addr::new(10, 0, 0, 8));
+    upload(&core, bob_elsewhere, b"three").expect("the refusal cost bob's account nothing");
 }

@@ -13,12 +13,13 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use hxd_core::media::MediaConfig;
-use hxd_core::Core;
+use hxd_core::{Core, HistoryPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::{cap, Caps};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::media::trans;
 use hxd_session::{ServerConfig, ServerCtx};
+use hxd_store_sqlite::SqliteStore;
 use hxproto::messages::tag;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -134,21 +135,32 @@ struct Server {
     legacy: SocketAddr,
     ng: SocketAddr,
     core: Arc<Core>,
+    /// The chat log, when the server has one — so a test can tombstone a
+    /// line the way a moderator will, which has no wire surface on this
+    /// branch (`moderation.md` owns that).
+    log: Option<Arc<SqliteStore>>,
 }
 
 async fn start_server(dir: &Path, cfg: MediaConfig) -> (SocketAddr, SocketAddr) {
-    let server = start_with(dir, cfg, false).await;
+    let server = start_with(dir, cfg, false, false).await;
     (server.legacy, server.ng)
 }
 
 async fn start(dir: &Path, cfg: MediaConfig) -> Server {
-    start_with(dir, cfg, false).await
+    start_with(dir, cfg, false, false).await
+}
+
+/// A server that keeps public chat, for the two questions history asks
+/// of media: what a page says about an image, and who paging one grants
+/// it to.
+async fn start_with_history(dir: &Path, cfg: MediaConfig) -> Server {
+    start_with(dir, cfg, false, true).await
 }
 
 /// `inbox` gives the server a durable store, which is what turns a
 /// private message to somebody who is not here into mail rather than a
 /// refusal — and what makes an image outlive the moment it was sent.
-async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool) -> Server {
+async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool, history: bool) -> Server {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     for who in ["alice", "bob"] {
@@ -172,9 +184,30 @@ async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool) -> Server {
     let codec = Arc::new(hxd_media::Codec::new(cfg.codec));
     let files = Arc::new(hxd_auth_file::FileAuth::new(accounts));
     let core = Core::new().with_media(codec, cfg);
+    let log = history.then(|| {
+        Arc::new(
+            SqliteStore::open(
+                dir.join("history.db"),
+                hxd_store_sqlite::Synchronous::Normal,
+            )
+            .unwrap(),
+        )
+    });
+    let core = match &log {
+        Some(store) => core.with_history(
+            store.clone(),
+            HistoryPolicy {
+                max_lines: 10_000,
+                max_days: 30,
+                max_page: 200,
+                replay: 0,
+            },
+        ),
+        None => core,
+    };
     let core = if inbox {
         let store = Arc::new(
-            hxd_store_sqlite::SqliteStore::open(
+            SqliteStore::open(
                 dir.join("messages.db"),
                 hxd_store_sqlite::Synchronous::Normal,
             )
@@ -196,7 +229,14 @@ async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool) -> Server {
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
             stamp_queued: true,
-            caps: Caps::empty().with(cap::INLINE_MEDIA),
+            caps: {
+                let base = Caps::empty().with(cap::INLINE_MEDIA);
+                if history {
+                    base.with(cap::CHAT_HISTORY)
+                } else {
+                    base
+                }
+            },
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
         }),
@@ -210,7 +250,11 @@ async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool) -> Server {
             login_timeout: Duration::from_secs(5),
             grace: Duration::from_secs(60),
             max_detached_per_addr: 2,
-            caps: vec!["media".into()],
+            caps: if history {
+                vec!["media".into(), "history".into()]
+            } else {
+                vec!["media".into()]
+            },
             trusted_proxies: Default::default(),
             forwarded_header: Default::default(),
             ..Default::default()
@@ -226,6 +270,7 @@ async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool) -> Server {
         legacy: legacy.local_addr().unwrap(),
         ng: ng.local_addr().unwrap(),
         core: legacy_ctx.core.clone(),
+        log,
     };
     tokio::spawn(hxd_session::serve(legacy, legacy_ctx));
     tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
@@ -323,6 +368,40 @@ impl Legacy {
             }
         }
         panic!("no user-change push named {nick}");
+    }
+
+    /// The same, for an image too big for one 65 535-byte field: the
+    /// part machinery, with only the handle kept.
+    async fn upload_chunked(&mut self, bytes: &[u8], part: usize) -> Vec<u8> {
+        let parts: Vec<&[u8]> = bytes.chunks(part).collect();
+        let count = parts.len() as u16;
+        let mut token = Vec::new();
+        for (n, payload) in parts.iter().enumerate() {
+            let last = n + 1 == parts.len();
+            let mut chunks = vec![
+                (
+                    tag::CHAT_MEDIA_PART_INDEX,
+                    (n as u16).to_be_bytes().to_vec(),
+                ),
+                (tag::CHAT_MEDIA_PAYLOAD, payload.to_vec()),
+                (tag::CHAT_MEDIA_PART_FINAL, vec![u8::from(last)]),
+            ];
+            if n == 0 {
+                chunks.push((tag::CHAT_MEDIA_DECLARED_TYPE, b"image/png".to_vec()));
+                chunks.push((tag::CHAT_MEDIA_PART_COUNT, count.to_be_bytes().to_vec()));
+            } else {
+                chunks.push((tag::CHAT_MEDIA_UPLOAD_TOKEN, token.clone()));
+            }
+            let reply = self.call(trans::UPLOAD_MEDIA, &chunks).await;
+            assert_eq!(reply.flag, 0, "part {n} refused");
+            if n == 0 {
+                token = field(&reply, tag::CHAT_MEDIA_UPLOAD_TOKEN).expect("a token");
+            }
+            if last {
+                return field(&reply, tag::CHAT_MEDIA_ID).expect("a handle on the final part");
+            }
+        }
+        unreachable!("a non-empty image has a final part")
     }
 
     async fn upload(&mut self, bytes: &[u8]) -> Frame {
@@ -716,6 +795,58 @@ async fn a_chunked_upload_and_a_multi_part_download_round_trip() {
 }
 
 #[tokio::test]
+async fn a_sliced_download_costs_one_token_however_many_parts_it_takes() {
+    // `download_per_minute` is one knob with one meaning, and the ng
+    // wire spends it once per image. Charging the legacy wire once per
+    // 751 *part* would quietly hand a classic client a fraction of the
+    // advertised budget — the fraction being whatever chunk size this
+    // server happens to advertise.
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, _) = start_server(
+        dir.path(),
+        MediaConfig {
+            download_per_minute: 1,
+            ..media_config()
+        },
+    )
+    .await;
+    let (mut alice, _) = Legacy::login(legacy, "alice", true).await;
+    let (mut bob, _) = Legacy::login(legacy, "bob", true).await;
+
+    let image = noisy_png(200, 200);
+    assert!(image.len() > 60_000, "the fixture spans several parts");
+    let handle = alice.upload_chunked(&image, 20_000).await;
+    alice
+        .send(
+            REQ_CHAT,
+            &[
+                (tag::BODY, Vec::new()),
+                (tag::CHAT_MEDIA_ID, handle.clone()),
+                (tag::CHAT_MEDIA_TYPE, b"image/png".to_vec()),
+            ],
+        )
+        .await;
+    bob.recv_type(HDR_CHAT).await;
+
+    // One token, and `download` asserts on a refusal at every part.
+    let (bytes, _) = bob.download(&handle).await;
+    assert!(bytes.len() > 60_000, "the whole image came back");
+
+    // The budget really is spent, though: a restart of the same download
+    // is a second one and there is nothing left to pay with.
+    let again = bob
+        .call(
+            trans::DOWNLOAD_MEDIA,
+            &[
+                (tag::CHAT_MEDIA_ID, handle.clone()),
+                (tag::CHAT_MEDIA_PART_INDEX, 0u16.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    assert_ne!(again.flag, 0, "the second download had no token to take");
+}
+
+#[tokio::test]
 async fn a_download_answers_the_same_way_to_everyone_who_may_not_have_it() {
     let dir = tempfile::tempdir().unwrap();
     let (legacy, _) = start_server(dir.path(), media_config()).await;
@@ -1084,7 +1215,7 @@ async fn an_image_waits_in_the_inbox_for_a_recipient_who_was_not_here() {
     // *mailbox* rather than any session, so whichever session eventually
     // collects the message can fetch the picture too.
     let dir = tempfile::tempdir().unwrap();
-    let server = start_with(dir.path(), media_config(), true).await;
+    let server = start_with(dir.path(), media_config(), true, false).await;
     let (mut alice, _) = Ng::login(server.ng, "alice").await;
 
     let uploaded = ng_upload(server.ng, &alice.bearer, &png(14, 7)).await;
@@ -1181,4 +1312,75 @@ async fn a_revocation_stops_the_next_download_and_tells_the_room() {
     let again = ng_upload(server.ng, &web.bearer, &png(16, 16)).await;
     assert_eq!(again.status, 400);
     assert_eq!(again.json()["error"]["code"], "media_rejected");
+}
+
+#[tokio::test]
+async fn paging_a_deleted_line_grants_its_image_to_nobody() {
+    // `history_access = "readers"` is the operator's other answer: a
+    // public line's audience is everyone holding read-chat, so paging
+    // one grants the image (§5.4). A *redacted* line is not that. The
+    // page already withholds the handle and says `removed`, but the
+    // grant is a separate act with a separate consequence — it never
+    // expires — and a reader who was shown nothing must be granted
+    // nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_with_history(
+        dir.path(),
+        MediaConfig {
+            history_access: hxd_core::HistoryAccess::Readers,
+            ..media_config()
+        },
+    )
+    .await;
+    let (mut alice, _) = Ng::login(server.ng, "alice").await;
+
+    let uploaded = ng_upload(server.ng, &alice.bearer, &png(16, 16)).await;
+    let id = uploaded.json()["media"]["id"].as_str().unwrap().to_owned();
+    let reply = alice
+        .request("chat", json!({ "text": "look", "media": id }))
+        .await;
+    assert!(reply.get("ok").is_some(), "{reply}");
+    // A sender sees its own echo, and that is where the durable id is.
+    let line_id = alice.event("chat").await["data"]["id"]
+        .as_u64()
+        .expect("a durable line id");
+
+    // A moderator takes the line down. The bytes are not revoked — this
+    // is a redaction, and the handle is still perfectly live, which is
+    // what makes the grant reachable at all.
+    use hxd_core::history::ChatLog;
+    assert!(server
+        .log
+        .as_ref()
+        .expect("a log")
+        .tombstone(line_id, std::time::SystemTime::now())
+        .unwrap());
+
+    // Bob arrives afterwards: he never saw the line live, so nothing has
+    // captured him.
+    let (mut bob, _) = Ng::login(server.ng, "bob").await;
+    let page = bob.request("history", json!({ "limit": 10 })).await;
+    let lines = page["ok"]["lines"].as_array().expect("a page").clone();
+    let row = lines
+        .iter()
+        .find(|l| l["id"].as_u64() == Some(line_id))
+        .expect("the redacted line is still in the page");
+    assert_eq!(row["deleted"], json!(true));
+    assert_eq!(row["media"]["removed"], json!(true));
+    assert_eq!(row["media"]["id"], Value::Null, "the handle was withheld");
+
+    // And it was withheld *and* ungranted: the handle the test knows
+    // still resolves for nobody Bob is.
+    let refused = http(
+        server.ng,
+        "GET",
+        &format!("/media/{id}"),
+        &[("Authorization", &bob.bearer)],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        refused.status, 404,
+        "the handle resolved for a reader who was shown nothing"
+    );
 }

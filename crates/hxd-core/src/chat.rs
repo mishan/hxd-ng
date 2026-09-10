@@ -796,19 +796,25 @@ impl Core {
     ) -> Result<MsgOutcome, ChatError> {
         let now = SystemTime::now();
 
-        // The handle resolves before anything is delivered or stored,
-        // and the set is captured whichever way the message goes: the
-        // sender's principal and the recipient's, which for an account
-        // is its mailbox, so mail that waits a day is still readable —
-        // image and all — by whatever session eventually collects it.
-        let media = match media {
-            Some(handle) => {
-                let reference = self
-                    .media_for_send(sender.uid, &handle)
-                    .map_err(|_| ChatError::NoSuchMedia)?;
-                self.media_capture(&handle, [sender.principal.clone(), to.principal.clone()]);
-                Some(reference)
-            }
+        // The handle resolves before anything is delivered or stored: a
+        // message carrying an image this sender may not attach is
+        // refused outright rather than sent without it.
+        //
+        // The *audience* is a separate act, and it happens at each point
+        // below where the message actually goes out — never here. The
+        // set is what a relay showed someone, and a send that comes back
+        // `Blocked`, `MailboxFull` or `NoSuchUser` relayed nothing;
+        // capturing up here would leave the refused recipient a
+        // permanent grant on an image they were never sent, and the set
+        // is only ever extended. Both principals are taken now because
+        // `sender` is consumed on the way down.
+        let image = media;
+        let audience = [sender.principal.clone(), to.principal.clone()];
+        let media = match image.as_ref() {
+            Some(handle) => Some(
+                self.media_for_send(sender.uid, handle)
+                    .map_err(|_| ChatError::NoSuchMedia)?,
+            ),
             None => None,
         };
 
@@ -867,6 +873,13 @@ impl Core {
                 to.uid
             }
             .ok_or(ChatError::NoSuchUser)?;
+            // There is a recipient and the event is about to go out, so
+            // now the image has been shown. Under the roster lock, which
+            // is why `media_capture` takes principals rather than
+            // looking them up.
+            if let Some(handle) = &image {
+                self.media_capture(handle, audience.clone());
+            }
             r.send_to(
                 uid,
                 Event::Msg {
@@ -922,7 +935,17 @@ impl Core {
             )
             .map_err(store_failed)?
         {
-            crate::inbox::Pushed::Stored(id) => id,
+            // Stored: the row is durable and carries the image's
+            // metadata, so whoever eventually reads it must be able to
+            // fetch the bytes. A retry (`Existing`) captured on its
+            // original send, and re-capturing here would grant the
+            // recipient a *different* handle if the retry named one.
+            crate::inbox::Pushed::Stored(id) => {
+                if let Some(handle) = &image {
+                    self.media_capture(handle, audience.clone());
+                }
+                id
+            }
             crate::inbox::Pushed::Existing(m) => {
                 // A retry is that same message, and it gets the answer
                 // the first send would get *now* rather than the one it

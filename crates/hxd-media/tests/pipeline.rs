@@ -288,6 +288,25 @@ fn an_arithmetic_coded_jpeg_is_refused_at_the_walk() {
 }
 
 #[test]
+fn fill_bytes_before_a_marker_do_not_derail_the_walk() {
+    // A marker may be preceded by any number of `0xff` fill bytes, and
+    // an odd-length run is the case a two-byte skip gets wrong: it eats
+    // the marker's own `0xff` and walks off the end. Every length has
+    // to arrive at the same image.
+    let base = jpeg(&rgb(16, 16));
+    assert_eq!(&base[base.len() - 2..], &[0xff, 0xd9], "EOI to pad before");
+    for fill in 1..=4 {
+        let mut padded = base[..base.len() - 2].to_vec();
+        padded.extend(std::iter::repeat_n(0xffu8, fill));
+        padded.extend_from_slice(&[0xff, 0xd9]);
+        let out = codec()
+            .canonicalize(&padded)
+            .unwrap_or_else(|e| panic!("{fill} fill byte(s) refused: {e:?}"));
+        assert_eq!((out.width, out.height), (16, 16));
+    }
+}
+
+#[test]
 fn concurrent_decodes_are_bounded_rather_than_refused() {
     // The permit is a queue, not a wall: two threads through a
     // one-permit codec both succeed, one after the other.

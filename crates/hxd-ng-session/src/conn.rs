@@ -842,6 +842,13 @@ fn media_for_reader(ctx: &NgCtx, uid: hxd_core::Uid, line: &hxd_core::LogLine) -
     let Some(meta) = line.media.as_ref() else {
         return false;
     };
+    // A redacted line's image went with it. `history_line_json` already
+    // withholds the handle here and stamps `removed`, but this function
+    // *grants* under the `readers` policy, and a grant nobody was shown
+    // the handle for is still a grant that never expires.
+    if line.flags.contains(hxd_core::LineFlags::DELETED) {
+        return false;
+    }
     let Ok(handle) = <hxd_core::media::Handle>::try_from(meta.id.as_slice()) else {
         return false;
     };
