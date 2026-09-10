@@ -13,6 +13,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::Follow;
 use super::{
     ArticleId, Author, BodyType, CompiledQuery, NewNode, NewPost, NewsError, NewsStore, NodeId,
     NodeKind, Posted, SearchOrder, SearchQuery, SubScope, ThreadQuery,
@@ -363,7 +364,8 @@ fn a_subscription_starts_caught_up_and_counts_what_follows(s: &dyn NewsStore) {
     post(s, cat, Some(root), "early reply", 101);
     let thread = SubScope::Thread(root);
     assert_eq!(
-        s.subscribe(&bob(), thread, false, 10, t(102)).unwrap(),
+        s.subscribe(&bob(), thread, Follow::Asked, 10, t(102))
+            .unwrap(),
         0,
         "a new row starts caught up, or the catch-up rule never rings it"
     );
@@ -379,7 +381,11 @@ fn a_subscription_starts_caught_up_and_counts_what_follows(s: &dyn NewsStore) {
 
     // A category counts new threads, not replies.
     let whole = SubScope::Category(cat);
-    assert_eq!(s.subscribe(&bob(), whole, false, 10, t(106)).unwrap(), 0);
+    assert_eq!(
+        s.subscribe(&bob(), whole, Follow::Asked, 10, t(106))
+            .unwrap(),
+        0
+    );
     post(s, cat, Some(root), "another reply", 107);
     assert_eq!(unread_of(s, &bob(), whole), 0);
     post(s, cat, None, "a new thread", 108);
@@ -396,7 +402,7 @@ fn a_subscription_needs_something_to_be_about(s: &dyn NewsStore) {
     let cat = category(s, "General");
     let root = post(s, cat, None, "question", 100);
     let reply = post(s, cat, Some(root), "reply", 101);
-    let refused = |scope| s.subscribe(&bob(), scope, false, 10, t(102));
+    let refused = |scope| s.subscribe(&bob(), scope, Follow::Asked, 10, t(102));
     assert_eq!(
         refused(SubScope::Thread(reply)),
         Err(NewsError::NoSuchArticle),
@@ -432,18 +438,22 @@ fn asking_is_explicit_and_posting_takes_nothing_back(s: &dyn NewsStore) {
             .find(|sub| sub.scope == scope)
     };
 
-    s.subscribe(&bob(), thread, true, 10, t(101)).unwrap();
+    s.subscribe(&bob(), thread, Follow::Posted(root), 10, t(101))
+        .unwrap();
     let r = row(thread).unwrap();
     assert!(r.auto && !r.muted);
-    s.subscribe(&bob(), thread, false, 10, t(102)).unwrap();
+    s.subscribe(&bob(), thread, Follow::Asked, 10, t(102))
+        .unwrap();
     assert!(!row(thread).unwrap().auto, "asking makes it explicit");
     s.mute(&bob(), thread, true, 10, t(103)).unwrap();
-    s.subscribe(&bob(), thread, true, 10, t(104)).unwrap();
+    s.subscribe(&bob(), thread, Follow::Posted(root), 10, t(104))
+        .unwrap();
     assert!(
         row(thread).unwrap().muted,
         "posting again does not take back a mute"
     );
-    s.subscribe(&bob(), thread, false, 10, t(105)).unwrap();
+    s.subscribe(&bob(), thread, Follow::Asked, 10, t(105))
+        .unwrap();
     assert!(
         !row(thread).unwrap().muted,
         "asking to follow is asking to hear about it"
@@ -451,11 +461,31 @@ fn asking_is_explicit_and_posting_takes_nothing_back(s: &dyn NewsStore) {
 
     // Muting what nobody followed makes a row an automatic subscribe
     // cannot touch: how a thread says "never".
-    let other = SubScope::Thread(post(s, cat, None, "other", 106));
+    let other_id = post(s, cat, None, "other", 106);
+    let other = SubScope::Thread(other_id);
     s.mute(&bob(), other, true, 10, t(107)).unwrap();
-    s.subscribe(&bob(), other, true, 10, t(108)).unwrap();
+    s.subscribe(&bob(), other, Follow::Posted(other_id), 10, t(108))
+        .unwrap();
     let r = row(other).unwrap();
     assert!(r.muted && !r.auto);
+
+    // A row made by posting starts at the post, not at the newest
+    // article: a reply stored between the post and the subscription is
+    // one the poster has not seen.
+    let fourth = post(s, cat, None, "fourth", 111);
+    let mine = post(s, cat, Some(fourth), "my reply", 112);
+    post(s, cat, Some(fourth), "a reply in between", 113);
+    assert_eq!(
+        s.subscribe(
+            &bob(),
+            SubScope::Thread(fourth),
+            Follow::Posted(mine),
+            10,
+            t(114)
+        )
+        .unwrap(),
+        1
+    );
 
     let third = SubScope::Thread(post(s, cat, None, "third", 109));
     s.mute(&bob(), third, false, 10, t(110)).unwrap();
@@ -472,10 +502,10 @@ fn asking_is_explicit_and_posting_takes_nothing_back(s: &dyn NewsStore) {
 fn the_cap_counts_every_row(s: &dyn NewsStore) {
     let cat = category(s, "General");
     let [a, b, c] = ["a", "b", "c"].map(|body| SubScope::Thread(post(s, cat, None, body, 100)));
-    s.subscribe(&bob(), a, false, 2, t(101)).unwrap();
+    s.subscribe(&bob(), a, Follow::Asked, 2, t(101)).unwrap();
     s.mute(&bob(), b, true, 2, t(102)).unwrap();
     assert_eq!(
-        s.subscribe(&bob(), c, false, 2, t(103)),
+        s.subscribe(&bob(), c, Follow::Asked, 2, t(103)),
         Err(NewsError::TooManySubs),
         "a muted row is a row"
     );
@@ -484,12 +514,12 @@ fn the_cap_counts_every_row(s: &dyn NewsStore) {
         Err(NewsError::TooManySubs)
     );
     assert_eq!(
-        s.subscribe(&bob(), a, false, 2, t(104)),
+        s.subscribe(&bob(), a, Follow::Asked, 2, t(104)),
         Ok(0),
         "what is already held is not a new row"
     );
     assert_eq!(
-        s.subscribe(&alice_mailbox(), c, false, 2, t(105)),
+        s.subscribe(&alice_mailbox(), c, Follow::Asked, 2, t(105)),
         Ok(0),
         "the cap is per mailbox"
     );
@@ -499,7 +529,8 @@ fn a_cursor_moves_forward_and_no_further_than_the_news(s: &dyn NewsStore) {
     let cat = category(s, "General");
     let root = post(s, cat, None, "question", 100);
     let thread = SubScope::Thread(root);
-    s.subscribe(&bob(), thread, false, 10, t(101)).unwrap();
+    s.subscribe(&bob(), thread, Follow::Asked, 10, t(101))
+        .unwrap();
     let first = post(s, cat, Some(root), "one", 102);
     let second = post(s, cat, Some(root), "two", 103);
     assert_eq!(s.seen(&bob(), thread, first).unwrap(), Some(1));
@@ -527,27 +558,41 @@ fn a_posts_audience_sees_muted_rows_too(s: &dyn NewsStore) {
     let root = post(s, cat, None, "question", 100);
     let thread = SubScope::Thread(root);
     let carol = Mailbox::login("carol");
-    s.subscribe(&bob(), thread, false, 10, t(101)).unwrap();
+    s.subscribe(&bob(), thread, Follow::Asked, 10, t(101))
+        .unwrap();
     s.mute(&carol, thread, true, 10, t(102)).unwrap();
     s.subscribe(
         &Mailbox::login("dave"),
         SubScope::Category(cat),
-        false,
+        Follow::Asked,
         10,
         t(103),
     )
     .unwrap();
-    post(s, cat, Some(root), "a reply", 104);
+    let reply = post(s, cat, Some(root), "a reply", 104);
 
-    let mut rows = s.subscribers(root, None).unwrap();
+    let mut rows = s.subscribers(root, None, reply).unwrap();
     rows.sort_by(|a, b| a.owner.login.cmp(&b.owner.login));
     assert_eq!(
         rows.iter()
-            .map(|r| (r.owner.login.as_str(), r.muted, r.unread))
+            .map(|r| (r.owner.login.as_str(), r.muted, r.unread, r.earlier))
             .collect::<Vec<_>>(),
-        [("bob", false, 1), ("carol", true, 1)]
+        [("bob", false, 1, 0), ("carol", true, 1, 0)]
     );
-    let rows = s.subscribers(root, Some(cat)).unwrap();
+    // Two replies landing together: asked about the later one, bob has one
+    // unread from before it, so only the earlier one rings.
+    let second = post(s, cat, Some(root), "another reply", 105);
+    let rows = s.subscribers(root, None, second).unwrap();
+    let bob_row = rows.iter().find(|r| r.owner.login == "bob").unwrap();
+    assert_eq!((bob_row.unread, bob_row.earlier), (2, 1));
+    let rows = s.subscribers(root, None, reply).unwrap();
+    let bob_row = rows.iter().find(|r| r.owner.login == "bob").unwrap();
+    assert_eq!(
+        (bob_row.unread, bob_row.earlier),
+        (2, 0),
+        "and asked about the earlier one, nothing came before it"
+    );
+    let rows = s.subscribers(root, Some(cat), reply).unwrap();
     let dave = rows.iter().find(|r| r.owner.login == "dave").unwrap();
     assert_eq!(
         (dave.scope, dave.unread),
@@ -566,12 +611,13 @@ fn the_two_kinds_of_mailbox_never_meet(s: &dyn NewsStore) {
     let root = post(s, cat, None, "question", 100);
     let thread = SubScope::Thread(root);
     let by_login = Mailbox::login("alice");
-    s.subscribe(&by_login, thread, false, 10, t(101)).unwrap();
+    s.subscribe(&by_login, thread, Follow::Asked, 10, t(101))
+        .unwrap();
     assert!(
         s.subscriptions(&alice_mailbox()).unwrap().is_empty(),
         "an identity never picks up a login's rows"
     );
-    s.subscribe(&alice_mailbox(), thread, false, 10, t(102))
+    s.subscribe(&alice_mailbox(), thread, Follow::Asked, 10, t(102))
         .unwrap();
     assert_eq!(s.subscriptions(&by_login).unwrap().len(), 1);
     assert_eq!(
@@ -595,8 +641,10 @@ fn linking_rotating_and_deleting_move_the_rows(s: &dyn NewsStore) {
     let (first, second) = ([1u8; 32], [2u8; 32]);
     let by_login = Mailbox::login("carol");
     let linked = Mailbox::identified("carol", first);
-    s.subscribe(&by_login, a, false, 10, t(102)).unwrap();
-    s.subscribe(&by_login, b, false, 10, t(103)).unwrap();
+    s.subscribe(&by_login, a, Follow::Asked, 10, t(102))
+        .unwrap();
+    s.subscribe(&by_login, b, Follow::Asked, 10, t(103))
+        .unwrap();
     // The identity already follows b, muted, which tells its row apart.
     s.mute(&linked, b, true, 10, t(104)).unwrap();
 
@@ -629,7 +677,8 @@ fn rows_go_with_what_they_follow(s: &dyn NewsStore) {
         SubScope::Thread(recent),
         SubScope::Category(other),
     ] {
-        s.subscribe(&bob(), scope, false, 10, t(10_001)).unwrap();
+        s.subscribe(&bob(), scope, Follow::Asked, 10, t(10_001))
+            .unwrap();
     }
     s.delete_node(general).unwrap();
     let scopes = |s: &dyn NewsStore| {
@@ -649,7 +698,13 @@ fn rows_go_with_what_they_follow(s: &dyn NewsStore) {
     s.prune(Duration::from_secs(10), t(20_000)).unwrap();
     assert_eq!(scopes(s), [SubScope::Category(other)]);
     assert_eq!(
-        s.subscribe(&bob(), SubScope::Thread(recent), false, 2, t(20_001)),
+        s.subscribe(
+            &bob(),
+            SubScope::Thread(recent),
+            Follow::Asked,
+            2,
+            t(20_001)
+        ),
         Err(NewsError::NoSuchArticle),
         "and the rows that went count against nothing"
     );
@@ -658,9 +713,9 @@ fn rows_go_with_what_they_follow(s: &dyn NewsStore) {
 fn a_listing_is_newest_first_and_says_what_it_follows(s: &dyn NewsStore) {
     let cat = category(s, "General");
     let root = post(s, cat, None, "question", 100);
-    s.subscribe(&bob(), SubScope::Thread(root), false, 10, t(101))
+    s.subscribe(&bob(), SubScope::Thread(root), Follow::Asked, 10, t(101))
         .unwrap();
-    s.subscribe(&bob(), SubScope::Category(cat), false, 10, t(102))
+    s.subscribe(&bob(), SubScope::Category(cat), Follow::Asked, 10, t(102))
         .unwrap();
     let rows = s.subscriptions(&bob()).unwrap();
     assert_eq!(

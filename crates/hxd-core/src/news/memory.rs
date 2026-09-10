@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use super::query::{words, Field, Term};
+use super::Follow;
 use super::{
     Article, ArticleId, ArticlePage, Author, BodyType, Hit, NewNode, NewPost, NewsError, NewsStore,
     Node, NodeId, NodeKind, Posted, Reference, SearchPage, SearchQuery, SubScope, Subscriber,
@@ -307,8 +308,20 @@ impl Inner {
     /// Live articles in `scope` past `last_seen` that `owner` did not
     /// write.
     fn unread(&self, owner: &Mailbox, scope: SubScope, last_seen: ArticleId) -> usize {
+        self.unread_before(owner, scope, last_seen, ArticleId::MAX)
+    }
+
+    /// The same, counting only articles older than `before`.
+    fn unread_before(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        last_seen: ArticleId,
+        before: ArticleId,
+    ) -> usize {
         self.in_scope(scope)
-            .filter(|a| a.id > last_seen && !a.deleted && !a.author.is(owner))
+            .filter(|a| a.id > last_seen && a.id < before)
+            .filter(|a| !a.deleted && !a.author.is(owner))
             .count()
     }
 
@@ -334,22 +347,25 @@ impl Inner {
             .find(|r| r.scope == scope && owns(owner, &r.owner))
     }
 
-    /// A new row, caught up, or `TooManySubs`.
+    /// A new row, caught up, or `TooManySubs`. Answers its cursor.
     fn add_sub(
         &mut self,
         owner: &Mailbox,
         scope: SubScope,
-        auto: bool,
+        how: Follow,
         muted: bool,
         max_subs: usize,
         at: SystemTime,
-    ) -> Result<(), NewsError> {
+    ) -> Result<ArticleId, NewsError> {
         self.check_target(scope)?;
         if self.subs.iter().filter(|r| owns(owner, &r.owner)).count() >= max_subs {
             return Err(NewsError::TooManySubs);
         }
         self.last_sub += 1;
-        let last_seen = self.newest(scope);
+        let (auto, last_seen) = match how {
+            Follow::Asked => (false, self.newest(scope)),
+            Follow::Posted(article) => (true, article),
+        };
         self.subs.push(SubRow {
             id: self.last_sub,
             owner: owner.clone(),
@@ -359,7 +375,7 @@ impl Inner {
             last_seen,
             at,
         });
-        Ok(())
+        Ok(last_seen)
     }
 
     /// Rows whose thread or category has gone — with a category's
@@ -758,7 +774,7 @@ impl NewsStore for MemoryNews {
         &self,
         owner: &Mailbox,
         scope: SubScope,
-        auto: bool,
+        how: Follow,
         max_subs: usize,
         at: SystemTime,
     ) -> Result<usize, NewsError> {
@@ -768,16 +784,13 @@ impl NewsStore for MemoryNews {
             Some(row) => {
                 // Asking is explicit, and asking to hear about something
                 // is not asking for it muted.
-                if !auto {
+                if how == Follow::Asked {
                     row.auto = false;
                     row.muted = false;
                 }
                 row.last_seen
             }
-            None => {
-                inner.add_sub(owner, scope, auto, false, max_subs, at)?;
-                inner.newest(scope)
-            }
+            None => inner.add_sub(owner, scope, how, false, max_subs, at)?,
         };
         Ok(inner.unread(owner, scope, last_seen))
     }
@@ -805,7 +818,9 @@ impl NewsStore for MemoryNews {
                 row.muted = muted;
                 Ok(())
             }
-            None if muted => inner.add_sub(owner, scope, false, true, max_subs, at),
+            None if muted => inner
+                .add_sub(owner, scope, Follow::Asked, true, max_subs, at)
+                .map(|_| ()),
             None => Ok(()),
         }
     }
@@ -862,6 +877,7 @@ impl NewsStore for MemoryNews {
         &self,
         root: ArticleId,
         category: Option<NodeId>,
+        article: ArticleId,
     ) -> Result<Vec<Subscriber>, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
@@ -876,6 +892,7 @@ impl NewsStore for MemoryNews {
                 scope: r.scope,
                 muted: r.muted,
                 unread: inner.unread(&r.owner, r.scope, r.last_seen),
+                earlier: inner.unread_before(&r.owner, r.scope, r.last_seen, article),
             })
             .collect())
     }

@@ -14,6 +14,7 @@
 use std::time::{Duration, SystemTime};
 
 use hxd_core::inbox::{Mailbox, StoreError};
+use hxd_core::news::Follow;
 use hxd_core::news::{
     Article, ArticleId, ArticlePage, Author, BodyType, NewNode, NewPost, NewsError, NewsStore,
     Node, NodeId, NodeKind, Posted, Reference, SubScope, Subscriber, Subscription, ThreadHead,
@@ -412,6 +413,33 @@ fn unread(
     Ok(usize::try_from(n).unwrap_or(0))
 }
 
+/// The same, counting only articles older than `before` — the catch-up
+/// rule's question about a post (§10.7).
+fn unread_before(
+    conn: &Connection,
+    owner: &Mailbox,
+    scope: SubScope,
+    last_seen: ArticleId,
+    before: ArticleId,
+) -> Result<usize, StoreError> {
+    let n: i64 = sql(conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM news_article
+              WHERE {} AND id > ?2 AND id < ?4 AND deleted_at IS NULL AND {}",
+            scope_sql(scope),
+            not_by(owner, 3)
+        ),
+        params![
+            target_i64(scope),
+            i64::from(last_seen),
+            bind(owner),
+            i64::from(before)
+        ],
+        |r| r.get(0),
+    ))?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
 /// Is there something at `scope` to subscribe to?
 fn check_target(conn: &Connection, scope: SubScope) -> Result<(), NewsError> {
     match scope {
@@ -459,11 +487,12 @@ fn sub_row(
 
 /// A new row for `owner`, caught up, or `TooManySubs`. Inside the
 /// caller's transaction, so the count and the insert see one database.
+/// Answers its cursor.
 fn add_sub(
     conn: &Connection,
     owner: &Mailbox,
     scope: SubScope,
-    auto: bool,
+    how: Follow,
     muted: bool,
     max_subs: usize,
     at: SystemTime,
@@ -480,7 +509,10 @@ fn add_sub(
     if usize::try_from(held).unwrap_or(usize::MAX) >= max_subs {
         return Err(NewsError::TooManySubs);
     }
-    let last_seen = newest(conn, scope)?;
+    let (auto, last_seen) = match how {
+        Follow::Asked => (false, newest(conn, scope)?),
+        Follow::Posted(article) => (true, article),
+    };
     sql(conn.execute(
         "INSERT INTO news_sub (owner, owner_fp, scope, target, auto, muted, last_seen, at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1211,7 +1243,7 @@ impl NewsStore for SqliteStore {
         &self,
         owner: &Mailbox,
         scope: SubScope,
-        auto: bool,
+        how: Follow,
         max_subs: usize,
         at: SystemTime,
     ) -> Result<usize, NewsError> {
@@ -1222,7 +1254,7 @@ impl NewsStore for SqliteStore {
             Some((id, seen)) => {
                 // Asking is explicit, and asking to hear about something
                 // is not asking for it muted.
-                if !auto {
+                if how == Follow::Asked {
                     sql(tx.execute(
                         "UPDATE news_sub SET auto = 0, muted = 0 WHERE id = ?1",
                         params![id],
@@ -1230,7 +1262,7 @@ impl NewsStore for SqliteStore {
                 }
                 seen
             }
-            None => add_sub(&tx, owner, scope, auto, false, max_subs, at)?,
+            None => add_sub(&tx, owner, scope, how, false, max_subs, at)?,
         };
         let n = unread(&tx, owner, scope, last_seen)?;
         sql(tx.commit())?;
@@ -1267,7 +1299,7 @@ impl NewsStore for SqliteStore {
                 ))?;
             }
             None if muted => {
-                add_sub(&tx, owner, scope, false, true, max_subs, at)?;
+                add_sub(&tx, owner, scope, Follow::Asked, true, max_subs, at)?;
             }
             None => {}
         }
@@ -1360,6 +1392,7 @@ impl NewsStore for SqliteStore {
         &self,
         root: ArticleId,
         category: Option<NodeId>,
+        article: ArticleId,
     ) -> Result<Vec<Subscriber>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let rows: Vec<(String, Option<String>, i64, i64, bool, i64)> = {
@@ -1386,12 +1419,15 @@ impl NewsStore for SqliteStore {
             .map(|(login, fp, kind, target, muted, last_seen)| {
                 let owner = sub_owner(login, fp)?;
                 let scope = scope_of(kind, target)?;
-                let unread = unread(&conn, &owner, scope, article_id(last_seen)?)?;
+                let last_seen = article_id(last_seen)?;
+                let unread = unread(&conn, &owner, scope, last_seen)?;
+                let earlier = unread_before(&conn, &owner, scope, last_seen, article)?;
                 Ok(Subscriber {
                     owner,
                     scope,
                     muted,
                     unread,
+                    earlier,
                 })
             })
             .collect()

@@ -1485,22 +1485,6 @@ pub fn inbox_purge(
     // So: the feature check first (a build without an inbox should say
     // that, not "no database"), then the file, then a handle that
     // matches what the command is for.
-    let store = match (dry_run, open_inbox_kind(config)?) {
-        (_, InboxKind::Unconfigured) => {
-            return Err("[inbox] is not configured; there is nothing to purge".into())
-        }
-        (_, InboxKind::Missing(path)) => {
-            return Err(format!(
-                "{}: no inbox database, so there is nothing to purge",
-                path.display()
-            ))
-        }
-        (true, InboxKind::At(path)) => open_read_only(&path)?,
-        (false, InboxKind::At(_)) => match open_inbox(config)? {
-            Some(store) => store,
-            None => return Err("[inbox] is not configured; there is nothing to purge".into()),
-        },
-    };
     let fingerprint = match fingerprint {
         Some(text) => Some(parse_fingerprint(text)?),
         None => None,
@@ -1515,16 +1499,34 @@ pub fn inbox_purge(
                 .unwrap_or_else(|| hxd_core::inbox::Mailbox::login(login.to_ascii_lowercase()))
         }
     };
-    if dry_run {
+    // The news half needs no inbox: `[news]` may keep a database of its
+    // own, and a later holder of the login must not inherit what the
+    // previous one followed on a server that keeps no mail either.
+    let news = news_db(config).is_some_and(|p| p.exists());
+    let mail = match (dry_run, open_inbox_kind(config)?) {
+        (_, InboxKind::Unconfigured | InboxKind::Missing(_)) if news => 0,
+        (_, InboxKind::Unconfigured) => {
+            return Err("[inbox] is not configured; there is nothing to purge".into())
+        }
+        (_, InboxKind::Missing(path)) => {
+            return Err(format!(
+                "{}: no inbox database, so there is nothing to purge",
+                path.display()
+            ))
+        }
         // What `purge` would take: everything in the mailbox, read or
         // not. Deleting mail is not undoable and the operator has just
         // deleted the account file, so it is worth being able to look
         // first.
-        let mail = store.purge_count(&mailbox).map_err(|e| e.to_string())?;
-        return Ok(mail + purge_news_subs(config, &mailbox, true)?);
-    }
-    let mail = store.purge(&mailbox).map_err(|e| e.to_string())?;
-    Ok(mail + purge_news_subs(config, &mailbox, false)?)
+        (true, InboxKind::At(path)) => open_read_only(&path)?
+            .purge_count(&mailbox)
+            .map_err(|e| e.to_string())?,
+        (false, InboxKind::At(_)) => match open_inbox(config)? {
+            Some(store) => store.purge(&mailbox).map_err(|e| e.to_string())?,
+            None => return Err("[inbox] is not configured; there is nothing to purge".into()),
+        },
+    };
+    Ok(mail + purge_news_subs(config, &mailbox, dry_run)?)
 }
 
 /// Where `[news]` keeps its database: its own `db`, or the file `[inbox]`
@@ -2108,7 +2110,7 @@ sync = "full"
     #[cfg(feature = "inbox")]
     #[test]
     fn a_purge_takes_the_news_subscriptions_too() {
-        use hxd_core::news::{NewNode, NodeKind, SubScope};
+        use hxd_core::news::{Follow, NewNode, NodeKind, SubScope};
         use hxd_core::NewsStore;
 
         // No `db` of its own: news shares the inbox's file, as the design
@@ -2135,7 +2137,7 @@ sync = "full"
                 .subscribe(
                     &alice,
                     SubScope::Category(cat),
-                    false,
+                    Follow::Asked,
                     10,
                     std::time::SystemTime::now(),
                 )
@@ -2148,6 +2150,39 @@ sync = "full"
             0,
             "a later alice follows nothing she did not ask for"
         );
+
+        // And on a server that keeps news and no mail at all.
+        let news_only = dir.path().join("news.sqlite");
+        let mut cfg = parse("[news]\ndb = \"placeholder\"\n\n[news.notify]\n").unwrap();
+        cfg.news.as_mut().unwrap().db = Some(news_only.clone());
+        cfg.paths.accounts = dir.path().join("accounts");
+        {
+            let store = hxd_store_sqlite::SqliteStore::open(
+                &news_only,
+                hxd_store_sqlite::Synchronous::Normal,
+            )
+            .unwrap();
+            let node = NewNode {
+                parent: None,
+                kind: NodeKind::Category,
+                name: "General".into(),
+                guid: [1; 16],
+                at: std::time::SystemTime::now(),
+            };
+            let cat = store.create_node(&node, 16).unwrap().id;
+            store
+                .subscribe(
+                    &hxd_core::inbox::Mailbox::login("alice"),
+                    SubScope::Category(cat),
+                    Follow::Asked,
+                    10,
+                    std::time::SystemTime::now(),
+                )
+                .unwrap();
+        }
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
+        assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 0);
     }
 
     #[cfg(feature = "inbox")]

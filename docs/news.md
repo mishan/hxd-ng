@@ -1459,6 +1459,13 @@ through the gateway. The decision lives in `hxd-core`, never in a
 frontend — `notify.rs`'s module documentation names that hazard
 exactly, and news would trip over it the same way.
 
+**Attentive means a session that can show the event.** An active session
+on the legacy wire does not count: that wire drops `news_notify`, because
+it has no way to say it (§10.11). An account whose only session is a
+classic client sitting in chat has not been told anything, and the push
+is the one thing that can reach them. It is the same test the inbox
+already makes about the legacy wire, `reads_on_delivery`.
+
 Attached ng sessions get a **targeted** event:
 
 ```jsonc
@@ -1509,6 +1516,18 @@ What that buys, in order of how much it saves us writing:
   nothing has to be swept.
 - **It is per scope, not global**, so a quiet thread you care about is
   not silenced by a loud one you also follow.
+
+**"Caught up" is asked of what came before the post, not of the
+total.** The question runs after the post commits. If it were "is
+unread now 1", two posts landing together would each count the other,
+and neither would ring. Asked instead as "was anything older than this
+article unread", the earlier of the two rings and the later does not,
+whatever order their notifications run in.
+
+**An automatic subscription starts at the post that made it**, for the
+same reason. It is made after the post commits, so starting it at the
+scope's newest article would treat a reply stored in between as already
+seen.
 
 Two floors sit under it:
 

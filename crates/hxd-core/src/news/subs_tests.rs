@@ -136,6 +136,20 @@ impl Server {
         login: &str,
         identity: Option<[u8; 32]>,
     ) -> (Uid, UnboundedReceiver<SeqEvent>) {
+        self.attach(login, identity, false)
+    }
+
+    /// A session on the legacy wire, which drops `news_notify`.
+    fn login_classic(&self, login: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
+        self.attach(login, None, true)
+    }
+
+    fn attach(
+        &self,
+        login: &str,
+        identity: Option<[u8; 32]>,
+        classic: bool,
+    ) -> (Uid, UnboundedReceiver<SeqEvent>) {
         let (uid, rx) = self
             .core
             .attach(AttachInfo {
@@ -149,7 +163,7 @@ impl Server {
                 transport: Transport::default(),
                 has_inbox: login != "guest",
                 is_person: login != "guest",
-                reads_on_delivery: false,
+                reads_on_delivery: classic,
                 identity,
             })
             .unwrap();
@@ -246,6 +260,51 @@ fn a_detached_session_is_rung() {
     assert!(s.core.connection_lost(alice, 8));
     s.post_as("bob", Some(root), "an answer");
     assert_eq!(s.gw.to("alice"), 1, "the phone is what the push is for");
+}
+
+#[test]
+fn a_classic_client_at_the_desk_is_not_someone_who_was_told() {
+    let s = Server::new(NotifyPolicy::default());
+    let (alice, _rx) = s.login_classic("alice");
+    let root = s.post(alice, None, "a question");
+    s.post_as("bob", Some(root), "an answer");
+    assert_eq!(
+        s.gw.to("alice"),
+        1,
+        "the legacy wire cannot show the event, so the phone is where it goes"
+    );
+}
+
+#[test]
+fn no_pushes_an_hour_keeps_nothing() {
+    let s = Server::new(NotifyPolicy {
+        max_per_hour: 0,
+        ..NotifyPolicy::default()
+    });
+    let root = s.post_as("alice", None, "a question");
+    s.post_as("bob", Some(root), "an answer");
+    assert!(s.gw.sent().is_empty());
+    assert!(
+        s.core.news_push.lock().unwrap().is_empty(),
+        "a bucket that can never fill would never be forgotten"
+    );
+}
+
+#[test]
+fn a_purged_account_leaves_no_budget_behind() {
+    let s = Server::new(NotifyPolicy {
+        max_per_hour: 1,
+        ..NotifyPolicy::default()
+    });
+    let root = s.post_as("alice", None, "a question");
+    s.post_as("bob", Some(root), "an answer");
+    assert_eq!(s.gw.to("alice"), 1);
+    assert_eq!(s.core.news_push.lock().unwrap().len(), 1);
+    s.core.inbox_purge(&Mailbox::login("alice"));
+    assert!(
+        s.core.news_push.lock().unwrap().is_empty(),
+        "the next alice starts with a full hour, not this one's spent one"
+    );
 }
 
 #[test]

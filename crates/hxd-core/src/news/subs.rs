@@ -32,6 +32,7 @@ use std::time::{Instant, SystemTime};
 
 use tracing::warn;
 
+use super::Follow;
 use super::{
     store_failed, ArticleId, Asker, AutoSubscribe, NewPost, NewsError, NewsStore, Notified,
     NotifyPolicy, NotifyReason, Posted, SubScope, Subscription,
@@ -125,7 +126,13 @@ impl Core {
     pub fn news_subscribe(&self, uid: Uid, scope: SubScope) -> Result<usize, NewsError> {
         let (store, mailbox, notify) = self.news_subscriber(uid)?;
         store
-            .subscribe(&mailbox, scope, false, notify.max_subs, SystemTime::now())
+            .subscribe(
+                &mailbox,
+                scope,
+                Follow::Asked,
+                notify.max_subs,
+                SystemTime::now(),
+            )
             .map_err(store_failed)
     }
 
@@ -173,7 +180,14 @@ impl Core {
 
     /// The news half of `inbox_claim`: subscriptions are keyed the way a
     /// mailbox is, so linking an identity owes them the same stamp.
+    ///
+    /// The push budget kept under the old key goes too, as it does on a
+    /// rotation and a purge. The new key starts with a full hour's worth,
+    /// which is at most one hour's extra pushes; the other way round, a
+    /// later holder of a freed login would start out with the previous
+    /// holder's spent budget.
     pub(crate) fn news_subs_claim(&self, login: &str, fingerprint: &[u8; 32]) {
+        self.forget_news_budget(&Mailbox::login(login));
         if let Some(store) = self.news.as_ref() {
             if let Err(e) = store.subs_claim(login, fingerprint) {
                 warn!("news: claiming {login}'s subscriptions: {e}");
@@ -182,6 +196,7 @@ impl Core {
     }
 
     pub(crate) fn news_subs_rotate(&self, from: &[u8; 32], to: &[u8; 32]) {
+        self.forget_news_budget(&Mailbox::identified("", *from));
         if let Some(store) = self.news.as_ref() {
             if let Err(e) = store.subs_rotate(from, to) {
                 warn!("news: rotating an identity's subscriptions: {e}");
@@ -190,6 +205,7 @@ impl Core {
     }
 
     pub(crate) fn news_subs_purge(&self, of: &Mailbox) {
+        self.forget_news_budget(of);
         if let Some(store) = self.news.as_ref() {
             if let Err(e) = store.subs_purge(of) {
                 warn!("news: purging {}'s subscriptions: {e}", of.login);
@@ -222,7 +238,8 @@ impl Core {
             // courtesy, and refusing the post over it would be the wrong
             // way round.
             if auto {
-                match store.subscribe(me, thread, true, notify.max_subs, post.at) {
+                let how = Follow::Posted(posted.id);
+                match store.subscribe(me, thread, how, notify.max_subs, post.at) {
                     Ok(_) | Err(NewsError::TooManySubs) => {}
                     Err(e) => {
                         store_failed(e);
@@ -273,7 +290,7 @@ impl Core {
             }
         }
         let rows = store
-            .subscribers(posted.root, starter.then_some(post.category))
+            .subscribers(posted.root, starter.then_some(post.category), posted.id)
             .unwrap_or_else(|e| {
                 warn!("news notify: subscribers of #{}: {e}", posted.root);
                 Vec::new()
@@ -301,11 +318,11 @@ impl Core {
             // bounds it.
             let (scope, cursor) = match row(thread) {
                 Some(r) if r.muted => continue,
-                Some(r) => (thread, Some(r.unread)),
+                Some(r) => (thread, Some(r)),
                 None if reason == NotifyReason::Subscription => {
                     let category = SubScope::Category(post.category);
                     match row(category) {
-                        Some(r) if !r.muted => (category, Some(r.unread)),
+                        Some(r) if !r.muted => (category, Some(r)),
                         _ => continue,
                     }
                 }
@@ -314,11 +331,12 @@ impl Core {
             if !self.news_may_notify(&to, asker.blockable.as_ref()) {
                 continue;
             }
-            // The catch-up rule (§10.7): unread is counted after this
-            // post, so 1 means this one alone — the owner had seen
-            // everything before it. More means they were already told and
-            // have not looked yet.
-            let rings = cursor.is_none_or(|unread| unread <= 1);
+            // The catch-up rule (§10.7): nothing older than this post was
+            // unread, so the owner had seen everything before it. Asked of
+            // what came *before* this article rather than of the total, so
+            // two posts that land together cannot each count the other
+            // and both stay silent: the earlier one rings.
+            let rings = cursor.is_none_or(|r| r.earlier == 0);
             let notified = Notified {
                 reason,
                 scope,
@@ -330,7 +348,7 @@ impl Core {
                 from_nick: post.author.nick.clone(),
                 from_login: post.author.login.clone(),
                 at: post.at,
-                unread: cursor.unwrap_or(1),
+                unread: cursor.map_or(1, |r| r.unread),
             };
             self.news_deliver(&to, notified, rings, notify.max_per_hour);
         }
@@ -376,11 +394,16 @@ impl Core {
             }
             // Across every session that owns the mailbox, as a private
             // message decides it: someone reading on a laptop does not
-            // need their phone to buzz.
+            // need their phone to buzz. But only a session that can show
+            // the event counts. The legacy wire drops `news_notify` (it
+            // has no way to say it, §10.11), so a classic client sitting
+            // in chat is not someone who has been told, and the phone is
+            // the only place this can reach them. `reads_on_delivery` is
+            // exactly "this is the legacy wire".
             uids.iter().any(|uid| {
                 r.users
                     .get(uid)
-                    .is_some_and(|s| s.info.status == SessionStatus::Active)
+                    .is_some_and(|s| s.info.status == SessionStatus::Active && !s.reads_on_delivery)
             })
         };
         if attentive || !rings {
@@ -411,6 +434,12 @@ impl Core {
     /// the catch-up rule, for an account following forty quiet scopes that
     /// all wake at once. Its lock is taken with nothing else held.
     fn news_push_allowed(&self, to: &Mailbox, per_hour: u32) -> bool {
+        // Zero is no pushes at all, and there is nothing to remember
+        // about that: a bucket that can never fill would never be
+        // forgotten either.
+        if per_hour == 0 {
+            return false;
+        }
         let per_hour = f64::from(per_hour);
         let refill =
             |at: Instant, now: Instant| now.duration_since(at).as_secs_f64() * per_hour / 3600.0;
@@ -427,5 +456,11 @@ impl Core {
         }
         *tokens -= 1.0;
         true
+    }
+
+    /// Drop the push budget kept for a mailbox that is going, or moving
+    /// to another key.
+    fn forget_news_budget(&self, who: &Mailbox) {
+        self.news_push.lock().unwrap().remove(&budget_key(who));
     }
 }

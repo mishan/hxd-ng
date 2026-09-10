@@ -470,6 +470,20 @@ pub struct Subscription {
     pub at: SystemTime,
 }
 
+/// How a subscription came to be asked for (§10.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Follow {
+    /// Someone asked. Explicit, and it unmutes: asking to follow is asking
+    /// to hear about it.
+    Asked,
+    /// Posting this article made it. Automatic, it never touches a row
+    /// that already exists, and a new row's cursor starts **at this
+    /// article** rather than at the scope's newest: the subscription is
+    /// made after the post commits, and a reply stored in between is one
+    /// the poster has not seen.
+    Posted(ArticleId),
+}
+
 /// A subscription row as a post's audience sees it (§10.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscriber {
@@ -481,6 +495,12 @@ pub struct Subscriber {
     /// Unread in the scope as the store stands — after the post, when the
     /// question is asked at post time.
     pub unread: usize,
+    /// How many of those are older than the article being posted. 0 means
+    /// the owner had caught up before it, which is the catch-up rule's
+    /// question (§10.7). Asked this way rather than as "unread is 1",
+    /// because two posts landing together would each count the other, and
+    /// neither would ring.
+    pub earlier: usize,
 }
 
 /// A post that is someone's business, as it reaches their attached
@@ -645,10 +665,11 @@ pub trait NewsStore: Send + Sync + 'static {
 
     /// Subscribe `owner` to `scope` and answer its unread count.
     ///
-    /// A new row starts **caught up**, its cursor at the newest article
-    /// in the scope: under the catch-up rule a subscription that starts
-    /// behind would never ring. An existing row keeps its cursor; asking
-    /// explicitly turns an automatic row explicit, and an automatic
+    /// A new row starts **caught up**: under the catch-up rule a
+    /// subscription that starts behind would never ring. Asked for, its
+    /// cursor is the newest article in the scope; made by posting, it is
+    /// the posted article ([`Follow::Posted`]). An existing row keeps its
+    /// cursor; asking turns an automatic row explicit, and an automatic
     /// subscribe never touches an existing row at all, muted or not —
     /// muting is how its owner said no, and posting again is not taking
     /// that back.
@@ -660,7 +681,7 @@ pub trait NewsStore: Send + Sync + 'static {
         &self,
         owner: &Mailbox,
         scope: SubScope,
-        auto: bool,
+        how: Follow,
         max_subs: usize,
         at: SystemTime,
     ) -> Result<usize, NewsError>;
@@ -696,11 +717,13 @@ pub trait NewsStore: Send + Sync + 'static {
     ) -> Result<Option<usize>, StoreError>;
 
     /// Every row on `Thread(root)`, and on `Category(category)` when one
-    /// is named, muted rows included, each with its unread count.
+    /// is named, muted rows included, each with its unread count and how
+    /// much of that is older than `article`.
     fn subscribers(
         &self,
         root: ArticleId,
         category: Option<NodeId>,
+        article: ArticleId,
     ) -> Result<Vec<Subscriber>, StoreError>;
 
     /// Unread across every unmuted row `owner` holds: the badge.

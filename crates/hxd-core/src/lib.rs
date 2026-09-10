@@ -38,10 +38,10 @@ pub use media::{
     MediaReject, MediaType, Principal, UploadOutcome, UploadPart,
 };
 pub use news::{
-    Article, ArticleId, ArticlePage, Author, AutoSubscribe, BodyType, MemoryNews, NewsError,
-    NewsPolicy, NewsStore, Node, NodeId, NodeKind, NodeTree, Notified, NotifyPolicy, NotifyReason,
-    PostRequest, Reference, SubScope, Subscriber, Subscription, ThreadHead, ThreadPage,
-    ThreadQuery,
+    Article, ArticleId, ArticlePage, Author, AutoSubscribe, BodyType, Follow, MemoryNews,
+    NewsError, NewsPolicy, NewsStore, Node, NodeId, NodeKind, NodeTree, Notified, NotifyPolicy,
+    NotifyReason, PostRequest, Reference, SubScope, Subscriber, Subscription, ThreadHead,
+    ThreadPage, ThreadQuery,
 };
 pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use roster::{
