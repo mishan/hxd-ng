@@ -1032,11 +1032,14 @@ enough whoever the author is.
   "body_types": ["text/plain", "text/markdown"],
   "max_refs": 32,
   "search": true,                // §6; false on a build without FTS5
-  "search_max_results": 500
+  "search_max_results": 500,
+  "subscribe": true,             // this session may follow things (§10)
+  "auto_subscribe": "participated", // present when the server keeps subscriptions
+  "unread": 3                    // across what it follows; present when subscribe is
 }
 ```
 
-`post` and `attach` are this session's resolved permissions, not the
+`post`, `attach` and `subscribe` are this session's resolved permissions, not the
 server's ceiling — the same courtesy `moderator` does in
 moderation.md §2, so a client can gray out a compose button instead of
 discovering the refusal after the user has typed.
@@ -1277,6 +1280,16 @@ here.
 notified.** Same rule as the inbox, for the same reason: there is nobody
 durable to address.
 
+**And a subscription moves the way mail does.** Linking an identity,
+rotating one and deleting an account each owe the mailbox an obligation
+(private-messages.md §4), and each is paid for subscriptions in the same
+call — `inbox_claim`, `inbox_rotate`, `inbox_purge` — so a link site that
+remembers one cannot forget the other. Authorship is not re-stamped: an
+article records its author as they were when they wrote it (§3.1). So an
+account that links an identity is not rung about replies to articles it
+wrote before the link. It still follows those threads, because the
+subscriptions moved.
+
 ### 10.3 What can be subscribed to
 
 Two scopes, and deliberately not a third:
@@ -1301,6 +1314,30 @@ to threads you started; `"off"` makes every subscription explicit. An
 auto-subscription is marked as such, so a client can offer "stop
 following threads I reply to" as one switch rather than a list.
 
+Four decisions made while building it, each one a question the paragraphs
+above leave open:
+
+- **A category subscription counts new threads, not every reply.**
+  Following a category is "tell me when something starts here". A reply
+  deep in one of its threads belongs to whoever follows that thread, and
+  counting it twice would make the category badge a second copy of every
+  thread badge.
+- **A subscription starts caught up.** A new row's cursor is the newest
+  article in the scope, so its unread count is 0. Under the catch-up rule
+  (§10.7), a row that started behind would never ring at all.
+- **Unsubscribing and muting are different answers.** Unsubscribing
+  deletes the row, and a reply to your own article still reaches you: that
+  case needs no subscription (§10.1). Muting keeps the row with no
+  doorbell, and silences everything in the thread, replies included.
+  Muting a scope nobody followed makes a muted row, and that is how a
+  thread says *never*. An automatic subscribe does not touch an existing
+  row, muted or not, so posting again does not undo a mute. Only an
+  explicit subscribe turns a row explicit and unmutes it, because asking
+  to follow is asking to hear.
+- **A muted category silences only its own reason.** Muting a category is
+  about its new threads, not about someone answering your article inside
+  one of them.
+
 ### 10.4 There is no notification table, and that is the point
 
 A private message needs the inbox because the message exists nowhere
@@ -1323,24 +1360,32 @@ CREATE TABLE news_sub (
   scope     INTEGER NOT NULL,          -- 0 thread, 1 category
   target    INTEGER NOT NULL,          -- thread root, or node id
   auto      INTEGER NOT NULL DEFAULT 0,
-  last_seen INTEGER NOT NULL DEFAULT 0,-- highest article id acknowledged
   muted     INTEGER NOT NULL DEFAULT 0,
+  last_seen INTEGER NOT NULL DEFAULT 0,-- highest article id acknowledged
   at        INTEGER NOT NULL
 );
-CREATE UNIQUE INDEX news_sub_one
-  ON news_sub (owner, IFNULL(owner_fp, ''), scope, target);
-CREATE INDEX news_sub_target ON news_sub (scope, target) WHERE muted = 0;
+CREATE UNIQUE INDEX news_sub_fp    ON news_sub (owner_fp, scope, target) WHERE owner_fp IS NOT NULL;
+CREATE UNIQUE INDEX news_sub_login ON news_sub (owner, scope, target) WHERE owner_fp IS NULL;
+CREATE INDEX news_sub_target ON news_sub (scope, target);
 ```
 
-The `IFNULL` in the unique index is not decoration: SQLite treats NULLs
-as distinct in a unique index, so a plain `(owner, owner_fp, …)` index
-would let an unidentified mailbox subscribe to one thread any number of
-times. `news_node_sibling` (§4) has the same shape for the same reason.
+Schema version 5. **Two partial unique indexes, one per kind of
+mailbox**, for the reason the inbox has two (private-messages.md §5).
+Under the mailbox rule an identified row is found by its fingerprint,
+whatever login sits beside it. A single index over `(owner, owner_fp)`
+would let a renamed identity hold two rows for one thread, and the
+first sketch's `IFNULL` form was unindexable for the lookups that
+matter. `news_sub_target` is not partial on `muted`, as that sketch had
+it, because a post's audience has to see a muted row in order to honor
+it (§10.5).
 
-**Unread is a query, not a column**: articles in the scope with
-`id > last_seen`, which is one range scan on `news_article_thread` or
-`news_article_roots`. A badge that is computed cannot drift from what it
-counts.
+**Unread is a query, not a column**: the live articles in the scope with
+`id > last_seen` that the owner did not write. For a thread that is one
+range scan on `news_article_root`; for a category, the thread starters,
+on `news_article_roots`. A badge that is computed cannot drift from what
+it counts, and a tombstone or your own reply is never something you have
+not read. A row whose thread or category goes — deleted, or pruned —
+goes in the same transaction, so it never counts against `max_subs`.
 
 ### 10.5 Who gets notified, and why
 
@@ -1365,7 +1410,27 @@ Deduplicated by mailbox, highest reason winning. Then filtered:
   already exists and already means "I do not want this person reaching
   me". It suppresses the notification and not the article: a public
   forum is public, so they can still read the post if they go and look,
-  but a blocked account cannot ring their phone.
+  but a blocked account cannot ring their phone. An identity guest can
+  be blocked by fingerprint in private messages, and that block holds
+  here too.
+
+The account behind a mailbox is asked about through
+`AccountDirectory::mailbox_access`, which resolves by the mailbox rule:
+an identified mailbox by its fingerprint whatever the account is called
+now, an unidentified one only by a login whose account has no identity.
+A login someone else has since taken therefore answers for nobody. That
+is the same seam the inbox uses, and it is wired whenever `[news]` is,
+with or without `[inbox]`. A server whose `Core` has no directory
+notifies nobody rather than guess whether a bit survived.
+
+Each notification counts against one cursor. A muted thread silences the
+account entirely; otherwise it is the thread's cursor where the account
+has a row there. A new thread with only a category row counts against
+the category. **A reply or a citation to someone with no row in the
+thread** counts against the thread with no cursor at all: it rings, and
+its `unread` is 1. Nothing is created by being notified, so being cited
+does not subscribe you to the citing thread, and `max_per_hour` bounds
+what the missing cursor cannot.
 
 **`reference` is the mention feature, and news gets it for free.** The
 roadmap's open question — "how a mention is defined, given that Hotline
@@ -1399,6 +1464,7 @@ Attached ng sessions get a **targeted** event:
 ```jsonc
 { "seq": 88, "ev": "news_notify", "data": {
     "reason": "reply",                    // reply | reference | subscription
+    "scope": "thread", "target": 398,     // the cursor this counts against
     "article": 412, "root": 398, "category": 7,
     "subject": "The derivative and the u16",
     "excerpt": "The part size is a u16, so the full-size PNG…",
@@ -1474,6 +1540,15 @@ thread through `news_thread` must not advance the cursor, because a
 client may prefetch, may render nothing, or may be a search result
 preview. The client says when it has shown someone something.
 
+The cursor only moves forward, and never past the newest article in the
+scope, so an id from the future cannot mark tomorrow's posts read. A
+scope this account does not follow answers `{ "unread": 0 }` rather than
+an error, because a client that says "seen" on every thread it shows
+should not have to check which ones are followed first. One cursor per
+scope has a cost for a thread read a page at a time: `up_to` is the
+highest id shown, and a thread reads in reply order rather than id order,
+so an older reply on a page not yet loaded is counted as seen.
+
 ### 10.9 Requests
 
 | `req` | params | ok |
@@ -1481,12 +1556,20 @@ preview. The client says when it has shown someone something.
 | `news_subscribe` | exactly one of `thread` / `category` | `{ "unread": 3 }` |
 | `news_unsubscribe` | exactly one of `thread` / `category` | `{}` |
 | `news_mute` | exactly one of `thread` / `category`, plus `muted` | `{}` |
-| `news_subs` | — | `{ "subs": [ … ] }` — scope, target, subject or name, `auto`, `muted`, `unread` |
+| `news_subs` | — | `{ "subs": [ … ] }`, newest first |
 | `news_seen` | exactly one of `thread` / `category`, plus `up_to` | `{ "unread": 0 }` |
+
+A sub is `{ "scope": "thread" | "category", "target", "category",
+"subject" | "name", "auto", "muted", "unread", "last_seen" }`: `category`
+is where the scope lives (the category itself, for a category), `subject`
+is a thread starter's (empty once it is a tombstone), and `name` a
+category's.
 
 Error codes on top of §9.2's: `no_mailbox` (a guest tried to subscribe —
 the same shape as `no_inbox`, and about *you* rather than about the
-target), `too_many_subs`.
+target), `too_many_subs`, and `not_available` from a server with no
+`[news.notify]`. A `thread` that names a reply rather than a starter is
+`no_such_article`; naming both scopes or neither is `bad_request`.
 
 The login reply's `news` block (§9.1) gains `unread` — the total across
 subscribed scopes — so a client can draw a badge on the first frame,
@@ -1515,16 +1598,17 @@ pub struct NewsNotice<'a> {
     pub article: ArticleId,
     pub root: ArticleId,
     pub category: NodeId,
-    /// The collapse key: "thread:398" or "category:7".
-    pub scope_key: &'a str,
+    /// The subscription it counts against; `scope.key()` is the
+    /// collapse key, "thread:398" or "category:7".
+    pub scope: SubScope,
     pub unread: usize,
 }
 ```
 
 `NotificationGateway` keeps its single method and its single hard
 contract — **`notify` must not block** — and the subscriber id is
-push-notifications.md §5's `hx-<hex>` mapping, unchanged. Nothing about
-news makes the gateway a different shape; it makes it a wider one.
+push-notifications.md §5's mapping from the mailbox, unchanged. Nothing
+about news makes the gateway a different shape; it makes it a wider one.
 
 ### 10.11 The legacy wire is not notified, yet
 
@@ -1582,9 +1666,11 @@ them worth attacking.
 - **Reply-spam to ring a phone** is answered by §10.7: the second reply
   rings nothing, because the target has not caught up from the first.
 - **Reference-spam** — naming forty of someone's old articles to notify
-  them forty times — collapses to one, because all forty resolve to one
-  mailbox and the audience is deduplicated per post, and then to nothing
-  under the catch-up rule.
+  them forty times — collapses to one per post, because all forty resolve
+  to one mailbox and the audience is deduplicated. Across posts it
+  collapses under the catch-up rule where the target has a cursor in the
+  citing thread, and under `max_per_hour` where they do not (§10.5). A
+  block stops it outright.
 - **Subscription flooding** is capped: `[news.notify] max_subs` per
   account, default 200.
 - **A blocked account cannot notify at all** (§10.5), which is the
@@ -1930,8 +2016,8 @@ flat_default_subject = "(no subject)"
 [news.notify]                   # absent = no subscriptions, no notifications
 auto_subscribe = "participated" # or "own_thread", or "off"
 reference = true                # does citing someone's article notify them
-max_subs = 200                  # subscribed scopes per account
-max_per_hour = 12               # news pushes per account, all scopes
+max_subs = 200                  # followed or muted scopes per account
+max_per_hour = 12               # news pushes per account, all scopes; 0 = badges, no pushes
 
 [news.attach]                   # absent = news without attachments
 max_bytes = 2097152             # per attachment, as uploaded
@@ -2093,18 +2179,23 @@ Each lands separately with tests, roughly a branch apiece.
    edges, the 1.2 flat view of §12.5 — renderer, header-block parser,
    defaults and the push — and `hxd import-mhxd-news`.
 
-**Landed:** W1, W2 and W4, and the part of W6 that needs neither
+**Landed:** W1, W2, W4 and W7, and the part of W6 that needs neither
 markdown nor attachments — the requests of §9.2, the events of §9.3 and
 the login block, with `markdown = "off"` as the only mode. Search is
 schema version 4: the index over the columns version 3 put there for it,
 `hxd news-reindex`, and a conformance suite that asserts which articles
-each row of the grammar finds. `[news]`
-accepts only the keys those honor; naming another, or another markdown
-mode, is a startup error until its stage lands. Not in it: §8's
-moderation ladder (W8), `order: "recent"` (§18), and the login
-block's attachment keys (W5). The ng e2e is
+each row of the grammar finds. Subscriptions are schema version 5:
+`news_sub`, the audience and the catch-up rule in `hxd-core::news::subs`,
+`news_notify`, the five requests of §10.9, `[news.notify]`, and
+`Notification` as a sum with `NewsNotice` in it — tested with a
+recording gateway, since no gateway exists yet. `[news]` accepts only
+the keys those honor; naming another, or another markdown mode, is a
+startup error until its stage lands. Not in it: §8's moderation ladder
+(W8), `order: "recent"` (§18), and the login block's attachment keys
+(W5). The ng e2e is
 `crates/hxd/tests/news.rs`, the out-of-process one `e2e/news.test.mjs`,
-and the first client is hx-ng's News view.
+and the first client is hx-ng's News view, which follows, mutes, badges
+and says "seen".
 
 W1–W2 is threaded news with plain bodies — small, and worth landing on
 its own. W1–W7 is the whole thing for the ng wire and a mobile client,

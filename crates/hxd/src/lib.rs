@@ -57,10 +57,10 @@ pub struct Config {
 
 /// Threaded news (`docs/news.md` §13).
 ///
-/// Only the keys this build acts on. The design's others — attachments,
-/// the 1.2 flat category, notifications — arrive with the
-/// stages that honor them, and until then naming one is a startup error
-/// rather than a promise the server quietly does not keep.
+/// Only the keys this build acts on. The design's others — attachments
+/// and the 1.2 flat category — arrive with the stages that honor them,
+/// and until then naming one is a startup error rather than a promise the
+/// server quietly does not keep.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewsSection {
@@ -110,6 +110,45 @@ pub struct NewsSection {
     /// Searches per session per minute.
     #[serde(default = "default_news_search_per_minute")]
     pub search_per_minute: u32,
+    /// `[news.notify]`: subscriptions and the notifications they earn
+    /// (§10). Absent = neither; present, even empty, = the defaults.
+    #[serde(default)]
+    pub notify: Option<NewsNotifySection>,
+}
+
+/// `[news.notify]` (`docs/news.md` §10, §13). Needs no feature and no
+/// gateway: without `[push]` an attached client still gets its badge, and
+/// only the doorbell for an absent one is missing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewsNotifySection {
+    /// `"participated"` (posting anything in a thread follows it),
+    /// `"own_thread"`, or `"off"`.
+    #[serde(default = "default_news_auto_subscribe")]
+    pub auto_subscribe: String,
+    /// Does citing someone's article notify them?
+    #[serde(default = "default_true")]
+    pub reference: bool,
+    /// Threads and categories one account may follow or mute.
+    #[serde(default = "default_news_max_subs")]
+    pub max_subs: usize,
+    /// News pushes per account per hour, every scope together. 0 is
+    /// badges and events with no pushes at all.
+    #[serde(default = "default_news_max_per_hour")]
+    pub max_per_hour: u32,
+}
+
+fn default_news_auto_subscribe() -> String {
+    hxd_core::NotifyPolicy::default()
+        .auto_subscribe
+        .name()
+        .into()
+}
+fn default_news_max_subs() -> usize {
+    hxd_core::NotifyPolicy::default().max_subs
+}
+fn default_news_max_per_hour() -> u32 {
+    hxd_core::NotifyPolicy::default().max_per_hour
 }
 
 impl NewsSection {
@@ -126,6 +165,14 @@ impl NewsSection {
             search: self.search,
             search_max_results: self.search_max_results,
             search_per_minute: self.search_per_minute,
+            notify: self.notify.as_ref().map(|n| hxd_core::NotifyPolicy {
+                // `check` has refused any other spelling by now.
+                auto_subscribe: hxd_core::AutoSubscribe::from_name(&n.auto_subscribe)
+                    .unwrap_or(hxd_core::AutoSubscribe::Participated),
+                reference: n.reference,
+                max_subs: n.max_subs,
+                max_per_hour: n.max_per_hour,
+            }),
         }
     }
 
@@ -165,6 +212,23 @@ impl NewsSection {
         }
         if !(1..=600).contains(&self.search_per_minute) {
             return Err("[news] search_per_minute must be between 1 and 600".into());
+        }
+        if let Some(notify) = &self.notify {
+            if hxd_core::AutoSubscribe::from_name(&notify.auto_subscribe).is_none() {
+                return Err(format!(
+                    "[news.notify] auto_subscribe = {:?}: it is \"participated\", \
+                     \"own_thread\" or \"off\"",
+                    notify.auto_subscribe
+                ));
+            }
+            // Zero would be a section that turns subscriptions on and then
+            // lets nobody hold one.
+            if !(1..=10_000).contains(&notify.max_subs) {
+                return Err("[news.notify] max_subs must be between 1 and 10000".into());
+            }
+            if notify.max_per_hour > 3600 {
+                return Err("[news.notify] max_per_hour must be at most 3600".into());
+            }
         }
         Ok(())
     }
@@ -1391,7 +1455,8 @@ fn open_read_only(path: &Path) -> Result<Arc<dyn hxd_core::MessageStore>, String
 }
 
 /// `hxd inbox purge <login> [--fingerprint HEX]`: take an account's mail
-/// with it (`docs/private-messages.md` §4).
+/// with it (`docs/private-messages.md` §4), and its news subscriptions,
+/// which are keyed the same way (`docs/news.md` §10.2).
 ///
 /// Deleting an account is `rm accounts/alice.toml`, which leaves the
 /// login free for someone else — and, without this, leaves the previous
@@ -1455,9 +1520,46 @@ pub fn inbox_purge(
         // not. Deleting mail is not undoable and the operator has just
         // deleted the account file, so it is worth being able to look
         // first.
-        return store.purge_count(&mailbox).map_err(|e| e.to_string());
+        let mail = store.purge_count(&mailbox).map_err(|e| e.to_string())?;
+        return Ok(mail + purge_news_subs(config, &mailbox, true)?);
     }
-    store.purge(&mailbox).map_err(|e| e.to_string())
+    let mail = store.purge(&mailbox).map_err(|e| e.to_string())?;
+    Ok(mail + purge_news_subs(config, &mailbox, false)?)
+}
+
+/// Where `[news]` keeps its database: its own `db`, or the file `[inbox]`
+/// or `[history]` names, which it then shares.
+#[cfg(feature = "inbox")]
+fn news_db(config: &Config) -> Option<PathBuf> {
+    let news = config.news.as_ref()?;
+    news.db
+        .clone()
+        .or_else(|| config.inbox.as_ref().map(|i| i.db.clone()))
+        .or_else(|| config.history.as_ref().and_then(|h| h.db.clone()))
+}
+
+/// The news half of a purge. Subscriptions are keyed as mail is
+/// (`docs/news.md` §10.2), so a later holder of the login must not
+/// inherit those either — and a later holder would be rung about threads
+/// the previous one followed. Counted on a dry run, the way mail is.
+#[cfg(feature = "inbox")]
+fn purge_news_subs(
+    config: &Config,
+    mailbox: &hxd_core::inbox::Mailbox,
+    dry_run: bool,
+) -> Result<usize, String> {
+    let Some(path) = news_db(config).filter(|p| p.exists()) else {
+        return Ok(0);
+    };
+    if dry_run {
+        let store = hxd_store_sqlite::SqliteStore::open_read_only(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        return hxd_core::NewsStore::subscriptions(&store, mailbox)
+            .map(|subs| subs.len())
+            .map_err(|e| e.to_string());
+    }
+    let store = open_sqlite(&path, hxd_store_sqlite::Synchronous::Normal)?;
+    hxd_core::NewsStore::subs_purge(&*store, mailbox).map_err(|e| e.to_string())
 }
 
 /// Without the feature there is no store to inspect, and saying so beats
@@ -1481,15 +1583,10 @@ pub fn inbox_purge(
 /// an operator's typo answered with a new file.
 #[cfg(feature = "inbox")]
 pub fn news_reindex(config: &Config) -> Result<u64, String> {
-    let Some(news) = &config.news else {
+    if config.news.is_none() {
         return Err("[news] is not configured; there is no index to rebuild".into());
-    };
-    let path = news
-        .db
-        .clone()
-        .or_else(|| config.inbox.as_ref().map(|i| i.db.clone()))
-        .or_else(|| config.history.as_ref().and_then(|h| h.db.clone()))
-        .ok_or("[news] names no database")?;
+    }
+    let path = news_db(config).ok_or("[news] names no database")?;
     if !path.exists() {
         return Err(format!(
             "{}: no news database, so there is nothing to index",
@@ -1724,7 +1821,12 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
         _ => return Err("[history] store was not opened".into()),
     };
     let core = match (stores.news, config.news.as_ref()) {
-        (Some(store), Some(news)) => core.with_news(store, news.to_policy()),
+        // The accounts too, whether or not there is an inbox: whether a
+        // subscriber may still read the news is a question about an
+        // account nobody may be logged into (§10.5).
+        (Some(store), Some(news)) => core
+            .with_news(store, news.to_policy())
+            .with_accounts(auth.clone()),
         (None, None) => core,
         _ => return Err("[news] store was not opened".into()),
     };
@@ -2001,6 +2103,51 @@ sync = "full"
         let err = inbox_purge(&cfg, "alice", None, false).unwrap_err();
         assert!(err.contains("nothing to purge"), "{err}");
         assert!(!db.exists());
+    }
+
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn a_purge_takes_the_news_subscriptions_too() {
+        use hxd_core::news::{NewNode, NodeKind, SubScope};
+        use hxd_core::NewsStore;
+
+        // No `db` of its own: news shares the inbox's file, as the design
+        // recommends, and the purge has to find it there.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("server.sqlite");
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n\n[news]\n\n[news.notify]\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = db.clone();
+        cfg.paths.accounts = dir.path().join("accounts");
+        {
+            let store =
+                hxd_store_sqlite::SqliteStore::open(&db, hxd_store_sqlite::Synchronous::Normal)
+                    .unwrap();
+            let node = NewNode {
+                parent: None,
+                kind: NodeKind::Category,
+                name: "General".into(),
+                guid: [1; 16],
+                at: std::time::SystemTime::now(),
+            };
+            let cat = store.create_node(&node, 16).unwrap().id;
+            let alice = hxd_core::inbox::Mailbox::login("alice");
+            store
+                .subscribe(
+                    &alice,
+                    SubScope::Category(cat),
+                    false,
+                    10,
+                    std::time::SystemTime::now(),
+                )
+                .unwrap();
+        }
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
+        assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
+        assert_eq!(
+            inbox_purge(&cfg, "alice", None, true).unwrap(),
+            0,
+            "a later alice follows nothing she did not ask for"
+        );
     }
 
     #[cfg(feature = "inbox")]

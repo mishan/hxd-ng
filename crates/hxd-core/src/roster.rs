@@ -294,6 +294,11 @@ pub enum Event {
     NewsNodeDeleted {
         id: crate::news::NodeId,
     },
+    /// A post is this session's account's business — a reply to its
+    /// article, a citation of one, or news in something it follows
+    /// (`docs/news.md` §10.6). **Targeted**, where the four above go to
+    /// every reader: this is the one a client raises a badge on.
+    NewsNotify(crate::news::Notified),
 }
 
 /// An event stamped with its position in the session's stream. `seq` is
@@ -685,6 +690,11 @@ pub struct Core {
     /// Where push notifications go, or `None` — which is the no-op, and
     /// the default. See [`crate::notify`].
     pub(crate) gateway: Option<Arc<dyn crate::notify::NotificationGateway>>,
+    /// What each account has left of its hourly news pushes
+    /// (`[news.notify] max_per_hour`), keyed by the mailbox rule. Its own
+    /// lock, taken with nothing else held.
+    #[allow(clippy::type_complexity)]
+    pub(crate) news_push: Mutex<HashMap<(Option<[u8; 32]>, String), (Instant, f64)>>,
     /// Serialises inbox flushes.
     ///
     /// A flush reads the pending rows, sends them under the roster lock,
@@ -725,6 +735,16 @@ impl Core {
         self.inbox = Some(store);
         self.directory = Some(directory);
         self.inbox_policy = policy;
+        self
+    }
+
+    /// Let the domain ask about accounts nobody is logged into, without an
+    /// inbox. [`Self::with_inbox`] takes one too; news notifications need
+    /// it on a server that keeps news and no mail, because a subscription
+    /// outlives its owner's session and whether they may still read the
+    /// news is a question about the account (`docs/news.md` §10.5).
+    pub fn with_accounts(mut self, directory: Arc<dyn crate::account::AccountDirectory>) -> Self {
+        self.directory = Some(directory);
         self
     }
 

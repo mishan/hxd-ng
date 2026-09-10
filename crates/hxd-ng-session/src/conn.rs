@@ -554,8 +554,12 @@ async fn handle_login(
         ok["media"] = crate::media::limits_json(cfg);
     }
     // What this session may do with the news, and the ceilings it will
-    // be held to. Present exactly when the `news` cap is.
-    if let Some(news) = crate::news::login_json(&ctx.core, uid) {
+    // be held to. Present exactly when the `news` cap is. Off the
+    // reactor, because its unread badge is a store read.
+    let news = off_reactor(&ctx.core, move |c| crate::news::login_json(c, uid))
+        .await
+        .flatten();
+    if let Some(news) = news {
         ok["news"] = news;
     }
     if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {

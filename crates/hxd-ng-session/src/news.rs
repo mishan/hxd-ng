@@ -7,8 +7,9 @@
 //! off the reactor, and writes the answer down.
 
 use hxd_core::news::{
-    Article, ArticleId, BodyType, Hit, NewsError, Node, NodeId, NodeKind, NodeTree, PostRequest,
-    Reference, SearchOrder, SearchRequest, ThreadHead, ThreadQuery,
+    Article, ArticleId, BodyType, Hit, NewsError, Node, NodeId, NodeKind, NodeTree, Notified,
+    PostRequest, Reference, SearchOrder, SearchRequest, SubScope, Subscription, ThreadHead,
+    ThreadQuery,
 };
 use hxd_core::{Core, Uid};
 use serde::de::DeserializeOwned;
@@ -45,8 +46,58 @@ pub fn news_err(e: &NewsError) -> (&'static str, &'static str) {
         NewsError::BadRequest(text) => ("bad_request", text),
         NewsError::SearchOff => ("not_available", "This server does not search its news."),
         NewsError::RateLimited => ("rate_limited", "Slow down."),
+        NewsError::NoMailbox => (
+            "no_mailbox",
+            "Your account has nowhere to keep that on this server.",
+        ),
+        NewsError::TooManySubs => (
+            "too_many_subs",
+            "You follow as much as this server allows. Unfollow something first.",
+        ),
+        NewsError::NotifyOff => ("not_available", "This server keeps no subscriptions."),
         NewsError::NoSession | NewsError::Store(_) => ("server_error", "Server error."),
     }
+}
+
+/// One subscription as `news_subs` lists it (§10.9): the scope, where it
+/// lives, what to call it, and how far behind its owner is.
+fn sub_json(s: &Subscription) -> Value {
+    let mut v = json!({
+        "scope": s.scope.kind_name(),
+        "target": s.scope.target(),
+        "category": s.category,
+        "auto": s.auto,
+        "muted": s.muted,
+        "unread": s.unread,
+        "last_seen": s.last_seen,
+    });
+    match s.scope {
+        SubScope::Thread(_) => v["subject"] = json!(s.label),
+        SubScope::Category(_) => v["name"] = json!(s.label),
+    }
+    v
+}
+
+/// The `news_notify` event (§10.6). `from.login` is absent for a guest's
+/// post, as it is on an article.
+pub fn notified_json(n: &Notified) -> Value {
+    let mut from = json!({ "nick": n.from_nick });
+    if let Some(login) = &n.from_login {
+        from["login"] = json!(login);
+    }
+    json!({
+        "reason": n.reason.name(),
+        "scope": n.scope.kind_name(),
+        "target": n.scope.target(),
+        "article": n.article,
+        "root": n.root,
+        "category": n.category,
+        "subject": n.subject,
+        "excerpt": n.excerpt,
+        "from": from,
+        "at": unix(n.at),
+        "unread": n.unread,
+    })
 }
 
 pub fn node_json(n: &Node) -> Value {
@@ -125,12 +176,15 @@ fn thread_json(h: &ThreadHead) -> Value {
 }
 
 /// The login reply's `news` block, present exactly when the `news` cap
-/// is. `post` is this session's own permission rather than the server's
-/// ceiling, so a client can gray out a compose button instead of
-/// discovering the refusal after someone has typed (§9.1).
+/// is. `post` and `subscribe` are this session's own permissions rather
+/// than the server's ceiling, so a client can gray out a compose button or
+/// leave out a Follow one instead of discovering the refusal after someone
+/// has typed or clicked (§9.1).
+///
+/// `unread` is a store read, so this is called off the reactor.
 pub fn login_json(core: &Core, uid: Uid) -> Option<Value> {
     let p = core.news_policy()?;
-    Some(json!({
+    let mut block = json!({
         "post": core.news_may_post(uid),
         "attach": false,
         "max_body": p.max_body,
@@ -141,7 +195,17 @@ pub fn login_json(core: &Core, uid: Uid) -> Option<Value> {
         "max_refs": p.max_refs,
         "search": p.search,
         "search_max_results": p.search_max_results,
-    }))
+        "subscribe": core.news_may_subscribe(uid),
+    });
+    // The badge on the first frame, the way `inbox` gives one (§10.9).
+    // Present exactly when `subscribe` is true.
+    if let Some(notify) = p.notify {
+        block["auto_subscribe"] = json!(notify.auto_subscribe.name());
+        if let Some(unread) = core.news_unread(uid) {
+            block["unread"] = json!(unread);
+        }
+    }
+    Some(block)
 }
 
 /// Byte offsets in `s` as UTF-16 code units: what a JSON client's strings
@@ -263,6 +327,30 @@ struct NodeParams {
     id: NodeId,
     #[serde(default)]
     name: Option<String>,
+}
+
+/// The subscription requests (§10.9): a scope, named as exactly one of
+/// `thread` and `category`, and what the request needs beside it.
+#[derive(Debug, Deserialize)]
+struct ScopeParams {
+    #[serde(default)]
+    thread: Option<ArticleId>,
+    #[serde(default)]
+    category: Option<NodeId>,
+    #[serde(default)]
+    muted: Option<bool>,
+    #[serde(default)]
+    up_to: Option<ArticleId>,
+}
+
+impl ScopeParams {
+    fn scope(&self) -> Option<SubScope> {
+        match (self.thread, self.category) {
+            (Some(root), None) => Some(SubScope::Thread(root)),
+            (None, Some(category)) => Some(SubScope::Category(category)),
+            _ => None,
+        }
+    }
 }
 
 /// A page size as the wire allows it: absent is the default, zero is a
@@ -555,6 +643,62 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
                 .await,
             )
         }
+
+        // --- Subscriptions (§10.9) ---------------------------------------
+        "news_subscribe" | "news_unsubscribe" | "news_mute" | "news_seen" => {
+            let Some(p) = parse::<ScopeParams>(params) else {
+                return malformed();
+            };
+            let Some(scope) = p.scope() else {
+                return bad("Name exactly one of `thread` and `category`.");
+            };
+            match req.req.as_str() {
+                "news_subscribe" => answer(
+                    off_reactor(core, move |c| {
+                        c.news_subscribe(uid, scope)
+                            .map(|unread| json!({ "unread": unread }))
+                    })
+                    .await,
+                ),
+                "news_unsubscribe" => answer(
+                    off_reactor(core, move |c| {
+                        c.news_unsubscribe(uid, scope).map(|()| json!({}))
+                    })
+                    .await,
+                ),
+                "news_mute" => {
+                    let Some(muted) = p.muted else {
+                        return bad("`muted` is true or false.");
+                    };
+                    answer(
+                        off_reactor(core, move |c| {
+                            c.news_mute(uid, scope, muted).map(|()| json!({}))
+                        })
+                        .await,
+                    )
+                }
+                _ => {
+                    let Some(up_to) = p.up_to else {
+                        return bad("`up_to` is the newest article that was shown.");
+                    };
+                    answer(
+                        off_reactor(core, move |c| {
+                            c.news_seen(uid, scope, up_to)
+                                .map(|unread| json!({ "unread": unread }))
+                        })
+                        .await,
+                    )
+                }
+            }
+        }
+
+        "news_subs" => answer(
+            off_reactor(core, move |c| {
+                c.news_subs(uid)
+                    .map(|subs| json!({ "subs": subs.iter().map(sub_json).collect::<Vec<_>>() }))
+            })
+            .await,
+        ),
 
         _ => reply_err(id, "unknown_method", "Unknown request."),
     }

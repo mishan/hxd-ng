@@ -854,6 +854,30 @@ impl AccountDirectory for FileAuth {
                 None => Mailbox::login(account.login),
             })
     }
+
+    fn mailbox_access(&self, who: &Mailbox) -> Option<AccessBits> {
+        let account = match who.fingerprint {
+            // Whatever the account is called now: the fingerprint is the
+            // person, and a rename is not a reason to stop reaching them.
+            Some(fp) => self.find_by_fingerprint(&fp).ok()??,
+            None => {
+                let login = who.login.to_ascii_lowercase();
+                if !valid_login(&login) {
+                    return None;
+                }
+                let account = self.load(&login).ok()?.into_account(login);
+                // An unidentified mailbox names an account with no
+                // identity and nothing else. One that has linked since is
+                // addressed by its fingerprint now, and its subscriptions
+                // were stamped with it when it linked.
+                if account.identity.fingerprint.is_some() {
+                    return None;
+                }
+                account
+            }
+        };
+        account.has_inbox.then_some(account.access)
+    }
 }
 
 #[cfg(test)]

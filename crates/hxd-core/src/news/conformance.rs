@@ -15,8 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     ArticleId, Author, BodyType, CompiledQuery, NewNode, NewPost, NewsError, NewsStore, NodeId,
-    NodeKind, Posted, SearchOrder, SearchQuery, ThreadQuery,
+    NodeKind, Posted, SearchOrder, SearchQuery, SubScope, ThreadQuery,
 };
+use crate::inbox::Mailbox;
 
 /// Run every case against a freshly built store. `new_store` is called
 /// once per case, so no case sees another's articles.
@@ -42,6 +43,18 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     search_scopes_and_pages(&*new_store());
     search_never_finds_what_is_gone(&*new_store());
     a_long_query_finds_what_it_was_pasted_from(&*new_store());
+    // Subscriptions: what unread counts, what a row may and may not be
+    // made into, and the mailbox rule holding for them as for mail.
+    a_subscription_starts_caught_up_and_counts_what_follows(&*new_store());
+    a_subscription_needs_something_to_be_about(&*new_store());
+    asking_is_explicit_and_posting_takes_nothing_back(&*new_store());
+    the_cap_counts_every_row(&*new_store());
+    a_cursor_moves_forward_and_no_further_than_the_news(&*new_store());
+    a_posts_audience_sees_muted_rows_too(&*new_store());
+    the_two_kinds_of_mailbox_never_meet(&*new_store());
+    linking_rotating_and_deleting_move_the_rows(&*new_store());
+    rows_go_with_what_they_follow(&*new_store());
+    a_listing_is_newest_first_and_says_what_it_follows(&*new_store());
 }
 
 /// The corpus the search cases share: two categories, three authors, and
@@ -300,6 +313,371 @@ fn a_long_query_finds_what_it_was_pasted_from(s: &dyn NewsStore) {
     let said = "the legacy binding comes last and then everything else follows it";
     let id = post(s, cat, None, &format!("{said}, eventually"), 100);
     assert_eq!(found(s, &query(&format!("\"{said}\""))), [id]);
+}
+
+fn bob_writing() -> Author {
+    Author {
+        nick: "Bob".into(),
+        login: Some("bob".into()),
+        fingerprint: None,
+    }
+}
+
+/// Bob's mailbox: keyed by login, as an account with no identity is.
+fn bob() -> Mailbox {
+    Mailbox::login("bob")
+}
+
+/// Alice's: keyed by the fingerprint `alice()` writes with.
+fn alice_mailbox() -> Mailbox {
+    Mailbox::identified("alice", [7u8; 32])
+}
+
+fn post_by(
+    s: &dyn NewsStore,
+    author: Author,
+    category: NodeId,
+    parent: Option<ArticleId>,
+    body: &str,
+    at: u64,
+) -> ArticleId {
+    let mut p = new_post(category, parent, body, at);
+    p.author = author;
+    s.post(&p, 32, 32)
+        .unwrap_or_else(|e| panic!("posting {body}: {e:?}"))
+        .id
+}
+
+fn unread_of(s: &dyn NewsStore, owner: &Mailbox, scope: SubScope) -> usize {
+    s.subscriptions(owner)
+        .unwrap()
+        .into_iter()
+        .find(|sub| sub.scope == scope)
+        .unwrap_or_else(|| panic!("{} follows nothing at {scope:?}", owner.login))
+        .unread
+}
+
+fn a_subscription_starts_caught_up_and_counts_what_follows(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let root = post(s, cat, None, "question", 100);
+    post(s, cat, Some(root), "early reply", 101);
+    let thread = SubScope::Thread(root);
+    assert_eq!(
+        s.subscribe(&bob(), thread, false, 10, t(102)).unwrap(),
+        0,
+        "a new row starts caught up, or the catch-up rule never rings it"
+    );
+    let reply = post(s, cat, Some(root), "a reply", 103);
+    post_by(s, bob_writing(), cat, Some(root), "bob's own", 104);
+    assert_eq!(
+        unread_of(s, &bob(), thread),
+        1,
+        "what bob wrote is not news to bob"
+    );
+    s.tombstone(reply, "mod", t(105)).unwrap();
+    assert_eq!(unread_of(s, &bob(), thread), 0, "nor is a tombstone");
+
+    // A category counts new threads, not replies.
+    let whole = SubScope::Category(cat);
+    assert_eq!(s.subscribe(&bob(), whole, false, 10, t(106)).unwrap(), 0);
+    post(s, cat, Some(root), "another reply", 107);
+    assert_eq!(unread_of(s, &bob(), whole), 0);
+    post(s, cat, None, "a new thread", 108);
+    assert_eq!(unread_of(s, &bob(), whole), 1);
+    assert_eq!(
+        s.unread_total(&bob()).unwrap(),
+        2,
+        "the thread's one and the category's one"
+    );
+}
+
+fn a_subscription_needs_something_to_be_about(s: &dyn NewsStore) {
+    let bundle = node(s, None, NodeKind::Bundle, "Projects");
+    let cat = category(s, "General");
+    let root = post(s, cat, None, "question", 100);
+    let reply = post(s, cat, Some(root), "reply", 101);
+    let refused = |scope| s.subscribe(&bob(), scope, false, 10, t(102));
+    assert_eq!(
+        refused(SubScope::Thread(reply)),
+        Err(NewsError::NoSuchArticle),
+        "a reply is not a thread"
+    );
+    assert_eq!(
+        refused(SubScope::Thread(9999)),
+        Err(NewsError::NoSuchArticle)
+    );
+    assert_eq!(
+        refused(SubScope::Category(bundle)),
+        Err(NewsError::NotACategory)
+    );
+    assert_eq!(
+        refused(SubScope::Category(9999)),
+        Err(NewsError::NoSuchNode)
+    );
+    assert_eq!(
+        s.mute(&bob(), SubScope::Category(bundle), true, 10, t(102)),
+        Err(NewsError::NotACategory)
+    );
+    assert!(s.subscriptions(&bob()).unwrap().is_empty());
+}
+
+fn asking_is_explicit_and_posting_takes_nothing_back(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let root = post(s, cat, None, "question", 100);
+    let thread = SubScope::Thread(root);
+    let row = |scope| {
+        s.subscriptions(&bob())
+            .unwrap()
+            .into_iter()
+            .find(|sub| sub.scope == scope)
+    };
+
+    s.subscribe(&bob(), thread, true, 10, t(101)).unwrap();
+    let r = row(thread).unwrap();
+    assert!(r.auto && !r.muted);
+    s.subscribe(&bob(), thread, false, 10, t(102)).unwrap();
+    assert!(!row(thread).unwrap().auto, "asking makes it explicit");
+    s.mute(&bob(), thread, true, 10, t(103)).unwrap();
+    s.subscribe(&bob(), thread, true, 10, t(104)).unwrap();
+    assert!(
+        row(thread).unwrap().muted,
+        "posting again does not take back a mute"
+    );
+    s.subscribe(&bob(), thread, false, 10, t(105)).unwrap();
+    assert!(
+        !row(thread).unwrap().muted,
+        "asking to follow is asking to hear about it"
+    );
+
+    // Muting what nobody followed makes a row an automatic subscribe
+    // cannot touch: how a thread says "never".
+    let other = SubScope::Thread(post(s, cat, None, "other", 106));
+    s.mute(&bob(), other, true, 10, t(107)).unwrap();
+    s.subscribe(&bob(), other, true, 10, t(108)).unwrap();
+    let r = row(other).unwrap();
+    assert!(r.muted && !r.auto);
+
+    let third = SubScope::Thread(post(s, cat, None, "third", 109));
+    s.mute(&bob(), third, false, 10, t(110)).unwrap();
+    assert!(
+        row(third).is_none(),
+        "unmuting what is not followed is nothing"
+    );
+
+    assert!(s.unsubscribe(&bob(), thread).unwrap());
+    assert!(!s.unsubscribe(&bob(), thread).unwrap());
+    assert!(row(thread).is_none());
+}
+
+fn the_cap_counts_every_row(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let [a, b, c] = ["a", "b", "c"].map(|body| SubScope::Thread(post(s, cat, None, body, 100)));
+    s.subscribe(&bob(), a, false, 2, t(101)).unwrap();
+    s.mute(&bob(), b, true, 2, t(102)).unwrap();
+    assert_eq!(
+        s.subscribe(&bob(), c, false, 2, t(103)),
+        Err(NewsError::TooManySubs),
+        "a muted row is a row"
+    );
+    assert_eq!(
+        s.mute(&bob(), c, true, 2, t(103)),
+        Err(NewsError::TooManySubs)
+    );
+    assert_eq!(
+        s.subscribe(&bob(), a, false, 2, t(104)),
+        Ok(0),
+        "what is already held is not a new row"
+    );
+    assert_eq!(
+        s.subscribe(&alice_mailbox(), c, false, 2, t(105)),
+        Ok(0),
+        "the cap is per mailbox"
+    );
+}
+
+fn a_cursor_moves_forward_and_no_further_than_the_news(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let root = post(s, cat, None, "question", 100);
+    let thread = SubScope::Thread(root);
+    s.subscribe(&bob(), thread, false, 10, t(101)).unwrap();
+    let first = post(s, cat, Some(root), "one", 102);
+    let second = post(s, cat, Some(root), "two", 103);
+    assert_eq!(s.seen(&bob(), thread, first).unwrap(), Some(1));
+    assert_eq!(
+        s.seen(&bob(), thread, root).unwrap(),
+        Some(1),
+        "never backwards"
+    );
+    assert_eq!(s.seen(&bob(), thread, ArticleId::MAX).unwrap(), Some(0));
+    assert_eq!(s.subscriptions(&bob()).unwrap()[0].last_seen, second);
+    post(s, cat, Some(root), "three", 104);
+    assert_eq!(
+        unread_of(s, &bob(), thread),
+        1,
+        "an id from the future marked nothing that came later"
+    );
+    assert_eq!(
+        s.seen(&Mailbox::login("carol"), thread, second).unwrap(),
+        None
+    );
+}
+
+fn a_posts_audience_sees_muted_rows_too(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let root = post(s, cat, None, "question", 100);
+    let thread = SubScope::Thread(root);
+    let carol = Mailbox::login("carol");
+    s.subscribe(&bob(), thread, false, 10, t(101)).unwrap();
+    s.mute(&carol, thread, true, 10, t(102)).unwrap();
+    s.subscribe(
+        &Mailbox::login("dave"),
+        SubScope::Category(cat),
+        false,
+        10,
+        t(103),
+    )
+    .unwrap();
+    post(s, cat, Some(root), "a reply", 104);
+
+    let mut rows = s.subscribers(root, None).unwrap();
+    rows.sort_by(|a, b| a.owner.login.cmp(&b.owner.login));
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.owner.login.as_str(), r.muted, r.unread))
+            .collect::<Vec<_>>(),
+        [("bob", false, 1), ("carol", true, 1)]
+    );
+    let rows = s.subscribers(root, Some(cat)).unwrap();
+    let dave = rows.iter().find(|r| r.owner.login == "dave").unwrap();
+    assert_eq!(
+        (dave.scope, dave.unread),
+        (SubScope::Category(cat), 0),
+        "a reply is no new thread"
+    );
+    assert_eq!(
+        s.unread_total(&carol).unwrap(),
+        0,
+        "a muted row badges nothing"
+    );
+}
+
+fn the_two_kinds_of_mailbox_never_meet(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let root = post(s, cat, None, "question", 100);
+    let thread = SubScope::Thread(root);
+    let by_login = Mailbox::login("alice");
+    s.subscribe(&by_login, thread, false, 10, t(101)).unwrap();
+    assert!(
+        s.subscriptions(&alice_mailbox()).unwrap().is_empty(),
+        "an identity never picks up a login's rows"
+    );
+    s.subscribe(&alice_mailbox(), thread, false, 10, t(102))
+        .unwrap();
+    assert_eq!(s.subscriptions(&by_login).unwrap().len(), 1);
+    assert_eq!(
+        s.subscriptions(&Mailbox::identified("alicia", [7u8; 32]))
+            .unwrap()
+            .len(),
+        1,
+        "an identity is itself under any login"
+    );
+    // `alice()` writes with the fingerprint, so the article is the
+    // identity's own and only the login-keyed mailbox counts it.
+    post(s, cat, Some(root), "alice again", 103);
+    assert_eq!(unread_of(s, &alice_mailbox(), thread), 0);
+    assert_eq!(unread_of(s, &by_login, thread), 1);
+}
+
+fn linking_rotating_and_deleting_move_the_rows(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let a = SubScope::Thread(post(s, cat, None, "a", 100));
+    let b = SubScope::Thread(post(s, cat, None, "b", 101));
+    let (first, second) = ([1u8; 32], [2u8; 32]);
+    let by_login = Mailbox::login("carol");
+    let linked = Mailbox::identified("carol", first);
+    s.subscribe(&by_login, a, false, 10, t(102)).unwrap();
+    s.subscribe(&by_login, b, false, 10, t(103)).unwrap();
+    // The identity already follows b, muted, which tells its row apart.
+    s.mute(&linked, b, true, 10, t(104)).unwrap();
+
+    assert_eq!(s.subs_claim("carol", &first).unwrap(), 2);
+    assert!(s.subscriptions(&by_login).unwrap().is_empty());
+    let rows = s.subscriptions(&linked).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter().find(|r| r.scope == b).unwrap().muted,
+        "where both followed one scope, the identity's row stands"
+    );
+
+    assert_eq!(s.subs_rotate(&first, &second).unwrap(), 2);
+    assert!(s.subscriptions(&linked).unwrap().is_empty());
+    let rotated = Mailbox::identified("carol", second);
+    assert_eq!(s.subscriptions(&rotated).unwrap().len(), 2);
+
+    assert_eq!(s.subs_purge(&rotated).unwrap(), 2);
+    assert!(s.subscriptions(&rotated).unwrap().is_empty());
+}
+
+fn rows_go_with_what_they_follow(s: &dyn NewsStore) {
+    let general = category(s, "General");
+    let other = category(s, "Other");
+    let old = post(s, general, None, "old", 100);
+    let recent = post(s, other, None, "recent", 10_000);
+    for scope in [
+        SubScope::Thread(old),
+        SubScope::Category(general),
+        SubScope::Thread(recent),
+        SubScope::Category(other),
+    ] {
+        s.subscribe(&bob(), scope, false, 10, t(10_001)).unwrap();
+    }
+    s.delete_node(general).unwrap();
+    let scopes = |s: &dyn NewsStore| {
+        let mut v: Vec<SubScope> = s
+            .subscriptions(&bob())
+            .unwrap()
+            .into_iter()
+            .map(|sub| sub.scope)
+            .collect();
+        v.sort_by_key(|scope| scope.key());
+        v
+    };
+    assert_eq!(
+        scopes(s),
+        [SubScope::Category(other), SubScope::Thread(recent)]
+    );
+    s.prune(Duration::from_secs(10), t(20_000)).unwrap();
+    assert_eq!(scopes(s), [SubScope::Category(other)]);
+    assert_eq!(
+        s.subscribe(&bob(), SubScope::Thread(recent), false, 2, t(20_001)),
+        Err(NewsError::NoSuchArticle),
+        "and the rows that went count against nothing"
+    );
+}
+
+fn a_listing_is_newest_first_and_says_what_it_follows(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let root = post(s, cat, None, "question", 100);
+    s.subscribe(&bob(), SubScope::Thread(root), false, 10, t(101))
+        .unwrap();
+    s.subscribe(&bob(), SubScope::Category(cat), false, 10, t(102))
+        .unwrap();
+    let rows = s.subscriptions(&bob()).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.scope, r.category, r.label.as_str(), r.at))
+            .collect::<Vec<_>>(),
+        [
+            (SubScope::Category(cat), cat, "General", t(102)),
+            (SubScope::Thread(root), cat, "about question", t(101)),
+        ]
+    );
+    s.tombstone(root, "mod", t(103)).unwrap();
+    assert_eq!(
+        s.subscriptions(&bob()).unwrap()[1].label,
+        "",
+        "a tombstone keeps its place and loses its words"
+    );
 }
 
 fn t(secs: u64) -> SystemTime {

@@ -23,9 +23,10 @@
 //! in `hxd-session` (§12.1); the domain names nodes by id.
 //!
 //! The trait grows with the stages of `docs/news.md` §16. What is here
-//! is the tree, plain-text articles, `#51` references and retention;
-//! markdown, search, attachments and subscriptions bring their methods
-//! with them rather than arriving early as stubs.
+//! is the tree, plain-text articles, `#51` references, retention, search,
+//! and subscriptions with the notifications they earn ([`subs`]);
+//! markdown and attachments bring their methods with them rather than
+//! arriving early as stubs.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -42,6 +43,9 @@ pub mod memory;
 pub mod query;
 #[cfg(test)]
 mod search_tests;
+mod subs;
+#[cfg(test)]
+mod subs_tests;
 
 pub use memory::MemoryNews;
 pub use query::{CompiledQuery, Field, Term};
@@ -304,6 +308,204 @@ pub struct NodeTree {
     pub children: Option<Vec<NodeTree>>,
 }
 
+/// What a subscription is to (§10.3). Two scopes, and deliberately not a
+/// third: there is no "all news", because an attached client already
+/// hears `news_posted` for everything, and a push for every post on the
+/// server is a setting nobody leaves on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubScope {
+    /// A thread, named by its starter. Every live article in it counts.
+    Thread(ArticleId),
+    /// A category. **Only new threads count**: following a category is
+    /// "tell me when something starts here", and a reply deep in one of
+    /// its threads is the business of whoever follows that thread.
+    Category(NodeId),
+}
+
+impl SubScope {
+    /// The store's spelling of the kind: 0 a thread, 1 a category.
+    pub fn kind_i64(self) -> i64 {
+        match self {
+            SubScope::Thread(_) => 0,
+            SubScope::Category(_) => 1,
+        }
+    }
+
+    pub fn target(self) -> u64 {
+        match self {
+            SubScope::Thread(id) => u64::from(id),
+            SubScope::Category(id) => id,
+        }
+    }
+
+    /// The inverse of [`Self::kind_i64`] and [`Self::target`]. `None` for
+    /// a kind nothing writes, or a thread id the legacy wire could not
+    /// name.
+    pub fn from_parts(kind: i64, target: i64) -> Option<Self> {
+        match kind {
+            0 => ArticleId::try_from(target).ok().map(SubScope::Thread),
+            1 => u64::try_from(target).ok().map(SubScope::Category),
+            _ => None,
+        }
+    }
+
+    /// The ng wire's spelling of the kind.
+    pub fn kind_name(self) -> &'static str {
+        match self {
+            SubScope::Thread(_) => "thread",
+            SubScope::Category(_) => "category",
+        }
+    }
+
+    /// `thread:398` or `category:7`: the collapse key a gateway hands its
+    /// provider, so two pushes for one scope collapse on the device
+    /// (§10.7).
+    pub fn key(self) -> String {
+        format!("{}:{}", self.kind_name(), self.target())
+    }
+}
+
+/// Why a mailbox is in a post's audience (§10.5). **Ordered by
+/// precedence, highest first**, so when two reasons name one mailbox the
+/// lesser of them is the one its notification says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NotifyReason {
+    /// Someone answered your article.
+    Reply,
+    /// Someone's body cited your article — the mention feature, arrived
+    /// at without guessing from a nick, because an article has exactly
+    /// one author.
+    Reference,
+    /// Something new in a thread or category you follow.
+    Subscription,
+}
+
+impl NotifyReason {
+    /// The ng wire's spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            NotifyReason::Reply => "reply",
+            NotifyReason::Reference => "reference",
+            NotifyReason::Subscription => "subscription",
+        }
+    }
+}
+
+/// When posting subscribes the poster (§10.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoSubscribe {
+    /// To any thread they post in: ask a question and you are subscribed
+    /// to its answers, with nothing to click.
+    Participated,
+    /// Only to threads they start.
+    OwnThread,
+    /// Every subscription is explicit.
+    Off,
+}
+
+impl AutoSubscribe {
+    pub fn name(self) -> &'static str {
+        match self {
+            AutoSubscribe::Participated => "participated",
+            AutoSubscribe::OwnThread => "own_thread",
+            AutoSubscribe::Off => "off",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "participated" => Some(AutoSubscribe::Participated),
+            "own_thread" => Some(AutoSubscribe::OwnThread),
+            "off" => Some(AutoSubscribe::Off),
+            _ => None,
+        }
+    }
+}
+
+/// `[news.notify]`: subscriptions, and who a post notifies. Absent from
+/// [`NewsPolicy`] means the server keeps no subscriptions at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotifyPolicy {
+    pub auto_subscribe: AutoSubscribe,
+    /// Does citing someone's article notify them? On by default: a
+    /// reference is deliberate — typed or picked — and much closer to an
+    /// `@` than to a footnote (§10.5).
+    pub reference: bool,
+    /// Rows one account may hold, muted ones included.
+    pub max_subs: usize,
+    /// News pushes per account per hour, every scope together. Past it
+    /// the push is dropped, never the event and never the unread count.
+    pub max_per_hour: u32,
+}
+
+impl Default for NotifyPolicy {
+    fn default() -> Self {
+        NotifyPolicy {
+            auto_subscribe: AutoSubscribe::Participated,
+            reference: true,
+            max_subs: 200,
+            max_per_hour: 12,
+        }
+    }
+}
+
+/// One subscription, as its owner lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subscription {
+    pub scope: SubScope,
+    /// The category the scope lives in: the category itself, or the one
+    /// holding the thread.
+    pub category: NodeId,
+    /// The thread starter's subject, or the category's name. Empty for a
+    /// starter that is now a tombstone.
+    pub label: String,
+    /// Made by posting rather than by asking (§10.3), so a client can
+    /// offer "stop following threads I reply to" as one switch.
+    pub auto: bool,
+    /// A cursor without a doorbell.
+    pub muted: bool,
+    /// The highest article id its owner has said they have seen.
+    pub last_seen: ArticleId,
+    pub unread: usize,
+    pub at: SystemTime,
+}
+
+/// A subscription row as a post's audience sees it (§10.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subscriber {
+    pub owner: Mailbox,
+    pub scope: SubScope,
+    /// Muted rows come back too: muting is something the audience has to
+    /// see in order to honor it.
+    pub muted: bool,
+    /// Unread in the scope as the store stands — after the post, when the
+    /// question is asked at post time.
+    pub unread: usize,
+}
+
+/// A post that is someone's business, as it reaches their attached
+/// sessions (`news_notify`, §10.6). Not `news_posted`, whose audience is
+/// every reader and which must never raise a badge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notified {
+    pub reason: NotifyReason,
+    /// The subscription this counts against.
+    pub scope: SubScope,
+    pub article: ArticleId,
+    pub root: ArticleId,
+    pub category: NodeId,
+    pub subject: String,
+    /// The opening of the body, one line, capped.
+    pub excerpt: String,
+    pub from_nick: String,
+    /// The poster's account, absent for a guest.
+    pub from_login: Option<String>,
+    pub at: SystemTime,
+    /// Unread in `scope` after this article, or 1 — this one — for a
+    /// reply or a citation to someone with no cursor in the thread.
+    pub unread: usize,
+}
+
 /// Why a news operation did not happen. Each is a distinct ng error code
 /// (§9.2); the mapping lives in the frontend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +535,14 @@ pub enum NewsError {
     SearchOff,
     /// Too many searches from this session; wait and ask again.
     RateLimited,
+    /// A session with no mailbox — a guest — asked for something only a
+    /// mailbox can hold. About you, where `AccessDenied` is about the
+    /// bits (§10.9).
+    NoMailbox,
+    /// Past `max_subs`.
+    TooManySubs,
+    /// This server keeps no subscriptions (`[news.notify]` is absent).
+    NotifyOff,
     Store(StoreError),
 }
 
@@ -421,6 +631,91 @@ pub trait NewsStore: Send + Sync + 'static {
     /// were indexed. The repair for an index that has drifted, and what
     /// an import or a change in how bodies render ends with (§6.4).
     fn reindex(&self) -> Result<u64, StoreError>;
+
+    // --- Subscriptions (§10) --------------------------------------------
+    //
+    // Keyed by mailbox, under the mailbox rule, exactly as the inbox is:
+    // an identified row matches by fingerprint whatever login sits beside
+    // it, and an unidentified row by login, and neither kind ever
+    // matches the other. **Unread is counted, never stored** (§10.4): the
+    // live articles in the scope past the cursor that the owner did not
+    // write — every one of them for a thread, the thread starters for a
+    // category. A deletion, a retention pass or a category going takes
+    // the rows that pointed at what went.
+
+    /// Subscribe `owner` to `scope` and answer its unread count.
+    ///
+    /// A new row starts **caught up**, its cursor at the newest article
+    /// in the scope: under the catch-up rule a subscription that starts
+    /// behind would never ring. An existing row keeps its cursor; asking
+    /// explicitly turns an automatic row explicit, and an automatic
+    /// subscribe never touches an existing row at all, muted or not —
+    /// muting is how its owner said no, and posting again is not taking
+    /// that back.
+    ///
+    /// `NoSuchArticle` for a thread id that is not a thread starter,
+    /// `NoSuchNode` and `NotACategory` for a category that is not one,
+    /// and `TooManySubs` when a new row would pass `max_subs`.
+    fn subscribe(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        auto: bool,
+        max_subs: usize,
+        at: SystemTime,
+    ) -> Result<usize, NewsError>;
+
+    /// Remove `owner`'s row for `scope`, answering whether there was one.
+    fn unsubscribe(&self, owner: &Mailbox, scope: SubScope) -> Result<bool, StoreError>;
+
+    /// Mute or unmute. Muting a scope with no row makes one, muted and
+    /// caught up, which is how a thread says "never" to auto-subscribe;
+    /// unmuting a scope with no row does nothing. Refuses what
+    /// [`Self::subscribe`] refuses.
+    fn mute(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        muted: bool,
+        max_subs: usize,
+        at: SystemTime,
+    ) -> Result<(), NewsError>;
+
+    /// Every row `owner` holds, newest first.
+    fn subscriptions(&self, owner: &Mailbox) -> Result<Vec<Subscription>, StoreError>;
+
+    /// Move `owner`'s cursor on `scope` to `up_to`, answering the unread
+    /// count after. The cursor only moves forward, and never past the
+    /// newest article in the scope, so an id from the future cannot mark
+    /// tomorrow's posts read. `None` when there is no row.
+    fn seen(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        up_to: ArticleId,
+    ) -> Result<Option<usize>, StoreError>;
+
+    /// Every row on `Thread(root)`, and on `Category(category)` when one
+    /// is named, muted rows included, each with its unread count.
+    fn subscribers(
+        &self,
+        root: ArticleId,
+        category: Option<NodeId>,
+    ) -> Result<Vec<Subscriber>, StoreError>;
+
+    /// Unread across every unmuted row `owner` holds: the badge.
+    fn unread_total(&self, owner: &Mailbox) -> Result<usize, StoreError>;
+
+    /// An account linked an identity: stamp its rows with the
+    /// fingerprint, the obligation `MessageStore::claim` pays for mail.
+    /// A row the identity already holds for the same scope wins.
+    fn subs_claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError>;
+
+    /// An identity rotated to a successor key: move its rows.
+    fn subs_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError>;
+
+    /// An account went: take its rows with it.
+    fn subs_purge(&self, of: &Mailbox) -> Result<usize, StoreError>;
 }
 
 /// How a search's hits are ordered.
@@ -521,6 +816,9 @@ pub struct NewsPolicy {
     /// unit of work from a keyed read, and this faces phones on the open
     /// internet.
     pub search_per_minute: u32,
+    /// Subscriptions and notifications, or `None` for a server that keeps
+    /// neither (§10).
+    pub notify: Option<NotifyPolicy>,
 }
 
 impl Default for NewsPolicy {
@@ -537,6 +835,7 @@ impl Default for NewsPolicy {
             search: true,
             search_max_results: 500,
             search_per_minute: 30,
+            notify: None,
         }
     }
 }
@@ -671,6 +970,14 @@ struct Asker {
     /// What this session's own articles were recorded under, where it
     /// can own any (see [`author_of`]).
     owner: Option<Mailbox>,
+    /// Where its subscriptions are kept: the mailbox rule, as private
+    /// messages have it, which is not the same question as authorship.
+    mailbox: Option<Mailbox>,
+    /// What a block is held against: the mailbox, or the fingerprint an
+    /// identity guest arrived with — the same test the inbox's
+    /// `inbox_block_uid` makes, so a guest someone blocked in private
+    /// messages cannot ring their phone from the news either.
+    blockable: Option<Mailbox>,
     login: String,
 }
 
@@ -722,6 +1029,8 @@ impl Core {
             access: sess.access,
             author: author_of(sess),
             owner: sess.is_person.then(|| sess.mailbox()),
+            mailbox: sess.has_inbox.then(|| sess.mailbox()),
+            blockable: (sess.has_inbox || sess.identity.is_some()).then(|| sess.mailbox()),
             login: sess.login.clone(),
         })
     }
@@ -819,8 +1128,9 @@ impl Core {
         store.refs_to(id, limit).map_err(|e| store_failed(e.into()))
     }
 
-    /// Post an article or a reply, and tell every reader their view of
-    /// that category is stale.
+    /// Post an article or a reply, tell every reader their view of that
+    /// category is stale, and tell the people it is addressed to that it
+    /// is theirs (§10).
     pub fn news_post(&self, uid: Uid, req: PostRequest) -> Result<ArticleId, NewsError> {
         let store = self.news_store()?;
         let asker = self.news_reader(uid)?;
@@ -851,7 +1161,7 @@ impl Core {
             category: req.category,
             parent: req.parent,
             refs: scan_refs(&body),
-            author: asker.author,
+            author: asker.author.clone(),
             subject,
             body,
             mime: req.mime,
@@ -865,10 +1175,15 @@ impl Core {
             category: post.category,
             root: posted.root,
             parent: post.parent,
-            subject: post.subject,
-            from_nick: post.author.nick,
+            subject: post.subject.clone(),
+            from_nick: post.author.nick.clone(),
             at: post.at,
         });
+        // After the broadcast, so a session that hears both hears "your
+        // copy is stale" before "and this one is yours".
+        if let Some(notify) = policy.notify {
+            self.news_after_post(&asker, &post, posted, notify);
+        }
         Ok(posted.id)
     }
 

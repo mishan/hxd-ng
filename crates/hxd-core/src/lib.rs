@@ -38,11 +38,12 @@ pub use media::{
     MediaReject, MediaType, Principal, UploadOutcome, UploadPart,
 };
 pub use news::{
-    Article, ArticleId, ArticlePage, Author, BodyType, MemoryNews, NewsError, NewsPolicy,
-    NewsStore, Node, NodeId, NodeKind, NodeTree, PostRequest, Reference, ThreadHead, ThreadPage,
+    Article, ArticleId, ArticlePage, Author, AutoSubscribe, BodyType, MemoryNews, NewsError,
+    NewsPolicy, NewsStore, Node, NodeId, NodeKind, NodeTree, Notified, NotifyPolicy, NotifyReason,
+    PostRequest, Reference, SubScope, Subscriber, Subscription, ThreadHead, ThreadPage,
     ThreadQuery,
 };
-pub use notify::{Notification, NotificationGateway};
+pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use roster::{
     AttachInfo, Core, Event, IdentityTag, InboxPolicy, Resume, SeqEvent, SessionStatus, Transport,
     Uid, UserDetails, UserInfo, OUTBOX_BUFFER_CAP,

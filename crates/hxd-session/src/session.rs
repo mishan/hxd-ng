@@ -1488,10 +1488,15 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
         // until it lands this wire has no news to be stale about. The
         // flat category's `NEWSFILE_POST` push is where the first of
         // these arms will go.
+        //
+        // `NewsNotify` is the same story told to one person: a legacy
+        // account is notified through a system mailbox with a `stop`
+        // reply, which is a feature of its own (`docs/news.md` §10.11).
         Event::NewsPosted { .. }
         | Event::NewsDeleted { .. }
         | Event::NewsNode(_)
-        | Event::NewsNodeDeleted { .. } => {}
+        | Event::NewsNodeDeleted { .. }
+        | Event::NewsNotify(_) => {}
         Event::Kicked => return false,
     }
     true

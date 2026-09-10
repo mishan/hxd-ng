@@ -12,10 +12,10 @@ use std::time::{Duration, SystemTime};
 use super::query::{words, Field, Term};
 use super::{
     Article, ArticleId, ArticlePage, Author, BodyType, Hit, NewNode, NewPost, NewsError, NewsStore,
-    Node, NodeId, NodeKind, Posted, Reference, SearchPage, SearchQuery, ThreadHead, ThreadPage,
-    ThreadQuery,
+    Node, NodeId, NodeKind, Posted, Reference, SearchPage, SearchQuery, SubScope, Subscriber,
+    Subscription, ThreadHead, ThreadPage, ThreadQuery,
 };
-use crate::inbox::StoreError;
+use crate::inbox::{Mailbox, StoreError};
 
 /// How much of a body a memory store's snippet shows.
 const SNIPPET_CHARS: usize = 160;
@@ -132,6 +132,24 @@ struct ArticleRow {
     deleted: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SubRow {
+    /// Insertion order, which is what "newest first" sorts by.
+    id: u64,
+    owner: Mailbox,
+    scope: SubScope,
+    auto: bool,
+    muted: bool,
+    last_seen: ArticleId,
+    at: SystemTime,
+}
+
+/// Does the row owned by `row` belong to `who`? The mailbox rule, which
+/// is the only way a subscription is ever found.
+fn owns(who: &Mailbox, row: &Mailbox) -> bool {
+    who.matches(&row.login, row.fingerprint.as_ref())
+}
+
 #[derive(Default)]
 struct Inner {
     last_node: NodeId,
@@ -142,6 +160,8 @@ struct Inner {
     articles: Vec<ArticleRow>,
     /// `(src, dst)` in order of appearance within each `src`.
     refs: Vec<(ArticleId, ArticleId)>,
+    last_sub: u64,
+    subs: Vec<SubRow>,
 }
 
 /// A [`NewsStore`] in a few `Vec`s.
@@ -270,6 +290,87 @@ impl Inner {
         self.refs
             .retain(|(src, dst)| !gone.contains(src) && !gone.contains(dst));
     }
+
+    /// The articles a scope is about: every one in a thread, the starters
+    /// in a category.
+    fn in_scope(&self, scope: SubScope) -> impl Iterator<Item = &ArticleRow> {
+        self.articles.iter().filter(move |a| match scope {
+            SubScope::Thread(root) => a.root == root,
+            SubScope::Category(c) => a.category == c && a.parent.is_none(),
+        })
+    }
+
+    fn newest(&self, scope: SubScope) -> ArticleId {
+        self.in_scope(scope).map(|a| a.id).max().unwrap_or(0)
+    }
+
+    /// Live articles in `scope` past `last_seen` that `owner` did not
+    /// write.
+    fn unread(&self, owner: &Mailbox, scope: SubScope, last_seen: ArticleId) -> usize {
+        self.in_scope(scope)
+            .filter(|a| a.id > last_seen && !a.deleted && !a.author.is(owner))
+            .count()
+    }
+
+    /// Is there something at `scope` to subscribe to?
+    fn check_target(&self, scope: SubScope) -> Result<(), NewsError> {
+        match scope {
+            SubScope::Thread(root) => self
+                .row(root)
+                .filter(|a| a.parent.is_none())
+                .map(|_| ())
+                .ok_or(NewsError::NoSuchArticle),
+            SubScope::Category(c) => match self.node(c) {
+                None => Err(NewsError::NoSuchNode),
+                Some(n) if n.kind != NodeKind::Category => Err(NewsError::NotACategory),
+                Some(_) => Ok(()),
+            },
+        }
+    }
+
+    fn sub_mut(&mut self, owner: &Mailbox, scope: SubScope) -> Option<&mut SubRow> {
+        self.subs
+            .iter_mut()
+            .find(|r| r.scope == scope && owns(owner, &r.owner))
+    }
+
+    /// A new row, caught up, or `TooManySubs`.
+    fn add_sub(
+        &mut self,
+        owner: &Mailbox,
+        scope: SubScope,
+        auto: bool,
+        muted: bool,
+        max_subs: usize,
+        at: SystemTime,
+    ) -> Result<(), NewsError> {
+        self.check_target(scope)?;
+        if self.subs.iter().filter(|r| owns(owner, &r.owner)).count() >= max_subs {
+            return Err(NewsError::TooManySubs);
+        }
+        self.last_sub += 1;
+        let last_seen = self.newest(scope);
+        self.subs.push(SubRow {
+            id: self.last_sub,
+            owner: owner.clone(),
+            scope,
+            auto,
+            muted,
+            last_seen,
+            at,
+        });
+        Ok(())
+    }
+
+    /// Rows whose thread or category has gone — with a category's
+    /// deletion, or a thread's retention.
+    fn drop_orphan_subs(&mut self) {
+        let subs = std::mem::take(&mut self.subs);
+        self.subs = subs
+            .into_iter()
+            .filter(|r| self.check_target(r.scope).is_ok())
+            .collect();
+    }
 }
 
 impl NewsStore for MemoryNews {
@@ -355,6 +456,7 @@ impl NewsStore for MemoryNews {
         };
         inner.remove_articles(&gone);
         inner.nodes.retain(|n| n.id != id);
+        inner.drop_orphan_subs();
         Ok(gone.len() as u64)
     }
 
@@ -583,6 +685,7 @@ impl NewsStore for MemoryNews {
             .map(|a| a.id)
             .collect();
         inner.remove_articles(&gone);
+        inner.drop_orphan_subs();
         let mut touched: Vec<NodeId> = stale.into_iter().map(|(_, c)| c).collect();
         touched.sort_unstable();
         touched.dedup();
@@ -649,6 +752,196 @@ impl NewsStore for MemoryNews {
     fn reindex(&self) -> Result<u64, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.articles.iter().filter(|a| !a.deleted).count() as u64)
+    }
+
+    fn subscribe(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        auto: bool,
+        max_subs: usize,
+        at: SystemTime,
+    ) -> Result<usize, NewsError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.check_target(scope)?;
+        let last_seen = match inner.sub_mut(owner, scope) {
+            Some(row) => {
+                // Asking is explicit, and asking to hear about something
+                // is not asking for it muted.
+                if !auto {
+                    row.auto = false;
+                    row.muted = false;
+                }
+                row.last_seen
+            }
+            None => {
+                inner.add_sub(owner, scope, auto, false, max_subs, at)?;
+                inner.newest(scope)
+            }
+        };
+        Ok(inner.unread(owner, scope, last_seen))
+    }
+
+    fn unsubscribe(&self, owner: &Mailbox, scope: SubScope) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.subs.len();
+        inner
+            .subs
+            .retain(|r| !(r.scope == scope && owns(owner, &r.owner)));
+        Ok(inner.subs.len() != before)
+    }
+
+    fn mute(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        muted: bool,
+        max_subs: usize,
+        at: SystemTime,
+    ) -> Result<(), NewsError> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.sub_mut(owner, scope) {
+            Some(row) => {
+                row.muted = muted;
+                Ok(())
+            }
+            None if muted => inner.add_sub(owner, scope, false, true, max_subs, at),
+            None => Ok(()),
+        }
+    }
+
+    fn subscriptions(&self, owner: &Mailbox) -> Result<Vec<Subscription>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut rows: Vec<&SubRow> = inner
+            .subs
+            .iter()
+            .filter(|r| owns(owner, &r.owner))
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.id));
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let (category, label) = match r.scope {
+                    SubScope::Thread(root) => {
+                        let a = inner.row(root)?;
+                        (a.category, a.subject.clone())
+                    }
+                    SubScope::Category(c) => (c, inner.node(c)?.name.clone()),
+                };
+                Some(Subscription {
+                    scope: r.scope,
+                    category,
+                    label,
+                    auto: r.auto,
+                    muted: r.muted,
+                    last_seen: r.last_seen,
+                    unread: inner.unread(owner, r.scope, r.last_seen),
+                    at: r.at,
+                })
+            })
+            .collect())
+    }
+
+    fn seen(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        up_to: ArticleId,
+    ) -> Result<Option<usize>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let newest = inner.newest(scope);
+        let Some(row) = inner.sub_mut(owner, scope) else {
+            return Ok(None);
+        };
+        row.last_seen = row.last_seen.max(up_to.min(newest));
+        let last_seen = row.last_seen;
+        Ok(Some(inner.unread(owner, scope, last_seen)))
+    }
+
+    fn subscribers(
+        &self,
+        root: ArticleId,
+        category: Option<NodeId>,
+    ) -> Result<Vec<Subscriber>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .subs
+            .iter()
+            .filter(|r| {
+                r.scope == SubScope::Thread(root)
+                    || category.is_some_and(|c| r.scope == SubScope::Category(c))
+            })
+            .map(|r| Subscriber {
+                owner: r.owner.clone(),
+                scope: r.scope,
+                muted: r.muted,
+                unread: inner.unread(&r.owner, r.scope, r.last_seen),
+            })
+            .collect())
+    }
+
+    fn unread_total(&self, owner: &Mailbox) -> Result<usize, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .subs
+            .iter()
+            .filter(|r| !r.muted && owns(owner, &r.owner))
+            .map(|r| inner.unread(owner, r.scope, r.last_seen))
+            .sum())
+    }
+
+    fn subs_claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let identified = Mailbox::identified(login, *fingerprint);
+        let held: Vec<SubScope> = inner
+            .subs
+            .iter()
+            .filter(|r| owns(&identified, &r.owner))
+            .map(|r| r.scope)
+            .collect();
+        let mut moved = 0;
+        inner.subs.retain_mut(|r| {
+            if r.owner.fingerprint.is_some() || r.owner.login != login {
+                return true;
+            }
+            moved += 1;
+            if held.contains(&r.scope) {
+                return false;
+            }
+            r.owner.fingerprint = Some(*fingerprint);
+            true
+        });
+        Ok(moved)
+    }
+
+    fn subs_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let held: Vec<SubScope> = inner
+            .subs
+            .iter()
+            .filter(|r| r.owner.fingerprint.as_ref() == Some(to))
+            .map(|r| r.scope)
+            .collect();
+        let mut moved = 0;
+        inner.subs.retain_mut(|r| {
+            if r.owner.fingerprint.as_ref() != Some(from) {
+                return true;
+            }
+            moved += 1;
+            if held.contains(&r.scope) {
+                return false;
+            }
+            r.owner.fingerprint = Some(*to);
+            true
+        });
+        Ok(moved)
+    }
+
+    fn subs_purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.subs.len();
+        inner.subs.retain(|r| !owns(of, &r.owner));
+        Ok(before - inner.subs.len())
     }
 }
 

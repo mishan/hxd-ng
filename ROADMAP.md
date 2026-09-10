@@ -328,16 +328,19 @@ with per-part MIME types since it was written. The design:
   cannot send — and the read format shows the same two headers, so it
   teaches the convention without a manual.
 
-**Begun: threaded news with plain bodies, on the ng wire, and search.**
-The domain (`hxd-core::news`, stage W1), the SQLite store (W2), full-text
-search over FTS5 with its closed query grammar and `hxd news-reindex`
-(W4, schema version 4), and the ng requests, events and login block that
-need nothing from markdown or attachments (the core of W6) have landed,
-with conformance suites both stores pass and hx-ng's News view as the
-first client. Next, in the order `docs/news.md` §16 allows: markdown
-(W3) and attachments (W5), then subscriptions and notifications (W7),
-moderation (W8), and the legacy binding that closes this phase (W9).
-`hxd-session` still dispatches no news opcode.
+**Begun: threaded news with plain bodies, on the ng wire, search, and
+subscriptions.** The domain (`hxd-core::news`, stage W1), the SQLite
+store (W2), full-text search over FTS5 with its closed query grammar and
+`hxd news-reindex` (W4, schema version 4), the ng requests, events and
+login block that need nothing from markdown or attachments (the core of
+W6), and subscriptions with the notifications they earn (W7, schema
+version 5: follow and mute, a computed unread badge, `news_notify`, and
+the catch-up rule in front of a `NotificationGateway` that no gateway
+implements yet) have landed. Both stores pass the conformance suites,
+and hx-ng's News view is the first client. Next, in the order
+`docs/news.md` §16 allows: markdown (W3) and attachments (W5), moderation
+(W8), and the legacy binding that closes this phase (W9). `hxd-session`
+still dispatches no news opcode.
 
 ## Phase 5 — Hardening and parity extras
 

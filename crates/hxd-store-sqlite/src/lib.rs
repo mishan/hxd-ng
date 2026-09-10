@@ -56,7 +56,7 @@ mod news;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -276,6 +276,32 @@ CREATE VIRTUAL TABLE news_fts USING fts5(
 INSERT INTO news_fts (news_fts, rank) VALUES ('secure-delete', 1);
 INSERT INTO news_fts (rowid, subject, search_body, author)
   SELECT id, subject, search_body, author FROM news_article WHERE deleted_at IS NULL;
+";
+
+// News subscriptions (`docs/news.md` §10.4): a subscription and a cursor,
+// and no notification table, because the article is already the durable
+// thing. Unread is counted from `news_article` when asked.
+//
+// Keyed by mailbox the way `message` is, and for the reason `mailbox_sql`
+// gives: two shapes of key, so two partial unique indexes, each of which
+// is also the index its owner's lookups use. `news_sub_target` is not
+// partial on `muted` as the design sketched it, because a post's audience
+// has to see a muted row in order to honor it.
+const SCHEMA_V5: &str = "
+CREATE TABLE news_sub (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner     TEXT    NOT NULL,
+  owner_fp  TEXT,
+  scope     INTEGER NOT NULL,
+  target    INTEGER NOT NULL,
+  auto      INTEGER NOT NULL DEFAULT 0,
+  muted     INTEGER NOT NULL DEFAULT 0,
+  last_seen INTEGER NOT NULL DEFAULT 0,
+  at        INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX news_sub_fp    ON news_sub (owner_fp, scope, target) WHERE owner_fp IS NOT NULL;
+CREATE UNIQUE INDEX news_sub_login ON news_sub (owner, scope, target) WHERE owner_fp IS NULL;
+CREATE INDEX news_sub_target ON news_sub (scope, target);
 ";
 
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL
@@ -507,6 +533,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 4 {
         steps.push_str(SCHEMA_V4);
+    }
+    if version < 5 {
+        steps.push_str(SCHEMA_V5);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"

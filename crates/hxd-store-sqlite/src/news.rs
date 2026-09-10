@@ -13,14 +13,15 @@
 
 use std::time::{Duration, SystemTime};
 
-use hxd_core::inbox::StoreError;
+use hxd_core::inbox::{Mailbox, StoreError};
 use hxd_core::news::{
     Article, ArticleId, ArticlePage, Author, BodyType, NewNode, NewPost, NewsError, NewsStore,
-    Node, NodeId, NodeKind, Posted, Reference, ThreadHead, ThreadPage, ThreadQuery,
+    Node, NodeId, NodeKind, Posted, Reference, SubScope, Subscriber, Subscription, ThreadHead,
+    ThreadPage, ThreadQuery,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
-use super::{cutoff, fp_from_hex, fp_hex, from_unix, unix, SqliteStore};
+use super::{bind, cutoff, fp_from_hex, fp_hex, from_unix, mailbox_sql, unix, SqliteStore};
 
 const ARTICLE_COLUMNS: &str = "id, category, parent, root, depth, nick, login, login_fp, \
                                subject, body, mime, at, deleted_at IS NOT NULL";
@@ -342,6 +343,188 @@ fn bump_delete_sn(conn: &Connection, category: i64) -> Result<(), StoreError> {
     Ok(())
 }
 
+// --- Subscriptions (docs/news.md §10.4) ---------------------------------
+//
+// A row is a scope and a cursor. Unread is counted from `news_article`
+// every time it is asked — the thread's articles on `news_article_root`,
+// a category's starters on `news_article_roots` — so a badge cannot
+// drift from what it counts.
+
+/// `?1`'s bind for a scope's target.
+fn target_i64(scope: SubScope) -> i64 {
+    match scope {
+        SubScope::Thread(root) => i64::from(root),
+        SubScope::Category(c) => clamp_node(c),
+    }
+}
+
+/// The articles a scope is about, as a predicate over `news_article`
+/// binding its target at `?1`: every article in a thread, the starters in
+/// a category.
+fn scope_sql(scope: SubScope) -> &'static str {
+    match scope {
+        SubScope::Thread(_) => "root = ?1",
+        SubScope::Category(_) => "category = ?1 AND parent IS NULL",
+    }
+}
+
+/// "Not written by `m`": the mailbox rule over an article's author
+/// columns, binding [`bind`]'s value at `?n`. `IS` rather than `=`, because
+/// a guest's article has no login, and `NULL = ?` would make it neither
+/// someone's nor not.
+fn not_by(m: &Mailbox, n: usize) -> String {
+    match m.fingerprint {
+        Some(_) => format!("login_fp IS NOT ?{n}"),
+        None => format!("NOT (login_fp IS NULL AND login IS ?{n})"),
+    }
+}
+
+/// The newest article in a scope, tombstones included — a cursor at a
+/// tombstone is still a cursor past everything before it.
+fn newest(conn: &Connection, scope: SubScope) -> Result<ArticleId, StoreError> {
+    let n: Option<i64> = sql(conn.query_row(
+        &format!(
+            "SELECT MAX(id) FROM news_article WHERE {}",
+            scope_sql(scope)
+        ),
+        params![target_i64(scope)],
+        |r| r.get(0),
+    ))?;
+    Ok(n.map(article_id).transpose()?.unwrap_or(0))
+}
+
+fn unread(
+    conn: &Connection,
+    owner: &Mailbox,
+    scope: SubScope,
+    last_seen: ArticleId,
+) -> Result<usize, StoreError> {
+    let n: i64 = sql(conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM news_article
+              WHERE {} AND id > ?2 AND deleted_at IS NULL AND {}",
+            scope_sql(scope),
+            not_by(owner, 3)
+        ),
+        params![target_i64(scope), i64::from(last_seen), bind(owner)],
+        |r| r.get(0),
+    ))?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
+/// Is there something at `scope` to subscribe to?
+fn check_target(conn: &Connection, scope: SubScope) -> Result<(), NewsError> {
+    match scope {
+        SubScope::Thread(root) => {
+            let parent: Option<Option<i64>> = sql(conn
+                .query_row(
+                    "SELECT parent FROM news_article WHERE id = ?1",
+                    params![i64::from(root)],
+                    |r| r.get(0),
+                )
+                .optional())?;
+            match parent {
+                Some(None) => Ok(()),
+                _ => Err(NewsError::NoSuchArticle),
+            }
+        }
+        SubScope::Category(c) => match kind_of(conn, c)? {
+            None => Err(NewsError::NoSuchNode),
+            Some(NodeKind::Bundle) => Err(NewsError::NotACategory),
+            Some(NodeKind::Category) => Ok(()),
+        },
+    }
+}
+
+/// `owner`'s row for `scope`: its id and cursor.
+fn sub_row(
+    conn: &Connection,
+    owner: &Mailbox,
+    scope: SubScope,
+) -> Result<Option<(i64, ArticleId)>, StoreError> {
+    let row: Option<(i64, i64)> = sql(conn
+        .query_row(
+            &format!(
+                "SELECT id, last_seen FROM news_sub
+                  WHERE {} AND scope = ?2 AND target = ?3",
+                mailbox_sql(owner, "owner", 1)
+            ),
+            params![bind(owner), scope.kind_i64(), target_i64(scope)],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional())?;
+    row.map(|(id, seen)| Ok((id, article_id(seen)?)))
+        .transpose()
+}
+
+/// A new row for `owner`, caught up, or `TooManySubs`. Inside the
+/// caller's transaction, so the count and the insert see one database.
+fn add_sub(
+    conn: &Connection,
+    owner: &Mailbox,
+    scope: SubScope,
+    auto: bool,
+    muted: bool,
+    max_subs: usize,
+    at: SystemTime,
+) -> Result<ArticleId, NewsError> {
+    check_target(conn, scope)?;
+    let held: i64 = sql(conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM news_sub WHERE {}",
+            mailbox_sql(owner, "owner", 1)
+        ),
+        params![bind(owner)],
+        |r| r.get(0),
+    ))?;
+    if usize::try_from(held).unwrap_or(usize::MAX) >= max_subs {
+        return Err(NewsError::TooManySubs);
+    }
+    let last_seen = newest(conn, scope)?;
+    sql(conn.execute(
+        "INSERT INTO news_sub (owner, owner_fp, scope, target, auto, muted, last_seen, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            owner.login,
+            owner.fingerprint.as_ref().map(fp_hex),
+            scope.kind_i64(),
+            target_i64(scope),
+            auto,
+            muted,
+            i64::from(last_seen),
+            unix(at),
+        ],
+    ))?;
+    Ok(last_seen)
+}
+
+/// Rows whose thread or category has gone. Run inside every write that
+/// removes either, so a `news_subs` listing never names nothing and a
+/// dead row never counts against `max_subs`.
+fn drop_orphan_subs(conn: &Connection) -> Result<(), StoreError> {
+    sql(conn.execute(
+        "DELETE FROM news_sub
+          WHERE (scope = 0 AND NOT EXISTS (SELECT 1 FROM news_article a
+                                            WHERE a.id = news_sub.target AND a.parent IS NULL))
+             OR (scope = 1 AND NOT EXISTS (SELECT 1 FROM news_node n
+                                            WHERE n.id = news_sub.target))",
+        [],
+    ))?;
+    Ok(())
+}
+
+fn sub_owner(login: String, fp: Option<String>) -> Result<Mailbox, StoreError> {
+    Ok(Mailbox {
+        login,
+        fingerprint: fp.as_deref().map(fp_from_hex).transpose()?,
+    })
+}
+
+fn scope_of(kind: i64, target: i64) -> Result<SubScope, StoreError> {
+    SubScope::from_parts(kind, target)
+        .ok_or_else(|| StoreError::new(format!("news_sub scope {kind} target {target}")))
+}
+
 // --- The search index (docs/news.md §6) ---------------------------------
 //
 // **It holds live articles and only those.** An external-content index
@@ -586,6 +769,7 @@ impl NewsStore for SqliteStore {
             "DELETE FROM news_node WHERE id = ?1",
             params![clamp_node(id)],
         ))?;
+        drop_orphan_subs(&tx)?;
         sql(tx.commit())?;
         Ok(gone)
     }
@@ -913,6 +1097,7 @@ impl NewsStore for SqliteStore {
         for category in touched {
             bump_delete_sn(&tx, category)?;
         }
+        drop_orphan_subs(&tx)?;
         sql(tx.commit())?;
         Ok(gone)
     }
@@ -1020,5 +1205,269 @@ impl NewsStore for SqliteStore {
         let indexed = sql(tx.execute(INDEX_LIVE, []))?;
         sql(tx.commit())?;
         Ok(indexed as u64)
+    }
+
+    fn subscribe(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        auto: bool,
+        max_subs: usize,
+        at: SystemTime,
+    ) -> Result<usize, NewsError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        check_target(&tx, scope)?;
+        let last_seen = match sub_row(&tx, owner, scope)? {
+            Some((id, seen)) => {
+                // Asking is explicit, and asking to hear about something
+                // is not asking for it muted.
+                if !auto {
+                    sql(tx.execute(
+                        "UPDATE news_sub SET auto = 0, muted = 0 WHERE id = ?1",
+                        params![id],
+                    ))?;
+                }
+                seen
+            }
+            None => add_sub(&tx, owner, scope, auto, false, max_subs, at)?,
+        };
+        let n = unread(&tx, owner, scope, last_seen)?;
+        sql(tx.commit())?;
+        Ok(n)
+    }
+
+    fn unsubscribe(&self, owner: &Mailbox, scope: SubScope) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let gone = sql(conn.execute(
+            &format!(
+                "DELETE FROM news_sub WHERE {} AND scope = ?2 AND target = ?3",
+                mailbox_sql(owner, "owner", 1)
+            ),
+            params![bind(owner), scope.kind_i64(), target_i64(scope)],
+        ))?;
+        Ok(gone > 0)
+    }
+
+    fn mute(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        muted: bool,
+        max_subs: usize,
+        at: SystemTime,
+    ) -> Result<(), NewsError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        match sub_row(&tx, owner, scope)? {
+            Some((id, _)) => {
+                sql(tx.execute(
+                    "UPDATE news_sub SET muted = ?2 WHERE id = ?1",
+                    params![id, muted],
+                ))?;
+            }
+            None if muted => {
+                add_sub(&tx, owner, scope, false, true, max_subs, at)?;
+            }
+            None => {}
+        }
+        sql(tx.commit())?;
+        Ok(())
+    }
+
+    fn subscriptions(&self, owner: &Mailbox) -> Result<Vec<Subscription>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let rows: Vec<(i64, i64, bool, bool, i64, i64)> = {
+            let mut stmt = sql(conn.prepare(&format!(
+                "SELECT scope, target, auto, muted, last_seen, at FROM news_sub
+                  WHERE {} ORDER BY id DESC",
+                mailbox_sql(owner, "owner", 1)
+            )))?;
+            let rows = sql(stmt.query_map(params![bind(owner)], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            }))?;
+            rows.collect::<rusqlite::Result<_>>()
+                .map_err(StoreError::new)?
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for (kind, target, auto, muted, last_seen, at) in rows {
+            let scope = scope_of(kind, target)?;
+            let found: Option<(i64, String)> = match scope {
+                SubScope::Thread(root) => sql(conn
+                    .query_row(
+                        "SELECT category, subject FROM news_article WHERE id = ?1",
+                        params![i64::from(root)],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional())?,
+                SubScope::Category(c) => sql(conn
+                    .query_row(
+                        "SELECT id, name FROM news_node WHERE id = ?1",
+                        params![clamp_node(c)],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional())?,
+            };
+            // Every write that removes a target removes its rows too, so
+            // this is a row that raced one; it is gone either way.
+            let Some((category, label)) = found else {
+                continue;
+            };
+            let last_seen = article_id(last_seen)?;
+            out.push(Subscription {
+                scope,
+                category: node_id(category)?,
+                label,
+                auto,
+                muted,
+                last_seen,
+                unread: unread(&conn, owner, scope, last_seen)?,
+                at: from_unix(at),
+            });
+        }
+        Ok(out)
+    }
+
+    fn seen(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        up_to: ArticleId,
+    ) -> Result<Option<usize>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let Some((id, last_seen)) = sub_row(&tx, owner, scope)? else {
+            return Ok(None);
+        };
+        let last_seen = last_seen.max(up_to.min(newest(&tx, scope)?));
+        sql(tx.execute(
+            "UPDATE news_sub SET last_seen = ?2 WHERE id = ?1",
+            params![id, i64::from(last_seen)],
+        ))?;
+        let n = unread(&tx, owner, scope, last_seen)?;
+        sql(tx.commit())?;
+        Ok(Some(n))
+    }
+
+    fn subscribers(
+        &self,
+        root: ArticleId,
+        category: Option<NodeId>,
+    ) -> Result<Vec<Subscriber>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let rows: Vec<(String, Option<String>, i64, i64, bool, i64)> = {
+            let mut stmt = sql(conn.prepare(
+                "SELECT owner, owner_fp, scope, target, muted, last_seen FROM news_sub
+                  WHERE (scope = 0 AND target = ?1) OR (scope = 1 AND target = ?2)",
+            ))?;
+            // No node has id -1, so a thread-only question binds that.
+            let category = category.map_or(-1, clamp_node);
+            let rows = sql(stmt.query_map(params![i64::from(root), category], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            }))?;
+            rows.collect::<rusqlite::Result<_>>()
+                .map_err(StoreError::new)?
+        };
+        rows.into_iter()
+            .map(|(login, fp, kind, target, muted, last_seen)| {
+                let owner = sub_owner(login, fp)?;
+                let scope = scope_of(kind, target)?;
+                let unread = unread(&conn, &owner, scope, article_id(last_seen)?)?;
+                Ok(Subscriber {
+                    owner,
+                    scope,
+                    muted,
+                    unread,
+                })
+            })
+            .collect()
+    }
+
+    fn unread_total(&self, owner: &Mailbox) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let rows: Vec<(i64, i64, i64)> = {
+            let mut stmt = sql(conn.prepare(&format!(
+                "SELECT scope, target, last_seen FROM news_sub WHERE {} AND muted = 0",
+                mailbox_sql(owner, "owner", 1)
+            )))?;
+            let rows = sql(stmt.query_map(params![bind(owner)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            }))?;
+            rows.collect::<rusqlite::Result<_>>()
+                .map_err(StoreError::new)?
+        };
+        let mut total = 0;
+        for (kind, target, last_seen) in rows {
+            total += unread(
+                &conn,
+                owner,
+                scope_of(kind, target)?,
+                article_id(last_seen)?,
+            )?;
+        }
+        Ok(total)
+    }
+
+    fn subs_claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let fp = fp_hex(fingerprint);
+        // A scope the identity already follows keeps the identity's row.
+        let dropped = sql(tx.execute(
+            "DELETE FROM news_sub
+              WHERE owner_fp IS NULL AND owner = ?1
+                AND EXISTS (SELECT 1 FROM news_sub s
+                             WHERE s.owner_fp = ?2 AND s.scope = news_sub.scope
+                               AND s.target = news_sub.target)",
+            params![login, fp],
+        ))?;
+        let moved = sql(tx.execute(
+            "UPDATE news_sub SET owner_fp = ?2 WHERE owner_fp IS NULL AND owner = ?1",
+            params![login, fp],
+        ))?;
+        sql(tx.commit())?;
+        Ok(dropped + moved)
+    }
+
+    fn subs_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let (from, to) = (fp_hex(from), fp_hex(to));
+        let dropped = sql(tx.execute(
+            "DELETE FROM news_sub
+              WHERE owner_fp = ?1
+                AND EXISTS (SELECT 1 FROM news_sub s
+                             WHERE s.owner_fp = ?2 AND s.scope = news_sub.scope
+                               AND s.target = news_sub.target)",
+            params![from, to],
+        ))?;
+        let moved = sql(tx.execute(
+            "UPDATE news_sub SET owner_fp = ?2 WHERE owner_fp = ?1",
+            params![from, to],
+        ))?;
+        sql(tx.commit())?;
+        Ok(dropped + moved)
+    }
+
+    fn subs_purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            &format!("DELETE FROM news_sub WHERE {}", mailbox_sql(of, "owner", 1)),
+            params![bind(of)],
+        ))
     }
 }

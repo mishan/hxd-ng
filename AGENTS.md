@@ -173,8 +173,9 @@ Three layers, all `cargo test --workspace`:
   at login, resync, blocks, retention) and `news.rs` (threaded news on
   the ng wire: the tree and its containment rules, threads in reading
   order and paged both ways, references and backlinks, tombstones, who
-  hears that the news changed — with a classic client in the room to
-  show the legacy wire is untouched).
+  hears that the news changed and who hears that it is theirs, following
+  and muting — with a classic client in the room to show the legacy wire
+  is untouched).
 - The scripted legacy client packs and parses with the same pinned
   `hxproto` revision GtkHx uses, so e2e doubles as wire-compat
   checking.
@@ -264,8 +265,10 @@ room and one SFU. The large open fronts, in rough order: HOPE + ciphers on the
 legacy wire (`hxcrypto` currently lives in GtkHx), the ng rate-limit and
 client-quickstart polish, the fogWraith Text-Encoding capability (cheap —
 the UTF-8 interior already satisfies its core mandate), files/HTXF, the
-rest of news (the domain, store, search and ng wire have landed with
-plain bodies; markdown, attachments, notifications and the legacy
-binding are staged in `docs/news.md` §16), and eventually the
+rest of news (the domain, store, search, subscriptions and ng wire have
+landed with plain bodies; markdown, attachments, moderation and the
+legacy binding are staged in `docs/news.md` §16), the push gateway itself
+(`docs/push-notifications.md` P3 onward — the domain already decides who
+is notified, for private messages and for news), and eventually the
 persistence/clustering phases. The mobile app the ng
 protocol exists for has not been started.

@@ -550,6 +550,13 @@ impl crate::AccountDirectory for Directory {
         let l = login.to_ascii_lowercase();
         self.0.iter().find(|m| m.login == l).cloned()
     }
+
+    fn mailbox_access(&self, who: &crate::inbox::Mailbox) -> Option<crate::AccessBits> {
+        self.0
+            .iter()
+            .any(|m| who.matches(&m.login, m.fingerprint.as_ref()))
+            .then(crate::AccessBits::empty)
+    }
 }
 
 /// A core that has both an inbox and media, which is what a refused

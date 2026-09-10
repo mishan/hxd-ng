@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hxd_core::{Core, NewsPolicy};
+use hxd_core::{Core, NewsPolicy, NotifyPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::Caps;
 use hxd_session::frame::{pack_frame, read_frame, Frame};
@@ -47,15 +47,20 @@ async fn start_server(dir: &Path, news: Option<NewsPolicy>) -> (SocketAddr, Sock
         )
         .unwrap();
     }
+    let files = Arc::new(hxd_auth_file::FileAuth::new(&accounts));
     let core = match news {
+        // The accounts as well, as `hxd` wires them: who a post may
+        // notify is a question about accounts nobody is logged into.
         Some(policy) => {
             let store = SqliteStore::open(dir.join("server.sqlite"), Synchronous::Normal).unwrap();
-            Core::new().with_news(Arc::new(store), policy)
+            Core::new()
+                .with_news(Arc::new(store), policy)
+                .with_accounts(files.clone())
         }
         None => Core::new(),
     };
     let core = Arc::new(core);
-    let auth: Arc<dyn hxd_core::AuthBackend> = Arc::new(hxd_auth_file::FileAuth::new(accounts));
+    let auth: Arc<dyn hxd_core::AuthBackend> = files;
     let legacy_ctx = ServerCtx {
         core: core.clone(),
         auth: auth.clone(),
@@ -99,6 +104,7 @@ async fn start_server(dir: &Path, news: Option<NewsPolicy>) -> (SocketAddr, Sock
 fn news_server() -> NewsPolicy {
     NewsPolicy {
         max_depth: 3,
+        notify: Some(NotifyPolicy::default()),
         ..NewsPolicy::default()
     }
 }
@@ -296,6 +302,185 @@ async fn the_login_reply_says_what_this_session_may_do() {
         hello["news"]["post"], false,
         "a reader who may not post is told so"
     );
+}
+
+#[tokio::test]
+async fn an_answer_reaches_whoever_asked_and_nobody_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, hello) = Ng::login(ng, "alice").await;
+    assert_eq!(hello["news"]["subscribe"], true);
+    assert_eq!(hello["news"]["auto_subscribe"], "participated");
+    assert_eq!(hello["news"]["unread"], 0);
+    let (mut bob, _) = Ng::login(ng, "bob").await;
+    let (mut lurker, _) = Ng::login(ng, "lurker").await;
+
+    let cat = category(&mut admin, None, "General").await;
+    let root = post(&mut alice, cat, None, "A question", "Does it ring?").await;
+    // Asking followed the thread, with nothing to click.
+    let subs = alice.ok("news_subs", json!({})).await;
+    assert_eq!(
+        subs["subs"],
+        json!([{
+            "scope": "thread", "target": root, "category": cat, "subject": "A question",
+            "auto": true, "muted": false, "unread": 0, "last_seen": root,
+        }])
+    );
+
+    let answer = post(&mut bob, cat, Some(root), "Re: A question", "It rings.").await;
+    let notice = alice.event("news_notify", |d| d["article"] == answer).await;
+    let d = &notice["data"];
+    assert_eq!(d["reason"], "reply");
+    assert_eq!(
+        (d["scope"].clone(), d["target"].clone()),
+        (json!("thread"), json!(root))
+    );
+    assert_eq!(
+        (d["root"].clone(), d["category"].clone()),
+        (json!(root), json!(cat))
+    );
+    assert_eq!(d["from"]["login"], "bob");
+    assert_eq!(d["excerpt"], "It rings.");
+    assert_eq!(d["unread"], 1);
+
+    // Every reader hears that the category changed; only the asker hears
+    // that the answer is hers, and the answerer is not news to himself.
+    lurker.event("news_posted", |d| d["id"] == answer).await;
+    lurker.no_event("news_notify").await;
+    bob.no_event("news_notify").await;
+
+    // A second answer is still hers, and the badge climbs.
+    let again = post(&mut bob, cat, Some(root), "Re: A question", "Twice.").await;
+    let notice = alice.event("news_notify", |d| d["article"] == again).await;
+    assert_eq!(notice["data"]["unread"], 2);
+    let (_, hello) = Ng::login(ng, "alice").await;
+    assert_eq!(hello["news"]["unread"], 2, "the badge on the first frame");
+
+    // Saying so is what clears it, and an id from the future is the
+    // newest there is.
+    let seen = alice
+        .ok("news_seen", json!({ "thread": root, "up_to": u32::MAX }))
+        .await;
+    assert_eq!(seen["unread"], 0);
+    assert_eq!(
+        alice.ok("news_subs", json!({})).await["subs"][0]["last_seen"],
+        again
+    );
+}
+
+#[tokio::test]
+async fn a_category_hears_new_threads_and_a_mute_says_never() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let (mut bob, _) = Ng::login(ng, "bob").await;
+    let (mut lurker, _) = Ng::login(ng, "lurker").await;
+    let cat = category(&mut admin, None, "General").await;
+
+    let followed = lurker
+        .ok("news_subscribe", json!({ "category": cat }))
+        .await;
+    assert_eq!(followed["unread"], 0);
+    let root = post(&mut alice, cat, None, "Something new", "Start here.").await;
+    let notice = lurker.event("news_notify", |d| d["article"] == root).await;
+    assert_eq!(notice["data"]["reason"], "subscription");
+    assert_eq!(notice["data"]["scope"], "category");
+    assert_eq!(notice["data"]["target"], cat);
+
+    let reply = post(&mut bob, cat, Some(root), "Re: Something new", "Here.").await;
+    alice.event("news_notify", |d| d["article"] == reply).await;
+    lurker.event("news_posted", |d| d["id"] == reply).await;
+    lurker.no_event("news_notify").await;
+
+    // Muted: the row stays, and nothing in the thread rings.
+    alice
+        .ok("news_mute", json!({ "thread": root, "muted": true }))
+        .await;
+    let quiet = post(&mut bob, cat, Some(root), "Re: Something new", "Hello?").await;
+    alice.event("news_posted", |d| d["id"] == quiet).await;
+    alice.no_event("news_notify").await;
+    let subs = alice.ok("news_subs", json!({})).await;
+    assert_eq!(subs["subs"][0]["muted"], true);
+    assert_eq!(
+        subs["subs"][0]["unread"], 2,
+        "a cursor without a doorbell still counts"
+    );
+
+    // Unfollowing is idempotent, and leaves nothing to list.
+    for _ in 0..2 {
+        lurker
+            .ok("news_unsubscribe", json!({ "category": cat }))
+            .await;
+    }
+    assert_eq!(lurker.ok("news_subs", json!({})).await["subs"], json!([]));
+}
+
+#[tokio::test]
+async fn subscribing_says_why_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let (mut outsider, hello) = Ng::login(ng, "outsider").await;
+    assert_eq!(hello["news"]["subscribe"], false);
+    assert!(hello["news"].get("unread").is_none());
+    let cat = category(&mut admin, None, "General").await;
+    let root = post(&mut alice, cat, None, "Root", "body").await;
+    let reply = post(&mut alice, cat, Some(root), "Re: Root", "reply").await;
+
+    for (method, params, code) in [
+        ("news_subscribe", json!({}), "bad_request"),
+        (
+            "news_subscribe",
+            json!({ "thread": root, "category": cat }),
+            "bad_request",
+        ),
+        (
+            "news_subscribe",
+            json!({ "thread": reply }),
+            "no_such_article",
+        ),
+        ("news_subscribe", json!({ "category": 999 }), "no_such_node"),
+        ("news_mute", json!({ "thread": root }), "bad_request"),
+        ("news_seen", json!({ "thread": root }), "bad_request"),
+        ("news_subscribe", json!({ "thread": "one" }), "bad_request"),
+    ] {
+        assert_eq!(
+            alice.refused(method, params.clone()).await,
+            code,
+            "{method} {params}"
+        );
+    }
+    assert_eq!(
+        outsider
+            .refused("news_subscribe", json!({ "category": cat }))
+            .await,
+        "access_denied"
+    );
+    assert_eq!(
+        alice
+            .ok("news_seen", json!({ "category": cat, "up_to": root }))
+            .await["unread"],
+        0,
+        "seeing what you do not follow is nothing to refuse"
+    );
+
+    // A server that keeps no subscriptions says so, and offers none.
+    let quiet = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(
+        quiet.path(),
+        Some(NewsPolicy {
+            notify: None,
+            ..news_server()
+        }),
+    )
+    .await;
+    let (mut alice, hello) = Ng::login(ng, "alice").await;
+    assert_eq!(hello["news"]["subscribe"], false);
+    assert!(hello["news"].get("auto_subscribe").is_none());
+    assert_eq!(alice.refused("news_subs", json!({})).await, "not_available");
 }
 
 #[tokio::test]

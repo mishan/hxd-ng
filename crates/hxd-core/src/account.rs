@@ -273,4 +273,17 @@ pub trait AccountDirectory: Send + Sync + 'static {
     /// same reason the login flow answers `login_failed` to both a wrong
     /// name and a wrong password.
     fn inbox_account(&self, login: &str) -> Option<crate::inbox::Mailbox>;
+
+    /// What the account `who` names *now* may do, when it still names one
+    /// that keeps a mailbox; `None` otherwise.
+    ///
+    /// The question a news notification asks about someone who is not
+    /// here (`docs/news.md` §10.5): a subscription made last year belongs
+    /// to an account whose read-news bit may since have been revoked, and
+    /// the revocation has to stop the pushes. Resolved by the mailbox
+    /// rule — an identified mailbox by its fingerprint, whatever the
+    /// account is called now, and an unidentified one only by a login
+    /// whose account has no identity — so a login someone else has since
+    /// taken answers for nobody.
+    fn mailbox_access(&self, who: &crate::inbox::Mailbox) -> Option<AccessBits>;
 }

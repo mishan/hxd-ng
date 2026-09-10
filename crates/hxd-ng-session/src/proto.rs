@@ -535,6 +535,9 @@ pub fn event_json(se: &SeqEvent) -> String {
         }
         Event::NewsNode(node) => ("news_node", json!({ "node": crate::news::node_json(node) })),
         Event::NewsNodeDeleted { id } => ("news_node_deleted", json!({ "id": id })),
+        // Addressed to one account, where the four above go to every
+        // reader: the one a client raises a badge on (§10.6).
+        Event::NewsNotify(n) => ("news_notify", crate::news::notified_json(n)),
         // No ng mapping yet (private-chat family, and any future event this
         // build predates): emit a placeholder so seq accounting stays
         // gapless. Clients ignore unknown `ev` values per spec.

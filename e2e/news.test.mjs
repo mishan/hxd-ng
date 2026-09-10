@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 
-import { markedSpans, referenceSpans } from '@hotline-ng/client';
+import { markedSpans, newsScopeOf, referenceSpans } from '@hotline-ng/client';
 
 import { fleet } from './harness/client.mjs';
 import { startFailing, startServer } from './harness/server.mjs';
@@ -42,12 +42,18 @@ describe('threaded news', () => {
       // No `db` of its own: it shares the inbox's file, which is the
       // configuration the design recommends and the one only this layer
       // can see being honored.
-      config: { inbox: { db: 'server.sqlite' }, news: { max_depth: 2 } },
+      // `[news.notify]` empty: subscriptions on, every key its default,
+      // which is itself something only a real config file can say.
+      config: { inbox: { db: 'server.sqlite' }, news: { max_depth: 2, notify: {} } },
       accounts: {
         editor: account('editor', EDITOR),
         alice: account('alice', 'read_news = true\npost_news = true\n'),
         reader: account('reader', 'read_news = true\n'),
         outsider: account('outsider', ''),
+        // Accounts of their own for following, so what the cases above
+        // posted and answered is not already in their badges.
+        asker: account('asker', 'read_news = true\npost_news = true\n'),
+        follower: account('follower', 'read_news = true\n'),
       },
     });
   });
@@ -205,6 +211,49 @@ describe('threaded news', () => {
 
     await editor.conn.newsDelete(id);
     assert.equal((await reader.conn.newsSearch({ q: 'derivative' })).total, 0, 'a deletion reaches the index');
+  });
+
+  test('an answer reaches whoever asked, and following a category hears what starts there', async () => {
+    const editor = await login('editor');
+    const asker = await login('asker');
+    const follower = await login('follower');
+    assert.equal(asker.conn.news.subscribe, true);
+    assert.equal(asker.conn.news.auto_subscribe, 'participated', 'the default an empty section gets');
+    assert.equal(asker.conn.news.unread, 0);
+
+    const { node } = await editor.conn.newsNodeCreate({ kind: 'category', name: 'Questions' });
+    await follower.waitFor('news_node', { 'node.id': node.id });
+    const { id: root } = await asker.conn.newsPost({ category: node.id, subject: 'Does it ring?', body: 'Asking.' });
+    const { subs } = await asker.conn.newsSubs();
+    assert.deepEqual(
+      subs.map((s) => [s.scope, s.target, s.subject, s.auto]),
+      [['thread', root, 'Does it ring?', true]],
+      'asking followed the thread, with nothing to click',
+    );
+    assert.deepEqual(await follower.conn.newsSubscribe({ category: node.id }), { unread: 0 });
+
+    const { id: answer } = await editor.conn.newsPost({
+      category: node.id,
+      parent: root,
+      subject: 'Re: Does it ring?',
+      body: 'It rings.',
+    });
+    const notice = await asker.waitFor('news_notify', { article: answer });
+    assert.equal(notice.data.reason, 'reply');
+    assert.deepEqual(newsScopeOf(notice.data), { thread: root });
+    assert.equal(notice.data.from.login, 'editor');
+    assert.equal(notice.data.unread, 1);
+    await follower.waitFor('news_posted', { id: answer });
+    await follower.expectNo('news_notify', { article: answer }, { since: 0 });
+
+    const { id: started } = await editor.conn.newsPost({ category: node.id, subject: 'Another', body: 'New.' });
+    const heard = await follower.waitFor('news_notify', { article: started });
+    assert.equal(heard.data.reason, 'subscription');
+    assert.deepEqual(newsScopeOf(heard.data), { category: node.id });
+
+    assert.deepEqual(await asker.conn.newsSeen({ thread: root }, answer), { unread: 0 });
+    const again = await login('asker');
+    assert.equal(again.conn.news.unread, 0, 'the badge on the first frame agrees');
   });
 });
 
