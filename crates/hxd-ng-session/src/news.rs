@@ -184,6 +184,7 @@ fn thread_json(h: &ThreadHead) -> Value {
 /// `unread` is a store read, so this is called off the reactor.
 pub fn login_json(core: &Core, uid: Uid) -> Option<Value> {
     let p = core.news_policy()?;
+    let markdown = core.news_markdown().unwrap_or(MarkdownMode::Off);
     let mut block = json!({
         "post": core.news_may_post(uid),
         "attach": false,
@@ -192,9 +193,11 @@ pub fn login_json(core: &Core, uid: Uid) -> Option<Value> {
         "max_depth": p.max_depth,
         // `render` and `source` are one thing to an ng client: either way
         // it is handed the source to draw (§9.2). They differ only in
-        // what the server makes for search and for the legacy wire.
-        "markdown": p.markdown.name(),
-        "body_types": if p.markdown == MarkdownMode::Off {
+        // what the server makes for search and for the legacy wire, and
+        // what is said here is what the server does, not what it was
+        // asked to.
+        "markdown": markdown.name(),
+        "body_types": if markdown == MarkdownMode::Off {
             json!(["text/plain"])
         } else {
             json!(["text/plain", "text/markdown"])

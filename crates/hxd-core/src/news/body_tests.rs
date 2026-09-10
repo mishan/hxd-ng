@@ -183,4 +183,11 @@ fn render_with_no_parser_is_source() {
     let (core, uid, cat) = server(MarkdownMode::Render, None);
     let id = post(&core, uid, cat, "**hi** there", BodyType::Markdown).unwrap();
     assert_eq!(found(&core, uid, "there"), [id]);
+    assert_eq!(
+        core.news_markdown(),
+        Some(MarkdownMode::Source),
+        "and it says so, rather than promising a downgrade it never makes"
+    );
+    let (parsed, _, _) = server(MarkdownMode::Render, Some(Arc::new(Fake::default())));
+    assert_eq!(parsed.news_markdown(), Some(MarkdownMode::Render));
 }

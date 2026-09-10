@@ -61,6 +61,9 @@ struct Writer {
     out: String,
     limit: usize,
     cut: bool,
+    /// Whitespace did not fit. It is owed only if something follows it:
+    /// a document that ends exactly at the limit is whole, not cut.
+    full: bool,
     stack: Vec<Container>,
     /// A list item's marker, waiting for the item's first line.
     marker: Option<String>,
@@ -70,8 +73,11 @@ struct Writer {
     at_line_start: bool,
     /// A blank line is owed before the next block.
     blank: bool,
-    /// Inside a link or an image: where it goes, and its text so far.
-    link: Option<(String, String)>,
+    /// The links and images open around the text, innermost last: where
+    /// each goes, and its text so far. A stack, because an image may sit
+    /// inside a link — `[![alt](img)](news:51)` — and each end closes its
+    /// own.
+    links: Vec<(String, String)>,
     /// Inside a table row, and whether a cell has been written in it yet.
     cells: Option<bool>,
     /// Prose waiting to be scanned for the `#51` shorthand. Scanned
@@ -88,12 +94,13 @@ pub fn render(source: &str, limit: usize) -> Rendered {
         out: String::new(),
         limit,
         cut: false,
+        full: false,
         stack: Vec::new(),
         marker: None,
         lists: Vec::new(),
         at_line_start: true,
         blank: false,
-        link: None,
+        links: Vec::new(),
         cells: None,
         prose: String::new(),
         refs: Vec::new(),
@@ -187,6 +194,15 @@ impl Writer {
                 self.lists.push(first);
             }
             Tag::Item => {
+                // An item whose first thing is a list has not written its
+                // own marker yet; it goes on a line of its own, or the
+                // nested marker would take its place.
+                if self.marker.is_some() {
+                    self.prefix();
+                    let kept = self.out.trim_end_matches(' ').len();
+                    self.out.truncate(kept);
+                    self.newline();
+                }
                 self.newline_if_needed();
                 if self.blank {
                     self.blank_line();
@@ -216,11 +232,11 @@ impl Writer {
                 }
                 self.cells = Some(true);
             }
+            // The destination's reference is recorded at the end, after
+            // the label's prose has been scanned, so references come out
+            // in the order they appear in the source.
             Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
-                if let Some(id) = news_target(&dest_url) {
-                    self.reference(id);
-                }
-                self.link = Some((dest_url.to_string(), String::new()));
+                self.links.push((dest_url.to_string(), String::new()));
             }
             // Emphasis, strong and strikethrough lose their markers and
             // keep their words; nothing else here is enabled.
@@ -257,9 +273,12 @@ impl Writer {
                 self.newline_if_needed();
             }
             TagEnd::Link | TagEnd::Image => {
-                let Some((dest, text)) = self.link.take() else {
+                let Some((dest, text)) = self.links.pop() else {
                     return;
                 };
+                if let Some(id) = news_target(&dest) {
+                    self.reference(id);
+                }
                 let text = text.trim();
                 let shown = match news_target(&dest) {
                     Some(id) => format!("news #{id}"),
@@ -355,7 +374,12 @@ impl Writer {
     /// Text, a line at a time, each line begun with what its containers
     /// put there.
     fn text(&mut self, text: &str) {
-        if let Some((_, shown)) = self.link.as_mut() {
+        // Past the limit nothing more is written, so nothing more is
+        // built either: the limit bounds the work, not just the output.
+        if self.cut {
+            return;
+        }
+        for (_, shown) in &mut self.links {
             shown.push_str(text);
         }
         let mut lines = text.split('\n').peekable();
@@ -399,16 +423,32 @@ impl Writer {
         if self.cut || s.is_empty() {
             return;
         }
-        if self.out.len() + s.len() <= self.limit.saturating_sub(CUT.len()) {
+        // Whatever fits is written whole; room for the ellipsis is made
+        // only once something does not fit.
+        if !self.full && self.out.len() + s.len() <= self.limit {
             self.out.push_str(s);
             return;
         }
-        let room = self.limit.saturating_sub(CUT.len() + self.out.len());
-        let mut end = room.min(s.len());
-        while !s.is_char_boundary(end) {
-            end -= 1;
+        // A block's closing newline past the limit is not yet a cut: it
+        // becomes one only if more text follows it.
+        if s.trim().is_empty() {
+            self.full = true;
+            return;
         }
-        self.out.push_str(&s[..end]);
+        let keep = self.limit.saturating_sub(CUT.len());
+        if self.full || self.out.len() > keep {
+            let mut end = keep;
+            while !self.out.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.out.truncate(end);
+        } else {
+            let mut end = (keep - self.out.len()).min(s.len());
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.out.push_str(&s[..end]);
+        }
         if self.out.len() + CUT.len() <= self.limit {
             self.out.push_str(CUT);
         }
@@ -527,6 +567,30 @@ mod tests {
         assert!(r.plain.len() <= 100, "{}", r.plain.len());
         assert!(r.plain.ends_with('…'));
         assert!(std::str::from_utf8(r.plain.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn an_image_inside_a_link_closes_its_own_frame() {
+        let r = render("[![a pixel](https://img.example/p.png)](news:51)", 100);
+        assert_eq!(r.plain, "a pixel (https://img.example/p.png) (news #51)");
+        assert_eq!(r.refs, [51], "the outer destination is not lost");
+    }
+
+    #[test]
+    fn references_come_out_in_the_order_they_were_written() {
+        assert_eq!(render("[see #2](news:1)", 100).refs, [2, 1]);
+    }
+
+    #[test]
+    fn the_ellipsis_is_made_room_for_only_when_something_does_not_fit() {
+        assert_eq!(render("abc", 3).plain, "abc");
+        assert_eq!(render("abcd", 3).plain, "…");
+        assert_eq!(render("abcdefgh", 6).plain, "abc…");
+    }
+
+    #[test]
+    fn an_item_that_opens_with_a_list_keeps_its_marker() {
+        assert_eq!(plain("- - inner\n- after"), "-\n  - inner\n- after");
     }
 
     #[test]

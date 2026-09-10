@@ -1132,6 +1132,20 @@ impl Core {
         self.news.as_ref().map(|_| self.news_policy)
     }
 
+    /// The markdown mode this server actually runs, which is what a client
+    /// should be told: `render` with no parser behind it behaves as
+    /// `source` (see [`Self::with_body_renderer`]), and saying `render`
+    /// would promise a downgrade and a search over it that never happen.
+    pub fn news_markdown(&self) -> Option<MarkdownMode> {
+        self.news.as_ref()?;
+        Some(
+            match (self.news_policy.markdown, self.body_renderer.is_some()) {
+                (MarkdownMode::Render, false) => MarkdownMode::Source,
+                (mode, _) => mode,
+            },
+        )
+    }
+
     /// May this session post? The login reply says so, the way it says
     /// whether a session moderates, so a client can gray out the button
     /// rather than discover the refusal after someone has typed (§9.1).
