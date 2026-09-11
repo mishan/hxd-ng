@@ -43,6 +43,11 @@ deliberate and commented at the site.
   there is stored and handed over when they arrive — so a 1.5 client's
   message reaches a phone that was asleep, and an ng client can address an
   account that holds no session at all.
+- **Threaded news** on the ng wire: categories and bundles, articles that
+  thread as replies, references between articles (a `#51` in the text)
+  with backlinks, and tombstones that keep a thread's shape when an
+  article goes. A 1.5 client in the same room sees nothing change: the
+  legacy wire carries no news yet.
 - **Sessions that survive the network.** An ng session detaches when its
   socket dies and resumes with a gapless event replay; the roster shows it
   as away in the meantime.
@@ -249,6 +254,34 @@ max_page = 200            # maximum rows in one request
 replay = 0                # plain chat lines replayed to old legacy clients
 ```
 
+### Threaded news
+
+Absent means no news: the ng wire never offers the `news` cap, and a news
+request is answered the way a server without the feature answers it. When
+`db` is omitted, news uses the database `[inbox]` or `[history]` names and
+shares its SQLite connection; with neither it is required. Nothing here
+reaches a legacy client yet — the 1.2 and 1.5 news transactions are a
+stage still to come. See [docs/news.md](docs/news.md).
+
+```toml
+[news]                    # presence turns it on
+# db = "messages.db"      # required only without [inbox] or [history]
+max_body = 65535          # the legacy NEWSDATA ceiling; ↓ freely, ↑ never
+max_subject = 255         # the 1.5 pstring
+max_refs = 32             # references recorded per article; past that, text
+max_depth = 32            # reply nesting
+max_node_depth = 16       # bundle nesting
+max_page = 200            # threads in one request
+retain_days = 0           # a thread's life after its last post; 0 = forever
+self_delete = true        # authors may delete their own; false = period behavior
+```
+
+Who may read, post, delete and rearrange is the account's news bits —
+`read_news`, `post_news`, `delete_articles` and the category and bundle
+bits in [docs/access-bits.md](docs/access-bits.md). An article is its
+author's to delete only when one person is behind the account, a password
+or a linked identity; a guest's belongs to nobody.
+
 ### Inline media
 
 Absent means no images: the legacy wire never confirms capability bit 3
@@ -430,7 +463,8 @@ nothing.
 ### Cargo features
 
 `voice`, `inbox` and `media` are all on by default, so CI covers them. The
-`inbox` feature supplies the shared SQLite store for both inbox and history;
+`inbox` feature supplies the shared SQLite store for the inbox, history and
+news;
 `media` supplies the image pipeline. Building without one leaves its
 dependency out of the binary entirely — no WebRTC stack, no bundled SQLite,
 no image decoder — and the matching config section then becomes a startup
@@ -449,6 +483,7 @@ error rather than a promise the build cannot keep.
 | [access-bits.md](docs/access-bits.md) | Account permissions: every access bit and its `[access]` key, the reserved numbers, `[extra]` policy, and what a new server starts with |
 | [private-messages.md](docs/private-messages.md) | The offline inbox: the mailbox rule, the store contract, delivery, blocking, retention |
 | [chat-history.md](docs/chat-history.md) | Scrollback: the chat log, cursor paging on both wires, retention, fogWraith's `Get Chat History` |
+| [news.md](docs/news.md) | Threaded news: the tree, articles and references, the store and its schema, the ng requests and events, search, subscriptions, markdown bodies, and the legacy binding still to come |
 | [inline-media.md](docs/inline-media.md) | Images in chat: the re-encode pipeline, handles and relay-time authorisation, 750/751 and the HTTP routes |
 | [moderation.md](docs/moderation.md) | Redaction, revocation, purges and reports: the acts, the audit trail, and what each wire can do |
 | [voice.md](docs/voice.md) | The SFU: hand-written SDP, RTP forwarding, and one room across both signalling wires |
