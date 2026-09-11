@@ -655,13 +655,15 @@ impl Writer {
         prefix
     }
 
-    /// An item's marker alone on its line: `-`, never `- `.
+    /// An item's marker alone on its line: `-`, never `- `. Trimmed before
+    /// it is written, so a space that is never kept cannot be what takes
+    /// the line past the limit.
     fn bare_marker(&mut self) {
-        self.prefix();
         if !self.cut {
-            let kept = self.out.trim_end_matches(' ').len();
-            self.out.truncate(kept);
+            let prefix = self.line_prefix(self.stack.len(), true);
+            self.raw(prefix.trim_end_matches(' '));
         }
+        self.marker = None;
         self.at_line_start = false;
     }
 
@@ -677,15 +679,20 @@ impl Writer {
             self.out.push_str(s);
             return;
         }
-        // A block's closing newline past the limit is not yet a cut: it
-        // becomes one only if more text follows it.
-        if s.trim().is_empty() {
+        // Whitespace past the limit is not yet a cut — a block's closing
+        // newline, or the end of a code line: it becomes one only if more
+        // text follows it.
+        let body = s.trim_end();
+        if body.is_empty() || (!self.full && self.out.len() + body.len() <= self.limit) {
+            self.out.push_str(body);
             self.full = true;
             return;
         }
         let keep = self.limit.saturating_sub(CUT.len());
         if self.full || self.out.len() > keep {
-            let mut end = keep;
+            // Whitespace that did not fit can leave the output short of
+            // `keep`; then the cut goes where the output ends.
+            let mut end = keep.min(self.out.len());
             while !self.out.is_char_boundary(end) {
                 end -= 1;
             }
@@ -1050,5 +1057,38 @@ mod tests {
             "https://hl.example",
             "and any other autolink is still its destination, once"
         );
+    }
+
+    #[test]
+    fn a_small_limit_cuts_only_what_does_not_fit() {
+        // Whatever the limit, the downgrade keeps within it, comes out
+        // whole when it fits, and ends in the ellipsis when it does not.
+        // The continuation under a wide marker is whitespace that may not
+        // fit while the output is still short of the ellipsis's room.
+        for body in [
+            "100. a\n\n     b",
+            "100. aaaa\n     bbbb\n\n     cccc",
+            "100.   -",
+            "- - - inner\n- after\n-\n- c",
+            "> ```\n> a\n>\n> b\n> ```",
+            "    code \n\n    more ",
+            "100. <news:51>\n\n     é [x](news:52) ü",
+            "| a | b |\n|---|---|\n| c | d |",
+        ] {
+            let whole = plain(body);
+            for limit in 0..=whole.len() + 1 {
+                let cut = render(body, limit).plain;
+                assert!(cut.len() <= limit, "{body:?} at {limit}: {cut:?}");
+                if whole.len() <= limit {
+                    assert_eq!(cut, whole, "{body:?} at {limit}");
+                } else if limit >= CUT.len() {
+                    assert!(cut.ends_with(CUT), "{body:?} at {limit}: {cut:?}");
+                }
+            }
+        }
+        // The space after a bare marker, and at the end of a code line,
+        // is never kept, so neither is what cuts a downgrade that fits.
+        assert_eq!(render("100.   -", 11).plain, "100.\n     -");
+        assert_eq!(render("    code ", 8).plain, "    code");
     }
 }
