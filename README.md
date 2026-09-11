@@ -46,8 +46,10 @@ deliberate and commented at the site.
 - **Threaded news** on the ng wire: categories and bundles, articles that
   thread as replies, references between articles (a `#51` in the text)
   with backlinks, tombstones that keep a thread's shape when an article
-  goes, and full-text search across all of it. A 1.5 client in the same
-  room sees nothing change: the legacy wire carries no news yet.
+  goes, and full-text search across all of it. Follow a thread or a
+  category and it keeps an unread count and tells you what is new; a
+  reply to your own article finds you. A 1.5 client in the same room sees
+  nothing change: the legacy wire carries no news yet.
 - **Sessions that survive the network.** An ng session detaches when its
   socket dies and resumes with a gapless event replay; the roster shows it
   as away in the meantime.
@@ -277,7 +279,19 @@ self_delete = true        # authors may delete their own; false = period behavio
 search = true             # false turns news_search off; the index is kept either way
 search_max_results = 500  # the deepest a search pages
 search_per_minute = 30    # searches per session
+
+[news.notify]                   # absent = no subscriptions, no notifications
+auto_subscribe = "participated" # or "own_thread", or "off"
+reference = true                # does citing someone's article notify them
+max_subs = 200                  # threads and categories followed or muted, per account
+max_per_hour = 12               # news pushes per account; 0 = badges, no pushes
 ```
+
+`[news.notify]` needs no feature and no gateway: an attached client gets
+its badge and its `news_notify` either way, and only the push to a device
+with no session open is missing — no gateway delivers one yet. A guest
+follows nothing; subscriptions are kept against the account, by the same
+rule as the inbox.
 
 Who may read, post, delete and rearrange is the account's news bits —
 `read_news`, `post_news`, `delete_articles` and the category and bundle
@@ -443,7 +457,8 @@ is created 0600, as are its `-wal` and `-shm` companions; keep the directory
 to match.
 
 Deleting an account is still `rm accounts/alice.toml`, which leaves its mail
-behind for whoever registers that login next — so take it with the account:
+and its news subscriptions behind for whoever registers that login next — so
+take them with the account:
 
 ```sh
 hxd inbox purge alice                     # while accounts/alice.toml exists
