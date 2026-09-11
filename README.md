@@ -44,8 +44,9 @@ deliberate and commented at the site.
   message reaches a phone that was asleep, and an ng client can address an
   account that holds no session at all.
 - **Threaded news** on the ng wire: categories and bundles, articles that
-  thread as replies, references between articles (a `#51` in the text)
-  with backlinks, tombstones that keep a thread's shape when an article
+  thread as replies and may be written in markdown, references between
+  articles (a `#51` in the text, or a `[link](news:51)`) with backlinks,
+  tombstones that keep a thread's shape when an article
   goes, and full-text search across all of it. Follow a thread or a
   category and it keeps an unread count and tells you what is new; a
   reply to your own article finds you. A 1.5 client in the same room sees
@@ -270,6 +271,7 @@ stage still to come. See [docs/news.md](docs/news.md).
 # db = "messages.db"      # required only without [inbox] or [history]
 max_body = 65535          # the legacy NEWSDATA ceiling; ↓ freely, ↑ never
 max_subject = 255         # the 1.5 pstring
+markdown = "render"       # or "source", or "off"; see below
 max_refs = 32             # references recorded per article; past that, text
 max_depth = 32            # reply nesting
 max_node_depth = 16       # bundle nesting
@@ -286,6 +288,15 @@ reference = true                # does citing someone's article notify them
 max_subs = 200                  # threads and categories followed or muted, per account
 max_per_hour = 12               # news pushes per account; 0 = badges, no pushes
 ```
+
+`markdown` decides what an article written in markdown gets. `render`
+accepts it and parses it once, at post time, for the plain-text downgrade
+that search reads and a legacy client will be given, and for the
+references its `news:` links make. `source` accepts and stores it and
+parses nothing; `off` takes plain text only. The default is `render` in a
+build with the `markdown` feature and `off` in one without, where asking
+for `render` is a startup error. Under `render`, a body whose lists and
+quotes nest deeper than a parse can afford is refused.
 
 `[news.notify]` needs no feature and no gateway: an attached client gets
 its badge and its `news_notify` either way, and only the push to a device
@@ -493,13 +504,14 @@ nothing.
 
 ### Cargo features
 
-`voice`, `inbox` and `media` are all on by default, so CI covers them. The
-`inbox` feature supplies the shared SQLite store for the inbox, history and
-news;
-`media` supplies the image pipeline. Building without one leaves its
-dependency out of the binary entirely — no WebRTC stack, no bundled SQLite,
-no image decoder — and the matching config section then becomes a startup
-error rather than a promise the build cannot keep.
+`voice`, `inbox`, `media` and `markdown` are all on by default, so CI covers
+them. The `inbox` feature supplies the shared SQLite store for the inbox,
+history and news; `media` supplies the image pipeline; `markdown` supplies
+the parser behind `[news] markdown = "render"`. Building without one leaves
+its dependency out of the binary entirely — no WebRTC stack, no bundled
+SQLite, no image decoder, no markdown parser — and the matching config
+section, or for `markdown` the `render` mode, then becomes a startup error
+rather than a promise the build cannot keep.
 
 ## Documentation
 
