@@ -65,13 +65,24 @@ pub const MAX_NESTING_WIDTH: usize = 64;
 /// `>`, and a list marker each take at least a column per level, and a
 /// block opens only on a line with a marker.
 pub fn nesting_width(source: &str) -> usize {
-    source.split('\n').map(line_width).max().unwrap_or(0)
+    let mut continuation = 0;
+    let mut widest = 0;
+    for line in source.split('\n') {
+        let width = line_width(line, continuation);
+        if width > 0 {
+            continuation = width;
+            widest = widest.max(width);
+        }
+    }
+    widest
 }
 
 /// The container syntax a line opens with, in columns, or nothing when
 /// it has no marker: indentation alone deepens nothing, and neither does
-/// a thematic break, however many dashes it has.
-fn line_width(line: &str) -> usize {
+/// a thematic break, however many dashes it has. Before the first marker,
+/// CommonMark permits at most three columns beyond the active container;
+/// any more is an indented code block whose punctuation is literal.
+fn line_width(line: &str, continuation: usize) -> usize {
     let b = line.as_bytes();
     if thematic_break(b) {
         return 0;
@@ -79,8 +90,18 @@ fn line_width(line: &str) -> usize {
     let (mut i, mut col, mut marked) = (0, 0, false);
     while let Some(&c) = b.get(i) {
         match c {
-            b' ' => col += 1,
-            b'\t' => col += 4 - col % 4,
+            b' ' => {
+                col += 1;
+                if !marked && col > continuation + 3 {
+                    return 0;
+                }
+            }
+            b'\t' => {
+                col += 4 - col % 4;
+                if !marked && col > continuation + 3 {
+                    return 0;
+                }
+            }
             b'>' => {
                 col += 1;
                 marked = true;
@@ -870,7 +891,7 @@ mod tests {
         assert_eq!(nesting_width(">quote"), 1);
         assert_eq!(nesting_width("> > - a"), 6);
         assert_eq!(nesting_width("- a\n  - b\n    - c"), 6);
-        assert_eq!(nesting_width("\t- a"), 6, "a tab reaches its tab stop");
+        assert_eq!(nesting_width("\t- a"), 0, "a tab opens indented code");
         assert_eq!(nesting_width("10. a\n1) b"), 4);
         assert_eq!(
             nesting_width("1234567890. a"),
@@ -904,6 +925,17 @@ mod tests {
             Markdown.refuses("an ordinary\n\n- list\n  - nested\n"),
             None
         );
+
+        let code = format!("{}- literal", " ".repeat(MAX_NESTING_WIDTH + 1));
+        assert_eq!(nesting_width(&code), 0);
+        assert_eq!(Markdown.refuses(&code), None);
+        assert_eq!(nesting_width("- item\n        - literal"), 2);
+
+        let nested = (0..=MAX_NESTING_WIDTH / 2)
+            .map(|depth| format!("{}- item", "  ".repeat(depth)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Markdown.refuses(&nested).is_some());
     }
 
     #[test]
