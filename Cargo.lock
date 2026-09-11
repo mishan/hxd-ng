@@ -923,8 +923,10 @@ dependencies = [
  "hxd-voice",
  "hxproto",
  "image",
+ "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "str0m",
  "tempfile",
  "tokio",
@@ -1012,6 +1014,7 @@ version = "0.1.0"
 dependencies = [
  "hxd-core",
  "rusqlite",
+ "sha2",
  "tempfile",
  "tracing",
 ]

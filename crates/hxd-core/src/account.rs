@@ -51,6 +51,9 @@ pub struct Account {
     /// linked accounts with `identity_login`), and those are precisely
     /// the accounts the fingerprint keying exists for.
     pub has_inbox: bool,
+    /// May this account stage images for news posts? Server-local policy;
+    /// defaults to the shared send-media access bit.
+    pub attach_news: bool,
     /// Portable-identity association (`docs/hotline-ng-identity.md` §8).
     /// Its `fingerprint` is the durable half of a
     /// [`crate::inbox::Mailbox`]: a login can be renamed and

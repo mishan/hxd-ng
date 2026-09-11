@@ -215,7 +215,7 @@ async fn main() {
                 .or_else(|| config.history.as_ref().and_then(|h| h.db.as_ref()))
                 .expect("configuration validation requires a news database");
             tracing::info!("threaded news at {}", db.display());
-            if news.retain_days > 0 {
+            if news.retain_days > 0 || news.attach.is_some() {
                 tokio::spawn(hxd::news_pruner(ctx.core.clone()));
             }
         }

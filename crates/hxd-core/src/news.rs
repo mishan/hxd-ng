@@ -23,14 +23,15 @@
 //! in `hxd-session` (§12.1); the domain names nodes by id.
 //!
 //! The trait grows with the stages of `docs/news.md` §16. What is here
-//! is the tree, plain-text articles, `#51` references, retention, search,
-//! and subscriptions with the notifications they earn ([`subs`]);
-//! markdown and attachments bring their methods with them rather than
-//! arriving early as stubs.
+//! is the tree, article bodies, `#51` references, durable attachments,
+//! retention, search, and subscriptions with the notifications they earn
+//! ([`subs`]).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::access::{bit, AccessBits};
@@ -278,6 +279,67 @@ pub struct Article {
     /// How many articles point at this one. The list is
     /// [`NewsStore::refs_to`].
     pub referenced_by: u32,
+    /// Durable image attachments, in display order (§7).
+    pub attachments: Vec<Attachment>,
+}
+
+/// The content-addressed identity of a durable news image.
+pub type BlobId = [u8; 32];
+
+/// One image attached to an article. The opaque handle is what crosses
+/// the ng wire; the content hash remains server-private.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub id: crate::media::Handle,
+    pub mime: crate::media::MediaType,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+    pub name: Option<String>,
+}
+
+/// A staged attachment and the fields the durable store needs to bind it
+/// atomically to a later post.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedAttachment {
+    pub attachment: Attachment,
+    pub blob: BlobId,
+    pub legacy_bytes: Option<u64>,
+    pub owner: crate::inbox::Mailbox,
+    pub staged_at: SystemTime,
+}
+
+/// A fetch authorized by the news store. Bytes live behind [`BlobStore`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentFetch {
+    pub attachment: Attachment,
+    pub blob: BlobId,
+}
+
+/// Durable content-addressed bytes, deliberately separate from inline
+/// chat media whose handles expire with the process (§7.1).
+pub trait BlobStore: Send + Sync + 'static {
+    fn put(&self, bytes: &[u8]) -> Result<BlobId, StoreError>;
+    fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError>;
+    /// Does the canonical file exist? Staging and maintenance ask this
+    /// without reading an archive-sized image into memory.
+    fn contains(&self, id: &BlobId) -> Result<bool, StoreError> {
+        Ok(self.get(id)?.is_some())
+    }
+    fn put_derivative(&self, id: &BlobId, bytes: &[u8]) -> Result<(), StoreError>;
+    fn derivative(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError>;
+    /// [`BlobStore::contains`], for the legacy derivative.
+    fn contains_derivative(&self, id: &BlobId) -> Result<bool, StoreError> {
+        Ok(self.derivative(id)?.is_some())
+    }
+    fn remove(&self, id: &BlobId) -> Result<(), StoreError>;
+    /// Unlink files no row keeps that are older than `older_than`, and
+    /// the leftovers of writes that never finished.
+    fn sweep_orphans(
+        &self,
+        keep: &HashSet<BlobId>,
+        older_than: SystemTime,
+    ) -> Result<u64, StoreError>;
 }
 
 /// A resolved reference. Unlike [`Author`] this is *current* state: a
@@ -325,6 +387,12 @@ pub struct NewPost {
     /// Who posting subscribes to the thread, when `auto_subscribe` says
     /// it does (§10.3).
     pub follow: Option<AutoFollow>,
+    /// Staged handles to bind to this article in the same transaction.
+    pub attachments: Vec<crate::media::Handle>,
+    /// Whose staged handles those must be. `None` for a session that is
+    /// not one person, which has none.
+    pub attachment_owner: Option<crate::inbox::Mailbox>,
+    pub attachment_cutoff: SystemTime,
 }
 
 /// The subscription a post makes for its poster, **in the post's own
@@ -636,6 +704,10 @@ pub enum NewsError {
     SearchOff,
     /// Too many searches from this session; wait and ask again.
     RateLimited,
+    /// The image pipeline refused an attachment upload, with the coarse
+    /// reason inline media gives for the same refusal (inline-media.md
+    /// §8.2) — too large, not an image, busy, rate-limited, blocked.
+    Media(crate::media::MediaReject),
     /// A session with no mailbox — a guest — asked for something only a
     /// mailbox can hold. About you, where `AccessDenied` is about the
     /// bits (§10.9).
@@ -644,6 +716,12 @@ pub enum NewsError {
     TooManySubs,
     /// This server keeps no subscriptions (`[news.notify]` is absent).
     NotifyOff,
+    /// A staged handle is missing, expired, or belongs to someone else.
+    NoSuchMedia,
+    /// The post names more attachments than policy allows.
+    AttachmentsFull,
+    /// The durable blob volume is at its configured ceiling.
+    NewsFull,
     Store(StoreError),
 }
 
@@ -733,6 +811,52 @@ pub trait NewsStore: Send + Sync + 'static {
     /// were indexed. The repair for an index that has drifted, and what
     /// an import or a change in how bodies render ends with (§6.4).
     fn reindex(&self) -> Result<u64, StoreError>;
+
+    // --- Attachments (§7) ---------------------------------------------
+
+    fn stage_attachment(&self, _staged: &StagedAttachment) -> Result<(), NewsError> {
+        Err(NewsError::Disabled)
+    }
+
+    /// Authorize a download. A live article grants every news reader;
+    /// an unexpired staged row grants only its uploader, and a session
+    /// with no `uploader` staged nothing.
+    fn attachment(
+        &self,
+        _id: &crate::media::Handle,
+        _uploader: Option<&crate::inbox::Mailbox>,
+        _staged_after: SystemTime,
+    ) -> Result<Option<AttachmentFetch>, StoreError> {
+        Ok(None)
+    }
+
+    /// The canonical and derivative bytes every metadata row accounts
+    /// for: what `max_total_bytes` is checked against (§7.4).
+    fn attachment_bytes(&self) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
+    /// Drop expired staged rows and return hashes no metadata row still
+    /// references, so the byte store can remove them.
+    fn expire_attachments(&self, _staged_before: SystemTime) -> Result<Vec<BlobId>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    fn attachment_blobs(&self) -> Result<HashSet<BlobId>, StoreError> {
+        Ok(HashSet::new())
+    }
+
+    /// Remove zero-reference metadata rows and return their hashes so the
+    /// byte store can unlink both canonical and derivative files.
+    fn unreferenced_blobs(&self) -> Result<Vec<BlobId>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    /// W8's block table already exists; staging consults it now so a
+    /// known-abusive image cannot be reintroduced under a new handle.
+    fn blob_blocked(&self, _id: &BlobId) -> Result<bool, StoreError> {
+        Ok(false)
+    }
 
     // --- Subscriptions (§10) --------------------------------------------
     //
@@ -925,6 +1049,17 @@ pub struct NewsPolicy {
     /// `Off` by default here, because a domain with no parser cannot
     /// render; the binary's default is `render` when it has one.
     pub markdown: MarkdownMode,
+    pub attach: Option<AttachmentPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachmentPolicy {
+    pub max_bytes: usize,
+    pub max_count: usize,
+    pub max_total_bytes: u64,
+    pub stage_ttl: Duration,
+    pub per_hour: u32,
+    pub legacy_derivative: bool,
 }
 
 impl Default for NewsPolicy {
@@ -943,6 +1078,7 @@ impl Default for NewsPolicy {
             search_per_minute: 30,
             notify: None,
             markdown: MarkdownMode::Off,
+            attach: None,
         }
     }
 }
@@ -955,6 +1091,7 @@ pub struct PostRequest {
     pub subject: String,
     pub body: String,
     pub mime: BodyType,
+    pub attachments: Vec<crate::media::Handle>,
 }
 
 /// The longest node name, in bytes. The legacy wire carries a name as a
@@ -1043,6 +1180,23 @@ fn clean_subject(s: &str) -> String {
         .to_string()
 }
 
+fn clean_attachment_name(name: Option<String>) -> Option<String> {
+    let name = name?;
+    let clean: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(255)
+        .collect();
+    (!clean.is_empty()).then_some(clean)
+}
+
+fn blob_hex(id: &BlobId) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// A body as the domain keeps it: exactly as typed, except that its line
 /// endings are LF whatever the sender used. The legacy edge converts to
 /// CR on the way out (§12.4).
@@ -1096,6 +1250,7 @@ struct Asker {
     /// messages cannot ring their phone from the news either.
     blockable: Option<Mailbox>,
     login: String,
+    attach_news: bool,
 }
 
 fn store_failed(e: NewsError) -> NewsError {
@@ -1111,6 +1266,18 @@ impl Core {
     pub fn with_news(mut self, store: Arc<dyn NewsStore>, policy: NewsPolicy) -> Self {
         self.news = Some(store);
         self.news_policy = policy;
+        self
+    }
+
+    /// Give news its durable byte store and the same image pipeline used
+    /// by inline media. The policy remains the capability switch.
+    pub fn with_news_attachments(
+        mut self,
+        blobs: Arc<dyn BlobStore>,
+        codec: Arc<dyn crate::media::MediaCodec>,
+    ) -> Self {
+        self.news_blobs = Some(blobs);
+        self.news_codec = Some(codec);
         self
     }
 
@@ -1178,6 +1345,22 @@ impl Core {
             .is_some_and(|a| a.has(bit::READ_NEWS) && a.has(bit::POST_NEWS))
     }
 
+    pub fn news_may_attach(&self, uid: Uid) -> bool {
+        self.news_policy.attach.is_some()
+            && self
+                .roster
+                .lock()
+                .unwrap()
+                .users
+                .get(&uid)
+                .is_some_and(|s| {
+                    s.access.has(bit::READ_NEWS)
+                        && s.access.has(bit::POST_NEWS)
+                        && s.attach_news
+                        && s.is_person
+                })
+    }
+
     fn news_store(&self) -> Result<&Arc<dyn NewsStore>, NewsError> {
         self.news.as_ref().ok_or(NewsError::Disabled)
     }
@@ -1197,7 +1380,215 @@ impl Core {
             mailbox: sess.has_inbox.then(|| sess.mailbox()),
             blockable: (sess.has_inbox || sess.identity.is_some()).then(|| sess.mailbox()),
             login: sess.login.clone(),
+            attach_news: sess.attach_news,
         })
+    }
+
+    /// Who a staged attachment belongs to: the session's person, never a
+    /// shared login. Staging under `guest` would let every guest post or
+    /// fetch every other guest's upload and spend one shared quota, so a
+    /// session that is not one person has no owner and may not stage.
+    fn attachment_owner(asker: &Asker) -> Option<Mailbox> {
+        asker.owner.clone()
+    }
+
+    /// Take one upload from `owner`'s hourly allowance, or say there is
+    /// none left. `refund` gives one back.
+    fn news_attach_charge(&self, owner: &Mailbox, per_hour: u32) -> bool {
+        let mut rates = self.news_attach_rate.lock().unwrap();
+        let now = std::time::Instant::now();
+        let bucket = rates
+            .entry((owner.fingerprint, owner.login.clone()))
+            .or_insert((now, f64::from(per_hour)));
+        let elapsed = now.duration_since(bucket.0).as_secs_f64();
+        bucket.0 = now;
+        bucket.1 = (bucket.1 + elapsed * f64::from(per_hour) / 3600.0).min(f64::from(per_hour));
+        if bucket.1 < 1.0 {
+            return false;
+        }
+        bucket.1 -= 1.0;
+        true
+    }
+
+    fn news_attach_refund(&self, owner: &Mailbox, per_hour: u32) {
+        if let Some(bucket) = self
+            .news_attach_rate
+            .lock()
+            .unwrap()
+            .get_mut(&(owner.fingerprint, owner.login.clone()))
+        {
+            bucket.1 = (bucket.1 + 1.0).min(f64::from(per_hour));
+        }
+    }
+
+    /// Validate, canonicalize, persist and stage one news image (§7.3).
+    /// Frontends call this off their reactor thread.
+    pub fn news_stage_attachment(
+        &self,
+        uid: Uid,
+        input: &[u8],
+        name: Option<String>,
+    ) -> Result<StagedAttachment, NewsError> {
+        use crate::media::MediaReject;
+
+        let store = self.news_store()?;
+        let asker = self.news_reader(uid)?;
+        let policy = self.news_policy.attach.ok_or(NewsError::Disabled)?;
+        if !asker.access.has(bit::POST_NEWS) || !asker.attach_news {
+            return Err(NewsError::AccessDenied);
+        }
+        let owner = Self::attachment_owner(&asker).ok_or(NewsError::NoMailbox)?;
+        if input.len() > policy.max_bytes {
+            return Err(NewsError::Media(MediaReject::TooLarge));
+        }
+        let codec = self.news_codec.as_ref().ok_or(NewsError::Disabled)?;
+        let blobs = self.news_blobs.as_ref().ok_or(NewsError::Disabled)?;
+        // Charged before the decode, because the decode is the cost the
+        // allowance exists to bound — but a pool too busy to start one
+        // is the server's shortfall, not the uploader's, and gives the
+        // upload back.
+        if !self.news_attach_charge(&owner, policy.per_hour) {
+            return Err(NewsError::Media(MediaReject::RateLimited));
+        }
+        let refused = |e: MediaReject| {
+            if e == MediaReject::Busy {
+                self.news_attach_refund(&owner, policy.per_hour);
+            }
+            NewsError::Media(e)
+        };
+        let canonical = codec.canonicalize(input).map_err(refused)?;
+        let derivative = if policy.legacy_derivative {
+            codec
+                .legacy_derivative(&canonical, 1024, 60_000)
+                .map_err(refused)?
+        } else {
+            None
+        };
+        let _serial = self.news_blob_serial.lock().unwrap();
+        let expected: BlobId = Sha256::digest(&canonical.bytes).into();
+        if store.blob_blocked(&expected)? {
+            // The answer chat media gives a blocked hash (inline-media.md
+            // §7): refused, without saying that a moderator is why.
+            tracing::info!(login = %asker.login, "news upload refused: canonical hash is blocked");
+            return Err(NewsError::Media(MediaReject::Generic));
+        }
+        // What this upload adds to the volume. Content addressing means
+        // a re-post of stored bytes adds nothing; the total itself is
+        // the metadata's sum rather than a walk of the directory, which
+        // would stat every file in the archive while every other upload
+        // waits on this lock.
+        let incoming = if blobs.contains(&expected)? {
+            0
+        } else {
+            canonical.bytes.len() as u64
+        } + match &derivative {
+            Some(d) if !blobs.contains_derivative(&expected)? => d.bytes.len() as u64,
+            _ => 0,
+        };
+        if store.attachment_bytes()?.saturating_add(incoming) > policy.max_total_bytes {
+            return Err(NewsError::NewsFull);
+        }
+        let blob = blobs.put(&canonical.bytes)?;
+        assert_eq!(
+            blob, expected,
+            "blob store returned a hash other than SHA-256"
+        );
+        if let Some(d) = &derivative {
+            blobs.put_derivative(&blob, &d.bytes)?;
+        }
+        let mut id = [0u8; crate::media::HANDLE_LEN];
+        getrandom::getrandom(&mut id).map_err(|e| NewsError::Store(StoreError::new(e)))?;
+        let staged = StagedAttachment {
+            attachment: Attachment {
+                id,
+                mime: canonical.mime,
+                width: canonical.width,
+                height: canonical.height,
+                bytes: canonical.bytes.len() as u64,
+                name: clean_attachment_name(name),
+            },
+            blob,
+            legacy_bytes: derivative.as_ref().map(|d| d.bytes.len() as u64),
+            owner,
+            staged_at: SystemTime::now(),
+        };
+        store.stage_attachment(&staged)?;
+        Ok(staged)
+    }
+
+    /// Fetch an attachment after store-side authorization. Every absent,
+    /// expired and unauthorized handle has the same answer.
+    pub fn news_attachment(
+        &self,
+        uid: Uid,
+        id: &crate::media::Handle,
+        legacy: bool,
+    ) -> Result<Option<(Attachment, BlobId, Vec<u8>)>, NewsError> {
+        let store = self.news_store()?;
+        let asker = self.news_reader(uid)?;
+        let policy = self.news_policy.attach.ok_or(NewsError::Disabled)?;
+        let blobs = self.news_blobs.as_ref().ok_or(NewsError::Disabled)?;
+        let owner = Self::attachment_owner(&asker);
+        let cutoff = SystemTime::now()
+            .checked_sub(policy.stage_ttl)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        // No `news_blob_serial` here: a read racing a removal finds no
+        // file, which is the same 404 as any other absent handle, and
+        // holding the lock would put every image on a page in one queue
+        // behind every upload's disk work.
+        let Some(found) = store.attachment(id, owner.as_ref(), cutoff)? else {
+            return Ok(None);
+        };
+        let bytes = if legacy {
+            blobs.derivative(&found.blob)?
+        } else {
+            blobs.get(&found.blob)?
+        };
+        Ok(bytes.map(|bytes| (found.attachment, found.blob, bytes)))
+    }
+
+    /// Expire abandoned stages and reap old orphan files. Called by the
+    /// binary's hourly news maintenance task.
+    pub fn news_expire_attachments(&self, now: SystemTime) -> Result<u64, NewsError> {
+        let store = self.news_store()?;
+        let policy = self.news_policy.attach.ok_or(NewsError::Disabled)?;
+        let blobs = self.news_blobs.as_ref().ok_or(NewsError::Disabled)?;
+        let before = now
+            .checked_sub(policy.stage_ttl)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let _serial = self.news_blob_serial.lock().unwrap();
+        for id in store.expire_attachments(before)? {
+            blobs.remove(&id)?;
+        }
+        for id in store.unreferenced_blobs()? {
+            blobs.remove(&id)?;
+        }
+        let keep = store.attachment_blobs()?;
+        for id in &keep {
+            if !blobs.contains(id)? {
+                warn!(blob = %blob_hex(id), "news attachment metadata has no canonical file");
+            }
+        }
+        blobs.sweep_orphans(&keep, before).map_err(NewsError::from)
+    }
+
+    fn news_remove_unreferenced(&self, store: &Arc<dyn NewsStore>) {
+        let Some(blobs) = self.news_blobs.as_ref() else {
+            return;
+        };
+        let _serial = self.news_blob_serial.lock().unwrap();
+        let ids = match store.unreferenced_blobs() {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!("news attachment cleanup: {e}");
+                return;
+            }
+        };
+        for id in ids {
+            if let Err(e) = blobs.remove(&id) {
+                warn!(blob = %blob_hex(&id), "news attachment cleanup: {e}");
+            }
+        }
     }
 
     fn news_fan_out(&self, ev: Event) {
@@ -1332,7 +1723,24 @@ impl Core {
             plain,
             at: SystemTime::now(),
             follow: subs::auto_follow(&asker, req.parent.is_none(), policy.notify),
+            attachments: req.attachments,
+            attachment_owner: Self::attachment_owner(&asker),
+            attachment_cutoff: SystemTime::now()
+                .checked_sub(policy.attach.map_or(Duration::ZERO, |a| a.stage_ttl))
+                .unwrap_or(SystemTime::UNIX_EPOCH),
         };
+        if !post.attachments.is_empty() {
+            let attach = policy.attach.ok_or(NewsError::NoSuchMedia)?;
+            if !asker.attach_news {
+                return Err(NewsError::AccessDenied);
+            }
+            if post.attachment_owner.is_none() {
+                return Err(NewsError::NoMailbox);
+            }
+            if post.attachments.len() > attach.max_count {
+                return Err(NewsError::AttachmentsFull);
+            }
+        }
         let posted = store
             .post(&post, policy.max_depth, policy.max_refs)
             .map_err(store_failed)?;
@@ -1344,6 +1752,7 @@ impl Core {
             subject: post.subject.clone(),
             from_nick: post.author.nick.clone(),
             at: post.at,
+            attachments: post.attachments.len() as u32,
         });
         // After the broadcast, so a session that hears both hears "your
         // copy is stale" before "and this one is yours".
@@ -1380,6 +1789,7 @@ impl Core {
             .tombstone(id, &asker.login, SystemTime::now())
             .map_err(|e| store_failed(e.into()))?
             .ok_or(NewsError::NoSuchArticle)?;
+        self.news_remove_unreferenced(store);
         self.news_fan_out(Event::NewsDeleted {
             id,
             category: article.category,
@@ -1453,6 +1863,7 @@ impl Core {
             return Err(NewsError::AccessDenied);
         }
         let gone = store.delete_node(id).map_err(store_failed)?;
+        self.news_remove_unreferenced(store);
         self.news_fan_out(Event::NewsNodeDeleted { id });
         Ok(gone)
     }
@@ -1572,10 +1983,14 @@ impl Core {
             return 0;
         }
         let age = Duration::from_secs(u64::from(days) * 24 * 3600);
-        store.prune(age, SystemTime::now()).unwrap_or_else(|e| {
+        let gone = store.prune(age, SystemTime::now()).unwrap_or_else(|e| {
             warn!("news retention: {e}");
             0
-        })
+        });
+        if gone > 0 {
+            self.news_remove_unreferenced(store);
+        }
+        gone
     }
 }
 
@@ -1635,6 +2050,7 @@ mod tests {
                 can_detach: false,
                 transport: Transport::default(),
                 has_inbox,
+                attach_news: false,
                 is_person,
                 reads_on_delivery: false,
                 identity: None,
@@ -1659,6 +2075,7 @@ mod tests {
                 subject: "subject".into(),
                 body: body.into(),
                 mime: BodyType::Plain,
+                attachments: Vec::new(),
             },
         )
     }
@@ -1941,6 +2358,7 @@ mod tests {
                     subject: subject.into(),
                     body: body.into(),
                     mime,
+                    attachments: Vec::new(),
                 },
             )
         };

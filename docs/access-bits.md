@@ -202,6 +202,7 @@ key derives a default rather than being false.
 | `can_detach` | May a session outlive its connection — the ng detach/resume path | A password *or* a linked identity. What disqualifies an account is not the missing password but the missing person: `guest` is one login several people share, and a drive-by should not get to park a nick on the roster |
 | `set_subject` | May this account set the public chat subject | Tracks `disconnect_users`, preserving the reference server's spirit of a config-granted privilege rather than a wire bit |
 | `inbox` | May private messages be stored for this account and delivered later | The same rule `can_detach` derives by, for the same reason: queuing mail against a shared login hands it to whoever logs in next |
+| `attach_news` | May this account stage durable images for news posts | Tracks `send_media` (bit 57), so image-upload policy has one default on both chat and news while an operator may narrow either account. Either way only an account that is one person stages: a staged handle is its uploader's, and `guest` is several people |
 
 ---
 

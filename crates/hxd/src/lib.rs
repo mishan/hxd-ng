@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -57,16 +57,18 @@ pub struct Config {
 
 /// Threaded news (`docs/news.md` §13).
 ///
-/// Only the keys this build acts on. The design's others — attachments
-/// and the 1.2 flat category — arrive with the stages that honor them,
-/// and until then naming one is a startup error rather than a promise the
-/// server quietly does not keep.
+/// Only the keys this build acts on. The design's 1.2 flat category arrives
+/// with the stage that honors it; until then naming one is a startup error
+/// rather than a promise the server quietly does not keep.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewsSection {
     /// The SQLite file. May be omitted when `[inbox]` or `[history]`
     /// names one; the sections then share it and one connection.
     pub db: Option<PathBuf>,
+    /// Filesystem root for durable content-addressed attachment bytes.
+    #[serde(default = "default_news_blobs")]
+    pub blobs: PathBuf,
     /// The legacy `NEWSDATA` ceiling. ↓ freely, ↑ never: 65 535 is what
     /// the 1.5 wire can carry in one chunk (§12.4).
     #[serde(default = "default_news_max_body")]
@@ -116,6 +118,45 @@ pub struct NewsSection {
     /// (§10). Absent = neither; present, even empty, = the defaults.
     #[serde(default)]
     pub notify: Option<NewsNotifySection>,
+    /// `[news.attach]`: durable image staging and article attachments.
+    #[serde(default)]
+    pub attach: Option<NewsAttachSection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewsAttachSection {
+    #[serde(default = "default_news_attach_max_bytes")]
+    pub max_bytes: usize,
+    #[serde(default = "default_news_attach_max_count")]
+    pub max_count: usize,
+    #[serde(default = "default_news_attach_max_total_bytes")]
+    pub max_total_bytes: u64,
+    #[serde(default = "default_news_attach_stage_ttl")]
+    pub stage_ttl: u64,
+    #[serde(default = "default_news_attach_per_hour")]
+    pub per_hour: u32,
+    #[serde(default = "default_true")]
+    pub legacy_derivative: bool,
+}
+
+fn default_news_blobs() -> PathBuf {
+    PathBuf::from("news-blobs")
+}
+fn default_news_attach_max_bytes() -> usize {
+    2 * 1024 * 1024
+}
+fn default_news_attach_max_count() -> usize {
+    8
+}
+fn default_news_attach_max_total_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+fn default_news_attach_stage_ttl() -> u64 {
+    1800
+}
+fn default_news_attach_per_hour() -> u32 {
+    20
 }
 
 /// `[news.notify]` (`docs/news.md` §10, §13). Needs no feature and no
@@ -177,6 +218,14 @@ impl NewsSection {
             }),
             markdown: hxd_core::MarkdownMode::from_name(&self.markdown)
                 .unwrap_or(hxd_core::MarkdownMode::Off),
+            attach: self.attach.as_ref().map(|a| hxd_core::AttachmentPolicy {
+                max_bytes: a.max_bytes,
+                max_count: a.max_count,
+                max_total_bytes: a.max_total_bytes,
+                stage_ttl: Duration::from_secs(a.stage_ttl),
+                per_hour: a.per_hour,
+                legacy_derivative: a.legacy_derivative,
+            }),
         }
     }
 
@@ -242,6 +291,23 @@ impl NewsSection {
             }
             if notify.max_per_hour > 3600 {
                 return Err("[news.notify] max_per_hour must be at most 3600".into());
+            }
+        }
+        if let Some(attach) = &self.attach {
+            if !cfg!(feature = "media") {
+                return Err(
+                    "[news.attach] is configured, but this build has no image pipeline \
+                     (built without the `media` feature)"
+                        .into(),
+                );
+            }
+            if attach.max_bytes == 0
+                || attach.max_count == 0
+                || attach.max_total_bytes == 0
+                || attach.stage_ttl == 0
+                || attach.per_hour == 0
+            {
+                return Err("[news.attach] limits must all be greater than zero".into());
             }
         }
         Ok(())
@@ -1025,6 +1091,32 @@ fn with_media(core: Core, config: &Config) -> Result<Core, String> {
     Ok(core.with_media(Arc::new(hxd_media::Codec::new(cfg.codec)), cfg))
 }
 
+#[cfg(all(feature = "media", feature = "inbox"))]
+fn with_news_attachments(core: Core, config: &Config) -> Result<Core, String> {
+    let Some(news) = config.news.as_ref() else {
+        return Ok(core);
+    };
+    let Some(attach) = news.attach.as_ref() else {
+        return Ok(core);
+    };
+    let limits = hxd_core::CodecLimits {
+        max_bytes: attach.max_bytes,
+        ..Default::default()
+    };
+    let codec = Arc::new(hxd_media::Codec::new(limits));
+    let blobs = hxd_store_sqlite::FileBlobStore::open(&news.blobs)
+        .map_err(|e| format!("{}: {e}", news.blobs.display()))?;
+    Ok(core.with_news_attachments(Arc::new(blobs), codec))
+}
+
+#[cfg(not(all(feature = "media", feature = "inbox")))]
+fn with_news_attachments(core: Core, config: &Config) -> Result<Core, String> {
+    if config.news.as_ref().is_some_and(|n| n.attach.is_some()) {
+        return Err("[news.attach] requires the `media` and `inbox` features".into());
+    }
+    Ok(core)
+}
+
 /// The parser behind `[news] markdown = "render"`. Only then: `"source"`
 /// is the reading for an operator who does not want one running.
 #[cfg(feature = "markdown")]
@@ -1715,17 +1807,26 @@ pub async fn history_pruner(core: Arc<Core>, max_lines: u32, max_days: u32) {
 }
 
 /// News retention: whole threads whose last post is older than `[news]
-/// retain_days`. Hourly and on the blocking pool, like the other two —
-/// never on the request path.
+/// retain_days`, then the attachment sweep — abandoned stages, and files
+/// no row keeps (`docs/news.md` §7.2). Hourly and on the blocking pool,
+/// like the other two — never on the request path.
 pub async fn news_pruner(core: Arc<Core>) {
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let core = core.clone();
-        let gone = tokio::task::spawn_blocking(move || core.prune_news())
-            .await
-            .unwrap_or(0);
+        let gone = tokio::task::spawn_blocking(move || {
+            let gone = core.prune_news();
+            match core.news_expire_attachments(SystemTime::now()) {
+                // A server without `[news.attach]`, which prunes anyway.
+                Ok(_) | Err(hxd_core::NewsError::Disabled) => {}
+                Err(e) => tracing::warn!("news attachment sweep: {e:?}"),
+            }
+            gone
+        })
+        .await
+        .unwrap_or(0);
         if gone > 0 {
             tracing::debug!(gone, "news articles pruned");
         }
@@ -1876,6 +1977,7 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
         _ => return Err("[news] store was not opened".into()),
     };
     let core = with_markdown(core, config);
+    let core = with_news_attachments(core, config)?;
     let core = with_media(core, config)?;
 
     Ok(ServerCtx {
@@ -2049,6 +2151,19 @@ sync = "full"
         let searchless = parse("[news]\ndb = \"n.sqlite\"\nsearch = false\n").unwrap();
         check_config(&searchless).unwrap();
         assert!(!searchless.news.unwrap().to_policy().search);
+        if cfg!(feature = "media") {
+            let attached = parse(
+                "[news]\ndb = \"n.sqlite\"\nblobs = \"pictures\"\n[news.attach]\nmax_count = 3\n",
+            )
+            .unwrap();
+            check_config(&attached).unwrap();
+            let news = attached.news.unwrap();
+            assert_eq!(news.blobs, PathBuf::from("pictures"));
+            assert_eq!(news.to_policy().attach.unwrap().max_count, 3);
+
+            let zero = parse("[news]\ndb = \"n.sqlite\"\n[news.attach]\nstage_ttl = 0\n").unwrap();
+            assert!(check_config(&zero).unwrap_err().contains("news.attach"));
+        }
         assert!(
             parse("[news]\ndb = \"n.sqlite\"\nflat_category = \"General\"\n").is_err(),
             "a key for a stage this build does not have is refused, not ignored"

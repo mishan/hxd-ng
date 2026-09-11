@@ -282,6 +282,15 @@ search = true             # false turns news_search off; the index is kept eithe
 search_max_results = 500  # the deepest a search pages
 search_per_minute = 30    # searches per session
 
+blobs = "news-blobs"      # durable content-addressed attachment bytes
+[news.attach]              # absent = attachments off
+max_bytes = 2097152        # one uploaded image
+max_count = 8              # images on one article
+max_total_bytes = 8589934592
+stage_ttl = 1800           # abandoned upload lifetime, seconds
+per_hour = 20              # staged images per account
+legacy_derivative = true   # make the bounded still W9 will serve
+
 [news.notify]                   # absent = no subscriptions, no notifications
 auto_subscribe = "participated" # or "own_thread", or "off"
 reference = true                # does citing someone's article notify them
@@ -303,6 +312,12 @@ its badge and its `news_notify` either way, and only the push to a device
 with no session open is missing — no gateway delivers one yet. A guest
 follows nothing; subscriptions are kept against the account, by the same
 rule as the inbox.
+
+`[news.attach]` needs the `media` image pipeline and the SQLite `inbox`
+feature. Uploads are canonicalized and staged before a post; the post binds
+their handles atomically. Staging permission defaults to the account's
+`send_media` bit and can be overridden with `[extra] attach_news`; a guest
+never stages, since a staged image belongs to the person who uploaded it.
 
 Who may read, post, delete and rearrange is the account's news bits —
 `read_news`, `post_news`, `delete_articles` and the category and bundle

@@ -11,13 +11,15 @@
 //! That range on `news_article_thread (category, path)` is how a thread
 //! comes back in display order with no recursive query.
 
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
 use hxd_core::inbox::{Mailbox, StoreError};
+use hxd_core::media::MediaType;
 use hxd_core::news::{
-    Article, ArticleId, ArticlePage, Author, BodyType, NewNode, NewPost, NewsError, NewsStore,
-    Node, NodeId, NodeKind, Posted, Reference, SubScope, Subscriber, Subscription, ThreadHead,
-    ThreadPage, ThreadQuery,
+    Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, Author, BlobId, BodyType,
+    NewNode, NewPost, NewsError, NewsStore, Node, NodeId, NodeKind, Posted, Reference,
+    StagedAttachment, SubScope, Subscriber, Subscription, ThreadHead, ThreadPage, ThreadQuery,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
@@ -36,6 +38,8 @@ const NODE_COLUMNS: &str = "n.id, n.parent, n.kind, n.name, n.guid, n.add_sn, n.
 
 /// A serial is a u32 on the legacy wire and wraps there, so it wraps here.
 const WRAP: i64 = 1 << 32;
+
+type AttachmentRow = (Vec<u8>, String, i64, i64, i64, Option<String>);
 
 fn sql<T>(r: rusqlite::Result<T>) -> Result<T, StoreError> {
     r.map_err(StoreError::new)
@@ -111,6 +115,41 @@ impl RawArticle {
         let referenced_by: i64 = sql(conn
             .prepare_cached("SELECT COUNT(*) FROM news_ref WHERE dst = ?1")
             .and_then(|mut s| s.query_row(params![self.id], |r| r.get(0))))?;
+        let mut attachments = Vec::new();
+        {
+            let mut stmt = sql(conn.prepare_cached(
+                "SELECT a.handle, b.mime, b.width, b.height, b.bytes, a.name
+                   FROM news_attach a JOIN news_blob b ON b.hash = a.hash
+                  WHERE a.article = ?1 ORDER BY a.ord",
+            ))?;
+            let rows = sql(stmt.query_map(params![self.id], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            }))?;
+            for row in rows {
+                let (handle, mime, width, height, bytes, name) = sql(row)?;
+                attachments.push(Attachment {
+                    id: handle
+                        .try_into()
+                        .map_err(|_| StoreError::new("a news attachment handle is not 16 bytes"))?,
+                    mime: MediaType::from_mime(&mime)
+                        .ok_or_else(|| StoreError::new(format!("unknown image type {mime:?}")))?,
+                    width: u32::try_from(width)
+                        .map_err(|_| StoreError::new("attachment width is not a u32"))?,
+                    height: u32::try_from(height)
+                        .map_err(|_| StoreError::new("attachment height is not a u32"))?,
+                    bytes: u64::try_from(bytes)
+                        .map_err(|_| StoreError::new("attachment size is negative"))?,
+                    name,
+                });
+            }
+        }
         Ok(Article {
             id,
             category: node_id(self.category)?,
@@ -131,6 +170,7 @@ impl RawArticle {
             deleted: self.deleted,
             refs,
             referenced_by: u32::try_from(referenced_by).unwrap_or(u32::MAX),
+            attachments,
         })
     }
 }
@@ -320,6 +360,7 @@ fn thread_end(root: ArticleId) -> Vec<u8> {
 /// them. Returns how many articles went.
 fn remove_articles(conn: &Connection, which: &str, arg: i64) -> Result<u64, StoreError> {
     unindex(conn, which, arg)?;
+    release_attachments(conn, which, arg)?;
     sql(conn.execute(
         &format!(
             "DELETE FROM news_ref
@@ -333,6 +374,27 @@ fn remove_articles(conn: &Connection, which: &str, arg: i64) -> Result<u64, Stor
         params![arg],
     ))?;
     Ok(gone as u64)
+}
+
+fn release_attachments(conn: &Connection, which: &str, arg: i64) -> Result<(), StoreError> {
+    sql(conn.execute(
+        &format!(
+            "UPDATE news_blob SET refs = refs - (
+               SELECT COUNT(*) FROM news_attach a
+                WHERE a.hash = news_blob.hash AND a.article IN
+                      (SELECT id FROM news_article WHERE {which})
+             )"
+        ),
+        params![arg],
+    ))?;
+    sql(conn.execute(
+        &format!(
+            "DELETE FROM news_attach WHERE article IN
+             (SELECT id FROM news_article WHERE {which})"
+        ),
+        params![arg],
+    ))?;
+    Ok(())
 }
 
 fn bump_delete_sn(conn: &Connection, category: i64) -> Result<(), StoreError> {
@@ -875,8 +937,6 @@ impl NewsStore for SqliteStore {
             "UPDATE news_article SET root = ?1, path = ?2 WHERE id = ?3",
             params![i64::from(root), path, i64::from(id)],
         ))?;
-        index_article(&tx, id)?;
-
         let mut kept: Vec<ArticleId> = Vec::new();
         for &dst in &p.refs {
             if kept.len() >= max_refs {
@@ -916,6 +976,44 @@ impl NewsStore for SqliteStore {
                 }
             }
         }
+        let mut names = Vec::new();
+        for (ord, handle) in p.attachments.iter().enumerate() {
+            if p.attachments[..ord].contains(handle) {
+                return Err(NewsError::NoSuchMedia);
+            }
+            let owner = p.attachment_owner.as_ref().ok_or(NewsError::NoSuchMedia)?;
+            let row: Option<(Option<i64>, i64, Option<String>)> = sql(tx
+                .query_row(
+                    &format!(
+                        "SELECT article, staged_at, name FROM news_attach
+                          WHERE handle = ?1 AND {}",
+                        mailbox_sql(owner, "uploader", 2)
+                    ),
+                    params![handle.as_slice(), bind(owner)],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional())?;
+            let Some((None, staged_at, name)) = row else {
+                return Err(NewsError::NoSuchMedia);
+            };
+            if staged_at < unix(p.attachment_cutoff) {
+                return Err(NewsError::NoSuchMedia);
+            }
+            sql(tx.execute(
+                "UPDATE news_attach SET article = ?1, ord = ?2 WHERE handle = ?3",
+                params![i64::from(id), ord as i64, handle.as_slice()],
+            ))?;
+            if let Some(name) = name {
+                names.push(name);
+            }
+        }
+        if !names.is_empty() {
+            sql(tx.execute(
+                "UPDATE news_article SET attach_names = ?1 WHERE id = ?2",
+                params![names.join("\n"), i64::from(id)],
+            ))?;
+        }
+        index_article(&tx, id)?;
         sql(tx.commit())?;
         Ok(Posted { id, root })
     }
@@ -1095,6 +1193,7 @@ impl NewsStore for SqliteStore {
         // Out of the index before its words go: a deletion that left the
         // body findable would not be one (§11).
         unindex(&tx, "id = ?1", i64::from(id))?;
+        release_attachments(&tx, "id = ?1", i64::from(id))?;
         sql(tx.execute(
             "UPDATE news_article
                 SET subject = '', body = '', plain = NULL, attach_names = NULL, nick = '',
@@ -1255,6 +1354,211 @@ impl NewsStore for SqliteStore {
         let indexed = sql(tx.execute(INDEX_LIVE, []))?;
         sql(tx.commit())?;
         Ok(indexed as u64)
+    }
+
+    fn stage_attachment(&self, staged: &StagedAttachment) -> Result<(), NewsError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        sql(tx.execute(
+            "INSERT INTO news_blob
+               (hash, mime, width, height, bytes, derivative, refs, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
+             ON CONFLICT(hash) DO UPDATE SET
+               derivative = COALESCE(news_blob.derivative, excluded.derivative)",
+            params![
+                staged.blob.as_slice(),
+                staged.attachment.mime.mime(),
+                i64::from(staged.attachment.width),
+                i64::from(staged.attachment.height),
+                i64::try_from(staged.attachment.bytes).unwrap_or(i64::MAX),
+                staged.legacy_bytes.and_then(|n| i64::try_from(n).ok()),
+                unix(staged.staged_at),
+            ],
+        ))?;
+        sql(tx.execute(
+            "INSERT INTO news_attach
+               (handle, hash, name, uploader, uploader_fp, staged_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                staged.attachment.id.as_slice(),
+                staged.blob.as_slice(),
+                staged.attachment.name,
+                staged.owner.login,
+                staged.owner.fingerprint.as_ref().map(fp_hex),
+                unix(staged.staged_at),
+            ],
+        ))?;
+        sql(tx.execute(
+            "UPDATE news_blob SET refs = refs + 1 WHERE hash = ?1",
+            params![staged.blob.as_slice()],
+        ))?;
+        sql(tx.commit())?;
+        Ok(())
+    }
+
+    fn attachment(
+        &self,
+        id: &hxd_core::media::Handle,
+        uploader: Option<&Mailbox>,
+        staged_after: SystemTime,
+    ) -> Result<Option<AttachmentFetch>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // Only an uploader has a staged row to see, so without one the
+        // staged arm is left out rather than bound to a mailbox that
+        // matches nothing.
+        let staged = uploader.map_or(String::new(), |u| {
+            format!(
+                "OR (a.article IS NULL AND a.staged_at >= ?2 AND {})",
+                mailbox_sql(u, "a.uploader", 3)
+            )
+        });
+        let sql_text = format!(
+            "SELECT a.hash, b.mime, b.width, b.height, b.bytes, a.name
+               FROM news_attach a JOIN news_blob b ON b.hash = a.hash
+               LEFT JOIN news_article n ON n.id = a.article
+              WHERE a.handle = ?1 AND
+                    ((a.article IS NOT NULL AND n.deleted_at IS NULL) {staged})"
+        );
+        let columns = |r: &Row| -> rusqlite::Result<AttachmentRow> {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        };
+        let row: Option<AttachmentRow> = sql(match uploader {
+            Some(u) => conn.query_row(
+                &sql_text,
+                params![id.as_slice(), unix(staged_after), bind(u)],
+                columns,
+            ),
+            None => conn.query_row(&sql_text, params![id.as_slice()], columns),
+        }
+        .optional())?;
+        row.map(|(hash, mime, width, height, bytes, name)| {
+            Ok(AttachmentFetch {
+                blob: hash
+                    .try_into()
+                    .map_err(|_| StoreError::new("a news blob hash is not 32 bytes"))?,
+                attachment: Attachment {
+                    id: *id,
+                    mime: MediaType::from_mime(&mime)
+                        .ok_or_else(|| StoreError::new(format!("unknown image type {mime:?}")))?,
+                    width: u32::try_from(width)
+                        .map_err(|_| StoreError::new("attachment width is not a u32"))?,
+                    height: u32::try_from(height)
+                        .map_err(|_| StoreError::new("attachment height is not a u32"))?,
+                    bytes: u64::try_from(bytes)
+                        .map_err(|_| StoreError::new("attachment size is negative"))?,
+                    name,
+                },
+            })
+        })
+        .transpose()
+    }
+
+    fn expire_attachments(&self, staged_before: SystemTime) -> Result<Vec<BlobId>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let counts: Vec<(Vec<u8>, i64)> = {
+            let mut stmt = sql(tx.prepare(
+                "SELECT hash, COUNT(*) FROM news_attach
+                  WHERE article IS NULL AND staged_at < ?1 GROUP BY hash",
+            ))?;
+            let rows =
+                sql(stmt.query_map(params![unix(staged_before)], |r| Ok((r.get(0)?, r.get(1)?))))?;
+            rows.collect::<rusqlite::Result<_>>()
+                .map_err(StoreError::new)?
+        };
+        sql(tx.execute(
+            "DELETE FROM news_attach WHERE article IS NULL AND staged_at < ?1",
+            params![unix(staged_before)],
+        ))?;
+        let mut remove = Vec::new();
+        for (hash, count) in counts {
+            sql(tx.execute(
+                "UPDATE news_blob SET refs = refs - ?1 WHERE hash = ?2",
+                params![count, hash],
+            ))?;
+            let refs: Option<i64> = sql(tx
+                .query_row(
+                    "SELECT refs FROM news_blob WHERE hash = ?1",
+                    params![hash],
+                    |r| r.get(0),
+                )
+                .optional())?;
+            if refs.is_some_and(|n| n <= 0) {
+                remove.push(
+                    hash.as_slice()
+                        .try_into()
+                        .map_err(|_| StoreError::new("a news blob hash is not 32 bytes"))?,
+                );
+                sql(tx.execute("DELETE FROM news_blob WHERE hash = ?1", params![hash]))?;
+            }
+        }
+        sql(tx.commit())?;
+        Ok(remove)
+    }
+
+    fn attachment_blobs(&self) -> Result<HashSet<BlobId>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare("SELECT hash FROM news_blob WHERE refs > 0"))?;
+        let rows = sql(stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)))?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            ids.insert(
+                sql(row)?
+                    .try_into()
+                    .map_err(|_| StoreError::new("a news blob hash is not 32 bytes"))?,
+            );
+        }
+        Ok(ids)
+    }
+
+    fn unreferenced_blobs(&self) -> Result<Vec<BlobId>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let ids = {
+            let mut stmt = sql(tx.prepare("SELECT hash FROM news_blob WHERE refs <= 0"))?;
+            let rows = sql(stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(
+                    sql(row)?
+                        .try_into()
+                        .map_err(|_| StoreError::new("a news blob hash is not 32 bytes"))?,
+                );
+            }
+            ids
+        };
+        sql(tx.execute("DELETE FROM news_blob WHERE refs <= 0", []))?;
+        sql(tx.commit())?;
+        Ok(ids)
+    }
+
+    fn attachment_bytes(&self) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = sql(conn.query_row(
+            "SELECT COALESCE(SUM(bytes + COALESCE(derivative, 0)), 0) FROM news_blob",
+            [],
+            |r| r.get(0),
+        ))?;
+        Ok(u64::try_from(total).unwrap_or(0))
+    }
+
+    fn blob_blocked(&self, id: &BlobId) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let found: Option<i64> = sql(conn
+            .query_row(
+                "SELECT 1 FROM media_block WHERE hash = ?1",
+                params![id.as_slice()],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(found.is_some())
     }
 
     fn subscribe(

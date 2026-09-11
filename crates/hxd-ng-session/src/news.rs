@@ -46,6 +46,7 @@ pub fn news_err(e: &NewsError) -> (&'static str, &'static str) {
         NewsError::BadRequest(text) => ("bad_request", text),
         NewsError::SearchOff => ("not_available", "This server does not search its news."),
         NewsError::RateLimited => ("rate_limited", "Slow down."),
+        NewsError::Media(r) => (crate::media::reject_status(*r).1, r.text()),
         NewsError::NoMailbox => (
             "no_mailbox",
             "Your account has nowhere to keep that on this server.",
@@ -55,6 +56,12 @@ pub fn news_err(e: &NewsError) -> (&'static str, &'static str) {
             "You follow as much as this server allows. Unfollow something first.",
         ),
         NewsError::NotifyOff => ("not_available", "This server keeps no subscriptions."),
+        NewsError::NoSuchMedia => ("no_such_media", "No such media."),
+        NewsError::AttachmentsFull => (
+            "attachments_full",
+            "That post has more attachments than this server allows.",
+        ),
+        NewsError::NewsFull => ("news_full", "This server's news storage is full."),
         NewsError::NoSession | NewsError::Store(_) => ("server_error", "Server error."),
     }
 }
@@ -134,6 +141,20 @@ fn ref_json(r: &Reference) -> Value {
     })
 }
 
+fn attachment_json(a: &hxd_core::news::Attachment) -> Value {
+    let mut value = json!({
+        "id": hxd_core::media::handle_str(&a.id),
+        "type": a.mime.mime(),
+        "width": a.width,
+        "height": a.height,
+        "bytes": a.bytes,
+    });
+    if let Some(name) = &a.name {
+        value["name"] = json!(name);
+    }
+    value
+}
+
 /// One article (§9.2). `login` and `fingerprint` are absent for a guest —
 /// absent rather than null, as everywhere on this wire, so a client can
 /// test for the key. A tombstone keeps every key with its words emptied,
@@ -158,9 +179,7 @@ pub fn article_json(a: &Article) -> Value {
         "mime": a.mime.mime(),
         "at": unix(a.at),
         "deleted": a.deleted,
-        // Always present and, until the attachment stage, always empty:
-        // one shape now is one less change for every client later.
-        "attachments": [],
+        "attachments": a.attachments.iter().map(attachment_json).collect::<Vec<_>>(),
         "refs": a.refs.iter().map(ref_json).collect::<Vec<_>>(),
         "referenced_by": a.referenced_by,
     })
@@ -187,7 +206,7 @@ pub fn login_json(core: &Core, uid: Uid) -> Option<Value> {
     let markdown = core.news_markdown().unwrap_or(MarkdownMode::Off);
     let mut block = json!({
         "post": core.news_may_post(uid),
-        "attach": false,
+        "attach": core.news_may_attach(uid),
         "max_body": p.max_body,
         "max_subject": p.max_subject,
         "max_depth": p.max_depth,
@@ -207,6 +226,14 @@ pub fn login_json(core: &Core, uid: Uid) -> Option<Value> {
         "search_max_results": p.search_max_results,
         "subscribe": core.news_may_subscribe(uid),
     });
+    if let Some(attach) = p.attach {
+        block["max_attachments"] = json!(attach.max_count);
+        block["max_attachment_bytes"] = json!(attach.max_bytes);
+        block["types"] = json!(hxd_core::MediaType::ALL
+            .iter()
+            .map(|kind| kind.mime())
+            .collect::<Vec<_>>());
+    }
     // `auto_subscribe` is the server's policy, sent whenever it keeps
     // subscriptions, as `max_body` is sent to a session that may not
     // post. `unread` is this session's badge on the first frame, the way
@@ -575,12 +602,6 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
             let Some(p) = parse::<PostParams>(params) else {
                 return malformed();
             };
-            // No attachment stage yet, so no handle is one this session
-            // staged: the same one answer §9.2 gives for a handle that is
-            // someone else's or has expired.
-            if !p.attach.is_empty() {
-                return reply_err(id, "no_such_media", "No such media.");
-            }
             let mime = match p.mime.as_deref() {
                 None => BodyType::Plain,
                 Some(m) => match BodyType::from_mime(m) {
@@ -594,7 +615,16 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
                 subject: p.subject,
                 body: p.body,
                 mime,
+                attachments: p
+                    .attach
+                    .iter()
+                    .map(|h| hxd_core::media::handle_from_str(h))
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default(),
             };
+            if post.attachments.len() != p.attach.len() {
+                return reply_err(id, "no_such_media", "No such media.");
+            }
             answer(
                 off_reactor(core, move |c| {
                     c.news_post(uid, post).map(|id| json!({ "id": id }))

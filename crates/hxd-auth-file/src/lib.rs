@@ -153,6 +153,9 @@ struct ExtraTable {
     /// everyone who walks through it and queuing mail there hands it to
     /// whoever logs in next.
     inbox: Option<bool>,
+    /// May this account stage durable news attachments? Default: the
+    /// shared send-media access bit.
+    attach_news: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,6 +208,10 @@ impl AccountFile {
                 .extra
                 .inbox
                 .unwrap_or(has_password || fingerprint.is_some()),
+            attach_news: self
+                .extra
+                .attach_news
+                .unwrap_or_else(|| access.has(bit::SEND_MEDIA)),
             identity: IdentityLink {
                 fingerprint,
                 identity_login: self.identity.login.unwrap_or(true),
@@ -981,30 +988,33 @@ mod tests {
         let g = auth.authenticate("guest", Proof::Plain(b"")).unwrap();
         assert!(!g.can_detach);
         assert!(!g.set_subject);
+        assert!(!g.attach_news);
         // Passworded admin: both derived on.
         write(
             td.path(),
             "root.toml",
-            "password = \"pw\"\n[access]\ndisconnect_users = true\n",
+            "password = \"pw\"\n[access]\ndisconnect_users = true\nsend_media = true\n",
         );
         let r = auth.authenticate("root", Proof::Plain(b"pw")).unwrap();
         assert!(r.can_detach);
         assert!(r.set_subject);
+        assert!(r.attach_news);
         // Explicit overrides beat the derivation, both directions.
         write(
             td.path(),
             "kiosk.toml",
-            "[extra]\ncan_detach = true\nset_subject = true\n",
+            "[extra]\ncan_detach = true\nset_subject = true\nattach_news = true\n",
         );
         let k = auth.authenticate("kiosk", Proof::Plain(b"")).unwrap();
-        assert!(k.can_detach && k.set_subject);
+        assert!(k.can_detach && k.set_subject && k.attach_news);
         write(
             td.path(),
             "probation.toml",
-            "password = \"pw\"\n[extra]\ncan_detach = false\n",
+            "password = \"pw\"\n[access]\nsend_media = true\n[extra]\ncan_detach = false\nattach_news = false\n",
         );
         let p = auth.authenticate("probation", Proof::Plain(b"pw")).unwrap();
         assert!(!p.can_detach);
+        assert!(!p.attach_news);
     }
 
     #[test]

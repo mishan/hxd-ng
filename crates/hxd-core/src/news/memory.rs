@@ -254,6 +254,7 @@ impl Inner {
             deleted: a.deleted,
             refs,
             referenced_by,
+            attachments: Vec::new(),
         }
     }
 
@@ -483,6 +484,12 @@ impl NewsStore for MemoryNews {
     }
 
     fn post(&self, p: &NewPost, max_depth: u16, max_refs: usize) -> Result<Posted, NewsError> {
+        // This store stages nothing, so no handle is one it staged: the
+        // answer the durable store gives a handle it has never seen,
+        // rather than an article posted without the pictures it named.
+        if !p.attachments.is_empty() {
+            return Err(NewsError::NoSuchMedia);
+        }
         let mut inner = self.inner.lock().unwrap();
         let category = inner.node(p.category).ok_or(NewsError::NoSuchNode)?;
         if category.kind != NodeKind::Category {

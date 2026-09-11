@@ -47,6 +47,7 @@ use hxd_core::media::{Canonical, CodecLimits, MediaCodec, MediaReject, MediaType
 use image::codecs::gif::{GifDecoder, GifEncoder};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
+use image::imageops::FilterType;
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageEncoder, ImageReader, Limits};
 use tracing::debug;
 use walk::{Format, WalkError};
@@ -216,6 +217,68 @@ impl MediaCodec for Codec {
             bytes,
         })
     }
+
+    fn legacy_derivative(
+        &self,
+        canonical: &Canonical,
+        max_dimension: u32,
+        max_bytes: usize,
+    ) -> Result<Option<Canonical>, MediaReject> {
+        let _permit = self.permits.acquire(self.limits.permit_wait)?;
+        let mut img = image::load_from_memory_with_format(
+            &canonical.bytes,
+            match canonical.mime {
+                MediaType::Jpeg => image::ImageFormat::Jpeg,
+                MediaType::Png => image::ImageFormat::Png,
+                MediaType::Gif => image::ImageFormat::Gif,
+            },
+        )
+        .map_err(decode_failed)?;
+        let longest = img.width().max(img.height());
+        if longest > max_dimension {
+            let scale = f64::from(max_dimension) / f64::from(longest);
+            img = img.resize(
+                (f64::from(img.width()) * scale).round().max(1.0) as u32,
+                (f64::from(img.height()) * scale).round().max(1.0) as u32,
+                FilterType::Triangle,
+            );
+        }
+        let preserve_alpha =
+            img.color().has_alpha() && img.to_rgba8().pixels().any(|pixel| pixel.0[3] != 0xff);
+        loop {
+            if preserve_alpha {
+                let bytes = encode_png(&img)?;
+                if bytes.len() <= max_bytes {
+                    return Ok(Some(Canonical {
+                        mime: MediaType::Png,
+                        width: img.width(),
+                        height: img.height(),
+                        bytes,
+                    }));
+                }
+            } else {
+                for quality in [85, 75, 65, 55, 45, 35] {
+                    let bytes = encode_jpeg_quality(&img, quality)?;
+                    if bytes.len() <= max_bytes {
+                        return Ok(Some(Canonical {
+                            mime: MediaType::Jpeg,
+                            width: img.width(),
+                            height: img.height(),
+                            bytes,
+                        }));
+                    }
+                }
+            }
+            if img.width() <= 64 && img.height() <= 64 {
+                return Ok(None);
+            }
+            img = img.resize(
+                (img.width() * 3 / 4).max(1),
+                (img.height() * 3 / 4).max(1),
+                FilterType::Triangle,
+            );
+        }
+    }
 }
 
 impl Codec {
@@ -284,6 +347,10 @@ fn encode_png(img: &DynamicImage) -> Result<Vec<u8>, MediaReject> {
 }
 
 fn encode_jpeg(img: &DynamicImage) -> Result<Vec<u8>, MediaReject> {
+    encode_jpeg_quality(img, JPEG_QUALITY)
+}
+
+fn encode_jpeg_quality(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, MediaReject> {
     let mut out = Vec::new();
     // JPEG has no alpha. Flattening onto white rather than letting the
     // encoder decide is the difference between a transparent PNG-turned-
@@ -291,7 +358,7 @@ fn encode_jpeg(img: &DynamicImage) -> Result<Vec<u8>, MediaReject> {
     // this path is only reached for a JPEG source, which had no alpha to
     // begin with.
     let rgb = DynamicImage::ImageRgb8(img.to_rgb8());
-    JpegEncoder::new_with_quality(Cursor::new(&mut out), JPEG_QUALITY)
+    JpegEncoder::new_with_quality(Cursor::new(&mut out), quality)
         .write_image(
             rgb.as_bytes(),
             rgb.width(),
@@ -374,5 +441,53 @@ impl Drop for Permit<'_> {
     fn drop(&mut self) {
         *self.0.available.lock().unwrap() += 1;
         self.0.changed.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod derivative_tests {
+    use super::*;
+
+    #[test]
+    fn a_legacy_derivative_is_a_bounded_still_and_preserves_alpha() {
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            16,
+            8,
+            image::Rgba([20, 40, 60, 128]),
+        ));
+        let canonical = Canonical {
+            mime: MediaType::Png,
+            width: image.width(),
+            height: image.height(),
+            bytes: encode_png(&image).unwrap(),
+        };
+        let derivative = Codec::new(CodecLimits::default())
+            .legacy_derivative(&canonical, 8, 60_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(derivative.mime, MediaType::Png);
+        assert_eq!((derivative.width, derivative.height), (8, 4));
+        assert!(derivative.bytes.len() <= 60_000);
+
+        let opaque = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([20, 40, 60, 255]),
+        ));
+        let canonical = Canonical {
+            mime: MediaType::Png,
+            width: opaque.width(),
+            height: opaque.height(),
+            bytes: encode_png(&opaque).unwrap(),
+        };
+        assert_eq!(
+            Codec::new(CodecLimits::default())
+                .legacy_derivative(&canonical, 8, 60_000)
+                .unwrap()
+                .unwrap()
+                .mime,
+            MediaType::Jpeg,
+            "an alpha channel with no transparent pixels is still opaque"
+        );
     }
 }

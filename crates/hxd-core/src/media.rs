@@ -227,6 +227,19 @@ pub trait MediaCodec: Send + Sync + 'static {
     /// Validate, canonicalize and re-encode. Never panics, whatever the
     /// input.
     fn canonicalize(&self, input: &[u8]) -> Result<Canonical, MediaReject>;
+
+    /// Make the bounded still image the legacy news wire can carry.
+    /// `None` means the source is valid but no derivative can meet the
+    /// byte ceiling. Implementations used outside news need not provide
+    /// one.
+    fn legacy_derivative(
+        &self,
+        _canonical: &Canonical,
+        _max_dimension: u32,
+        _max_bytes: usize,
+    ) -> Result<Option<Canonical>, MediaReject> {
+        Ok(None)
+    }
 }
 
 /// Who a download is for. Never a bare uid: uids recycle, and a set

@@ -10,11 +10,14 @@
  */
 
 import assert from 'node:assert/strict';
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
 import { markedSpans, newsScopeOf, referenceSpans } from '@hotline-ng/client';
 
 import { fleet } from './harness/client.mjs';
+import { pngBlob } from './harness/png.mjs';
 import { startFailing, startServer } from './harness/server.mjs';
 
 const account = (name, access) => `name = "${name}"
@@ -281,11 +284,75 @@ describe('threaded news', () => {
   });
 });
 
+describe('news attachments', () => {
+  let server;
+  const crew = fleet(() => server);
+
+  before(async () => {
+    server = await startServer({
+      // `blobs` named, so bytes landing there is the file's doing, and
+      // `[news.attach]` with one key, so every other limit is the default
+      // a real config file gets.
+      config: { inbox: { db: 'server.sqlite' }, news: { blobs: 'pictures', attach: { max_count: 2 } } },
+      accounts: {
+        editor: account('editor', `${EDITOR}send_media = true\n`),
+        reader: account('reader', 'read_news = true\n'),
+      },
+    });
+  });
+  after(async () => {
+    await crew.closeAll();
+    await server?.stop();
+  });
+
+  const login = (who) => crew.connect({ login: who, password: `pw-${who}`, nick: who });
+  const stored = () =>
+    readdirSync(join(server.dir, 'pictures'), { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).length;
+  const code = (p) =>
+    p.then(
+      () => 'ok',
+      (e) => e.wire?.code ?? String(e),
+    );
+
+  test('an image staged over HTTP goes out with its article and comes back to another client', async () => {
+    const editor = await login('editor');
+    const reader = await login('reader');
+    assert.equal(editor.conn.news.attach, true);
+    assert.equal(editor.conn.news.max_attachments, 2, 'the value from the config file');
+    assert.equal(editor.conn.news.max_attachment_bytes, 2 * 1024 * 1024, 'the default');
+    assert.equal(reader.conn.news.attach, false, 'a reader who may not post may not attach');
+    assert.equal(await code(reader.conn.uploadNewsAttachment(pngBlob(4, 4))), 'access_denied');
+
+    const staged = await editor.conn.uploadNewsAttachment(pngBlob(24, 12), 'Café 日本.png');
+    assert.equal(staged.name, 'Café 日本.png', 'a name past ASCII survives the header both ways');
+    assert.deepEqual([staged.type, staged.width, staged.height], ['image/png', 24, 12]);
+    assert.equal(staged.expires_in, 1800);
+    assert.ok(stored() > 0, 'the bytes are where the config file said');
+
+    const { node } = await editor.conn.newsNodeCreate({ kind: 'category', name: 'Pictures' });
+    const { id } = await editor.conn.newsPost({ category: node.id, subject: 'With a picture', body: 'See.', attach: [staged.id] });
+    const article = await reader.conn.newsArticle(id);
+    assert.deepEqual(
+      article.attachments.map((a) => [a.id, a.name]),
+      [[staged.id, 'Café 日本.png']],
+    );
+    const image = await reader.conn.fetchNewsAttachment(staged.id);
+    assert.equal(image.type, 'image/png');
+    assert.deepEqual([...new Uint8Array(await image.slice(0, 4).arrayBuffer())], [0x89, 0x50, 0x4e, 0x47]);
+
+    await editor.conn.newsDelete(id);
+    assert.equal(await code(reader.conn.fetchNewsAttachment(staged.id)), 'no_such_media');
+    assert.equal(stored(), 0, 'a deletion unlinks the bytes, not only the row');
+  });
+});
+
 describe('a news section the server cannot honor', () => {
   test('refuses to start rather than doing less than it says', async () => {
     const { output } = await startFailing({ config: { news: { db: 'news.sqlite', markdown: 'html' } } });
     assert.match(output, /markdown/);
     const alone = await startFailing({ config: { news: {} } });
     assert.match(alone.output, /\[news\] needs db/);
+    const none = await startFailing({ config: { news: { db: 'news.sqlite', attach: { max_count: 0 } } } });
+    assert.match(none.output, /\[news\.attach\]/);
   });
 });

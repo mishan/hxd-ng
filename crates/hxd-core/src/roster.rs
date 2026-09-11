@@ -283,6 +283,7 @@ pub enum Event {
         subject: String,
         from_nick: String,
         at: SystemTime,
+        attachments: u32,
     },
     /// An article became a tombstone.
     NewsDeleted {
@@ -385,6 +386,7 @@ pub(crate) struct UserSession {
     /// no.) It doubles as "is this session a repliable identity" — the
     /// sender of a stored message is recorded only when it is true.
     pub(crate) has_inbox: bool,
+    pub(crate) attach_news: bool,
     /// See [`AttachInfo::is_person`].
     pub(crate) is_person: bool,
     /// See [`AttachInfo::reads_on_delivery`].
@@ -419,6 +421,8 @@ pub struct AttachInfo {
     /// May private messages be stored for this account and delivered
     /// later? (The `[extra] inbox` flag; guests default to no.)
     pub has_inbox: bool,
+    /// May this session stage durable news attachments?
+    pub attach_news: bool,
     /// Is exactly one person behind this account? [`Account::is_person`]:
     /// what news records authorship against, independent of `has_inbox`.
     ///
@@ -697,6 +701,9 @@ pub struct Core {
     /// lock, taken with nothing else held.
     #[allow(clippy::type_complexity)]
     pub(crate) news_push: Mutex<HashMap<(Option<[u8; 32]>, String), (Instant, f64)>>,
+    /// News attachment staging rate, keyed by uploader mailbox.
+    #[allow(clippy::type_complexity)]
+    pub(crate) news_attach_rate: Mutex<HashMap<(Option<[u8; 32]>, String), (Instant, f64)>>,
     /// Serialises inbox flushes.
     ///
     /// A flush reads the pending rows, sends them under the roster lock,
@@ -714,6 +721,12 @@ pub struct Core {
     /// the capability. It carries its own mutex; the roster's may be
     /// taken before it and never after (`crate::media`).
     pub(crate) media: Option<crate::media::MediaStore>,
+    /// Durable news bytes and the shared hostile-image pipeline. Kept
+    /// outside the roster lock: both can do disk or decode work.
+    pub(crate) news_blobs: Option<Arc<dyn crate::news::BlobStore>>,
+    pub(crate) news_codec: Option<Arc<dyn crate::media::MediaCodec>>,
+    /// Serializes attachment filesystem and metadata transitions.
+    pub(crate) news_blob_serial: Mutex<()>,
     /// Makes persisted id order and live fan-out order the same fact.
     /// Nothing but public chat takes this lock; order is it first, then
     /// (briefly) `roster`.
@@ -810,6 +823,7 @@ impl Core {
                 connected_at: Instant::now(),
                 can_detach: info.can_detach,
                 has_inbox: info.has_inbox,
+                attach_news: info.attach_news,
                 is_person: info.is_person,
                 reads_on_delivery: info.reads_on_delivery,
                 identity: info.identity,
@@ -1123,6 +1137,7 @@ pub(crate) fn test_attach(
             can_detach: false,
             transport: Transport::default(),
             has_inbox: false,
+            attach_news: false,
             is_person: false,
             reads_on_delivery: false,
             identity: None,
@@ -1159,6 +1174,7 @@ mod tests {
                 can_detach: true,
                 transport: Transport::default(),
                 has_inbox: true,
+                attach_news: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,
@@ -1235,6 +1251,7 @@ mod tests {
                 can_detach: false,
                 transport: Transport::default(),
                 has_inbox: false,
+                attach_news: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: None,

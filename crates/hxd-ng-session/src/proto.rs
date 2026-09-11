@@ -517,6 +517,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             subject,
             from_nick,
             at,
+            attachments,
         } => (
             "news_posted",
             json!({
@@ -527,7 +528,7 @@ pub fn event_json(se: &SeqEvent) -> String {
                 "subject": subject,
                 "from": { "nick": from_nick },
                 "at": unix(*at),
-                "attachments": 0,
+                "attachments": attachments,
             }),
         ),
         Event::NewsDeleted { id, category } => {
