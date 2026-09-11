@@ -72,6 +72,7 @@ fn attach_boxed(core: &Core, nick: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
                 ..Default::default()
             },
             has_inbox: true,
+            attach_news: false,
             is_person: true,
             reads_on_delivery: false,
             identity: None,
@@ -109,6 +110,7 @@ fn attach_with(
                 ..Default::default()
             },
             has_inbox: false,
+            attach_news: false,
             is_person: false,
             reads_on_delivery: false,
             identity: None,

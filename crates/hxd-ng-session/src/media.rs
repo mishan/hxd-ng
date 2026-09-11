@@ -214,7 +214,7 @@ pub async fn download(id: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
 }
 
 /// `Bearer <session>.<token>` → the uid it belongs to.
-fn bearer_session(req: &Request<Incoming>, ctx: &NgCtx) -> Option<hxd_core::Uid> {
+pub(crate) fn bearer_session(req: &Request<Incoming>, ctx: &NgCtx) -> Option<hxd_core::Uid> {
     let (session, token) = credential(req)?;
     ctx.registry.validate(&ctx.core, &session, &token)
 }
@@ -234,18 +234,24 @@ fn credential(req: &Request<Incoming>) -> Option<(String, String)> {
     (!session.is_empty() && !token.is_empty()).then(|| (session.to_owned(), token.to_owned()))
 }
 
-/// The six codes onto statuses (§8.2), with the ng error shape in the
-/// body so a client has one parser for every failure this server
-/// produces.
-fn reject(e: MediaReject) -> Resp {
-    let (status, code) = match e {
+/// The six codes onto statuses and ng error codes (§8.2). News
+/// attachments share them (`news.md` §9.4), on both of its routes and on
+/// the socket.
+pub(crate) fn reject_status(e: MediaReject) -> (StatusCode, &'static str) {
+    match e {
         MediaReject::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "media_too_large"),
         MediaReject::Unsupported => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media"),
         MediaReject::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         MediaReject::NotAuthorized => (StatusCode::FORBIDDEN, "access_denied"),
         MediaReject::Busy => (StatusCode::SERVICE_UNAVAILABLE, "server_busy"),
         MediaReject::Generic => (StatusCode::BAD_REQUEST, "media_rejected"),
-    };
+    }
+}
+
+/// [`reject_status`], with the ng error shape in the body so a client
+/// has one parser for every failure this server produces.
+pub(crate) fn reject(e: MediaReject) -> Resp {
+    let (status, code) = reject_status(e);
     let resp = json_resp(
         status,
         json!({ "error": { "code": code, "text": e.text() } }),
@@ -263,21 +269,21 @@ fn retry_after(mut resp: Resp) -> Resp {
     resp
 }
 
-fn not_found() -> Resp {
+pub(crate) fn not_found() -> Resp {
     json_resp(
         StatusCode::NOT_FOUND,
         json!({ "error": { "code": "no_such_media", "text": "Media not found" } }),
     )
 }
 
-fn unauthorized() -> Resp {
+pub(crate) fn unauthorized() -> Resp {
     json_resp(
         StatusCode::UNAUTHORIZED,
         json!({ "error": { "code": "not_logged_in", "text": "Media needs a session." } }),
     )
 }
 
-fn json_resp(status: StatusCode, v: serde_json::Value) -> Resp {
+pub(crate) fn json_resp(status: StatusCode, v: serde_json::Value) -> Resp {
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")

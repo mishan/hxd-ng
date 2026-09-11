@@ -1390,6 +1390,7 @@ mod tests {
             file_getinfo: true,
             has_password: password,
             has_inbox: password,
+            attach_news: false,
             identity: hxd_core::IdentityLink {
                 identity_login: true,
                 allow_self_link: true,

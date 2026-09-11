@@ -16,6 +16,8 @@
 //! | `/identity/enroll/…` | the enrollment mailbox, `identity-enrollment.md` §5 |
 //! | `POST /media` | inline media, `inline-media.md` §8.2 |
 //! | `GET  /media/<id>` | the canonical bytes |
+//! | `POST /news/blob` | stage a durable news image |
+//! | `GET  /news/blob/<id>` | an authorized news image |
 //! | `GET  /ng` (and `/`) | upgrade → the JSON protocol |
 //! | `GET  /trtp` | upgrade → the TRTP tunnel |
 //!
@@ -165,6 +167,17 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         let resp = match (req.method(), path.strip_prefix("/files/")) {
             (&Method::GET, Some(token)) if !token.is_empty() && !token.contains('/') => {
                 download_file(token, req, &ctx).await
+            }
+            _ => plain(StatusCode::NOT_FOUND, "not found"),
+        };
+        return cors(resp);
+    }
+
+    if path == "/news/blob" || path.starts_with("/news/blob/") {
+        let resp = match (req.method(), path.strip_prefix("/news/blob/")) {
+            (&Method::POST, None) => boxed(crate::news_blob::upload(req, &ctx).await),
+            (&Method::GET, Some(id)) if !id.is_empty() && !id.contains('/') => {
+                boxed(crate::news_blob::download(id, req, &ctx).await)
             }
             _ => plain(StatusCode::NOT_FOUND, "not found"),
         };
@@ -388,6 +401,8 @@ fn cors_route(path: &str) -> bool {
         || path == "/media"
         || path.starts_with("/media/")
         || path.starts_with("/files/")
+        || path == "/news/blob"
+        || path.starts_with("/news/blob/")
 }
 
 /// `*` rather than an echo of `Origin`: there is no cookie or other
@@ -427,7 +442,7 @@ fn preflight() -> Resp {
         // preflight it triggers succeed.
         .header(
             ACCESS_CONTROL_ALLOW_HEADERS,
-            "content-type, authorization, if-none-match, range",
+            "content-type, authorization, if-none-match, range, x-attachment-name",
         )
         .header(ACCESS_CONTROL_MAX_AGE, "86400")
         .body(full(Bytes::new()))
