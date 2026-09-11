@@ -5,10 +5,10 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures_util::{SinkExt, StreamExt};
-use hxd_core::{Core, MarkdownMode, NewsPolicy, NotifyPolicy};
+use hxd_core::{AttachmentPolicy, Core, MarkdownMode, NewsPolicy, NotifyPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::Caps;
 use hxd_session::frame::{pack_frame, read_frame, Frame};
@@ -16,6 +16,7 @@ use hxd_session::{ServerConfig, ServerCtx};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
 use hxproto::messages::tag;
 use serde_json::{json, Value};
+use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -23,7 +24,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 const EVERY_NEWS_BIT: &str = "read_news = true\npost_news = true\ndelete_articles = true\n\
     create_categories = true\ndelete_categories = true\ncreate_news_bundles = true\n\
-    delete_news_bundles = true\n";
+    delete_news_bundles = true\nsend_media = true\n";
 
 fn account(name: &str, access: &str) -> String {
     format!("name = \"{name}\"\npassword = \"pw\"\n[access]\nread_chat = true\nsend_chat = true\n{access}")
@@ -32,12 +33,28 @@ fn account(name: &str, access: &str) -> String {
 /// A server with news (or without, when `news` is `None`), and the two
 /// addresses its wires listen on.
 async fn start_server(dir: &Path, news: Option<NewsPolicy>) -> (SocketAddr, SocketAddr) {
+    let (legacy, ng, _) = start_server_core(dir, news).await;
+    (legacy, ng)
+}
+
+/// [`start_server`], keeping its `Core` for a test that does what the
+/// binary's timers would.
+async fn start_server_core(
+    dir: &Path,
+    news: Option<NewsPolicy>,
+) -> (SocketAddr, SocketAddr, Arc<Core>) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     for (login, access) in [
         ("admin", EVERY_NEWS_BIT),
-        ("alice", "read_news = true\npost_news = true\n"),
-        ("bob", "read_news = true\npost_news = true\n"),
+        (
+            "alice",
+            "read_news = true\npost_news = true\nsend_media = true\n",
+        ),
+        (
+            "bob",
+            "read_news = true\npost_news = true\nsend_media = true\n",
+        ),
         ("lurker", "read_news = true\n"),
         ("outsider", ""),
     ] {
@@ -52,10 +69,19 @@ async fn start_server(dir: &Path, news: Option<NewsPolicy>) -> (SocketAddr, Sock
         // The accounts as well, as `hxd` wires them: who a post may
         // notify is a question about accounts nobody is logged into.
         Some(policy) => {
-            let store = SqliteStore::open(dir.join("server.sqlite"), Synchronous::Normal).unwrap();
-            let core = Core::new()
-                .with_news(Arc::new(store), policy)
+            let store = Arc::new(
+                SqliteStore::open(dir.join("server.sqlite"), Synchronous::Normal).unwrap(),
+            );
+            let mut core = Core::new()
+                .with_news(store, policy)
                 .with_accounts(files.clone());
+            if policy.attach.is_some() {
+                let blobs = hxd_store_sqlite::FileBlobStore::open(dir.join("news-blobs")).unwrap();
+                core = core.with_news_attachments(
+                    Arc::new(blobs),
+                    Arc::new(hxd_media::Codec::new(Default::default())),
+                );
+            }
             // The parser `render` asks for, as `hxd` gives it one.
             if policy.markdown == MarkdownMode::Render {
                 core.with_body_renderer(Arc::new(hxd_markdown::Markdown))
@@ -83,7 +109,7 @@ async fn start_server(dir: &Path, news: Option<NewsPolicy>) -> (SocketAddr, Sock
         }),
     };
     let ng_ctx = NgCtx {
-        core,
+        core: core.clone(),
         auth,
         cfg: Arc::new(NgConfig {
             server_name: "news-test".into(),
@@ -104,7 +130,7 @@ async fn start_server(dir: &Path, news: Option<NewsPolicy>) -> (SocketAddr, Sock
     let addresses = (legacy.local_addr().unwrap(), ng.local_addr().unwrap());
     tokio::spawn(hxd_session::serve(legacy, legacy_ctx));
     tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
-    addresses
+    (addresses.0, addresses.1, core)
 }
 
 fn news_server() -> NewsPolicy {
@@ -120,10 +146,15 @@ struct Ng {
     ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
     next: u64,
     events: Vec<Value>,
+    bearer: String,
 }
 
 impl Ng {
     async fn login(addr: SocketAddr, login: &str) -> (Self, Value) {
+        Self::login_with(addr, login, "pw").await
+    }
+
+    async fn login_with(addr: SocketAddr, login: &str, password: &str) -> (Self, Value) {
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
@@ -131,12 +162,19 @@ impl Ng {
             ws,
             next: 1,
             events: Vec::new(),
+            bearer: String::new(),
         };
         let reply = client
-            .request("login", json!({ "login": login, "password": "pw" }))
+            .request("login", json!({ "login": login, "password": password }))
             .await;
         assert!(reply.get("ok").is_some(), "{reply}");
-        (client, reply["ok"].clone())
+        let ok = reply["ok"].clone();
+        client.bearer = format!(
+            "Bearer {}.{}",
+            ok["session"].as_str().unwrap(),
+            ok["token"].as_str().unwrap()
+        );
+        (client, ok)
     }
 
     /// Come back to a detached session on a fresh socket.
@@ -148,6 +186,7 @@ impl Ng {
             ws,
             next: 1,
             events: Vec::new(),
+            bearer: format!("Bearer {session}.{token}"),
         };
         client
             .ok(
@@ -283,6 +322,104 @@ fn ids(list: &Value, key: &str) -> Vec<u64> {
         .collect()
 }
 
+struct HttpReply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl HttpReply {
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.body)
+            .unwrap_or_else(|_| panic!("not JSON: {:?}", String::from_utf8_lossy(&self.body)))
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+async fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> HttpReply {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut raw = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut raw))
+        .await
+        .unwrap()
+        .unwrap();
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("no HTTP header terminator");
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let headers = lines
+        .filter_map(|line| {
+            line.split_once(':')
+                .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+        })
+        .collect();
+    HttpReply {
+        status,
+        headers,
+        body: raw[split + 4..].to_vec(),
+    }
+}
+
+fn png(width: u32, height: u32) -> Vec<u8> {
+    use image::{DynamicImage, ImageEncoder, RgbaImage};
+    let mut image = RgbaImage::new(width, height);
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        *pixel = image::Rgba([(x * 5 % 256) as u8, (y * 3 % 256) as u8, 0x30, 0xff]);
+    }
+    let image = DynamicImage::ImageRgba8(image);
+    let mut bytes = Vec::new();
+    image::codecs::png::PngEncoder::new(std::io::Cursor::new(&mut bytes))
+        .write_image(image.as_bytes(), width, height, image.color().into())
+        .unwrap();
+    bytes
+}
+
+fn file_count(root: &Path) -> usize {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .map(|path| {
+            if path.is_dir() {
+                file_count(&path)
+            } else {
+                usize::from(path.is_file())
+            }
+        })
+        .sum()
+}
+
 #[tokio::test]
 async fn the_login_reply_says_what_this_session_may_do() {
     let dir = tempfile::tempdir().unwrap();
@@ -309,6 +446,341 @@ async fn the_login_reply_says_what_this_session_may_do() {
         hello["news"]["post"], false,
         "a reader who may not post is told so"
     );
+}
+
+#[tokio::test]
+async fn a_staged_attachment_becomes_durable_news_for_every_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut policy = news_server();
+    policy.attach = Some(AttachmentPolicy {
+        max_bytes: 16 * 1024,
+        max_count: 2,
+        max_total_bytes: 1024 * 1024,
+        stage_ttl: Duration::from_secs(30 * 60),
+        per_hour: 20,
+        legacy_derivative: true,
+    });
+    let (_legacy, ng) = start_server(dir.path(), Some(policy)).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, hello) = Ng::login(ng, "alice").await;
+    let (mut bob, _) = Ng::login(ng, "bob").await;
+    assert_eq!(hello["news"]["attach"], true);
+    assert_eq!(hello["news"]["max_attachments"], 2);
+    assert_eq!(hello["news"]["max_attachment_bytes"], 16 * 1024);
+    assert_eq!(
+        hello["news"]["types"],
+        json!(["image/jpeg", "image/png", "image/gif"])
+    );
+
+    let sent = png(20, 10);
+    let staged = http(
+        ng,
+        "POST",
+        "/news/blob",
+        &[
+            ("Authorization", &alice.bearer),
+            ("Content-Type", "image/png"),
+            ("X-Attachment-Name", "diagram.png"),
+        ],
+        &sent,
+    )
+    .await;
+    assert_eq!(staged.status, 201, "{:?}", staged.json());
+    assert_eq!(staged.header("access-control-allow-origin"), Some("*"));
+    let blob = staged.json()["blob"].clone();
+    let handle = blob["id"].as_str().unwrap().to_owned();
+    assert_eq!(blob["type"], "image/png");
+    assert_eq!(blob["width"], 20);
+    assert_eq!(blob["height"], 10);
+    assert_eq!(blob["name"], "diagram.png");
+
+    let private = http(
+        ng,
+        "GET",
+        &format!("/news/blob/{handle}"),
+        &[("Authorization", &bob.bearer)],
+        b"",
+    )
+    .await;
+    assert_eq!(
+        private.status, 404,
+        "a staged handle belongs only to its uploader"
+    );
+
+    let cat = category(&mut admin, None, "General").await;
+    assert_eq!(
+        bob.refused(
+            "news_post",
+            json!({
+                "category": cat,
+                "subject": "Not Bob's",
+                "body": "No borrowing.",
+                "attach": [&handle],
+            }),
+        )
+        .await,
+        "no_such_media"
+    );
+    let article = alice
+        .ok(
+            "news_post",
+            json!({
+                "category": cat,
+                "subject": "With a diagram",
+                "body": "The durable copy.",
+                "attach": [&handle],
+            }),
+        )
+        .await["id"]
+        .as_u64()
+        .unwrap();
+
+    let fetched = http(
+        ng,
+        "GET",
+        &format!("/news/blob/{handle}"),
+        &[("Authorization", &bob.bearer)],
+        b"",
+    )
+    .await;
+    assert_eq!(fetched.status, 200);
+    assert_eq!(fetched.header("content-type"), Some("image/png"));
+    assert_eq!(fetched.header("x-content-type-options"), Some("nosniff"));
+    assert!(fetched.header("etag").is_some());
+    assert!(fetched.body.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(file_count(&dir.path().join("news-blobs")) > 0);
+
+    let article_json = bob.ok("news_article", json!({ "id": article })).await["article"].clone();
+    let mut attached = blob;
+    attached.as_object_mut().unwrap().remove("expires_in");
+    assert_eq!(article_json["attachments"], json!([attached]));
+
+    admin.ok("news_delete", json!({ "id": article })).await;
+    let removed = http(
+        ng,
+        "GET",
+        &format!("/news/blob/{handle}"),
+        &[("Authorization", &bob.bearer)],
+        b"",
+    )
+    .await;
+    assert_eq!(removed.status, 404, "a tombstone stops attachment access");
+    assert_eq!(file_count(&dir.path().join("news-blobs")), 0);
+}
+
+fn attach_policy() -> AttachmentPolicy {
+    AttachmentPolicy {
+        max_bytes: 16 * 1024,
+        max_count: 2,
+        max_total_bytes: 1024 * 1024,
+        stage_ttl: Duration::from_secs(30 * 60),
+        per_hour: 20,
+        legacy_derivative: true,
+    }
+}
+
+fn attaching(attach: AttachmentPolicy) -> NewsPolicy {
+    NewsPolicy {
+        attach: Some(attach),
+        ..news_server()
+    }
+}
+
+async fn stage(ng: SocketAddr, who: &Ng, image: &[u8], name: &str) -> HttpReply {
+    http(
+        ng,
+        "POST",
+        "/news/blob",
+        &[
+            ("Authorization", &who.bearer),
+            ("Content-Type", "image/png"),
+            ("X-Attachment-Name", name),
+        ],
+        image,
+    )
+    .await
+}
+
+async fn fetch_blob(ng: SocketAddr, who: &Ng, path: &str) -> HttpReply {
+    http(
+        ng,
+        "GET",
+        &format!("/news/blob/{path}"),
+        &[("Authorization", &who.bearer)],
+        b"",
+    )
+    .await
+}
+
+fn staged_id(reply: &HttpReply) -> String {
+    assert_eq!(reply.status, 201, "{:?}", reply.json());
+    reply.json()["blob"]["id"].as_str().unwrap().to_owned()
+}
+
+fn refusal(reply: &HttpReply) -> (u16, String) {
+    let code = reply.json()["error"]["code"].as_str().unwrap().to_owned();
+    (reply.status, code)
+}
+
+#[tokio::test]
+async fn an_attachment_refusal_says_what_would_fix_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(
+        dir.path(),
+        Some(attaching(AttachmentPolicy {
+            max_count: 1,
+            per_hour: 4,
+            ..attach_policy()
+        })),
+    )
+    .await;
+    let accounts = dir.path().join("accounts");
+    // Every news bit but send-media; and every bit on a login that no one
+    // person is behind.
+    std::fs::write(
+        accounts.join("carol.toml"),
+        account("carol", "read_news = true\npost_news = true\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        accounts.join("guest.toml"),
+        "name = \"Guest\"\n[access]\nread_news = true\npost_news = true\nsend_media = true\n",
+    )
+    .unwrap();
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, hello) = Ng::login(ng, "alice").await;
+    let (carol, carol_hello) = Ng::login(ng, "carol").await;
+    let (guest, guest_hello) = Ng::login_with(ng, "guest", "").await;
+    assert_eq!(hello["news"]["attach"], true);
+    assert_eq!(carol_hello["news"]["attach"], false);
+    assert_eq!(
+        guest_hello["news"]["attach"], false,
+        "a shared login is nobody's to stage under, whatever its bits"
+    );
+    assert_eq!(
+        refusal(&stage(ng, &carol, &png(20, 10), "a.png").await),
+        (403, "access_denied".into())
+    );
+    assert_eq!(
+        refusal(&stage(ng, &guest, &png(20, 10), "a.png").await),
+        (403, "no_mailbox".into())
+    );
+
+    // Refused before the body is read, and before the allowance is spent.
+    assert_eq!(
+        refusal(&stage(ng, &alice, &vec![0; 16 * 1024 + 1], "big.png").await),
+        (413, "media_too_large".into())
+    );
+    // The allowance: one spent on bytes that are not an image, two on
+    // the pictures below, and one on the blocked re-upload. Words, and
+    // enough of them to clear the pipeline's floor, so what refuses them
+    // is the sniff rather than the size.
+    let prose = "Not an image, only words. ".repeat(64);
+    assert_eq!(
+        refusal(&stage(ng, &alice, prose.as_bytes(), "a.png").await),
+        (415, "unsupported_media".into())
+    );
+    let first = staged_id(&stage(ng, &alice, &png(20, 10), "first.png").await);
+    let second = staged_id(&stage(ng, &alice, &png(30, 10), "second.png").await);
+
+    let cat = category(&mut admin, None, "General").await;
+    let post = |attach: Vec<&String>| json!({ "category": cat, "subject": "Pictures", "body": "Two.", "attach": attach });
+    assert_eq!(
+        alice
+            .refused("news_post", post(vec![&first, &second]))
+            .await,
+        "attachments_full"
+    );
+    alice.ok("news_post", post(vec![&first])).await;
+
+    let canonical = fetch_blob(ng, &alice, &first).await;
+    assert_eq!(canonical.header("content-type"), Some("image/png"));
+    let legacy = fetch_blob(ng, &alice, &format!("{first}?size=legacy")).await;
+    assert_eq!(legacy.status, 200);
+    assert_eq!(
+        legacy.header("content-type"),
+        Some("image/jpeg"),
+        "an opaque image's derivative is a JPEG"
+    );
+    assert!(legacy.body.starts_with(&[0xff, 0xd8]));
+    assert!(legacy.body.len() <= 60_000);
+
+    // A moderator's block, in the table W8 will write, is the answer chat
+    // media gives a blocked hash: refused, and not told why.
+    let hash: [u8; 32] = sha2::Sha256::digest(&canonical.body).into();
+    rusqlite::Connection::open(dir.path().join("server.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO media_block (hash, at, by) VALUES (?1, 0, 'moderator')",
+            [hash.as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        refusal(&stage(ng, &alice, &png(20, 10), "again.png").await),
+        (400, "media_rejected".into())
+    );
+
+    let limited = stage(ng, &alice, &png(40, 10), "one-more.png").await;
+    assert_eq!(refusal(&limited), (429, "rate_limited".into()));
+    assert!(limited.header("retry-after").is_some());
+}
+
+#[tokio::test]
+async fn a_full_archive_refuses_rather_than_evicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(
+        dir.path(),
+        Some(attaching(AttachmentPolicy {
+            max_total_bytes: 100,
+            ..attach_policy()
+        })),
+    )
+    .await;
+    let (alice, _) = Ng::login(ng, "alice").await;
+    assert_eq!(
+        refusal(&stage(ng, &alice, &png(20, 10), "a.png").await),
+        (507, "news_full".into())
+    );
+    assert_eq!(file_count(&dir.path().join("news-blobs")), 0);
+}
+
+#[tokio::test]
+async fn the_sweep_takes_abandoned_stages_and_files_nothing_keeps() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, core) = start_server_core(dir.path(), Some(attaching(attach_policy()))).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let (bob, _) = Ng::login(ng, "bob").await;
+    let kept = staged_id(&stage(ng, &alice, &png(20, 10), "kept.png").await);
+    let abandoned = staged_id(&stage(ng, &alice, &png(30, 10), "abandoned.png").await);
+    let cat = category(&mut admin, None, "General").await;
+    alice
+        .ok(
+            "news_post",
+            json!({ "category": cat, "subject": "Kept", "body": "This one.", "attach": [&kept] }),
+        )
+        .await;
+
+    // What a crash leaves behind: bytes no row names, and a write that
+    // was never renamed into place.
+    let blobs = dir.path().join("news-blobs");
+    let stray = blobs.join("ab").join("cd");
+    std::fs::create_dir_all(&stray).unwrap();
+    std::fs::write(stray.join("ab".repeat(32)), b"orphan").unwrap();
+    std::fs::write(stray.join(".stage-0-0"), b"half a write").unwrap();
+
+    // The pruner's view an hour and a half from now: past the stage TTL.
+    let swept = core
+        .news_expire_attachments(SystemTime::now() + Duration::from_secs(90 * 60))
+        .unwrap();
+    assert_eq!(swept, 2, "the orphan and the unfinished write");
+    assert_eq!(
+        file_count(&blobs),
+        2,
+        "the posted image and its derivative, and nothing of the abandoned one"
+    );
+    assert_eq!(fetch_blob(ng, &alice, &abandoned).await.status, 404);
+    assert_eq!(fetch_blob(ng, &bob, &kept).await.status, 200);
 }
 
 #[tokio::test]

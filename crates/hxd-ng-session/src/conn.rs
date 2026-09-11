@@ -384,6 +384,7 @@ async fn handle_login(
         login: account.login.clone(),
         addr: Some(peer.ip()),
         can_detach: account.can_detach,
+        attach_news: account.attach_news,
         // The plaintext listener is loopback-only and WSS is mandatory in
         // production (`docs/hotline-ng.md` §9), so ng sockets are
         // encrypted by construction — unless the client told us at

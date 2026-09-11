@@ -64,6 +64,11 @@ hxd-media = { workspace = true }
 image = { version = ">=0.25.5, <0.25.10", default-features = false, features = [
     "png",
 ] }
+# The news e2e blocks an image the way a moderator will, by the hash of
+# its canonical bytes in the store's own table. Same pins as
+# `hxd-store-sqlite`'s.
+rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.10"
 str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false }

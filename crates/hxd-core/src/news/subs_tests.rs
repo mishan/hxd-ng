@@ -162,6 +162,7 @@ impl Server {
                 can_detach: true,
                 transport: Transport::default(),
                 has_inbox: login != "guest",
+                attach_news: false,
                 is_person: login != "guest",
                 reads_on_delivery: classic,
                 identity,
@@ -190,6 +191,7 @@ impl Server {
                     subject: "subject".into(),
                     body: body.into(),
                     mime: BodyType::Plain,
+                    attachments: Vec::new(),
                 },
             )
             .unwrap()

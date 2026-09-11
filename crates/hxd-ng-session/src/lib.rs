@@ -10,6 +10,7 @@ mod http;
 pub mod identity;
 pub mod media;
 pub mod news;
+mod news_blob;
 pub mod proto;
 mod registry;
 mod tunnel;
