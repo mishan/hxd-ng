@@ -267,7 +267,7 @@ fn a_thread_comes_back_in_preorder(s: &dyn NewsStore) {
     let late = post(s, cat, Some(first), "late reply to the first", 6);
     post(s, cat, Some(other), "elsewhere", 7);
 
-    let page = s.thread(starter, None, 100).unwrap();
+    let page = s.thread(starter, None, None, 100).unwrap();
     assert!(!page.has_more);
     let order: Vec<(ArticleId, u16)> = page.articles.iter().map(|a| (a.id, a.depth)).collect();
     assert_eq!(
@@ -361,27 +361,37 @@ fn a_thread_pages_forward_through_its_replies(s: &dyn NewsStore) {
     let other = post(s, cat, None, "other", 6);
 
     let ids = |p: &super::ArticlePage| p.articles.iter().map(|a| a.id).collect::<Vec<_>>();
-    let first = s.thread(root, None, 2).unwrap();
+    let first = s.thread(root, None, None, 2).unwrap();
     assert_eq!(ids(&first), [root, a]);
     assert!(first.has_more);
-    let second = s.thread(root, Some(a), 2).unwrap();
+    let snapshot = first.snapshot;
+    assert_eq!(snapshot, d);
+    let late = post(s, cat, Some(a), "late beneath an earlier reply", 7);
+    let second = s.thread(root, Some(a), Some(snapshot), 2).unwrap();
     assert_eq!(ids(&second), [b, c]);
     assert!(second.has_more);
-    let third = s.thread(root, Some(c), 2).unwrap();
+    assert_eq!(second.snapshot, snapshot);
+    let third = s.thread(root, Some(c), Some(snapshot), 2).unwrap();
     assert_eq!(ids(&third), [d]);
     assert!(!third.has_more);
+    assert_eq!(third.snapshot, snapshot);
+    assert_eq!(
+        ids(&s.thread(root, None, None, 10).unwrap()),
+        [root, a, b, late, c, d],
+        "a fresh traversal sees the reply that the earlier snapshot excludes"
+    );
 
     assert_eq!(
-        s.thread(root, Some(other), 2),
+        s.thread(root, Some(other), Some(snapshot), 2),
         Err(NewsError::NoSuchArticle),
         "a cursor from another thread is not a place in this one"
     );
     assert_eq!(
-        s.thread(a, None, 2),
+        s.thread(a, None, None, 2),
         Err(NewsError::NoSuchArticle),
         "a reply is not a thread"
     );
-    assert_eq!(s.thread(9999, None, 2), Err(NewsError::NoSuchArticle));
+    assert_eq!(s.thread(9999, None, None, 2), Err(NewsError::NoSuchArticle));
 }
 
 fn references_resolve_once_and_report_their_target_now(s: &dyn NewsStore) {
@@ -464,7 +474,7 @@ fn a_tombstone_keeps_its_place_and_loses_its_words(s: &dyn NewsStore) {
     assert_eq!(was.body, "middle", "the article as it was, for the record");
     assert_eq!(was.refs.len(), 1);
 
-    let thread = s.thread(root, None, 10).unwrap();
+    let thread = s.thread(root, None, None, 10).unwrap();
     assert_eq!(
         thread.articles.iter().map(|a| a.id).collect::<Vec<_>>(),
         [root, middle, below],
@@ -560,7 +570,7 @@ fn pruning_takes_whole_threads_by_their_last_post(s: &dyn NewsStore) {
     assert_eq!(gone, 4);
     assert!(s.article(stale).unwrap().is_none());
     assert!(s.article(alive).unwrap().is_some());
-    assert_eq!(s.thread(alive, None, 10).unwrap().articles.len(), 2);
+    assert_eq!(s.thread(alive, None, None, 10).unwrap().articles.len(), 2);
     assert!(s.article(citing).unwrap().unwrap().refs.is_empty());
     assert_eq!(s.node(cat).unwrap().unwrap().delete_sn, before + 1);
     assert_eq!(

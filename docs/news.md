@@ -1015,7 +1015,7 @@ than sending limits for something that cannot be done.
 |---|---|---|
 | `news_tree` | `parent?` (node id; absent = root), `depth?` (1–4, default 1) | `{ "nodes": [ … ] }` |
 | `news_threads` | `category`, `before?` / `after?` (thread root id), `order?` (`"created"`, the default and so far the only one: `"recent"` is an open question, §18, and asking for it is `bad_request`), `limit?` (1–200, default 50) | `{ "threads": [ … ], "has_more": bool }` |
-| `news_thread` | `root`, `after?` (article id), `limit?` (1–100, default 25) | `{ "articles": [ … ], "has_more": bool }` |
+| `news_thread` | `root`, `after?` (article id), `snapshot?` (article id returned by the first page; required with `after`), `limit?` (1–100, default 25) | `{ "articles": [ … ], "has_more": bool, "snapshot": article_id }` |
 | `news_article` | `id` | `{ "article": { … } }` |
 | `news_post` | `category`, `parent?`, `subject`, `body`, `mime?` (`"text/plain"` \| `"text/markdown"`, default plain), `attach?` (handles) | `{ "id": 51 }` |
 | `news_delete` | `id`, `reason?` | `{}` |
@@ -1039,9 +1039,15 @@ There is deliberately **no error code for a bad search query**: §6.2
 compiles anything into something, so `news_search` answers with results
 or with an empty list.
 
-Pagination follows the `history` request exactly: cursors are ids,
-`before`/`after` are exclusive, `has_more` is computed by fetching
-`limit + 1`, and the caller clamps the limit before the store sees it.
+Pagination follows the `history` request where its ordering permits:
+cursors are ids, `before`/`after` are exclusive, `has_more` is computed
+by fetching `limit + 1`, and the caller clamps the limit before the
+store sees it. A thread's preorder is mutable — a new reply to an early
+article sorts before later siblings — so the first `news_thread` page
+also returns `snapshot`, the newest article admitted to that traversal.
+Every request with `after` must echo it. Newer replies then belong to a
+fresh traversal instead of appearing on some later pages while falling
+behind other cursors.
 
 An `article` object:
 

@@ -608,23 +608,30 @@ impl NewsStore for SqliteStore {
         &self,
         root: ArticleId,
         after: Option<ArticleId>,
+        snapshot: Option<ArticleId>,
         limit: usize,
     ) -> Result<ArticlePage, NewsError> {
         if limit == 0 {
             return Err(NewsError::BadRequest("A page needs a limit of at least 1."));
         }
         let conn = self.conn.lock().unwrap();
-        let starter: Option<(i64, Option<i64>)> = sql(conn
+        let starter: Option<(i64, Option<i64>, Option<i64>)> = sql(conn
             .query_row(
-                "SELECT category, parent FROM news_article WHERE id = ?1",
+                "SELECT category, parent,
+                        (SELECT MAX(id) FROM news_article WHERE root = ?1)
+                   FROM news_article WHERE id = ?1",
                 params![i64::from(root)],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional())?;
-        let category = match starter {
-            Some((category, None)) => category,
+        let (category, newest) = match starter {
+            Some((category, None, Some(newest))) => (category, article_id(newest)?),
             _ => return Err(NewsError::NoSuchArticle),
         };
+        let snapshot = snapshot.unwrap_or(newest);
+        if snapshot < root {
+            return Err(NewsError::BadRequest("The snapshot predates this thread."));
+        }
         // The cursor is a place in this thread, so it has to be in it.
         let from: Vec<u8> = match after {
             None => Vec::new(),
@@ -636,17 +643,22 @@ impl NewsStore for SqliteStore {
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional())?;
-                match found {
+                let path = match found {
                     Some((r, path)) if r == i64::from(root) => path,
                     _ => return Err(NewsError::NoSuchArticle),
+                };
+                if id > snapshot {
+                    return Err(NewsError::BadRequest("The cursor is past this snapshot."));
                 }
+                path
             }
         };
         let take = limit.saturating_add(1).min(i64::MAX as usize) as i64;
         let sql_text = format!(
             "SELECT {ARTICLE_COLUMNS} FROM news_article
               WHERE category = ?1 AND path >= ?2 AND path < ?3 AND path > ?4
-              ORDER BY path LIMIT ?5"
+                AND id <= ?5
+              ORDER BY path LIMIT ?6"
         );
         let raws: Vec<RawArticle> = {
             let mut stmt = sql(conn.prepare_cached(&sql_text))?;
@@ -656,6 +668,7 @@ impl NewsStore for SqliteStore {
                     root.to_be_bytes().as_slice(),
                     thread_end(root),
                     from,
+                    i64::from(snapshot),
                     take
                 ],
                 raw_article,
@@ -669,7 +682,11 @@ impl NewsStore for SqliteStore {
             .take(limit)
             .map(|r| r.into_article(&conn))
             .collect::<Result<_, _>>()?;
-        Ok(ArticlePage { articles, has_more })
+        Ok(ArticlePage {
+            articles,
+            has_more,
+            snapshot,
+        })
     }
 
     fn tombstone(

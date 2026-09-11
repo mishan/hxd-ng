@@ -284,6 +284,10 @@ pub struct ArticlePage {
     /// siblings oldest first.
     pub articles: Vec<Article>,
     pub has_more: bool,
+    /// The newest article admitted to this traversal. Echo it on every
+    /// later page so replies posted meanwhile do not move behind the
+    /// cursor and disappear from the walk.
+    pub snapshot: ArticleId,
 }
 
 /// A node with the part of the tree under it that was asked for.
@@ -366,12 +370,14 @@ pub trait NewsStore: Send + Sync + 'static {
     fn threads(&self, q: &ThreadQuery) -> Result<ThreadPage, NewsError>;
 
     /// A thread in preorder, from the start or from after `after` (an
-    /// article in it). `NoSuchArticle` when `root` is not a thread
-    /// starter.
+    /// article in it). The first page chooses a `snapshot`; later pages
+    /// echo it so the mutable preorder is stable for the whole walk.
+    /// `NoSuchArticle` when `root` is not a thread starter.
     fn thread(
         &self,
         root: ArticleId,
         after: Option<ArticleId>,
+        snapshot: Option<ArticleId>,
         limit: usize,
     ) -> Result<ArticlePage, NewsError>;
 
@@ -666,6 +672,7 @@ impl Core {
         uid: Uid,
         root: ArticleId,
         after: Option<ArticleId>,
+        snapshot: Option<ArticleId>,
         limit: usize,
     ) -> Result<ArticlePage, NewsError> {
         let store = self.news_store()?;
@@ -673,7 +680,9 @@ impl Core {
         if limit == 0 {
             return Err(NewsError::BadRequest("A page needs a limit of at least 1."));
         }
-        store.thread(root, after, limit).map_err(store_failed)
+        store
+            .thread(root, after, snapshot, limit)
+            .map_err(store_failed)
     }
 
     pub fn news_article(&self, uid: Uid, id: ArticleId) -> Result<Article, NewsError> {

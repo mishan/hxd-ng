@@ -462,14 +462,28 @@ async fn pages_move_both_ways() {
         .await;
     assert_eq!(ids(&page["articles"], ""), [t1, r1]);
     assert_eq!(page["has_more"], true);
+    let snapshot = page["snapshot"].as_u64().unwrap();
+    assert_eq!(snapshot, r4);
+    let late = post(&mut admin, cat, Some(r1), "re", "late").await;
+    assert_eq!(
+        admin
+            .refused("news_thread", json!({ "root": t1, "after": r1 }))
+            .await,
+        "bad_request"
+    );
     let rest = admin
         .ok(
             "news_thread",
-            json!({ "root": t1, "after": r1, "limit": 10 }),
+            json!({ "root": t1, "after": r1, "snapshot": snapshot, "limit": 10 }),
         )
         .await;
     assert_eq!(ids(&rest["articles"], ""), [r2, r3, r4]);
     assert_eq!(rest["has_more"], false);
+    assert_eq!(rest["snapshot"], snapshot);
+    let fresh = admin
+        .ok("news_thread", json!({ "root": t1, "limit": 10 }))
+        .await;
+    assert_eq!(ids(&fresh["articles"], ""), [t1, r1, r2, late, r3, r4]);
 }
 
 #[tokio::test]

@@ -168,6 +168,8 @@ struct ThreadParams {
     #[serde(default)]
     after: Option<ArticleId>,
     #[serde(default)]
+    snapshot: Option<ArticleId>,
+    #[serde(default)]
     limit: Option<usize>,
 }
 
@@ -308,18 +310,21 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
             let Some(p) = parse::<ThreadParams>(params) else {
                 return malformed();
             };
+            if p.after.is_some() && p.snapshot.is_none() {
+                return bad("A later thread page needs the first page's snapshot.");
+            }
             let limit = match page_size(p.limit, 25, policy.max_page.min(100)) {
                 Ok(n) => n,
                 Err(text) => return bad(&text),
             };
             answer(
                 off_reactor(core, move |c| {
-                    c.news_thread(uid, p.root, p.after, limit).map(|page| {
-                        json!({
+                    c.news_thread(uid, p.root, p.after, p.snapshot, limit)
+                        .map(|page| json!({
                             "articles": page.articles.iter().map(article_json).collect::<Vec<_>>(),
                             "has_more": page.has_more,
-                        })
-                    })
+                            "snapshot": page.snapshot,
+                        }))
                 })
                 .await,
             )

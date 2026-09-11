@@ -372,6 +372,7 @@ impl NewsStore for MemoryNews {
         &self,
         root: ArticleId,
         after: Option<ArticleId>,
+        snapshot: Option<ArticleId>,
         limit: usize,
     ) -> Result<ArticlePage, NewsError> {
         if limit == 0 {
@@ -382,19 +383,36 @@ impl NewsStore for MemoryNews {
             .row(root)
             .filter(|a| a.parent.is_none())
             .ok_or(NewsError::NoSuchArticle)?;
+        let newest = inner
+            .articles
+            .iter()
+            .filter(|a| a.root == root)
+            .map(|a| a.id)
+            .max()
+            .expect("a thread contains its starter");
+        let snapshot = snapshot.unwrap_or(newest);
+        if snapshot < root {
+            return Err(NewsError::BadRequest("The snapshot predates this thread."));
+        }
         let from: Vec<u8> = match after {
             None => Vec::new(),
-            Some(id) => inner
-                .row(id)
-                .filter(|a| a.root == root)
-                .ok_or(NewsError::NoSuchArticle)?
-                .path
-                .clone(),
+            Some(id) => {
+                let path = inner
+                    .row(id)
+                    .filter(|a| a.root == root)
+                    .ok_or(NewsError::NoSuchArticle)?
+                    .path
+                    .clone();
+                if id > snapshot {
+                    return Err(NewsError::BadRequest("The cursor is past this snapshot."));
+                }
+                path
+            }
         };
         let mut rows: Vec<&ArticleRow> = inner
             .articles
             .iter()
-            .filter(|a| a.root == root && (after.is_none() || a.path > from))
+            .filter(|a| a.root == root && a.id <= snapshot && (after.is_none() || a.path > from))
             .collect();
         rows.sort_by(|a, b| a.path.cmp(&b.path));
         let has_more = rows.len() > limit;
@@ -402,6 +420,7 @@ impl NewsStore for MemoryNews {
         Ok(ArticlePage {
             articles: rows.into_iter().map(|a| inner.view(a)).collect(),
             has_more,
+            snapshot,
         })
     }
 
