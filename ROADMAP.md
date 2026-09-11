@@ -328,9 +328,25 @@ with per-part MIME types since it was written. The design:
   cannot send — and the read format shows the same two headers, so it
   teaches the convention without a manual.
 
-Not started. `hxd-session` dispatches no news opcode and `hxd-core` has no
-`news` module; the access bits it needs (20, 21, 33–37) have been parsed
-since Phase 1.
+**Begun: threaded news on the ng wire, with markdown, search, and
+subscriptions.** These have landed:
+- the domain (`hxd-core::news`, stage W1) and the SQLite store (W2);
+- markdown bodies (W3: `hxd-markdown`, with a plain-text downgrade that
+  search reads, and references from `news:` links);
+- full-text search over FTS5, with its closed query grammar and
+  `hxd news-reindex` (W4, schema version 4);
+- the ng requests, events and login block that need no attachments (the
+  core of W6);
+- subscriptions and the notifications they earn (W7, schema version 5:
+  follow and mute, a computed unread badge, `news_notify`, and the
+  catch-up rule in front of a `NotificationGateway` that no gateway
+  implements yet).
+
+Both stores pass the conformance suites, and hx-ng's News view is the
+first client, rendering markdown articles, and chat in GtkHx's dialect.
+Next, in the order `docs/news.md` §16 allows: attachments (W5),
+moderation (W8), and the legacy binding that closes this phase (W9).
+`hxd-session` still dispatches no news opcode.
 
 ## Phase 5 — Hardening and parity extras
 

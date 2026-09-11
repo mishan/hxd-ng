@@ -50,14 +50,15 @@ been exercised on newer toolchains; CI runs stable.
 
 | Crate | Role |
 |---|---|
-| `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation, access bits, auth traits. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
+| `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation, the news tree, access bits, auth traits. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman ↔ UTF-8 at its edges. `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket. |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the WebSocket-as-byte-stream adapter (`tunnel.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
 | `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy + `[identity]` link), first-run guest bootstrap. Identity links are written back with `toml_edit` so hand-edited files keep their comments; fingerprint lookups scan the directory. |
 | `hxd-media` | The inline-media pipeline (`docs/inline-media.md`): magic-byte sniff, hand-written JPEG/PNG/GIF container walkers that refuse polyglots, a bounded decode and a re-encode that strips every byte of metadata by construction. Behind `hxd-core`'s `MediaCodec` trait and the `media` Cargo feature, and knows nothing about Hotline. |
+| `hxd-markdown` | Markdown news bodies (`docs/news.md` §5): pulldown-cmark, built without its HTML writer, folded into the plain-text downgrade that search and legacy clients read, and the references a body makes. Text in, text out — nothing here ever produces markup. Behind `hxd-core`'s `BodyRenderer` trait and the `markdown` Cargo feature. |
 | `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
-| `hxd-store-sqlite` | The private-message inbox's durable store: one SQLite file, WAL, the schema and migrations of `docs/private-messages.md` §5, and the conformance suite both stores are run against. Behind `hxd-core`'s `MessageStore` trait and the `inbox` Cargo feature; the in-memory store beside it in `hxd-core` is what the domain tests use. |
+| `hxd-store-sqlite` | The durable store for the private-message inbox, chat history and news: one SQLite file, WAL, the schema and migrations of `docs/private-messages.md` §5 and `docs/news.md` §4, and the conformance suites both stores of each kind are run against. Behind `hxd-core`'s `MessageStore`, `ChatLog` and `NewsStore` traits and the `inbox` Cargo feature; the in-memory stores beside them in `hxd-core` are what the domain tests use. |
 | `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1). |
 | `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing. Its `tests/` hold the e2e suites. |
 
@@ -168,9 +169,14 @@ Three layers, all `cargo test --workspace`:
   server per case with its own accounts directory), `media.rs` (inline
   media on both wires: the capability echo and its limits, single-shot
   and chunked upload, sliced downloads, a capable and a classic client
-  in one room, a photo crossing each way, and a revocation) and
+  in one room, a photo crossing each way, and a revocation),
   `inbox.rs` (offline private messages across both wires: queue, flush
-  at login, resync, blocks, retention).
+  at login, resync, blocks, retention) and `news.rs` (threaded news on
+  the ng wire: the tree and its containment rules, threads in reading
+  order and paged both ways, references and backlinks, tombstones, who
+  hears that the news changed and who hears that it is theirs, following
+  and muting — with a classic client in the room to show the legacy wire
+  is untouched).
 - The scripted legacy client packs and parses with the same pinned
   `hxproto` revision GtkHx uses, so e2e doubles as wire-compat
   checking.
@@ -185,7 +191,13 @@ Three layers, all `cargo test --workspace`:
   written from the spec by the client rather than by us, so where the
   two agree the agreement is evidence rather than a tautology. Node
   only, so voice and video stay in the Rust suites where the real SFU
-  is.
+  is. The client is **pinned**: CI checks hx-ng out at the commit
+  `e2e/hx-ng.rev` names, and a local run notes when `../hx-ng` is
+  elsewhere. A wire change lands server first, covered by the Rust
+  suites; the client follows; then the pin advances in the commit that
+  adds the e2e cases using it. Advancing it is deliberate, like the
+  `hxproto` pin — and in a stack, each branch pins the client commit
+  its own e2e cases need.
 
 House rules: **tests fail loudly** — never skip around something broken.
 A chat sender receives its own echo, so tests must match events by
@@ -200,7 +212,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 node --check tools/ng-client.mjs
-cd e2e && npm install && npm test   # needs a sibling ../hx-ng checkout
+cd e2e && npm install && npm test   # needs a sibling ../hx-ng; CI pins it
 ```
 
 The best end-to-end check of all: point a real GtkHx at the legacy port
@@ -253,6 +265,11 @@ cross-tested; voice and video are implemented on both wires, sharing one
 room and one SFU. The large open fronts, in rough order: HOPE + ciphers on the
 legacy wire (`hxcrypto` currently lives in GtkHx), the ng rate-limit and
 client-quickstart polish, the fogWraith Text-Encoding capability (cheap —
-the UTF-8 interior already satisfies its core mandate), files/HTXF, news,
-and eventually the persistence/clustering phases. The mobile app the ng
+the UTF-8 interior already satisfies its core mandate), files/HTXF, the
+rest of news (the domain, store, search, subscriptions, markdown bodies
+and the ng wire have landed; attachments, moderation and the legacy
+binding are staged in `docs/news.md` §16), the push gateway itself
+(`docs/push-notifications.md` P3 onward — the domain already decides who
+is notified, for private messages and for news), and eventually the
+persistence/clustering phases. The mobile app the ng
 protocol exists for has not been started.

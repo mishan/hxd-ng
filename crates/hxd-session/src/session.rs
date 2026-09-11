@@ -1072,6 +1072,7 @@ async fn login_phase(
         addr: Some(peer.ip()),
         can_detach: account.can_detach,
         has_inbox: account.has_inbox,
+        is_person: account.is_person(),
         // This wire has no `msg_read` and never will — a private message
         // is a window that opens and nothing comes back — so handing one
         // over is as much as it will ever say about reading it
@@ -1483,6 +1484,19 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
         // the next 751, which now answers "not found"
         // (moderation.md §6).
         Event::MediaRevoked { .. } => {}
+        // Nothing yet: the legacy news binding is `docs/news.md` W9, and
+        // until it lands this wire has no news to be stale about. The
+        // flat category's `NEWSFILE_POST` push is where the first of
+        // these arms will go.
+        //
+        // `NewsNotify` is the same story told to one person: a legacy
+        // account is notified through a system mailbox with a `stop`
+        // reply, which is a feature of its own (`docs/news.md` §10.11).
+        Event::NewsPosted { .. }
+        | Event::NewsDeleted { .. }
+        | Event::NewsNode(_)
+        | Event::NewsNodeDeleted { .. }
+        | Event::NewsNotify(_) => {}
         Event::Kicked => return false,
     }
     true

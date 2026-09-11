@@ -130,7 +130,7 @@ enum Target {
 /// logged in as `alice` with identity B must not be handed mail addressed
 /// to the `alice` who held that login before, and that is exactly what
 /// comparing logins would do.
-fn sessions_of(r: &RosterInner, mailbox: &Mailbox) -> Vec<Uid> {
+pub(crate) fn sessions_of(r: &RosterInner, mailbox: &Mailbox) -> Vec<Uid> {
     let mut uids: Vec<Uid> = r
         .users
         .iter()
@@ -1028,14 +1028,16 @@ impl Core {
         if !attentive && !to_self {
             if let Some(gateway) = &self.gateway {
                 let unread = store.counts(&to.mailbox).map(|c| c.unread).unwrap_or(0);
-                gateway.notify(&crate::notify::Notification {
-                    to: &to.mailbox,
-                    from: Some(&from_mailbox),
-                    from_nick: &sender_nick,
-                    text: &body,
-                    id,
-                    unread,
-                });
+                gateway.notify(&crate::notify::Notification::Message(
+                    crate::notify::MessageNotice {
+                        to: &to.mailbox,
+                        from: Some(&from_mailbox),
+                        from_nick: &sender_nick,
+                        text: &body,
+                        id,
+                        unread,
+                    },
+                ));
             }
         }
 
@@ -1410,8 +1412,11 @@ impl Core {
 
     /// An account has linked an identity: move its mail onto the
     /// fingerprint. The account-linking path owes this call — see
-    /// [`crate::inbox::MessageStore::claim`].
+    /// [`crate::inbox::MessageStore::claim`]. News subscriptions are keyed
+    /// the same way and move in the same call, so every link site that
+    /// pays one obligation pays both. Returns how much mail moved.
     pub fn inbox_claim(&self, login: &str, fingerprint: &[u8; 32]) -> usize {
+        self.news_subs_claim(login, fingerprint);
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };
@@ -1440,6 +1445,7 @@ impl Core {
     /// links next. The alternative — mail follows the account — would
     /// hand an account's history to whoever links to it afterwards.
     pub fn inbox_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> usize {
+        self.news_subs_rotate(from, to);
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };
@@ -1452,9 +1458,14 @@ impl Core {
         }
     }
 
-    /// An account has been deleted: take its mail with it, so a later
-    /// holder of the freed login inherits nothing.
+    /// An account has been deleted: take its mail and its news
+    /// subscriptions with it, so a later holder of the freed login
+    /// inherits neither. Its news push budget goes too, but that is
+    /// memory, and only a purge in the server's own process reaches it —
+    /// `hxd inbox purge` purges the stores from a process of its own (see
+    /// `news_subs_rotate`). Returns how much mail went.
     pub fn inbox_purge(&self, of: &Mailbox) -> usize {
+        self.news_subs_purge(of);
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };
@@ -1774,6 +1785,13 @@ mod inbox_tests {
             let l = login.to_ascii_lowercase();
             self.0.iter().find(|m| m.login == l).cloned()
         }
+
+        fn mailbox_access(&self, who: &Mailbox) -> Option<AccessBits> {
+            self.0
+                .iter()
+                .any(|m| who.matches(&m.login, m.fingerprint.as_ref()))
+                .then(AccessBits::empty)
+        }
     }
 
     /// A core with an inbox, and optionally somewhere to send
@@ -1819,6 +1837,7 @@ mod inbox_tests {
                 can_detach: true,
                 transport: crate::Transport::default(),
                 has_inbox: true,
+                is_person: true,
                 reads_on_delivery: false,
                 identity: Some(fingerprint),
             })
@@ -1845,6 +1864,7 @@ mod inbox_tests {
                 can_detach: true,
                 transport: crate::Transport::default(),
                 has_inbox,
+                is_person: has_inbox,
                 reads_on_delivery: false,
                 identity: None,
             })
@@ -2535,6 +2555,7 @@ mod inbox_tests {
                 can_detach: false,
                 transport: crate::Transport::default(),
                 has_inbox: false,
+                is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(3)),
             })
@@ -2572,6 +2593,7 @@ mod inbox_tests {
                 can_detach: false,
                 transport: crate::Transport::default(),
                 has_inbox: false,
+                is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(7)),
             })
@@ -2858,10 +2880,13 @@ mod notify_tests {
 
     impl NotificationGateway for Recorder {
         fn notify(&self, n: &Notification<'_>) {
+            let Notification::Message(m) = n else {
+                panic!("a private message notified something else: {n:?}");
+            };
             self.sent
                 .lock()
                 .unwrap()
-                .push((n.to.login.clone(), n.text.to_string(), n.unread));
+                .push((m.to.login.clone(), m.text.to_string(), m.unread));
         }
     }
 

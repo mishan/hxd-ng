@@ -52,9 +52,11 @@ impl Synchronous {
     }
 }
 
+mod news;
+
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -189,6 +191,117 @@ CREATE TABLE media_block (
   at   INTEGER NOT NULL,
   by   TEXT NOT NULL
 );
+";
+
+// The news tree (`docs/news.md` §4): what threaded news with plain bodies
+// needs, and nothing its later stages have not settled yet. The search
+// index, the attachment tables and subscriptions are further additive
+// versions when they land, each with the code that fills them — a table
+// nothing writes is a table whose contents a later build has to guess at.
+//
+// `news_article_root` is not in the design's list. It is what makes a
+// thread's aggregates (reply count, last post) and retention's grouping a
+// lookup by root rather than a scan, and it costs one index.
+const SCHEMA_V3: &str = "
+CREATE TABLE news_node (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent     INTEGER REFERENCES news_node(id),
+  kind       INTEGER NOT NULL,
+  name       TEXT    NOT NULL,
+  guid       BLOB    NOT NULL,
+  add_sn     INTEGER NOT NULL DEFAULT 1,
+  delete_sn  INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+-- IFNULL because SQLite treats NULLs as distinct in a unique index, and
+-- two root-level nodes named alike must collide like any other siblings.
+CREATE UNIQUE INDEX news_node_sibling ON news_node (IFNULL(parent, 0), name);
+
+CREATE TABLE news_article (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  category   INTEGER NOT NULL REFERENCES news_node(id),
+  parent     INTEGER REFERENCES news_article(id),
+  root       INTEGER NOT NULL,
+  path       BLOB    NOT NULL,
+  depth      INTEGER NOT NULL,
+  nick       TEXT    NOT NULL,
+  login      TEXT,
+  login_fp   TEXT,
+  subject    TEXT    NOT NULL,
+  body       TEXT    NOT NULL,
+  mime       TEXT    NOT NULL DEFAULT 'text/plain',
+  plain      TEXT,
+  attach_names TEXT,
+  at         INTEGER NOT NULL,
+  deleted_at INTEGER,
+  deleted_by TEXT,
+  -- What the search index reads, by name (docs/news.md §6.1). Computed
+  -- on read and stored nowhere, so the text exists once. Here from the
+  -- start, with `attach_names` in the expression before anything writes
+  -- it, because a generated column's expression cannot be changed
+  -- without rebuilding the table.
+  author      TEXT GENERATED ALWAYS AS (nick || ' ' || IFNULL(login, '')) VIRTUAL,
+  search_body TEXT GENERATED ALWAYS AS
+    (COALESCE(plain, body) || IFNULL(char(10) || attach_names, '')) VIRTUAL
+);
+CREATE INDEX news_article_thread ON news_article (category, path);
+CREATE INDEX news_article_roots  ON news_article (category, id) WHERE parent IS NULL;
+CREATE INDEX news_article_root   ON news_article (root, id);
+CREATE INDEX news_article_author ON news_article (login_fp, login, id);
+CREATE INDEX news_article_at     ON news_article (at);
+
+CREATE TABLE news_ref (
+  src  INTEGER NOT NULL REFERENCES news_article(id),
+  dst  INTEGER NOT NULL REFERENCES news_article(id),
+  ord  INTEGER NOT NULL,
+  PRIMARY KEY (src, dst)
+) WITHOUT ROWID;
+CREATE INDEX news_ref_dst ON news_ref (dst, src);
+";
+
+// News search (`docs/news.md` §6). External content over `news_article`,
+// reading the columns version 3 put there for it by name, so the text is
+// stored once. The index holds live articles and only those — the
+// invariant every write in `news.rs` keeps — so it is filled from them
+// here rather than with FTS5's own `rebuild`, which would index
+// tombstones too. `secure-delete` is what makes a removal overwrite the
+// removed tokens instead of leaving them for a merge.
+const SCHEMA_V4: &str = "
+CREATE VIRTUAL TABLE news_fts USING fts5(
+  subject, search_body, author,
+  content = 'news_article',
+  content_rowid = 'id',
+  tokenize = 'unicode61 remove_diacritics 2'
+);
+INSERT INTO news_fts (news_fts, rank) VALUES ('secure-delete', 1);
+INSERT INTO news_fts (rowid, subject, search_body, author)
+  SELECT id, subject, search_body, author FROM news_article WHERE deleted_at IS NULL;
+";
+
+// News subscriptions (`docs/news.md` §10.4): a subscription and a cursor,
+// and no notification table, because the article is already the durable
+// thing. Unread is counted from `news_article` when asked.
+//
+// Keyed by mailbox the way `message` is, and for the reason `mailbox_sql`
+// gives: two shapes of key, so two partial unique indexes, each of which
+// is also the index its owner's lookups use. `news_sub_target` is not
+// partial on `muted` as the design sketched it, because a post's audience
+// has to see a muted row in order to honor it.
+const SCHEMA_V5: &str = "
+CREATE TABLE news_sub (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner     TEXT    NOT NULL,
+  owner_fp  TEXT,
+  scope     INTEGER NOT NULL,
+  target    INTEGER NOT NULL,
+  auto      INTEGER NOT NULL DEFAULT 0,
+  muted     INTEGER NOT NULL DEFAULT 0,
+  last_seen INTEGER NOT NULL DEFAULT 0,
+  at        INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX news_sub_fp    ON news_sub (owner_fp, scope, target) WHERE owner_fp IS NOT NULL;
+CREATE UNIQUE INDEX news_sub_login ON news_sub (owner, scope, target) WHERE owner_fp IS NULL;
+CREATE INDEX news_sub_target ON news_sub (scope, target);
 ";
 
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL
@@ -414,6 +527,15 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 2 {
         steps.push_str(SCHEMA_V2);
+    }
+    if version < 3 {
+        steps.push_str(SCHEMA_V3);
+    }
+    if version < 4 {
+        steps.push_str(SCHEMA_V4);
+    }
+    if version < 5 {
+        steps.push_str(SCHEMA_V5);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -1413,6 +1535,416 @@ mod tests {
     #[test]
     fn chat_log_passes_the_conformance_suite() {
         hxd_core::history::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+    }
+
+    #[test]
+    fn news_passes_the_conformance_suite() {
+        hxd_core::news::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+    }
+
+    /// A category and a way to post into it, for the search tests.
+    fn news_fixture() -> (SqliteStore, hxd_core::news::NodeId) {
+        use hxd_core::news::{NewNode, NewsStore, NodeKind};
+        let store = SqliteStore::in_memory().unwrap();
+        let cat = store
+            .create_node(
+                &NewNode {
+                    parent: None,
+                    kind: NodeKind::Category,
+                    name: "General".into(),
+                    guid: [0; 16],
+                    at: UNIX_EPOCH,
+                },
+                16,
+            )
+            .unwrap();
+        (store, cat.id)
+    }
+
+    fn news_post(
+        store: &SqliteStore,
+        cat: hxd_core::news::NodeId,
+        subject: &str,
+        body: &str,
+        nick: &str,
+        login: Option<&str>,
+    ) -> u32 {
+        use hxd_core::news::{Author, BodyType, NewPost, NewsStore};
+        store
+            .post(
+                &NewPost {
+                    category: cat,
+                    parent: None,
+                    author: Author {
+                        nick: nick.into(),
+                        login: login.map(str::to_string),
+                        fingerprint: None,
+                    },
+                    subject: subject.into(),
+                    body: body.into(),
+                    mime: BodyType::Plain,
+                    plain: None,
+                    refs: Vec::new(),
+                    at: UNIX_EPOCH,
+                    follow: None,
+                },
+                32,
+                32,
+            )
+            .unwrap()
+            .id
+    }
+
+    fn news_search(store: &SqliteStore, q: &str) -> hxd_core::news::SearchPage {
+        use hxd_core::news::{CompiledQuery, NewsStore, SearchOrder, SearchQuery};
+        store
+            .search(&SearchQuery {
+                terms: CompiledQuery::parse(q),
+                categories: None,
+                before: None,
+                after: None,
+                order: SearchOrder::Relevance,
+                offset: 0,
+                limit: 50,
+            })
+            .unwrap()
+    }
+
+    const NO_DRIFT: Vec<String> = Vec::new();
+
+    /// How the index differs from indexing the live articles afresh,
+    /// token by token: what it holds that they would not put there, and
+    /// what they would that it lacks. Empty is the invariant every write
+    /// in news.rs keeps.
+    ///
+    /// FTS5's own `integrity-check` cannot say this. Its structural form
+    /// passes an index gone stale against its content, and the form that
+    /// does compare content counts the tombstones the index leaves out on
+    /// purpose as damage. The structural form is asked as well, for what
+    /// it can see: a secure-delete from an older segment, which is every
+    /// tombstone of an article posted in its own transaction, drew a false
+    /// "malformed" from it until SQLite 3.46.1, so a store that stops
+    /// passing it is a store bundling an SQLite from before then.
+    fn index_drift(conn: &Connection) -> Vec<String> {
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE temp.fresh USING fts5(
+               subject, search_body, author, tokenize = '{}');
+             INSERT INTO temp.fresh (rowid, subject, search_body, author)
+               SELECT id, subject, search_body, author FROM news_article
+                WHERE deleted_at IS NULL;
+             CREATE VIRTUAL TABLE temp.fresh_tokens USING fts5vocab(temp, fresh, instance);
+             CREATE VIRTUAL TABLE temp.live_tokens USING fts5vocab(main, news_fts, instance);",
+            news::TOKENIZER
+        ))
+        .unwrap();
+        let mut drift = Vec::new();
+        for (has, lacks, what) in [
+            ("live_tokens", "fresh_tokens", "stale"),
+            ("fresh_tokens", "live_tokens", "missing"),
+        ] {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT term, doc, col, offset FROM temp.{has}
+                     EXCEPT SELECT term, doc, col, offset FROM temp.{lacks}"
+                ))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{what}: {:?} in {} {} at {}",
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?
+                    ))
+                })
+                .unwrap();
+            drift.extend(rows.map(Result::unwrap));
+        }
+        conn.execute_batch(
+            "DROP TABLE temp.live_tokens; DROP TABLE temp.fresh_tokens; DROP TABLE temp.fresh;",
+        )
+        .unwrap();
+        if let Err(e) =
+            conn.execute_batch("INSERT INTO news_fts (news_fts) VALUES ('integrity-check')")
+        {
+            drift.push(format!("integrity-check: {e}"));
+        }
+        drift
+    }
+
+    #[test]
+    fn every_write_keeps_the_index_to_the_live_articles() {
+        use hxd_core::news::{NewNode, NewsStore, NodeKind};
+        let (store, cat) = news_fixture();
+        let drift = |store: &SqliteStore| index_drift(&store.conn.lock().unwrap());
+        let a = news_post(&store, cat, "One", "phase four", "Alice", Some("alice"));
+        news_post(&store, cat, "Two", "phase five", "Bob", Some("bob"));
+        assert_eq!(drift(&store), NO_DRIFT, "posts");
+        NewsStore::tombstone(&store, a, "moderator", UNIX_EPOCH).unwrap();
+        assert_eq!(drift(&store), NO_DRIFT, "a tombstone");
+        let other = store
+            .create_node(
+                &NewNode {
+                    parent: None,
+                    kind: NodeKind::Category,
+                    name: "Other".into(),
+                    guid: [1; 16],
+                    at: UNIX_EPOCH,
+                },
+                16,
+            )
+            .unwrap()
+            .id;
+        news_post(&store, other, "Three", "phase six", "Carol", None);
+        NewsStore::delete_node(&store, other).unwrap();
+        assert_eq!(drift(&store), NO_DRIFT, "a category deleted");
+        NewsStore::prune(
+            &store,
+            Duration::from_secs(1),
+            UNIX_EPOCH + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(drift(&store), NO_DRIFT, "a prune");
+
+        // And it is a check that can fail: text changed under the index.
+        let b = news_post(&store, cat, "Four", "phase seven", "Dave", None);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE news_article SET subject = 'changed' WHERE id = ?1",
+                [b],
+            )
+            .unwrap();
+        assert!(!drift(&store).is_empty());
+    }
+
+    #[test]
+    fn the_query_is_put_through_the_tokenizer_the_index_was_made_with() {
+        assert!(SCHEMA_V4.contains(&format!("tokenize = '{}'", news::TOKENIZER)));
+        let (store, cat) = news_fixture();
+        let id = news_post(
+            &store,
+            cat,
+            "Sizes",
+            "the derivative is a u16",
+            "Alice",
+            Some("alice"),
+        );
+        // U+093E, a vowel sign: a letter to Rust, a separator to
+        // unicode61. A phrase of nothing must not sink the rest.
+        assert!(
+            !hxd_core::news::CompiledQuery::parse("\u{93e}")
+                .terms
+                .is_empty(),
+            "the grammar keeps it, so it is the store that has to drop it"
+        );
+        let found = |q: &str| {
+            news_search(&store, q)
+                .hits
+                .iter()
+                .map(|h| h.article)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(found("derivative \u{93e}"), [id]);
+        assert_eq!(found("derivative -\u{93e}"), [id]);
+        assert!(found("\u{93e}").is_empty(), "alone it is nothing to find");
+    }
+
+    #[test]
+    fn a_subject_match_outranks_a_body_match_and_accents_fold() {
+        let (store, cat) = news_fixture();
+        let body = news_post(
+            &store,
+            cat,
+            "Unrelated",
+            "the café sizes are fine",
+            "Bob",
+            Some("bob"),
+        );
+        let subject = news_post(
+            &store,
+            cat,
+            "Attachment sizes",
+            "nothing to see",
+            "Bob",
+            Some("bob"),
+        );
+        let page = news_search(&store, "sizes");
+        assert_eq!(
+            page.hits.iter().map(|h| h.article).collect::<Vec<_>>(),
+            [subject, body],
+            "the subject is weighted over the body"
+        );
+        // `remove_diacritics 2`: the index folds what a person typed.
+        assert_eq!(news_search(&store, "cafe").hits[0].article, body);
+        assert_eq!(news_search(&store, "CAFÉ").hits[0].article, body);
+    }
+
+    #[test]
+    fn a_snippet_is_text_with_its_matches_marked() {
+        let (store, cat) = news_fixture();
+        news_post(
+            &store,
+            cat,
+            "Sizes",
+            "the derivative is a u16, and the derivative is small",
+            "Alice",
+            Some("alice"),
+        );
+        let marked = |hit: &hxd_core::news::Hit| -> Vec<String> {
+            hit.marks
+                .iter()
+                .map(|&(a, b)| hit.snippet[a as usize..b as usize].to_owned())
+                .collect()
+        };
+        let hit = news_search(&store, "derivative").hits.remove(0);
+        assert_eq!(
+            hit.snippet,
+            "the derivative is a u16, and the derivative is small"
+        );
+        assert_eq!(marked(&hit), ["derivative", "derivative"]);
+
+        // Any character may be in a body, the private-use ones included,
+        // and a snippet keeps them as typed: they are text, not marks, and
+        // an unmatched one around a match cannot stretch its range. Apart,
+        // since `unicode61` counts them as letters of the word they touch.
+        let tricks = "\u{e001} sneaky \u{e000} derivative \u{e000} unclosed \u{e001}";
+        news_post(&store, cat, "Tricks", tricks, "Mallory", None);
+        let hit = news_search(&store, "sneaky").hits.remove(0);
+        assert_eq!(hit.snippet, tricks);
+        assert_eq!(marked(&hit), ["sneaky"]);
+        let hit = news_search(&store, "unclosed derivative").hits.remove(0);
+        assert_eq!(hit.snippet, tricks);
+        assert_eq!(marked(&hit), ["derivative", "unclosed"]);
+    }
+
+    #[test]
+    fn a_rebuilt_index_answers_as_the_live_one_did() {
+        use hxd_core::news::NewsStore;
+        let (store, cat) = news_fixture();
+        let a = news_post(&store, cat, "One", "phase four", "Alice", Some("alice"));
+        news_post(&store, cat, "Two", "phase five", "Bob", Some("bob"));
+        // Named, because `ChatLog` has a `tombstone` too.
+        NewsStore::tombstone(&store, a, "moderator", UNIX_EPOCH).unwrap();
+        let before = news_search(&store, "phase");
+        assert_eq!(store.reindex().unwrap(), 1, "live articles only");
+        assert_eq!(news_search(&store, "phase"), before);
+        assert_eq!(index_drift(&store.conn.lock().unwrap()), NO_DRIFT);
+    }
+
+    #[test]
+    fn version_three_migrates_into_a_searchable_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO news_node (kind, name, guid, created_at) VALUES (1, 'General', X'00', 1);
+                 INSERT INTO news_article (category, root, path, depth, nick, subject, body, at)
+                   VALUES (1, 1, X'00000001', 0, 'alice', 'Before search', 'findable words', 1);
+                 INSERT INTO news_article (category, root, path, depth, nick, subject, body, at,
+                                           deleted_at)
+                   VALUES (1, 2, X'00000002', 0, '', '', '', 1, 2);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let page = news_search(&store, "findable");
+        assert_eq!(page.hits.iter().map(|h| h.article).collect::<Vec<_>>(), [1]);
+        assert_eq!(index_drift(&store.conn.lock().unwrap()), NO_DRIFT);
+    }
+
+    #[test]
+    fn the_article_table_feeds_the_index_the_right_text() {
+        // `author` and `search_body` are what the index reads by name, so
+        // they must hold the right text: the downgrade in place of the
+        // body where there is one, and attachment names after it.
+        let (store, cat) = news_fixture();
+        let id = news_post(
+            &store,
+            cat,
+            "Sizes",
+            "the derivative is a u16",
+            "Alice",
+            Some("alice"),
+        );
+        let guest = news_post(&store, cat, "Sizes", "a guest says so too", "guest", None);
+
+        let conn = store.conn.lock().unwrap();
+        let computed = |id: u32| -> (String, String) {
+            conn.query_row(
+                "SELECT author, search_body FROM news_article WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            computed(id),
+            ("Alice alice".into(), "the derivative is a u16".into())
+        );
+        assert_eq!(computed(guest).0, "guest ");
+
+        // The downgrade stands in for the body where there is one, and
+        // attachment names follow it on their own line.
+        conn.execute(
+            "UPDATE news_article SET plain = 'the plain text', attach_names = 'crash.png'
+              WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        assert_eq!(computed(id).1, "the plain text\ncrash.png");
+    }
+
+    #[test]
+    fn version_two_migrates_without_losing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute(
+                "INSERT INTO message (recipient, sender_nick, body, sent_at)
+                 VALUES ('dave', 'alice', 'before news', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chat_line (nick, body, at) VALUES ('alice', 'a line', 1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        assert_eq!(
+            store.pending(&Mailbox::login("dave"), 10).unwrap()[0].body,
+            "before news"
+        );
+        let page = store
+            .query(&HistoryQuery {
+                channel: 0,
+                before: None,
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(page.lines[0].text, "a line");
+        use hxd_core::news::NewsStore;
+        assert!(store.nodes(None).unwrap().is_empty(), "news starts empty");
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

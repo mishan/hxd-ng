@@ -72,6 +72,7 @@ fn attach_boxed(core: &Core, nick: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
                 ..Default::default()
             },
             has_inbox: true,
+            is_person: true,
             reads_on_delivery: false,
             identity: None,
         })
@@ -108,6 +109,7 @@ fn attach_with(
                 ..Default::default()
             },
             has_inbox: false,
+            is_person: false,
             reads_on_delivery: false,
             identity: None,
         })
@@ -547,6 +549,13 @@ impl crate::AccountDirectory for Directory {
     fn inbox_account(&self, login: &str) -> Option<crate::inbox::Mailbox> {
         let l = login.to_ascii_lowercase();
         self.0.iter().find(|m| m.login == l).cloned()
+    }
+
+    fn mailbox_access(&self, who: &crate::inbox::Mailbox) -> Option<crate::AccessBits> {
+        self.0
+            .iter()
+            .any(|m| who.matches(&m.login, m.fingerprint.as_ref()))
+            .then(crate::AccessBits::empty)
     }
 }
 

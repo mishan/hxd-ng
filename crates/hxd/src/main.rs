@@ -48,11 +48,16 @@ enum Command {
         fingerprint: Option<String>,
         dry_run: bool,
     },
+    /// `news-reindex`.
+    NewsReindex,
 }
 
 const USAGE: &str = "usage:\n  \
 hxd [--config hxd-ng.toml]\n  \
-hxd [--config …] inbox purge <login> [--fingerprint FP] [--dry-run]\n\n\
+hxd [--config …] inbox purge <login> [--fingerprint FP] [--dry-run]\n  \
+hxd [--config …] news-reindex\n\n\
+`news-reindex` rebuilds the news search index from the articles: the\n\
+repair for an index that has drifted.\n\n\
 `inbox purge` takes an account's mail with it when the account is\n\
 deleted — otherwise the freed login's next holder inherits it.\n\
 Pass --fingerprint (the value in the account's [identity] table, or\n\
@@ -97,6 +102,10 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
         }
         [] => Command::Serve,
+        ["news-reindex"] if fingerprint.is_some() || dry_run => {
+            return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
+        }
+        ["news-reindex"] => Command::NewsReindex,
         ["inbox", "purge", login] => Command::InboxPurge {
             login: login.to_string(),
             fingerprint,
@@ -127,6 +136,11 @@ async fn main() {
             } else {
                 println!("purged {n} rows belonging to {login}");
             }
+            return Ok(());
+        }
+        if let Command::NewsReindex = command {
+            let n = hxd::news_reindex(&config)?;
+            println!("indexed {n} articles");
             return Ok(());
         }
         let voice = hxd::voice::build(&config)?;
@@ -191,6 +205,19 @@ async fn main() {
                 history.max_lines,
                 history.max_days,
             ));
+        }
+
+        if let Some(news) = &config.news {
+            let db = news
+                .db
+                .as_ref()
+                .or_else(|| config.inbox.as_ref().map(|i| &i.db))
+                .or_else(|| config.history.as_ref().and_then(|h| h.db.as_ref()))
+                .expect("configuration validation requires a news database");
+            tracing::info!("threaded news at {}", db.display());
+            if news.retain_days > 0 {
+                tokio::spawn(hxd::news_pruner(ctx.core.clone()));
+            }
         }
 
         if let Some(media) = &config.media {

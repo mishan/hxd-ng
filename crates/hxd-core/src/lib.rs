@@ -13,6 +13,7 @@ pub mod chat;
 pub mod history;
 pub mod inbox;
 pub mod media;
+pub mod news;
 pub mod notify;
 pub mod roster;
 pub mod video;
@@ -36,7 +37,13 @@ pub use media::{
     Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRef,
     MediaReject, MediaType, Principal, UploadOutcome, UploadPart,
 };
-pub use notify::{Notification, NotificationGateway};
+pub use news::{
+    Article, ArticleId, ArticlePage, Author, AutoFollow, AutoSubscribe, BodyRenderer, BodyType,
+    MarkdownMode, MemoryNews, NewsError, NewsPolicy, NewsStore, Node, NodeId, NodeKind, NodeTree,
+    Notified, NotifyPolicy, NotifyReason, PostRequest, Reference, Rendered, SubScope, Subscriber,
+    Subscription, ThreadHead, ThreadPage, ThreadQuery,
+};
+pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use roster::{
     AttachInfo, Core, Event, IdentityTag, InboxPolicy, Resume, SeqEvent, SessionStatus, Transport,
     Uid, UserDetails, UserInfo, OUTBOX_BUFFER_CAP,

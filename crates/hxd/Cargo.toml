@@ -11,7 +11,7 @@ default-run = "hxd"
 [features]
 # Voice chat. On by default so CI covers it; a server that doesn't want
 # a WebRTC stack in its binary builds with --no-default-features.
-default = ["voice", "inbox", "media"]
+default = ["voice", "inbox", "media", "markdown"]
 voice = ["dep:hxd-voice"]
 # The durable private-message inbox. On by default so CI covers it; a
 # server that wants neither offline messages nor a bundled SQLite in its
@@ -23,6 +23,11 @@ inbox = ["dep:hxd-store-sqlite"]
 # a `[media]` config section is a startup error rather than a silently
 # ignored promise.
 media = ["dep:hxd-media"]
+# Markdown news bodies: the parser that writes the plain-text downgrade
+# and finds references (`docs/news.md` §5). On by default so CI covers
+# it; without it `[news] markdown` defaults to "off", and asking for
+# "render" is a startup error. "source" needs no parser.
+markdown = ["dep:hxd-markdown"]
 
 [[bin]]
 name = "hxd"
@@ -34,6 +39,7 @@ hxd-auth-file = { workspace = true }
 hxd-session = { workspace = true }
 hxd-ng-session = { workspace = true }
 hxd-media = { workspace = true, optional = true }
+hxd-markdown = { workspace = true, optional = true }
 hxd-voice = { workspace = true, optional = true }
 hl-identity = { workspace = true }
 base64 = "0.22"
@@ -50,6 +56,8 @@ hxproto = { workspace = true }
 hxd-voice = { workspace = true }
 # The inbox e2e uses the real store on a real file, not a fake.
 hxd-store-sqlite = { workspace = true }
+# The news e2e posts markdown through the real renderer.
+hxd-markdown = { workspace = true }
 # The media e2e uploads real images through the real pipeline, so it
 # needs an encoder to make one with. Same pin as `hxd-media`'s.
 hxd-media = { workspace = true }

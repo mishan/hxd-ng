@@ -854,6 +854,30 @@ impl AccountDirectory for FileAuth {
                 None => Mailbox::login(account.login),
             })
     }
+
+    fn mailbox_access(&self, who: &Mailbox) -> Option<AccessBits> {
+        let account = match who.fingerprint {
+            // Whatever the account is called now: the fingerprint is the
+            // person, and a rename is not a reason to stop reaching them.
+            Some(fp) => self.find_by_fingerprint(&fp).ok()??,
+            None => {
+                let login = who.login.to_ascii_lowercase();
+                if !valid_login(&login) {
+                    return None;
+                }
+                let account = self.load(&login).ok()?.into_account(login);
+                // An unidentified mailbox names an account with no
+                // identity and nothing else. One that has linked since is
+                // addressed by its fingerprint now, and its subscriptions
+                // were stamped with it when it linked.
+                if account.identity.fingerprint.is_some() {
+                    return None;
+                }
+                account
+            }
+        };
+        account.has_inbox.then_some(account.access)
+    }
 }
 
 #[cfg(test)]
@@ -1588,6 +1612,15 @@ mod tests {
         assert!(!has("open", b""), "a shared door is not an address");
         assert!(!has("quiet", b"pw"));
         assert!(has("kiosk", b""));
+
+        // Whether a person is behind the account is not the switch: news
+        // authorship follows the password, whatever the mail policy says.
+        let person =
+            |l: &str, pw: &[u8]| auth.authenticate(l, Proof::Plain(pw)).unwrap().is_person();
+        assert!(person("plain", b"pw"));
+        assert!(!person("open", b""));
+        assert!(person("quiet", b"pw"));
+        assert!(!person("kiosk", b""));
     }
 
     #[test]
@@ -1609,5 +1642,77 @@ mod tests {
         // filesystem is touched at all.
         assert_eq!(auth.inbox_account("../../etc/passwd"), None);
         assert_eq!(auth.inbox_account(""), None);
+    }
+
+    #[test]
+    fn a_mailbox_is_found_by_its_fingerprint_whatever_the_login_is_now() {
+        let (td, auth) = backend();
+        let fp = [0x3cu8; 32];
+        let text = format!(
+            "password = \"pw\"\n[access]\nread_news = true\n[identity]\nfingerprint = \"{}\"\n",
+            hl_identity::Fingerprint(fp)
+        );
+        write(td.path(), "alice.toml", &text);
+        // Renamed since the subscription was made: the fingerprint is
+        // the person, and the login the row was stamped with is history.
+        std::fs::rename(td.path().join("alice.toml"), td.path().join("alicia.toml")).unwrap();
+        let access = auth.mailbox_access(&Mailbox::identified("alice", fp));
+        assert!(access.is_some_and(|a| a.has(bit::READ_NEWS)), "{access:?}");
+        assert_eq!(
+            auth.mailbox_access(&Mailbox::identified("alicia", [0x3du8; 32])),
+            None,
+            "another identity is nobody, whatever login it carries"
+        );
+    }
+
+    #[test]
+    fn a_login_keyed_mailbox_is_nobody_once_its_account_has_linked() {
+        let (td, auth) = backend();
+        write(
+            td.path(),
+            "carol.toml",
+            "password = \"pw\"\n[access]\nread_news = true\n",
+        );
+        let by_login = Mailbox::login("Carol");
+        let access = auth.mailbox_access(&by_login);
+        assert!(access.is_some_and(|a| a.has(bit::READ_NEWS)), "{access:?}");
+
+        // Linked since: the account is addressed by its fingerprint now,
+        // and a row still keyed by the login answers for nobody. That is
+        // what stops a reused login being rung for its previous holder.
+        let fp = [0x4eu8; 32];
+        assert!(matches!(
+            auth.link_identity("carol", &fp).unwrap(),
+            LinkOutcome::Linked(_)
+        ));
+        assert_eq!(auth.mailbox_access(&by_login), None);
+        assert!(auth
+            .mailbox_access(&Mailbox::identified("carol", fp))
+            .is_some());
+    }
+
+    #[test]
+    fn an_account_without_an_inbox_is_nobody_either_way() {
+        let (td, auth) = backend();
+        let fp = [0x5fu8; 32];
+        write(
+            td.path(),
+            "quiet.toml",
+            "password = \"pw\"\n[access]\nread_news = true\n[extra]\ninbox = false\n",
+        );
+        write(
+            td.path(),
+            "hush.toml",
+            &format!(
+                "password = \"pw\"\n[access]\nread_news = true\n[extra]\ninbox = false\n\
+                 [identity]\nfingerprint = \"{}\"\n",
+                hl_identity::Fingerprint(fp)
+            ),
+        );
+        assert_eq!(auth.mailbox_access(&Mailbox::login("quiet")), None);
+        assert_eq!(auth.mailbox_access(&Mailbox::identified("hush", fp)), None);
+        // And the answers for "no such account" are the same `None`.
+        assert_eq!(auth.mailbox_access(&Mailbox::login("nobody")), None);
+        assert_eq!(auth.mailbox_access(&Mailbox::login("../quiet")), None);
     }
 }

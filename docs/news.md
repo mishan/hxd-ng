@@ -1,13 +1,14 @@
 # Threaded news: articles, attachments, references and search
 
 ROADMAP Phase 4 promises "1.2 flat news post/read, and the 1.5 threaded
-news tree (categories, bundles, threads)". Nothing is built: `hxd-session`
-dispatches no news opcode, `hxd-core` has no `news` module, and the ng
-protocol has never had one. This document designs the whole thing — the
-domain, the store, markdown bodies, cross-references, full-text search,
-image attachments, and the Hotline-ng binding — and specs the legacy 1.5
-binding so the model can be checked against the wire it must eventually
-serve.
+news tree (categories, bundles, threads)". When this was written nothing
+was built: `hxd-session` dispatched no news opcode, `hxd-core` had no
+`news` module, and the ng protocol had never had one. This document
+designs the whole thing — the domain, the store, markdown bodies,
+cross-references, full-text search, image attachments, and the
+Hotline-ng binding — and specs the legacy 1.5 binding so the model can
+be checked against the wire it must eventually serve. What has been
+built since, and what has not, is §16's to say.
 
 Phase 4's own description is the floor, not the ceiling: what a modern
 client wants from a forum is rich text, links between posts and a search
@@ -285,8 +286,8 @@ its reply 44 has `[41, 44]`; 47's reply 51 has `[41, 47, 51]`. Ordering
 a category's articles by `path` **is** preorder, byte comparison does
 it, and one index (`category, path`) serves both "the whole thread" and
 "the thread's next page". The path is built at insert from the parent's,
-which is one indexed read, and `[news] max_depth` (default 32) bounds
-it to 128 bytes.
+which is one indexed read, and `[news] max_depth` bounds it at four
+bytes a level.
 
 The alternative — sending a flat list of `(id, parent)` and letting the
 client build the tree, which is what CATLIST does — is what the legacy
@@ -335,28 +336,32 @@ pub struct ThreadQuery {
     pub category: NodeId,
     pub before: Option<ArticleId>, // cursor on the thread root
     pub after: Option<ArticleId>,
-    pub order: ThreadOrder,        // Created | Recent
     pub limit: usize,              // clamped by the caller
 }
 
 pub struct ThreadPage { pub threads: Vec<ThreadHead>, pub has_more: bool }
-pub struct ArticlePage { pub articles: Vec<Article>, pub has_more: bool }
+pub struct ArticlePage {
+    pub articles: Vec<Article>,
+    pub has_more: bool,
+    pub snapshot: ArticleId,       // echoed on later pages (§9.2)
+}
 
 pub trait NewsStore: Send + Sync + 'static {
     // Tree
     fn nodes(&self, parent: Option<NodeId>) -> Result<Vec<Node>, StoreError>;
     fn node(&self, id: NodeId) -> Result<Option<Node>, StoreError>;
-    fn create_node(&self, parent: Option<NodeId>, kind: NodeKind, name: &str)
-        -> Result<Node, StoreError>;
-    fn rename_node(&self, id: NodeId, name: &str) -> Result<bool, StoreError>;
-    fn delete_node(&self, id: NodeId) -> Result<u64, StoreError>; // articles removed
+    fn create_node(&self, n: &NewNode, max_depth: u16) -> Result<Node, NewsError>;
+    fn rename_node(&self, id: NodeId, name: &str) -> Result<Node, NewsError>;
+    fn delete_node(&self, id: NodeId) -> Result<u64, NewsError>; // articles removed
 
     // Articles
-    fn post(&self, p: &NewPost) -> Result<ArticleId, StoreError>;
+    fn post(&self, p: &NewPost, max_depth: u16, max_refs: usize)
+        -> Result<Posted, NewsError>;             // the new id and its root
     fn article(&self, id: ArticleId) -> Result<Option<Article>, StoreError>;
-    fn threads(&self, q: &ThreadQuery) -> Result<ThreadPage, StoreError>;
-    fn thread(&self, root: ArticleId, after: Option<ArticleId>, limit: usize)
-        -> Result<ArticlePage, StoreError>;
+    fn threads(&self, q: &ThreadQuery) -> Result<ThreadPage, NewsError>;
+    fn thread(&self, root: ArticleId, after: Option<ArticleId>,
+              snapshot: Option<ArticleId>, limit: usize)
+        -> Result<ArticlePage, NewsError>;
     fn category_all(&self, category: NodeId, max: usize)
         -> Result<Vec<Article>, StoreError>;      // the legacy CATLIST shape
     fn tombstone(&self, id: ArticleId, by: &str, at: SystemTime)
@@ -364,8 +369,8 @@ pub trait NewsStore: Send + Sync + 'static {
     fn by_author(&self, who: &Author, since: SystemTime)
         -> Result<Vec<ArticleId>, StoreError>;    // moderation purge
 
-    // References (§5.3) — written with the article, read on the way out
-    fn refs_from(&self, id: ArticleId) -> Result<Vec<Reference>, StoreError>;
+    // References (§5.3) — written with the article; its own ride in
+    // `Article::refs`, and the backlinks are read here
     fn refs_to(&self, id: ArticleId, limit: usize)
         -> Result<Vec<Reference>, StoreError>;
 
@@ -388,14 +393,26 @@ pub trait NewsStore: Send + Sync + 'static {
     fn unread(&self, who: &Mailbox) -> Result<usize, StoreError>;
 
     // Retention
-    fn prune(&self, max_age: Option<Duration>, now: SystemTime)
-        -> Result<u64, StoreError>;
+    fn prune(&self, max_age: Duration, now: SystemTime) -> Result<u64, StoreError>;
 }
 ```
 
 Synchronous, like `MessageStore` and `ChatLog`, for the reason their
 module docs give: `Core` is sync all the way down, and the frontends
 already know to call through `off_reactor`.
+
+The methods that write and the reads that check what they were asked
+for answer a `NewsError` rather than a `StoreError`: containment, reply
+depth, sibling names and which referenced ids name an article are
+decided inside the store's own transaction, for the reason
+`MessageStore::push` gives — a check made outside it is one a
+concurrent write can invalidate. `create_node` takes a `NewNode` whose
+guid is the caller's, so both stores stay deterministic under test, and
+`post` answers the new id together with its root, which the
+`news_posted` event needs. The trait grows with the stages:
+`category_all`, `by_author`, search, subscriptions and `reindex` arrive
+with the stages that call them rather than ahead of them as stubs, and
+`NewPost`'s `plain` and `attach` with W3 and W5.
 
 `category_all` exists because the 1.5 wire has no pagination — a
 `NEWSCATLIST` reply is the whole category — and a trait that could not
@@ -446,12 +463,18 @@ CREATE TABLE news_article (
   body       TEXT    NOT NULL,             -- verbatim as typed
   mime       TEXT    NOT NULL DEFAULT 'text/plain',
   plain      TEXT,                         -- the §5.4 downgrade; NULL when body is plain
+  attach_names TEXT,                       -- attachment file names, one per line (W5)
   at         INTEGER NOT NULL,
   deleted_at INTEGER,
-  deleted_by TEXT
+  deleted_by TEXT,
+  -- What news_fts reads by name (§6.1): computed on read, stored nowhere.
+  author      TEXT GENERATED ALWAYS AS (nick || ' ' || IFNULL(login, '')) VIRTUAL,
+  search_body TEXT GENERATED ALWAYS AS
+    (COALESCE(plain, body) || IFNULL(char(10) || attach_names, '')) VIRTUAL
 );
 CREATE INDEX news_article_thread ON news_article (category, path);
 CREATE INDEX news_article_roots  ON news_article (category, id) WHERE parent IS NULL;
+CREATE INDEX news_article_root   ON news_article (root, id);
 CREATE INDEX news_article_author ON news_article (login_fp, login, id);
 CREATE INDEX news_article_at     ON news_article (at);
 
@@ -464,11 +487,12 @@ CREATE TABLE news_ref (
 CREATE INDEX news_ref_dst ON news_ref (dst, src);
 
 CREATE VIRTUAL TABLE news_fts USING fts5(
-  subject, body, author,
+  subject, search_body, author,
   content = 'news_article',
   content_rowid = 'id',
   tokenize = 'unicode61 remove_diacritics 2'
 );
+INSERT INTO news_fts (news_fts, rank) VALUES ('secure-delete', 1);
 
 CREATE TABLE news_blob (
   hash        BLOB PRIMARY KEY,             -- SHA-256 of the canonical bytes
@@ -522,6 +546,20 @@ The migration from version 2 is additive: the new tables, the virtual
 table, and their indexes. No `ALTER` on an existing table — the shape
 the version-2 arm already established.
 
+**The schema lands in steps.** Version 3 is `news_node`, `news_article`
+and `news_ref`: what threaded news with plain bodies writes.
+`news_fts`, `news_blob`, `news_attach` and `news_sub` arrive as further
+additive versions with the stages that fill them (W4, W5, W7), because a
+table nothing writes is a table whose contents a later build has to
+guess at. The columns the index reads are the exception, and are in
+version 3 already: `author` and `search_body` are generated columns, and
+a generated column's expression cannot be changed without rebuilding the
+table — so `attach_names` is in `search_body`'s expression before
+anything writes it, and W4 and W5 are purely additive. `news_article_root`
+is there for a reason worth keeping: a thread's aggregates — its reply count and last post —
+and retention's grouping are all "every article with this root", and
+that index makes each a lookup.
+
 ## 5. Body text: markdown, references, and the plain-text downgrade
 
 ### 5.1 The decision
@@ -564,9 +602,20 @@ pub struct Rendered {
 }
 
 pub trait BodyRenderer: Send + Sync + 'static {
-    fn render(&self, source: &str) -> Rendered;
+    /// `plain` no longer than `limit` bytes — the renderer's to keep.
+    fn render(&self, source: &str, limit: usize) -> Rendered;
 }
 ```
+
+The limit is a parameter because it cannot be a caller's afterthought. A
+downgrade can outgrow its source, and the worst case is not linear: a
+quote opened thousands deep and then continued lazily repeats its prefix
+on every line after it. That is quadratic output from a body that passed
+every size check, and it has to stop where it is written. Past the limit
+the renderer builds nothing more either — no prefix, no blank line — so
+the limit bounds the work as well as the output, and the work before it
+is linear: a link's label is measured in the output when the link
+closes, never copied into every link and image open around it.
 
 Implemented on [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark):
 pure Rust, CommonMark, and an event stream — so the plain-text render is
@@ -574,13 +623,38 @@ a fold over events and the reference scan is one match arm on
 `Tag::Link`. The dialect is CommonMark minus two things:
 
 - **Raw HTML is literal text**, never interpreted, on the way in and on
-  the way out.
+  the way out. It is also opaque: an inline tag, or an HTML block by any
+  of CommonMark's start conditions, is not prose, so a `#51` inside one
+  is not a reference. `<br>` on a line of its own starts a block that
+  runs to the next blank line, so `Fixed in #51.` under it cites nothing.
 - **No images by URL.** An article's pictures are its attachments. A body
   that can fetch `https://tracker.example/pixel.gif` is a body that
   reports every reader's address to a stranger, and news is read by more
   people over more time than anything else on this server.
 
 Rendering happens once, at post time, off the reactor. Never on a read.
+
+GitHub's tables and strikethrough are on, because authors type them and
+GtkHx's chat dialect already has `~~strike~~`. pulldown-cmark is built
+without its `html` feature, so there is no HTML writer in the binary to
+call by mistake.
+
+**What that dialect means for each construct.** Written down once the
+renderer existed, because each is a choice a client has to make the same
+way:
+
+- **An image by URL is a link to where it would have been fetched from.**
+  In the downgrade it is `alt (url)`, and no client draws it as a picture,
+  so the tracking-pixel risk above never reaches a reader.
+- **The shorthand is prose.** In a markdown body `#51` is a reference in
+  text and never inside a code span or block. An article quoting a
+  shell prompt or a C preprocessor line is not citing anything. A plain
+  body has no code to exclude, so the whole of it is scanned, and so is
+  a markdown body under `"source"`, where nothing parses it.
+- **A code span keeps its backticks** in the downgrade: a backticked
+  command is not decoration, and a text view reads it better with them.
+- **A line break the author typed is kept.** Chat-era authors expect it,
+  and a text view has no reflow to lose it to.
 
 ### 5.3 References
 
@@ -590,6 +664,9 @@ scheme:
 ```markdown
 This was settled in [the sizes thread](news:51), and #47 has the numbers.
 ```
+
+The scheme matches in any case, as a URI scheme does, so `NEWS:51` is
+the same reference.
 
 `#<digits>` is the shorthand, recognized by a scanner in `hxd-core` — not
 by the markdown parser — when it is delimited by whitespace or
@@ -637,18 +714,43 @@ not the ambiguous kind of mention.
 - Emphasis and strong markers are dropped; the words stay.
 - A heading becomes its text followed by a blank line.
 - A bullet list becomes `- ` lines, an ordered list `1. ` lines —
-  markdown's plain-text ancestry doing the work for us.
+  markdown's plain-text ancestry doing the work for us. An empty item
+  keeps its bare marker. A tight list stays tight, even around an item
+  holding a quote or a code block; a loose one keeps its blank lines.
 - A fenced code block becomes its contents indented four spaces, fences
-  gone. A block quote becomes `> ` lines.
+  gone. A block quote becomes `> ` lines, its blank lines included — one
+  inside quoted code is still `>`, so the quote does not come apart.
 - `[text](news:51)` becomes `text (news #51)`; `[text](https://…)`
-  becomes `text (https://…)`; a bare `#51` is left exactly as typed.
+  becomes `text (https://…)`; a bare `#51` is left exactly as typed. A
+  link whose text is its destination says it once: `<https://…>` is
+  `https://…`, and `<news:51>` is `news #51`.
 - A table becomes its cells, tab-separated, one row per line. Nobody is
   happy about this and nobody has a better answer for a 1996 text view.
 
-**The downgrade can be longer than the source** — every link grows — so
-it is capped independently at `max_body` and truncated at a character
-boundary with a trailing `…`. The truncation affects the legacy part
-only; the source is untouched and an ng client sees all of it.
+**The downgrade can be longer than the source**, and the domain gives
+the renderer room for that: a small multiple of `max_body`, which no
+article a person writes comes near, because a link or a list line
+downgrades to about its own length. Only a body built to expand — a
+reference definition cited over and over, a quote nested thousands
+deep — reaches it, and is cut there at a character boundary with a
+trailing `…`. So the downgrade stored, and the index over it, is whole
+for any ordinary article, and the source is untouched either way: an ng
+client sees all of it. Cutting to `max_body` for a legacy client happens
+at the legacy edge, when that binding lands (§12.4, §16).
+
+**A body nested too deeply is refused**, before it is parsed. A
+CommonMark parser matches each line against every block still open
+around it, and a list item stays open across a blank line, which costs
+one byte: a body that opens thousands of levels and then runs blank
+lines costs levels times lines, seconds of CPU from one that passes
+every size check. So a line may open with at most 64 columns of list
+and quote syntax — indentation, `>`, list markers — and an article past
+that is `bad_request`, "That article nests too deeply.", as one too long
+is. Every open block takes at least a column of the line that opened
+it, so the cap bounds the depth and the parse with it, and it admits
+lists far deeper than any client draws. A thematic break is not
+counted, however many dashes it has. A plain body, and markdown under
+`source`, is never parsed and never refused for this.
 
 ### 5.5 The knob
 
@@ -659,7 +761,13 @@ under all three — only their quality varies.
 |---|---|
 | `"render"` (default) | Bodies may declare `text/markdown`; the downgrade is generated; the index is built over it. |
 | `"source"` | Markdown is accepted and stored, no downgrade is generated, a legacy client is served the source. The `markdown` feature is not required. This is the pure client-side reading, for an operator who does not want a parser in their server. |
-| `"off"` | `text/markdown` is refused with `bad_request`. Every body is `text/plain`. |
+| `"off"` | `text/markdown` is refused with `bad_body_type`. Every body is `text/plain`. |
+
+`"render"` is the default in a build with the `markdown` feature, and
+`"off"` in one without, where asking for `"render"` is a startup error.
+To an ng client `"render"` and `"source"` are the same thing: either way
+it is handed the source, and the login block lists `text/markdown` in
+`body_types`.
 
 ## 6. Search and the news index
 
@@ -667,20 +775,40 @@ under all three — only their quality varies.
 
 SQLite's FTS5 is already compiled into the store's SQLite: `rusqlite`'s
 `bundled` build has it with no additional feature and no additional
-dependency (verified against the pinned 0.32 build, SQLite 3.46). Search
+dependency (verified against the pinned 0.40 build, SQLite 3.53). Search
 therefore costs a table and some care, not a search engine.
 
 ```sql
 CREATE VIRTUAL TABLE news_fts USING fts5(
-  subject, body, author,
+  subject, search_body, author,
   content = 'news_article',
   content_rowid = 'id',
   tokenize = 'unicode61 remove_diacritics 2'
 );
+INSERT INTO news_fts (news_fts, rank) VALUES ('secure-delete', 1);
 ```
 
 An **external-content** table: the text is not stored twice, FTS5 reads
-it from `news_article` through the rowid. The index is written in the
+it from `news_article` through the rowid.
+
+External content reads each indexed column **by name** from the content
+table, so the columns it indexes are columns `news_article` has:
+`author` and `search_body` are virtual generated columns (§4), computed
+when read and stored nowhere, so the text still exists once and
+`snippet()` reads it through them. The alternatives were weighed and
+lost: a view as the content table works the same way at the cost of a
+second object to keep in step; FTS5's own copy of the text doubles it
+and gives moderation two copies to remove; a contentless index has no
+`snippet()` at all, and match offsets computed outside FTS5 could
+disagree with what it matched.
+
+A tombstone leaves the index with the values it was indexed under, read
+off the row itself — `INSERT INTO news_fts(news_fts, rowid, …) SELECT
+'delete', id, subject, search_body, author FROM news_article` — before
+the row is blanked, in the same transaction. The index is created with
+`secure-delete` on, so a removed article's tokens are overwritten when
+it leaves rather than lingering until a merge: a moderation act that
+left a body recoverable from the index file would not be one. The index is written in the
 same transaction as the article — on post, on tombstone, and on a
 moderation purge. A tombstoned article is *deleted from the index*, not
 blanked in it, which is what makes a deletion real for search as well as
@@ -689,13 +817,14 @@ for reads.
 What is indexed:
 
 - `subject`, weighted heaviest.
-- `body` — **the plain-text downgrade where there is one**, the body
-  otherwise. This is the second job that column does, and half the
+- `search_body` — **the plain-text downgrade where there is one**, the
+  body otherwise. This is the second job the downgrade does, and half the
   argument for computing it.
 - `author` — nick and login, so `from:alice` is a query rather than a
   separate filter.
-- Attachment file names, appended to `body`. A
-  `screenshot-of-the-crash.png` is a searchable fact about an article.
+- Attachment file names, which `search_body` appends from
+  `attach_names`. A `screenshot-of-the-crash.png` is a searchable fact
+  about an article.
 
 ### 6.2 The query language is ours, not FTS5's
 
@@ -715,7 +844,9 @@ server compiles it into an FTS5 expression from a closed grammar:
 Everything else — every FTS5 operator, every stray quote or paren — is
 escaped into a literal term. **A malformed query returns results, never
 an error.** Terms are capped at 16 per query and 64 bytes each, so the
-compiled expression is bounded before SQLite sees it.
+compiled expression is bounded before SQLite sees it. A term cut inside
+a word keeps what it has of that word as a prefix, so a pasted sentence
+longer than the cap still finds the article it came from.
 
 ### 6.3 Results, ranking and paging
 
@@ -743,6 +874,23 @@ is what a person means by narrowing a search.
 full-text query is a different unit of work from a keyed read, and this
 endpoint faces phones on the open internet.
 
+As built, a few things the paragraphs above leave open are settled:
+
+- **`recent` is offset-paged too**, for now. It is id-ordered and so
+  stable enough that an offset only drifts by what was posted since; a
+  cursor form is worth adding when a client needs one.
+- **`category` may name a bundle**, and then means every category
+  anywhere under it — which is what "that category and its descendants"
+  can only mean in a tree where categories hold no nodes.
+- **A hit carries its thread's `root`**, so opening one costs no second
+  request.
+- **`from` is `from:` as a parameter**: an author term added to the
+  query, so "everything by alice" is a search with no words in `q`.
+- **The index holds live articles and only those.** A post adds its row
+  and a tombstone, a category deletion and retention take theirs out, in
+  the transaction that changes the article; FTS5's own `rebuild` is not
+  used, because it would index tombstones.
+
 ### 6.4 The memory store, and reindexing
 
 `MemoryNews` implements search as a naive tokenized scan so the
@@ -751,9 +899,21 @@ against both implementations. It does not implement ranking, and the
 conformance suite therefore asserts result sets and never order; ranking
 is asserted in the SQLite store's own tests.
 
-`hxd news-reindex` rebuilds `news_fts` from `news_article`. It is needed
-after an mhxd import (§12.6), after a `markdown` mode change that alters
-every downgrade, and as the repair for an index that has drifted.
+Nor does it tokenize the way the index does. It splits on what Rust
+calls letters and digits and matches the words as they are, where
+`unicode61` folds diacritics and splits at combining marks and at some
+vowel signs. The two agree on ASCII, and the suite's corpus keeps to
+it: outside ASCII the memory store is a stand-in, not a model. The
+SQLite store puts each term through its own tokenizer before building
+the expression and drops one that comes out empty, as the grammar drops
+a term with no words, so no term can sink the rest of a query.
+
+`hxd news-reindex` rebuilds `news_fts` from `news_article`, from what
+is stored and nothing else. It is needed after an mhxd import (§12.6)
+and as the repair for an index that has drifted. It re-renders nothing:
+a downgrade is fixed when its article is posted, so a `markdown` mode
+change applies to articles posted after it, and reindexing does not
+reach back.
 
 ### 6.5 The legacy wire cannot search
 
@@ -897,17 +1057,20 @@ Every bit this needs is already allocated and already parsed:
 | Create a bundle | `CREATE_NEWS_BUNDLES` (36) |
 | Delete a bundle | `DELETE_NEWS_BUNDLES` (37) |
 
-Two things the bitmap does not cover, both `[extra]` keys rather than
-squatted bits, for the reason hotline-ng.md §4/D5 gives:
+Two things the bitmap does not cover, both config rather than squatted
+bits, for the reason hotline-ng.md §4/D5 gives:
 
 - **`[extra] attach_news`**, defaulting to the account's `SEND_MEDIA`
   (57). Someone trusted to put an image in chat is trusted to put one
   in an article; an operator can say otherwise either way.
-- **`[extra] news_self_delete`**, default `true`: an author may delete
-  their own article without bit 33. This is a **deliberate deviation**
-  from period behavior, where deletion is bit 33 or nothing. It is
+- **`[news] self_delete`**, default `true`: an author may delete their
+  own article without bit 33. This is a **deliberate deviation** from
+  period behavior, where deletion is bit 33 or nothing. It is
   server-local policy, it never crosses either wire as a bit, and a
-  server that wants the period answer sets it `false`.
+  server that wants the period answer sets it `false`. It is a
+  server-wide key (§13) rather than a per-account one: whether an
+  author owns what they wrote is a rule of the place, not a privilege
+  of the person.
 
 Deleting a category deletes its articles, which decrements every blob
 refcount underneath it; deleting a bundle requires it to be empty,
@@ -916,7 +1079,10 @@ be four hundred audit rows or a refusal, not one click.
 
 Moderation follows moderation.md's ladder unchanged: a moderator may
 not delete an article by a session holding `cant_be_disconnected` (23)
-unless they hold `delete_users` (15).
+unless they hold `delete_users` (15). That asks about the author's
+privileges, which an article does not record yet, so it arrives with
+the rest of moderation in W8 (§16); until then `delete_articles` is
+enough whoever the author is.
 
 ## 9. The ng wire
 
@@ -931,6 +1097,7 @@ unless they hold `delete_users` (15).
   "attach": true,                // …and may attach
   "max_body": 65535,
   "max_subject": 255,
+  "max_depth": 32,               // reply nesting: past it, do not offer Reply
   "max_attachments": 8,
   "max_attachment_bytes": 2097152,
   "types": ["image/jpeg", "image/png", "image/gif"],
@@ -938,27 +1105,34 @@ unless they hold `delete_users` (15).
   "body_types": ["text/plain", "text/markdown"],
   "max_refs": 32,
   "search": true,                // §6; false on a build without FTS5
-  "search_max_results": 500
+  "search_max_results": 500,
+  "subscribe": true,             // this session may follow things (§10)
+  "auto_subscribe": "participated", // present when the server keeps subscriptions
+  "unread": 3                    // across what it follows; present when subscribe is true
 }
 ```
 
-`post` and `attach` are this session's resolved permissions, not the
+`post`, `attach` and `subscribe` are this session's resolved permissions, not the
 server's ceiling — the same courtesy `moderator` does in
 moderation.md §2, so a client can gray out a compose button instead of
 discovering the refusal after the user has typed.
+
+Until attachments land (W5), `attach` is always `false` and the block
+leaves out `max_attachments`, `max_attachment_bytes` and `types` rather
+than sending limits for something that cannot be done.
 
 ### 9.2 Requests
 
 | `req` | params | ok |
 |---|---|---|
 | `news_tree` | `parent?` (node id; absent = root), `depth?` (1–4, default 1) | `{ "nodes": [ … ] }` |
-| `news_threads` | `category`, `before?` / `after?` (thread root id), `order?` (`"created"` \| `"recent"`, default `"created"`), `limit?` (1–200, default 50) | `{ "threads": [ … ], "has_more": bool }` |
-| `news_thread` | `root`, `after?` (article id), `limit?` (1–100, default 25) | `{ "articles": [ … ], "has_more": bool }` |
+| `news_threads` | `category`, `before?` / `after?` (thread root id), `order?` (`"created"`, the default and so far the only one: `"recent"` is an open question, §18, and asking for it is `bad_request`), `limit?` (1–200, default 50) | `{ "threads": [ … ], "has_more": bool }` |
+| `news_thread` | `root`, `after?` (article id), `snapshot?` (article id returned by the first page; required with `after`), `limit?` (1–100, default 25) | `{ "articles": [ … ], "has_more": bool, "snapshot": article_id }` |
 | `news_article` | `id` | `{ "article": { … } }` |
 | `news_post` | `category`, `parent?`, `subject`, `body`, `mime?` (`"text/plain"` \| `"text/markdown"`, default plain), `attach?` (handles) | `{ "id": 51 }` |
 | `news_delete` | `id`, `reason?` | `{}` |
 | `news_refs` | `id`, `limit?` (1–200, default 50) | `{ "referenced_by": [ … ] }` — the articles pointing at this one |
-| `news_search` | `q`, `category?`, `from?`, `before?` / `after?` (times), `offset?`, `limit?` (1–50, default 20) | `{ "hits": [ … ], "total": 137, "capped": false }` |
+| `news_search` | `q`, `category?`, `from?`, `before?` / `after?` (times), `order?` (`"relevance"`, the default, or `"recent"`), `offset?`, `limit?` (1–50, default 20) | `{ "hits": [ … ], "total": 137, "capped": false }` |
 | `news_node_create` | `parent?`, `kind` (`"bundle"` \| `"category"`), `name` | `{ "node": { … } }` |
 | `news_node_rename` | `id`, `name` | `{}` |
 | `news_node_delete` | `id` | `{ "articles": 12 }` |
@@ -977,9 +1151,25 @@ There is deliberately **no error code for a bad search query**: §6.2
 compiles anything into something, so `news_search` answers with results
 or with an empty list.
 
-Pagination follows the `history` request exactly: cursors are ids,
-`before`/`after` are exclusive, `has_more` is computed by fetching
-`limit + 1`, and the caller clamps the limit before the store sees it.
+A `hit` is `{ "id", "root", "category", "subject", "from", "at",
+"snippet", "marks" }`: `from` the author's nick, `snippet` plain text
+from around what matched, and `marks` a list of `[start, end)` pairs in
+the snippet **counted in UTF-16 code units** — what a JSON client's
+strings index by, in JavaScript and Swift's `NSString` and Java alike —
+so a client slices the match straight out of the string it received.
+A server with `search = false` answers `news_search` `not_available`,
+and too many searches answer `rate_limited`.
+
+Search pages by offset (§6.3). Every other paged request follows the
+`history` request where its ordering permits:
+cursors are ids, `before`/`after` are exclusive, `has_more` is computed
+by fetching `limit + 1`, and the caller clamps the limit before the
+store sees it. A thread's preorder is mutable — a new reply to an early
+article sorts before later siblings — so the first `news_thread` page
+also returns `snapshot`, the newest article admitted to that traversal.
+Every request with `after` must echo it. Newer replies then belong to a
+fresh traversal instead of appearing on some later pages while falling
+behind other cursors.
 
 An `article` object:
 
@@ -1013,6 +1203,17 @@ A `thread` object in `news_threads` is `{ "article": <article>,
 "replies": 3, "last_at": …, "last_id": 51 }` — the starter in full,
 because a listing that shows the first paragraph needs the body, and
 counting a round trip per row is what a mobile client cannot afford.
+`news_threads` lists **newest first**; `before` pages toward older
+threads and `after` toward newer ones, and a page read with `after` is
+the threads nearest the cursor, still newest first. A thread whose every
+article is a tombstone is not listed: there is nothing left in it to
+read.
+
+A `node` object is `{ "id", "parent", "kind", "name", "count",
+"created_at" }` — `parent` null at the root, `count` the sub-nodes of a
+bundle or the live articles of a category — with `children` on a bundle
+that a `news_tree` of `depth` above 1 reached into. An article's
+`parent` is likewise null for a thread's starter.
 
 **The `plain` downgrade never crosses the ng wire.** An ng client is
 told the body's type and handed the source; rendering markdown is what
@@ -1152,6 +1353,16 @@ here.
 notified.** Same rule as the inbox, for the same reason: there is nobody
 durable to address.
 
+**And a subscription moves the way mail does.** Linking an identity,
+rotating one and deleting an account each owe the mailbox an obligation
+(private-messages.md §4), and each is paid for subscriptions in the same
+call — `inbox_claim`, `inbox_rotate`, `inbox_purge` — so a link site that
+remembers one cannot forget the other. Authorship is not re-stamped: an
+article records its author as they were when they wrote it (§3.1). So an
+account that links an identity is not rung about replies to articles it
+wrote before the link. It still follows those threads, because the
+subscriptions moved.
+
 ### 10.3 What can be subscribed to
 
 Two scopes, and deliberately not a third:
@@ -1176,6 +1387,30 @@ to threads you started; `"off"` makes every subscription explicit. An
 auto-subscription is marked as such, so a client can offer "stop
 following threads I reply to" as one switch rather than a list.
 
+Four decisions made while building it, each one a question the paragraphs
+above leave open:
+
+- **A category subscription counts new threads, not every reply.**
+  Following a category is "tell me when something starts here". A reply
+  deep in one of its threads belongs to whoever follows that thread, and
+  counting it twice would make the category badge a second copy of every
+  thread badge.
+- **A subscription starts caught up.** A new row's cursor is the newest
+  article in the scope, so its unread count is 0. Under the catch-up rule
+  (§10.7), a row that started behind would never ring at all.
+- **Unsubscribing and muting are different answers.** Unsubscribing
+  deletes the row, and a reply to your own article still reaches you: that
+  case needs no subscription (§10.1). Muting keeps the row with no
+  doorbell, and silences everything in the thread, replies included.
+  Muting a scope nobody followed makes a muted row, and that is how a
+  thread says *never*. An automatic subscribe does not touch an existing
+  row, muted or not, so posting again does not undo a mute. Only an
+  explicit subscribe turns a row explicit and unmutes it, because asking
+  to follow is asking to hear.
+- **A muted category silences only its own reason.** Muting a category is
+  about its new threads, not about someone answering your article inside
+  one of them.
+
 ### 10.4 There is no notification table, and that is the point
 
 A private message needs the inbox because the message exists nowhere
@@ -1198,24 +1433,32 @@ CREATE TABLE news_sub (
   scope     INTEGER NOT NULL,          -- 0 thread, 1 category
   target    INTEGER NOT NULL,          -- thread root, or node id
   auto      INTEGER NOT NULL DEFAULT 0,
-  last_seen INTEGER NOT NULL DEFAULT 0,-- highest article id acknowledged
   muted     INTEGER NOT NULL DEFAULT 0,
+  last_seen INTEGER NOT NULL DEFAULT 0,-- highest article id acknowledged
   at        INTEGER NOT NULL
 );
-CREATE UNIQUE INDEX news_sub_one
-  ON news_sub (owner, IFNULL(owner_fp, ''), scope, target);
-CREATE INDEX news_sub_target ON news_sub (scope, target) WHERE muted = 0;
+CREATE UNIQUE INDEX news_sub_fp    ON news_sub (owner_fp, scope, target) WHERE owner_fp IS NOT NULL;
+CREATE UNIQUE INDEX news_sub_login ON news_sub (owner, scope, target) WHERE owner_fp IS NULL;
+CREATE INDEX news_sub_target ON news_sub (scope, target);
 ```
 
-The `IFNULL` in the unique index is not decoration: SQLite treats NULLs
-as distinct in a unique index, so a plain `(owner, owner_fp, …)` index
-would let an unidentified mailbox subscribe to one thread any number of
-times. `news_node_sibling` (§4) has the same shape for the same reason.
+Schema version 5. **Two partial unique indexes, one per kind of
+mailbox**, for the reason the inbox has two (private-messages.md §5).
+Under the mailbox rule an identified row is found by its fingerprint,
+whatever login sits beside it. A single index over `(owner, owner_fp)`
+would let a renamed identity hold two rows for one thread, and the
+first sketch's `IFNULL` form was unindexable for the lookups that
+matter. `news_sub_target` is not partial on `muted`, as that sketch had
+it, because a post's audience has to see a muted row in order to honor
+it (§10.5).
 
-**Unread is a query, not a column**: articles in the scope with
-`id > last_seen`, which is one range scan on `news_article_thread` or
-`news_article_roots`. A badge that is computed cannot drift from what it
-counts.
+**Unread is a query, not a column**: the live articles in the scope with
+`id > last_seen` that the owner did not write. For a thread that is one
+range scan on `news_article_root`; for a category, the thread starters,
+on `news_article_roots`. A badge that is computed cannot drift from what
+it counts, and a tombstone or your own reply is never something you have
+not read. A row whose thread or category goes — deleted, or pruned —
+goes in the same transaction, so it never counts against `max_subs`.
 
 ### 10.5 Who gets notified, and why
 
@@ -1240,7 +1483,27 @@ Deduplicated by mailbox, highest reason winning. Then filtered:
   already exists and already means "I do not want this person reaching
   me". It suppresses the notification and not the article: a public
   forum is public, so they can still read the post if they go and look,
-  but a blocked account cannot ring their phone.
+  but a blocked account cannot ring their phone. An identity guest can
+  be blocked by fingerprint in private messages, and that block holds
+  here too.
+
+The account behind a mailbox is asked about through
+`AccountDirectory::mailbox_access`, which resolves by the mailbox rule:
+an identified mailbox by its fingerprint whatever the account is called
+now, an unidentified one only by a login whose account has no identity.
+A login someone else has since taken therefore answers for nobody. That
+is the same seam the inbox uses, and it is wired whenever `[news]` is,
+with or without `[inbox]`. A server whose `Core` has no directory
+notifies nobody rather than guess whether a bit survived.
+
+Each notification counts against one cursor. A muted thread silences the
+account entirely; otherwise it is the thread's cursor where the account
+has a row there. A new thread with only a category row counts against
+the category. **A reply or a citation to someone with no row in the
+thread** counts against the thread with no cursor at all: it rings, and
+its `unread` is 1. Nothing is created by being notified, so being cited
+does not subscribe you to the citing thread, and `max_per_hour` bounds
+what the missing cursor cannot.
 
 **`reference` is the mention feature, and news gets it for free.** The
 roadmap's open question — "how a mention is defined, given that Hotline
@@ -1269,11 +1532,19 @@ through the gateway. The decision lives in `hxd-core`, never in a
 frontend — `notify.rs`'s module documentation names that hazard
 exactly, and news would trip over it the same way.
 
+**Attentive means a session that can show the event.** An active session
+on the legacy wire does not count: that wire drops `news_notify`, because
+it has no way to say it (§10.11). An account whose only session is a
+classic client sitting in chat has not been told anything, and the push
+is the one thing that can reach them. It is the same test the inbox
+already makes about the legacy wire, `reads_on_delivery`.
+
 Attached ng sessions get a **targeted** event:
 
 ```jsonc
 { "seq": 88, "ev": "news_notify", "data": {
     "reason": "reply",                    // reply | reference | subscription
+    "scope": "thread", "target": 398,     // the cursor this counts against
     "article": 412, "root": 398, "category": 7,
     "subject": "The derivative and the u16",
     "excerpt": "The part size is a u16, so the full-size PNG…",
@@ -1319,12 +1590,35 @@ What that buys, in order of how much it saves us writing:
 - **It is per scope, not global**, so a quiet thread you care about is
   not silenced by a loud one you also follow.
 
+**"Caught up" is asked of what came before the post, not of the
+total.** The question runs after the post commits. If it were "is
+unread now 1", two posts landing together would each count the other,
+and neither would ring. Asked instead as "was anything older than this
+article unread", the earlier of the two rings and the later does not,
+whatever order their notifications run in.
+
+**An automatic subscription is made in the post's own write.** Made
+after the post commits, it has no right place to start. At the scope's
+newest article, it would count a reply stored in between as already
+seen. At the post, it would count that reply as unread even though
+nobody was told about it: no row existed when the reply chose its
+audience. So the scope would not ring again until `news_seen`. Made in
+the same transaction as the article, the row exists before any later
+article gets an id, and it starts caught up at the post, which is the
+thread's newest.
+
 Two floors sit under it:
 
 - `[news.notify] max_per_hour` per account across every news push
   (default 12), because a subscriber to forty scopes can be rung forty
   times by the rule above. Exceeding it drops the push, never the event
-  and never the unread count.
+  and never the unread count. The budget lives in the server's memory,
+  kept under the mailbox rule, and a restart forgets it. Linking an
+  identity forgets the budget under the old key. `hxd inbox purge`, though,
+  runs in a process of its own and cannot reach it. So a login that is
+  deleted and taken again within the hour can start with the previous
+  holder's partly spent budget. The cost is a push delayed until the
+  bucket refills.
 - **The gateway's collapse key**: `msggroup` is set to the scope —
   `thread:398` — so two pushes for one scope that are somehow both in
   flight collapse on the device. This is the "vendor collapse keys"
@@ -1349,6 +1643,16 @@ thread through `news_thread` must not advance the cursor, because a
 client may prefetch, may render nothing, or may be a search result
 preview. The client says when it has shown someone something.
 
+The cursor only moves forward, and never past the newest article in the
+scope, so an id from the future cannot mark tomorrow's posts read. A
+scope this account does not follow answers `{ "unread": 0 }` rather than
+an error, because a client that says "seen" on every thread it shows
+should not have to check which ones are followed first. A scope that
+names nothing is still refused (§10.9). One cursor per
+scope has a cost for a thread read a page at a time: `up_to` is the
+highest id shown, and a thread reads in reply order rather than id order,
+so an older reply on a page not yet loaded is counted as seen.
+
 ### 10.9 Requests
 
 | `req` | params | ok |
@@ -1356,12 +1660,24 @@ preview. The client says when it has shown someone something.
 | `news_subscribe` | exactly one of `thread` / `category` | `{ "unread": 3 }` |
 | `news_unsubscribe` | exactly one of `thread` / `category` | `{}` |
 | `news_mute` | exactly one of `thread` / `category`, plus `muted` | `{}` |
-| `news_subs` | — | `{ "subs": [ … ] }` — scope, target, subject or name, `auto`, `muted`, `unread` |
+| `news_subs` | — | `{ "subs": [ … ] }`, newest first |
 | `news_seen` | exactly one of `thread` / `category`, plus `up_to` | `{ "unread": 0 }` |
+
+A sub is `{ "scope": "thread" | "category", "target", "category",
+"subject" | "name", "auto", "muted", "unread", "last_seen" }`: `category`
+is where the scope lives (the category itself, for a category), `subject`
+is a thread starter's (empty once it is a tombstone), and `name` a
+category's.
 
 Error codes on top of §9.2's: `no_mailbox` (a guest tried to subscribe —
 the same shape as `no_inbox`, and about *you* rather than about the
-target), `too_many_subs`.
+target), `too_many_subs`, and `not_available` from a server with no
+`[news.notify]`. Every request that takes a scope refuses one that names
+nothing: a `thread` that is a reply rather than a starter, or no article at all,
+is `no_such_article`, and a `category` that is not one is
+`no_such_node` or `not_a_category`. Not following something that is
+there is no error: `news_unsubscribe` and unmuting answer `{}`, and
+`news_seen` answers 0. Naming both scopes or neither is `bad_request`.
 
 The login reply's `news` block (§9.1) gains `unread` — the total across
 subscribed scopes — so a client can draw a badge on the first frame,
@@ -1390,16 +1706,17 @@ pub struct NewsNotice<'a> {
     pub article: ArticleId,
     pub root: ArticleId,
     pub category: NodeId,
-    /// The collapse key: "thread:398" or "category:7".
-    pub scope_key: &'a str,
+    /// The subscription it counts against; `scope.key()` is the
+    /// collapse key, "thread:398" or "category:7".
+    pub scope: SubScope,
     pub unread: usize,
 }
 ```
 
 `NotificationGateway` keeps its single method and its single hard
 contract — **`notify` must not block** — and the subscriber id is
-push-notifications.md §5's `hx-<hex>` mapping, unchanged. Nothing about
-news makes the gateway a different shape; it makes it a wider one.
+push-notifications.md §5's mapping from the mailbox, unchanged. Nothing
+about news makes the gateway a different shape; it makes it a wider one.
 
 ### 10.11 The legacy wire is not notified, yet
 
@@ -1457,9 +1774,11 @@ them worth attacking.
 - **Reply-spam to ring a phone** is answered by §10.7: the second reply
   rings nothing, because the target has not caught up from the first.
 - **Reference-spam** — naming forty of someone's old articles to notify
-  them forty times — collapses to one, because all forty resolve to one
-  mailbox and the audience is deduplicated per post, and then to nothing
-  under the catch-up rule.
+  them forty times — collapses to one per post, because all forty resolve
+  to one mailbox and the audience is deduplicated. Across posts it
+  collapses under the catch-up rule where the target has a cursor in the
+  citing thread, and under `max_per_hour` where they do not (§10.5). A
+  block stops it outright.
 - **Subscription flooding** is capped: `[news.notify] max_subs` per
   account, default 200.
 - **A blocked account cannot notify at all** (§10.5), which is the
@@ -1594,11 +1913,12 @@ wire enforces up front is better than a lossy conversion at the edge.
 Subjects are pstrings, hence 255. Both are enforced in the domain, so
 neither wire can create something the other cannot show.
 
-The plain downgrade is capped at the same 65 535 **independently of the
-source**, because rendering grows text: every `[label](news:51)` becomes
-`label (news #51)`. A body that fits and a downgrade that does not is an
-ordinary case, not an edge one, and it is why §5.4 truncates rather than
-refusing the post.
+The plain part a 1.5 client is served is cut to the same 65 535
+**independently of the source**, because rendering can grow text. A
+body that fits and a downgrade that does not is a case to handle, not
+refuse, so the cut happens here, at the edge, with a trailing `…` at a
+character boundary. The stored downgrade is not cut to it, so search
+reads past it (§5.4).
 
 Text conversion is `hxd-session`'s existing edge: UTF-8 → Mac Roman
 with `?` for unmappable on the way out, Mac Roman → UTF-8 on the way
@@ -1784,7 +2104,7 @@ max_body = 65535                # the legacy NEWSDATA ceiling; ↓ freely, ↑ n
 max_subject = 255
 markdown = "render"             # render | source | off — §5.5
 max_refs = 32                   # references recorded per article
-search = true                   # false disables news_search and skips the index
+search = true                   # false disables news_search; the index is kept regardless
 search_max_results = 500        # deepest reachable offset
 search_per_minute = 30          # per session
 max_depth = 32                  # reply nesting
@@ -1805,8 +2125,8 @@ flat_default_subject = "(no subject)"
 [news.notify]                   # absent = no subscriptions, no notifications
 auto_subscribe = "participated" # or "own_thread", or "off"
 reference = true                # does citing someone's article notify them
-max_subs = 200                  # subscribed scopes per account
-max_per_hour = 12               # news pushes per account, all scopes
+max_subs = 200                  # followed or muted scopes per account
+max_per_hour = 12               # news pushes per account, all scopes; 0 = badges, no pushes
 
 [news.attach]                   # absent = news without attachments
 max_bytes = 2097152             # per attachment, as uploaded
@@ -1829,7 +2149,7 @@ the `markdown` feature is the same error for the same reason: a config
 that silently does less than it says is worse than one that refuses to
 start. `[news]` without `[news.attach]` is news with no pictures, which
 is a legitimate server; `markdown = "off"` with `search = false` is
-plain-text news with no index, which is the smallest thing this design
+plain-text news with no search, which is the smallest thing this design
 builds.
 
 ## 14. What this does not change
@@ -1864,9 +2184,10 @@ builds.
   at all, and an animated GIF whose derivative is a still frame.
 - **`hxd-markdown` unit tests**: each downgrade rule of §5.4 with its
   expected plain text; raw HTML surviving as literal text; an image by
-  URL rejected; a link to `news:51` yielding both the rendered form and
-  the reference; a downgrade that outgrows `max_body` truncated at a
-  character boundary and not mid-codepoint.
+  URL downgraded to the link it is; a link to `news:51` yielding both the rendered form and
+  the reference; a downgrade that outgrows its limit truncated at a
+  character boundary and not mid-codepoint; deep nesting and nested
+  links costing linear time.
 - **Reference tests**: the `#51` shorthand recognized after whitespace
   and punctuation and *not* as an ATX heading; extraction from a plain
   body with the `markdown` feature off; an id naming nothing staying
@@ -1960,13 +2281,36 @@ Each lands separately with tests, roughly a branch apiece.
    and a digest, and it is a feature of its own.
 8. **W8 — moderation and retention.** The audit kind, the report
    target, the purge arm, index and reference cleanup on tombstone, the
-   sweeper's jobs, the CLI surface.
+   sweeper's jobs, the CLI surface, and §8's ladder on `news_delete`.
 9. **W9 — the legacy 1.5 binding.** The hx-libs opcode additions and
    the pin bump (§1), path resolution, the transactions of §12.1,
    `CATEGORYITEM` with guid and serials, `CATLIST` with its body and
    attachment parts, `NEWS_GETTHREAD` by MIME type, the Mac Roman
    edges, the 1.2 flat view of §12.5 — renderer, header-block parser,
    defaults and the push — and `hxd import-mhxd-news`.
+
+**Landed:** W1, W2, W3, W4 and W7, and the part of W6 that needs no
+attachments — the requests of §9.2, the events of §9.3 and the login
+block. Markdown is `hxd-markdown` on pulldown-cmark behind
+`BodyRenderer` and the `markdown` feature. It has the three modes of
+§5.5, the downgrade stored in `plain` (which the index and the
+notification excerpt read instead of the source), and references from
+`news:` links and prose shorthand. Chat markdown is not the server's
+business at all (hotline-ng.md §8). Search is
+schema version 4: the index over the columns version 3 put there for it,
+`hxd news-reindex`, and a conformance suite that asserts which articles
+each row of the grammar finds. Subscriptions are schema version 5:
+`news_sub`, the audience and the catch-up rule in `hxd-core::news::subs`,
+`news_notify`, the five requests of §10.9, `[news.notify]`, and
+`Notification` as a sum with `NewsNotice` in it — tested with a
+recording gateway, since no gateway exists yet. `[news]` accepts only
+the keys those honor; naming another, or another markdown mode, is a
+startup error until its stage lands. Not in it: §8's moderation ladder
+(W8), `order: "recent"` (§18), and the login block's attachment keys
+(W5). The ng e2e is
+`crates/hxd/tests/news.rs`, the out-of-process one `e2e/news.test.mjs`,
+and the first client is hx-ng's News view, which follows, mutes, badges
+and says "seen".
 
 W1–W2 is threaded news with plain bodies — small, and worth landing on
 its own. W1–W7 is the whole thing for the ng wire and a mobile client,

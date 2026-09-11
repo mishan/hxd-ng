@@ -9,6 +9,7 @@ pub mod enroll;
 mod http;
 pub mod identity;
 pub mod media;
+pub mod news;
 pub mod proto;
 mod registry;
 mod tunnel;

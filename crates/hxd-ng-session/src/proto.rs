@@ -506,6 +506,38 @@ pub fn event_json(se: &SeqEvent) -> String {
             "video_status",
             json!({ "cid": cid, "publishers": publishers_json(publications) }),
         ),
+        // "Your copy is stale", to everyone who may read news
+        // (`docs/news.md` §9.3). A header, so a client showing that
+        // category can splice one row in rather than refetch.
+        Event::NewsPosted {
+            id,
+            category,
+            root,
+            parent,
+            subject,
+            from_nick,
+            at,
+        } => (
+            "news_posted",
+            json!({
+                "id": id,
+                "category": category,
+                "root": root,
+                "parent": parent,
+                "subject": subject,
+                "from": { "nick": from_nick },
+                "at": unix(*at),
+                "attachments": 0,
+            }),
+        ),
+        Event::NewsDeleted { id, category } => {
+            ("news_deleted", json!({ "id": id, "category": category }))
+        }
+        Event::NewsNode(node) => ("news_node", json!({ "node": crate::news::node_json(node) })),
+        Event::NewsNodeDeleted { id } => ("news_node_deleted", json!({ "id": id })),
+        // Addressed to one account, where the four above go to every
+        // reader: the one a client raises a badge on (§10.6).
+        Event::NewsNotify(n) => ("news_notify", crate::news::notified_json(n)),
         // No ng mapping yet (private-chat family, and any future event this
         // build predates): emit a placeholder so seq accounting stays
         // gapless. Clients ignore unknown `ev` values per spec.

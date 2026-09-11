@@ -147,12 +147,22 @@ pub enum Event {
     },
     /// A server notice into a chat (kick announcements and the like).
     /// Semantic text; each frontend formats it (legacy: `\r<text>`).
-    Notice { cid: u32, from: Uid, text: String },
+    Notice {
+        cid: u32,
+        from: Uid,
+        text: String,
+    },
     /// A chat (or, for cid 0, server) subject change.
-    ChatSubject { cid: u32, subject: String },
+    ChatSubject {
+        cid: u32,
+        subject: String,
+    },
     /// A private chat's password change, announced to its members
     /// (reference-server behavior).
-    ChatPassword { cid: u32, password: String },
+    ChatPassword {
+        cid: u32,
+        password: String,
+    },
     /// An invitation to a private chat.
     ChatInvite {
         cid: u32,
@@ -160,9 +170,15 @@ pub enum Event {
         from_nick: String,
     },
     /// Someone joined a private chat the recipient is in.
-    ChatUserJoined { cid: u32, user: UserInfo },
+    ChatUserJoined {
+        cid: u32,
+        user: UserInfo,
+    },
     /// Someone left a private chat the recipient is in.
-    ChatUserParted { cid: u32, uid: Uid },
+    ChatUserParted {
+        cid: u32,
+        uid: Uid,
+    },
     /// A private message to the recipient.
     ///
     /// A message out of the inbox ([`crate::inbox`]) carries `queued`,
@@ -211,13 +227,18 @@ pub enum Event {
     /// people who may have it on screen. The line or message that
     /// carried it keeps its metadata, so a client drops the image and
     /// keeps the placeholder.
-    MediaRevoked { id: crate::media::Handle },
+    MediaRevoked {
+        id: crate::media::Handle,
+    },
 
     // --- Voice (see [`crate::voice`]) ---------------------------------
     /// An SDP offer for the recipient's own peer connection: the initial
     /// one answering a join, or a renegotiation. Opaque to the domain —
     /// both frontends carry the string verbatim.
-    VoiceOffer { cid: u32, sdp: String },
+    VoiceOffer {
+        cid: u32,
+        sdp: String,
+    },
     /// A server ICE candidate, or (empty candidate) end-of-candidates.
     VoiceIce {
         cid: u32,
@@ -245,6 +266,39 @@ pub enum Event {
         cid: u32,
         publications: Vec<crate::video::VideoPublication>,
     },
+
+    // --- News (see [`crate::news`]) -----------------------------------
+    //
+    // "Your copy is stale", sent to every session holding read-news —
+    // what `NEWSFILE_POST` has always been, carried forward
+    // (`docs/news.md` §9.3). Never a notification: what is addressed to
+    // one person is a different event with a different audience.
+    /// An article was posted. A header rather than the article, because
+    /// the cheap refresh is usually no refetch at all.
+    NewsPosted {
+        id: crate::news::ArticleId,
+        category: crate::news::NodeId,
+        root: crate::news::ArticleId,
+        parent: Option<crate::news::ArticleId>,
+        subject: String,
+        from_nick: String,
+        at: SystemTime,
+    },
+    /// An article became a tombstone.
+    NewsDeleted {
+        id: crate::news::ArticleId,
+        category: crate::news::NodeId,
+    },
+    /// A node was created or renamed.
+    NewsNode(crate::news::Node),
+    NewsNodeDeleted {
+        id: crate::news::NodeId,
+    },
+    /// A post is this session's account's business — a reply to its
+    /// article, a citation of one, or news in something it follows
+    /// (`docs/news.md` §10.6). **Targeted**, where the four above go to
+    /// every reader: this is the one a client raises a badge on.
+    NewsNotify(crate::news::Notified),
 }
 
 /// An event stamped with its position in the session's stream. `seq` is
@@ -331,6 +385,8 @@ pub(crate) struct UserSession {
     /// no.) It doubles as "is this session a repliable identity" — the
     /// sender of a stored message is recorded only when it is true.
     pub(crate) has_inbox: bool,
+    /// See [`AttachInfo::is_person`].
+    pub(crate) is_person: bool,
     /// See [`AttachInfo::reads_on_delivery`].
     pub(crate) reads_on_delivery: bool,
     /// This session's identity fingerprint — the durable half of its
@@ -340,6 +396,9 @@ pub(crate) struct UserSession {
     /// transport detach/resume instead of resetting on every WebSocket.
     pub(crate) history_refill: Instant,
     pub(crate) history_tokens: f64,
+    /// News search's ration, kept the same way and for the same reason.
+    pub(crate) search_refill: Instant,
+    pub(crate) search_tokens: f64,
     /// Whether this session has been announced (shows on the user list,
     /// generates events). False between login and login-completion.
     pub(crate) visible: bool,
@@ -360,6 +419,11 @@ pub struct AttachInfo {
     /// May private messages be stored for this account and delivered
     /// later? (The `[extra] inbox` flag; guests default to no.)
     pub has_inbox: bool,
+    /// Is exactly one person behind this account? [`Account::is_person`]:
+    /// what news records authorship against, independent of `has_inbox`.
+    ///
+    /// [`Account::is_person`]: crate::Account::is_person
+    pub is_person: bool,
     /// This session's wire cannot say it has read a message, so handing
     /// one over *is* the read (`docs/private-messages.md` §11).
     ///
@@ -616,11 +680,23 @@ pub struct Core {
     /// Store calls never happen under `roster`.
     pub(crate) history: Option<Arc<dyn crate::history::ChatLog>>,
     pub(crate) history_policy: crate::history::HistoryPolicy,
+    /// The news tree, or `None` when no `[news]` section asked for one.
+    /// On `Core` rather than in `RosterInner` for the reason `inbox` is:
+    /// store calls are disk I/O and never happen under the roster lock.
+    pub(crate) news: Option<Arc<dyn crate::news::NewsStore>>,
+    pub(crate) news_policy: crate::news::NewsPolicy,
+    /// The markdown parser behind `[news] markdown = "render"`, or `None`.
+    pub(crate) body_renderer: Option<Arc<dyn crate::news::BodyRenderer>>,
     pub(crate) directory: Option<Arc<dyn crate::account::AccountDirectory>>,
     pub(crate) inbox_policy: InboxPolicy,
     /// Where push notifications go, or `None` — which is the no-op, and
     /// the default. See [`crate::notify`].
     pub(crate) gateway: Option<Arc<dyn crate::notify::NotificationGateway>>,
+    /// What each account has left of its hourly news pushes
+    /// (`[news.notify] max_per_hour`), keyed by the mailbox rule. Its own
+    /// lock, taken with nothing else held.
+    #[allow(clippy::type_complexity)]
+    pub(crate) news_push: Mutex<HashMap<(Option<[u8; 32]>, String), (Instant, f64)>>,
     /// Serialises inbox flushes.
     ///
     /// A flush reads the pending rows, sends them under the roster lock,
@@ -661,6 +737,16 @@ impl Core {
         self.inbox = Some(store);
         self.directory = Some(directory);
         self.inbox_policy = policy;
+        self
+    }
+
+    /// Let the domain ask about accounts nobody is logged into, without an
+    /// inbox. [`Self::with_inbox`] takes one too; news notifications need
+    /// it on a server that keeps news and no mail, because a subscription
+    /// outlives its owner's session and whether they may still read the
+    /// news is a question about the account (`docs/news.md` §10.5).
+    pub fn with_accounts(mut self, directory: Arc<dyn crate::account::AccountDirectory>) -> Self {
+        self.directory = Some(directory);
         self
     }
 
@@ -724,10 +810,13 @@ impl Core {
                 connected_at: Instant::now(),
                 can_detach: info.can_detach,
                 has_inbox: info.has_inbox,
+                is_person: info.is_person,
                 reads_on_delivery: info.reads_on_delivery,
                 identity: info.identity,
                 history_refill: Instant::now(),
                 history_tokens: 10.0,
+                search_refill: Instant::now(),
+                search_tokens: f64::from(self.news_policy.search_per_minute),
                 visible: false,
                 outbox: Outbox::live(tx),
             },
@@ -1034,6 +1123,7 @@ pub(crate) fn test_attach(
             can_detach: false,
             transport: Transport::default(),
             has_inbox: false,
+            is_person: false,
             reads_on_delivery: false,
             identity: None,
         })
@@ -1069,6 +1159,7 @@ mod tests {
                 can_detach: true,
                 transport: Transport::default(),
                 has_inbox: true,
+                is_person: true,
                 reads_on_delivery: false,
                 identity: None,
             })
@@ -1144,6 +1235,7 @@ mod tests {
                 can_detach: false,
                 transport: Transport::default(),
                 has_inbox: false,
+                is_person: false,
                 reads_on_delivery: false,
                 identity: None,
             })

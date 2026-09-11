@@ -402,6 +402,7 @@ async fn handle_login(
             inline_media: ctx.core.media_enabled(),
         },
         has_inbox: account.has_inbox,
+        is_person: account.is_person(),
         // ng has `msg_read`; a client says for itself when it has read
         // something, and delivery is not that.
         reads_on_delivery: false,
@@ -486,6 +487,10 @@ async fn handle_login(
     if ctx.core.media_enabled() && !caps.iter().any(|c| c == "media") {
         caps.push("media".into());
     }
+    // And `news`, whenever there is a tree to read.
+    if ctx.core.news_enabled() && !caps.iter().any(|c| c == "news") {
+        caps.push("news".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
@@ -547,6 +552,15 @@ async fn handle_login(
     // find out (`docs/inline-media.md` §8.1).
     if let Some(cfg) = ctx.core.media_config() {
         ok["media"] = crate::media::limits_json(cfg);
+    }
+    // What this session may do with the news, and the ceilings it will
+    // be held to. Present exactly when the `news` cap is. Off the
+    // reactor, because its unread badge is a store read.
+    let news = off_reactor(&ctx.core, move |c| crate::news::login_json(c, uid))
+        .await
+        .flatten();
+    if let Some(news) = news {
+        ok["news"] = news;
     }
     if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
         // The client never learned it was logged in; a ghost session with
@@ -684,7 +698,7 @@ async fn handle_resume(
 /// `inbox_account`. On a tokio worker one slow disk, or an external
 /// `sqlite3` holding a write lock, stalls every session that worker is
 /// carrying. This file already does exactly this for `authenticate`.
-async fn off_reactor<T: Send + 'static>(
+pub(crate) async fn off_reactor<T: Send + 'static>(
     core: &std::sync::Arc<hxd_core::Core>,
     f: impl FnOnce(&hxd_core::Core) -> T + Send + 'static,
 ) -> Option<T> {
@@ -1457,6 +1471,12 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 Err(_) => reply_err(req.id, "bad_request", "Malformed video_subscribe."),
             }
         }
+
+        // --- News (docs/news.md §9) -----------------------------------
+        //
+        // One family, handled in its own module: the requests are many
+        // and all of them are translations of one domain call.
+        r if r.starts_with("news_") => crate::news::handle(ctx, state.uid, req).await,
 
         "logout" => {
             ctx.core.end_session(state.uid);

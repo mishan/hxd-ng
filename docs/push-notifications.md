@@ -18,6 +18,16 @@ ships with a no-op default and a `UniqushGateway` HTTP implementation.
 Push is off unless configured. A server that wants nothing to do with a
 Go daemon and a Redis loses push, not the build.
 
+**Refined 2026-09 against the identity spec.** Three things changed shape
+once identity landed:
+- **The subscriber is a mailbox**, keyed by fingerprint where there is one
+  (§5).
+- **On an identity session the device names itself** with its
+  certificate (§5.1).
+- **Credentials are per server, and the app is not.** An operator's push
+  credentials are a VAPID keypair, while a native app reaches APNs and FCM
+  through a relay its publisher runs (§8.1, §8.2).
+
 ---
 
 ## 1. What uniqush actually is
@@ -204,6 +214,12 @@ fingerprint where there is one and the login only where there is not.
 See private-messages.md §4 — it is the same rule the mailbox itself uses,
 and the same failure if it is broken.
 
+**And `Notification` is a sum**, since news brought a second kind
+(news.md §10.10): `Message(MessageNotice)` for a private message,
+`News(NewsNotice)` for an article someone should hear about. A gateway
+builds a different payload for each — a conversation to open, a thread to
+open — and `to()` answers the mailbox either way.
+
 `UniqushGateway` lives in its own crate (`hxd-push-uniqush`) so that a
 build without push pulls in no HTTP client at all, and so that a future
 `hxd-push-webpush` is a sibling rather than a rewrite.
@@ -258,15 +274,42 @@ registered against a recycled uid would push someone else's DMs to a
 stranger's phone. That is the worst bug this subsystem can have, so the
 mapping must not go anywhere near uids.
 
-**The mapping: `hx-<lowercase hex of the account name's canonical UTF-8
-bytes>`.** Deterministic, collision-free, inside the accepted charset, and
-reversible — which matters at three in the morning when you are reading
-uniqush's logs and want to know whose device that is. No new state, no
-migration, no lookup table. Long names produce long subscriber ids;
-uniqush does not care, and Hotline logins are short.
+Nor, as the first draft had it, can the login alone, even hex-encoded: a
+login recycles too, on a rename, and a device registered against
+`alice` would push the next `alice`'s private messages to the first one's
+phone. That is the uid failure on a slower clock.
+
+**The mapping is the mailbox's, with the two kinds kept apart:**
+
+- an identified mailbox is `hx-f-<lowercase hex of the 32 fingerprint
+  bytes>`;
+- an unidentified one is `hx-l-<lowercase hex of the login's canonical
+  UTF-8 bytes>`.
+
+Deterministic, collision-free, inside the accepted charset, and reversible
+— which matters at three in the morning when you are reading uniqush's
+logs and want to know whose device that is. The two prefixes carry the
+mailbox rule's strictness into uniqush (private-messages.md §4): an
+identity never shares a subscriber with a login, whatever the login is.
+No new state and no lookup table; long names make long ids, and uniqush
+does not care.
+
+The login-keyed form keeps the rename hazard the fingerprint form is free
+of, so it inherits the mailbox's obligations, owed at the same call
+sites:
+
+- **Deleting an account unregisters its devices** (`inbox_purge`'s twin).
+- **Linking an identity moves them from `hx-l-` to `hx-f-`.** That means
+  an `/unsubscribe` and a `/subscribe` per device, which the gateway can do
+  because its device index holds each triple (`inbox_claim`'s twin).
+- **A rename by an operator is a deletion and a registration** as far as
+  the gateway is concerned. The devices re-register at their next login.
+
+An identity has none of these, which is one reason identity accounts are
+the easy case.
 
 If a future account model grows a stable opaque account id (the database
-backend is the natural place), the subscriber id becomes that id instead,
+backend is the natural place), the `hx-l-` form becomes that id instead,
 and the hex-form subscribers age out as their delivery points are dropped
 or re-registered.
 
@@ -300,6 +343,69 @@ index over uniqush's, and it is what makes the next paragraph possible.
 The `service` name is one constant per server instance (config
 `[push] service`, default `hxd`), which lets one uniqush deployment serve
 several hxd-ng instances.
+
+### 5.1 With an identity, the device names itself
+
+The identity spec gives every device a certificate with a key of its own,
+and on an identity session that key *is* the transport principal's `id`
+(hotline-ng-identity.md §3.3, §5). private-messages.md §10 already
+observed that the registry wants `(identity_fp, device_fp)`. Taking that
+seriously changes five things, and each one is a problem above that stops
+being one.
+
+**`devid` is the device fingerprint, and the client does not choose it.**
+On an identity session `push_register` ignores a client-supplied `devid`
+and uses the fingerprint of the certificate the socket authenticated with.
+The gateway's index is keyed `(subscriber, devid)`. So when a device
+re-registers with a changed endpoint — an ntfy distributor
+re-provisioning, a reinstalled app on the same key — the old triple is
+unsubscribed and the new one takes its place. Registrations **converge**
+instead of accumulating, which is the "stale delivery points" risk in §10
+answered for every identity device. A password session supplies its own
+`devid`: a random value per install that the client keeps. It is a lookup
+key and nothing more, and re-registering with the same one replaces as
+above.
+
+**A device's registration lives as long as its certificate.** The index
+records the certificate's `expires`. Past it, the gateway skips the
+device on `/push` and unsubscribes it on the next pass; renewal
+(identity-enrollment.md) re-registers at the next login. A certificate the
+revocation list names is unsubscribed when the list is refreshed. Together
+these give the one thing a password account cannot have: **a lost phone
+stops buzzing when its key is revoked**, not when someone remembers to
+call `push_unregister` from another device.
+
+**The certificate's capabilities say who may do what.** Registering needs
+the certificate's `message` bit (bit 1): a push is a message delivered to
+that device, and a certificate its identity issued for logging in alone
+has not been trusted with messages. Unregistering *this* device needs
+nothing more than the session. Unregistering *another* device, or all of
+them, is account management and needs `manage` (bit 3), the same line
+hotline-ng-identity.md §8.2 draws around writing a link. A web client's
+certificate, which omits `manage`, can therefore turn its own
+notifications off and cannot silence the owner's phone.
+
+**Rotation drops, it does not re-key.** Device certificates are signed by
+the identity key, so a rotated identity's devices are re-certified under
+the successor and re-register when they next log in. The gateway
+unsubscribes everything under the predecessor's `hx-f-` rather than moving
+it. Moving it would keep delivering to devices the successor has not
+vouched for. Unlinking needs nothing: an unlinked identity has no mailbox
+on this server, so nothing addresses its subscriber, and its registrations
+lie dormant until it links again. That is the same answer
+hotline-ng-identity.md §8.4 gives for its mail.
+
+**The payload can be sealed to the device.** A certificate carries
+`device_enc`, an X25519 key meant for end-to-end messaging. Encrypting
+the notification's content to it, under a domain string of its own
+(`hl-identity/push/v1`) and inside whatever the transport already does,
+takes uniqush, the relay of §8.2, and Apple or Google out of the trust set
+for content. §6's asymmetry is then gone for identity devices:
+`content = "full"` costs the same on APNs as on UnifiedPush. The server
+still reads it, because it is the server, and a password device still gets
+§6's content policy. This needs the sealing specified in `hl-identity`
+with test vectors, like every other object there, so it is a stage of its
+own (§9, P6) rather than a detail of P3.
 
 ## 6. When we push, and what's in it
 
@@ -362,6 +468,15 @@ decrypts and renders itself; for FCM the display text goes in
 `background`. `/previewpush` renders any of these without sending, which
 is how the payload builder's tests should check themselves.
 
+**News notifies too, by a rule of its own** (news.md §10.5–§10.7).
+Someone answered your article, cited it, or posted in something you
+follow. It is a push only when you had caught up with that thread or
+category, so a busy one rings once per visit. The notice carries the
+scope, and `SubScope::key()` — `thread:398` — is its collapse key:
+`msggroup` for FCM, and the RFC 8030 `Topic` header once uniqush sets one.
+The payload names a thread to open rather than a message, and content
+policy applies to its excerpt as it does to a message's text.
+
 ## 7. Deployment and security posture
 
 **uniqush's REST API is unauthenticated.** There is no token, no basic
@@ -401,6 +516,13 @@ session, and the gateway derives the subscriber id from the *session's*
 account — never from a client-supplied field. Otherwise anyone could
 register a device against anyone's account and subscribe to their DMs.
 
+**And only an account can register.** A guest has no mailbox, so there
+is nothing durable to deliver to (private-messages.md §2). The login reply
+does not offer push to a guest session (§8.1), and `push_register` from
+one is refused `no_mailbox`, the code news gives a guest who tries to
+subscribe. On an identity session the device is the certificate's rather
+than the client's, and so is what it may do with other devices (§5.1).
+
 ## 8. Protocol additions
 
 Two new ng requests, fitting the existing shapes in
@@ -408,8 +530,18 @@ Two new ng requests, fitting the existing shapes in
 
 | `req` | params | ok | notes |
 |---|---|---|---|
-| `push_register` | `type` (`"unifiedpush"`\|`"webpush"`\|`"apns"`\|`"fcm"`), `endpoint?`, `p256dh?`, `auth?`, `token?`, `devid?` | `{}` | account taken from the session, never from params; idempotent |
-| `push_unregister` | `devid?` (omit = all devices) | `{}` | logout-everywhere is `push_unregister` with no `devid` |
+| `push_register` | `type` (`"webpush"`\|`"unifiedpush"`, or `"apns"`\|`"fcm"` with `token` for an operator who ships their own app), `endpoint`, `p256dh`, `auth`, `devid?` | `{ "devid": "…" }` | account from the session, never from params; `devid` from the device certificate on an identity session (§5.1) and required from the client otherwise; idempotent per `devid`, and a changed endpoint replaces the old one |
+| `push_unregister` | `devid?` (omit = this device), `all?` | `{}` | another device, or `all`, needs `manage` on an identity session |
+
+**Omitting `devid` means this device, not every device.** The first draft
+had it the other way round, so the request a client sends most — turn
+notifications off here — was one missing field away from silencing
+every device the account owns. Logging out everywhere is `all: true`,
+said on purpose.
+
+Errors: `no_mailbox` (a guest), `not_available` (no gateway configured),
+`no_capability` (an identity device whose certificate lacks `message`,
+or `manage` for another device), `bad_request` (a triple that is not one).
 
 **`push_unregister` is harder than it looks, and the gateway absorbs
 that.** uniqush has no unsubscribe-all endpoint, `/unsubscribe` will not
@@ -431,6 +563,95 @@ an explicit `push_unregister` (or a vendor telling uniqush the token is
 dead) removes a device.
 
 Nothing about this touches the legacy wire. A 1.x client has no devices.
+
+### 8.1 Per server, and asked for
+
+Every server has its own push credentials, and they cost its operator
+nothing. For Web Push and UnifiedPush, a credential is a **VAPID keypair**
+(RFC 8292) that the server generates once. No vendor account, no
+certificate, no app store: `hxd` makes one on first start when `[push]` is
+configured and hands it to uniqush with `/addpsp`. That keypair is what
+makes a registration *this server's*. A push service accepts pushes to an
+endpoint only when they are signed by the key the subscription was made
+with.
+
+The login reply offers it, to sessions that can take it up:
+
+```jsonc
+"caps": [ "push", … ],
+"push": {
+  "vapid": "BEl6…",        // the server's public key, base64url, uncompressed P-256
+  "types": ["webpush"],    // what push_register accepts here
+  "content": "sender"      // what a notification will say: full | sender | generic
+}
+```
+
+Present only for a session with a mailbox, so a guest is never asked, as
+news offers `subscribe` only to one (news.md §9.1). `content` is there so
+a client can tell its user, before they agree, whether the text of their
+messages will leave the server.
+
+**The device's consent is the client's to ask for.** The server never
+asks. In a browser, the client asks the user for notification permission,
+then calls `pushManager.subscribe({ userVisibleOnly: true,
+applicationServerKey: push.vapid })`, and sends the resulting endpoint and
+keys as `push_register`. On Android, a UnifiedPush distributor is asked
+for an endpoint for that server, which UnifiedPush calls an *instance*.
+Either way the result is per server by construction. A subscription is
+bound to one application server key, so a browser client that talks to
+three servers holds three subscriptions, one service-worker registration
+each, and turning one off touches nothing else.
+
+This settles §11's question about the service: **per server**. One uniqush
+may still serve several hxd-ng instances, each under its own `service`
+and its own VAPID keypair.
+
+### 8.2 Native apps: the credentials belong to the app
+
+APNs and FCM do not work this way, and no configuration makes them. An
+APNs key is issued to the developer account that owns an app's bundle id,
+and FCM's credentials to the Firebase project the app is built against. An
+operator who did not publish the app cannot push to it. So a mobile app
+distributed through a store, and pointed at servers run by strangers,
+cannot have each server hold its own APNs credentials.
+
+**The answer is a relay the app's publisher runs**, and it is the one
+Matrix (a "push gateway") and Mastodon (a Web Push → APNs relay) arrived
+at for the same reason:
+
+- The app registers with its platform (APNs or FCM) and gets a device
+  token.
+- It asks its publisher's relay for a **Web Push endpoint** bound to that
+  token — an opaque URL.
+- It registers that endpoint with each server as `type: "webpush"`, with
+  keys it generated itself.
+- Each server pushes to the relay exactly as it pushes to ntfy: RFC 8291
+  ciphertext, signed with that server's VAPID key.
+- The relay forwards the ciphertext to APNs or FCM as a data payload, and
+  the app decrypts it on the device.
+
+What this buys:
+- **Operators configure nothing vendor-specific.** Every server speaks
+  only Web Push, which is uniqush's working backend (§1), and `apns` and
+  `fcm` PSPs are needed only by an operator who ships their own build.
+- **The relay cannot read the payload.** It holds no key for it, the way
+  ntfy cannot today (§6). With §5.1's sealing on top, neither can Apple.
+- **One set of vendor credentials**, held by the one party Apple and
+  Google will issue them to.
+
+What it costs:
+- **The relay sees metadata**: which servers a device uses, and when they
+  push.
+- **It is a service the publisher has to keep running.** A relay that is
+  down is push that is down for every server that app talks to. Its
+  obligations are the same as §4's for uniqush: a timeout, a breaker,
+  and a doorbell that failing to ring loses nothing.
+
+The relay knows nothing about Hotline, accounts, or hxd-ng. It maps
+endpoint paths to device tokens, and it belongs to the app, not to this
+repository. It is written down here because it is what makes "every
+operator sets their own credentials" true for mobile as well as for the
+browser.
 
 ## 9. Staging
 
@@ -455,20 +676,33 @@ Phase 7 item 2 and are listed because item 3 is worthless without them.
    that was never stored is a doorbell for nothing. Idle notifies too, by
    the rule, though nothing sets idle yet (hotline-ng.md §12). Mention
    parsing and cross-device dedup remain open.
-3. **P3 — `hxd-push-uniqush`.** The HTTP client: subscriber-id mapping,
-   the device index (§5), `/subscribe`, `/unsubscribe`, `/push`, payload
-   construction per content policy (minding the reserved field names and
+3. **P3 — `hxd-push-uniqush`.** The HTTP client: the subscriber-id
+   mapping with its two prefixes (§5), the device index keyed
+   `(subscriber, devid)` with each certificate's expiry beside it (§5.1),
+   `/subscribe`, `/unsubscribe`, `/push`, payload construction per kind of
+   notice and per content policy (minding the reserved field names and
    the Web Push size ceiling), dropped-delivery-point logging, and — not
    optional, see §4 — an aggressive client timeout plus a circuit breaker,
    so a wedged sidecar degrades to no-push rather than to backpressure.
    Tested against a mock HTTP server; no uniqush needed in CI.
-4. **P4 — ng protocol.** `push_register` / `push_unregister`, the `caps`
-   list, config (`[push]` block), and the docs including the §7 warnings.
-   E2E with the scripted ng client and a stub gateway.
+4. **P4 — ng protocol.** `push_register` / `push_unregister` with the
+   device taken from the certificate on an identity session, the `caps`
+   entry and the login reply's `push` block (§8.1), the VAPID keypair
+   generated on first start, config (`[push]` block), the claim, purge and
+   rotation calls of §5 and §5.1, and the docs including the §7 warnings.
+   E2E with the scripted ng client and a stub gateway, and in hx-ng, whose
+   browser client is the first thing that can actually say yes to a
+   permission prompt.
 5. **P5 — a real end-to-end.** A UnifiedPush distributor (ntfy) on a real
    Android device, a real uniqush, a real hxd-ng: DM a detached user, watch
    the phone buzz. This is the exit criterion; everything before it is
    plumbing that hasn't met a vendor yet.
+
+6. **P6 — sealed payloads.** The `hl-identity/push/v1` sealing to a
+   device's `device_enc` (§5.1), specified and vectored in `hl-identity`,
+   implemented in hx-ng's library, and switched on per registration where
+   the device has a certificate. Independent of P5; it is what makes
+   `content = "full"` safe to recommend.
 
 APNs and FCM are deliberately absent from the staging. APNs is blocked on
 an Apple developer account and an app that doesn't exist (uniqush's HTTP/2
@@ -478,8 +712,10 @@ sandbox allows). FCM is blocked only on an app: uniqush's
 **FCM-to-browser P5b** is a cheap second real-world check once P5 passes,
 and it exercises the gateway's per-backend payload shaping (§6) that the
 Web Push path doesn't. When the mobile app is real enough to have a bundle
-id, the gateway needs no changes: each is a different `pushservicetype`
-on a different PSP.
+id, it gets the relay of §8.2, and the servers need no changes at all:
+they already speak Web Push. The `apns` and `fcm` registration types stay
+for an operator who publishes their own build, where each is a different
+`pushservicetype` on a different PSP.
 
 ## 10. Risks, honestly
 
@@ -490,8 +726,10 @@ on a different PSP.
 | Second daemon + Redis is real operational weight for a small server | Medium | Push is optional and off by default; a small legacy-only server is unaffected |
 | Maintainer bias toward our own project | Medium — it's the kind of bias that doesn't feel like one | The trait, the separate crate, and a `WebPushGateway` escape hatch are the mitigation; re-evaluate at P3 if the sidecar is fighting us |
 | uniqush's unauthenticated API exposed | **High if misconfigured** — `/subscriptions` hands out send-capable device credentials, `/stop` kills the daemon | Loopback only, documented at §7 and repeated in the deployment docs; the gateway's own device index means we never call `/subscriptions` in normal operation |
-| Subscriber-id collision or uid reuse | **High** — wrong person's DMs | The hex mapping (§5) makes collisions impossible and never touches uids |
-| Stale delivery points accumulate as endpoints rotate | Medium — pushes to addresses nobody reads | The gateway's device index lets us unsubscribe the old triple when a client re-registers a changed endpoint; vendor 404/410 is the backstop, not the plan |
+| Subscriber-id collision, uid reuse, or a retaken login | **High** — wrong person's DMs | The mailbox mapping (§5) never touches uids, keys identities by fingerprint, keeps the two kinds apart by prefix, and gives login-keyed subscribers the mailbox's purge and claim obligations |
+| Stale delivery points accumulate as endpoints rotate | Medium — pushes to addresses nobody reads | The device index is keyed `(subscriber, devid)`, so a re-registration replaces; on identity sessions `devid` is the certificate's and cannot drift (§5.1); vendor 404/410 is the backstop, not the plan |
+| A lost or stolen device keeps receiving notifications | Medium — a stranger reads the lock screen | Identity devices stop at certificate revocation or expiry (§5.1); password devices only at `push_unregister`, which is one more reason identity accounts are the recommended case |
+| The app publisher's relay (§8.2) goes down or goes bad | Medium for mobile, none for the browser | It sees metadata and never content; failing to ring loses nothing; a browser or UnifiedPush device does not use it |
 | `/push` blocks; a slow provider becomes our latency | Medium | `notify` is spawned, never awaited; client timeout + circuit breaker in P3 |
 | Redis loses the delivery-point set | Medium | Persistence required and documented; devices re-register on login, so recovery is a login cycle |
 
@@ -500,8 +738,10 @@ on a different PSP.
 - **Mentions need a definition.** Nick-match in chat text is the obvious
   one, but nicks aren't unique on a Hotline server (hotline-ng.md §12
   keeps duplicates legal) and nicks change freely. A mention that
-  notifies the wrong person is worse than one that misses. Possibly
-  mentions are out of scope for the first cut and DMs alone carry P1–P5.
+  notifies the wrong person is worse than one that misses. **News has
+  one, by construction** (news.md §10.5): a reference names an article,
+  and an article has exactly one author. Chat is still open, and "cite
+  the thing, not the person" is the shape to try first.
 - ~~**Do legacy-originated PMs push?**~~ — **answered 2026-09: yes, and
   the decision is in the domain.** Phase 7 item 5 says a legacy client's
   PM to a detached user is "accepted, queued, and pushed", so both wires
@@ -509,14 +749,22 @@ on a different PSP.
   silently skipping it was the failure to avoid, and placing the decision
   in `hxd-core::chat` is what avoids it.
 - **Coalescing.** Twenty chat lines in a busy room shouldn't be twenty
-  buzzes. A per-account rate limit or a digest window is needed before
-  P5 is pleasant to live with; where it lives (domain, gateway, or the
-  vendor's own collapse keys) is undecided.
-- **Whether `service` should be per-server or per-app.** One uniqush
-  serving several hxd-ng instances wants distinct services; a single
-  mobile app talking to several servers wants distinct VAPID keys per
-  server anyway. Probably per-server, but it interacts with how the app
-  handles multi-server accounts, which nobody has designed yet.
+  buzzes. **Answered for news** (news.md §10.7): a scope rings only when
+  its subscriber had caught up with it, which needs the cursor news has
+  and chat does not, with a per-account hourly ceiling underneath and the
+  scope as the vendor collapse key. For chat — which in practice means
+  private messages, the only chat that pushes — a per-account rate limit
+  or a digest window is still needed before P5 is pleasant to live with.
+- ~~**Whether `service` should be per-server or per-app.**~~ — **answered
+  2026-09: per server** (§8.1). Each server has its own VAPID keypair and
+  its own `service`; what is per app is the relay a native app's
+  publisher runs (§8.2), which the servers never need to know about.
+- **What a multi-server app shows.** A phone following three servers
+  holds three registrations and gets three streams of pushes, each
+  naming its server. Whether a client merges them into one inbox, and
+  what "mark as read" means across them, is the app's to design. The
+  protocol gives it one thing to hold on to: an identity fingerprint is
+  the same on every server that identity uses.
 - Whether uniqush should be vendored for
   version-pinning and reproducible deployment, or simply documented as an
   external dependency with a minimum version — which is **2.8.0** either

@@ -32,7 +32,9 @@ window offers to offline delivery.
 Out of scope for the MVP, listed so their absence is a decision and not an
 oversight: private chats (rooms), news, files and transfers, account
 administration, tracker anything, message history from before your session,
-push notifications, and durable offline delivery.
+push notifications, and durable offline delivery. Message history, durable
+offline delivery and news have since been built on top of the MVP rather
+than into it; §7 lists them beside the MVP set.
 
 ## 2. The paradigm shift, concretely
 
@@ -292,6 +294,13 @@ Requests:
 | `ping` | — | `{}` | keepalive for clients that want RTT |
 | `logout` | — | `{}` | ends the session *now* (no grace) |
 
+News is a request family of its own — `news_tree`, `news_threads`,
+`news_thread`, `news_article`, `news_post` and the rest, following
+and muting among them — with events of its own and a `news` block in
+the login reply. It is specified in [news.md](news.md) §9, and its
+subscriptions and `news_notify` in §10 (§10.6, §10.9), rather than
+repeated here.
+
 `blocks` lists objects rather than logins because a block can be held
 against an identity that logged in as a guest: its login is `guest` and
 the fingerprint is what tells it apart, so a list of logins would name
@@ -416,6 +425,17 @@ subject ≤ 255 bytes.
 Chat text crossing to legacy clients is converted with `?` for unmappable
 characters — tell your users their emoji become question marks on
 twenty-five-year-old Macs, which is honestly part of the charm.
+
+**Chat text is plain text, and a client may draw a closed markdown
+dialect in it.** GtkHx renders a conservative subset on receipt — bold,
+italic, code, strikethrough, links with a scheme allowlist, fenced code
+and quotes, and nothing else (GtkHx's `docs/chat-view.md` §4) — and
+hx-ng renders the same one, ported from the same scanner with the same
+tests, so a line reads the same in both. None of it is on the wire.
+What is sent is the literal text, a legacy client sees the asterisks,
+and the server neither parses nor rewrites it. A news article is
+different: its body says what it is (`mime`), and markdown there is the
+fuller dialect of news.md §5.
 
 **The legacy wire itself can negotiate UTF-8.** fogWraith's
 [Text-Encoding extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Text-Encoding.md)
