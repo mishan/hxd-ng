@@ -1035,7 +1035,7 @@ enough whoever the author is.
   "search_max_results": 500,
   "subscribe": true,             // this session may follow things (§10)
   "auto_subscribe": "participated", // present when the server keeps subscriptions
-  "unread": 3                    // across what it follows; present when subscribe is
+  "unread": 3                    // across what it follows; present when subscribe is true
 }
 ```
 
@@ -1574,7 +1574,8 @@ The cursor only moves forward, and never past the newest article in the
 scope, so an id from the future cannot mark tomorrow's posts read. A
 scope this account does not follow answers `{ "unread": 0 }` rather than
 an error, because a client that says "seen" on every thread it shows
-should not have to check which ones are followed first. One cursor per
+should not have to check which ones are followed first. A scope that
+names nothing is still refused (§10.9). One cursor per
 scope has a cost for a thread read a page at a time: `up_to` is the
 highest id shown, and a thread reads in reply order rather than id order,
 so an older reply on a page not yet loaded is counted as seen.
@@ -1598,8 +1599,12 @@ category's.
 Error codes on top of §9.2's: `no_mailbox` (a guest tried to subscribe —
 the same shape as `no_inbox`, and about *you* rather than about the
 target), `too_many_subs`, and `not_available` from a server with no
-`[news.notify]`. A `thread` that names a reply rather than a starter is
-`no_such_article`; naming both scopes or neither is `bad_request`.
+`[news.notify]`. Every request that takes a scope refuses one that names
+nothing: a `thread` that is a reply rather than a starter, or no article at all,
+is `no_such_article`, and a `category` that is not one is
+`no_such_node` or `not_a_category`. Not following something that is
+there is no error: `news_unsubscribe` and unmuting answer `{}`, and
+`news_seen` answers 0. Naming both scopes or neither is `bad_request`.
 
 The login reply's `news` block (§9.1) gains `unread` — the total across
 subscribed scopes — so a client can draw a badge on the first frame,

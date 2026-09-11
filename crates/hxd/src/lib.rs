@@ -1531,11 +1531,18 @@ pub fn inbox_purge(
 
 /// Where `[news]` keeps its database: its own `db`, or the file `[inbox]`
 /// or `[history]` names, which it then shares.
+///
+/// Answered without a `[news]` section too. With news turned off, the
+/// shared file still holds whatever it wrote, and a purge that stopped
+/// looking there would leave a login's subscriptions to be found again
+/// when news came back. A `db` of its own is only known while the section
+/// names it.
 #[cfg(feature = "inbox")]
 fn news_db(config: &Config) -> Option<PathBuf> {
-    let news = config.news.as_ref()?;
-    news.db
-        .clone()
+    config
+        .news
+        .as_ref()
+        .and_then(|n| n.db.clone())
         .or_else(|| config.inbox.as_ref().map(|i| i.db.clone()))
         .or_else(|| config.history.as_ref().and_then(|h| h.db.clone()))
 }
@@ -2113,54 +2120,11 @@ sync = "full"
         use hxd_core::news::{NewNode, NodeKind, SubScope};
         use hxd_core::NewsStore;
 
-        // No `db` of its own: news shares the inbox's file, as the design
-        // recommends, and the purge has to find it there.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("server.sqlite");
-        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n\n[news]\n\n[news.notify]\n").unwrap();
-        cfg.inbox.as_mut().unwrap().db = db.clone();
-        cfg.paths.accounts = dir.path().join("accounts");
-        {
+        // A database at `path` in which alice follows one category.
+        fn alice_follows_one(path: &Path) {
             let store =
-                hxd_store_sqlite::SqliteStore::open(&db, hxd_store_sqlite::Synchronous::Normal)
+                hxd_store_sqlite::SqliteStore::open(path, hxd_store_sqlite::Synchronous::Normal)
                     .unwrap();
-            let node = NewNode {
-                parent: None,
-                kind: NodeKind::Category,
-                name: "General".into(),
-                guid: [1; 16],
-                at: std::time::SystemTime::now(),
-            };
-            let cat = store.create_node(&node, 16).unwrap().id;
-            let alice = hxd_core::inbox::Mailbox::login("alice");
-            store
-                .subscribe(
-                    &alice,
-                    SubScope::Category(cat),
-                    10,
-                    std::time::SystemTime::now(),
-                )
-                .unwrap();
-        }
-        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
-        assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
-        assert_eq!(
-            inbox_purge(&cfg, "alice", None, true).unwrap(),
-            0,
-            "a later alice follows nothing she did not ask for"
-        );
-
-        // And on a server that keeps news and no mail at all.
-        let news_only = dir.path().join("news.sqlite");
-        let mut cfg = parse("[news]\ndb = \"placeholder\"\n\n[news.notify]\n").unwrap();
-        cfg.news.as_mut().unwrap().db = Some(news_only.clone());
-        cfg.paths.accounts = dir.path().join("accounts");
-        {
-            let store = hxd_store_sqlite::SqliteStore::open(
-                &news_only,
-                hxd_store_sqlite::Synchronous::Normal,
-            )
-            .unwrap();
             let node = NewNode {
                 parent: None,
                 kind: NodeKind::Category,
@@ -2178,6 +2142,40 @@ sync = "full"
                 )
                 .unwrap();
         }
+
+        // No `db` of its own: news shares the inbox's file, as the design
+        // recommends, and the purge has to find it there.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("server.sqlite");
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n\n[news]\n\n[news.notify]\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = db.clone();
+        cfg.paths.accounts = dir.path().join("accounts");
+        alice_follows_one(&db);
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
+        assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
+        assert_eq!(
+            inbox_purge(&cfg, "alice", None, true).unwrap(),
+            0,
+            "a later alice follows nothing she did not ask for"
+        );
+
+        // And on a server that keeps news and no mail at all.
+        let news_only = dir.path().join("news.sqlite");
+        let mut cfg = parse("[news]\ndb = \"placeholder\"\n\n[news.notify]\n").unwrap();
+        cfg.news.as_mut().unwrap().db = Some(news_only.clone());
+        cfg.paths.accounts = dir.path().join("accounts");
+        alice_follows_one(&news_only);
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
+        assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 0);
+
+        // And with `[news]` taken out since: the file it shared keeps what
+        // it wrote, for a later alice to find when news comes back.
+        let shared = dir.path().join("news-off.sqlite");
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = shared.clone();
+        cfg.paths.accounts = dir.path().join("accounts");
+        alice_follows_one(&shared);
         assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
         assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
         assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 0);

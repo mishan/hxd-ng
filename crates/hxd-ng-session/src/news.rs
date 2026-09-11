@@ -197,8 +197,11 @@ pub fn login_json(core: &Core, uid: Uid) -> Option<Value> {
         "search_max_results": p.search_max_results,
         "subscribe": core.news_may_subscribe(uid),
     });
-    // The badge on the first frame, the way `inbox` gives one (§10.9).
-    // Present exactly when `subscribe` is true.
+    // `auto_subscribe` is the server's policy, sent whenever it keeps
+    // subscriptions, as `max_body` is sent to a session that may not
+    // post. `unread` is this session's badge on the first frame, the way
+    // `inbox` gives one (§10.9), and present exactly when `subscribe` is
+    // true.
     if let Some(notify) = p.notify {
         block["auto_subscribe"] = json!(notify.auto_subscribe.name());
         if let Some(unread) = core.news_unread(uid) {

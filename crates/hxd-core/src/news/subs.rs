@@ -36,7 +36,7 @@ use tracing::warn;
 
 use super::{
     store_failed, ArticleId, Asker, AutoFollow, AutoSubscribe, NewPost, NewsError, NewsStore,
-    Notified, NotifyPolicy, NotifyReason, Posted, SubScope, Subscription,
+    NodeKind, Notified, NotifyPolicy, NotifyReason, Posted, SubScope, Subscription,
 };
 use crate::access::bit;
 use crate::inbox::Mailbox;
@@ -103,6 +103,26 @@ pub(super) fn auto_follow(
     })
 }
 
+/// Is there something at `scope` to follow: a thread starter, or a
+/// category? `news_subscribe` and muting learn it by making a row. The
+/// requests that make none ask it here, so a scope nobody follows is still
+/// a no-op and one that names nothing is refused the way subscribing
+/// refuses it (§10.9). Asked only where no row answers it: a row goes with
+/// its target, so one that exists already has.
+fn scope_exists(store: &dyn NewsStore, scope: SubScope) -> Result<(), NewsError> {
+    match scope {
+        SubScope::Thread(root) => match store.article(root)? {
+            Some(a) if a.parent.is_none() => Ok(()),
+            _ => Err(NewsError::NoSuchArticle),
+        },
+        SubScope::Category(c) => match store.node(c)?.map(|n| n.kind) {
+            None => Err(NewsError::NoSuchNode),
+            Some(NodeKind::Bundle) => Err(NewsError::NotACategory),
+            Some(NodeKind::Category) => Ok(()),
+        },
+    }
+}
+
 impl Core {
     /// The store, the asking session's mailbox and the policy, or why
     /// this session cannot hold a subscription: no news, no
@@ -152,17 +172,24 @@ impl Core {
             .map_err(store_failed)
     }
 
-    /// Stop following. Idempotent: not following is the answer either way.
+    /// Stop following. Idempotent: not following is the answer either way,
+    /// for a scope that is there to follow ([`scope_exists`]).
     pub fn news_unsubscribe(&self, uid: Uid, scope: SubScope) -> Result<(), NewsError> {
         let (store, mailbox, _) = self.news_subscriber(uid)?;
-        store
+        let gone = store
             .unsubscribe(&mailbox, scope)
-            .map(|_| ())
-            .map_err(|e| store_failed(e.into()))
+            .map_err(|e| store_failed(e.into()))?;
+        if !gone {
+            scope_exists(&**store, scope).map_err(store_failed)?;
+        }
+        Ok(())
     }
 
     pub fn news_mute(&self, uid: Uid, scope: SubScope, muted: bool) -> Result<(), NewsError> {
         let (store, mailbox, notify) = self.news_subscriber(uid)?;
+        if !muted {
+            scope_exists(&**store, scope).map_err(store_failed)?;
+        }
         store
             .mute(&mailbox, scope, muted, notify.max_subs, SystemTime::now())
             .map_err(store_failed)
@@ -180,7 +207,8 @@ impl Core {
     /// move the cursor, because a client may prefetch, may render nothing,
     /// or may be drawing a search preview. Not following is 0 unread,
     /// not an error — a client that says "seen" on every thread it shows
-    /// should not have to know which ones it follows first.
+    /// should not have to know which ones it follows first. A scope that
+    /// names nothing is an error ([`scope_exists`]).
     pub fn news_seen(
         &self,
         uid: Uid,
@@ -188,10 +216,15 @@ impl Core {
         up_to: ArticleId,
     ) -> Result<usize, NewsError> {
         let (store, mailbox, _) = self.news_subscriber(uid)?;
-        store
+        match store
             .seen(&mailbox, scope, up_to)
-            .map(|unread| unread.unwrap_or(0))
-            .map_err(|e| store_failed(e.into()))
+            .map_err(|e| store_failed(e.into()))?
+        {
+            Some(unread) => Ok(unread),
+            None => scope_exists(&**store, scope)
+                .map(|()| 0)
+                .map_err(store_failed),
+        }
     }
 
     /// The news half of `inbox_claim`: subscriptions are keyed the way a

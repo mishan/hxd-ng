@@ -443,6 +443,28 @@ async fn subscribing_says_why_not() {
             "no_such_article",
         ),
         ("news_subscribe", json!({ "category": 999 }), "no_such_node"),
+        // The requests that make no row refuse a scope that names
+        // nothing as well.
+        (
+            "news_unsubscribe",
+            json!({ "thread": reply }),
+            "no_such_article",
+        ),
+        (
+            "news_unsubscribe",
+            json!({ "category": 999 }),
+            "no_such_node",
+        ),
+        (
+            "news_mute",
+            json!({ "category": 999, "muted": false }),
+            "no_such_node",
+        ),
+        (
+            "news_seen",
+            json!({ "thread": reply, "up_to": reply }),
+            "no_such_article",
+        ),
         ("news_mute", json!({ "thread": root }), "bad_request"),
         ("news_seen", json!({ "thread": root }), "bad_request"),
         ("news_subscribe", json!({ "thread": "one" }), "bad_request"),
@@ -466,6 +488,13 @@ async fn subscribing_says_why_not() {
         0,
         "seeing what you do not follow is nothing to refuse"
     );
+    // Nor is leaving what you never followed, so long as it is there.
+    alice
+        .ok("news_unsubscribe", json!({ "category": cat }))
+        .await;
+    alice
+        .ok("news_mute", json!({ "category": cat, "muted": false }))
+        .await;
 
     // A server that keeps no subscriptions says so, and offers none.
     let quiet = tempfile::tempdir().unwrap();
