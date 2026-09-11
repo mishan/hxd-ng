@@ -45,9 +45,9 @@ deliberate and commented at the site.
   account that holds no session at all.
 - **Threaded news** on the ng wire: categories and bundles, articles that
   thread as replies, references between articles (a `#51` in the text)
-  with backlinks, and tombstones that keep a thread's shape when an
-  article goes. A 1.5 client in the same room sees nothing change: the
-  legacy wire carries no news yet.
+  with backlinks, tombstones that keep a thread's shape when an article
+  goes, and full-text search across all of it. A 1.5 client in the same
+  room sees nothing change: the legacy wire carries no news yet.
 - **Sessions that survive the network.** An ng session detaches when its
   socket dies and resumes with a gapless event replay; the roster shows it
   as away in the meantime.
@@ -274,6 +274,9 @@ max_node_depth = 16       # bundle nesting
 max_page = 200            # threads in one request
 retain_days = 0           # a thread's life after its last post; 0 = forever
 self_delete = true        # authors may delete their own; false = period behavior
+search = true             # false turns news_search off; the index is kept either way
+search_max_results = 500  # the deepest a search pages
+search_per_minute = 30    # searches per session
 ```
 
 Who may read, post, delete and rearrange is the account's news bits —
@@ -448,6 +451,19 @@ hxd inbox purge alice --fingerprint <fp>  # after it is gone: the value from
                                           # its [identity] table
 hxd inbox purge alice --dry-run           # how much would go
 ```
+
+### News
+
+The search index is kept in step with the articles by the same writes
+that change them. If it ever drifts — a database restored from a copy, a
+file edited by hand — rebuild it from the articles:
+
+```sh
+hxd news-reindex
+```
+
+It opens the database the server uses, which must already exist, and
+leaves the articles as they are. See [docs/news.md](docs/news.md) §6.4.
 
 ### Voice
 
