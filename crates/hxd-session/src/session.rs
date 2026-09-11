@@ -1072,6 +1072,7 @@ async fn login_phase(
         addr: Some(peer.ip()),
         can_detach: account.can_detach,
         has_inbox: account.has_inbox,
+        is_person: account.is_person(),
         // This wire has no `msg_read` and never will — a private message
         // is a window that opens and nothing comes back — so handing one
         // over is as much as it will ever say about reading it

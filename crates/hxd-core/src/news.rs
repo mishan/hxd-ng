@@ -467,13 +467,21 @@ const MAX_REF_CANDIDATES: usize = 256;
 /// punctuation. Not recognized after `&`, where `&#51;` is an HTML
 /// character reference; after another `#`; or glued to a word on either
 /// side. An ATX heading never matches, because a heading's `#` is
-/// followed by a space and this needs a digit.
+/// followed by a space and this needs a digit. The neighbors are judged
+/// as characters, not bytes, so an em dash, a curly quote or an
+/// ideographic space bounds a reference as `-`, `"` and a space do, and a
+/// letter from any script glues to it as `a` does.
 ///
 /// Runs on plain bodies, which is what lets a 1.5 client typing `see #51`
 /// produce a real link in an ng client. What comes back are candidates —
 /// in order of appearance, deduplicated, nonzero — and the store decides
 /// which of them name an article.
 pub fn scan_refs(body: &str) -> Vec<ArticleId> {
+    // Whitespace, or anything printable that is neither a letter, a digit
+    // nor `_` — which in ASCII is exactly punctuation.
+    fn delimits(c: char) -> bool {
+        c.is_whitespace() || !(c.is_alphanumeric() || c == '_' || c.is_control())
+    }
     let bytes = body.as_bytes();
     let mut out: Vec<ArticleId> = Vec::new();
     let mut i = 0;
@@ -482,23 +490,19 @@ pub fn scan_refs(body: &str) -> Vec<ArticleId> {
             i += 1;
             continue;
         }
-        let opens = match i.checked_sub(1).map(|p| bytes[p]) {
+        // `#` and the digits are ASCII, so `i` and `end` are always
+        // character boundaries and the neighbors decode whole.
+        let opens = match body[..i].chars().next_back() {
             None => true,
-            Some(b'&' | b'#') => false,
-            Some(c) => c.is_ascii_whitespace() || (c.is_ascii_punctuation() && c != b'_'),
+            Some('&' | '#') => false,
+            Some(c) => delimits(c),
         };
         let start = i + 1;
         let mut end = start;
         while end < bytes.len() && bytes[end].is_ascii_digit() {
             end += 1;
         }
-        let closes = match bytes.get(end) {
-            None => true,
-            Some(&c) => {
-                !(c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80)
-                    && (c.is_ascii_whitespace() || c.is_ascii_punctuation())
-            }
-        };
+        let closes = body[end..].chars().next().is_none_or(delimits);
         if opens && closes && end > start && end - start <= 10 {
             if let Ok(id) = body[start..end].parse::<ArticleId>() {
                 if id != 0 && !out.contains(&id) {
@@ -546,14 +550,15 @@ fn clean_name(s: &str) -> Result<String, NewsError> {
 
 /// This session as the author of whatever it is about to write.
 fn author_of(sess: &UserSession) -> Author {
-    // The same test the inbox uses for "is there somebody durable behind
-    // this session": a guest has no mailbox, and neither the shared
-    // `guest` login nor a fingerprint it happened to arrive with makes
-    // an article *its* to delete later.
+    // Only a session with exactly one person behind its account is
+    // somebody: neither the shared `guest` login nor a fingerprint it
+    // happened to arrive with makes an article *its* to delete later.
+    // `is_person` rather than `has_inbox`, which an operator may turn
+    // off for an account's mail without meaning its articles too.
     Author {
         nick: sess.info.nick.clone(),
-        login: sess.has_inbox.then(|| sess.login.clone()),
-        fingerprint: sess.identity.filter(|_| sess.has_inbox),
+        login: sess.is_person.then(|| sess.login.clone()),
+        fingerprint: sess.identity.filter(|_| sess.is_person),
     }
 }
 
@@ -562,7 +567,9 @@ fn author_of(sess: &UserSession) -> Author {
 struct Asker {
     access: AccessBits,
     author: Author,
-    mailbox: Option<Mailbox>,
+    /// What this session's own articles were recorded under, where it
+    /// can own any (see [`author_of`]).
+    owner: Option<Mailbox>,
     login: String,
 }
 
@@ -613,7 +620,7 @@ impl Core {
         Ok(Asker {
             access: sess.access,
             author: author_of(sess),
-            mailbox: sess.has_inbox.then(|| sess.mailbox()),
+            owner: sess.is_person.then(|| sess.mailbox()),
             login: sess.login.clone(),
         })
     }
@@ -780,7 +787,7 @@ impl Core {
             .filter(|a| !a.deleted)
             .ok_or(NewsError::NoSuchArticle)?;
         let own = self.news_policy.self_delete
-            && asker.mailbox.as_ref().is_some_and(|m| article.author.is(m));
+            && asker.owner.as_ref().is_some_and(|m| article.author.is(m));
         if !own && !asker.access.has(bit::DELETE_ARTICLES) {
             return Err(NewsError::AccessDenied);
         }
@@ -919,8 +926,18 @@ mod tests {
     }
 
     /// A session with an account behind it, the way a real login gives
-    /// one: `has_inbox` is what makes it somebody.
+    /// one: `is_person` is what makes it somebody.
     fn member(core: &Core, login: &str, access: AccessBits) -> Uid {
+        attach_as(core, login, access, true, true)
+    }
+
+    fn attach_as(
+        core: &Core,
+        login: &str,
+        access: AccessBits,
+        has_inbox: bool,
+        is_person: bool,
+    ) -> Uid {
         let (uid, _rx) = core
             .attach(AttachInfo {
                 nick: login.to_string(),
@@ -931,7 +948,8 @@ mod tests {
                 addr: None,
                 can_detach: false,
                 transport: Transport::default(),
-                has_inbox: true,
+                has_inbox,
+                is_person,
                 reads_on_delivery: false,
                 identity: None,
             })
@@ -966,6 +984,11 @@ mod tests {
         assert_eq!(scan_refs("(#51), and #47."), [51, 47]);
         assert_eq!(scan_refs("#51 then #51 again"), [51], "deduplicated");
         assert_eq!(scan_refs("line one\n#9\nline three"), [9]);
+        // Unicode punctuation and whitespace bound it too: what a Mac
+        // client's smart quotes and em dashes arrive as.
+        assert_eq!(scan_refs("see #51—later"), [51]);
+        assert_eq!(scan_refs("“#51” and (#47)…"), [51, 47]);
+        assert_eq!(scan_refs("—#8\u{3000}#9"), [8, 9]);
     }
 
     #[test]
@@ -981,6 +1004,8 @@ mod tests {
             "#",
             "#99999999999",
             "#51é",
+            "café#51",
+            "#51٣",
         ] {
             assert!(
                 scan_refs(text).is_empty(),
@@ -1160,6 +1185,33 @@ mod tests {
             Err(NewsError::AccessDenied)
         );
         assert_eq!(core.news_delete(guest, id), Err(NewsError::AccessDenied));
+    }
+
+    #[test]
+    fn authorship_is_the_accounts_not_its_mailboxs() {
+        // `[extra] inbox` is mail policy. Turning it off does not make an
+        // account's articles nobody's, and turning it on for `guest` does
+        // not make a guest's articles every guest's.
+        let core = news_core();
+        let admin = member(&core, "admin", editor());
+        let cat = core
+            .news_node_create(admin, None, NodeKind::Category, "General")
+            .unwrap();
+
+        let staff = attach_as(&core, "staff", poster(), false, true);
+        let mine = post(&core, staff, cat.id, None, "mine").unwrap();
+        let article = core.news_article(staff, mine).unwrap();
+        assert_eq!(article.author.login.as_deref(), Some("staff"));
+        assert_eq!(core.news_delete(staff, mine), Ok(()));
+
+        let guest = attach_as(&core, "guest", poster(), true, false);
+        let id = post(&core, guest, cat.id, None, "drive-by").unwrap();
+        assert_eq!(core.news_article(guest, id).unwrap().author.login, None);
+        let next_guest = attach_as(&core, "guest", poster(), true, false);
+        assert_eq!(
+            core.news_delete(next_guest, id),
+            Err(NewsError::AccessDenied)
+        );
     }
 
     #[test]

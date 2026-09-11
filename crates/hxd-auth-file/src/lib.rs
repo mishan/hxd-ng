@@ -1588,6 +1588,15 @@ mod tests {
         assert!(!has("open", b""), "a shared door is not an address");
         assert!(!has("quiet", b"pw"));
         assert!(has("kiosk", b""));
+
+        // Whether a person is behind the account is not the switch: news
+        // authorship follows the password, whatever the mail policy says.
+        let person =
+            |l: &str, pw: &[u8]| auth.authenticate(l, Proof::Plain(pw)).unwrap().is_person();
+        assert!(person("plain", b"pw"));
+        assert!(!person("open", b""));
+        assert!(person("quiet", b"pw"));
+        assert!(!person("kiosk", b""));
     }
 
     #[test]

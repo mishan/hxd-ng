@@ -636,6 +636,7 @@ fn losing_the_connection_leaves_voice_even_when_the_session_survives() {
             can_detach: true,
             transport: crate::Transport::default(),
             has_inbox: true,
+            is_person: true,
             reads_on_delivery: false,
             identity: None,
         })
@@ -682,6 +683,7 @@ fn the_departure_from_voice_is_waiting_in_the_replay_tail() {
             can_detach: true,
             transport: crate::Transport::default(),
             has_inbox: true,
+            is_person: true,
             reads_on_delivery: false,
             identity: None,
         })

@@ -58,6 +58,18 @@ pub struct Account {
     pub identity: IdentityLink,
 }
 
+impl Account {
+    /// Is exactly one person behind this account — a password, or a
+    /// linked identity? The rule `has_inbox` defaults to, but a fact
+    /// about the account rather than a switch an operator can flip: it
+    /// is what authorship is recorded against (`docs/news.md` §3.1), and
+    /// turning off an account's mail should not make its articles
+    /// nobody's, nor turning it on for `guest` make them everybody's.
+    pub fn is_person(&self) -> bool {
+        self.has_password || self.identity.fingerprint.is_some()
+    }
+}
+
 /// How an account relates to a portable identity. All server-local
 /// policy; nothing here crosses the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

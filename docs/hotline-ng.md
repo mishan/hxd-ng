@@ -32,7 +32,9 @@ window offers to offline delivery.
 Out of scope for the MVP, listed so their absence is a decision and not an
 oversight: private chats (rooms), news, files and transfers, account
 administration, tracker anything, message history from before your session,
-push notifications, and durable offline delivery.
+push notifications, and durable offline delivery. Message history, durable
+offline delivery and news have since been built on top of the MVP rather
+than into it; §7 lists them beside the MVP set.
 
 ## 2. The paradigm shift, concretely
 

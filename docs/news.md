@@ -1,13 +1,14 @@
 # Threaded news: articles, attachments, references and search
 
 ROADMAP Phase 4 promises "1.2 flat news post/read, and the 1.5 threaded
-news tree (categories, bundles, threads)". Nothing is built: `hxd-session`
-dispatches no news opcode, `hxd-core` has no `news` module, and the ng
-protocol has never had one. This document designs the whole thing — the
-domain, the store, markdown bodies, cross-references, full-text search,
-image attachments, and the Hotline-ng binding — and specs the legacy 1.5
-binding so the model can be checked against the wire it must eventually
-serve.
+news tree (categories, bundles, threads)". When this was written nothing
+was built: `hxd-session` dispatched no news opcode, `hxd-core` had no
+`news` module, and the ng protocol had never had one. This document
+designs the whole thing — the domain, the store, markdown bodies,
+cross-references, full-text search, image attachments, and the
+Hotline-ng binding — and specs the legacy 1.5 binding so the model can
+be checked against the wire it must eventually serve. What has been
+built since, and what has not, is §16's to say.
 
 Phase 4's own description is the floor, not the ceiling: what a modern
 client wants from a forum is rich text, links between posts and a search
@@ -335,28 +336,32 @@ pub struct ThreadQuery {
     pub category: NodeId,
     pub before: Option<ArticleId>, // cursor on the thread root
     pub after: Option<ArticleId>,
-    pub order: ThreadOrder,        // Created | Recent
     pub limit: usize,              // clamped by the caller
 }
 
 pub struct ThreadPage { pub threads: Vec<ThreadHead>, pub has_more: bool }
-pub struct ArticlePage { pub articles: Vec<Article>, pub has_more: bool }
+pub struct ArticlePage {
+    pub articles: Vec<Article>,
+    pub has_more: bool,
+    pub snapshot: ArticleId,       // echoed on later pages (§9.2)
+}
 
 pub trait NewsStore: Send + Sync + 'static {
     // Tree
     fn nodes(&self, parent: Option<NodeId>) -> Result<Vec<Node>, StoreError>;
     fn node(&self, id: NodeId) -> Result<Option<Node>, StoreError>;
-    fn create_node(&self, parent: Option<NodeId>, kind: NodeKind, name: &str)
-        -> Result<Node, StoreError>;
-    fn rename_node(&self, id: NodeId, name: &str) -> Result<bool, StoreError>;
-    fn delete_node(&self, id: NodeId) -> Result<u64, StoreError>; // articles removed
+    fn create_node(&self, n: &NewNode, max_depth: u16) -> Result<Node, NewsError>;
+    fn rename_node(&self, id: NodeId, name: &str) -> Result<Node, NewsError>;
+    fn delete_node(&self, id: NodeId) -> Result<u64, NewsError>; // articles removed
 
     // Articles
-    fn post(&self, p: &NewPost) -> Result<ArticleId, StoreError>;
+    fn post(&self, p: &NewPost, max_depth: u16, max_refs: usize)
+        -> Result<Posted, NewsError>;             // the new id and its root
     fn article(&self, id: ArticleId) -> Result<Option<Article>, StoreError>;
-    fn threads(&self, q: &ThreadQuery) -> Result<ThreadPage, StoreError>;
-    fn thread(&self, root: ArticleId, after: Option<ArticleId>, limit: usize)
-        -> Result<ArticlePage, StoreError>;
+    fn threads(&self, q: &ThreadQuery) -> Result<ThreadPage, NewsError>;
+    fn thread(&self, root: ArticleId, after: Option<ArticleId>,
+              snapshot: Option<ArticleId>, limit: usize)
+        -> Result<ArticlePage, NewsError>;
     fn category_all(&self, category: NodeId, max: usize)
         -> Result<Vec<Article>, StoreError>;      // the legacy CATLIST shape
     fn tombstone(&self, id: ArticleId, by: &str, at: SystemTime)
@@ -364,8 +369,8 @@ pub trait NewsStore: Send + Sync + 'static {
     fn by_author(&self, who: &Author, since: SystemTime)
         -> Result<Vec<ArticleId>, StoreError>;    // moderation purge
 
-    // References (§5.3) — written with the article, read on the way out
-    fn refs_from(&self, id: ArticleId) -> Result<Vec<Reference>, StoreError>;
+    // References (§5.3) — written with the article; its own ride in
+    // `Article::refs`, and the backlinks are read here
     fn refs_to(&self, id: ArticleId, limit: usize)
         -> Result<Vec<Reference>, StoreError>;
 
@@ -388,8 +393,7 @@ pub trait NewsStore: Send + Sync + 'static {
     fn unread(&self, who: &Mailbox) -> Result<usize, StoreError>;
 
     // Retention
-    fn prune(&self, max_age: Option<Duration>, now: SystemTime)
-        -> Result<u64, StoreError>;
+    fn prune(&self, max_age: Duration, now: SystemTime) -> Result<u64, StoreError>;
 }
 ```
 
@@ -397,16 +401,18 @@ Synchronous, like `MessageStore` and `ChatLog`, for the reason their
 module docs give: `Core` is sync all the way down, and the frontends
 already know to call through `off_reactor`.
 
-As built, the methods that write answer a `NewsError` rather than a
-`StoreError`: containment, reply depth, sibling names and which
-referenced ids name an article are decided inside the store's own
-transaction, for the reason `MessageStore::push` gives — a check made
-outside it is one a concurrent write can invalidate. `create_node` takes
-a `NewNode` whose guid is the caller's, so both stores stay deterministic
-under test, and `post` answers the new id together with its root, which
-the `news_posted` event needs. The trait grows with the stages:
+The methods that write and the reads that check what they were asked
+for answer a `NewsError` rather than a `StoreError`: containment, reply
+depth, sibling names and which referenced ids name an article are
+decided inside the store's own transaction, for the reason
+`MessageStore::push` gives — a check made outside it is one a
+concurrent write can invalidate. `create_node` takes a `NewNode` whose
+guid is the caller's, so both stores stay deterministic under test, and
+`post` answers the new id together with its root, which the
+`news_posted` event needs. The trait grows with the stages:
 `category_all`, `by_author`, search, subscriptions and `reindex` arrive
-with the stages that call them rather than ahead of them as stubs.
+with the stages that call them rather than ahead of them as stubs, and
+`NewPost`'s `plain` and `attach` with W3 and W5.
 
 `category_all` exists because the 1.5 wire has no pagination — a
 `NEWSCATLIST` reply is the whole category — and a trait that could not
@@ -486,6 +492,7 @@ CREATE VIRTUAL TABLE news_fts USING fts5(
   content_rowid = 'id',
   tokenize = 'unicode61 remove_diacritics 2'
 );
+INSERT INTO news_fts (news_fts, rank) VALUES ('secure-delete', 1);
 
 CREATE TABLE news_blob (
   hash        BLOB PRIMARY KEY,             -- SHA-256 of the canonical bytes
@@ -708,6 +715,7 @@ CREATE VIRTUAL TABLE news_fts USING fts5(
   content_rowid = 'id',
   tokenize = 'unicode61 remove_diacritics 2'
 );
+INSERT INTO news_fts (news_fts, rank) VALUES ('secure-delete', 1);
 ```
 
 An **external-content** table: the text is not stored twice, FTS5 reads

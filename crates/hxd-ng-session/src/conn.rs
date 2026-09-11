@@ -402,6 +402,7 @@ async fn handle_login(
             inline_media: ctx.core.media_enabled(),
         },
         has_inbox: account.has_inbox,
+        is_person: account.is_person(),
         // ng has `msg_read`; a client says for itself when it has read
         // something, and delivery is not that.
         reads_on_delivery: false,

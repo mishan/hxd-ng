@@ -1568,11 +1568,14 @@ mod tests {
         )
         .unwrap();
 
+        // Built as §6.1 has the search stage build it, secure-delete
+        // included, so the tombstone below overwrites what it removes.
         conn.execute_batch(
             "CREATE VIRTUAL TABLE fts USING fts5(
                subject, search_body, author,
                content = 'news_article', content_rowid = 'id',
                tokenize = 'unicode61 remove_diacritics 2');
+             INSERT INTO fts(fts, rank) VALUES ('secure-delete', 1);
              INSERT INTO fts(fts) VALUES ('rebuild');",
         )
         .unwrap();

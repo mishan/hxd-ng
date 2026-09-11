@@ -1819,6 +1819,7 @@ mod inbox_tests {
                 can_detach: true,
                 transport: crate::Transport::default(),
                 has_inbox: true,
+                is_person: true,
                 reads_on_delivery: false,
                 identity: Some(fingerprint),
             })
@@ -1845,6 +1846,7 @@ mod inbox_tests {
                 can_detach: true,
                 transport: crate::Transport::default(),
                 has_inbox,
+                is_person: has_inbox,
                 reads_on_delivery: false,
                 identity: None,
             })
@@ -2535,6 +2537,7 @@ mod inbox_tests {
                 can_detach: false,
                 transport: crate::Transport::default(),
                 has_inbox: false,
+                is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(3)),
             })
@@ -2572,6 +2575,7 @@ mod inbox_tests {
                 can_detach: false,
                 transport: crate::Transport::default(),
                 has_inbox: false,
+                is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(7)),
             })

@@ -380,6 +380,8 @@ pub(crate) struct UserSession {
     /// no.) It doubles as "is this session a repliable identity" — the
     /// sender of a stored message is recorded only when it is true.
     pub(crate) has_inbox: bool,
+    /// See [`AttachInfo::is_person`].
+    pub(crate) is_person: bool,
     /// See [`AttachInfo::reads_on_delivery`].
     pub(crate) reads_on_delivery: bool,
     /// This session's identity fingerprint — the durable half of its
@@ -409,6 +411,11 @@ pub struct AttachInfo {
     /// May private messages be stored for this account and delivered
     /// later? (The `[extra] inbox` flag; guests default to no.)
     pub has_inbox: bool,
+    /// Is exactly one person behind this account? [`Account::is_person`]:
+    /// what news records authorship against, independent of `has_inbox`.
+    ///
+    /// [`Account::is_person`]: crate::Account::is_person
+    pub is_person: bool,
     /// This session's wire cannot say it has read a message, so handing
     /// one over *is* the read (`docs/private-messages.md` §11).
     ///
@@ -778,6 +785,7 @@ impl Core {
                 connected_at: Instant::now(),
                 can_detach: info.can_detach,
                 has_inbox: info.has_inbox,
+                is_person: info.is_person,
                 reads_on_delivery: info.reads_on_delivery,
                 identity: info.identity,
                 history_refill: Instant::now(),
@@ -1088,6 +1096,7 @@ pub(crate) fn test_attach(
             can_detach: false,
             transport: Transport::default(),
             has_inbox: false,
+            is_person: false,
             reads_on_delivery: false,
             identity: None,
         })
@@ -1123,6 +1132,7 @@ mod tests {
                 can_detach: true,
                 transport: Transport::default(),
                 has_inbox: true,
+                is_person: true,
                 reads_on_delivery: false,
                 identity: None,
             })
@@ -1198,6 +1208,7 @@ mod tests {
                 can_detach: false,
                 transport: Transport::default(),
                 has_inbox: false,
+                is_person: false,
                 reads_on_delivery: false,
                 identity: None,
             })
