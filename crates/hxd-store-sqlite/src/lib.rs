@@ -331,6 +331,7 @@ CREATE TABLE news_attach (
 );
 CREATE INDEX news_attach_article ON news_attach (article, ord);
 CREATE INDEX news_attach_staged ON news_attach (staged_at) WHERE article IS NULL;
+CREATE INDEX news_attach_hash ON news_attach (hash);
 ";
 
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL

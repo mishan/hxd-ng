@@ -2765,11 +2765,12 @@ async fn the_identity_routes_answer_cors_so_a_page_elsewhere_can_read_them() {
     // `ETag` and the file-range response headers have to be exposed by
     // name: cross-origin, a page cannot read a header that is not on this
     // list. Cards use ETag for revalidation and Files uses the others for
-    // exact progress and resume accounting.
+    // exact progress and resume accounting. `Retry-After` likewise, for
+    // the upload routes' 429.
     let card = http(ng, "GET", "/identity/card/nope", &[], b"").await;
     assert_eq!(
         card.header("access-control-expose-headers"),
-        Some("ETag, Content-Length, Content-Range, Accept-Ranges"),
+        Some("ETag, Content-Length, Content-Range, Accept-Ranges, Retry-After"),
         "{:?}",
         card.headers
     );

@@ -376,6 +376,10 @@ fn remove_articles(conn: &Connection, which: &str, arg: i64) -> Result<u64, Stor
     Ok(gone as u64)
 }
 
+/// Give back the references the articles `which` names hold. Only the
+/// blobs those articles name are touched, each counted on
+/// `news_attach_hash`, so a category's deletion costs what it attached
+/// rather than a scan of every attachment for every blob in the archive.
 fn release_attachments(conn: &Connection, which: &str, arg: i64) -> Result<(), StoreError> {
     sql(conn.execute(
         &format!(
@@ -383,6 +387,10 @@ fn release_attachments(conn: &Connection, which: &str, arg: i64) -> Result<(), S
                SELECT COUNT(*) FROM news_attach a
                 WHERE a.hash = news_blob.hash AND a.article IN
                       (SELECT id FROM news_article WHERE {which})
+             )
+             WHERE hash IN (
+               SELECT a.hash FROM news_attach a
+                WHERE a.article IN (SELECT id FROM news_article WHERE {which})
              )"
         ),
         params![arg],

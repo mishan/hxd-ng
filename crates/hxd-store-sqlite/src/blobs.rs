@@ -51,13 +51,18 @@ impl FileBlobStore {
             .parent()
             .ok_or_else(|| StoreError::new("blob path has no parent"))?;
         fs::create_dir_all(parent).map_err(StoreError::new)?;
-        let serial = TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
-        let temp = parent.join(format!(".stage-{}-{serial}", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(StoreError::new)?;
+        let (temp, mut file) = loop {
+            let serial = TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
+            let temp = parent.join(format!(".stage-{}-{serial}", std::process::id()));
+            match OpenOptions::new().write(true).create_new(true).open(&temp) {
+                Ok(file) => break (temp, file),
+                // Left by an earlier process that had this pid and died
+                // before its rename. The sweep will take it; this write
+                // takes the next name.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(StoreError::new(e)),
+            }
+        };
         file.write_all(bytes).map_err(StoreError::new)?;
         file.sync_all().map_err(StoreError::new)?;
         match fs::rename(&temp, path) {
@@ -201,6 +206,24 @@ impl BlobStore for FileBlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_temporary_name_is_stepped_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileBlobStore::open(dir.path()).unwrap();
+        let id: BlobId = Sha256::digest(b"after a crash").into();
+        let parent = store.path(&id).parent().unwrap().to_owned();
+        fs::create_dir_all(&parent).unwrap();
+        // What a process that had this pid left behind when it died: the
+        // very names this one is about to try.
+        let next = TEMP_SERIAL.load(Ordering::Relaxed);
+        for serial in next..next + 64 {
+            let stale = parent.join(format!(".stage-{}-{serial}", std::process::id()));
+            fs::write(stale, b"stale").unwrap();
+        }
+        assert_eq!(store.put(b"after a crash").unwrap(), id);
+        assert!(store.contains(&id).unwrap());
+    }
 
     #[test]
     fn bytes_are_content_addressed_and_derivatives_are_separate() {

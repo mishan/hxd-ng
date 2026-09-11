@@ -57,14 +57,45 @@ fn same(a: &Mailbox, b: &Mailbox) -> bool {
     a.matches(&b.login, b.fingerprint.as_ref())
 }
 
+/// A mailbox as an hourly budget's map key: its fingerprint, or its login
+/// when it has none.
+pub(super) type BudgetKey = (Option<[u8; 32]>, String);
+
+/// Hourly budgets by mailbox: when each was last spent from, and what is
+/// left in it.
+pub(super) type Budgets = std::collections::HashMap<BudgetKey, (Instant, f64)>;
+
 /// The key a push budget is kept under — the mailbox rule as a map key, so
 /// a renamed identity keeps its budget and a login someone else has since
 /// taken does not inherit one.
-fn budget_key(m: &Mailbox) -> (Option<[u8; 32]>, String) {
+pub(super) fn budget_key(m: &Mailbox) -> BudgetKey {
     match m.fingerprint {
         Some(fp) => (Some(fp), String::new()),
         None => (None, m.login.clone()),
     }
+}
+
+/// Take one from `key`'s bucket in `budgets`: `per_hour` of them,
+/// refilling across the hour, so a burst up to the hour's worth and then
+/// one as each comes due. Past [`BUDGETS_KEPT`] entries the full buckets
+/// are forgotten first. The caller holds the map's lock and has refused a
+/// `per_hour` of zero, whose bucket would never fill to be forgotten.
+pub(super) fn spend(budgets: &mut Budgets, key: BudgetKey, per_hour: u32) -> bool {
+    let per_hour = f64::from(per_hour);
+    let refill =
+        |at: Instant, now: Instant| now.duration_since(at).as_secs_f64() * per_hour / 3600.0;
+    let now = Instant::now();
+    if budgets.len() >= BUDGETS_KEPT {
+        budgets.retain(|_, (at, tokens)| *tokens + refill(*at, now) < per_hour);
+    }
+    let (at, tokens) = budgets.entry(key).or_insert((now, per_hour));
+    *tokens = (*tokens + refill(*at, now)).min(per_hour);
+    *at = now;
+    if *tokens < 1.0 {
+        return false;
+    }
+    *tokens -= 1.0;
+    true
 }
 
 /// The opening of a body as one line, cut at a word near the limit. What a
@@ -478,22 +509,11 @@ impl Core {
         if per_hour == 0 {
             return false;
         }
-        let per_hour = f64::from(per_hour);
-        let refill =
-            |at: Instant, now: Instant| now.duration_since(at).as_secs_f64() * per_hour / 3600.0;
-        let now = Instant::now();
-        let mut budgets = self.news_push.lock().unwrap();
-        if budgets.len() >= BUDGETS_KEPT {
-            budgets.retain(|_, (at, tokens)| *tokens + refill(*at, now) < per_hour);
-        }
-        let (at, tokens) = budgets.entry(budget_key(to)).or_insert((now, per_hour));
-        *tokens = (*tokens + refill(*at, now)).min(per_hour);
-        *at = now;
-        if *tokens < 1.0 {
-            return false;
-        }
-        *tokens -= 1.0;
-        true
+        spend(
+            &mut self.news_push.lock().unwrap(),
+            budget_key(to),
+            per_hour,
+        )
     }
 
     /// Drop the push budget kept for a mailbox that is going, or moving
