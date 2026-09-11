@@ -705,7 +705,7 @@ under all three — only their quality varies.
 
 SQLite's FTS5 is already compiled into the store's SQLite: `rusqlite`'s
 `bundled` build has it with no additional feature and no additional
-dependency (verified against the pinned 0.32 build, SQLite 3.46). Search
+dependency (verified against the pinned 0.40 build, SQLite 3.53). Search
 therefore costs a table and some care, not a search engine.
 
 ```sql
@@ -1056,7 +1056,7 @@ than sending limits for something that cannot be done.
 | `news_post` | `category`, `parent?`, `subject`, `body`, `mime?` (`"text/plain"` \| `"text/markdown"`, default plain), `attach?` (handles) | `{ "id": 51 }` |
 | `news_delete` | `id`, `reason?` | `{}` |
 | `news_refs` | `id`, `limit?` (1–200, default 50) | `{ "referenced_by": [ … ] }` — the articles pointing at this one |
-| `news_search` | `q`, `category?`, `from?`, `before?` / `after?` (times), `offset?`, `limit?` (1–50, default 20) | `{ "hits": [ … ], "total": 137, "capped": false }` |
+| `news_search` | `q`, `category?`, `from?`, `before?` / `after?` (times), `order?` (`"relevance"`, the default, or `"recent"`), `offset?`, `limit?` (1–50, default 20) | `{ "hits": [ … ], "total": 137, "capped": false }` |
 | `news_node_create` | `parent?`, `kind` (`"bundle"` \| `"category"`), `name` | `{ "node": { … } }` |
 | `news_node_rename` | `id`, `name` | `{}` |
 | `news_node_delete` | `id` | `{ "articles": 12 }` |
@@ -1081,11 +1081,11 @@ from around what matched, and `marks` a list of `[start, end)` pairs in
 the snippet **counted in UTF-16 code units** — what a JSON client's
 strings index by, in JavaScript and Swift's `NSString` and Java alike —
 so a client slices the match straight out of the string it received.
-`news_search` also takes `order?` (`"relevance"`, the default, or
-`"recent"`). A server with `search = false` answers it `not_available`,
+A server with `search = false` answers `news_search` `not_available`,
 and too many searches answer `rate_limited`.
 
-Pagination follows the `history` request where its ordering permits:
+Search pages by offset (§6.3). Every other paged request follows the
+`history` request where its ordering permits:
 cursors are ids, `before`/`after` are exclusive, `has_more` is computed
 by fetching `limit + 1`, and the caller clamps the limit before the
 store sees it. A thread's preorder is mutable — a new reply to an early
@@ -1954,7 +1954,7 @@ the `markdown` feature is the same error for the same reason: a config
 that silently does less than it says is worse than one that refuses to
 start. `[news]` without `[news.attach]` is news with no pictures, which
 is a legitimate server; `markdown = "off"` with `search = false` is
-plain-text news with no index, which is the smallest thing this design
+plain-text news with no search, which is the smallest thing this design
 builds.
 
 ## 14. What this does not change

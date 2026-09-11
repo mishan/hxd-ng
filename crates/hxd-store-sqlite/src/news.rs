@@ -456,42 +456,32 @@ fn searchable(
     })
 }
 
-/// Where `snippet()` puts its marks: two private-use characters, taken
-/// back out here and turned into byte ranges, so what leaves the store is
-/// text and offsets rather than markup.
-const MARK_OPEN: char = '\u{e000}';
-const MARK_CLOSE: char = '\u{e001}';
+/// Where `snippet()` puts its marks: two bytes that never occur in UTF-8,
+/// taken back out here and turned into byte ranges, so what leaves the
+/// store is text and offsets rather than markup. Any character would do
+/// until a body carried it — every one is valid in a body, and a body is
+/// stored as typed — and these are the markers no body can.
+const MARK_OPEN: u8 = 0xfe;
+const MARK_CLOSE: u8 = 0xff;
 
-/// A snippet without its markers, and the ranges they bracketed. A body
-/// may carry these characters itself; they are dropped like the real
-/// ones, an unmatched close is ignored and an unclosed open runs to the
-/// end — a stray mark on the author's own words, never a range outside
-/// the text.
-fn unmark(marked: &str) -> (String, Vec<(u32, u32)>) {
-    let mut text = String::with_capacity(marked.len());
+/// A snippet without its markers, and the ranges they bracketed.
+fn unmark(marked: &[u8]) -> Result<(String, Vec<(u32, u32)>), StoreError> {
+    let mut text = Vec::with_capacity(marked.len());
     let mut marks = Vec::new();
-    let mut open: Option<usize> = None;
-    for c in marked.chars() {
-        match c {
-            MARK_OPEN => {
-                open.get_or_insert(text.len());
-            }
+    let mut open = None;
+    for &b in marked {
+        match b {
+            MARK_OPEN => open = Some(text.len()),
             MARK_CLOSE => {
                 if let Some(start) = open.take() {
-                    if start < text.len() {
-                        marks.push((start as u32, text.len() as u32));
-                    }
+                    marks.push((start as u32, text.len() as u32));
                 }
             }
-            c => text.push(c),
+            b => text.push(b),
         }
     }
-    if let Some(start) = open {
-        if start < text.len() {
-            marks.push((start as u32, text.len() as u32));
-        }
-    }
-    (text, marks)
+    let text = String::from_utf8(text).map_err(StoreError::new)?;
+    Ok((text, marks))
 }
 
 struct RawHit {
@@ -501,7 +491,7 @@ struct RawHit {
     category: i64,
     root: i64,
     at: i64,
-    snippet: Option<String>,
+    snippet: Vec<u8>,
 }
 
 impl NewsStore for SqliteStore {
@@ -978,7 +968,8 @@ impl NewsStore for SqliteStore {
             };
             let sql_text = format!(
                 "SELECT a.id, a.subject, a.nick, a.category, a.root, a.at,
-                        snippet(news_fts, 1, char(57344), char(57345), '…', 16)
+                        snippet(news_fts, 1, CAST(X'fe' AS TEXT), CAST(X'ff' AS TEXT),
+                                '…', 16)
                  {from} ORDER BY {order} LIMIT ? OFFSET ?"
             );
             let mut all = binds.clone();
@@ -993,12 +984,16 @@ impl NewsStore for SqliteStore {
                     category: r.get(3)?,
                     root: r.get(4)?,
                     at: r.get(5)?,
-                    snippet: r.get(6)?,
+                    // As bytes: with its markers in, it is not UTF-8.
+                    snippet: match r.get_ref(6)? {
+                        rusqlite::types::ValueRef::Text(b) => b.to_vec(),
+                        _ => Vec::new(),
+                    },
                 })
             }))?;
             for row in rows {
                 let raw = sql(row)?;
-                let (snippet, marks) = unmark(raw.snippet.as_deref().unwrap_or(""));
+                let (snippet, marks) = unmark(&raw.snippet)?;
                 hits.push(Hit {
                     article: article_id(raw.id)?,
                     root: article_id(raw.root)?,

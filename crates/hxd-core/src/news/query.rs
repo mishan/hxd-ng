@@ -167,10 +167,14 @@ impl CompiledQuery {
     }
 
     /// Add "by this author" — the `from` parameter, which is `from:` said
-    /// as a field rather than typed.
+    /// as a field rather than typed. It counts toward [`MAX_TERMS`], and a
+    /// query already full gives up its last typed term for it: narrowing
+    /// to an author is what was asked for, and one term fewer only finds
+    /// more.
     pub fn push_author(&mut self, who: &str) {
         let (words, prefix) = bounded(who, false);
         if !words.is_empty() {
+            self.terms.truncate(MAX_TERMS - 1);
             self.terms.push(Term {
                 words,
                 field: Field::Author,
@@ -303,6 +307,10 @@ mod tests {
     fn a_query_is_bounded_before_anything_reads_it() {
         let many: String = (0..40).map(|n| format!("w{n} ")).collect();
         assert_eq!(parsed(&many).len(), MAX_TERMS);
+        let mut by = CompiledQuery::parse(&many);
+        by.push_author("alice");
+        assert_eq!(by.terms.len(), MAX_TERMS, "`from` is inside the bound");
+        assert_eq!(by.terms.last().unwrap().field, Field::Author);
         let long = "é".repeat(100);
         let term = &parsed(&long)[0];
         let cut = &term.words[0];

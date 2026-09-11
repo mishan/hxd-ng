@@ -1763,33 +1763,31 @@ mod tests {
             "Alice",
             Some("alice"),
         );
+        let marked = |hit: &hxd_core::news::Hit| -> Vec<String> {
+            hit.marks
+                .iter()
+                .map(|&(a, b)| hit.snippet[a as usize..b as usize].to_owned())
+                .collect()
+        };
         let hit = news_search(&store, "derivative").hits.remove(0);
-        assert!(!hit.snippet.contains('\u{e000}') && !hit.snippet.contains('\u{e001}'));
-        let marked: Vec<&str> = hit
-            .marks
-            .iter()
-            .map(|&(a, b)| &hit.snippet[a as usize..b as usize])
-            .collect();
-        assert_eq!(marked, ["derivative", "derivative"]);
-
-        // A body that carries the marker characters itself cannot make
-        // the parse fall over or reach outside the snippet: it may mark a
-        // stray word of its author's own text, and nothing worse.
-        news_post(
-            &store,
-            cat,
-            "Tricks",
-            "\u{e001}sneaky\u{e000} derivative \u{e000}unclosed",
-            "Mallory",
-            None,
+        assert_eq!(
+            hit.snippet,
+            "the derivative is a u16, and the derivative is small"
         );
-        for hit in news_search(&store, "derivative").hits {
-            for &(a, b) in &hit.marks {
-                assert!(a < b && (b as usize) <= hit.snippet.len());
-                assert!(hit.snippet.is_char_boundary(a as usize));
-                assert!(hit.snippet.is_char_boundary(b as usize));
-            }
-        }
+        assert_eq!(marked(&hit), ["derivative", "derivative"]);
+
+        // Any character may be in a body, the private-use ones included,
+        // and a snippet keeps them as typed: they are text, not marks, and
+        // an unmatched one around a match cannot stretch its range. Apart,
+        // since `unicode61` counts them as letters of the word they touch.
+        let tricks = "\u{e001} sneaky \u{e000} derivative \u{e000} unclosed \u{e001}";
+        news_post(&store, cat, "Tricks", tricks, "Mallory", None);
+        let hit = news_search(&store, "sneaky").hits.remove(0);
+        assert_eq!(hit.snippet, tricks);
+        assert_eq!(marked(&hit), ["sneaky"]);
+        let hit = news_search(&store, "unclosed derivative").hits.remove(0);
+        assert_eq!(hit.snippet, tricks);
+        assert_eq!(marked(&hit), ["derivative", "unclosed"]);
     }
 
     #[test]
