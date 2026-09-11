@@ -211,13 +211,15 @@ fn cors_route(path: &str) -> bool {
 /// refuses to authenticate by certificate on a request that carries
 /// `Origin`. `ETag` is exposed because `GET /identity/card/<fp>` is worth
 /// revalidating rather than refetching, and a cross-origin page cannot
-/// read the header to do it otherwise.
+/// read the header to do it otherwise. `Retry-After` is exposed for the
+/// same reason: a 429 from `/media` or `/news/blob` says how long to wait
+/// there and nowhere else.
 fn cors(mut resp: Resp) -> Resp {
     let h = resp.headers_mut();
     h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     h.insert(
         ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_static("ETag"),
+        HeaderValue::from_static("ETag, Retry-After"),
     );
     resp
 }

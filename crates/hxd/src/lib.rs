@@ -1084,33 +1084,49 @@ fn ng_caps(config: &Config, voice: Option<&Voice>) -> Vec<String> {
 /// Give the domain an image pipeline when `[media]` asks for one.
 #[cfg(feature = "media")]
 fn with_media(core: Core, config: &Config) -> Result<Core, String> {
-    let Some(media) = config.media.as_ref() else {
-        return Ok(core);
-    };
-    let cfg = media.to_media_config()?;
-    Ok(core.with_media(Arc::new(hxd_media::Codec::new(cfg.codec)), cfg))
+    let media = config
+        .media
+        .as_ref()
+        .map(|m| m.to_media_config())
+        .transpose()?;
+    // One pipeline, and so one decode budget, for the whole server. News
+    // attachments take a larger upload than chat and get their own byte
+    // ceiling over the same limits and permits, so `[media]`'s caps and
+    // `max_concurrent_decodes` hold for both (`docs/news.md` §7.1).
+    let codec = hxd_media::Codec::new(media.as_ref().map_or_else(Default::default, |m| m.codec));
+    let core = with_news_attachments(core, config, &codec)?;
+    Ok(match media {
+        Some(cfg) => core.with_media(Arc::new(codec), cfg),
+        None => core,
+    })
 }
 
 #[cfg(all(feature = "media", feature = "inbox"))]
-fn with_news_attachments(core: Core, config: &Config) -> Result<Core, String> {
+fn with_news_attachments(
+    core: Core,
+    config: &Config,
+    codec: &hxd_media::Codec,
+) -> Result<Core, String> {
     let Some(news) = config.news.as_ref() else {
         return Ok(core);
     };
     let Some(attach) = news.attach.as_ref() else {
         return Ok(core);
     };
-    let limits = hxd_core::CodecLimits {
-        max_bytes: attach.max_bytes,
-        ..Default::default()
-    };
-    let codec = Arc::new(hxd_media::Codec::new(limits));
     let blobs = hxd_store_sqlite::FileBlobStore::open(&news.blobs)
         .map_err(|e| format!("{}: {e}", news.blobs.display()))?;
-    Ok(core.with_news_attachments(Arc::new(blobs), codec))
+    Ok(core.with_news_attachments(
+        Arc::new(blobs),
+        Arc::new(codec.with_max_bytes(attach.max_bytes)),
+    ))
 }
 
-#[cfg(not(all(feature = "media", feature = "inbox")))]
-fn with_news_attachments(core: Core, config: &Config) -> Result<Core, String> {
+#[cfg(all(feature = "media", not(feature = "inbox")))]
+fn with_news_attachments(
+    core: Core,
+    config: &Config,
+    _codec: &hxd_media::Codec,
+) -> Result<Core, String> {
     if config.news.as_ref().is_some_and(|n| n.attach.is_some()) {
         return Err("[news.attach] requires the `media` and `inbox` features".into());
     }
@@ -1145,6 +1161,9 @@ fn with_media(core: Core, config: &Config) -> Result<Core, String> {
                     (built without the `media` feature)"
                 .into(),
         );
+    }
+    if config.news.as_ref().is_some_and(|n| n.attach.is_some()) {
+        return Err("[news.attach] requires the `media` and `inbox` features".into());
     }
     Ok(core)
 }
@@ -1977,7 +1996,6 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
         _ => return Err("[news] store was not opened".into()),
     };
     let core = with_markdown(core, config);
-    let core = with_news_attachments(core, config)?;
     let core = with_media(core, config)?;
 
     Ok(ServerCtx {

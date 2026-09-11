@@ -61,14 +61,28 @@ const JPEG_QUALITY: u8 = 85;
 /// decode permits.
 pub struct Codec {
     limits: CodecLimits,
-    permits: Permits,
+    permits: std::sync::Arc<Permits>,
 }
 
 impl Codec {
     pub fn new(limits: CodecLimits) -> Self {
         Codec {
-            permits: Permits::new(limits.max_concurrent_decodes.max(1)),
+            permits: std::sync::Arc::new(Permits::new(limits.max_concurrent_decodes.max(1))),
             limits,
+        }
+    }
+
+    /// This pipeline with another byte ceiling, sharing its decode
+    /// permits. News attachments take larger uploads than chat, but a
+    /// server has one decode budget, and every other limit is the
+    /// operator's either way.
+    pub fn with_max_bytes(&self, max_bytes: usize) -> Self {
+        Codec {
+            limits: CodecLimits {
+                max_bytes,
+                ..self.limits
+            },
+            permits: self.permits.clone(),
         }
     }
 
@@ -447,6 +461,30 @@ impl Drop for Permit<'_> {
 #[cfg(test)]
 mod derivative_tests {
     use super::*;
+
+    #[test]
+    fn a_narrowed_codec_shares_the_decode_permits() {
+        let codec = Codec::new(CodecLimits {
+            max_concurrent_decodes: 1,
+            permit_wait: std::time::Duration::from_millis(10),
+            ..CodecLimits::default()
+        });
+        let news = codec.with_max_bytes(codec.limits.max_bytes * 8);
+        let png = encode_png(&DynamicImage::ImageRgba8(image::RgbaImage::from_fn(
+            64,
+            64,
+            |x, y| image::Rgba([(x * 4) as u8, (y * 4) as u8, 0x30, 0xff]),
+        )))
+        .unwrap();
+        let held = codec.permits.acquire(std::time::Duration::ZERO).unwrap();
+        assert_eq!(
+            news.canonicalize(&png),
+            Err(MediaReject::Busy),
+            "chat's decode is news's too"
+        );
+        drop(held);
+        assert!(news.canonicalize(&png).is_ok());
+    }
 
     #[test]
     fn a_legacy_derivative_is_a_bounded_still_and_preserves_alpha() {

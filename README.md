@@ -318,6 +318,9 @@ feature. Uploads are canonicalized and staged before a post; the post binds
 their handles atomically. Staging permission defaults to the account's
 `send_media` bit and can be overridden with `[extra] attach_news`; a guest
 never stages, since a staged image belongs to the person who uploaded it.
+News images go through the same pipeline as chat's: `[media]`'s dimension,
+pixel and frame caps and its `max_concurrent_decodes` hold for both, and
+only the byte ceiling is `[news.attach]`'s own.
 
 Who may read, post, delete and rearrange is the account's news bits —
 `read_news`, `post_news`, `delete_articles` and the category and bundle

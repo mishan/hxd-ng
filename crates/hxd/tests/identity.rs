@@ -2761,11 +2761,12 @@ async fn the_identity_routes_answer_cors_so_a_page_elsewhere_can_read_them() {
 
     // `ETag` has to be exposed by name: cross-origin, a page cannot read
     // a header that is not on that list, and the card fetch is built to
-    // be revalidated rather than refetched.
+    // be revalidated rather than refetched. `Retry-After` likewise, for
+    // the upload routes' 429.
     let card = http(ng, "GET", "/identity/card/nope", &[], b"").await;
     assert_eq!(
         card.header("access-control-expose-headers"),
-        Some("ETag"),
+        Some("ETag, Retry-After"),
         "{:?}",
         card.headers
     );

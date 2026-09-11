@@ -1394,20 +1394,16 @@ impl Core {
 
     /// Take one upload from `owner`'s hourly allowance, or say there is
     /// none left. `refund` gives one back.
+    /// Kept the way the push budget is, under the mailbox rule's key and
+    /// pruned by the same rule, so a renamed identity does not start a
+    /// fresh hour and the map does not grow with every account that ever
+    /// staged.
     fn news_attach_charge(&self, owner: &Mailbox, per_hour: u32) -> bool {
-        let mut rates = self.news_attach_rate.lock().unwrap();
-        let now = std::time::Instant::now();
-        let bucket = rates
-            .entry((owner.fingerprint, owner.login.clone()))
-            .or_insert((now, f64::from(per_hour)));
-        let elapsed = now.duration_since(bucket.0).as_secs_f64();
-        bucket.0 = now;
-        bucket.1 = (bucket.1 + elapsed * f64::from(per_hour) / 3600.0).min(f64::from(per_hour));
-        if bucket.1 < 1.0 {
-            return false;
-        }
-        bucket.1 -= 1.0;
-        true
+        subs::spend(
+            &mut self.news_attach_rate.lock().unwrap(),
+            subs::budget_key(owner),
+            per_hour,
+        )
     }
 
     fn news_attach_refund(&self, owner: &Mailbox, per_hour: u32) {
@@ -1415,7 +1411,7 @@ impl Core {
             .news_attach_rate
             .lock()
             .unwrap()
-            .get_mut(&(owner.fingerprint, owner.login.clone()))
+            .get_mut(&subs::budget_key(owner))
         {
             bucket.1 = (bucket.1 + 1.0).min(f64::from(per_hour));
         }
@@ -2003,6 +1999,23 @@ fn create_bit(kind: NodeKind) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    /// The upload allowance is the mailbox's, and an identity's mailbox
+    /// is its fingerprint, not whatever it is called this week.
+    #[test]
+    fn an_upload_allowance_follows_the_identity_across_a_rename() {
+        let core = crate::Core::new();
+        let mut before = Mailbox::login("old");
+        before.fingerprint = Some([1; 32]);
+        let mut after = Mailbox::login("new");
+        after.fingerprint = Some([1; 32]);
+        assert!(core.news_attach_charge(&before, 1));
+        assert!(
+            !core.news_attach_charge(&after, 1),
+            "a rename is not a fresh hour"
+        );
+        core.news_attach_refund(&after, 1);
+        assert!(core.news_attach_charge(&before, 1));
+    }
     use super::*;
     use crate::roster::{drain, test_attach, AttachInfo, Transport};
 
