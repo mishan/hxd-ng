@@ -144,7 +144,19 @@ async fn main() {
             return Ok(());
         }
         let voice = hxd::voice::build(&config)?;
-        let ctx = build_ctx(&config, voice.as_ref())?;
+        let files = hxd::files::build(&config)?;
+        // Bind HTXF before either frontend advertises Files. A configured
+        // but unavailable transfer port is a startup failure, never a
+        // capability promise that downloads cannot fulfill.
+        let files_listener = match files.as_ref() {
+            Some(files) => Some(
+                TcpListener::bind(&files.bind)
+                    .await
+                    .map_err(|e| format!("files bind {}: {e}", files.bind))?,
+            ),
+            None => None,
+        };
+        let ctx = build_ctx(&config, voice.as_ref(), files.as_ref())?;
 
         let listener = TcpListener::bind(&config.server.bind)
             .await
@@ -158,7 +170,25 @@ async fn main() {
 
         // The ng context is built before voice is consumed below, so its
         // capability list can see it.
-        let ng_ctx = hxd::build_ng_ctx(&config, &ctx, voice.as_ref())?;
+        let ng_ctx = hxd::build_ng_ctx(&config, &ctx, voice.as_ref(), files.as_ref())?;
+
+        if let (Some(files), Some(listener)) = (files.as_ref(), files_listener) {
+            tracing::info!(
+                "read-only Files from {} with HTXF on {}",
+                config.files.as_ref().unwrap().origin,
+                files.bind
+            );
+            let service = files.service.clone();
+            let core = ctx.core.clone();
+            let timeout = files.handshake_timeout;
+            tokio::spawn(async move {
+                if let Err(error) =
+                    hxd_files::serve_htxf(listener, service.transfers.clone(), core, timeout).await
+                {
+                    tracing::error!("HTXF accept loop: {error}");
+                }
+            });
+        }
 
         // Voice: the UDP media socket and the pump that drives it. Both
         // wires advertise the capability only because building this

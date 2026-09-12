@@ -250,6 +250,52 @@ max_detached_per_addr = 2
 forwarded_header = "x-forwarded-for"
 ```
 
+### Read-only files
+
+Absent means neither wire advertises Files and the HTXF listener is not
+opened. The manifest is local JSON; only the configured HTTP(S) origin may
+provide bytes, so no client or manifest row can turn the server into an
+arbitrary-URL proxy. See [docs/files-plan.md](docs/files-plan.md).
+
+```toml
+[files]
+manifest = "files.json"
+origin = "https://downloads.example/files/"
+# bind = "0.0.0.0:5501"       # default: [server] bind, port plus one
+max_file_size = 68719476736   # per object
+max_entries = 100000
+max_concurrent = 8            # origin responses streamed at once
+request_timeout = 15          # origin connect/request seconds
+reference_ttl = 60            # unclaimed HTXF references
+download_ttl = 60             # ng bearer URLs; reusable for resume
+handshake_timeout = 10        # HTXF preamble seconds
+```
+
+The manifest schema is deliberately small and strict. Sizes are decimal
+strings so its shape agrees with the ng wire:
+
+```json
+{
+  "version": 1,
+  "files": [
+    {
+      "path": "manuals/read me.txt",
+      "size": "12",
+      "media_type": "text/plain",
+      "etag": "\"release-7\"",
+      "ranges": true,
+      "created": 123,
+      "modified": 456,
+      "comment": "Start here"
+    }
+  ]
+}
+```
+
+When `etag` is present, every origin response must return that exact ETag.
+`ranges = true` promises the origin honors open-ended byte ranges and returns
+the corresponding `Content-Range`; a mismatch fails the transfer closed.
+
 ### Portable identity
 
 Needs `[ng]`, because the identity endpoints and the tunnel are served by

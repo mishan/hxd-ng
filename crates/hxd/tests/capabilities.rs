@@ -44,6 +44,7 @@ async fn start_server(dir: &Path, supported: Caps, ng_caps: &[&str]) -> (SocketA
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
         }),
+        files: None,
     };
     let ng_ctx = NgCtx {
         core: ctx.core.clone(),
@@ -63,6 +64,7 @@ async fn start_server(dir: &Path, supported: Caps, ng_caps: &[&str]) -> (SocketA
         identity: None,
         tunnel: None,
         enroll: None,
+        files: None,
     };
 
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

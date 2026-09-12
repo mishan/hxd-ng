@@ -148,6 +148,7 @@ mod tests {
             history: None,
             media: None,
             news: None,
+            files: None,
         }
     }
 

@@ -10,6 +10,7 @@
 pub mod access;
 pub mod account;
 pub mod chat;
+pub mod files;
 pub mod history;
 pub mod inbox;
 pub mod media;
@@ -25,6 +26,10 @@ pub use account::{
     Proof, UnlinkOutcome,
 };
 pub use chat::{ChatError, MsgOutcome};
+pub use files::{
+    FileBody, FileEntry, FileError, FileFuture, FileInfo, FileKind, FilePath, FilePrincipal,
+    FileSource,
+};
 pub use history::{
     ChatLog, HistoryPage, HistoryPolicy, HistoryQuery, LineFlags, LineId, LogLine, MediaMeta,
     MemoryLog, NewLine,

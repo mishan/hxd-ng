@@ -24,6 +24,7 @@ import { readFileSync } from 'node:fs';
  *
  *     base+0   [server]  legacy TCP
  *     base+1   [ng]      WebSocket and HTTP
+ *     base+2   [files]   legacy HTXF
  *     base+4   [voice]   UDP, *derived* rather than configured
  *
  * The gap is not padding. `voice::build` defaults the media port to the
@@ -85,11 +86,19 @@ function udpFree(port) {
 export async function findBlock() {
   for (let attempt = 0; attempt < 40; attempt++) {
     const base = roll();
-    if ((await tcpFree(base)) && (await tcpFree(base + 1)) && (await udpFree(base + 4))) {
-      return { base, legacy: base, ng: base + 1, voice: base + 4 };
+    if (
+      (await tcpFree(base)) &&
+      (await tcpFree(base + 1)) &&
+      (await tcpFree(base + 2)) &&
+      (await udpFree(base + 4))
+    ) {
+      return { base, legacy: base, ng: base + 1, files: base + 2, voice: base + 4 };
     }
     if (process.env.HXD_E2E_PORT_BASE) {
-      throw new Error(`HXD_E2E_PORT_BASE=${base} is not free (needs ${base}, ${base + 1}, udp ${base + 4})`);
+      throw new Error(
+        `HXD_E2E_PORT_BASE=${base} is not free ` +
+          `(needs ${base}, ${base + 1}, ${base + 2}, udp ${base + 4})`,
+      );
     }
   }
   throw new Error('found no free port block below the ephemeral range after many tries');

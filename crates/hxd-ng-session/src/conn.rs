@@ -48,10 +48,10 @@ const PONG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 type Ws = WebSocketStream<TokioIo<Upgraded>>;
 
 /// Per-connection state once a session is attached.
-struct SessState {
-    uid: Uid,
+pub(crate) struct SessState {
+    pub(crate) uid: Uid,
     session_id: String,
-    access: AccessBits,
+    pub(crate) access: AccessBits,
 }
 
 /// Why the connection loop ended, deciding the session's fate.
@@ -1477,6 +1477,9 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         // One family, handled in its own module: the requests are many
         // and all of them are translations of one domain call.
         r if r.starts_with("news_") => crate::news::handle(ctx, state.uid, req).await,
+
+        // --- Files (docs/files-plan.md) -------------------------------
+        r if r.starts_with("files_") => crate::files::handle(ctx, state, req).await,
 
         "logout" => {
             ctx.core.end_session(state.uid);

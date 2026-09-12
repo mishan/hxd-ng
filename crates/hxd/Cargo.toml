@@ -35,6 +35,7 @@ path = "src/main.rs"
 
 [dependencies]
 hxd-core = { workspace = true }
+hxd-files = { workspace = true }
 hxd-auth-file = { workspace = true }
 hxd-session = { workspace = true }
 hxd-ng-session = { workspace = true }
@@ -52,6 +53,7 @@ toml = { workspace = true }
 
 [dev-dependencies]
 hxproto = { workspace = true }
+hxfiles-xfer = { workspace = true }
 # The media e2e stands real WebRTC clients up against the real SFU.
 hxd-voice = { workspace = true }
 # The inbox e2e uses the real store on a real file, not a fake.

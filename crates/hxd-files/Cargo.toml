@@ -1,0 +1,25 @@
+[package]
+name = "hxd-files"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Manifest-backed HTTP file source and HTXF service"
+publish = false
+
+[dependencies]
+hxd-core = { workspace = true }
+hxfiles-xfer = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { version = "0.3", default-features = false }
+url = "2"
+getrandom = "0.2"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

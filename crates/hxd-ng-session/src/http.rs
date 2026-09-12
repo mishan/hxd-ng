@@ -32,23 +32,26 @@
 //! points a page at a server other than the one that served it, and the
 //! enrollment mailbox is reached by a phone that followed a QR code.
 
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
-use hxd_core::{IdentityTag, LinkAuthority, Transport};
-use hyper::body::Incoming;
+use futures_util::TryStreamExt;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, Limited, StreamBody};
+use hxd_core::{FileError, FileKind, IdentityTag, LinkAuthority, Transport};
+use hyper::body::{Frame as BodyFrame, Incoming};
 use hyper::header::{
-    HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    HeaderValue, ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
     ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
-    AUTHORIZATION, CONTENT_TYPE, ETAG, ORIGIN,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, ORIGIN, RANGE,
 };
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
 
 use crate::identity::{
@@ -56,7 +59,18 @@ use crate::identity::{
 };
 use crate::{conn, tunnel, ForwardedHeader, NgCtx};
 
-type Resp = Response<Full<Bytes>>;
+type RespBody = UnsyncBoxBody<Bytes, io::Error>;
+type Resp = Response<RespBody>;
+
+fn full(bytes: Bytes) -> RespBody {
+    Full::new(bytes)
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn boxed(resp: Response<Full<Bytes>>) -> Resp {
+    resp.map(|body| body.map_err(|never| match never {}).boxed_unsync())
+}
 
 /// Request bodies on the identity endpoints. The objects inside are
 /// bounded individually — a card at 16 KiB (§3.4), a certificate at 4
@@ -139,9 +153,19 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
     // other route a page fetches.
     if path == "/media" || path.starts_with("/media/") {
         let resp = match (req.method(), path.strip_prefix("/media/")) {
-            (&Method::POST, None) => crate::media::upload(req, &ctx).await,
+            (&Method::POST, None) => boxed(crate::media::upload(req, &ctx).await),
             (&Method::GET, Some(id)) if !id.is_empty() && !id.contains('/') => {
-                crate::media::download(id, req, &ctx).await
+                boxed(crate::media::download(id, req, &ctx).await)
+            }
+            _ => plain(StatusCode::NOT_FOUND, "not found"),
+        };
+        return cors(resp);
+    }
+
+    if path.starts_with("/files/") {
+        let resp = match (req.method(), path.strip_prefix("/files/")) {
+            (&Method::GET, Some(token)) if !token.is_empty() && !token.contains('/') => {
+                download_file(token, req, &ctx).await
             }
             _ => plain(StatusCode::NOT_FOUND, "not found"),
         };
@@ -179,6 +203,84 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
     resp
 }
 
+async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
+    let Some(service) = ctx.files.as_ref() else {
+        return plain(StatusCode::NOT_FOUND, "not found");
+    };
+    let Some(grant) = service.downloads.resolve(token, &ctx.core) else {
+        // Expired, unknown, and no-longer-authorized tokens are deliberately
+        // indistinguishable: a bearer URL must not become a session oracle.
+        return plain(StatusCode::NOT_FOUND, "not found");
+    };
+    let info = match service.source.info(&grant.path).await {
+        Ok(info) if info.kind == FileKind::File => info,
+        _ => return plain(StatusCode::NOT_FOUND, "not found"),
+    };
+    let range_requested = req.headers().contains_key(RANGE);
+    let offset = match req.headers().get(RANGE) {
+        None => 0,
+        Some(value) => match value.to_str().ok().and_then(parse_range) {
+            Some(offset) if offset < info.size => offset,
+            _ => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(CONTENT_RANGE, format!("bytes */{}", info.size))
+                    .body(full(Bytes::new()))
+                    .unwrap()
+            }
+        },
+    };
+    let body = match service.source.open(&grant.path, offset).await {
+        Ok(body) => body,
+        Err(FileError::RangeInvalid | FileError::RangeUnsupported) => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(CONTENT_RANGE, format!("bytes */{}", info.size))
+                .body(full(Bytes::new()))
+                .unwrap()
+        }
+        Err(_) => return plain(StatusCode::BAD_GATEWAY, "file origin unavailable"),
+    };
+    if body.len != info.size - offset {
+        return plain(StatusCode::BAD_GATEWAY, "file origin changed");
+    }
+    let status = if range_requested {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let stream = ReaderStream::new(body.reader).map_ok(BodyFrame::data);
+    let mut response = Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, body.len.to_string())
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CACHE_CONTROL, "private, no-store")
+        .header(
+            CONTENT_TYPE,
+            info.media_type
+                .as_deref()
+                .unwrap_or("application/octet-stream"),
+        );
+    if range_requested {
+        response = response.header(
+            CONTENT_RANGE,
+            format!("bytes {offset}-{}/{}", info.size - 1, info.size),
+        );
+    }
+    response
+        .body(StreamBody::new(stream).boxed_unsync())
+        .unwrap()
+}
+
+fn parse_range(value: &str) -> Option<u64> {
+    let value = value.strip_prefix("bytes=")?;
+    let (start, end) = value.split_once('-')?;
+    if start.is_empty() || !end.is_empty() || value.contains(',') {
+        return None;
+    }
+    start.parse().ok()
+}
+
 /// The routes a page fetches. An upgrade is not subject to CORS and has
 /// returned above by the time this is asked.
 fn cors_route(path: &str) -> bool {
@@ -186,6 +288,7 @@ fn cors_route(path: &str) -> bool {
         || path.starts_with("/identity/")
         || path == "/media"
         || path.starts_with("/media/")
+        || path.starts_with("/files/")
 }
 
 /// `*` rather than an echo of `Origin`: there is no cookie or other
@@ -202,7 +305,7 @@ fn cors(mut resp: Resp) -> Resp {
     h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     h.insert(
         ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_static("ETag"),
+        HeaderValue::from_static("ETag, Content-Length, Content-Range, Accept-Ranges"),
     );
     resp
 }
@@ -225,10 +328,10 @@ fn preflight() -> Resp {
         // preflight it triggers succeed.
         .header(
             ACCESS_CONTROL_ALLOW_HEADERS,
-            "content-type, authorization, if-none-match",
+            "content-type, authorization, if-none-match, range",
         )
         .header(ACCESS_CONTROL_MAX_AGE, "86400")
-        .body(Full::new(Bytes::new()))
+        .body(full(Bytes::new()))
         .unwrap();
     cors(resp)
 }
@@ -345,7 +448,7 @@ async fn upgrade(
     });
     // hyper_tungstenite builds a body of its own type; re-wrap it.
     let (parts, _) = response.into_parts();
-    Response::from_parts(parts, Full::new(Bytes::new()))
+    Response::from_parts(parts, full(Bytes::new()))
 }
 
 /// §6.1: bearer token in `Authorization`, `?token=` in the URL, or a
@@ -1295,14 +1398,14 @@ fn get_card(fp: &str, if_none_match: Option<&str>, ctx: &NgCtx) -> Resp {
                 return Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header(ETAG, etag)
-                    .body(Full::new(Bytes::new()))
+                    .body(full(Bytes::new()))
                     .unwrap();
             }
             Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "application/cbor")
                 .header(ETAG, etag)
-                .body(Full::new(Bytes::from(bytes)))
+                .body(full(Bytes::from(bytes)))
                 .unwrap()
         }
         None => plain(StatusCode::NOT_FOUND, "no card for that identity"),
@@ -1398,7 +1501,7 @@ fn json_resp(status: StatusCode, v: Value) -> Resp {
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(v.to_string())))
+        .body(full(Bytes::from(v.to_string())))
         .unwrap()
 }
 
@@ -1406,7 +1509,7 @@ fn plain(status: StatusCode, text: &str) -> Resp {
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(text.to_owned())))
+        .body(full(Bytes::from(text.to_owned())))
         .unwrap()
 }
 

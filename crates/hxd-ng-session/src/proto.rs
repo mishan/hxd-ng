@@ -106,6 +106,18 @@ pub struct HistoryParams {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct FilesPathParams {
+    /// Slash-separated UTF-8 path relative to the configured Files root.
+    #[serde(default)]
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FilesDownloadParams {
+    pub path: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MsgReadParams {
     pub up_to: u64,

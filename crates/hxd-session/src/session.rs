@@ -22,8 +22,9 @@ use hxd_core::access::bit;
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, LinkAuthority,
-    LinkOutcome, Proof, SeqEvent, SessionStatus, Transport, Uid, UserInfo,
+    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, FileEntry, FileKind,
+    FilePrincipal, LinkAuthority, LinkOutcome, Proof, SeqEvent, SessionStatus, Transport, Uid,
+    UserInfo,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::text;
@@ -35,6 +36,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
 use crate::caps::{cap, Caps};
+use crate::files;
 use crate::frame::{pack_frame, read_frame, Frame, ReadError, MAX_FRAME_DATA};
 use crate::media;
 use crate::video;
@@ -143,6 +145,7 @@ pub struct ServerCtx {
     pub core: Arc<Core>,
     pub auth: Arc<dyn AuthBackend>,
     pub cfg: Arc<ServerConfig>,
+    pub files: Option<Arc<hxd_files::FileService>>,
 }
 
 /// Accept loop: one [`run_session`] task per connection. Plain TCP, so
@@ -1616,6 +1619,234 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
         }
 
+        // --- Read-only Files -----------------------------------------
+        t if t == ClientHdr::FileList.as_u32() => {
+            if !sess.can(bit::DOWNLOAD_FILES) {
+                reply_error(tx, f.trans, "You are not allowed to list files.");
+                return;
+            }
+            let Some(service) = ctx.files.as_ref() else {
+                reply_error(tx, f.trans, "Files are not available on this server.");
+                return;
+            };
+            let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
+            let large = sess.has_cap(cap::LARGE_FILES);
+            let path = match files::resolve_dir(
+                service.source.as_ref(),
+                dir.as_ref().map(|chunk| chunk.data),
+                large,
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let entries = match files::list(service.source.as_ref(), &path, large).await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let mut chunks = Vec::with_capacity(entries.len() * if large { 2 } else { 1 });
+            let mut wire_len = 0usize;
+            for entry in entries {
+                let payload = files::list_payload(&entry);
+                wire_len = wire_len.saturating_add(4 + payload.len());
+                chunks.push((files::LIST_TAG, payload));
+                if large {
+                    wire_len = wire_len.saturating_add(12);
+                    chunks.push((tag::FILESIZE64, entry.entry.size.to_be_bytes().to_vec()));
+                }
+            }
+            if wire_len > MAX_FRAME_DATA as usize {
+                reply_error(tx, f.trans, "This folder has too many entries.");
+            } else {
+                reply(tx, f.trans, chunks);
+            }
+        }
+
+        t if t == ClientHdr::FileGetInfo.as_u32() => {
+            if !sess.can(bit::DOWNLOAD_FILES) {
+                reply_error(tx, f.trans, "You are not allowed to inspect files.");
+                return;
+            }
+            let Some(service) = ctx.files.as_ref() else {
+                reply_error(tx, f.trans, "Files are not available on this server.");
+                return;
+            };
+            let name = f.chunks().find(|chunk| chunk.tag == tag::FILE_NAME);
+            let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
+            let Some(name) = name else {
+                reply_error(tx, f.trans, "No file name was supplied.");
+                return;
+            };
+            let large = sess.has_cap(cap::LARGE_FILES);
+            let (_path, info, wire_name) = match files::resolve_file(
+                service.source.as_ref(),
+                dir.as_ref().map(|chunk| chunk.data),
+                name.data,
+                large,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let entry = FileEntry {
+                name: info.path.name().unwrap_or_default().to_owned(),
+                kind: info.kind,
+                size: info.size,
+                media_type: info.media_type.clone(),
+                modified: info.modified,
+            };
+            let (type_code, creator) = files::type_creator(&entry);
+            let mut chunks = vec![
+                (tag::FILE_NAME, wire_name),
+                (tag::FILE_TYPE, type_code.to_vec()),
+                (tag::FILE_CREATOR, creator.to_vec()),
+                (
+                    tag::FILE_SIZE,
+                    (info.size.min(u32::MAX as u64) as u32)
+                        .to_be_bytes()
+                        .to_vec(),
+                ),
+            ];
+            if large {
+                chunks.push((tag::FILESIZE64, info.size.to_be_bytes().to_vec()));
+            }
+            chunks.push((tag::FILE_DATE_CREATE, files::date(info.created)));
+            chunks.push((tag::FILE_DATE_MODIFY, files::date(info.modified)));
+            chunks.push((
+                tag::FILE_COMMENT,
+                mac_text(info.comment.as_deref().unwrap_or_default())
+                    .into_iter()
+                    .take(255)
+                    .collect(),
+            ));
+            reply(tx, f.trans, chunks);
+        }
+
+        t if t == ClientHdr::FileGet.as_u32() => {
+            if !sess.can(bit::DOWNLOAD_FILES) {
+                reply_error(tx, f.trans, "You are not allowed to download files.");
+                return;
+            }
+            let Some(service) = ctx.files.as_ref() else {
+                reply_error(tx, f.trans, "Files are not available on this server.");
+                return;
+            };
+            let name = f.chunks().find(|chunk| chunk.tag == tag::FILE_NAME);
+            let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
+            let Some(name) = name else {
+                reply_error(tx, f.trans, "No file name was supplied.");
+                return;
+            };
+            let large = sess.has_cap(cap::LARGE_FILES);
+            let (path, info, wire_name) = match files::resolve_file(
+                service.source.as_ref(),
+                dir.as_ref().map(|chunk| chunk.data),
+                name.data,
+                large,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            if info.kind != FileKind::File {
+                reply_error(tx, f.trans, "That path is not a file.");
+                return;
+            }
+            let mut offset = f
+                .chunks()
+                .find(|chunk| chunk.tag == tag::RFLT)
+                .map(|chunk| u64::from(hxfiles_xfer::rflt::parse_compatible(chunk.data).data))
+                .unwrap_or(0);
+            if let Some(chunk) = f.chunks().find(|chunk| chunk.tag == tag::OFFSET64) {
+                if !large || chunk.data.len() != 8 {
+                    reply_error(tx, f.trans, "Malformed file resume offset.");
+                    return;
+                }
+                offset = u64::from_be_bytes(chunk.data.try_into().expect("eight bytes"));
+            }
+            if offset > info.size {
+                reply_error(tx, f.trans, "Resume offset is beyond the file.");
+                return;
+            }
+            let Some(serial) = ctx.core.session_serial(sess.uid) else {
+                reply_error(tx, f.trans, "Session ended.");
+                return;
+            };
+            let entry = FileEntry {
+                name: info.path.name().unwrap_or_default().to_owned(),
+                kind: info.kind,
+                size: info.size,
+                media_type: info.media_type.clone(),
+                modified: info.modified,
+            };
+            let (type_code, creator) = files::type_creator(&entry);
+            let comment: Vec<_> = mac_text(info.comment.as_deref().unwrap_or_default())
+                .into_iter()
+                .take(255)
+                .collect();
+            let prepared = hxd_files::prepare_legacy(
+                &service.transfers,
+                service.source.clone(),
+                hxd_files::LegacyTransfer {
+                    principal: FilePrincipal {
+                        uid: sess.uid,
+                        serial,
+                    },
+                    path,
+                    offset,
+                    large,
+                    wire_name,
+                    type_code,
+                    creator,
+                    wire_comment: comment,
+                },
+            )
+            .await;
+            let (reference, transfer_size) = match prepared {
+                Ok(value) => value,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let mut chunks = vec![
+                (tag::HTXF_REF, reference.to_be_bytes().to_vec()),
+                (
+                    tag::HTXF_SIZE,
+                    (transfer_size.min(u32::MAX as u64) as u32)
+                        .to_be_bytes()
+                        .to_vec(),
+                ),
+            ];
+            if large {
+                chunks.push((tag::XFERSIZE64, transfer_size.to_be_bytes().to_vec()));
+                chunks.push((
+                    tag::FILE_SIZE,
+                    (info.size.min(u32::MAX as u64) as u32)
+                        .to_be_bytes()
+                        .to_vec(),
+                ));
+                chunks.push((tag::FILESIZE64, info.size.to_be_bytes().to_vec()));
+                chunks.push((tag::OFFSET64, offset.to_be_bytes().to_vec()));
+            }
+            reply(tx, f.trans, chunks);
+        }
+
         // --- Chat -----------------------------------------------------
         t if t == ClientHdr::Chat.as_u32() => {
             let (mut cid, mut style, mut body) = (0u32, 0u16, String::new());
@@ -2422,6 +2653,21 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             debug!("unimplemented transaction {other:#x}");
             reply_error(tx, f.trans, "Not implemented.");
         }
+    }
+}
+
+fn file_error_text(error: &hxd_core::FileError) -> &'static str {
+    match error {
+        hxd_core::FileError::InvalidPath => "Malformed file path.",
+        hxd_core::FileError::NotFound => "File not found.",
+        hxd_core::FileError::NotFolder => "That path is not a folder.",
+        hxd_core::FileError::NotFile => "That path is not a file.",
+        hxd_core::FileError::RangeUnsupported => "This file cannot be resumed.",
+        hxd_core::FileError::RangeInvalid => "Invalid file range.",
+        hxd_core::FileError::OriginChanged => "The file changed at its origin.",
+        hxd_core::FileError::TooLarge => "This file needs Large File support.",
+        hxd_core::FileError::Busy => "The file service is busy.",
+        hxd_core::FileError::Unavailable(_) => "The file service is unavailable.",
     }
 }
 
