@@ -260,7 +260,7 @@ async fn classic_hides_oversized_files_while_large_file_resume_is_exact() {
             &htxf::Preamble {
                 reference,
                 transfer_len,
-                type_code: 1,
+                type_code: 0,
                 flags: 0,
                 resume_digest: None,
             }
@@ -328,7 +328,7 @@ async fn classic_hides_oversized_files_while_large_file_resume_is_exact() {
             &htxf::Preamble {
                 reference,
                 transfer_len,
-                type_code: 1,
+                type_code: 0,
                 flags: htxf::FLAG_LARGE_FILE,
                 resume_digest: None,
             }

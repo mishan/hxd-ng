@@ -81,7 +81,7 @@ impl TransferRegistry {
         let large_flag = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
         if large_flag != transfer.large
             || preamble.flags & htxf::FLAG_RESUME != 0
-            || preamble.type_code != 1
+            || preamble.type_code != 0
             || preamble.transfer_len != transfer.encoded.transfer_len
         {
             return Err(FileError::InvalidPath);
@@ -235,6 +235,11 @@ mod tests {
             Err(FileError::InvalidPath)
         ));
         preamble.transfer_len = transfer_len;
+        assert!(matches!(
+            registry.claim(&core, &preamble),
+            Err(FileError::InvalidPath)
+        ));
+        preamble.type_code = 0;
         core.end_session(principal.uid);
         assert!(matches!(
             registry.claim(&core, &preamble),
