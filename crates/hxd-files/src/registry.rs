@@ -8,32 +8,90 @@ use hxd_core::{Core, FileError, FilePath, FilePrincipal, FileSource};
 use hxfiles_xfer::ffo;
 use hxfiles_xfer::htxf;
 
+use crate::LocalFileSource;
+
+const MAX_PENDING_TRANSFERS: usize = 4_096;
+const MAX_DOWNLOAD_TOKENS: usize = 4_096;
+
 #[derive(Clone)]
-pub struct PreparedTransfer {
+pub struct PreparedDownload {
     pub principal: FilePrincipal,
     pub path: FilePath,
     pub source: Arc<dyn FileSource>,
     pub offset: u64,
+    pub resource_offset: u64,
     pub large: bool,
     pub encoded: ffo::Encoded,
-    pub(crate) expires: Instant,
 }
 
-impl std::fmt::Debug for PreparedTransfer {
+impl std::fmt::Debug for PreparedDownload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedTransfer")
+        f.debug_struct("PreparedDownload")
             .field("principal", &self.principal)
             .field("path", &self.path)
             .field("offset", &self.offset)
+            .field("resource_offset", &self.resource_offset)
             .field("large", &self.large)
             .field("transfer_len", &self.encoded.transfer_len)
             .finish()
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadQuote {
+    pub data_offset: u64,
+    pub resource_offset: u64,
+    pub digest: Option<[u8; htxf::RESUME_DIGEST_LEN]>,
+}
+
+#[derive(Clone)]
+pub struct PreparedUpload {
+    pub principal: FilePrincipal,
+    pub path: FilePath,
+    pub source: Arc<LocalFileSource>,
+    pub owner: String,
+    /// The HTXF payload size declared on FILE_PUT.
+    pub transfer_len: u64,
+    pub large: bool,
+    pub quote: Option<UploadQuote>,
+}
+
+impl std::fmt::Debug for PreparedUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedUpload")
+            .field("principal", &self.principal)
+            .field("path", &self.path)
+            .field("owner", &self.owner)
+            .field("transfer_len", &self.transfer_len)
+            .field("large", &self.large)
+            .field("quote", &self.quote)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PreparedTransfer {
+    Download(PreparedDownload),
+    Upload(PreparedUpload),
+}
+
+impl PreparedTransfer {
+    fn principal(&self) -> FilePrincipal {
+        match self {
+            PreparedTransfer::Download(value) => value.principal,
+            PreparedTransfer::Upload(value) => value.principal,
+        }
+    }
+}
+
+struct Entry {
+    transfer: PreparedTransfer,
+    expires: Instant,
+}
+
 pub struct TransferRegistry {
     ttl: Duration,
-    entries: Mutex<HashMap<u32, PreparedTransfer>>,
+    entries: Mutex<HashMap<u32, Entry>>,
 }
 
 impl TransferRegistry {
@@ -44,17 +102,25 @@ impl TransferRegistry {
         }
     }
 
-    pub fn issue(&self, mut transfer: PreparedTransfer) -> Result<u32, FileError> {
-        transfer.expires = Instant::now() + self.ttl;
+    pub fn issue(&self, transfer: PreparedTransfer) -> Result<u32, FileError> {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|_, value| value.expires > Instant::now());
+        if entries.len() >= MAX_PENDING_TRANSFERS {
+            return Err(FileError::Busy);
+        }
         for _ in 0..64 {
             let mut bytes = [0; 4];
             getrandom::getrandom(&mut bytes)
                 .map_err(|e| FileError::Unavailable(format!("transfer reference: {e}")))?;
             let reference = u32::from_ne_bytes(bytes);
             if reference != 0 && !entries.contains_key(&reference) {
-                entries.insert(reference, transfer);
+                entries.insert(
+                    reference,
+                    Entry {
+                        transfer,
+                        expires: Instant::now() + self.ttl,
+                    },
+                );
                 return Ok(reference);
             }
         }
@@ -69,26 +135,62 @@ impl TransferRegistry {
         preamble: &htxf::Preamble,
     ) -> Result<PreparedTransfer, FileError> {
         let mut entries = self.entries.lock().unwrap();
-        let transfer = entries
+        let entry = entries
             .get(&preamble.reference)
             .ok_or(FileError::NotFound)?;
-        if transfer.expires <= Instant::now()
-            || core.session_serial(transfer.principal.uid) != Some(transfer.principal.serial)
+        let principal = entry.transfer.principal();
+        if entry.expires <= Instant::now()
+            || core.session_serial(principal.uid) != Some(principal.serial)
         {
             entries.remove(&preamble.reference);
             return Err(FileError::NotFound);
         }
-        let large_flag = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
-        if large_flag != transfer.large
-            || preamble.flags & htxf::FLAG_RESUME != 0
-            || preamble.type_code != 0
-            || preamble.transfer_len != transfer.encoded.transfer_len
-        {
+        if preamble.type_code != 0 {
             return Err(FileError::InvalidPath);
+        }
+        match &entry.transfer {
+            PreparedTransfer::Download(transfer) => {
+                let large_flag = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
+                if large_flag != transfer.large
+                    || preamble.flags & htxf::FLAG_RESUME != 0
+                    || preamble.transfer_len != transfer.encoded.transfer_len
+                {
+                    return Err(FileError::InvalidPath);
+                }
+            }
+            PreparedTransfer::Upload(transfer) => {
+                let resume = transfer.quote.is_some();
+                let resumed_bytes = transfer.quote.as_ref().map_or(0, |quote| {
+                    quote.data_offset.saturating_add(quote.resource_offset)
+                });
+                let expected_len = transfer
+                    .transfer_len
+                    .checked_sub(resumed_bytes)
+                    .ok_or(FileError::RangeInvalid)?;
+                let expected_flags = if transfer.large {
+                    htxf::FLAG_LARGE_FILE
+                        | htxf::FLAG_SIZE64
+                        | if resume { htxf::FLAG_RESUME } else { 0 }
+                } else {
+                    0
+                };
+                if preamble.flags != expected_flags || preamble.transfer_len != expected_len {
+                    return Err(FileError::InvalidPath);
+                }
+                match (&transfer.quote, &preamble.resume_digest) {
+                    (Some(quote), Some(echoed))
+                        if quote.digest.as_ref().is_some_and(|expected| {
+                            hxfiles_xfer::resume_digest::matches(expected, echoed)
+                        }) => {}
+                    (None, None) => {}
+                    _ => return Err(FileError::InvalidPath),
+                }
+            }
         }
         Ok(entries
             .remove(&preamble.reference)
-            .expect("entry checked under the same lock"))
+            .expect("entry checked under the same lock")
+            .transfer)
     }
 }
 
@@ -124,6 +226,9 @@ impl DownloadTokens {
         };
         let mut grants = self.grants.lock().unwrap();
         grants.retain(|_, value| value.expires_at > Instant::now());
+        if grants.len() >= MAX_DOWNLOAD_TOKENS {
+            return Err(FileError::Busy);
+        }
         grants.insert(token.clone(), grant);
         Ok(token)
     }
@@ -204,15 +309,15 @@ mod tests {
             false,
         )
         .unwrap();
-        PreparedTransfer {
+        PreparedTransfer::Download(PreparedDownload {
             principal,
             path: FilePath::parse("file").unwrap(),
             source: Arc::new(UnusedSource),
             offset: 0,
+            resource_offset: 0,
             large: false,
             encoded,
-            expires: Instant::now(),
-        }
+        })
     }
 
     #[test]
@@ -221,7 +326,10 @@ mod tests {
         let principal = attach(&core, "first");
         let registry = TransferRegistry::new(Duration::from_secs(30));
         let transfer = prepared(principal);
-        let transfer_len = transfer.encoded.transfer_len;
+        let transfer_len = match &transfer {
+            PreparedTransfer::Download(value) => value.encoded.transfer_len,
+            PreparedTransfer::Upload(_) => unreachable!(),
+        };
         let reference = registry.issue(transfer).unwrap();
         let mut preamble = htxf::Preamble {
             reference,
@@ -261,5 +369,27 @@ mod tests {
         let second = attach(&core, "second");
         assert_ne!(second.serial, first.serial);
         assert!(tokens.resolve(&token, &core).is_none());
+    }
+
+    #[test]
+    fn pending_authorizations_are_bounded() {
+        let core = Core::new();
+        let principal = attach(&core, "first");
+        let registry = TransferRegistry::new(Duration::from_secs(30));
+        let transfer = prepared(principal);
+        for _ in 0..MAX_PENDING_TRANSFERS {
+            registry.issue(transfer.clone()).unwrap();
+        }
+        assert!(matches!(registry.issue(transfer), Err(FileError::Busy)));
+
+        let tokens = DownloadTokens::new(Duration::from_secs(30));
+        let path = FilePath::parse("file").unwrap();
+        for _ in 0..MAX_DOWNLOAD_TOKENS {
+            tokens.issue(principal, path.clone()).unwrap();
+        }
+        assert!(matches!(
+            tokens.issue(principal, path),
+            Err(FileError::Busy)
+        ));
     }
 }

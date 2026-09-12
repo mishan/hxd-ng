@@ -131,6 +131,7 @@ fn error_reply(id: u64, error: FileError) -> String {
         FileError::NotFound => ("not_found", "File not found."),
         FileError::NotFolder => ("not_folder", "Path is not a folder."),
         FileError::NotFile => ("not_file", "Path is not a file."),
+        FileError::AlreadyExists => ("already_exists", "A file already exists at that path."),
         FileError::RangeUnsupported => ("range_unsupported", "This file cannot be resumed."),
         FileError::RangeInvalid => ("range_invalid", "Invalid file range."),
         FileError::OriginChanged => ("origin_changed", "The file changed at its origin."),

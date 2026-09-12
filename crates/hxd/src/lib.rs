@@ -55,19 +55,21 @@ pub struct Config {
     /// Threaded news (`docs/news.md` §13). Absent = no news on either
     /// wire, answered the way a server without the feature answers.
     pub news: Option<NewsSection>,
-    /// Read-only manifest-backed files. Absent means no Files capability,
+    /// Manifest-backed or capability-rooted local files. Absent means no Files capability,
     /// control transactions, transfer listener, or ng download routes.
     pub files: Option<FilesSection>,
 }
 
-/// The read-only Files service (`docs/files-plan.md`).
+/// The Files service (`docs/files-plan.md`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilesSection {
-    /// Local JSON manifest. It names paths and metadata, never origins.
-    pub manifest: PathBuf,
-    /// Fixed HTTP(S) base URL under which manifest paths are fetched.
-    pub origin: String,
+    /// Local JSON manifest. Must be paired with `origin` and excludes `root`.
+    pub manifest: Option<PathBuf>,
+    /// Fixed HTTP(S) base URL. Must be paired with `manifest` and excludes `root`.
+    pub origin: Option<String>,
+    /// Capability root for a writable local file area. Excludes manifest mode.
+    pub root: Option<PathBuf>,
     /// HTXF listener. Omitted means the legacy control port plus one.
     pub bind: Option<String>,
     #[serde(default = "default_files_max_size")]
@@ -76,6 +78,12 @@ pub struct FilesSection {
     pub max_entries: usize,
     #[serde(default = "default_files_max_concurrent")]
     pub max_concurrent: usize,
+    #[serde(default = "default_files_max_partial_bytes")]
+    pub max_partial_bytes: u64,
+    #[serde(default = "default_files_max_partials")]
+    pub max_partials: usize,
+    #[serde(default = "default_files_max_partials_per_account")]
+    pub max_partials_per_account: usize,
     #[serde(default = "default_files_request_timeout")]
     pub request_timeout: u64,
     #[serde(default = "default_files_reference_ttl")]
@@ -84,6 +92,10 @@ pub struct FilesSection {
     pub download_ttl: u64,
     #[serde(default = "default_files_handshake_timeout")]
     pub handshake_timeout: u64,
+    #[serde(default = "default_files_partial_ttl")]
+    pub partial_ttl: u64,
+    #[serde(default = "default_files_upload_timeout")]
+    pub upload_timeout: u64,
 }
 
 fn default_files_max_size() -> u64 {
@@ -94,6 +106,15 @@ fn default_files_max_entries() -> usize {
 }
 fn default_files_max_concurrent() -> usize {
     8
+}
+fn default_files_max_partial_bytes() -> u64 {
+    64 * 1024 * 1024 * 1024
+}
+fn default_files_max_partials() -> usize {
+    1_024
+}
+fn default_files_max_partials_per_account() -> usize {
+    4
 }
 fn default_files_request_timeout() -> u64 {
     15
@@ -106,6 +127,12 @@ fn default_files_download_ttl() -> u64 {
 }
 fn default_files_handshake_timeout() -> u64 {
     10
+}
+fn default_files_partial_ttl() -> u64 {
+    7 * 24 * 60 * 60
+}
+fn default_files_upload_timeout() -> u64 {
+    60 * 60
 }
 
 /// Threaded news (`docs/news.md` §13).
@@ -1297,16 +1324,34 @@ pub fn check_config(config: &Config) -> Result<(), String> {
         news.check()?;
     }
     if let Some(files) = &config.files {
+        if !matches!(
+            (&files.manifest, &files.origin, &files.root),
+            (Some(_), Some(_), None) | (None, None, Some(_))
+        ) {
+            return Err(
+                "[files] requires either root, or both manifest and origin, but never both modes"
+                    .into(),
+            );
+        }
         if files.max_file_size == 0 {
             return Err("[files] max_file_size must be non-zero".into());
         }
-        if files.max_entries == 0 || files.max_concurrent == 0 {
-            return Err("[files] max_entries and max_concurrent must be non-zero".into());
+        if files.max_entries == 0
+            || files.max_concurrent == 0
+            || files.max_partial_bytes == 0
+            || files.max_partials == 0
+            || files.max_partials_per_account == 0
+        {
+            return Err(
+                "[files] size, entry, concurrency, and partial limits must be non-zero".into(),
+            );
         }
         if files.request_timeout == 0
             || files.reference_ttl == 0
             || files.download_ttl == 0
             || files.handshake_timeout == 0
+            || files.partial_ttl == 0
+            || files.upload_timeout == 0
         {
             return Err("[files] timeout and TTL values must be non-zero".into());
         }
@@ -2618,6 +2663,43 @@ sync = "full"
                 ng_caps(&config, Some(&voice), None),
                 vec!["voice".to_string(), "video".to_string()]
             );
+        }
+    }
+
+    #[test]
+    fn files_requires_exactly_one_source_mode_and_secure_nonzero_limits() {
+        let local = parse("[files]\nroot = \"files\"\n").unwrap();
+        check_config(&local).unwrap();
+        let files = local.files.unwrap();
+        assert_eq!(files.root, Some(PathBuf::from("files")));
+        assert!(files.manifest.is_none());
+        assert_eq!(files.max_partials, 1_024);
+        assert_eq!(files.max_partials_per_account, 4);
+        assert_eq!(files.upload_timeout, 60 * 60);
+
+        let manifest =
+            parse("[files]\nmanifest = \"files.json\"\norigin = \"https://example.test/\"\n")
+                .unwrap();
+        check_config(&manifest).unwrap();
+
+        for invalid in [
+            "[files]\n",
+            "[files]\nmanifest = \"files.json\"\n",
+            "[files]\norigin = \"https://example.test/\"\n",
+            "[files]\nroot = \"files\"\nmanifest = \"files.json\"\norigin = \"https://example.test/\"\n",
+        ] {
+            let config = parse(invalid).unwrap();
+            assert!(check_config(&config).unwrap_err().contains("either root"));
+        }
+        for key in [
+            "max_partial_bytes",
+            "max_partials",
+            "max_partials_per_account",
+            "upload_timeout",
+            "partial_ttl",
+        ] {
+            let config = parse(&format!("[files]\nroot = \"files\"\n{key} = 0\n")).unwrap();
+            assert!(check_config(&config).is_err(), "{key}");
         }
     }
 }
