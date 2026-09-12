@@ -250,12 +250,13 @@ max_detached_per_addr = 2
 forwarded_header = "x-forwarded-for"
 ```
 
-### Read-only files
+### Files
 
 Absent means neither wire advertises Files and the HTXF listener is not
-opened. The manifest is local JSON; only the configured HTTP(S) origin may
-provide bytes, so no client or manifest row can turn the server into an
-arbitrary-URL proxy. See [docs/files-plan.md](docs/files-plan.md).
+opened. Choose exactly one source mode. The manifest mode is read-only: only
+the configured HTTP(S) origin may provide bytes, so no client or manifest row
+can turn the server into an arbitrary-URL proxy. See
+[docs/files-plan.md](docs/files-plan.md).
 
 ```toml
 [files]
@@ -270,6 +271,38 @@ reference_ttl = 60            # unclaimed HTXF references
 download_ttl = 60             # ng bearer URLs; reusable for resume
 handshake_timeout = 10        # HTXF preamble seconds
 ```
+
+A local root enables FilePut for accounts with both `upload_files` and
+`upload_anywhere`. Existing files are never overwritten. Uploads are staged in
+an internal mode-0700 directory, scoped by account and destination, and become
+visible through an atomic no-replace link only after the declared transfer has
+arrived and validated. Client paths are resolved beneath an open directory
+capability; absolute paths, traversal, symlinks, and the internal state path are
+not reachable through either protocol.
+
+```toml
+[files]
+root = "/srv/hxd/files"        # must already exist
+# bind = "0.0.0.0:5501"
+max_file_size = 68719476736   # data and resource forks combined
+max_entries = 100000
+max_concurrent = 8
+max_partial_bytes = 68719476736
+max_partials = 1024          # global abandoned/in-progress upload cap
+max_partials_per_account = 4
+request_timeout = 15          # each local read/write must make progress
+upload_timeout = 3600         # hard wall-clock limit for one upload
+partial_ttl = 604800          # abandoned partials, seconds
+reference_ttl = 60
+download_ttl = 60
+handshake_timeout = 10
+```
+
+The local source keeps Finder metadata and resource forks in CAP-format records
+under `.hxd-state`; that directory is reserved to the server and omitted from
+listings. Large File uploads use raw bytes. A resumed one is accepted only when
+the client echoes the server's SHA-256 digest for the exact stored offset and
+trailing window. Folder upload and general file mutation remain separate work.
 
 The manifest schema is deliberately small and strict. Sizes are decimal
 strings so its shape agrees with the ng wire:

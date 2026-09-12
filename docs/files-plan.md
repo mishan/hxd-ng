@@ -1,7 +1,8 @@
 # Files implementation plan
 
-Status: implemented, 2026-09-12. The first slice is read-only,
-manifest-backed HTTP (below). This document is the execution plan and
+Status: first and second slices implemented, 2026-09-12. The first slice is
+read-only manifest-backed HTTP; the second adds a capability-rooted local file
+area and single-file uploads. This document is the execution plan and
 acceptance contract for the Files work across hxd-ng and its clients. The
 exploratory notes in
 [`file-sources.md`](file-sources.md) remain useful design background; this
@@ -26,9 +27,28 @@ HTTP origin through both frontends:
 - ordinary files remain byte-compatible for clients that do not negotiate the
   Large File capability.
 
-This release does not add uploads, mutations, folder-transfer transactions,
-queueing, or a local-directory backend. Those are follow-on work and must not
-be implied by advertising behavior that the server cannot complete safely.
+The first slice did not add uploads, mutations, folder-transfer transactions,
+queueing, or a local-directory backend. The second slice adds only a local
+source and FilePut; general mutations, folder transfers, and queueing remain
+follow-on work and are not implied by the advertised behavior.
+
+### Local writable slice
+
+The local source opens its configured root once as a directory capability and
+performs every later lookup relative to that authority. Protocol paths cannot
+name absolute paths, traverse upward, follow symlinks, or reach `.hxd-state`.
+Uploads require both legacy upload access bits, never overwrite a visible file,
+and are published atomically only after the exact declared body and FFO
+structure validate.
+
+Incomplete uploads live under the mode-0700 `.hxd-state` directory. Their
+opaque names bind the canonical account login to the destination path; limits
+bound their global bytes and count, count per account, concurrent I/O, idle
+time, total duration, and retention. Classic uploads preserve DATA, MACR, and CAP Finder
+metadata. Large File uploads are raw data and resume only after the server
+recomputes the quoted partial length and SHA-256 trailing-window digest and
+constant-time compares the client's echo. HTTP and ng downloads remain
+read-only even when backed by this local area.
 
 ## Repository and branch order
 
@@ -173,9 +193,6 @@ The work is complete only when all of these are true:
 
 The following remain separate milestones:
 
-- FilePut and upload resume, including partial digests and Large File upload
-  flags;
-- local-directory sources and HFS/AppleDouble resource-fork persistence;
 - folder get/put transactions and their 64-bit aggregate counts;
 - move, rename, delete, mkdir, comments, and drop-box semantics;
 - transfer queueing, per-account quotas, and background origin prefetching;

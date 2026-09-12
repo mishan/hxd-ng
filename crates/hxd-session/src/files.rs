@@ -95,6 +95,19 @@ pub(crate) async fn resolve_file(
     Ok((found.path, info, found.name))
 }
 
+pub(crate) async fn resolve_upload(
+    source: &dyn FileSource,
+    dir: Option<&[u8]>,
+    name: &[u8],
+    large: bool,
+) -> Result<FilePath, FileError> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(FileError::InvalidPath);
+    }
+    let parent = resolve_dir(source, dir, large).await?;
+    parent.join(&text::to_utf8(name))
+}
+
 pub(crate) fn list_payload(entry: &WireEntry) -> Vec<u8> {
     let mut out = Vec::with_capacity(20 + entry.name.len());
     out.extend_from_slice(&type_creator(&entry.entry).0);

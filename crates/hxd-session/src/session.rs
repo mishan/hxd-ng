@@ -1706,7 +1706,9 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 media_type: info.media_type.clone(),
                 modified: info.modified,
             };
-            let (type_code, creator) = files::type_creator(&entry);
+            let (inferred_type, inferred_creator) = files::type_creator(&entry);
+            let type_code = info.type_code.unwrap_or(inferred_type);
+            let creator = info.creator_code.unwrap_or(inferred_creator);
             let mut chunks = vec![
                 (tag::FILE_NAME, wire_name),
                 (tag::FILE_TYPE, type_code.to_vec()),
@@ -1767,11 +1769,13 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "That path is not a file.");
                 return;
             }
-            let mut offset = f
+            let resume = f
                 .chunks()
                 .find(|chunk| chunk.tag == tag::RFLT)
-                .map(|chunk| u64::from(hxfiles_xfer::rflt::parse_compatible(chunk.data).data))
-                .unwrap_or(0);
+                .map(|chunk| hxfiles_xfer::rflt::parse_compatible(chunk.data))
+                .unwrap_or_default();
+            let mut offset = u64::from(resume.data);
+            let resource_offset = u64::from(resume.resource);
             if let Some(chunk) = f.chunks().find(|chunk| chunk.tag == tag::OFFSET64) {
                 if !large || chunk.data.len() != 8 {
                     reply_error(tx, f.trans, "Malformed file resume offset.");
@@ -1781,6 +1785,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             if offset > info.size {
                 reply_error(tx, f.trans, "Resume offset is beyond the file.");
+                return;
+            }
+            if resource_offset > info.resource_size {
+                reply_error(
+                    tx,
+                    f.trans,
+                    "Resource-fork resume offset is beyond the file.",
+                );
                 return;
             }
             let Some(serial) = ctx.core.session_serial(sess.uid) else {
@@ -1794,7 +1806,9 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 media_type: info.media_type.clone(),
                 modified: info.modified,
             };
-            let (type_code, creator) = files::type_creator(&entry);
+            let (inferred_type, inferred_creator) = files::type_creator(&entry);
+            let type_code = info.type_code.unwrap_or(inferred_type);
+            let creator = info.creator_code.unwrap_or(inferred_creator);
             let comment: Vec<_> = mac_text(info.comment.as_deref().unwrap_or_default())
                 .into_iter()
                 .take(255)
@@ -1809,6 +1823,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     },
                     path,
                     offset,
+                    resource_offset,
                     large,
                     wire_name,
                     type_code,
@@ -1843,6 +1858,154 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 ));
                 chunks.push((tag::FILESIZE64, info.size.to_be_bytes().to_vec()));
                 chunks.push((tag::OFFSET64, offset.to_be_bytes().to_vec()));
+            }
+            reply(tx, f.trans, chunks);
+        }
+
+        t if t == ClientHdr::FilePut.as_u32() => {
+            if !sess.can(bit::UPLOAD_FILES) || !sess.can(bit::UPLOAD_ANYWHERE) {
+                reply_error(tx, f.trans, "You are not allowed to upload files here.");
+                return;
+            }
+            let Some(service) = ctx.files.as_ref() else {
+                reply_error(tx, f.trans, "Files are not available on this server.");
+                return;
+            };
+            let Some(source) = service.uploads.as_ref() else {
+                reply_error(tx, f.trans, "This file area is read-only.");
+                return;
+            };
+            let Some(name) = f.chunks().find(|chunk| chunk.tag == tag::FILE_NAME) else {
+                reply_error(tx, f.trans, "No file name was supplied.");
+                return;
+            };
+            let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
+            let large = sess.has_cap(cap::LARGE_FILES);
+            let path = match files::resolve_upload(
+                service.source.as_ref(),
+                dir.as_ref().map(|chunk| chunk.data),
+                name.data,
+                large,
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let Some(size32) = f.chunks().find(|chunk| chunk.tag == tag::HTXF_SIZE) else {
+                reply_error(tx, f.trans, "No upload size was supplied.");
+                return;
+            };
+            if size32.data.len() != 4 {
+                reply_error(tx, f.trans, "Malformed upload size.");
+                return;
+            }
+            let legacy_size = u32::from_be_bytes(size32.data.try_into().expect("four bytes"));
+            let size64 = f.chunks().find(|chunk| chunk.tag == tag::XFERSIZE64);
+            let transfer_len = if large {
+                let Some(size64) = size64 else {
+                    reply_error(tx, f.trans, "Large uploads require a 64-bit size.");
+                    return;
+                };
+                if size64.data.len() != 8 {
+                    reply_error(tx, f.trans, "Malformed 64-bit upload size.");
+                    return;
+                }
+                let value = u64::from_be_bytes(size64.data.try_into().expect("eight bytes"));
+                if legacy_size != value.min(u64::from(u32::MAX)) as u32 {
+                    reply_error(tx, f.trans, "Upload sizes disagree.");
+                    return;
+                }
+                value
+            } else {
+                if size64.is_some() {
+                    reply_error(tx, f.trans, "64-bit upload size was not negotiated.");
+                    return;
+                }
+                u64::from(legacy_size)
+            };
+            let preview = f.chunks().find(|chunk| chunk.tag == tag::FILE_PREVIEW);
+            let resume_requested = match preview.as_ref().map(|chunk| chunk.data) {
+                None => false,
+                Some([0, 1] | [0, 2]) => true,
+                Some(_) => {
+                    reply_error(tx, f.trans, "Malformed upload resume option.");
+                    return;
+                }
+            };
+            let Some(serial) = ctx.core.session_serial(sess.uid) else {
+                reply_error(tx, f.trans, "Session ended.");
+                return;
+            };
+            let prepared = hxd_files::prepare_upload(
+                &service.transfers,
+                source.clone(),
+                hxd_files::UploadTransfer {
+                    principal: FilePrincipal {
+                        uid: sess.uid,
+                        serial,
+                    },
+                    path,
+                    owner: sess.account.login.clone(),
+                    transfer_len,
+                    large,
+                    resume_requested,
+                },
+            )
+            .await;
+            let (reference, quote) = match prepared {
+                Ok(value) => value,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let resumed = quote.as_ref().map_or(0, |value| {
+                value.data_offset.saturating_add(value.resource_offset)
+            });
+            let remaining = match transfer_len.checked_sub(resumed) {
+                Some(value) => value,
+                None => {
+                    reply_error(tx, f.trans, "Stored partial exceeds the upload size.");
+                    return;
+                }
+            };
+            let mut chunks = vec![
+                (tag::HTXF_REF, reference.to_be_bytes().to_vec()),
+                (
+                    tag::HTXF_SIZE,
+                    (remaining.min(u64::from(u32::MAX)) as u32)
+                        .to_be_bytes()
+                        .to_vec(),
+                ),
+            ];
+            if large {
+                chunks.push((tag::XFERSIZE64, remaining.to_be_bytes().to_vec()));
+            }
+            if let Some(quote) = quote {
+                if quote.data_offset > u64::from(u32::MAX)
+                    || quote.resource_offset > u64::from(u32::MAX)
+                {
+                    if !large {
+                        reply_error(tx, f.trans, "Stored partial needs Large File support.");
+                        return;
+                    }
+                } else {
+                    let rflt = hxfiles_xfer::rflt::encode(hxfiles_xfer::rflt::Resume {
+                        data: quote.data_offset as u32,
+                        resource: quote.resource_offset as u32,
+                    });
+                    chunks.push((tag::RFLT, rflt.to_vec()));
+                }
+                if large {
+                    chunks.push((tag::OFFSET64, quote.data_offset.to_be_bytes().to_vec()));
+                    if let Some(digest) = quote.digest {
+                        chunks.push((tag::PARTIAL_DIGEST, digest.to_vec()));
+                    }
+                }
             }
             reply(tx, f.trans, chunks);
         }
@@ -2662,6 +2825,7 @@ fn file_error_text(error: &hxd_core::FileError) -> &'static str {
         hxd_core::FileError::NotFound => "File not found.",
         hxd_core::FileError::NotFolder => "That path is not a folder.",
         hxd_core::FileError::NotFile => "That path is not a file.",
+        hxd_core::FileError::AlreadyExists => "A file already exists at that path.",
         hxd_core::FileError::RangeUnsupported => "This file cannot be resumed.",
         hxd_core::FileError::RangeInvalid => "Invalid file range.",
         hxd_core::FileError::OriginChanged => "The file changed at its origin.",

@@ -173,11 +173,19 @@ async fn main() {
         let ng_ctx = hxd::build_ng_ctx(&config, &ctx, voice.as_ref(), files.as_ref())?;
 
         if let (Some(files), Some(listener)) = (files.as_ref(), files_listener) {
-            tracing::info!(
-                "read-only Files from {} with HTXF on {}",
-                config.files.as_ref().unwrap().origin,
-                files.bind
-            );
+            let section = config.files.as_ref().expect("Files service has config");
+            let source = section
+                .root
+                .as_ref()
+                .map(|path| format!("local root {}", path.display()))
+                .or_else(|| {
+                    section
+                        .origin
+                        .as_ref()
+                        .map(|origin| format!("HTTP origin {origin}"))
+                })
+                .expect("validated Files source");
+            tracing::info!("Files from {} with HTXF on {}", source, files.bind);
             let service = files.service.clone();
             let core = ctx.core.clone();
             let timeout = files.handshake_timeout;
