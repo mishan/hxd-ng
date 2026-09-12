@@ -1,5 +1,8 @@
 # Chat history: server-held scrollback for both wires
 
+Status: built — H1–H3 of §10, both wires. H4 is client-side work in
+GtkHx; H5 is moderation.md's.
+
 ROADMAP Phase 6 item 1 promises "server-held scrollback replay" and notes
 that no public server implements fogWraith's spec — hxd-ng becoming the
 first real implementation, and so the reference GtkHx tests against, is
@@ -159,7 +162,10 @@ against a catch-up page by id alone.
 The cost is that public chat lines serialise through one SQLite insert.
 On a server for friends that is nothing; if it ever is something, the
 trait is the seam and a write-behind log with pre-assigned ids is the
-answer behind it, not a weaker ordering rule above it.
+answer behind it, not a weaker ordering rule above it. Until then,
+hxd-ng records the time spent under `log_serial` on the chat path as a
+metric, so the day the insert matters is visible before it is reported
+(hxd-ng-design-review-2026-09.md §5.7); nothing about the path changes.
 
 The insert now sits on the chat path, so the frontends call
 `chat_public` through `off_reactor` exactly as they call `msg` — the

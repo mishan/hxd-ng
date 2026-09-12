@@ -1,5 +1,9 @@
 # Voice chat: one SFU, two signalling wires
 
+Status: built, 2026-09. V0–V4 of §9 have landed on both wires; V5 (real
+clients, one mixed room) is the exit criterion, and §11 holds what is
+open.
+
 hxd-ng implements the fogWraith voice-chat capability — a server-side SFU
 that clients reach over WebRTC, signalled over the client's existing
 control connection — for **both** protocol populations at once. A GtkHx
@@ -234,7 +238,8 @@ That is deliberate and safe *only* because the media layer is sans-IO
 (§5): every call is an in-memory state change on a str0m `Rtc` behind its
 own mutex, never a socket operation or an await. If that ever changes,
 the discipline from the token registry applies (copy out, release, call,
-reacquire).
+reacquire). It has already changed once — §12, the DTLS certificate —
+and what follows from that is §11's open item.
 
 ## 5. The SFU crate and why str0m
 
@@ -522,6 +527,11 @@ V5 is what remains: real clients, real microphones, one room.
 - **The spec pin.** Diff `75d4485` against GtkHx's `525e94e` before V3 and
   record the pin here; if they differ in anything normative, GtkHx is the
   client we test against and its reading wins until it updates.
+- **`VoiceMedia` under the roster lock.** §4's invariant has been false
+  once (§12). Either the SFU goes behind its own lock or an actor with a
+  channel, with the roster holding membership only, or a debug-build
+  assertion or timed test enforces a threshold on every `VoiceMedia`
+  call made under the lock. Neither exists yet.
 
 ---
 
@@ -576,6 +586,16 @@ The SFU now generates one certificate at startup and hands every peer a
 clone. Sharing it is the ordinary shape for a server: a fingerprint
 identifies the server, not the session, and each peer still verifies the
 one its own offer carried.
+
+That fix closed the instance and left the rule as it was, and the design
+review of 2026-09 (§5.4 there) is right that the rule is what bit. The
+discipline from here: the SFU moves behind its own lock, or behind an
+actor with a channel, and the roster holds only the membership set — the
+shape `MediaStore` already has (inline-media.md §4). Until that lands, a
+debug-build assertion or a test times every `VoiceMedia` call made under
+the roster lock and fails above a threshold, so the next call that is
+not a cheap in-memory mutation is caught in CI rather than in the field.
+Open item, §11.
 
 **ICE-lite makes the *local* address load-bearing, and NAT breaks it.**
 str0m's ICE agent discards an inbound STUN request whose destination is

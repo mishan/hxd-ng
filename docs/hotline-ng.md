@@ -1,5 +1,12 @@
 # Hotline-ng: the HTTP-era protocol — MVP design
 
+Status: built — the MVP below, plus history (chat-history.md), the
+inbox (private-messages.md), news (news.md), media (inline-media.md),
+voice and video (voice.md, capabilities-video.md) and identity
+(hotline-ng-identity.md). The vouch requests, the `system` user flag,
+`retry_after` and the `*@host` ban entry are design from companions not
+yet built, and say so where they appear.
+
 The Phase 7 design, opened early and deliberately small: **user list and
 chat**, the minimum a mobile app needs to be immediately usable. This
 document is the protocol spec for that MVP plus the domain-layer changes it
@@ -291,6 +298,7 @@ Requests:
 | `block` / `unblock` | exactly one of `uid` / `login`, or for `unblock` `fingerprint` | `{}` | refuse or accept mail from that account |
 | `blocks` | — | `{ "blocked": [{ "login", "fingerprint"? }] }` | who you have blocked |
 | `nick` | `nick?`, `icon?` | `{}` | nick honored only with use_any_name |
+| `vouch` / `unvouch` / `vouches` | [identity-vouch.md](identity-vouch.md) §3.2 | there | lend a member's standing to an identity key; needs `[extra] vouch` (access-bits.md §4). Params, replies and errors are specified there, not here. *Design* |
 | `ping` | — | `{}` | keepalive for clients that want RTT |
 | `logout` | — | `{}` | ends the session *now* (no grace) |
 
@@ -316,6 +324,12 @@ and "no such uid", so none can be told from the others), `no_inbox`
 (*your* account has none, which is a different thing), `mailbox_full`,
 `blocked`, `server_error`.
 
+`rate_limited` from `chat`, `msg` and the news posts during a
+never-seen key's newcomer delay carries `retry_after` (seconds) in the
+error data, so a client can grey the compose box for that long rather
+than retry blind — [identity-registrar.md](identity-registrar.md) §7.3.
+*Design, with the registrar.*
+
 Events (all carry `seq`):
 
 | `ev` | data | mirrors domain event |
@@ -336,6 +350,7 @@ A `user` object is:
 {
   "uid": 3, "nick": "Alice", "icon": 128,
   "admin": false,
+  "system": false,                 // true for the server's own account only
   "status": "active",              // active | idle | detached
   "transport": "encrypted",        // encrypted | cleartext — see below
   "identity": {                    // absent unless the socket proved one
@@ -346,6 +361,12 @@ A `user` object is:
 ```
 
 Uids remain the 16-bit legacy ids so the two rosters are one roster.
+
+`system` is `true` for exactly one user, the server's reserved account
+([system-account.md](system-account.md) §2): always present in the
+roster snapshot on both wires, `admin` set, protected from kick and ban,
+and the uid that server mail and commands (§3 there) come from and go
+to. *Design; the account is not built yet.*
 
 `transport` comes from [`hotline-ng-auth.md`](hotline-ng-auth.md) §7.2
 and §8, `identity` from [`hotline-ng-identity.md`](hotline-ng-identity.md)
@@ -465,7 +486,12 @@ lands.
 - Rate limiting: per-connection request cap (token bucket, config) from day
   one — this endpoint faces phones on the open internet, a harsher place
   than port 5500. Login attempts per address are separately capped.
-- The ban list applies at WS accept exactly as at legacy accept.
+- The ban list applies at WS accept exactly as at legacy accept. Its
+  entry form gains `*@host`, which bans a registrar: an identity carrying
+  any attestation from that host is refused with `denied`, before the
+  admission policy runs, and it is checked where the identity is, not at
+  accept — [identity-registrar.md](identity-registrar.md) §7.3. *Design,
+  with the registrar.*
 - Roster pollution is bounded three ways: `can_detach` is per-account and
   off for guests (§2), detached sessions are capped per source address,
   and a kick or ban of a detached user ends its session immediately — the

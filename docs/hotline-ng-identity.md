@@ -1,11 +1,16 @@
 # Hotline identity — portable identity, and the identity profile for hotline-ng
 
-Status: draft, for discussion. Implemented in hxd-ng: the identity
-objects (§3, `crates/hl-identity`, with test vectors in
-`identity-test-vectors.json`), the profile's part of authentication (§5),
-cards (§7), account association including `trtp_login` (§8), and the
-`hlid` tool. Not yet: revocation, reserved-name enforcement, and
-everything in the registrar and federation specs.
+Status: partial. Built in hxd-ng: the identity objects (§3,
+`crates/hl-identity`, with test vectors in `identity-test-vectors.json`),
+the profile's part of authentication (§5), cards (§7), account
+association including `trtp_login` (§8), and the `hlid` tool. Design
+only: revocation, rotation and freeze (`identity-registrar.md`, which
+§5.2 step 4, §8.5 and §12 now cite), vouching (`identity-vouch.md`), the
+system account (`system-account.md`), reserved-name enforcement, and
+everything in the federation spec, which does not exist yet. The
+identity object set is frozen at `v = 1` until the registrar's
+revocation path is built end to end; no new identity features before
+then.
 
 This revision splits the earlier single document in two, after review
 pointed out that the transport's authentication and the definition of a
@@ -22,9 +27,12 @@ since code and other documents cite them.
 
 Companion documents: `hotline-ng-auth.md` (the transport this profiles),
 `identity-threat-model.md` (what this protects and from whom),
-`hotline-ng.md` (the WebSocket protocol), and the registrar and
-federation specs (handles, key storage, revocation, presence, vouches —
-referenced but not defined here).
+`hotline-ng.md` (the WebSocket protocol), `identity-registrar.md`
+(handles, revocation, rotation, freeze and key backup — what §5.2 step 4
+and §8.5 apply), `identity-vouch.md` (vouches and the `vouch` capability
+bit), `system-account.md` (the one account meant to be reachable by
+nobody, §8.3), and the federation spec (presence and signed ban lists —
+referenced but not written).
 
 ---
 
@@ -137,11 +145,13 @@ limit is what bounds that cache.
 | `device_enc` | bstr(32) | yes | Device X25519 public key (E2E messaging) |
 | `issued` | uint | yes | |
 | `expires` | uint | yes | Recommended 90 days; renew at one-third remaining |
-| `caps` | uint | no | Absent = all. Bit 0 login, 1 message, 2 vouch, 3 manage |
+| `caps` | uint | no | Absent = all. Bit 0 login, 1 message, 2 vouch — may sign vouches and withdrawals (`identity-vouch.md` §4.1), 3 manage |
 | `name` | tstr | no | Human label, device lists only. 1–64 characters, no leading or trailing space, and no control or invisible characters (§3.5) — it is rendered next to a fingerprint. Absent is fine; present and blank is not |
 | `sig` | bstr(64) | yes | |
 
-Web-client certificates should omit the vouch and manage bits.
+Web-client certificates omit the vouch and manage bits, so a script in
+a browser can neither spend the user's vouches (`identity-vouch.md`
+§4.1) nor revoke their other devices (`identity-registrar.md` §4.4).
 
 ### 3.4 User card
 
@@ -157,7 +167,7 @@ encoded.
 | `icon` | uint | no | Legacy icon id |
 | `profile` | tstr | no | ≤ 2048 bytes |
 | `attestations` | array | no | Attestation objects, each fully signed; at most 8. The size limit alone allows dozens, and each one an unauthenticated caller embeds is a signature the server verifies |
-| `vouches` | array | no | Federation spec; ignored by servers that don't implement it |
+| `vouches` | array | no | Portable vouches for this identity, at most 8, each fully signed (`identity-vouch.md` §4.2); ignored by servers that don't implement it |
 | `links` | array of tstr | no | URLs to display; servers never fetch them |
 | `successor` | bstr(32) | no | SHA-256 of a pre-committed successor identity key (threat model, "stolen identity key"). Once set, immutable: a later card for the same identity that changes or omits it is refused (`bad_card`) by any server that cached the earlier one, and rotation is accepted only to the committed key. A server persists the commitment for identities with standing on it — see §13. |
 | `sig` | bstr(64) | yes | |
@@ -173,7 +183,7 @@ Domain `hl-identity/attestation/v1`, signed by a registrar key.
 | `registrar` | tstr | yes | Registrar host, lowercase. Hostname syntax (ASCII letters, digits, `-`, `.`), 1–253 bytes — it is rendered as part of the handle, and anything else could read downstream as a different host |
 | `registrar_key` | bstr(32) | yes | Hint only; verifiers confirm against the registrar's published key |
 | `handle` | tstr | yes | Local part, 1–64 bytes; full handle is `handle@registrar`. No `@`, no whitespace, and no control or invisible characters — a handle is rendered next to account logins and display names, so a zero-width space or a bidi override in one is a spoof of another |
-| `registered` | uint | yes | First registration; preserved across reissue; the value used for age. Non-zero and no later than `issued` — a registrar writing `0` would hand its users infinite standing wherever `min_attestation_age` is set |
+| `registered` | uint | yes | First registration; preserved across reissue; the value used for age. Non-zero and no later than `issued` — a registrar writing `0` would hand its users infinite standing wherever `[identity.probation] until_age` is set |
 | `issued` | uint | yes | |
 | `expires` | uint | yes | Recommended one year; strictly after `issued` |
 | `level` | uint | no | Registrar-declared signup strictness, 0–3 |
@@ -191,7 +201,8 @@ client that makes one needs the other three.
 
 Defined by the transport, `hotline-ng-auth.md` §4.3. This profile uses it
 for nothing the transport does not; the federation spec signs ban lists
-and vouches with it.
+with it. A vouch is signed by the voucher's own identity or device key
+(`identity-vouch.md` §4.1), never by a server key.
 
 ---
 
@@ -205,7 +216,7 @@ Inside the `identity` block of `GET /.well-known/hotline`
   // "enabled", "bindings", "association", and the "challenge" and "auth"
   // endpoints are the transport's
   "new_accounts": "guest",                // deny | guest | create (§8.1)
-  "min_attestation_age": 0,               // seconds (§11)
+  "min_attestation_age": 0,               // seconds; [identity.probation] until_age (§11, §12)
   "trusted_registrars": [],               // hosts whose attestations are accepted;
                                           // empty accepts none — every identity is unattested
   "endpoints": {
@@ -238,13 +249,17 @@ of an identity.
   "device_cert": "…base64url CBOR…",     // §3.3
   "create":      false,                  // optional, see §5.3
   "login":       "alice",                // optional, see §5.4
-  "password":    "…"
+  "password":    "…",
+  "rotation":    "…base64url CBOR…"      // optional, identity-registrar.md §4.6
 }
 ```
 
 `card` and `device_cert` are required. A request without them is not a
 request this profile can admit, and hxd-ng has no other profile, so it is
-refused (`bad_cert`).
+refused (`bad_cert`). The request MAY carry `rotation`, a rotation
+record (`identity-registrar.md` §4.6) whose `successor` is the
+certificate's `identity`; the server handles it per
+`identity-registrar.md` §7.4.
 
 ### 5.2 Verification
 
@@ -255,12 +270,14 @@ continues in this order and fails on the first error:
    proof — or, on the mTLS binding, the client certificate's key; within
    validity; login capability set;
 3. `card` signature; `identity` matches the certificate;
-4. neither key revoked (cached revocation list; behaviour on a stale cache
-   is a setting);
+4. records fetched per `identity-registrar.md` §7.2 and applied per
+   `identity-registrar.md` §7.3; a stale cache is `[identity]
+   revocation_stale`;
 5. attestations verified against trusted registrars, expired or untrusted
-   ones discarded, age computed from the oldest surviving `registered`;
-6. admission policy (§11): allow list, minimum attestation age, unattested
-   policy.
+   ones discarded, and, after attestation revocations are applied, age
+   computed from the oldest surviving `registered`;
+6. admission policy (§11): allow list, then the standing class and
+   probation of `identity-registrar.md` §7.5.
 
 On success the principal's `subject` is the identity fingerprint and its
 `profile` is the card, the certificate and the accepted attestations, all
@@ -278,7 +295,8 @@ Success (200) adds to the transport's `token` and `expires_in`:
   "handle": "alice@hl.example",            // null if no accepted attestation
   "age": 31536000,                          // seconds; 0 if unattested
   "outcome": "linked",                      // see below
-  "account": "alice"                        // the login, when one is associated
+  "account": "alice",                       // the login, when one is associated
+  "vouched_by": 1                           // live vouches counted, when admitted as vouched (identity-vouch.md §3.3)
 }
 ```
 
@@ -306,6 +324,7 @@ transport's codes:
 | `bad_card`, `bad_cert`, `card_too_large` | 401 | prove it again |
 | `login_failed` | 401 | the `login`/`password` of §5.4 didn't verify |
 | `revoked`, `no_manage` | 403 | policy, or the device certificate lacks `manage` |
+| `rotated`, `frozen` | 403 | a record applied at §5.2 step 4 (`identity-registrar.md` §7.3); `rotated` carries `successor` in the body |
 | `already_linked`, `would_orphan`, `not_linked` | 409 | conflicts with the account's state (§8.2, §8.4) |
 
 `denied` (403) is the transport's code and is what admission policy (§11)
@@ -454,6 +473,12 @@ as guest):
   created under is never one the server gives its own meaning to, `guest`
   in particular.
 
+`create` never applies to an `unknown` identity — one with no accepted
+attestation and no vouch (`identity-registrar.md` §7.3); such an identity
+gets what `[identity.admission] unknown` says, whatever `new_accounts`
+is. An identity a member with standing here answers for
+(`identity-vouch.md` §3.3, §4.3) qualifies as an attested one does.
+
 `deny` is decided on every path that admits an identity with no linked
 account — the unattested one, the `classic_pending_link` one of §8.2, and
 the re-admission of a device already on file (§5.5) — and again when the
@@ -556,9 +581,15 @@ two is the `[identity] trtp_login` setting:
   nobody**, on either wire: no password means every password login is
   refused (the rule above), and the flag refuses the key that was the
   other way in. §8.4's `would_orphan` stops the *server* writing that
-  state; nothing stops an operator typing it, so the file backend names
-  such accounts in a warning at startup, where an operator is looking.
-  Set a password, or allow identity login.
+  state, and the account file makes it unrepresentable from the other
+  side: on an account with no password `identity_login` is derived true,
+  and a file that sets it false is read as true and named in a warning
+  at startup, where an operator is looking. The flag is the account's
+  own only when the account has a password to fall back on. The one
+  legitimate instance is the system account (`system-account.md` §2):
+  an account file marked `system = true` keeps `identity_login = false`
+  with no password, because nobody is meant to reach it, and the
+  startup warning skips it.
 
   A password-less account that is *not* linked has a narrower version of
   the same shape: the plain TCP port admits it (an empty password matches
@@ -569,6 +600,22 @@ two is the `[identity] trtp_login` setting:
 
 Either way the session is identity-aware from the server's point of view
 and indistinguishable from a native identity session in the roster.
+
+**The whole matrix, in one place.** Every combination of the three
+account properties and the two ways in, so that no cell has to be
+derived by hand again. *Password path* is a classic Login (107) on the
+plain TCP port, or inside a tunnel under `trtp_login = verify`;
+*identity path* is an ng `login` on an identity socket, or a tunnelled
+guest login, or `trtp_login = trust`.
+
+| Password | Linked | `identity_login` | Password path | Identity path (this identity) |
+|---|---|---|---|---|
+| yes | no | — | the account | not this account: `new_accounts` decides (§8.1); linking is §8.2 |
+| yes | yes | true | the account | the account |
+| yes | yes | false | the account | `denied` |
+| no | no | derived true | plain TCP: admitted, an empty password matches; tunnel or ng: never self-linked (§8.2), so `new_accounts` decides | `new_accounts` decides |
+| no | yes | derived true | refused, empty password included (§12) | the account |
+| no | yes | false | refused | refused — only `system = true` may be here (system-account.md §2) |
 
 ### 8.4 Unlinking
 
@@ -594,11 +641,12 @@ Re-linking the same identity to the same account brings it all back.
 
 ### 8.5 Rotation
 
-When a rotation record from the registrar spec is verified — either
-carried in the card's attestations as a successor attestation, or picked
-up during revocation refresh — a server holding the predecessor
-fingerprint moves the link to the successor, logs both, and keeps bans and
-reserved names with the account.
+A rotation is its own signed object (`identity-registrar.md` §4.6),
+learned from a trusted registrar's records or from the successor's
+`auth` request (§5.1). It never rides in a card, and an earlier
+revision's "carried in the card's attestations as a successor
+attestation" is withdrawn. What a server accepts, and what moves to the
+successor on acceptance, is `identity-registrar.md` §7.4.
 
 ### 8.6 Legacy clients on the TCP port
 
@@ -670,14 +718,16 @@ longer than a socket. Refusal is the transport's `denied`.
 |---|---|
 | `allow_list` | Non-empty: only these fingerprints or handles are admitted |
 | `trusted_registrars` / `[identity.registrar_keys]` | Whose attestations count. Empty accepts none; there is no "empty means any" |
-| `min_attestation_age` | The oldest accepted `registered` must be at least this many seconds ago |
-| `unattested` | What an identity with no accepted attestation gets: `deny`, `guest`, `allow` |
-| `new_accounts` | What an admitted identity with no linked account gets (§8.1) |
+| `[identity.admission] unknown` | What an identity with no accepted attestation and no vouch gets: `deny`, `guest`, `allow` (`identity-registrar.md` §7.5; was `unattested`) |
+| `[identity.admission] vouched` | The same, for an identity a member with standing here answers for (`identity-vouch.md` §3.3) |
+| `[identity.admission] attested` | The same, for an identity a trusted registrar names |
+| `[identity.probation] until_age` | Own age before full access; until then the session's access is masked per `identity-registrar.md` §7.5 (was `min_attestation_age`, which gated the door; age no longer does) |
+| `new_accounts` | What an admitted attested or vouched identity with no linked account gets (§8.1); never applies to an `unknown` one |
 | `identity_login` (per account) | Whether the linked account accepts identity login at all (§8.1, §8.3) |
 
-The defaults are arranged so that an attested identity is never treated
-worse than an unattested one: `new_accounts = guest` beside
-`unattested = guest`.
+The defaults are arranged so that an attested or vouched identity is
+never treated worse than an unknown one: `new_accounts = guest` beside
+`admission.unknown = guest`.
 
 ---
 
@@ -692,21 +742,32 @@ section because hxd-ng has one profile and one switch.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `[identity] new_accounts` | `guest` | `deny`, `guest`, `create`. The default is `guest` rather than `deny` so that, with `unattested = guest`, an attested identity is never treated worse than an unattested one |
+| `[identity] new_accounts` | `guest` | `deny`, `guest`, `create`. The default is `guest` rather than `deny` so that, with `admission.unknown = guest`, an attested or vouched identity is never treated worse than an unknown one. Never applies to an `unknown` identity (§8.1, `identity-registrar.md` §7.3) |
 | `[identity.default_access]` | guest access | Access bits for accounts `create` writes, keyed exactly as an account file's `[access]` table. The guest fallback is convenient but wrong for anything guests may not have — the messaging extension's `AccessMessaging`, for one — so operators using `create` should set it explicitly |
-| `[identity] max_new_accounts_per_hour` | `60` | Ceiling on accounts `create` may write per hour; `0` turns creation off while leaving the rest of `create` in place. Past the ceiling, identities are still admitted, as guests. `create` writes a file per never-seen key, and with `unattested = guest` any fresh key qualifies |
+| `[identity] max_new_accounts_per_hour` | `60` | Ceiling on accounts `create` may write per hour; `0` turns creation off while leaving the rest of `create` in place. Past the ceiling, identities are still admitted, as guests. `create` writes a file per never-seen attested or vouched key; `admission.unknown = allow` is the one setting under which a bare key qualifies, and this ceiling is then the only bound on it |
 | `[identity] allow_list` | empty | Fingerprints or handles; non-empty means identity login is restricted to these |
-| `[identity] min_attestation_age` | `0` | Seconds |
-| `[identity] unattested` | `guest` | `deny`, `guest`, `allow` |
-| `[identity.registrar_keys]` | empty | Registrar host → base64url public key. **Empty accepts no attestation at all**, so every identity is unattested; there is no "empty means any". Static until the registrar spec's discovery fetch exists |
+| `[identity.admission] unknown`, `vouched`, `attested` | `guest`, `allow`, `allow` | *(not implemented; hxd-ng reads `unattested` today)* What each standing class is admitted as (`identity-registrar.md` §7.5). `unknown` replaces `unattested`, which is read as an alias for one release after the rename lands, with a startup warning |
+| `[identity.probation] until_age` | `2592000` | *(not implemented; hxd-ng reads `min_attestation_age` today)* Own age before full access (`identity-registrar.md` §7.5). Replaces `min_attestation_age`, which gated the door; an alias for one release, with a startup warning |
+| `[identity.probation] clean_record` | `true` | *(not implemented)* A moderation action against the key restarts the clock (`identity-registrar.md` §7.5) |
+| `[identity.probation] access` | the four in `identity-registrar.md` §7.5 | *(not implemented)* Access mask while on probation, `access-bits.md` key names |
+| `[identity.registrar_keys]` | empty | Registrar host → base64url public key: an override consulted before discovery and never refreshed (`identity-registrar.md` §7.1). Until the discovery fetch is built it is also the only source, so **empty accepts no attestation at all** and every identity is unattested; there is no "empty means any" |
 | `[identity] trtp_login` | `verify` | `verify` or `trust`; see §8.3 |
 | `[identity] successors` | `identity-successors` | Where §3.4 successor commitments are kept, for the identities §13 says get one. `""` keeps them in the card cache only, which a restart forgets — and so does enough traffic to evict the card. Making the caches forget is the attack the commitment exists to stop |
-| `[identity] revocation_max_age`, `revocation_stale` | — | *(not implemented)* §5.2 step 4 is stubbed; there is no registrar to fetch a list from yet |
+| `[identity] revocation_max_age` | `3600` | *(not implemented)* How long a fetched record list is cached: the smaller of this and the list's own `expires` (`identity-registrar.md` §7.2) |
+| `[identity] revocation_stale` | `cached` | *(not implemented)* `cached`, `guest`, `deny`: what §5.2 step 4 does when the registrar is unreachable and the cache is past its lifetime (`identity-registrar.md` §7.2) |
+| `[identity] frozen` | `deny` | *(not implemented)* `deny`, `guest`: what a frozen identity is admitted as (`identity-registrar.md` §7.3) |
+| `[identity] revoked_devices`, `revoked_identities` | empty | *(not implemented)* Fingerprints refused by hand, consulted before any registrar (`identity-registrar.md` §7.3) |
+| `[identity] banned_registrars` | empty | *(not implemented)* Hosts whose identities are refused outright, before the admission policy runs (`identity-registrar.md` §7.3) |
+| `[identity] newcomer_delay` | `120` | *(not implemented)* Seconds before a never-seen `unknown` key may chat, message or post; `0` disables (`identity-registrar.md` §7.3) |
 
 Account files gain an `[identity]` table: `fingerprint` (the 52-character
-form), `login` (bool, default true), `allow_self_link` (bool, default
-true) and `reserve_name` (bool, default false). Existing account files
-without it are valid.
+form), `login` (bool, default true; on an account with no password it is
+derived true and cannot be set false, §8.3), `allow_self_link` (bool,
+default true) and `reserve_name` (bool, default false) — and, beside it,
+a file-level `system` flag (bool, default false), marking the one
+account that may be password-less with `login = false`
+(`system-account.md` §2). Existing account files without any of them
+are valid.
 
 An account with a linked identity and no password is reachable *only* by
 proving the identity: the password path refuses it outright, empty
@@ -723,7 +784,8 @@ to run on a server that also serves the legacy port.
   "connection is the credential" path work (§5.5). hxd-ng keys them by
   device public key with the identity public key alongside. Both tables
   are bounded and evicted: they are filled by the `auth` endpoint, which
-  any fresh key can reach when `unattested = guest`. Bounding the *count*
+  any fresh key can reach when `[identity.admission] unknown = guest`.
+  Bounding the *count*
   only bounds the memory if the entries are bounded too — the cached
   bytes are a card (§3.4, 16 KiB) and a certificate (§3.3, 4 KiB), which
   is what those size limits are for.
@@ -735,18 +797,21 @@ to run on a server that also serves the legacy port.
 - **Who gets anchored.** Only an identity with *standing* on this server:
   one with an account here (linked or created) or an attestation the
   server accepted. Anchoring every card that ever authenticated
-  contradicts the bounded-growth rule above — with `unattested = guest`
-  any fresh key can reach the `auth` endpoint, and each one would leave a
+  contradicts the bounded-growth rule above — with
+  `[identity.admission] unknown = guest` any fresh key can reach the
+  `auth` endpoint, and each one would leave a
   durable line behind. What a commitment protects is a relationship
   people on the server have with an identity; a key nobody here knows has
   none yet, and gets its anchor on the login that gives it one. A server
   bounds the table as well and says so in its log when it is full: a
   ceiling that only holds while the operator's policy is restrictive is
   not a bound.
-- Registrar keys for attestation checks are fetched from the registrar's
-  `/.well-known/hotline` over HTTPS and cached with a long lifetime. A
-  server with no outbound network still runs identity; it just accepts no
-  attestations.
+- Registrar keys for attestation checks are resolved in the order of
+  `identity-registrar.md` §7.1: a static `[identity.registrar_keys]`
+  entry first, and only otherwise the registrar's `/.well-known/hotline`
+  over HTTPS, cached for 24 hours, with one refresh on a signature
+  failure before the failure stands. A server with no outbound network
+  still runs identity; it just accepts no attestations.
 - Bounding the verification work one request can buy matters as much as
   bounding storage: a card is an unauthenticated caller's bytes, and
   everything in it that costs a signature check needs a count. hxd-ng
@@ -769,23 +834,26 @@ to run on a server that also serves the legacy port.
 
 ## 14. Open questions
 
-- **`trtp_login = trust` and legacy client UX.** A 1.5 client will still
-  show a login box. Is "type anything" acceptable, or should tunnels
-  advertise a fixed placeholder login the user is told to use?
+- ~~**`trtp_login = trust` and legacy client UX.** A 1.5 client will
+  still show a login box. Is "type anything" acceptable, or should
+  tunnels advertise a fixed placeholder login the user is told to use?~~
+  **Answered: a fixed placeholder.** A tunnel advertises one (`hlid
+  tunnel --login-hint`) and tells the user to type it; the server
+  ignores what is typed, as `trust` already says (§8.3). The login box
+  is a fixture of the client, and the placeholder is what makes filling
+  it harmless.
 - **Reserved name as login name.** Simple and matches how operators think,
   but a user can't reserve a display name that differs from their login.
   Is a separate `reserved_name` field worth the schema change?
 - **Card size and media.** 16 KiB is generous for text and useless for
   images. Should icons and images be referenced by hash through the inline
   media extension rather than inlined?
-- **Device renewal without the identity key.** A phone holding only a device
-  key can't mint its own renewal. The registrar spec needs a renew-device
-  flow that doesn't unwrap the identity key on the device; its shape decides
-  whether 90-day certificates are practical. `identity-enrollment.md` makes
-  renewal a one-key prompt at whichever machine holds the identity key,
-  which is most of the practicality; what it does not do is the case
-  where no such machine exists, which its §12 leaves to the registrar
-  spec.
+- ~~**Device renewal without the identity key.** A phone holding only a
+  device key can't mint its own renewal.~~ **Answered by
+  `identity-registrar.md` §9.4:** a device with no holder restores the
+  seed from a registrar envelope, mints its own certificate and drops
+  the seed. `identity-enrollment.md` covers the case where a holder
+  exists; delegated certification is declined at §9.4 there.
 - **Web device lifetimes.** §3.3 recommends 90 days for every device.
   A browser's device key is a non-extractable `CryptoKey` in IndexedDB,
   which page code cannot read but a copied profile directory can, so
@@ -799,15 +867,13 @@ to run on a server that also serves the legacy port.
   direction — shorter because an XSS can mint tokens for as long as the
   page is open, or longer because four paste ceremonies a year is what
   will stop people using it?
-- **SSO through a registrar.** The transport's open questions
-  (`hotline-ng-auth.md` §13) weigh OIDC as a transport binding. The
-  alternative that keeps users on keys is an OIDC-backed registrar that
-  issues attestations after the IdP login; the server then trusts it
-  through `[identity.registrar_keys]` and `min_attestation_age` with no
-  transport change, and those users keep cards and E2E. It needs the
-  registrar spec, and a client that generates a key without a ceremony —
-  which the web client already does. Worth writing up once the registrar
-  spec exists.
+- ~~**SSO through a registrar.** The transport's open questions
+  (`hotline-ng-auth.md` §13) weigh OIDC as a transport binding; the
+  alternative that keeps users on keys is an OIDC-backed registrar.~~
+  **Answered by `identity-registrar.md` §5.3, `proof = oidc`:** the
+  registrar takes the provider's id_token as signup proof and issues an
+  ordinary attestation, the server trusts it through the knobs of §11
+  with no transport change, and those users keep cards and E2E.
 - **Multiple sessions per identity on one server.** `hotline-ng.md` §12
   already asks whether the roster should group same-user sessions. Identity
   gives it a reliable key to group on; this document doesn't require it.

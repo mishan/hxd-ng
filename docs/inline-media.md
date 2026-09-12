@@ -1,5 +1,9 @@
 # Inline media: images in chat, on both wires
 
+Status: built, both wires, 2026-09. What is still open is marked in
+place and gathered at §12 and §14; the one review decision not yet in
+code is the `410` of §8.2.
+
 ROADMAP Phase 6 item 3 files inline media under "mostly relay +
 capability bits". The relay half is; the other half is a server-side
 image pipeline that decodes hostile bytes and re-encodes them, which is
@@ -232,8 +236,11 @@ which is what a revocation's re-upload block is keyed on.
 The total of canonical bytes across all live handles is capped at
 `max_total_bytes` (default 256 MiB). When an upload would cross it, the
 oldest handles are dropped until it fits — the spec permits deleting
-early, and evicting an old image is better than refusing a new one. A
-server under that pressure is one with a hostile uploader, and the
+early, and evicting an old image is better than refusing a new one. On
+the ng wire an evicted handle answers `410`, not `404`, to a principal
+who could have fetched it (§8.2): the store keeps a tombstone — handle,
+set, original expiry — so that "gone" is told apart from "never yours"
+without telling anyone else anything. A server under that pressure is one with a hostile uploader, and the
 per-account and per-address quotas are the real bound; the total cap is
 what keeps the process alive if those are set generously.
 
@@ -316,7 +323,9 @@ where per-recipient capability already lives.
 
 A download by anyone else, of any handle that exists or does not, is
 `"Media not found"` with code 4 — one answer, so the error cannot be
-used to test whether a handle exists.
+used to test whether a handle exists. A principal *in* the set whose
+handle has since expired or been evicted gets the same code on the
+legacy wire and a distinct status on the ng wire (§8.2).
 
 ### 5.4 History readers
 
@@ -348,9 +357,10 @@ answer 404. **On the legacy wire a history entry carries no media at
 all**, because 700's entries have no allocated sub-fields for it — that
 allocation is chat-history.md §11's open upstream question, and
 inventing numbers for it here would put two implementations on
-different ones. A 1.5 client therefore sees scrollback text where a
-capable ng client sees the image; live lines are unaffected, which is
-where nearly all of the images are.
+different ones. A GtkHx reading history therefore sees scrollback text
+where a capable ng client sees the image; live lines are unaffected,
+which is where nearly all of the images are. (A period client has no
+history at all; 700 is an extension.)
 
 ## 6. Rate limits and the numbers
 
@@ -508,8 +518,19 @@ session that does not exist is 401 whatever the path.
 Errors map the six codes onto status codes rather than a JSON body,
 because a `fetch` caller branches on the status first: 1 → 413,
 2 → 415, 3 → 429 (with `Retry-After`), 4 → 403 on upload, 5 → 503, and
-0 → 400. A download that fails for any reason is **404**, one answer,
-the spec's non-distinguishing rule in HTTP's own words. Bodies are a
+0 → 400. A download by a principal outside the handle's set, or of a
+handle that never existed, is **404**, one answer, the spec's
+non-distinguishing rule in HTTP's own words. A handle that *was* the
+caller's and is gone — swept at `handle_ttl`, evicted under
+`max_total_bytes` (§4), or revoked — is **410 Gone**, so a client can
+render "expired" rather than "forbidden". *(Decided 2026-09 from the
+design review's §5.3; not yet in code, which answers 404 for both.)*
+This narrows the spec's "never distinguish expired from unauthorized"
+deliberately: the spec lets a server delete early, and a handle it
+deleted is one it may say it deleted — to the people who could have
+fetched it. Everyone else gets 404 for a gone handle exactly as for a
+live one, so the answer still tests nothing. The legacy 751 has no
+second code and keeps saying "Media not found" (§7.3). Bodies are a
 one-line JSON `{ "error": { "code": "media_rejected", "text": "…" } }`
 in the ng error shape so a client has one parser.
 
@@ -571,7 +592,11 @@ Pinning a handle while an undelivered row references it would close the
 second case at the cost of letting the inbox extend a handle's life
 indefinitely — a mailbox is capped at `cap` waiting messages, so the
 bound exists, but it is a different bound from the one the spec states.
-Not in v1; §14 keeps it.
+Not in v1; §14 keeps it — with one constraint from the 2026-09 review
+(§5.3 there): the pin lands **before `[inbox]` and `[media]` are enabled
+together in a release**, because that combination is exactly the case a
+phone user hits, a photo sent while they were asleep. §12 lists it as
+the staging risk it is.
 
 ## 10. Privacy and logging
 
@@ -673,6 +698,13 @@ as what each one is tested by.
    table, the CLI — is moderation.md §5's own branch, and lands with the
    redaction and reporting it shares a table with.
 
+**Open before a release enables both.** The undelivered-mail pin (§9,
+§14) is the one item gating a release that turns on `[inbox]` and
+`[media]` together; until it lands, an operator enabling both should
+know that a queued photo older than `handle_ttl` arrives as its
+placeholder. The `410` of §8.2 is the other review decision not yet in
+code, and is small.
+
 E2E lives in `crates/hxd/tests/media.rs`, against real servers on both
 ports: the capability echo and its six limits; single-shot and chunked
 upload; a sliced multi-part download; a capable and a classic client in
@@ -706,7 +738,12 @@ its queued mail. A 1.5 client sees nothing new at all.
   "or the source format".
 - **Pinning handles for undelivered mail** (§9). Reports already pin
   (moderation.md §4.3), so the mechanism will exist; the question is
-  only whether mail should use it.
+  only whether mail should use it — and it is answered as far as
+  release order goes: before `[inbox]` and `[media]` ship together
+  (§12).
+- **`410` for a gone handle** (§8.2) is a narrowing of the spec's
+  non-distinguishing rule, told only to principals in the set; worth
+  saying upstream so the rule can say "to anyone outside the set".
 - **A gateway** is off the table until someone asks for it; when they
   do, the constraints in the spec (public chat only, canonical bytes,
   128-bit paths, at most one upload per line) are the design.

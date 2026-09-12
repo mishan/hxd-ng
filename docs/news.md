@@ -1,5 +1,12 @@
 # Threaded news: articles, attachments, references and search
 
+Status: the ng wire is built — §16 says which stages, and which keys of
+§13 the server accepts. The legacy 1.2 and 1.5 bindings (§12), the
+image part (§12.3) and the mhxd importer (§12.6) are designed and not
+built; the last two are deferred and get status lines of their own when
+scheduled. §10.7's `stale_after` floor is a 2026-09 amendment and is
+not built either.
+
 ROADMAP Phase 4 promises "1.2 flat news post/read, and the 1.5 threaded
 news tree (categories, bundles, threads)". When this was written nothing
 was built: `hxd-session` dispatched no news opcode, `hxd-core` had no
@@ -1586,7 +1593,8 @@ What that buys, in order of how much it saves us writing:
   rule reads a column the badge needs anyway.
 - **It re-arms itself.** The moment a client calls `news_seen`, the next
   post in that scope rings again. Nothing decays, nothing expires,
-  nothing has to be swept.
+  nothing has to be swept — with the one floor below, which is a
+  comparison and not a sweep.
 - **It is per scope, not global**, so a quiet thread you care about is
   not silenced by a loud one you also follow.
 
@@ -1607,8 +1615,25 @@ the same transaction as the article, the row exists before any later
 article gets an id, and it starts caught up at the post, which is the
 thread's newest.
 
-Two floors sit under it:
+Three floors sit under it:
 
+- `[news.notify] stale_after` (default 7 days; `0` disables). The rule
+  as stated silences a scope until `news_seen`, and a client that never
+  calls it — a push-only endpoint, a client with its badge hidden, a
+  legacy client once §10.11's digest exists — would be told about a
+  scope exactly once for the life of the subscription
+  (hxd-ng-design-review-2026-09.md §5.1). So a subscriber who has been
+  un-caught-up for longer than `stale_after` is **treated as caught up
+  for the purpose of the rule**, and the post rings. "How long" is
+  measured from the oldest unread article in the scope, which the
+  audience scan already reads, and it is asked in units of
+  `stale_after`: the post rings if that age has crossed a multiple of
+  the setting since the scope's previous article. One ring per period
+  behind, not one per post, so a hot thread nobody is reading buzzes
+  once a week rather than forty times an evening. It is a comparison at
+  post time against columns already there; there is still no
+  scheduler, no pending state and nothing to sweep, and `max_per_hour`
+  still sits under it.
 - `[news.notify] max_per_hour` per account across every news push
   (default 12), because a subscriber to forty scopes can be rung forty
   times by the rule above. Exceeding it drops the push, never the event
@@ -1745,19 +1770,16 @@ asking the operator. Replying `stop` is not pretty — it is a 1980s
 mailing-list convention wearing a Hotline private message — but it works
 on an unmodified 1.2 client, which no capability transaction does.
 
-What it needs that does not exist yet:
+What it needs, two parts of which are now decided elsewhere and none
+of which is built:
 
-- **A real mailbox for the server.** `Notification.from` is
-  `Option<&Mailbox>` and is `None` when there is nobody to reply to,
-  which is exactly today's state: moderation.md's server messages go out
-  and nothing comes back. A repliable system identity is a reserved
-  account with a mailbox of its own, and reserving it is a decision
-  about the account namespace, not about news.
-- **A parser for the reply**, with the same forgiving posture as
-  §12.5's header block: `stop` on a line by itself, case insensitive,
-  and anything else answered with a short message saying what the word
-  is. Scoped by which notification is being replied to, so `stop` means
-  this thread rather than everything.
+- **A real mailbox for the server** is the system account of
+  system-account.md §2. `Notification.from`, `None` today because there
+  is nobody to reply to, becomes that account's mailbox.
+- **The reply parser** is system-account.md §3's `/stop [#article]`: a
+  command to that account, scoped there to the most recent notification
+  or a named article, so `stop` means this thread rather than
+  everything.
 - **A digest, probably.** One private message per reply is too many even
   under the catch-up rule, because a legacy client has no badge to
   quiet — every notification is an interruption. The catch-up rule needs
@@ -1783,6 +1805,11 @@ them worth attacking.
   account, default 200.
 - **A blocked account cannot notify at all** (§10.5), which is the
   escape hatch for a person rather than a thread.
+- **A client that never marks seen** is the first bullet's other face:
+  without `stale_after` (§10.7) it is rung once per scope and then
+  never, a silence rather than a flood. The floor trades one for the
+  other at a week, and an operator who would rather have the silence
+  sets it to `0`.
 
 ## 11. Moderation and retention
 
@@ -1864,6 +1891,14 @@ encoding, and `parse_news_folderitem` shows clients accept either; we
 send the richer one, which is what lets a client skip a refetch.
 
 ### 12.3 The article listing, and its parts
+
+**Deferred.** The `image/*` part this section ends on — the §7.3
+derivative listed as a third part — is not on the path to a usable
+client: no period client renders it, and an ng client fetches the
+canonical bytes over HTTP (§9.4). It stays here as the shape the wire
+was designed for, and gets a status line of its own when it is
+scheduled (hxd-ng-design-review-2026-09.md §3). The listing itself and
+the `text/*` parts are not deferred; they are W9.
 
 `NEWS_LISTCATEGORY` replies with one `CATLIST` chunk: a `post_count` header,
 then per post `postid`, an 8-byte Mac date, `parentid`, flags,
@@ -2080,6 +2115,11 @@ does not yet name (§1); it goes into the same hx-libs change.
 
 ### 12.6 Importing an mhxd tree
 
+**Deferred.** The importer is not on the path to a usable client and is
+not scheduled; it gets a status line of its own when it is
+(hxd-ng-design-review-2026-09.md §3). What follows is kept so the
+id-remapping and reference rules are decided once.
+
 `hxd import-mhxd-news <dir>` walks a period news directory: `cat_`-
 prefixed directories are categories, others are bundles, and each file
 is RFC-822 headers (`From`, `Content-Type`, `Subject`, `Date`,
@@ -2127,6 +2167,7 @@ auto_subscribe = "participated" # or "own_thread", or "off"
 reference = true                # does citing someone's article notify them
 max_subs = 200                  # followed or muted scopes per account
 max_per_hour = 12               # news pushes per account, all scopes; 0 = badges, no pushes
+stale_after = 604800            # seconds behind before a scope rings again anyway (§10.7); 0 = never
 
 [news.attach]                   # absent = news without attachments
 max_bytes = 2097152             # per attachment, as uploaded
@@ -2342,7 +2383,7 @@ first, and posts back into it by typing `Subject:` and `Re: #398` — the
 two lines it has been reading in every entry — with sane answers filled
 in when it types neither. Ask a question from a laptop, close it,
 and the phone buzzes once when someone answers — once, however many
-people answer, until you have read them. An article deleted by a
+people answer, until you have read them or a week has gone by (§10.7). An article deleted by a
 moderator is a tombstone in every thread on every wire, its bytes
 unlinked and its hash remembered.
 

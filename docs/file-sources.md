@@ -1,8 +1,14 @@
 # File sources: serving a remote origin over HTXF
 
-Status: design exploration, 2026-09-09. Nothing here is built yet — the
+Status: superseded by [`files-plan.md`](files-plan.md) for the first slice; kept as exploratory background (ROADMAP Phase 3 says the same).
+
+Nothing here is built yet — the
 file area is ROADMAP.md Phase 3 and `hxd-session` dispatches no opcode in
 the `0x00c8`–`0x00d5` range today.
+
+The execution scope and acceptance gates are now maintained in
+[`files-plan.md`](files-plan.md); this document remains the lower-level
+exploration that informed that plan.
 
 ## Summary
 
