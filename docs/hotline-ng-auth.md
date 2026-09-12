@@ -1,7 +1,7 @@
 # Hotline-ng transport authentication — an authenticated principal for the ng listener
 
-Status: draft, for discussion. Split out of `hotline-ng-identity.md`
-after review: that document tried to be both the transport's
+Status: partial — built in hxd-ng, less the "not yet" list two
+paragraphs down. Split out of `hotline-ng-identity.md` after review: that document tried to be both the transport's
 authentication layer and the definition of a Hotline identity, and the
 two have different owners and different lifetimes. This document is the
 transport half. It says how a connection to the ng listener acquires an
@@ -221,7 +221,7 @@ authentication, with `Content-Type: application/json`:
     "min_attestation_age": 0,
     "trusted_registrars": []
   },
-  "registrar": null                         // or the registrar spec's block
+  "registrar": null                         // or a registrar's block, identity-registrar.md §3
 }
 ```
 
@@ -925,7 +925,8 @@ the `[identity]` section because hxd-ng has one profile and one switch.
     touches nothing here: an OIDC-backed *registrar* that issues
     attestations after the provider's login, so the user keeps a key and
     the server trusts the registrar through the identity profile's
-    existing knobs. Which route is wanted depends on whether SSO users
+    existing knobs. That route now exists: `identity-registrar.md` §5.3,
+    `proof = oidc`. Which route is wanted depends on whether SSO users
     should have a portable identity, and both can coexist.
   - *DPoP* (RFC 9449) is what §6.2 already is in shape — a server nonce,
     a proof signed by the key, bound to the server, a time window — in

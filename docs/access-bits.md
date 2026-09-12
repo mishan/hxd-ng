@@ -1,5 +1,9 @@
 # Account permissions: every bit, key and switch
 
+Status: built. The `vouch` extra (§4), the `system` flag and the
+probation mask (§5) are design from companions not yet built, and are
+marked so where they appear.
+
 What an account may do on this server is decided in three places, and
 only the first of them crosses the wire:
 
@@ -32,11 +36,16 @@ Where it goes:
   field after login. This is a deliberate deviation: the reference server
   sends an all-ones constant there, and clients grey out what an account
   cannot do based on what they read — which only works if it is true.
-- **ng wire.** The bitmap is never shipped. A client learns what the
+- **ng wire.** The *bitmap* is never shipped. A client learns what the
   *server* offers from `caps` in the login reply, and what its own
-  account may do by being refused: every gate answers `access_denied`.
-  The one access-derived field on the ng roster is `admin`, which is
-  bit 22.
+  account may do from per-feature booleans, each defined where the
+  feature is: `admin` on the roster (bit 22), the news block's `post`,
+  `attach` and `subscribe` (news.md §9.1), `self.identity.probation`
+  (identity-registrar.md §7.5). They exist because a UI has to draw a
+  compose button before anyone has refused it. Everything a UI does not
+  need in advance is learned by being refused — every gate answers
+  `access_denied` — and the booleans grow one feature at a time, never
+  into a second bitmap.
 
 Granting, in an account file (`hxd-auth-file`, one TOML file per
 account):
@@ -202,6 +211,7 @@ key derives a default rather than being false.
 | `can_detach` | May a session outlive its connection — the ng detach/resume path | A password *or* a linked identity. What disqualifies an account is not the missing password but the missing person: `guest` is one login several people share, and a drive-by should not get to park a nick on the roster |
 | `set_subject` | May this account set the public chat subject | Tracks `disconnect_users`, preserving the reference server's spirit of a config-granted privilege rather than a wire bit |
 | `inbox` | May private messages be stored for this account and delivered later | The same rule `can_detach` derives by, for the same reason: queuing mail against a shared login hands it to whoever logs in next |
+| `vouch` | May this account vouch for an identity key — `identity-vouch.md` §3.1, the requests in §3.2 there. *Design; not read by the server yet* | The same rule as `can_detach`: a password *or* a linked identity. An account that was itself created on the strength of a vouch derives `false` until the operator sets it |
 
 ---
 
@@ -218,9 +228,25 @@ they say who may *become* this account rather than what it may do.
 | `allow_self_link` | May a holder link their own key to this account | `true` |
 | `reserve_name` | Is the account's name reserved for the linked identity | `false` |
 
+Beside them, one file-level flag, because it is about who may be the
+account rather than what it may do: **`system`** (bool, default
+`false`) marks the server's own account — `system-account.md` §2 — the
+one account that is legitimately reachable by nobody: no password,
+`login = false`, an empty bitmap, always on the roster. One per server,
+written on first start. *Design; not read by the server yet.*
+
 An account with no password and `login = false` can be reached by
 nothing. `unlink` refuses to write that state; an operator typing it by
-hand gets a startup complaint instead.
+hand gets a startup complaint instead — unless the file says `system =
+true`, which is what tells the startup check that this is the one
+account for which the state is intended.
+
+**The probation mask.** `[identity.probation] access`
+(identity-registrar.md §7.5) uses the key names of §2's `[access]` and
+§4's `[extra]` tables, validated against the same table as an account
+file; a session on probation has its resolved access masked by it, and
+a key absent from the mask leaves that permission as the account has
+it. *Design, with the registrar.*
 
 ---
 

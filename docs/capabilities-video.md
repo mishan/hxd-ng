@@ -1,6 +1,7 @@
 # Video Chat Extension
 
-> **Status: draft, 2026-09.** Written in the shape of a fogWraith
+> **Status: draft, 2026-09; built in hxd-ng, GtkHx rendering pending.**
+> Written in the shape of a fogWraith
 > protocol document so it can be contributed upstream as
 > `Docs/Protocol/Capabilities-Video.md`. Section 16 (the Hotline-ng
 > binding) is **not** part of the classic-protocol extension and would be

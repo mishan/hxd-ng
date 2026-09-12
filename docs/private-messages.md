@@ -1,5 +1,10 @@
 # Private messages, and an inbox for the offline
 
+Status: built — the SQLite store, the domain, both wires, the notify
+seam and blocking (M1–M6 of §13) are in hxd-ng. §8's delivered/read
+split, under which delivery to a legacy client no longer marks a
+message read, is a 2026-09 amendment and is design until it lands.
+
 Phase 7 item 2 promises "a durable per-user inbox: DMs and mentions that
 arrive while detached are stored and delivered on reconnect, with read
 state," and `docs/push-notifications.md` §6 states the consequence
@@ -213,7 +218,8 @@ pub trait MessageStore: Send + Sync + 'static {
     fn pending(&self, to: &Mailbox, limit: usize) -> Result<Vec<StoredMessage>, StoreError>;
     fn pending_count(&self, to: &Mailbox) -> Result<usize, StoreError>;
     fn is_pending(&self, to: &Mailbox, id: MessageId) -> Result<bool, StoreError>;
-    // `Delivery::Read` is the legacy wire: see §11.
+    // `Delivery::Read` was the legacy wire's, and §8 retires it: once
+    // the delivered/read split lands nothing passes it and it goes.
     fn mark_delivered(&self, ids: &[MessageId], at: SystemTime, what: Delivery)
         -> Result<(), StoreError>;
     fn mark_read(&self, to: &Mailbox, up_to: MessageId, at: SystemTime)
@@ -263,8 +269,8 @@ CREATE TABLE message (
   body         TEXT    NOT NULL,
   guid         TEXT,                  -- the client's own id, when it gave one
   sent_at      INTEGER NOT NULL,      -- unix seconds
-  delivered_at INTEGER,               -- handed to a live connection
-  read_at      INTEGER                -- the client said so
+  delivered_at INTEGER,               -- handed to a live connection, on either wire
+  read_at      INTEGER                -- an ng client said so (`msg_read`); never the legacy wire (§8)
 );
 -- Retry safety: one message per (sender, recipient, guid), keyed on the
 -- *mailbox* rather than on its two columns — see below.
@@ -473,6 +479,15 @@ nick equals the reader's own renders as that reader's own words, since
 GtkHx classifies `is_self` by name. Whether a 1.5 client does the same
 thing with uid 0 has not been checked against a real one.
 
+There is a second answer once the system account exists.
+system-account.md §4 delivers absent-sender mail from *that* account's
+uid instead: the window is titled *Server*, the `[queued …]` stamp says
+who, and the reply box addresses something that can act on `/msg
+<login> …`, which is a reply that reaches someone. It is `[system]
+queued_from_system`, off by default until it has been seen on a real
+1.5 client — the same caution as the paragraph above, pointed the other
+way.
+
 Concretely `Event::Msg` carries `from`, `from_nick`, `from_login`, the
 text, the stored `id`, `sent_at`, and `queued` — one boolean rather than
 a timestamp comparison against a threshold, because a threshold is a bug
@@ -536,12 +551,13 @@ frontend, not in the stored body — and when Capabilities-Messaging lands
 it becomes the *fallback* path, for clients that negotiate no messaging
 capability (§12).
 
-**Not inventing an addressing mechanism for 1.x.** A server pseudo-user
-taking `/msg <login> …` would let period clients address accounts, and it
-was considered: a permanent fake roster row and a command language on a
-wire that has none, to give a twenty-five-year-old client a feature its
-UI has no concept of. Capabilities-Messaging's `Find User (822)` is the
-right answer to that question and it is a different subsystem.
+**Addressing an account from 1.x is a command to the system account.**
+`/msg <login> …` exists, as a private message to the reserved account of
+system-account.md §3 — not as the pseudo-user with a command language
+of its own that an earlier draft of this paragraph declined to invent.
+Capabilities-Messaging's `Find User (822)` is the right answer to that
+question for a client that can negotiate it, and it is a different
+subsystem.
 
 ## 8. Read state
 
@@ -549,15 +565,29 @@ Three timestamps, each meaning one thing: `sent_at`, `delivered_at` (the
 server handed it to a live connection), `read_at` (a client said so, via
 `msg_read`).
 
-A legacy session has no way to say it read something, so on that wire
-**delivery is the read**: the flush sets both. That is not a shortcut, it
-is the truth about what that wire can express, and the alternative — a
-permanently unread inbox for every 1.x user — would make the unread count
-useless for the accounts that use both wires. It belongs to the *session* rather than to
-the store or to the caller: `flush_inbox(uid)` reads the flag off the
-session it is flushing to, because the same mailbox is read on both
-wires and the answer differs per connection — a phone and a 1.5 client
-holding one account at once each get the rule their own wire can honour.
+A legacy session has no way to say it read something, and an earlier
+draft of this section made delivery the read on that wire — the flush
+set both — on the argument that a permanently unread inbox for every 1.x
+user would make the count useless. The consequence it did not state is
+the one a person with a phone and a period client meets: the phone's
+badge drops to zero because the Mac received the message
+(hxd-ng-design-review-2026-09.md §5.2). So the two are split.
+**Delivery to a legacy session sets `delivered_at` only.** `read_at` is
+set by the ng `msg_read` request, and by nothing on the legacy wire.
+`inbox.unread`, and the login reply's count, are messages with no
+`read_at` — which is what a badge means anyway, and the same split XMPP
+made between delivery and display receipts.
+
+Said plainly, because a client author and an operator will both meet
+it: **mail delivered to a period client stays unread on the ng side
+until an ng client marks it.** An account used only from 1.x has a
+count that only grows, and nothing on that wire can lower it; that is
+the truth about what the wire can express, and the badge it would have
+zeroed is on a client that wire's user does not have. Retention follows
+the same fact: `retain_read` never applies to mail only a legacy client
+has seen, and `retain_unread` does — thirty days from `sent_at` rather
+than seven from a read that never happened. The flush no longer needs
+to know which wire it is writing to.
 
 And one more thing that wire cannot do, said here rather than discovered:
 **`delivered_at` on the legacy wire means "handed to the writer task"**,

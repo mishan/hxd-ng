@@ -1,5 +1,10 @@
 # Moderation: removing bad content, and hearing about it
 
+Status: design, not built. Kick and ban are what they have always been;
+the acts, reports, tables and requests below are chat-history.md §10's
+H5 and wait on it. The 2026-09 amendments from system-account.md §6 and
+identity-vouch.md §6 and §10 are folded in.
+
 [chat-history.md](chat-history.md) makes public chat a record and
 [inline-media.md](inline-media.md) lets people post images into it. A
 server that keeps what people said and shows what people sent needs a
@@ -144,6 +149,14 @@ A purge is by sender identity, not by uid: the sender may be gone, and
 the uid may be someone else's by now. The chat log stores login and
 fingerprint for exactly this (chat-history.md §3.3).
 
+Every path that bans — `kick { ban }` on the ng wire, a legacy kick
+with ban, an entry added to the ban list, and `kick { purge }` — also
+writes the voucher suspension identity-vouch.md §6 describes when the
+subject was admitted on a vouch. What it writes, for how long, and what
+it pointedly does not do to the voucher are that section's to say; the
+row it leaves is §7's `vouched_banned`, and the moderator making the
+decision has the voucher's name in front of them (`vouched_by`, §7).
+
 ### 3.4 What is not an act
 
 - **Editing a line** (704 upstream). No. A moderator changes what a
@@ -216,10 +229,12 @@ closing.
 
 At filing, `Event::Report { id, kind, summary }` goes to every session
 whose account has `moderate`. On the ng wire that is a `report` event;
-on the legacy wire it is a **server message** (104, the shape the inbox
-already uses for queued mail from an absent sender): one line,
+on the legacy wire it is a **private message from the system account's
+uid** (system-account.md §2), not the reader's own: one line,
 `[report #17] alice reported an image from bob: "…reason…"`, and nothing
-a period client has to understand beyond a PM window opening. An
+a period client has to understand beyond a PM window opening — one
+whose reply box addresses the account that takes `/report` and the
+rest of system-account.md §3. An
 operator who does not want moderators' 1.5 clients popping windows
 turns it off with `[moderation] notify_legacy = false`; the report is
 still there when they look.
@@ -277,14 +292,22 @@ line with media returns `media` without `id` and with
   server's.
 - **Revocation reaches the next download only.** A client that already
   has the bytes has them.
-- **Reports arrive as server messages** (§4.5) and the moderator acts
-  from an ng client or the CLI. A `/report` chat command was
-  considered and rejected: the reference server has no commands, and a
-  period client typing `/report` expects it to be chat.
+- **Reports arrive as private messages from the system account** (§4.5)
+  and the moderator acts from an ng client or the CLI. A `/report`
+  *chat* command was considered and rejected, and the objection stands:
+  public chat is never parsed, and a period client typing `/report`
+  expects it to be chat. `/report <who> <reason…>` exists as a command
+  to the system account instead, system-account.md §3, which a 1.2
+  client can use because it is a private message.
 - **Kick and ban** are unchanged, and `[moderation] kick_purges =
   seconds` makes a legacy kick purge the target's recent output as the
   ng `kick { purge }` does — off by default, because a kick over the
-  legacy wire has meant one thing for twenty-five years.
+  legacy wire has meant one thing for twenty-five years. Two things
+  reach the ban list from the identity work without a new transaction:
+  its entry forms gain `*@host`, which bans a registrar
+  (identity-registrar.md §7.3), and a ban of a vouched identity from
+  this wire writes the same voucher suspension as one from the ng wire
+  (§3.3, identity-vouch.md §6).
 
 ## 7. Storage, CLI, configuration
 
@@ -293,13 +316,14 @@ Schema version 2 (the same bump as history and media) adds:
 ```sql
 CREATE TABLE moderation (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind         INTEGER NOT NULL,        -- redact | revoke | purge | close
+  kind         INTEGER NOT NULL,        -- redact | revoke | purge | close | vouched_banned
   actor        TEXT    NOT NULL,        -- login, or 'cli'
   actor_fp     TEXT,
   target_line  INTEGER,
   target_media BLOB,
   target_login TEXT,
   target_fp    TEXT,
+  vouched_by   TEXT,                    -- voucher's login, when the target was admitted on a vouch
   reason       TEXT    NOT NULL,
   evidence     TEXT,                    -- scrubbed after evidence_days
   media_hash   BLOB,
@@ -311,6 +335,7 @@ CREATE TABLE report (
   reporter     TEXT, reporter_fp TEXT,  -- NULL for a guest
   target_line  INTEGER, target_media BLOB, target_msg INTEGER,
   target_login TEXT, target_fp TEXT,
+  vouched_by   TEXT,                    -- as on moderation
   reason       TEXT    NOT NULL,
   evidence     TEXT,
   verified     INTEGER NOT NULL DEFAULT 1,
@@ -323,6 +348,14 @@ CREATE TABLE media_block ( hash BLOB PRIMARY KEY, at INTEGER NOT NULL, by TEXT N
 
 `chat_line` gains `deleted_by TEXT`; the audit row is the record, the
 column is the fast answer.
+
+`vouched_banned` is the row identity-vouch.md §6 writes from every ban
+path (§3.3): `target_*` is the banned identity, `vouched_by` the
+voucher, one row per voucher with an account here, and the moderation
+UI shows it beside the voucher's name for as long as the suspension
+lasts. `vouched_by` on both tables is what puts the voucher's name in
+front of the moderator; the ng `report` object and `moderation_log`
+entries carry it when set.
 
 CLI, beside `inbox purge` and in its shape:
 

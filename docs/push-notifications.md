@@ -1,5 +1,9 @@
 # Push notifications: delegating the device registry to uniqush-push
 
+Status: design; only the `NotificationGateway` trait exists. The first
+gateway to build is decided below, and it is not the one this document
+was written around.
+
 Phase 7 item 3 promises "a `NotificationGateway` trait (APNs / FCM /
 UnifiedPush / WebPush behind it) plus a device-token registry." This
 document argues that we should **build the trait and not the registry** —
@@ -27,6 +31,21 @@ once identity landed:
 - **Credentials are per server, and the app is not.** An operator's push
   credentials are a VAPID keypair, while a native app reaches APNs and FCM
   through a relay its publisher runs (§8.1, §8.2).
+
+**Decision, 2026-09: the first gateway is `WebPushGateway`, in-process.**
+The design review (`hxd-ng-design-review-2026-09.md` §3, action 1) is
+right that the sidecar is more than the first gateway needs. A native
+Web Push sender — VAPID (RFC 8292), the delivery protocol (RFC 8030) and
+the payload encryption (RFC 8291) — is one crate behind the existing
+`NotificationGateway` trait, no daemon, no Redis, and it is the escape
+hatch §3 and §10 already reserve. It goes first; the license review §3
+mentions for a native implementation comes before the crate. The
+uniqush design the rest of this document describes is **kept**, as the
+multi-vendor path for when there is an iOS app that needs APNs; when
+that is scheduled, this document moves to `docs/proposals/` and the Web
+Push gateway gets its own. Nothing below is withdrawn — the seam (§4),
+the subscriber model (§5), the payload rules (§6) and the protocol
+additions (§8) hold for either gateway; only the order changed.
 
 ---
 

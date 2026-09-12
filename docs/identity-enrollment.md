@@ -1,6 +1,6 @@
 # Identity enrollment — certifying a device without the paste
 
-Status: draft, being built. Done in hxd-ng: the §4 request and the §5.4
+Status: partial. Done in hxd-ng: the §4 request and the §5.4
 bundle in `hl-identity`, with test vectors; `hlid cert --bundle`, which
 writes a bundle for the paste path; the §5 mailbox, served under
 `/identity/enroll` and advertised in discovery; CORS on the identity
@@ -123,6 +123,16 @@ one format.
 Five routes under the advertised prefix. All bodies are JSON. Secrets
 are 32 bytes base64url, handled as `hotline-ng.md` §9 handles tokens:
 CSPRNG, stored hashed, never logged.
+
+The typed-code path — §5.1 through §5.5, with the human comparison of
+§6 and §9 — is the normative ceremony, and an implementation of any
+role here MUST support it. The QR code of §5.6 and the paste that
+hx-ng's `identity-keys.md` §7 describes are optional client
+conveniences over it: the QR adds a pinned identity and a pairing proof
+to the same five routes, the paste bypasses them, and neither is
+required of a mailbox, a holder or an enrollee. Three normative
+ceremonies would be three audit surfaces for one trust decision; this
+is the one.
 
 ### 5.1 The holder opens a session
 
@@ -640,18 +650,13 @@ enrollee and a holder on different servers should see the same clock.
 - **A subscription instead of a poll** for the holder, over a WebSocket
   on the ng listener. The `pending` shape is designed to be pushed
   unchanged. Not needed until an agent is expected to run for days.
-- **Mobile without a desktop.** This flow enrolls a phone when the user
-  has a holder somewhere else. A user who has no holder needs the
-  identity key on the phone, and there are two candidate routes, neither
-  of which this document takes: a registrar-held password-wrapped key
-  envelope unwrapped on the phone by a WebAuthn PRF passkey, in a Worker
-  that mints the certificate and exits (hx-ng's phase C plus a registrar
-  backup); or *delegated certification*, where an already-enrolled
-  device with a new capability bit may certify another device to depth
-  one, which also answers `hotline-ng-identity.md` §14's "device renewal
-  without the identity key" and would let a phone enroll a phone with the
-  identity key offline. The second widens what a stolen device can do
-  and needs its own threat-model entry before it is more than a
-  question. Both belong to the registrar spec.
+- ~~**Mobile without a desktop.** This flow enrolls a phone when the
+  user has a holder somewhere else. A user who has no holder needs the
+  identity key on the phone.~~ **Answered by `identity-registrar.md`
+  §9.4:** the phone fetches a registrar envelope, unwraps the seed
+  briefly, mints its own certificate and drops it — hx-ng's phase C with
+  the registrar as the copy. The other route, *delegated certification*
+  (an enrolled device certifying another to depth one), is declined
+  there for widening what a stolen device can do.
 - **Denial reasons.** `denied` carries a free string for the enrollee's
   UI. If there turn out to be three reasons, they should be codes.
