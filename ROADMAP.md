@@ -244,6 +244,12 @@ administered entirely from GtkHx. This is the dogfooding point.
 
 ## Phase 3 — Files and transfers
 
+The execution plan for the first read-only slice, including the GtkHx
+crate extraction and the Large File capability, is
+[`docs/files-plan.md`](docs/files-plan.md). The older
+[`docs/file-sources.md`](docs/file-sources.md) document is exploratory
+background, not a separate implementation contract.
+
 - File area rooted in config; listing, info, move/rename/delete/mkdir,
   comments; drop-box semantics (upload-only folders).
 - Resource forks via `hxhfs` sidecars, fork headers via `hxfiles-xfer`.

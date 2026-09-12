@@ -1,62 +1,130 @@
 # hxd-ng
 
-A Hotline server in Rust, written from scratch. It serves two protocol
-populations from one shared state:
+A Hotline server, written from scratch in Rust, that serves the Hotline
+clients of 1997 and the phones of today from one shared state — and a new
+protocol, **Hotline-ng**, for the clients that want more than 1997 offered.
 
-- **Legacy Hotline**, TCP `:5500` — the 1.2/1.5 wire format, byte-compatible
-  with clients from the late 90s.
-- **Hotline-ng**, WebSocket `:5700` — a JSON protocol designed mobile-first,
-  where a session survives a dropped connection.
+## What Hotline is
 
-One roster, one set of chat rooms, one voice room. A 1.5 client and a phone
-are in the same conversation, and neither can tell which wire the other is
-on.
+[Hotline](https://en.wikipedia.org/wiki/Hotline_Communications) was a
+Mac-first chat, file-sharing and bulletin-board system from the late
+1990s: you ran a server, people connected to it directly, and a tracker
+told them where servers were. Nothing about it was centralised, which is
+why it still exists. A small community still runs servers, writes clients,
+and extends the protocol; [hlwiki.com](https://hlwiki.com/index.php/Clients)
+keeps the list.
 
-Two clients already speak to it: [GtkHx](https://github.com/mishan/gtkhx),
-the period client revival, on the legacy wire, and
-[hx-ng](https://github.com/mishan/hx-ng), a browser client, on the ng one.
+## What hxd-ng is
 
-**Never break old clients** is the hard requirement, and it outranks
-everything else here. Deviations from reference-server behavior are
-deliberate and commented at the site.
+A server that speaks two wires from one roster, one set of chat rooms and
+one voice room:
 
-## What it does
+- **Legacy Hotline** on TCP `:5500` — the classic wire, byte-compatible
+  with 1.2 and 1.5 clients and with the modern clients that speak it.
+  *Never break an old client* is the rule that outranks every other, and
+  an unmodified 1.5 client on an emulated Mac is the check a release has
+  to pass.
+- **Hotline-ng** on WebSocket `:5700` — a JSON protocol designed for
+  phones: a session survives a dropped connection, private messages wait
+  for you, identity is a key you carry between servers, and voice and
+  video are one WebRTC connection.
 
-- **Chat, private chats, private messages, moderation** on both wires, with
-  mhxd as the behavioral reference for everything a period client can
-  observe.
-- **Voice and video** through one SFU: one UDP port, one peer connection,
-  one room shared across both wires. Video adds media sections to the voice
-  session rather than standing up anything of its own, and nothing is
-  delivered to a peer that has not subscribed to it.
-- **Images in chat**, on both wires. A photo attached in a 1.5 client
-  renders in the browser and the other way round: the server validates,
-  re-encodes and strips every byte of metadata, hands back an opaque
-  handle, and decides who may fetch it from who was in the room when the
-  line was sent. Clients that never negotiated the capability see the
-  caption and nothing else.
-- **Portable identity** — an Ed25519 keypair is who you are, independent of
-  any one server's account table. A client proves it over HTTP, links it to
-  an account, and can carry it to another server. Legacy clients reach it
-  too, through a TRTP-over-WebSocket tunnel.
-- **Private messages that outlive a session.** Mail for someone who is not
-  there is stored and handed over when they arrive — so a 1.5 client's
-  message reaches a phone that was asleep, and an ng client can address an
-  account that holds no session at all.
-- **Threaded news** on the ng wire: categories and bundles, articles that
-  thread as replies and may be written in markdown, references between
-  articles (a `#51` in the text, or a `[link](news:51)`) with backlinks,
-  tombstones that keep a thread's shape when an article
-  goes, and full-text search across all of it. Follow a thread or a
-  category and it keeps an unread count and tells you what is new; a
-  reply to your own article finds you. A 1.5 client in the same room sees
-  nothing change: the legacy wire carries no news yet.
-- **Sessions that survive the network.** An ng session detaches when its
-  socket dies and resumes with a gapless event replay; the roster shows it
-  as away in the meantime.
+Someone on a 1.5 client and someone on a phone are in the same chat,
+see each other on the same user list, and send each other private
+messages; neither can tell which wire the other is on. Where the ng wire
+offers something the classic wire cannot carry, the classic client sees
+what it always saw and nothing breaks.
 
-Status and what is not built yet: [ROADMAP.md](ROADMAP.md). Orientation for
-working in the code: [AGENTS.md](AGENTS.md).
+## What it offers today
+
+Three populations reach this server, and not every feature reaches all
+three. **Period client** means unmodified Hotline 1.2 / 1.5 / 1.9 on the
+classic wire. **Extended client** means a modern client on the classic
+wire that negotiates the community's protocol extensions — today that is
+[GtkHx](https://github.com/mishan/gtkhx). **ng client** means anything on
+the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
+
+| | Period client | Extended client (GtkHx) | ng client (hx-ng) |
+|---|---|---|---|
+| Public chat, private chats, user list, private messages | yes | yes | yes |
+| Kick, ban, broadcast, server notices | yes | yes | yes |
+| **Private messages that wait for you** while you are away | receives them | receives them | sends, receives, reads later, blocks |
+| **Sessions that survive the network** — close the app, reopen, nothing missed | shown as away | shown as away | yes |
+| **Chat history** — scrollback the server kept | — | yes | yes |
+| **Images in chat**, re-encoded and metadata-stripped by the server | sees the caption | yes | yes |
+| **Voice chat** — one room, one UDP port, no transcoding | — | yes | yes |
+| **Video** — camera and screen share on the voice connection, opt-in per stream | — | when GtkHx adds it | yes |
+| **Threaded news** — markdown, references between articles, follows, search | not yet | not yet | yes |
+| **Portable identity** — an Ed25519 key that is you on any server that runs this | through a local tunnel | through a local tunnel | yes |
+| Kick and ban | yes | yes | yes |
+
+No official Hotline software ever had voice or video; they are community
+extensions, and today GtkHx and hx-ng are the two clients that speak them.
+Between them that is voice on Linux, macOS and Windows desktops and in
+the browser on a phone, in one room. Video is in hx-ng now and reaches
+GtkHx when its rendering lands.
+
+**Not built yet, and worth knowing before you run this:**
+
+- **The file area.** No file list, no transfers, no drop boxes. This is
+  the largest gap for a Hotline server and the next major piece of work;
+  the plan is [docs/files-plan.md](docs/files-plan.md).
+- **Tracker registration.** The server does not announce itself to a
+  tracker yet.
+- **News on the classic wire.** A period client sees an empty news pane;
+  the 1.2 flat and 1.5 threaded bindings are designed and not yet built.
+- **Moderation beyond kick and ban.** Reports, redaction of a chat
+  line, revoking an image, purging a user's recent output: designed in
+  [docs/moderation.md](docs/moderation.md), tables in the schema, no
+  requests yet.
+- **Push notifications** to a phone with the app closed.
+- **The identity registrar**, which is what gives a key a name like
+  `alice@hl.example` and publishes revocations. Designed
+  ([docs/identity-registrar.md](docs/identity-registrar.md)), not built;
+  until then every identity is unattested and admitted as the
+  `unattested` policy says.
+
+If you need a complete classic Hotline server today,
+[Mobius](https://github.com/jhalter/mobius) is the one to run. If you want
+the ng wire — phones, surviving sessions, offline messages, voice with
+GtkHx — this is the only server that has it.
+
+## What it aims to offer
+
+The [roadmap](ROADMAP.md) in one paragraph: the file area and folder
+transfers, then the legacy news bindings, so that a period client gets
+everything a period server gave it. Then the pieces that make the ng
+wire a real mobile experience — push, the registrar, and the enrollment
+flow that certifies a phone without a paste. Then federation: signed
+ban lists a server can subscribe to, vouches that let a member bring
+someone in without opening the door
+([docs/identity-vouch.md](docs/identity-vouch.md)), and identities that
+carry standing between servers. Clustering comes last, because the
+session model has to be right before it is spread across nodes.
+
+The protocol is meant to be shared. Every ng document is written to be
+implemented by someone else, and the community's other protocol work —
+[fogWraith's extensions](https://github.com/fogWraith/Hotline), which
+this server implements on the classic wire, and the
+[hotline-rs](https://github.com/hotline-rs) crates — is what this project
+is converging with rather than competing against.
+
+## Clients
+
+Any Hotline client connects to the classic wire. The ones with a current
+maintainer:
+
+| Client | Platforms | Wire | Notes |
+|---|---|---|---|
+| [GtkHx](https://github.com/mishan/gtkhx) | Linux, macOS, Windows | classic, with extensions | Voice, inline images, chat history, UTF-8, TLS, large files. The reference for the extended tier above |
+| [hx-ng](https://github.com/mishan/hx-ng) | any browser, including phones | ng | Chat, user list, private messages, news, identity, voice and video. Static files; put it in front of your server |
+| [Hotline Navigator](https://hotlinenavigator.com/) | macOS, Windows, Linux, iOS, Android | classic | A modern cross-platform client with TLS and inline previews; [source](https://github.com/fuzzywalrus/Hotline-Navigator) |
+| [Hotline](https://github.com/mierau/hotline) by Dustin Mierau | macOS, iOS, iPadOS | classic | A remake by the original author |
+| [Hermes](https://github.com/fogWraith/Hotline) by fogWraith | — | classic, with extensions | Alpha, alongside the Janus server and the extension specs |
+| Hotline 1.2 / 1.5 / 1.9 | classic Mac OS, Windows | classic | The originals, on real or emulated hardware. Still the compatibility bar |
+
+Voice and video need a client that speaks the extensions or the ng wire:
+GtkHx or hx-ng.
 
 ## Getting started
 
@@ -91,15 +159,15 @@ with a guest account; add more as TOML files in that directory.
 
 ### Say hello
 
-The best end-to-end check is a real client, and there is one for each wire.
+The best end-to-end check is a real client, and there is one for each
+wire.
 
-**[GtkHx](https://github.com/mishan/gtkhx)** speaks the legacy wire — point
-it at `127.0.0.1:5500`.
+**[GtkHx](https://github.com/mishan/gtkhx)** speaks the classic wire — point
+it at `127.0.0.1:5500`. So does any other Hotline client; GtkHx is the one
+that will also show you voice and inline images.
 
-**[hx-ng](https://github.com/mishan/hx-ng)** is the browser client for the ng
-wire: public chat, the user list with the classic icons, private messages,
-and the voice and video the SFU already serves. It never sees the legacy
-wire, and the server cannot tell it apart from any other ng client.
+**[hx-ng](https://github.com/mishan/hx-ng)** is the browser client for the
+ng wire. It needs an `[ng]` section in the server's config (below):
 
 ```sh
 git clone https://github.com/mishan/hx-ng && cd hx-ng
@@ -110,9 +178,9 @@ npm install && npm run dev     # http://localhost:5701, bound to every
 The two clients in the same room, one on each wire, is the check worth
 running before believing any of this.
 
-The repo also ships two deliberately minimal harnesses, for when you want to
-see the protocol rather than use it. `tools/ng-client.mjs` is a terminal ng
-client — no install on Node 22+; on older Node, `cd tools && npm install`
+The repo also ships two deliberately minimal harnesses, for when you want
+to see the protocol rather than use it. `tools/ng-client.mjs` is a terminal
+ng client — no install on Node 22+; on older Node, `cd tools && npm install`
 once for the `ws` fallback:
 
 ```sh
@@ -263,8 +331,9 @@ Absent means no news: the ng wire never offers the `news` cap, and a news
 request is answered the way a server without the feature answers it. When
 `db` is omitted, news uses the database `[inbox]` or `[history]` names and
 shares its SQLite connection; with neither it is required. Nothing here
-reaches a legacy client yet — the 1.2 and 1.5 news transactions are a
-stage still to come. See [docs/news.md](docs/news.md).
+reaches a legacy client yet — the 1.2 flat-news and 1.5 threaded-news
+transactions are a stage still to come, so a period client sees an empty
+news pane. See [docs/news.md](docs/news.md).
 
 ```toml
 [news]                    # presence turns it on
@@ -515,24 +584,31 @@ rather than a promise the build cannot keep.
 
 ## Documentation
 
-| Document | What it covers |
-|---|---|
-| [hotline-ng.md](docs/hotline-ng.md) | The ng protocol: framing, the login/resume/sync handshake, the request and event tables, seq accounting |
-| [hotline-ng-auth.md](docs/hotline-ng-auth.md) | Transport authentication: the principal, the challenge and mTLS bindings, transport tokens, the TRTP tunnel, cleartext marking, tunnels and relays |
-| [hotline-ng-identity.md](docs/hotline-ng-identity.md) | Portable identity: the signed objects, the identity profile at authentication, cards, account association |
-| [identity-enrollment.md](docs/identity-enrollment.md) | Certifying a device through a mailbox and a pairing code instead of a paste; renewal; what the mailbox is trusted with |
-| [identity-threat-model.md](docs/identity-threat-model.md) | What identity defends against, and what it deliberately does not |
-| [identity-test-vectors.json](docs/identity-test-vectors.json) | Signed objects and reject cases — the contract a second implementation is checked against |
-| [access-bits.md](docs/access-bits.md) | Account permissions: every access bit and its `[access]` key, the reserved numbers, `[extra]` policy, and what a new server starts with |
-| [private-messages.md](docs/private-messages.md) | The offline inbox: the mailbox rule, the store contract, delivery, blocking, retention |
-| [chat-history.md](docs/chat-history.md) | Scrollback: the chat log, cursor paging on both wires, retention, fogWraith's `Get Chat History` |
-| [news.md](docs/news.md) | Threaded news: the tree, articles and references, the store and its schema, the ng requests and events, search, subscriptions, markdown bodies, and the legacy binding still to come |
-| [inline-media.md](docs/inline-media.md) | Images in chat: the re-encode pipeline, handles and relay-time authorisation, 750/751 and the HTTP routes |
-| [moderation.md](docs/moderation.md) | Redaction, revocation, purges and reports: the acts, the audit trail, and what each wire can do |
-| [voice.md](docs/voice.md) | The SFU: hand-written SDP, RTP forwarding, and one room across both signalling wires |
-| [capabilities-video.md](docs/capabilities-video.md) | Video: publications, subscriptions, limits, and the renegotiation path |
-| [push-notifications.md](docs/push-notifications.md) | Push: the notify decision in the domain, and delegating the device registry |
-| [proposals/](docs/proposals/messaging-identity-amendment.md) | Proposed amendments to fogWraith's messaging extension |
+The ng protocol documents are written to be implemented by someone
+other than this server. The last column is what this server has built.
+
+| Document | What it covers | Built |
+|---|---|---|
+| [hotline-ng.md](docs/hotline-ng.md) | The ng protocol: framing, the login/resume/sync handshake, the request and event tables, seq accounting | yes |
+| [hotline-ng-auth.md](docs/hotline-ng-auth.md) | Transport authentication: the principal, the challenge and mTLS bindings, transport tokens, the TRTP tunnel, cleartext marking, tunnels and relays | yes |
+| [hotline-ng-identity.md](docs/hotline-ng-identity.md) | Portable identity: the signed objects, the identity profile at authentication, cards, account association | yes, to the registrar stub |
+| [identity-enrollment.md](docs/identity-enrollment.md) | Certifying a device through a mailbox and a pairing code instead of a paste; renewal | server side |
+| [identity-registrar.md](docs/identity-registrar.md) | The registrar: handles, revocation, rotation, freeze, key backup, transparency; what a server does with it | no |
+| [identity-vouch.md](docs/identity-vouch.md) | A member lending standing to a key: rules, the local and portable forms, accountability | no |
+| [identity-threat-model.md](docs/identity-threat-model.md) | What identity defends against, and what it deliberately does not | — |
+| [identity-test-vectors.json](docs/identity-test-vectors.json) | Signed objects and reject cases — the contract a second implementation is checked against | yes |
+| [system-account.md](docs/system-account.md) | The reserved server account: where commands and notifications live on the classic wire | no |
+| [access-bits.md](docs/access-bits.md) | Account permissions: every access bit and its `[access]` key, the reserved numbers, `[extra]` policy | yes |
+| [private-messages.md](docs/private-messages.md) | The offline inbox: the mailbox rule, the store contract, delivery, blocking, retention | yes |
+| [chat-history.md](docs/chat-history.md) | Scrollback: the chat log, cursor paging on both wires, retention | yes |
+| [news.md](docs/news.md) | Threaded news: the tree, articles and references, the store, the ng requests, search, subscriptions, markdown, and the legacy binding | ng wire |
+| [inline-media.md](docs/inline-media.md) | Images in chat: the re-encode pipeline, handles and relay-time authorisation, 750/751 and the HTTP routes | yes |
+| [moderation.md](docs/moderation.md) | Redaction, revocation, purges and reports: the acts, the audit trail, and what each wire can do | schema only |
+| [voice.md](docs/voice.md) | The SFU: hand-written SDP, RTP forwarding, and one room across both signalling wires | yes |
+| [capabilities-video.md](docs/capabilities-video.md) | Video: publications, subscriptions, limits, and the renegotiation path | yes |
+| [push-notifications.md](docs/push-notifications.md) | Push: the notify decision in the domain, and the gateway | trait only |
+| [files-plan.md](docs/files-plan.md) | The file area: the first read-only slice and the Large File capability | no |
+| [proposals/](docs/proposals/messaging-identity-amendment.md) | Proposed amendments to fogWraith's messaging extension | — |
 
 ## Development
 
