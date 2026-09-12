@@ -432,6 +432,34 @@ the wire only for a client that does this. Mail that arrived while the
 socket was gone was never in the buffer at all: it is still pending, and
 `sync` flushes it as events after its own reply (§6).
 
+### 7.2 Files
+
+The `files` capability means this server exposes the read-only file area.
+Every path is slash-separated UTF-8 relative to its root; `""` names the
+root. Paths are values, not URLs, and `.` / `..`, empty components, leading
+slashes and trailing slashes are malformed.
+
+- `files_list { path? }` returns `{ path, entries }`. Each entry is
+  `{ name, kind, size, media_type?, modified? }`, where `kind` is `file` or
+  `folder`.
+- `files_info { path }` returns
+  `{ path, name, kind, size, media_type?, created?, modified?, comment? }`.
+- `files_download { path }` requires a file and returns
+  `{ url, size, media_type? }`. `url` is a same-server bearer URL such as
+  `/files/<token>`; it is short-lived and bound to the session that asked.
+
+All `size` values, including folder child counts, are decimal strings. A
+client parses them as unsigned 64-bit integers or `bigint`; interpreting one
+as a JSON number can silently round it. Timestamps are optional integer
+seconds in the manifest's Hotline header epoch.
+
+`GET` on the returned URL streams the file through this server and accepts
+one open-ended range, `Range: bytes=<offset>-`. A valid range answers `206`
+with `Content-Range`; an absent range answers `200`. Suffix, bounded, multiple,
+malformed, and out-of-bounds ranges answer `416`. The token is reusable for
+resume until it expires, but dies immediately with its `(uid, serial)`
+session. Unknown, expired, and unauthorized tokens all answer `404`.
+
 ## 8. Text, encoding, limits
 
 The protocol is UTF-8 by construction (it's JSON). Normative limits, chosen

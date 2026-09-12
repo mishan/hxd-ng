@@ -21,7 +21,9 @@ use hxd_ng_session::{
 use hxd_session::{cap, Caps, ServerConfig, ServerCtx, TrtpLogin};
 use serde::Deserialize;
 
+pub mod files;
 pub mod voice;
+pub use files::Files;
 pub use voice::Voice;
 
 /// The `hxd-ng.toml` schema. Everything has a default; an absent file is a
@@ -53,6 +55,57 @@ pub struct Config {
     /// Threaded news (`docs/news.md` §13). Absent = no news on either
     /// wire, answered the way a server without the feature answers.
     pub news: Option<NewsSection>,
+    /// Read-only manifest-backed files. Absent means no Files capability,
+    /// control transactions, transfer listener, or ng download routes.
+    pub files: Option<FilesSection>,
+}
+
+/// The read-only Files service (`docs/files-plan.md`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesSection {
+    /// Local JSON manifest. It names paths and metadata, never origins.
+    pub manifest: PathBuf,
+    /// Fixed HTTP(S) base URL under which manifest paths are fetched.
+    pub origin: String,
+    /// HTXF listener. Omitted means the legacy control port plus one.
+    pub bind: Option<String>,
+    #[serde(default = "default_files_max_size")]
+    pub max_file_size: u64,
+    #[serde(default = "default_files_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_files_max_concurrent")]
+    pub max_concurrent: usize,
+    #[serde(default = "default_files_request_timeout")]
+    pub request_timeout: u64,
+    #[serde(default = "default_files_reference_ttl")]
+    pub reference_ttl: u64,
+    #[serde(default = "default_files_download_ttl")]
+    pub download_ttl: u64,
+    #[serde(default = "default_files_handshake_timeout")]
+    pub handshake_timeout: u64,
+}
+
+fn default_files_max_size() -> u64 {
+    64 * 1024 * 1024 * 1024
+}
+fn default_files_max_entries() -> usize {
+    100_000
+}
+fn default_files_max_concurrent() -> usize {
+    8
+}
+fn default_files_request_timeout() -> u64 {
+    15
+}
+fn default_files_reference_ttl() -> u64 {
+    60
+}
+fn default_files_download_ttl() -> u64 {
+    60
+}
+fn default_files_handshake_timeout() -> u64 {
+    10
 }
 
 /// Threaded news (`docs/news.md` §13).
@@ -955,7 +1008,7 @@ impl Config {
 /// session. A capability lands here only once the code behind it is
 /// wired and enabled — never from a config key alone, because the echo
 /// is a promise that the extension's transactions will work.
-fn legacy_caps(config: &Config, voice: Option<&Voice>) -> Caps {
+fn legacy_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>) -> Caps {
     let mut caps = Caps::empty();
     if config.history.is_some() {
         caps = caps.with(cap::CHAT_HISTORY);
@@ -972,6 +1025,9 @@ fn legacy_caps(config: &Config, voice: Option<&Voice>) -> Caps {
             caps = caps.with(cap::VIDEO);
         }
     }
+    if files.is_some() {
+        caps = caps.with(cap::LARGE_FILES);
+    }
     caps
 }
 
@@ -984,7 +1040,7 @@ fn video_enabled(config: &Config) -> bool {
 /// The same answer for the ng wire, where capabilities are names rather
 /// than bits. Kept beside [`legacy_caps`] so the two wires can't drift
 /// into advertising different things.
-fn ng_caps(config: &Config, voice: Option<&Voice>) -> Vec<String> {
+fn ng_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>) -> Vec<String> {
     let mut caps = Vec::new();
     if config.history.is_some() {
         caps.push("history".to_string());
@@ -1011,6 +1067,9 @@ fn ng_caps(config: &Config, voice: Option<&Voice>) -> Vec<String> {
     // W9, and 1.5 clients have never needed a capability bit for news.
     if config.news.is_some() && cfg!(feature = "inbox") {
         caps.push("news".to_string());
+    }
+    if files.is_some() {
+        caps.push("files".to_string());
     }
     caps
 }
@@ -1236,6 +1295,21 @@ pub fn check_config(config: &Config) -> Result<(), String> {
             );
         }
         news.check()?;
+    }
+    if let Some(files) = &config.files {
+        if files.max_file_size == 0 {
+            return Err("[files] max_file_size must be non-zero".into());
+        }
+        if files.max_entries == 0 || files.max_concurrent == 0 {
+            return Err("[files] max_entries and max_concurrent must be non-zero".into());
+        }
+        if files.request_timeout == 0
+            || files.reference_ttl == 0
+            || files.download_ttl == 0
+            || files.handshake_timeout == 0
+        {
+            return Err("[files] timeout and TTL values must be non-zero".into());
+        }
     }
     Ok(())
 }
@@ -1756,6 +1830,7 @@ pub fn build_ng_ctx(
     config: &Config,
     legacy: &ServerCtx,
     voice: Option<&Voice>,
+    files: Option<&Files>,
 ) -> Result<Option<NgCtx>, String> {
     let Some(ng) = config.ng.as_ref() else {
         return Ok(None);
@@ -1792,7 +1867,7 @@ pub fn build_ng_ctx(
             login_timeout: Duration::from_secs(config.server.login_timeout),
             grace: Duration::from_secs(ng.grace),
             max_detached_per_addr: ng.max_detached_per_addr,
-            caps: ng_caps(config, voice),
+            caps: ng_caps(config, voice, files),
             trusted_proxies: TrustedProxies::parse(&ng.trusted_proxies)?,
             forwarded_header: ForwardedHeader::parse(&ng.forwarded_header)?,
         }),
@@ -1800,12 +1875,17 @@ pub fn build_ng_ctx(
         identity,
         tunnel,
         enroll,
+        files: files.map(|value| value.service.clone()),
     }))
 }
 
 /// Assemble the shared server context from a config: bootstrap the accounts
 /// directory, read the agreement file, wire the domain core and backend.
-pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, String> {
+pub fn build_ctx(
+    config: &Config,
+    voice: Option<&Voice>,
+    files: Option<&Files>,
+) -> Result<ServerCtx, String> {
     FileAuth::bootstrap(&config.paths.accounts)
         .map_err(|e| format!("{}: {e}", config.paths.accounts.display()))?;
 
@@ -1888,7 +1968,7 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
             login_timeout: Duration::from_secs(config.server.login_timeout),
             ban_time: Duration::from_secs(config.server.ban_time),
             stamp_queued: config.server.stamp_queued,
-            caps: legacy_caps(config, voice),
+            caps: legacy_caps(config, voice, files),
             mark_cleartext: config.server.mark_cleartext,
             trtp_login: match config.identity.as_ref().map(|i| i.trtp_login.as_str()) {
                 None | Some("verify") => TrtpLogin::Verify,
@@ -1898,6 +1978,7 @@ pub fn build_ctx(config: &Config, voice: Option<&Voice>) -> Result<ServerCtx, St
                 }
             },
         }),
+        files: files.map(|value| value.service.clone()),
     })
 }
 
@@ -1962,9 +2043,9 @@ sync = "full"
         assert_eq!(history.max_days, 0);
         assert_eq!(history.max_page, 200);
         assert_eq!(history.replay, 0);
-        assert!(legacy_caps(&cfg, None).has(cap::CHAT_HISTORY));
+        assert!(legacy_caps(&cfg, None, None).has(cap::CHAT_HISTORY));
         assert_eq!(
-            ng_caps(&cfg, None),
+            ng_caps(&cfg, None, None),
             vec!["history".to_string(), "inbox".to_string()]
         );
 
@@ -2016,9 +2097,9 @@ sync = "full"
             "render wherever there is a parser to render with"
         );
         #[cfg(feature = "inbox")]
-        assert!(ng_caps(&cfg, None).contains(&"news".to_string()));
+        assert!(ng_caps(&cfg, None, None).contains(&"news".to_string()));
         assert!(
-            !legacy_caps(&cfg, None).has(cap::CHAT_HISTORY),
+            !legacy_caps(&cfg, None, None).has(cap::CHAT_HISTORY),
             "news claims no legacy capability bit"
         );
 
@@ -2489,8 +2570,8 @@ sync = "full"
         )
         .unwrap();
         assert!(video_enabled(&c));
-        assert!(legacy_caps(&c, None).is_empty());
-        assert!(ng_caps(&c, None).is_empty());
+        assert!(legacy_caps(&c, None, None).is_empty());
+        assert!(ng_caps(&c, None, None).is_empty());
     }
 
     /// The capability answers with a real SFU behind them. Building one
@@ -2518,20 +2599,23 @@ sync = "full"
         #[test]
         fn voice_alone_is_advertised_when_video_is_not_configured() {
             let (config, voice) = voiced(false);
-            let caps = legacy_caps(&config, Some(&voice));
+            let caps = legacy_caps(&config, Some(&voice), None);
             assert!(caps.has(cap::VOICE));
             assert!(!caps.has(cap::VIDEO));
-            assert_eq!(ng_caps(&config, Some(&voice)), vec!["voice".to_string()]);
+            assert_eq!(
+                ng_caps(&config, Some(&voice), None),
+                vec!["voice".to_string()]
+            );
         }
 
         #[test]
         fn video_is_advertised_only_alongside_voice() {
             let (config, voice) = voiced(true);
-            let caps = legacy_caps(&config, Some(&voice));
+            let caps = legacy_caps(&config, Some(&voice), None);
             assert!(caps.has(cap::VOICE));
             assert!(caps.has(cap::VIDEO));
             assert_eq!(
-                ng_caps(&config, Some(&voice)),
+                ng_caps(&config, Some(&voice), None),
                 vec!["voice".to_string(), "video".to_string()]
             );
         }

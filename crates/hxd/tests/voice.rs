@@ -91,6 +91,7 @@ async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<Rec
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
         }),
+        files: None,
     };
     let ng_ctx = NgCtx {
         core: ctx.core.clone(),
@@ -114,6 +115,7 @@ async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<Rec
         identity: None,
         tunnel: None,
         enroll: None,
+        files: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1,12 +1,9 @@
 # Files implementation plan
 
-Status: design, not built, 2026-09-11. The first slice this document
-commits to is read-only, manifest-backed HTTP (below). The design review
-(`hxd-ng-design-review-2026-09.md` §3, action 4) recommends local-disk
-read-only as the smaller first slice, because it is what every existing
-Hotline server does and what the Tier 3 conformance suite tests; that
-decision is open. This document is the execution plan for the
-Files work in hxd-ng and hx-ng. The exploratory notes in
+Status: implemented, 2026-09-12. The first slice is read-only,
+manifest-backed HTTP (below). This document is the execution plan and
+acceptance contract for the Files work across hxd-ng and its clients. The
+exploratory notes in
 [`file-sources.md`](file-sources.md) remain useful design background; this
 document fixes the first implementation boundary and its acceptance gates.
 
@@ -35,7 +32,7 @@ be implied by advertising behavior that the server cannot complete safely.
 
 ## Repository and branch order
 
-The work spans three repositories and is landed in dependency order:
+The work spans four repositories and is landed in dependency order:
 
 1. `hx-libs`: add the shared, safe `hxfiles-xfer` codec and any missing
    `hxproto` Large File vocabulary. No GtkHx C ABI enters this repository.
@@ -183,4 +180,3 @@ The following remain separate milestones:
 - move, rename, delete, mkdir, comments, and drop-box semantics;
 - transfer queueing, per-account quotas, and background origin prefetching;
 - direct origin URLs in the ng client.
-

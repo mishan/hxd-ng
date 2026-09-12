@@ -81,6 +81,7 @@ async fn start_server(dir: &Path, news: Option<NewsPolicy>) -> (SocketAddr, Sock
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
         }),
+        files: None,
     };
     let ng_ctx = NgCtx {
         core,
@@ -98,6 +99,7 @@ async fn start_server(dir: &Path, news: Option<NewsPolicy>) -> (SocketAddr, Sock
         identity: None,
         tunnel: None,
         enroll: None,
+        files: None,
     };
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

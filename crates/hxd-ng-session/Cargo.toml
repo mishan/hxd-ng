@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 hxd-core = { workspace = true }
+hxd-files = { workspace = true }
 hl-identity = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -26,4 +27,5 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 hyper-tungstenite = "0.15"
 http-body-util = "0.1"
 bytes = "1"
+tokio-util = { version = "0.7", features = ["io"] }
 base64 = "0.22"

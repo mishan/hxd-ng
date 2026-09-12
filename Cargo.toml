@@ -9,6 +9,7 @@ resolver = "2"
 members = [
     "crates/hl-identity",
     "crates/hxd-core",
+    "crates/hxd-files",
     "crates/hxd-media",
     "crates/hxd-markdown",
     "crates/hxd-auth-file",
@@ -28,11 +29,14 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Shared with GtkHx (see the note at the top of this file).
-hxproto = { git = "https://github.com/mishan/hx-libs.git", rev = "784c4d3e095588ac20546fedf0f8f8cdb15da1e9" }
+# Replaced by the dependency branch's pinned git revision before landing.
+hxproto = { git = "https://github.com/mishan/hx-libs.git", rev = "061d2d71a4148fc924f98d0dd71bf178497aa661" }
+hxfiles-xfer = { git = "https://github.com/mishan/hx-libs.git", rev = "061d2d71a4148fc924f98d0dd71bf178497aa661" }
 
 # Internal.
 hl-identity = { path = "crates/hl-identity" }
 hxd-core = { path = "crates/hxd-core" }
+hxd-files = { path = "crates/hxd-files" }
 hxd-auth-file = { path = "crates/hxd-auth-file" }
 hxd-session = { path = "crates/hxd-session" }
 hxd-ng-session = { path = "crates/hxd-ng-session" }
