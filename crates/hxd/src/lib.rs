@@ -25,6 +25,7 @@ pub mod files;
 pub mod voice;
 pub use files::Files;
 pub use voice::Voice;
+pub mod tracker;
 
 /// The `hxd-ng.toml` schema. Everything has a default; an absent file is a
 /// runnable server.
@@ -58,6 +59,9 @@ pub struct Config {
     /// Manifest-backed or capability-rooted local files. Absent means no Files capability,
     /// control transactions, transfer listener, or ng download routes.
     pub files: Option<FilesSection>,
+    /// UDP registration with Hotline trackers. Absent = the server stays
+    /// unlisted and opens no registration sockets.
+    pub tracker: Option<tracker::TrackerSection>,
 }
 
 /// The Files service (`docs/files-plan.md`).
@@ -1403,6 +1407,9 @@ pub fn check_config(config: &Config) -> Result<(), String> {
             return Err("[files] timeout and TTL values must be non-zero".into());
         }
     }
+    if let Some(tracker) = &config.tracker {
+        tracker.check(&config.server.name)?;
+    }
     Ok(())
 }
 
@@ -2077,6 +2084,56 @@ pub fn build_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracker_configuration_is_explicit_validated_and_redacts_secrets() {
+        let cfg = parse(
+            r#"
+[server]
+name = "Listed server"
+
+[tracker]
+description = "A community"
+interval = 300
+advertised_port = 5500
+ack_timeout_ms = 1500
+
+[tracker.v3]
+hostname = "hl.example"
+country_code = "US"
+language = "en"
+maturity = 1
+listing_category = 10
+tags = "chat,retro"
+
+[[tracker.targets]]
+address = "classic.example"
+protocol = "v1"
+password = "old secret"
+
+[[tracker.targets]]
+address = "[2001:db8::1]:5499"
+protocol = "v3"
+hmac_secret = "new secret"
+"#,
+        )
+        .unwrap();
+        check_config(&cfg).unwrap();
+        let tracker = cfg.tracker.as_ref().unwrap();
+        assert_eq!(tracker.targets.len(), 2);
+        assert_eq!(tracker.targets[0].protocol, tracker::TrackerProtocol::V1);
+        assert_eq!(tracker.targets[1].protocol, tracker::TrackerProtocol::V3);
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("old secret"));
+        assert!(!debug.contains("new secret"));
+        assert!(debug.contains("[redacted]"));
+
+        let empty = parse("[tracker]\n").unwrap();
+        assert!(check_config(&empty).unwrap_err().contains("targets"));
+        let typo =
+            parse("[tracker]\n[[tracker.targets]]\naddress = \"example.com\"\nprotocol = \"v4\"\n");
+        assert!(typo.is_err());
+    }
 
     #[test]
     fn the_inbox_section_parses_and_refuses_numbers_that_disable_it() {

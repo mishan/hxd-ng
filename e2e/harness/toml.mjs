@@ -10,13 +10,18 @@ function scalar(v) {
   if (typeof v === 'string') return JSON.stringify(v);
   if (typeof v === 'number' || typeof v === 'boolean') return String(v);
   if (Array.isArray(v)) return `[${v.map(scalar).join(', ')}]`;
+  if (v !== null && typeof v === 'object') {
+    const entries = Object.entries(v).filter(([, value]) => value !== undefined);
+    return `{ ${entries.map(([key, value]) => `${key} = ${scalar(value)}`).join(', ')} }`;
+  }
   throw new Error(`no TOML spelling for ${typeof v}: ${String(v)}`);
 }
 
 /**
  * `{ server: { name: 'e2e' }, voice: { video: { max_fps: 30 } } }` into
- * the `[server]` / `[voice.video]` shape hxd expects. Nesting is one
- * level deep, which is all the config has ever needed.
+ * the `[server]` / `[voice.video]` shape hxd expects. Arrays may contain
+ * inline tables for repeated entries such as tracker targets; named table
+ * nesting remains one level deep.
  *
  * A section whose value is `undefined` is omitted entirely — that is how
  * a test says "this build gets no `[media]` section", which is a

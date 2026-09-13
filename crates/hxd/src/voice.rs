@@ -149,6 +149,7 @@ mod tests {
             media: None,
             news: None,
             files: None,
+            tracker: None,
         }
     }
 

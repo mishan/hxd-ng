@@ -69,8 +69,6 @@ GtkHx when its rendering lands.
 - **The file area.** No file list, no transfers, no drop boxes. This is
   the largest gap for a Hotline server and the next major piece of work;
   the plan is [docs/files-plan.md](docs/files-plan.md).
-- **Tracker registration.** The server does not announce itself to a
-  tracker yet.
 - **News on the classic wire.** A period client sees an empty news pane;
   the 1.2 flat and 1.5 threaded bindings are designed and not yet built.
 - **Moderation beyond kick and ban.** Reports, redaction of a chat
@@ -226,6 +224,30 @@ stamp_queued = true     # stamp a message that waited in the inbox with its
 [paths]
 accounts = "accounts"
 agreement = "agreement.txt"
+```
+
+### Tracker registration
+
+An optional `[tracker]` section announces the server over UDP using classic
+HTRK v1 or the metadata-bearing v3 protocol. Targets name their protocol
+explicitly because a silent v1 UDP tracker cannot be probed for v3. See
+[docs/tracker-registration.md](docs/tracker-registration.md) for the complete
+metadata and security configuration.
+
+```toml
+[tracker]
+description = "A small Hotline community"
+interval = 300
+# advertised_port = 5500  # only when NAT maps a different public port
+
+[[tracker.targets]]
+address = "hltracker.example" # UDP/5499 when the port is omitted
+protocol = "v1"
+
+[[tracker.targets]]
+address = "argus.example:5499"
+protocol = "v3"
+hmac_secret = "shared secret"
 ```
 
 ### The ng frontend
