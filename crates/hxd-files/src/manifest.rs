@@ -8,9 +8,7 @@ use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use hxd_core::{FileBody, FileEntry, FileError, FileInfo, FileKind, FilePath, FileSource};
-use reqwest::header::{
-    HeaderValue, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_MATCH, RANGE,
-};
+use reqwest::header::{HeaderValue, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_MATCH, RANGE};
 use serde::de::{self, Visitor};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -342,15 +340,6 @@ impl FileSource for HttpManifestSource {
                     return Err(FileError::OriginChanged);
                 }
             }
-            if object.ranges
-                && response
-                    .headers()
-                    .get(ACCEPT_RANGES)
-                    .and_then(|v| v.to_str().ok())
-                    != Some("bytes")
-            {
-                return Err(FileError::OriginChanged);
-            }
             let stream = response
                 .bytes_stream()
                 .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e));
@@ -365,6 +354,10 @@ impl FileSource for HttpManifestSource {
                 reader: Box::pin(reader),
             })
         })
+    }
+
+    fn supports_ranges(&self, path: &FilePath) -> bool {
+        self.objects.get(path).is_some_and(|object| object.ranges)
     }
 }
 

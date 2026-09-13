@@ -67,7 +67,8 @@ async fn start() -> Running {
                     })
                     .and_then(|value| value.strip_suffix('-'))
                     .and_then(|value| value.parse::<u64>().ok());
-                let (size, full) = if first.contains("/hello.txt ") {
+                let (size, full) = if first.contains("/hello.txt ") || first.contains("/fixed.txt ")
+                {
                     (11, b"hello world".as_slice())
                 } else {
                     (HUGE_SIZE, &[][..])
@@ -87,7 +88,7 @@ async fn start() -> Running {
                     _ => ("416 Range Not Satisfiable", &[][..], None),
                 };
                 let mut response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
                     body.len()
                 );
                 if let Some(value) = content_range {
@@ -103,6 +104,7 @@ async fn start() -> Running {
     let manifest = format!(
         r#"{{"version":1,"files":[
           {{"path":"hello.txt","size":"11","media_type":"text/plain","ranges":true}},
+          {{"path":"fixed.txt","size":"11","ranges":false}},
           {{"path":"huge.bin","size":"{HUGE_SIZE}","ranges":true}}
         ]}}"#
     );
@@ -114,8 +116,8 @@ async fn start() -> Running {
     .unwrap();
     let service = Arc::new(FileService::new(
         Arc::new(source),
-        Arc::new(TransferRegistry::new(Duration::from_secs(30))),
-        Arc::new(DownloadTokens::new(Duration::from_secs(30))),
+        Arc::new(TransferRegistry::new(Duration::from_secs(30), 64, 16)),
+        Arc::new(DownloadTokens::new(Duration::from_secs(30), 64, 16)),
     ));
 
     let temp = tempfile::tempdir().unwrap();
@@ -238,7 +240,7 @@ async fn classic_hides_oversized_files_while_large_file_resume_is_exact() {
         .filter(|chunk| chunk.tag == LIST_ENTRY)
         .map(|chunk| chunk.data[20..].to_vec())
         .collect();
-    assert_eq!(names, [b"hello.txt".to_vec()]);
+    assert_eq!(names, [b"fixed.txt".to_vec(), b"hello.txt".to_vec()]);
     assert!(listing.chunks().all(|chunk| chunk.tag != tag::FILESIZE64));
     let ordinary = classic
         .request(FILE_GET, &[(tag::FILE_NAME, b"hello.txt".to_vec())])
@@ -387,7 +389,13 @@ async fn ng_lists_decimal_sizes_and_proxies_full_and_ranged_downloads() {
     .await
     .unwrap();
     let listed = reply(&mut ws, 2).await;
-    assert_eq!(listed["ok"]["entries"][1]["size"], HUGE_SIZE.to_string());
+    let huge = listed["ok"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "huge.bin")
+        .unwrap();
+    assert_eq!(huge["size"], HUGE_SIZE.to_string());
     ws.send(Message::Text(
         json!({"id":3,"req":"files_download","params":{"path":"hello.txt"}}).to_string(),
     ))
@@ -398,6 +406,10 @@ async fn ng_lists_decimal_sizes_and_proxies_full_and_ranged_downloads() {
     let path = prepared["ok"]["url"].as_str().unwrap();
     let full = http_get(server.ng, path, None).await;
     assert!(full.starts_with("HTTP/1.1 200 OK"));
+    assert!(full.contains("accept-ranges: bytes"));
+    assert!(full.contains(
+        "content-disposition: attachment; filename=\"hello.txt\"; filename*=UTF-8''hello.txt"
+    ));
     assert!(full.ends_with("hello world"));
     let ranged = http_get(server.ng, path, Some("bytes=6-")).await;
     assert!(ranged.starts_with("HTTP/1.1 206 Partial Content"));
@@ -405,13 +417,28 @@ async fn ng_lists_decimal_sizes_and_proxies_full_and_ranged_downloads() {
     assert!(ranged.ends_with("world"));
     let malformed = http_get(server.ng, path, Some("bytes=-5")).await;
     assert!(malformed.starts_with("HTTP/1.1 416 Range Not Satisfiable"));
+    let duplicate =
+        http_get_headers(server.ng, path, "Range: bytes=0-\r\nRange: bytes=6-\r\n").await;
+    assert!(duplicate.starts_with("HTTP/1.1 416 Range Not Satisfiable"));
 
     ws.send(Message::Text(
-        json!({"id":4,"req":"logout","params":{}}).to_string(),
+        json!({"id":4,"req":"files_download","params":{"path":"fixed.txt"}}).to_string(),
     ))
     .await
     .unwrap();
-    reply(&mut ws, 4).await;
+    let fixed = reply(&mut ws, 4).await;
+    let fixed_path = fixed["ok"]["url"].as_str().unwrap();
+    let fixed_full = http_get(server.ng, fixed_path, None).await;
+    assert!(!fixed_full.contains("accept-ranges:"));
+    let fixed_range = http_get(server.ng, fixed_path, Some("bytes=6-")).await;
+    assert!(fixed_range.starts_with("HTTP/1.1 416 Range Not Satisfiable"));
+
+    ws.send(Message::Text(
+        json!({"id":5,"req":"logout","params":{}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    reply(&mut ws, 5).await;
     let stale = http_get(server.ng, path, None).await;
     assert!(stale.starts_with("HTTP/1.1 404 Not Found"));
 }
@@ -436,11 +463,15 @@ async fn reply(
 }
 
 async fn http_get(address: SocketAddr, path: &str, range: Option<&str>) -> String {
-    let mut stream = TcpStream::connect(address).await.unwrap();
     let range = range.map_or(String::new(), |value| format!("Range: {value}\r\n"));
+    http_get_headers(address, path, &range).await
+}
+
+async fn http_get_headers(address: SocketAddr, path: &str, headers: &str) -> String {
+    let mut stream = TcpStream::connect(address).await.unwrap();
     stream
         .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n{range}Connection: close\r\n\r\n")
+            format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n{headers}Connection: close\r\n\r\n")
                 .as_bytes(),
         )
         .await

@@ -41,12 +41,16 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
         .unwrap_or_else(|| transfer_bind(&config.server.bind))?;
     let service = Arc::new(FileService::new(
         Arc::new(source),
-        Arc::new(TransferRegistry::new(Duration::from_secs(
-            section.reference_ttl,
-        ))),
-        Arc::new(DownloadTokens::new(Duration::from_secs(
-            section.download_ttl,
-        ))),
+        Arc::new(TransferRegistry::new(
+            Duration::from_secs(section.reference_ttl),
+            section.max_references,
+            section.max_references_per_session,
+        )),
+        Arc::new(DownloadTokens::new(
+            Duration::from_secs(section.download_ttl),
+            section.max_downloads,
+            section.max_downloads_per_session,
+        )),
     ));
     Ok(Some(Files {
         service,

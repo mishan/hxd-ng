@@ -80,8 +80,16 @@ pub struct FilesSection {
     pub request_timeout: u64,
     #[serde(default = "default_files_reference_ttl")]
     pub reference_ttl: u64,
+    #[serde(default = "default_files_max_references")]
+    pub max_references: usize,
+    #[serde(default = "default_files_max_references_per_session")]
+    pub max_references_per_session: usize,
     #[serde(default = "default_files_download_ttl")]
     pub download_ttl: u64,
+    #[serde(default = "default_files_max_downloads")]
+    pub max_downloads: usize,
+    #[serde(default = "default_files_max_downloads_per_session")]
+    pub max_downloads_per_session: usize,
     #[serde(default = "default_files_handshake_timeout")]
     pub handshake_timeout: u64,
 }
@@ -101,8 +109,20 @@ fn default_files_request_timeout() -> u64 {
 fn default_files_reference_ttl() -> u64 {
     60
 }
+fn default_files_max_references() -> usize {
+    4096
+}
+fn default_files_max_references_per_session() -> usize {
+    64
+}
 fn default_files_download_ttl() -> u64 {
     60
+}
+fn default_files_max_downloads() -> usize {
+    4096
+}
+fn default_files_max_downloads_per_session() -> usize {
+    64
 }
 fn default_files_handshake_timeout() -> u64 {
     10
@@ -1302,6 +1322,13 @@ pub fn check_config(config: &Config) -> Result<(), String> {
         }
         if files.max_entries == 0 || files.max_concurrent == 0 {
             return Err("[files] max_entries and max_concurrent must be non-zero".into());
+        }
+        if files.max_references == 0
+            || files.max_references_per_session == 0
+            || files.max_downloads == 0
+            || files.max_downloads_per_session == 0
+        {
+            return Err("[files] registry limits must be non-zero".into());
         }
         if files.request_timeout == 0
             || files.reference_ttl == 0

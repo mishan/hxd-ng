@@ -88,7 +88,8 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     uid: state.uid,
                     serial,
                 },
-                path,
+                path.clone(),
+                service.source.supports_ranges(&path),
             ) {
                 Ok(token) => crate::proto::reply_ok(
                     req.id,

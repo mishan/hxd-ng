@@ -44,7 +44,8 @@ use hyper::body::{Frame as BodyFrame, Incoming};
 use hyper::header::{
     HeaderValue, ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
     ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
-    AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, ORIGIN, RANGE,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    ETAG, ORIGIN, RANGE,
 };
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -216,28 +217,23 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
         Ok(info) if info.kind == FileKind::File => info,
         _ => return plain(StatusCode::NOT_FOUND, "not found"),
     };
-    let range_requested = req.headers().contains_key(RANGE);
-    let offset = match req.headers().get(RANGE) {
+    let mut ranges = req.headers().get_all(RANGE).iter();
+    let range = ranges.next();
+    if ranges.next().is_some() {
+        return range_not_satisfiable(info.size);
+    }
+    let range_requested = range.is_some();
+    let offset = match range {
         None => 0,
         Some(value) => match value.to_str().ok().and_then(parse_range) {
             Some(offset) if offset < info.size => offset,
-            _ => {
-                return Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header(CONTENT_RANGE, format!("bytes */{}", info.size))
-                    .body(full(Bytes::new()))
-                    .unwrap()
-            }
+            _ => return range_not_satisfiable(info.size),
         },
     };
     let body = match service.source.open(&grant.path, offset).await {
         Ok(body) => body,
         Err(FileError::RangeInvalid | FileError::RangeUnsupported) => {
-            return Response::builder()
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(CONTENT_RANGE, format!("bytes */{}", info.size))
-                .body(full(Bytes::new()))
-                .unwrap()
+            return range_not_satisfiable(info.size);
         }
         Err(_) => return plain(StatusCode::BAD_GATEWAY, "file origin unavailable"),
     };
@@ -253,14 +249,20 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
     let mut response = Response::builder()
         .status(status)
         .header(CONTENT_LENGTH, body.len.to_string())
-        .header(ACCEPT_RANGES, "bytes")
         .header(CACHE_CONTROL, "private, no-store")
+        .header(
+            CONTENT_DISPOSITION,
+            content_disposition(grant.path.name().unwrap_or("download")),
+        )
         .header(
             CONTENT_TYPE,
             info.media_type
                 .as_deref()
                 .unwrap_or("application/octet-stream"),
         );
+    if grant.ranges {
+        response = response.header(ACCEPT_RANGES, "bytes");
+    }
     if range_requested {
         response = response.header(
             CONTENT_RANGE,
@@ -271,6 +273,47 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
         Ok(response) => response,
         Err(_) => plain(StatusCode::BAD_GATEWAY, "file metadata is invalid"),
     }
+}
+
+fn range_not_satisfiable(size: u64) -> Resp {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(CONTENT_RANGE, format!("bytes */{size}"))
+        .body(full(Bytes::new()))
+        .unwrap()
+}
+
+fn content_disposition(name: &str) -> HeaderValue {
+    let mut fallback = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '-' | '_' | '(' | ')') {
+            fallback.push(ch);
+        } else {
+            fallback.push('_');
+        }
+    }
+    if fallback.is_empty() {
+        fallback.push_str("download");
+    }
+
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.as_bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
+            encoded.push(char::from(*byte));
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))
+    .expect("sanitized content disposition is a valid header")
 }
 
 fn parse_range(value: &str) -> Option<u64> {
@@ -1524,6 +1567,26 @@ impl From<&TransportIdentity> for IdentityTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_names_are_safe_and_preserve_utf8() {
+        assert_eq!(
+            content_disposition("résumé \"draft\".txt").to_str().unwrap(),
+            "attachment; filename=\"r_sum_ _draft_.txt\"; filename*=UTF-8''r%C3%A9sum%C3%A9%20%22draft%22.txt"
+        );
+        assert!(!content_disposition("bad\r\nname.txt")
+            .to_str()
+            .unwrap()
+            .contains(['\r', '\n']));
+    }
+
+    #[test]
+    fn only_one_open_ended_range_is_valid() {
+        assert_eq!(parse_range("bytes=5-"), Some(5));
+        for value in ["bytes=-5", "bytes=5-9", "bytes=1-,2-", "items=5-"] {
+            assert_eq!(parse_range(value), None);
+        }
+    }
 
     #[test]
     fn a_bearer_token_survives_its_scheme_being_shouted() {

@@ -160,6 +160,11 @@ pub trait FileSource: Send + Sync + 'static {
     fn list<'a>(&'a self, path: &'a FilePath) -> FileFuture<'a, Vec<FileEntry>>;
     fn info<'a>(&'a self, path: &'a FilePath) -> FileFuture<'a, FileInfo>;
     fn open<'a>(&'a self, path: &'a FilePath, from: u64) -> FileFuture<'a, FileBody>;
+
+    /// Whether this source can open `path` from a nonzero byte offset.
+    fn supports_ranges(&self, _path: &FilePath) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

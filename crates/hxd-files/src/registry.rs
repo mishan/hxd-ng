@@ -34,6 +34,8 @@ impl std::fmt::Debug for PreparedTransfer {
 
 pub struct TransferRegistry {
     ttl: Duration,
+    max_entries: usize,
+    max_per_principal: usize,
     entries: Mutex<HashMap<u32, TransferEntry>>,
 }
 
@@ -44,9 +46,13 @@ struct TransferEntry {
 }
 
 impl TransferRegistry {
-    pub fn new(ttl: Duration) -> Self {
+    pub fn new(ttl: Duration, max_entries: usize, max_per_principal: usize) -> Self {
+        assert!(max_entries > 0);
+        assert!(max_per_principal > 0);
         TransferRegistry {
             ttl,
+            max_entries,
+            max_per_principal,
             entries: Mutex::new(HashMap::new()),
         }
     }
@@ -55,6 +61,15 @@ impl TransferRegistry {
         transfer.expires = Instant::now() + self.ttl;
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|_, value| value.transfer.expires > Instant::now());
+        if entries.len() >= self.max_entries
+            || entries
+                .values()
+                .filter(|entry| entry.transfer.principal == transfer.principal)
+                .count()
+                >= self.max_per_principal
+        {
+            return Err(FileError::Busy);
+        }
         for _ in 0..64 {
             let mut bytes = [0; 4];
             getrandom::getrandom(&mut bytes)
@@ -127,25 +142,46 @@ impl TransferRegistry {
 pub struct DownloadGrant {
     pub principal: FilePrincipal,
     pub path: FilePath,
+    pub ranges: bool,
     pub expires_at: Instant,
 }
 
 pub struct DownloadTokens {
     ttl: Duration,
+    max_grants: usize,
+    max_per_principal: usize,
     grants: Mutex<HashMap<[u8; 32], DownloadGrant>>,
 }
 
 impl DownloadTokens {
-    pub fn new(ttl: Duration) -> Self {
+    pub fn new(ttl: Duration, max_grants: usize, max_per_principal: usize) -> Self {
+        assert!(max_grants > 0);
+        assert!(max_per_principal > 0);
         DownloadTokens {
             ttl,
+            max_grants,
+            max_per_principal,
             grants: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn issue(&self, principal: FilePrincipal, path: FilePath) -> Result<String, FileError> {
+    pub fn issue(
+        &self,
+        principal: FilePrincipal,
+        path: FilePath,
+        ranges: bool,
+    ) -> Result<String, FileError> {
         let mut grants = self.grants.lock().unwrap();
         grants.retain(|_, value| value.expires_at > Instant::now());
+        if grants.len() >= self.max_grants
+            || grants
+                .values()
+                .filter(|grant| grant.principal == principal)
+                .count()
+                >= self.max_per_principal
+        {
+            return Err(FileError::Busy);
+        }
         for _ in 0..64 {
             let mut raw = [0; 32];
             getrandom::getrandom(&mut raw)
@@ -156,6 +192,7 @@ impl DownloadTokens {
                 slot.insert(DownloadGrant {
                     principal,
                     path: path.clone(),
+                    ranges,
                     expires_at: Instant::now() + self.ttl,
                 });
                 return Ok(token);
@@ -268,7 +305,7 @@ mod tests {
     fn transfer_references_reject_mismatched_handshakes_and_ended_sessions() {
         let core = Core::new();
         let principal = attach(&core, "first");
-        let registry = TransferRegistry::new(Duration::from_secs(30));
+        let registry = TransferRegistry::new(Duration::from_secs(30), 8, 4);
         let transfer = prepared(principal);
         let transfer_len = transfer.encoded.transfer_len;
         let reference = registry.issue(transfer).unwrap();
@@ -300,9 +337,9 @@ mod tests {
     fn download_tokens_stop_authorizing_when_the_issuing_session_ends() {
         let core = Core::new();
         let first = attach(&core, "first");
-        let tokens = DownloadTokens::new(Duration::from_secs(30));
+        let tokens = DownloadTokens::new(Duration::from_secs(30), 8, 4);
         let token = tokens
-            .issue(first, FilePath::parse("file").unwrap())
+            .issue(first, FilePath::parse("file").unwrap(), true)
             .unwrap();
         assert!(tokens.resolve(&token, &core).is_some());
 
@@ -310,5 +347,38 @@ mod tests {
         let second = attach(&core, "second");
         assert_ne!(second.serial, first.serial);
         assert!(tokens.resolve(&token, &core).is_none());
+    }
+
+    #[test]
+    fn registries_bound_global_and_per_principal_entries() {
+        let core = Core::new();
+        let first = attach(&core, "first");
+        let second = attach(&core, "second");
+        let transfers = TransferRegistry::new(Duration::from_secs(30), 3, 2);
+        transfers.issue(prepared(first)).unwrap();
+        transfers.issue(prepared(first)).unwrap();
+        assert!(matches!(
+            transfers.issue(prepared(first)),
+            Err(FileError::Busy)
+        ));
+        transfers.issue(prepared(second)).unwrap();
+        assert!(matches!(
+            transfers.issue(prepared(second)),
+            Err(FileError::Busy)
+        ));
+
+        let downloads = DownloadTokens::new(Duration::from_secs(30), 3, 2);
+        let path = FilePath::parse("file").unwrap();
+        downloads.issue(first, path.clone(), false).unwrap();
+        downloads.issue(first, path.clone(), true).unwrap();
+        assert!(matches!(
+            downloads.issue(first, path.clone(), false),
+            Err(FileError::Busy)
+        ));
+        downloads.issue(second, path.clone(), false).unwrap();
+        assert!(matches!(
+            downloads.issue(second, path, false),
+            Err(FileError::Busy)
+        ));
     }
 }

@@ -267,7 +267,11 @@ max_entries = 100000
 max_concurrent = 8            # origin responses streamed at once
 request_timeout = 15          # origin connect/request seconds
 reference_ttl = 60            # unclaimed HTXF references
+max_references = 4096         # outstanding HTXF references globally
+max_references_per_session = 64
 download_ttl = 60             # ng bearer URLs; reusable for resume
+max_downloads = 4096          # outstanding ng bearer URLs globally
+max_downloads_per_session = 64
 handshake_timeout = 10        # HTXF preamble seconds
 ```
 
