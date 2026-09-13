@@ -7,6 +7,7 @@ use base64::Engine;
 use hxd_core::{Core, FileError, FilePath, FilePrincipal, FileSource};
 use hxfiles_xfer::ffo;
 use hxfiles_xfer::htxf;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 pub struct PreparedTransfer {
@@ -33,7 +34,13 @@ impl std::fmt::Debug for PreparedTransfer {
 
 pub struct TransferRegistry {
     ttl: Duration,
-    entries: Mutex<HashMap<u32, PreparedTransfer>>,
+    entries: Mutex<HashMap<u32, TransferEntry>>,
+}
+
+#[derive(Clone)]
+struct TransferEntry {
+    generation: [u8; 16],
+    transfer: PreparedTransfer,
 }
 
 impl TransferRegistry {
@@ -47,14 +54,23 @@ impl TransferRegistry {
     pub fn issue(&self, mut transfer: PreparedTransfer) -> Result<u32, FileError> {
         transfer.expires = Instant::now() + self.ttl;
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|_, value| value.expires > Instant::now());
+        entries.retain(|_, value| value.transfer.expires > Instant::now());
         for _ in 0..64 {
             let mut bytes = [0; 4];
             getrandom::getrandom(&mut bytes)
                 .map_err(|e| FileError::Unavailable(format!("transfer reference: {e}")))?;
             let reference = u32::from_ne_bytes(bytes);
             if reference != 0 && !entries.contains_key(&reference) {
-                entries.insert(reference, transfer);
+                let mut generation = [0; 16];
+                getrandom::getrandom(&mut generation)
+                    .map_err(|e| FileError::Unavailable(format!("transfer generation: {e}")))?;
+                entries.insert(
+                    reference,
+                    TransferEntry {
+                        generation,
+                        transfer,
+                    },
+                );
                 return Ok(reference);
             }
         }
@@ -68,14 +84,24 @@ impl TransferRegistry {
         core: &Core,
         preamble: &htxf::Preamble,
     ) -> Result<PreparedTransfer, FileError> {
-        let mut entries = self.entries.lock().unwrap();
-        let transfer = entries
+        let entry = self
+            .entries
+            .lock()
+            .unwrap()
             .get(&preamble.reference)
+            .cloned()
             .ok_or(FileError::NotFound)?;
+        let transfer = &entry.transfer;
         if transfer.expires <= Instant::now()
             || core.session_serial(transfer.principal.uid) != Some(transfer.principal.serial)
         {
-            entries.remove(&preamble.reference);
+            let mut entries = self.entries.lock().unwrap();
+            if entries
+                .get(&preamble.reference)
+                .is_some_and(|current| current.generation == entry.generation)
+            {
+                entries.remove(&preamble.reference);
+            }
             return Err(FileError::NotFound);
         }
         let large_flag = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
@@ -86,9 +112,14 @@ impl TransferRegistry {
         {
             return Err(FileError::InvalidPath);
         }
-        Ok(entries
-            .remove(&preamble.reference)
-            .expect("entry checked under the same lock"))
+        let mut entries = self.entries.lock().unwrap();
+        match entries.get(&preamble.reference) {
+            Some(current) if current.generation == entry.generation => Ok(entries
+                .remove(&preamble.reference)
+                .expect("matching entry exists")
+                .transfer),
+            _ => Err(FileError::NotFound),
+        }
     }
 }
 
@@ -101,7 +132,7 @@ pub struct DownloadGrant {
 
 pub struct DownloadTokens {
     ttl: Duration,
-    grants: Mutex<HashMap<String, DownloadGrant>>,
+    grants: Mutex<HashMap<[u8; 32], DownloadGrant>>,
 }
 
 impl DownloadTokens {
@@ -113,32 +144,50 @@ impl DownloadTokens {
     }
 
     pub fn issue(&self, principal: FilePrincipal, path: FilePath) -> Result<String, FileError> {
-        let mut raw = [0; 32];
-        getrandom::getrandom(&mut raw)
-            .map_err(|e| FileError::Unavailable(format!("download token: {e}")))?;
-        let token = URL_SAFE_NO_PAD.encode(raw);
-        let grant = DownloadGrant {
-            principal,
-            path,
-            expires_at: Instant::now() + self.ttl,
-        };
         let mut grants = self.grants.lock().unwrap();
         grants.retain(|_, value| value.expires_at > Instant::now());
-        grants.insert(token.clone(), grant);
-        Ok(token)
+        for _ in 0..64 {
+            let mut raw = [0; 32];
+            getrandom::getrandom(&mut raw)
+                .map_err(|e| FileError::Unavailable(format!("download token: {e}")))?;
+            let token = URL_SAFE_NO_PAD.encode(raw);
+            let digest = token_digest(&token);
+            if let std::collections::hash_map::Entry::Vacant(slot) = grants.entry(digest) {
+                slot.insert(DownloadGrant {
+                    principal,
+                    path: path.clone(),
+                    expires_at: Instant::now() + self.ttl,
+                });
+                return Ok(token);
+            }
+        }
+        Err(FileError::Unavailable(
+            "could not allocate a download token".into(),
+        ))
     }
 
     pub fn resolve(&self, token: &str, core: &Core) -> Option<DownloadGrant> {
-        let mut grants = self.grants.lock().unwrap();
-        let grant = grants.get(token)?.clone();
+        let digest = token_digest(token);
+        let grant = self.grants.lock().unwrap().get(&digest)?.clone();
         if grant.expires_at <= Instant::now()
             || core.session_serial(grant.principal.uid) != Some(grant.principal.serial)
         {
-            grants.remove(token);
+            let mut grants = self.grants.lock().unwrap();
+            if grants.get(&digest).is_some_and(|current| {
+                current.principal == grant.principal
+                    && current.path == grant.path
+                    && current.expires_at == grant.expires_at
+            }) {
+                grants.remove(&digest);
+            }
             return None;
         }
         Some(grant)
     }
+}
+
+fn token_digest(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 #[cfg(test)]

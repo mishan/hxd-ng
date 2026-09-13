@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -7,7 +8,9 @@ use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use hxd_core::{FileBody, FileEntry, FileError, FileInfo, FileKind, FilePath, FileSource};
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_MATCH, RANGE};
+use reqwest::header::{
+    HeaderValue, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_MATCH, RANGE,
+};
 use serde::de::{self, Visitor};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -126,6 +129,14 @@ impl HttpManifestSource {
         let mut objects = BTreeMap::new();
         let mut folders = BTreeSet::from([FilePath::root()]);
         for record in manifest.files {
+            if let Some(media_type) = record.media_type.as_deref() {
+                HeaderValue::from_bytes(media_type.as_bytes()).map_err(|_| {
+                    FileError::Unavailable(format!(
+                        "manifest path {} has an invalid media type",
+                        record.path
+                    ))
+                })?;
+            }
             let path = FilePath::parse(&record.path)?;
             if path.is_root() || record.size > limits.max_file_size {
                 return Err(if record.size > limits.max_file_size {
@@ -345,7 +356,9 @@ impl FileSource for HttpManifestSource {
                 .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e));
             let reader = PermitReader {
                 inner: StreamReader::new(stream),
-                _permit: permit,
+                permit: Some(permit),
+                idle: self.request_timeout,
+                deadline: Box::pin(tokio::time::sleep(self.request_timeout)),
             };
             Ok(FileBody {
                 len: expected,
@@ -361,7 +374,9 @@ fn header_u64(value: Option<&reqwest::header::HeaderValue>) -> Option<u64> {
 
 struct PermitReader<R> {
     inner: R,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
+    idle: Duration,
+    deadline: Pin<Box<tokio::time::Sleep>>,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for PermitReader<R> {
@@ -370,7 +385,30 @@ impl<R: AsyncRead + Unpin> AsyncRead for PermitReader<R> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(result) => {
+                if result.is_ok() && buf.filled().len() > before {
+                    this.deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + this.idle);
+                } else if result.is_err() || buf.remaining() > 0 {
+                    this.permit.take();
+                }
+                Poll::Ready(result)
+            }
+            Poll::Pending => match this.deadline.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    this.permit.take();
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "origin response body stalled",
+                    )))
+                }
+                Poll::Pending => Poll::Pending,
+            },
+        }
     }
 }
 
@@ -442,6 +480,8 @@ mod tests {
                 .as_slice(),
             br#"{"version":1,"files":[{"path":"x/y","size":"1"},{"path":"x","size":"1"}]}"#
                 .as_slice(),
+            br#"{"version":1,"files":[{"path":"x","size":"1","media_type":"text/plain\nmalicious: yes"}]}"#
+                .as_slice(),
         ] {
             assert!(HttpManifestSource::from_json(
                 "https://example.invalid/",
@@ -488,5 +528,41 @@ mod tests {
         assert!(matches!(redirected, Err(FileError::Unavailable(_))));
         let changed = source.open(&FilePath::parse("changed").unwrap(), 0).await;
         assert!(matches!(changed, Err(FileError::OriginChanged)));
+    }
+
+    #[tokio::test]
+    async fn stalled_response_body_times_out_and_releases_its_permit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stalled, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 1024];
+            let _ = stalled.read(&mut request).await.unwrap();
+            stalled
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let source = HttpManifestSource::from_json(
+            &format!("http://{address}/"),
+            br#"{"version":1,"files":[{"path":"stalled","size":"1"}]}"#,
+            ManifestLimits {
+                max_concurrent: 1,
+                request_timeout: Duration::from_millis(50),
+                ..ManifestLimits::default()
+            },
+        )
+        .unwrap();
+
+        let body = source
+            .open(&FilePath::parse("stalled").unwrap(), 0)
+            .await
+            .unwrap();
+        let mut reader = body.reader;
+        let mut bytes = Vec::new();
+        let error = reader.read_to_end(&mut bytes).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(source.permits.available_permits(), 1);
     }
 }

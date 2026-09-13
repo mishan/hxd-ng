@@ -267,9 +267,10 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
             format!("bytes {offset}-{}/{}", info.size - 1, info.size),
         );
     }
-    response
-        .body(StreamBody::new(stream).boxed_unsync())
-        .unwrap()
+    match response.body(StreamBody::new(stream).boxed_unsync()) {
+        Ok(response) => response,
+        Err(_) => plain(StatusCode::BAD_GATEWAY, "file metadata is invalid"),
+    }
 }
 
 fn parse_range(value: &str) -> Option<u64> {

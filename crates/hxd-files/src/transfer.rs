@@ -67,8 +67,20 @@ pub async fn serve_htxf(
     core: Arc<Core>,
     handshake_timeout: Duration,
 ) -> std::io::Result<()> {
+    let mut accept_backoff = Duration::from_millis(10);
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => {
+                accept_backoff = Duration::from_millis(10);
+                accepted
+            }
+            Err(error) => {
+                warn!(%error, "HTXF accept failed; retrying");
+                tokio::time::sleep(accept_backoff).await;
+                accept_backoff = (accept_backoff * 2).min(Duration::from_secs(1));
+                continue;
+            }
+        };
         let registry = registry.clone();
         let core = core.clone();
         tokio::spawn(async move {

@@ -17,7 +17,7 @@ impl FilePath {
     }
 
     pub fn parse(path: &str) -> Result<Self, FileError> {
-        if path.is_empty() || path == "/" {
+        if path.is_empty() {
             return Ok(Self::root());
         }
         if path.starts_with('/') || path.ends_with('/') {
@@ -181,11 +181,18 @@ mod tests {
         );
         assert_eq!(path.parent().unwrap().as_slash_path(), "manuals/1998");
         assert_eq!(path.name(), Some("read me.txt"));
-        for bad in ["/absolute", "trailing/", "a//b", "a/../b", "a/./b", "a\0b"] {
+        for bad in [
+            "/",
+            "/absolute",
+            "trailing/",
+            "a//b",
+            "a/../b",
+            "a/./b",
+            "a\0b",
+        ] {
             assert_eq!(FilePath::parse(bad), Err(FileError::InvalidPath));
         }
         assert!(FilePath::parse("").unwrap().is_root());
-        assert!(FilePath::parse("/").unwrap().is_root());
     }
 
     #[test]

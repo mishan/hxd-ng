@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 const TASK: u32 = 0x0001_0000;
 const LOGIN: u32 = 0x006b;
 const FILE_LIST: u32 = 0x00c8;
+const FILE_GET_INFO: u32 = 0x00ce;
 const FILE_GET: u32 = 0x00ca;
 const LIST_ENTRY: u16 = 0x00c8;
 const HUGE_SIZE: u64 = u32::MAX as u64 + 6;
@@ -31,6 +32,7 @@ struct Running {
     legacy: SocketAddr,
     ng: SocketAddr,
     htxf: SocketAddr,
+    _temp: tempfile::TempDir,
 }
 
 async fn start() -> Running {
@@ -124,9 +126,6 @@ async fn start() -> Running {
         "name = \"guest\"\n[access]\ndownload_files = true\nread_chat = true\nuse_any_name = true\n",
     )
     .unwrap();
-    // FileAuth reads on demand, so the temporary directory must outlive the
-    // spawned servers. The test process owns this small fixture thereafter.
-    let accounts = temp.keep().join("accounts");
     let core = Arc::new(Core::new());
     let auth: Arc<dyn hxd_core::AuthBackend> = Arc::new(hxd_auth_file::FileAuth::new(&accounts));
     let legacy_ctx = ServerCtx {
@@ -166,6 +165,7 @@ async fn start() -> Running {
         legacy: legacy.local_addr().unwrap(),
         ng: ng.local_addr().unwrap(),
         htxf: transfer.local_addr().unwrap(),
+        _temp: temp,
     };
     tokio::spawn(hxd_session::serve(legacy, legacy_ctx));
     tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
@@ -294,6 +294,32 @@ async fn classic_hides_oversized_files_while_large_file_resume_is_exact() {
         u64::from_be_bytes(huge[1].data.try_into().unwrap()),
         HUGE_SIZE
     );
+
+    let info = capable
+        .request(FILE_GET_INFO, &[(tag::FILE_NAME, b"huge.bin".to_vec())])
+        .await;
+    let info_chunks: Vec<_> = info.chunks().collect();
+    let sizes = info_chunks
+        .windows(2)
+        .find(|pair| pair[0].tag == tag::FILE_SIZE)
+        .expect("clamped file size and adjacent exact companion");
+    assert_eq!(sizes[0].as_uint(), u32::MAX);
+    assert_eq!(sizes[1].tag, tag::FILESIZE64);
+    assert_eq!(
+        u64::from_be_bytes(sizes[1].data.try_into().unwrap()),
+        HUGE_SIZE
+    );
+
+    let eof_resume = capable
+        .request(
+            FILE_GET,
+            &[
+                (tag::FILE_NAME, b"huge.bin".to_vec()),
+                (tag::OFFSET64, HUGE_SIZE.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    assert_ne!(eof_resume.flag & 1, 0);
 
     let offset = HUGE_SIZE - 5;
     let get = capable

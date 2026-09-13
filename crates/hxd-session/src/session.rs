@@ -1652,7 +1652,9 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 }
             };
             let mut chunks = Vec::with_capacity(entries.len() * if large { 2 } else { 1 });
-            let mut wire_len = 0usize;
+            // DataSize includes the two-byte chunk count as well as every
+            // chunk header and payload.
+            let mut wire_len = 2usize;
             for entry in entries {
                 let payload = files::list_payload(&entry);
                 wire_len = wire_len.saturating_add(4 + payload.len());
@@ -1767,19 +1769,20 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "That path is not a file.");
                 return;
             }
-            let mut offset = f
-                .chunks()
-                .find(|chunk| chunk.tag == tag::RFLT)
+            let resume = f.chunks().find(|chunk| chunk.tag == tag::RFLT);
+            let mut has_resume = resume.is_some();
+            let mut offset = resume
                 .map(|chunk| u64::from(hxfiles_xfer::rflt::parse_compatible(chunk.data).data))
                 .unwrap_or(0);
             if let Some(chunk) = f.chunks().find(|chunk| chunk.tag == tag::OFFSET64) {
+                has_resume = true;
                 if !large || chunk.data.len() != 8 {
                     reply_error(tx, f.trans, "Malformed file resume offset.");
                     return;
                 }
                 offset = u64::from_be_bytes(chunk.data.try_into().expect("eight bytes"));
             }
-            if offset > info.size {
+            if offset > info.size || (has_resume && offset == info.size) {
                 reply_error(tx, f.trans, "Resume offset is beyond the file.");
                 return;
             }
