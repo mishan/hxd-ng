@@ -333,13 +333,26 @@ pub trait BlobStore: Send + Sync + 'static {
         Ok(self.derivative(id)?.is_some())
     }
     fn remove(&self, id: &BlobId) -> Result<(), StoreError>;
-    /// Unlink files no row keeps that are older than `older_than`, and
-    /// the leftovers of writes that never finished.
-    fn sweep_orphans(
-        &self,
-        keep: &HashSet<BlobId>,
-        older_than: SystemTime,
-    ) -> Result<u64, StoreError>;
+    /// Walk the store for the orphan sweep. The domain calls this without
+    /// its blob lock, so it reports rather than decides: what has a file,
+    /// and what was last written before `older_than`. What it unlinks
+    /// itself is what no id leads to — the temporary file of a write that
+    /// died before its rename, or a blob's file away from its path — once
+    /// it is that old. A file it cannot unlink or a directory it cannot
+    /// read is logged and passed over rather than ending the walk.
+    fn survey(&self, older_than: SystemTime) -> Result<BlobSurvey, StoreError>;
+}
+
+/// What [`BlobStore::survey`] found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BlobSurvey {
+    /// Every blob with a canonical file.
+    pub present: HashSet<BlobId>,
+    /// Every blob with a file, canonical or derivative, last written
+    /// before the cutoff: the only ones an orphan sweep may unlink.
+    pub old: HashSet<BlobId>,
+    /// Files no id leads to, unlinked.
+    pub strays: u64,
 }
 
 /// A resolved reference. Unlike [`Author`] this is *current* state: a
@@ -1454,9 +1467,18 @@ impl Core {
         };
         let canonical = codec.canonicalize(input).map_err(refused)?;
         let derivative = if policy.legacy_derivative {
-            codec
-                .legacy_derivative(&canonical, 1024, 60_000)
-                .map_err(refused)?
+            match codec.legacy_derivative(&canonical, 1024, 60_000) {
+                Ok(derivative) => derivative,
+                Err(MediaReject::Busy) => return Err(refused(MediaReject::Busy)),
+                // The canonical bytes are sound — they are this server's
+                // own encode — so this is §7.3's image with no derivative:
+                // a 1.5 client reads a line about it. Refusing the upload
+                // would cost the ng reader the picture too.
+                Err(e) => {
+                    warn!(login = %asker.login, "news legacy derivative failed: {e:?}");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -1544,7 +1566,8 @@ impl Core {
     }
 
     /// Expire abandoned stages and reap old orphan files. Called by the
-    /// binary's hourly news maintenance task.
+    /// binary's hourly news maintenance task. Returns how many orphans and
+    /// dead writes went.
     pub fn news_expire_attachments(&self, now: SystemTime) -> Result<u64, NewsError> {
         let store = self.news_store()?;
         let policy = self.news_policy.attach.ok_or(NewsError::Disabled)?;
@@ -1552,20 +1575,49 @@ impl Core {
         let before = now
             .checked_sub(policy.stage_ttl)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let _serial = self.news_blob_serial.lock().unwrap();
-        for id in store.expire_attachments(before)? {
-            blobs.remove(&id)?;
+        // A row is gone before its file is unlinked, so a file that will
+        // not go is an orphan the next sweep takes — and must not keep
+        // the rest from going.
+        let unlink = |id: &BlobId| match blobs.remove(id) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(blob = %blob_hex(id), "news attachment sweep: {e}");
+                false
+            }
+        };
+        {
+            let _serial = self.news_blob_serial.lock().unwrap();
+            for id in store.expire_attachments(before)? {
+                unlink(&id);
+            }
+            for id in store.unreferenced_blobs()? {
+                unlink(&id);
+            }
         }
-        for id in store.unreferenced_blobs()? {
-            blobs.remove(&id)?;
-        }
+        // The walk stats every file in the archive, so it holds no lock:
+        // an upload waiting on it would wait on the size of the archive.
+        // What it finds is only a lead. Each file is weighed against the
+        // rows again under the lock before anything is unlinked, since an
+        // upload may have staged those very bytes since the walk began.
         let keep = store.attachment_blobs()?;
-        for id in &keep {
+        let survey = blobs.survey(before)?;
+        let orphans: Vec<BlobId> = survey.old.difference(&keep).copied().collect();
+        let missing: Vec<BlobId> = keep.difference(&survey.present).copied().collect();
+        let mut removed = survey.strays;
+        if orphans.is_empty() && missing.is_empty() {
+            return Ok(removed);
+        }
+        let _serial = self.news_blob_serial.lock().unwrap();
+        let keep = store.attachment_blobs()?;
+        for id in orphans.iter().filter(|id| !keep.contains(*id)) {
+            removed += u64::from(unlink(id));
+        }
+        for id in missing.iter().filter(|id| keep.contains(*id)) {
             if !blobs.contains(id)? {
                 warn!(blob = %blob_hex(id), "news attachment metadata has no canonical file");
             }
         }
-        blobs.sweep_orphans(&keep, before).map_err(NewsError::from)
+        Ok(removed)
     }
 
     fn news_remove_unreferenced(&self, store: &Arc<dyn NewsStore>) {
@@ -1999,6 +2051,9 @@ fn create_bit(kind: NodeKind) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::roster::{drain, test_attach, AttachInfo, Transport};
+
     /// The upload allowance is the mailbox's, and an identity's mailbox
     /// is its fingerprint, not whatever it is called this week.
     #[test]
@@ -2016,8 +2071,6 @@ mod tests {
         core.news_attach_refund(&after, 1);
         assert!(core.news_attach_charge(&before, 1));
     }
-    use super::*;
-    use crate::roster::{drain, test_attach, AttachInfo, Transport};
 
     fn reader() -> AccessBits {
         AccessBits::empty().with(bit::READ_NEWS)

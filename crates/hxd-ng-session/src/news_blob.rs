@@ -148,7 +148,16 @@ pub async fn download(id: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, mime)
         .header(CACHE_CONTROL, "private, max-age=604800, immutable")
-        .header("etag", format!("\"{}\"", hash_prefix(&blob)))
+        // The derivative is other bytes behind the same handle, so it is
+        // another validator.
+        .header(
+            "etag",
+            format!(
+                "\"{}{}\"",
+                hash_prefix(&blob),
+                if legacy { ".l" } else { "" }
+            ),
+        )
         .header("x-content-type-options", "nosniff")
         .header(CONTENT_DISPOSITION, "inline")
         .header(CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'")

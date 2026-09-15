@@ -1,15 +1,15 @@
 //! Filesystem-backed durable news image bytes (`docs/news.md` §7.2).
 
-use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirEntry, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use hxd_core::inbox::StoreError;
-use hxd_core::news::{BlobId, BlobStore};
+use hxd_core::news::{BlobId, BlobStore, BlobSurvey};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 static TEMP_SERIAL: AtomicU64 = AtomicU64::new(0);
 
@@ -81,27 +81,41 @@ impl FileBlobStore {
             .map_err(StoreError::new)
     }
 
+    /// Every file two directories down, where [`Self::path`] puts them.
+    /// The root failing is no store at all, and an error; below it, a
+    /// directory that cannot be read is logged and passed over, so one
+    /// bad directory does not hide the rest of the archive.
     fn files(&self) -> Result<Vec<PathBuf>, StoreError> {
+        let firsts = fs::read_dir(&self.root).map_err(StoreError::new)?;
         let mut out = Vec::new();
-        for first in fs::read_dir(&self.root).map_err(StoreError::new)? {
-            let first = first.map_err(StoreError::new)?.path();
+        for first in firsts.filter_map(|e| Self::entry(&self.root, e)) {
             if !first.is_dir() {
                 continue;
             }
-            for second in fs::read_dir(first).map_err(StoreError::new)? {
-                let second = second.map_err(StoreError::new)?.path();
-                if !second.is_dir() {
-                    continue;
-                }
-                for file in fs::read_dir(second).map_err(StoreError::new)? {
-                    let file = file.map_err(StoreError::new)?.path();
-                    if file.is_file() {
-                        out.push(file);
-                    }
+            for second in Self::entries(&first) {
+                if second.is_dir() {
+                    out.extend(Self::entries(&second).into_iter().filter(|f| f.is_file()));
                 }
             }
         }
         Ok(out)
+    }
+
+    fn entries(dir: &Path) -> Vec<PathBuf> {
+        match fs::read_dir(dir) {
+            Ok(read) => read.filter_map(|e| Self::entry(dir, e)).collect(),
+            Err(e) => {
+                warn!(dir = %dir.display(), "news blob sweep: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    fn entry(dir: &Path, entry: std::io::Result<DirEntry>) -> Option<PathBuf> {
+        entry
+            .map(|e| e.path())
+            .map_err(|e| warn!(dir = %dir.display(), "news blob sweep: {e}"))
+            .ok()
     }
 
     fn id_from_path(path: &Path) -> Option<BlobId> {
@@ -171,40 +185,50 @@ impl BlobStore for FileBlobStore {
         }
     }
 
-    fn sweep_orphans(
-        &self,
-        keep: &HashSet<BlobId>,
-        older_than: SystemTime,
-    ) -> Result<u64, StoreError> {
-        let mut removed = 0;
+    fn survey(&self, older_than: SystemTime) -> Result<BlobSurvey, StoreError> {
+        let mut survey = BlobSurvey::default();
         for path in self.files()? {
             let old = fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .is_ok_and(|at| at < older_than);
-            if !old {
-                continue;
-            }
-            let orphan = match Self::id_from_path(&path) {
-                Some(id) => !keep.contains(&id),
-                // A write that died between its temporary file and the
-                // rename. Nothing will ever finish it, and nothing else
-                // would ever unlink it.
-                None => path
+            let named = Self::id_from_path(&path);
+            let placed =
+                named.filter(|id| path == self.path(id) || path == self.derivative_path(id));
+            let Some(id) = placed else {
+                // Nothing this store would ever read: a write that died
+                // between its temporary file and the rename, or a blob's
+                // name away from its blob's path. Nothing will ever finish
+                // or find it, and nothing else would ever unlink it; and a
+                // write takes seconds, not the stage TTL, so an old one is
+                // no write in flight. Any other file is not ours to judge.
+                let temp = path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(".stage-")),
+                    .is_some_and(|n| n.starts_with(".stage-"));
+                if old && (temp || named.is_some()) {
+                    match fs::remove_file(&path) {
+                        Ok(()) => survey.strays += 1,
+                        Err(e) => warn!(path = %path.display(), "news blob sweep: {e}"),
+                    }
+                }
+                continue;
             };
-            if orphan {
-                fs::remove_file(path).map_err(StoreError::new)?;
-                removed += 1;
+            if path.extension().is_none() {
+                survey.present.insert(id);
+            }
+            if old {
+                survey.old.insert(id);
             }
         }
-        Ok(removed)
+        Ok(survey)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -251,19 +275,31 @@ mod tests {
         store.put_derivative(&orphan, b"legacy orphan").unwrap();
         let stray = store.path(&kept).with_file_name(".stage-0-0");
         fs::write(&stray, b"half a write").unwrap();
-        let removed = store
-            .sweep_orphans(
-                &HashSet::from([kept]),
-                SystemTime::now() + std::time::Duration::from_secs(1),
-            )
+        // A blob's name in a directory its hash does not lead to: nothing
+        // looks there, so nothing would ever unlink it by its id.
+        let misplaced = dir.path().join("00").join("00").join("ab".repeat(32));
+        fs::create_dir_all(misplaced.parent().unwrap()).unwrap();
+        fs::write(&misplaced, b"lost").unwrap();
+        let operator = store.path(&kept).with_file_name("README");
+        fs::write(&operator, b"not ours").unwrap();
+
+        let fresh = store.survey(SystemTime::UNIX_EPOCH).unwrap();
+        assert_eq!(fresh.present, HashSet::from([kept, orphan]));
+        assert!(fresh.old.is_empty(), "nothing is old enough yet");
+        assert_eq!(fresh.strays, 0);
+        assert!(stray.exists(), "a write that may be in flight is left be");
+
+        let later = store
+            .survey(SystemTime::now() + Duration::from_secs(1))
             .unwrap();
-        assert_eq!(
-            removed, 3,
-            "the canonical and derivative files were reaped, and the unfinished write"
+        assert_eq!(later.old, HashSet::from([kept, orphan]));
+        assert_eq!(later.strays, 2);
+        assert!(!stray.exists(), "the unfinished write is taken");
+        assert!(!misplaced.exists(), "and the blob no path leads to");
+        assert!(operator.exists(), "a file that is none of ours is left be");
+        assert!(
+            store.contains(&orphan).unwrap() && store.derivative(&orphan).unwrap().is_some(),
+            "and nothing else: which blobs are orphans is the rows' to say"
         );
-        assert!(!stray.exists());
-        assert!(store.contains(&kept).unwrap());
-        assert!(!store.contains(&orphan).unwrap());
-        assert!(store.derivative(&orphan).unwrap().is_none());
     }
 }

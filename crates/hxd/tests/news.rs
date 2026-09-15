@@ -763,10 +763,10 @@ async fn the_sweep_takes_abandoned_stages_and_files_nothing_keeps() {
         )
         .await;
 
-    // What a crash leaves behind: bytes no row names, and a write that
-    // was never renamed into place.
+    // What a crash leaves behind: bytes no row names, where their hash
+    // puts them, and a write that was never renamed into place.
     let blobs = dir.path().join("news-blobs");
-    let stray = blobs.join("ab").join("cd");
+    let stray = blobs.join("ab").join("ab");
     std::fs::create_dir_all(&stray).unwrap();
     std::fs::write(stray.join("ab".repeat(32)), b"orphan").unwrap();
     std::fs::write(stray.join(".stage-0-0"), b"half a write").unwrap();

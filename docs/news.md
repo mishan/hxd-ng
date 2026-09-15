@@ -58,7 +58,7 @@ locks the legacy wire out.
   inline-media.md §5 and the reason the two stores are separate.
 - **Legacy clients get a derivative.** The 1.5 wire's article parts are
   capped at 65 535 bytes by the chunk header, so a 2 MiB photo cannot
-  ride it. `hxd-media` re-encodes each attachment once at post time
+  ride it. `hxd-media` re-encodes each attachment once, when it is staged,
   into a ≤ 60 000-byte, ≤ 1024 px version, and *that* is what a 1.5
   client fetches with `GETTHREAD`. The canonical bytes are what an ng
   client gets.
@@ -964,8 +964,7 @@ pub trait BlobStore: Send + Sync + 'static {
     fn derivative(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError>;
     fn contains_derivative(&self, id: &BlobId) -> Result<bool, StoreError>;
     fn remove(&self, id: &BlobId) -> Result<(), StoreError>;
-    fn sweep_orphans(&self, keep: &HashSet<BlobId>, older_than: SystemTime)
-        -> Result<u64, StoreError>;
+    fn survey(&self, older_than: SystemTime) -> Result<BlobSurvey, StoreError>;
 }
 ```
 
@@ -986,10 +985,16 @@ screenshot store it once and a re-post costs a refcount increment.
 unlinked and the row is dropped. A staged attachment holds a reference
 too, so an upload nobody ever posted is collected by the stage sweep
 and not by a race. An orphan sweep — files with no row, rows with no
-files — runs from the same hourly task as inbox retention, logs what it
-finds, and unlinks only files older than the stage TTL so an upload in
-flight is never swept. The same sweep takes the temporary files of writes
-that died before their rename.
+files — runs from the hourly news task, logs what it finds, and unlinks
+only files older than the stage TTL so an upload in flight is never
+swept. The same sweep takes the temporary files of writes that died
+before their rename, and a blob's file found away from the path its
+name gives. Its walk of the directory holds no lock, because
+it stats every file in the archive and an upload waiting on it would
+wait on the archive's size; what the walk finds is weighed against the
+rows again under the lock before anything is unlinked. A file that will
+not unlink, or a directory that cannot be read, is logged and passed
+over rather than ending the sweep.
 
 This is the first user content hxd-ng writes to disk, which is worth
 saying plainly: it is a thing to back up, a thing a purge must actually
@@ -1038,7 +1043,7 @@ line of text about it.
 | Legacy derivative | 60 000 B, 1024 px | `hxd-media`, at stage |
 | Staged handle lifetime | 30 min | store, swept hourly |
 | Uploads per account | 20 / hour | domain |
-| Total blob bytes | 8 GiB | store; a post over it is refused, never evicted |
+| Total blob bytes | 8 GiB | store; an upload over it is refused (507), never evicted |
 | Article body | 65 535 bytes | domain — §12.4 says why that number |
 | Plain downgrade | 65 535 bytes | renderer, truncated at a char boundary (§5.4) |
 | References per article | 32 | domain, at extraction |
@@ -2204,10 +2209,10 @@ stale_after = 604800            # seconds behind before a scope rings again anyw
 [news.attach]                   # absent = news without attachments
 max_bytes = 2097152             # per attachment, as uploaded
 max_count = 8                   # per article
-max_total_bytes = 8589934592    # across the whole store; a post over it is refused
+max_total_bytes = 8589934592    # across the whole store; an upload over it is refused
 stage_ttl = 1800                # seconds a staged handle lives unposted
 per_hour = 20                   # uploads per account
-legacy_derivative = true        # generate the ≤60 000 B version at post time
+legacy_derivative = true        # generate the ≤60 000 B version at stage time
 ```
 
 `[news.notify]` needs no feature — subscriptions and the `news_notify`
@@ -2216,8 +2221,9 @@ degradation: an attached client still gets its badge, and only the
 doorbell for an absent one is missing. A gateway is `[push]`'s business,
 not news's.
 
-`[news.attach]` without the `media` feature is a startup error, the way
-`[media]` and `[inbox]` already are, and `markdown = "render"` without
+`[news.attach]` without the `media` and `inbox` features is a startup
+error, the way `[media]` and `[inbox]` already are, and
+`markdown = "render"` without
 the `markdown` feature is the same error for the same reason: a config
 that silently does less than it says is worse than one that refuses to
 start. `[news]` without `[news.attach]` is news with no pictures, which
