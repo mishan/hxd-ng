@@ -6,6 +6,7 @@
 
 mod conn;
 pub mod enroll;
+mod files;
 mod http;
 pub mod identity;
 pub mod media;
@@ -233,6 +234,8 @@ pub struct NgCtx {
     /// so it is beside `identity` rather than inside it — a registrar
     /// would mount this and nothing more.
     pub enroll: Option<Arc<enroll::Mailbox>>,
+    /// Shared read-only file source and authorization registries.
+    pub files: Option<Arc<hxd_files::FileService>>,
 }
 
 /// Accept loop: one connection task per socket. Each is HTTP until it

@@ -4,6 +4,7 @@
 //! extension of it — both speak to `hxd-core`.
 
 pub mod caps;
+mod files;
 pub mod frame;
 pub mod media;
 pub mod session;

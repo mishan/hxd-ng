@@ -250,6 +250,109 @@ max_detached_per_addr = 2
 forwarded_header = "x-forwarded-for"
 ```
 
+### Files
+
+Absent means neither wire advertises Files and the HTXF listener is not
+opened. Choose exactly one source mode. The manifest mode is read-only: only
+the configured HTTP(S) origin may provide bytes, so no client or manifest row
+can turn the server into an arbitrary-URL proxy. See
+[docs/files-plan.md](docs/files-plan.md).
+
+```toml
+[files]
+manifest = "files.json"
+origin = "https://downloads.example/files/"
+# bind = "0.0.0.0:5501"       # default: [server] bind, port plus one
+max_file_size = 68719476736   # per object
+max_entries = 100000
+max_concurrent = 8            # origin responses streamed at once
+request_timeout = 15          # origin connect/request seconds
+reference_ttl = 60            # unclaimed HTXF references
+max_references = 4096         # outstanding HTXF references globally
+max_references_per_session = 64
+max_references_per_account = 256  # across all of one account's sessions
+download_ttl = 60             # ng bearer URLs; reusable for resume
+max_downloads = 4096          # outstanding ng bearer URLs globally
+max_downloads_per_session = 64
+max_downloads_per_account = 256
+handshake_timeout = 10        # HTXF preamble seconds
+idle_timeout = 60             # a download whose receiver stops reading, either wire
+```
+
+Listing and Get Info are the account's `[extra] file_list` and
+`file_getinfo`, which are on unless the account file turns them off, as on
+mhxd; downloading needs `download_files`. A download ends with the session that
+asked for it, and an HTXF transfer must come from the address of a direct
+control connection.
+
+A local root enables FilePut. As on mhxd, an account with `upload_files` may
+upload into any folder whose path names an upload folder or a drop box
+(`Uploads`, `Drop Box`, in any case), and one that also has `upload_anywhere`
+may upload anywhere. A drop box's contents are listed only to accounts with
+`view_drop_boxes`. Existing files are never overwritten. Uploads are staged in
+an internal mode-0700 directory, scoped by account and destination, and become
+visible through an atomic no-replace link only after the transfer has arrived
+and validated. Client paths are resolved beneath an open directory capability
+without following symlinks; absolute paths, traversal, symlinks, and the
+internal state path, however it is spelled, are not reachable through either
+protocol.
+
+```toml
+[files]
+root = "/srv/hxd/files"        # must already exist
+# bind = "0.0.0.0:5501"
+max_file_size = 68719476736   # data and resource forks combined
+max_entries = 100000
+max_concurrent = 8
+max_partial_bytes = 68719476736
+max_partials = 1024          # global abandoned/in-progress upload cap
+max_partials_per_account = 4
+request_timeout = 15          # each local read/write must make progress
+upload_timeout = 3600         # hard wall-clock limit for one upload
+partial_ttl = 604800          # abandoned partials, seconds
+reference_ttl = 60
+download_ttl = 60
+handshake_timeout = 10
+```
+
+The local source keeps Finder metadata and resource forks in CAP-format records
+under `.hxd-state`; that directory is reserved to the server and omitted from
+listings. Large File uploads use raw bytes. A resumed one is accepted only when
+the client echoes the server's SHA-256 digest for the exact stored offset and
+trailing window. Folder upload and general file mutation remain separate work.
+
+An interrupted upload stays unlisted until it completes, where mhxd shows the
+truncated file. A classic client that offers to resume only when it sees the
+file on the server therefore starts over; one that asks to resume anyway is
+given the stored offset. An account at `max_partials_per_account` gives up its
+least recently touched partial to make room for a new upload, and a partial
+with nothing in it is dropped when its transfer ends.
+
+The manifest schema is deliberately small and strict. Sizes are decimal
+strings so its shape agrees with the ng wire:
+
+```json
+{
+  "version": 1,
+  "files": [
+    {
+      "path": "manuals/read me.txt",
+      "size": "12",
+      "media_type": "text/plain",
+      "etag": "\"release-7\"",
+      "ranges": true,
+      "created": 123,
+      "modified": 456,
+      "comment": "Start here"
+    }
+  ]
+}
+```
+
+When `etag` is present, every origin response must return that exact ETag.
+`ranges = true` promises the origin honors open-ended byte ranges and returns
+the corresponding `Content-Range`; a mismatch fails the transfer closed.
+
 ### Portable identity
 
 Needs `[ng]`, because the identity endpoints and the tunnel are served by

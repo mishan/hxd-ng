@@ -139,6 +139,7 @@ async fn start_both(dir: &Path, video: bool) -> Server {
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
         }),
+        files: None,
     };
     let ng_caps = if video {
         vec!["voice".to_string(), "video".to_string()]
@@ -163,6 +164,7 @@ async fn start_both(dir: &Path, video: bool) -> Server {
         identity: None,
         tunnel: None,
         enroll: None,
+        files: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

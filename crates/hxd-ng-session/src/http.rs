@@ -32,17 +32,19 @@
 //! points a page at a server other than the one that served it, and the
 //! enrollment mailbox is reached by a phone that followed a QR code.
 
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
-use hxd_core::{IdentityTag, LinkAuthority, Transport};
-use hyper::body::Incoming;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, Limited, StreamBody};
+use hxd_core::{FileError, FileKind, IdentityTag, LinkAuthority, Transport};
+use hyper::body::{Frame as BodyFrame, Incoming};
 use hyper::header::{
-    HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    HeaderValue, ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
     ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
-    AUTHORIZATION, CONTENT_TYPE, ETAG, ORIGIN,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    ETAG, ORIGIN, RANGE,
 };
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -56,7 +58,18 @@ use crate::identity::{
 };
 use crate::{conn, tunnel, ForwardedHeader, NgCtx};
 
-type Resp = Response<Full<Bytes>>;
+type RespBody = UnsyncBoxBody<Bytes, io::Error>;
+type Resp = Response<RespBody>;
+
+fn full(bytes: Bytes) -> RespBody {
+    Full::new(bytes)
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn boxed(resp: Response<Full<Bytes>>) -> Resp {
+    resp.map(|body| body.map_err(|never| match never {}).boxed_unsync())
+}
 
 /// Request bodies on the identity endpoints. The objects inside are
 /// bounded individually — a card at 16 KiB (§3.4), a certificate at 4
@@ -139,9 +152,19 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
     // other route a page fetches.
     if path == "/media" || path.starts_with("/media/") {
         let resp = match (req.method(), path.strip_prefix("/media/")) {
-            (&Method::POST, None) => crate::media::upload(req, &ctx).await,
+            (&Method::POST, None) => boxed(crate::media::upload(req, &ctx).await),
             (&Method::GET, Some(id)) if !id.is_empty() && !id.contains('/') => {
-                crate::media::download(id, req, &ctx).await
+                boxed(crate::media::download(id, req, &ctx).await)
+            }
+            _ => plain(StatusCode::NOT_FOUND, "not found"),
+        };
+        return cors(resp);
+    }
+
+    if path.starts_with("/files/") {
+        let resp = match (req.method(), path.strip_prefix("/files/")) {
+            (&Method::GET, Some(token)) if !token.is_empty() && !token.contains('/') => {
+                download_file(token, req, &ctx).await
             }
             _ => plain(StatusCode::NOT_FOUND, "not found"),
         };
@@ -179,6 +202,184 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
     resp
 }
 
+async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
+    let Some(service) = ctx.files.as_ref() else {
+        return plain(StatusCode::NOT_FOUND, "not found");
+    };
+    let Some(grant) = service.downloads.resolve(token, &ctx.core) else {
+        // Expired, unknown, and no-longer-authorized tokens are deliberately
+        // indistinguishable: a bearer URL must not become a session oracle.
+        return plain(StatusCode::NOT_FOUND, "not found");
+    };
+    let info = match service.source.info(&grant.path).await {
+        Ok(info) if info.kind == FileKind::File => info,
+        _ => return plain(StatusCode::NOT_FOUND, "not found"),
+    };
+    // RFC 9110 §14.2: a server may ignore Range, and must ignore one it
+    // cannot parse. So a file that cannot start mid-way, more than one
+    // range, and a malformed header all get the whole file; only a range
+    // that is well formed and misses the file answers 416.
+    let mut headers = req.headers().get_all(RANGE).iter();
+    let range = match (headers.next(), headers.next()) {
+        (Some(value), None) if grant.ranges => value.to_str().ok().and_then(parse_range),
+        _ => None,
+    };
+    let (offset, len) = match range.map(|range| range.resolve(info.size)) {
+        None => (0, info.size),
+        Some(Some(span)) => span,
+        Some(None) => return range_not_satisfiable(info.size),
+    };
+    let body = match service.source.open(&grant.path, offset).await {
+        Ok(body) => body,
+        Err(FileError::RangeInvalid | FileError::RangeUnsupported) => {
+            return range_not_satisfiable(info.size);
+        }
+        Err(_) => return plain(StatusCode::BAD_GATEWAY, "file origin unavailable"),
+    };
+    if body.len != info.size - offset {
+        return plain(StatusCode::BAD_GATEWAY, "file origin changed");
+    }
+    let status = if range.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let chunks = hxd_files::pump(
+        body,
+        len,
+        service.idle_timeout,
+        hxd_files::Liveness::new(ctx.core.clone(), grant.principal),
+    );
+    let stream = futures_util::stream::unfold(chunks, |mut chunks| async move {
+        let chunk = chunks.recv().await?;
+        Some((
+            chunk.map(|bytes| BodyFrame::data(Bytes::from(bytes))),
+            chunks,
+        ))
+    });
+    let mut response = Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, len.to_string())
+        .header(CACHE_CONTROL, "private, no-store")
+        .header(
+            CONTENT_DISPOSITION,
+            content_disposition(grant.path.name().unwrap_or("download")),
+        )
+        .header(
+            CONTENT_TYPE,
+            info.media_type
+                .as_deref()
+                .unwrap_or("application/octet-stream"),
+        );
+    if grant.ranges {
+        response = response.header(ACCEPT_RANGES, "bytes");
+    }
+    if range.is_some() {
+        response = response.header(
+            CONTENT_RANGE,
+            format!("bytes {offset}-{}/{}", offset + len - 1, info.size),
+        );
+    }
+    match response.body(StreamBody::new(stream).boxed_unsync()) {
+        Ok(response) => response,
+        Err(_) => plain(StatusCode::BAD_GATEWAY, "file metadata is invalid"),
+    }
+}
+
+fn range_not_satisfiable(size: u64) -> Resp {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(CONTENT_RANGE, format!("bytes */{size}"))
+        .body(full(Bytes::new()))
+        .unwrap()
+}
+
+fn content_disposition(name: &str) -> HeaderValue {
+    let mut fallback = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '-' | '_' | '(' | ')') {
+            fallback.push(ch);
+        } else {
+            fallback.push('_');
+        }
+    }
+    if fallback.is_empty() {
+        fallback.push_str("download");
+    }
+
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.as_bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
+            encoded.push(char::from(*byte));
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))
+    .expect("sanitized content disposition is a valid header")
+}
+
+/// One byte range, as `Range: bytes=` spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteRange {
+    /// `first-` or `first-last`.
+    From { first: u64, last: Option<u64> },
+    /// `-count`: the file's final bytes.
+    Suffix(u64),
+}
+
+impl ByteRange {
+    /// The `(offset, length)` this range selects from a file of `size`
+    /// bytes, or `None` when it selects nothing (RFC 9110 §14.1.1).
+    fn resolve(self, size: u64) -> Option<(u64, u64)> {
+        match self {
+            ByteRange::From { first, last } if first < size => {
+                let last = last.unwrap_or(u64::MAX).min(size - 1);
+                Some((first, last - first + 1))
+            }
+            ByteRange::Suffix(count) if count > 0 && size > 0 => {
+                let len = count.min(size);
+                Some((size - len, len))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A single range, or `None` for anything else: more than one range, a
+/// unit other than bytes, a backwards range, or any stray character.
+fn parse_range(value: &str) -> Option<ByteRange> {
+    let (first, last) = value.strip_prefix("bytes=")?.trim().split_once('-')?;
+    let number = |digits: &str| {
+        (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+    };
+    match (first.is_empty(), last.is_empty()) {
+        (true, false) => Some(ByteRange::Suffix(number(last)?)),
+        (false, true) => Some(ByteRange::From {
+            first: number(first)?,
+            last: None,
+        }),
+        (false, false) => {
+            let (first, last) = (number(first)?, number(last)?);
+            (first <= last).then_some(ByteRange::From {
+                first,
+                last: Some(last),
+            })
+        }
+        (true, true) => None,
+    }
+}
+
 /// The routes a page fetches. An upgrade is not subject to CORS and has
 /// returned above by the time this is asked.
 fn cors_route(path: &str) -> bool {
@@ -186,6 +387,7 @@ fn cors_route(path: &str) -> bool {
         || path.starts_with("/identity/")
         || path == "/media"
         || path.starts_with("/media/")
+        || path.starts_with("/files/")
 }
 
 /// `*` rather than an echo of `Origin`: there is no cookie or other
@@ -202,7 +404,7 @@ fn cors(mut resp: Resp) -> Resp {
     h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     h.insert(
         ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_static("ETag"),
+        HeaderValue::from_static("ETag, Content-Length, Content-Range, Accept-Ranges"),
     );
     resp
 }
@@ -225,10 +427,10 @@ fn preflight() -> Resp {
         // preflight it triggers succeed.
         .header(
             ACCESS_CONTROL_ALLOW_HEADERS,
-            "content-type, authorization, if-none-match",
+            "content-type, authorization, if-none-match, range",
         )
         .header(ACCESS_CONTROL_MAX_AGE, "86400")
-        .body(Full::new(Bytes::new()))
+        .body(full(Bytes::new()))
         .unwrap();
     cors(resp)
 }
@@ -345,7 +547,7 @@ async fn upgrade(
     });
     // hyper_tungstenite builds a body of its own type; re-wrap it.
     let (parts, _) = response.into_parts();
-    Response::from_parts(parts, Full::new(Bytes::new()))
+    Response::from_parts(parts, full(Bytes::new()))
 }
 
 /// §6.1: bearer token in `Authorization`, `?token=` in the URL, or a
@@ -1295,14 +1497,14 @@ fn get_card(fp: &str, if_none_match: Option<&str>, ctx: &NgCtx) -> Resp {
                 return Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header(ETAG, etag)
-                    .body(Full::new(Bytes::new()))
+                    .body(full(Bytes::new()))
                     .unwrap();
             }
             Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "application/cbor")
                 .header(ETAG, etag)
-                .body(Full::new(Bytes::from(bytes)))
+                .body(full(Bytes::from(bytes)))
                 .unwrap()
         }
         None => plain(StatusCode::NOT_FOUND, "no card for that identity"),
@@ -1398,7 +1600,7 @@ fn json_resp(status: StatusCode, v: Value) -> Resp {
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(v.to_string())))
+        .body(full(Bytes::from(v.to_string())))
         .unwrap()
 }
 
@@ -1406,7 +1608,7 @@ fn plain(status: StatusCode, text: &str) -> Resp {
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(text.to_owned())))
+        .body(full(Bytes::from(text.to_owned())))
         .unwrap()
 }
 
@@ -1420,6 +1622,47 @@ impl From<&TransportIdentity> for IdentityTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_names_are_safe_and_preserve_utf8() {
+        assert_eq!(
+            content_disposition("résumé \"draft\".txt").to_str().unwrap(),
+            "attachment; filename=\"r_sum_ _draft_.txt\"; filename*=UTF-8''r%C3%A9sum%C3%A9%20%22draft%22.txt"
+        );
+        assert!(!content_disposition("bad\r\nname.txt")
+            .to_str()
+            .unwrap()
+            .contains(['\r', '\n']));
+    }
+
+    #[test]
+    fn one_byte_range_of_any_form_parses_and_resolves_against_the_size() {
+        let from = |first, last| ByteRange::From { first, last };
+        assert_eq!(parse_range("bytes=5-"), Some(from(5, None)));
+        assert_eq!(parse_range("bytes=5-9"), Some(from(5, Some(9))));
+        assert_eq!(parse_range("bytes=-5"), Some(ByteRange::Suffix(5)));
+        for value in [
+            "bytes=1-,2-",
+            "bytes=0-1,4-5",
+            "items=5-",
+            "bytes=+5-",
+            "bytes=5-+9",
+            "bytes=9-5",
+            "bytes=-",
+            "bytes=5",
+        ] {
+            assert_eq!(parse_range(value), None, "{value}");
+        }
+
+        assert_eq!(from(5, None).resolve(11), Some((5, 6)));
+        assert_eq!(from(0, Some(4)).resolve(11), Some((0, 5)));
+        assert_eq!(from(6, Some(99)).resolve(11), Some((6, 5)));
+        assert_eq!(ByteRange::Suffix(5).resolve(11), Some((6, 5)));
+        assert_eq!(ByteRange::Suffix(99).resolve(11), Some((0, 11)));
+        assert_eq!(from(11, None).resolve(11), None);
+        assert_eq!(ByteRange::Suffix(0).resolve(11), None);
+        assert_eq!(ByteRange::Suffix(5).resolve(0), None);
+    }
 
     #[test]
     fn a_bearer_token_survives_its_scheme_being_shouted() {

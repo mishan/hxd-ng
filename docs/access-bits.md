@@ -211,6 +211,8 @@ key derives a default rather than being false.
 | `can_detach` | May a session outlive its connection — the ng detach/resume path | A password *or* a linked identity. What disqualifies an account is not the missing password but the missing person: `guest` is one login several people share, and a drive-by should not get to park a nick on the roster |
 | `set_subject` | May this account set the public chat subject | Tracks `disconnect_users`, preserving the reference server's spirit of a config-granted privilege rather than a wire bit |
 | `inbox` | May private messages be stored for this account and delivered later | The same rule `can_detach` derives by, for the same reason: queuing mail against a shared login hands it to whoever logs in next |
+| `file_list` | May this account list file folders, on either wire. The bitmap has no bit for it; mhxd's `access_extra` does | `true`, as mhxd's is for every account that does not turn it off |
+| `file_getinfo` | May this account ask for a file's or folder's info (legacy Get Info, ng `files_info`) | `true`, as for `file_list`. Downloading stays `download_files`, and a known name downloads without either |
 | `vouch` | May this account vouch for an identity key — `identity-vouch.md` §3.1, the requests in §3.2 there. *Design; not read by the server yet* | The same rule as `can_detach`: a password *or* a linked identity. An account that was itself created on the strength of a vouch derives `false` until the operator sets it |
 
 ---

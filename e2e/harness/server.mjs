@@ -226,7 +226,8 @@ export async function startServer({ config = {}, accounts = {}, guest = true } =
   for (let attempt = 0; attempt < 4; attempt++) {
     const ports = await findBlock();
     const nonce = `hxd-e2e-${randomUUID().slice(0, 8)}`;
-    const { dir, merged } = materialize({ config, ports, name: nonce, guest });
+    const resolvedConfig = typeof config === 'function' ? config(ports) : config;
+    const { dir, merged } = materialize({ config: resolvedConfig, ports, name: nonce, guest });
     const server = new Server(launch(dir), dir, ports, merged, merged.server.name);
     try {
       await waitForDiscovery(server, 15_000);

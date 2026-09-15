@@ -1,12 +1,10 @@
 # Files implementation plan
 
-Status: design, not built, 2026-09-11. The first slice this document
-commits to is read-only, manifest-backed HTTP (below). The design review
-(`hxd-ng-design-review-2026-09.md` §3, action 4) recommends local-disk
-read-only as the smaller first slice, because it is what every existing
-Hotline server does and what the Tier 3 conformance suite tests; that
-decision is open. This document is the execution plan for the
-Files work in hxd-ng and hx-ng. The exploratory notes in
+Status: first and second slices implemented, 2026-09-12. The first slice is
+read-only manifest-backed HTTP; the second adds a capability-rooted local file
+area and single-file uploads. This document is the execution plan and
+acceptance contract for the Files work across hxd-ng and its clients. The
+exploratory notes in
 [`file-sources.md`](file-sources.md) remain useful design background; this
 document fixes the first implementation boundary and its acceptance gates.
 
@@ -29,13 +27,41 @@ HTTP origin through both frontends:
 - ordinary files remain byte-compatible for clients that do not negotiate the
   Large File capability.
 
-This release does not add uploads, mutations, folder-transfer transactions,
-queueing, or a local-directory backend. Those are follow-on work and must not
-be implied by advertising behavior that the server cannot complete safely.
+The first slice did not add uploads, mutations, folder-transfer transactions,
+queueing, or a local-directory backend. The second slice adds only a local
+source and FilePut; general mutations, folder transfers, and queueing remain
+follow-on work and are not implied by the advertised behavior.
+
+### Local writable slice
+
+The local source opens its configured root once as a directory capability and
+performs every later lookup relative to that authority. Protocol paths cannot
+name absolute paths, traverse upward, follow symlinks, or reach `.hxd-state`
+by any spelling a case-folding filesystem accepts. Uploads follow mhxd's
+access rule: `upload_files` alone reaches folders whose path names an upload
+folder or a drop box, and `upload_anywhere` reaches the rest. A drop box lists
+only for `view_drop_boxes`. Uploads never overwrite a visible file and are
+published atomically only after the exact body and FFO structure validate.
+
+Incomplete uploads live under the mode-0700 `.hxd-state` directory. Their
+opaque names bind the canonical account login to the destination path; limits
+bound their global bytes and count, count per account, concurrent I/O, idle
+time, total duration, and retention. An account at its count gives up its
+least recently touched partial rather than being refused, a partial with
+nothing in it goes when its transfer ends, and a partial expires as a whole.
+Classic uploads preserve DATA, MACR, and CAP Finder metadata; the MACR fork is
+optional, as the protocol's two-fork object and mhxd's client have it. Large File uploads are raw data and resume only after the server
+recomputes the quoted partial length and SHA-256 trailing-window digest and
+constant-time compares the client's echo. A client may turn the quote down by
+sending the whole file without `HTXF_FLAG_RESUME`; that upload replaces the
+partial. A request may leave the upload size out, as mhxd's own client always
+does, and the server then caps the upload by any quoted offset plus the
+length the handshake states.
+HTTP and ng downloads remain read-only even when backed by this local area.
 
 ## Repository and branch order
 
-The work spans three repositories and is landed in dependency order:
+The work spans four repositories and is landed in dependency order:
 
 1. `hx-libs`: add the shared, safe `hxfiles-xfer` codec and any missing
    `hxproto` Large File vocabulary. No GtkHx C ABI enters this repository.
@@ -116,10 +142,12 @@ client path nor a manifest entry may supply an arbitrary host or URL.
   followed by its exact 64-bit companion.
 - Apply the same pairing to FileList, FileGetInfo, and FileGet replies.
 - Bind every HTXF reference to the issuing `(uid, serial)`, path, prepared
-  range, and expiry.
+  range, and expiry, and, for a direct control connection, to its address.
+  A reference is spent by any presentation of it.
 - Validate 16-byte legacy and extended HTXF handshakes before consuming any
-  optional 64-bit field. Reject unauthorized flags and mismatched declared
-  lengths.
+  optional 64-bit field. Reject unauthorized flags. A download's declared
+  length is not consulted: the protocol has the client send 0 there, and
+  mhxd's own client echoes the transfer size instead.
 - Encode FILP with the real variable-length filename/comment area, the DATA
   fork, and the trailing zero-length MACR marker.
 - Parse 32-bit RFLT resumes for old clients and negotiated 64-bit offsets for
@@ -176,11 +204,7 @@ The work is complete only when all of these are true:
 
 The following remain separate milestones:
 
-- FilePut and upload resume, including partial digests and Large File upload
-  flags;
-- local-directory sources and HFS/AppleDouble resource-fork persistence;
 - folder get/put transactions and their 64-bit aggregate counts;
 - move, rename, delete, mkdir, comments, and drop-box semantics;
 - transfer queueing, per-account quotas, and background origin prefetching;
 - direct origin URLs in the ng client.
-

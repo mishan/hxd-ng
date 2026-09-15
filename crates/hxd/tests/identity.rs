@@ -205,6 +205,7 @@ async fn start_server_inner(
             stamp_queued: true,
             trtp_login,
         }),
+        files: None,
     };
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -240,6 +241,7 @@ async fn start_server_inner(
         identity: Some(Arc::new(identity)),
         tunnel: Some(tunnel),
         enroll: enroll.map(|c| Arc::new(hxd_ng_session::enroll::Mailbox::new(c))),
+        files: None,
     };
     tokio::spawn(hxd_session::serve(l1, legacy_ctx));
     tokio::spawn(hxd_ng_session::serve(l2, ng_ctx.clone()));
@@ -2611,6 +2613,7 @@ async fn a_token_offered_to_a_server_without_identity_is_refused() {
         identity: None,
         tunnel: None,
         enroll: None,
+        files: None,
     };
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = l.local_addr().unwrap();
@@ -2759,13 +2762,14 @@ async fn the_identity_routes_answer_cors_so_a_page_elsewhere_can_read_them() {
         );
     }
 
-    // `ETag` has to be exposed by name: cross-origin, a page cannot read
-    // a header that is not on that list, and the card fetch is built to
-    // be revalidated rather than refetched.
+    // `ETag` and the file-range response headers have to be exposed by
+    // name: cross-origin, a page cannot read a header that is not on this
+    // list. Cards use ETag for revalidation and Files uses the others for
+    // exact progress and resume accounting.
     let card = http(ng, "GET", "/identity/card/nope", &[], b"").await;
     assert_eq!(
         card.header("access-control-expose-headers"),
-        Some("ETag"),
+        Some("ETag, Content-Length, Content-Range, Accept-Ranges"),
         "{:?}",
         card.headers
     );

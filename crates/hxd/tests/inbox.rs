@@ -89,6 +89,7 @@ async fn start_full(dir: &Path, policy: InboxPolicy, who: &[&str], inbox: bool) 
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
         }),
+        files: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),
@@ -115,6 +116,7 @@ async fn start_full(dir: &Path, policy: InboxPolicy, who: &[&str], inbox: bool) 
         identity: None,
         tunnel: None,
         enroll: None,
+        files: None,
     };
 
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

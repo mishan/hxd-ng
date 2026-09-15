@@ -34,6 +34,12 @@ pub struct Account {
     /// May this account set the public chat subject? Backend default:
     /// tracks the disconnect-users (admin) bit.
     pub set_subject: bool,
+    /// May this account list folders? The access bitmap has no bit for it;
+    /// this is mhxd's `file_list` extra. Backend default: yes, as mhxd's.
+    pub file_list: bool,
+    /// May this account ask for a file's or folder's info? mhxd's
+    /// `file_getinfo` extra. Backend default: yes, as mhxd's.
+    pub file_getinfo: bool,
     /// Whether a non-empty password is set. Identity unlinking refuses
     /// to orphan an account that has no other way in.
     pub has_password: bool,

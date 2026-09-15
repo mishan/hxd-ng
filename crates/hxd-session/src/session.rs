@@ -14,7 +14,7 @@
 //! what 1.2 and 1.5 clients expect. Deviations are deliberate and
 //! commented.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,8 +22,9 @@ use hxd_core::access::bit;
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, LinkAuthority,
-    LinkOutcome, Proof, SeqEvent, SessionStatus, Transport, Uid, UserInfo,
+    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, FileEntry, FileKind,
+    FilePrincipal, LinkAuthority, LinkOutcome, Proof, SeqEvent, SessionStatus, Transport, Uid,
+    UserInfo,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::text;
@@ -35,6 +36,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
 use crate::caps::{cap, Caps};
+use crate::files;
 use crate::frame::{pack_frame, read_frame, Frame, ReadError, MAX_FRAME_DATA};
 use crate::media;
 use crate::video;
@@ -143,6 +145,7 @@ pub struct ServerCtx {
     pub core: Arc<Core>,
     pub auth: Arc<dyn AuthBackend>,
     pub cfg: Arc<ServerConfig>,
+    pub files: Option<Arc<hxd_files::FileService>>,
 }
 
 /// Accept loop: one [`run_session`] task per connection. Plain TCP, so
@@ -154,12 +157,13 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) -> std::io::Result<()>
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let span = tracing::info_span!("session", %peer);
-            run_session(
+            run_connection(
                 stream,
                 peer,
                 ctx,
                 Transport::default(),
                 LinkAuthority::default(),
+                true,
             )
             .instrument(span)
             .await;
@@ -692,6 +696,11 @@ struct Session {
     /// index that continues it. One image costs one token however many
     /// 751s carry it — see `allow_download`.
     media_stream: Option<(hxd_core::media::Handle, u16)>,
+    /// Where this session's file transfers must connect from: the control
+    /// connection's own address, when that is a direct TCP connection. A
+    /// tunnelled session's peer is whoever terminated its WebSocket, so it
+    /// binds nothing.
+    transfer_addr: Option<IpAddr>,
 }
 
 impl Session {
@@ -771,6 +780,21 @@ pub async fn run_session<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    run_connection(stream, peer, ctx, transport, link, false).await
+}
+
+/// [`run_session`], told whether `peer` is the client's own TCP address.
+/// Only then can a file transfer be required to come from it.
+async fn run_connection<S>(
+    stream: S,
+    peer: SocketAddr,
+    ctx: ServerCtx,
+    transport: Transport,
+    link: LinkAuthority,
+    direct: bool,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     if ctx.core.is_banned(peer.ip()) {
         info!("refusing banned address");
         return;
@@ -805,6 +829,7 @@ pub async fn run_session<S>(
     // --- Login, then the session loop -----------------------------------
     let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport, link).await;
     if let Some((mut sess, mut events)) = outcome {
+        sess.transfer_addr = direct.then(|| peer.ip());
         let uid = sess.uid;
         info!(uid, login = %sess.account.login, "logged in");
         session_loop(&mut frames, &mut events, &tx, &ctx, &mut sess).await;
@@ -1173,6 +1198,7 @@ async fn login_phase(
             .unwrap_or(0.0),
         media_refill: Instant::now(),
         media_stream: None,
+        transfer_addr: None,
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -1614,6 +1640,463 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             if !sess.announced {
                 complete_login(tx, ctx, sess).await;
             }
+        }
+
+        // --- Read-only Files -----------------------------------------
+        // Listing and Get Info have no access bit; the bitmap defines none
+        // for them. As on mhxd they are the server-local `file_list` and
+        // `file_getinfo` extras, which every account has unless its file
+        // turns them off (accounts.c), so a user who may not download can
+        // still browse.
+        t if t == ClientHdr::FileList.as_u32() => {
+            if !sess.account.file_list {
+                reply_error(tx, f.trans, "You are not allowed to list files.");
+                return;
+            }
+            let Some(service) = ctx.files.as_ref() else {
+                reply_error(tx, f.trans, "Files are not available on this server.");
+                return;
+            };
+            let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
+            let large = sess.has_cap(cap::LARGE_FILES);
+            let path = match files::resolve_dir(
+                service.source.as_ref(),
+                dir.as_ref().map(|chunk| chunk.data),
+                large,
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            // mhxd shows a drop box's contents only to accounts that may
+            // view drop boxes (files.c, check_dropbox).
+            if path.is_drop_box() && !sess.can(bit::VIEW_DROP_BOXES) {
+                reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
+                return;
+            }
+            let entries = match files::list(service.source.as_ref(), &path, large).await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let mut chunks = Vec::with_capacity(entries.len() * if large { 2 } else { 1 });
+            // DataSize includes the two-byte chunk count as well as every
+            // chunk header and payload.
+            let mut wire_len = 2usize;
+            for entry in entries {
+                let payload = files::list_payload(&entry);
+                wire_len = wire_len.saturating_add(4 + payload.len());
+                chunks.push((files::LIST_TAG, payload));
+                if large {
+                    wire_len = wire_len.saturating_add(12);
+                    chunks.push((tag::FILESIZE64, entry.entry.size.to_be_bytes().to_vec()));
+                }
+            }
+            if wire_len > MAX_FRAME_DATA as usize {
+                reply_error(tx, f.trans, "This folder has too many entries.");
+            } else {
+                reply(tx, f.trans, chunks);
+            }
+        }
+
+        t if t == ClientHdr::FileGetInfo.as_u32() => {
+            if !sess.account.file_getinfo {
+                reply_error(tx, f.trans, "You are not allowed to get file info.");
+                return;
+            }
+            let Some(service) = ctx.files.as_ref() else {
+                reply_error(tx, f.trans, "Files are not available on this server.");
+                return;
+            };
+            let name = f.chunks().find(|chunk| chunk.tag == tag::FILE_NAME);
+            let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
+            let Some(name) = name else {
+                reply_error(tx, f.trans, "No file name was supplied.");
+                return;
+            };
+            let large = sess.has_cap(cap::LARGE_FILES);
+            let (_path, info, wire_name) = match files::resolve_entry(
+                service.source.as_ref(),
+                dir.as_ref().map(|chunk| chunk.data),
+                name.data,
+                large,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let entry = FileEntry {
+                name: info.path.name().unwrap_or_default().to_owned(),
+                kind: info.kind,
+                size: info.size,
+                media_type: info.media_type.clone(),
+                modified: info.modified,
+            };
+            let (inferred_type, inferred_creator) = files::type_creator(&entry);
+            let type_code = info.type_code.unwrap_or(inferred_type);
+            // Get Info shows a folder's creator as "n/a ", as mhxd answers
+            // it; listings keep the creator they have always carried.
+            let creator = if info.kind == FileKind::Folder {
+                *b"n/a "
+            } else {
+                info.creator_code.unwrap_or(inferred_creator)
+            };
+            let mut chunks = vec![
+                (tag::FILE_NAME, wire_name),
+                (tag::FILE_TYPE, type_code.to_vec()),
+                (tag::FILE_CREATOR, creator.to_vec()),
+                // Field 213, the type code the Get Info window draws its
+                // icon from.
+                (tag::FILE_ICON, type_code.to_vec()),
+                (
+                    tag::FILE_SIZE,
+                    (info.size.min(u32::MAX as u64) as u32)
+                        .to_be_bytes()
+                        .to_vec(),
+                ),
+            ];
+            if large {
+                chunks.push((tag::FILESIZE64, info.size.to_be_bytes().to_vec()));
+            }
+            chunks.push((tag::FILE_DATE_CREATE, files::date(info.created)));
+            chunks.push((tag::FILE_DATE_MODIFY, files::date(info.modified)));
+            chunks.push((
+                tag::FILE_COMMENT,
+                mac_text(info.comment.as_deref().unwrap_or_default())
+                    .into_iter()
+                    .take(255)
+                    .collect(),
+            ));
+            reply(tx, f.trans, chunks);
+        }
+
+        t if t == ClientHdr::FileGet.as_u32() => {
+            if !sess.can(bit::DOWNLOAD_FILES) {
+                reply_error(tx, f.trans, "You are not allowed to download files.");
+                return;
+            }
+            let Some(service) = ctx.files.as_ref() else {
+                reply_error(tx, f.trans, "Files are not available on this server.");
+                return;
+            };
+            let name = f.chunks().find(|chunk| chunk.tag == tag::FILE_NAME);
+            let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
+            let Some(name) = name else {
+                reply_error(tx, f.trans, "No file name was supplied.");
+                return;
+            };
+            let large = sess.has_cap(cap::LARGE_FILES);
+            let (path, info, wire_name) = match files::resolve_file(
+                service.source.as_ref(),
+                dir.as_ref().map(|chunk| chunk.data),
+                name.data,
+                large,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            if info.kind != FileKind::File {
+                reply_error(tx, f.trans, "That path is not a file.");
+                return;
+            }
+            let resume = f
+                .chunks()
+                .find(|chunk| chunk.tag == tag::RFLT)
+                .map(|chunk| hxfiles_xfer::rflt::parse_compatible(chunk.data))
+                .unwrap_or_default();
+            let mut offset = u64::from(resume.data);
+            let resource_offset = u64::from(resume.resource);
+            if let Some(chunk) = f.chunks().find(|chunk| chunk.tag == tag::OFFSET64) {
+                if !large || chunk.data.len() != 8 {
+                    reply_error(tx, f.trans, "Malformed file resume offset.");
+                    return;
+                }
+                offset = u64::from_be_bytes(chunk.data.try_into().expect("eight bytes"));
+            }
+            // Offsets at the very end are a finished download asking again;
+            // they get a transfer of headers alone, as mhxd sends it.
+            if offset > info.size {
+                reply_error(tx, f.trans, "Resume offset is beyond the file.");
+                return;
+            }
+            if resource_offset > info.resource_size {
+                reply_error(
+                    tx,
+                    f.trans,
+                    "Resource-fork resume offset is beyond the file.",
+                );
+                return;
+            }
+            // A resume from inside the file needs a source that can start
+            // there. Refused here, the client gets a task error; issued a
+            // reference, it would only see its transfer socket close.
+            if offset != 0 && offset < info.size && !service.source.supports_ranges(&path) {
+                reply_error(tx, f.trans, "This file cannot be resumed.");
+                return;
+            }
+            let Some(serial) = ctx.core.session_serial(sess.uid) else {
+                reply_error(tx, f.trans, "Session ended.");
+                return;
+            };
+            let entry = FileEntry {
+                name: info.path.name().unwrap_or_default().to_owned(),
+                kind: info.kind,
+                size: info.size,
+                media_type: info.media_type.clone(),
+                modified: info.modified,
+            };
+            let (inferred_type, inferred_creator) = files::type_creator(&entry);
+            let type_code = info.type_code.unwrap_or(inferred_type);
+            let creator = info.creator_code.unwrap_or(inferred_creator);
+            let comment: Vec<_> = mac_text(info.comment.as_deref().unwrap_or_default())
+                .into_iter()
+                .take(255)
+                .collect();
+            let prepared = hxd_files::prepare_legacy(
+                &service.transfers,
+                service.source.clone(),
+                hxd_files::LegacyTransfer {
+                    principal: FilePrincipal {
+                        uid: sess.uid,
+                        serial,
+                    },
+                    account: sess.account.login.clone(),
+                    peer: sess.transfer_addr,
+                    path,
+                    offset,
+                    resource_offset,
+                    large,
+                    wire_name,
+                    type_code,
+                    creator,
+                    wire_comment: comment,
+                },
+            )
+            .await;
+            let (reference, transfer_size) = match prepared {
+                Ok(value) => value,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let mut chunks = vec![
+                (tag::HTXF_REF, reference.to_be_bytes().to_vec()),
+                (
+                    tag::HTXF_SIZE,
+                    (transfer_size.min(u32::MAX as u64) as u32)
+                        .to_be_bytes()
+                        .to_vec(),
+                ),
+            ];
+            if large {
+                chunks.push((tag::XFERSIZE64, transfer_size.to_be_bytes().to_vec()));
+                chunks.push((
+                    tag::FILE_SIZE,
+                    (info.size.min(u32::MAX as u64) as u32)
+                        .to_be_bytes()
+                        .to_vec(),
+                ));
+                chunks.push((tag::FILESIZE64, info.size.to_be_bytes().to_vec()));
+                chunks.push((tag::OFFSET64, offset.to_be_bytes().to_vec()));
+            }
+            reply(tx, f.trans, chunks);
+        }
+
+        t if t == ClientHdr::FilePut.as_u32() => {
+            if !sess.can(bit::UPLOAD_FILES) {
+                reply_error(tx, f.trans, "You are not allowed to upload files.");
+                return;
+            }
+            let Some(service) = ctx.files.as_ref() else {
+                reply_error(tx, f.trans, "Files are not available on this server.");
+                return;
+            };
+            let Some(source) = service.uploads.as_ref() else {
+                reply_error(tx, f.trans, "This file area is read-only.");
+                return;
+            };
+            let Some(name) = f.chunks().find(|chunk| chunk.tag == tag::FILE_NAME) else {
+                reply_error(tx, f.trans, "No file name was supplied.");
+                return;
+            };
+            let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
+            let large = sess.has_cap(cap::LARGE_FILES);
+            let path = match files::resolve_upload(
+                service.source.as_ref(),
+                dir.as_ref().map(|chunk| chunk.data),
+                name.data,
+                large,
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            // mhxd lets an account without upload-anywhere upload into any
+            // folder whose path names an upload folder or a drop box
+            // (files.c, rcv_file_put).
+            if !sess.can(bit::UPLOAD_ANYWHERE)
+                && !path
+                    .parent()
+                    .is_some_and(|folder| folder.is_upload_folder())
+            {
+                reply_error(tx, f.trans, "You are not allowed to upload files here.");
+                return;
+            }
+            // A resume needs the client to ask for one. mhxd writes an upload
+            // in place, so an interrupted one is listed and a client offers
+            // to resume what it sees; here a partial stays unlisted until it
+            // completes, so nobody is served half a file, and a client that
+            // offers resume only for a listed file starts over instead.
+            //
+            // mhxd reads these fields as integers of whatever width they
+            // come in, and a zero option asks for no resume.
+            let resume_requested = match f.chunks().find(|chunk| chunk.tag == tag::FILE_PREVIEW) {
+                None => false,
+                Some(chunk) => match files::wire_uint(chunk.data) {
+                    Some(option) => option != 0,
+                    None => {
+                        reply_error(tx, f.trans, "Malformed upload resume option.");
+                        return;
+                    }
+                },
+            };
+            let legacy_size = match f.chunks().find(|chunk| chunk.tag == tag::HTXF_SIZE) {
+                None => None,
+                Some(chunk) => match files::wire_uint(chunk.data).map(u32::try_from) {
+                    Some(Ok(size)) => Some(size),
+                    _ => {
+                        reply_error(tx, f.trans, "Malformed upload size.");
+                        return;
+                    }
+                },
+            };
+            let wide_size = match f.chunks().find(|chunk| chunk.tag == tag::XFERSIZE64) {
+                None => None,
+                Some(_) if !large => {
+                    reply_error(tx, f.trans, "64-bit upload size was not negotiated.");
+                    return;
+                }
+                Some(chunk) if chunk.data.len() == 8 => Some(u64::from_be_bytes(
+                    chunk.data.try_into().expect("eight bytes"),
+                )),
+                Some(_) => {
+                    reply_error(tx, f.trans, "Malformed 64-bit upload size.");
+                    return;
+                }
+            };
+            let transfer_len = match (legacy_size, wide_size) {
+                (Some(legacy), Some(wide)) => {
+                    if legacy != wide.min(u64::from(u32::MAX)) as u32 {
+                        reply_error(tx, f.trans, "Upload sizes disagree.");
+                        return;
+                    }
+                    Some(wide)
+                }
+                // XFERSIZE64 is a SHOULD. Without it the 32-bit size stands,
+                // unless it is clamped and so is not the length.
+                (Some(legacy), None) if !large || legacy != u32::MAX => Some(u64::from(legacy)),
+                (Some(_), None) => {
+                    reply_error(tx, f.trans, "Large uploads require a 64-bit size.");
+                    return;
+                }
+                (None, Some(wide)) => Some(wide),
+                // The size is optional (Hotline.md, Upload File): mhxd's own
+                // client never sends it, and a Large File resume request
+                // leaves it out. The handshake states it instead.
+                (None, None) => None,
+            };
+            let Some(serial) = ctx.core.session_serial(sess.uid) else {
+                reply_error(tx, f.trans, "Session ended.");
+                return;
+            };
+            let prepared = hxd_files::prepare_upload(
+                &service.transfers,
+                source.clone(),
+                hxd_files::UploadTransfer {
+                    principal: FilePrincipal {
+                        uid: sess.uid,
+                        serial,
+                    },
+                    peer: sess.transfer_addr,
+                    path,
+                    owner: sess.account.login.clone(),
+                    transfer_len,
+                    large,
+                    resume_requested,
+                },
+            )
+            .await;
+            let (reference, quote) = match prepared {
+                Ok(value) => value,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let resumed = quote.as_ref().map_or(0, |value| {
+                value.data_offset.saturating_add(value.resource_offset)
+            });
+            let mut chunks = vec![(tag::HTXF_REF, reference.to_be_bytes().to_vec())];
+            // Without a declared size there is no remainder to echo, as in
+            // mhxd's reply; the client works it out from the quoted offset.
+            if let Some(transfer_len) = transfer_len {
+                let Some(remaining) = transfer_len.checked_sub(resumed) else {
+                    reply_error(tx, f.trans, "Stored partial exceeds the upload size.");
+                    return;
+                };
+                chunks.push((
+                    tag::HTXF_SIZE,
+                    (remaining.min(u64::from(u32::MAX)) as u32)
+                        .to_be_bytes()
+                        .to_vec(),
+                ));
+                if large {
+                    chunks.push((tag::XFERSIZE64, remaining.to_be_bytes().to_vec()));
+                }
+            }
+            if let Some(quote) = quote {
+                if quote.data_offset > u64::from(u32::MAX)
+                    || quote.resource_offset > u64::from(u32::MAX)
+                {
+                    if !large {
+                        reply_error(tx, f.trans, "Stored partial needs Large File support.");
+                        return;
+                    }
+                } else {
+                    let rflt = hxfiles_xfer::rflt::encode(hxfiles_xfer::rflt::Resume {
+                        data: quote.data_offset as u32,
+                        resource: quote.resource_offset as u32,
+                    });
+                    chunks.push((tag::RFLT, rflt.to_vec()));
+                }
+                if large {
+                    chunks.push((tag::OFFSET64, quote.data_offset.to_be_bytes().to_vec()));
+                    if let Some(digest) = quote.digest {
+                        chunks.push((tag::PARTIAL_DIGEST, digest.to_vec()));
+                    }
+                }
+            }
+            reply(tx, f.trans, chunks);
         }
 
         // --- Chat -----------------------------------------------------
@@ -2422,6 +2905,22 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             debug!("unimplemented transaction {other:#x}");
             reply_error(tx, f.trans, "Not implemented.");
         }
+    }
+}
+
+fn file_error_text(error: &hxd_core::FileError) -> &'static str {
+    match error {
+        hxd_core::FileError::InvalidPath => "Malformed file path.",
+        hxd_core::FileError::NotFound => "File not found.",
+        hxd_core::FileError::NotFolder => "That path is not a folder.",
+        hxd_core::FileError::NotFile => "That path is not a file.",
+        hxd_core::FileError::AlreadyExists => "A file already exists at that path.",
+        hxd_core::FileError::RangeUnsupported => "This file cannot be resumed.",
+        hxd_core::FileError::RangeInvalid => "Invalid file range.",
+        hxd_core::FileError::OriginChanged => "The file changed at its origin.",
+        hxd_core::FileError::TooLarge => "This file needs Large File support.",
+        hxd_core::FileError::Busy => "The file service is busy.",
+        hxd_core::FileError::Unavailable(_) => "The file service is unavailable.",
     }
 }
 

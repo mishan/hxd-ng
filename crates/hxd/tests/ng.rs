@@ -55,6 +55,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
         }),
+        files: None,
     };
     let ng_ctx = NgCtx {
         core,
@@ -74,6 +75,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
         identity: None,
         tunnel: None,
         enroll: None,
+        files: None,
     };
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

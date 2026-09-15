@@ -432,6 +432,64 @@ the wire only for a client that does this. Mail that arrived while the
 socket was gone was never in the buffer at all: it is still pending, and
 `sync` flushes it as events after its own reply (§6).
 
+### 7.2 Files
+
+The `files` capability means this server exposes the read-only file area.
+Every path is slash-separated UTF-8 relative to its root; `""` names the
+root. Paths are values, not URLs, and `.` / `..`, empty components, leading
+slashes and trailing slashes are malformed.
+
+- `files_list { path? }` returns `{ path, entries }`. Each entry is
+  `{ name, kind, size, media_type?, modified? }`, where `kind` is `file` or
+  `folder`.
+- `files_info { path }` returns
+  `{ path, name, kind, size, media_type?, created?, modified?, comment? }`.
+  `path` names an entry, so `""` is `bad_request`.
+- `files_download { path }` requires a file and returns
+  `{ url, size, media_type? }`. `url` is a same-server bearer URL such as
+  `/files/<token>`; it is short-lived and bound to the session that asked.
+  `""` is `bad_request`.
+
+`files_list` and `files_info` need the account's `[extra] file_list` and
+`file_getinfo`, as on the legacy wire. Both are on unless the account file
+turns them off, as mhxd has them, so an account that may not download can
+still browse. A drop box, any path naming "drop box" in any case, also
+lists only for `view_drop_boxes`. `files_download` needs the
+`download_files` access bit.
+
+These methods answer errors from this set:
+
+| code | when |
+|---|---|
+| `bad_request` | malformed params, or a malformed path |
+| `not_available` | Files is not configured, or its source is unavailable |
+| `access_denied` | `files_list` without `file_list` (or, for a drop box, without `view_drop_boxes`), `files_info` without `file_getinfo`, or `files_download` without `download_files` |
+| `not_authorized` | the session ended while the request was handled |
+| `not_found` | no entry at that path |
+| `not_folder` | `files_list` on a file |
+| `not_file` | `files_download` on a folder |
+| `too_large` | the entry exceeds this server's size limit |
+| `busy` | this server's outstanding-download limits are reached; retry later |
+| `range_unsupported`, `range_invalid`, `origin_changed` | the source refused the request as the corresponding HTTP failure would |
+
+All `size` values, including folder child counts, are decimal strings. A
+client parses them as unsigned 64-bit integers or `bigint`; interpreting one
+as a JSON number can silently round it. Timestamps are optional integer
+seconds in the manifest's Hotline header epoch.
+
+`GET` on the returned URL streams the file through this server. When the
+file can be read from an offset, the full response carries
+`Accept-Ranges: bytes`, and one byte range — `bytes=<first>-`,
+`bytes=<first>-<last>`, or the suffix `bytes=-<count>` — answers `206` with
+`Content-Range`. A range that selects nothing, its first byte at or past
+the end, answers `416`. Otherwise `Range` is ignored, as RFC 9110 lets a
+server ignore it, and the answer is `200` with the whole file: for a file
+that cannot be resumed, for more than one range, and for a header that does
+not parse. The token is reusable for resume until it expires, and dies with
+its `(uid, serial)` session, taking any download still streaming on it
+along. So does a download whose receiver stops reading for the server's
+idle timeout. Unknown, expired, and unauthorized tokens all answer `404`.
+
 ## 8. Text, encoding, limits
 
 The protocol is UTF-8 by construction (it's JSON). Normative limits, chosen
