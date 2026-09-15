@@ -76,6 +76,8 @@ these live fields without operator duplication:
 - process uptime;
 - inline-media and voice support, only when those services were built and
   started;
+- large-file (64-bit) transfer support, whenever the Files service was built —
+  the same condition under which both wires echo the large-file capability;
 - current visible-session count in the fixed header.
 
 The optional `[tracker.v3]` table supplies operator facts:

@@ -250,6 +250,7 @@ async fn main() {
                         protocol_version: config.server.version,
                         inline_media: config.media.is_some() && cfg!(feature = "media"),
                         voice: voice.is_some(),
+                        large_files: files.is_some(),
                     },
                     ctx.core.clone(),
                 )?)

@@ -52,6 +52,7 @@ const TLV_SERVER_LAUNCHED: u16 = 0x020e;
 const TLV_PROTOCOL_VERSION: u16 = 0x0300;
 const TLV_SUPPORTS_INLINE_MEDIA: u16 = 0x0304;
 const TLV_SUPPORTS_VOICE: u16 = 0x0305;
+const TLV_SUPPORTS_LARGE_FILES: u16 = 0x0306;
 const TLV_SUPPORTS_IPV6: u16 = 0x0307;
 const TLV_TAGS: u16 = 0x0310;
 const TLV_PRIVATE_LISTING: u16 = 0x0500;
@@ -222,6 +223,7 @@ impl TrackerSection {
                     protocol_version: 0,
                     inline_media: true,
                     voice: true,
+                    large_files: true,
                 };
                 let base = build_v3(
                     &advertisement,
@@ -401,6 +403,9 @@ pub struct Advertisement {
     pub protocol_version: u16,
     pub inline_media: bool,
     pub voice: bool,
+    /// 64-bit transfers, on exactly the condition both wires echo the
+    /// large-file capability: a Files service was built.
+    pub large_files: bool,
 }
 
 /// Running per-target registration tasks.
@@ -779,6 +784,9 @@ fn build_v3(
         if advertisement.voice {
             push_tlv(&mut packet, &mut count, TLV_SUPPORTS_VOICE, &[1])?;
         }
+        if advertisement.large_files {
+            push_tlv(&mut packet, &mut count, TLV_SUPPORTS_LARGE_FILES, &[1])?;
+        }
         push_metadata(&mut packet, &mut count, metadata)?;
     }
     if let Some(token) = token {
@@ -1044,6 +1052,7 @@ mod tests {
             protocol_version: 185,
             inline_media: true,
             voice: false,
+            large_files: true,
         }
     }
 
@@ -1162,6 +1171,7 @@ mod tests {
         assert_eq!(fields[&TLV_UPTIME].len(), 4);
         assert_eq!(fields[&TLV_SUPPORTS_INLINE_MEDIA], [1]);
         assert!(!fields.contains_key(&TLV_SUPPORTS_VOICE));
+        assert_eq!(fields[&TLV_SUPPORTS_LARGE_FILES], [1]);
         assert_eq!(fields[&TLV_ADDRESS_IPV6], ipv6.octets());
         assert_eq!(fields[&TLV_HOSTNAME], b"hl.example");
         assert_eq!(fields[&TLV_COUNTRY_CODE], b"US");
