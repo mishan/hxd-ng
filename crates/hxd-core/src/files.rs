@@ -36,6 +36,7 @@ impl FilePath {
                 || part == "."
                 || part == ".."
                 || part.contains('/')
+                || part.contains('\\')
                 // Control characters, NUL among them, name nothing a
                 // client can type, and a URL parser drops tab, CR and LF
                 // outright: `..<tab>` would reach an origin as `..`.
@@ -97,6 +98,11 @@ pub struct FileInfo {
     pub kind: FileKind,
     /// Data-fork bytes for a file, direct visible children for a folder.
     pub size: u64,
+    /// Classic-Mac resource-fork bytes. Zero for sources without one.
+    pub resource_size: u64,
+    /// Finder type and creator metadata when the source preserves it.
+    pub type_code: Option<[u8; 4]>,
+    pub creator_code: Option<[u8; 4]>,
     pub media_type: Option<String>,
     /// Seconds since 2000-01-01, the Hotline header epoch.
     pub created: Option<u32>,
@@ -130,6 +136,7 @@ pub enum FileError {
     NotFound,
     NotFolder,
     NotFile,
+    AlreadyExists,
     RangeUnsupported,
     RangeInvalid,
     OriginChanged,
@@ -145,6 +152,7 @@ impl fmt::Display for FileError {
             FileError::NotFound => f.write_str("file not found"),
             FileError::NotFolder => f.write_str("path is not a folder"),
             FileError::NotFile => f.write_str("path is not a file"),
+            FileError::AlreadyExists => f.write_str("file already exists"),
             FileError::RangeUnsupported => f.write_str("source does not support resume"),
             FileError::RangeInvalid => f.write_str("resume offset is outside the file"),
             FileError::OriginChanged => f.write_str("origin object changed"),
@@ -163,6 +171,18 @@ pub trait FileSource: Send + Sync + 'static {
     fn list<'a>(&'a self, path: &'a FilePath) -> FileFuture<'a, Vec<FileEntry>>;
     fn info<'a>(&'a self, path: &'a FilePath) -> FileFuture<'a, FileInfo>;
     fn open<'a>(&'a self, path: &'a FilePath, from: u64) -> FileFuture<'a, FileBody>;
+
+    fn open_resource<'a>(&'a self, _path: &'a FilePath, from: u64) -> FileFuture<'a, FileBody> {
+        Box::pin(async move {
+            if from != 0 {
+                return Err(FileError::RangeInvalid);
+            }
+            Ok(FileBody {
+                len: 0,
+                reader: Box::pin(tokio::io::empty()),
+            })
+        })
+    }
 
     /// Whether this source can open `path` from a nonzero byte offset.
     fn supports_ranges(&self, _path: &FilePath) -> bool {
@@ -196,6 +216,7 @@ mod tests {
             "a//b",
             "a/../b",
             "a/./b",
+            "a\\b",
             "a\0b",
             "a/..\t/b",
             ".\t./b",

@@ -1,19 +1,19 @@
-//! Read-only Files across both frontends and the HTXF data channel.
+//! Files across both frontends and the HTXF data channel.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hxd_core::Core;
+use hxd_core::{Core, FileSource};
 use hxd_files::{
-    DownloadTokens, EntryLimits, FileService, HttpManifestSource, HtxfTimeouts, ManifestLimits,
-    TransferRegistry,
+    DownloadTokens, EntryLimits, FileService, HttpManifestSource, HtxfTimeouts, LocalFileSource,
+    LocalLimits, ManifestLimits, TransferRegistry,
 };
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{cap, Caps, ServerConfig, ServerCtx};
-use hxfiles_xfer::{htxf, rflt};
+use hxfiles_xfer::{ffo, htxf, rflt};
 use hxproto::messages::tag;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,6 +26,7 @@ const LOGIN: u32 = 0x006b;
 const FILE_LIST: u32 = 0x00c8;
 const FILE_GET_INFO: u32 = 0x00ce;
 const FILE_GET: u32 = 0x00ca;
+const FILE_PUT: u32 = 0x00cb;
 const LIST_ENTRY: u16 = 0x00c8;
 const HUGE_SIZE: u64 = u32::MAX as u64 + 6;
 
@@ -34,6 +35,21 @@ struct Running {
     ng: SocketAddr,
     htxf: SocketAddr,
     _temp: tempfile::TempDir,
+}
+
+const IDLE: Duration = Duration::from_secs(5);
+const LIMITS: EntryLimits = EntryLimits {
+    total: 64,
+    per_session: 16,
+    per_account: 64,
+};
+
+fn transfers() -> Arc<TransferRegistry> {
+    Arc::new(TransferRegistry::new(Duration::from_secs(30), LIMITS))
+}
+
+fn downloads() -> Arc<DownloadTokens> {
+    Arc::new(DownloadTokens::new(Duration::from_secs(30), LIMITS))
 }
 
 async fn start() -> Running {
@@ -117,25 +133,46 @@ async fn start() -> Running {
         ManifestLimits::default(),
     )
     .unwrap();
-    let limits = EntryLimits {
-        total: 64,
-        per_session: 16,
-        per_account: 64,
-    };
-    let idle = Duration::from_secs(5);
     let service = Arc::new(FileService::new(
         Arc::new(source),
-        Arc::new(TransferRegistry::new(Duration::from_secs(30), limits)),
-        Arc::new(DownloadTokens::new(Duration::from_secs(30), limits)),
-        idle,
+        None,
+        transfers(),
+        downloads(),
+        IDLE,
     ));
 
+    run_service(
+        service,
+        "download_files = true\nread_chat = true\nuse_any_name = true\n",
+    )
+    .await
+}
+
+async fn start_local() -> (Running, tempfile::TempDir, Arc<LocalFileSource>) {
+    let temp = tempfile::tempdir().unwrap();
+    let source = Arc::new(LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap());
+    let service = Arc::new(FileService::new(
+        source.clone(),
+        Some(source.clone()),
+        transfers(),
+        downloads(),
+        IDLE,
+    ));
+    let running = run_service(
+        service,
+        "download_files = true\nupload_files = true\nupload_anywhere = true\nread_chat = true\nuse_any_name = true\n",
+    )
+    .await;
+    (running, temp, source)
+}
+
+async fn run_service(service: Arc<FileService>, access: &str) -> Running {
     let temp = tempfile::tempdir().unwrap();
     let accounts = temp.path().join("accounts");
     std::fs::create_dir(&accounts).unwrap();
     std::fs::write(
         accounts.join("guest.toml"),
-        "name = \"guest\"\n[access]\ndownload_files = true\nread_chat = true\nuse_any_name = true\n",
+        format!("name = \"guest\"\n[access]\n{access}"),
     )
     .unwrap();
     // An account that may look but not download.
@@ -204,7 +241,7 @@ async fn start() -> Running {
         core,
         HtxfTimeouts {
             handshake: Duration::from_secs(5),
-            idle,
+            idle: service.idle_timeout,
         },
     ));
     running
@@ -332,6 +369,16 @@ fn classic_download(reference: u32) -> htxf::Preamble {
 async fn classic_hides_oversized_files_while_large_file_resume_is_exact() {
     let server = start().await;
     let mut classic = Legacy::login(server.legacy, false).await;
+    let denied = classic
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"denied".to_vec()),
+                (tag::HTXF_SIZE, 1u32.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    assert_ne!(denied.flag & 1, 0);
     let listing = classic.request(FILE_LIST, &[]).await;
     assert_eq!(
         listed_names(&listing),
@@ -760,6 +807,381 @@ async fn ng_request(ws: &mut Ws, id: u64, req: &str, params: Value) -> Value {
     .await
     .unwrap();
     reply(ws, id).await
+}
+
+#[tokio::test]
+async fn local_file_put_preserves_forks_refuses_escape_and_resumes_large_raw_data() {
+    let (server, root, source) = start_local().await;
+    let mut classic = Legacy::login(server.legacy, false).await;
+    let encoded = ffo::encode(
+        &ffo::Metadata {
+            name: b"ignored-client-name",
+            type_code: *b"BINA",
+            creator: *b"TEST",
+            comment: b"metadata",
+            create_time: 5,
+            modify_time: 7,
+        },
+        ffo::Forks {
+            data_len: 5,
+            data_offset: 0,
+            resource_len: 4,
+            resource_offset: 0,
+        },
+        false,
+    )
+    .unwrap();
+    let put = classic
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"upload.bin".to_vec()),
+                (
+                    tag::HTXF_SIZE,
+                    (encoded.transfer_len as u32).to_be_bytes().to_vec(),
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(put.flag & 1, 0);
+    let reference = put
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let mut transfer = TcpStream::connect(server.htxf).await.unwrap();
+    transfer
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: encoded.transfer_len,
+                type_code: 0,
+                flags: 0,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    transfer.write_all(&encoded.prefix).await.unwrap();
+    transfer.write_all(b"hello").await.unwrap();
+    transfer.write_all(&encoded.resource_header).await.unwrap();
+    transfer.write_all(b"fork").await.unwrap();
+    let mut ignored = Vec::new();
+    transfer.read_to_end(&mut ignored).await.unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("upload.bin")).unwrap(),
+        b"hello"
+    );
+    let info = source
+        .info(&hxd_core::FilePath::parse("upload.bin").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(info.type_code, Some(*b"BINA"));
+    assert_eq!(info.creator_code, Some(*b"TEST"));
+    assert_eq!(info.resource_size, 4);
+    assert_eq!(info.created, Some(5));
+    assert_eq!(info.modified, Some(7));
+    assert_eq!(info.comment.as_deref(), Some("metadata"));
+
+    let data_only = ffo::encode(
+        &ffo::Metadata {
+            name: b"ignored",
+            type_code: *b"BINA",
+            creator: *b"TEST",
+            comment: b"",
+            create_time: 0,
+            modify_time: 0,
+        },
+        ffo::Forks {
+            data_len: 4,
+            data_offset: 0,
+            resource_len: 0,
+            resource_offset: 0,
+        },
+        false,
+    )
+    .unwrap();
+    let put = classic
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"plain.bin".to_vec()),
+                (
+                    tag::HTXF_SIZE,
+                    (data_only.transfer_len as u32).to_be_bytes().to_vec(),
+                ),
+            ],
+        )
+        .await;
+    let reference = put
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let mut transfer = TcpStream::connect(server.htxf).await.unwrap();
+    transfer
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: data_only.transfer_len,
+                type_code: 0,
+                flags: 0,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    transfer.write_all(&data_only.prefix).await.unwrap();
+    transfer.write_all(b"data").await.unwrap();
+    transfer
+        .write_all(&data_only.resource_header)
+        .await
+        .unwrap();
+    let mut ignored = Vec::new();
+    transfer.read_to_end(&mut ignored).await.unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("plain.bin")).unwrap(),
+        b"data"
+    );
+
+    let get = classic
+        .request(FILE_GET, &[(tag::FILE_NAME, b"upload.bin".to_vec())])
+        .await;
+    let reference = get
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let transfer_len = u64::from(
+        get.chunks()
+            .find(|chunk| chunk.tag == tag::HTXF_SIZE)
+            .unwrap()
+            .as_uint(),
+    );
+    let mut download = TcpStream::connect(server.htxf).await.unwrap();
+    download
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len,
+                type_code: 0,
+                flags: 0,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut downloaded = Vec::new();
+    download.read_to_end(&mut downloaded).await.unwrap();
+    assert!(downloaded.windows(5).any(|window| window == b"hello"));
+    assert!(downloaded.ends_with(b"fork"));
+    let rflt = hxfiles_xfer::rflt::encode(hxfiles_xfer::rflt::Resume {
+        data: 5,
+        resource: 2,
+    });
+    let resumed_get = classic
+        .request(
+            FILE_GET,
+            &[
+                (tag::FILE_NAME, b"upload.bin".to_vec()),
+                (tag::RFLT, rflt.to_vec()),
+            ],
+        )
+        .await;
+    let reference = resumed_get
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let transfer_len = u64::from(
+        resumed_get
+            .chunks()
+            .find(|chunk| chunk.tag == tag::HTXF_SIZE)
+            .unwrap()
+            .as_uint(),
+    );
+    let mut download = TcpStream::connect(server.htxf).await.unwrap();
+    download
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len,
+                type_code: 0,
+                flags: 0,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut downloaded = Vec::new();
+    download.read_to_end(&mut downloaded).await.unwrap();
+    assert!(downloaded.ends_with(b"rk"));
+
+    let overwrite = classic
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"upload.bin".to_vec()),
+                (tag::HTXF_SIZE, 1u32.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    assert_ne!(overwrite.flag & 1, 0);
+    let escape = classic
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"../escape".to_vec()),
+                (tag::HTXF_SIZE, 1u32.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    assert_ne!(escape.flag & 1, 0);
+    assert!(!root.path().join("escape").exists());
+
+    let mut capable = Legacy::login(server.legacy, true).await;
+    let first = capable
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"large.bin".to_vec()),
+                (tag::HTXF_SIZE, 11u32.to_be_bytes().to_vec()),
+                (tag::XFERSIZE64, 11u64.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    let reference = first
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let mut interrupted = TcpStream::connect(server.htxf).await.unwrap();
+    interrupted
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: 11,
+                type_code: 0,
+                flags: htxf::FLAG_LARGE_FILE | htxf::FLAG_SIZE64,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    interrupted.write_all(b"hello").await.unwrap();
+    interrupted.shutdown().await.unwrap();
+    let mut ignored = Vec::new();
+    interrupted.read_to_end(&mut ignored).await.unwrap();
+    assert!(!root.path().join("large.bin").exists());
+
+    let resume = capable
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"large.bin".to_vec()),
+                (tag::FILE_PREVIEW, vec![0, 2]),
+                (tag::HTXF_SIZE, 11u32.to_be_bytes().to_vec()),
+                (tag::XFERSIZE64, 11u64.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    assert_eq!(resume.flag & 1, 0);
+    assert_eq!(
+        resume
+            .chunks()
+            .find(|chunk| chunk.tag == tag::OFFSET64)
+            .map(|chunk| u64::from_be_bytes(chunk.data.try_into().unwrap())),
+        Some(5)
+    );
+    let reference = resume
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let digest: [u8; htxf::RESUME_DIGEST_LEN] = resume
+        .chunks()
+        .find(|chunk| chunk.tag == tag::PARTIAL_DIGEST)
+        .unwrap()
+        .data
+        .try_into()
+        .unwrap();
+    let flags = htxf::FLAG_LARGE_FILE | htxf::FLAG_SIZE64 | htxf::FLAG_RESUME;
+    let mut rejected = TcpStream::connect(server.htxf).await.unwrap();
+    rejected
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: 6,
+                type_code: 0,
+                flags,
+                resume_digest: Some([0; htxf::RESUME_DIGEST_LEN]),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut ignored = Vec::new();
+    rejected.read_to_end(&mut ignored).await.unwrap();
+    assert!(!root.path().join("large.bin").exists());
+
+    // The wrong digest spent that reference, so the client asks again.
+    let resume = capable
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"large.bin".to_vec()),
+                (tag::FILE_PREVIEW, vec![0, 2]),
+                (tag::HTXF_SIZE, 11u32.to_be_bytes().to_vec()),
+                (tag::XFERSIZE64, 11u64.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    assert_eq!(resume.flag & 1, 0);
+    let reference = resume
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let digest: [u8; htxf::RESUME_DIGEST_LEN] = resume
+        .chunks()
+        .find(|chunk| chunk.tag == tag::PARTIAL_DIGEST)
+        .unwrap()
+        .data
+        .try_into()
+        .unwrap();
+    let mut resumed = TcpStream::connect(server.htxf).await.unwrap();
+    resumed
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: 6,
+                type_code: 0,
+                flags,
+                resume_digest: Some(digest),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    resumed.write_all(b" world").await.unwrap();
+    let mut ignored = Vec::new();
+    resumed.read_to_end(&mut ignored).await.unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("large.bin")).unwrap(),
+        b"hello world"
+    );
 }
 
 async fn reply(ws: &mut Ws, id: u64) -> Value {

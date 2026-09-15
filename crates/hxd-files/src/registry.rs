@@ -10,8 +10,10 @@ use hxfiles_xfer::ffo;
 use hxfiles_xfer::htxf;
 use sha2::{Digest, Sha256};
 
+use crate::LocalFileSource;
+
 #[derive(Clone)]
-pub struct PreparedTransfer {
+pub struct PreparedDownload {
     pub principal: FilePrincipal,
     /// The account behind `principal`. Sessions are cheap to open, so the
     /// per-session cap alone would let one account fill the registry.
@@ -25,22 +27,88 @@ pub struct PreparedTransfer {
     pub path: FilePath,
     pub source: Arc<dyn FileSource>,
     pub offset: u64,
+    pub resource_offset: u64,
     pub large: bool,
     pub encoded: ffo::Encoded,
-    pub(crate) expires: Instant,
 }
 
-impl std::fmt::Debug for PreparedTransfer {
+impl std::fmt::Debug for PreparedDownload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedTransfer")
+        f.debug_struct("PreparedDownload")
             .field("principal", &self.principal)
             .field("account", &self.account)
             .field("peer", &self.peer)
             .field("path", &self.path)
             .field("offset", &self.offset)
+            .field("resource_offset", &self.resource_offset)
             .field("large", &self.large)
             .field("transfer_len", &self.encoded.transfer_len)
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadQuote {
+    pub data_offset: u64,
+    pub resource_offset: u64,
+    pub generation: [u8; 16],
+    pub digest: Option<[u8; htxf::RESUME_DIGEST_LEN]>,
+}
+
+#[derive(Clone)]
+pub struct PreparedUpload {
+    pub principal: FilePrincipal,
+    /// As for [`PreparedDownload::peer`].
+    pub peer: Option<IpAddr>,
+    pub path: FilePath,
+    pub source: Arc<LocalFileSource>,
+    pub owner: String,
+    /// The HTXF payload size declared on FILE_PUT.
+    pub transfer_len: u64,
+    pub large: bool,
+    pub quote: Option<UploadQuote>,
+}
+
+impl std::fmt::Debug for PreparedUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedUpload")
+            .field("principal", &self.principal)
+            .field("peer", &self.peer)
+            .field("path", &self.path)
+            .field("owner", &self.owner)
+            .field("transfer_len", &self.transfer_len)
+            .field("large", &self.large)
+            .field("quote", &self.quote)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PreparedTransfer {
+    Download(PreparedDownload),
+    Upload(PreparedUpload),
+}
+
+impl PreparedTransfer {
+    fn principal(&self) -> FilePrincipal {
+        match self {
+            PreparedTransfer::Download(value) => value.principal,
+            PreparedTransfer::Upload(value) => value.principal,
+        }
+    }
+
+    fn account(&self) -> &str {
+        match self {
+            PreparedTransfer::Download(value) => &value.account,
+            PreparedTransfer::Upload(value) => &value.owner,
+        }
+    }
+
+    fn peer(&self) -> Option<IpAddr> {
+        match self {
+            PreparedTransfer::Download(value) => value.peer,
+            PreparedTransfer::Upload(value) => value.peer,
+        }
     }
 }
 
@@ -62,8 +130,8 @@ impl EntryLimits {
     fn admits<'a>(
         &self,
         len: usize,
-        mut owners: impl Iterator<Item = (&'a FilePrincipal, &'a str)>,
-        principal: &FilePrincipal,
+        mut owners: impl Iterator<Item = (FilePrincipal, &'a str)>,
+        principal: FilePrincipal,
         account: &str,
     ) -> bool {
         if len >= self.total {
@@ -78,16 +146,17 @@ impl EntryLimits {
     }
 }
 
+#[derive(Clone)]
+struct Entry {
+    generation: [u8; 16],
+    transfer: PreparedTransfer,
+    expires: Instant,
+}
+
 pub struct TransferRegistry {
     ttl: Duration,
     limits: EntryLimits,
-    entries: Mutex<HashMap<u32, TransferEntry>>,
-}
-
-#[derive(Clone)]
-struct TransferEntry {
-    generation: [u8; 16],
-    transfer: PreparedTransfer,
+    entries: Mutex<HashMap<u32, Entry>>,
 }
 
 impl TransferRegistry {
@@ -100,17 +169,16 @@ impl TransferRegistry {
         }
     }
 
-    pub fn issue(&self, mut transfer: PreparedTransfer) -> Result<u32, FileError> {
-        transfer.expires = Instant::now() + self.ttl;
+    pub fn issue(&self, transfer: PreparedTransfer) -> Result<u32, FileError> {
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|_, value| value.transfer.expires > Instant::now());
+        entries.retain(|_, value| value.expires > Instant::now());
         if !self.limits.admits(
             entries.len(),
             entries
                 .values()
-                .map(|entry| (&entry.transfer.principal, entry.transfer.account.as_str())),
-            &transfer.principal,
-            &transfer.account,
+                .map(|entry| (entry.transfer.principal(), entry.transfer.account())),
+            transfer.principal(),
+            transfer.account(),
         ) {
             return Err(FileError::Busy);
         }
@@ -125,9 +193,10 @@ impl TransferRegistry {
                     .map_err(|e| FileError::Unavailable(format!("transfer generation: {e}")))?;
                 entries.insert(
                     reference,
-                    TransferEntry {
+                    Entry {
                         generation,
                         transfer,
+                        expires: Instant::now() + self.ttl,
                     },
                 );
                 return Ok(reference);
@@ -155,40 +224,73 @@ impl TransferRegistry {
             .get(&preamble.reference)
             .cloned()
             .ok_or(FileError::NotFound)?;
-        let transfer = &entry.transfer;
+        let principal = entry.transfer.principal();
         // Consulted with the registry unlocked; the generation check below
         // makes sure what is removed is still what was inspected.
-        let live = transfer.expires > Instant::now()
-            && core.session_serial(transfer.principal.uid) == Some(transfer.principal.serial);
-        let from_peer = transfer
-            .peer
+        let live = entry.expires > Instant::now()
+            && core.session_serial(principal.uid) == Some(principal.serial);
+        let from_peer = entry
+            .transfer
+            .peer()
             .is_none_or(|expected| expected.to_canonical() == peer.to_canonical());
-        // The download handshake's Data size is not consulted. The protocol
-        // has the client send 0 there (Hotline.md, Download File), mhxd
-        // reads it only for uploads, and mhxd's own client echoes the
-        // reply's transfer size instead, so both must work.
-        let large_flag = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
-        let well_formed = large_flag == transfer.large
-            && preamble.flags & htxf::FLAG_RESUME == 0
-            && preamble.type_code == 0;
-        let mut entries = self.entries.lock().unwrap();
-        let transfer = match entries.get(&preamble.reference) {
-            Some(current) if current.generation == entry.generation => {
-                entries
-                    .remove(&preamble.reference)
-                    .expect("matching entry exists")
-                    .transfer
+        {
+            let mut entries = self.entries.lock().unwrap();
+            match entries.get(&preamble.reference) {
+                Some(current) if current.generation == entry.generation => {
+                    entries.remove(&preamble.reference);
+                }
+                _ => return Err(FileError::NotFound),
             }
-            _ => return Err(FileError::NotFound),
-        };
-        drop(entries);
+        }
         if !live || !from_peer {
             return Err(FileError::NotFound);
         }
-        if !well_formed {
+        if preamble.type_code != 0 {
             return Err(FileError::InvalidPath);
         }
-        Ok(transfer)
+        match &entry.transfer {
+            PreparedTransfer::Download(transfer) => {
+                // The download handshake's Data size is not consulted. The
+                // protocol has the client send 0 there (Hotline.md,
+                // Download File), mhxd reads it only for uploads, and
+                // mhxd's own client echoes the reply's transfer size
+                // instead, so both must work.
+                let large_flag = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
+                if large_flag != transfer.large || preamble.flags & htxf::FLAG_RESUME != 0 {
+                    return Err(FileError::InvalidPath);
+                }
+            }
+            PreparedTransfer::Upload(transfer) => {
+                let resume = transfer.quote.is_some();
+                let resumed_bytes = transfer.quote.as_ref().map_or(0, |quote| {
+                    quote.data_offset.saturating_add(quote.resource_offset)
+                });
+                let expected_len = transfer
+                    .transfer_len
+                    .checked_sub(resumed_bytes)
+                    .ok_or(FileError::RangeInvalid)?;
+                let expected_flags = if transfer.large {
+                    htxf::FLAG_LARGE_FILE
+                        | htxf::FLAG_SIZE64
+                        | if resume { htxf::FLAG_RESUME } else { 0 }
+                } else {
+                    0
+                };
+                if preamble.flags != expected_flags || preamble.transfer_len != expected_len {
+                    return Err(FileError::InvalidPath);
+                }
+                match (&transfer.quote, &preamble.resume_digest) {
+                    (Some(quote), Some(echoed))
+                        if quote.digest.as_ref().is_some_and(|expected| {
+                            hxfiles_xfer::resume_digest::matches(expected, echoed)
+                        }) => {}
+                    (Some(quote), None) if !transfer.large => {}
+                    (None, None) => {}
+                    _ => return Err(FileError::InvalidPath),
+                }
+            }
+        }
+        Ok(entry.transfer)
     }
 }
 
@@ -230,8 +332,8 @@ impl DownloadTokens {
             grants.len(),
             grants
                 .values()
-                .map(|grant| (&grant.principal, grant.account.as_str())),
-            &principal,
+                .map(|grant| (grant.principal, grant.account.as_str())),
+            principal,
             account,
         ) {
             return Err(FileError::Busy);
@@ -337,7 +439,7 @@ mod tests {
         }
     }
 
-    fn prepared(principal: FilePrincipal, account: &str) -> PreparedTransfer {
+    fn download(principal: FilePrincipal, account: &str) -> PreparedDownload {
         let encoded = ffo::encode(
             &ffo::Metadata {
                 name: b"file",
@@ -356,17 +458,21 @@ mod tests {
             false,
         )
         .unwrap();
-        PreparedTransfer {
+        PreparedDownload {
             principal,
             account: account.into(),
             peer: Some(HERE),
             path: FilePath::parse("file").unwrap(),
             source: Arc::new(UnusedSource),
             offset: 0,
+            resource_offset: 0,
             large: false,
             encoded,
-            expires: Instant::now(),
         }
+    }
+
+    fn prepared(principal: FilePrincipal, account: &str) -> PreparedTransfer {
+        PreparedTransfer::Download(download(principal, account))
     }
 
     fn handshake(reference: u32, transfer_len: u64) -> htxf::Preamble {
@@ -384,13 +490,17 @@ mod tests {
         let core = Core::new();
         let principal = attach(&core, "first");
         let registry = TransferRegistry::new(Duration::from_secs(30), limits(8, 4, 4));
-        let transfer = prepared(principal, "first");
+        let transfer = download(principal, "first");
         let echoed = transfer.encoded.transfer_len;
-        let reference = registry.issue(transfer.clone()).unwrap();
+        let reference = registry
+            .issue(PreparedTransfer::Download(transfer.clone()))
+            .unwrap();
         registry
             .claim(&core, &handshake(reference, 0), HERE)
             .expect("the protocol's own zero");
-        let reference = registry.issue(transfer).unwrap();
+        let reference = registry
+            .issue(PreparedTransfer::Download(transfer))
+            .unwrap();
         registry
             .claim(&core, &handshake(reference, echoed), HERE)
             .expect("mhxd's client echoes the transfer size");
@@ -442,9 +552,11 @@ mod tests {
             FileError::NotFound
         );
 
-        let mut tunnelled = prepared(principal, "first");
+        let mut tunnelled = download(principal, "first");
         tunnelled.peer = None;
-        let reference = registry.issue(tunnelled).unwrap();
+        let reference = registry
+            .issue(PreparedTransfer::Download(tunnelled))
+            .unwrap();
         registry
             .claim(&core, &handshake(reference, 0), ELSEWHERE)
             .expect("a tunnelled session's reference has no address to match");
@@ -488,6 +600,45 @@ mod tests {
         let second = attach(&core, "second");
         assert_ne!(second.serial, first.serial);
         assert!(tokens.resolve(&token, &core).is_none());
+    }
+
+    #[test]
+    fn classic_resume_claims_without_a_large_file_digest() {
+        let core = Core::new();
+        let principal = attach(&core, "first");
+        let temp = tempfile::tempdir().unwrap();
+        let source =
+            Arc::new(LocalFileSource::open(temp.path(), crate::LocalLimits::default()).unwrap());
+        let registry = TransferRegistry::new(Duration::from_secs(30), limits(8, 4, 4));
+        let reference = registry
+            .issue(PreparedTransfer::Upload(PreparedUpload {
+                principal,
+                peer: None,
+                path: FilePath::parse("file").unwrap(),
+                source,
+                owner: "first".into(),
+                transfer_len: 10,
+                large: false,
+                quote: Some(UploadQuote {
+                    data_offset: 3,
+                    resource_offset: 2,
+                    generation: [7; 16],
+                    digest: None,
+                }),
+            }))
+            .unwrap();
+        let preamble = htxf::Preamble {
+            reference,
+            transfer_len: 5,
+            type_code: 0,
+            flags: 0,
+            resume_digest: None,
+        };
+
+        assert!(matches!(
+            registry.claim(&core, &preamble, HERE),
+            Ok(PreparedTransfer::Upload(_))
+        ));
     }
 
     #[test]

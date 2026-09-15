@@ -1,14 +1,19 @@
-//! Read-only manifest-backed HTTP files and transfer authorization.
+//! Bounded HTTP and capability-rooted local files with transfer authorization.
 
+mod local;
 mod manifest;
 mod registry;
 mod transfer;
 
 pub use manifest::{HttpManifestSource, ManifestLimits};
 pub use registry::{
-    DownloadGrant, DownloadTokens, EntryLimits, PreparedTransfer, TransferRegistry,
+    DownloadGrant, DownloadTokens, EntryLimits, PreparedDownload, PreparedTransfer, PreparedUpload,
+    TransferRegistry, UploadQuote,
 };
-pub use transfer::{prepare_legacy, pump, serve_htxf, HtxfTimeouts, LegacyTransfer, Liveness};
+pub use transfer::{
+    prepare_legacy, prepare_upload, pump, serve_htxf, HtxfTimeouts, LegacyTransfer, Liveness,
+    UploadTransfer,
+};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +24,8 @@ use hxd_core::FileSource;
 #[derive(Clone)]
 pub struct FileService {
     pub source: Arc<dyn FileSource>,
+    /// Present only for a capability-rooted local source.
+    pub uploads: Option<Arc<LocalFileSource>>,
     pub transfers: Arc<TransferRegistry>,
     pub downloads: Arc<DownloadTokens>,
     /// How long a download may make no progress toward its receiver, on
@@ -29,15 +36,18 @@ pub struct FileService {
 impl FileService {
     pub fn new(
         source: Arc<dyn FileSource>,
+        uploads: Option<Arc<LocalFileSource>>,
         transfers: Arc<TransferRegistry>,
         downloads: Arc<DownloadTokens>,
         idle_timeout: Duration,
     ) -> Self {
         FileService {
             source,
+            uploads,
             transfers,
             downloads,
             idle_timeout,
         }
     }
 }
+pub use local::{LocalFileSource, LocalLimits};
