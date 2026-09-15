@@ -39,7 +39,6 @@ const TLV_SERVER_SOFTWARE: u16 = 0x0200;
 const TLV_COUNTRY_CODE: u16 = 0x0201;
 const TLV_REGION: u16 = 0x0202;
 const TLV_LANGUAGE: u16 = 0x0203;
-const TLV_MAX_USERS: u16 = 0x0204;
 const TLV_MATURITY: u16 = 0x0205;
 const TLV_UPTIME: u16 = 0x0206;
 const TLV_RULES_URL: u16 = 0x0207;
@@ -50,7 +49,6 @@ const TLV_LINK_UP_MBIT: u16 = 0x020b;
 const TLV_TIMEZONE_OFFSET: u16 = 0x020c;
 const TLV_CONTACT_URL: u16 = 0x020d;
 const TLV_SERVER_LAUNCHED: u16 = 0x020e;
-const TLV_MIN_PROTOCOL_VERSION: u16 = 0x0210;
 const TLV_PROTOCOL_VERSION: u16 = 0x0300;
 const TLV_SUPPORTS_INLINE_MEDIA: u16 = 0x0304;
 const TLV_SUPPORTS_VOICE: u16 = 0x0305;
@@ -136,6 +134,10 @@ pub enum TrackerProtocol {
 
 /// Operator-declared v3 fields. Live values and capabilities are supplied by
 /// the running server instead of duplicated in configuration.
+///
+/// `MAX_USERS` and `MIN_PROTOCOL_VERSION` are deliberately absent: the spec
+/// defines them as limits the server enforces at login, and hxd-ng has no
+/// user cap or client-version floor to report.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrackerV3Metadata {
@@ -144,7 +146,6 @@ pub struct TrackerV3Metadata {
     pub country_code: Option<String>,
     pub region: Option<String>,
     pub language: Option<String>,
-    pub max_users: Option<u16>,
     pub maturity: Option<u8>,
     pub rules_url: Option<String>,
     pub banner_url: Option<String>,
@@ -154,7 +155,6 @@ pub struct TrackerV3Metadata {
     pub timezone_offset_min: Option<i16>,
     pub contact_url: Option<String>,
     pub server_launched: Option<u32>,
-    pub min_protocol_version: Option<u16>,
     pub tags: Option<String>,
     #[serde(default)]
     pub private_listing: bool,
@@ -208,7 +208,7 @@ impl TrackerSection {
             }
             if let Some(password) = &target.password {
                 match target.protocol {
-                    TrackerProtocol::V1 => check_legacy_string("tracker password", password)
+                    TrackerProtocol::V1 => check_legacy_credential("tracker password", password)
                         .map_err(|error| format!("{where_}: {error}"))?,
                     TrackerProtocol::V3 => check_pascal_utf8("tracker password", password)
                         .map_err(|error| format!("{where_}: {error}"))?,
@@ -258,7 +258,6 @@ impl TrackerV3Metadata {
             && self.country_code.is_none()
             && self.region.is_none()
             && self.language.is_none()
-            && self.max_users.is_none()
             && self.maturity.is_none()
             && self.rules_url.is_none()
             && self.banner_url.is_none()
@@ -268,7 +267,6 @@ impl TrackerV3Metadata {
             && self.timezone_offset_min.is_none()
             && self.contact_url.is_none()
             && self.server_launched.is_none()
-            && self.min_protocol_version.is_none()
             && self.tags.is_none()
             && !self.private_listing
             && self.listing_category.is_none()
@@ -325,6 +323,22 @@ fn check_legacy_string(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A credential must survive Mac Roman conversion exactly. Display text may
+/// degrade to `?` on the wire, but a password that does would never match,
+/// and a v1 tracker drops a bad password without saying so.
+fn check_legacy_credential(name: &str, value: &str) -> Result<(), String> {
+    let mut buf = [0u8; 4];
+    if let Some(ch) = value
+        .chars()
+        .find(|&ch| ch != '?' && hxproto::text::from_utf8(ch.encode_utf8(&mut buf)) == b"?")
+    {
+        return Err(format!(
+            "{name} contains {ch:?}, which Mac Roman cannot represent for tracker v1"
+        ));
+    }
+    check_legacy_string(name, value)
+}
+
 fn check_pascal_utf8(name: &str, value: &str) -> Result<(), String> {
     if value.len() > u8::MAX as usize {
         return Err(format!("{name} exceeds 255 UTF-8 bytes for tracker v3"));
@@ -343,14 +357,16 @@ fn validate_address(address: &str) -> Result<(), String> {
             Ok(())
         };
     }
-    if address.parse::<Ipv6Addr>().is_ok() {
-        return Ok(());
+    if address.starts_with('[') {
+        return match address.strip_suffix(']') {
+            Some(inner) if inner[1..].parse::<Ipv6Addr>().is_ok() => Ok(()),
+            _ => Err("bracketed address must be [IPv6] or [IPv6]:port".into()),
+        };
     }
-    if address.starts_with('[') && address.ends_with(']') {
-        return address[1..address.len() - 1]
-            .parse::<Ipv6Addr>()
-            .map(|_| ())
-            .map_err(|_| "bracketed address must contain an IPv6 address".into());
+    // `2001:db8::1:5499` is both a bare address and an address with a port;
+    // brackets are the only unambiguous spelling.
+    if address.matches(':').count() > 1 {
+        return Err("an IPv6 address must be bracketed: [IPv6] or [IPv6]:port".into());
     }
     if !address.contains(':') {
         return Ok(());
@@ -367,8 +383,6 @@ fn validate_address(address: &str) -> Result<(), String> {
 fn service_address(address: &str) -> String {
     if address.parse::<SocketAddr>().is_ok() {
         address.to_owned()
-    } else if address.parse::<Ipv6Addr>().is_ok() {
-        format!("[{address}]:{DEFAULT_TRACKER_PORT}")
     } else if address.starts_with('[') && address.ends_with(']') {
         format!("{address}:{DEFAULT_TRACKER_PORT}")
     } else if address.rsplit_once(':').is_some() {
@@ -439,6 +453,20 @@ pub fn start(
     let (stop, receiver) = watch::channel(false);
     let mut tasks = Vec::with_capacity(section.targets.len());
     for target in section.targets.clone() {
+        if target.protocol == TrackerProtocol::V3
+            && target.password.is_some()
+            && target.hmac_secret.is_some()
+        {
+            // Legal, and a fallback for a tracker without HMAC support, but a
+            // conforming v3 tracker ignores the password while it still
+            // crosses the network in the clear.
+            tracing::warn!(
+                target: "tracker",
+                tracker = %target.address,
+                "v3 target has both hmac_secret and a cleartext password; \
+                 the password is sent unencrypted and ignored by HMAC-capable trackers"
+            );
+        }
         let receiver = receiver.clone();
         let advertisement = advertisement.clone();
         let metadata = section.v3.clone();
@@ -865,7 +893,6 @@ fn push_metadata(
     string!(country_code, TLV_COUNTRY_CODE);
     string!(region, TLV_REGION);
     string!(language, TLV_LANGUAGE);
-    number!(max_users, TLV_MAX_USERS);
     if let Some(value) = metadata.maturity {
         push_tlv(packet, count, TLV_MATURITY, &[value])?;
     }
@@ -877,7 +904,6 @@ fn push_metadata(
     number!(timezone_offset_min, TLV_TIMEZONE_OFFSET);
     string!(contact_url, TLV_CONTACT_URL);
     number!(server_launched, TLV_SERVER_LAUNCHED);
-    number!(min_protocol_version, TLV_MIN_PROTOCOL_VERSION);
     string!(tags, TLV_TAGS);
     if metadata.ipv6.is_some() {
         push_tlv(packet, count, TLV_SUPPORTS_IPV6, &[1])?;
@@ -1109,7 +1135,6 @@ mod tests {
             country_code: Some("US".into()),
             region: Some("California".into()),
             language: Some("en".into()),
-            max_users: Some(100),
             maturity: Some(2),
             rules_url: Some("https://hl.example/rules".into()),
             banner_url: Some("https://hl.example/banner.png".into()),
@@ -1119,7 +1144,6 @@ mod tests {
             timezone_offset_min: Some(-420),
             contact_url: Some("mailto:admin@hl.example".into()),
             server_launched: Some(1_700_000_000),
-            min_protocol_version: Some(185),
             tags: Some("chat,retro".into()),
             private_listing: true,
             listing_category: Some(10),
@@ -1130,7 +1154,10 @@ mod tests {
             .into_iter()
             .map(|(id, value)| (id, value.to_vec()))
             .collect();
-        assert_eq!(fields[&TLV_SERVER_SOFTWARE], b"hxd-ng/0.1.0");
+        assert_eq!(
+            fields[&TLV_SERVER_SOFTWARE],
+            format!("hxd-ng/{}", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
         assert_eq!(fields[&TLV_PROTOCOL_VERSION], 185u16.to_be_bytes());
         assert_eq!(fields[&TLV_UPTIME].len(), 4);
         assert_eq!(fields[&TLV_SUPPORTS_INLINE_MEDIA], [1]);
@@ -1140,7 +1167,6 @@ mod tests {
         assert_eq!(fields[&TLV_COUNTRY_CODE], b"US");
         assert_eq!(fields[&TLV_REGION], b"California");
         assert_eq!(fields[&TLV_LANGUAGE], b"en");
-        assert_eq!(fields[&TLV_MAX_USERS], 100u16.to_be_bytes());
         assert_eq!(fields[&TLV_MATURITY], [2]);
         assert_eq!(fields[&TLV_RULES_URL], b"https://hl.example/rules");
         assert_eq!(fields[&TLV_BANNER_URL], b"https://hl.example/banner.png");
@@ -1150,7 +1176,6 @@ mod tests {
         assert_eq!(fields[&TLV_TIMEZONE_OFFSET], (-420i16).to_be_bytes());
         assert_eq!(fields[&TLV_CONTACT_URL], b"mailto:admin@hl.example");
         assert_eq!(fields[&TLV_SERVER_LAUNCHED], 1_700_000_000u32.to_be_bytes());
-        assert_eq!(fields[&TLV_MIN_PROTOCOL_VERSION], 185u16.to_be_bytes());
         assert_eq!(fields[&TLV_TAGS], b"chat,retro");
         assert_eq!(fields[&TLV_SUPPORTS_IPV6], [1]);
         assert_eq!(fields[&TLV_PRIVATE_LISTING], [1]);
@@ -1332,5 +1357,52 @@ mod tests {
             .check("server")
             .unwrap_err()
             .contains("listing_category"));
+    }
+
+    #[test]
+    fn a_v1_password_must_survive_mac_roman_exactly() {
+        let mut section = TrackerSection {
+            description: String::new(),
+            interval: 300,
+            advertised_port: None,
+            ack_timeout_ms: 2_000,
+            v3: TrackerV3Metadata::default(),
+            targets: vec![target("tracker.example".into(), TrackerProtocol::V1)],
+        };
+        for accepted in ["plain", "café", "what?"] {
+            section.targets[0].password = Some(accepted.into());
+            section.check("server").unwrap();
+        }
+        section.targets[0].password = Some("пароль".into());
+        assert!(section.check("server").unwrap_err().contains("Mac Roman"));
+        // v3 carries the password as UTF-8, so the same text is fine there.
+        section.targets[0].protocol = TrackerProtocol::V3;
+        section.check("server").unwrap();
+    }
+
+    #[test]
+    fn addresses_default_the_port_and_require_bracketed_ipv6() {
+        for (address, service) in [
+            ("tracker.example", "tracker.example:5499"),
+            ("tracker.example:6000", "tracker.example:6000"),
+            ("192.0.2.1", "192.0.2.1:5499"),
+            ("192.0.2.1:6000", "192.0.2.1:6000"),
+            ("[2001:db8::1]", "[2001:db8::1]:5499"),
+            ("[2001:db8::1]:6000", "[2001:db8::1]:6000"),
+        ] {
+            validate_address(address).unwrap();
+            assert_eq!(service_address(address), service);
+        }
+        for rejected in [
+            "2001:db8::1",
+            "2001:db8::1:5499",
+            "[2001:db8::1",
+            "[tracker.example]",
+            "[2001:db8::1]:0",
+            "tracker.example:0",
+            ":5499",
+        ] {
+            assert!(validate_address(rejected).is_err(), "{rejected}");
+        }
     }
 }
