@@ -36,6 +36,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     a_thread_of_nothing_but_tombstones_is_not_listed(&*new_store());
     deleting_a_category_takes_its_articles_and_a_bundle_must_be_empty(&*new_store());
     pruning_takes_whole_threads_by_their_last_post(&*new_store());
+    a_post_naming_an_unstaged_handle_posts_nothing(&*new_store());
     // Search: which articles a query finds. Never the order a relevance
     // search puts them in — the memory store does not rank — and never
     // snippets, which only an index can make well.
@@ -92,6 +93,9 @@ fn corpus(s: &dyn NewsStore) -> Corpus {
                 refs: Vec::new(),
                 at: t(at),
                 follow: None,
+                attachments: Vec::new(),
+                attachment_owner: None,
+                attachment_cutoff: t(0),
             },
             32,
             32,
@@ -813,6 +817,9 @@ fn new_post(category: NodeId, parent: Option<ArticleId>, body: &str, at: u64) ->
         refs: Vec::new(),
         at: t(at),
         follow: None,
+        attachments: Vec::new(),
+        attachment_owner: None,
+        attachment_cutoff: t(0),
     }
 }
 
@@ -1328,6 +1335,22 @@ fn deleting_a_category_takes_its_articles_and_a_bundle_must_be_empty(s: &dyn New
     );
     assert_eq!(s.delete_node(bundle), Ok(0));
     assert_eq!(s.delete_node(bundle), Err(NewsError::NoSuchNode));
+}
+
+/// A handle nothing staged is refused, and refusing it posts nothing:
+/// an article and its attachments are one write (§7.3), so there is no
+/// article left behind without the pictures it named.
+fn a_post_naming_an_unstaged_handle_posts_nothing(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let mut p = new_post(cat, None, "with a picture", 1);
+    p.attachments = vec![[7; crate::media::HANDLE_LEN]];
+    p.attachment_owner = Some(alice_mailbox());
+    assert!(matches!(s.post(&p, 32, 32), Err(NewsError::NoSuchMedia)));
+    assert!(s
+        .threads(&page(cat, None, None, 10))
+        .unwrap()
+        .threads
+        .is_empty());
 }
 
 fn pruning_takes_whole_threads_by_their_last_post(s: &dyn NewsStore) {

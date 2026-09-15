@@ -58,7 +58,7 @@ locks the legacy wire out.
   inline-media.md §5 and the reason the two stores are separate.
 - **Legacy clients get a derivative.** The 1.5 wire's article parts are
   capped at 65 535 bytes by the chunk header, so a 2 MiB photo cannot
-  ride it. `hxd-media` re-encodes each attachment once at post time
+  ride it. `hxd-media` re-encodes each attachment once, when it is staged,
   into a ≤ 60 000-byte, ≤ 1024 px version, and *that* is what a 1.5
   client fetches with `GETTHREAD`. The canonical bytes are what an ng
   client gets.
@@ -954,17 +954,25 @@ input, and duplicating it would be the actual mistake.
 ### 7.2 The blob store
 
 ```rust
-pub struct BlobId(pub [u8; 32]);          // SHA-256 of the canonical bytes
+pub type BlobId = [u8; 32];               // SHA-256 of the canonical bytes
 
 pub trait BlobStore: Send + Sync + 'static {
     fn put(&self, bytes: &[u8]) -> Result<BlobId, StoreError>;
     fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError>;
+    fn contains(&self, id: &BlobId) -> Result<bool, StoreError>;
     fn put_derivative(&self, id: &BlobId, bytes: &[u8]) -> Result<(), StoreError>;
     fn derivative(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError>;
-    fn remove(&self, id: &BlobId) -> Result<bool, StoreError>;
-    fn total_bytes(&self) -> Result<u64, StoreError>;
+    fn contains_derivative(&self, id: &BlobId) -> Result<bool, StoreError>;
+    fn remove(&self, id: &BlobId) -> Result<(), StoreError>;
+    fn survey(&self, older_than: SystemTime) -> Result<BlobSurvey, StoreError>;
 }
 ```
+
+The byte store does not count its own volume. The total the cap is
+checked against is the sum `news_blob` keeps
+(`NewsStore::attachment_bytes`), which moves in the same transactions as
+the rows. Walking the directory instead would stat every file in the
+archive on every upload, while every other upload waited.
 
 The first implementation is a directory: `<blobs>/ab/cd/abcdef…` and
 `<blobs>/ab/cd/abcdef….l` for the derivative, written to a temporary
@@ -977,9 +985,16 @@ screenshot store it once and a re-post costs a refcount increment.
 unlinked and the row is dropped. A staged attachment holds a reference
 too, so an upload nobody ever posted is collected by the stage sweep
 and not by a race. An orphan sweep — files with no row, rows with no
-files — runs from the same hourly task as inbox retention, logs what it
-finds, and unlinks only files older than the stage TTL so an upload in
-flight is never swept.
+files — runs from the hourly news task, logs what it finds, and unlinks
+only files older than the stage TTL so an upload in flight is never
+swept. The same sweep takes the temporary files of writes that died
+before their rename, and a blob's file found away from the path its
+name gives. Its walk of the directory holds no lock, because
+it stats every file in the archive and an upload waiting on it would
+wait on the archive's size; what the walk finds is weighed against the
+rows again under the lock before anything is unlinked. A file that will
+not unlink, or a directory that cannot be read, is logged and passed
+over rather than ending the sweep.
 
 This is the first user content hxd-ng writes to disk, which is worth
 saying plainly: it is a thing to back up, a thing a purge must actually
@@ -1028,7 +1043,7 @@ line of text about it.
 | Legacy derivative | 60 000 B, 1024 px | `hxd-media`, at stage |
 | Staged handle lifetime | 30 min | store, swept hourly |
 | Uploads per account | 20 / hour | domain |
-| Total blob bytes | 8 GiB | store; a post over it is refused, never evicted |
+| Total blob bytes | 8 GiB | store; an upload over it is refused (507), never evicted |
 | Article body | 65 535 bytes | domain — §12.4 says why that number |
 | Plain downgrade | 65 535 bytes | renderer, truncated at a char boundary (§5.4) |
 | References per article | 32 | domain, at extraction |
@@ -1124,9 +1139,13 @@ server's ceiling — the same courtesy `moderator` does in
 moderation.md §2, so a client can gray out a compose button instead of
 discovering the refusal after the user has typed.
 
-Until attachments land (W5), `attach` is always `false` and the block
-leaves out `max_attachments`, `max_attachment_bytes` and `types` rather
-than sending limits for something that cannot be done.
+Without `[news.attach]`, `attach` is `false` and the block leaves out
+`max_attachments`, `max_attachment_bytes` and `types` rather than
+sending limits for something that cannot be done. With it, `attach`
+still reflects this account's resolved `[extra] attach_news` policy, and
+is `false` for a session that is not one person — a guest — whatever its
+bits, because a staged handle belongs to its uploader and a shared login
+is not one (§9.4).
 
 ### 9.2 Requests
 
@@ -1291,7 +1310,7 @@ POST /news/blob
   Authorization: Bearer <session>.<token>
   Content-Type: image/jpeg | image/png | image/gif     (a hint; sniffing ignores it)
   Content-Length: ≤ max_attachment_bytes               (413 before reading otherwise)
-  X-Attachment-Name: screenshot.png                    (optional, for display)
+  X-Attachment-Name: caf%C3%A9.png                     (optional, for display; see below)
   <body: the image>
 
   201 { "blob": { "id": "…22 chars…", "type": "image/png",
@@ -1310,11 +1329,29 @@ GET /news/blob/{id}
        <canonical bytes>
 ```
 
-Status mapping matches `/media`: 413 too large, 415 unsupported, 429
-rate-limited with `Retry-After`, 400 malformed, 503 the decoder was
-busy, 507 the blob cap. A download that fails for any reason is
-**404** — one answer, so the route cannot be used to test whether a
-handle exists.
+`X-Attachment-Name` is the file name as UTF-8, percent-encoded the way
+`encodeURIComponent` does it. A header value past ASCII is bytes that a
+proxy may mangle, and a file name often goes past ASCII. The server
+decodes the name, keeps a value that does not decode exactly as it
+arrived, and cuts it to 255 characters. A client with a lone surrogate
+in hand sends U+FFFD, since a lone surrogate has no UTF-8 encoding.
+
+Status mapping matches `/media`:
+
+- 413 too large;
+- 415 unsupported;
+- 429 rate-limited, with `Retry-After`;
+- 400 malformed, or a hash a moderator has blocked — the answer chat
+  media gives the same upload;
+- 403 an account that may not attach (`access_denied`), or a session
+  that is not one person (`no_mailbox`), since a staged handle belongs
+  to a person;
+- 503 the decoder was busy, and only that, because 503 means "try
+  again". A busy decoder does not count against the hourly allowance;
+- 507 the blob cap.
+
+A download that fails for any reason is **404** — one answer, so the
+route cannot be used to test whether a handle exists.
 
 Two differences from `/media`, both following from §7.1:
 
@@ -2172,10 +2209,10 @@ stale_after = 604800            # seconds behind before a scope rings again anyw
 [news.attach]                   # absent = news without attachments
 max_bytes = 2097152             # per attachment, as uploaded
 max_count = 8                   # per article
-max_total_bytes = 8589934592    # across the whole store; a post over it is refused
+max_total_bytes = 8589934592    # across the whole store; an upload over it is refused
 stage_ttl = 1800                # seconds a staged handle lives unposted
 per_hour = 20                   # uploads per account
-legacy_derivative = true        # generate the ≤60 000 B version at post time
+legacy_derivative = true        # generate the ≤60 000 B version at stage time
 ```
 
 `[news.notify]` needs no feature — subscriptions and the `news_notify`
@@ -2184,8 +2221,9 @@ degradation: an attached client still gets its badge, and only the
 doorbell for an absent one is missing. A gateway is `[push]`'s business,
 not news's.
 
-`[news.attach]` without the `media` feature is a startup error, the way
-`[media]` and `[inbox]` already are, and `markdown = "render"` without
+`[news.attach]` without the `media` and `inbox` features is a startup
+error, the way `[media]` and `[inbox]` already are, and
+`markdown = "render"` without
 the `markdown` feature is the same error for the same reason: a config
 that silently does less than it says is worse than one that refuses to
 start. `[news]` without `[news.attach]` is news with no pictures, which
@@ -2330,9 +2368,7 @@ Each lands separately with tests, roughly a branch apiece.
    edges, the 1.2 flat view of §12.5 — renderer, header-block parser,
    defaults and the push — and `hxd import-mhxd-news`.
 
-**Landed:** W1, W2, W3, W4 and W7, and the part of W6 that needs no
-attachments — the requests of §9.2, the events of §9.3 and the login
-block. Markdown is `hxd-markdown` on pulldown-cmark behind
+**Landed:** W1 through W7. Markdown is `hxd-markdown` on pulldown-cmark behind
 `BodyRenderer` and the `markdown` feature. It has the three modes of
 §5.5, the downgrade stored in `plain` (which the index and the
 notification excerpt read instead of the source), and references from
@@ -2344,11 +2380,15 @@ each row of the grammar finds. Subscriptions are schema version 5:
 `news_sub`, the audience and the catch-up rule in `hxd-core::news::subs`,
 `news_notify`, the five requests of §10.9, `[news.notify]`, and
 `Notification` as a sum with `NewsNotice` in it — tested with a
-recording gateway, since no gateway exists yet. `[news]` accepts only
-the keys those honor; naming another, or another markdown mode, is a
+recording gateway, since no gateway exists yet. Attachments are schema
+version 6: the content-addressed filesystem `BlobStore`, staged handles,
+atomic article binding and refcounts, legacy derivatives, quotas and
+orphan cleanup, hash blocking, authenticated ng upload/download routes,
+and attachment names in FTS. hx-ng stages them in its composer and
+renders authenticated blob URLs in articles. `[news]` accepts only the
+keys those stages honor; naming another, or another markdown mode, is a
 startup error until its stage lands. Not in it: §8's moderation ladder
-(W8), `order: "recent"` (§18), and the login block's attachment keys
-(W5). The ng e2e is
+(W8), `order: "recent"` (§18), and the legacy binding (W9). The ng e2e is
 `crates/hxd/tests/news.rs`, the out-of-process one `e2e/news.test.mjs`,
 and the first client is hx-ng's News view, which follows, mutes, badges
 and says "seen".

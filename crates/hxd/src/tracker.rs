@@ -1309,6 +1309,7 @@ mod tests {
                 can_detach: false,
                 transport: hxd_core::Transport::default(),
                 has_inbox: false,
+                attach_news: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,

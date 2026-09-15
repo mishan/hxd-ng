@@ -52,11 +52,14 @@ impl Synchronous {
     }
 }
 
+mod blobs;
 mod news;
+
+pub use blobs::FileBlobStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -194,10 +197,9 @@ CREATE TABLE media_block (
 ";
 
 // The news tree (`docs/news.md` §4): what threaded news with plain bodies
-// needs, and nothing its later stages have not settled yet. The search
-// index, the attachment tables and subscriptions are further additive
-// versions when they land, each with the code that fills them — a table
-// nothing writes is a table whose contents a later build has to guess at.
+// needs. Search, subscriptions and attachments arrive in later additive
+// versions, each beside the code that fills it — a table nothing writes
+// is a table whose contents a later build has to guess at.
 //
 // `news_article_root` is not in the design's list. It is what makes a
 // thread's aggregates (reply count, last post) and retention's grouping a
@@ -302,6 +304,34 @@ CREATE TABLE news_sub (
 CREATE UNIQUE INDEX news_sub_fp    ON news_sub (owner_fp, scope, target) WHERE owner_fp IS NOT NULL;
 CREATE UNIQUE INDEX news_sub_login ON news_sub (owner, scope, target) WHERE owner_fp IS NULL;
 CREATE INDEX news_sub_target ON news_sub (scope, target);
+";
+
+// Durable news image metadata (§7). Bytes live in the filesystem blob
+// store; this transactionally owns staging and article references.
+const SCHEMA_V6: &str = "
+CREATE TABLE news_blob (
+  hash       BLOB PRIMARY KEY,
+  mime       TEXT    NOT NULL,
+  width      INTEGER NOT NULL,
+  height     INTEGER NOT NULL,
+  bytes      INTEGER NOT NULL,
+  derivative INTEGER,
+  refs       INTEGER NOT NULL DEFAULT 0,
+  at         INTEGER NOT NULL
+);
+CREATE TABLE news_attach (
+  handle      BLOB PRIMARY KEY,
+  hash        BLOB NOT NULL REFERENCES news_blob(hash),
+  article     INTEGER REFERENCES news_article(id),
+  ord         INTEGER,
+  name        TEXT,
+  uploader    TEXT NOT NULL,
+  uploader_fp TEXT,
+  staged_at   INTEGER NOT NULL
+);
+CREATE INDEX news_attach_article ON news_attach (article, ord);
+CREATE INDEX news_attach_staged ON news_attach (staged_at) WHERE article IS NULL;
+CREATE INDEX news_attach_hash ON news_attach (hash);
 ";
 
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL
@@ -536,6 +566,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 5 {
         steps.push_str(SCHEMA_V5);
+    }
+    if version < 6 {
+        steps.push_str(SCHEMA_V6);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -1587,6 +1620,9 @@ mod tests {
                     refs: Vec::new(),
                     at: UNIX_EPOCH,
                     follow: None,
+                    attachments: Vec::new(),
+                    attachment_owner: None,
+                    attachment_cutoff: UNIX_EPOCH,
                 },
                 32,
                 32,
@@ -1608,6 +1644,139 @@ mod tests {
                 limit: 50,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn a_news_attachment_is_private_while_staged_and_public_when_posted() {
+        use hxd_core::media::MediaType;
+        use hxd_core::news::{Attachment, NewsStore, StagedAttachment};
+
+        let (store, cat) = news_fixture();
+        let alice = hxd_core::inbox::Mailbox::login("alice");
+        let bob = hxd_core::inbox::Mailbox::login("bob");
+        let staged = StagedAttachment {
+            attachment: Attachment {
+                id: [7; 16],
+                mime: MediaType::Png,
+                width: 3,
+                height: 2,
+                bytes: 81,
+                name: Some("diagram.png".into()),
+            },
+            blob: [9; 32],
+            legacy_bytes: Some(60),
+            owner: alice.clone(),
+            staged_at: UNIX_EPOCH + Duration::from_secs(20),
+        };
+        store.stage_attachment(&staged).unwrap();
+        assert!(store
+            .attachment(&staged.attachment.id, Some(&alice), UNIX_EPOCH)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .attachment(&staged.attachment.id, Some(&bob), UNIX_EPOCH)
+            .unwrap()
+            .is_none());
+
+        assert!(
+            store
+                .attachment(&staged.attachment.id, None, UNIX_EPOCH)
+                .unwrap()
+                .is_none(),
+            "a session that is not one person staged nothing"
+        );
+        assert_eq!(store.attachment_bytes().unwrap(), 81 + 60);
+
+        let mut second = staged.clone();
+        second.attachment.id = [6; 16];
+        second.attachment.name = Some("chart.png".into());
+        store.stage_attachment(&second).unwrap();
+        assert_eq!(
+            store.attachment_blobs().unwrap(),
+            std::collections::HashSet::from([staged.blob]),
+            "identical canonical bytes have one durable blob"
+        );
+        assert_eq!(
+            store.attachment_bytes().unwrap(),
+            81 + 60,
+            "and are counted once"
+        );
+
+        let mut post = hxd_core::news::NewPost {
+            category: cat,
+            parent: None,
+            author: hxd_core::news::Author {
+                nick: "Alice".into(),
+                login: Some("alice".into()),
+                fingerprint: None,
+            },
+            subject: "With a picture".into(),
+            body: "See it.".into(),
+            mime: hxd_core::news::BodyType::Plain,
+            plain: None,
+            refs: Vec::new(),
+            at: UNIX_EPOCH + Duration::from_secs(30),
+            follow: None,
+            attachments: vec![staged.attachment.id],
+            attachment_owner: Some(bob.clone()),
+            attachment_cutoff: UNIX_EPOCH,
+        };
+        assert!(matches!(
+            store.post(&post, 32, 32),
+            Err(hxd_core::NewsError::NoSuchMedia)
+        ));
+        post.attachment_owner = Some(alice);
+        post.attachment_cutoff = UNIX_EPOCH + Duration::from_secs(21);
+        assert!(matches!(
+            store.post(&post, 32, 32),
+            Err(hxd_core::NewsError::NoSuchMedia)
+        ));
+        post.attachment_cutoff = UNIX_EPOCH;
+        post.attachments.push(staged.attachment.id);
+        assert!(matches!(
+            store.post(&post, 32, 32),
+            Err(hxd_core::NewsError::NoSuchMedia)
+        ));
+        post.attachments[1] = second.attachment.id;
+        let posted = store.post(&post, 32, 32).unwrap();
+        let article = store.article(posted.id).unwrap().unwrap();
+        assert_eq!(
+            article.attachments,
+            vec![staged.attachment.clone(), second.attachment.clone()]
+        );
+        assert_eq!(news_search(&store, "diagram").hits[0].article, posted.id);
+        assert_eq!(news_search(&store, "chart").hits[0].article, posted.id);
+        assert!(
+            store
+                .attachment(&staged.attachment.id, None, UNIX_EPOCH)
+                .unwrap()
+                .is_some(),
+            "a published attachment is every reader's"
+        );
+        assert!(store
+            .attachment(&staged.attachment.id, Some(&bob), UNIX_EPOCH)
+            .unwrap()
+            .is_some());
+
+        NewsStore::tombstone(
+            &store,
+            posted.id,
+            "moderator",
+            UNIX_EPOCH + Duration::from_secs(40),
+        )
+        .unwrap();
+        assert!(store
+            .attachment(&staged.attachment.id, Some(&bob), UNIX_EPOCH)
+            .unwrap()
+            .is_none());
+        assert!(store.attachment_blobs().unwrap().is_empty());
+        assert_eq!(store.unreferenced_blobs().unwrap(), vec![staged.blob]);
+
+        post.attachments = vec![[8; 16]];
+        assert!(matches!(
+            store.post(&post, 32, 32),
+            Err(hxd_core::NewsError::NoSuchMedia)
+        ));
     }
 
     const NO_DRIFT: Vec<String> = Vec::new();

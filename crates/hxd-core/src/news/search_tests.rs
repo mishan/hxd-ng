@@ -27,6 +27,7 @@ fn editor(core: &Core) -> Uid {
             can_detach: false,
             transport: Transport::default(),
             has_inbox: true,
+            attach_news: false,
             is_person: true,
             reads_on_delivery: false,
             identity: None,
@@ -58,6 +59,7 @@ fn post(core: &Core, uid: Uid, category: NodeId, body: &str) -> ArticleId {
             subject: "subject".into(),
             body: body.into(),
             mime: BodyType::Plain,
+            attachments: Vec::new(),
         },
     )
     .unwrap()
