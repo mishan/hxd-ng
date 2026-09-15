@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hxd_files::{
-    DownloadTokens, FileService, HttpManifestSource, ManifestLimits, TransferRegistry,
+    DownloadTokens, EntryLimits, FileService, HttpManifestSource, HtxfTimeouts, ManifestLimits,
+    TransferRegistry,
 };
 
 use crate::Config;
@@ -14,7 +15,7 @@ use crate::Config;
 pub struct Files {
     pub service: Arc<FileService>,
     pub bind: String,
-    pub handshake_timeout: Duration,
+    pub timeouts: HtxfTimeouts,
 }
 
 pub fn build(config: &Config) -> Result<Option<Files>, String> {
@@ -39,23 +40,34 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
         .clone()
         .map(Ok)
         .unwrap_or_else(|| transfer_bind(&config.server.bind))?;
+    let idle = Duration::from_secs(section.idle_timeout);
     let service = Arc::new(FileService::new(
         Arc::new(source),
         Arc::new(TransferRegistry::new(
             Duration::from_secs(section.reference_ttl),
-            section.max_references,
-            section.max_references_per_session,
+            EntryLimits {
+                total: section.max_references,
+                per_session: section.max_references_per_session,
+                per_account: section.max_references_per_account,
+            },
         )),
         Arc::new(DownloadTokens::new(
             Duration::from_secs(section.download_ttl),
-            section.max_downloads,
-            section.max_downloads_per_session,
+            EntryLimits {
+                total: section.max_downloads,
+                per_session: section.max_downloads_per_session,
+                per_account: section.max_downloads_per_account,
+            },
         )),
+        idle,
     ));
     Ok(Some(Files {
         service,
         bind,
-        handshake_timeout: Duration::from_secs(section.handshake_timeout),
+        timeouts: HtxfTimeouts {
+            handshake: Duration::from_secs(section.handshake_timeout),
+            idle,
+        },
     }))
 }
 

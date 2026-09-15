@@ -444,21 +444,48 @@ slashes and trailing slashes are malformed.
   `folder`.
 - `files_info { path }` returns
   `{ path, name, kind, size, media_type?, created?, modified?, comment? }`.
+  `path` names an entry, so `""` is `bad_request`.
 - `files_download { path }` requires a file and returns
   `{ url, size, media_type? }`. `url` is a same-server bearer URL such as
   `/files/<token>`; it is short-lived and bound to the session that asked.
+  `""` is `bad_request`.
+
+Listing and info need a session and nothing more, as on the legacy wire
+(mhxd lets every account browse unless its file says otherwise);
+`files_download` needs the `download_files` access bit.
+
+These methods answer errors from this set:
+
+| code | when |
+|---|---|
+| `bad_request` | malformed params, or a malformed path |
+| `not_available` | Files is not configured, or its source is unavailable |
+| `access_denied` | `files_download` without `download_files` |
+| `not_authorized` | the session ended while the request was handled |
+| `not_found` | no entry at that path |
+| `not_folder` | `files_list` on a file |
+| `not_file` | `files_download` on a folder |
+| `too_large` | the entry exceeds this server's size limit |
+| `busy` | this server's outstanding-download limits are reached; retry later |
+| `range_unsupported`, `range_invalid`, `origin_changed` | the source refused the request as the corresponding HTTP failure would |
 
 All `size` values, including folder child counts, are decimal strings. A
 client parses them as unsigned 64-bit integers or `bigint`; interpreting one
 as a JSON number can silently round it. Timestamps are optional integer
 seconds in the manifest's Hotline header epoch.
 
-`GET` on the returned URL streams the file through this server and accepts
-one open-ended range, `Range: bytes=<offset>-`. A valid range answers `206`
-with `Content-Range`; an absent range answers `200`. Suffix, bounded, multiple,
-malformed, and out-of-bounds ranges answer `416`. The token is reusable for
-resume until it expires, but dies immediately with its `(uid, serial)`
-session. Unknown, expired, and unauthorized tokens all answer `404`.
+`GET` on the returned URL streams the file through this server. When the
+file can be read from an offset, the full response carries
+`Accept-Ranges: bytes`, and one byte range — `bytes=<first>-`,
+`bytes=<first>-<last>`, or the suffix `bytes=-<count>` — answers `206` with
+`Content-Range`. A range that selects nothing, its first byte at or past
+the end, answers `416`. Otherwise `Range` is ignored, as RFC 9110 lets a
+server ignore it, and the answer is `200` with the whole file: for a file
+that cannot be resumed, for more than one range, and for a header that does
+not parse. The token is reusable for resume until it expires, and dies with
+its `(uid, serial)` session, taking any download still streaming on it
+along. So does a download whose receiver stops reading for the server's
+idle timeout. Unknown, expired, and unauthorized tokens all answer `404`.
 
 ## 8. Text, encoding, limits
 

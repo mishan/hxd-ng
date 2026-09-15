@@ -9,16 +9,11 @@ use crate::proto::{FilesDownloadParams, FilesPathParams, ReqEnvelope};
 use crate::NgCtx;
 
 pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) -> String {
-    if !state.access.has(bit::DOWNLOAD_FILES) {
-        return crate::proto::reply_err(
-            req.id,
-            "access_denied",
-            "You are not allowed to read files.",
-        );
-    }
     let Some(service) = ctx.files.as_ref() else {
         return crate::proto::reply_err(req.id, "not_available", "Files are not available.");
     };
+    // Listing and info need a session and nothing more, as on the legacy
+    // wire; only a download asks for `download_files`.
     match req.req.as_str() {
         "files_list" => {
             let params = if req.params.is_null() {
@@ -67,6 +62,13 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
             }
         }
         "files_download" => {
+            if !state.access.has(bit::DOWNLOAD_FILES) {
+                return crate::proto::reply_err(
+                    req.id,
+                    "access_denied",
+                    "You are not allowed to download files.",
+                );
+            }
             let params = serde_json::from_value::<FilesDownloadParams>(req.params.clone());
             let Ok(params) = params else {
                 return crate::proto::reply_err(req.id, "bad_request", "Malformed files_download.");
@@ -80,7 +82,10 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 Ok(_) => return crate::proto::reply_err(req.id, "not_file", "Path is not a file."),
                 Err(error) => return error_reply(req.id, error),
             };
-            let Some(serial) = ctx.core.session_serial(state.uid) else {
+            let (Some(serial), Some(details)) = (
+                ctx.core.session_serial(state.uid),
+                ctx.core.user_details(state.uid),
+            ) else {
                 return crate::proto::reply_err(req.id, "not_authorized", "Session ended.");
             };
             match service.downloads.issue(
@@ -88,6 +93,7 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     uid: state.uid,
                     serial,
                 },
+                &details.login,
                 path.clone(),
                 service.source.supports_ranges(&path),
             ) {

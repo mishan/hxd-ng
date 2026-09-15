@@ -197,6 +197,21 @@ impl HttpManifestSource {
             });
         }
 
+        // Folder sizes are child counts, and they have to be settled before
+        // the listings are built: a listing entry is a snapshot of its
+        // object, and a classic client shows a folder's size as its count.
+        let mut counts: BTreeMap<FilePath, u64> = BTreeMap::new();
+        for path in objects.keys().filter(|p| !p.is_root()) {
+            *counts
+                .entry(path.parent().expect("non-root path has parent"))
+                .or_default() += 1;
+        }
+        for (path, object) in &mut objects {
+            if object.info.kind == FileKind::Folder {
+                object.info.size = counts.get(path).copied().unwrap_or(0);
+            }
+        }
+
         let keys: Vec<_> = objects.keys().cloned().collect();
         let mut children: BTreeMap<FilePath, Vec<FileEntry>> = BTreeMap::new();
         for path in keys.iter().filter(|p| !p.is_root()) {
@@ -212,11 +227,6 @@ impl HttpManifestSource {
         }
         for values in children.values_mut() {
             values.sort_by(|a, b| a.name.cmp(&b.name));
-        }
-        for (path, object) in &mut objects {
-            if object.info.kind == FileKind::Folder {
-                object.info.size = children.get(path).map_or(0, |v| v.len() as u64);
-            }
         }
 
         let client = reqwest::Client::builder()
@@ -456,6 +466,8 @@ mod tests {
             ["archive.sit", "manuals"]
         );
         assert_eq!(root[0].size, 4_294_967_297);
+        assert_eq!(root[1].kind, FileKind::Folder);
+        assert_eq!(root[1].size, 1, "a listed folder carries its child count");
         let folder = FilePath::parse("manuals").unwrap();
         assert_eq!(source.info(&folder).await.unwrap().size, 1);
         assert_eq!(source.list(&folder).await.unwrap()[0].name, "read me.txt");
@@ -465,6 +477,7 @@ mod tests {
     fn manifest_rejects_escape_duplicates_and_numeric_sizes() {
         for manifest in [
             br#"{"version":1,"files":[{"path":"../secret","size":"1"}]}"#.as_slice(),
+            br#"{"version":1,"files":[{"path":"a/..\t/..\t/secret","size":"1"}]}"#.as_slice(),
             br#"{"version":1,"files":[{"path":"x","size":"1"},{"path":"x","size":"2"}]}"#
                 .as_slice(),
             br#"{"version":1,"files":[{"path":"x","size":1}]}"#.as_slice(),

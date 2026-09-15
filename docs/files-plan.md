@@ -113,10 +113,12 @@ client path nor a manifest entry may supply an arbitrary host or URL.
   followed by its exact 64-bit companion.
 - Apply the same pairing to FileList, FileGetInfo, and FileGet replies.
 - Bind every HTXF reference to the issuing `(uid, serial)`, path, prepared
-  range, and expiry.
+  range, and expiry, and, for a direct control connection, to its address.
+  A reference is spent by any presentation of it.
 - Validate 16-byte legacy and extended HTXF handshakes before consuming any
-  optional 64-bit field. Reject unauthorized flags and mismatched declared
-  lengths.
+  optional 64-bit field. Reject unauthorized flags. A download's declared
+  length is not consulted: the protocol has the client send 0 there, and
+  mhxd's own client echoes the transfer size instead.
 - Encode FILP with the real variable-length filename/comment area, the DATA
   fork, and the trailing zero-length MACR marker.
 - Parse 32-bit RFLT resumes for old clients and negotiated 64-bit offsets for

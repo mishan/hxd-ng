@@ -36,7 +36,10 @@ impl FilePath {
                 || part == "."
                 || part == ".."
                 || part.contains('/')
-                || part.contains('\0')
+                // Control characters, NUL among them, name nothing a
+                // client can type, and a URL parser drops tab, CR and LF
+                // outright: `..<tab>` would reach an origin as `..`.
+                || part.chars().any(char::is_control)
         }) {
             return Err(FileError::InvalidPath);
         }
@@ -194,6 +197,10 @@ mod tests {
             "a/../b",
             "a/./b",
             "a\0b",
+            "a/..\t/b",
+            ".\t./b",
+            "a\rb",
+            "a\u{7f}b",
         ] {
             assert_eq!(FilePath::parse(bad), Err(FileError::InvalidPath));
         }

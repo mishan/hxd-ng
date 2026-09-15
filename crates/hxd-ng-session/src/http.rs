@@ -37,7 +37,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::TryStreamExt;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, Limited, StreamBody};
 use hxd_core::{FileError, FileKind, IdentityTag, LinkAuthority, Transport};
 use hyper::body::{Frame as BodyFrame, Incoming};
@@ -52,7 +51,6 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
 
 use crate::identity::{
@@ -217,18 +215,19 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
         Ok(info) if info.kind == FileKind::File => info,
         _ => return plain(StatusCode::NOT_FOUND, "not found"),
     };
-    let mut ranges = req.headers().get_all(RANGE).iter();
-    let range = ranges.next();
-    if ranges.next().is_some() {
-        return range_not_satisfiable(info.size);
-    }
-    let range_requested = range.is_some();
-    let offset = match range {
-        None => 0,
-        Some(value) => match value.to_str().ok().and_then(parse_range) {
-            Some(offset) if offset < info.size => offset,
-            _ => return range_not_satisfiable(info.size),
-        },
+    // RFC 9110 §14.2: a server may ignore Range, and must ignore one it
+    // cannot parse. So a file that cannot start mid-way, more than one
+    // range, and a malformed header all get the whole file; only a range
+    // that is well formed and misses the file answers 416.
+    let mut headers = req.headers().get_all(RANGE).iter();
+    let range = match (headers.next(), headers.next()) {
+        (Some(value), None) if grant.ranges => value.to_str().ok().and_then(parse_range),
+        _ => None,
+    };
+    let (offset, len) = match range.map(|range| range.resolve(info.size)) {
+        None => (0, info.size),
+        Some(Some(span)) => span,
+        Some(None) => return range_not_satisfiable(info.size),
     };
     let body = match service.source.open(&grant.path, offset).await {
         Ok(body) => body,
@@ -240,15 +239,27 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
     if body.len != info.size - offset {
         return plain(StatusCode::BAD_GATEWAY, "file origin changed");
     }
-    let status = if range_requested {
+    let status = if range.is_some() {
         StatusCode::PARTIAL_CONTENT
     } else {
         StatusCode::OK
     };
-    let stream = ReaderStream::new(body.reader).map_ok(BodyFrame::data);
+    let chunks = hxd_files::pump(
+        body,
+        len,
+        service.idle_timeout,
+        hxd_files::Liveness::new(ctx.core.clone(), grant.principal),
+    );
+    let stream = futures_util::stream::unfold(chunks, |mut chunks| async move {
+        let chunk = chunks.recv().await?;
+        Some((
+            chunk.map(|bytes| BodyFrame::data(Bytes::from(bytes))),
+            chunks,
+        ))
+    });
     let mut response = Response::builder()
         .status(status)
-        .header(CONTENT_LENGTH, body.len.to_string())
+        .header(CONTENT_LENGTH, len.to_string())
         .header(CACHE_CONTROL, "private, no-store")
         .header(
             CONTENT_DISPOSITION,
@@ -263,10 +274,10 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
     if grant.ranges {
         response = response.header(ACCEPT_RANGES, "bytes");
     }
-    if range_requested {
+    if range.is_some() {
         response = response.header(
             CONTENT_RANGE,
-            format!("bytes {offset}-{}/{}", info.size - 1, info.size),
+            format!("bytes {offset}-{}/{}", offset + len - 1, info.size),
         );
     }
     match response.body(StreamBody::new(stream).boxed_unsync()) {
@@ -316,13 +327,57 @@ fn content_disposition(name: &str) -> HeaderValue {
     .expect("sanitized content disposition is a valid header")
 }
 
-fn parse_range(value: &str) -> Option<u64> {
-    let value = value.strip_prefix("bytes=")?;
-    let (start, end) = value.split_once('-')?;
-    if start.is_empty() || !end.is_empty() || value.contains(',') {
-        return None;
+/// One byte range, as `Range: bytes=` spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteRange {
+    /// `first-` or `first-last`.
+    From { first: u64, last: Option<u64> },
+    /// `-count`: the file's final bytes.
+    Suffix(u64),
+}
+
+impl ByteRange {
+    /// The `(offset, length)` this range selects from a file of `size`
+    /// bytes, or `None` when it selects nothing (RFC 9110 §14.1.1).
+    fn resolve(self, size: u64) -> Option<(u64, u64)> {
+        match self {
+            ByteRange::From { first, last } if first < size => {
+                let last = last.unwrap_or(u64::MAX).min(size - 1);
+                Some((first, last - first + 1))
+            }
+            ByteRange::Suffix(count) if count > 0 && size > 0 => {
+                let len = count.min(size);
+                Some((size - len, len))
+            }
+            _ => None,
+        }
     }
-    start.parse().ok()
+}
+
+/// A single range, or `None` for anything else: more than one range, a
+/// unit other than bytes, a backwards range, or any stray character.
+fn parse_range(value: &str) -> Option<ByteRange> {
+    let (first, last) = value.strip_prefix("bytes=")?.trim().split_once('-')?;
+    let number = |digits: &str| {
+        (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+    };
+    match (first.is_empty(), last.is_empty()) {
+        (true, false) => Some(ByteRange::Suffix(number(last)?)),
+        (false, true) => Some(ByteRange::From {
+            first: number(first)?,
+            last: None,
+        }),
+        (false, false) => {
+            let (first, last) = (number(first)?, number(last)?);
+            (first <= last).then_some(ByteRange::From {
+                first,
+                last: Some(last),
+            })
+        }
+        (true, true) => None,
+    }
 }
 
 /// The routes a page fetches. An upgrade is not subject to CORS and has
@@ -1581,11 +1636,32 @@ mod tests {
     }
 
     #[test]
-    fn only_one_open_ended_range_is_valid() {
-        assert_eq!(parse_range("bytes=5-"), Some(5));
-        for value in ["bytes=-5", "bytes=5-9", "bytes=1-,2-", "items=5-"] {
-            assert_eq!(parse_range(value), None);
+    fn one_byte_range_of_any_form_parses_and_resolves_against_the_size() {
+        let from = |first, last| ByteRange::From { first, last };
+        assert_eq!(parse_range("bytes=5-"), Some(from(5, None)));
+        assert_eq!(parse_range("bytes=5-9"), Some(from(5, Some(9))));
+        assert_eq!(parse_range("bytes=-5"), Some(ByteRange::Suffix(5)));
+        for value in [
+            "bytes=1-,2-",
+            "bytes=0-1,4-5",
+            "items=5-",
+            "bytes=+5-",
+            "bytes=5-+9",
+            "bytes=9-5",
+            "bytes=-",
+            "bytes=5",
+        ] {
+            assert_eq!(parse_range(value), None, "{value}");
         }
+
+        assert_eq!(from(5, None).resolve(11), Some((5, 6)));
+        assert_eq!(from(0, Some(4)).resolve(11), Some((0, 5)));
+        assert_eq!(from(6, Some(99)).resolve(11), Some((6, 5)));
+        assert_eq!(ByteRange::Suffix(5).resolve(11), Some((6, 5)));
+        assert_eq!(ByteRange::Suffix(99).resolve(11), Some((0, 11)));
+        assert_eq!(from(11, None).resolve(11), None);
+        assert_eq!(ByteRange::Suffix(0).resolve(11), None);
+        assert_eq!(ByteRange::Suffix(5).resolve(0), None);
     }
 
     #[test]

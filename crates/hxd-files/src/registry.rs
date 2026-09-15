@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,15 @@ use sha2::{Digest, Sha256};
 #[derive(Clone)]
 pub struct PreparedTransfer {
     pub principal: FilePrincipal,
+    /// The account behind `principal`. Sessions are cheap to open, so the
+    /// per-session cap alone would let one account fill the registry.
+    pub account: String,
+    /// Where the control connection came from, when that address means
+    /// something. A transfer connection from anywhere else is refused and
+    /// spends the reference, as mhxd does (`htxf.c`, `got_hdr`). A tunnelled
+    /// session has no such address: its peer is whoever terminated the
+    /// WebSocket.
+    pub peer: Option<IpAddr>,
     pub path: FilePath,
     pub source: Arc<dyn FileSource>,
     pub offset: u64,
@@ -24,6 +34,8 @@ impl std::fmt::Debug for PreparedTransfer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedTransfer")
             .field("principal", &self.principal)
+            .field("account", &self.account)
+            .field("peer", &self.peer)
             .field("path", &self.path)
             .field("offset", &self.offset)
             .field("large", &self.large)
@@ -32,10 +44,43 @@ impl std::fmt::Debug for PreparedTransfer {
     }
 }
 
+/// Per-session and per-account ceilings on outstanding entries.
+#[derive(Debug, Clone, Copy)]
+pub struct EntryLimits {
+    pub total: usize,
+    pub per_session: usize,
+    pub per_account: usize,
+}
+
+impl EntryLimits {
+    fn assert_valid(&self) {
+        assert!(self.total > 0);
+        assert!(self.per_session > 0);
+        assert!(self.per_account > 0);
+    }
+
+    fn admits<'a>(
+        &self,
+        len: usize,
+        mut owners: impl Iterator<Item = (&'a FilePrincipal, &'a str)>,
+        principal: &FilePrincipal,
+        account: &str,
+    ) -> bool {
+        if len >= self.total {
+            return false;
+        }
+        let (mut by_session, mut by_account) = (0, 0);
+        owners.all(|(owner, owner_account)| {
+            by_session += usize::from(owner == principal);
+            by_account += usize::from(owner_account == account);
+            by_session < self.per_session && by_account < self.per_account
+        })
+    }
+}
+
 pub struct TransferRegistry {
     ttl: Duration,
-    max_entries: usize,
-    max_per_principal: usize,
+    limits: EntryLimits,
     entries: Mutex<HashMap<u32, TransferEntry>>,
 }
 
@@ -46,13 +91,11 @@ struct TransferEntry {
 }
 
 impl TransferRegistry {
-    pub fn new(ttl: Duration, max_entries: usize, max_per_principal: usize) -> Self {
-        assert!(max_entries > 0);
-        assert!(max_per_principal > 0);
+    pub fn new(ttl: Duration, limits: EntryLimits) -> Self {
+        limits.assert_valid();
         TransferRegistry {
             ttl,
-            max_entries,
-            max_per_principal,
+            limits,
             entries: Mutex::new(HashMap::new()),
         }
     }
@@ -61,13 +104,14 @@ impl TransferRegistry {
         transfer.expires = Instant::now() + self.ttl;
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|_, value| value.transfer.expires > Instant::now());
-        if entries.len() >= self.max_entries
-            || entries
+        if !self.limits.admits(
+            entries.len(),
+            entries
                 .values()
-                .filter(|entry| entry.transfer.principal == transfer.principal)
-                .count()
-                >= self.max_per_principal
-        {
+                .map(|entry| (&entry.transfer.principal, entry.transfer.account.as_str())),
+            &transfer.principal,
+            &transfer.account,
+        ) {
             return Err(FileError::Busy);
         }
         for _ in 0..64 {
@@ -94,10 +138,15 @@ impl TransferRegistry {
         ))
     }
 
+    /// Claims the reference a transfer connection from `peer` presented.
+    ///
+    /// A reference is spent by any presentation, the malformed and the
+    /// misdirected included: a wrong guess must not leave it for the next.
     pub fn claim(
         &self,
         core: &Core,
         preamble: &htxf::Preamble,
+        peer: IpAddr,
     ) -> Result<PreparedTransfer, FileError> {
         let entry = self
             .entries
@@ -107,40 +156,46 @@ impl TransferRegistry {
             .cloned()
             .ok_or(FileError::NotFound)?;
         let transfer = &entry.transfer;
-        if transfer.expires <= Instant::now()
-            || core.session_serial(transfer.principal.uid) != Some(transfer.principal.serial)
-        {
-            let mut entries = self.entries.lock().unwrap();
-            if entries
-                .get(&preamble.reference)
-                .is_some_and(|current| current.generation == entry.generation)
-            {
-                entries.remove(&preamble.reference);
+        // Consulted with the registry unlocked; the generation check below
+        // makes sure what is removed is still what was inspected.
+        let live = transfer.expires > Instant::now()
+            && core.session_serial(transfer.principal.uid) == Some(transfer.principal.serial);
+        let from_peer = transfer
+            .peer
+            .is_none_or(|expected| expected.to_canonical() == peer.to_canonical());
+        // The download handshake's Data size is not consulted. The protocol
+        // has the client send 0 there (Hotline.md, Download File), mhxd
+        // reads it only for uploads, and mhxd's own client echoes the
+        // reply's transfer size instead, so both must work.
+        let large_flag = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
+        let well_formed = large_flag == transfer.large
+            && preamble.flags & htxf::FLAG_RESUME == 0
+            && preamble.type_code == 0;
+        let mut entries = self.entries.lock().unwrap();
+        let transfer = match entries.get(&preamble.reference) {
+            Some(current) if current.generation == entry.generation => {
+                entries
+                    .remove(&preamble.reference)
+                    .expect("matching entry exists")
+                    .transfer
             }
+            _ => return Err(FileError::NotFound),
+        };
+        drop(entries);
+        if !live || !from_peer {
             return Err(FileError::NotFound);
         }
-        let large_flag = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
-        if large_flag != transfer.large
-            || preamble.flags & htxf::FLAG_RESUME != 0
-            || preamble.type_code != 0
-            || preamble.transfer_len != transfer.encoded.transfer_len
-        {
+        if !well_formed {
             return Err(FileError::InvalidPath);
         }
-        let mut entries = self.entries.lock().unwrap();
-        match entries.get(&preamble.reference) {
-            Some(current) if current.generation == entry.generation => Ok(entries
-                .remove(&preamble.reference)
-                .expect("matching entry exists")
-                .transfer),
-            _ => Err(FileError::NotFound),
-        }
+        Ok(transfer)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct DownloadGrant {
     pub principal: FilePrincipal,
+    pub account: String,
     pub path: FilePath,
     pub ranges: bool,
     pub expires_at: Instant,
@@ -148,19 +203,16 @@ pub struct DownloadGrant {
 
 pub struct DownloadTokens {
     ttl: Duration,
-    max_grants: usize,
-    max_per_principal: usize,
+    limits: EntryLimits,
     grants: Mutex<HashMap<[u8; 32], DownloadGrant>>,
 }
 
 impl DownloadTokens {
-    pub fn new(ttl: Duration, max_grants: usize, max_per_principal: usize) -> Self {
-        assert!(max_grants > 0);
-        assert!(max_per_principal > 0);
+    pub fn new(ttl: Duration, limits: EntryLimits) -> Self {
+        limits.assert_valid();
         DownloadTokens {
             ttl,
-            max_grants,
-            max_per_principal,
+            limits,
             grants: Mutex::new(HashMap::new()),
         }
     }
@@ -168,18 +220,20 @@ impl DownloadTokens {
     pub fn issue(
         &self,
         principal: FilePrincipal,
+        account: &str,
         path: FilePath,
         ranges: bool,
     ) -> Result<String, FileError> {
         let mut grants = self.grants.lock().unwrap();
         grants.retain(|_, value| value.expires_at > Instant::now());
-        if grants.len() >= self.max_grants
-            || grants
+        if !self.limits.admits(
+            grants.len(),
+            grants
                 .values()
-                .filter(|grant| grant.principal == principal)
-                .count()
-                >= self.max_per_principal
-        {
+                .map(|grant| (&grant.principal, grant.account.as_str())),
+            &principal,
+            account,
+        ) {
             return Err(FileError::Busy);
         }
         for _ in 0..64 {
@@ -191,6 +245,7 @@ impl DownloadTokens {
             if let std::collections::hash_map::Entry::Vacant(slot) = grants.entry(digest) {
                 slot.insert(DownloadGrant {
                     principal,
+                    account: account.to_owned(),
                     path: path.clone(),
                     ranges,
                     expires_at: Instant::now() + self.ttl,
@@ -232,6 +287,9 @@ mod tests {
     use super::*;
     use hxd_core::{AccessBits, AttachInfo, FileBody, FileEntry, FileFuture, FileInfo, Transport};
 
+    const HERE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+    const ELSEWHERE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+
     struct UnusedSource;
 
     impl FileSource for UnusedSource {
@@ -245,6 +303,14 @@ mod tests {
 
         fn open<'a>(&'a self, _path: &'a FilePath, _from: u64) -> FileFuture<'a, FileBody> {
             Box::pin(async { unreachable!("registry tests do not open their source") })
+        }
+    }
+
+    fn limits(total: usize, per_session: usize, per_account: usize) -> EntryLimits {
+        EntryLimits {
+            total,
+            per_session,
+            per_account,
         }
     }
 
@@ -271,7 +337,7 @@ mod tests {
         }
     }
 
-    fn prepared(principal: FilePrincipal) -> PreparedTransfer {
+    fn prepared(principal: FilePrincipal, account: &str) -> PreparedTransfer {
         let encoded = ffo::encode(
             &ffo::Metadata {
                 name: b"file",
@@ -292,6 +358,8 @@ mod tests {
         .unwrap();
         PreparedTransfer {
             principal,
+            account: account.into(),
+            peer: Some(HERE),
             path: FilePath::parse("file").unwrap(),
             source: Arc::new(UnusedSource),
             offset: 0,
@@ -301,45 +369,118 @@ mod tests {
         }
     }
 
-    #[test]
-    fn transfer_references_reject_mismatched_handshakes_and_ended_sessions() {
-        let core = Core::new();
-        let principal = attach(&core, "first");
-        let registry = TransferRegistry::new(Duration::from_secs(30), 8, 4);
-        let transfer = prepared(principal);
-        let transfer_len = transfer.encoded.transfer_len;
-        let reference = registry.issue(transfer).unwrap();
-        let mut preamble = htxf::Preamble {
+    fn handshake(reference: u32, transfer_len: u64) -> htxf::Preamble {
+        htxf::Preamble {
             reference,
-            transfer_len: transfer_len + 1,
-            type_code: 1,
+            transfer_len,
+            type_code: 0,
             flags: 0,
             resume_digest: None,
-        };
-        assert!(matches!(
-            registry.claim(&core, &preamble),
-            Err(FileError::InvalidPath)
-        ));
-        preamble.transfer_len = transfer_len;
-        assert!(matches!(
-            registry.claim(&core, &preamble),
-            Err(FileError::InvalidPath)
-        ));
-        preamble.type_code = 0;
+        }
+    }
+
+    #[test]
+    fn a_download_handshake_may_send_zero_or_the_size_for_its_length() {
+        let core = Core::new();
+        let principal = attach(&core, "first");
+        let registry = TransferRegistry::new(Duration::from_secs(30), limits(8, 4, 4));
+        let transfer = prepared(principal, "first");
+        let echoed = transfer.encoded.transfer_len;
+        let reference = registry.issue(transfer.clone()).unwrap();
+        registry
+            .claim(&core, &handshake(reference, 0), HERE)
+            .expect("the protocol's own zero");
+        let reference = registry.issue(transfer).unwrap();
+        registry
+            .claim(&core, &handshake(reference, echoed), HERE)
+            .expect("mhxd's client echoes the transfer size");
+    }
+
+    #[test]
+    fn references_are_single_use_and_spent_by_a_wrong_presentation() {
+        let core = Core::new();
+        let principal = attach(&core, "first");
+        let registry = TransferRegistry::new(Duration::from_secs(30), limits(8, 4, 4));
+
+        let reference = registry.issue(prepared(principal, "first")).unwrap();
+        registry
+            .claim(&core, &handshake(reference, 0), HERE)
+            .unwrap();
+        assert_eq!(
+            registry
+                .claim(&core, &handshake(reference, 0), HERE)
+                .unwrap_err(),
+            FileError::NotFound
+        );
+
+        let reference = registry.issue(prepared(principal, "first")).unwrap();
+        assert_eq!(
+            registry
+                .claim(&core, &handshake(reference, 0), ELSEWHERE)
+                .unwrap_err(),
+            FileError::NotFound
+        );
+        assert_eq!(
+            registry
+                .claim(&core, &handshake(reference, 0), HERE)
+                .unwrap_err(),
+            FileError::NotFound,
+            "a reference presented from the wrong address is gone"
+        );
+
+        let reference = registry.issue(prepared(principal, "first")).unwrap();
+        let mut malformed = handshake(reference, 0);
+        malformed.type_code = 1;
+        assert_eq!(
+            registry.claim(&core, &malformed, HERE).unwrap_err(),
+            FileError::InvalidPath
+        );
+        assert_eq!(
+            registry
+                .claim(&core, &handshake(reference, 0), HERE)
+                .unwrap_err(),
+            FileError::NotFound
+        );
+
+        let mut tunnelled = prepared(principal, "first");
+        tunnelled.peer = None;
+        let reference = registry.issue(tunnelled).unwrap();
+        registry
+            .claim(&core, &handshake(reference, 0), ELSEWHERE)
+            .expect("a tunnelled session's reference has no address to match");
+    }
+
+    #[test]
+    fn references_expire_and_die_with_their_session() {
+        let core = Core::new();
+        let principal = attach(&core, "first");
+        let expired = TransferRegistry::new(Duration::ZERO, limits(8, 4, 4));
+        let reference = expired.issue(prepared(principal, "first")).unwrap();
+        assert_eq!(
+            expired
+                .claim(&core, &handshake(reference, 0), HERE)
+                .unwrap_err(),
+            FileError::NotFound
+        );
+
+        let registry = TransferRegistry::new(Duration::from_secs(30), limits(8, 4, 4));
+        let reference = registry.issue(prepared(principal, "first")).unwrap();
         core.end_session(principal.uid);
-        assert!(matches!(
-            registry.claim(&core, &preamble),
-            Err(FileError::NotFound)
-        ));
+        assert_eq!(
+            registry
+                .claim(&core, &handshake(reference, 0), HERE)
+                .unwrap_err(),
+            FileError::NotFound
+        );
     }
 
     #[test]
     fn download_tokens_stop_authorizing_when_the_issuing_session_ends() {
         let core = Core::new();
         let first = attach(&core, "first");
-        let tokens = DownloadTokens::new(Duration::from_secs(30), 8, 4);
+        let tokens = DownloadTokens::new(Duration::from_secs(30), limits(8, 4, 4));
         let token = tokens
-            .issue(first, FilePath::parse("file").unwrap(), true)
+            .issue(first, "first", FilePath::parse("file").unwrap(), true)
             .unwrap();
         assert!(tokens.resolve(&token, &core).is_some());
 
@@ -350,34 +491,59 @@ mod tests {
     }
 
     #[test]
-    fn registries_bound_global_and_per_principal_entries() {
+    fn registries_bound_global_per_session_and_per_account_entries() {
         let core = Core::new();
         let first = attach(&core, "first");
         let second = attach(&core, "second");
-        let transfers = TransferRegistry::new(Duration::from_secs(30), 3, 2);
-        transfers.issue(prepared(first)).unwrap();
-        transfers.issue(prepared(first)).unwrap();
+        let transfers = TransferRegistry::new(Duration::from_secs(30), limits(3, 2, 8));
+        transfers.issue(prepared(first, "first")).unwrap();
+        transfers.issue(prepared(first, "first")).unwrap();
         assert!(matches!(
-            transfers.issue(prepared(first)),
+            transfers.issue(prepared(first, "first")),
             Err(FileError::Busy)
         ));
-        transfers.issue(prepared(second)).unwrap();
+        transfers.issue(prepared(second, "second")).unwrap();
         assert!(matches!(
-            transfers.issue(prepared(second)),
+            transfers.issue(prepared(second, "second")),
             Err(FileError::Busy)
         ));
 
-        let downloads = DownloadTokens::new(Duration::from_secs(30), 3, 2);
+        let downloads = DownloadTokens::new(Duration::from_secs(30), limits(3, 2, 8));
         let path = FilePath::parse("file").unwrap();
-        downloads.issue(first, path.clone(), false).unwrap();
-        downloads.issue(first, path.clone(), true).unwrap();
+        downloads
+            .issue(first, "first", path.clone(), false)
+            .unwrap();
+        downloads.issue(first, "first", path.clone(), true).unwrap();
         assert!(matches!(
-            downloads.issue(first, path.clone(), false),
+            downloads.issue(first, "first", path.clone(), false),
             Err(FileError::Busy)
         ));
-        downloads.issue(second, path.clone(), false).unwrap();
+        downloads
+            .issue(second, "second", path.clone(), false)
+            .unwrap();
         assert!(matches!(
-            downloads.issue(second, path, false),
+            downloads.issue(second, "second", path.clone(), false),
+            Err(FileError::Busy)
+        ));
+
+        // One account across sessions: each session is under its own cap,
+        // and the account's is what stops them.
+        let third = attach(&core, "shared");
+        let fourth = attach(&core, "shared");
+        let shared = TransferRegistry::new(Duration::from_secs(30), limits(16, 2, 3));
+        shared.issue(prepared(third, "shared")).unwrap();
+        shared.issue(prepared(third, "shared")).unwrap();
+        shared.issue(prepared(fourth, "shared")).unwrap();
+        assert!(matches!(
+            shared.issue(prepared(fourth, "shared")),
+            Err(FileError::Busy)
+        ));
+        let tokens = DownloadTokens::new(Duration::from_secs(30), limits(16, 2, 3));
+        tokens.issue(third, "shared", path.clone(), false).unwrap();
+        tokens.issue(third, "shared", path.clone(), false).unwrap();
+        tokens.issue(fourth, "shared", path.clone(), false).unwrap();
+        assert!(matches!(
+            tokens.issue(fourth, "shared", path, false),
             Err(FileError::Busy)
         ));
     }

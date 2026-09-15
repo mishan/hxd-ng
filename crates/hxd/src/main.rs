@@ -180,10 +180,10 @@ async fn main() {
             );
             let service = files.service.clone();
             let core = ctx.core.clone();
-            let timeout = files.handshake_timeout;
+            let timeouts = files.timeouts;
             tokio::spawn(async move {
                 if let Err(error) =
-                    hxd_files::serve_htxf(listener, service.transfers.clone(), core, timeout).await
+                    hxd_files::serve_htxf(listener, service.transfers.clone(), core, timeouts).await
                 {
                     tracing::error!("HTXF accept loop: {error}");
                 }

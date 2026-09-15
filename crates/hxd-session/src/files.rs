@@ -85,11 +85,31 @@ pub(crate) async fn resolve_file(
     name: &[u8],
     large: bool,
 ) -> Result<(FilePath, FileInfo, Vec<u8>), FileError> {
+    resolve_named(source, dir, name, large, Some(FileKind::File)).await
+}
+
+/// A named entry of either kind: Get Info asks about folders too.
+pub(crate) async fn resolve_entry(
+    source: &dyn FileSource,
+    dir: Option<&[u8]>,
+    name: &[u8],
+    large: bool,
+) -> Result<(FilePath, FileInfo, Vec<u8>), FileError> {
+    resolve_named(source, dir, name, large, None).await
+}
+
+async fn resolve_named(
+    source: &dyn FileSource,
+    dir: Option<&[u8]>,
+    name: &[u8],
+    large: bool,
+    kind: Option<FileKind>,
+) -> Result<(FilePath, FileInfo, Vec<u8>), FileError> {
     let parent = resolve_dir(source, dir, large).await?;
     let found = list(source, &parent, large)
         .await?
         .into_iter()
-        .find(|entry| entry.entry.kind == FileKind::File && entry.name == name)
+        .find(|entry| kind.is_none_or(|kind| entry.entry.kind == kind) && entry.name == name)
         .ok_or(FileError::NotFound)?;
     let info = source.info(&found.path).await?;
     Ok((found.path, info, found.name))

@@ -29,7 +29,6 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Shared with GtkHx (see the note at the top of this file).
-# Replaced by the dependency branch's pinned git revision before landing.
 hxproto = { git = "https://github.com/mishan/hx-libs.git", rev = "a61f478ff17a0f9e55623dab317ac315088562cb" }
 hxfiles-xfer = { git = "https://github.com/mishan/hx-libs.git", rev = "a61f478ff17a0f9e55623dab317ac315088562cb" }
 

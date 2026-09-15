@@ -84,14 +84,22 @@ pub struct FilesSection {
     pub max_references: usize,
     #[serde(default = "default_files_max_references_per_session")]
     pub max_references_per_session: usize,
+    #[serde(default = "default_files_max_references_per_account")]
+    pub max_references_per_account: usize,
     #[serde(default = "default_files_download_ttl")]
     pub download_ttl: u64,
     #[serde(default = "default_files_max_downloads")]
     pub max_downloads: usize,
     #[serde(default = "default_files_max_downloads_per_session")]
     pub max_downloads_per_session: usize,
+    #[serde(default = "default_files_max_downloads_per_account")]
+    pub max_downloads_per_account: usize,
     #[serde(default = "default_files_handshake_timeout")]
     pub handshake_timeout: u64,
+    /// Seconds a download may make no progress toward its receiver, on
+    /// either wire, before it is abandoned.
+    #[serde(default = "default_files_idle_timeout")]
+    pub idle_timeout: u64,
 }
 
 fn default_files_max_size() -> u64 {
@@ -115,6 +123,9 @@ fn default_files_max_references() -> usize {
 fn default_files_max_references_per_session() -> usize {
     64
 }
+fn default_files_max_references_per_account() -> usize {
+    256
+}
 fn default_files_download_ttl() -> u64 {
     60
 }
@@ -124,8 +135,14 @@ fn default_files_max_downloads() -> usize {
 fn default_files_max_downloads_per_session() -> usize {
     64
 }
+fn default_files_max_downloads_per_account() -> usize {
+    256
+}
 fn default_files_handshake_timeout() -> u64 {
     10
+}
+fn default_files_idle_timeout() -> u64 {
+    60
 }
 
 /// Threaded news (`docs/news.md` §13).
@@ -1325,8 +1342,10 @@ pub fn check_config(config: &Config) -> Result<(), String> {
         }
         if files.max_references == 0
             || files.max_references_per_session == 0
+            || files.max_references_per_account == 0
             || files.max_downloads == 0
             || files.max_downloads_per_session == 0
+            || files.max_downloads_per_account == 0
         {
             return Err("[files] registry limits must be non-zero".into());
         }
@@ -1334,6 +1353,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
             || files.reference_ttl == 0
             || files.download_ttl == 0
             || files.handshake_timeout == 0
+            || files.idle_timeout == 0
         {
             return Err("[files] timeout and TTL values must be non-zero".into());
         }

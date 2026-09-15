@@ -14,7 +14,7 @@
 //! what 1.2 and 1.5 clients expect. Deviations are deliberate and
 //! commented.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -157,12 +157,13 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) -> std::io::Result<()>
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let span = tracing::info_span!("session", %peer);
-            run_session(
+            run_connection(
                 stream,
                 peer,
                 ctx,
                 Transport::default(),
                 LinkAuthority::default(),
+                true,
             )
             .instrument(span)
             .await;
@@ -695,6 +696,11 @@ struct Session {
     /// index that continues it. One image costs one token however many
     /// 751s carry it — see `allow_download`.
     media_stream: Option<(hxd_core::media::Handle, u16)>,
+    /// Where this session's file transfers must connect from: the control
+    /// connection's own address, when that is a direct TCP connection. A
+    /// tunnelled session's peer is whoever terminated its WebSocket, so it
+    /// binds nothing.
+    transfer_addr: Option<IpAddr>,
 }
 
 impl Session {
@@ -774,6 +780,21 @@ pub async fn run_session<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    run_connection(stream, peer, ctx, transport, link, false).await
+}
+
+/// [`run_session`], told whether `peer` is the client's own TCP address.
+/// Only then can a file transfer be required to come from it.
+async fn run_connection<S>(
+    stream: S,
+    peer: SocketAddr,
+    ctx: ServerCtx,
+    transport: Transport,
+    link: LinkAuthority,
+    direct: bool,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     if ctx.core.is_banned(peer.ip()) {
         info!("refusing banned address");
         return;
@@ -808,6 +829,7 @@ pub async fn run_session<S>(
     // --- Login, then the session loop -----------------------------------
     let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport, link).await;
     if let Some((mut sess, mut events)) = outcome {
+        sess.transfer_addr = direct.then(|| peer.ip());
         let uid = sess.uid;
         info!(uid, login = %sess.account.login, "logged in");
         session_loop(&mut frames, &mut events, &tx, &ctx, &mut sess).await;
@@ -1176,6 +1198,7 @@ async fn login_phase(
             .unwrap_or(0.0),
         media_refill: Instant::now(),
         media_stream: None,
+        transfer_addr: None,
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -1620,11 +1643,11 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
 
         // --- Read-only Files -----------------------------------------
+        // Listing and Get Info need no access bit. mhxd gates them on the
+        // server-local `file_list` and `file_getinfo` extras, which every
+        // account has unless its file turns them off (accounts.c), so on
+        // the reference a user who may not download can still browse.
         t if t == ClientHdr::FileList.as_u32() => {
-            if !sess.can(bit::DOWNLOAD_FILES) {
-                reply_error(tx, f.trans, "You are not allowed to list files.");
-                return;
-            }
             let Some(service) = ctx.files.as_ref() else {
                 reply_error(tx, f.trans, "Files are not available on this server.");
                 return;
@@ -1672,10 +1695,6 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
 
         t if t == ClientHdr::FileGetInfo.as_u32() => {
-            if !sess.can(bit::DOWNLOAD_FILES) {
-                reply_error(tx, f.trans, "You are not allowed to inspect files.");
-                return;
-            }
             let Some(service) = ctx.files.as_ref() else {
                 reply_error(tx, f.trans, "Files are not available on this server.");
                 return;
@@ -1687,7 +1706,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 return;
             };
             let large = sess.has_cap(cap::LARGE_FILES);
-            let (_path, info, wire_name) = match files::resolve_file(
+            let (_path, info, wire_name) = match files::resolve_entry(
                 service.source.as_ref(),
                 dir.as_ref().map(|chunk| chunk.data),
                 name.data,
@@ -1709,10 +1728,20 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 modified: info.modified,
             };
             let (type_code, creator) = files::type_creator(&entry);
+            // Get Info shows a folder's creator as "n/a ", as mhxd answers
+            // it; listings keep the creator they have always carried.
+            let creator = if info.kind == FileKind::Folder {
+                *b"n/a "
+            } else {
+                creator
+            };
             let mut chunks = vec![
                 (tag::FILE_NAME, wire_name),
                 (tag::FILE_TYPE, type_code.to_vec()),
                 (tag::FILE_CREATOR, creator.to_vec()),
+                // Field 213, the type code the Get Info window draws its
+                // icon from.
+                (tag::FILE_ICON, type_code.to_vec()),
                 (
                     tag::FILE_SIZE,
                     (info.size.min(u32::MAX as u64) as u32)
@@ -1770,20 +1799,27 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 return;
             }
             let resume = f.chunks().find(|chunk| chunk.tag == tag::RFLT);
-            let mut has_resume = resume.is_some();
             let mut offset = resume
                 .map(|chunk| u64::from(hxfiles_xfer::rflt::parse_compatible(chunk.data).data))
                 .unwrap_or(0);
             if let Some(chunk) = f.chunks().find(|chunk| chunk.tag == tag::OFFSET64) {
-                has_resume = true;
                 if !large || chunk.data.len() != 8 {
                     reply_error(tx, f.trans, "Malformed file resume offset.");
                     return;
                 }
                 offset = u64::from_be_bytes(chunk.data.try_into().expect("eight bytes"));
             }
-            if offset > info.size || (has_resume && offset == info.size) {
+            // An offset at the very end is a finished download asking again;
+            // it gets a transfer of headers alone, as mhxd sends it.
+            if offset > info.size {
                 reply_error(tx, f.trans, "Resume offset is beyond the file.");
+                return;
+            }
+            // A resume from inside the file needs a source that can start
+            // there. Refused here, the client gets a task error; issued a
+            // reference, it would only see its transfer socket close.
+            if offset != 0 && offset < info.size && !service.source.supports_ranges(&path) {
+                reply_error(tx, f.trans, "This file cannot be resumed.");
                 return;
             }
             let Some(serial) = ctx.core.session_serial(sess.uid) else {
@@ -1810,6 +1846,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         uid: sess.uid,
                         serial,
                     },
+                    account: sess.account.login.clone(),
+                    peer: sess.transfer_addr,
                     path,
                     offset,
                     large,
