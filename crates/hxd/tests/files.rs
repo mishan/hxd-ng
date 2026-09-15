@@ -1108,13 +1108,12 @@ async fn local_file_put_preserves_forks_refuses_escape_and_resumes_large_raw_dat
         .find(|chunk| chunk.tag == tag::HTXF_REF)
         .unwrap()
         .as_uint();
-    let digest: [u8; htxf::RESUME_DIGEST_LEN] = resume
-        .chunks()
-        .find(|chunk| chunk.tag == tag::PARTIAL_DIGEST)
-        .unwrap()
-        .data
-        .try_into()
-        .unwrap();
+    assert!(
+        resume
+            .chunks()
+            .any(|chunk| chunk.tag == tag::PARTIAL_DIGEST),
+        "a large-file resume quote carries its digest"
+    );
     let flags = htxf::FLAG_LARGE_FILE | htxf::FLAG_SIZE64 | htxf::FLAG_RESUME;
     let mut rejected = TcpStream::connect(server.htxf).await.unwrap();
     rejected
@@ -1181,6 +1180,126 @@ async fn local_file_put_preserves_forks_refuses_escape_and_resumes_large_raw_dat
     assert_eq!(
         std::fs::read(root.path().join("large.bin")).unwrap(),
         b"hello world"
+    );
+
+    // A large-file client may leave the 64-bit length off FILE_PUT and the
+    // handshake alike when 32 bits carry it.
+    let small = capable
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"small.bin".to_vec()),
+                (tag::HTXF_SIZE, 3u32.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    assert_eq!(small.flag & 1, 0);
+    let reference = small
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let mut transfer = TcpStream::connect(server.htxf).await.unwrap();
+    transfer
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: 3,
+                type_code: 0,
+                flags: htxf::FLAG_LARGE_FILE,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    transfer.write_all(b"abc").await.unwrap();
+    let mut ignored = Vec::new();
+    transfer.read_to_end(&mut ignored).await.unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("small.bin")).unwrap(),
+        b"abc"
+    );
+
+    // A client that turns a resume quote down sends the whole file, which
+    // replaces the partial instead of extending it.
+    let first = capable
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"declined.bin".to_vec()),
+                (tag::HTXF_SIZE, 11u32.to_be_bytes().to_vec()),
+                (tag::XFERSIZE64, 11u64.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    let reference = first
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let mut interrupted = TcpStream::connect(server.htxf).await.unwrap();
+    interrupted
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: 11,
+                type_code: 0,
+                flags: htxf::FLAG_LARGE_FILE | htxf::FLAG_SIZE64,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    interrupted.write_all(b"stale").await.unwrap();
+    interrupted.shutdown().await.unwrap();
+    let mut ignored = Vec::new();
+    interrupted.read_to_end(&mut ignored).await.unwrap();
+    assert!(!root.path().join("declined.bin").exists());
+
+    let quoted = capable
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"declined.bin".to_vec()),
+                (tag::FILE_PREVIEW, vec![0, 2]),
+                (tag::HTXF_SIZE, 11u32.to_be_bytes().to_vec()),
+                (tag::XFERSIZE64, 11u64.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    assert!(quoted
+        .chunks()
+        .any(|chunk| chunk.tag == tag::PARTIAL_DIGEST));
+    let reference = quoted
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let mut whole = TcpStream::connect(server.htxf).await.unwrap();
+    whole
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: 11,
+                type_code: 0,
+                flags: htxf::FLAG_LARGE_FILE | htxf::FLAG_SIZE64,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    whole.write_all(b"fresh bytes").await.unwrap();
+    let mut ignored = Vec::new();
+    whole.read_to_end(&mut ignored).await.unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("declined.bin")).unwrap(),
+        b"fresh bytes"
     );
 }
 

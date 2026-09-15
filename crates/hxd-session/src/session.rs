@@ -1956,20 +1956,28 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             let legacy_size = u32::from_be_bytes(size32.data.try_into().expect("four bytes"));
             let size64 = f.chunks().find(|chunk| chunk.tag == tag::XFERSIZE64);
             let transfer_len = if large {
-                let Some(size64) = size64 else {
-                    reply_error(tx, f.trans, "Large uploads require a 64-bit size.");
-                    return;
-                };
-                if size64.data.len() != 8 {
-                    reply_error(tx, f.trans, "Malformed 64-bit upload size.");
-                    return;
+                match size64 {
+                    // XFERSIZE64 is a SHOULD. Without it the 32-bit size
+                    // stands, unless it is clamped and so is not the length.
+                    None if legacy_size != u32::MAX => u64::from(legacy_size),
+                    None => {
+                        reply_error(tx, f.trans, "Large uploads require a 64-bit size.");
+                        return;
+                    }
+                    Some(size64) => {
+                        if size64.data.len() != 8 {
+                            reply_error(tx, f.trans, "Malformed 64-bit upload size.");
+                            return;
+                        }
+                        let value =
+                            u64::from_be_bytes(size64.data.try_into().expect("eight bytes"));
+                        if legacy_size != value.min(u64::from(u32::MAX)) as u32 {
+                            reply_error(tx, f.trans, "Upload sizes disagree.");
+                            return;
+                        }
+                        value
+                    }
                 }
-                let value = u64::from_be_bytes(size64.data.try_into().expect("eight bytes"));
-                if legacy_size != value.min(u64::from(u32::MAX)) as u32 {
-                    reply_error(tx, f.trans, "Upload sizes disagree.");
-                    return;
-                }
-                value
             } else {
                 if size64.is_some() {
                     reply_error(tx, f.trans, "64-bit upload size was not negotiated.");

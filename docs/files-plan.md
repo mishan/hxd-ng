@@ -47,8 +47,10 @@ bound their global bytes and count, count per account, concurrent I/O, idle
 time, total duration, and retention. Classic uploads preserve DATA, MACR, and CAP Finder
 metadata. Large File uploads are raw data and resume only after the server
 recomputes the quoted partial length and SHA-256 trailing-window digest and
-constant-time compares the client's echo. HTTP and ng downloads remain
-read-only even when backed by this local area.
+constant-time compares the client's echo. A client may turn the quote down by
+sending the whole file without `HTXF_FLAG_RESUME`; that upload replaces the
+partial. HTTP and ng downloads remain read-only even when backed by this local
+area.
 
 ## Repository and branch order
 
