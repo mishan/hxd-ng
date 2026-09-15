@@ -39,6 +39,26 @@ fn init_tracing() {
         .init();
 }
 
+async fn shutdown_signal() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| format!("install SIGTERM handler: {e}"))?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(|e| format!("install Ctrl-C handler: {e}"))
+            }
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| format!("install Ctrl-C handler: {e}"))
+}
+
 /// What the command line asked for.
 enum Command {
     Serve,
@@ -161,6 +181,9 @@ async fn main() {
         let listener = TcpListener::bind(&config.server.bind)
             .await
             .map_err(|e| format!("bind {}: {e}", config.server.bind))?;
+        let legacy_addr = listener
+            .local_addr()
+            .map_err(|e| format!("legacy listener address: {e}"))?;
         tracing::info!(
             "hxd-ng listening on {} (server name {:?}, version {})",
             config.server.bind,
@@ -197,6 +220,43 @@ async fn main() {
                 }
             });
         }
+
+        // Bind every configured listener before telling a tracker this
+        // process is available. A bad ng bind must not leave a transient
+        // listing for a server whose startup failed.
+        let ng_listener = match &config.ng {
+            Some(ng) => Some(
+                TcpListener::bind(&ng.bind)
+                    .await
+                    .map_err(|e| format!("ng bind {}: {e}", ng.bind))?,
+            ),
+            None => None,
+        };
+
+        let tracker = match &config.tracker {
+            Some(section) => {
+                let advertised_port = section.advertised_port.unwrap_or(legacy_addr.port());
+                tracing::info!(
+                    "tracker registration to {} target(s), advertising TCP port {}",
+                    section.targets.len(),
+                    advertised_port
+                );
+                Some(hxd::tracker::start(
+                    section,
+                    hxd::tracker::Advertisement {
+                        name: config.server.name.clone(),
+                        description: section.description.clone(),
+                        port: advertised_port,
+                        protocol_version: config.server.version,
+                        inline_media: config.media.is_some() && cfg!(feature = "media"),
+                        voice: voice.is_some(),
+                        large_files: files.is_some(),
+                    },
+                    ctx.core.clone(),
+                )?)
+            }
+            None => None,
+        };
 
         // Voice: the UDP media socket and the pump that drives it. Both
         // wires advertise the capability only because building this
@@ -270,11 +330,8 @@ async fn main() {
 
         // The Hotline-ng WebSocket frontend, when configured: its accept
         // loop plus the detached-session sweeper.
-        if let Some(ng_ctx) = ng_ctx {
+        if let (Some(ng_ctx), Some(ng_listener)) = (ng_ctx, ng_listener) {
             let ng = config.ng.as_ref().unwrap();
-            let ng_listener = TcpListener::bind(&ng.bind)
-                .await
-                .map_err(|e| format!("ng bind {}: {e}", ng.bind))?;
             tracing::info!(
                 "hotline-ng WebSocket on {} (grace {}s) — TLS is the reverse proxy's job",
                 ng.bind,
@@ -297,15 +354,20 @@ async fn main() {
             tokio::spawn(hxd_ng_session::serve(ng_listener, ng_ctx));
         }
 
-        tokio::select! {
+        let outcome = tokio::select! {
             r = hxd_session::serve(listener, ctx) => {
                 r.map_err(|e| format!("accept loop: {e}"))
             }
-            _ = tokio::signal::ctrl_c() => {
+            signal = shutdown_signal() => {
+                signal?;
                 tracing::info!("shutting down");
                 Ok(())
             }
+        };
+        if let Some(tracker) = tracker {
+            tracker.shutdown().await;
         }
+        outcome
     }
     .await;
 

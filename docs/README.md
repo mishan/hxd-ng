@@ -45,6 +45,7 @@ to another project.
 | [capabilities-video.md](capabilities-video.md) — video publications and subscriptions | yes | ng; extended when GtkHx renders | spec, contributed to fogWraith's set |
 | [files-plan.md](files-plan.md) — the file area's first slice | no | all | design |
 | [file-sources.md](file-sources.md) — exploratory background for files | superseded | — | design |
+| [tracker-registration.md](tracker-registration.md) — HTRK v1/v3 server heartbeats, authentication and operator configuration | yes | server infrastructure | design; implements fogWraith specs |
 
 ## Proposals
 

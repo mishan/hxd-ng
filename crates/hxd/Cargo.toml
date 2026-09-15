@@ -39,6 +39,7 @@ hxd-files = { workspace = true }
 hxd-auth-file = { workspace = true }
 hxd-session = { workspace = true }
 hxd-ng-session = { workspace = true }
+hxproto = { workspace = true }
 hxd-media = { workspace = true, optional = true }
 hxd-markdown = { workspace = true, optional = true }
 hxd-voice = { workspace = true, optional = true }
@@ -50,9 +51,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rand_core = { workspace = true }
 
 [dev-dependencies]
-hxproto = { workspace = true }
 hxfiles-xfer = { workspace = true }
 # The media e2e stands real WebRTC clients up against the real SFU.
 hxd-voice = { workspace = true }

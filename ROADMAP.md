@@ -361,8 +361,10 @@ moderation (W8), and the legacy binding that closes this phase (W9).
 
 - TLS on a dedicated port (rustls server-side), same TLS-from-byte-zero model
   GtkHx already speaks. Reject HOPE-on-TLS as redundant, same as the client.
-- Tracker registration (UDP heartbeat to v1 trackers; v3 registration once
-  scoped against Argus).
+- **Tracker registration — implemented 2026-09.** Independent UDP heartbeat
+  loops for explicitly configured v1 and v3 targets; live user/capability
+  metadata, HMAC nonces, acknowledgments and per-target tokens, and v3
+  deregistration on graceful shutdown.
 - Rate limiting, flood protection, connection caps per IP, ban enforcement at
   accept time.
 - Fuzz the frame decoder (`cargo-fuzz` against the session layer's read
@@ -581,7 +583,6 @@ resist the reorder.
 - Whether HOPE handshake logic gets promoted out of `hxnet` into a shared
   crate or reimplemented server-side (decide when Phase 2 starts, with the
   code open).
-- Tracker v3 registration semantics (scope against Argus when Phase 5 nears).
 - Whether to publish the `hotline-rs` crates to crates.io (separate from
   extraction; no rush while `publish = false`).
 - Detached-user rendering on the legacy wire: away flag, hidden, or a
