@@ -63,8 +63,8 @@ pub struct PreparedUpload {
     pub path: FilePath,
     pub source: Arc<LocalFileSource>,
     pub owner: String,
-    /// The HTXF payload size declared on FILE_PUT. A resume request may leave
-    /// it out, and then the claim resolves it from the handshake.
+    /// The HTXF payload size declared on FILE_PUT. A request may leave it
+    /// out, and then the claim resolves it from the handshake.
     pub transfer_len: Option<u64>,
     pub large: bool,
     pub quote: Option<UploadQuote>,
@@ -308,12 +308,14 @@ impl TransferRegistry {
                         }
                         total
                     }
-                    // A resume request may leave the size out ("Resume Flow
-                    // (Upload)"). The handshake then states what is left to
-                    // send, and the upload is capped by the quoted offset plus
-                    // that length: begin_upload reserves it against the
-                    // partial quota, and the receive path checks it against
-                    // the file size limit before writing.
+                    // The size is optional (Hotline.md, Upload File): mhxd's
+                    // own client never sends it, and a Large File resume
+                    // request leaves it out ("Resume Flow (Upload)"). The
+                    // handshake then states what is left to send, and the
+                    // upload is capped by any quoted offset plus that length:
+                    // begin_upload reserves it against the partial quota, and
+                    // the receive path spends every fork against it before
+                    // writing.
                     None => resumed_bytes
                         .checked_add(preamble.transfer_len)
                         .ok_or(FileError::TooLarge)?,

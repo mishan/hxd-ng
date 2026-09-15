@@ -285,13 +285,17 @@ mhxd; downloading needs `download_files`. A download ends with the session that
 asked for it, and an HTXF transfer must come from the address of a direct
 control connection.
 
-A local root enables FilePut for accounts with both `upload_files` and
-`upload_anywhere`. Existing files are never overwritten. Uploads are staged in
+A local root enables FilePut. As on mhxd, an account with `upload_files` may
+upload into any folder whose path names an upload folder or a drop box
+(`Uploads`, `Drop Box`, in any case), and one that also has `upload_anywhere`
+may upload anywhere. A drop box's contents are listed only to accounts with
+`view_drop_boxes`. Existing files are never overwritten. Uploads are staged in
 an internal mode-0700 directory, scoped by account and destination, and become
-visible through an atomic no-replace link only after the declared transfer has
-arrived and validated. Client paths are resolved beneath an open directory
-capability; absolute paths, traversal, symlinks, and the internal state path are
-not reachable through either protocol.
+visible through an atomic no-replace link only after the transfer has arrived
+and validated. Client paths are resolved beneath an open directory capability
+without following symlinks; absolute paths, traversal, symlinks, and the
+internal state path, however it is spelled, are not reachable through either
+protocol.
 
 ```toml
 [files]
@@ -316,6 +320,13 @@ under `.hxd-state`; that directory is reserved to the server and omitted from
 listings. Large File uploads use raw bytes. A resumed one is accepted only when
 the client echoes the server's SHA-256 digest for the exact stored offset and
 trailing window. Folder upload and general file mutation remain separate work.
+
+An interrupted upload stays unlisted until it completes, where mhxd shows the
+truncated file. A classic client that offers to resume only when it sees the
+file on the server therefore starts over; one that asks to resume anyway is
+given the stored offset. An account at `max_partials_per_account` gives up its
+least recently touched partial to make room for a new upload, and a partial
+with nothing in it is dropped when its transfer ends.
 
 The manifest schema is deliberately small and strict. Sizes are decimal
 strings so its shape agrees with the ng wire:

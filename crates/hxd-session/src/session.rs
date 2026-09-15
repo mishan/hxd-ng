@@ -1672,6 +1672,12 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     return;
                 }
             };
+            // mhxd shows a drop box's contents only to accounts that may
+            // view drop boxes (files.c, check_dropbox).
+            if path.is_drop_box() && !sess.can(bit::VIEW_DROP_BOXES) {
+                reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
+                return;
+            }
             let entries = match files::list(service.source.as_ref(), &path, large).await {
                 Ok(entries) => entries,
                 Err(error) => {
@@ -1913,8 +1919,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
 
         t if t == ClientHdr::FilePut.as_u32() => {
-            if !sess.can(bit::UPLOAD_FILES) || !sess.can(bit::UPLOAD_ANYWHERE) {
-                reply_error(tx, f.trans, "You are not allowed to upload files here.");
+            if !sess.can(bit::UPLOAD_FILES) {
+                reply_error(tx, f.trans, "You are not allowed to upload files.");
                 return;
             }
             let Some(service) = ctx.files.as_ref() else {
@@ -1945,24 +1951,44 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     return;
                 }
             };
-            let preview = f.chunks().find(|chunk| chunk.tag == tag::FILE_PREVIEW);
-            let resume_requested = match preview.as_ref().map(|chunk| chunk.data) {
+            // mhxd lets an account without upload-anywhere upload into any
+            // folder whose path names an upload folder or a drop box
+            // (files.c, rcv_file_put).
+            if !sess.can(bit::UPLOAD_ANYWHERE)
+                && !path
+                    .parent()
+                    .is_some_and(|folder| folder.is_upload_folder())
+            {
+                reply_error(tx, f.trans, "You are not allowed to upload files here.");
+                return;
+            }
+            // A resume needs the client to ask for one. mhxd writes an upload
+            // in place, so an interrupted one is listed and a client offers
+            // to resume what it sees; here a partial stays unlisted until it
+            // completes, so nobody is served half a file, and a client that
+            // offers resume only for a listed file starts over instead.
+            //
+            // mhxd reads these fields as integers of whatever width they
+            // come in, and a zero option asks for no resume.
+            let resume_requested = match f.chunks().find(|chunk| chunk.tag == tag::FILE_PREVIEW) {
                 None => false,
-                Some([0, 1] | [0, 2]) => true,
-                Some(_) => {
-                    reply_error(tx, f.trans, "Malformed upload resume option.");
-                    return;
-                }
+                Some(chunk) => match files::wire_uint(chunk.data) {
+                    Some(option) => option != 0,
+                    None => {
+                        reply_error(tx, f.trans, "Malformed upload resume option.");
+                        return;
+                    }
+                },
             };
             let legacy_size = match f.chunks().find(|chunk| chunk.tag == tag::HTXF_SIZE) {
                 None => None,
-                Some(chunk) if chunk.data.len() == 4 => Some(u32::from_be_bytes(
-                    chunk.data.try_into().expect("four bytes"),
-                )),
-                Some(_) => {
-                    reply_error(tx, f.trans, "Malformed upload size.");
-                    return;
-                }
+                Some(chunk) => match files::wire_uint(chunk.data).map(u32::try_from) {
+                    Some(Ok(size)) => Some(size),
+                    _ => {
+                        reply_error(tx, f.trans, "Malformed upload size.");
+                        return;
+                    }
+                },
             };
             let wide_size = match f.chunks().find(|chunk| chunk.tag == tag::XFERSIZE64) {
                 None => None,
@@ -1994,13 +2020,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     return;
                 }
                 (None, Some(wide)) => Some(wide),
-                // A resume request carries no size (Large File extension,
-                // "Resume Flow (Upload)"); the handshake states it instead.
-                (None, None) if resume_requested => None,
-                (None, None) => {
-                    reply_error(tx, f.trans, "No upload size was supplied.");
-                    return;
-                }
+                // The size is optional (Hotline.md, Upload File): mhxd's own
+                // client never sends it, and a Large File resume request
+                // leaves it out. The handshake states it instead.
+                (None, None) => None,
             };
             let Some(serial) = ctx.core.session_serial(sess.uid) else {
                 reply_error(tx, f.trans, "Session ended.");

@@ -39,8 +39,8 @@ pub struct UploadTransfer {
     pub peer: Option<IpAddr>,
     pub path: FilePath,
     pub owner: String,
-    /// The declared HTXF payload size. Only a resume request may leave it
-    /// out; the handshake then states it.
+    /// The declared HTXF payload size. A request may leave it out, as
+    /// mhxd's own client always does; the handshake then states it.
     pub transfer_len: Option<u64>,
     pub large: bool,
     pub resume_requested: bool,
@@ -220,8 +220,9 @@ async fn serve_one(
             serve_download(stream, transfer, &alive, timeouts.idle).await
         }
         PreparedTransfer::Upload(transfer) => {
+            let alive = Liveness::new(core, transfer.principal);
             let timeout = transfer.source.limits().upload_timeout;
-            tokio::time::timeout(timeout, serve_upload(stream, transfer, preamble))
+            tokio::time::timeout(timeout, serve_upload(stream, transfer, preamble, &alive))
                 .await
                 .map_err(|_| FileError::Unavailable("upload exceeded its time limit".into()))?
         }
@@ -277,45 +278,58 @@ async fn serve_upload(
     mut stream: TcpStream,
     transfer: PreparedUpload,
     preamble: htxf::Preamble,
+    alive: &Liveness,
 ) -> Result<(), FileError> {
-    let _permit = transfer.source.acquire_io_permit().await?;
+    // Local I/O permits are taken around each piece of disk work rather
+    // than for the whole upload: a client trickling bytes must not hold
+    // capacity that listings and downloads share.
     let fresh = transfer.quote.is_none();
-    let begin_source = transfer.source.clone();
     let owner = transfer.owner.clone();
     let path = transfer.path.clone();
-    // The claim resolves a length that a resume request left out.
+    // The claim resolves a length the request left out.
     let reserve = transfer
         .transfer_len
         .ok_or_else(|| FileError::Unavailable("upload length was not resolved".into()))?;
-    let mut files = tokio::task::spawn_blocking(move || {
-        begin_source.begin_upload(&owner, &path, fresh, reserve)
+    let quote = transfer.quote.clone();
+    let files = on_disk(&transfer.source, move |source| {
+        let files = source.begin_upload(&owner, &path, fresh, reserve)?;
+        if let Some(quote) = quote {
+            source.recheck_resume(&files, &quote)?;
+        }
+        Ok(files)
+    })
+    .await?;
+    let result = if transfer.large {
+        receive_large(&mut stream, &transfer, &preamble, &files, alive).await
+    } else {
+        receive_legacy(&mut stream, &transfer, &preamble, &files, alive).await
+    };
+    // Nothing is published for a session that ended while its bytes were
+    // arriving.
+    let result = result.and_then(|hfs| alive.check().map(|()| hfs));
+    let path = transfer.path.clone();
+    on_disk(&transfer.source, move |source| match result {
+        Ok(hfs) => source.publish_upload(&path, &files, &hfs),
+        // Dropped here, off the runtime: a partial left empty is removed as
+        // it goes.
+        Err(error) => {
+            drop(files);
+            Err(error)
+        }
     })
     .await
-    .map_err(|error| FileError::Unavailable(format!("local file worker: {error}")))??;
-    if let Some(quote) = transfer.quote.clone() {
-        let check_source = transfer.source.clone();
-        files = tokio::task::spawn_blocking(move || {
-            check_source.recheck_resume(&files, &quote)?;
-            Ok::<_, FileError>(files)
-        })
+}
+
+/// Runs local disk work on the blocking pool, under an I/O permit.
+async fn on_disk<T: Send + 'static>(
+    source: &Arc<LocalFileSource>,
+    work: impl FnOnce(&LocalFileSource) -> Result<T, FileError> + Send + 'static,
+) -> Result<T, FileError> {
+    let _permit = source.acquire_io_permit().await?;
+    let source = source.clone();
+    tokio::task::spawn_blocking(move || work(&source))
         .await
-        .map_err(|error| FileError::Unavailable(format!("local file worker: {error}")))??;
-    }
-    let result = if transfer.large {
-        receive_large(&mut stream, &transfer, &preamble, &files).await
-    } else {
-        receive_legacy(&mut stream, &transfer, &preamble, &files).await
-    };
-    match result {
-        Ok(hfs) => {
-            let publish_source = transfer.source.clone();
-            let path = transfer.path.clone();
-            tokio::task::spawn_blocking(move || publish_source.publish_upload(&path, &files, &hfs))
-                .await
-                .map_err(|error| FileError::Unavailable(format!("local file worker: {error}")))?
-        }
-        Err(error) => Err(error),
-    }
+        .map_err(|error| FileError::Unavailable(format!("local file worker: {error}")))?
 }
 
 async fn receive_large(
@@ -323,6 +337,7 @@ async fn receive_large(
     transfer: &PreparedUpload,
     preamble: &htxf::Preamble,
     files: &crate::local::UploadFiles,
+    alive: &Liveness,
 ) -> Result<hxhfs::HfsInfo, FileError> {
     let offset = transfer.quote.as_ref().map_or(0, |quote| quote.data_offset);
     let final_len = offset
@@ -345,9 +360,11 @@ async fn receive_large(
         stream,
         &mut output,
         preamble.transfer_len,
-        transfer.source.limits().io_timeout,
+        &transfer.source,
+        alive,
     )
     .await?;
+    let _permit = transfer.source.acquire_io_permit().await?;
     output
         .sync_all()
         .await
@@ -360,15 +377,21 @@ async fn receive_legacy(
     transfer: &PreparedUpload,
     preamble: &htxf::Preamble,
     files: &crate::local::UploadFiles,
+    alive: &Liveness,
 ) -> Result<hxhfs::HfsInfo, FileError> {
-    let timeout = transfer.source.limits().io_timeout;
+    let source = &transfer.source;
+    let timeout = source.limits().io_timeout;
+    // Everything the object says about its own size is spent against the
+    // length the handshake declared before a byte of it is written, so a
+    // fork header cannot claim more than was reserved for it.
+    let mut budget = preamble.transfer_len;
     let mut fixed = [0; ffo::FFO_HEADER_LEN + ffo::FORK_HEADER_LEN];
+    spend(&mut budget, fixed.len() as u64)?;
     read_exact_timeout(stream, &mut fixed, timeout).await?;
+    // The fork count is not consulted, as mhxd does not consult it: the
+    // fork headers say what follows, and the declared length says where
+    // the object ends.
     if &fixed[..4] != b"FILP" || fixed[4..6] != 1u16.to_be_bytes() || fixed[6..22] != [0; 16] {
-        return Err(FileError::InvalidPath);
-    }
-    let fork_count = u16::from_be_bytes(fixed[22..24].try_into().expect("two bytes"));
-    if !matches!(fork_count, 2 | 3) {
         return Err(FileError::InvalidPath);
     }
     let info_header =
@@ -380,16 +403,19 @@ async fn receive_legacy(
     {
         return Err(FileError::InvalidPath);
     }
+    spend(&mut budget, info_header.length)?;
     let mut info = vec![0; info_header.length as usize];
     read_exact_timeout(stream, &mut info, timeout).await?;
     let parsed = ffo::parse_info(&info).map_err(|_| FileError::InvalidPath)?;
     let mut data_header = [0; ffo::FORK_HEADER_LEN];
+    spend(&mut budget, data_header.len() as u64)?;
     read_exact_timeout(stream, &mut data_header, timeout).await?;
     let data_header =
         ffo::parse_fork_header(&data_header, false).map_err(|_| FileError::InvalidPath)?;
     if &data_header.tag != b"DATA" {
         return Err(FileError::InvalidPath);
     }
+    spend(&mut budget, data_header.length)?;
     let data_offset = transfer.quote.as_ref().map_or(0, |quote| quote.data_offset);
     let data_len = data_offset
         .checked_add(data_header.length)
@@ -406,15 +432,26 @@ async fn receive_legacy(
     data.seek(std::io::SeekFrom::Start(data_offset))
         .await
         .map_err(|error| unavailable("seek partial data fork", error))?;
-    copy_exact(stream, &mut data, data_header.length, timeout).await?;
+    copy_exact(stream, &mut data, data_header.length, source, alive).await?;
 
-    let consumed =
-        fixed.len() as u64 + info.len() as u64 + ffo::FORK_HEADER_LEN as u64 + data_header.length;
-    let mut resource_header = [0; ffo::FORK_HEADER_LEN];
-    read_exact_timeout(stream, &mut resource_header, timeout).await?;
-    let resource_header =
-        ffo::parse_fork_header(&resource_header, false).map_err(|_| FileError::InvalidPath)?;
-    if &resource_header.tag != b"MACR" || (fork_count == 3) != (resource_header.length != 0) {
+    // The protocol's object has two forks, and mhxd's client sends no MACR
+    // header for an empty resource fork, so one is read only while declared
+    // bytes remain, which is when mhxd reads it.
+    let resource_length = if budget == 0 {
+        0
+    } else {
+        let mut resource_header = [0; ffo::FORK_HEADER_LEN];
+        spend(&mut budget, resource_header.len() as u64)?;
+        read_exact_timeout(stream, &mut resource_header, timeout).await?;
+        let resource_header =
+            ffo::parse_fork_header(&resource_header, false).map_err(|_| FileError::InvalidPath)?;
+        if &resource_header.tag != b"MACR" {
+            return Err(FileError::InvalidPath);
+        }
+        spend(&mut budget, resource_header.length)?;
+        resource_header.length
+    };
+    if budget != 0 {
         return Err(FileError::InvalidPath);
     }
     let resource_offset = transfer
@@ -422,12 +459,12 @@ async fn receive_legacy(
         .as_ref()
         .map_or(0, |quote| quote.resource_offset);
     let resource_len = resource_offset
-        .checked_add(resource_header.length)
+        .checked_add(resource_length)
         .ok_or(FileError::TooLarge)?;
-    if data_len.saturating_add(resource_len) > transfer.source.limits().max_file_size {
+    if data_len.saturating_add(resource_len) > source.limits().max_file_size {
         return Err(FileError::TooLarge);
     }
-    if resource_header.length != 0 {
+    if resource_length != 0 {
         let mut resource = tokio::fs::File::from_std(
             files
                 .resource
@@ -438,19 +475,14 @@ async fn receive_legacy(
             .seek(std::io::SeekFrom::Start(resource_offset))
             .await
             .map_err(|error| unavailable("seek partial resource fork", error))?;
-        copy_exact(stream, &mut resource, resource_header.length, timeout).await?;
+        copy_exact(stream, &mut resource, resource_length, source, alive).await?;
+        let _permit = source.acquire_io_permit().await?;
         resource
             .sync_all()
             .await
             .map_err(|error| unavailable("sync uploaded resource fork", error))?;
     }
-    let consumed = consumed
-        .checked_add(ffo::FORK_HEADER_LEN as u64)
-        .and_then(|value| value.checked_add(resource_header.length))
-        .ok_or(FileError::TooLarge)?;
-    if consumed != preamble.transfer_len {
-        return Err(FileError::InvalidPath);
-    }
+    let _permit = source.acquire_io_permit().await?;
     data.sync_all()
         .await
         .map_err(|error| unavailable("sync uploaded data fork", error))?;
@@ -477,14 +509,26 @@ async fn read_exact_timeout<R: AsyncRead + Unpin>(
         .map_err(|error| unavailable("read upload", error))
 }
 
+/// Takes `amount` from what the handshake declared is left to arrive.
+fn spend(budget: &mut u64, amount: u64) -> Result<(), FileError> {
+    *budget = budget.checked_sub(amount).ok_or(FileError::InvalidPath)?;
+    Ok(())
+}
+
+/// Copies exactly `remaining` bytes of an upload into its partial. Each disk
+/// write takes an I/O permit of its own, and the session is checked between
+/// chunks: an upload ends with a kick, as a download does.
 async fn copy_exact<R: AsyncRead + Unpin>(
     reader: &mut R,
     writer: &mut tokio::fs::File,
     mut remaining: u64,
-    timeout: Duration,
+    source: &LocalFileSource,
+    alive: &Liveness,
 ) -> Result<(), FileError> {
-    let mut buffer = [0; 64 * 1024];
+    let timeout = source.limits().io_timeout;
+    let mut buffer = vec![0; CHUNK];
     while remaining != 0 {
+        alive.check()?;
         let want = remaining.min(buffer.len() as u64) as usize;
         let read = tokio::time::timeout(timeout, reader.read(&mut buffer[..want]))
             .await
@@ -493,6 +537,7 @@ async fn copy_exact<R: AsyncRead + Unpin>(
         if read == 0 {
             return Err(FileError::OriginChanged);
         }
+        let _permit = source.acquire_io_permit().await?;
         tokio::time::timeout(timeout, writer.write_all(&buffer[..read]))
             .await
             .map_err(|_| FileError::Unavailable("local file write stalled".into()))?

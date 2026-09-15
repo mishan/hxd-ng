@@ -13,8 +13,9 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
         return crate::proto::reply_err(req.id, "not_available", "Files are not available.");
     };
     // Listing and info are the account's `[extra] file_list` and
-    // `file_getinfo`, as on the legacy wire; only a download asks for the
-    // `download_files` bit.
+    // `file_getinfo`, and a drop box's listing also `view_drop_boxes`, as
+    // on the legacy wire; only a download asks for the `download_files`
+    // bit.
     match req.req.as_str() {
         "files_list" => {
             if !state.file_list {
@@ -36,6 +37,13 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 Ok(path) => path,
                 Err(error) => return error_reply(req.id, error),
             };
+            if path.is_drop_box() && !state.access.has(bit::VIEW_DROP_BOXES) {
+                return crate::proto::reply_err(
+                    req.id,
+                    "access_denied",
+                    "You are not allowed to view drop boxes.",
+                );
+            }
             match service.source.list(&path).await {
                 Ok(entries) => crate::proto::reply_ok(
                     req.id,

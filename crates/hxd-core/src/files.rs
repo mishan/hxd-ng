@@ -74,6 +74,22 @@ impl FilePath {
     pub fn as_slash_path(&self) -> String {
         self.0.join("/")
     }
+
+    /// Whether this path lies in a drop box, by mhxd's rule: its path names
+    /// "drop box", in any case (`files.c`, `check_dropbox`).
+    pub fn is_drop_box(&self) -> bool {
+        self.as_slash_path()
+            .to_ascii_lowercase()
+            .contains("drop box")
+    }
+
+    /// Whether an account without upload-anywhere may upload into the
+    /// folder at this path, by mhxd's rule: its path names an upload folder
+    /// or a drop box, in any case (`files.c`, `rcv_file_put`).
+    pub fn is_upload_folder(&self) -> bool {
+        let path = self.as_slash_path().to_ascii_lowercase();
+        path.contains("upload") || path.contains("drop box")
+    }
 }
 
 impl fmt::Display for FilePath {

@@ -115,6 +115,19 @@ async fn resolve_named(
     Ok((found.path, info, found.name))
 }
 
+/// An unsigned integer field of any width up to eight bytes, as mhxd's
+/// `dh_getint` reads one.
+pub(crate) fn wire_uint(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() || bytes.len() > 8 {
+        return None;
+    }
+    Some(
+        bytes
+            .iter()
+            .fold(0u64, |value, byte| value << 8 | u64::from(*byte)),
+    )
+}
+
 pub(crate) async fn resolve_upload(
     source: &dyn FileSource,
     dir: Option<&[u8]>,
@@ -253,6 +266,16 @@ fn parse_dir(bytes: &[u8]) -> Result<Vec<Vec<u8>>, FileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_fields_read_at_any_width() {
+        assert_eq!(wire_uint(&[2]), Some(2));
+        assert_eq!(wire_uint(&[0, 2]), Some(2));
+        assert_eq!(wire_uint(&[0, 0, 0, 0]), Some(0));
+        assert_eq!(wire_uint(&[1, 0, 0, 0, 0, 0, 0, 0]), Some(1 << 56));
+        assert_eq!(wire_uint(&[]), None);
+        assert_eq!(wire_uint(&[0; 9]), None);
+    }
 
     #[test]
     fn dir_parser_is_structural() {

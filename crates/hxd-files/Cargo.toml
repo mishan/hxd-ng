@@ -24,6 +24,7 @@ cap-std = "4"
 getrandom = "0.2"
 base64 = "0.22"
 sha2 = "0.10"
+cap-fs-ext = "4"
 
 [dev-dependencies]
 tempfile = "3"

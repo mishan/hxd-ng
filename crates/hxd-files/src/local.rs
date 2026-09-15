@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, DirEntry, Metadata, OpenOptions, Permissions};
 use hxd_core::{FileBody, FileEntry, FileError, FileInfo, FileKind, FilePath, FileSource};
@@ -22,6 +23,10 @@ const PARTIAL_DIR: &str = "partials";
 const METADATA_DIR: &str = "metadata";
 const HEADER_EPOCH: u64 = 946_684_800;
 const UPLOAD_GENERATION_LEN: usize = 16;
+/// Every file a partial upload keeps, by suffix on its base name.
+const PARTIAL_SUFFIXES: [&str; 4] = ["data", "rsrc", "fndrinfo", "generation"];
+/// The longest name Linux and macOS filesystems store, in bytes.
+const NAME_MAX: usize = 255;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LocalLimits {
@@ -56,6 +61,10 @@ struct Inner {
     root: Arc<Dir>,
     partials: Arc<Dir>,
     metadata: Arc<Dir>,
+    /// The state directory's identity. A case-folding filesystem resolves
+    /// more spellings to it than a name check can know, so directories
+    /// are refused by what they are rather than what they are called.
+    state_id: Option<(u64, u64)>,
     limits: LocalLimits,
     permits: Arc<Semaphore>,
     active_uploads: Mutex<HashSet<String>>,
@@ -103,8 +112,13 @@ impl LocalFileSource {
                 .map_err(|error| unavailable("protect state directory", error))?;
         }
         let state = root
-            .open_dir(STATE_DIR)
+            .open_dir_nofollow(STATE_DIR)
             .map_err(|error| unavailable("open state directory", error))?;
+        let state_id = identity(
+            &state
+                .dir_metadata()
+                .map_err(|error| unavailable("stat state directory", error))?,
+        );
         let partials = state
             .open_dir(PARTIAL_DIR)
             .map_err(|error| unavailable("open partial directory", error))?;
@@ -116,6 +130,7 @@ impl LocalFileSource {
                 root: Arc::new(root),
                 partials: Arc::new(partials),
                 metadata: Arc::new(metadata),
+                state_id,
                 limits,
                 permits: Arc::new(Semaphore::new(limits.max_concurrent)),
                 active_uploads: Mutex::new(HashSet::new()),
@@ -146,7 +161,12 @@ impl LocalFileSource {
         }
         let (parent, name) = self.open_parent(path)?;
         match parent.symlink_metadata(&name) {
-            Ok(_) => return Err(FileError::AlreadyExists),
+            Ok(_) => {
+                // This account's partial for a path that now exists can
+                // never be published, so it gives its slot back.
+                self.discard_inactive_partial(&partial_base(owner, path));
+                return Err(FileError::AlreadyExists);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(map_lookup_error(error)),
         }
@@ -158,6 +178,7 @@ impl LocalFileSource {
         }
         // Without a declared size only the partial count limits can apply
         // here; the bytes are reserved once the handshake states them.
+        self.make_room(owner, &partial_base(owner, path))?;
         self.enforce_partial_quota(owner, path, transfer_len.unwrap_or(0))?;
         if !resume_requested {
             return Ok(None);
@@ -239,6 +260,88 @@ impl LocalFileSource {
         file.sync_all()
             .map_err(|error| unavailable("sync partial generation", error))?;
         Ok(generation)
+    }
+
+    /// Makes room under the per-account partial cap for an upload to `base`
+    /// by dropping that account's least recently touched partials. Refusing
+    /// instead would let a few failed or abandoned uploads lock an account,
+    /// and with it every guest, since guests share one, out of uploading
+    /// for the whole retention period. A partial being uploaded to is never
+    /// dropped; when every one is, the cap refuses as before.
+    fn make_room(&self, owner: &str, base: &str) -> Result<(), FileError> {
+        let owner_prefix = format!("{}-", owner_key(owner));
+        let active = self.inner.active_uploads.lock().unwrap();
+        let mut owned: Vec<_> = self
+            .partial_bases()?
+            .into_iter()
+            .filter(|(name, state)| {
+                name != base && name.starts_with(&owner_prefix) && state.has_data
+            })
+            .collect();
+        let cap = self.inner.limits.max_partials_per_account;
+        if owned.len() < cap {
+            return Ok(());
+        }
+        let excess = owned.len() + 1 - cap;
+        owned.retain(|(name, _)| !active.contains(name));
+        owned.sort_by_key(|(_, state)| state.newest);
+        for (_, state) in owned.iter().take(excess) {
+            self.remove_partial_files(&state.names);
+        }
+        Ok(())
+    }
+
+    /// Removes `base`'s files unless an upload is using them.
+    fn discard_inactive_partial(&self, base: &str) {
+        let active = self.inner.active_uploads.lock().unwrap();
+        if !active.contains(base) {
+            self.remove_partial_files(&PARTIAL_SUFFIXES.map(|suffix| format!("{base}.{suffix}")));
+        }
+    }
+
+    fn remove_partial_files(&self, names: &[String]) {
+        for name in names {
+            let _ = self.inner.partials.remove_file(name);
+        }
+    }
+
+    /// Every partial on disk, by base name.
+    fn partial_bases(&self) -> Result<HashMap<String, PartialState>, FileError> {
+        let mut bases: HashMap<String, PartialState> = HashMap::new();
+        for entry in self
+            .inner
+            .partials
+            .entries()
+            .map_err(|error| unavailable("scan partial directory", error))?
+        {
+            let entry = entry.map_err(|error| unavailable("scan partial entry", error))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some((base, suffix)) = name.rsplit_once('.') else {
+                continue;
+            };
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            // A time that cannot be read counts as now: it keeps the
+            // partial rather than expiring it early.
+            let touched = metadata
+                .modified()
+                .map_or_else(|_| SystemTime::now(), |time| time.into_std());
+            let state = bases.entry(base.to_owned()).or_insert(PartialState {
+                newest: UNIX_EPOCH,
+                has_data: false,
+                names: Vec::new(),
+            });
+            state.newest = state.newest.max(touched);
+            state.has_data |= suffix == "data";
+            state.names.push(name);
+        }
+        Ok(bases)
     }
 
     fn enforce_partial_quota(
@@ -324,6 +427,7 @@ impl LocalFileSource {
         self.sweep_partials()?;
         let base = partial_base(owner, path);
         let active = self.lock_upload_base(&base)?;
+        self.make_room(owner, &base)?;
         let guard = UploadGuard {
             inner: self.inner.clone(),
             base: base.clone(),
@@ -510,6 +614,9 @@ impl LocalFileSource {
                 &final_finder,
             )
             .map_err(|error| unavailable("publish Finder metadata", error))?;
+        // A link lives in its directory, so it is durable once that
+        // directory is synced: the sidecars' before the data is linked, and
+        // the destination's after.
         let resource_len = files
             .resource
             .metadata()
@@ -525,6 +632,11 @@ impl LocalFileSource {
                 return Err(unavailable("publish resource fork", error));
             }
         }
+        if let Err(error) = sync_dir(&self.inner.metadata) {
+            let _ = self.inner.metadata.remove_file(&final_finder);
+            let _ = self.inner.metadata.remove_file(&final_resource);
+            return Err(error);
+        }
         if let Err(error) =
             self.inner
                 .partials
@@ -538,7 +650,12 @@ impl LocalFileSource {
                 unavailable("publish data fork", error)
             });
         }
-        for suffix in ["data", "rsrc", "fndrinfo", "generation"] {
+        // The upload is visible now, so a failed sync is not a failed
+        // upload; it only leaves the link less durable than it should be.
+        if let Err(error) = sync_dir(&parent) {
+            tracing::warn!(%error, "upload published but its folder was not synced");
+        }
+        for suffix in PARTIAL_SUFFIXES {
             let _ = self
                 .inner
                 .partials
@@ -547,14 +664,42 @@ impl LocalFileSource {
         Ok(())
     }
 
+    /// The name check catches the plain spelling of the state directory
+    /// early; [`Self::descend`] and [`Self::stat`] refuse it however a
+    /// case-folding filesystem lets it be spelled. A component longer than
+    /// a filesystem name can be is malformed rather than an I/O failure.
     fn validate_path(path: &FilePath) -> Result<(), FileError> {
-        if path
-            .components()
-            .any(|component| component.eq_ignore_ascii_case(STATE_DIR))
-        {
+        if path.components().any(|component| {
+            component.eq_ignore_ascii_case(STATE_DIR) || component.len() > NAME_MAX
+        }) {
             return Err(FileError::InvalidPath);
         }
         Ok(())
+    }
+
+    fn is_state_dir(&self, metadata: &Metadata) -> bool {
+        metadata.is_dir()
+            && self.inner.state_id.is_some()
+            && identity(metadata) == self.inner.state_id
+    }
+
+    /// Opens `component` beneath `dir` as a directory, never through a
+    /// symlink and never into the server's own state.
+    fn descend(&self, dir: &Dir, component: &str) -> Result<Dir, FileError> {
+        let metadata = dir.symlink_metadata(component).map_err(map_lookup_error)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(FileError::NotFolder);
+        }
+        // Checked above and opened here without following, so a symlink
+        // swapped in between the two fails rather than being followed.
+        let opened = dir.open_dir_nofollow(component).map_err(map_lookup_error)?;
+        let metadata = opened
+            .dir_metadata()
+            .map_err(|error| unavailable("stat directory", error))?;
+        if self.is_state_dir(&metadata) {
+            return Err(FileError::InvalidPath);
+        }
+        Ok(opened)
     }
 
     fn open_parent(&self, path: &FilePath) -> Result<(Dir, String), FileError> {
@@ -567,11 +712,7 @@ impl LocalFileSource {
             .try_clone()
             .map_err(|error| unavailable("clone root directory", error))?;
         for component in components {
-            let metadata = dir.symlink_metadata(component).map_err(map_lookup_error)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(FileError::NotFolder);
-            }
-            dir = dir.open_dir(component).map_err(map_lookup_error)?;
+            dir = self.descend(&dir, component)?;
         }
         Ok((dir, name))
     }
@@ -584,11 +725,7 @@ impl LocalFileSource {
             .try_clone()
             .map_err(|error| unavailable("clone root directory", error))?;
         for component in path.components() {
-            let metadata = dir.symlink_metadata(component).map_err(map_lookup_error)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(FileError::NotFolder);
-            }
-            dir = dir.open_dir(component).map_err(map_lookup_error)?;
+            dir = self.descend(&dir, component)?;
         }
         Ok(dir)
     }
@@ -605,6 +742,9 @@ impl LocalFileSource {
         let metadata = dir.symlink_metadata(name).map_err(map_lookup_error)?;
         if metadata.file_type().is_symlink() {
             return Err(FileError::NotFound);
+        }
+        if self.is_state_dir(&metadata) {
+            return Err(FileError::InvalidPath);
         }
         Ok(metadata)
     }
@@ -671,6 +811,9 @@ impl LocalFileSource {
         let metadata = entry
             .metadata()
             .map_err(|error| unavailable("read file metadata", error))?;
+        if self.is_state_dir(&metadata) {
+            return Ok(None);
+        }
         if kind == FileKind::File
             && metadata.len().saturating_add(self.resource_len(&path))
                 > self.inner.limits.max_file_size
@@ -716,22 +859,7 @@ impl LocalFileSource {
             return Err(FileError::TooLarge);
         }
         let size = if kind == FileKind::Folder {
-            let dir = self.open_dir(path)?;
-            let mut count = 0u64;
-            for entry in dir
-                .entries()
-                .map_err(|error| unavailable("list folder metadata", error))?
-            {
-                let entry = entry.map_err(|error| unavailable("read folder metadata", error))?;
-                if self.visible_entry(path, entry)?.is_none() {
-                    continue;
-                }
-                if count >= self.inner.limits.max_entries as u64 {
-                    return Err(FileError::TooLarge);
-                }
-                count += 1;
-            }
-            count
+            self.count_visible(path, false)?
         } else {
             metadata.len()
         };
@@ -751,6 +879,37 @@ impl LocalFileSource {
         })
     }
 
+    /// The entries of the folder at `path` that a listing would show. As a
+    /// size inside another listing, the count stops at the entry limit
+    /// rather than failing the listing it appears in.
+    fn count_visible(&self, path: &FilePath, capped: bool) -> Result<u64, FileError> {
+        let dir = self.open_dir(path)?;
+        let limit = self.inner.limits.max_entries as u64;
+        let mut count = 0u64;
+        for entry in dir
+            .entries()
+            .map_err(|error| unavailable("list folder metadata", error))?
+        {
+            let entry = entry.map_err(|error| unavailable("read folder metadata", error))?;
+            if self.visible_entry(path, entry)?.is_none() {
+                continue;
+            }
+            if count >= limit {
+                return if capped {
+                    Ok(limit)
+                } else {
+                    Err(FileError::TooLarge)
+                };
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Expires partials whose every file is older than the retention
+    /// period. A partial's files go together, judged by the newest of them:
+    /// a resume touches the data but not the generation, and losing either
+    /// alone would leave a partial that can neither resume nor give way.
     fn sweep_partials(&self) -> Result<(), FileError> {
         let cutoff = SystemTime::now()
             .checked_sub(self.inner.limits.partial_ttl)
@@ -758,31 +917,43 @@ impl LocalFileSource {
         // Hold this lock through the scan so begin_upload cannot make a base
         // active between the membership check and removal.
         let active = self.inner.active_uploads.lock().unwrap();
-        for entry in self
-            .inner
-            .partials
-            .entries()
-            .map_err(|error| unavailable("scan partial directory", error))?
-        {
-            let entry = entry.map_err(|error| unavailable("scan partial entry", error))?;
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            let name = entry.file_name();
-            let base = name
-                .to_str()
-                .and_then(|name| name.rsplit_once('.').map(|(base, _)| base));
-            if metadata.is_file()
-                && !base.is_some_and(|base| active.contains(base))
-                && metadata
-                    .modified()
-                    .is_ok_and(|time| time.into_std() < cutoff)
-            {
-                let _ = self.inner.partials.remove_file(entry.file_name());
+        for (base, state) in self.partial_bases()? {
+            if state.newest < cutoff && !active.contains(&base) {
+                self.remove_partial_files(&state.names);
             }
         }
         Ok(())
     }
+}
+
+struct PartialState {
+    newest: SystemTime,
+    has_data: bool,
+    names: Vec<String>,
+}
+
+/// A directory's identity, which no spelling of its name can change.
+fn identity(metadata: &Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn sync_dir(dir: &Dir) -> Result<(), FileError> {
+    // A `Dir` is a path-only handle, which cannot be synced; a readable
+    // handle on the same directory can.
+    let mut options = OpenOptions::new();
+    options.read(true).maybe_dir(true);
+    dir.open_with(".", &options)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| unavailable("sync directory", error))
 }
 
 pub(crate) struct UploadFiles {
@@ -790,6 +961,24 @@ pub(crate) struct UploadFiles {
     pub resource: std::fs::File,
     base: String,
     _guard: UploadGuard,
+}
+
+impl Drop for UploadFiles {
+    fn drop(&mut self) {
+        // An upload that ends with nothing written leaves nothing to
+        // resume, so it gives its partial slot back now rather than at
+        // expiry. The base is still held here: the guards drop after this.
+        let empty = |file: &std::fs::File| file.metadata().is_ok_and(|m| m.len() == 0);
+        if empty(&self.data) && empty(&self.resource) {
+            for suffix in PARTIAL_SUFFIXES {
+                let _ = self
+                    ._guard
+                    .inner
+                    .partials
+                    .remove_file(format!("{}.{suffix}", self.base));
+            }
+        }
+    }
 }
 
 struct UploadGuard {
@@ -888,10 +1077,18 @@ impl FileSource for LocalFileSource {
                     if entries.len() >= source.inner.limits.max_entries {
                         return Err(FileError::TooLarge);
                     }
+                    // A classic client shows a folder's size as its item
+                    // count, which is what mhxd sends.
+                    let size = match visible.kind {
+                        FileKind::Folder => {
+                            source.count_visible(&path.join(&visible.name)?, true)?
+                        }
+                        FileKind::File => visible.metadata.len(),
+                    };
                     entries.push(FileEntry {
                         name: visible.name,
                         kind: visible.kind,
-                        size: visible.metadata.len(),
+                        size,
                         media_type: None,
                         modified: header_time(visible.metadata.modified().ok()),
                     });
@@ -967,7 +1164,9 @@ impl LocalFileSource {
                     return Err(FileError::NotFile);
                 }
                 let (dir, name) = source.open_parent(&path)?;
-                dir.open(name).map_err(map_lookup_error)?
+                let mut options = OpenOptions::new();
+                options.read(true).follow(FollowSymlinks::No);
+                dir.open_with(name, &options).map_err(map_lookup_error)?
             };
             let metadata = file
                 .metadata()
@@ -1412,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_length_partials_are_globally_bounded() {
+    fn partials_are_globally_bounded_while_their_uploads_run() {
         let temp = tempfile::tempdir().unwrap();
         let source = LocalFileSource::open(
             temp.path(),
@@ -1425,11 +1624,42 @@ mod tests {
         let first = source
             .begin_upload("alice", &FilePath::parse("a").unwrap(), true, 0)
             .unwrap();
-        drop(first);
         assert!(matches!(
             source.begin_upload("bob", &FilePath::parse("b").unwrap(), true, 0),
             Err(FileError::Busy)
         ));
+        // Nothing was written, so the partial gives its slot back as the
+        // upload ends rather than holding it until expiry.
+        drop(first);
+        source
+            .begin_upload("bob", &FilePath::parse("b").unwrap(), true, 0)
+            .unwrap();
+    }
+
+    fn partials_dir(root: &Path) -> std::path::PathBuf {
+        root.join(STATE_DIR).join(PARTIAL_DIR)
+    }
+
+    /// Sets the named files of a partial back to `when`.
+    fn touch_partial(root: &Path, base: &str, suffixes: &[&str], when: SystemTime) {
+        for suffix in suffixes {
+            std::fs::File::options()
+                .write(true)
+                .open(partials_dir(root).join(format!("{base}.{suffix}")))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(when))
+                .unwrap();
+        }
+    }
+
+    fn begin_nonempty(source: &LocalFileSource, owner: &str, path: &str) -> String {
+        use std::io::Write;
+
+        let mut partial = source
+            .begin_upload(owner, &FilePath::parse(path).unwrap(), true, 8)
+            .unwrap();
+        partial.data.write_all(b"abc").unwrap();
+        partial.base.clone()
     }
 
     #[test]
@@ -1444,29 +1674,157 @@ mod tests {
             },
         )
         .unwrap();
-        let first = source
-            .begin_upload("alice", &FilePath::parse("old").unwrap(), true, 0)
-            .unwrap();
-        let first_base = first.base.clone();
-        drop(first);
-        let old = std::fs::FileTimes::new().set_modified(UNIX_EPOCH);
-        for suffix in ["data", "rsrc"] {
-            std::fs::File::options()
-                .write(true)
-                .open(
-                    temp.path()
-                        .join(STATE_DIR)
-                        .join(PARTIAL_DIR)
-                        .join(format!("{first_base}.{suffix}")),
-                )
-                .unwrap()
-                .set_times(old)
-                .unwrap();
-        }
+        let first = begin_nonempty(&source, "alice", "old");
+        touch_partial(
+            temp.path(),
+            &first,
+            &["data", "rsrc", "generation"],
+            UNIX_EPOCH,
+        );
 
-        let second = source
+        source
             .begin_upload("bob", &FilePath::parse("new").unwrap(), true, 0)
             .unwrap();
-        drop(second);
+    }
+
+    #[test]
+    fn a_partial_expires_as_a_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(
+            temp.path(),
+            LocalLimits {
+                partial_ttl: Duration::from_secs(60),
+                ..LocalLimits::default()
+            },
+        )
+        .unwrap();
+        let path = FilePath::parse("kept.bin").unwrap();
+        let base = begin_nonempty(&source, "alice", "kept.bin");
+
+        // A resume touches the data and not the generation; the partial is
+        // as young as its newest file, and still resumes.
+        touch_partial(temp.path(), &base, &["data"], UNIX_EPOCH);
+        source.sweep_partials().unwrap();
+        assert!(source
+            .prepare_upload("alice", &path, Some(8), false, true)
+            .unwrap()
+            .is_some());
+
+        touch_partial(
+            temp.path(),
+            &base,
+            &["data", "rsrc", "generation"],
+            UNIX_EPOCH,
+        );
+        source.sweep_partials().unwrap();
+        assert!(fs::read_dir(partials_dir(temp.path()))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn an_account_at_its_partial_cap_gives_up_its_oldest() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(
+            temp.path(),
+            LocalLimits {
+                max_partials_per_account: 2,
+                ..LocalLimits::default()
+            },
+        )
+        .unwrap();
+        let older = begin_nonempty(&source, "guest", "older");
+        let newer = begin_nonempty(&source, "guest", "newer");
+        touch_partial(
+            temp.path(),
+            &older,
+            &["data", "rsrc", "generation"],
+            SystemTime::now() - Duration::from_secs(3600),
+        );
+
+        source
+            .begin_upload("guest", &FilePath::parse("third").unwrap(), true, 8)
+            .unwrap();
+        let exists = |base: &str| {
+            partials_dir(temp.path())
+                .join(format!("{base}.data"))
+                .exists()
+        };
+        assert!(!exists(&older), "the least recently touched gave way");
+        assert!(exists(&newer));
+    }
+
+    #[test]
+    fn a_partial_whose_destination_now_exists_is_discarded() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        begin_nonempty(&source, "alice", "taken.bin");
+        fs::write(temp.path().join("taken.bin"), b"someone else's").unwrap();
+
+        assert!(matches!(
+            source.prepare_upload(
+                "alice",
+                &FilePath::parse("taken.bin").unwrap(),
+                Some(8),
+                false,
+                true
+            ),
+            Err(FileError::AlreadyExists)
+        ));
+        assert!(fs::read_dir(partials_dir(temp.path()))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_state_directory_is_refused_by_identity_not_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        // Standing in for a spelling a case-folding filesystem resolves to
+        // the same directory: the name no longer says what it is.
+        fs::rename(temp.path().join(STATE_DIR), temp.path().join("renamed")).unwrap();
+        let renamed = FilePath::parse("renamed").unwrap();
+        assert!(matches!(
+            source.list(&renamed).await,
+            Err(FileError::InvalidPath)
+        ));
+        assert!(matches!(
+            source.info(&renamed).await,
+            Err(FileError::InvalidPath)
+        ));
+        assert!(matches!(
+            source
+                .list(&FilePath::parse("renamed/partials").unwrap())
+                .await,
+            Err(FileError::InvalidPath)
+        ));
+        assert!(source.list(&FilePath::root()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn listed_folders_carry_their_child_count() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("folder")).unwrap();
+        fs::write(temp.path().join("folder/a"), b"a").unwrap();
+        fs::write(temp.path().join("folder/b"), b"b").unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        let root = source.list(&FilePath::root()).await.unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].kind, FileKind::Folder);
+        assert_eq!(root[0].size, 2);
+    }
+
+    #[test]
+    fn names_longer_than_a_filesystem_allows_are_malformed() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        let long = FilePath::parse(&"x".repeat(NAME_MAX + 1)).unwrap();
+        assert!(matches!(
+            source.prepare_upload("alice", &long, Some(1), false, false),
+            Err(FileError::InvalidPath)
+        ));
     }
 }

@@ -36,21 +36,27 @@ follow-on work and are not implied by the advertised behavior.
 
 The local source opens its configured root once as a directory capability and
 performs every later lookup relative to that authority. Protocol paths cannot
-name absolute paths, traverse upward, follow symlinks, or reach `.hxd-state`.
-Uploads require both legacy upload access bits, never overwrite a visible file,
-and are published atomically only after the exact declared body and FFO
-structure validate.
+name absolute paths, traverse upward, follow symlinks, or reach `.hxd-state`
+by any spelling a case-folding filesystem accepts. Uploads follow mhxd's
+access rule: `upload_files` alone reaches folders whose path names an upload
+folder or a drop box, and `upload_anywhere` reaches the rest. A drop box lists
+only for `view_drop_boxes`. Uploads never overwrite a visible file and are
+published atomically only after the exact body and FFO structure validate.
 
 Incomplete uploads live under the mode-0700 `.hxd-state` directory. Their
 opaque names bind the canonical account login to the destination path; limits
 bound their global bytes and count, count per account, concurrent I/O, idle
-time, total duration, and retention. Classic uploads preserve DATA, MACR, and CAP Finder
-metadata. Large File uploads are raw data and resume only after the server
+time, total duration, and retention. An account at its count gives up its
+least recently touched partial rather than being refused, a partial with
+nothing in it goes when its transfer ends, and a partial expires as a whole.
+Classic uploads preserve DATA, MACR, and CAP Finder metadata; the MACR fork is
+optional, as the protocol's two-fork object and mhxd's client have it. Large File uploads are raw data and resume only after the server
 recomputes the quoted partial length and SHA-256 trailing-window digest and
 constant-time compares the client's echo. A client may turn the quote down by
 sending the whole file without `HTXF_FLAG_RESUME`; that upload replaces the
-partial. A resume request may leave the upload size out, and the server then
-caps the upload by the quoted offset plus the length the handshake states.
+partial. A request may leave the upload size out, as mhxd's own client always
+does, and the server then caps the upload by any quoted offset plus the
+length the handshake states.
 HTTP and ng downloads remain read-only even when backed by this local area.
 
 ## Repository and branch order

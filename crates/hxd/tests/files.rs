@@ -149,6 +149,13 @@ async fn start() -> Running {
 }
 
 async fn start_local() -> (Running, tempfile::TempDir, Arc<LocalFileSource>) {
+    start_local_with(
+        "download_files = true\nupload_files = true\nupload_anywhere = true\nread_chat = true\nuse_any_name = true\n",
+    )
+    .await
+}
+
+async fn start_local_with(access: &str) -> (Running, tempfile::TempDir, Arc<LocalFileSource>) {
     let temp = tempfile::tempdir().unwrap();
     let source = Arc::new(LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap());
     let service = Arc::new(FileService::new(
@@ -158,12 +165,188 @@ async fn start_local() -> (Running, tempfile::TempDir, Arc<LocalFileSource>) {
         downloads(),
         IDLE,
     ));
-    let running = run_service(
-        service,
-        "download_files = true\nupload_files = true\nupload_anywhere = true\nread_chat = true\nuse_any_name = true\n",
+    let running = run_service(service, access).await;
+    (running, temp, source)
+}
+
+/// A two-fork object as mhxd's client sends one: INFO and DATA, and no MACR
+/// header when there is no resource fork.
+fn two_fork_object(data: &[u8]) -> Vec<u8> {
+    let encoded = ffo::encode(
+        &ffo::Metadata {
+            name: b"ignored",
+            type_code: *b"TEXT",
+            creator: *b"ttxt",
+            comment: b"",
+            create_time: 0,
+            modify_time: 0,
+        },
+        ffo::Forks {
+            data_len: data.len() as u64,
+            data_offset: 0,
+            resource_len: 0,
+            resource_offset: 0,
+        },
+        false,
+    )
+    .unwrap();
+    let mut object = encoded.prefix;
+    object[22..24].copy_from_slice(&2u16.to_be_bytes());
+    object.extend_from_slice(data);
+    object
+}
+
+/// Sends a classic upload's handshake, declaring `declared` bytes, and then
+/// `object`, and waits for the server to close.
+async fn upload(address: SocketAddr, reference: u32, declared: usize, object: &[u8]) {
+    let mut transfer = TcpStream::connect(address).await.unwrap();
+    transfer
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: declared as u64,
+                type_code: 0,
+                flags: 0,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The server may refuse, and hang up, part way through.
+    let _ = transfer.write_all(object).await;
+    let mut ignored = Vec::new();
+    let _ = timeout(Duration::from_secs(5), transfer.read_to_end(&mut ignored))
+        .await
+        .unwrap();
+}
+
+fn reference_of(reply: &Frame) -> u32 {
+    u32::from_be_bytes(field(reply, tag::HTXF_REF).unwrap().try_into().unwrap())
+}
+
+#[tokio::test]
+async fn classic_uploads_follow_mhxd_for_access_shape_and_session() {
+    let (server, root, _source) = start_local_with(
+        "download_files = true\nupload_files = true\nread_chat = true\nuse_any_name = true\n",
     )
     .await;
-    (running, temp, source)
+    for folder in ["Uploads", "Drop Box", "plain"] {
+        std::fs::create_dir(root.path().join(folder)).unwrap();
+    }
+    let mut classic = Legacy::login(server.legacy, false).await;
+
+    // Without upload-anywhere, only upload folders and drop boxes take one.
+    for folder in [None, Some(b"plain".as_slice())] {
+        let mut chunks = vec![(tag::FILE_NAME, b"refused.txt".to_vec())];
+        if let Some(folder) = folder {
+            chunks.push((tag::DIR, dir(folder)));
+        }
+        let put = classic.request(FILE_PUT, &chunks).await;
+        assert_ne!(put.flag & 1, 0, "{folder:?}");
+    }
+
+    // mhxd's client sends a name and a folder and nothing else.
+    let put = classic
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"hx.txt".to_vec()),
+                (tag::DIR, dir(b"Uploads")),
+            ],
+        )
+        .await;
+    assert_eq!(put.flag & 1, 0, "no size field is needed");
+    let object = two_fork_object(b"from hx");
+    upload(server.htxf, reference_of(&put), object.len(), &object).await;
+    assert_eq!(
+        std::fs::read(root.path().join("Uploads/hx.txt")).unwrap(),
+        b"from hx"
+    );
+
+    // A zero resume option of any width asks for no resume.
+    let put = classic
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"wide.txt".to_vec()),
+                (tag::DIR, dir(b"Drop Box")),
+                (tag::FILE_PREVIEW, vec![0, 0, 0, 0]),
+            ],
+        )
+        .await;
+    assert_eq!(put.flag & 1, 0);
+    let object = two_fork_object(b"dropped");
+    upload(server.htxf, reference_of(&put), object.len(), &object).await;
+    assert_eq!(
+        std::fs::read(root.path().join("Drop Box/wide.txt")).unwrap(),
+        b"dropped"
+    );
+    let listing = classic
+        .request(FILE_LIST, &[(tag::DIR, dir(b"Drop Box"))])
+        .await;
+    assert_ne!(
+        listing.flag & 1,
+        0,
+        "a drop box is not listed to an account that may not view drop boxes"
+    );
+
+    // A fork cannot claim more than the handshake declared.
+    let put = classic
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"liar.bin".to_vec()),
+                (tag::DIR, dir(b"Uploads")),
+            ],
+        )
+        .await;
+    let object = two_fork_object(b"0123456789");
+    upload(server.htxf, reference_of(&put), object.len() - 8, &object).await;
+    assert!(!root.path().join("Uploads/liar.bin").exists());
+    let partials = root.path().join(".hxd-state/partials");
+    assert!(
+        std::fs::read_dir(&partials).unwrap().next().is_none(),
+        "nothing was written, and the empty partial went with its transfer"
+    );
+
+    // An upload ends with its session, as a download does.
+    let put = classic
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"orphan.bin".to_vec()),
+                (tag::DIR, dir(b"Uploads")),
+            ],
+        )
+        .await;
+    let object = two_fork_object(&vec![b'x'; 256 * 1024]);
+    let mut transfer = TcpStream::connect(server.htxf).await.unwrap();
+    transfer
+        .write_all(
+            &htxf::Preamble {
+                reference: reference_of(&put),
+                transfer_len: object.len() as u64,
+                type_code: 0,
+                flags: 0,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let half = object.len() / 2;
+    transfer.write_all(&object[..half]).await.unwrap();
+    drop(classic);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = transfer.write_all(&object[half..]).await;
+    let mut ignored = Vec::new();
+    let _ = timeout(Duration::from_secs(5), transfer.read_to_end(&mut ignored))
+        .await
+        .unwrap();
+    assert!(!root.path().join("Uploads/orphan.bin").exists());
 }
 
 async fn run_service(service: Arc<FileService>, access: &str) -> Running {
