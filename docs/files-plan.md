@@ -49,8 +49,9 @@ metadata. Large File uploads are raw data and resume only after the server
 recomputes the quoted partial length and SHA-256 trailing-window digest and
 constant-time compares the client's echo. A client may turn the quote down by
 sending the whole file without `HTXF_FLAG_RESUME`; that upload replaces the
-partial. HTTP and ng downloads remain read-only even when backed by this local
-area.
+partial. A resume request may leave the upload size out, and the server then
+caps the upload by the quoted offset plus the length the handshake states.
+HTTP and ng downloads remain read-only even when backed by this local area.
 
 ## Repository and branch order
 

@@ -63,8 +63,9 @@ pub struct PreparedUpload {
     pub path: FilePath,
     pub source: Arc<LocalFileSource>,
     pub owner: String,
-    /// The HTXF payload size declared on FILE_PUT.
-    pub transfer_len: u64,
+    /// The HTXF payload size declared on FILE_PUT. A resume request may leave
+    /// it out, and then the claim resolves it from the handshake.
+    pub transfer_len: Option<u64>,
     pub large: bool,
     pub quote: Option<UploadQuote>,
 }
@@ -248,7 +249,7 @@ impl TransferRegistry {
         if preamble.type_code != 0 {
             return Err(FileError::InvalidPath);
         }
-        let declined_quote = match &entry.transfer {
+        let (declined_quote, resolved_len) = match &entry.transfer {
             PreparedTransfer::Download(transfer) => {
                 // The download handshake's Data size is not consulted. The
                 // protocol has the client send 0 there (Hotline.md,
@@ -259,7 +260,7 @@ impl TransferRegistry {
                 if large_flag != transfer.large || preamble.flags & htxf::FLAG_RESUME != 0 {
                     return Err(FileError::InvalidPath);
                 }
-                false
+                (false, None)
             }
             PreparedTransfer::Upload(transfer) => {
                 // Large-file mode is fixed when FILE_PUT is quoted, and the
@@ -297,21 +298,35 @@ impl TransferRegistry {
                     }
                     _ => 0,
                 };
-                let expected_len = transfer
-                    .transfer_len
-                    .checked_sub(resumed_bytes)
-                    .ok_or(FileError::RangeInvalid)?;
-                if preamble.transfer_len != expected_len {
-                    return Err(FileError::InvalidPath);
-                }
-                transfer.quote.is_some() && !resumes
+                let total = match transfer.transfer_len {
+                    Some(total) => {
+                        let expected_len = total
+                            .checked_sub(resumed_bytes)
+                            .ok_or(FileError::RangeInvalid)?;
+                        if preamble.transfer_len != expected_len {
+                            return Err(FileError::InvalidPath);
+                        }
+                        total
+                    }
+                    // A resume request may leave the size out ("Resume Flow
+                    // (Upload)"). The handshake then states what is left to
+                    // send, and the upload is capped by the quoted offset plus
+                    // that length: begin_upload reserves it against the
+                    // partial quota, and the receive path checks it against
+                    // the file size limit before writing.
+                    None => resumed_bytes
+                        .checked_add(preamble.transfer_len)
+                        .ok_or(FileError::TooLarge)?,
+                };
+                (transfer.quote.is_some() && !resumes, Some(total))
             }
         };
         let mut transfer = entry.transfer;
-        if declined_quote {
-            if let PreparedTransfer::Upload(upload) = &mut transfer {
+        if let PreparedTransfer::Upload(upload) = &mut transfer {
+            if declined_quote {
                 upload.quote = None;
             }
+            upload.transfer_len = resolved_len;
         }
         Ok(transfer)
     }
@@ -640,7 +655,7 @@ mod tests {
                 path: FilePath::parse("file").unwrap(),
                 source,
                 owner: "first".into(),
-                transfer_len: 10,
+                transfer_len: Some(10),
                 large: false,
                 quote: Some(UploadQuote {
                     data_offset: 3,
@@ -667,6 +682,7 @@ mod tests {
     fn large_upload(
         principal: FilePrincipal,
         source: Arc<LocalFileSource>,
+        transfer_len: Option<u64>,
         quote: Option<UploadQuote>,
     ) -> PreparedTransfer {
         PreparedTransfer::Upload(PreparedUpload {
@@ -675,7 +691,7 @@ mod tests {
             path: FilePath::parse("file").unwrap(),
             source,
             owner: "first".into(),
-            transfer_len: 10,
+            transfer_len,
             large: true,
             quote,
         })
@@ -707,7 +723,7 @@ mod tests {
 
         // SIZE64 is optional when 32 bits carry the length.
         let reference = registry
-            .issue(large_upload(principal, source.clone(), None))
+            .issue(large_upload(principal, source.clone(), Some(10), None))
             .unwrap();
         assert!(matches!(
             registry.claim(
@@ -720,7 +736,7 @@ mod tests {
 
         // RESUME needs a quoted offset to continue.
         let reference = registry
-            .issue(large_upload(principal, source.clone(), None))
+            .issue(large_upload(principal, source.clone(), Some(10), None))
             .unwrap();
         assert!(matches!(
             registry.claim(&core, &preamble(reference, 6, resume, quote.digest), HERE),
@@ -729,7 +745,12 @@ mod tests {
 
         // A quoted resume continues only with the quoted digest.
         let reference = registry
-            .issue(large_upload(principal, source.clone(), Some(quote.clone())))
+            .issue(large_upload(
+                principal,
+                source.clone(),
+                Some(10),
+                Some(quote.clone()),
+            ))
             .unwrap();
         assert!(matches!(
             registry.claim(
@@ -741,7 +762,12 @@ mod tests {
         ));
         // That spent the reference, so the client asks again.
         let reference = registry
-            .issue(large_upload(principal, source.clone(), Some(quote.clone())))
+            .issue(large_upload(
+                principal,
+                source.clone(),
+                Some(10),
+                Some(quote.clone()),
+            ))
             .unwrap();
         match registry.claim(&core, &preamble(reference, 6, resume, quote.digest), HERE) {
             Ok(PreparedTransfer::Upload(upload)) => assert_eq!(upload.quote, Some(quote.clone())),
@@ -751,18 +777,38 @@ mod tests {
         // Declining the quote means sending the whole file, and the quote
         // lapses so the partial is replaced.
         let reference = registry
-            .issue(large_upload(principal, source.clone(), Some(quote.clone())))
+            .issue(large_upload(
+                principal,
+                source.clone(),
+                Some(10),
+                Some(quote.clone()),
+            ))
             .unwrap();
         assert!(matches!(
             registry.claim(&core, &preamble(reference, 6, sized, None), HERE),
             Err(FileError::InvalidPath)
         ));
         let reference = registry
-            .issue(large_upload(principal, source, Some(quote)))
+            .issue(large_upload(
+                principal,
+                source.clone(),
+                Some(10),
+                Some(quote.clone()),
+            ))
             .unwrap();
         match registry.claim(&core, &preamble(reference, 10, sized, None), HERE) {
             Ok(PreparedTransfer::Upload(upload)) => assert_eq!(upload.quote, None),
             other => panic!("declined claim: {other:?}"),
+        }
+
+        // A resume request may leave the size out. The handshake then states
+        // what is left to send, and the claim resolves the total from it.
+        let reference = registry
+            .issue(large_upload(principal, source, None, Some(quote.clone())))
+            .unwrap();
+        match registry.claim(&core, &preamble(reference, 6, resume, quote.digest), HERE) {
+            Ok(PreparedTransfer::Upload(upload)) => assert_eq!(upload.transfer_len, Some(10)),
+            other => panic!("undeclared claim: {other:?}"),
         }
     }
 

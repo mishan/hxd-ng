@@ -1301,6 +1301,96 @@ async fn local_file_put_preserves_forks_refuses_escape_and_resumes_large_raw_dat
         std::fs::read(root.path().join("declined.bin")).unwrap(),
         b"fresh bytes"
     );
+
+    // A resume request may leave the size out. The reply then echoes no
+    // remainder, and the handshake states what is left to send.
+    let first = capable
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"unsized.bin".to_vec()),
+                (tag::HTXF_SIZE, 11u32.to_be_bytes().to_vec()),
+                (tag::XFERSIZE64, 11u64.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    let reference = first
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let mut interrupted = TcpStream::connect(server.htxf).await.unwrap();
+    interrupted
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: 11,
+                type_code: 0,
+                flags: htxf::FLAG_LARGE_FILE | htxf::FLAG_SIZE64,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    interrupted.write_all(b"hello").await.unwrap();
+    interrupted.shutdown().await.unwrap();
+    let mut ignored = Vec::new();
+    interrupted.read_to_end(&mut ignored).await.unwrap();
+
+    let quoted = capable
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"unsized.bin".to_vec()),
+                (tag::FILE_PREVIEW, vec![0, 2]),
+            ],
+        )
+        .await;
+    assert_eq!(quoted.flag & 1, 0);
+    assert!(!quoted.chunks().any(|chunk| chunk.tag == tag::HTXF_SIZE));
+    assert_eq!(
+        quoted
+            .chunks()
+            .find(|chunk| chunk.tag == tag::OFFSET64)
+            .map(|chunk| u64::from_be_bytes(chunk.data.try_into().unwrap())),
+        Some(5)
+    );
+    let digest: [u8; htxf::RESUME_DIGEST_LEN] = quoted
+        .chunks()
+        .find(|chunk| chunk.tag == tag::PARTIAL_DIGEST)
+        .unwrap()
+        .data
+        .try_into()
+        .unwrap();
+    let reference = quoted
+        .chunks()
+        .find(|chunk| chunk.tag == tag::HTXF_REF)
+        .unwrap()
+        .as_uint();
+    let mut resumed = TcpStream::connect(server.htxf).await.unwrap();
+    resumed
+        .write_all(
+            &htxf::Preamble {
+                reference,
+                transfer_len: 6,
+                type_code: 0,
+                flags: htxf::FLAG_LARGE_FILE | htxf::FLAG_SIZE64 | htxf::FLAG_RESUME,
+                resume_digest: Some(digest),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    resumed.write_all(b" world").await.unwrap();
+    let mut ignored = Vec::new();
+    resumed.read_to_end(&mut ignored).await.unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("unsized.bin")).unwrap(),
+        b"hello world"
+    );
 }
 
 async fn reply(ws: &mut Ws, id: u64) -> Value {

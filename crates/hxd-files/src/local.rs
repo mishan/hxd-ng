@@ -135,7 +135,7 @@ impl LocalFileSource {
         &self,
         owner: &str,
         path: &FilePath,
-        transfer_len: u64,
+        transfer_len: Option<u64>,
         large: bool,
         resume_requested: bool,
     ) -> Result<Option<UploadQuote>, FileError> {
@@ -151,10 +151,14 @@ impl LocalFileSource {
             Err(error) => return Err(map_lookup_error(error)),
         }
         let overhead = if large { 0 } else { 1_024 };
-        if transfer_len > self.inner.limits.max_file_size.saturating_add(overhead) {
+        if transfer_len
+            .is_some_and(|len| len > self.inner.limits.max_file_size.saturating_add(overhead))
+        {
             return Err(FileError::TooLarge);
         }
-        self.enforce_partial_quota(owner, path, transfer_len)?;
+        // Without a declared size only the partial count limits can apply
+        // here; the bytes are reserved once the handshake states them.
+        self.enforce_partial_quota(owner, path, transfer_len.unwrap_or(0))?;
         if !resume_requested {
             return Ok(None);
         }
@@ -1249,14 +1253,14 @@ mod tests {
         assert!(source.list(&FilePath::root()).await.unwrap().is_empty());
 
         let quote = source
-            .prepare_upload("alice", &path, 128, false, true)
+            .prepare_upload("alice", &path, Some(128), false, true)
             .unwrap()
             .unwrap();
         assert_eq!(quote.data_offset, 3);
         assert_eq!(quote.resource_offset, 4);
         assert!(quote.digest.is_none());
         assert!(source
-            .prepare_upload("mallory", &path, 128, false, true)
+            .prepare_upload("mallory", &path, Some(128), false, true)
             .unwrap()
             .is_none());
 
@@ -1280,7 +1284,7 @@ mod tests {
         resource.reader.read_to_end(&mut bytes).await.unwrap();
         assert_eq!(bytes, b"rsrc");
         assert!(matches!(
-            source.prepare_upload("alice", &path, 3, false, false),
+            source.prepare_upload("alice", &path, Some(3), false, false),
             Err(FileError::AlreadyExists)
         ));
     }
@@ -1343,7 +1347,7 @@ mod tests {
         drop(partial);
 
         let quote = source
-            .prepare_upload("alice", &path, 20, true, true)
+            .prepare_upload("alice", &path, Some(20), true, true)
             .unwrap()
             .unwrap();
         assert_eq!(quote.data_offset, 7);
@@ -1368,7 +1372,7 @@ mod tests {
         drop(original);
 
         let quote = source
-            .prepare_upload("alice", &path, 5, false, true)
+            .prepare_upload("alice", &path, Some(5), false, true)
             .unwrap()
             .unwrap();
         let mut replacement = source.begin_upload("alice", &path, true, 5).unwrap();

@@ -39,7 +39,9 @@ pub struct UploadTransfer {
     pub peer: Option<IpAddr>,
     pub path: FilePath,
     pub owner: String,
-    pub transfer_len: u64,
+    /// The declared HTXF payload size. Only a resume request may leave it
+    /// out; the handshake then states it.
+    pub transfer_len: Option<u64>,
     pub large: bool,
     pub resume_requested: bool,
 }
@@ -103,9 +105,10 @@ pub async fn prepare_upload(
     })
     .await
     .map_err(|error| FileError::Unavailable(format!("local file worker: {error}")))??;
-    if quote.as_ref().is_some_and(|value| {
-        value.data_offset.saturating_add(value.resource_offset) > request.transfer_len
-    }) {
+    let resumed = quote.as_ref().map_or(0, |value| {
+        value.data_offset.saturating_add(value.resource_offset)
+    });
+    if request.transfer_len.is_some_and(|total| resumed > total) {
         return Err(FileError::RangeInvalid);
     }
     if !request.large
@@ -280,7 +283,10 @@ async fn serve_upload(
     let begin_source = transfer.source.clone();
     let owner = transfer.owner.clone();
     let path = transfer.path.clone();
-    let reserve = transfer.transfer_len;
+    // The claim resolves a length that a resume request left out.
+    let reserve = transfer
+        .transfer_len
+        .ok_or_else(|| FileError::Unavailable("upload length was not resolved".into()))?;
     let mut files = tokio::task::spawn_blocking(move || {
         begin_source.begin_upload(&owner, &path, fresh, reserve)
     })

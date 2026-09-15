@@ -1945,52 +1945,60 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     return;
                 }
             };
-            let Some(size32) = f.chunks().find(|chunk| chunk.tag == tag::HTXF_SIZE) else {
-                reply_error(tx, f.trans, "No upload size was supplied.");
-                return;
-            };
-            if size32.data.len() != 4 {
-                reply_error(tx, f.trans, "Malformed upload size.");
-                return;
-            }
-            let legacy_size = u32::from_be_bytes(size32.data.try_into().expect("four bytes"));
-            let size64 = f.chunks().find(|chunk| chunk.tag == tag::XFERSIZE64);
-            let transfer_len = if large {
-                match size64 {
-                    // XFERSIZE64 is a SHOULD. Without it the 32-bit size
-                    // stands, unless it is clamped and so is not the length.
-                    None if legacy_size != u32::MAX => u64::from(legacy_size),
-                    None => {
-                        reply_error(tx, f.trans, "Large uploads require a 64-bit size.");
-                        return;
-                    }
-                    Some(size64) => {
-                        if size64.data.len() != 8 {
-                            reply_error(tx, f.trans, "Malformed 64-bit upload size.");
-                            return;
-                        }
-                        let value =
-                            u64::from_be_bytes(size64.data.try_into().expect("eight bytes"));
-                        if legacy_size != value.min(u64::from(u32::MAX)) as u32 {
-                            reply_error(tx, f.trans, "Upload sizes disagree.");
-                            return;
-                        }
-                        value
-                    }
-                }
-            } else {
-                if size64.is_some() {
-                    reply_error(tx, f.trans, "64-bit upload size was not negotiated.");
-                    return;
-                }
-                u64::from(legacy_size)
-            };
             let preview = f.chunks().find(|chunk| chunk.tag == tag::FILE_PREVIEW);
             let resume_requested = match preview.as_ref().map(|chunk| chunk.data) {
                 None => false,
                 Some([0, 1] | [0, 2]) => true,
                 Some(_) => {
                     reply_error(tx, f.trans, "Malformed upload resume option.");
+                    return;
+                }
+            };
+            let legacy_size = match f.chunks().find(|chunk| chunk.tag == tag::HTXF_SIZE) {
+                None => None,
+                Some(chunk) if chunk.data.len() == 4 => Some(u32::from_be_bytes(
+                    chunk.data.try_into().expect("four bytes"),
+                )),
+                Some(_) => {
+                    reply_error(tx, f.trans, "Malformed upload size.");
+                    return;
+                }
+            };
+            let wide_size = match f.chunks().find(|chunk| chunk.tag == tag::XFERSIZE64) {
+                None => None,
+                Some(_) if !large => {
+                    reply_error(tx, f.trans, "64-bit upload size was not negotiated.");
+                    return;
+                }
+                Some(chunk) if chunk.data.len() == 8 => Some(u64::from_be_bytes(
+                    chunk.data.try_into().expect("eight bytes"),
+                )),
+                Some(_) => {
+                    reply_error(tx, f.trans, "Malformed 64-bit upload size.");
+                    return;
+                }
+            };
+            let transfer_len = match (legacy_size, wide_size) {
+                (Some(legacy), Some(wide)) => {
+                    if legacy != wide.min(u64::from(u32::MAX)) as u32 {
+                        reply_error(tx, f.trans, "Upload sizes disagree.");
+                        return;
+                    }
+                    Some(wide)
+                }
+                // XFERSIZE64 is a SHOULD. Without it the 32-bit size stands,
+                // unless it is clamped and so is not the length.
+                (Some(legacy), None) if !large || legacy != u32::MAX => Some(u64::from(legacy)),
+                (Some(_), None) => {
+                    reply_error(tx, f.trans, "Large uploads require a 64-bit size.");
+                    return;
+                }
+                (None, Some(wide)) => Some(wide),
+                // A resume request carries no size (Large File extension,
+                // "Resume Flow (Upload)"); the handshake states it instead.
+                (None, None) if resume_requested => None,
+                (None, None) => {
+                    reply_error(tx, f.trans, "No upload size was supplied.");
                     return;
                 }
             };
@@ -2025,24 +2033,23 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             let resumed = quote.as_ref().map_or(0, |value| {
                 value.data_offset.saturating_add(value.resource_offset)
             });
-            let remaining = match transfer_len.checked_sub(resumed) {
-                Some(value) => value,
-                None => {
+            let mut chunks = vec![(tag::HTXF_REF, reference.to_be_bytes().to_vec())];
+            // Without a declared size there is no remainder to echo, as in
+            // mhxd's reply; the client works it out from the quoted offset.
+            if let Some(transfer_len) = transfer_len {
+                let Some(remaining) = transfer_len.checked_sub(resumed) else {
                     reply_error(tx, f.trans, "Stored partial exceeds the upload size.");
                     return;
-                }
-            };
-            let mut chunks = vec![
-                (tag::HTXF_REF, reference.to_be_bytes().to_vec()),
-                (
+                };
+                chunks.push((
                     tag::HTXF_SIZE,
                     (remaining.min(u64::from(u32::MAX)) as u32)
                         .to_be_bytes()
                         .to_vec(),
-                ),
-            ];
-            if large {
-                chunks.push((tag::XFERSIZE64, remaining.to_be_bytes().to_vec()));
+                ));
+                if large {
+                    chunks.push((tag::XFERSIZE64, remaining.to_be_bytes().to_vec()));
+                }
             }
             if let Some(quote) = quote {
                 if quote.data_offset > u64::from(u32::MAX)
