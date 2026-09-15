@@ -278,8 +278,9 @@ handshake_timeout = 10        # HTXF preamble seconds
 idle_timeout = 60             # a download whose receiver stops reading, either wire
 ```
 
-Listing and Get Info are open to every account, as they are on mhxd;
-downloading needs `download_files`. A download ends with the session that
+Listing and Get Info are the account's `[extra] file_list` and
+`file_getinfo`, which are on unless the account file turns them off, as on
+mhxd; downloading needs `download_files`. A download ends with the session that
 asked for it, and an HTXF transfer must come from the address of a direct
 control connection.
 

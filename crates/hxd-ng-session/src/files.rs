@@ -12,10 +12,18 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
     let Some(service) = ctx.files.as_ref() else {
         return crate::proto::reply_err(req.id, "not_available", "Files are not available.");
     };
-    // Listing and info need a session and nothing more, as on the legacy
-    // wire; only a download asks for `download_files`.
+    // Listing and info are the account's `[extra] file_list` and
+    // `file_getinfo`, as on the legacy wire; only a download asks for the
+    // `download_files` bit.
     match req.req.as_str() {
         "files_list" => {
+            if !state.file_list {
+                return crate::proto::reply_err(
+                    req.id,
+                    "access_denied",
+                    "You are not allowed to list files.",
+                );
+            }
             let params = if req.params.is_null() {
                 Ok(FilesPathParams::default())
             } else {
@@ -48,6 +56,13 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
             }
         }
         "files_info" => {
+            if !state.file_getinfo {
+                return crate::proto::reply_err(
+                    req.id,
+                    "access_denied",
+                    "You are not allowed to get file info.",
+                );
+            }
             let params = serde_json::from_value::<FilesPathParams>(req.params.clone());
             let Ok(params) = params else {
                 return crate::proto::reply_err(req.id, "bad_request", "Malformed files_info.");

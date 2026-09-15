@@ -450,9 +450,10 @@ slashes and trailing slashes are malformed.
   `/files/<token>`; it is short-lived and bound to the session that asked.
   `""` is `bad_request`.
 
-Listing and info need a session and nothing more, as on the legacy wire
-(mhxd lets every account browse unless its file says otherwise);
-`files_download` needs the `download_files` access bit.
+`files_list` and `files_info` need the account's `[extra] file_list` and
+`file_getinfo`, as on the legacy wire. Both are on unless the account file
+turns them off, as mhxd has them, so an account that may not download can
+still browse. `files_download` needs the `download_files` access bit.
 
 These methods answer errors from this set:
 
@@ -460,7 +461,7 @@ These methods answer errors from this set:
 |---|---|
 | `bad_request` | malformed params, or a malformed path |
 | `not_available` | Files is not configured, or its source is unavailable |
-| `access_denied` | `files_download` without `download_files` |
+| `access_denied` | `files_list` without `file_list`, `files_info` without `file_getinfo`, or `files_download` without `download_files` |
 | `not_authorized` | the session ended while the request was handled |
 | `not_found` | no entry at that path |
 | `not_folder` | `files_list` on a file |

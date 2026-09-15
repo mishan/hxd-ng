@@ -1643,11 +1643,16 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
 
         // --- Read-only Files -----------------------------------------
-        // Listing and Get Info need no access bit. mhxd gates them on the
-        // server-local `file_list` and `file_getinfo` extras, which every
-        // account has unless its file turns them off (accounts.c), so on
-        // the reference a user who may not download can still browse.
+        // Listing and Get Info have no access bit; the bitmap defines none
+        // for them. As on mhxd they are the server-local `file_list` and
+        // `file_getinfo` extras, which every account has unless its file
+        // turns them off (accounts.c), so a user who may not download can
+        // still browse.
         t if t == ClientHdr::FileList.as_u32() => {
+            if !sess.account.file_list {
+                reply_error(tx, f.trans, "You are not allowed to list files.");
+                return;
+            }
             let Some(service) = ctx.files.as_ref() else {
                 reply_error(tx, f.trans, "Files are not available on this server.");
                 return;
@@ -1695,6 +1700,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
 
         t if t == ClientHdr::FileGetInfo.as_u32() => {
+            if !sess.account.file_getinfo {
+                reply_error(tx, f.trans, "You are not allowed to get file info.");
+                return;
+            }
             let Some(service) = ctx.files.as_ref() else {
                 reply_error(tx, f.trans, "Files are not available on this server.");
                 return;

@@ -153,6 +153,12 @@ struct ExtraTable {
     /// everyone who walks through it and queuing mail there hands it to
     /// whoever logs in next.
     inbox: Option<bool>,
+    /// May this account list folders? Default: true, as mhxd's
+    /// `file_list` extra is for every account that does not turn it off.
+    file_list: Option<bool>,
+    /// May this account ask for file and folder info? Default: true, as
+    /// mhxd's `file_getinfo` extra.
+    file_getinfo: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -193,6 +199,8 @@ impl AccountFile {
                 .extra
                 .set_subject
                 .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
+            file_list: self.extra.file_list.unwrap_or(true),
+            file_getinfo: self.extra.file_getinfo.unwrap_or(true),
             has_password,
             // The same rule `can_detach` derives by, and for the same
             // reason: what disqualifies an account is not the absence of
@@ -1005,6 +1013,20 @@ mod tests {
         );
         let p = auth.authenticate("probation", Proof::Plain(b"pw")).unwrap();
         assert!(!p.can_detach);
+    }
+
+    #[test]
+    fn file_extras_are_on_unless_turned_off_one_at_a_time() {
+        let (td, auth) = backend();
+        write(td.path(), "guest.toml", "");
+        let g = auth.authenticate("guest", Proof::Plain(b"")).unwrap();
+        assert!(g.file_list && g.file_getinfo);
+        write(td.path(), "nolist.toml", "[extra]\nfile_list = false\n");
+        let l = auth.lookup("nolist").unwrap();
+        assert!(!l.file_list && l.file_getinfo);
+        write(td.path(), "noinfo.toml", "[extra]\nfile_getinfo = false\n");
+        let i = auth.lookup("noinfo").unwrap();
+        assert!(i.file_list && !i.file_getinfo);
     }
 
     #[test]

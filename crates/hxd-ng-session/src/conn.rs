@@ -52,6 +52,10 @@ pub(crate) struct SessState {
     pub(crate) uid: Uid,
     session_id: String,
     pub(crate) access: AccessBits,
+    /// The account's `[extra] file_list` and `file_getinfo`, which the
+    /// roster does not carry.
+    pub(crate) file_list: bool,
+    pub(crate) file_getinfo: bool,
 }
 
 /// Why the connection loop ended, deciding the session's fate.
@@ -579,6 +583,8 @@ async fn handle_login(
             uid,
             session_id,
             access: account.access,
+            file_list: account.file_list,
+            file_getinfo: account.file_getinfo,
         },
         events,
     ))
@@ -628,10 +634,22 @@ async fn handle_resume(
         }
     };
     let access = ctx.core.access_of(uid).unwrap_or_default();
+    // The file extras live in the account rather than on the roster, so a
+    // resume reads them again: the session outlived its connection, not
+    // its account. An account that can no longer be read gets neither.
+    let auth = ctx.auth.clone();
+    let login = ctx.core.user_details(uid).map(|details| details.login);
+    let account =
+        tokio::task::spawn_blocking(move || login.and_then(|login| auth.lookup(&login).ok()))
+            .await
+            .ok()
+            .flatten();
     let state = SessState {
         uid,
         session_id: p.session.clone(),
         access,
+        file_list: account.as_ref().is_some_and(|account| account.file_list),
+        file_getinfo: account.as_ref().is_some_and(|account| account.file_getinfo),
     };
 
     // From here the session is attached: any send failure means the new

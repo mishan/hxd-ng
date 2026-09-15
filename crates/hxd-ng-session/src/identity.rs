@@ -1386,6 +1386,8 @@ mod tests {
             access: AccessBits::empty(),
             can_detach: password,
             set_subject: false,
+            file_list: true,
+            file_getinfo: true,
             has_password: password,
             has_inbox: password,
             identity: hxd_core::IdentityLink {

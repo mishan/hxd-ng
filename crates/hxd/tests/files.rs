@@ -144,6 +144,17 @@ async fn start() -> Running {
         "name = \"Browser\"\npassword = \"pw\"\n[access]\nread_chat = true\n",
     )
     .unwrap();
+    // Accounts that may download, but not list, and not get info.
+    for (login, extra) in [("nolist", "file_list"), ("noinfo", "file_getinfo")] {
+        std::fs::write(
+            accounts.join(format!("{login}.toml")),
+            format!(
+                "password = \"pw\"\n[access]\ndownload_files = true\nread_chat = true\n\
+                 [extra]\n{extra} = false\n"
+            ),
+        )
+        .unwrap();
+    }
     let core = Arc::new(Core::new());
     let auth: Arc<dyn hxd_core::AuthBackend> = Arc::new(hxd_auth_file::FileAuth::new(&accounts));
     let legacy_ctx = ServerCtx {
@@ -595,6 +606,66 @@ async fn browsing_needs_no_access_bit_but_downloading_does() {
     assert_eq!(info["ok"]["size"], "11");
     let download = ng_request(&mut ws, 4, "files_download", json!({"path": "hello.txt"})).await;
     assert_eq!(download["error"]["code"], "access_denied");
+}
+
+#[tokio::test]
+async fn listing_and_get_info_are_separate_extras() {
+    let server = start().await;
+    let hello = [(tag::FILE_NAME, b"hello.txt".to_vec())];
+
+    let mut nolist = Legacy::login_as(server.legacy, "nolist", "pw").await;
+    assert_ne!(nolist.request(FILE_LIST, &[]).await.flag & 1, 0);
+    assert_eq!(nolist.request(FILE_GET_INFO, &hello).await.flag & 1, 0);
+    let mut noinfo = Legacy::login_as(server.legacy, "noinfo", "pw").await;
+    assert_eq!(noinfo.request(FILE_LIST, &[]).await.flag & 1, 0);
+    assert_ne!(noinfo.request(FILE_GET_INFO, &hello).await.flag & 1, 0);
+    assert_eq!(
+        noinfo.request(FILE_GET, &hello).await.flag & 1,
+        0,
+        "downloading is its own question"
+    );
+
+    for (login, list, info) in [("nolist", false, true), ("noinfo", true, false)] {
+        let mut ws = ng_login(
+            server.ng,
+            json!({"login": login, "password": "pw", "nick": login}),
+        )
+        .await;
+        let listed = ng_request(&mut ws, 2, "files_list", json!({})).await;
+        assert_eq!(listed.get("ok").is_some(), list, "{login}: {listed}");
+        let answer = ng_request(&mut ws, 3, "files_info", json!({"path": "hello.txt"})).await;
+        assert_eq!(answer.get("ok").is_some(), info, "{login}: {answer}");
+    }
+
+    // The roster does not carry the extras, so a resumed session reads
+    // them again from its account.
+    let url = format!("ws://{}/", server.ng);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let login = ng_request(
+        &mut ws,
+        1,
+        "login",
+        json!({"login": "nolist", "password": "pw", "nick": "nolist"}),
+    )
+    .await;
+    let (session, token) = (
+        login["ok"]["session"].as_str().unwrap().to_owned(),
+        login["ok"]["token"].as_str().unwrap().to_owned(),
+    );
+    drop(ws);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let resumed = ng_request(
+        &mut ws,
+        1,
+        "resume",
+        json!({"session": session, "token": token, "last_seq": 0}),
+    )
+    .await;
+    assert!(resumed.get("ok").is_some(), "{resumed}");
+    let listed = ng_request(&mut ws, 2, "files_list", json!({})).await;
+    assert_eq!(listed["error"]["code"], "access_denied");
+    let answer = ng_request(&mut ws, 3, "files_info", json!({"path": "hello.txt"})).await;
+    assert!(answer.get("ok").is_some(), "{answer}");
 }
 
 #[tokio::test]
