@@ -4011,8 +4011,13 @@ async fn an_agent_rotates_past_its_own_per_address_limit() {
     let _ = agent.child.kill();
     let output = agent.reader.join().unwrap();
     let _ = agent.child.wait();
+    // Matched as the refusal is printed, not as a bare "429": the
+    // agent's output carries random enrollment codes, and one such as
+    // S048-429G failed this test on a run that was never limited.
     assert!(
-        !output.contains("rate_limited") && !output.contains("429"),
+        !["rate_limited", "status code 429", "(429)"]
+            .iter()
+            .any(|refusal| output.contains(refusal)),
         "the agent rate-limited itself out of its own mailbox:\n{output}"
     );
 }
