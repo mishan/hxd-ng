@@ -1,7 +1,8 @@
 # The Web Push gateway: the device registry hxd-ng keeps itself
 
-Status: design, unimplemented. Staged in §9; each stage marks itself
-here as it lands.
+Status: partial. The device registry, its two stores and the three
+mailbox obligations are built; the sender, the wire and the client are
+not. Staged in §9; each stage marks itself here as it lands.
 
 [push-notifications.md](push-notifications.md) §0 decided that the first
 gateway is `WebPushGateway`, in-process, and that when it is built it
@@ -395,12 +396,13 @@ the same shape news uses for a server with no `[news.notify]`.
 
 ## 9. Staging
 
-1. **G1 — the registry.** `Device`, `PushStore`, the memory
-   implementation, the SQLite one and its schema version, the
-   conformance suite, and the three obligations wired at the call sites
-   that already claim, purge and rotate mail and subscriptions. No
-   network, no crypto, nothing to configure: the whole stage is testable
-   against the two stores.
+1. **G1 — the registry. Built.** `Device`, `PushStore`, `MemoryDevices`,
+   the SQLite table at schema version 7, the conformance suite over
+   both, and the three obligations paid from `Core::inbox_claim`,
+   `inbox_rotate` and `inbox_purge` beside mail's and news's.
+   `hxd inbox purge` takes an account's devices with its mail, and
+   `Core::sweep_devices` is the expiry housekeeping. No network, no
+   crypto, nothing to configure.
 2. **G2 — the sender.** `hxd-push-webpush`: VAPID, RFC 8291, the
    headers, the destination check, the breaker. Tested against RFC 8291's
    test vector, by verifying RFC 8292's example token (an ES256

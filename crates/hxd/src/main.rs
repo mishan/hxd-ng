@@ -78,8 +78,9 @@ hxd [--config …] inbox purge <login> [--fingerprint FP] [--dry-run]\n  \
 hxd [--config …] news-reindex\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
-`inbox purge` takes an account's mail with it when the account is\n\
-deleted — otherwise the freed login's next holder inherits it.\n\
+`inbox purge` takes an account's mail, news subscriptions and push\n\
+devices with it when the account is deleted — otherwise the freed\n\
+login's next holder inherits them.\n\
 Pass --fingerprint (the value in the account's [identity] table, or\n\
 its hex) when the account file is already gone. --dry-run says how\n\
 much would go without taking it.";

@@ -16,6 +16,7 @@ pub mod inbox;
 pub mod media;
 pub mod news;
 pub mod notify;
+pub mod push;
 pub mod roster;
 pub mod video;
 pub mod voice;
@@ -50,6 +51,7 @@ pub use news::{
     Subscription, ThreadHead, ThreadPage, ThreadQuery,
 };
 pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
+pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};
 pub use roster::{
     AttachInfo, Core, Event, IdentityTag, InboxPolicy, Resume, SeqEvent, SessionStatus, Transport,
     Uid, UserDetails, UserInfo, OUTBOX_BUFFER_CAP,

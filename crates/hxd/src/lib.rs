@@ -1846,11 +1846,13 @@ pub fn inbox_purge(
             None => return Err("[inbox] is not configured; there is nothing to purge".into()),
         },
     };
-    Ok(mail + purge_news_subs(config, &mailbox, dry_run)?)
+    Ok(mail
+        + purge_news_subs(config, &mailbox, dry_run)?
+        + purge_devices(config, &mailbox, dry_run)?)
 }
 
-/// Where `[news]` keeps its database: its own `db`, or the file `[inbox]`
-/// or `[history]` names, which it then shares.
+/// Where the shared store file is: `[news]`'s own `db`, or the file
+/// `[inbox]` or `[history]` names, which every other table then shares.
 ///
 /// Answered without a `[news]` section too. With news turned off, the
 /// shared file still holds whatever it wrote, and a purge that stopped
@@ -1889,6 +1891,47 @@ fn purge_news_subs(
     }
     let store = open_sqlite(&path, hxd_store_sqlite::Synchronous::Normal)?;
     hxd_core::NewsStore::subs_purge(&*store, mailbox).map_err(|e| e.to_string())
+}
+
+/// Where push devices are kept: the file `[inbox]` names, else
+/// `[history]`'s, else `[news]`'s — the order the server itself opens
+/// them in, and the one place that order is written down, so a purge
+/// cannot look in one file while the server writes to another.
+#[cfg(feature = "inbox")]
+pub(crate) fn push_db(config: &Config) -> Option<PathBuf> {
+    config
+        .inbox
+        .as_ref()
+        .map(|i| i.db.clone())
+        .or_else(|| config.history.as_ref().and_then(|h| h.db.clone()))
+        .or_else(|| config.news.as_ref().and_then(|n| n.db.clone()))
+}
+
+/// The push half of a purge (`docs/webpush-gateway.md` §2). Devices are
+/// keyed as mail is, so a later holder of the login must not inherit the
+/// previous one's phone — which would be that phone buzzing for a
+/// stranger's private messages, the failure the mailbox rule exists to
+/// prevent. Counted on a dry run, the way mail and subscriptions are.
+#[cfg(feature = "inbox")]
+fn purge_devices(
+    config: &Config,
+    mailbox: &hxd_core::inbox::Mailbox,
+    dry_run: bool,
+) -> Result<usize, String> {
+    let Some(path) = push_db(config).filter(|p| p.exists()) else {
+        return Ok(0);
+    };
+    if dry_run {
+        let store = hxd_store_sqlite::SqliteStore::open_read_only(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        // Every device, expired ones included: a dry run reports what a
+        // purge would take, and a purge takes them all.
+        return hxd_core::PushStore::devices(&store, mailbox, SystemTime::UNIX_EPOCH)
+            .map(|d| d.len())
+            .map_err(|e| e.to_string());
+    }
+    let store = open_sqlite(&path, hxd_store_sqlite::Synchronous::Normal)?;
+    hxd_core::PushStore::devices_purge(&*store, mailbox).map_err(|e| e.to_string())
 }
 
 /// Without the feature there is no store to inspect, and saying so beats
@@ -2523,6 +2566,64 @@ sync = "full"
         let err = inbox_purge(&cfg, "alice", None, false).unwrap_err();
         assert!(err.contains("nothing to purge"), "{err}");
         assert!(!db.exists());
+    }
+
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn a_purge_takes_the_push_devices_too() {
+        use hxd_core::push::{Device, DeviceId};
+        use hxd_core::PushStore;
+
+        // A database at `path` in which alice has registered a phone.
+        fn alice_has_a_phone(path: &Path) {
+            let store =
+                hxd_store_sqlite::SqliteStore::open(path, hxd_store_sqlite::Synchronous::Normal)
+                    .unwrap();
+            store
+                .register(
+                    &Device {
+                        owner: hxd_core::inbox::Mailbox::login("alice"),
+                        devid: DeviceId::parse("alices-phone").unwrap(),
+                        endpoint: "https://push.example/1".into(),
+                        p256dh: [4; 65],
+                        auth: [9; 16],
+                        expires: None,
+                        registered_at: std::time::SystemTime::now(),
+                        last_push_at: None,
+                    },
+                    8,
+                )
+                .unwrap();
+        }
+
+        // The shared file, found the way the news subscriptions are: a
+        // later holder of the login must not inherit someone's phone.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("server.sqlite");
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = db.clone();
+        cfg.paths.accounts = dir.path().join("accounts");
+        alice_has_a_phone(&db);
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
+        assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
+        assert_eq!(
+            inbox_purge(&cfg, "alice", None, true).unwrap(),
+            0,
+            "and the next alice is pushed at nobody's phone"
+        );
+
+        // News keeping a file of its own does not move the devices: they
+        // are where the server keeps them, beside the mail.
+        let mail = dir.path().join("mail.sqlite");
+        let news = dir.path().join("own-news.sqlite");
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n\n[news]\n\n[news.notify]\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = mail.clone();
+        cfg.news.as_mut().unwrap().db = Some(news);
+        cfg.paths.accounts = dir.path().join("accounts");
+        alice_has_a_phone(&mail);
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
+        assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 0);
     }
 
     #[cfg(feature = "inbox")]

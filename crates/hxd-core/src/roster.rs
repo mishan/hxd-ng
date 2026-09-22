@@ -696,6 +696,11 @@ pub struct Core {
     /// Where push notifications go, or `None` — which is the no-op, and
     /// the default. See [`crate::notify`].
     pub(crate) gateway: Option<Arc<dyn crate::notify::NotificationGateway>>,
+    /// The devices a gateway pushes to, or `None` when no `[push]`
+    /// section configured one. On `Core` because the three mailbox
+    /// obligations are paid here, beside mail's and news's; the gateway
+    /// holds its own handle to the same store and does the sending.
+    pub(crate) devices: Option<Arc<dyn crate::push::PushStore>>,
     /// What each account has left of its hourly news pushes
     /// (`[news.notify] max_per_hour`), keyed by the mailbox rule. Its own
     /// lock, taken with nothing else held.
@@ -788,6 +793,17 @@ impl Core {
         gateway: Arc<dyn crate::notify::NotificationGateway>,
     ) -> Self {
         self.gateway = Some(gateway);
+        self
+    }
+
+    /// The device registry (`docs/webpush-gateway.md` §2).
+    ///
+    /// The domain keeps it for the obligations a mailbox owes — linking,
+    /// deletion and rotation move or drop devices exactly as they move
+    /// mail and subscriptions — and for the expiry sweep. Sending is the
+    /// gateway's, and a gateway is given the same `Arc`.
+    pub fn with_devices(mut self, devices: Arc<dyn crate::push::PushStore>) -> Self {
+        self.devices = Some(devices);
         self
     }
 
