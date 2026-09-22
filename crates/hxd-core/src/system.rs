@@ -64,10 +64,12 @@ impl Default for SystemPolicy {
 pub(crate) struct SystemState {
     pub(crate) policy: SystemPolicy,
     pub(crate) uid: Mutex<Option<Uid>>,
-    /// `uid -> (last refill, tokens, warned)`, the same bucket shape the
-    /// news push budget uses, plus whether this session has already been
-    /// told to slow down. Session state, so it goes when the session
-    /// does.
+    /// `uid -> (serial, last refill, tokens, warned)`, the same bucket
+    /// shape the news push budget uses, plus whether this session has
+    /// already been told to slow down. Session state: an entry left by a
+    /// session that has ended is replaced, not inherited, when its uid is
+    /// handed to someone else, which the serial is there to notice. At
+    /// most one entry per uid, so the map is bounded by the uid space.
     pub(crate) rate: Mutex<HashMap<Uid, Ration>>,
     /// The last news scope each mailbox was notified about, which is
     /// what a bare `/stop` unsubscribes from. Memory, deliberately: the
@@ -76,10 +78,10 @@ pub(crate) struct SystemState {
     pub(crate) last_notified: Mutex<LastNotified>,
 }
 
-/// One session's command ration: when it was last refilled, what is
-/// left of it, and whether this session has already been told to slow
-/// down.
-type Ration = (Instant, f64, bool);
+/// One session's command ration: the serial of the session it belongs
+/// to, when it was last refilled, what is left of it, and whether this
+/// session has already been told to slow down.
+type Ration = (u64, Instant, f64, bool);
 
 /// The last news scope a mailbox was notified about, keyed as every
 /// mailbox-keyed map in the domain is — fingerprint where there is one,
@@ -113,10 +115,11 @@ impl Core {
     }
 
     /// Put the account on the roster. Called once at startup, before any
-    /// client can connect, so it holds the first uid the roster hands
-    /// out — a real uid, because uid 0 goes through the broadcast path
-    /// on a period client and would render as a server-wide announcement
-    /// rather than a message from someone.
+    /// client can connect, so its uid is taken before anyone else's and
+    /// stays put for the life of the server — a real uid, because uid 0
+    /// goes through the broadcast path on a period client and would
+    /// render as a server-wide announcement rather than a message from
+    /// someone.
     pub fn start_system_session(&self) -> Option<Uid> {
         let system = self.system.as_ref()?;
         let uid = self
@@ -210,6 +213,18 @@ impl Core {
         let Some(system) = self.system.as_ref() else {
             return Rationed::Refused { first: false };
         };
+        // Copied out and released before the ration's own lock: nothing
+        // here holds the roster while taking another.
+        let Some(serial) = self
+            .roster
+            .lock()
+            .unwrap()
+            .users
+            .get(&uid)
+            .map(|s| s.serial)
+        else {
+            return Rationed::Refused { first: false };
+        };
         let mut rate = system.rate.lock().unwrap();
         if per_minute == 0 {
             // No commands at all is not a burst to warn about once; it
@@ -218,7 +233,14 @@ impl Core {
         }
         let per_minute = f64::from(per_minute);
         let now = Instant::now();
-        let (at, tokens, warned) = rate.entry(uid).or_insert((now, per_minute, false));
+        let fresh = (serial, now, per_minute, false);
+        let ration = rate.entry(uid).or_insert(fresh);
+        if ration.0 != serial {
+            // The uid was recycled: a new session starts with a full
+            // ration, not with whatever its predecessor left.
+            *ration = fresh;
+        }
+        let (_, at, tokens, warned) = ration;
         let refill = now.duration_since(*at).as_secs_f64() * per_minute / 60.0;
         *tokens = (*tokens + refill).min(per_minute);
         *at = now;
@@ -363,9 +385,27 @@ impl Core {
                 }
             },
         };
-        match self.news_unsubscribe(from, scope) {
-            Ok(()) => "ok: stopped".into(),
-            Err(_) => "error: that did not work".into(),
+        match scope {
+            // A reply to someone's article, or a citation of it, reaches
+            // them whether or not they follow the thread, so
+            // unsubscribing would answer `ok` and the next reply would
+            // ring anyway. What `stop` means is this thread (`news.md`
+            // §10.11), and the thing that silences every reason in a
+            // thread is a mute.
+            SubScope::Thread(_) => match self.news_mute(from, scope, true) {
+                Ok(()) => "ok: stopped — nothing in that thread will notify you".into(),
+                Err(crate::news::NewsError::TooManySubs) => {
+                    "error: you follow or mute too many threads already".into()
+                }
+                Err(_) => "error: that did not work".into(),
+            },
+            // A category rings only the people following it, and only for
+            // new threads; a mute there would leave a row behind for no
+            // reason a follow does not already cover.
+            SubScope::Category(_) => match self.news_unsubscribe(from, scope) {
+                Ok(()) => "ok: stopped".into(),
+                Err(_) => "error: that did not work".into(),
+            },
         }
     }
 

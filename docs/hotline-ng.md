@@ -359,7 +359,7 @@ A `user` object is:
 {
   "uid": 3, "nick": "Alice", "icon": 128,
   "admin": false,
-  "system": false,                 // true for the server's own account only
+  // "system": true                // only on the server's own account; absent otherwise
   "status": "active",              // active | idle | detached
   "transport": "encrypted",        // encrypted | cleartext — see below
   "identity": {                    // absent unless the socket proved one
@@ -371,11 +371,13 @@ A `user` object is:
 
 Uids remain the 16-bit legacy ids so the two rosters are one roster.
 
-`system` is `true` for exactly one user, the server's reserved account
-([system-account.md](system-account.md) §2): always present in the
-roster snapshot on both wires, `admin` set, protected from kick and ban,
-and the uid that server mail and commands (§3 there) come from and go
-to. *Design; the account is not built yet.*
+`system` is present, and `true`, on exactly one user: the server's
+reserved account ([system-account.md](system-account.md) §2), when the
+server runs one. Every other user object leaves the key out, so a
+client reads a missing `system` as `false`. That account is always in
+the roster snapshot on both wires, has `admin` set, is protected from
+kick and ban, and is the uid that server mail and commands (§3 there)
+come from and go to.
 
 `transport` comes from [`hotline-ng-auth.md`](hotline-ng-auth.md) §7.2
 and §8, `identity` from [`hotline-ng-identity.md`](hotline-ng-identity.md)

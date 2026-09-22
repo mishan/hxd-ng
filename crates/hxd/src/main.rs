@@ -198,8 +198,8 @@ async fn main() {
             None => None,
         };
         let ctx = build_ctx(&config, voice.as_ref(), files.as_ref(), push.as_ref())?;
-        // The reserved account takes the first uid, before any client
-        // can connect: a period client needs a real uid on a private
+        // The reserved account takes its uid before any client can
+        // connect: a period client needs a real uid on a private
         // message for a window to open, and needs it to still be there
         // when the user hits reply.
         if let Some(uid) = ctx.core.start_system_session() {

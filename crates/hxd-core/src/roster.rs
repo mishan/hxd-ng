@@ -396,9 +396,9 @@ pub(crate) struct UserSession {
     /// See [`AttachInfo::reads_on_delivery`].
     pub(crate) reads_on_delivery: bool,
     /// The reserved server account (`crate::system`). One session ever,
-    /// made at startup: it cannot be kicked or banned, it is not counted
-    /// toward the server's capacity, and a private message to it is a
-    /// command rather than mail.
+    /// made at startup: it cannot be kicked or banned, a tracker is not
+    /// told about it, and a private message to it is a command rather
+    /// than mail.
     pub(crate) system: bool,
     /// This session's identity fingerprint — the durable half of its
     /// mailbox key. See [`AttachInfo::identity`].

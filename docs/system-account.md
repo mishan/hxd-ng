@@ -66,7 +66,7 @@ bitmap is empty; it never sends chat, never joins a room, never
 transfers a file. Everything it does, it does as the server.
 
 **It is always on the roster**, on both wires: a session created at
-startup with the first uid the roster hands out — a real uid, not a
+startup, before any client can connect, holding a real uid — not a
 magic number, because `private-messages.md` §6.4 already found that uid
 0 goes through the broadcast path on a period client — with `admin`
 set, so a 1.x list draws it in red and an ng client can mark it. The
@@ -107,7 +107,7 @@ has.
 | `/report <who> <reason…>` *(not built)* | Files a report against that user, exactly as the ng `report { user }` request does, with the reason as `evidence`. The reporter gets `ok: report #17 filed` and the moderators get what `moderation.md` §4.5 says they get | the ng `report` rules; one per target per hour |
 | `/msg <login> <text…>` | Sends a private message to an account by login, whether or not it holds a session — the ng `msg { to_login }` request. The answer says `sent` or `queued`. This is the addressing mechanism `private-messages.md` §7 declined to invent as a pseudo-user; as a command to the account that already exists it costs nothing it was worried about | `send_msgs` |
 | `/block <who>`, `/unblock <who>`, `/blocks` | The three ng block requests | — |
-| `/stop [#article]` | Unsubscribes from the news scope of the most recent notification this account sent the user, or from the thread of the named article. `news.md` §10.11 | — |
+| `/stop [#article]` | Stops the news scope of the most recent notification this account sent the user, or the thread of the named article. A thread is **muted** rather than unfollowed, because a reply to your article or a citation of it reaches you with no subscription at all and only a mute silences it; a category is unfollowed. `news.md` §10.11 | — |
 | `/vouch <who>`, `/unvouch <who>`, `/vouches` *(not built)* | `identity-vouch.md` §3.2, by nick: the roster session's identity fingerprint is what gets vouched for, so a period client can vouch for the person it can see | `[extra] vouch` |
 
 Every command runs **as the session that sent it**, with that session's

@@ -1306,7 +1306,10 @@ mod tests {
                 ),
             ],
         };
-        let core = Arc::new(Core::new());
+        // The system account is on the roster too, and a tracker is
+        // told about people, not rows: the count below stays 1.
+        let core = Arc::new(Core::new().with_system(hxd_core::SystemPolicy::default()));
+        core.start_system_session().unwrap();
         let (uid, _events) = core
             .attach(hxd_core::AttachInfo {
                 nick: "Visible".into(),

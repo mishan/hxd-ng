@@ -932,6 +932,16 @@ fn media_for_reader(ctx: &NgCtx, uid: hxd_core::Uid, line: &hxd_core::LogLine) -
     ctx.core.media_fetch(uid, &handle).is_some()
 }
 
+/// Is this `msg` addressed to the system account, by uid or by login?
+fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
+    match (p.to, p.to_login.as_deref()) {
+        (Some(uid), None) => core.system_uid() == Some(uid),
+        (None, Some(login)) => core.is_system_login(login),
+        // Both or neither is a malformed request, answered below.
+        _ => false,
+    }
+}
+
 async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut WsTx) -> Flow {
     let send = |s: String| Message::Text(s);
     let out = match req.req.as_str() {
@@ -1049,7 +1059,10 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         },
 
         "msg" => match serde_json::from_value::<MsgParams>(req.params.clone()) {
-            Ok(_) if !state.access.has(bit::SEND_MSGS) => reply_err(
+            // A message to the system account is a command line, and
+            // `/block` or `/stop` needs no right to message anyone
+            // (`docs/system-account.md` §3); `/msg` checks the bit itself.
+            Ok(p) if !state.access.has(bit::SEND_MSGS) && !to_system(&ctx.core, &p) => reply_err(
                 req.id,
                 "access_denied",
                 "You are not allowed to send private messages.",

@@ -641,8 +641,14 @@ impl AuthBackend for FileAuth {
             // otherwise write a password-less `guest.toml` with a
             // fingerprint in it, and `lookup("")` would find it. An
             // existing account file collides on its own, which covers
-            // reserved names.
-            if !valid_login(&candidate) || is_reserved_login(&candidate) {
+            // reserved names. The server's own login is skipped the same
+            // way: a file written under it could never be logged in to,
+            // and the handle behind it would be left holding a login that
+            // refuses it and an orphan with its fingerprint in.
+            if !valid_login(&candidate)
+                || is_reserved_login(&candidate)
+                || self.is_reserved(&candidate)
+            {
                 candidate = format!("{base}-{n}");
                 continue;
             }
@@ -1551,6 +1557,35 @@ mod tests {
         assert!(made);
         assert_eq!(acct.login, "guest-2");
         assert!(!td.path().join("guest.toml").exists());
+    }
+
+    #[test]
+    fn the_reserved_login_is_nobody_to_log_in_as() {
+        // A migrated server's account file of the same name, password
+        // and all, stops being a way in.
+        let (td, auth) = backend();
+        write(td.path(), "server.toml", "password = \"hunter2\"\n");
+        let auth = auth.reserving("Server");
+        assert!(matches!(
+            auth.authenticate("server", Proof::Plain(b"hunter2")),
+            Err(AuthError::NoSuchAccount)
+        ));
+        assert!(matches!(
+            auth.lookup("SERVER"),
+            Err(AuthError::NoSuchAccount)
+        ));
+    }
+
+    #[test]
+    fn create_never_writes_the_reserved_login() {
+        let (td, auth) = backend();
+        let auth = auth.reserving("server");
+        let (acct, made) = auth
+            .find_or_create_linked("server", "Server", &[6u8; 32], AccessBits::empty())
+            .unwrap();
+        assert!(made);
+        assert_eq!(acct.login, "server-2");
+        assert!(!td.path().join("server.toml").exists());
     }
 
     #[test]
