@@ -701,6 +701,9 @@ pub struct Core {
     /// obligations are paid here, beside mail's and news's; the gateway
     /// holds its own handle to the same store and does the sending.
     pub(crate) devices: Option<Arc<dyn crate::push::PushStore>>,
+    /// What a registration may do: how many devices a mailbox holds, and
+    /// whether an endpoint on a private network is acceptable.
+    pub(crate) push_policy: crate::push::PushPolicy,
     /// What each account has left of its hourly news pushes
     /// (`[news.notify] max_per_hour`), keyed by the mailbox rule. Its own
     /// lock, taken with nothing else held.
@@ -804,6 +807,13 @@ impl Core {
     /// gateway's, and a gateway is given the same `Arc`.
     pub fn with_devices(mut self, devices: Arc<dyn crate::push::PushStore>) -> Self {
         self.devices = Some(devices);
+        self
+    }
+
+    /// `[push]`'s limits on a registration (`docs/webpush-gateway.md` §2,
+    /// §6). The defaults without it are the configuration's defaults.
+    pub fn with_push_policy(mut self, policy: crate::push::PushPolicy) -> Self {
+        self.push_policy = policy;
         self
     }
 

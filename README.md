@@ -555,6 +555,50 @@ Nothing touches disk: handles live in memory for their day and go with a
 restart, which the extension's own spec allows for — clients are told
 not to cache them across sessions.
 
+### Push notifications
+
+Absent means no notifications leave the server: the ng wire offers no
+`push` capability, a client never asks its user for permission, and
+`push_register` is answered `not_available`. Present, the server is its
+own Web Push sender — no sidecar and no third-party service — and what
+it sends is encrypted to each device's own key, so the push service
+relays ciphertext it cannot read. See
+[docs/webpush-gateway.md](docs/webpush-gateway.md).
+
+```toml
+[push]                                # presence turns it on
+contact = "mailto:admin@example.org"  # required; a push service may refuse a push without one
+content = "sender"                    # full | sender | generic
+vapid_key = "vapid.key"               # created on first start, mode 0600
+db = "server.sqlite"                  # default: the file [inbox], [history] or [news] names, in that order; required with none of them
+timeout = 10                          # seconds to wait for a push service, name lookup included
+message_ttl = 2419200                 # how long it holds a private message's notification
+news_ttl = 86400                      # the same for a news notice
+breaker_failures = 5                  # failures before a push service is skipped
+breaker_cooldown = 60                 # seconds it stays skipped
+max_inflight = 64                     # pushes in flight at once
+max_inflight_per_origin = 8           # of those, to any one push service
+max_devices = 20                      # devices one account may register
+allow_private_endpoints = false       # for an operator running their own push service
+```
+
+**`vapid_key` is the server's identity to every push service its users
+subscribed through.** Every subscription is bound to it, so losing the
+file or replacing it silently means every push is accepted by nobody and
+no client can tell why. Back it up with the accounts directory. A server
+whose key file is missing while devices are registered refuses to start
+rather than mint a new key over them — restore the file, or point
+`vapid_key` back at it. Rotating it deliberately is `hxd push rekey`
+with the server stopped: it writes a new key and drops every registered
+device, which the old key's subscriptions were bound to, and every
+client re-subscribes at its next login.
+
+`content` decides how much of a message leaves the server. On Web Push
+the payload is encrypted to the device's own key and the push service
+cannot read it, which makes `full` defensible; the default is `sender`
+because a notification on a lock screen is read by whoever is looking at
+it.
+
 ### Voice and video
 
 Both absent by default. Video rides the voice session, so `[voice.video]`
@@ -716,14 +760,16 @@ nothing.
 
 ### Cargo features
 
-`voice`, `inbox`, `media` and `markdown` are all on by default, so CI covers
-them. The `inbox` feature supplies the shared SQLite store for the inbox,
-history and news; `media` supplies the image pipeline; `markdown` supplies
-the parser behind `[news] markdown = "render"`. Building without one leaves
-its dependency out of the binary entirely — no WebRTC stack, no bundled
-SQLite, no image decoder, no markdown parser — and the matching config
-section, or for `markdown` the `render` mode, then becomes a startup error
-rather than a promise the build cannot keep.
+`voice`, `inbox`, `media`, `markdown` and `push` are all on by default, so
+CI covers them. The `inbox` feature supplies the shared SQLite store for
+the inbox, history, news and devices; `media` supplies the image pipeline;
+`markdown` supplies the parser behind `[news] markdown = "render"`; `push`
+supplies the Web Push sender, and needs `inbox` for the store its devices
+live in. Building without one leaves its dependency out of the binary
+entirely — no WebRTC stack, no bundled SQLite, no image decoder, no
+markdown parser, no TLS client — and the matching config section, or for
+`markdown` the `render` mode, then becomes a startup error rather than a
+promise the build cannot keep.
 
 ## Documentation
 

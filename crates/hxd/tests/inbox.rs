@@ -117,6 +117,7 @@ async fn start_full(dir: &Path, policy: InboxPolicy, who: &[&str], inbox: bool) 
         tunnel: None,
         enroll: None,
         files: None,
+        push: None,
     };
 
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -52,6 +52,10 @@ pub(crate) struct SessState {
     pub(crate) uid: Uid,
     session_id: String,
     pub(crate) access: AccessBits,
+    /// This socket's device certificate, where it authenticated with
+    /// one: what `push_register` files the registration under and what
+    /// decides whether it may (`crate::push`).
+    pub(crate) device: Option<crate::push::DeviceOnSocket>,
     /// The account's `[extra] file_list` and `file_getinfo`, which the
     /// roster does not carry.
     pub(crate) file_list: bool,
@@ -435,7 +439,11 @@ async fn handle_login(
     // then includes self).
     ctx.core.announce(uid);
 
-    let Some((session_id, token)) = ctx.registry.issue(&ctx.core, uid) else {
+    // Whose device this session is, for the requests that are about a
+    // device rather than an account: decided here, at login, and kept
+    // with the session so a resume cannot change it.
+    let device = identity.map(crate::push::DeviceOnSocket::of);
+    let Some((session_id, token)) = ctx.registry.issue(&ctx.core, uid, device.clone()) else {
         ctx.core.end_session(uid);
         return None;
     };
@@ -495,6 +503,12 @@ async fn handle_login(
     // And `news`, whenever there is a tree to read.
     if ctx.core.news_enabled() && !caps.iter().any(|c| c == "news") {
         caps.push("news".into());
+    }
+    // And `push`, whenever a gateway is configured: a client that sees
+    // it knows `push_register` will answer, and one that does not knows
+    // not to ask its user for a permission it could not use.
+    if ctx.push.is_some() && !caps.iter().any(|c| c == "push") {
+        caps.push("push".into());
     }
     let mut ok = json!({
         "session": session_id,
@@ -567,6 +581,12 @@ async fn handle_login(
     if let Some(news) = news {
         ok["news"] = news;
     }
+    // What this session would be pushed at, offered only to a session
+    // with a mailbox — a guest has nothing durable to be notified about,
+    // so it is never asked for a notification permission.
+    if let Some(push) = crate::push::login_json(ctx, account.has_inbox) {
+        ok["push"] = push;
+    }
     if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
         // The client never learned it was logged in; a ghost session with
         // no transport (and a leaked token) must not linger.
@@ -584,6 +604,7 @@ async fn handle_login(
             uid,
             session_id,
             access: account.access,
+            device,
             file_list: account.file_list,
             file_getinfo: account.file_getinfo,
         },
@@ -649,6 +670,10 @@ async fn handle_resume(
         uid,
         session_id: p.session.clone(),
         access,
+        // The device the session logged in as, whatever this socket did
+        // or did not present: the token proves continuity, and the
+        // certificate's rights are the session's.
+        device: ctx.registry.device(&p.session),
         file_list: account.as_ref().is_some_and(|account| account.file_list),
         file_getinfo: account.as_ref().is_some_and(|account| account.file_getinfo),
     };
@@ -1496,6 +1521,8 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         // One family, handled in its own module: the requests are many
         // and all of them are translations of one domain call.
         r if r.starts_with("news_") => crate::news::handle(ctx, state.uid, req).await,
+
+        r if r.starts_with("push_") => crate::push::handle(ctx, state, req).await,
 
         // --- Files (docs/files-plan.md) -------------------------------
         r if r.starts_with("files_") => crate::files::handle(ctx, state, req).await,

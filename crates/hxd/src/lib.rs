@@ -22,8 +22,10 @@ use hxd_session::{cap, Caps, ServerConfig, ServerCtx, TrtpLogin};
 use serde::Deserialize;
 
 pub mod files;
+pub mod push;
 pub mod voice;
 pub use files::Files;
+pub use push::Push;
 pub use voice::Voice;
 pub mod tracker;
 
@@ -62,6 +64,100 @@ pub struct Config {
     /// UDP registration with Hotline trackers. Absent = the server stays
     /// unlisted and opens no registration sockets.
     pub tracker: Option<tracker::TrackerSection>,
+    /// Web Push notifications (`docs/webpush-gateway.md` §8). Absent =
+    /// no gateway, no `push` capability, and `push_register` answered
+    /// `not_available`.
+    pub push: Option<PushSection>,
+}
+
+/// `[push]`: where a notification goes when nobody is watching.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushSection {
+    /// The VAPID `sub`: a `mailto:` or `https:` URL a push service can
+    /// reach the operator at. Not decoration — a service may refuse a
+    /// push without one, so it is required rather than defaulted.
+    pub contact: String,
+    /// How much of a message leaves the server: `full`, `sender` or
+    /// `generic`. On Web Push the payload is encrypted to the device's
+    /// own key and the push service cannot read it, which is what makes
+    /// `full` a defensible default elsewhere; `sender` is the default
+    /// here because a notification on a lock screen is read by whoever
+    /// is looking at it.
+    #[serde(default = "default_push_content")]
+    pub content: String,
+    /// The server's VAPID keypair. Created on first start with
+    /// owner-only permissions, and never replaced: every subscription on
+    /// the server is bound to it.
+    #[serde(default = "default_vapid_key")]
+    pub vapid_key: PathBuf,
+    /// Where the devices are kept. Defaults to the file `[inbox]`,
+    /// `[history]` or `[news]` names, in that order, which it then
+    /// shares; with none of those it is required.
+    pub db: Option<PathBuf>,
+    /// Seconds to wait for a push service before giving up on one
+    /// notification.
+    #[serde(default = "default_push_timeout")]
+    pub timeout: u64,
+    /// How long a push service should hold a private message's
+    /// notification for a device that is offline.
+    #[serde(default = "default_message_ttl")]
+    pub message_ttl: u64,
+    /// The same for a news notice, which is worth much less by tomorrow.
+    #[serde(default = "default_news_ttl")]
+    pub news_ttl: u64,
+    /// Consecutive failures before an origin is skipped outright.
+    #[serde(default = "default_breaker_failures")]
+    pub breaker_failures: u32,
+    /// Seconds it stays skipped, after which one probe is let through.
+    #[serde(default = "default_breaker_cooldown")]
+    pub breaker_cooldown: u64,
+    /// Pushes in flight at once, across every account.
+    #[serde(default = "default_max_inflight")]
+    pub max_inflight: usize,
+    /// Pushes in flight at once to any one push service, so that one
+    /// answering slowly cannot hold every permit.
+    #[serde(default = "default_max_inflight_per_origin")]
+    pub max_inflight_per_origin: usize,
+    /// Devices one account may register. Past it a new one is refused
+    /// `too_many_devices`; one it already has may always re-register.
+    #[serde(default = "default_max_devices")]
+    pub max_devices: usize,
+    /// For the operator running their own push service on a private
+    /// network, and for nobody else.
+    #[serde(default)]
+    pub allow_private_endpoints: bool,
+}
+
+fn default_push_content() -> String {
+    "sender".into()
+}
+fn default_vapid_key() -> PathBuf {
+    PathBuf::from("vapid.key")
+}
+fn default_push_timeout() -> u64 {
+    10
+}
+fn default_message_ttl() -> u64 {
+    4 * 7 * 24 * 60 * 60
+}
+fn default_news_ttl() -> u64 {
+    24 * 60 * 60
+}
+fn default_breaker_failures() -> u32 {
+    5
+}
+fn default_breaker_cooldown() -> u64 {
+    60
+}
+fn default_max_inflight() -> usize {
+    64
+}
+fn default_max_inflight_per_origin() -> usize {
+    8
+}
+fn default_max_devices() -> usize {
+    hxd_core::push::DEFAULT_MAX_DEVICES
 }
 
 /// The Files service (`docs/files-plan.md`).
@@ -1475,6 +1571,22 @@ pub fn check_config(config: &Config) -> Result<(), String> {
         }
         news.check()?;
     }
+    if let Some(push) = &config.push {
+        // Caught here, where the operator is told, rather than as "store
+        // was not opened" after the key file has been written.
+        let shared = config.inbox.is_some()
+            || config.history.as_ref().is_some_and(|h| h.db.is_some())
+            || config.news.as_ref().is_some_and(|n| n.db.is_some());
+        if push.db.is_none() && !shared {
+            return Err(
+                "[push] needs db unless [inbox], [history] or [news] names the shared database"
+                    .into(),
+            );
+        }
+        if push.max_devices == 0 {
+            return Err("[push] max_devices must be at least 1".into());
+        }
+    }
     if let Some(files) = &config.files {
         if !matches!(
             (&files.manifest, &files.origin, &files.root),
@@ -1567,6 +1679,7 @@ struct RuntimeStores {
     inbox: Option<Arc<dyn hxd_core::MessageStore>>,
     history: Option<Arc<dyn hxd_core::ChatLog>>,
     news: Option<Arc<dyn hxd_core::NewsStore>>,
+    devices: Option<Arc<dyn hxd_core::PushStore>>,
 }
 
 /// Open the databases the config names, **one store object per file**
@@ -1587,6 +1700,9 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
             .or_else(|| inbox_path.clone())
             .or_else(|| history_path.clone())
     });
+    // Devices share whatever file there is, as news does, in the order
+    // `push_db` writes down — the same order the purge looks in.
+    let push_path = config.push.as_ref().and_then(|_| push_db(config));
     let inbox_sync = config
         .inbox
         .as_ref()
@@ -1603,10 +1719,11 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
             .map(|p| Ok((p.clone(), database_path(p)?)))
             .transpose()
     };
-    let (inbox_path, history_path, news_path) = (
+    let (inbox_path, history_path, news_path, push_path) = (
         keyed(&inbox_path)?,
         keyed(&history_path)?,
         keyed(&news_path)?,
+        keyed(&push_path)?,
     );
 
     let mut opened: Vec<(PathBuf, Arc<SqliteStore>)> = Vec::new();
@@ -1632,10 +1749,15 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         Some(p) => Some(open(p, Synchronous::Normal)? as Arc<dyn hxd_core::NewsStore>),
         None => None,
     };
+    let devices = match &push_path {
+        Some(p) => Some(open(p, Synchronous::Normal)? as Arc<dyn hxd_core::PushStore>),
+        None => None,
+    };
     Ok(RuntimeStores {
         inbox,
         history,
         news,
+        devices,
     })
 }
 
@@ -1669,14 +1791,19 @@ struct RuntimeStores {
     inbox: Option<Arc<dyn hxd_core::MessageStore>>,
     history: Option<Arc<dyn hxd_core::ChatLog>>,
     news: Option<Arc<dyn hxd_core::NewsStore>>,
+    devices: Option<Arc<dyn hxd_core::PushStore>>,
 }
 
 #[cfg(not(feature = "inbox"))]
 fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
-    if config.inbox.is_some() || config.history.is_some() || config.news.is_some() {
+    if config.inbox.is_some()
+        || config.history.is_some()
+        || config.news.is_some()
+        || config.push.is_some()
+    {
         return Err(
-            "[inbox], [history] or [news] is configured, but this build has no SQLite \
-                    store (built without the `inbox` feature)"
+            "[inbox], [history], [news] or [push] is configured, but this build has no \
+                    SQLite store (built without the `inbox` feature)"
                 .into(),
         );
     }
@@ -1684,6 +1811,7 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         inbox: None,
         history: None,
         news: None,
+        devices: None,
     })
 }
 
@@ -1819,12 +1947,14 @@ pub fn inbox_purge(
                 .unwrap_or_else(|| hxd_core::inbox::Mailbox::login(login.to_ascii_lowercase()))
         }
     };
-    // The news half needs no inbox: `[news]` may keep a database of its
-    // own, and a later holder of the login must not inherit what the
-    // previous one followed on a server that keeps no mail either.
-    let news = news_db(config).is_some_and(|p| p.exists());
+    // The news and push halves need no inbox: either may keep a
+    // database of its own, and a later holder of the login must not
+    // inherit what the previous one followed, or their phone, on a
+    // server that keeps no mail.
+    let others =
+        news_db(config).is_some_and(|p| p.exists()) || push_db(config).is_some_and(|p| p.exists());
     let mail = match (dry_run, open_inbox_kind(config)?) {
-        (_, InboxKind::Unconfigured | InboxKind::Missing(_)) if news => 0,
+        (_, InboxKind::Unconfigured | InboxKind::Missing(_)) if others => 0,
         (_, InboxKind::Unconfigured) => {
             return Err("[inbox] is not configured; there is nothing to purge".into())
         }
@@ -1893,16 +2023,19 @@ fn purge_news_subs(
     hxd_core::NewsStore::subs_purge(&*store, mailbox).map_err(|e| e.to_string())
 }
 
-/// Where push devices are kept: the file `[inbox]` names, else
-/// `[history]`'s, else `[news]`'s — the order the server itself opens
-/// them in, and the one place that order is written down, so a purge
-/// cannot look in one file while the server writes to another.
+/// Where push devices are kept: `[push]`'s own `db`, else the file
+/// `[inbox]` names, else `[history]`'s, else `[news]`'s — the order the
+/// server itself opens them in, and the one place that order is written
+/// down, so a purge cannot look in one file while the server writes to
+/// another. Answered without a `[push]` section too, for the reason
+/// [`news_db`] is: push turned off leaves its rows where they were.
 #[cfg(feature = "inbox")]
 pub(crate) fn push_db(config: &Config) -> Option<PathBuf> {
     config
-        .inbox
+        .push
         .as_ref()
-        .map(|i| i.db.clone())
+        .and_then(|p| p.db.clone())
+        .or_else(|| config.inbox.as_ref().map(|i| i.db.clone()))
         .or_else(|| config.history.as_ref().and_then(|h| h.db.clone()))
         .or_else(|| config.news.as_ref().and_then(|n| n.db.clone()))
 }
@@ -2068,9 +2201,28 @@ pub async fn news_pruner(core: Arc<Core>) {
     }
 }
 
+/// Delete the device rows whose certificates have expired. Skipping it
+/// costs rows and never a wrong push: the gateway compares expiry
+/// itself, so a lapsed device stops being sent to the moment it lapses
+/// rather than the next time this runs.
+pub async fn device_sweeper(core: Arc<Core>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let core = core.clone();
+        let gone = tokio::task::spawn_blocking(move || core.sweep_devices())
+            .await
+            .unwrap_or(0);
+        if gone > 0 {
+            tracing::debug!(gone, "push devices expired");
+        }
+    }
+}
+
 /// Media retention: expired handles and abandoned upload sessions.
 ///
-/// Hourly, like the other two, because a handle lives a day. Every
+/// Hourly, like the others, because a handle lives a day. Every
 /// access re-checks expiry itself, so this is housekeeping — it frees
 /// memory rather than deciding what is servable, and nothing is served
 /// between sweeps that a sweep would have taken.
@@ -2093,6 +2245,7 @@ pub fn build_ng_ctx(
     legacy: &ServerCtx,
     voice: Option<&Voice>,
     files: Option<&Files>,
+    push: Option<&Push>,
 ) -> Result<Option<NgCtx>, String> {
     let Some(ng) = config.ng.as_ref() else {
         return Ok(None);
@@ -2138,6 +2291,7 @@ pub fn build_ng_ctx(
         tunnel,
         enroll,
         files: files.map(|value| value.service.clone()),
+        push: push.and_then(Push::info),
     }))
 }
 
@@ -2147,6 +2301,7 @@ pub fn build_ctx(
     config: &Config,
     voice: Option<&Voice>,
     files: Option<&Files>,
+    push: Option<&Push>,
 ) -> Result<ServerCtx, String> {
     FileAuth::bootstrap(&config.paths.accounts)
         .map_err(|e| format!("{}: {e}", config.paths.accounts.display()))?;
@@ -2219,6 +2374,17 @@ pub fn build_ctx(
     };
     let core = with_markdown(core, config);
     let core = with_media(core, config)?;
+    // The registry and the gateway together or not at all: a registry
+    // with nothing to send from would take registrations and drop every
+    // notification, which is worse than saying there is no push.
+    let core = match (stores.devices, push) {
+        (Some(devices), Some(push)) => core
+            .with_devices(devices.clone())
+            .with_push_policy(push.policy())
+            .with_notifications(push.start(devices)?),
+        (_, None) => core,
+        (None, Some(_)) => return Err("[push] store was not opened".into()),
+    };
 
     Ok(ServerCtx {
         core: Arc::new(core),
@@ -2568,6 +2734,152 @@ sync = "full"
         assert!(!db.exists());
     }
 
+    #[test]
+    fn a_push_section_is_checked_before_anything_binds() {
+        let ok = parse("[push]\ncontact = \"mailto:admin@example.org\"\n")
+            .expect("contact is the only key the section itself requires");
+        let push = ok.push.unwrap();
+        assert_eq!(push.content, "sender", "the default is not `full`");
+        assert_eq!(push.vapid_key, PathBuf::from("vapid.key"));
+        assert_eq!(push.max_inflight, 64);
+
+        // The checks that happen where the operator can be told, rather
+        // than at the first notification nobody was watching for.
+        let refused = |toml: &str| {
+            let config = parse(toml).expect("it parses; it is the section that is wrong");
+            match crate::push::build(&config) {
+                Err(e) => e,
+                Ok(_) => panic!("{toml:?} should have been refused"),
+            }
+        };
+        assert!(
+            refused("[push]\ncontact = \"mailto:a@example.org\"\ncontent = \"loud\"\n")
+                .contains("content")
+        );
+        assert!(
+            refused("[push]\ncontact = \"admin@example.org\"\n").contains("mailto:"),
+            "a contact a push service cannot use is refused at startup"
+        );
+        assert!(
+            refused("[push]\ncontact = \"mailto:a@example.org\"\nmax_inflight = 0\n")
+                .contains("max_inflight")
+        );
+
+        // And where the devices go is a startup question, not a "store
+        // was not opened" after the key file has been written.
+        let alone = parse("[push]\ncontact = \"mailto:a@example.org\"\n").unwrap();
+        assert!(check_config(&alone)
+            .unwrap_err()
+            .contains("[push] needs db"));
+        for toml in [
+            "[push]\ncontact = \"mailto:a@example.org\"\ndb = \"push.sqlite\"\n",
+            "[inbox]\ndb = \"inbox.sqlite\"\n\n[push]\ncontact = \"mailto:a@example.org\"\n",
+            "[news]\ndb = \"news.sqlite\"\n\n[push]\ncontact = \"mailto:a@example.org\"\n",
+        ] {
+            check_config(&parse(toml).unwrap()).unwrap_or_else(|e| panic!("{toml:?}: {e}"));
+        }
+        let none =
+            parse("[push]\ncontact = \"mailto:a@example.org\"\ndb = \"p\"\nmax_devices = 0\n")
+                .unwrap();
+        assert!(check_config(&none).unwrap_err().contains("max_devices"));
+    }
+
+    /// A missing key is a first start only when there are no devices: a
+    /// deleted file, or a moved `vapid_key`, must not mint a key every
+    /// registered device is already invalid against.
+    #[cfg(feature = "push")]
+    #[tokio::test]
+    async fn a_lost_key_with_devices_registered_refuses_to_start() {
+        use hxd_core::push::{Device, DeviceId, MemoryDevices};
+        use hxd_core::PushStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = parse("[push]\ncontact = \"mailto:a@example.org\"\ndb = \"p\"\n").unwrap();
+        config.push.as_mut().unwrap().vapid_key = dir.path().join("vapid.key");
+        let push = crate::push::build(&config).unwrap().unwrap();
+
+        let devices = Arc::new(MemoryDevices::new());
+        devices
+            .register(
+                &Device {
+                    owner: hxd_core::inbox::Mailbox::login("alice"),
+                    devid: DeviceId::parse("alices-phone").unwrap(),
+                    endpoint: "https://push.example/1".into(),
+                    p256dh: [4; 65],
+                    auth: [9; 16],
+                    expires: None,
+                    registered_at: std::time::SystemTime::now(),
+                    last_push_at: None,
+                },
+                8,
+            )
+            .unwrap();
+        let refused = match push.start(devices) {
+            Err(e) => e,
+            Ok(_) => panic!("a missing key with devices registered must not start"),
+        };
+        assert!(refused.contains("push rekey"), "{refused}");
+        assert!(
+            !dir.path().join("vapid.key").exists(),
+            "and nothing was minted"
+        );
+
+        // An empty registry is a first start.
+        push.start(Arc::new(MemoryDevices::new())).unwrap();
+        assert!(dir.path().join("vapid.key").exists());
+        assert!(push.info().is_some(), "and the login block has its key");
+    }
+
+    /// `hxd push rekey` replaces the key and drops the rows it
+    /// invalidated, in the file the server keeps them in.
+    #[cfg(feature = "push")]
+    #[test]
+    fn a_rekey_takes_the_devices_with_the_old_key() {
+        use hxd_core::push::{Device, DeviceId};
+        use hxd_core::PushStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("push.sqlite");
+        let mut config = parse("[push]\ncontact = \"mailto:a@example.org\"\ndb = \"p\"\n").unwrap();
+        let section = config.push.as_mut().unwrap();
+        section.db = Some(db.clone());
+        section.vapid_key = dir.path().join("vapid.key");
+        let old = hxd_push_webpush::Vapid::load_or_create(
+            &dir.path().join("vapid.key"),
+            "mailto:a@example.org",
+            true,
+        )
+        .unwrap()
+        .public_key()
+        .to_string();
+        {
+            let store =
+                hxd_store_sqlite::SqliteStore::open(&db, hxd_store_sqlite::Synchronous::Normal)
+                    .unwrap();
+            store
+                .register(
+                    &Device {
+                        owner: hxd_core::inbox::Mailbox::login("alice"),
+                        devid: DeviceId::parse("alices-phone").unwrap(),
+                        endpoint: "https://push.example/1".into(),
+                        p256dh: [4; 65],
+                        auth: [9; 16],
+                        expires: None,
+                        registered_at: std::time::SystemTime::now(),
+                        last_push_at: None,
+                    },
+                    8,
+                )
+                .unwrap();
+        }
+        let (dropped, new) = crate::push::rekey(&config).unwrap();
+        assert_eq!(dropped, 1);
+        assert_ne!(new, old);
+        let store = hxd_store_sqlite::SqliteStore::open(&db, hxd_store_sqlite::Synchronous::Normal)
+            .unwrap();
+        assert!(!store.any_devices().unwrap());
+    }
+
     #[cfg(feature = "inbox")]
     #[test]
     fn a_purge_takes_the_push_devices_too() {
@@ -2624,6 +2936,27 @@ sync = "full"
         assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
         assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
         assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 0);
+
+        // `[push]` keeping a file of its own is where the server writes
+        // them, so it is where the purge looks — beside mail or with no
+        // mail at all.
+        let own = dir.path().join("own-push.sqlite");
+        let push = format!("[push]\ncontact = \"mailto:a@example.org\"\ndb = {own:?}\n");
+        let mut cfg = parse(&format!("[inbox]\ndb = \"placeholder\"\n\n{push}")).unwrap();
+        cfg.inbox.as_mut().unwrap().db = dir.path().join("mail-too.sqlite");
+        cfg.paths.accounts = dir.path().join("accounts");
+        alice_has_a_phone(&own);
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
+        assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
+
+        let mut cfg = parse(&push).unwrap();
+        cfg.paths.accounts = dir.path().join("accounts");
+        alice_has_a_phone(&own);
+        assert_eq!(
+            inbox_purge(&cfg, "alice", None, false).unwrap(),
+            1,
+            "a server that keeps push and no mail is purged too, not refused"
+        );
     }
 
     #[cfg(feature = "inbox")]

@@ -309,6 +309,15 @@ the login reply. It is specified in [news.md](news.md) §9, and its
 subscriptions and `news_notify` in §10 (§10.6, §10.9), rather than
 repeated here.
 
+Push devices are a pair of requests, `push_register` and
+`push_unregister`, with a `push` block in the login reply and `push` in
+`caps` when the server sends notifications. They are specified in
+[push-notifications.md](push-notifications.md) §8 and §8.1 — the
+params, the error codes, and why omitting `devid` means *this* device —
+and [webpush-gateway.md](webpush-gateway.md) §7 settles what §8 left to
+the gateway: where an identity device's id comes from, its bounds on a
+password session, and the per-account cap (`too_many_devices`).
+
 `blocks` lists objects rather than logins because a block can be held
 against an identity that logged in as a guest: its login is `guest` and
 the fingerprint is what tells it apart, so a list of logins would name
@@ -583,9 +592,10 @@ Each lands separately with tests, roughly a branch apiece:
 
 ## 11. Future extensions (design hooks, no work now)
 
-- **Push + offline inbox** (the rest of Phase 7): a `NotificationGateway`
-  registration request, and the outbox growing a durable tail in Postgres —
-  the seq/replay model is already the right substrate.
+- **Push + offline inbox** (the rest of Phase 7): device registration is
+  specified (§7, and push-notifications.md §8) and the offline inbox is
+  built (§7.1); what remains here is the outbox growing a durable tail in
+  Postgres — the seq/replay model is already the right substrate.
 - **Inline media**: designed in [inline-media.md](inline-media.md) §8 —
   bytes over HTTP on the ng port, a `media` handle on `chat`/`msg`
   requests and a `media` object on their events.

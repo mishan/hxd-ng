@@ -36,12 +36,14 @@
 use std::time::SystemTime;
 
 use crate::inbox::{Mailbox, StoreError};
+use crate::roster::Uid;
 
 /// How many devices a mailbox may hold when the configuration does not
 /// say (`[push] max_devices`).
 pub const DEFAULT_MAX_DEVICES: usize = 20;
 
 pub mod conformance;
+pub mod endpoint;
 pub mod memory;
 
 pub use memory::MemoryDevices;
@@ -81,6 +83,17 @@ impl DeviceId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Is this spelled the way [`Self::of_device`] spells a device
+    /// fingerprint? Such an id is an identity device's, and a session
+    /// without that device's certificate may not claim it.
+    pub fn is_device_fingerprint(&self) -> bool {
+        self.0.len() == 64
+            && self
+                .0
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }
 }
 
@@ -206,15 +219,150 @@ pub trait PushStore: Send + Sync + 'static {
     fn devices_purge(&self, of: &Mailbox) -> Result<usize, StoreError>;
 }
 
-/// The domain's side of the registry: the three obligations a mailbox
-/// owes, paid from [`crate::roster::Core::inbox_claim`] and its
-/// siblings, and the expiry sweep the binary runs on an interval.
+/// Why a device was not registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushError {
+    /// No `[push]`, so there is no registry and nothing would ever be
+    /// sent. The same shape news gives a server with no `[news.notify]`.
+    NotAvailable,
+    /// A guest. There is nothing durable to deliver to, so there is
+    /// nothing to wake someone about (private-messages.md §2).
+    NoMailbox,
+    /// The session is gone.
+    NoSession,
+    /// The subscription is not one: an endpoint that is not an `https`
+    /// URL we may fetch, or keys of the wrong size.
+    BadSubscription(&'static str),
+    /// A new device past the mailbox's cap (`docs/webpush-gateway.md`
+    /// §2). A device it already has may always re-register.
+    TooManyDevices,
+    /// The store would not answer. An operator's problem, said as one.
+    StoreFailed,
+}
+
+/// `[push]`'s limits on a registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushPolicy {
+    /// Devices a mailbox may hold.
+    pub max_devices: usize,
+    /// Lift the address check, for the operator whose push service is
+    /// on their own network — at registration here, as the gateway lifts
+    /// it at send.
+    pub allow_private_endpoints: bool,
+}
+
+impl Default for PushPolicy {
+    fn default() -> Self {
+        PushPolicy {
+            max_devices: DEFAULT_MAX_DEVICES,
+            allow_private_endpoints: false,
+        }
+    }
+}
+
+/// What a client sent to register a device, once the frontend has
+/// decoded it. The `devid` is **not** in it: on an identity session it
+/// is the certificate's and the client does not choose it, and on a
+/// password session the frontend has parsed the client's own
+/// (push-notifications.md §5.1), so by here it is settled either way.
+#[derive(Debug, Clone)]
+pub struct Registration {
+    pub devid: DeviceId,
+    pub endpoint: String,
+    pub p256dh: [u8; 65],
+    pub auth: [u8; 16],
+    /// The device certificate's expiry, for a session that has one.
+    pub expires: Option<SystemTime>,
+}
+
+/// The domain's side of the registry: registration, the three
+/// obligations a mailbox owes, paid from
+/// [`crate::roster::Core::inbox_claim`] and its siblings, and the expiry
+/// sweep the binary runs on an interval.
 ///
 /// Each is a store call whose failure is logged and swallowed, as mail's
 /// and news's are: an operator's disk problem must not take down a
 /// login, and a device left behind is a push that goes nowhere, not a
 /// message that is lost.
 impl crate::roster::Core {
+    /// Is there a registry at all? What the login reply's `push` block
+    /// and the `push` capability are present for.
+    pub fn push_enabled(&self) -> bool {
+        self.devices.is_some()
+    }
+
+    /// Register `uid`'s device, answering whether it replaced a row —
+    /// which is a device that re-provisioned rather than a new one.
+    ///
+    /// The account comes from the session and never from the request:
+    /// otherwise anyone could register a device against anyone's account
+    /// and subscribe to their private messages (push-notifications.md
+    /// §7). Whether the *device* may do this — its certificate's
+    /// `message` bit — is the frontend's, because it is a fact about the
+    /// transport and the domain has never seen a certificate.
+    pub fn push_register(&self, uid: Uid, r: Registration) -> Result<bool, PushError> {
+        let store = self.devices.as_ref().ok_or(PushError::NotAvailable)?;
+        let owner = self.push_mailbox(uid)?;
+        // The shape check a client can be told about. The address it
+        // resolves to is the gateway's to check, before every send.
+        let policy = self.push_policy;
+        endpoint::registrable(&r.endpoint, policy.allow_private_endpoints)
+            .map_err(|_| PushError::BadSubscription("That is not a push endpoint."))?;
+        let registered = store
+            .register(
+                &Device {
+                    owner,
+                    devid: r.devid,
+                    endpoint: r.endpoint,
+                    p256dh: r.p256dh,
+                    auth: r.auth,
+                    expires: r.expires,
+                    registered_at: SystemTime::now(),
+                    last_push_at: None,
+                },
+                policy.max_devices,
+            )
+            .map_err(|e| {
+                tracing::warn!("push: registering a device: {e}");
+                PushError::StoreFailed
+            })?;
+        match registered {
+            Registered::Added => Ok(false),
+            Registered::Replaced => Ok(true),
+            Registered::Full => Err(PushError::TooManyDevices),
+        }
+    }
+
+    /// Forget one of `uid`'s devices, or all of them.
+    ///
+    /// Answers nothing about how many there were: telling a client the
+    /// size of an account's device list is not this request's business,
+    /// and the answer is the same whether or not there was anything to
+    /// take.
+    pub fn push_unregister(&self, uid: Uid, devid: Option<DeviceId>) -> Result<(), PushError> {
+        let store = self.devices.as_ref().ok_or(PushError::NotAvailable)?;
+        let owner = self.push_mailbox(uid)?;
+        let result = match devid {
+            Some(devid) => store.unregister(&owner, &devid).map(|_| ()),
+            None => store.unregister_all(&owner).map(|_| ()),
+        };
+        result.map_err(|e| {
+            tracing::warn!("push: unregistering a device of {}: {e}", owner.login);
+            PushError::StoreFailed
+        })
+    }
+
+    /// The mailbox a registration belongs to: a session's own, and only
+    /// where it has one.
+    fn push_mailbox(&self, uid: Uid) -> Result<Mailbox, PushError> {
+        let r = self.roster.lock().unwrap();
+        let sess = r.users.get(&uid).ok_or(PushError::NoSession)?;
+        if !sess.has_inbox {
+            return Err(PushError::NoMailbox);
+        }
+        Ok(sess.mailbox())
+    }
+
     pub(crate) fn devices_claim(&self, login: &str, fingerprint: &[u8; 32]) {
         if let Some(store) = self.devices.as_ref() {
             if let Err(e) = store.devices_claim(login, fingerprint) {

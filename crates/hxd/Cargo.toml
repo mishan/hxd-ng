@@ -11,7 +11,7 @@ default-run = "hxd"
 [features]
 # Voice chat. On by default so CI covers it; a server that doesn't want
 # a WebRTC stack in its binary builds with --no-default-features.
-default = ["voice", "inbox", "media", "markdown"]
+default = ["voice", "inbox", "media", "markdown", "push"]
 voice = ["dep:hxd-voice"]
 # The durable private-message inbox. On by default so CI covers it; a
 # server that wants neither offline messages nor a bundled SQLite in its
@@ -28,6 +28,13 @@ media = ["dep:hxd-media"]
 # it; without it `[news] markdown` defaults to "off", and asking for
 # "render" is a startup error. "source" needs no parser.
 markdown = ["dep:hxd-markdown"]
+# Web Push notifications (`docs/webpush-gateway.md`). On by default so
+# CI covers it; a server that wants neither notifications nor a TLS
+# client and two elliptic curves in its binary builds without it, and
+# then a `[push]` config section is a startup error rather than a
+# silently ignored promise. Needs `inbox`: the devices live in that
+# store.
+push = ["dep:hxd-push-webpush", "inbox"]
 
 [[bin]]
 name = "hxd"
@@ -46,6 +53,7 @@ hxd-voice = { workspace = true, optional = true }
 hl-identity = { workspace = true }
 base64 = "0.22"
 hxd-store-sqlite = { workspace = true, optional = true }
+hxd-push-webpush = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

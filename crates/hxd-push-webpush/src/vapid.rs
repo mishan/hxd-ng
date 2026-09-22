@@ -180,7 +180,9 @@ impl Vapid {
     }
 }
 
-fn check_contact(contact: &str) -> Result<(), VapidError> {
+/// Is `contact` something a push service can reach an operator at? Asked
+/// at startup, before the key is, so a bad one is said where it is typed.
+pub fn check_contact(contact: &str) -> Result<(), VapidError> {
     if contact.starts_with("mailto:") || contact.starts_with("https://") {
         Ok(())
     } else {

@@ -1030,6 +1030,7 @@ dependencies = [
  "hxd-markdown",
  "hxd-media",
  "hxd-ng-session",
+ "hxd-push-webpush",
  "hxd-session",
  "hxd-store-sqlite",
  "hxd-voice",

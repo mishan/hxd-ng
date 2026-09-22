@@ -13,6 +13,7 @@ pub mod media;
 pub mod news;
 mod news_blob;
 pub mod proto;
+pub mod push;
 mod registry;
 mod tunnel;
 
@@ -237,6 +238,10 @@ pub struct NgCtx {
     pub enroll: Option<Arc<enroll::Mailbox>>,
     /// Shared read-only file source and authorization registries.
     pub files: Option<Arc<hxd_files::FileService>>,
+    /// What to tell a client about push, when a gateway is configured.
+    /// `None` means the capability is absent, the login reply has no
+    /// `push` block, and `push_register` answers `not_available`.
+    pub push: Option<Arc<push::PushInfo>>,
 }
 
 /// Accept loop: one connection task per socket. Each is HTTP until it

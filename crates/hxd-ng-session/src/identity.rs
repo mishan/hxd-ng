@@ -137,6 +137,12 @@ pub struct TransportIdentity {
     pub outcome: Outcome,
     /// The device certificate's capability mask (`None` = all).
     pub device_caps: Option<u64>,
+    /// When that certificate expires, as unix seconds. A device's push
+    /// registration lives exactly this long: past it the gateway stops
+    /// sending and the row is swept, which is how a lost identity device
+    /// stops buzzing without anyone remembering to unregister it
+    /// (push-notifications.md §5.1).
+    pub device_expires: u64,
     /// The linked account's login when `outcome` is `Linked` or
     /// `Created`. The application login re-reads the account; this is
     /// which one.
@@ -725,6 +731,7 @@ impl IdentityState {
             age,
             outcome,
             device_caps: cert.caps,
+            device_expires: cert.expires,
             account,
             downstream_cleartext: req.downstream == Downstream::Cleartext,
         };
@@ -1710,6 +1717,7 @@ mod tests {
             age: 0,
             outcome: Outcome::Guest,
             device_caps: None,
+            device_expires: u64::MAX,
             account: None,
             downstream_cleartext: false,
         }

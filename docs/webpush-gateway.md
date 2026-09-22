@@ -1,9 +1,10 @@
 # The Web Push gateway: the device registry hxd-ng keeps itself
 
-Status: partial. The device registry and the sender are built; the two
-ng requests, the configuration and the client are not, so nothing
-registers a device yet and nothing is sent in anger. Staged in §9; each
-stage marks itself here as it lands.
+Status: partial. The server side is built — the registry, the sender,
+the two ng requests and `[push]` — so a configured server accepts
+registrations and pushes to them. What is left is a client that asks its
+user for permission and renders what arrives, and a real end-to-end
+against a phone. Staged in §9; each stage marks itself here as it lands.
 
 [push-notifications.md](push-notifications.md) §0 decided that the first
 gateway is `WebPushGateway`, in-process, and that when it is built it
@@ -49,7 +50,9 @@ speaks only Web Push.
 
 A device is a row. The store trait lives in `hxd-core` beside
 `MessageStore` and `NewsStore`, and the SQLite implementation beside
-theirs, in the same file the inbox and the news are in.
+theirs: in the file the inbox, history or news keeps, in that order of
+preference, unless `[push] db` names one of its own. `hxd inbox purge`
+looks where the server writes, by the same rule.
 
 ```rust
 pub struct Device {
@@ -304,8 +307,14 @@ degraded notification; a queue that never drains is an outage.
 ## 6. The destination is attacker-chosen, and it is a URL we fetch
 
 `endpoint` comes from the client. The sidecar refused non-routable
-destinations for us (§7 there); here it is our check, and it runs **at
-registration and again before every send**, because DNS moves:
+destinations for us (§7 there); here it is our check, and it runs in two
+halves, because one of them can be answered where the registration is
+and the other cannot. **At registration**: the URL's shape, and the
+address itself where the host is a literal — a client naming
+`https://127.0.0.1/` is told no while it is still asking. **Before every
+send**: what the host's *name* resolves to, because DNS moves and a name
+that answered publicly last week can answer `127.0.0.1` today. The
+rules, either way:
 
 - `https` only, no userinfo, no fragment. Any port: a self-hosted push
   service need not sit on 443, and the address check below is what keeps
@@ -315,10 +324,12 @@ registration and again before every send**, because DNS moves:
   familiar cases: no loopback, private, shared (CGNAT, `100.64.0.0/10`),
   link-local, unique-local or site-local, multicast, documentation,
   benchmarking, reserved, broadcast or unspecified address. An IPv6
-  address that carries an IPv4 one — v4-mapped, v4-compatible, NAT64
-  (`64:ff9b::/96`, `64:ff9b:1::/48`), 6to4 (`2002::/16`) — is judged by
-  the IPv4 address inside it, and Teredo (`2001::/32`) is refused
-  outright; on a host with NAT64, `64:ff9b::a00:1` *is* `10.0.0.1`.
+  address that carries an IPv4 one — v4-mapped, v4-compatible, NAT64's
+  well-known prefix (`64:ff9b::/96`), 6to4 (`2002::/16`) — is judged by
+  the IPv4 address inside it; on a host with NAT64, `64:ff9b::a00:1`
+  *is* `10.0.0.1`. Local-use NAT64 (`64:ff9b:1::/48`), whose IPv4 address
+  is not in a fixed place, and `2001::/23`, Teredo among it, are refused
+  outright.
 - **The address checked is the address connected to.** A name is
   resolved once per send, every answer is checked, and the connection is
   made to those checked addresses and no others. Checking one resolution
@@ -341,7 +352,9 @@ registration and again before every send**, because DNS moves:
 
 Refusing at registration gives the client an error it can show; refusing
 at send time deletes nothing, counts against the origin's breaker, and
-skips.
+skips. The shape half lives in the domain, beside the store that will
+hold the row; the resolver half lives in the gateway, because the domain
+is synchronous and has no business doing DNS.
 
 ## 7. The ng protocol
 
@@ -380,6 +393,7 @@ that §8 left to the gateway:
 contact = "mailto:admin@example.org"  # VAPID `sub`; required
 content = "sender"                    # full | sender | generic (§6 there)
 vapid_key = "vapid.key"               # generated on first start, 0600
+db = "server.sqlite"                  # default: [inbox]'s, [history]'s or [news]'s file
 timeout = 10
 message_ttl = 2419200                 # 4 weeks
 news_ttl = 86400
@@ -412,11 +426,14 @@ the same shape news uses for a server with no `[news.notify]`.
    not reproduced), are the tests for the two that cannot be checked by
    reading; the answer table and everything the gateway decides are
    tested behind a transport seam, so no TLS server is needed in CI.
-3. **G3 — the wire.** `push_register`, `push_unregister`, the `push`
-   block, `caps`, `[push]`, the keypair on first start, and
-   `hxd push rekey`. E2E with the scripted ng client. A listing command
-   for operators (`hxd push devices`) is wanted and not part of the
-   stage.
+3. **G3 — the wire. Built.** `push_register` and `push_unregister`, the
+   login reply's `push` block and `push` in `caps`, `[push]` and the
+   `push` Cargo feature, the keypair read — or, on a first start, created
+   — before anything binds, the devices in the store, the expiry sweeper
+   beside the inbox's, and `hxd push rekey`. E2E against a real server
+   with the real registry. `hxd push devices` is not in it: an operator
+   who wants to count devices has the store, and it lands if one ever
+   needs it.
 4. **G4 — the client.** hx-ng asks for permission, subscribes with the
    offered key, registers, and renders both payload kinds in its service
    worker. The first thing in the chain that can say yes to a prompt.
