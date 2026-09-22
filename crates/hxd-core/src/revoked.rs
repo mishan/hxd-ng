@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 use tracing::info;
 
-use crate::roster::{is_buffering, Core, Event, IdentityTag, Uid};
+use crate::roster::{is_buffering, Core, Event, IdentityTag, Uid, UserSession};
 
 /// The fingerprints refused by hand: identity keys, which refuse every
 /// device of the identity, and device keys, which refuse one.
@@ -51,15 +51,28 @@ impl Core {
         self.revoked.read().unwrap().is_revoked(identity, device)
     }
 
+    /// Does the current list refuse this session's transport identity?
+    /// Asked under the roster lock, which is the lock order `attach` set.
+    pub(crate) fn refuses_session(&self, sess: &UserSession) -> bool {
+        sess.info
+            .transport
+            .identity
+            .as_ref()
+            .is_some_and(|tag| self.revoked.read().unwrap().refuses(tag))
+    }
+
     /// Install a revocation list, replacing the last, and end every
     /// session it refuses. Answers the sessions it ended, as uid and
     /// nick, for the log.
     ///
     /// A live session is sent `Kicked`, which its frontend answers by
     /// closing the connection; a detached one has no connection to hear
-    /// it and is ended here, as a kick ends it. Either way the resume
-    /// token dies with the session, which is the point: an attacker
-    /// holding one should not be able to come back through it.
+    /// it and is ended here, as a kick ends it. A live one whose socket
+    /// fails before the kick is read would otherwise park detached, so
+    /// `connection_lost` ends a refused session rather than detaching it,
+    /// and `resume` refuses one outright. Either way the resume token
+    /// dies with the session, which is the point: an attacker holding
+    /// one should not be able to come back through it.
     pub fn set_revocations(&self, list: Revocations) -> Vec<(Uid, String)> {
         // Written first and with nothing else held: an `attach` from here
         // on is refused, and one that got in before is on the roster for
@@ -175,6 +188,30 @@ mod tests {
         let on = |uid| core.snapshot().iter().any(|u| u.uid == uid);
         assert!(!on(away), "the detached one is gone at once");
         assert!(on(other_device) && on(plain), "nobody else is touched");
+    }
+
+    #[test]
+    fn a_revoked_session_whose_socket_fails_first_neither_parks_nor_resumes() {
+        let core = Core::new();
+        // Live when the list lands, so all it gets is `Kicked`; its
+        // socket then fails before the frontend reads that far.
+        let (live, _rx) = attach(&core, "live", Some(tag(1, 10))).unwrap();
+        core.set_revocations(list(&[1], &[]));
+        assert!(
+            !core.connection_lost(live, 10),
+            "a refused session ends rather than detaching"
+        );
+        assert!(core.user(live).is_none());
+
+        // And a session that somehow is parked is not resumed.
+        let (parked, _rx) = attach(&core, "parked", Some(tag(2, 20))).unwrap();
+        assert!(core.connection_lost(parked, 10));
+        *core.revoked.write().unwrap() = list(&[2], &[]);
+        assert!(matches!(
+            core.resume(parked, 0),
+            crate::roster::Resume::Gone
+        ));
+        assert!(core.user(parked).is_none(), "and it is ended");
     }
 
     #[test]

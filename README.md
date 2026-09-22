@@ -436,10 +436,14 @@ systemctl reload hxd                         # or kill -HUP: applies it
 ```
 
 The command edits the config file in place, keeping its comments, and
-refuses to write one the server would not load. Fingerprints are the
+refuses to write one the server would not load. While it runs it holds
+`<config>.revoke` beside the file, so a second one at the same moment is
+refused rather than losing an entry; if a command is killed and leaves
+that file behind, remove it. Fingerprints are the
 52-character form `hlid inspect` and `hlid keygen` print. Nothing changes
 in the running server until SIGHUP, which re-reads these two lists and
-nothing else: every session the key holds, connected or waiting to
+nothing else (a file that fails to load, or has gone missing, leaves the
+lists as they were): every session the key holds, connected or waiting to
 resume, ends then, its next login is refused with `revoked`, and nobody
 else is dropped. An account whose linked identity is revoked can still
 log in with its password.

@@ -966,7 +966,10 @@ impl Core {
         let Some(sess) = r.users.get_mut(&uid) else {
             return false;
         };
-        if !sess.can_detach {
+        // A revoked key's session never parks: its `Kicked` may not have
+        // reached the frontend before the socket failed, and a detached
+        // session would keep a resume token alive for whoever stole it.
+        if !sess.can_detach || self.refuses_session(sess) {
             r.end_session(uid);
             return false;
         }
@@ -1025,6 +1028,12 @@ impl Core {
         let Some(sess) = r.users.get_mut(&uid) else {
             return Resume::Gone;
         };
+        // The backstop to `connection_lost`'s check: a token is no way
+        // back for a key revoked since it was issued.
+        if self.refuses_session(sess) {
+            r.end_session(uid);
+            return Resume::Gone;
+        }
         let (tx, rx) = mpsc::unbounded_channel();
         let old = std::mem::replace(&mut sess.outbox.sink, Sink::Live(tx));
         let next_seq = sess.outbox.next_seq;

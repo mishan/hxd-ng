@@ -1562,12 +1562,17 @@ impl IdentitySection {
 /// no longer loads, or no longer checks, leaves the lists as they were.
 /// A file with no `[identity]` section at all revokes nothing.
 ///
+/// A missing file is one that no longer loads, not an empty config:
+/// `Config::load` reads it as the defaults, which would lift every
+/// revocation because the file was moved.
+///
 /// Answers how many keys are listed and the sessions ended.
 pub fn reload_revocations(
     core: &Core,
     path: &Path,
 ) -> Result<(usize, Vec<(hxd_core::Uid, String)>), String> {
-    let config = Config::load(path)?;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let config: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     check_config(&config)?;
     let list = match &config.identity {
         Some(section) => section.revocations()?,
@@ -1607,6 +1612,11 @@ pub enum RevokeOutcome {
 /// then refused to reload would have revoked nothing. The write is a
 /// rename, so a server reloading at the same moment reads the old file
 /// or the new one, never half of either.
+///
+/// The temporary file beside it is also the lock: created exclusively
+/// before the file is read, so a second command at the same moment is
+/// refused rather than rewriting from the same original and dropping
+/// the first one's entry.
 pub fn revoke_command(
     path: &Path,
     fingerprint: &str,
@@ -1620,6 +1630,46 @@ pub fn revoke_command(
     // The file itself, not a symlink to it: renaming over a link would
     // replace the link and leave the file it named unedited.
     let path = &std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let tmp = path.with_extension("toml.revoke");
+    // Owner-only from its first byte: a config file can hold tracker
+    // passwords and HMAC secrets, and one left behind by a command that
+    // died must not be readable by anyone the original was not.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&tmp).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "{} exists: another revoke is editing {}, or one died and left it (remove it if so)",
+                tmp.display(),
+                path.display()
+            )
+        } else {
+            format!("{}: {e}", tmp.display())
+        }
+    })?;
+    let result = revoke_locked(path, &tmp, file, fp, spelled, what, lift);
+    if !matches!(result, Ok((_, RevokeOutcome::Changed))) {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// `revoke_command` with `tmp` held: read, edit, check, and rename `tmp`
+/// over `path`. The caller removes `tmp` on anything but a rename.
+fn revoke_locked(
+    path: &Path,
+    tmp: &Path,
+    mut file: std::fs::File,
+    fp: [u8; 32],
+    spelled: String,
+    what: RevokeWhat,
+    lift: bool,
+) -> Result<(String, RevokeOutcome), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut doc: toml_edit::DocumentMut = text
         .parse()
@@ -1666,22 +1716,22 @@ pub fn revoke_command(
     let edited = doc.to_string();
     let config: Config = toml::from_str(&edited).map_err(|e| format!("{}: {e}", path.display()))?;
     check_config(&config)?;
-    let tmp = path.with_extension("toml.revoke");
-    std::fs::write(&tmp, &edited).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    // With the original's mode: a config file can hold tracker passwords
-    // and HMAC secrets, and an operator who made it owner-only should not
-    // find it world-readable because they revoked a key.
+    {
+        use std::io::Write;
+        file.write_all(edited.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+    }
+    // Then the original's mode, which is what the renamed file will have
+    // anyway: an operator who made it owner-only keeps it owner-only, and
+    // one who made it group-readable is not surprised by 0600.
     let perms = std::fs::metadata(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .permissions();
-    std::fs::set_permissions(&tmp, perms).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{}: {e}", tmp.display())
-    })?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{}: {e}", path.display())
-    })?;
+    std::fs::set_permissions(tmp, perms).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    // Renamed only on the way out, so `revoke_command` sees `Changed`
+    // exactly when `tmp` is gone.
+    std::fs::rename(tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok((spelled, outcome))
 }
 
@@ -2735,6 +2785,44 @@ mod tests {
                 .1,
             RevokeOutcome::Unchanged
         );
+    }
+
+    #[test]
+    fn revoke_holds_its_temporary_file_as_a_lock_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hxd-ng.toml");
+        std::fs::write(&path, "[ng]\n[identity]\n").unwrap();
+        let tmp = dir.path().join("hxd-ng.toml.revoke");
+        let fp = |b: u8| hl_identity::Fingerprint([b; 32]).to_string();
+
+        // Another command mid-edit: refused, and its file is left alone.
+        std::fs::write(&tmp, "theirs").unwrap();
+        let err = revoke_command(&path, &fp(7), RevokeWhat::Identity, false).unwrap_err();
+        assert!(err.contains("another revoke"), "{err}");
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "theirs");
+        std::fs::remove_file(&tmp).unwrap();
+
+        // Changed, unchanged or refused, the lock goes with the command.
+        revoke_command(&path, &fp(7), RevokeWhat::Identity, false).unwrap();
+        assert!(!tmp.exists());
+        revoke_command(&path, &fp(7), RevokeWhat::Identity, false).unwrap();
+        assert!(!tmp.exists());
+        revoke_command(&path, "not-a-key", RevokeWhat::Identity, false).unwrap_err();
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn a_reload_from_a_missing_file_keeps_the_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hxd-ng.toml");
+        let core = Core::new();
+        core.set_revocations(hxd_core::Revocations {
+            identities: [[7; 32]].into_iter().collect(),
+            devices: Default::default(),
+        });
+        let err = reload_revocations(&core, &path).unwrap_err();
+        assert!(err.contains("hxd-ng.toml"), "{err}");
+        assert!(core.is_revoked(&[7; 32], &[0; 32]), "nothing was lifted");
     }
 
     #[test]
