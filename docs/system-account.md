@@ -58,10 +58,13 @@ exists.
 the auth backend itself — one place every frontend's login already goes
 through, answered `NoSuchAccount`, so an account file of that name left
 by a migrated server stops being a way in and no login path can forget
-to check. The `system = true` account file of the original design, and
-with it the §8.3 "reachable by nobody" exemption, is what this needs
-when the account grows things an account file holds; it does not have
-any yet. Its access
+to check. The `system = true` account file of the original design is
+what this needs when the account grows things an account file holds;
+it does not have any yet. When it does, it brings back the one
+exception to `hotline-ng-identity.md` §8.3, which now reads
+`identity_login` as true on every account file with no password: the
+"reachable by nobody" state is unrepresentable in a file, and has no
+need to be, while the system account has none. Its access
 bitmap is empty; it never sends chat, never joins a room, never
 transfers a file. Everything it does, it does as the server.
 
@@ -175,9 +178,10 @@ behaviour has been.
   stays, since it is. §6.4: the option of §4 here.
 - `news.md` §10.11: "a real mailbox for the server" is §2 here; the
   reply parser is §3's `/stop`.
-- `hotline-ng-identity.md` §8.1 and §8.3: `system = true` is the
-  legitimate form of the reachable-by-nobody state; the startup warning
-  skips it. §12's account-file table gains the flag.
+- `hotline-ng-identity.md` §8.1 and §8.3: *(superseded as built)* the
+  account has no file, and §8.3 makes the reachable-by-nobody state
+  unrepresentable in one, so there is no `system = true` exemption to
+  make until §2's account file exists.
 - `hotline-ng.md` §7: `"system": true` on the `user` object; the roster
   snapshot always contains it.
 - `identity-registrar.md` §5.2: the built-in reserved list already has

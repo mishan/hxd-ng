@@ -129,6 +129,7 @@ mod tests {
             is_person: true,
             reads_on_delivery: false,
             identity: None,
+            system: false,
         })?;
         core.announce(uid);
         Some((uid, rx))
