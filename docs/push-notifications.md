@@ -2,7 +2,15 @@
 
 Status: design; only the `NotificationGateway` trait exists. The first
 gateway to build is decided below, and it is not the one this document
-was written around.
+was written around: it is in-process Web Push, whose own design is
+[`webpush-gateway.md`](webpush-gateway.md). What that document does not
+restate — the seam (§4), the subscriber model (§5, §5.1), when a push
+happens and what it may contain (§6), and the protocol additions (§8,
+§8.1) — is normative here for either gateway. The uniqush sidecar of
+§1–§3, §7 and §9's P3 is the multi-vendor path, kept and not scheduled;
+the two rules in §7 that hold for any gateway — the account comes from
+the session, and a guest has no mailbox to register — are restated in §8
+and bind either one.
 
 Phase 7 item 3 promises "a `NotificationGateway` trait (APNs / FCM /
 UnifiedPush / WebPush behind it) plus a device-token registry." This
@@ -42,8 +50,10 @@ hatch §3 and §10 already reserve. It goes first; the license review §3
 mentions for a native implementation comes before the crate. The
 uniqush design the rest of this document describes is **kept**, as the
 multi-vendor path for when there is an iOS app that needs APNs; when
-that is scheduled, this document moves to `docs/proposals/` and the Web
-Push gateway gets its own. Nothing below is withdrawn — the seam (§4),
+that is scheduled, this document moves to `docs/proposals/`. The Web
+Push gateway has its own, [`webpush-gateway.md`](webpush-gateway.md),
+whose §1 tabulates what moving the sender in-process changes and whose
+§9 stages it. Nothing below is withdrawn — the seam (§4),
 the subscriber model (§5), the payload rules (§6) and the protocol
 additions (§8) hold for either gateway; only the order changed.
 
@@ -560,7 +570,8 @@ said on purpose.
 
 Errors: `no_mailbox` (a guest), `not_available` (no gateway configured),
 `no_capability` (an identity device whose certificate lacks `message`,
-or `manage` for another device), `bad_request` (a triple that is not one).
+or `manage` for another device), `too_many_devices` (a new `devid` past
+the server's per-account cap), `bad_request` (a triple that is not one).
 
 **`push_unregister` is harder than it looks, and the gateway absorbs
 that.** uniqush has no unsubscribe-all endpoint, `/unsubscribe` will not
