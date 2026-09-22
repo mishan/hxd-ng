@@ -2384,12 +2384,12 @@ recording gateway, since no gateway exists yet. The `stale_after` floor
 under the catch-up rule is built with it: the audience scan dates the
 oldest and newest unread article older than the post, and the floor is
 the period comparison between them, so a subscriber who never marks
-anything seen hears about a scope once a period rather than once ever. Attachments are schema
-version 6: the content-addressed filesystem `BlobStore`, staged handles,
-atomic article binding and refcounts, legacy derivatives, quotas and
-orphan cleanup, hash blocking, authenticated ng upload/download routes,
-and attachment names in FTS. hx-ng stages them in its composer and
-renders authenticated blob URLs in articles. `[news]` accepts only the
+anything seen hears about a scope once a period rather than once ever.
+Attachments are schema version 6: the content-addressed filesystem
+`BlobStore`, staged handles, atomic article binding and refcounts,
+legacy derivatives, quotas and orphan cleanup, hash blocking,
+authenticated ng upload/download routes, and attachment names in FTS.
+hx-ng stages them in its composer and renders authenticated blob URLs in articles. `[news]` accepts only the
 keys those stages honor; naming another, or another markdown mode, is a
 startup error until its stage lands. Not in it: §8's moderation ladder
 (W8), `order: "recent"` (§18), and the legacy binding (W9). The ng e2e is

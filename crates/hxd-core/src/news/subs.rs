@@ -70,6 +70,8 @@ fn same(a: &Mailbox, b: &Mailbox) -> bool {
 /// sweep — and `max_per_hour` still sits under it.
 pub(super) fn stale_rings(row: &Subscriber, at: SystemTime, stale_after: Duration) -> bool {
     // Zero is the bare rule, and a floor of zero would divide by it.
+    // Divided in nanoseconds below, so a sub-second floor from a policy
+    // built in code is a period like any other rather than a zero.
     if stale_after.is_zero() {
         return false;
     }
@@ -84,7 +86,8 @@ pub(super) fn stale_rings(row: &Subscriber, at: SystemTime, stale_after: Duratio
     else {
         return false;
     };
-    now_behind.as_secs() / stale_after.as_secs() > then_behind.as_secs() / stale_after.as_secs()
+    let period = stale_after.as_nanos();
+    now_behind.as_nanos() / period > then_behind.as_nanos() / period
 }
 
 /// A mailbox as an hourly budget's map key: its fingerprint, or its login

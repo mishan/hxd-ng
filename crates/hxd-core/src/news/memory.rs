@@ -335,28 +335,25 @@ impl Inner {
             .count()
     }
 
-    /// When the oldest — or, for `newest`, the newest — of the articles
-    /// [`Self::unread_before`] counts was posted. `None` when it counts
-    /// none. The stale floor of §10.7 measures from the first and asks
-    /// its period question against the second.
-    fn earlier_at(
+    /// When the oldest and the newest of the articles
+    /// [`Self::unread_before`] counts were posted, in one pass. `None`
+    /// when it counts none. The stale floor of §10.7 measures from the
+    /// first and asks its period question against the second.
+    fn earlier_span(
         &self,
         owner: &Mailbox,
         scope: SubScope,
         last_seen: ArticleId,
         before: ArticleId,
-        newest: bool,
-    ) -> Option<SystemTime> {
-        let times = self
-            .in_scope(scope)
+    ) -> Option<(SystemTime, SystemTime)> {
+        self.in_scope(scope)
             .filter(|a| a.id > last_seen && a.id < before)
             .filter(|a| !a.deleted && !a.author.is(owner))
-            .map(|a| a.at);
-        if newest {
-            times.max()
-        } else {
-            times.min()
-        }
+            .map(|a| a.at)
+            .fold(None, |span, at| match span {
+                None => Some((at, at)),
+                Some((oldest, newest)) => Some((oldest.min(at), newest.max(at))),
+            })
     }
 
     /// Is there something at `scope` to subscribe to?
@@ -935,14 +932,17 @@ impl NewsStore for MemoryNews {
                 r.scope == SubScope::Thread(root)
                     || category.is_some_and(|c| r.scope == SubScope::Category(c))
             })
-            .map(|r| Subscriber {
-                owner: r.owner.clone(),
-                scope: r.scope,
-                muted: r.muted,
-                unread: inner.unread(&r.owner, r.scope, r.last_seen),
-                earlier: inner.unread_before(&r.owner, r.scope, r.last_seen, article),
-                earlier_oldest: inner.earlier_at(&r.owner, r.scope, r.last_seen, article, false),
-                earlier_newest: inner.earlier_at(&r.owner, r.scope, r.last_seen, article, true),
+            .map(|r| {
+                let span = inner.earlier_span(&r.owner, r.scope, r.last_seen, article);
+                Subscriber {
+                    owner: r.owner.clone(),
+                    scope: r.scope,
+                    muted: r.muted,
+                    unread: inner.unread(&r.owner, r.scope, r.last_seen),
+                    earlier: inner.unread_before(&r.owner, r.scope, r.last_seen, article),
+                    earlier_oldest: span.map(|(oldest, _)| oldest),
+                    earlier_newest: span.map(|(_, newest)| newest),
+                }
             })
             .collect())
     }

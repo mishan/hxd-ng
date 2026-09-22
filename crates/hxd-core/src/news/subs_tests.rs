@@ -680,6 +680,17 @@ mod stale_floor {
     }
 
     #[test]
+    fn a_floor_under_a_second_is_a_period_and_not_a_zero() {
+        // Config speaks whole seconds, but a policy built in code need
+        // not; a half-second floor must not divide by zero.
+        assert!(stale_rings(
+            &row(Some(0), 0),
+            at(1),
+            Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
     fn a_clock_that_went_backwards_decides_nothing() {
         assert!(!stale_rings(&row(Some(10), 12), at(3), WEEK));
     }
