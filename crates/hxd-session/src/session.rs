@@ -1114,8 +1114,28 @@ async fn login_phase(
         system: false,
         transport,
     };
-    let Some((uid, events)) = ctx.core.attach(attach) else {
-        reply_error(tx, f.trans, "Server full.");
+    // A key revoked after the tunnel authenticated: `attach` refuses it,
+    // and asking first only buys the right words.
+    let revoked = attach
+        .transport
+        .identity
+        .as_ref()
+        .is_some_and(|t| ctx.core.is_revoked(&t.fingerprint, &t.device));
+    let attached = if revoked {
+        None
+    } else {
+        ctx.core.attach(attach)
+    };
+    let Some((uid, events)) = attached else {
+        reply_error(
+            tx,
+            f.trans,
+            if revoked {
+                "This key is revoked on this server."
+            } else {
+                "Server full."
+            },
+        );
         return None;
     };
 

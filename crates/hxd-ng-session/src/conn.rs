@@ -430,12 +430,26 @@ async fn handle_login(
         // cannot ask to be the server.
         system: false,
     };
-    let Some((uid, events)) = ctx.core.attach(attach) else {
-        let _ = send_frame(
-            ws_tx,
-            Message::Text(reply_err(req.id, "server_full", "Server full.")),
-        )
-        .await;
+    // A key revoked after this socket authenticated (`crate::identity`
+    // refuses it at auth; this is the socket that got in first). `attach`
+    // refuses it too, so asking here only buys the right error.
+    let revoked = attach
+        .transport
+        .identity
+        .as_ref()
+        .is_some_and(|t| ctx.core.is_revoked(&t.fingerprint, &t.device));
+    let attached = if revoked {
+        None
+    } else {
+        ctx.core.attach(attach)
+    };
+    let Some((uid, events)) = attached else {
+        let (code, text) = if revoked {
+            ("revoked", "This key is revoked on this server.")
+        } else {
+            ("server_full", "Server full.")
+        };
+        let _ = send_frame(ws_tx, Message::Text(reply_err(req.id, code, text))).await;
         return None;
     };
     // ng has no agreement dance: announce immediately (the snapshot below

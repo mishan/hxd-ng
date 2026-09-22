@@ -13,9 +13,12 @@
 //! touches the backend is synchronous file I/O — `http.rs` calls in from
 //! the blocking pool.
 //!
-//! Not yet here, deliberately: revocation (needs a registrar to fetch
-//! from) and rate limiting (should share the login-attempt limiter when
-//! that exists). Each is marked where it would go.
+//! Revocation is the operator's own list (`identity-registrar.md`),
+//! held by the core so that installing it can end the sessions it
+//! refuses; the registrar's published records, which need a registrar to
+//! fetch from, are not here yet. Nor is rate limiting, which should share
+//! the login-attempt limiter when that exists. Each is marked where it
+//! would go.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -166,6 +169,7 @@ impl TransportIdentity {
     pub fn tag(&self) -> IdentityTag {
         IdentityTag {
             fingerprint: self.fingerprint.0,
+            device: Fingerprint::of(&self.device).0,
             handle: self.handle.clone(),
         }
     }
@@ -544,14 +548,29 @@ impl IdentityState {
         assoc: Assoc,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
         let classic_offered = req.classic.is_some();
-        // Step 4, revocation: no registrar to ask yet. When there is one,
-        // this is where a cached revocation list is consulted and
-        // `Revoked` returned.
+        let fingerprint = Fingerprint::of(&card.identity);
+
+        // Step 4, revocation: the operator's own list, consulted first and
+        // needing no registrar (`identity-registrar.md`). A revoked
+        // device's cached certificate goes with it, so the mTLS
+        // path cannot re-admit it from the cache. The registrar's
+        // published records, when there is a registrar to fetch them
+        // from, are consulted here too.
+        let device = Fingerprint::of(&cert.device);
+        if self.core.is_revoked(&fingerprint.0, &device.0) {
+            debug!(
+                fingerprint = %fingerprint.short(),
+                device = %device.short(),
+                "identity auth refused: revoked here"
+            );
+            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            t.devices.remove(&cert.device);
+            return Err(AuthRefused::Revoked);
+        }
 
         // Step 5: attestations against the trusted table.
         let now = now_unix();
         let (handle, age) = self.accept_attestations(&card.attestations, now);
-        let fingerprint = Fingerprint::of(&card.identity);
 
         // A card that moves a committed successor is refused outright —
         // *first*, before any account is linked or created. Checking it
@@ -960,6 +979,16 @@ impl IdentityState {
             .get(&key)
             .is_none_or(|(_, issued)| issued.elapsed() >= TTL);
         if expired {
+            t.tokens.remove(&key);
+            return None;
+        }
+        // A token minted before its key was revoked is not a way round the
+        // revocation: it dies here, whichever caller holds it.
+        let revoked = t.tokens.get(&key).is_some_and(|(ident, _)| {
+            self.core
+                .is_revoked(&ident.fingerprint.0, &Fingerprint::of(&ident.device).0)
+        });
+        if revoked {
             t.tokens.remove(&key);
             return None;
         }

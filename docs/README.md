@@ -24,7 +24,7 @@ to another project.
 | [hotline-ng-auth.md](hotline-ng-auth.md) — transport authentication, discovery, transport tokens, the TRTP tunnel, tunnels and relays | yes | ng, and period/extended through a tunnel | spec |
 | [hotline-ng-identity.md](hotline-ng-identity.md) — the identity objects, the identity profile at auth, cards, account association | yes, to the registrar stub | ng, tunnel | spec |
 | [identity-enrollment.md](identity-enrollment.md) — certifying a device through a mailbox and a code | server side | ng | spec |
-| [identity-registrar.md](identity-registrar.md) — handles, revocation, rotation, freeze, key backup, transparency, standing and probation | no | ng | spec |
+| [identity-registrar.md](identity-registrar.md) — handles, revocation, rotation, freeze, key backup, transparency, standing and probation | the server-local revocation list | ng | spec |
 | [identity-vouch.md](identity-vouch.md) — a member lending standing to a key | no | ng; local form from any account | spec |
 | [identity-threat-model.md](identity-threat-model.md) — what identity defends against | — | — | design |
 | [identity-test-vectors.json](identity-test-vectors.json) — signed objects and reject cases | yes | — | spec |

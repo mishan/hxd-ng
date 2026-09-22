@@ -226,8 +226,10 @@ The roster snapshot rides in the login reply — a mobile client renders one
 round-trip after connect. Failure codes: `login_failed` (wrong account or
 password — deliberately one code), `denied` (the server's identity policy
 refused this socket, `hotline-ng-identity.md` §8.1 — nothing about the
-credentials failed, and there is nothing to retry), `banned`,
-`server_full`.
+credentials failed, and there is nothing to retry), `revoked` (the
+socket's identity or device key was revoked on this server after it
+authenticated, `identity-registrar.md` §7.3 — the same code
+`/identity/auth` refuses it with from then on), `banned`, `server_full`.
 
 **Resume** (existing session):
 

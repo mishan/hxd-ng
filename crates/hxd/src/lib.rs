@@ -1095,6 +1095,16 @@ pub struct IdentitySection {
     /// making the caches forget is the attack it exists to stop.
     #[serde(default = "default_anchors")]
     pub successors: PathBuf,
+    /// Identity fingerprints refused by hand, every device of each
+    /// (`docs/identity-registrar.md`). Consulted before anything
+    /// else, and needs no registrar. Re-read on SIGHUP, which also ends
+    /// the sessions a new entry refuses.
+    #[serde(default)]
+    pub revoked_identities: Vec<String>,
+    /// Device fingerprints refused by hand: one stolen device, leaving
+    /// the identity's others in. Re-read on SIGHUP with the other list.
+    #[serde(default)]
+    pub revoked_devices: Vec<String>,
     /// Serve the enrollment mailbox (`docs/identity-enrollment.md` §10).
     /// Off, the routes 404 and discovery omits the endpoint, so a device
     /// enrolls by the paste as before.
@@ -1524,6 +1534,157 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     writeln!(f, "{text}")
 }
 
+impl IdentitySection {
+    /// The two revocation lists, as the core holds them. Every entry must
+    /// be a fingerprint in its display form: a typo that silently revoked
+    /// nothing would leave a stolen key in, so it is a startup error, and
+    /// on a reload the old lists stay.
+    pub fn revocations(&self) -> Result<hxd_core::Revocations, String> {
+        let parse = |key: &str, list: &[String]| {
+            list.iter()
+                .map(|entry| {
+                    hl_identity::Fingerprint::parse(entry.trim())
+                        .map(|fp| fp.0)
+                        .ok_or_else(|| format!("[identity] {key}: {entry:?} is not a fingerprint"))
+                })
+                .collect::<Result<std::collections::HashSet<_>, _>>()
+        };
+        Ok(hxd_core::Revocations {
+            identities: parse("revoked_identities", &self.revoked_identities)?,
+            devices: parse("revoked_devices", &self.revoked_devices)?,
+        })
+    }
+}
+
+/// Re-read `[identity]`'s revocation lists from the config file and
+/// install them, ending every session they now refuse. What SIGHUP does,
+/// and all it does: nothing else in the file is re-read, and a file that
+/// no longer loads, or no longer checks, leaves the lists as they were.
+/// A file with no `[identity]` section at all revokes nothing.
+///
+/// Answers how many keys are listed and the sessions ended.
+pub fn reload_revocations(
+    core: &Core,
+    path: &Path,
+) -> Result<(usize, Vec<(hxd_core::Uid, String)>), String> {
+    let config = Config::load(path)?;
+    check_config(&config)?;
+    let list = match &config.identity {
+        Some(section) => section.revocations()?,
+        None => hxd_core::Revocations::default(),
+    };
+    let listed = list.identities.len() + list.devices.len();
+    Ok((listed, core.set_revocations(list)))
+}
+
+/// Which of `[identity]`'s two lists `hxd identity revoke` edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeWhat {
+    /// `revoked_identities`: every device of the identity.
+    Identity,
+    /// `revoked_devices`: the one device.
+    Device,
+}
+
+/// What `hxd identity revoke` changed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    /// The fingerprint was added (or, with `lift`, removed).
+    Changed,
+    /// It was already listed (or, with `lift`, already absent); the file
+    /// is untouched.
+    Unchanged,
+}
+
+/// `hxd identity revoke`: add a fingerprint to one of `[identity]`'s
+/// revocation lists in the config file at `path`, or with `lift` take it
+/// out, and answer the fingerprint as written. Applied by the next
+/// SIGHUP, or restart, of the server reading that file.
+///
+/// The file is edited rather than rewritten, so an operator's comments
+/// and layout survive, and it is checked the way the server will check it
+/// before anything is written: a command that left a config the server
+/// then refused to reload would have revoked nothing. The write is a
+/// rename, so a server reloading at the same moment reads the old file
+/// or the new one, never half of either.
+pub fn revoke_command(
+    path: &Path,
+    fingerprint: &str,
+    what: RevokeWhat,
+    lift: bool,
+) -> Result<(String, RevokeOutcome), String> {
+    let fp = parse_fingerprint(fingerprint).map_err(|_| {
+        format!("{fingerprint:?} is not a fingerprint: give the 52-character form hlid prints, or 64 hex characters")
+    })?;
+    let spelled = hl_identity::Fingerprint(fp).to_string();
+    // The file itself, not a symlink to it: renaming over a link would
+    // replace the link and leave the file it named unedited.
+    let path = &std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let identity = doc
+        .get_mut("identity")
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| {
+            format!(
+                "{} has no [identity] section: identity login is off, so there is no key to revoke",
+                path.display()
+            )
+        })?;
+    let key = match what {
+        RevokeWhat::Identity => "revoked_identities",
+        RevokeWhat::Device => "revoked_devices",
+    };
+    if !identity.contains_key(key) {
+        identity.insert(key, toml_edit::value(toml_edit::Array::new()));
+    }
+    let list = identity[key]
+        .as_array_mut()
+        .ok_or_else(|| format!("[identity] {key} is not a list"))?;
+    // Compared as fingerprints rather than as text, so an entry written
+    // in another case, or with the confusables the form tolerates, is
+    // still the same key.
+    let listed = |v: &toml_edit::Value| {
+        v.as_str()
+            .and_then(|s| hl_identity::Fingerprint::parse(s.trim()))
+            .is_some_and(|f| f.0 == fp)
+    };
+    let present = list.iter().any(listed);
+    let outcome = match (lift, present) {
+        (false, true) | (true, false) => return Ok((spelled, RevokeOutcome::Unchanged)),
+        (false, false) => {
+            list.push(spelled.as_str());
+            RevokeOutcome::Changed
+        }
+        (true, true) => {
+            list.retain(|v| !listed(v));
+            RevokeOutcome::Changed
+        }
+    };
+    let edited = doc.to_string();
+    let config: Config = toml::from_str(&edited).map_err(|e| format!("{}: {e}", path.display()))?;
+    check_config(&config)?;
+    let tmp = path.with_extension("toml.revoke");
+    std::fs::write(&tmp, &edited).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    // With the original's mode: a config file can hold tracker passwords
+    // and HMAC secrets, and an operator who made it owner-only should not
+    // find it world-readable because they revoked a key.
+    let perms = std::fs::metadata(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .permissions();
+    std::fs::set_permissions(&tmp, perms).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", tmp.display())
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })?;
+    Ok((spelled, outcome))
+}
+
 fn build_identity(
     section: &IdentitySection,
     auth: Arc<dyn hxd_core::AuthBackend>,
@@ -1613,6 +1774,9 @@ pub fn check_config(config: &Config) -> Result<(), String> {
              served by the ng listener, so [identity] without [ng] does nothing"
                 .into(),
         );
+    }
+    if let Some(identity) = &config.identity {
+        identity.revocations()?;
     }
     if let Some(inbox) = &config.inbox {
         hxd_core::InboxPolicy {
@@ -2183,7 +2347,7 @@ pub fn news_reindex(_config: &Config) -> Result<u64, String> {
 /// raw hex for anyone reading it out of a hash. Crockford first — the
 /// tooling that tells the operator to run this prints that form, and
 /// requiring hex meant `rm alice.toml` left the mailbox unpurgeable.
-#[cfg(feature = "inbox")]
+// Not behind `inbox`: `hxd identity revoke` reads fingerprints too.
 fn parse_fingerprint(text: &str) -> Result<[u8; 32], String> {
     let text = text.trim();
     if let Some(fp) = hl_identity::Fingerprint::parse(text) {
@@ -2322,11 +2486,16 @@ pub fn build_ng_ctx(
         return Ok(None);
     };
     let identity = match config.identity.as_ref() {
-        Some(section) => Some(Arc::new(build_identity(
-            section,
-            legacy.auth.clone(),
-            legacy.core.clone(),
-        )?)),
+        Some(section) => {
+            // Installed before anything can connect, so there is no
+            // session yet for it to end.
+            legacy.core.set_revocations(section.revocations()?);
+            Some(Arc::new(build_identity(
+                section,
+                legacy.auth.clone(),
+                legacy.core.clone(),
+            )?))
+        }
         None => None,
     };
     let tunnel: Option<Arc<dyn TunnelSink>> = identity
@@ -2493,6 +2662,105 @@ pub fn build_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `hxd identity revoke` against a file an operator wrote by hand.
+    #[test]
+    fn revoke_edits_the_file_in_place_and_keeps_what_the_operator_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hxd-ng.toml");
+        let original =
+            "# my server\n[ng]\n\n[identity]\n# lost laptop, 2026-09\nnew_accounts = \"guest\"\n";
+        std::fs::write(&path, original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let fp = hl_identity::Fingerprint([7; 32]);
+        let hex: String = [7u8; 32].iter().map(|b| format!("{b:02x}")).collect();
+
+        // Hex in, the display form written, and the comments still there.
+        let (spelled, outcome) = revoke_command(&path, &hex, RevokeWhat::Identity, false).unwrap();
+        assert_eq!(
+            (spelled.as_str(), outcome),
+            (fp.to_string().as_str(), RevokeOutcome::Changed)
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# my server") && text.contains("# lost laptop"),
+            "{text}"
+        );
+        let listed = || {
+            let config = Config::load(&path).unwrap();
+            config.identity.unwrap().revocations().unwrap()
+        };
+        assert!(listed().identities.contains(&[7; 32]));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "an owner-only file stays owner-only");
+        }
+
+        // Again is nothing, in any spelling of the same key.
+        let upper = fp.to_string().to_uppercase();
+        assert_eq!(
+            revoke_command(&path, &upper, RevokeWhat::Identity, false)
+                .unwrap()
+                .1,
+            RevokeOutcome::Unchanged
+        );
+
+        // A device goes on the other list.
+        revoke_command(
+            &path,
+            &hl_identity::Fingerprint([8; 32]).to_string(),
+            RevokeWhat::Device,
+            false,
+        )
+        .unwrap();
+        assert!(listed().devices.contains(&[8; 32]));
+
+        // Lifting takes it out, and lifting twice is nothing.
+        assert_eq!(
+            revoke_command(&path, &hex, RevokeWhat::Identity, true)
+                .unwrap()
+                .1,
+            RevokeOutcome::Changed
+        );
+        assert!(listed().identities.is_empty());
+        assert_eq!(
+            revoke_command(&path, &hex, RevokeWhat::Identity, true)
+                .unwrap()
+                .1,
+            RevokeOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn revoke_refuses_what_would_revoke_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hxd-ng.toml");
+        let fp = hl_identity::Fingerprint([7; 32]).to_string();
+
+        std::fs::write(&path, "[ng]\n[identity]\n").unwrap();
+        let err = revoke_command(&path, "not-a-key", RevokeWhat::Identity, false).unwrap_err();
+        assert!(err.contains("not a fingerprint"), "{err}");
+
+        // No [identity]: identity login is off, and a list there would be
+        // read by nothing.
+        std::fs::write(&path, "[ng]\n").unwrap();
+        let err = revoke_command(&path, &fp, RevokeWhat::Identity, false).unwrap_err();
+        assert!(err.contains("no [identity] section"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[ng]\n");
+
+        // A file the server would refuse to load is not written, so the
+        // command never leaves a reload that fails.
+        std::fs::write(&path, "[identity]\n").unwrap();
+        let err = revoke_command(&path, &fp, RevokeWhat::Identity, false).unwrap_err();
+        assert!(err.contains("needs [ng]"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[identity]\n");
+    }
 
     #[test]
     fn tracker_configuration_is_explicit_validated_and_redacts_secrets() {

@@ -86,6 +86,9 @@ pub struct Transport {
 pub struct IdentityTag {
     /// SHA-256 of the identity public key.
     pub fingerprint: [u8; 32],
+    /// SHA-256 of the device key the socket authenticated with: what a
+    /// device revocation names (`crate::revoked`). Not shown to anyone.
+    pub device: [u8; 32],
     /// `handle@registrar`, when an attestation was accepted.
     pub handle: Option<String>,
 }
@@ -756,6 +759,10 @@ pub struct Core {
     /// Nothing but public chat takes this lock; order is it first, then
     /// (briefly) `roster`.
     pub(crate) log_serial: Mutex<()>,
+    /// Keys the operator has refused by hand (`crate::revoked`). Read
+    /// under the roster lock by `attach`, and written with nothing held,
+    /// so the order is roster first, then this.
+    pub(crate) revoked: std::sync::RwLock<crate::revoked::Revocations>,
 }
 
 impl Core {
@@ -841,9 +848,22 @@ impl Core {
     /// fine — a client merges user-change events it receives before its
     /// user-list fetch.
     ///
-    /// Returns `None` only if all 65535 uids are in use.
+    /// Returns `None` when all 65535 uids are in use, or when the transport identity is
+    /// one the operator has revoked. The frontends check revocation
+    /// before they get here and say so; this is the backstop for a socket
+    /// that authenticated before a revocation arrived, and it is asked
+    /// under the roster lock so a revocation's sweep cannot miss a
+    /// session that attaches while it runs.
     pub fn attach(&self, info: AttachInfo) -> Option<(Uid, UnboundedReceiver<SeqEvent>)> {
         let mut r = self.roster.lock().unwrap();
+        if info
+            .transport
+            .identity
+            .as_ref()
+            .is_some_and(|tag| self.revoked.read().unwrap().refuses(tag))
+        {
+            return None;
+        }
         let uid = r.next_uid()?;
         r.last_serial += 1;
         let serial = r.last_serial;

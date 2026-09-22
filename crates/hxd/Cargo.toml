@@ -59,6 +59,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+# `hxd identity revoke` edits the operator's config file in place, and
+# keeps their comments doing it.
+toml_edit = "0.22"
 hmac = { workspace = true }
 sha2 = { workspace = true }
 rand_core = { workspace = true }
