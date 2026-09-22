@@ -491,6 +491,11 @@ impl Core {
     /// The event to every session `to` holds, and the push when none of
     /// them is watching (§10.6).
     fn news_deliver(&self, to: &Mailbox, n: Notified, rings: bool, per_hour: u32) {
+        // What a bare `/stop` to the system account unsubscribes from:
+        // the thing they were just told about (`docs/system-account.md`
+        // §3). Recorded for every notification, not only the ones that
+        // ring, because the user saw the badge either way.
+        self.system_notified(to, n.scope);
         let attentive = {
             let mut r = self.roster.lock().unwrap();
             let uids = crate::chat::sessions_of(&r, to);

@@ -76,6 +76,7 @@ fn attach_boxed(core: &Core, nick: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
             is_person: true,
             reads_on_delivery: false,
             identity: None,
+            system: false,
         })
         .unwrap();
     core.announce(uid);
@@ -114,6 +115,7 @@ fn attach_with(
             is_person: false,
             reads_on_delivery: false,
             identity: None,
+            system: false,
         })
         .unwrap();
     core.announce(uid);

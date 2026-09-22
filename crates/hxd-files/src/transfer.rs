@@ -720,6 +720,7 @@ mod tests {
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,
+                system: false,
             })
             .unwrap();
         FilePrincipal {

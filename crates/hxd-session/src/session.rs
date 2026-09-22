@@ -1111,6 +1111,7 @@ async fn login_phase(
             .identity
             .fingerprint
             .or_else(|| transport.identity.as_ref().map(|t| t.fingerprint)),
+        system: false,
         transport,
     };
     let Some((uid, events)) = ctx.core.attach(attach) else {
@@ -2395,10 +2396,6 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
 
         // --- Messaging ------------------------------------------------
         t if t == ClientHdr::Msg.as_u32() => {
-            if !sess.can(bit::SEND_MSGS) {
-                reply_error(tx, f.trans, "You are not allowed to send private messages.");
-                return;
-            }
             let (mut to, mut body) = (0 as Uid, String::new());
             let (mut handle, mut declared) = (None, false);
             for c in f.chunks() {
@@ -2409,6 +2406,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     tag::CHAT_MEDIA_TYPE => declared = true,
                     _ => {}
                 }
+            }
+            // A message to the system account is a command line, not a
+            // private message, and `/block` or `/stop` needs no right to
+            // message anyone (`docs/system-account.md` §3). The commands
+            // that do reach a person, `/msg`, check the bit themselves.
+            if !sess.can(bit::SEND_MSGS) && ctx.core.system_uid() != Some(to) {
+                reply_error(tx, f.trans, "You are not allowed to send private messages.");
+                return;
             }
             // Same rule as chat: dropped outright from a sender that did
             // not negotiate the bit. This transaction *does* have a task

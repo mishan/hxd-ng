@@ -404,6 +404,11 @@ pub fn user_json(u: &UserInfo) -> Value {
         // know about this session's link.
         "transport": if u.transport.encrypted { "encrypted" } else { "cleartext" },
     });
+    // Present only where it is true, so a roster row costs nothing for
+    // the 65,534 sessions that are people.
+    if u.system {
+        v["system"] = json!(true);
+    }
     if let Some(id) = &u.transport.identity {
         v["identity"] = json!({
             "fingerprint": hl_identity::Fingerprint(id.fingerprint).to_string(),

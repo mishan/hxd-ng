@@ -31,6 +31,7 @@ fn editor(core: &Core) -> Uid {
             is_person: true,
             reads_on_delivery: false,
             identity: None,
+            system: false,
         })
         .unwrap();
     core.announce(uid);

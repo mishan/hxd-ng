@@ -1015,6 +1015,7 @@ fn losing_the_connection_ends_the_publication_even_though_the_session_lives() {
             is_person: true,
             reads_on_delivery: false,
             identity: None,
+            system: false,
         })
         .unwrap();
     core.announce(a);

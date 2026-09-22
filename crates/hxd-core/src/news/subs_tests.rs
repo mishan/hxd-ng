@@ -116,7 +116,10 @@ impl Server {
                     ..NewsPolicy::default()
                 },
             )
-            .with_notifications(gw.clone());
+            .with_notifications(gw.clone())
+            // Present so `/stop` can be sent to it; nothing is on the
+            // roster until a test starts its session.
+            .with_system(crate::SystemPolicy::default());
         Server {
             core: Arc::new(core),
             gw,
@@ -166,6 +169,7 @@ impl Server {
                 is_person: login != "guest",
                 reads_on_delivery: classic,
                 identity,
+                system: false,
             })
             .unwrap();
         self.core.announce(uid);
@@ -694,4 +698,36 @@ mod stale_floor {
     fn a_clock_that_went_backwards_decides_nothing() {
         assert!(!stale_rings(&row(Some(10), 12), at(3), WEEK));
     }
+}
+
+/// `/stop` to the system account (`docs/system-account.md` §3) after a
+/// reply: the author follows nothing that unsubscribing could remove, so
+/// only a mute makes the next reply stay quiet.
+#[test]
+fn stop_after_a_reply_silences_the_thread() {
+    let s = Server::new(NotifyPolicy::default());
+    let server = s.core.start_system_session().unwrap();
+    let (alice, mut rx) = s.login("alice");
+    let root = s.post(alice, None, "a question");
+    s.post_as("bob", Some(root), "an answer");
+    assert_eq!(notices(&mut rx).len(), 1, "the reply reached her");
+
+    s.core
+        .msg(alice, server, "stop".into(), None, None)
+        .unwrap();
+    let said: Vec<String> = drain(&mut rx)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Msg { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].starts_with("ok: stopped"), "{said:?}");
+
+    s.post_as("carol", Some(root), "another answer");
+    assert!(
+        notices(&mut rx).is_empty(),
+        "a muted thread says nothing, reply or not"
+    );
 }

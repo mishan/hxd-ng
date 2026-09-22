@@ -715,6 +715,12 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
+        // A message to the reserved account is a command line, not mail
+        // (`docs/system-account.md` §1). Answered, never delivered and
+        // never stored — there is nobody behind it to read it.
+        if Some(to) == self.system_uid() {
+            return self.run_system_command(from, &text);
+        }
         let (sender, recipient) = {
             let r = self.roster.lock().unwrap();
             let sender = Sender::resolve(&r, from)?;
@@ -756,6 +762,10 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
+        // The same account by name, for a client that addresses by login.
+        if self.is_system_login(to) {
+            return self.run_system_command(from, &text);
+        }
         let directory = self.directory.as_ref().ok_or(ChatError::NoSuchUser)?;
         // One `None` for "no such account" and "that account takes no
         // offline messages", so this path cannot be used to tell them
@@ -784,6 +794,24 @@ impl Core {
             guid,
             media,
         )
+    }
+
+    /// Parse, act, answer. The sender's ack is `Delivered`, because
+    /// from the wire's point of view the message arrived: what happened
+    /// to it is in the answer, which is on its way back as a private
+    /// message of its own.
+    fn run_system_command(&self, from: Uid, text: &str) -> Result<MsgOutcome, ChatError> {
+        // A session that is not on the roster is not one that can be
+        // answered, and this is the same refusal any other message path
+        // would give it.
+        {
+            let r = self.roster.lock().unwrap();
+            r.users.get(&from).ok_or(ChatError::NoSuchUser)?;
+        }
+        if let Some(answer) = self.system_command(from, text) {
+            self.system_reply(from, answer);
+        }
+        Ok(MsgOutcome::Delivered)
     }
 
     fn deliver(
@@ -1542,6 +1570,13 @@ impl Core {
     pub fn kick(&self, target: Uid, ban_for: Option<Duration>) -> Result<String, ChatError> {
         let mut r = self.roster.lock().unwrap();
         let sess = r.users.get(&target).ok_or(ChatError::NoSuchUser)?;
+        // The server cannot be kicked off its own roster
+        // (`docs/system-account.md` §2). Refused the same way a kick of
+        // somebody who is not there is refused, because from the
+        // moderator's point of view there is nobody there to kick.
+        if sess.system {
+            return Err(ChatError::NoSuchUser);
+        }
         let nick = sess.info.nick.clone();
         if let Some(dur) = ban_for {
             let ban = Ban {
@@ -1848,6 +1883,7 @@ mod inbox_tests {
                 is_person: true,
                 reads_on_delivery: false,
                 identity: Some(fingerprint),
+                system: false,
             })
             .unwrap();
         core.announce(uid);
@@ -1876,6 +1912,7 @@ mod inbox_tests {
                 is_person: has_inbox,
                 reads_on_delivery: false,
                 identity: None,
+                system: false,
             })
             .unwrap();
         core.announce(uid);
@@ -2568,6 +2605,7 @@ mod inbox_tests {
                 is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(3)),
+                system: false,
             })
             .unwrap();
         core.announce(g);
@@ -2607,6 +2645,7 @@ mod inbox_tests {
                 is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(7)),
+                system: false,
             })
             .unwrap();
         core.announce(g);

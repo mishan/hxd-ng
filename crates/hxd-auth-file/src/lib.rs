@@ -292,6 +292,15 @@ pub struct FileAuth {
     /// reading and parsing every account on every identity auth; a file
     /// whose size or mtime moved is re-read, so a hand edit still counts.
     index: Mutex<HashMap<String, (FileStamp, Option<String>)>>,
+    /// A login nobody may authenticate as, lowercase: the reserved
+    /// server account (`docs/system-account.md` §2). It is on the roster
+    /// and it is a mailbox, and it is reachable by nobody — which for
+    /// this one account is the intended state rather than the
+    /// misconfiguration the identity spec warns about. Enforced here
+    /// rather than in each frontend, so no login path can miss it, and
+    /// answered `NoSuchAccount` because as far as a would-be logger-in
+    /// is concerned there is no account there.
+    reserved: Option<String>,
 }
 
 /// Enough of a file's metadata to notice an edit.
@@ -307,7 +316,20 @@ impl FileAuth {
             dir: dir.into(),
             assoc: Mutex::new(()),
             index: Mutex::new(HashMap::new()),
+            reserved: None,
         }
+    }
+
+    /// Reserve a login. Nothing authenticates as it and nothing looks it
+    /// up; an account file of that name, from a server migrated from
+    /// something else, stops being a way in.
+    pub fn reserving(mut self, login: &str) -> Self {
+        self.reserved = Some(login.to_ascii_lowercase());
+        self
+    }
+
+    fn is_reserved(&self, login: &str) -> bool {
+        self.reserved.as_deref() == Some(login)
     }
 
     /// Read every account file and report what an operator would want to
@@ -412,6 +434,9 @@ impl FileAuth {
     }
 
     fn load(&self, login: &str) -> Result<AccountFile, AuthError> {
+        if self.is_reserved(login) {
+            return Err(AuthError::NoSuchAccount);
+        }
         let path = self.dir.join(format!("{login}.toml"));
         let text = std::fs::read_to_string(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -616,8 +641,14 @@ impl AuthBackend for FileAuth {
             // otherwise write a password-less `guest.toml` with a
             // fingerprint in it, and `lookup("")` would find it. An
             // existing account file collides on its own, which covers
-            // reserved names.
-            if !valid_login(&candidate) || is_reserved_login(&candidate) {
+            // reserved names. The server's own login is skipped the same
+            // way: a file written under it could never be logged in to,
+            // and the handle behind it would be left holding a login that
+            // refuses it and an orphan with its fingerprint in.
+            if !valid_login(&candidate)
+                || is_reserved_login(&candidate)
+                || self.is_reserved(&candidate)
+            {
                 candidate = format!("{base}-{n}");
                 continue;
             }
@@ -1526,6 +1557,35 @@ mod tests {
         assert!(made);
         assert_eq!(acct.login, "guest-2");
         assert!(!td.path().join("guest.toml").exists());
+    }
+
+    #[test]
+    fn the_reserved_login_is_nobody_to_log_in_as() {
+        // A migrated server's account file of the same name, password
+        // and all, stops being a way in.
+        let (td, auth) = backend();
+        write(td.path(), "server.toml", "password = \"hunter2\"\n");
+        let auth = auth.reserving("Server");
+        assert!(matches!(
+            auth.authenticate("server", Proof::Plain(b"hunter2")),
+            Err(AuthError::NoSuchAccount)
+        ));
+        assert!(matches!(
+            auth.lookup("SERVER"),
+            Err(AuthError::NoSuchAccount)
+        ));
+    }
+
+    #[test]
+    fn create_never_writes_the_reserved_login() {
+        let (td, auth) = backend();
+        let auth = auth.reserving("server");
+        let (acct, made) = auth
+            .find_or_create_linked("server", "Server", &[6u8; 32], AccessBits::empty())
+            .unwrap();
+        assert!(made);
+        assert_eq!(acct.login, "server-2");
+        assert!(!td.path().join("server.toml").exists());
     }
 
     #[test]

@@ -1,6 +1,12 @@
 # The system account — where commands live
 
-Status: draft, unimplemented. This document is the rule three others
+Status: partial. Built: the account on the roster, the reserved login,
+the command line and `/help`, `/msg`, `/block`, `/unblock`, `/blocks`
+and `/stop`, the rate limit, and `[system]`. Not built: `/report` and
+`/vouch`, which wait on the subsystems they belong to (moderation is
+schema only; vouching is unimplemented), and §4's queued-mail option,
+which is not to be defaulted on before it has been seen on a real 1.5
+client. This document is the rule three others
 were each half-stating: `moderation.md` §6 rejected a `/report` chat
 command, `private-messages.md` §7 rejected a `/msg <login>` pseudo-user,
 and `news.md` §10.11 then required "a real mailbox for the server" that
@@ -44,19 +50,23 @@ it *to the server*, and never where they addressed it to the room.
 
 One reserved account, `[system] login` (default `server`), with a
 display name `[system] nick` (default `Server`) and an icon
-`[system] icon`. It is created on first start like the guest account,
-as an account file marked `system = true`.
+`[system] icon`. It has no account file: there is nothing an account
+file holds that it needs, and its login is reserved whether or not one
+exists.
 
-**Nobody can log into it.** It has no password and `[identity] login =
-false`, which `hotline-ng-identity.md` §8.3 describes as "reachable by
-nobody" and warns about at startup. For this one account that state is
-the intended one, and `system = true` is what tells the startup check
-so, rather than the operator having to ignore a warning. Its access
+**Nobody can log into it.** As built, the reserved login is refused by
+the auth backend itself — one place every frontend's login already goes
+through, answered `NoSuchAccount`, so an account file of that name left
+by a migrated server stops being a way in and no login path can forget
+to check. The `system = true` account file of the original design, and
+with it the §8.3 "reachable by nobody" exemption, is what this needs
+when the account grows things an account file holds; it does not have
+any yet. Its access
 bitmap is empty; it never sends chat, never joins a room, never
 transfers a file. Everything it does, it does as the server.
 
 **It is always on the roster**, on both wires: a session created at
-startup with the first uid the roster hands out — a real uid, not a
+startup, before any client can connect, holding a real uid — not a
 magic number, because `private-messages.md` §6.4 already found that uid
 0 goes through the broadcast path on a period client — with `admin`
 set, so a 1.x list draws it in red and an ng client can mark it. The
@@ -66,7 +76,9 @@ the moderation sense: kick and ban refuse it. It is not counted toward
 
 **It is a mailbox.** `Notification.from` in the news document, which is
 `None` today because there is nobody to reply to, becomes this
-account's mailbox. News notifications, moderation's report lines to
+account's mailbox. *(Built: the account answers commands as itself.
+Routing news and moderation notifications through it is the next
+step.)* News notifications, moderation's report lines to
 moderators (`moderation.md` §4.5), and any future thing the server has
 to say to one person come from it, as private messages with a uid a
 client can reply to. That is the reason it exists on the roster at all
@@ -92,11 +104,11 @@ has.
 | Command | Does | Needs |
 |---|---|---|
 | `/help` | The list below, in one message | — |
-| `/report <who> <reason…>` | Files a report against that user, exactly as the ng `report { user }` request does, with the reason as `evidence`. The reporter gets `ok: report #17 filed` and the moderators get what `moderation.md` §4.5 says they get | the ng `report` rules; one per target per hour |
+| `/report <who> <reason…>` *(not built)* | Files a report against that user, exactly as the ng `report { user }` request does, with the reason as `evidence`. The reporter gets `ok: report #17 filed` and the moderators get what `moderation.md` §4.5 says they get | the ng `report` rules; one per target per hour |
 | `/msg <login> <text…>` | Sends a private message to an account by login, whether or not it holds a session — the ng `msg { to_login }` request. The answer says `sent` or `queued`. This is the addressing mechanism `private-messages.md` §7 declined to invent as a pseudo-user; as a command to the account that already exists it costs nothing it was worried about | `send_msgs` |
 | `/block <who>`, `/unblock <who>`, `/blocks` | The three ng block requests | — |
-| `/stop [#article]` | Unsubscribes from the news scope of the most recent notification this account sent the user, or from the thread of the named article. `news.md` §10.11 | — |
-| `/vouch <who>`, `/unvouch <who>`, `/vouches` | `identity-vouch.md` §3.2, by nick: the roster session's identity fingerprint is what gets vouched for, so a period client can vouch for the person it can see | `[extra] vouch` |
+| `/stop [#article]` | Stops the news scope of the most recent notification this account sent the user, or the thread of the named article. A thread is **muted** rather than unfollowed, because a reply to your article or a citation of it reaches you with no subscription at all and only a mute silences it; a category is unfollowed. `news.md` §10.11 | — |
+| `/vouch <who>`, `/unvouch <who>`, `/vouches` *(not built)* | `identity-vouch.md` §3.2, by nick: the roster session's identity fingerprint is what gets vouched for, so a period client can vouch for the person it can see | `[extra] vouch` |
 
 Every command runs **as the session that sent it**, with that session's
 access and identity. The system account confers nothing; it is a place
@@ -176,6 +188,12 @@ behaviour has been.
 
 ## 7. Open questions
 
+- **A nick that is not reserved.** The login is; a session with
+  `use_any_name` can still call itself *Server*. The roster row carries
+  `system: true` and the account holds a real uid, so nothing is
+  confused about which is which, but a period client's user list shows
+  two identical names. Reserved-nick handling belongs with the identity
+  spec's reserved names rather than here.
 - **Should the system account be hidden from the ng roster** and
   surfaced as a first-class "server" affordance instead? An ng client
   has no need of a fake user row; it has requests. But hiding it makes

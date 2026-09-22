@@ -511,7 +511,16 @@ async fn run_target(
         if *stop.borrow() {
             break;
         }
-        let users = core.snapshot().len().min(u16::MAX as usize) as u16;
+        // People, not rows: the reserved server account sits on the
+        // roster so a private message to it has a uid to open a window
+        // on, and a tracker listing that counted it would show every
+        // empty server with one user (`docs/system-account.md` §2).
+        let users = core
+            .snapshot()
+            .iter()
+            .filter(|u| !u.system)
+            .count()
+            .min(u16::MAX as usize) as u16;
         let heartbeat = tokio::select! {
             result = send_heartbeat(
                 &address,
@@ -1297,7 +1306,10 @@ mod tests {
                 ),
             ],
         };
-        let core = Arc::new(Core::new());
+        // The system account is on the roster too, and a tracker is
+        // told about people, not rows: the count below stays 1.
+        let core = Arc::new(Core::new().with_system(hxd_core::SystemPolicy::default()));
+        core.start_system_session().unwrap();
         let (uid, _events) = core
             .attach(hxd_core::AttachInfo {
                 nick: "Visible".into(),
@@ -1313,6 +1325,7 @@ mod tests {
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,
+                system: false,
             })
             .unwrap();
         core.announce(uid);

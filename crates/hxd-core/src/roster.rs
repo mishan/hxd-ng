@@ -101,6 +101,10 @@ pub struct UserInfo {
     /// Administrator affordance (the legacy edge renders it as color
     /// bit 2).
     pub admin: bool,
+    /// The reserved server account (`docs/system-account.md` §2). A
+    /// client may draw it differently; a legacy one sees an admin, which
+    /// is the closest that wire has to "not a person".
+    pub system: bool,
     pub status: SessionStatus,
 }
 
@@ -391,6 +395,11 @@ pub(crate) struct UserSession {
     pub(crate) is_person: bool,
     /// See [`AttachInfo::reads_on_delivery`].
     pub(crate) reads_on_delivery: bool,
+    /// The reserved server account (`crate::system`). One session ever,
+    /// made at startup: it cannot be kicked or banned, a tracker is not
+    /// told about it, and a private message to it is a command rather
+    /// than mail.
+    pub(crate) system: bool,
     /// This session's identity fingerprint — the durable half of its
     /// mailbox key. See [`AttachInfo::identity`].
     pub(crate) identity: Option<[u8; 32]>,
@@ -439,6 +448,11 @@ pub struct AttachInfo {
     /// their badge wrong on every other client they own, and their mail
     /// ageing on the 30-day unread clock instead of the 7-day read one.
     pub reads_on_delivery: bool,
+    /// This session is the reserved server account
+    /// (`docs/system-account.md` §2). Set by
+    /// [`Core::start_system_session`] and by nothing else — a login can
+    /// never ask for it.
+    pub system: bool,
     /// The identity this session belongs to: **the account's linked
     /// fingerprint** where there is one, and otherwise the fingerprint
     /// the transport authenticated with.
@@ -704,6 +718,9 @@ pub struct Core {
     /// What a registration may do: how many devices a mailbox holds, and
     /// whether an endpoint on a private network is acceptable.
     pub(crate) push_policy: crate::push::PushPolicy,
+    /// The reserved server account, or `None` when `[system]` did not
+    /// ask for one. See [`crate::system`].
+    pub(crate) system: Option<crate::system::SystemState>,
     /// What each account has left of its hourly news pushes
     /// (`[news.notify] max_per_hour`), keyed by the mailbox rule. Its own
     /// lock, taken with nothing else held.
@@ -840,6 +857,7 @@ impl Core {
                     transport: info.transport,
                     nick: info.nick,
                     icon: info.icon,
+                    system: info.system,
                     admin: info.admin,
                     status: SessionStatus::Active,
                 },
@@ -852,6 +870,7 @@ impl Core {
                 attach_news: info.attach_news,
                 is_person: info.is_person,
                 reads_on_delivery: info.reads_on_delivery,
+                system: info.system,
                 identity: info.identity,
                 history_refill: Instant::now(),
                 history_tokens: 10.0,
@@ -1167,6 +1186,7 @@ pub(crate) fn test_attach(
             is_person: false,
             reads_on_delivery: false,
             identity: None,
+            system: false,
         })
         .unwrap();
     core.announce(uid);
@@ -1204,6 +1224,7 @@ mod tests {
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,
+                system: false,
             })
             .unwrap();
         core.announce(uid);
@@ -1281,6 +1302,7 @@ mod tests {
                 is_person: false,
                 reads_on_delivery: false,
                 identity: None,
+                system: false,
             })
             .unwrap();
 
