@@ -36,6 +36,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
 use crate::caps::{cap, Caps};
+use crate::encoding::TextEncoding;
 use crate::files;
 use crate::frame::{pack_frame, read_frame, Frame, ReadError, MAX_FRAME_DATA};
 use crate::media;
@@ -285,7 +286,12 @@ fn reply(tx: &Tx, trans: u32, chunks: Vec<(u16, Vec<u8>)>) {
     });
 }
 
+/// Task error texts are the server's own words and ASCII, which is the
+/// same bytes in Mac Roman and in UTF-8 — so one conversion serves every
+/// connection whatever it negotiated. The assertion keeps it that way: a
+/// text that needed the connection's encoding would have to be passed it.
 fn reply_error(tx: &Tx, trans: u32, msg: &str) {
+    debug_assert!(msg.is_ascii(), "task error text must be ASCII: {msg:?}");
     let _ = tx.send(Outbound::Reply {
         trans,
         error: true,
@@ -297,6 +303,7 @@ fn reply_error(tx: &Tx, trans: u32, msg: &str) {
 /// inline-media extension's optional error code needs
 /// (`docs/inline-media.md` §7.2).
 fn reply_error_with(tx: &Tx, trans: u32, msg: &str, extra: Vec<(u16, Vec<u8>)>) {
+    debug_assert!(msg.is_ascii(), "task error text must be ASCII: {msg:?}");
     let mut chunks = vec![(tag::TASK_ERROR, text::from_utf8(msg))];
     chunks.extend(extra);
     let _ = tx.send(Outbound::Reply {
@@ -317,13 +324,12 @@ fn notify(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
     let _ = tx.send(Outbound::Notify { ty, chunks });
 }
 
-/// The domain is UTF-8; this edge speaks Mac Roman. Egress conversion is
-/// lossy (`?` for unmappable) and nicks are truncated to the wire's 31
-/// bytes *after* conversion (Mac Roman is single-byte, so no split risk).
-fn mac_nick(nick: &str) -> Vec<u8> {
-    let mut v = text::from_utf8(nick);
-    v.truncate(31);
-    v
+/// The domain is UTF-8; this edge speaks the connection's encoding. On
+/// Mac Roman egress is lossy (`?` for unmappable), and either way a nick
+/// is cut to the wire's 31 bytes *after* conversion, at a character
+/// boundary.
+fn wire_nick(enc: TextEncoding, nick: &str) -> Vec<u8> {
+    enc.encode_capped(nick, 31)
 }
 
 /// The legacy color field is a bitfield in practice: bit 1 away, bit 2
@@ -352,8 +358,8 @@ fn wire_color(u: &UserInfo, mark_cleartext: bool) -> u16 {
 
 /// The `HTLS_DATA_USER_LIST` payload: uid, icon, color, nlen (all u16 BE),
 /// then the name bytes. `struct hl_userlist_hdr` minus the chunk header.
-fn userlist_payload(u: &UserInfo, mark_cleartext: bool) -> Vec<u8> {
-    let nick = mac_nick(&u.nick);
+fn userlist_payload(u: &UserInfo, mark_cleartext: bool, enc: TextEncoding) -> Vec<u8> {
+    let nick = wire_nick(enc, &u.nick);
     let mut v = Vec::with_capacity(8 + nick.len());
     v.extend_from_slice(&u.uid.to_be_bytes());
     v.extend_from_slice(&u.icon.to_be_bytes());
@@ -363,7 +369,11 @@ fn userlist_payload(u: &UserInfo, mark_cleartext: bool) -> Vec<u8> {
     v
 }
 
-fn user_change_chunks(u: &UserInfo, mark_cleartext: bool) -> Vec<(u16, Vec<u8>)> {
+fn user_change_chunks(
+    u: &UserInfo,
+    mark_cleartext: bool,
+    enc: TextEncoding,
+) -> Vec<(u16, Vec<u8>)> {
     vec![
         (tag::UID, u.uid.to_be_bytes().to_vec()),
         (tag::ICON, u.icon.to_be_bytes().to_vec()),
@@ -371,7 +381,7 @@ fn user_change_chunks(u: &UserInfo, mark_cleartext: bool) -> Vec<(u16, Vec<u8>)>
             tag::COLOUR,
             wire_color(u, mark_cleartext).to_be_bytes().to_vec(),
         ),
-        (tag::NAME, mac_nick(&u.nick)),
+        (tag::NAME, wire_nick(enc, &u.nick)),
     ]
 }
 
@@ -379,10 +389,6 @@ fn user_change_chunks(u: &UserInfo, mark_cleartext: bool) -> Vec<(u16, Vec<u8>)>
 /// (`hl_decode` in the C tree).
 fn hl_decode(data: &[u8]) -> Vec<u8> {
     data.iter().map(|b| !b).collect()
-}
-
-fn cap31(data: &[u8]) -> &[u8] {
-    &data[..data.len().min(31)]
 }
 
 /// The `CHAT_ID` of a voice transaction. Absent means the public chat,
@@ -456,58 +462,27 @@ fn stamp(t: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
-/// UTF-8 → Mac Roman, with the line endings this wire uses.
-///
-/// The conversion belongs here and not in the stored text: the domain
-/// holds whatever the sender's wire gave it — an ng client's `\n`, a
-/// legacy client's `\r` — and each frontend renders that in its own
-/// terms, exactly as with Mac Roman itself. A 1.x client draws a bare
-/// `\n` as a glyph rather than a line break, so a multi-line private
-/// message from an ng client arrived as one run of text with a symbol in
-/// it, and the queued stamp (which is `\r`) made a body with both. CRLF
-/// collapses to one `\r`, or the pair renders as a blank line.
-fn mac_text(text: &str) -> Vec<u8> {
-    let bytes = text::from_utf8(text);
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
-                out.push(b'\r');
-                i += 2;
-            }
-            b'\n' => {
-                out.push(b'\r');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
 // --- Chat line formatting ----------------------------------------------
 //
 // Hotline chat is server-formatted: the server composes the display line
 // and clients render it verbatim. These mirror the reference server's
 // default formats — `"\r%13.13s:  %s"` and `"\r *** %s %s"` — byte for
 // byte, name field right-aligned in 13 columns and truncated to 13.
+//
+// The leading `\r` is the line's framing, not a line ending in the text,
+// so it stays `\r` on a UTF-8 connection too: it is what every client
+// splits a chat push on, and the Text-Encoding spec's LF rule is about
+// the text a line carries. That text never contains a break — it is
+// split on CR and LF and each piece attributed on its own.
 
-fn format_chat_line(out: &mut Vec<u8>, nick: &[u8], line: &[u8], style: u16) {
+fn format_chat_line(out: &mut Vec<u8>, enc: TextEncoding, nick: &[u8], line: &[u8], style: u16) {
     out.push(b'\r');
     if style == 1 {
         out.extend_from_slice(b" *** ");
         out.extend_from_slice(nick);
         out.push(b' ');
     } else {
-        let shown = &nick[..nick.len().min(13)];
-        for _ in shown.len()..13 {
-            out.push(b' ');
-        }
-        out.extend_from_slice(shown);
+        out.extend(enc.name_column(nick));
         out.extend_from_slice(b":  ");
     }
     out.extend_from_slice(line);
@@ -518,18 +493,18 @@ fn format_chat_line(out: &mut Vec<u8>, nick: &[u8], line: &[u8], style: u16) {
 /// `\r`/`\n`, including CRLF pairs) are skipped rather than rendered as
 /// blank attributed lines. Input that is *only* delimiters (or empty)
 /// still formats one empty line — the reference's "no token found" path.
-fn format_chat(nick: &[u8], text: &[u8], style: u16) -> Vec<u8> {
+fn format_chat(enc: TextEncoding, nick: &[u8], text: &[u8], style: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len() + 32);
     let mut wrote = false;
     for line in text.split(|b| *b == b'\r' || *b == b'\n') {
         if line.is_empty() {
             continue;
         }
-        format_chat_line(&mut out, nick, line, style);
+        format_chat_line(&mut out, enc, nick, line, style);
         wrote = true;
     }
     if !wrote {
-        format_chat_line(&mut out, nick, b"", style);
+        format_chat_line(&mut out, enc, nick, b"", style);
     }
     out
 }
@@ -544,7 +519,7 @@ fn format_chat(nick: &[u8], text: &[u8], style: u16) -> Vec<u8> {
 /// allow, and the store keeps the body as it was said. The split is on
 /// the encoded bytes so nothing the encoding produces can slip through
 /// either.
-fn format_replay(line: &hxd_core::LogLine) -> Vec<u8> {
+fn format_replay(line: &hxd_core::LogLine, enc: TextEncoding) -> Vec<u8> {
     let seconds = line
         .at
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -555,16 +530,16 @@ fn format_replay(line: &hxd_core::LogLine) -> Vec<u8> {
         hour = day / 3600,
         minute = day / 60 % 60
     );
-    let mut attribution = text::from_utf8(&prefix);
+    let mut attribution = enc.encode(&prefix);
     if line.flags.contains(hxd_core::LineFlags::ACTION) {
         attribution.extend_from_slice(b"*** ");
-        attribution.extend(mac_nick(&line.from_nick));
+        attribution.extend(wire_nick(enc, &line.from_nick));
         attribution.push(b' ');
     } else {
-        attribution.extend(mac_nick(&line.from_nick));
+        attribution.extend(wire_nick(enc, &line.from_nick));
         attribution.extend_from_slice(b":  ");
     }
-    let body = text::from_utf8(&line.text);
+    let body = enc.encode(&line.text);
     let mut out = Vec::with_capacity(body.len() + attribution.len());
     let mut wrote = false;
     for segment in body.split(|b| *b == b'\r' || *b == b'\n') {
@@ -652,7 +627,7 @@ fn parse_login(f: &Frame) -> LoginRequest {
     let mut req = LoginRequest::default();
     for c in f.chunks() {
         match c.tag {
-            tag::NAME => req.nick = Some(cap31(c.data).to_vec()),
+            tag::NAME => req.nick = Some(c.data.to_vec()),
             tag::ICON => req.icon = c.as_uint() as u16,
             tag::VERSION => req.clientversion = c.as_uint() as u16,
             tag::CAPABILITIES => req.caps = Caps::from_wire(c.data),
@@ -660,12 +635,12 @@ fn parse_login(f: &Frame) -> LoginRequest {
                 if c.data.len() == 1 && c.data[0] == 0 {
                     req.hope_probe = true;
                 } else {
-                    req.login = hl_decode(cap31(c.data));
+                    req.login = hl_decode(c.data);
                 }
             }
             // A single NUL byte is "no password" on the wire.
             tag::PASSWORD if !(c.data.len() == 1 && c.data[0] == 0) => {
-                req.password = hl_decode(cap31(c.data));
+                req.password = hl_decode(c.data);
             }
             _ => {}
         }
@@ -685,6 +660,10 @@ struct Session {
     /// gated on these: a client that didn't negotiate a capability must
     /// never be sent its transactions.
     caps: Caps,
+    /// Every text field in and out, from bit 1 of `caps`. Fixed at login:
+    /// the spec negotiates it once, and a connection whose encoding could
+    /// change would have text in flight in the old one.
+    enc: TextEncoding,
     history_replayed: bool,
     /// Download budget for 751, refilled continuously. Per connection
     /// rather than per account, because it bounds this socket's writes:
@@ -1016,14 +995,24 @@ async fn login_phase(
         return None;
     }
 
+    // The encoding comes from the same frame as the credentials, so it is
+    // settled before anything in that frame is read as text. Bit 1 needs
+    // nothing wired to be honored, but it is still only honored when the
+    // server lists it: the echo below is what tells the client which
+    // encoding it got, and the two must agree.
+    let enc = TextEncoding::negotiated(req.caps.intersect(ctx.cfg.caps));
+
     // Authenticate on the blocking pool — backends do file I/O. Login and
-    // password are canonicalized Mac Roman → UTF-8 before the backend sees
-    // them, so an accented password typed on a legacy client matches the
-    // UTF-8 account file. (HOPE proofs will need this same canonical form.)
+    // password are canonicalized to UTF-8 from the connection's encoding
+    // before the backend sees them, so an accented password typed on a
+    // legacy client matches the UTF-8 account file, and matches it
+    // whichever encoding the client negotiated. (HOPE proofs will need
+    // this same canonical form.) The wire's 31-byte cap applies to what
+    // was sent, as it always has.
     let auth = ctx.auth.clone();
     let core = ctx.core.clone();
-    let login_str = text::to_utf8(&req.login);
-    let password = text::to_utf8(&req.password).into_bytes();
+    let login_str = enc.decode_capped(&req.login, 31);
+    let password = enc.decode_capped(&req.password, 31).into_bytes();
     let identity_fp = transport.identity.as_ref().map(|t| t.fingerprint);
     let policy = ctx.cfg.trtp_login;
     let verdict = tokio::task::spawn_blocking(move || {
@@ -1060,7 +1049,7 @@ async fn login_phase(
     // the client's own nick to stick; otherwise the account name rules.
     let got_name = req.nick.is_some();
     let nick = match (&req.nick, account.access.has(bit::USE_ANY_NAME)) {
-        (Some(n), true) => text::to_utf8(n),
+        (Some(n), true) => enc.decode_capped(n, 31),
         _ => account.name.clone(),
     };
 
@@ -1128,7 +1117,7 @@ async fn login_phase(
             (tag::UID, uid.to_be_bytes().to_vec()),
             (tag::VERSION, ctx.cfg.version.to_be_bytes().to_vec()),
             (TAG_BANNERID, 0u16.to_be_bytes().to_vec()),
-            (tag::SERVERNAME, text::from_utf8(&ctx.cfg.name)),
+            (tag::SERVERNAME, enc.encode(&ctx.cfg.name)),
         ]
     };
     // The capability echo: the bits we agreed to (settled above, before
@@ -1175,7 +1164,7 @@ async fn login_phase(
     let mut agreement_sent = false;
     if !account.access.has(bit::DONT_SHOW_AGREEMENT) {
         if let Some(text_utf8) = &ctx.cfg.agreement {
-            push(tx, hdr::AGREEMENT, vec![(tag::BODY, mac_text(text_utf8))]);
+            push(tx, hdr::AGREEMENT, vec![(tag::BODY, enc.body(text_utf8))]);
             agreement_sent = true;
         }
     }
@@ -1192,6 +1181,7 @@ async fn login_phase(
         account,
         announced: false,
         caps,
+        enc,
         history_replayed: false,
         media_tokens: ctx
             .core
@@ -1244,7 +1234,7 @@ async fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     (tag::ACCESS, sess.account.access.to_wire().to_vec()),
                     (
                         tag::USER_LIST,
-                        userlist_payload(&me, ctx.cfg.mark_cleartext),
+                        userlist_payload(&me, ctx.cfg.mark_cleartext, sess.enc),
                     ),
                 ],
             );
@@ -1271,7 +1261,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
             push(
                 tx,
                 hdr::USER_CHANGE,
-                user_change_chunks(&u, ctx.cfg.mark_cleartext),
+                user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc),
             );
         }
         Event::Parted(uid) => {
@@ -1289,9 +1279,14 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
             media,
             ..
         } => {
-            // Format at the edge, in Mac Roman, so the 13-column name
-            // alignment stays byte-correct for legacy renderers.
-            let line = format_chat(&mac_nick(&from.nick), &text::from_utf8(&text), style);
+            // Format at the edge, in the connection's encoding, so the
+            // 13-column name alignment stays correct for its renderer.
+            let line = format_chat(
+                sess.enc,
+                &wire_nick(sess.enc, &from.nick),
+                &sess.enc.encode(&text),
+                style,
+            );
             let mut chunks = vec![(tag::BODY, line)];
             if cid != 0 {
                 chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
@@ -1312,7 +1307,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
             let mut line = Vec::with_capacity(text.len() + 3);
             line.push(b'\r');
             line.push(b'<');
-            line.extend_from_slice(&text::from_utf8(&text));
+            line.extend_from_slice(&sess.enc.encode(&text));
             line.push(b'>');
             let mut chunks = vec![(tag::BODY, line)];
             if cid != 0 {
@@ -1327,7 +1322,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                 hdr::CHAT_SUBJECT,
                 vec![
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
-                    (tag::CHAT_SUBJECT, text::from_utf8(&subject)),
+                    (tag::CHAT_SUBJECT, sess.enc.encode(&subject)),
                 ],
             );
         }
@@ -1337,7 +1332,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                 hdr::CHAT_SUBJECT,
                 vec![
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
-                    (tag::PASSWORD, text::from_utf8(&password)),
+                    (tag::PASSWORD, sess.enc.encode(&password)),
                 ],
             );
         }
@@ -1352,7 +1347,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                 vec![
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
                     (tag::UID, from.to_be_bytes().to_vec()),
-                    (tag::NAME, mac_nick(&from_nick)),
+                    (tag::NAME, wire_nick(sess.enc, &from_nick)),
                 ],
             );
         }
@@ -1370,7 +1365,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                             .to_be_bytes()
                             .to_vec(),
                     ),
-                    (tag::NAME, mac_nick(&user.nick)),
+                    (tag::NAME, wire_nick(sess.enc, &user.nick)),
                 ],
             );
         }
@@ -1412,8 +1407,8 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
             let uid = if from == 0 { sess.uid } else { from };
             let mut chunks = vec![
                 (tag::UID, uid.to_be_bytes().to_vec()),
-                (tag::BODY, mac_text(&body)),
-                (tag::NAME, mac_nick(&from_nick)),
+                (tag::BODY, sess.enc.body(&body)),
+                (tag::NAME, wire_nick(sess.enc, &from_nick)),
             ];
             if let Some(media) = media.filter(|_| sess.caps.has(cap::INLINE_MEDIA)) {
                 chunks.extend(media::companion_chunks(&media));
@@ -1430,8 +1425,8 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                 hdr::MSG_BROADCAST,
                 vec![
                     (tag::UID, from.to_be_bytes().to_vec()),
-                    (tag::BODY, mac_text(&text)),
-                    (tag::NAME, mac_nick(&from_nick)),
+                    (tag::BODY, sess.enc.body(&text)),
+                    (tag::NAME, wire_nick(sess.enc, &from_nick)),
                 ],
             );
         }
@@ -1568,11 +1563,16 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .core
                 .snapshot()
                 .iter()
-                .map(|u| (tag::USER_LIST, userlist_payload(u, ctx.cfg.mark_cleartext)))
+                .map(|u| {
+                    (
+                        tag::USER_LIST,
+                        userlist_payload(u, ctx.cfg.mark_cleartext, sess.enc),
+                    )
+                })
                 .collect();
             chunks.push((
                 tag::CHAT_SUBJECT,
-                text::from_utf8(&ctx.core.public_subject()),
+                sess.enc.encode(&ctx.core.public_subject()),
             ));
             reply(tx, f.trans, chunks);
             // Optional compatibility replay, only for clients that did
@@ -1595,7 +1595,11 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             off_reactor(&ctx.core, move |c| c.history(uid, query)).await
                         {
                             for line in page.lines {
-                                push(tx, hdr::CHAT, vec![(tag::BODY, format_replay(&line))]);
+                                push(
+                                    tx,
+                                    hdr::CHAT,
+                                    vec![(tag::BODY, format_replay(&line, sess.enc))],
+                                );
                             }
                         }
                     }
@@ -1608,7 +1612,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::NAME if sess.can(bit::USE_ANY_NAME) => {
-                        nick = Some(text::to_utf8(cap31(c.data)));
+                        nick = Some(sess.enc.decode_capped(c.data, 31));
                     }
                     tag::ICON => icon = Some(c.as_uint() as u16),
                     _ => {}
@@ -1626,7 +1630,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::NAME if sess.can(bit::USE_ANY_NAME) => {
-                        nick = Some(text::to_utf8(cap31(c.data)));
+                        nick = Some(sess.enc.decode_capped(c.data, 31));
                     }
                     tag::ICON => {
                         let v = c.as_uint() as u16;
@@ -1665,6 +1669,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 service.source.as_ref(),
                 dir.as_ref().map(|chunk| chunk.data),
                 large,
+                sess.enc,
             )
             .await
             {
@@ -1680,7 +1685,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
                 return;
             }
-            let entries = match files::list(service.source.as_ref(), &path, large).await {
+            let entries = match files::list(service.source.as_ref(), &path, large, sess.enc).await {
                 Ok(entries) => entries,
                 Err(error) => {
                     reply_error(tx, f.trans, file_error_text(&error));
@@ -1728,6 +1733,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 dir.as_ref().map(|chunk| chunk.data),
                 name.data,
                 large,
+                sess.enc,
             )
             .await
             {
@@ -1774,10 +1780,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             chunks.push((tag::FILE_DATE_MODIFY, files::date(info.modified)));
             chunks.push((
                 tag::FILE_COMMENT,
-                mac_text(info.comment.as_deref().unwrap_or_default())
-                    .into_iter()
-                    .take(255)
-                    .collect(),
+                sess.enc
+                    .body_capped(info.comment.as_deref().unwrap_or_default(), 255),
             ));
             reply(tx, f.trans, chunks);
         }
@@ -1803,6 +1807,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 dir.as_ref().map(|chunk| chunk.data),
                 name.data,
                 large,
+                sess.enc,
             )
             .await
             {
@@ -1865,10 +1870,9 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             let (inferred_type, inferred_creator) = files::type_creator(&entry);
             let type_code = info.type_code.unwrap_or(inferred_type);
             let creator = info.creator_code.unwrap_or(inferred_creator);
-            let comment: Vec<_> = mac_text(info.comment.as_deref().unwrap_or_default())
-                .into_iter()
-                .take(255)
-                .collect();
+            let comment = sess
+                .enc
+                .body_capped(info.comment.as_deref().unwrap_or_default(), 255);
             let prepared = hxd_files::prepare_legacy(
                 &service.transfers,
                 service.source.clone(),
@@ -1944,6 +1948,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 dir.as_ref().map(|chunk| chunk.data),
                 name.data,
                 large,
+                sess.enc,
             )
             .await
             {
@@ -2109,7 +2114,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 match c.tag {
                     tag::CHAT_ID => cid = c.as_uint(),
                     tag::STYLE => style = c.as_uint() as u16,
-                    tag::BODY => body = text::to_utf8(&c.data[..c.data.len().min(MAX_CHAT_INPUT)]),
+                    tag::BODY => body = sess.enc.decode_capped(c.data, MAX_CHAT_INPUT),
                     tag::CHAT_MEDIA_ID => handle = media::parse_handle(c.data),
                     tag::CHAT_MEDIA_TYPE => declared = true,
                     TAG_CHAT_AWAY => {} // No away state yet; rider ignored.
@@ -2225,12 +2230,12 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         let nick = if deleted {
                             Vec::new()
                         } else {
-                            text::from_utf8(&line.from_nick)
+                            sess.enc.encode(&line.from_nick)
                         };
                         let body = if deleted {
                             Vec::new()
                         } else {
-                            text::from_utf8(&line.text)
+                            sess.enc.encode(&line.text)
                         };
                         let timestamp = line
                             .at
@@ -2272,10 +2277,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::CHAT_ID => cid = c.as_uint(),
-                    tag::CHAT_SUBJECT => {
-                        subject = Some(text::to_utf8(&c.data[..c.data.len().min(255)]))
-                    }
-                    tag::PASSWORD => password = Some(text::to_utf8(cap31(c.data))),
+                    tag::CHAT_SUBJECT => subject = Some(sess.enc.decode_capped(c.data, 255)),
+                    tag::PASSWORD => password = Some(sess.enc.decode_capped(c.data, 31)),
                     _ => {}
                 }
             }
@@ -2328,7 +2331,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                                 .to_be_bytes()
                                 .to_vec(),
                         ),
-                        (tag::NAME, mac_nick(&me.nick)),
+                        (tag::NAME, wire_nick(sess.enc, &me.nick)),
                     ],
                 ),
                 Err(e) => reply_error(tx, f.trans, err_text(e)),
@@ -2366,7 +2369,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::CHAT_ID => cid = c.as_uint(),
-                    tag::PASSWORD => password = text::to_utf8(cap31(c.data)),
+                    tag::PASSWORD => password = sess.enc.decode_capped(c.data, 31),
                     _ => {}
                 }
             }
@@ -2374,9 +2377,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 Ok((rows, subject)) => {
                     let mut chunks: Vec<(u16, Vec<u8>)> = rows
                         .iter()
-                        .map(|u| (tag::USER_LIST, userlist_payload(u, ctx.cfg.mark_cleartext)))
+                        .map(|u| {
+                            (
+                                tag::USER_LIST,
+                                userlist_payload(u, ctx.cfg.mark_cleartext, sess.enc),
+                            )
+                        })
                         .collect();
-                    chunks.push((tag::CHAT_SUBJECT, text::from_utf8(&subject)));
+                    chunks.push((tag::CHAT_SUBJECT, sess.enc.encode(&subject)));
                     reply(tx, f.trans, chunks);
                 }
                 Err(e) => reply_error(tx, f.trans, err_text(e)),
@@ -2401,7 +2409,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::UID => to = c.as_uint() as Uid,
-                    tag::BODY => body = text::to_utf8(&c.data[..c.data.len().min(MAX_CHAT_INPUT)]),
+                    tag::BODY => body = sess.enc.decode_capped(c.data, MAX_CHAT_INPUT),
                     tag::CHAT_MEDIA_ID => handle = media::parse_handle(c.data),
                     tag::CHAT_MEDIA_TYPE => declared = true,
                     _ => {}
@@ -2451,7 +2459,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             let body = f
                 .chunks()
                 .find(|c| c.tag == tag::BODY)
-                .map(|c| text::to_utf8(&c.data[..c.data.len().min(MAX_CHAT_INPUT)]))
+                .map(|c| sess.enc.decode_capped(c.data, MAX_CHAT_INPUT))
                 .unwrap_or_default();
             if body.is_empty() {
                 reply_error(tx, f.trans, "Empty broadcast.");
@@ -2494,8 +2502,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 tx,
                 f.trans,
                 vec![
-                    (tag::BODY, text::from_utf8(&info)),
-                    (tag::NAME, mac_nick(&d.info.nick)),
+                    (tag::BODY, sess.enc.body(&info)),
+                    (tag::NAME, wire_nick(sess.enc, &d.info.nick)),
                 ],
             );
         }
@@ -2936,28 +2944,6 @@ mod tests {
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    }
-
-    #[test]
-    fn a_body_leaves_this_wire_with_one_kind_of_line_ending() {
-        // The domain holds what the sender's wire gave it. A 1.x client
-        // draws a bare `\n` as a glyph, so an ng client's multi-line
-        // message arrived as one run of text with a symbol in it — and
-        // the queued stamp is a `\r`, so a stamped one had both.
-        assert_eq!(mac_text("one\ntwo"), b"one\rtwo");
-        assert_eq!(mac_text("one\r\ntwo"), b"one\rtwo");
-        assert_eq!(mac_text("one\rtwo"), b"one\rtwo", "already this wire's");
-        assert_eq!(mac_text("[queued …]\rbody\nmore"), {
-            let mut want = b"[queued ".to_vec();
-            want.extend_from_slice(&text::from_utf8("…"));
-            want.extend_from_slice(b"]\rbody\rmore");
-            want
-        });
-        // Trailing and consecutive delimiters are left as they are: a
-        // blank line is the sender's, not ours to remove.
-        assert_eq!(mac_text("a\n\nb\n"), b"a\r\rb\r");
-        // And the rest of the conversion is unchanged.
-        assert_eq!(mac_text("caf\u{e9}"), text::from_utf8("caf\u{e9}"));
     }
 
     #[test]

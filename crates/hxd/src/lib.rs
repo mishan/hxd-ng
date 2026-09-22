@@ -1307,7 +1307,9 @@ impl Config {
 /// wired and enabled — never from a config key alone, because the echo
 /// is a promise that the extension's transactions will work.
 fn legacy_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>) -> Caps {
-    let mut caps = Caps::empty();
+    // Text-Encoding has nothing to wire: the domain is UTF-8 already, and
+    // the session only has to stop converting. So it is always offered.
+    let mut caps = Caps::empty().with(cap::TEXT_ENCODING);
     if config.history.is_some() {
         caps = caps.with(cap::CHAT_HISTORY);
     }
@@ -3366,7 +3368,11 @@ sync = "full"
         )
         .unwrap();
         assert!(video_enabled(&c));
-        assert!(legacy_caps(&c, None, None).is_empty());
+        // Text-Encoding is the one bit that needs nothing built.
+        assert_eq!(
+            legacy_caps(&c, None, None),
+            Caps::empty().with(cap::TEXT_ENCODING)
+        );
         assert!(ng_caps(&c, None, None).is_empty());
     }
 

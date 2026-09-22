@@ -51,6 +51,7 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 | **Private messages that wait for you** while you are away | receives them | receives them | sends, receives, reads later, blocks |
 | **Sessions that survive the network** — close the app, reopen, nothing missed | shown as away | shown as away | yes |
 | **Chat history** — scrollback the server kept | — | yes | yes |
+| **Any script** — names, chat and messages in UTF-8 | Mac Roman, `?` for the rest | yes | yes |
 | **Images in chat**, re-encoded and metadata-stripped by the server | sees the caption | yes | yes |
 | **Voice chat** — one room, one UDP port, no transcoding | — | yes | yes |
 | **Video** — camera and screen share on the voice connection, opt-in per stream | — | when GtkHx adds it | yes |
