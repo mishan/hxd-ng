@@ -151,6 +151,7 @@ mod tests {
             files: None,
             tracker: None,
             push: None,
+            system: None,
         }
     }
 

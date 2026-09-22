@@ -292,6 +292,15 @@ pub struct FileAuth {
     /// reading and parsing every account on every identity auth; a file
     /// whose size or mtime moved is re-read, so a hand edit still counts.
     index: Mutex<HashMap<String, (FileStamp, Option<String>)>>,
+    /// A login nobody may authenticate as, lowercase: the reserved
+    /// server account (`docs/system-account.md` §2). It is on the roster
+    /// and it is a mailbox, and it is reachable by nobody — which for
+    /// this one account is the intended state rather than the
+    /// misconfiguration the identity spec warns about. Enforced here
+    /// rather than in each frontend, so no login path can miss it, and
+    /// answered `NoSuchAccount` because as far as a would-be logger-in
+    /// is concerned there is no account there.
+    reserved: Option<String>,
 }
 
 /// Enough of a file's metadata to notice an edit.
@@ -307,7 +316,20 @@ impl FileAuth {
             dir: dir.into(),
             assoc: Mutex::new(()),
             index: Mutex::new(HashMap::new()),
+            reserved: None,
         }
+    }
+
+    /// Reserve a login. Nothing authenticates as it and nothing looks it
+    /// up; an account file of that name, from a server migrated from
+    /// something else, stops being a way in.
+    pub fn reserving(mut self, login: &str) -> Self {
+        self.reserved = Some(login.to_ascii_lowercase());
+        self
+    }
+
+    fn is_reserved(&self, login: &str) -> bool {
+        self.reserved.as_deref() == Some(login)
     }
 
     /// Read every account file and report what an operator would want to
@@ -412,6 +434,9 @@ impl FileAuth {
     }
 
     fn load(&self, login: &str) -> Result<AccountFile, AuthError> {
+        if self.is_reserved(login) {
+            return Err(AuthError::NoSuchAccount);
+        }
         let path = self.dir.join(format!("{login}.toml"));
         let text = std::fs::read_to_string(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

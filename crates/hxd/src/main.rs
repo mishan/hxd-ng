@@ -198,6 +198,24 @@ async fn main() {
             None => None,
         };
         let ctx = build_ctx(&config, voice.as_ref(), files.as_ref(), push.as_ref())?;
+        // The reserved account takes the first uid, before any client
+        // can connect: a period client needs a real uid on a private
+        // message for a window to open, and needs it to still be there
+        // when the user hits reply.
+        if let Some(uid) = ctx.core.start_system_session() {
+            let system = config.system.as_ref().expect("a session means a section");
+            tracing::info!(
+                uid,
+                "{} is on the roster as {:?}{}",
+                system.login,
+                system.nick,
+                if system.commands {
+                    ""
+                } else {
+                    " (commands off)"
+                }
+            );
+        }
 
         let listener = TcpListener::bind(&config.server.bind)
             .await

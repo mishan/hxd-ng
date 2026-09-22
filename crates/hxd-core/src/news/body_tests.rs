@@ -78,6 +78,7 @@ fn server_with(policy: NewsPolicy, renderer: Option<Arc<Fake>>) -> (Core, Uid, N
             is_person: true,
             reads_on_delivery: false,
             identity: None,
+            system: false,
         })
         .unwrap();
     core.announce(uid);

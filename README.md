@@ -600,6 +600,31 @@ cannot read it, which makes `full` defensible; the default is `sender`
 because a notification on a lock screen is read by whoever is looking at
 it.
 
+### The server account
+
+Absent means no account on the roster and no commands: a private message
+is a private message on every wire. Present, a reserved account sits on
+the user list, and a private message to it is a command line — which is
+the only place the server reads text as anything but text. **Public chat
+is never parsed**, on any wire: a 1.5 user typing `/report` into the chat
+box gets chat, because that is what they asked for. See
+[docs/system-account.md](docs/system-account.md).
+
+```toml
+[system]              # presence turns it on
+login = "server"      # reserved: nobody can log in as it
+nick = "Server"       # what the user list shows
+icon = 0
+commands = true       # false leaves the account and answers with one line
+rate = 10             # commands a minute, per session
+```
+
+It is what makes a period client able to do things its wire cannot
+express: `/msg <login> <message>` reaches an account whether or not it is
+online, which a 1.5 client's user list has no way to name. `/help`,
+`/block`, `/unblock`, `/blocks` and `/stop` are the rest of what it
+answers today.
+
 ### Voice and video
 
 Both absent by default. Video rides the voice session, so `[voice.video]`

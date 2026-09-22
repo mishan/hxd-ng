@@ -426,6 +426,9 @@ async fn handle_login(
             .identity
             .fingerprint
             .or_else(|| identity.map(|i| i.fingerprint.0)),
+        // Only `Core::start_system_session` ever sets this: a login
+        // cannot ask to be the server.
+        system: false,
     };
     let Some((uid, events)) = ctx.core.attach(attach) else {
         let _ = send_frame(

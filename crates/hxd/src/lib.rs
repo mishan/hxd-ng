@@ -64,6 +64,10 @@ pub struct Config {
     /// UDP registration with Hotline trackers. Absent = the server stays
     /// unlisted and opens no registration sockets.
     pub tracker: Option<tracker::TrackerSection>,
+    /// The reserved server account (`docs/system-account.md`). Absent =
+    /// no account on the roster, and a private message is a private
+    /// message on every wire.
+    pub system: Option<SystemSection>,
     /// Web Push notifications (`docs/webpush-gateway.md` §8). Absent =
     /// no gateway, no `push` capability, and `push_register` answered
     /// `not_available`.
@@ -158,6 +162,61 @@ fn default_max_inflight_per_origin() -> usize {
 }
 fn default_max_devices() -> usize {
     hxd_core::push::DEFAULT_MAX_DEVICES
+}
+
+/// `[system]`: the account commands are addressed to.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemSection {
+    /// The reserved login. Nobody can authenticate as it, whatever
+    /// account file of that name a migrated server may have.
+    #[serde(default = "default_system_login")]
+    pub login: String,
+    /// What the roster shows.
+    #[serde(default = "default_system_nick")]
+    pub nick: String,
+    #[serde(default)]
+    pub icon: u16,
+    /// Parse private messages to it. Off, it stays on the roster as the
+    /// account notifications come from, and answers every message with
+    /// one line saying commands are off.
+    #[serde(default = "default_true")]
+    pub commands: bool,
+    /// Commands a minute, per session.
+    #[serde(default = "default_system_rate")]
+    pub rate: u32,
+}
+
+fn default_system_login() -> String {
+    hxd_core::SystemPolicy::default().login
+}
+fn default_system_nick() -> String {
+    hxd_core::SystemPolicy::default().nick
+}
+fn default_system_rate() -> u32 {
+    hxd_core::SystemPolicy::default().rate
+}
+
+impl SystemSection {
+    pub fn to_policy(&self) -> hxd_core::SystemPolicy {
+        hxd_core::SystemPolicy {
+            login: self.login.to_ascii_lowercase(),
+            nick: self.nick.clone(),
+            icon: self.icon,
+            commands: self.commands,
+            rate: self.rate,
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.login.trim().is_empty() {
+            return Err("[system] login must be a login".into());
+        }
+        if self.nick.trim().is_empty() {
+            return Err("[system] nick must be a name".into());
+        }
+        Ok(())
+    }
 }
 
 /// The Files service (`docs/files-plan.md`).
@@ -1596,6 +1655,9 @@ pub fn check_config(config: &Config) -> Result<(), String> {
             return Err("[push] max_devices must be at least 1".into());
         }
     }
+    if let Some(system) = &config.system {
+        system.check()?;
+    }
     if let Some(files) = &config.files {
         if !matches!(
             (&files.manifest, &files.origin, &files.root),
@@ -2339,7 +2401,12 @@ pub fn build_ctx(
         None => Core::new(),
     };
 
-    let auth = Arc::new(FileAuth::new(&config.paths.accounts));
+    // The reserved login is refused at the one place every frontend's
+    // login goes through, so none of them can miss it.
+    let auth = Arc::new(match config.system.as_ref() {
+        Some(system) => FileAuth::new(&config.paths.accounts).reserving(&system.login),
+        None => FileAuth::new(&config.paths.accounts),
+    });
     // Say at startup what an operator would otherwise learn from a user:
     // an account file that does not parse, or one nothing can log in to.
     auth.audit();
@@ -2380,6 +2447,10 @@ pub fn build_ctx(
             .with_accounts(auth.clone()),
         (None, None) => core,
         _ => return Err("[news] store was not opened".into()),
+    };
+    let core = match config.system.as_ref() {
+        Some(system) => core.with_system(system.to_policy()),
+        None => core,
     };
     let core = with_markdown(core, config);
     let core = with_media(core, config)?;

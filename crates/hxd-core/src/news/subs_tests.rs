@@ -166,6 +166,7 @@ impl Server {
                 is_person: login != "guest",
                 reads_on_delivery: classic,
                 identity,
+                system: false,
             })
             .unwrap();
         self.core.announce(uid);

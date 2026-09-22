@@ -18,6 +18,7 @@ pub mod news;
 pub mod notify;
 pub mod push;
 pub mod roster;
+pub mod system;
 pub mod video;
 pub mod voice;
 
@@ -56,6 +57,7 @@ pub use roster::{
     AttachInfo, Core, Event, IdentityTag, InboxPolicy, Resume, SeqEvent, SessionStatus, Transport,
     Uid, UserDetails, UserInfo, OUTBOX_BUFFER_CAP,
 };
+pub use system::SystemPolicy;
 pub use video::{VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream};
 pub use voice::{
     IceCandidate, MediaEvent, VoiceError, VoiceJoin, VoiceMedia, VoiceParticipant,

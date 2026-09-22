@@ -1111,6 +1111,7 @@ async fn login_phase(
             .identity
             .fingerprint
             .or_else(|| transport.identity.as_ref().map(|t| t.fingerprint)),
+        system: false,
         transport,
     };
     let Some((uid, events)) = ctx.core.attach(attach) else {
