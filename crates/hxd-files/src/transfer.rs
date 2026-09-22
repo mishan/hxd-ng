@@ -518,7 +518,32 @@ fn spend(budget: &mut u64, amount: u64) -> Result<(), FileError> {
 /// Copies exactly `remaining` bytes of an upload into its partial. Each disk
 /// write takes an I/O permit of its own, and the session is checked between
 /// chunks: an upload ends with a kick, as a download does.
+///
+/// Whatever arrived is flushed before this returns, on the way out of a
+/// failure as much as a success: `tokio::fs::File` buffers a write and
+/// dropping one does not push it to the file, so an upload that ends early
+/// would otherwise leave a partial the next resume quote measures as
+/// shorter than it is — or as empty, which discards it.
 async fn copy_exact<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    writer: &mut tokio::fs::File,
+    remaining: u64,
+    source: &LocalFileSource,
+    alive: &Liveness,
+) -> Result<(), FileError> {
+    let result = copy_chunks(reader, writer, remaining, source, alive).await;
+    if let Ok(_permit) = source.acquire_io_permit().await {
+        let flushed = tokio::time::timeout(source.limits().io_timeout, writer.flush())
+            .await
+            .map_err(|_| FileError::Unavailable("local file write stalled".into()))
+            .and_then(|write| write.map_err(|error| unavailable("flush partial upload", error)));
+        result.and(flushed)
+    } else {
+        result
+    }
+}
+
+async fn copy_chunks<R: AsyncRead + Unpin>(
     reader: &mut R,
     writer: &mut tokio::fs::File,
     mut remaining: u64,
