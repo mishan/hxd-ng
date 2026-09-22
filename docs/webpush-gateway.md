@@ -1,8 +1,9 @@
 # The Web Push gateway: the device registry hxd-ng keeps itself
 
-Status: partial. The device registry, its two stores and the three
-mailbox obligations are built; the sender, the wire and the client are
-not. Staged in §9; each stage marks itself here as it lands.
+Status: partial. The device registry and the sender are built; the two
+ng requests, the configuration and the client are not, so nothing
+registers a device yet and nothing is sent in anger. Staged in §9; each
+stage marks itself here as it lands.
 
 [push-notifications.md](push-notifications.md) §0 decided that the first
 gateway is `WebPushGateway`, in-process, and that when it is built it
@@ -403,12 +404,14 @@ the same shape news uses for a server with no `[news.notify]`.
    `hxd inbox purge` takes an account's devices with its mail, and
    `Core::sweep_devices` is the expiry housekeeping. No network, no
    crypto, nothing to configure.
-2. **G2 — the sender.** `hxd-push-webpush`: VAPID, RFC 8291, the
-   headers, the destination check, the breaker. Tested against RFC 8291's
-   test vector, by verifying RFC 8292's example token (an ES256
-   signature is randomized, so it can be verified but not reproduced),
-   and against a mock transport for the answer table of §5. No hxd-ng
-   types in it beyond the trait it implements.
+2. **G2 — the sender. Built.** `hxd-push-webpush`: the VAPID keypair
+   and its token, RFC 8291 encryption, RFC 8030's headers, the
+   destination check, the per-origin breaker and the in-flight caps, and
+   the answer table. RFC 8291's own vector, and RFC 8292's example token
+   verified (an ES256 signature is randomized, so it can be verified but
+   not reproduced), are the tests for the two that cannot be checked by
+   reading; the answer table and everything the gateway decides are
+   tested behind a transport seam, so no TLS server is needed in CI.
 3. **G3 — the wire.** `push_register`, `push_unregister`, the `push`
    block, `caps`, `[push]`, the keypair on first start, and
    `hxd push rekey`. E2E with the scripted ng client. A listing command

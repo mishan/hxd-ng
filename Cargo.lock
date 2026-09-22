@@ -1139,6 +1139,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "hxd-push-webpush"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "bytes",
+ "hkdf",
+ "hmac",
+ "http-body-util",
+ "hxd-core",
+ "hyper",
+ "hyper-util",
+ "p256",
+ "rand_core 0.6.4",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
 name = "hxd-session"
 version = "0.1.0"
 dependencies = [

@@ -16,6 +16,7 @@ members = [
     "crates/hxd-session",
     "crates/hxd-voice",
     "crates/hxd-ng-session",
+    "crates/hxd-push-webpush",
     "crates/hxd-store-sqlite",
     "crates/hxd",
     "crates/hlid",
@@ -43,6 +44,7 @@ hxd-ng-session = { path = "crates/hxd-ng-session" }
 hxd-media = { path = "crates/hxd-media" }
 hxd-markdown = { path = "crates/hxd-markdown" }
 hxd-voice = { path = "crates/hxd-voice" }
+hxd-push-webpush = { path = "crates/hxd-push-webpush" }
 hxd-store-sqlite = { path = "crates/hxd-store-sqlite" }
 
 # External.
