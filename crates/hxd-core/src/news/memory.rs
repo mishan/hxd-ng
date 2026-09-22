@@ -335,6 +335,30 @@ impl Inner {
             .count()
     }
 
+    /// When the oldest — or, for `newest`, the newest — of the articles
+    /// [`Self::unread_before`] counts was posted. `None` when it counts
+    /// none. The stale floor of §10.7 measures from the first and asks
+    /// its period question against the second.
+    fn earlier_at(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        last_seen: ArticleId,
+        before: ArticleId,
+        newest: bool,
+    ) -> Option<SystemTime> {
+        let times = self
+            .in_scope(scope)
+            .filter(|a| a.id > last_seen && a.id < before)
+            .filter(|a| !a.deleted && !a.author.is(owner))
+            .map(|a| a.at);
+        if newest {
+            times.max()
+        } else {
+            times.min()
+        }
+    }
+
     /// Is there something at `scope` to subscribe to?
     fn check_target(&self, scope: SubScope) -> Result<(), NewsError> {
         match scope {
@@ -917,6 +941,8 @@ impl NewsStore for MemoryNews {
                 muted: r.muted,
                 unread: inner.unread(&r.owner, r.scope, r.last_seen),
                 earlier: inner.unread_before(&r.owner, r.scope, r.last_seen, article),
+                earlier_oldest: inner.earlier_at(&r.owner, r.scope, r.last_seen, article, false),
+                earlier_newest: inner.earlier_at(&r.owner, r.scope, r.last_seen, article, true),
             })
             .collect())
     }

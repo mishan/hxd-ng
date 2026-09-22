@@ -300,6 +300,11 @@ pub struct NewsNotifySection {
     /// badges and events with no pushes at all.
     #[serde(default = "default_news_max_per_hour")]
     pub max_per_hour: u32,
+    /// Seconds a scope may stay un-caught-up before it rings anyway
+    /// (§10.7). Without it a client that never marks anything seen hears
+    /// about a scope once and never again. 0 disables the floor.
+    #[serde(default = "default_news_stale_after")]
+    pub stale_after: u64,
 }
 
 fn default_news_auto_subscribe() -> String {
@@ -313,6 +318,9 @@ fn default_news_max_subs() -> usize {
 }
 fn default_news_max_per_hour() -> u32 {
     hxd_core::NotifyPolicy::default().max_per_hour
+}
+fn default_news_stale_after() -> u64 {
+    hxd_core::NotifyPolicy::default().stale_after.as_secs()
 }
 
 impl NewsSection {
@@ -336,6 +344,7 @@ impl NewsSection {
                 reference: n.reference,
                 max_subs: n.max_subs,
                 max_per_hour: n.max_per_hour,
+                stale_after: Duration::from_secs(n.stale_after),
             }),
             markdown: hxd_core::MarkdownMode::from_name(&self.markdown)
                 .unwrap_or(hxd_core::MarkdownMode::Off),

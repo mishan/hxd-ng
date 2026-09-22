@@ -5,7 +5,7 @@ Status: the ng wire is built — §16 says which stages, and which keys of
 image part (§12.3) and the mhxd importer (§12.6) are designed and not
 built; the last two are deferred and get status lines of their own when
 scheduled. §10.7's `stale_after` floor is a 2026-09 amendment and is
-not built either.
+built.
 
 ROADMAP Phase 4 promises "1.2 flat news post/read, and the 1.5 threaded
 news tree (categories, bundles, threads)". When this was written nothing
@@ -2380,7 +2380,11 @@ each row of the grammar finds. Subscriptions are schema version 5:
 `news_sub`, the audience and the catch-up rule in `hxd-core::news::subs`,
 `news_notify`, the five requests of §10.9, `[news.notify]`, and
 `Notification` as a sum with `NewsNotice` in it — tested with a
-recording gateway, since no gateway exists yet. Attachments are schema
+recording gateway, since no gateway exists yet. The `stale_after` floor
+under the catch-up rule is built with it: the audience scan dates the
+oldest and newest unread article older than the post, and the floor is
+the period comparison between them, so a subscriber who never marks
+anything seen hears about a scope once a period rather than once ever. Attachments are schema
 version 6: the content-addressed filesystem `BlobStore`, staged handles,
 atomic article binding and refcounts, legacy derivatives, quotas and
 orphan cleanup, hash blocking, authenticated ng upload/download routes,

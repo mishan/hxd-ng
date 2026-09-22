@@ -55,6 +55,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     the_cap_counts_every_row(&*new_store());
     a_cursor_moves_forward_and_no_further_than_the_news(&*new_store());
     a_posts_audience_sees_muted_rows_too(&*new_store());
+    an_audience_row_dates_what_it_has_not_read(&*new_store());
     the_two_kinds_of_mailbox_never_meet(&*new_store());
     linking_rotating_and_deleting_move_the_rows(&*new_store());
     rows_go_with_what_they_follow(&*new_store());
@@ -555,6 +556,58 @@ fn posting_follows_its_thread_in_the_same_write(s: &dyn NewsStore) {
         .expect("the subscription is a courtesy, never a reason to refuse");
     assert!(s.article(capped.id).unwrap().is_some());
     assert_eq!(rows(s), [(thread, true, mine)]);
+}
+
+/// The two columns the stale floor reads (§10.7): when the oldest and
+/// the newest of the articles a subscriber has not read were posted. A
+/// row that is caught up dates nothing, because the rule rings it
+/// anyway.
+fn an_audience_row_dates_what_it_has_not_read(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let root = post(s, cat, None, "question", 100);
+    let thread = SubScope::Thread(root);
+    s.subscribe(&bob(), thread, 10, t(101)).unwrap();
+    let of = |article| {
+        s.subscribers(root, None, article)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.owner == bob())
+            .expect("bob follows the thread")
+    };
+
+    // Caught up: nothing older than the post is unread, and there is
+    // nothing to date.
+    let first = post(s, cat, Some(root), "one", 200);
+    let row = of(first);
+    assert_eq!(
+        (row.earlier, row.earlier_oldest, row.earlier_newest),
+        (0, None, None)
+    );
+
+    // Three unread now, spanning from the first of them to the last.
+    post(s, cat, Some(root), "two", 300);
+    let latest = post(s, cat, Some(root), "three", 400);
+    let row = of(latest);
+    assert_eq!(row.earlier, 2, "the two before this one");
+    assert_eq!(
+        (row.earlier_oldest, row.earlier_newest),
+        (Some(t(200)), Some(t(300))),
+        "the span of what is unread and older than the post"
+    );
+
+    // What bob wrote is not news to bob, and dates nothing; nor does a
+    // tombstone.
+    s.seen(&bob(), thread, latest).unwrap();
+    post_by(s, bob_writing(), cat, Some(root), "bob's own", 500);
+    let gone = post(s, cat, Some(root), "deleted", 600);
+    s.tombstone(gone, "mod", t(601)).unwrap();
+    let last = post(s, cat, Some(root), "and one more", 700);
+    let row = of(last);
+    assert_eq!(
+        (row.earlier, row.earlier_oldest, row.earlier_newest),
+        (0, None, None),
+        "neither his own post nor a tombstone is something he has not read"
+    );
 }
 
 fn the_cap_counts_every_row(s: &dyn NewsStore) {

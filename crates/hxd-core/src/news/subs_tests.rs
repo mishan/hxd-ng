@@ -609,3 +609,78 @@ fn linking_an_identity_takes_the_subscriptions_along() {
     s.post_as("bob", Some(root), "an answer");
     assert_eq!(s.gw.to("alice"), 1);
 }
+
+/// The stale floor under the catch-up rule (§10.7). A unit test of the
+/// comparison rather than a server one, because the server's clock is
+/// the wall clock and a week of it is not something a test can wait
+/// for. What it is asked of — the two dates on an audience row — is a
+/// conformance case, `an_audience_row_dates_what_it_has_not_read`.
+mod stale_floor {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    use crate::news::subs::stale_rings;
+
+    const WEEK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// A row `behind` days un-caught-up whose newest unread article
+    /// landed `previous` days after the oldest.
+    fn row(oldest: Option<u64>, previous: u64) -> Subscriber {
+        let base = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        Subscriber {
+            owner: Mailbox::login("bob"),
+            scope: SubScope::Thread(1),
+            muted: false,
+            unread: 1,
+            earlier: usize::from(oldest.is_some()),
+            earlier_oldest: oldest.map(|d| base + DAY * d as u32),
+            earlier_newest: oldest.map(|_| base + DAY * previous as u32),
+        }
+    }
+
+    /// `at`, as days after the same base.
+    fn at(days: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_000_000) + DAY * days as u32
+    }
+
+    #[test]
+    fn a_scope_a_period_further_behind_rings_again() {
+        // Eight days of unread, the last ring six days in: this post is
+        // the first to cross a week.
+        assert!(stale_rings(&row(Some(0), 6), at(8), WEEK));
+    }
+
+    #[test]
+    fn a_second_post_in_the_same_period_stays_quiet() {
+        // The week was crossed by the article at day 8; day 9 is still
+        // the same week behind, and a hot thread does not buzz per post.
+        assert!(!stale_rings(&row(Some(0), 8), at(9), WEEK));
+    }
+
+    #[test]
+    fn the_second_week_rings_again() {
+        assert!(stale_rings(&row(Some(0), 13), at(14), WEEK));
+    }
+
+    #[test]
+    fn a_scope_inside_the_first_period_is_left_to_the_rule() {
+        assert!(!stale_rings(&row(Some(0), 3), at(5), WEEK));
+    }
+
+    #[test]
+    fn a_caught_up_row_has_nothing_to_measure() {
+        // The rule rings it anyway; the floor never gets the question.
+        assert!(!stale_rings(&row(None, 0), at(30), WEEK));
+    }
+
+    #[test]
+    fn zero_is_the_bare_rule() {
+        assert!(!stale_rings(&row(Some(0), 6), at(90), Duration::ZERO));
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_decides_nothing() {
+        assert!(!stale_rings(&row(Some(10), 12), at(3), WEEK));
+    }
+}
