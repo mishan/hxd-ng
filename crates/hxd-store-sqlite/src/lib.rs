@@ -54,12 +54,13 @@ impl Synchronous {
 
 mod blobs;
 mod news;
+mod push;
 
 pub use blobs::FileBlobStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -334,6 +335,31 @@ CREATE INDEX news_attach_staged ON news_attach (staged_at) WHERE article IS NULL
 CREATE INDEX news_attach_hash ON news_attach (hash);
 ";
 
+/// Devices, for the Web Push gateway (`docs/webpush-gateway.md` §2).
+/// Keyed `(mailbox, devid)` under the mailbox rule, as the inbox and the
+/// news subscriptions are, and with the same pair of partial unique
+/// indexes: an identified row is unique per fingerprint whatever login
+/// sits beside it, and an unidentified one per login. Registering over
+/// the key replaces, which is what keeps a re-provisioned phone one row
+/// rather than two.
+const SCHEMA_V7: &str = "
+CREATE TABLE push_device (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner         TEXT    NOT NULL,
+  owner_fp      TEXT,
+  devid         TEXT    NOT NULL,
+  endpoint      TEXT    NOT NULL,
+  p256dh        BLOB    NOT NULL,
+  auth          BLOB    NOT NULL,
+  expires       INTEGER,
+  registered_at INTEGER NOT NULL,
+  last_push_at  INTEGER
+);
+CREATE UNIQUE INDEX push_device_fp    ON push_device (owner_fp, devid) WHERE owner_fp IS NOT NULL;
+CREATE UNIQUE INDEX push_device_login ON push_device (owner, devid) WHERE owner_fp IS NULL;
+CREATE INDEX push_device_expires ON push_device (expires) WHERE expires IS NOT NULL;
+";
+
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL
 /// predicate over a `(<col>, <col>_fp)` pair — **one shape per kind of
 /// mailbox**, and one bind either way ([`bind`] supplies it).
@@ -569,6 +595,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 6 {
         steps.push_str(SCHEMA_V6);
+    }
+    if version < 7 {
+        steps.push_str(SCHEMA_V7);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -1573,6 +1602,11 @@ mod tests {
     #[test]
     fn news_passes_the_conformance_suite() {
         hxd_core::news::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+    }
+
+    #[test]
+    fn push_devices_pass_the_conformance_suite() {
+        hxd_core::push::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
     /// A category and a way to post into it, for the search tests.

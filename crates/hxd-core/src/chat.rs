@@ -1412,11 +1412,13 @@ impl Core {
 
     /// An account has linked an identity: move its mail onto the
     /// fingerprint. The account-linking path owes this call — see
-    /// [`crate::inbox::MessageStore::claim`]. News subscriptions are keyed
-    /// the same way and move in the same call, so every link site that
-    /// pays one obligation pays both. Returns how much mail moved.
+    /// [`crate::inbox::MessageStore::claim`]. News subscriptions and push
+    /// devices are keyed the same way and move in the same call, so every
+    /// link site that pays one obligation pays all three. Returns how
+    /// much mail moved.
     pub fn inbox_claim(&self, login: &str, fingerprint: &[u8; 32]) -> usize {
         self.news_subs_claim(login, fingerprint);
+        self.devices_claim(login, fingerprint);
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };
@@ -1430,7 +1432,10 @@ impl Core {
     }
 
     /// An identity rotated to a successor key: move its mailbox and its
-    /// blocks — see [`crate::inbox::MessageStore::rotate`].
+    /// blocks — see [`crate::inbox::MessageStore::rotate`]. Its news
+    /// subscriptions move with them; its **devices are dropped** rather
+    /// than moved, because a successor has not vouched for them
+    /// (`crate::push::PushStore::devices_rotate`).
     ///
     /// **Nothing calls this yet, because nothing rotates yet**: §8.5 of
     /// the identity spec describes rotation and the registrar spec owns
@@ -1446,6 +1451,7 @@ impl Core {
     /// hand an account's history to whoever links to it afterwards.
     pub fn inbox_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> usize {
         self.news_subs_rotate(from, to);
+        self.devices_rotate(from, to);
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };
@@ -1458,14 +1464,15 @@ impl Core {
         }
     }
 
-    /// An account has been deleted: take its mail and its news
-    /// subscriptions with it, so a later holder of the freed login
-    /// inherits neither. Its news push budget goes too, but that is
+    /// An account has been deleted: take its mail, its news
+    /// subscriptions and its push devices with it, so a later holder of
+    /// the freed login inherits none of them. Its news push budget goes too, but that is
     /// memory, and only a purge in the server's own process reaches it —
     /// `hxd inbox purge` purges the stores from a process of its own (see
     /// `news_subs_rotate`). Returns how much mail went.
     pub fn inbox_purge(&self, of: &Mailbox) -> usize {
         self.news_subs_purge(of);
+        self.devices_purge(of);
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };

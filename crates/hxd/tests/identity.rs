@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, Stream, StreamExt};
 use hl_identity::{cert, Card, DeviceCert, DeviceKey, IdentityKey, LoginProof, ServerKey};
+use hxd_core::push::PushStore;
 use hxd_core::Core;
 use hxd_ng_session::{IdentityConfig, IdentityState, NgConfig, NgCtx, Registry, TunnelSink};
 use hxd_session::frame::{pack_frame, Frame};
@@ -62,6 +63,7 @@ async fn start_server_forwarded(dir: &Path, proxies: &[&str]) -> (SocketAddr, So
         hxd_ng_session::ForwardedHeader::Forwarded,
         Some(Default::default()),
         None,
+        None,
     )
     .await
 }
@@ -78,6 +80,7 @@ async fn start_server_with_inbox(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) 
         hxd_ng_session::ForwardedHeader::default(),
         Some(Default::default()),
         None,
+        None,
     )
     .await
 }
@@ -91,6 +94,7 @@ async fn start_server_without_mailbox(dir: &Path) -> (SocketAddr, SocketAddr, Ng
         &[],
         false,
         hxd_ng_session::ForwardedHeader::default(),
+        None,
         None,
         None,
     )
@@ -109,6 +113,7 @@ async fn start_server_with_web_client(dir: &Path) -> (SocketAddr, SocketAddr, Ng
         hxd_ng_session::ForwardedHeader::default(),
         Some(Default::default()),
         Some("http://{ng}/app/"),
+        None,
     )
     .await
 }
@@ -127,6 +132,7 @@ async fn start_server_with_small_mailbox(
         false,
         hxd_ng_session::ForwardedHeader::default(),
         Some(cfg),
+        None,
         None,
     )
     .await
@@ -147,6 +153,7 @@ async fn start_server_full(
         hxd_ng_session::ForwardedHeader::default(),
         Some(Default::default()),
         None,
+        None,
     )
     .await
 }
@@ -161,6 +168,7 @@ async fn start_server_inner(
     forwarded_header: hxd_ng_session::ForwardedHeader,
     enroll: Option<hxd_ng_session::enroll::MailboxConfig>,
     web_client: Option<&str>,
+    devices: Option<Arc<hxd_core::push::MemoryDevices>>,
 ) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -188,6 +196,10 @@ async fn start_server_inner(
         )
     } else {
         Core::new()
+    };
+    let core = match &devices {
+        Some(devices) => core.with_devices(devices.clone()),
+        None => core,
     };
     let core = Arc::new(core);
     let auth: Arc<dyn hxd_core::AuthBackend> = file_auth;
@@ -242,6 +254,12 @@ async fn start_server_inner(
         tunnel: Some(tunnel),
         enroll: enroll.map(|c| Arc::new(hxd_ng_session::enroll::Mailbox::new(c))),
         files: None,
+        push: devices.map(|_| {
+            Arc::new(hxd_ng_session::push::PushInfo {
+                vapid: "BEl6…".into(),
+                content: "sender".into(),
+            })
+        }),
     };
     tokio::spawn(hxd_session::serve(l1, legacy_ctx));
     tokio::spawn(hxd_ng_session::serve(l2, ng_ctx.clone()));
@@ -2614,6 +2632,7 @@ async fn a_token_offered_to_a_server_without_identity_is_refused() {
         tunnel: None,
         enroll: None,
         files: None,
+        push: None,
     };
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = l.local_addr().unwrap();
@@ -4221,6 +4240,7 @@ async fn a_web_client_the_server_names_off_its_own_origin_gets_no_qr_code() {
         hxd_ng_session::ForwardedHeader::default(),
         Some(Default::default()),
         Some("https://evil.test/app/"),
+        None,
     )
     .await;
     let hlid = hlid_binary();
@@ -4275,5 +4295,212 @@ async fn a_web_client_the_server_names_off_its_own_origin_gets_no_qr_code() {
     assert!(
         !said.contains("Scan this"),
         "and no QR code either:\n{said}"
+    );
+}
+
+// --- Push devices on an identity session (docs/webpush-gateway.md §7) ----
+
+/// A server with a mailbox and a device registry, and the registry.
+async fn start_server_with_push(dir: &Path) -> (SocketAddr, Arc<hxd_core::push::MemoryDevices>) {
+    let devices = Arc::new(hxd_core::push::MemoryDevices::new());
+    let (_legacy, ng, _ctx) = start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        true,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        None,
+        Some(devices.clone()),
+    )
+    .await;
+    (ng, devices)
+}
+
+/// A subscription, as a browser hands it to a client: the RFC 8291
+/// example's keys, so they are a real point on the curve.
+fn subscription(devid: &str) -> Value {
+    json!({
+        "type": "webpush",
+        "endpoint": format!("https://push.example.net/v/{devid}"),
+        "p256dh": "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+        "auth": "BTBZMqHH6r4Tts7J_aSIgg",
+        "devid": devid,
+    })
+}
+
+/// The id an identity device is filed under: its own fingerprint.
+fn device_id(p: &Person) -> String {
+    hxd_core::push::DeviceId::of_device(&hl_identity::Fingerprint::of(&p.dev.public()).0)
+        .as_str()
+        .to_string()
+}
+
+/// Another device of `p`'s identity, whose certificate carries `caps`
+/// and nothing else.
+fn another_device(p: &Person, seed: u8, caps: u64) -> Person {
+    let id = IdentityKey::from_seed(&p.id.seed());
+    let dev = DeviceKey::from_seed(&[seed; 32]);
+    let mut c = DeviceCert::for_device(&id, &dev, now() - 5, cert::RECOMMENDED_LIFETIME).unwrap();
+    c.caps = Some(caps);
+    Person {
+        cert: c.sign(&id),
+        card: p.card.clone(),
+        id,
+        dev,
+    }
+}
+
+/// Link `p` to alice — which needs `manage`, so `p` is a full device —
+/// and open an ng session as it.
+async fn link_to_alice(ng: SocketAddr, p: &Person) -> (Ng, Value) {
+    let r = try_authenticate(ng, p, json!({ "login": "alice", "password": "pw" })).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let auth = r.json();
+    ng_login(ng, auth["token"].as_str().unwrap(), "Alice").await
+}
+
+/// Open an ng session as a device of an identity already linked.
+async fn alices_device(ng: SocketAddr, p: &Person) -> (Ng, Value) {
+    let auth = authenticate(ng, p).await;
+    assert_eq!(auth["outcome"], "linked", "{auth}");
+    ng_login(ng, auth["token"].as_str().unwrap(), "Alice").await
+}
+
+#[tokio::test]
+async fn an_identity_device_names_itself_and_its_certificate_decides() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ng, devices) = start_server_with_push(dir.path()).await;
+    let phone = person(40, "Alice");
+    let (mut c, ok) = link_to_alice(ng, &phone).await;
+    assert!(ok["push"].is_object(), "{ok}");
+    let mailbox = hxd_core::inbox::Mailbox::identified("alice", phone.id.fingerprint().0);
+
+    // The client's own suggestion is ignored: the device is its key.
+    let r = c
+        .request("push_register", subscription("client-chosen"))
+        .await;
+    assert_eq!(r["ok"]["devid"], device_id(&phone), "{r}");
+    let rows = devices
+        .devices(&mailbox, std::time::SystemTime::now())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].expires.is_some(),
+        "and it lives as long as the certificate"
+    );
+
+    // Omitting devid on unregister is *this* device.
+    let r = c.request("push_unregister", json!({})).await;
+    assert!(r.get("ok").is_some(), "{r}");
+    assert!(devices
+        .devices(&mailbox, std::time::SystemTime::now())
+        .unwrap()
+        .is_empty());
+
+    // A certificate for logging in alone is not trusted with messages.
+    let kiosk = another_device(&phone, 141, hl_identity::caps::LOGIN);
+    let (mut k, _) = alices_device(ng, &kiosk).await;
+    let r = k
+        .request("push_register", subscription("kiosk-device"))
+        .await;
+    assert_eq!(r["error"]["code"], "no_capability", "{r}");
+
+    // A web certificate may register and turn itself off, and may not
+    // silence the owner's phone or every device.
+    c.request("push_register", subscription("x-x-x-x-x")).await;
+    let web = another_device(&phone, 142, hl_identity::caps::WEB);
+    let (mut w, _) = alices_device(ng, &web).await;
+    let r = w.request("push_register", subscription("web-device")).await;
+    assert_eq!(r["ok"]["devid"], device_id(&web), "{r}");
+    for params in [
+        json!({ "all": true }),
+        json!({ "devid": device_id(&phone) }),
+    ] {
+        let r = w.request("push_unregister", params.clone()).await;
+        assert_eq!(r["error"]["code"], "no_capability", "{params}: {r}");
+    }
+    let r = w.request("push_unregister", json!({})).await;
+    assert!(r.get("ok").is_some(), "{r}");
+    assert_eq!(
+        devices
+            .devices(&mailbox, std::time::SystemTime::now())
+            .unwrap()
+            .iter()
+            .map(|d| d.devid.as_str().to_string())
+            .collect::<Vec<_>>(),
+        [device_id(&phone)],
+        "the phone is still there"
+    );
+
+    // A password login on the linked account shares the mailbox, and
+    // may not take the phone's row by naming its fingerprint.
+    let (mut pw, _) = ng_password_login(ng, "alice").await;
+    let r = pw
+        .request("push_register", subscription(&device_id(&phone)))
+        .await;
+    assert_eq!(r["error"]["code"], "bad_request", "{r}");
+    assert!(
+        devices
+            .devices(&mailbox, std::time::SystemTime::now())
+            .unwrap()[0]
+            .expires
+            .is_some(),
+        "and the phone keeps its expiry"
+    );
+}
+
+/// The certificate is the session's, not the socket's: a session resumed
+/// on a socket that presented none is still that device, with that
+/// device's rights and nothing more.
+#[tokio::test]
+async fn a_resumed_session_is_still_the_device_it_logged_in_as() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ng, devices) = start_server_with_push(dir.path()).await;
+    let phone = person(44, "Alice");
+    drop(link_to_alice(ng, &phone).await);
+    let web = another_device(&phone, 143, hl_identity::caps::WEB);
+    let (c, ok) = alices_device(ng, &web).await;
+    let (session, token) = (
+        ok["session"].as_str().unwrap().to_string(),
+        ok["token"].as_str().unwrap().to_string(),
+    );
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng"))
+        .await
+        .unwrap();
+    let mut r = Ng::from_ws(ws).await;
+    let resumed = r
+        .request(
+            "resume",
+            json!({ "session": session, "token": token, "last_seq": 0 }),
+        )
+        .await;
+    assert!(resumed.get("ok").is_some(), "{resumed}");
+
+    let reply = r
+        .request("push_register", subscription("client-chosen"))
+        .await;
+    assert_eq!(
+        reply["ok"]["devid"],
+        device_id(&web),
+        "the device, not a client-chosen id: {reply}"
+    );
+    let rows = devices
+        .devices(
+            &hxd_core::inbox::Mailbox::identified("alice", web.id.fingerprint().0),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].expires.is_some(), "bounded by its certificate");
+
+    let reply = r.request("push_unregister", json!({ "all": true })).await;
+    assert_eq!(
+        reply["error"]["code"], "no_capability",
+        "a web certificate is no more trusted for having dropped its socket: {reply}"
     );
 }

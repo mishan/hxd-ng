@@ -70,16 +70,23 @@ enum Command {
     },
     /// `news-reindex`.
     NewsReindex,
+    /// `push rekey`.
+    PushRekey,
 }
 
 const USAGE: &str = "usage:\n  \
 hxd [--config hxd-ng.toml]\n  \
 hxd [--config …] inbox purge <login> [--fingerprint FP] [--dry-run]\n  \
-hxd [--config …] news-reindex\n\n\
+hxd [--config …] news-reindex\n  \
+hxd [--config …] push rekey\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
-`inbox purge` takes an account's mail with it when the account is\n\
-deleted — otherwise the freed login's next holder inherits it.\n\
+`push rekey` replaces the server's VAPID key and drops every registered\n\
+push device, which the old key's subscriptions were bound to; clients\n\
+re-register at their next login. Stop the server first.\n\n\
+`inbox purge` takes an account's mail, news subscriptions and push\n\
+devices with it when the account is deleted — otherwise the freed\n\
+login's next holder inherits them.\n\
 Pass --fingerprint (the value in the account's [identity] table, or\n\
 its hex) when the account file is already gone. --dry-run says how\n\
 much would go without taking it.";
@@ -126,6 +133,10 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
         }
         ["news-reindex"] => Command::NewsReindex,
+        ["push", "rekey"] if fingerprint.is_some() || dry_run => {
+            return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
+        }
+        ["push", "rekey"] => Command::PushRekey,
         ["inbox", "purge", login] => Command::InboxPurge {
             login: login.to_string(),
             fingerprint,
@@ -158,6 +169,11 @@ async fn main() {
             }
             return Ok(());
         }
+        if let Command::PushRekey = command {
+            let (dropped, public) = hxd::push::rekey(&config)?;
+            println!("new VAPID key {public}; dropped {dropped} registered devices");
+            return Ok(());
+        }
         if let Command::NewsReindex = command {
             let n = hxd::news_reindex(&config)?;
             println!("indexed {n} articles");
@@ -165,6 +181,11 @@ async fn main() {
         }
         let voice = hxd::voice::build(&config)?;
         let files = hxd::files::build(&config)?;
+        // The push configuration is checked here; the VAPID key is read
+        // in `build_ctx`, once the device registry is open to say whether
+        // a missing key is a first start — and still before anything
+        // binds, because every subscription is bound to that key.
+        let push = hxd::push::build(&config)?;
         // Bind HTXF before either frontend advertises Files. A configured
         // but unavailable transfer port is a startup failure, never a
         // capability promise that downloads cannot fulfill.
@@ -176,7 +197,7 @@ async fn main() {
             ),
             None => None,
         };
-        let ctx = build_ctx(&config, voice.as_ref(), files.as_ref())?;
+        let ctx = build_ctx(&config, voice.as_ref(), files.as_ref(), push.as_ref())?;
 
         let listener = TcpListener::bind(&config.server.bind)
             .await
@@ -193,7 +214,8 @@ async fn main() {
 
         // The ng context is built before voice is consumed below, so its
         // capability list can see it.
-        let ng_ctx = hxd::build_ng_ctx(&config, &ctx, voice.as_ref(), files.as_ref())?;
+        let ng_ctx =
+            hxd::build_ng_ctx(&config, &ctx, voice.as_ref(), files.as_ref(), push.as_ref())?;
 
         if let (Some(files), Some(listener)) = (files.as_ref(), files_listener) {
             let section = config.files.as_ref().expect("Files service has config");
@@ -326,6 +348,9 @@ async fn main() {
                 media.max_total_bytes / (1024 * 1024),
             );
             tokio::spawn(hxd::media_sweeper(ctx.core.clone()));
+        }
+        if ctx.core.push_enabled() {
+            tokio::spawn(hxd::device_sweeper(ctx.core.clone()));
         }
 
         // The Hotline-ng WebSocket frontend, when configured: its accept

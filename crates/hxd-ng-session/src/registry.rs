@@ -25,6 +25,13 @@ struct Entry {
     /// and nothing else about the socket the session belongs to.
     media_tokens: f64,
     media_refill: Instant,
+    /// The device certificate the session logged in with, if it did.
+    /// A property of the session, not of whichever socket carries it
+    /// (hotline-ng-auth.md §7.2): a resume on a socket with no
+    /// certificate is still that device, with that device's rights, and
+    /// must not come back as a password session that may do what the
+    /// certificate withheld.
+    device: Option<crate::push::DeviceOnSocket>,
 }
 
 /// See the module docs.
@@ -47,8 +54,14 @@ impl Registry {
         Self::default()
     }
 
-    /// Mint a session id + token for a freshly attached session.
-    pub fn issue(&self, core: &Core, uid: Uid) -> Option<(String, String)> {
+    /// Mint a session id + token for a freshly attached session, which
+    /// logged in with `device`'s certificate or with none.
+    pub fn issue(
+        &self,
+        core: &Core,
+        uid: Uid,
+        device: Option<crate::push::DeviceOnSocket>,
+    ) -> Option<(String, String)> {
         let serial = core.session_serial(uid)?;
         let mut raw = [0u8; 32];
         getrandom::getrandom(&mut raw).ok()?;
@@ -71,6 +84,7 @@ impl Registry {
                 // where the configured rate is known.
                 media_tokens: f64::MAX,
                 media_refill: Instant::now(),
+                device,
             },
         );
         Some((session_id, token))
@@ -103,6 +117,16 @@ impl Registry {
             return None;
         }
         Some(uid)
+    }
+
+    /// The device certificate `session_id` logged in with, for a resume
+    /// that has just been validated.
+    pub(crate) fn device(&self, session_id: &str) -> Option<crate::push::DeviceOnSocket> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .and_then(|e| e.device.clone())
     }
 
     /// Take one media-download token for this session, refilling at

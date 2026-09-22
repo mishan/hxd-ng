@@ -28,7 +28,8 @@ to another project.
 | [identity-vouch.md](identity-vouch.md) — a member lending standing to a key | no | ng; local form from any account | spec |
 | [identity-threat-model.md](identity-threat-model.md) — what identity defends against | — | — | design |
 | [identity-test-vectors.json](identity-test-vectors.json) — signed objects and reject cases | yes | — | spec |
-| [push-notifications.md](push-notifications.md) — the notify decision and the gateway | trait only | ng | design |
+| [push-notifications.md](push-notifications.md) — the notify decision, the subscriber model, and the multi-vendor sidecar | trait only | ng | design |
+| [webpush-gateway.md](webpush-gateway.md) — the in-process Web Push sender and the device registry | no | ng | design |
 
 ## Features on both wires
 

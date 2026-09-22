@@ -91,6 +91,7 @@ async fn start_server(dir: &Path, replay: usize) -> (SocketAddr, SocketAddr) {
         tunnel: None,
         enroll: None,
         files: None,
+        push: None,
     };
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -150,6 +150,7 @@ mod tests {
             news: None,
             files: None,
             tracker: None,
+            push: None,
         }
     }
 
