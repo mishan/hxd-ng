@@ -30,13 +30,13 @@
 //! it, and the legacy binding (W9) posts through the same `news_post`.
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::warn;
 
 use super::{
     store_failed, ArticleId, Asker, AutoFollow, AutoSubscribe, NewPost, NewsError, NewsStore,
-    NodeKind, Notified, NotifyPolicy, NotifyReason, Posted, SubScope, Subscription,
+    NodeKind, Notified, NotifyPolicy, NotifyReason, Posted, SubScope, Subscriber, Subscription,
 };
 use crate::access::bit;
 use crate::inbox::Mailbox;
@@ -55,6 +55,39 @@ const BUDGETS_KEPT: usize = 4096;
 /// either side.
 fn same(a: &Mailbox, b: &Mailbox) -> bool {
     a.matches(&b.login, b.fingerprint.as_ref())
+}
+
+/// The stale floor under the catch-up rule (`docs/news.md` §10.7): does
+/// this post ring for a scope its subscriber has not caught up with?
+///
+/// How far behind the scope is, measured from the oldest article the
+/// owner has not read, asked in units of `stale_after`: the post rings
+/// when that age crosses a multiple the scope's previous unread article
+/// had not reached. One ring per period behind rather than one per post,
+/// so a hot thread nobody is reading buzzes once a week and not forty
+/// times an evening. A comparison against two columns the audience scan
+/// already aggregates — still no scheduler, nothing pending, nothing to
+/// sweep — and `max_per_hour` still sits under it.
+pub(super) fn stale_rings(row: &Subscriber, at: SystemTime, stale_after: Duration) -> bool {
+    // Zero is the bare rule, and a floor of zero would divide by it.
+    // Divided in nanoseconds below, so a sub-second floor from a policy
+    // built in code is a period like any other rather than a zero.
+    if stale_after.is_zero() {
+        return false;
+    }
+    let (Some(oldest), Some(previous)) = (row.earlier_oldest, row.earlier_newest) else {
+        return false;
+    };
+    // A clock that went backwards, or an article stamped in the future:
+    // an elapsed time that will not subtract is not one this can judge,
+    // and the rule's own answer stands.
+    let (Ok(now_behind), Ok(then_behind)) =
+        (at.duration_since(oldest), previous.duration_since(oldest))
+    else {
+        return false;
+    };
+    let period = stale_after.as_nanos();
+    now_behind.as_nanos() / period > then_behind.as_nanos() / period
 }
 
 /// A mailbox as an hourly budget's map key: its fingerprint, or its login
@@ -404,8 +437,11 @@ impl Core {
             // unread, so the owner had seen everything before it. Asked of
             // what came *before* this article rather than of the total, so
             // two posts that land together cannot each count the other
-            // and both stay silent: the earlier one rings.
-            let rings = cursor.is_none_or(|r| r.earlier == 0);
+            // and both stay silent: the earlier one rings. Under it the
+            // stale floor, for the subscriber who never says they read
+            // anything and would otherwise hear about a scope once.
+            let rings = cursor
+                .is_none_or(|r| r.earlier == 0 || stale_rings(r, post.at, notify.stale_after));
             let notified = Notified {
                 reason,
                 scope,

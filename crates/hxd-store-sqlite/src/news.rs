@@ -492,7 +492,9 @@ fn unread(
 /// its own index.
 const SUBSCRIBERS: &str = "
 SELECT s.owner, s.owner_fp, s.scope, s.target, s.muted,
-       COUNT(a.id), COUNT(CASE WHEN a.id < ?3 THEN 1 END)
+       COUNT(a.id), COUNT(CASE WHEN a.id < ?3 THEN 1 END),
+       MIN(CASE WHEN a.id < ?3 THEN a.at END),
+       MAX(CASE WHEN a.id < ?3 THEN a.at END)
   FROM news_sub s
   LEFT JOIN news_article a
          ON a.root = s.target AND a.id > s.last_seen AND a.deleted_at IS NULL
@@ -503,7 +505,9 @@ SELECT s.owner, s.owner_fp, s.scope, s.target, s.muted,
  GROUP BY s.id
 UNION ALL
 SELECT s.owner, s.owner_fp, s.scope, s.target, s.muted,
-       COUNT(a.id), COUNT(CASE WHEN a.id < ?3 THEN 1 END)
+       COUNT(a.id), COUNT(CASE WHEN a.id < ?3 THEN 1 END),
+       MIN(CASE WHEN a.id < ?3 THEN a.at END),
+       MAX(CASE WHEN a.id < ?3 THEN a.at END)
   FROM news_sub s
   LEFT JOIN news_article a
          ON a.category = s.target AND a.parent IS NULL
@@ -515,8 +519,20 @@ SELECT s.owner, s.owner_fp, s.scope, s.target, s.muted,
  GROUP BY s.id";
 
 /// A row of [`SUBSCRIBERS`]: owner, owner_fp, scope, target, muted,
-/// unread, earlier.
-type AudienceRow = (String, Option<String>, i64, i64, bool, i64, i64);
+/// unread, earlier, and the oldest and newest of those earlier articles
+/// — the two the stale floor of §10.7 reads, aggregated in the same pass
+/// rather than in a query of their own.
+type AudienceRow = (
+    String,
+    Option<String>,
+    i64,
+    i64,
+    bool,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+);
 
 /// Is there something at `scope` to subscribe to?
 fn check_target(conn: &Connection, scope: SubScope) -> Result<(), NewsError> {
@@ -1737,6 +1753,8 @@ impl NewsStore for SqliteStore {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
                     ))
                 },
             ))?;
@@ -1744,15 +1762,19 @@ impl NewsStore for SqliteStore {
                 .map_err(StoreError::new)?
         };
         rows.into_iter()
-            .map(|(login, fp, kind, target, muted, unread, earlier)| {
-                Ok(Subscriber {
-                    owner: sub_owner(login, fp)?,
-                    scope: scope_of(kind, target)?,
-                    muted,
-                    unread: usize::try_from(unread).unwrap_or(0),
-                    earlier: usize::try_from(earlier).unwrap_or(0),
-                })
-            })
+            .map(
+                |(login, fp, kind, target, muted, unread, earlier, oldest, newest)| {
+                    Ok(Subscriber {
+                        owner: sub_owner(login, fp)?,
+                        scope: scope_of(kind, target)?,
+                        muted,
+                        unread: usize::try_from(unread).unwrap_or(0),
+                        earlier: usize::try_from(earlier).unwrap_or(0),
+                        earlier_oldest: oldest.map(from_unix),
+                        earlier_newest: newest.map(from_unix),
+                    })
+                },
+            )
             .collect()
     }
 

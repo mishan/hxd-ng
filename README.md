@@ -490,6 +490,7 @@ auto_subscribe = "participated" # or "own_thread", or "off"
 reference = true                # does citing someone's article notify them
 max_subs = 200                  # threads and categories followed or muted, per account
 max_per_hour = 12               # news pushes per account; 0 = badges, no pushes
+stale_after = 604800            # seconds behind before a scope rings again anyway; 0 = never
 ```
 
 `markdown` decides what an article written in markdown gets. `render`

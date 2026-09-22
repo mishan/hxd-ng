@@ -612,6 +612,16 @@ pub struct NotifyPolicy {
     /// News pushes per account per hour, every scope together. Past it
     /// the push is dropped, never the event and never the unread count.
     pub max_per_hour: u32,
+    /// How far behind a scope may fall before the catch-up rule stops
+    /// silencing it (§10.7). The rule on its own tells a subscriber who
+    /// never calls `news_seen` about a scope exactly once for the life
+    /// of the subscription; past this, a scope that has been
+    /// un-caught-up for longer is treated as caught up and the post
+    /// rings. Measured from the oldest unread article and asked in units
+    /// of this setting, so a thread nobody reads rings once a period
+    /// rather than once a post. `Duration::ZERO` disables the floor and
+    /// restores the bare rule.
+    pub stale_after: Duration,
 }
 
 impl Default for NotifyPolicy {
@@ -621,6 +631,7 @@ impl Default for NotifyPolicy {
             reference: true,
             max_subs: 200,
             max_per_hour: 12,
+            stale_after: Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
 }
@@ -663,6 +674,15 @@ pub struct Subscriber {
     /// because two posts landing together would each count the other, and
     /// neither would ring.
     pub earlier: usize,
+    /// When the oldest of those `earlier` articles was posted: how long
+    /// this scope has been un-caught-up, which is what
+    /// [`NotifyPolicy::stale_after`] is measured from (§10.7). `None`
+    /// exactly when `earlier` is 0, where the rule rings anyway.
+    pub earlier_oldest: Option<SystemTime>,
+    /// When the newest of them was posted — the scope's previous ring,
+    /// so the floor can ask whether this post crosses a period the last
+    /// one did not. `None` on the same condition.
+    pub earlier_newest: Option<SystemTime>,
 }
 
 /// A post that is someone's business, as it reaches their attached
