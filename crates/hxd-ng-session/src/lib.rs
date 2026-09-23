@@ -75,7 +75,7 @@ pub struct NgConfig {
     pub max_detached_per_addr: usize,
     /// Optional protocol extensions this server offers, reported in the
     /// login reply's `caps` list so clients feature-detect instead of
-    /// version-sniffing (`docs/hotline-ng.md` §11). The ng twin of the
+    /// version-sniffing (`docs/hotline-ng.md` §4). The ng twin of the
     /// legacy wire's `DATA_CAPABILITIES` bitmask — a list of names
     /// because the transport is already JSON and a name outlives a bit
     /// allocation.

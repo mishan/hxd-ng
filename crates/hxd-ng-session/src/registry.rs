@@ -6,7 +6,7 @@
 //! is what the registry trusts, because uids recycle and a stale token must
 //! never resume into a stranger's session.
 //!
-//! The domain doesn't know tokens exist (`docs/hotline-ng.md` §4, D4).
+//! The domain doesn't know tokens exist (`docs/hotline-ng-rationale.md` §4, D4).
 
 use std::collections::HashMap;
 use std::sync::Mutex;

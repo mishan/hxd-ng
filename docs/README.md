@@ -21,6 +21,7 @@ to another project.
 | Document | Built | Population | Kind |
 |---|---|---|---|
 | [hotline-ng.md](hotline-ng.md) — framing, handshake, requests and events, seq accounting | yes | ng | spec |
+| [hotline-ng-rationale.md](hotline-ng-rationale.md) — why hotline-ng.md says what it does, and how hxd-ng built it | yes | — | design |
 | [hotline-ng-auth.md](hotline-ng-auth.md) — transport authentication, discovery, transport tokens, the TRTP tunnel, tunnels and relays | yes | ng, and period/extended through a tunnel | spec |
 | [hotline-ng-identity.md](hotline-ng-identity.md) — the identity objects, the identity profile at auth, cards, account association | yes, to the registrar stub | ng, tunnel | spec |
 | [identity-enrollment.md](identity-enrollment.md) — certifying a device through a mailbox and a code | server side | ng | spec |

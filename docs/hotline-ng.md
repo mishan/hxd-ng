@@ -1,449 +1,434 @@
-# Hotline-ng: the HTTP-era protocol — MVP design
+# Hotline-ng: the WebSocket protocol
 
-Status: built — the MVP below, plus history (chat-history.md), the
+Status: built — the core below, plus history (chat-history.md), the
 inbox (private-messages.md), news (news.md), media (inline-media.md),
-voice and video (voice.md, capabilities-video.md) and identity
-(hotline-ng-identity.md). The vouch requests, the `system` user flag,
-`retry_after` and the `*@host` ban entry are design from companions not
-yet built, and say so where they appear.
+voice and video (voice.md, capabilities-video.md), files (§7.2) and
+identity (hotline-ng-identity.md). The vouch requests, `retry_after`,
+the `*@host` ban entry and the general rate limits of §9 are design not
+yet built in hxd-ng, and say so where they appear.
 
-The Phase 7 design, opened early and deliberately small: **user list and
-chat**, the minimum a mobile app needs to be immediately usable. This
-document is the protocol spec for that MVP plus the domain-layer changes it
-requires. Everything else Phase 7 promises (durable inbox, push
-notifications, real password hashing for ng-only accounts) extends this
-design; nothing here needs to be redone for it.
+> **Conformance language:** The key words "MUST", "MUST NOT", "REQUIRED",
+> "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and
+> "OPTIONAL" in this document are to be interpreted as described in
+> [RFC 2119](https://datatracker.ietf.org/doc/html/rfc2119).
 
-Decisions taken at design time (2026-08): **WebSocket-only transport** with
-in-band auth (no HTTP framework until media/history/push need one),
-**detached sessions with resume are in the MVP** (they are the point of the
-phase, and they cost no persistence), and **TLS terminates in a reverse
-proxy** (nginx/caddy with real certificates; the server listens plaintext on
-localhost and the spec mandates WSS in production).
+This document is normative. It states rules and cites their reasons
+rather than arguing them: the reasoning, the design history and how
+hxd-ng builds the protocol are in
+[hotline-ng-rationale.md](hotline-ng-rationale.md), cited as
+"rationale §n". Values marked *hxd-ng* are that server's choices, given
+so a client author knows what to expect from it; they are not
+requirements on other servers.
 
 ---
 
-## 1. What the MVP is
+## Contents
 
-A mobile (or web, or CLI) client can: log in with a Hotline account or as a
-guest, see the user list with live updates, read and send public chat
-(including `/me` actions), receive server notices and broadcasts, survive
-network blips without churning the roster, and log out. Legacy and ng users
-see each other and chat together; neither knows the other is different.
+1. [Scope and conformance](#1-scope-and-conformance)
+2. [Sessions and presence](#2-sessions-and-presence)
+3. [Event sequencing](#3-event-sequencing)
+4. [Capabilities and extension families](#4-capabilities-and-extension-families)
+5. [Transport and framing](#5-transport-and-framing)
+6. [The handshake](#6-the-handshake)
+7. [Requests and events](#7-requests-and-events)
+8. [Text and limits](#8-text-and-limits)
+9. [Security](#9-security)
+10. [Error codes](#10-error-codes)
+11. [Obligations checklist](#11-obligations-checklist)
+12. [Open questions](#12-open-questions)
 
-A mobile client can also send and receive **private messages** — first-class
-in the MVP: they cross to and from legacy clients, and a PM to a detached
-session buffers and replays on resume, which is the closest thing the grace
-window offers to offline delivery.
+---
 
-Out of scope for the MVP, listed so their absence is a decision and not an
-oversight: private chats (rooms), news, files and transfers, account
-administration, tracker anything, message history from before your session,
-push notifications, and durable offline delivery. Message history, durable
-offline delivery and news have since been built on top of the MVP rather
-than into it; §7 lists them beside the MVP set.
+## 1. Scope and conformance
 
-## 2. The paradigm shift, concretely
+Hotline-ng is a JSON protocol over WebSocket for Hotline servers. It is
+designed for clients whose connections come and go — phones first — and
+it shares one roster, one chat and one mail system with the classic
+Hotline wire on the same server: a classic client and an ng client see
+each other and talk to each other without either knowing the other is
+different.
 
-Legacy Hotline: you are "on the server" while your TCP socket lives. This
-protocol: you are on the server while your **session** lives; a WebSocket
-*attaches* to the session. The states:
+This document specifies:
 
-| State | Meaning | Legacy clients see |
-|---|---|---|
-| `active` | A connection is attached | normal |
-| `idle` | Attached but quiet (future: client-set or timer) | away flag |
-| `detached` | No connection; grace window running | away flag |
+- sessions that outlive their connections (§2) and the seq accounting
+  that makes resuming one exact (§3);
+- the capability list and the extension families it advertises (§4);
+- framing (§5), the handshake (§6), the core requests and events (§7),
+  text limits (§8), security requirements (§9) and error codes (§10).
 
-Closing the app puts you in `detached`, not gone. Reconnecting inside the
-grace window (default **5 minutes**, config `[ng] grace`) resumes the same
-session — same uid, no part/join churn, missed events replayed. If the
-window lapses, the session ends exactly as a legacy disconnect would.
+Each extension family is specified in its own document (§4); this one
+specifies only what they have in common. Authentication before the
+upgrade, and the identity a socket carries into it, are specified in
+[hotline-ng-auth.md](hotline-ng-auth.md) and
+[hotline-ng-identity.md](hotline-ng-identity.md).
 
-**Detaching is a per-account permission, and guests don't get it.** A
-roster presence that outlives its connection is exactly what a spammer
-wants — join as a guest with a URL for a nick, drop the socket, pollute the
-user list for free. So: accounts carry a `can_detach` flag; without it, a
-dropped WebSocket ends the session immediately (legacy behavior) and
-`resume` answers `session_expired`. The default is derived, not hardcoded:
-**password-protected accounts may detach, password-less ones (guest) may
-not**, overridable per account either way (`[extra] can_detach = true` for
-a trusted kiosk account, `= false` for a passworded account on probation).
-Two backstops keep even permitted detaching bounded: at most **2 detached
-sessions per source address** (config `[ng] max_detached_per_addr`; the
-oldest is ended when exceeded; behind a reverse proxy the address is the
-one the proxy forwards, see the identity spec's §5.3, since otherwise
-every client shares the proxy's), and admin moderation works on detached
-users — they sit on the roster, so they can be kicked and banned like
-anyone else, which ends the session on the spot.
+**A conforming server** implements §2, §3 and §5–§9, and answers every
+request it receives (§5). It MAY implement any extension family, and
+MUST advertise in `caps` (§4) exactly the families it serves.
 
-The legacy mapping costs nothing: the wire color field is a bitfield in
-practice — bit 1 is away, bit 2 is admin (0 normal, 1 away, 2 admin,
-3 admin-away) — so `idle`/`detached` set the away bit and the 1.x user list
-renders it natively. Legacy-side away state maps back to `idle` in ng
-rosters. No legacy client changes, no extension bits.
+**A conforming client** follows every client requirement of §2–§10
+(§11 summarizes them), and MUST tolerate everything this document says may be added: unknown
+fields, unknown events, unknown capabilities and unknown error codes.
 
-## 3. Architecture placement
+Examples are JSON with comments (`jsonc`); the wire carries plain JSON.
+"Absent" means the key is not in the object; it is not the same as
+`null` unless the field's definition says so.
 
-A second frontend crate, sibling to the legacy one:
+## 2. Sessions and presence
 
-```
-                 ┌────────────────────────────────────────────┐
-  TCP :5500 ────▶│ hxd-session   (legacy wire, Mac Roman,     │
-                 │                server-formatted chat)      │
-                 │        │                                   │
-                 │        ▼                                   │
-                 │     hxd-core   (UTF-8, semantic events,    │
-                 │        ▲        user-scoped sessions)      │
-                 │        │                                   │
-  WS  :5700 ────▶│ hxd-ng-session (JSON/WebSocket, tokens,    │
-  (wss:// via    │                 resume, outbox replay)     │
-   proxy)        └────────────────────────────────────────────┘
-```
+A **session** is a user's presence on the server: a uid on the roster, an
+outbox of events (§3) and a secret token. A WebSocket **attaches** to a
+session; the session is not the connection, and it may outlive it.
 
-`hxd-ng-session` depends on `hxd-core`, `tokio-tungstenite`, `serde`/
-`serde_json`, and a CSPRNG for tokens. It never sees the legacy wire;
-`hxd-session` never sees JSON. Chat stays **semantic in the domain** — the
-legacy frontend applies the `\r%13.13s:  %s` formatting at its edge (as it
-already does), and ng clients receive structured `{from, text, style}` and
-render however they like. This split was built in Phase 2a on purpose; the
-MVP is the payoff.
+| `status` | Meaning |
+|---|---|
+| `active` | A connection is attached. |
+| `idle` | A connection is attached, but the user is away. *Reserved: nothing sets it yet, in hxd-ng or in this document (§12).* |
+| `detached` | No connection is attached; the grace window is running. |
 
-## 4. Domain-layer changes (the D-steps)
+**Detaching.** When a connection is lost without `logout`, the server
+MUST either end the session — exactly as a classic disconnect would — or
+detach it. A detached session stays on the roster with status
+`detached`, keeps its uid, and buffers its events (§3). If no connection
+resumes it within the **grace window**, the server MUST end it.
 
-**D1 — UTF-8 at the domain boundary.** Today `hxd-core` carries nicks and
-chat text as raw Mac Roman bytes. It flips to `String`: the legacy frontend
-converts Mac Roman → UTF-8 on ingest and UTF-8 → Mac Roman (lossy `?` for
-unmappable, truncate nicks to 31 bytes *after* conversion) on egress, via
-`hxproto::text`. This is lossless for all legacy-origin text — Mac
-Roman → UTF-8 is injective and round-trips exactly — and lossy only for
-ng-origin text shown to legacy clients, which is unavoidable. The
-kick-announcement `ChatLine` event becomes a semantic `Notice { cid, text }`
-that each frontend formats (legacy: `\r<text>`; ng: a `notice` event).
+- The login reply's `detach` field (§6.1) tells the client which will
+  happen: `{ "grace": <seconds> }` when this session may detach, `null`
+  when it never will. A client given `null` MUST NOT attempt `resume`;
+  it logs in again instead.
+- Whether a session may detach is server policy. A server SHOULD NOT let
+  a session with no password or identity detach (rationale §2). *hxd-ng:*
+  per account, `[extra] can_detach`, defaulting to "has a password".
+- A server SHOULD cap detached sessions per source address, ending the
+  oldest when the cap is exceeded. *hxd-ng:* `[ng] max_detached_per_addr`,
+  default 2.
+- *hxd-ng:* `[ng] grace`, default 300 seconds.
 
-**D2 — presence states.** `UserSession` gains
-`status: Active | Idle | Detached`; `UserInfo` carries it; roster events
-fire on transitions. The legacy frontend derives the wire color from
-`(admin, status)` instead of storing it; the ng frontend serializes the
-status string.
+**Moderating detached sessions.** A detached session is on the roster and
+MUST be subject to kick and ban like any other. Kicking or banning one
+MUST end it immediately; there is no connection to deliver `kicked` to.
 
-**D3 — the outbox.** The per-session event channel becomes a seq-stamped
-outbox owned by the roster entry:
+**Takeover.** A `resume` of a session that already has a connection
+attached MUST succeed if the token is valid (last device wins, rationale
+§2). The server MUST close the previous connection with WebSocket close
+code 1008 and reason `replaced`.
 
-- Every event gets the session's next `seq` (u64, monotonic, starts 1).
-- With a connection attached: deliver immediately (channel as today, now
-  carrying `(seq, Event)`).
-- Detached: buffer, bounded (default 512 events); overflow marks the buffer
-  broken — a later resume is refused with `resync_required` rather than
-  silently gappy.
-- `Core::connection_lost(uid)` → status `Detached`, start buffering.
-  `Core::end_session(uid)` → today's `detach` (parts chats, roster part).
-  The legacy frontend keeps calling `end_session` on socket death —
-  unchanged behavior; grace for legacy clients is pointless since no 1.x
-  client can re-attach.
-- A sweeper (tokio interval task owned by the binary, calling
-  `Core::sweep_detached(now)`) ends sessions whose grace lapsed.
+**Legacy presentation.** A session whose status is `idle` or `detached`
+MUST be shown to classic clients with the away bit set in the user list's
+color field.
 
-**D4 — session tokens** live in `hxd-ng-session`, not the domain: a registry
-of `session_id → (token hash, uid, outbox handle)`. The domain doesn't know
-what a token is.
+**Uids** are the classic wire's 16-bit user ids, shared by both
+populations: the two rosters are one roster. A uid identifies a session
+only while that session lives; uids are reused.
 
-**D5 — account extras.** The account files grow an `[extra]` section for
-server-local policy that never crosses the wire — the same concept as
-mhxd's `access_extra`, deliberately *not* bits in the access bitmap (those
-are ecosystem-shared wire vocabulary; fogWraith already allocates upward
-from 55, and squatting on reserved bits invites collisions). First key:
-`can_detach`, defaulting to *has-a-password*. `Account` grows the resolved
-flag; `AttachInfo` carries it into the roster so `connection_lost` can
-consult it. The Phase 2a public-subject gate (currently approximated by the
-admin bit) moves to `[extra] set_subject` here too, retiring that
-deviation.
+## 3. Event sequencing
+
+Every server-to-client event carries `seq`, an unsigned integer scoped to
+the session.
+
+- The first event of a session MUST have `seq` 1, and each later event
+  MUST have exactly the previous `seq` plus one. Seqs are never reused
+  within a session and never reset while it lives, across any number of
+  resumes.
+- A server MUST NOT skip a seq. An event the server has to deliver but
+  cannot express on this wire — because the family it belongs to has no
+  ng binding yet — MUST still be sent, with a placeholder `ev` the client
+  does not recognize. *hxd-ng:* `{ "seq": n, "ev": "unsupported", "data": {} }`.
+- A client MUST ignore an event whose `ev` it does not recognize, and MUST
+  still count its `seq` as received.
+- While a session is detached, the server buffers its events. The buffer
+  MAY be bounded (*hxd-ng:* 512 events). When a bounded buffer overflows,
+  the server MUST mark the session as unable to replay: a later `resume`
+  is answered `resync_required` (§6.2), never a partial replay.
+
+Replies do not carry `seq` and are not counted.
+
+## 4. Capabilities and extension families
+
+The login reply carries `caps`, an array of capability names. It MUST be
+present, and empty when the server offers no extensions. A client MUST
+ignore names it does not recognize.
+
+A capability says a family of requests will be answered; it is not a
+switch the client turns on. A server that does not serve a family MUST
+answer that family's requests with an error — `unknown_method` or the
+family's own "not available" code — and MUST NOT close the connection
+over them.
+
+| `caps` name | Family | Specified in | Login reply block |
+|---|---|---|---|
+| `history` | Server-held chat scrollback: the `history` request | §7 here; chat-history.md §7 | `history` |
+| `inbox` | Durable private messages: `inbox`, `msg_read`, `block`, `unblock`, `blocks`, and `msg` to an absent account | §7.1 here; private-messages.md §6 | `inbox` |
+| `media` | Images in chat and private messages; bytes over HTTP | inline-media.md §8 | `media` |
+| `news` | Threaded news, subscriptions and `news_notify` | news.md §9, §10.9 | `news` |
+| `voice` | Voice rooms | voice.md §8 | — |
+| `video` | Camera and screen publications, layered on voice | capabilities-video.md, "Hotline-ng Binding" | `video` |
+| `files` | The read-only file area | §7.2 here | — |
+| `identity` | The server has the identity endpoints of hotline-ng-auth.md | hotline-ng-identity.md §6.1 | fields in `self`, on a socket that authenticated with one |
+| `push` | Push device registration | push-notifications.md §8; webpush-gateway.md §7 | `push` |
+
+- `video` MUST NOT appear without `voice`.
+- A login reply block is present exactly when its capability is, except
+  where the family's own document says otherwise.
+- Each family's document is normative for its requests, events, error
+  codes and login block; this document does not repeat them.
 
 ## 5. Transport and framing
 
-One WebSocket endpoint (config `[ng] bind`, default `127.0.0.1:5700`,
-disabled when absent). Text frames, one JSON object per frame. The server
-sends WS pings (hxd-ng: every 30 s) and treats a connection that has sent
-nothing at all — pongs included — for three of those periods as lost
-(→ detached), which is what notices a peer that stopped reading rather
-than waiting for TCP to give up. TLS is the proxy's job; the server never speaks it.
+**Endpoint.** The protocol runs on a WebSocket upgraded from an HTTP/1.1
+`GET`. *hxd-ng:* on the ng listener (`[ng] bind`, default
+`127.0.0.1:5700`, disabled when absent), at the paths `/` and `/ng`. The
+same listener serves the HTTP endpoints of hotline-ng-auth.md, the
+inline-media and news-attachment byte routes, and the TRTP tunnel.
 
-Three JSON shapes, discriminated by their first key:
+**Frames.** Each message is one WebSocket **text** frame holding one
+JSON object. A client MUST NOT send binary frames; a server MUST ignore
+them. A server MAY close the connection on a text frame that is not a
+request object as specified below. *hxd-ng* does, and treats it as a
+lost connection (§2); it does the same for a message larger than 256 KiB.
+
+There are three message shapes, told apart by their keys:
 
 ```jsonc
-// Client → server request. id is client-chosen, echoed in the reply.
+// Client → server: a request. id is client-chosen and echoed in the reply.
 { "id": 7, "req": "chat", "params": { "text": "hello" } }
 
-// Server → client reply.
+// Server → client: a reply, exactly one of ok or error.
 { "reply": 7, "ok": { } }
 { "reply": 7, "error": { "code": "access_denied", "text": "…" } }
 
-// Server → client event. seq is per-session, monotonic, gapless.
+// Server → client: an event (§3).
 { "seq": 42, "ev": "chat", "data": { } }
 ```
 
-Requests are answered in order. Unknown `req` → `error` with code
-`unknown_method`; unknown fields in `params` are ignored (forward compat);
-unknown `ev` values must be ignored by clients (same rule). Error codes are
-a closed set per method plus the universal `unknown_method`,
-`not_logged_in`, `access_denied`, `bad_request`, `rate_limited`.
+- `id` MUST be a non-negative integer that fits in 64 bits. Clients
+  SHOULD NOT reuse one while its reply is outstanding.
+- `params` MAY be omitted for a request that takes none. A client
+  SHOULD send `{}` rather than omit `params` for a request whose params
+  are all optional; a server SHOULD accept the omission, and MUST accept
+  it where this document says so (`login`, `history`, `inbox`). A request
+  whose `params` are present but malformed MUST be answered
+  `bad_request`.
+- The server MUST answer every request with exactly one reply, and MUST
+  answer requests in the order they were received (rationale §5).
+- A server MUST ignore fields in `params` it does not recognize. A client
+  MUST ignore fields in `ok`, in `error` and in event `data` it does not
+  recognize.
+- An error object has a `code`, from the closed sets of §10 and the
+  family documents, and a `text` for a human. Clients MUST act on `code`
+  and MUST NOT parse `text`.
+
+**Keepalive.** The server SHOULD send WebSocket pings, and MAY treat a
+connection from which it has received no frame at all — pongs included —
+for several ping periods as lost. *hxd-ng:* a ping every 30 s, and lost
+after 90 s of silence; a send that blocks for 90 s is also a lost
+connection. Clients MUST answer pings (every WebSocket library does).
+
+**Close codes** the server uses:
+
+| Code | Reason | When |
+|---|---|---|
+| 1000 | `logout` | After the `logout` reply. |
+| 1000 | `kicked` | After the `kicked` event. |
+| 1008 | `replaced` | Another connection resumed this session (§2). |
+
+A connection closed for any other reason — a failed handshake, a dead
+link, a server shutdown — is a lost connection, and the session detaches
+or ends per §2.
 
 ## 6. The handshake
 
-The first request on a fresh socket must be `login` or `resume`, within the
-login timeout.
+The first request on a new connection MUST be `login` or `resume`, and it
+MUST arrive within the server's login timeout (*hxd-ng:* 10 s), or the
+server closes the connection. Any other first request is answered
+`not_logged_in` and the connection is closed. After a successful
+handshake, `login` and `resume` are answered `bad_request`.
 
-**Login** (new session):
+A handshake that fails is answered with its error and the connection is
+then closed. The client opens a new connection to try again.
+
+### 6.1 Login
+
+Starts a new session.
 
 ```jsonc
 { "id": 0, "req": "login", "params": {
     "login": "alice",        // omit or "" for guest
     "password": "…",         // omit for password-less accounts
-    "nick": "Alice",         // honored only with use_any_name
-    "icon": 128              // legacy icon id; optional
-} }
-
-{ "reply": 0, "ok": {
-    "session": "s_9f2c44b1",         // public session id
-    "token": "…base64url, 32 bytes…",// secret; store for resume
-    "self": { "uid": 3, "nick": "Alice", "icon": 128,
-              "admin": true, "status": "active" },
-    "server": { "name": "My Server", "subject": "welcome!" },
-    "users": [ { "uid": 1, "nick": "Alice", "icon": 2,
-                 "admin": false, "status": "active" }, … ],
-    "detach": { "grace": 300 },      // null when the account can't detach —
-                                     // the client then knows a resume will
-                                     // never succeed and re-logins instead
-    "caps": [ "voice", "history" ], // optional extensions this server
-                                     // offers; always present, empty when
-                                     // the build offers none (§11)
-    "history": { "max_lines": 10000, "max_days": 0 }, // when enabled
-    "seq": 0                          // events start at seq 1
+    "nick": "Alice",         // honored only with the use-any-name privilege
+    "icon": 128              // classic icon id; optional
 } }
 ```
 
-The roster snapshot rides in the login reply — a mobile client renders one
-round-trip after connect. Failure codes: `login_failed` (wrong account or
-password — deliberately one code), `denied` (the server's identity policy
-refused this socket, `hotline-ng-identity.md` §8.1 — nothing about the
-credentials failed, and there is nothing to retry), `revoked` (the
-socket's identity or device key was revoked on this server after it
-authenticated, `identity-registrar.md` §7.3 — the same code
-`/identity/auth` refuses it with from then on), `banned`, `server_full`.
+`params` MAY be omitted entirely, which is a guest login. On a socket
+that authenticated with an identity before the upgrade, `login` and
+`password` are ignored and SHOULD be omitted; the account is chosen as
+hotline-ng-identity.md §8.1 says.
 
-**Resume** (existing session):
+```jsonc
+{ "reply": 0, "ok": {
+    "session": "s_9f2c44b1",           // opaque session id
+    "token": "…",                       // opaque secret; keep it for resume
+    "self": { …user… },                 // §7.4, plus the fields below
+    "server": { "name": "My Server", "subject": "welcome!",
+                "agreement": "…" },     // agreement optional
+    "users": [ { …user… }, … ],        // the roster, including self
+    "detach": { "grace": 300 },         // or null (§2)
+    "caps": [ "history", "voice" ],     // always present (§4)
+    "seq": 0                            // the first event is seq 1
+    // …plus one block per capability that has one (§4)
+} }
+```
+
+| Field | Rule |
+|---|---|
+| `session` | Opaque string. Clients MUST NOT interpret it. |
+| `token` | Opaque string, a bearer credential for this session (§9). Clients MUST store it only where they would store a password, and MUST NOT log it. |
+| `self` | This session's `user` object (§7.4). On a socket that authenticated with an identity it also carries `identity.age`, `identity.outcome` and `identity.account`, which are for this user only (hotline-ng-identity.md §6.1). |
+| `server` | `name` and `subject` are strings. `agreement`, when present, is the server's agreement text, for the client to show; accepting it is not a protocol step. |
+| `users` | The complete roster at this moment, as `user` objects. |
+| `detach` | §2. |
+| `caps` | §4. |
+| `seq` | The seq the client is at: 0 for a new session. |
+
+The roster is complete at the reply: the client needs no event to learn
+who is present, and every event that follows is a change to it.
+
+Errors:
+
+| Code | Meaning |
+|---|---|
+| `bad_request` | `params` present but malformed. |
+| `login_failed` | No such account, or the wrong password. Deliberately one code (rationale §5). |
+| `denied` | The server's identity policy refused this socket (hotline-ng-identity.md §8.1). No credentials failed, and there is nothing to retry. |
+| `revoked` | The socket's identity or device key was revoked on this server after it authenticated (identity-registrar.md §7.3). |
+| `banned` | The address or identity is banned. *hxd-ng* refuses a banned address before the upgrade — closing the TCP connection at accept, or answering the HTTP request 403 — and never sends this code. |
+| `server_full` | No uid is free. |
+| `server_error` | The server could not complete the login. |
+
+### 6.2 Resume
+
+Attaches this connection to an existing session.
 
 ```jsonc
 { "id": 0, "req": "resume", "params": {
     "session": "s_9f2c44b1", "token": "…", "last_seq": 41 } }
 
-{ "reply": 0, "ok": { "replay": 3, "self": { … } } }
-// followed immediately by events 42, 43, 44, then live traffic
+{ "reply": 0, "ok": { "replay": 3, "self": { …user… } } }
+// then events 42, 43, 44, then live traffic
 ```
 
-Failure codes: `session_expired` (grace lapsed or token wrong — log in
-again), `resync_required` (buffer overflowed; the session is still alive:
-follow with `sync`, below, and continue from its returned seq). A resume
-while another connection is attached takes the session over: the old
-connection is closed with a `replaced` close code — last device wins, which
-is the mobile-friendly answer.
+- `last_seq` is the highest seq the client has received. It MAY be
+  omitted, meaning 0.
+- On success the reply's `replay` is the number of buffered events that
+  follow it, in seq order, before any live event. `self` is the session's
+  `user` object as it is now.
+- The server MUST answer `resync_required`, not replay, when it cannot
+  deliver every event after `last_seq`: the buffer overflowed (§3), some
+  of those events were already sent to an earlier connection (before it
+  was lost, or one this resume takes over) and are not in the buffer, or
+  `last_seq` is not a seq this session has reached.
 
-**Sync** (recover from `resync_required` without losing the session):
+Errors:
+
+| Code | Meaning |
+|---|---|
+| `bad_request` | `params` malformed. |
+| `session_expired` | No such session, the token is wrong, or the grace window lapsed. Log in again. |
+| `resync_required` | The session is alive and **this connection is now attached to it**, but the events after `last_seq` cannot be replayed. Follow with `sync` (§6.3) on this same connection. |
+
+`resync_required` is the one handshake error that does not close the
+connection.
+
+### 6.3 Sync
+
+Recovers from `resync_required` without losing the session. Valid at any
+time after the handshake.
 
 ```jsonc
 { "id": 1, "req": "sync" }
-{ "reply": 1, "ok": { "server": { … }, "users": [ … ], "seq": 977 } }
+{ "reply": 1, "ok": { "server": { "name": "…", "subject": "…" },
+                      "users": [ … ], "seq": 977 } }
 ```
 
-Stored mail follows a `resume` or a `sync` reply as **ordinary events
-with later seqs** — never inside the reply, and never before it. `seq`
-is what the client says it is at, so anything the server emits ahead of
-that number is something the client has just been told it is past. A
-`resume` answered `resync_required` therefore flushes nothing itself: the
-flush comes after `sync`, whose seq the client will honour.
+`users` is the complete roster and `seq` is the seq the client continues
+from: the next event it receives has a greater one.
 
-That is a statement about the *flush*, not about the socket. A session
-answered `resync_required` is live again from that moment, so traffic
-addressed to it — someone sending it a message, which delivers rather
-than queues once the session is attached — arrives in the window between
-that reply and the `sync` one, carrying seqs below the number `sync` will
-report. **A client must not discard events it has already received when
-it applies `sync`'s seq**: that number says where to *continue* from, not
-which of the frames already in hand to throw away.
+- **The server MUST NOT send an event with a seq at or below `sync`'s
+  `seq` after the `sync` reply** (rationale §5). A server that cannot keep
+  this promise does not conform.
+- A session answered `resync_required` is live from that moment, so
+  events can arrive between that error and the `sync` reply, carrying
+  seqs below the one `sync` reports. **A client MUST NOT discard events it
+  has already received when it applies `sync`'s seq**: that number says
+  where to continue from, not which frames in hand to throw away.
 
-**Nothing at or below `sync`'s seq arrives after its reply.** The server
-owes the client that, and it is a real obligation rather than a
-likelihood: a reply and an event share one socket, so a server whose
-reply can overtake an event the session was already handed reports a
-number the client is not in fact past — and a client doing the natural
-thing, dropping what it has already seen by seq, would drop a message the
-store has marked delivered. hxd-ng reads the session's seq and drains its
-pending events ahead of the reply. Seq assignment and channel enqueue are
-one atomic operation, so everything at or below the snapshot is already
-there to drain and anything enqueued later has a higher seq. A server that
-cannot make this promise must
-say so, because the alternative rule for clients — never discard an event
-by seq — is weaker and has to be stated somewhere.
+### 6.4 Stored mail after the handshake
 
-## 7. Requests and events — the MVP set
+Private messages that waited for this account while it had no session
+(§7.1) are delivered as ordinary `msg` events, with later seqs, **after**
+the reply to `login`, to a successful `resume`, or to `sync` — never
+inside a reply and never before it. A `resume` answered
+`resync_required` delivers no stored mail; the `sync` that follows it
+does (rationale §5).
 
-Requests:
+## 7. Requests and events
 
-| `req` | params | ok | notes |
-|---|---|---|---|
-| `login` / `resume` / `sync` | above | above | handshake only |
-| `chat` | `text`, `style?` (`"normal"`\|`"action"`) | `{}` | needs send-chat access; multi-line allowed, server relays as one event |
-| `history` | `before?` / `after?` (line id), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | needs chat-history access; rows ascend by id; both cursors mean the exclusive range `after < id < before`, paged forward; `params` may be omitted |
-| `msg` | exactly one of `to` (uid) / `to_login`, plus `text`, `guid?` | `{ "queued": bool }` | needs send-msgs access; same 4096-byte cap as chat. See §7.1 |
-| `inbox` | `before?` (id), `limit?` (1–200, default 50) | `{ messages, unread, total }` | newest first, paging backwards. `params` may be omitted |
-| `msg_read` | `up_to` (id) | `{ unread, total }` | marks everything of yours up to that id read |
-| `block` / `unblock` | exactly one of `uid` / `login`, or for `unblock` `fingerprint` | `{}` | refuse or accept mail from that account |
-| `blocks` | — | `{ "blocked": [{ "login", "fingerprint"? }] }` | who you have blocked |
-| `nick` | `nick?`, `icon?` | `{}` | nick honored only with use_any_name |
-| `vouch` / `unvouch` / `vouches` | [identity-vouch.md](identity-vouch.md) §3.2 | there | lend a member's standing to an identity key; needs `[extra] vouch` (access-bits.md §4). Params, replies and errors are specified there, not here. *Design* |
-| `ping` | — | `{}` | keepalive for clients that want RTT |
-| `logout` | — | `{}` | ends the session *now* (no grace) |
-
-News is a request family of its own — `news_tree`, `news_threads`,
-`news_thread`, `news_article`, `news_post` and the rest, following
-and muting among them — with events of its own and a `news` block in
-the login reply. It is specified in [news.md](news.md) §9, and its
-subscriptions and `news_notify` in §10 (§10.6, §10.9), rather than
-repeated here.
-
-Push devices are a pair of requests, `push_register` and
-`push_unregister`, with a `push` block in the login reply and `push` in
-`caps` when the server sends notifications. They are specified in
-[push-notifications.md](push-notifications.md) §8 and §8.1 — the
-params, the error codes, and why omitting `devid` means *this* device —
-and [webpush-gateway.md](webpush-gateway.md) §7 settles what §8 left to
-the gateway: where an identity device's id comes from, its bounds on a
-password session, and the per-account cap (`too_many_devices`).
-
-`blocks` lists objects rather than logins because a block can be held
-against an identity that logged in as a guest: its login is `guest` and
-the fingerprint is what tells it apart, so a list of logins would name
-something `unblock` could not resolve once that guest had left. The
-`fingerprint` is present exactly when the block is keyed on one, and is
-the 52-character form. Blocking still needs someone the caller can see
-(a `uid` on the roster or a `login`); `fingerprint` only lifts a block
-that already exists.
-
-Errors from the message requests: `access_denied`, `no_such_user` (one
-answer for "no such account", "that account takes no offline messages"
-and "no such uid", so none can be told from the others), `no_inbox`
-(*your* account has none, which is a different thing), `mailbox_full`,
-`blocked`, `server_error`.
-
-`rate_limited` from `chat`, `msg` and the news posts during a
-never-seen key's newcomer delay carries `retry_after` (seconds) in the
-error data, so a client can grey the compose box for that long rather
-than retry blind — [identity-registrar.md](identity-registrar.md) §7.3.
-*Design, with the registrar.*
-
-Events (all carry `seq`):
-
-| `ev` | data | mirrors domain event |
-|---|---|---|
-| `user_joined` | `{ user }` | `Joined` |
-| `user_changed` | `{ user }` | `Changed` (includes status transitions) |
-| `user_parted` | `{ "uid": n }` | `Parted` |
-| `chat` | `{ "from": {uid, nick}, "text", "style", "id"?, "at" }` | `Chat` (cid 0 only in MVP); `id` exists when persisted |
-| `notice` | `{ "text" }` | `Notice` |
-| `subject` | `{ "subject" }` | `ChatSubject` (cid 0) |
-| `broadcast` | `{ "from": {uid, nick}, "text" }` | `Broadcast` |
-| `msg` | `{ from: {uid, nick, login?}, text, id?, at, queued }` | `Msg` — see §7.1 |
-| `kicked` | `{}` | `Kicked`; server then closes, session ends |
-
-A `user` object is:
-
-```jsonc
-{
-  "uid": 3, "nick": "Alice", "icon": 128,
-  "admin": false,
-  // "system": true                // only on the server's own account; absent otherwise
-  "status": "active",              // active | idle | detached
-  "transport": "encrypted",        // encrypted | cleartext — see below
-  "identity": {                    // absent unless the socket proved one
-    "fingerprint": "6htgz65…",     // 52 characters, Crockford base32
-    "handle": "alice@hl.example"   // null when no attestation was accepted
-  }
-}
-```
-
-Uids remain the 16-bit legacy ids so the two rosters are one roster.
-
-`system` is present, and `true`, on exactly one user: the server's
-reserved account ([system-account.md](system-account.md) §2), when the
-server runs one. Every other user object leaves the key out, so a
-client reads a missing `system` as `false`. That account is always in
-the roster snapshot on both wires, has `admin` set, is protected from
-kick and ban, and is the uid that server mail and commands (§3 there)
-come from and go to.
-
-`transport` comes from [`hotline-ng-auth.md`](hotline-ng-auth.md) §7.2
-and §8, `identity` from [`hotline-ng-identity.md`](hotline-ng-identity.md)
-§6.1, and both are present whether or not those endpoints are enabled —
-a plain TCP legacy session reads as `"cleartext"` with no `identity`, so a
-client can
-warn before a private message goes somewhere unencrypted without
-feature-detecting anything. A session is `"cleartext"` when the legacy
-client is on plain TCP, or when a tunnel told the server at
-`/identity/auth` that its own downstream hop is cleartext (§5.2
-`downstream`): a client may declare itself less safe than it looks, never
-more. `identity` carries only what the roster is entitled to show —
-never `age`, `outcome`, or anything that authorizes.
-
-The login reply's `self` object carries the same fields, plus `age` and
-`outcome` from `/identity/auth`, which are for the user themself.
-
-Events that exist in the domain but have no ng mapping yet (the
-private-chat room family) are delivered to ng sessions as placeholder
-frames the client ignores, keeping seq accounting gapless.
+The core requests are tabled in §7.3 and the core events in §7.4. Private
+messages (§7.1) and files (§7.2) come first because other documents cite
+them by those numbers.
 
 ### 7.1 Private messages
 
-Design and rationale: [private-messages.md](private-messages.md). What a
-client has to know:
+`msg` sends a private message. The rest of the private-message requests
+belong to the `inbox` capability (§4).
 
 - **Addressing.** `to` names a uid on the roster; `to_login` names an
-  account, whether or not it holds a session. Exactly one — a request
-  with both is `bad_request`, because guessing which was meant is how a
-  message reaches the wrong person.
-- **`guid`** is the client's own id for the message, a UUID in either
-  spelling. Two sends of the same guid between the same pair are one
-  message — stored once, never refused — which is what makes a retry safe
-  after a socket died between the send and the reply; without it a retry
-  is a second message. The *reply* to a retry describes the message as it
-  stands now, not as it stood then: a recipient who was away for the
-  original send and is here for the retry gets it, and the retry is
-  answered `queued: false` where the original said `true`. A client that
-  treats a changed answer as an error has it backwards — that is the
-  message being delivered.
-- **The reply** says `queued: true` when the message waited rather than
-  going straight to a live session, and nothing else. The message id is
-  the *recipient's* handle for marking read; handing a monotonic id to
-  the sender would tell them how much mail the server carries.
-- **The `msg` event** carries `id` (absent when nothing durable was
-  stored — a message between sessions on a server with no inbox, or from
-  a guest), `at` (unix seconds, when it was sent, not when it arrived),
-  `queued` (true when it had been waiting), and `from.login` — absent
-  when there is nobody to reply to, which is the case for a guest.
-- **The login reply's `inbox`** block (`{ unread, total }`) is present
-  whenever the server has an inbox, so a client can render a badge before
+  account, whether or not it holds a session. A request MUST name exactly
+  one; naming both or neither is `bad_request`.
+- **`text`** MUST be non-empty unless the message carries `media`
+  (inline-media.md §8.3); an empty message is `bad_request`.
+- **`guid`** is the client's own id for the message: a UUID, hyphenated or
+  not. A client SHOULD send one. Two sends with the same guid between the
+  same sender and recipient of a **stored** message — the recipient has an
+  inbox and the sender has a mailbox — are one message, stored once and
+  never refused, so a retry after a lost reply is safe. A message that is
+  not stored (a guest's, or one to an account with no inbox, or on a
+  server without the `inbox` capability) is not deduplicated, and neither
+  is one sent without a guid: a retry is a second message. The reply to a retry describes the message as it
+  stands now: a recipient who was away for the first send and is present
+  for the retry receives it, and the retry is answered `queued: false`
+  where the first send was answered `true`. That is delivery, not an
+  error.
+- **The reply** is `{ "queued": bool }`: `true` when the message waited
+  in the recipient's inbox rather than going straight to a live session.
+  It carries no message id (rationale §5).
+- **The `msg` event** carries `from` (`{ uid, nick, login? }`), `text`,
+  `at`, `queued` and, when the message was stored, `id`. `from.uid` is 0
+  when a queued message's sender no longer has a session. `from.login` is
+  absent when there is nobody to reply to — a guest, or an account since
+  deleted. `id` is absent when nothing durable was stored. `at` is when
+  the message was sent, not when it arrived.
+- **The login reply's `inbox`** block, `{ unread, total }`, is present
+  whenever the server has an inbox, so a client can show a badge before
   any mail arrives.
 
-**A client that resyncs must pull `inbox`.** When `resume` answers
-`resync_required`, the events in the gap are gone, and any `msg` among
-them was already marked delivered — the store is the only remaining copy.
-So the recovery is `sync`, then `inbox` to see what private-message traffic
-the gap held, then `history { after: last_id }` (looping while `has_more`) to
-recover its public chat. A line returned by history has the same id as its
-live event, so a client deduplicates by id. §3's
-"a dropped socket stops losing messages" is true of the store and true of
-the wire only for a client that does this. Mail that arrived while the
-socket was gone was never in the buffer at all: it is still pending, and
-`sync` flushes it as events after its own reply (§6).
+A stored message to an account with no attached session — detached, or
+no session at all — waits in the inbox (`queued: true`) and is delivered
+after the handshake of its next connection (§6.4). A message that is not
+stored reaches a detached session through its outbox (§3) and is
+delivered on resume; to an account with no session it cannot be
+delivered at all, and is `no_such_user`.
+
+**A client that receives `resync_required` MUST recover as follows:**
+`sync`; then `inbox`, to find the private messages the gap held — they
+were marked delivered when they entered it, and the store is now the only
+copy; then `history` with `after` set to the last chat line id it holds,
+repeated while `has_more`, to recover the gap's public chat. A line
+returned by `history` has the same id as its live `chat` event, so the
+client deduplicates by id. Mail that arrived while no connection was
+attached was never in the buffer; it is still pending, and `sync`
+delivers it (§6.4).
 
 ### 7.2 Files
 
@@ -454,7 +439,8 @@ slashes and trailing slashes are malformed.
 
 - `files_list { path? }` returns `{ path, entries }`. Each entry is
   `{ name, kind, size, media_type?, modified? }`, where `kind` is `file` or
-  `folder`.
+  `folder`. In this section a `?` field is present and `null` when
+  unknown, rather than absent.
 - `files_info { path }` returns
   `{ path, name, kind, size, media_type?, created?, modified?, comment? }`.
   `path` names an entry, so `""` is `bad_request`.
@@ -503,128 +489,242 @@ its `(uid, serial)` session, taking any download still streaming on it
 along. So does a download whose receiver stops reading for the server's
 idle timeout. Unknown, expired, and unauthorized tokens all answer `404`.
 
-## 8. Text, encoding, limits
+### 7.3 The core requests
 
-The protocol is UTF-8 by construction (it's JSON). Normative limits, chosen
-to keep the legacy bridge sane: nick ≤ 31 bytes *in its Mac Roman form*,
-which the server enforces as **31 characters** — every character converts
-to exactly one Mac Roman byte, or to `?`, so the two are the same bound
-and characters is the one that can be counted before the conversion. A
-longer nick is truncated once, on the way in, and every viewer sees the
-same one; counting UTF-8 bytes instead would cut a 28-character accented
-nick that a 1.x client carries whole. Chat text ≤ 4096 bytes per request,
-subject ≤ 255 bytes.
-Chat text crossing to legacy clients is converted with `?` for unmappable
-characters — tell your users their emoji become question marks on
-twenty-five-year-old Macs, which is honestly part of the charm.
+The requests every conforming server answers, plus those of the `history`
+and `inbox` capabilities, which are specified here rather than in a
+family document. Each family of §4 adds its own.
 
-**Chat text is plain text, and a client may draw a closed markdown
-dialect in it.** GtkHx renders a conservative subset on receipt — bold,
-italic, code, strikethrough, links with a scheme allowlist, fenced code
-and quotes, and nothing else (GtkHx's `docs/chat-view.md` §4) — and
-hx-ng renders the same one, ported from the same scanner with the same
-tests, so a line reads the same in both. None of it is on the wire.
-What is sent is the literal text, a legacy client sees the asterisks,
-and the server neither parses nor rewrites it. A news article is
-different: its body says what it is (`mime`), and markdown there is the
-fuller dialect of news.md §5.
+| `req` | `params` | `ok` | Errors besides §10's universal set |
+|---|---|---|---|
+| `login` / `resume` / `sync` | §6 | §6 | §6 |
+| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?` | `{}` | `server_error` |
+| `nick` | `nick?`, `icon?` | `{}` | — |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?` | `{ "queued": bool }` | `no_such_user`, `mailbox_full`, `blocked`, `server_error` |
+| `history` | `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `server_error` |
+| `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
+| `msg_read` | `up_to` (message id) | `{ "unread", "total" }` | `no_inbox`, `server_error` |
+| `block` | exactly one of `uid` / `login` | `{}` | `no_such_user`, `no_inbox`, `server_error` |
+| `unblock` | exactly one of `uid` / `login` / `fingerprint` | `{}` | `no_such_user`, `no_inbox`, `server_error` |
+| `blocks` | — | `{ "blocked": [ { "login", "fingerprint"? } ] }` | `no_inbox`, `server_error` |
+| `vouch` / `unvouch` / `vouches` | identity-vouch.md §3.2 | there | there. *Design, not built.* |
+| `ping` | — | `{}` | — |
+| `logout` | — | `{}` | — |
 
-**The legacy wire itself can negotiate UTF-8.** fogWraith's
-[Text-Encoding extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Text-Encoding.md)
-defines `CAPABILITY_TEXT_ENCODING` (bit 1 of `DATA_CAPABILITIES`, field
-`0x01F0`): a legacy-wire client that advertises it, and gets the bit echoed
-in the login reply, exchanges UTF-8 in every text field — Mac Roman becomes
-the fallback for clients that don't negotiate, exactly the per-connection
-bridge that spec mandates ("servers MUST store all text internally as
-UTF-8", which is what hxd-core now does). **Implemented** in the legacy
-frontend: the conversion calls at `hxd-session`'s edges go through a
-per-connection encoding fixed at login, plus the spec's CR↔LF line-ending
-normalization at egress (a body reaches a UTF-8 client with LF and a Mac
-Roman one with CR, whatever its sender typed). Its future HOPE `app_id` refinement (per-client encoding guesses
-for Shift-JIS/Latin-1 legacy clients) can ride the HOPE work when that
-lands.
+- **`chat`** needs the send-chat privilege. The text MAY contain line
+  breaks and is relayed as one event. `media` is inline-media.md §8.3's.
+- **`nick`** changes this session's nick and icon. A new nick is honored
+  only with the use-any-name privilege and is otherwise ignored, as is an
+  empty one; either way the reply is `{}`.
+- **`msg`** needs the send-messages privilege, except to the server's own
+  account (system-account.md §3). See §7.1.
+- **`history`** needs the chat-history privilege. It pages public chat by
+  line id: rows ascend by id; `before` and `after` are exclusive bounds,
+  and together mean `after < id < before`, paged forward from `after`;
+  an id of 0 is the same as omitting the bound. `limit` 0 is
+  `bad_request`; a server MAY cap `limit` below 200. The login reply's
+  `history` block, `{ max_lines, max_days }`, is the server's retention
+  (chat-history.md §7). A server MAY rate-limit this request.
+- **`inbox`** lists this account's stored messages, newest first, paging
+  backward from `before`. Each is `{ id, from: { nick, login? }, text, at,
+  read, media? }`; there is no uid, which may have been reused since.
+- **`msg_read`** marks every message of this account's with an id at or
+  below `up_to` read, and returns the counts after it.
+- **`block`** refuses mail from an account, or from the identity of a
+  session on the roster; **`unblock`** accepts it again. `fingerprint`
+  names an existing block by the 52-character fingerprint `blocks`
+  reports, and is valid only for `unblock`. A block keyed on a fingerprint
+  lists with `fingerprint` present; one keyed on an account lists without
+  it.
+- **`logout`** ends the session at once, with no grace, and the server
+  then closes the connection (§5).
 
-## 9. Security posture
+**News** (`news_*`), **push** (`push_register`, `push_unregister`),
+**voice** (`voice_*`), **video** (`video_*`) and **files** (`files_*`)
+requests are specified where §4 says.
 
-- WSS mandatory in production; the plaintext listener binds localhost by
-  default and the docs say why.
-- Tokens: 32 bytes from the OS CSPRNG, stored server-side as a SHA-256
-  hash, compared in constant time. A token is a bearer credential for one
-  session, dies with it, and never appears in logs.
-- Auth reuses the `AuthBackend` trait as-is (plaintext-equivalent secrets —
-  the legacy constraint, documented there). ng-only accounts with argon2
-  arrive with the database backend, not the MVP.
-- Rate limiting: per-connection request cap (token bucket, config) from day
-  one — this endpoint faces phones on the open internet, a harsher place
-  than port 5500. Login attempts per address are separately capped.
-- The ban list applies at WS accept exactly as at legacy accept. Its
-  entry form gains `*@host`, which bans a registrar: an identity carrying
-  any attestation from that host is refused with `denied`, before the
-  admission policy runs, and it is checked where the identity is, not at
-  accept — [identity-registrar.md](identity-registrar.md) §7.3. *Design,
-  with the registrar.*
-- Roster pollution is bounded three ways: `can_detach` is per-account and
-  off for guests (§2), detached sessions are capped per source address,
-  and a kick or ban of a detached user ends its session immediately — the
-  kick path must call `end_session` directly when no connection is attached
-  to receive the event.
+`rate_limited` from `chat`, `msg` and the news posts during a never-seen
+key's newcomer delay carries `retry_after` (seconds) in the error object,
+so a client can disable its compose box for that long rather than retry
+blind (identity-registrar.md §7.3). *Design, with the registrar.*
 
-## 10. Implementation stages
+### 7.4 The core events
 
-Each lands separately with tests, roughly a branch apiece:
+| `ev` | `data` | Sent when |
+|---|---|---|
+| `user_joined` | `{ "user": {…} }` | A session joins the roster. |
+| `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag or status changes. |
+| `user_parted` | `{ "uid": n }` | A session leaves the roster. |
+| `chat` | `{ "from": { uid, nick }, "text", "style", "at", "id"?, "media"? }` | A line of public chat. `id` is present when the server kept the line (the `history` capability). |
+| `notice` | `{ "text" }` | A server notice, such as a kick announcement. |
+| `subject` | `{ "subject" }` | The public chat's subject changed. |
+| `broadcast` | `{ "from": { uid, nick }, "text" }` | An administrator's broadcast. |
+| `msg` | `{ "from": { uid, nick, login? }, "text", "at", "queued", "id"?, "media"? }` | A private message (§7.1). |
+| `kicked` | `{}` | This session was kicked. The server then closes the connection (§5) and the session is over. |
 
-1. **N1 — domain prep**: D1 (UTF-8 + `Notice`), D2 (status), with the
-   legacy frontend updated at its edges. Pure refactor, legacy Tier-3-style
-   e2e stays green — this is the step most likely to shake out bugs, do it
-   alone.
-2. **N2 — outbox + policy**: D3 (`seq`, buffering, `connection_lost` /
-   `end_session` / `sweep_detached`, the per-address detached cap, the
-   kick-while-detached path) and D5 (`[extra] can_detach` with the
-   has-a-password default). Unit-tested in `hxd-core` /`hxd-auth-file`
-   without any network.
-3. **N3 — the frontend**: `hxd-ng-session` crate — WS accept, handshake,
-   token registry (D4), request dispatch, event encoding; binary config
-   (`[ng] bind`, `grace`) and the sweeper task. E2E with a scripted
-   tokio-tungstenite client.
-4. **N4 — cross-frontend e2e**: legacy scripted client + ng scripted client
-   on one server — mutual roster visibility, chat both ways with correct
-   formatting/conversion, detached-shows-away on the legacy list, resume
-   replay after a dropped WS, grace expiry parts both rosters, kick over ng.
-5. **N5 — polish for a real app**: rate limits, close codes, the `replaced`
-   takeover path, and a `docs/hotline-ng-client.md` quickstart for whoever
-   writes the mobile app (likely us).
+Timestamps (`at`) are integer Unix seconds. Events of the extension
+families — `voice_*`, `video_status`, `news_*` — are specified where §4
+says, and `media_revoked` in moderation.md §5. Every event, of any family,
+counts in §3's sequence.
 
-## 11. Future extensions (design hooks, no work now)
+**The `user` object:**
 
-- **Push + offline inbox** (the rest of Phase 7): device registration is
-  specified (§7, and push-notifications.md §8) and the offline inbox is
-  built (§7.1); what remains here is the outbox growing a durable tail in
-  Postgres — the seq/replay model is already the right substrate.
-- **Inline media**: designed in [inline-media.md](inline-media.md) §8 —
-  bytes over HTTP on the ng port, a `media` handle on `chat`/`msg`
-  requests and a `media` object on their events.
-- **Moderation**: designed in [moderation.md](moderation.md) §5 — a
-  `report` request for anyone, `redact`/`revoke`/`purge`/`kick` and
-  the report queue for moderators, and `chat_redacted`/`media_revoked`
-  events so a client can blank what it already drew.
-- **Private chats**: the domain events exist; ng needs a `cid` field on
-  `chat`/`subject` events and room-lifecycle requests. Voice already
-  carries `cid` on every request and event, so nothing there changes.
-- **Authentication and identity** (`docs/hotline-ng-auth.md`, `docs/hotline-ng-identity.md`): authentication moves to
-  the HTTP layer before the upgrade, so an authenticated socket arrives
-  knowing which device key holds it; `login` then ignores credentials for
-  identity users and associates an account. The same design adds a
-  second WebSocket path carrying TRTP in binary frames, so a legacy client
-  behind a plain tunnel gets an identity-aware, encrypted session with no
-  change to the legacy wire. This is what ends the "no HTTP framework"
-  decision above.
-- **Capabilities**: the login reply carries a `caps: [...]` list so
-  clients feature-detect instead of version-sniffing. It ships with the
-  legacy wire's `DATA_CAPABILITIES` negotiation (`docs/voice.md` §7) and
-  starts empty; each extension adds its name as it lands.
-- The hotline-rs org's protocol work, if it converges here: this spec is
-  the artifact to share — it's implementation-independent and the org's
-  server could adopt it wholesale.
+```jsonc
+{
+  "uid": 3, "nick": "Alice", "icon": 128,
+  "admin": false,
+  "status": "active",              // §2
+  "transport": "encrypted",        // encrypted | cleartext
+  "identity": {                    // absent unless the session proved one
+    "fingerprint": "6htgz65…",     // 52 characters, Crockford base32
+    "handle": "alice@hl.example"   // null when no attestation was accepted
+  },
+  "system": true                   // only on the server's own account
+}
+```
+
+| Field | Rule |
+|---|---|
+| `uid` | §2. |
+| `nick`, `icon` | As shown to every other user, classic clients included. |
+| `admin` | The user may disconnect other users: the classic wire's admin color. |
+| `status` | §2. |
+| `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. |
+| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1). It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. |
+| `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
+
+## 8. Text and limits
+
+All text on this wire is UTF-8; JSON makes it so. A server that shares its
+roster with classic clients converts text at the classic wire's edge,
+and text that crosses to a classic client without the Text-Encoding
+capability loses every character Mac Roman lacks, which becomes `?`.
+
+| Limit | Value | Enforcement |
+|---|---|---|
+| Nick | 31 **characters** | Truncated on the way in, once, so every viewer sees the same nick (rationale §5). |
+| Chat text | 4096 bytes of UTF-8 | Truncated at a character boundary. |
+| Private message text | 4096 bytes of UTF-8 | Truncated at a character boundary. |
+| Subject | 255 characters | The classic wire's bound, applied as characters where a subject is set. |
+
+A server truncates text over these limits rather than rejecting the
+request. A client SHOULD enforce them before sending, so that what its
+user typed is what arrives.
+
+**Chat text is plain text.** A server MUST NOT parse, rewrite or
+annotate it. A client MAY render a closed markdown dialect in it on
+receipt, and SHOULD use the one GtkHx and hx-ng share (rationale §5); it
+MUST NOT render anything a classic client would not also see as text. A
+news body is different: it declares its own type (news.md §5).
+
+## 9. Security
+
+- **TLS.** In production the WebSocket MUST be `wss://`. A server that
+  speaks plaintext SHOULD listen only on loopback by default, behind a
+  proxy that terminates TLS. *hxd-ng* never speaks TLS itself.
+- **Tokens.** A session token MUST come from a CSPRNG with at least 128
+  bits of entropy, and SHOULD be stored server-side only as a hash and
+  compared in constant time. A token is a bearer credential for one
+  session and MUST die with it. Servers and clients MUST NOT log tokens.
+  *hxd-ng:* 32 bytes, hex-encoded, stored as SHA-256, trusted as
+  `(uid, serial)` so a token for an ended session never resumes a later
+  session on the same uid.
+- **Credentials.** `password` crosses the wire as the classic wire's
+  plaintext-equivalent secret; TLS is what protects it. A socket that
+  authenticated with an identity (hotline-ng-auth.md) sends none.
+- **Bans.** The server's ban list MUST apply to this listener as it does
+  to the classic one. *hxd-ng* checks the client address — the one a
+  trusted proxy forwards — on every HTTP request, the upgrade included.
+  A `*@host` entry bans a registrar: an identity carrying any attestation
+  from that host is refused with `denied`, before the admission policy
+  runs, and it is checked where the identity is, not at accept
+  (identity-registrar.md §7.3). *Design, with the registrar.*
+- **Rate limits.** This endpoint faces phones on the open internet. A
+  server SHOULD limit requests per connection and login attempts per
+  address, and answers a request over its limit `rate_limited`, which a
+  client MUST NOT treat as fatal. *hxd-ng* limits `history`,
+  `news_search`, media and news-attachment uploads, media downloads, and
+  enrollment; the general per-connection and login-attempt limits are not
+  yet built.
+- **Roster pollution** is bounded by the detach rules of §2: permission
+  per account and off for guests, a per-address cap, and moderation that
+  ends a detached session on the spot.
+
+## 10. Error codes
+
+**Universal** — any request MAY be answered with these:
+
+| Code | Meaning |
+|---|---|
+| `unknown_method` | The server does not implement this `req`. |
+| `not_logged_in` | The first request was not `login` or `resume` (§6). |
+| `bad_request` | `params` malformed, a required param missing, or a combination this document forbids. |
+| `access_denied` | The session lacks the privilege this request needs. |
+| `rate_limited` | Over a limit (§9). Retry later; MAY carry `retry_after`. |
+| `server_error` | The server failed. Not the client's fault; MAY be retried. |
+
+**Core** — from §6 and §7:
+
+| Code | From | Meaning |
+|---|---|---|
+| `login_failed` | `login` | Wrong account or password. |
+| `denied` | `login` | Identity policy refused this socket. |
+| `revoked` | `login` | This identity or device key is revoked here. |
+| `banned` | `login` | Banned (§6.1). |
+| `server_full` | `login` | No uid free. |
+| `session_expired` | `resume` | Log in again. |
+| `resync_required` | `resume` | Attached; follow with `sync`. |
+| `not_available` | `history`, `files_*`, family requests | The server does not offer this. |
+| `no_such_user` | `msg`, `block`, `unblock` | No such uid, no such account, or that account takes no offline mail — one answer for all three. |
+| `no_inbox` | `inbox`, `msg_read`, `block`, `unblock`, `blocks` | *Your* account has no inbox, or the server has none: the `inbox` family's "not available" code. |
+| `mailbox_full` | `msg` | The recipient's inbox is at its cap. |
+| `blocked` | `msg` | The recipient blocks you. |
+
+The files codes are §7.2's. Each family's document lists its own. A
+client MUST treat a code it does not recognize as a failure of that one
+request.
+
+## 11. Obligations checklist
+
+A summary of the rules above, for implementers; the sections are
+normative, this list is not.
+
+**A server:**
+
+- answers every request, once, in order, and ignores binary frames (§5);
+- stamps every event with a gapless seq, placeholders included (§3);
+- detaches or ends a session whose connection is lost, ends a detached
+  session when its grace lapses, and ends a kicked or banned detached
+  session at once (§2);
+- closes a taken-over connection with 1008 `replaced` (§2);
+- answers `resync_required` rather than replay partially (§3, §6.2);
+- sends nothing at or below `sync`'s seq after its reply (§6.3);
+- delivers stored mail after the `login`, successful `resume` or `sync`
+  reply — never before or inside one, and not after a `resync_required`
+  (§6.4);
+- advertises exactly the families it serves, and answers an unserved
+  family's requests with an error rather than closing (§4);
+- shows `idle` and `detached` sessions to classic clients as away (§2);
+- issues tokens with enough entropy, ends them with their session, never
+  logs them, and applies its ban list to this listener (§9).
+
+**A client:**
+
+- sends only text frames, answers pings, acts on an error's `code` and
+  never parses its `text` (§5);
+- ignores unknown fields, events, capabilities and error codes, and
+  counts unknown events' seqs (§3, §4, §5, §10);
+- stores the token like a password and resumes with the last seq it
+  received (§6.2), or logs in again when `detach` was `null` (§2);
+- on `resync_required`: `sync`, then `inbox`, then `history` from its last
+  line id, keeping events it already had (§6.3, §7.1);
+- should send a `guid` with every private message, and reuse it on retry
+  (§7.1);
+- reads an absent `system` as `false` (§7.4);
+- treats `rate_limited` as a delay, not a failure (§9);
+- renders no markup in chat that a classic client would not also see as
+  text (§8);
+- parses file sizes as strings (§7.2).
 
 ## 12. Open questions
 
@@ -633,6 +733,7 @@ Each lands separately with tests, roughly a branch apiece:
   into ng `idle`.
 - Whether the roster should distinguish "same user, multiple sessions"
   before the multi-device future arrives, or let each login be its own
-  roster row (MVP does the latter).
+  roster row (as it does now).
 - Guest nick collisions: legacy servers allow duplicate nicks; mobile UX
-  may want uniqueness. MVP inherits the legacy answer (duplicates fine).
+  may want uniqueness. The protocol inherits the legacy answer
+  (duplicates fine).

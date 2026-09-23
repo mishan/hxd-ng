@@ -1236,7 +1236,7 @@ inferred from this one.
 
 `hotline-ng-auth.md` §5: the `registrar` block is §3 here.
 
-`hotline-ng.md` §7 and the legacy ban list: the `*@host` entry form and
+`hotline-ng.md` §7 and §9, and the legacy ban list: the `*@host` entry form and
 the `retry_after` on `rate_limited` during `newcomer_delay` (§7.3).
 
 `identity-enrollment.md` §12: "Mobile without a desktop" is answered by

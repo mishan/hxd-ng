@@ -834,6 +834,7 @@ other than this server. The last column is what this server has built.
 | Document | What it covers | Built |
 |---|---|---|
 | [hotline-ng.md](docs/hotline-ng.md) | The ng protocol: framing, the login/resume/sync handshake, the request and event tables, seq accounting | yes |
+| [hotline-ng-rationale.md](docs/hotline-ng-rationale.md) | The reasoning behind the ng protocol, its domain-layer changes and the order it was built in | yes |
 | [hotline-ng-auth.md](docs/hotline-ng-auth.md) | Transport authentication: the principal, the challenge and mTLS bindings, transport tokens, the TRTP tunnel, cleartext marking, tunnels and relays | yes |
 | [hotline-ng-identity.md](docs/hotline-ng-identity.md) | Portable identity: the signed objects, the identity profile at authentication, cards, account association | yes, to the registrar stub |
 | [identity-enrollment.md](docs/identity-enrollment.md) | Certifying a device through a mailbox and a pairing code instead of a paste; renewal | server side |

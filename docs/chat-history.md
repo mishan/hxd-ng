@@ -407,7 +407,7 @@ one place the log's fidelity to what was said has to give way.
 
 ### 7.2 The `history` request
 
-hotline-ng.md §11 sketched `{ "before_seq" }`; that was the wrong
+An early draft of hotline-ng.md sketched `{ "before_seq" }`; that was the wrong
 cursor. A seq is per session and dies with it; a line id is what
 survives a re-login, a second device, and a lapsed grace window.
 
