@@ -55,9 +55,11 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 | **Images in chat**, re-encoded and metadata-stripped by the server | sees the caption | yes | yes |
 | **Voice chat** — one room, one UDP port, no transcoding | — | yes | yes |
 | **Video** — camera and screen share on the voice connection, opt-in per stream | — | when GtkHx adds it | yes |
+| **The file area** — browse, Get Info, download; upload into upload folders and drop boxes | yes | yes, plus files over 4 GiB and verified resume | browse and download |
 | **Threaded news** — markdown, references between articles, follows, search | not yet | not yet | yes |
 | **Portable identity** — an Ed25519 key that is you on any server that runs this | through a local tunnel | through a local tunnel | yes |
 | Kick and ban | yes | yes | yes |
+| **Tracker listing** — announced to HTRK v1 and v3 trackers | found through the tracker | found through the tracker | — (connects by address) |
 
 No official Hotline software ever had voice or video; they are community
 extensions, and today GtkHx and hx-ng are the two clients that speak them.
@@ -67,9 +69,10 @@ GtkHx when its rendering lands.
 
 **Not built yet, and worth knowing before you run this:**
 
-- **The file area.** No file list, no transfers, no drop boxes. This is
-  the largest gap for a Hotline server and the next major piece of work;
-  the plan is [docs/files-plan.md](docs/files-plan.md).
+- **The rest of the file area.** Folder downloads and uploads, and
+  file management — delete, rename, move, new folder, setting a comment —
+  on either wire; uploads on the ng wire. What is built is in
+  [docs/files-plan.md](docs/files-plan.md).
 - **News on the classic wire.** A period client sees an empty news pane;
   the 1.2 flat and 1.5 threaded bindings are designed and not yet built.
 - **Moderation beyond kick and ban.** Reports, redaction of a chat
@@ -90,8 +93,8 @@ GtkHx — this is the only server that has it.
 
 ## What it aims to offer
 
-The [roadmap](ROADMAP.md) in one paragraph: the file area and folder
-transfers, then the legacy news bindings, so that a period client gets
+The [roadmap](ROADMAP.md) in one paragraph: folder transfers and the rest
+of the file area, then the legacy news bindings, so that a period client gets
 everything a period server gave it. Then the pieces that make the ng
 wire a real mobile experience — push, the registrar, and the enrollment
 flow that certifies a phone without a paste. Then federation: signed
@@ -854,7 +857,7 @@ other than this server. The last column is what this server has built.
 | [voice.md](docs/voice.md) | The SFU: hand-written SDP, RTP forwarding, and one room across both signalling wires | yes |
 | [capabilities-video.md](docs/capabilities-video.md) | Video: publications, subscriptions, limits, and the renegotiation path | yes |
 | [push-notifications.md](docs/push-notifications.md) | Push: the notify decision in the domain, and the gateway | trait only |
-| [files-plan.md](docs/files-plan.md) | The file area: the first read-only slice and the Large File capability | no |
+| [files-plan.md](docs/files-plan.md) | The file area: browsing and downloads, the local area and uploads, and the Large File capability | yes, less folders and file management |
 | [proposals/](docs/proposals/messaging-identity-amendment.md) | Proposed amendments to fogWraith's messaging extension | — |
 
 ## Development
