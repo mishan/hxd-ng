@@ -141,12 +141,15 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
             ev = events.recv() => match ev {
                 Some(se) => {
                     let kicked = matches!(se.event, hxd_core::Event::Kicked);
-                    if !send_frame(&mut ws_tx, Message::Text(event_json(&se))).await {
-                        break Exit::ConnectionLost;
-                    }
+                    let sent = send_frame(&mut ws_tx, Message::Text(event_json(&se))).await;
+                    // A kick ends the session whether or not the client
+                    // heard about it: failing the send is no way to stay.
                     if kicked {
                         end_kicked(&ctx, &state, &mut ws_tx).await;
                         break Exit::SessionOver;
+                    }
+                    if !sent {
+                        break Exit::ConnectionLost;
                     }
                 }
                 None => break Exit::Replaced,
@@ -327,8 +330,18 @@ async fn handle_login(
         }
         account
     })
-    .await
-    .ok()?;
+    .await;
+    // The blocking task panicked. Nothing was attached, so there is
+    // nothing to undo, but the client is owed an answer.
+    let Ok(verdict) = verdict else {
+        warn!("ng login task failed");
+        let _ = send_frame(
+            ws_tx,
+            Message::Text(reply_err(req.id, "server_error", "Server error.")),
+        )
+        .await;
+        return None;
+    };
 
     let account = match verdict {
         Ok(a) => a,
@@ -461,13 +474,24 @@ async fn handle_login(
     // with the session so a resume cannot change it.
     let device = identity.map(crate::push::DeviceOnSocket::of);
     let Some((session_id, token)) = ctx.registry.issue(&ctx.core, uid, device.clone()) else {
+        warn!(uid, "ng login could not issue a session token");
         ctx.core.end_session(uid);
+        let _ = send_frame(
+            ws_tx,
+            Message::Text(reply_err(req.id, "server_error", "Server error.")),
+        )
+        .await;
         return None;
     };
 
     let Some(me) = ctx.core.user(uid) else {
         ctx.core.end_session(uid);
         ctx.registry.remove(&session_id);
+        let _ = send_frame(
+            ws_tx,
+            Message::Text(reply_err(req.id, "server_error", "Server error.")),
+        )
+        .await;
         return None;
     };
     let users: Vec<_> = ctx.core.snapshot().iter().map(user_json).collect();
@@ -767,6 +791,21 @@ pub(crate) async fn off_reactor<T: Send + 'static>(
     tokio::task::spawn_blocking(move || f(&core)).await.ok()
 }
 
+/// Parse a request's `params` where every field is optional, so that
+/// omitting `params` altogether means the same as sending `{}`. Serde will
+/// not build a struct from a JSON null, which is what an absent `params`
+/// arrives as; without this, "no params" is `bad_request` for exactly the
+/// requests that need none.
+fn params_or_default<T: serde::de::DeserializeOwned + Default>(
+    params: &Value,
+) -> Result<T, serde_json::Error> {
+    if params.is_null() {
+        Ok(T::default())
+    } else {
+        serde_json::from_value(params.clone())
+    }
+}
+
 /// Send one frame and continue, for the handful of places that answer
 /// before the dispatch table's single exit.
 async fn finish(ws_tx: &mut WsTx, out: String) -> Flow {
@@ -1019,12 +1058,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
             } else if !ctx.core.allow_history_request(state.uid).unwrap_or(false) {
                 reply_err(req.id, "rate_limited", "Slow down.")
             } else {
-                let parsed = if req.params.is_null() {
-                    Ok(HistoryParams::default())
-                } else {
-                    serde_json::from_value::<HistoryParams>(req.params.clone())
-                };
-                match parsed {
+                match params_or_default::<HistoryParams>(&req.params) {
                     Ok(p) if p.limit.is_none_or(|n| n != 0) => {
                         let query = hxd_core::HistoryQuery {
                             channel: 0,
@@ -1056,7 +1090,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
             }
         }
 
-        "nick" => match serde_json::from_value::<NickParams>(req.params.clone()) {
+        "nick" => match params_or_default::<NickParams>(&req.params) {
             Ok(p) => {
                 let nick = p
                     .nick
@@ -1192,13 +1226,8 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         // client that woke to a push, or resynced, or simply opened,
         // reads to find out where it is.
         // `params` may be omitted entirely: both fields are optional, so
-        // "the first page" needs nothing said. Serde will not deserialise
-        // a null into a struct, hence the explicit default.
-        "inbox" => match if req.params.is_null() {
-            Ok(InboxParams::default())
-        } else {
-            serde_json::from_value::<InboxParams>(req.params.clone())
-        } {
+        // "the first page" needs nothing said.
+        "inbox" => match params_or_default::<InboxParams>(&req.params) {
             Ok(p) => {
                 let limit = p.limit.unwrap_or(50).clamp(1, 200);
                 let (uid, before) = (state.uid, p.before);
@@ -1367,7 +1396,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         // negotiation, and its `caps` list is a hint for feature
         // detection rather than a switch — a client that calls these on a
         // server without an SFU gets `voice_disabled` from the domain.
-        "voice_join" => match serde_json::from_value::<VoiceRoomParams>(req.params.clone()) {
+        "voice_join" => match params_or_default::<VoiceRoomParams>(&req.params) {
             Ok(_) if !state.access.has(bit::VOICE_CHAT) => reply_err(
                 req.id,
                 "access_denied",
@@ -1391,7 +1420,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_join."),
         },
 
-        "voice_leave" => match serde_json::from_value::<VoiceRoomParams>(req.params.clone()) {
+        "voice_leave" => match params_or_default::<VoiceRoomParams>(&req.params) {
             Ok(p) => match ctx.core.voice_leave(state.uid, p.cid) {
                 Ok(()) => reply_ok(req.id, json!({})),
                 Err(e) => {
@@ -1488,7 +1517,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
             Err(_) => reply_err(req.id, "bad_request", "Malformed video_start."),
         },
 
-        "video_stop" => match serde_json::from_value::<VideoStopParams>(req.params.clone()) {
+        "video_stop" => match params_or_default::<VideoStopParams>(&req.params) {
             // An absent kind stops everything this session is publishing
             // in the room; a kind we don't know is a mistake rather than
             // a wildcard, so it must not fall through to the wildcard.
@@ -1527,7 +1556,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         },
 
         "video_subscribe" => {
-            match serde_json::from_value::<VideoSubscribeParams>(req.params.clone()) {
+            match params_or_default::<VideoSubscribeParams>(&req.params) {
                 // Receiving needs no privilege bit beyond being in the
                 // room; the bits govern publishing. An absent or empty
                 // array is "no video at all", which is where every

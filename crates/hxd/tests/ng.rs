@@ -188,6 +188,26 @@ impl Ng {
         }
     }
 
+    /// A request with no `params` key at all, as a client sends one that
+    /// needs none.
+    async fn request_bare(&mut self, method: &str) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.ws
+            .send(Message::Text(
+                json!({ "id": id, "req": method }).to_string(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let v = self.recv_json().await;
+            if v.get("reply").and_then(Value::as_u64) == Some(id) {
+                return v;
+            }
+            self.note_event(v);
+        }
+    }
+
     async fn request_ok(&mut self, method: &str, params: Value) -> Value {
         let v = self.request(method, params).await;
         assert!(v.get("ok").is_some(), "{method} should succeed, got: {v}");
@@ -513,6 +533,43 @@ async fn malformed_login_params_are_rejected_not_guested() {
     let mut c = Ng::connect(ng_addr).await;
     let v = c.request("login", json!(42)).await;
     assert_eq!(v["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn requests_whose_params_are_all_optional_may_omit_them() {
+    let td = tempfile::tempdir().unwrap();
+    let (_legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
+    let (mut c, _) = Ng::login(ng_addr, "bob", "s3cret", "Bob").await;
+
+    // Omitting `params` means `{}`: `nick` with nothing to change is a
+    // no-op, and the voice and video requests reach the domain — which
+    // refuses them for its own reasons, never as a malformed request.
+    c.request_bare("nick").await["ok"]
+        .as_object()
+        .expect("nick without params should succeed");
+    for method in ["voice_join", "voice_leave", "video_stop", "video_subscribe"] {
+        let v = c.request_bare(method).await;
+        assert_ne!(
+            v["error"]["code"], "bad_request",
+            "{method} without params: {v}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_push_request_is_an_unknown_method() {
+    let td = tempfile::tempdir().unwrap();
+    let (_legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
+    let (mut c, _) = Ng::login(ng_addr, "bob", "s3cret", "Bob").await;
+
+    // The families dispatch on a prefix, so each has its own fallback,
+    // which must say what the top level says for a name it does not know.
+    // (News and files answer their own "not available" first on a server
+    // without them, as this one is; push has no such gate.)
+    for method in ["no_such", "push_no_such"] {
+        let v = c.request(method, json!({})).await;
+        assert_eq!(v["error"]["code"], "unknown_method", "{method}: {v}");
+    }
 }
 
 #[tokio::test]
