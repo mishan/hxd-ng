@@ -392,6 +392,7 @@ async fn run_service(service: Arc<FileService>, access: &str) -> Running {
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             stamp_queued: true,
+            news: Default::default(),
         }),
         files: Some(service.clone()),
     };

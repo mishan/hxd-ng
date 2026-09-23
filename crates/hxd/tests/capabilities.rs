@@ -43,6 +43,7 @@ async fn start_server(dir: &Path, supported: Caps, ng_caps: &[&str]) -> (SocketA
             caps: supported,
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
+            news: Default::default(),
         }),
         files: None,
     };

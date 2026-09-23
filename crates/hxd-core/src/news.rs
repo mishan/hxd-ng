@@ -271,6 +271,10 @@ pub struct Article {
     /// Exactly as typed, with its line endings made LF.
     pub body: String,
     pub mime: BodyType,
+    /// The plain-text downgrade of a markdown body posted under `render`
+    /// (§5.4), and `None` for every other body, which is its own plain
+    /// text. What a legacy client is served in the body's place.
+    pub plain: Option<String>,
     pub at: SystemTime,
     pub deleted: bool,
     /// What the body pointed at, resolved when it was posted, reported as
@@ -281,6 +285,43 @@ pub struct Article {
     pub referenced_by: u32,
     /// Durable image attachments, in display order (§7).
     pub attachments: Vec<Attachment>,
+}
+
+/// One article as the legacy 1.5 listing shows it (§12.3): what a
+/// `CATLIST` entry carries, with the lengths of the texts rather than the
+/// texts, so listing a category of thousands does not load thousands of
+/// bodies to measure them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub id: ArticleId,
+    pub parent: Option<ArticleId>,
+    pub root: ArticleId,
+    pub at: SystemTime,
+    /// Empty for a tombstone, as is `nick`.
+    pub subject: String,
+    pub nick: String,
+    pub mime: BodyType,
+    pub deleted: bool,
+    pub body_len: TextLen,
+    /// The downgrade's, where [`Article::plain`] has one.
+    pub plain_len: Option<TextLen>,
+}
+
+/// How long a text is, both ways a wire might ask: in characters, which
+/// is its length in Mac Roman, and in UTF-8 bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextLen {
+    pub chars: usize,
+    pub bytes: usize,
+}
+
+impl TextLen {
+    pub fn of(s: &str) -> Self {
+        TextLen {
+            chars: s.chars().count(),
+            bytes: s.len(),
+        }
+    }
 }
 
 /// The content-addressed identity of a durable news image.
@@ -844,6 +885,22 @@ pub trait NewsStore: Send + Sync + 'static {
     /// were indexed. The repair for an index that has drifted, and what
     /// an import or a change in how bodies render ends with (§6.4).
     fn reindex(&self) -> Result<u64, StoreError>;
+
+    // --- The legacy wire (§12) ----------------------------------------
+
+    /// A category as one 1.5 listing shows it: whole threads, newest
+    /// thread first and each in preorder, until the next would take the
+    /// listing past `limit` articles. A newest thread longer than `limit`
+    /// on its own comes back as its first `limit` articles, which being
+    /// preorder leaves no reply without its parent. A thread whose every
+    /// article is a tombstone is not listed, as in [`Self::threads`].
+    /// `NoSuchNode` or `NotACategory` for anything but a category.
+    fn listing(&self, category: NodeId, limit: usize) -> Result<Vec<Listed>, NewsError>;
+
+    /// A category's newest `limit` articles, newest first by id,
+    /// tombstones among them: the 1.2 flat view (§12.5), which has no
+    /// threads to walk and shows a deletion as the place it left.
+    fn recent(&self, category: NodeId, limit: usize) -> Result<Vec<Article>, NewsError>;
 
     // --- Attachments (§7) ---------------------------------------------
 
@@ -1750,6 +1807,40 @@ impl Core {
             .map_err(|e| store_failed(e.into()))?
             .ok_or(NewsError::NoSuchArticle)?;
         store.refs_to(id, limit).map_err(|e| store_failed(e.into()))
+    }
+
+    /// A category as one legacy 1.5 listing shows it (§12.3):
+    /// [`NewsStore::listing`], for a session that may read.
+    pub fn news_listing(
+        &self,
+        uid: Uid,
+        category: NodeId,
+        limit: usize,
+    ) -> Result<Vec<Listed>, NewsError> {
+        let store = self.news_store()?;
+        self.news_reader(uid)?;
+        if limit == 0 {
+            return Err(NewsError::BadRequest(
+                "A listing needs a limit of at least 1.",
+            ));
+        }
+        store.listing(category, limit).map_err(store_failed)
+    }
+
+    /// A category's newest articles for the 1.2 flat view (§12.5):
+    /// [`NewsStore::recent`], for a session that may read.
+    pub fn news_recent(
+        &self,
+        uid: Uid,
+        category: NodeId,
+        limit: usize,
+    ) -> Result<Vec<Article>, NewsError> {
+        let store = self.news_store()?;
+        self.news_reader(uid)?;
+        if limit == 0 {
+            return Err(NewsError::BadRequest("A page needs a limit of at least 1."));
+        }
+        store.recent(category, limit).map_err(store_failed)
     }
 
     /// Post an article or a reply, tell every reader their view of that

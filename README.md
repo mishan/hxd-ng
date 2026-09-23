@@ -56,7 +56,7 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 | **Voice chat** — one room, one UDP port, no transcoding | — | yes | yes |
 | **Video** — camera and screen share on the voice connection, opt-in per stream | — | when GtkHx adds it | yes |
 | **The file area** — browse, Get Info, download; upload into upload folders and drop boxes | yes | yes, plus files over 4 GiB and verified resume | browse and download |
-| **Threaded news** — markdown, references between articles, follows, search | not yet | not yet | yes |
+| **Threaded news** — markdown, references between articles, follows, search | reads and posts as plain text; 1.2 sees one category | reads and posts as plain text | yes |
 | **Push notifications** — a private message or a news reply while the app is closed | — | — | yes, as Web Push |
 | **Portable identity** — an Ed25519 key that is you on any server that runs this | through a local tunnel | through a local tunnel | yes |
 | Kick and ban | yes | yes | yes |
@@ -74,8 +74,6 @@ GtkHx when its rendering lands.
   file management — delete, rename, move, new folder, setting a comment —
   on either wire; uploads on the ng wire. What is built is in
   [docs/files-plan.md](docs/files-plan.md).
-- **News on the classic wire.** A period client sees an empty news pane;
-  the 1.2 flat and 1.5 threaded bindings are designed and not yet built.
 - **Moderation beyond kick and ban.** Reports, redaction of a chat
   line, revoking an image, purging a user's recent output: designed in
   [docs/moderation.md](docs/moderation.md), tables in the schema, no
@@ -97,8 +95,8 @@ GtkHx — this is the only server that has it.
 ## What it aims to offer
 
 The [roadmap](ROADMAP.md) in one paragraph: folder transfers and the rest
-of the file area, then the legacy news bindings, so that a period client gets
-everything a period server gave it. Then the pieces that make the ng
+of the file area, so that a period client gets everything a period server
+gave it. Then the pieces that make the ng
 wire a real mobile experience — the registrar, and the enrollment
 flow that certifies a phone without a paste. Then federation: signed
 ban lists a server can subscribe to, vouches that let a member bring
@@ -560,10 +558,12 @@ replay = 0                # plain chat lines replayed to old legacy clients
 Absent means no news: the ng wire never offers the `news` cap, and a news
 request is answered the way a server without the feature answers it. When
 `db` is omitted, news uses the database `[inbox]` or `[history]` names and
-shares its SQLite connection; with neither it is required. Nothing here
-reaches a legacy client yet — the 1.2 flat-news and 1.5 threaded-news
-transactions are a stage still to come, so a period client sees an empty
-news pane. See [docs/news.md](docs/news.md).
+shares its SQLite connection; with neither it is required. A 1.5 client
+browses the same tree over the threaded-news transactions, reading a
+markdown article's plain-text part. A 1.2 client reads and posts into the
+one category `flat_category` names, rendered newest first as a single
+document; without it, a 1.2 client is told this server's news is
+threaded. See [docs/news.md](docs/news.md) §12.
 
 ```toml
 [news]                    # presence turns it on
@@ -580,6 +580,13 @@ self_delete = true        # authors may delete their own; false = period behavio
 search = true             # false turns news_search off; the index is kept either way
 search_max_results = 500  # the deepest a search pages
 search_per_minute = 30    # searches per session
+legacy_catlist_max = 2000 # articles in one 1.5 category listing
+
+flat_category = "General" # the 1.2 view: names from the root, "Bundle/Category"
+flat_articles = 100       # entries in the 1.2 document; 65 535 bytes usually decides
+flat_reply = "newest_thread"   # where a post with no Re: goes, or "new_thread"
+flat_default_subject = "(no subject)"
+# flat_masthead = "..."   # the line above the entries; absent = built in, "" = none
 
 blobs = "news-blobs"      # durable content-addressed attachment bytes
 [news.attach]              # absent = attachments off
@@ -588,7 +595,7 @@ max_count = 8              # images on one article
 max_total_bytes = 8589934592
 stage_ttl = 1800           # abandoned upload lifetime, seconds
 per_hour = 20              # staged images per account
-legacy_derivative = true   # make the bounded still W9 will serve
+legacy_derivative = true   # make the bounded still a 1.5 image part will serve
 
 [news.notify]                   # absent = no subscriptions, no notifications
 auto_subscribe = "participated" # or "own_thread", or "off"

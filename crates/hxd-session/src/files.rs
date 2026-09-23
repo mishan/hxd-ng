@@ -243,7 +243,7 @@ fn unique_name(
     unreachable!("the numeric suffix always offers another wire name")
 }
 
-fn parse_dir(bytes: &[u8]) -> Result<Vec<Vec<u8>>, FileError> {
+pub(crate) fn parse_dir(bytes: &[u8]) -> Result<Vec<Vec<u8>>, FileError> {
     let count = bytes
         .get(..2)
         .map(|value| u16::from_be_bytes(value.try_into().expect("two bytes")) as usize)

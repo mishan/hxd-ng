@@ -17,16 +17,17 @@ use std::time::{Duration, SystemTime};
 use hxd_core::inbox::{Mailbox, StoreError};
 use hxd_core::media::MediaType;
 use hxd_core::news::{
-    Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, Author, BlobId, BodyType,
+    Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, Author, BlobId, BodyType, Listed,
     NewNode, NewPost, NewsError, NewsStore, Node, NodeId, NodeKind, Posted, Reference,
-    StagedAttachment, SubScope, Subscriber, Subscription, ThreadHead, ThreadPage, ThreadQuery,
+    StagedAttachment, SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage,
+    ThreadQuery,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
 use super::{bind, cutoff, fp_from_hex, fp_hex, from_unix, mailbox_sql, unix, SqliteStore};
 
 const ARTICLE_COLUMNS: &str = "id, category, parent, root, depth, nick, login, login_fp, \
-                               subject, body, mime, at, deleted_at IS NOT NULL";
+                               subject, body, mime, at, deleted_at IS NOT NULL, plain";
 
 const NODE_COLUMNS: &str = "n.id, n.parent, n.kind, n.name, n.guid, n.add_sn, n.delete_sn, \
      n.created_at, \
@@ -75,6 +76,7 @@ struct RawArticle {
     mime: String,
     at: i64,
     deleted: bool,
+    plain: Option<String>,
 }
 
 fn raw_article(r: &Row<'_>) -> rusqlite::Result<RawArticle> {
@@ -92,6 +94,7 @@ fn raw_article(r: &Row<'_>) -> rusqlite::Result<RawArticle> {
         mime: r.get(10)?,
         at: r.get(11)?,
         deleted: r.get(12)?,
+        plain: r.get(13)?,
     })
 }
 
@@ -166,6 +169,7 @@ impl RawArticle {
             body: self.body,
             mime: BodyType::from_mime(&self.mime)
                 .ok_or_else(|| StoreError::new(format!("unknown body type {:?}", self.mime)))?,
+            plain: self.plain,
             at: from_unix(self.at),
             deleted: self.deleted,
             refs,
@@ -1378,6 +1382,113 @@ impl NewsStore for SqliteStore {
         let indexed = sql(tx.execute(INDEX_LIVE, []))?;
         sql(tx.commit())?;
         Ok(indexed as u64)
+    }
+
+    fn listing(&self, category: NodeId, limit: usize) -> Result<Vec<Listed>, NewsError> {
+        let conn = self.conn.lock().unwrap();
+        match kind_of(&conn, category)? {
+            None => return Err(NewsError::NoSuchNode),
+            Some(NodeKind::Bundle) => return Err(NewsError::NotACategory),
+            Some(NodeKind::Category) => {}
+        }
+        // Which threads, newest first, stopping at the first that does
+        // not fit: a count per thread from the roots index, not a row per
+        // article, since most of a big category is never listed.
+        let mut roots: Vec<(i64, usize)> = Vec::new();
+        {
+            let mut stmt = sql(conn.prepare_cached(
+                "SELECT a.id, (SELECT COUNT(*) FROM news_article d WHERE d.root = a.id)
+                   FROM news_article a
+                  WHERE a.category = ?1 AND a.parent IS NULL
+                    AND EXISTS (SELECT 1 FROM news_article d
+                                 WHERE d.root = a.id AND d.deleted_at IS NULL)
+                  ORDER BY a.id DESC",
+            ))?;
+            let mut rows = sql(stmt.query(params![clamp_node(category)]))?;
+            let mut total = 0usize;
+            while let Some(row) = sql(rows.next())? {
+                let (root, count): (i64, i64) = (sql(row.get(0))?, sql(row.get(1))?);
+                let count = usize::try_from(count).unwrap_or(0);
+                if !roots.is_empty() && total + count > limit {
+                    break;
+                }
+                roots.push((root, count));
+                total += count;
+                if total >= limit {
+                    break;
+                }
+            }
+        }
+        // Each text is measured as its row goes by and not kept. SQLite's
+        // `length` would count the characters without reading them out,
+        // but it stops at a NUL, which a body may hold, and so does every
+        // string function that might have hidden one from it.
+        let mut stmt = sql(conn.prepare_cached(
+            "SELECT id, parent, root, at, subject, nick, mime, deleted_at IS NOT NULL,
+                    body, plain
+               FROM news_article
+              WHERE category = ?1 AND path >= ?2 AND path < ?3
+              ORDER BY path LIMIT ?4",
+        ))?;
+        let mut out = Vec::new();
+        for (root, _) in roots {
+            let root = article_id(root)?;
+            let room = limit.saturating_sub(out.len()).min(i64::MAX as usize) as i64;
+            let mut rows = sql(stmt.query(params![
+                clamp_node(category),
+                root.to_be_bytes().as_slice(),
+                thread_end(root),
+                room
+            ]))?;
+            while let Some(row) = sql(rows.next())? {
+                let mime: String = sql(row.get(6))?;
+                out.push(Listed {
+                    id: article_id(sql(row.get(0))?)?,
+                    parent: sql(row.get::<_, Option<i64>>(1))?
+                        .map(article_id)
+                        .transpose()?,
+                    root: article_id(sql(row.get(2))?)?,
+                    at: from_unix(sql(row.get(3))?),
+                    subject: sql(row.get(4))?,
+                    nick: sql(row.get(5))?,
+                    mime: BodyType::from_mime(&mime)
+                        .ok_or_else(|| StoreError::new(format!("unknown body type {mime:?}")))?,
+                    deleted: sql(row.get(7))?,
+                    body_len: TextLen::of(sql(row.get_ref(8))?.as_str().map_err(StoreError::new)?),
+                    plain_len: sql(row.get_ref(9))?
+                        .as_str_or_null()
+                        .map_err(StoreError::new)?
+                        .map(TextLen::of),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn recent(&self, category: NodeId, limit: usize) -> Result<Vec<Article>, NewsError> {
+        let conn = self.conn.lock().unwrap();
+        match kind_of(&conn, category)? {
+            None => return Err(NewsError::NoSuchNode),
+            Some(NodeKind::Bundle) => return Err(NewsError::NotACategory),
+            Some(NodeKind::Category) => {}
+        }
+        let sql_text = format!(
+            "SELECT {ARTICLE_COLUMNS} FROM news_article
+              WHERE category = ?1 ORDER BY id DESC LIMIT ?2"
+        );
+        let raws: Vec<RawArticle> = {
+            let mut stmt = sql(conn.prepare_cached(&sql_text))?;
+            let rows = sql(stmt.query_map(
+                params![clamp_node(category), limit.min(i64::MAX as usize) as i64],
+                raw_article,
+            ))?;
+            rows.collect::<rusqlite::Result<_>>()
+                .map_err(StoreError::new)?
+        };
+        Ok(raws
+            .into_iter()
+            .map(|r| r.into_article(&conn))
+            .collect::<Result<_, _>>()?)
     }
 
     fn stage_attachment(&self, staged: &StagedAttachment) -> Result<(), NewsError> {
