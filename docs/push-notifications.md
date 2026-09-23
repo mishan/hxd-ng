@@ -2,10 +2,10 @@
 
 Status: the first gateway is built. It is not the one this document was
 written around: it is in-process Web Push, whose own design is
-[`webpush-gateway.md`](webpush-gateway.md), and which hx-ng receives. What that document does not
-restate — the seam (§4), the subscriber model (§5, §5.1), when a push
-happens and what it may contain (§6), and the protocol additions (§8,
-§8.1) — is normative here for either gateway. The uniqush sidecar of
+[`webpush-gateway.md`](webpush-gateway.md), and which hx-ng receives.
+What that document does not restate — the seam (§4), the subscriber
+model (§5, §5.1), when a push happens and what it may contain (§6), and
+the protocol additions (§8, §8.1) — is normative here for either gateway. The uniqush sidecar of
 §1–§3, §7 and §9's P3 is the multi-vendor path, kept and not scheduled;
 the two rules in §7 that hold for any gateway — the account comes from
 the session, and a guest has no mailbox to register — are restated in §8
