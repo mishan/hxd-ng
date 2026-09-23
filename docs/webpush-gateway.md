@@ -1,10 +1,10 @@
 # The Web Push gateway: the device registry hxd-ng keeps itself
 
-Status: partial. The server side is built — the registry, the sender,
-the two ng requests and `[push]` — so a configured server accepts
-registrations and pushes to them. What is left is a client that asks its
-user for permission and renders what arrives, and a real end-to-end
-against a phone. Staged in §9; each stage marks itself here as it lands.
+Status: built — the registry, the sender, the two ng requests and
+`[push]` on the server, and hx-ng as the client that asks for
+permission and renders what arrives. What is left is §9's G5, a real
+end-to-end against a phone. Staged in §9; each stage marks itself there
+as it lands.
 
 [push-notifications.md](push-notifications.md) §0 decided that the first
 gateway is `WebPushGateway`, in-process, and that when it is built it
@@ -434,7 +434,7 @@ the same shape news uses for a server with no `[news.notify]`.
    with the real registry. `hxd push devices` is not in it: an operator
    who wants to count devices has the store, and it lands if one ever
    needs it.
-4. **G4 — the client.** hx-ng asks for permission, subscribes with the
+4. **G4 — the client. Built, in hx-ng.** hx-ng asks for permission, subscribes with the
    offered key, registers, and renders both payload kinds in its service
    worker. The first thing in the chain that can say yes to a prompt.
 5. **G5 — a real end-to-end.** A browser and a UnifiedPush distributor on
