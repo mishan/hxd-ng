@@ -362,9 +362,12 @@ first client, rendering markdown articles, and chat in GtkHx's dialect.
   `flat_category` names — read newest first, posted into with
   `Subject:` / `Re:` headers, and pushed to every reader whichever wire
   the post came from.
+- moderation (W8), with the rest of moderation below: a moderator's
+  delete of someone else's article is an audit row, meets the kick
+  ladder, and answers the reports on it; a purge takes articles too.
 
-Left: moderation (W8), and two deferred parts of W9 — the `image/*` part
-a 1.5 client would fetch a derivative by, and the mhxd importer.
+Left: two deferred parts of W9 — the `image/*` part a 1.5 client would
+fetch a derivative by, and the mhxd importer.
 
 ## Phase 5 — Hardening and parity extras
 
@@ -424,7 +427,10 @@ In rough order of value-for-effort:
    [docs/moderation.md](docs/moderation.md) (same date) adds redaction,
    revocation, purges and reports with an audit trail; the legacy wire
    receives reports as server messages and is moderated from ng or the
-   CLI until fogWraith allocates the transactions.
+   CLI until fogWraith allocates the transactions. **Implemented
+   2026-09**: the acts, reports and trail on both wires and the CLI,
+   `/report` through the system account, and a durable block list; the
+   vouching hooks wait on vouching.
 4. **Voice** — an SFU, a genuinely large subsystem (this is where Janus has
    two known server-side bugs, both written up in the "Open" section of
    gtkhx's `docs/voice.md` — read them as a spec of what not to do).

@@ -229,6 +229,24 @@ pub enum Event {
     },
     /// The recipient has been kicked; its transport should close.
     Kicked,
+    /// A public line was redacted (`docs/moderation.md` §3.1). Delivered
+    /// to every session that reads public chat; a client that rendered
+    /// the line blanks it in place, and one that has not never sees it
+    /// as anything but the tombstone history returns.
+    ChatRedacted {
+        id: crate::history::LineId,
+    },
+    /// A report was filed (`docs/moderation.md` §4.5). To moderators
+    /// only, and only while it is open.
+    Report(crate::moderation::Report),
+    /// A report was closed. `yours` is true for the reporter's own
+    /// sessions, false for the moderators', so a wire that can only say
+    /// one of the two things says the right one.
+    ReportClosed {
+        id: crate::moderation::ReportId,
+        outcome: crate::moderation::Outcome,
+        yours: bool,
+    },
     /// An image the recipient could fetch has been revoked by a
     /// moderator (moderation.md §3.2). Delivered to everyone in the
     /// handle's authorization set that still holds a session — the
@@ -401,6 +419,8 @@ pub(crate) struct UserSession {
     /// sender of a stored message is recorded only when it is true.
     pub(crate) has_inbox: bool,
     pub(crate) attach_news: bool,
+    /// See [`AttachInfo::moderate`].
+    pub(crate) moderate: bool,
     /// See [`AttachInfo::is_person`].
     pub(crate) is_person: bool,
     /// See [`AttachInfo::reads_on_delivery`].
@@ -442,6 +462,9 @@ pub struct AttachInfo {
     pub has_inbox: bool,
     /// May this session stage durable news attachments?
     pub attach_news: bool,
+    /// May this session moderate (`docs/moderation.md` §2)? The
+    /// account's `[extra] moderate`, which defaults to the kick bit.
+    pub moderate: bool,
     /// Is exactly one person behind this account? [`Account::is_person`]:
     /// what news records authorship against, independent of `has_inbox`.
     ///
@@ -770,6 +793,14 @@ pub struct Core {
     /// under the roster lock by `attach`, and written with nothing held,
     /// so the order is roster first, then this.
     pub(crate) revoked: std::sync::RwLock<crate::revoked::Revocations>,
+    /// The audit trail and the reports, or `None` — in which case every
+    /// act and report is refused as a server without the feature
+    /// refuses it. Store calls never happen under `roster`.
+    pub(crate) moderation: Option<Arc<dyn crate::moderation::ModerationStore>>,
+    pub(crate) moderation_policy: crate::moderation::ModerationPolicy,
+    /// What each reporter has left of their hourly reports. Its own
+    /// lock, taken with nothing else held.
+    pub(crate) report_rate: Mutex<crate::moderation::ReportRates>,
 }
 
 impl Core {
@@ -896,6 +927,7 @@ impl Core {
                 kicked: false,
                 has_inbox: info.has_inbox,
                 attach_news: info.attach_news,
+                moderate: info.moderate,
                 is_person: info.is_person,
                 reads_on_delivery: info.reads_on_delivery,
                 system: info.system,
@@ -1221,6 +1253,7 @@ pub(crate) fn test_attach(
             transport: Transport::default(),
             has_inbox: false,
             attach_news: false,
+            moderate: false,
             is_person: false,
             reads_on_delivery: false,
             identity: None,
@@ -1259,6 +1292,7 @@ mod tests {
                 transport: Transport::default(),
                 has_inbox: true,
                 attach_news: false,
+                moderate: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,
@@ -1337,6 +1371,7 @@ mod tests {
                 transport: Transport::default(),
                 has_inbox: false,
                 attach_news: false,
+                moderate: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: None,

@@ -162,6 +162,9 @@ struct ExtraTable {
     /// May this account stage durable news attachments? Default: the
     /// shared send-media access bit.
     attach_news: Option<bool>,
+    /// May this account redact, revoke, purge and read reports? Default:
+    /// the disconnect_users (kick) bit (`docs/moderation.md` §2).
+    moderate: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -220,6 +223,10 @@ impl AccountFile {
                 .extra
                 .attach_news
                 .unwrap_or_else(|| access.has(bit::SEND_MEDIA)),
+            moderate: self
+                .extra
+                .moderate
+                .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
             identity: IdentityLink {
                 fingerprint,
                 // Derived true on an account with no password, whatever
@@ -948,6 +955,28 @@ impl AccountDirectory for FileAuth {
         };
         account.has_inbox.then_some(account.access)
     }
+
+    fn account(&self, login: &str) -> Option<(Mailbox, AccessBits)> {
+        let login = login.to_ascii_lowercase();
+        if !valid_login(&login) {
+            return None;
+        }
+        let account = self.load(&login).ok()?.into_account(login);
+        Some(keyed(account))
+    }
+
+    fn account_by_key(&self, fingerprint: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
+        Some(keyed(self.find_by_fingerprint(fingerprint).ok()??))
+    }
+}
+
+/// An account as the mailbox rule keys it, and what it may do.
+fn keyed(account: Account) -> (Mailbox, AccessBits) {
+    let mailbox = match account.identity.fingerprint {
+        Some(fp) => Mailbox::identified(account.login, fp),
+        None => Mailbox::login(account.login),
+    };
+    (mailbox, account.access)
 }
 
 #[cfg(test)]
@@ -1052,6 +1081,7 @@ mod tests {
         assert!(!g.can_detach);
         assert!(!g.set_subject);
         assert!(!g.attach_news);
+        assert!(!g.moderate);
         // Passworded admin: both derived on.
         write(
             td.path(),
@@ -1062,14 +1092,26 @@ mod tests {
         assert!(r.can_detach);
         assert!(r.set_subject);
         assert!(r.attach_news);
+        // The kick bit makes a moderator (`docs/moderation.md` §2).
+        assert!(r.moderate);
         // Explicit overrides beat the derivation, both directions.
         write(
             td.path(),
             "kiosk.toml",
-            "[extra]\ncan_detach = true\nset_subject = true\nattach_news = true\n",
+            "[extra]\ncan_detach = true\nset_subject = true\nattach_news = true\nmoderate = true\n",
         );
         let k = auth.authenticate("kiosk", Proof::Plain(b"")).unwrap();
-        assert!(k.can_detach && k.set_subject && k.attach_news);
+        assert!(k.can_detach && k.set_subject && k.attach_news && k.moderate);
+        write(
+            td.path(),
+            "bouncer.toml",
+            "password = \"pw\"\n[access]\ndisconnect_users = true\n[extra]\nmoderate = false\n",
+        );
+        let b = auth.authenticate("bouncer", Proof::Plain(b"pw")).unwrap();
+        assert!(
+            !b.moderate,
+            "an operator may keep the kick and withhold redaction"
+        );
         write(
             td.path(),
             "probation.toml",
@@ -1785,6 +1827,33 @@ mod tests {
             None,
             "another identity is nobody, whatever login it carries"
         );
+    }
+
+    #[test]
+    fn an_account_is_found_for_moderation_whether_or_not_it_takes_mail() {
+        let (td, auth) = backend();
+        let fp = [0x4eu8; 32];
+        write(
+            td.path(),
+            "boss.toml",
+            &format!(
+                "password = \"pw\"\n[access]\ncant_be_disconnected = true\n\
+                 [extra]\ninbox = false\n[identity]\nfingerprint = \"{}\"\n",
+                hl_identity::Fingerprint(fp)
+            ),
+        );
+        // Nothing for mail: the account keeps none.
+        assert_eq!(auth.inbox_account("boss"), None);
+        assert_eq!(auth.mailbox_access(&Mailbox::identified("boss", fp)), None);
+        // Everything for the ladder, by login and by key.
+        let (mailbox, access) = auth.account("Boss").expect("by login");
+        assert_eq!(mailbox, Mailbox::identified("boss", fp));
+        assert!(access.has(bit::CANT_BE_DISCONNECTED));
+        let (mailbox, access) = auth.account_by_key(&fp).expect("by key");
+        assert_eq!(mailbox.login, "boss");
+        assert!(access.has(bit::CANT_BE_DISCONNECTED));
+        assert_eq!(auth.account("nobody"), None);
+        assert_eq!(auth.account_by_key(&[0x4fu8; 32]), None);
     }
 
     #[test]

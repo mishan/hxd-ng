@@ -414,9 +414,13 @@ struct Entry {
     /// block is keyed on (moderation.md §3.2).
     hash: [u8; 32],
     uploader: Principal,
-    /// The uploader's account, for the operator's log and for a purge by
-    /// sender identity.
+    /// The uploader's account, for the operator's log.
     uploader_login: String,
+    /// The uploader as a person, where it is one: what a purge by sender
+    /// identity matches (moderation.md §3.3), and what the moderation
+    /// ladder asks about. `None` for a plain guest, whose `guest` login
+    /// names nobody in particular.
+    uploader_mailbox: Option<Mailbox>,
     created: Instant,
     expires: Instant,
     /// A report pins a handle past its TTL while a moderator judges it
@@ -436,6 +440,15 @@ impl Entry {
             _ => self.expires,
         };
         now >= until
+    }
+
+    fn record(&self, id: Handle, now: Instant) -> MediaRecord {
+        MediaRecord {
+            reference: self.media_ref(id, now),
+            hash: self.hash,
+            uploader_login: self.uploader_login.clone(),
+            uploader: self.uploader_mailbox.clone(),
+        }
     }
 
     fn media_ref(&self, id: Handle, now: Instant) -> MediaRef {
@@ -546,8 +559,22 @@ impl MediaStore {
 /// decode.
 struct Uploader {
     login: String,
+    mailbox: Option<Mailbox>,
     addr: Option<IpAddr>,
     principal: Principal,
+}
+
+/// What a moderator's act needs to know about an image
+/// (moderation.md §3.2, §4.3). Never reaches a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaRecord {
+    /// The metadata, with the handle while the bytes are still there.
+    pub reference: MediaRef,
+    /// SHA-256 of the canonical bytes, which is what a block keys on.
+    pub hash: [u8; 32],
+    pub uploader_login: String,
+    /// See `Entry::uploader_mailbox`.
+    pub uploader: Option<Mailbox>,
 }
 
 impl Core {
@@ -601,6 +628,7 @@ impl Core {
             }
             Uploader {
                 login: sess.login.clone(),
+                mailbox: (sess.is_person || sess.identity.is_some()).then(|| sess.mailbox()),
                 addr: sess.addr,
                 principal: Principal::Session {
                     uid,
@@ -690,6 +718,10 @@ impl Core {
     }
 
     /// Hold a handle past its TTL while a report on it is open.
+    ///
+    /// A pin already in force is kept rather than extended: the cap is
+    /// from the first report, so filing another — or reconnecting and
+    /// filing another — cannot hold an image forever.
     pub fn media_pin(&self, id: &Handle, until: Duration) -> bool {
         let Some(store) = self.media.as_ref() else {
             return false;
@@ -698,10 +730,90 @@ impl Core {
         let mut inner = store.inner.lock().unwrap();
         match inner.items.get_mut(id) {
             Some(e) if e.bytes.is_some() => {
-                e.pinned_until = Some(now + until);
+                if e.pinned_until.is_none_or(|pin| pin <= now) {
+                    e.pinned_until = Some(now + until);
+                }
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Let a handle's TTL govern it again: the last open report on it
+    /// was closed (moderation.md §4.4). A pin already past its TTL
+    /// leaves the handle for the next sweep.
+    pub fn media_unpin(&self, id: &Handle) {
+        let Some(store) = self.media.as_ref() else {
+            return;
+        };
+        if let Some(e) = store.inner.lock().unwrap().items.get_mut(id) {
+            e.pinned_until = None;
+        }
+    }
+
+    /// An image as a moderator's act sees it, live or not.
+    pub fn media_record(&self, id: &Handle) -> Option<MediaRecord> {
+        let store = self.media.as_ref()?;
+        let now = Instant::now();
+        let inner = store.inner.lock().unwrap();
+        inner.items.get(id).map(|e| e.record(*id, now))
+    }
+
+    /// The same, but only for a session that was shown the image — its
+    /// uploader, or a principal in its set — whether or not the bytes
+    /// are still there. What a report on an image asks first: nobody
+    /// reports what they were never shown, and a handle they were not
+    /// shown must not be confirmed to exist.
+    pub fn media_shown_to(&self, viewer: Uid, id: &Handle) -> Option<MediaRecord> {
+        let (session, mailbox) = {
+            let r = self.roster.lock().unwrap();
+            let sess = r.users.get(&viewer)?;
+            (
+                Principal::Session {
+                    uid: viewer,
+                    serial: sess.serial,
+                },
+                sess.has_inbox.then(|| Principal::Mailbox(sess.mailbox())),
+            )
+        };
+        let store = self.media.as_ref()?;
+        let now = Instant::now();
+        let inner = store.inner.lock().unwrap();
+        let e = inner.items.get(id)?;
+        let shown = |p: &Principal| e.uploader == *p || e.audience.contains(p);
+        (shown(&session) || mailbox.as_ref().is_some_and(shown)).then(|| e.record(*id, now))
+    }
+
+    /// Every handle `who` uploaded in the last `within` whose bytes are
+    /// still here: a purge's image arm (moderation.md §3.3).
+    pub fn media_uploaded_by(&self, who: &Mailbox, within: Duration) -> Vec<Handle> {
+        let Some(store) = self.media.as_ref() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let inner = store.inner.lock().unwrap();
+        inner
+            .order
+            .iter()
+            .filter(|h| {
+                inner.items.get(*h).is_some_and(|e| {
+                    e.live(now)
+                        && now.duration_since(e.created) <= within
+                        && e.uploader_mailbox
+                            .as_ref()
+                            .is_some_and(|m| who.matches(&m.login, m.fingerprint.as_ref()))
+                })
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Refuse these canonical hashes from now on. The durable block list
+    /// is the moderation store's; this is how a restarted server learns
+    /// it, and how a block made by a news act reaches chat.
+    pub fn media_block_hashes(&self, hashes: impl IntoIterator<Item = [u8; 32]>) {
+        if let Some(store) = self.media.as_ref() {
+            store.inner.lock().unwrap().blocked.extend(hashes);
         }
     }
 
@@ -742,12 +854,22 @@ impl Core {
         // one direction this pair is ever allowed in.
         let mut r = self.roster.lock().unwrap();
         let ev = Event::MediaRevoked { id: *id };
+        // A mailbox in the set is a private message's recipient, whose
+        // image may be on screen on any session of theirs. Each session
+        // hears it once however many principals name it.
+        let mut told = HashSet::new();
         for who in audience {
-            if let Principal::Session { uid, serial } = who {
-                if r.users.get(&uid).is_some_and(|s| s.serial == serial) {
-                    r.send_to(uid, ev.clone());
+            match who {
+                Principal::Session { uid, serial } => {
+                    if r.users.get(&uid).is_some_and(|s| s.serial == serial) {
+                        told.insert(uid);
+                    }
                 }
+                Principal::Mailbox(m) => told.extend(crate::chat::sessions_of(&r, &m)),
             }
+        }
+        for uid in told {
+            r.send_to(uid, ev.clone());
         }
         let _ = now;
         Some(reference)
@@ -933,6 +1055,7 @@ impl MediaStore {
             hash,
             uploader: who.principal.clone(),
             uploader_login: who.login.clone(),
+            uploader_mailbox: who.mailbox.clone(),
             created: now,
             expires: now + self.cfg.handle_ttl,
             pinned_until: None,

@@ -236,6 +236,7 @@ pub(crate) fn error_text(e: &NewsError) -> &'static str {
         NewsError::NotEmpty => "That bundle is not empty.",
         NewsError::BadBodyType => "This server does not take articles of that type.",
         NewsError::BadRequest(why) => why,
+        NewsError::Protected => "That author's articles are protected.",
         _ => "Server error.",
     }
 }
@@ -707,6 +708,18 @@ fn delete_thread(
                 Some(last) if page.has_more => after = Some(last.id),
                 _ => break,
             }
+        }
+    }
+    // Every article this takes is asked about first, so a reply the
+    // deleter may not take — a protected author's (§8) — refuses the
+    // request before anything has gone, as promised above.
+    if !article.deleted {
+        core.news_may_delete(who.uid, id)?;
+    }
+    for reply in &under {
+        match core.news_may_delete(who.uid, *reply) {
+            Ok(()) | Err(NewsError::NoSuchArticle) => {}
+            Err(e) => return Err(e),
         }
     }
     if !article.deleted {

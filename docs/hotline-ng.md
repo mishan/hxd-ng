@@ -567,7 +567,9 @@ blind (identity-registrar.md §7.3). *Design, with the registrar.*
 
 Timestamps (`at`) are integer Unix seconds. Events of the extension
 families — `voice_*`, `video_status`, `news_*` — are specified where §4
-says, and `media_revoked` in moderation.md §5. Every event, of any family,
+says, and `media_revoked`, `chat_redacted`, `report` and `report_closed`
+in moderation.md §5, whose requests — `report`, `redact`, `revoke`,
+`purge`, `kick` and the rest — are specified there too. Every event, of any family,
 counts in §3's sequence.
 
 **The `user` object:**

@@ -152,6 +152,7 @@ mod tests {
             tracker: None,
             push: None,
             registrar: None,
+            moderation: None,
             system: None,
         }
     }

@@ -56,6 +56,7 @@ pub fn news_err(e: &NewsError) -> (&'static str, &'static str) {
             "You follow as much as this server allows. Unfollow something first.",
         ),
         NewsError::NotifyOff => ("not_available", "This server keeps no subscriptions."),
+        NewsError::Protected => ("protected", "That author's articles are protected."),
         NewsError::NoSuchMedia => ("no_such_media", "No such media."),
         NewsError::AttachmentsFull => (
             "attachments_full",
@@ -339,6 +340,13 @@ struct ArticleParams {
     id: ArticleId,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteParams {
+    id: ArticleId,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -633,13 +641,19 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
             )
         }
 
-        // `reason` is accepted and not yet kept: the moderation record it
-        // belongs in is the moderation stage's (§11).
+        // `reason` goes in the moderation record when the article is
+        // someone else's (§11); an author's own delete keeps no record.
         "news_delete" => {
-            let Some(p) = parse::<ArticleParams>(params) else {
+            let Some(p) = parse::<DeleteParams>(params) else {
                 return malformed();
             };
-            answer(off_reactor(core, move |c| c.news_delete(uid, p.id).map(|()| json!({}))).await)
+            let why = p.reason.unwrap_or_default();
+            answer(
+                off_reactor(core, move |c| {
+                    c.news_delete_for(uid, p.id, &why).map(|()| json!({}))
+                })
+                .await,
+            )
         }
 
         "news_node_create" => {

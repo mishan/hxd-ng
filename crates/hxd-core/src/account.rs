@@ -60,6 +60,12 @@ pub struct Account {
     /// May this account stage images for news posts? Server-local policy;
     /// defaults to the shared send-media access bit.
     pub attach_news: bool,
+    /// May this account redact, revoke, purge and read reports
+    /// (`docs/moderation.md` §2)? Server-local policy, the `[extra]
+    /// moderate` key. Backend default: the disconnect-users (kick) bit —
+    /// someone trusted to disconnect a person is trusted to take down
+    /// what they posted.
+    pub moderate: bool,
     /// Portable-identity association (`docs/hotline-ng-identity.md` §8).
     /// Its `fingerprint` is the durable half of a
     /// [`crate::inbox::Mailbox`]: a login can be renamed and
@@ -295,4 +301,29 @@ pub trait AccountDirectory: Send + Sync + 'static {
     /// whose account has no identity — so a login someone else has since
     /// taken answers for nobody.
     fn mailbox_access(&self, who: &crate::inbox::Mailbox) -> Option<AccessBits>;
+
+    /// The account `login` names, as its mailbox key and what it may do,
+    /// **whether or not it keeps a mailbox**. Moderation's question
+    /// (`docs/moderation.md` §2): the ladder protects an account for
+    /// what it may do, not for whether it takes mail, and a purge by
+    /// login must find an identity-linked account's rows by its key.
+    ///
+    /// The default is [`Self::inbox_account`] and [`Self::mailbox_access`]
+    /// together, which is right for a directory that has no accounts
+    /// without mailboxes.
+    fn account(&self, login: &str) -> Option<(crate::inbox::Mailbox, AccessBits)> {
+        let mailbox = self.inbox_account(login)?;
+        let access = self.mailbox_access(&mailbox)?;
+        Some((mailbox, access))
+    }
+
+    /// The account linked to `fingerprint`, the same way.
+    fn account_by_key(
+        &self,
+        fingerprint: &[u8; 32],
+    ) -> Option<(crate::inbox::Mailbox, AccessBits)> {
+        let mailbox = crate::inbox::Mailbox::identified(String::new(), *fingerprint);
+        let access = self.mailbox_access(&mailbox)?;
+        Some((mailbox, access))
+    }
 }

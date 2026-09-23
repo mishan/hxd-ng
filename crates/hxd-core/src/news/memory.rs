@@ -719,6 +719,16 @@ impl NewsStore for MemoryNews {
         Ok(Some(before))
     }
 
+    fn articles_by(&self, who: &Mailbox, since: SystemTime) -> Result<Vec<ArticleId>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .articles
+            .iter()
+            .filter(|a| !a.deleted && a.at >= since && a.author.is(who))
+            .map(|a| a.id)
+            .collect())
+    }
+
     fn refs_to(&self, id: ArticleId, limit: usize) -> Result<Vec<Reference>, StoreError> {
         let inner = self.inner.lock().unwrap();
         let mut srcs: Vec<ArticleId> = inner

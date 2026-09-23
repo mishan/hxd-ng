@@ -1,9 +1,12 @@
 # Moderation: removing bad content, and hearing about it
 
-Status: design, not built. Kick and ban are what they have always been;
-the acts, reports, tables and requests below are chat-history.md §10's
-H5 and wait on it. The 2026-09 amendments from system-account.md §6 and
-identity-vouch.md §6 and §10 are folded in.
+Status: built, both wires, 2026-09 — chat-history.md's H5, the wire half
+of inline-media.md's M6, and news.md's W8, as one branch. Not built: the
+vouching hooks of §3.3 and §7 (`vouched_banned`, `vouched_by`), which
+wait on identity-vouch.md, and a registrar ban (`*@host`, §6), which
+waits on identity-registrar.md §7. Where the build settled something
+this design left open, the section says so. The 2026-09 amendments from
+system-account.md §6 and identity-vouch.md §6 and §10 are folded in.
 
 [chat-history.md](chat-history.md) makes public chat a record and
 [inline-media.md](inline-media.md) lets people post images into it. A
@@ -76,8 +79,11 @@ agree on.
 
 A moderator may not redact, revoke or purge a session that has
 `cant_be_disconnected` (bit 23) unless they have `delete_users` (bit 15)
-— the same ladder kick uses, so "can be kicked by" and "can be moderated
-by" are one question.
+— kick's rule, so "can be kicked by" and "can be moderated by" are one
+question, with one rung above it that the period wire never had (a kick
+of the unkickable is refused whoever asks, as mhxd refuses it). The
+question is asked of every session the person holds and, when they hold
+none, of their account: the author of a line is usually long gone.
 
 ## 3. The acts
 
@@ -97,10 +103,11 @@ has to be typed.
    `DELETED`; `deleted_at` is stamped. The id and timestamp stay — the
    history spec's cursor-stability argument, and ours.
 3. If the line carried media, its handle is revoked (§3.2) in the same
-   act; the media metadata columns stay, so a history entry can still
+   act, with §3.2's default block, and the one audit row records the
+   hash; the media metadata columns stay, so a history entry can still
    say "[image removed]".
-4. `Event::ChatRedacted { cid: 0, id }` to every session that reads
-   public chat.
+4. `Event::ChatRedacted { id }` to every session that reads public
+   chat.
 
 Evidence — the original text — lives in the audit row for
 `[moderation] evidence_days` (default 30) and is then scrubbed to an
@@ -147,7 +154,11 @@ motion.
 
 A purge is by sender identity, not by uid: the sender may be gone, and
 the uid may be someone else's by now. The chat log stores login and
-fingerprint for exactly this (chat-history.md §3.3).
+fingerprint for exactly this (chat-history.md §3.3). A uid names the
+identity behind the session; a plain guest has none, and is kicked
+rather than purged. The purge also answers every open report on the
+person, and the news arm of news.md §11 deletes their articles in the
+window under the same row.
 
 Every path that bans — `kick { ban }` on the ng wire, a legacy kick
 with ban, an entry added to the ban list, and `kick { purge }` — also
@@ -182,9 +193,11 @@ decision has the voucher's name in front of them (`vouched_by`, §7).
 
 A report has a reason, required, at most 1024 characters. It is stored
 with the reporter's mailbox (login and fingerprint), the target, the
-evidence, and `open` status. A guest can report; the reporter is then
-the session's `(uid, serial)` and the reporter cannot be told the
-outcome later, which the reply says.
+evidence, and `open` status. A guest can report; the report then has no
+reporter, the guest's session is only what its rate is kept against,
+and the reporter cannot be told the outcome later — which the reply
+says, as `follow_up: false`. An article (news.md §11) is a fifth
+target, named by id, reported by anyone who may read it.
 
 ### 4.2 Private messages
 
@@ -193,9 +206,10 @@ to show it. Reporting a message copies its stored body into the report
 at that moment; the inbox row is untouched. Only the recipient may
 report it — the store already scopes `inbox` reads by mailbox, and the
 same check applies. A message with no inbox row (a server without one,
-or a PM to a guest) can still be reported by pasting; the client sends
-the text as `evidence` and the server marks the report `unverified`,
-which the moderator sees.
+or a PM to a guest) can still be reported by pasting: as built, that is
+a report on its sender (`user`) with the text as `evidence`, which the
+server marks `verified: false` and the moderator sees. It is the
+reporter's word about a person, not a row the server can vouch for.
 
 ### 4.3 Images
 
@@ -210,19 +224,36 @@ exception, and it is defensible: the operator can read their own
 process memory, moderators are the operator's trust boundary, and the
 alternative is moderating an image by its caption.
 
+As built, two refinements. A report on a **chat line that carried an
+image** holds that image the same way — the image is part of what was
+reported, and a moderator judging the line has to be able to see it;
+the ng `report` object names it as `target.media` beside `target.line`.
+And a pin already in force is **kept rather than extended**: its cap
+runs from the first report, so filing again cannot hold an image
+forever. A moderator who was not online at filing is granted the image
+when they list the report.
+
 ### 4.4 Lifecycle
 
 `open` → one of `removed` (the moderator redacted / revoked / purged),
 `dismissed`, or `duplicate` (of another report, which is closed with
 it). Each close records the moderator and an optional note. Closing a
-report unpins its handle. A report against a target that is already
+report unpins its handle once no other open report holds it. A
+moderator may not dismiss a report **about themselves** (`own_report`):
+that is another moderator's judgment, or the operator's. Removing what
+was reported is still open to them, since an act removes rather than
+excuses and is its own record. A report against a target that is already
 gone — a redacted line, a revoked handle — is accepted and closed as
 `removed` at once with no moderator involved, so the reporter is told
 rather than ignored.
 
 Rate limit: 10 reports per hour per account, and a second report of the
 same target by the same reporter is the first one (answered with its
-id). Reports are retained `[moderation] report_days` (default 90) after
+id) — for a person, the same person by the mailbox rule, which two
+guests never are. A guest pays from its session's ration and from its
+address's, which every guest there shares: a reconnect is a new
+session, and the address is what stays. Accounts are people, and
+people behind one address are not rationed together. Reports are retained `[moderation] report_days` (default 90) after
 closing.
 
 ### 4.5 Who hears
@@ -248,17 +279,24 @@ Requests, all `access_denied` without `moderate` except `report`:
 
 | `req` | params | ok | errors |
 |---|---|---|---|
-| `report` | exactly one of `line` (id), `media` (handle), `msg` (inbox id), `user` (`uid` \| `login` \| `fingerprint`); `reason`; `evidence?` (text, for a PM with no row) | `{ "id", "outcome": "open" \| "removed" }` | `bad_request`, `no_such_target`, `rate_limited`, `not_available` |
+| `report` | exactly one of `line` (id), `media` (handle), `msg` (inbox id), `user` (`uid` \| `login` \| `fingerprint`), `article` (id); `reason`; `evidence?` (text, for a PM with no row) | `{ "id", "outcome": "open" \| "removed", "follow_up" }` | `bad_request`, `no_such_target`, `rate_limited`, `not_available` |
 | `reports` | `status?` (`open` default \| `closed` \| `all`), `before?`, `limit?` (1–100) | `{ "reports": [ … ], "has_more" }` | |
-| `report_close` | `id`, `outcome` (`dismissed` \| `duplicate`), `note?`, `of?` (id, for duplicate) | `{}` | `no_such_report` |
+| `report_close` | `id`, `outcome` (`dismissed` \| `duplicate`), `note?`, `of?` (id, for duplicate) | `{}` | `no_such_report`, `own_report` |
 | `redact` | `id` (line), `reason` | `{}` | `no_such_line`, `protected` |
 | `revoke` | `media` (handle), `reason`, `block?` (default true) | `{}` | `no_such_media`, `protected` |
-| `purge` | `login` \| `fingerprint` \| `uid`, `since?` (seconds, default 3600), `reason` | `{ "lines": n, "media": n }` | `no_such_user`, `protected` |
-| `kick` | `uid`, `ban?` (seconds), `purge?` (seconds), `reason?` | `{}` | `no_such_user`, `protected` |
+| `purge` | `login` \| `fingerprint` \| `uid`, `since?` (seconds, default 3600), `reason` | `{ "lines": n, "media": n, "articles": n }` | `no_such_user`, `protected` |
+| `kick` | `uid`, `ban?` (seconds, at most a year), `purge?` (seconds), `reason?` (required with `purge`) | `{}` | `no_such_user`, `protected` |
 | `moderation_log` | `before?`, `limit?` | `{ "entries": [ … ], "has_more" }` | |
 
 `kick` is new to the ng wire — it has only ever *received* `kicked` —
 and needs the kick bit, not `moderate`; `purge` inside it needs both.
+A `purge` of a guest, who has no identity to purge by, is skipped and
+the kick goes ahead — a guest is who the button is pressed on most.
+It asks what a legacy kick asks, in the same order: a target holding
+cant-be-disconnected is `protected` from any kicker, as mhxd refuses
+it, and the room hears the same notice. The rung above applies to the
+acts, which the period wire never had. `news_delete` (news.md §9.2)
+takes a `reason?` too, kept when the article is someone else's.
 A `report` object:
 
 ```jsonc
@@ -276,7 +314,7 @@ Events:
 | `chat_redacted` | `{ "id" }` | everyone reading public chat; a client blanks the line in place |
 | `media_revoked` | `{ "id" }` | everyone who could fetch it; a client drops the image and keeps the placeholder |
 | `report` | the report object | moderators |
-| `report_closed` | `{ "id", "outcome" }` | the reporter, if they have a mailbox and a session; and moderators |
+| `report_closed` | `{ "id", "outcome", "yours" }` | the reporter (`yours: true`), if they have a mailbox and a session; and moderators |
 
 `history` returns a redacted line as the tombstone chat-history.md §7.2
 describes: `deleted: true`, empty `text`, no `from.nick`. A redacted
@@ -302,7 +340,13 @@ line with media returns `media` without `id` and with
 - **Kick and ban** are unchanged, and `[moderation] kick_purges =
   seconds` makes a legacy kick purge the target's recent output as the
   ng `kick { purge }` does — off by default, because a kick over the
-  legacy wire has meant one thing for twenty-five years. Two things
+  legacy wire has meant one thing for twenty-five years — when the
+  kicker may purge, which is the question the ng request asks too.
+- **A report's close reaches its reporter** as one more line from the
+  system account, `[report #17] closed: removed`; moderators, who acted
+  or watched it acted on, get no window for it. On a server with no
+  system account both kinds of line arrive in the shape mhxd uses for
+  its own server messages, the recipient's own uid. Two things
   reach the ban list from the identity work without a new transaction:
   its entry forms gain `*@host`, which bans a registrar
   (identity-registrar.md §7.3), and a ban of a vouched identity from
@@ -311,12 +355,15 @@ line with media returns `media` without `id` and with
 
 ## 7. Storage, CLI, configuration
 
-Schema version 2 (the same bump as history and media) adds:
+Schema version 2 (the same bump as history and media) reserved these,
+and version 8 added what filling them needed — an article as a target
+of both tables, the report an act closes, the name a report's subject
+went by, and the sweeper's two partial indexes:
 
 ```sql
 CREATE TABLE moderation (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind         INTEGER NOT NULL,        -- redact | revoke | purge | close | vouched_banned
+  kind         INTEGER NOT NULL,        -- redact | revoke | purge | close | news_delete | news_node_delete (| vouched_banned, with vouching)
   actor        TEXT    NOT NULL,        -- login, or 'cli'
   actor_fp     TEXT,
   target_line  INTEGER,
@@ -346,6 +393,17 @@ CREATE INDEX report_open ON report (id) WHERE closed_at IS NULL;
 CREATE TABLE media_block ( hash BLOB PRIMARY KEY, at INTEGER NOT NULL, by TEXT NOT NULL );
 ```
 
+```sql
+ALTER TABLE moderation ADD COLUMN target_article INTEGER;
+ALTER TABLE moderation ADD COLUMN target_report INTEGER;
+ALTER TABLE report ADD COLUMN target_article INTEGER;
+ALTER TABLE report ADD COLUMN target_nick TEXT;
+```
+
+The `vouched_by` columns sketched above are not in either version: a
+column nothing writes is one a later build has to guess at, and they
+land with vouching.
+
 `chat_line` gains `deleted_by TEXT`; the audit row is the record, the
 column is the fast answer.
 
@@ -363,17 +421,20 @@ CLI, beside `inbox purge` and in its shape:
 hxd history redact <id> --reason "…"
 hxd media revoke <handle-or-prefix> --reason "…" [--no-block]
 hxd purge <login> [--fingerprint FP] [--since 1h] --reason "…" [--dry-run]
-hxd reports [--all] | hxd reports close <id> --outcome dismissed|duplicate [--note "…"]
+hxd reports [--all] | hxd reports close <id> --outcome dismissed|duplicate [--note "…"] [--of <id>]
 hxd moderation log [--limit N]
 ```
 
 The CLI acts as `cli` in the audit trail and runs against the store
 directly, so it works while the server is down; a running server sees
 the change on its next read (the memory media store is the exception —
-`media revoke` from the CLI needs the server up, and says so).
+`media revoke` from the CLI needs the server up, and says so, and a
+purge from the CLI takes lines and articles but not images).
 
 ```toml
-[moderation]                # present whenever [history] or [media] is
+[moderation]                # optional; moderation is always on, kept in the
+                            # database [inbox], [history] or [news] names
+                            # (in that order), and in memory with none
 evidence_days = 30          # how long a redacted line's text stays readable to moderators
 report_days = 90            # closed reports are kept this long
 pin_days = 7                # a reported image outlives its handle TTL up to this
@@ -386,7 +447,8 @@ kick_purges = 0             # seconds of a kicked user's output to purge; 0 = no
 Moderation lands as the last stage of each of the two designs — H5 and
 M6 — because it needs the rows to exist, and it is one branch, not two:
 the audit table, the acts, the reports, the ng requests and events, the
-CLI. E2E in `crates/hxd/tests/moderation.rs`: a redacted line is a
+CLI. **Landed** that way, with news.md's W8 in it. E2E in
+`crates/hxd/tests/moderation.rs`: a redacted line is a
 tombstone through 700 and `history` and a `chat_redacted` event to an
 ng client that had rendered it; a revoked image 404s mid-download and
 its re-upload is refused; a purge with a kick empties the last hour of

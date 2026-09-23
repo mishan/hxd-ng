@@ -66,6 +66,11 @@ async fn start_server_with(
         ),
         ("lurker", "read_news = true\n"),
         ("outsider", ""),
+        // Unkickable, which the moderation ladder protects (§8).
+        (
+            "boss",
+            "read_news = true\npost_news = true\ncant_be_disconnected = true\n",
+        ),
     ] {
         std::fs::write(
             accounts.join(format!("{login}.toml")),
@@ -2461,6 +2466,45 @@ async fn a_period_subject_or_name_is_cut_to_fit_not_refused() {
     alice
         .event("news_posted", |d| d["subject"] == "Release notes")
         .await;
+}
+
+/// A thread delete that cannot be done whole is not done at all: a
+/// reply by a protected author refuses the request before the parent or
+/// any other reply has gone (§8's ladder on the legacy wire).
+#[tokio::test]
+async fn a_thread_with_a_protected_reply_is_refused_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let (mut boss, _) = Ng::login(ng, "boss").await;
+    let (mut ng_admin, _) = Ng::login(ng, "admin").await;
+    let general = category(&mut ng_admin, None, "General").await;
+    let root = post(&mut alice, general, None, "Thread", "start").await;
+    let first = post(&mut alice, general, Some(root), "r", "first").await;
+    let protected = post(&mut boss, general, Some(root), "r", "the boss").await;
+    let last = post(&mut alice, general, Some(root), "r", "last").await;
+
+    let mut admin = Period::login(legacy, "admin").await;
+    assert_eq!(
+        admin
+            .refused(
+                DELETE_THREAD,
+                vec![
+                    news_path(&[b"General"]),
+                    id_field(tag::THREADID, root),
+                    (tag::DELETEREPLIES, 1u32.to_be_bytes().to_vec()),
+                ],
+            )
+            .await,
+        "That author's articles are protected."
+    );
+    for id in [root, first, protected, last] {
+        assert_eq!(
+            alice.ok("news_article", json!({ "id": id })).await["article"]["deleted"],
+            false,
+            "{id} is untouched"
+        );
+    }
 }
 
 #[tokio::test]

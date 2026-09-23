@@ -87,6 +87,37 @@ describe('config', () => {
     assert.match(output, /\[history\] needs db/);
   });
 
+  test('[moderation] takes its keys and refuses a pin that would not outlive a look', async () => {
+    const { code, output } = await startFailing({
+      config: { inbox: { db: 'messages.db' }, moderation: { pin_days: 0 } },
+    });
+    assert.notEqual(code, 0);
+    assert.match(output, /\[moderation\] pin_days must be at least 1/);
+    const typo = await startFailing({
+      config: { moderation: { evidence_dayz: 3 } },
+    });
+    assert.notEqual(typo.code, 0);
+    assert.match(typo.output, /evidence_dayz/);
+    await withServer(
+      {
+        config: {
+          inbox: { db: 'messages.db' },
+          moderation: {
+            evidence_days: 3,
+            report_days: 10,
+            pin_days: 2,
+            notify_legacy: false,
+            kick_purges: 600,
+          },
+        },
+      },
+      async (_server, crew) => {
+        const probe = await crew.connect({ nick: 'Probe' });
+        assert.ok(probe.conn, 'every key parses and the server serves');
+      },
+    );
+  });
+
   test('a misspelled key is a startup error, not a silently ignored promise', async () => {
     // `deny_unknown_fields` on every section. The failure it prevents is
     // the worst kind: a server that starts, looks healthy, and does not

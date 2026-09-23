@@ -406,6 +406,7 @@ async fn handle_login(
         addr: Some(peer.ip()),
         can_detach: account.can_detach,
         attach_news: account.attach_news,
+        moderate: account.moderate,
         // The plaintext listener is loopback-only and WSS is mandatory in
         // production (`docs/hotline-ng.md` §9), so ng sockets are
         // encrypted by construction — unless the client told us at
@@ -508,6 +509,11 @@ async fn handle_login(
         server["agreement"] = json!(agreement);
     }
     let mut me_json = user_json(&me);
+    // A fact about this session, not a bitmap position: the client shows
+    // the moderation controls (docs/moderation.md §2).
+    if account.moderate {
+        me_json["moderator"] = json!(true);
+    }
     if let Some(i) = identity {
         // `age` and `outcome` are for the user themself, never the roster.
         // The outcome reflects the account this session actually landed
@@ -621,6 +627,13 @@ async fn handle_login(
         .flatten();
     if let Some(news) = news {
         ok["news"] = news;
+    }
+    // Open reports, for a moderator's badge (docs/moderation.md §4.5).
+    let moderation = off_reactor(&ctx.core, move |c| crate::moderation::login_json(c, uid))
+        .await
+        .flatten();
+    if let Some(moderation) = moderation {
+        ok["moderation"] = moderation;
     }
     // What this session would be pushed at, offered only to a session
     // with a mailbox — a guest has nothing durable to be notified about,
@@ -1582,6 +1595,9 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         r if r.starts_with("news_") => crate::news::handle(ctx, state.uid, req).await,
 
         r if r.starts_with("push_") => crate::push::handle(ctx, state, req).await,
+
+        // Reports and the acts (docs/moderation.md §5).
+        r if crate::moderation::handles(r) => crate::moderation::handle(ctx, state, req).await,
 
         // --- Files (docs/files-plan.md) -------------------------------
         r if r.starts_with("files_") => crate::files::handle(ctx, state, req).await,

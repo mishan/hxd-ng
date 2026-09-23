@@ -1234,6 +1234,26 @@ impl NewsStore for SqliteStore {
         Ok(Some(before))
     }
 
+    fn articles_by(&self, who: &Mailbox, since: SystemTime) -> Result<Vec<ArticleId>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // `news_article_author` is (login_fp, login, id): the mailbox rule
+        // over the author's two columns, as the inbox keys its rows.
+        let query = format!(
+            "SELECT id FROM news_article
+              WHERE {} AND deleted_at IS NULL AND at >= ?2
+              ORDER BY id ASC",
+            mailbox_sql(who, "login", 1)
+        );
+        let mut stmt = sql(conn.prepare_cached(&query))?;
+        let rows = sql(stmt.query_map(params![bind(who), unix(since)], |r| r.get::<_, i64>(0)))?;
+        rows.map(|r| {
+            let id = sql(r)?;
+            ArticleId::try_from(id)
+                .map_err(|_| StoreError::new(format!("article id {id} is not an id")))
+        })
+        .collect()
+    }
+
     fn refs_to(&self, id: ArticleId, limit: usize) -> Result<Vec<Reference>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = sql(conn.prepare_cached(

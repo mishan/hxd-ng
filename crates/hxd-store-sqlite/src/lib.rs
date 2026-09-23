@@ -54,6 +54,7 @@ impl Synchronous {
 }
 
 mod blobs;
+mod moderation;
 mod news;
 mod push;
 mod registrar;
@@ -63,7 +64,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -363,6 +364,24 @@ CREATE UNIQUE INDEX push_device_login ON push_device (owner, devid) WHERE owner_
 CREATE INDEX push_device_expires ON push_device (expires) WHERE expires IS NOT NULL;
 ";
 
+/// Moderation (`docs/moderation.md` §7, `docs/news.md` §11). Version 2
+/// reserved the audit trail, the reports and the block list; this is
+/// what filling them needed besides. An article is a target of both an
+/// act and a report; an act can be the close of a report; and a report
+/// keeps the name its subject went by, because a moderator reading
+/// "a guest" three days later has nothing else to go on. The two partial
+/// indexes are the sweeper's: evidence still to scrub, and closed
+/// reports still to age out.
+const SCHEMA_V8: &str = "
+ALTER TABLE moderation ADD COLUMN target_article INTEGER;
+ALTER TABLE moderation ADD COLUMN target_report INTEGER;
+ALTER TABLE report ADD COLUMN target_article INTEGER;
+ALTER TABLE report ADD COLUMN target_nick TEXT;
+CREATE INDEX moderation_evidence_at ON moderation (at)
+  WHERE evidence IS NOT NULL AND evidence != '';
+CREATE INDEX report_closed_at ON report (closed_at) WHERE closed_at IS NOT NULL;
+";
+
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL
 /// predicate over a `(<col>, <col>_fp)` pair — **one shape per kind of
 /// mailbox**, and one bind either way ([`bind`] supplies it).
@@ -601,6 +620,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 7 {
         steps.push_str(SCHEMA_V7);
+    }
+    if version < 8 {
+        steps.push_str(SCHEMA_V8);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -1519,14 +1541,58 @@ impl ChatLog for SqliteStore {
         Ok(HistoryPage { lines, has_more })
     }
 
-    fn tombstone(&self, id: LineId, at: SystemTime) -> Result<bool, StoreError> {
+    fn line(&self, id: LineId) -> Result<Option<LogLine>, StoreError> {
         let conn = self.conn.lock().unwrap();
+        let sql = format!("SELECT {HISTORY_COLUMNS} FROM chat_line WHERE id = ?1");
+        conn.query_row(&sql, params![clamp_id(id)], history_row)
+            .optional()
+            .map_err(StoreError::new)?
+            .transpose()
+    }
+
+    fn lines_by(
+        &self,
+        channel: u32,
+        who: &Mailbox,
+        since: SystemTime,
+    ) -> Result<Vec<LogLine>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // `chat_line`'s sender columns are `login` and `login_fp`, the
+        // pair `mailbox_sql` reads. A guest's line has neither and so
+        // matches no mailbox, which is the rule's own answer.
+        let sql = format!(
+            "SELECT {HISTORY_COLUMNS} FROM chat_line
+              WHERE channel = ?1 AND at >= ?2 AND deleted_at IS NULL AND {}
+              ORDER BY id ASC",
+            mailbox_sql(who, "login", 3)
+        );
+        let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
+        let rows = stmt
+            .query_map(
+                params![i64::from(channel), unix(since), bind(who)],
+                history_row,
+            )
+            .map_err(StoreError::new)?;
+        collect_history(rows)
+    }
+
+    fn tombstone(&self, id: LineId, by: &str, at: SystemTime) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // A second redaction of the same line keeps the first one's who
+        // and when: the record of a removal is of the removal.
         let changed = conn
             .execute(
                 "UPDATE chat_line
-                    SET nick = '', body = '', flags = flags | ?1, deleted_at = ?2
-                  WHERE id = ?3",
-                params![i64::from(LineFlags::DELETED.bits()), unix(at), clamp_id(id)],
+                    SET nick = '', body = '', flags = flags | ?1,
+                        deleted_at = IFNULL(deleted_at, ?2),
+                        deleted_by = IFNULL(deleted_by, ?3)
+                  WHERE id = ?4",
+                params![
+                    i64::from(LineFlags::DELETED.bits()),
+                    unix(at),
+                    by,
+                    clamp_id(id)
+                ],
             )
             .map_err(StoreError::new)?;
         Ok(changed != 0)
@@ -1595,6 +1661,11 @@ mod tests {
     #[test]
     fn passes_the_conformance_suite() {
         conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+    }
+
+    #[test]
+    fn moderation_passes_the_conformance_suite() {
+        hxd_core::moderation::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
     #[test]
@@ -2146,6 +2217,39 @@ mod tests {
         assert_eq!(page.lines[0].text, "a line");
         use hxd_core::news::NewsStore;
         assert!(store.nodes(None).unwrap().is_empty(), "news starts empty");
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_seven_migrates_into_a_moderation_store() {
+        use hxd_core::moderation::{ModerationStore, ReportFilter};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            // A block made by hand, the only way a version 7 server had.
+            conn.execute(
+                "INSERT INTO media_block (hash, at, by) VALUES (?1, 1, 'operator')",
+                params![[4u8; 32].as_slice()],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 7).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        assert_eq!(store.blocked_hashes().unwrap(), [[4u8; 32]]);
+        assert!(store
+            .reports(ReportFilter::All, None, 10)
+            .unwrap()
+            .is_empty());
         let conn = Connection::open(&path).unwrap();
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))

@@ -790,6 +790,9 @@ pub enum NewsError {
     TooManySubs,
     /// This server keeps no subscriptions (`[news.notify]` is absent).
     NotifyOff,
+    /// The author holds cant-be-disconnected and the deleter does not
+    /// hold delete-users: the moderation ladder (§8).
+    Protected,
     /// A staged handle is missing, expired, or belongs to someone else.
     NoSuchMedia,
     /// The post names more attachments than policy allows.
@@ -864,6 +867,11 @@ pub trait NewsStore: Send + Sync + 'static {
         by: &str,
         at: SystemTime,
     ) -> Result<Option<Article>, StoreError>;
+
+    /// Every live article `who` wrote at or after `since`, oldest first,
+    /// by [`Author::is`]: the news arm of a purge (`docs/news.md` §11,
+    /// `docs/moderation.md` §3.3).
+    fn articles_by(&self, who: &Mailbox, since: SystemTime) -> Result<Vec<ArticleId>, StoreError>;
 
     /// The articles pointing at `id`, newest first. Tombstones are never
     /// among them — a tombstone's references went with its body.
@@ -1719,7 +1727,7 @@ impl Core {
         Ok(removed)
     }
 
-    fn news_remove_unreferenced(&self, store: &Arc<dyn NewsStore>) {
+    pub(crate) fn news_remove_unreferenced(&self, store: &Arc<dyn NewsStore>) {
         let Some(blobs) = self.news_blobs.as_ref() else {
             return;
         };
@@ -1738,7 +1746,7 @@ impl Core {
         }
     }
 
-    fn news_fan_out(&self, ev: Event) {
+    pub(crate) fn news_fan_out(&self, ev: Event) {
         let mut r = self.roster.lock().unwrap();
         r.broadcast_where(&ev, None, |s| s.access.has(bit::READ_NEWS));
     }
@@ -1943,14 +1951,10 @@ impl Core {
         Ok(posted.id)
     }
 
-    /// Delete an article: its author's own (unless `self_delete` is off),
-    /// or anyone's with `delete_articles`. What is left is a tombstone.
-    ///
-    /// Not yet here: §8's moderation ladder, which spares an author
-    /// holding `cant_be_disconnected` from anyone without `delete_users`.
-    /// It asks about the author's privileges, which an article does not
-    /// record, and it lands with the rest of moderation in W8.
-    pub fn news_delete(&self, uid: Uid, id: ArticleId) -> Result<(), NewsError> {
+    /// Would [`Self::news_delete`] be allowed? Asked of every article a
+    /// legacy thread delete takes before it takes any, so the request is
+    /// refused whole rather than done by halves.
+    pub fn news_may_delete(&self, uid: Uid, id: ArticleId) -> Result<(), NewsError> {
         let store = self.news_store()?;
         let asker = self.news_reader(uid)?;
         let article = store
@@ -1958,23 +1962,76 @@ impl Core {
             .map_err(|e| store_failed(e.into()))?
             .filter(|a| !a.deleted)
             .ok_or(NewsError::NoSuchArticle)?;
-        let own = self.news_policy.self_delete
-            && asker.owner.as_ref().is_some_and(|m| article.author.is(m));
-        if !own && !asker.access.has(bit::DELETE_ARTICLES) {
+        self.news_delete_allowed(uid, &asker, &article).map(|_| ())
+    }
+
+    /// The access rules and §8's ladder for deleting `article`. `true`
+    /// when it is someone else's, which makes the delete a moderation act.
+    fn news_delete_allowed(
+        &self,
+        uid: Uid,
+        asker: &Asker,
+        article: &Article,
+    ) -> Result<bool, NewsError> {
+        let mine = asker.owner.as_ref().is_some_and(|m| article.author.is(m));
+        if self.news_policy.self_delete && mine {
+            return Ok(false);
+        }
+        if !asker.access.has(bit::DELETE_ARTICLES) {
             return Err(NewsError::AccessDenied);
+        }
+        if mine {
+            return Ok(false);
+        }
+        self.news_moderation_check(uid, &article.author)?;
+        Ok(true)
+    }
+
+    /// Delete an article: its author's own (unless `self_delete` is off),
+    /// or anyone's with `delete_articles`. What is left is a tombstone.
+    /// See [`Self::news_delete_for`]; this is the legacy wire's, which
+    /// carries no reason.
+    pub fn news_delete(&self, uid: Uid, id: ArticleId) -> Result<(), NewsError> {
+        self.news_delete_for(uid, id, "")
+    }
+
+    /// Delete an article, saying why.
+    ///
+    /// Someone else's article is a moderation act (§11): §8's ladder
+    /// spares an author holding `cant_be_disconnected` from anyone
+    /// without `delete_users` — asked of the author's sessions and
+    /// account now, since an article does not record its author's
+    /// privileges — and the audit row takes the article's words before
+    /// the store clears them. An author's own delete is neither.
+    pub fn news_delete_for(&self, uid: Uid, id: ArticleId, why: &str) -> Result<(), NewsError> {
+        let store = self.news_store()?;
+        let asker = self.news_reader(uid)?;
+        let article = store
+            .article(id)
+            .map_err(|e| store_failed(e.into()))?
+            .filter(|a| !a.deleted)
+            .ok_or(NewsError::NoSuchArticle)?;
+        let moderated = self.news_delete_allowed(uid, &asker, &article)?;
+        if moderated && why.chars().count() > crate::moderation::MAX_ACT_REASON {
+            return Err(NewsError::BadRequest("That reason is too long."));
         }
         // `None` here is a delete that lost a race with another: the
         // article is a tombstone either way, and the other one announced
-        // it.
-        store
+        // it — and recorded it, which is why the audit row waits for
+        // this answer rather than going first.
+        let was = store
             .tombstone(id, &asker.login, SystemTime::now())
             .map_err(|e| store_failed(e.into()))?
             .ok_or(NewsError::NoSuchArticle)?;
+        if moderated {
+            self.news_moderation_record(uid, &was, why);
+        }
         self.news_remove_unreferenced(store);
         self.news_fan_out(Event::NewsDeleted {
             id,
             category: article.category,
         });
+        self.news_moderation_closed(uid, id);
         Ok(())
     }
 
@@ -2043,7 +2100,18 @@ impl Core {
         if !asker.access.has(needed) {
             return Err(NewsError::AccessDenied);
         }
+        // A category takes its articles with it: who wrote what, and the
+        // reports waiting on any of it, are read before they go, for the
+        // audit row this delete writes (`docs/news.md` §11). A bundle
+        // must be empty, and so takes nothing worth a row.
+        let taken = match node.kind {
+            NodeKind::Category => Some(self.news_category_contents(store, id)),
+            NodeKind::Bundle => None,
+        };
         let gone = store.delete_node(id).map_err(store_failed)?;
+        if let Some(listed) = taken {
+            self.news_node_moderation_record(uid, &node, gone, &listed);
+        }
         self.news_remove_unreferenced(store);
         self.news_fan_out(Event::NewsNodeDeleted { id });
         Ok(gone)
@@ -2250,6 +2318,7 @@ mod tests {
                 transport: Transport::default(),
                 has_inbox,
                 attach_news: false,
+                moderate: false,
                 is_person,
                 reads_on_delivery: false,
                 identity: None,

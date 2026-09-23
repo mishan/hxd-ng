@@ -1,7 +1,7 @@
 # Chat history: server-held scrollback for both wires
 
-Status: built — H1–H3 of §10, both wires. H4 is client-side work in
-GtkHx; H5 is moderation.md's.
+Status: built — H1–H3 and H5 of §10, both wires. H4 is client-side work
+in GtkHx.
 
 ROADMAP Phase 6 item 1 promises "server-held scrollback replay" and notes
 that no public server implements fogWraith's spec — hxd-ng becoming the
@@ -515,8 +515,8 @@ the day a third table arrives.
 
 ## 10. Staging
 
-H1–H3 are implemented in hxd-ng. H4 is the remaining client-side follow-up;
-H5 belongs to the moderation implementation.
+H1–H3 and H5 are implemented in hxd-ng. H4 is the remaining client-side
+follow-up.
 
 1. **H1 — the log.** `ChatLog`, `MemoryLog`, `LineFlags`, the
    `Event::Chat` fields, the serialising lock in `chat_public`, schema
@@ -541,7 +541,9 @@ H5 belongs to the moderation implementation.
 4. **H4 — GtkHx against a real server.** Point the Tier-3 suite's
    history cases at hxd-ng in place of the mock, and fix the catch-up
    loop of §6.3 on the client side.
-5. **H5 — moderation** (moderation.md §8), once the rows exist.
+5. **H5 — moderation** (moderation.md §8), once the rows exist. Landed
+   with the rest of moderation: `redact`, `purge`, the `chat_redacted`
+   event, and a tombstone on 700 and `history` alike.
 
 ## 11. Open questions, and what to raise upstream
 

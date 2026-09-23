@@ -37,7 +37,7 @@ log of [chat-history.md](chat-history.md).
 - **The media gateway is not implemented.** The spec requires it off by
   default; a legacy recipient sees the text the sender typed.
 
-**Implemented 2026-09**, stages M1–M5 of §12 plus the media half of M6;
+**Implemented 2026-09**, stages M1–M6 of §12;
 what is still open is marked in place and summarized at §12. The
 sections below describe the server as it is, with the two places its
 behavior differs from what this document first specified called out as
@@ -695,8 +695,9 @@ as what each one is tested by.
    `media_grant` are what a report needs to outlive a TTL and reach a
    moderator, and `Event::MediaRevoked` tells everyone who could have it
    on screen. The acts' *wire surface* — `revoke`, `report`, the audit
-   table, the CLI — is moderation.md §5's own branch, and lands with the
-   redaction and reporting it shares a table with.
+   table, the CLI — landed with moderation.md's own branch, beside the
+   redaction and reporting it shares a table with; the block list is
+   durable there, so a restart does not forget a revocation.
 
 **Open before a release enables both.** The undelivered-mail pin (§9,
 §14) is the one item gating a release that turns on `[inbox]` and

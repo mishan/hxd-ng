@@ -1,12 +1,11 @@
 # The system account — where commands live
 
 Status: partial. Built: the account on the roster, the reserved login,
-the command line and `/help`, `/msg`, `/block`, `/unblock`, `/blocks`
-and `/stop`, the rate limit, and `[system]`. Not built: `/report` and
-`/vouch`, which wait on the subsystems they belong to (moderation is
-schema only; vouching is unimplemented), and §4's queued-mail option,
-which is not to be defaulted on before it has been seen on a real 1.5
-client. This document is the rule three others
+the command line and `/help`, `/msg`, `/report`, `/block`, `/unblock`,
+`/blocks` and `/stop`, the rate limit, `[system]`, and moderation's
+report lines to legacy moderators. Not built: `/vouch`, which waits on
+vouching, and §4's queued-mail option, which is not to be defaulted on
+before it has been seen on a real 1.5 client. This document is the rule three others
 were each half-stating: `moderation.md` §6 rejected a `/report` chat
 command, `private-messages.md` §7 rejected a `/msg <login>` pseudo-user,
 and `news.md` §10.11 then required "a real mailbox for the server" that
@@ -107,7 +106,7 @@ has.
 | Command | Does | Needs |
 |---|---|---|
 | `/help` | The list below, in one message | — |
-| `/report <who> <reason…>` *(not built)* | Files a report against that user, exactly as the ng `report { user }` request does, with the reason as `evidence`. The reporter gets `ok: report #17 filed` and the moderators get what `moderation.md` §4.5 says they get | the ng `report` rules; one per target per hour |
+| `/report <who> <reason…>` | Files a report against that user, exactly as the ng `report { user }` request does. The reporter gets `ok: report #17 filed` — a guest, that it will not hear how it ends — the moderators get what `moderation.md` §4.5 says they get, and the close comes back as `[report #17] closed: removed` | the ng `report` rules: ten an hour, and a second report of the same person while the first is open is the first |
 | `/msg <login> <text…>` | Sends a private message to an account by login, whether or not it holds a session — the ng `msg { to_login }` request. The answer says `sent` or `queued`. This is the addressing mechanism `private-messages.md` §7 declined to invent as a pseudo-user; as a command to the account that already exists it costs nothing it was worried about | `send_msgs` |
 | `/block <who>`, `/unblock <who>`, `/blocks` | The three ng block requests | — |
 | `/stop [#article]` | Stops the news scope of the most recent notification this account sent the user, or the thread of the named article. A thread is **muted** rather than unfollowed, because a reply to your article or a citation of it reaches you with no subscription at all and only a mute silences it; a category is unfollowed. `news.md` §10.11 | — |

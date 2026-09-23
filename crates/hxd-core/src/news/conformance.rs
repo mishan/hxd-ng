@@ -33,6 +33,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     a_thread_pages_forward_through_its_replies(&*new_store());
     references_resolve_once_and_report_their_target_now(&*new_store());
     a_tombstone_keeps_its_place_and_loses_its_words(&*new_store());
+    an_authors_articles_are_found_by_the_mailbox_rule(&*new_store());
     a_thread_of_nothing_but_tombstones_is_not_listed(&*new_store());
     deleting_a_category_takes_its_articles_and_a_bundle_must_be_empty(&*new_store());
     pruning_takes_whole_threads_by_their_last_post(&*new_store());
@@ -1354,6 +1355,43 @@ fn a_tombstone_keeps_its_place_and_loses_its_words(s: &dyn NewsStore) {
     assert_eq!(after.children, before.children - 1);
     assert!(s.tombstone(middle, "moderator", t(11)).unwrap().is_none());
     assert!(s.tombstone(9999, "moderator", t(11)).unwrap().is_none());
+}
+
+/// What a purge's news arm selects: live articles only, oldest first,
+/// from the cutoff on, and matched as mail is — an identified author by
+/// fingerprint, a bare one by login, and neither kind the other.
+fn an_authors_articles_are_found_by_the_mailbox_rule(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let early = post(s, cat, None, "early", 100);
+    let bobs = post_by(s, bob_writing(), cat, None, "bob's", 150);
+    let reply = post(s, cat, Some(bobs), "late reply", 200);
+    let gone = post(s, cat, None, "gone", 250);
+    s.tombstone(gone, "mod", t(260)).unwrap();
+    let anon = post_by(
+        s,
+        Author {
+            nick: "Guest".into(),
+            login: None,
+            fingerprint: None,
+        },
+        cat,
+        None,
+        "a guest's",
+        300,
+    );
+    let by = |who: &Mailbox, since| s.articles_by(who, t(since)).unwrap();
+    assert_eq!(by(&alice_mailbox(), 0), [early, reply]);
+    assert_eq!(by(&alice_mailbox(), 150), [reply]);
+    // Renamed since: the fingerprint is what names her.
+    assert_eq!(
+        by(&Mailbox::identified("alicia", [7u8; 32]), 0),
+        [early, reply]
+    );
+    assert_eq!(by(&bob(), 0), [bobs]);
+    // A bare login never claims an identified author's work.
+    assert!(by(&Mailbox::login("alice"), 0).is_empty());
+    assert!(by(&Mailbox::login("guest"), 0).is_empty());
+    let _ = anon;
 }
 
 fn a_thread_of_nothing_but_tombstones_is_not_listed(s: &dyn NewsStore) {
