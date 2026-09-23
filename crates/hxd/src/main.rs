@@ -140,6 +140,36 @@ enum Command {
     RegistrarInspect {
         target: String,
     },
+    /// `history redact <id> --reason R`.
+    HistoryRedact {
+        id: u64,
+        reason: String,
+    },
+    /// `media revoke <handle> --reason R [--no-block]`.
+    MediaRevoke,
+    /// `purge <login> [--fingerprint FP] [--since 1h] --reason R [--dry-run]`.
+    Purge {
+        login: String,
+        fingerprint: Option<String>,
+        since: std::time::Duration,
+        reason: String,
+        dry_run: bool,
+    },
+    /// `reports [--all]`.
+    Reports {
+        all: bool,
+    },
+    /// `reports close <id> --outcome O [--note N] [--of ID]`.
+    ReportsClose {
+        id: u64,
+        outcome: String,
+        note: Option<String>,
+        of: Option<u64>,
+    },
+    /// `moderation log [--limit N]`.
+    ModerationLog {
+        limit: usize,
+    },
 }
 
 const USAGE: &str = "usage:\n  \
@@ -152,7 +182,13 @@ hxd [--config …] registrar freeze <fingerprint> [--lift]\n  \
 hxd [--config …] registrar revoke <handle> --reason abuse|lapsed|unspecified\n  \
 hxd [--config …] registrar recover <handle> --identity <fingerprint> [--keep-age]\n  \
 hxd [--config …] registrar invites --add N\n  \
-hxd registrar inspect <host>\n\n\
+hxd registrar inspect <host>\n  \
+hxd [--config …] history redact <line-id> --reason R\n  \
+hxd [--config …] media revoke <handle> --reason R [--no-block]\n  \
+hxd [--config …] purge <login> [--fingerprint FP] [--since 1h] --reason R [--dry-run]\n  \
+hxd [--config …] reports [--all]\n  \
+hxd [--config …] reports close <id> --outcome dismissed|duplicate [--note N] [--of ID]\n  \
+hxd [--config …] moderation log [--limit N]\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
 `push rekey` replaces the server's VAPID key and drops every registered\n\
@@ -176,7 +212,17 @@ devices with it when the account is deleted — otherwise the freed\n\
 login's next holder inherits them.\n\
 Pass --fingerprint (the value in the account's [identity] table, or\n\
 its hex) when the account file is already gone. --dry-run says how\n\
-much would go without taking it.";
+much would go without taking it.\n\n\
+The moderation commands act as `cli` in the audit trail, against the\n\
+database directly, so they work with the server down; a running server\n\
+sees the change on its next read. `history redact` blanks a public\n\
+line and keeps its words for moderators; `purge` redacts a person's\n\
+lines and deletes their articles from the last --since (1h unless\n\
+said; `all` for everything). Images live in the running server's\n\
+memory, so `media revoke` — and a purge's images — are an ng\n\
+moderator's to do. `reports` lists what is open (--all for\n\
+everything) and `reports close` dismisses one or marks it a\n\
+duplicate --of another; `moderation log` is the audit trail.";
 
 fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut config = PathBuf::from("hxd-ng.toml");
@@ -189,6 +235,13 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut identity = None;
     let mut keep_age = false;
     let mut add = None;
+    let mut since = None;
+    let mut no_block = false;
+    let mut all = false;
+    let mut outcome = None;
+    let mut note = None;
+    let mut of = None;
+    let mut limit = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -228,6 +281,42 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                         .ok_or_else(|| "--add needs a positive number".to_string())?,
                 );
             }
+            "--since" => {
+                since = Some(hxd::moderation::parse_since(
+                    &args
+                        .next()
+                        .ok_or_else(|| "--since needs a duration".to_string())?,
+                )?);
+            }
+            "--no-block" => no_block = true,
+            "--all" => all = true,
+            "--outcome" => {
+                outcome = Some(
+                    args.next()
+                        .ok_or_else(|| "--outcome needs dismissed or duplicate".to_string())?,
+                );
+            }
+            "--note" => {
+                note = Some(
+                    args.next()
+                        .ok_or_else(|| "--note needs a value".to_string())?,
+                );
+            }
+            "--of" => {
+                of = Some(
+                    args.next()
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .ok_or_else(|| "--of needs a report id".to_string())?,
+                );
+            }
+            "--limit" => {
+                limit = Some(
+                    args.next()
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .filter(|n| (1..=100).contains(n))
+                        .ok_or_else(|| "--limit needs a number from 1 to 100".to_string())?,
+                );
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -251,8 +340,45 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     {
         return Err("--lift belongs to `identity revoke` and `registrar freeze`".to_string());
     }
-    if reason.is_some() && !matches!(words[..], ["registrar", "revoke", _]) {
-        return Err("--reason belongs to `registrar revoke`".to_string());
+    if reason.is_some()
+        && !matches!(
+            words[..],
+            ["registrar", "revoke", _]
+                | ["history", "redact", _]
+                | ["media", "revoke", _]
+                | ["purge", _]
+        )
+    {
+        return Err(
+            "--reason belongs to `registrar revoke`, `history redact`, `media revoke` and \
+             `purge`"
+                .to_string(),
+        );
+    }
+    if since.is_some() && !matches!(words[..], ["purge", _]) {
+        return Err("--since belongs to `purge`".to_string());
+    }
+    if no_block && !matches!(words[..], ["media", "revoke", _]) {
+        return Err("--no-block belongs to `media revoke`".to_string());
+    }
+    if all && !matches!(words[..], ["reports"]) {
+        return Err("--all belongs to `reports`".to_string());
+    }
+    if (outcome.is_some() || note.is_some() || of.is_some())
+        && !matches!(words[..], ["reports", "close", _])
+    {
+        return Err("--outcome, --note and --of belong to `reports close`".to_string());
+    }
+    if limit.is_some() && !matches!(words[..], ["moderation", "log"]) {
+        return Err("--limit belongs to `moderation log`".to_string());
+    }
+    if (fingerprint.is_some() || dry_run)
+        && matches!(
+            words.first(),
+            Some(&"history" | &"media" | &"reports" | &"moderation")
+        )
+    {
+        return Err("--fingerprint and --dry-run belong to `inbox purge` and `purge`".to_string());
     }
     if (identity.is_some() || keep_age) && !matches!(words[..], ["registrar", "recover", _]) {
         return Err("--identity and --keep-age belong to `registrar recover`".to_string());
@@ -262,6 +388,27 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     }
     if (fingerprint.is_some() || dry_run) && words.first() == Some(&"registrar") {
         return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string());
+    }
+    // `purge` shares `--fingerprint` and `--dry-run` with `inbox purge`,
+    // and is the only other command that does. After every other flag's
+    // check, so a stray one is refused here as anywhere.
+    if let ["purge", login] = words[..] {
+        // A dry run changes nothing, so it has nothing to say why about.
+        let reason = match (reason, dry_run) {
+            (Some(reason), _) => reason,
+            (None, true) => String::new(),
+            (None, false) => return Err("`purge` needs --reason: every act says why".into()),
+        };
+        return Ok((
+            config,
+            Command::Purge {
+                login: login.to_string(),
+                fingerprint,
+                since: since.unwrap_or(std::time::Duration::from_secs(3600)),
+                reason,
+                dry_run,
+            },
+        ));
     }
     let command = match words[..] {
         // A flag that belongs to a subcommand is an error on the way to
@@ -312,6 +459,25 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
         },
         ["registrar", "inspect", target] => Command::RegistrarInspect {
             target: target.to_string(),
+        },
+        ["history", "redact", id] => Command::HistoryRedact {
+            id: id
+                .parse()
+                .map_err(|_| format!("{id:?} is not a chat line id"))?,
+            reason: reason.ok_or("`history redact` needs --reason: every act says why")?,
+        },
+        ["media", "revoke", _] => Command::MediaRevoke,
+        ["reports"] => Command::Reports { all },
+        ["reports", "close", id] => Command::ReportsClose {
+            id: id
+                .parse()
+                .map_err(|_| format!("{id:?} is not a report id"))?,
+            outcome: outcome.ok_or("`reports close` needs --outcome dismissed|duplicate")?,
+            note,
+            of,
+        },
+        ["moderation", "log"] => Command::ModerationLog {
+            limit: limit.unwrap_or(50),
         },
         ["inbox", "purge", login] => Command::InboxPurge {
             login: login.to_string(),
@@ -423,6 +589,55 @@ async fn main() {
                 for code in hxd::registrar::invites_add(&config, *add)? {
                     println!("{code}");
                 }
+                return Ok(());
+            }
+            _ => {}
+        }
+        match &command {
+            Command::HistoryRedact { id, reason } => {
+                hxd::moderation::redact(&config, *id, reason)?;
+                println!("redacted line {id}");
+                return Ok(());
+            }
+            Command::MediaRevoke => return hxd::moderation::media_revoke(),
+            Command::Purge {
+                login,
+                fingerprint,
+                since,
+                reason,
+                dry_run,
+            } => {
+                let took = hxd::moderation::purge(
+                    &config,
+                    login,
+                    fingerprint.as_deref(),
+                    *since,
+                    reason,
+                    *dry_run,
+                )?;
+                let verb = if *dry_run { "would purge" } else { "purged" };
+                println!(
+                    "{verb} {} chat lines and {} articles by {login}",
+                    took.lines, took.articles
+                );
+                return Ok(());
+            }
+            Command::Reports { all } => {
+                println!("{}", hxd::moderation::reports(&config, *all)?);
+                return Ok(());
+            }
+            Command::ReportsClose {
+                id,
+                outcome,
+                note,
+                of,
+            } => {
+                hxd::moderation::reports_close(&config, *id, outcome, note.clone(), *of)?;
+                println!("closed report #{id} as {outcome}");
+                return Ok(());
+            }
+            Command::ModerationLog { limit } => {
+                println!("{}", hxd::moderation::log(&config, *limit)?);
                 return Ok(());
             }
             _ => {}
@@ -628,6 +843,8 @@ async fn main() {
         if ctx.core.push_enabled() {
             tokio::spawn(hxd::device_sweeper(ctx.core.clone()));
         }
+        // The audit trail's evidence window and closed reports' retention.
+        tokio::spawn(hxd::moderation::pruner(ctx.core.clone()));
         #[cfg(unix)]
         tokio::spawn(reload_on_hangup(
             ctx.core.clone(),

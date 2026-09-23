@@ -128,16 +128,15 @@ fn png(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// The two listeners, and the domain behind them — which a moderation
-/// test needs, because revoking is an act the wires do not carry yet
-/// (moderation.md §5 defines the requests; they land with that branch).
+/// The two listeners, and the domain behind them — which these tests
+/// reach into for what the media store does beneath a moderator's act.
+/// The acts themselves, over both wires, are `tests/moderation.rs`.
 struct Server {
     legacy: SocketAddr,
     ng: SocketAddr,
     core: Arc<Core>,
     /// The chat log, when the server has one — so a test can tombstone a
-    /// line the way a moderator will, which has no wire surface on this
-    /// branch (`moderation.md` owns that).
+    /// line and leave its image alive, which no moderator's act does.
     log: Option<Arc<SqliteStore>>,
 }
 
@@ -1263,9 +1262,9 @@ async fn an_image_waits_in_the_inbox_for_a_recipient_who_was_not_here() {
 
 #[tokio::test]
 async fn a_revocation_stops_the_next_download_and_tells_the_room() {
-    // The media half of moderation.md §3.2, from the domain — the wire
-    // requests that will call it land with that document's own branch.
-    // What matters here is what the two wires do either side of it.
+    // The media half of moderation.md §3.2, from the domain: what the
+    // two wires do either side of a revocation, whoever made it. The
+    // `revoke` request itself is `tests/moderation.rs`'s.
     let dir = tempfile::tempdir().unwrap();
     let server = start(dir.path(), media_config()).await;
     let (mut classic, _) = Legacy::login(server.legacy, "alice", true).await;
@@ -1350,15 +1349,16 @@ async fn paging_a_deleted_line_grants_its_image_to_nobody() {
         .as_u64()
         .expect("a durable line id");
 
-    // A moderator takes the line down. The bytes are not revoked — this
-    // is a redaction, and the handle is still perfectly live, which is
-    // what makes the grant reachable at all.
+    // The line is tombstoned in the store and its bytes are left alone.
+    // A moderator's redaction revokes both; this is the harder case,
+    // with the handle still perfectly live, which is what makes the
+    // grant reachable at all.
     use hxd_core::history::ChatLog;
     assert!(server
         .log
         .as_ref()
         .expect("a log")
-        .tombstone(line_id, std::time::SystemTime::now())
+        .tombstone(line_id, "moderator", std::time::SystemTime::now())
         .unwrap());
 
     // Bob arrives afterwards: he never saw the line live, so nothing has

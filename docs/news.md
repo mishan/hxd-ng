@@ -1103,9 +1103,11 @@ be four hundred audit rows or a refusal, not one click.
 Moderation follows moderation.md's ladder unchanged: a moderator may
 not delete an article by a session holding `cant_be_disconnected` (23)
 unless they hold `delete_users` (15). That asks about the author's
-privileges, which an article does not record yet, so it arrives with
-the rest of moderation in W8 (§16); until then `delete_articles` is
-enough whoever the author is.
+privileges, which an article does not record, so it is asked of the
+author's sessions and, when they hold none, of their account now —
+the answer `protected` on the ng wire and a task error on the legacy
+one. An author deleting their own article is not a moderation act and
+meets no ladder.
 
 ## 9. The ng wire
 
@@ -1864,6 +1866,15 @@ it rather than being re-invented:
   one audit row.
 - **Reports** grow a target: `report.target_article`, filed by anyone
   with `READ_NEWS`, delivered to moderators the moment they are filed.
+- **Deleting a category** takes every article in it in one click, so
+  it writes one audit row of its own (`news_node_delete`): the
+  category's name, how many articles went, and whose they were by
+  count — not their words, since a category can hold thousands — and
+  answers the reports waiting on any of them. It meets no ladder: the
+  delete-categories bit is trusted above it, as on a period server.
+- **A legacy thread delete is refused whole.** Every article it would
+  take is asked about first, so a protected author's reply refuses the
+  request before the parent has gone.
 - **Search and references follow the tombstone.** A deleted article is
   removed from `news_fts` in the same transaction, so it cannot be found
   by text; its outbound `news_ref` rows go with it, and its inbound ones
@@ -2424,7 +2435,7 @@ Each lands separately with tests, roughly a branch apiece.
    edges, the 1.2 flat view of §12.5 — renderer, header-block parser,
    defaults and the push — and `hxd import-mhxd-news`.
 
-**Landed:** W1 through W7, and W9 without its two deferred parts. Markdown is `hxd-markdown` on pulldown-cmark behind
+**Landed:** W1 through W8, and W9 without its two deferred parts. Markdown is `hxd-markdown` on pulldown-cmark behind
 `BodyRenderer` and the `markdown` feature. It has the three modes of
 §5.5, the downgrade stored in `plain` (which the index and the
 notification excerpt read instead of the source), and references from
@@ -2447,8 +2458,11 @@ legacy derivatives, quotas and orphan cleanup, hash blocking,
 authenticated ng upload/download routes, and attachment names in FTS.
 hx-ng stages them in its composer and renders authenticated blob URLs in articles. `[news]` accepts only the
 keys those stages honor; naming another, or another markdown mode, is a
-startup error until its stage lands. Not in it: §8's moderation ladder
-(W8) and `order: "recent"` (§18). The ng e2e is
+startup error until its stage lands. Not in it: `order: "recent"`
+(§18). W8 landed with the rest of moderation (moderation.md): the
+`news_delete` audit kind with the article's words and attachments in
+it, `article` as a report target, the purge's news arm, §8's ladder,
+the moderation sweeper, and `hxd purge` reaching articles. The ng e2e is
 `crates/hxd/tests/news.rs`, the out-of-process one `e2e/news.test.mjs`,
 and the first client is hx-ng's News view, which follows, mutes, badges
 and says "seen".

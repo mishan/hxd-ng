@@ -144,6 +144,7 @@ impl Core {
                 // to it is a command, answered and not stored.
                 has_inbox: false,
                 attach_news: false,
+                moderate: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: None,
@@ -164,6 +165,11 @@ impl Core {
             let r = self.roster.lock().unwrap();
             r.users.get(&uid).filter(|s| s.system).map(|_| uid)
         })
+    }
+
+    /// What the system account is called on the roster.
+    pub fn system_nick(&self) -> Option<String> {
+        self.system.as_ref().map(|s| s.policy.nick.clone())
     }
 
     /// Is `login` the reserved one? Asked where a login is looked up, so
@@ -297,6 +303,16 @@ impl Core {
                 self.command_block(from, who, command == "block")
             }
             "blocks" => self.command_blocks(from),
+            "report" => {
+                let Some(who) = words.next() else {
+                    return "error: /report <nick or login> <reason>".into();
+                };
+                let reason = tail(words);
+                if reason.trim().is_empty() {
+                    return "error: /report <nick or login> <reason>".into();
+                }
+                self.command_report(from, who, &reason)
+            }
             "stop" => self.command_stop(from, words.next()),
             _ => self.help(),
         }
@@ -310,6 +326,7 @@ impl Core {
          /help — this\n\
          /msg <login> <message> — message an account, online or not\n\
          /block <nick or login>, /unblock <…>, /blocks — who may message you\n\
+         /report <nick or login> <reason> — tell the moderators about someone\n\
          /stop [#article] — stop following a news thread"
             .into()
     }
@@ -346,6 +363,40 @@ impl Core {
             Err(crate::ChatError::NoInbox) => {
                 "error: this server does not keep a block list".into()
             }
+            Err(_) => "error: that did not work".into(),
+        }
+    }
+
+    /// `/report`: the ng `report { user }` request, for a wire that has
+    /// no report transaction (`docs/moderation.md` §6). By nick first,
+    /// as a period client's user list names people, then by login.
+    fn command_report(&self, from: Uid, who: &str, reason: &str) -> String {
+        if self.is_system_login(who)
+            || self
+                .system_nick()
+                .is_some_and(|n| n.eq_ignore_ascii_case(who))
+        {
+            return "error: that is me".into();
+        }
+        let person = match self.uid_of_nick(who) {
+            Some(uid) => crate::moderation::PersonRef::Uid(uid),
+            None => crate::moderation::PersonRef::Login(who.into()),
+        };
+        let request = crate::moderation::ReportRequest::User(person);
+        match self.report(from, request, reason, None) {
+            Ok(filed) if filed.follow_up => format!("ok: report #{} filed", filed.id),
+            Ok(filed) => format!(
+                "ok: report #{} filed — as a guest you will not hear how it ends",
+                filed.id
+            ),
+            Err(crate::moderation::ModError::NoSuchTarget) => "error: nobody by that name".into(),
+            Err(crate::moderation::ModError::RateLimited) => {
+                "error: you have reported enough for one hour".into()
+            }
+            Err(crate::moderation::ModError::Disabled) => {
+                "error: this server takes no reports".into()
+            }
+            Err(crate::moderation::ModError::BadRequest(why)) => format!("error: {why}"),
             Err(_) => "error: that did not work".into(),
         }
     }
@@ -552,6 +603,7 @@ mod tests {
                     transport: Transport::default(),
                     has_inbox: true,
                     attach_news: false,
+                    moderate: false,
                     is_person: true,
                     reads_on_delivery: false,
                     identity: None,
@@ -763,6 +815,83 @@ mod tests {
             "two commands, then one refusal and silence: {said:?}"
         );
         assert_eq!(said[2], "error: slow down");
+    }
+
+    #[test]
+    fn report_files_against_a_nick_or_a_login_and_reaches_the_moderators() {
+        let directory = Arc::new(Directory(
+            ["alice", "bob", "carol"]
+                .iter()
+                .map(|l| l.to_string())
+                .collect(),
+        ));
+        let store = Arc::new(crate::moderation::MemoryModeration::default());
+        let s = Server {
+            core: Arc::new(
+                Core::new()
+                    .with_inbox(
+                        Arc::new(MemoryStore::new()),
+                        directory,
+                        InboxPolicy::default(),
+                    )
+                    .with_system(SystemPolicy::default())
+                    .with_moderation(store.clone(), Default::default()),
+            ),
+        };
+        s.core.start_system_session().unwrap();
+        let (alice, mut rx) = s.login("alice");
+        let (_bob, _) = s.login("bob");
+        let (carol, mut carol_rx) = s
+            .core
+            .attach(AttachInfo {
+                nick: "carol".into(),
+                icon: 1,
+                admin: true,
+                access: member(),
+                login: "carol".into(),
+                addr: None,
+                can_detach: true,
+                transport: Transport::default(),
+                has_inbox: true,
+                attach_news: false,
+                moderate: true,
+                is_person: true,
+                reads_on_delivery: false,
+                identity: None,
+                system: false,
+            })
+            .unwrap();
+        s.core.announce(carol);
+        drain(&mut carol_rx);
+
+        assert_eq!(
+            command(&s, alice, &mut rx, "/report BOB spamming\nsince noon"),
+            "ok: report #1 filed"
+        );
+        let filed = drain(&mut carol_rx)
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Report(r) => Some(r),
+                _ => None,
+            })
+            .expect("the moderator hears it");
+        assert_eq!(filed.about.login.as_deref(), Some("bob"));
+        assert_eq!(
+            filed.reason, "spamming\nsince noon",
+            "the reason may run on"
+        );
+        assert_eq!(
+            command(&s, alice, &mut rx, "/report nobody at all"),
+            "error: nobody by that name"
+        );
+        assert_eq!(
+            command(&s, alice, &mut rx, "/report bob"),
+            "error: /report <nick or login> <reason>"
+        );
+        assert_eq!(
+            command(&s, alice, &mut rx, "/report server hi"),
+            "error: that is me"
+        );
     }
 
     #[test]

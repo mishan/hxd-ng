@@ -75,6 +75,7 @@ fn server_with(policy: NewsPolicy, renderer: Option<Arc<Fake>>) -> (Core, Uid, N
             transport: Transport::default(),
             has_inbox: true,
             attach_news: false,
+            moderate: false,
             is_person: true,
             reads_on_delivery: false,
             identity: None,

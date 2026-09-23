@@ -22,6 +22,7 @@ use hxd_session::{cap, Caps, ServerConfig, ServerCtx, TrtpLogin};
 use serde::Deserialize;
 
 pub mod files;
+pub mod moderation;
 pub mod push;
 pub mod registrar;
 pub mod voice;
@@ -77,6 +78,11 @@ pub struct Config {
     /// = not a registrar: discovery's `registrar` block is `null` and
     /// the `/registrar` routes 404. Needs `[identity]`.
     pub registrar: Option<registrar::RegistrarSection>,
+    /// Moderation's retention and legacy behavior
+    /// (`docs/moderation.md` §7). Absent = the defaults: moderation is
+    /// always on, its trail kept in the database `[inbox]`, `[history]`
+    /// or `[news]` names, and in memory on a server with none.
+    pub moderation: Option<moderation::ModerationSection>,
 }
 
 /// `[push]`: where a notification goes when nobody is watching.
@@ -1998,6 +2004,9 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     if let Some(system) = &config.system {
         system.check()?;
     }
+    if let Some(moderation) = &config.moderation {
+        moderation.check()?;
+    }
     if let Some(files) = &config.files {
         if !matches!(
             (&files.manifest, &files.origin, &files.root),
@@ -2091,6 +2100,7 @@ struct RuntimeStores {
     history: Option<Arc<dyn hxd_core::ChatLog>>,
     news: Option<Arc<dyn hxd_core::NewsStore>>,
     devices: Option<Arc<dyn hxd_core::PushStore>>,
+    moderation: Option<Arc<dyn hxd_core::ModerationStore>>,
 }
 
 /// Open the databases the config names, **one store object per file**
@@ -2164,11 +2174,18 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         Some(p) => Some(open(p, Synchronous::Normal)? as Arc<dyn hxd_core::PushStore>),
         None => None,
     };
+    // Already open: the trail shares whichever of those files comes first
+    // in `moderation::db`'s order.
+    let moderation = match keyed(&moderation::db(config))? {
+        Some(p) => Some(open(&p, Synchronous::Normal)? as Arc<dyn hxd_core::ModerationStore>),
+        None => None,
+    };
     Ok(RuntimeStores {
         inbox,
         history,
         news,
         devices,
+        moderation,
     })
 }
 
@@ -2203,6 +2220,7 @@ struct RuntimeStores {
     history: Option<Arc<dyn hxd_core::ChatLog>>,
     news: Option<Arc<dyn hxd_core::NewsStore>>,
     devices: Option<Arc<dyn hxd_core::PushStore>>,
+    moderation: Option<Arc<dyn hxd_core::ModerationStore>>,
 }
 
 #[cfg(not(feature = "inbox"))]
@@ -2223,6 +2241,7 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         history: None,
         news: None,
         devices: None,
+        moderation: None,
     })
 }
 
@@ -2800,6 +2819,15 @@ pub fn build_ctx(
     };
     let core = with_markdown(core, config);
     let core = with_media(core, config)?;
+    // After media, so the durable block list reaches the image store.
+    // Always on: kick and ban never needed a database, and reports on a
+    // server with none are kept until it stops.
+    let core = core.with_moderation(
+        stores
+            .moderation
+            .unwrap_or_else(|| Arc::new(hxd_core::MemoryModeration::default())),
+        moderation::policy(config),
+    );
     // The registry and the gateway together or not at all: a registry
     // with nothing to send from would take registrations and drop every
     // notification, which is worse than saying there is no push.

@@ -59,7 +59,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-markdown` | Markdown news bodies (`docs/news.md` §5): pulldown-cmark, built without its HTML writer, folded into the plain-text downgrade that search and legacy clients read, and the references a body makes. Text in, text out — nothing here ever produces markup. Behind `hxd-core`'s `BodyRenderer` trait and the `markdown` Cargo feature. |
 | `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
 | `hxd-registrar` | The identity registrar (`docs/identity-registrar.md`): handles and their lifecycle, attestations, the records it publishes (revocation, rotation, freeze), the issuance log and stats, rate limits and replay, the operator's freeze, revoke and recover. Signed bytes in, signed bytes out; no HTTP, no roster, no account table beyond the reserved names it is handed. Its `RegistrarStore` trait, an in-memory store and the conformance suite live here. |
-| `hxd-store-sqlite` | The durable store for the private-message inbox, chat history and news: one SQLite file, WAL, the schema and migrations of `docs/private-messages.md` §5 and `docs/news.md` §4, and the conformance suites both stores of each kind are run against. Behind `hxd-core`'s `MessageStore`, `ChatLog` and `NewsStore` traits and the `inbox` Cargo feature; the in-memory stores beside them in `hxd-core` are what the domain tests use. The registrar's store is here too, in a file and a schema of its own. |
+| `hxd-store-sqlite` | The durable store for the private-message inbox, chat history, news and the moderation trail: one SQLite file, WAL, the schema and migrations of `docs/private-messages.md` §5, `docs/news.md` §4 and `docs/moderation.md` §7, and the conformance suites both stores of each kind are run against. Behind `hxd-core`'s `MessageStore`, `ChatLog`, `NewsStore` and `ModerationStore` traits and the `inbox` Cargo feature; the in-memory stores beside them in `hxd-core` are what the domain tests use. The registrar's store is here too, in a file and a schema of its own. |
 | `hxd-push-webpush` | The push sender (`docs/webpush-gateway.md`): a VAPID keypair and its RFC 8292 token, RFC 8291 payload encryption, RFC 8030's headers, the destination check a client-chosen URL demands, and a per-origin circuit breaker. Behind `hxd-core`'s `NotificationGateway` trait, reading the devices out of its `PushStore`, and knowing nothing about Hotline. |
 | `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1); `register`, `revoke` and `rotate` talk to a registrar. |
 | `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing. Its `tests/` hold the e2e suites. |
@@ -193,7 +193,13 @@ Three layers, all `cargo test --workspace`:
   and muting — and on the legacy wire: a scripted 1.5 client walking
   the tree an ng client built, reading both parts of a markdown article,
   posting and keeping house, and a 1.2 client reading the flat category,
-  posting into it and hearing its push) and `registrar.rs` (the registrar built from a real
+  posting into it and hearing its push), `moderation.rs` (the acts and
+  reports on both wires against one database: a redaction blanking a
+  rendered line and paging as a tombstone on 700 and `history`, a
+  revocation and its refused re-upload, a kick with a purge across the
+  log and the news, the ladder, a report reaching a legacy moderator
+  from the system account and an ng one as an event, `/report`, and a
+  reported image outliving its TTL for the moderator) and `registrar.rs` (the registrar built from a real
   `[registrar]` section: discovery under its own host only, handles,
   rotations published under both keys, a card's commitment, invites from
   the file and the command, the operator's commands on the running
@@ -291,8 +297,8 @@ that front. The large open fronts, in rough order: HOPE + ciphers on the
 legacy wire (`hxcrypto` currently lives in GtkHx), the ng rate-limit and
 client-quickstart polish, files/HTXF, the
 rest of news (the domain, store, search, subscriptions, markdown bodies,
-attachments, the ng wire and the legacy binding have landed; moderation,
-the legacy image part and the mhxd importer are staged in
+attachments, the ng wire, the legacy binding and moderation have
+landed; the legacy image part and the mhxd importer are staged in
 `docs/news.md` §16), the push gateway itself
 (`docs/push-notifications.md` P3 onward — the domain already decides who
 is notified, for private messages and for news), and eventually the

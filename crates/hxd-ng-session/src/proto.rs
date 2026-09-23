@@ -501,6 +501,14 @@ pub fn event_json(se: &SeqEvent) -> String {
             json!({ "from": { "uid": from, "nick": from_nick }, "text": text }),
         ),
         Event::Kicked => ("kicked", json!({})),
+        // A client blanks the line in place (moderation.md §5); history
+        // already answers it as the tombstone.
+        Event::ChatRedacted { id } => ("chat_redacted", json!({ "id": id })),
+        Event::Report(report) => ("report", crate::moderation::report_json(report)),
+        Event::ReportClosed { id, outcome, yours } => (
+            "report_closed",
+            json!({ "id": id, "outcome": outcome.name(), "yours": yours }),
+        ),
         // A client drops the image and keeps the placeholder the line or
         // message already carries (moderation.md §5).
         Event::MediaRevoked { id } => (

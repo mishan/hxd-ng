@@ -447,12 +447,13 @@ fn err_text(e: ChatError) -> &'static str {
     }
 }
 
-/// `YYYY-MM-DD HH:MM UTC`, for the queued-message stamp.
+/// `YYYY-MM-DD HH:MM UTC`, for the queued-message stamp and the
+/// operator's moderation listings.
 ///
 /// UTC, and said so in the text: the server knows nothing about where the
 /// reader is, and the legacy wire has no way for a client to tell it. A
 /// stamp in an unstated zone would be worse than one in a stated one.
-fn stamp(t: SystemTime) -> String {
+pub fn stamp(t: SystemTime) -> String {
     let c = civil(t);
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02} UTC",
@@ -1133,6 +1134,7 @@ async fn login_phase(
         can_detach: account.can_detach,
         has_inbox: account.has_inbox,
         attach_news: account.attach_news,
+        moderate: account.moderate,
         is_person: account.is_person(),
         // This wire has no `msg_read` and never will — a private message
         // is a window that opens and nothing comes back — so handing one
@@ -1317,6 +1319,25 @@ async fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
     // arrives live just as much as to one waiting here.
     let uid = sess.uid;
     off_reactor(&ctx.core, move |c| c.flush_inbox(uid)).await;
+}
+
+/// A private message from the system account, or — on a server with
+/// none — in the shape mhxd uses for its own server messages: the
+/// recipient's own uid, which a 1.x client renders through the PM path.
+fn system_msg(tx: &Tx, ctx: &ServerCtx, sess: &Session, text: &str) {
+    let (uid, nick) = match (ctx.core.system_uid(), ctx.core.system_nick()) {
+        (Some(uid), Some(nick)) => (uid, nick),
+        _ => (sess.uid, "Server".to_string()),
+    };
+    push(
+        tx,
+        hdr::MSG,
+        vec![
+            (tag::UID, uid.to_be_bytes().to_vec()),
+            (tag::BODY, sess.enc.body(text)),
+            (tag::NAME, wire_nick(sess.enc, &nick)),
+        ],
+    );
 }
 
 /// Encode one domain event onto the wire. Returns `false` when the session
@@ -1573,6 +1594,33 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
         // the next 751, which now answers "not found"
         // (moderation.md §6).
         Event::MediaRevoked { .. } => {}
+        // The same limit, for a line: a 106 was sent and there is no
+        // transaction to unsend it (moderation.md §6). History (700)
+        // shows the tombstone, which is what a capable client reads.
+        Event::ChatRedacted { .. } => {}
+        // A report reaches a legacy moderator as a private message from
+        // the system account (moderation.md §4.5): a window that opens,
+        // and nothing a period client has to understand beyond that.
+        Event::Report(report) => {
+            if ctx.core.moderation_policy().notify_legacy {
+                system_msg(tx, ctx, sess, &report.summary());
+            }
+        }
+        // The reporter hears how it ended; the moderators, who acted or
+        // saw it acted on, need no window for it on this wire.
+        Event::ReportClosed {
+            id,
+            outcome,
+            yours: true,
+        } => {
+            system_msg(
+                tx,
+                ctx,
+                sess,
+                &format!("[report #{id}] closed: {}", outcome.name()),
+            );
+        }
+        Event::ReportClosed { yours: false, .. } => {}
         // A post into the flat category grows a 1.2 client's pane, whichever
         // wire it came from (`docs/news.md` §12.5): mhxd's push, carrying
         // the one new entry for the client to prepend. Every reader gets
@@ -2613,6 +2661,26 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 return;
             }
             let ban_for = ban.then_some(ctx.cfg.ban_time);
+            // `[moderation] kick_purges` makes a kick take the target's
+            // recent output with it, as the ng `kick { purge }` does —
+            // and only for a kicker who may purge, since that is the
+            // question the ng request asks too (moderation.md §6). Off
+            // by default: a kick over this wire has meant one thing for
+            // twenty-five years. Before the kick, while the target's
+            // session still says who they are.
+            let window = ctx.core.moderation_policy().kick_purges;
+            if !window.is_zero() && ctx.core.is_moderator(sess.uid) {
+                let who = hxd_core::PersonRef::Uid(target);
+                let by = hxd_core::Actor::Session(sess.uid);
+                let why = if ban { "banned" } else { "kicked" };
+                let core = ctx.core.clone();
+                let purged =
+                    tokio::task::spawn_blocking(move || core.purge_sender(by, &who, window, why))
+                        .await;
+                if let Ok(Err(e)) = purged {
+                    debug!(target, "kick purge skipped: {e:?}");
+                }
+            }
             match ctx.core.kick(target, ban_for) {
                 Ok(nick) => {
                     reply(tx, f.trans, vec![]);

@@ -14,6 +14,7 @@ pub mod files;
 pub mod history;
 pub mod inbox;
 pub mod media;
+pub mod moderation;
 pub mod news;
 pub mod notify;
 pub mod push;
@@ -42,8 +43,12 @@ pub use inbox::{
     StoredMessage,
 };
 pub use media::{
-    Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRef,
-    MediaReject, MediaType, Principal, UploadOutcome, UploadPart,
+    Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRecord,
+    MediaRef, MediaReject, MediaType, Principal, UploadOutcome, UploadPart,
+};
+pub use moderation::{
+    Act, ActKind, Actor, Filed, MemoryModeration, ModError, ModerationPolicy, ModerationStore,
+    Outcome, PersonRef, Purged, Report, ReportFilter, ReportRequest, ReportTarget, Subject,
 };
 pub use news::{
     Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, AttachmentPolicy, Author,

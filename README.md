@@ -48,6 +48,7 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 |---|---|---|---|
 | Public chat, private chats, user list, private messages | yes | yes | yes |
 | Kick, ban, broadcast, server notices | yes | yes | yes |
+| **Moderation** — reports, redacting a chat line, revoking an image, purging someone's last hour | reports by `/report` to the server account; moderators get reports as messages | the same | yes |
 | **Private messages that wait for you** while you are away | receives them | receives them | sends, receives, reads later, blocks |
 | **Sessions that survive the network** — close the app, reopen, nothing missed | shown as away | shown as away | yes |
 | **Chat history** — scrollback the server kept | — | yes | yes |
@@ -74,10 +75,6 @@ GtkHx when its rendering lands.
   file management — delete, rename, move, new folder, setting a comment —
   on either wire; uploads on the ng wire. What is built is in
   [docs/files-plan.md](docs/files-plan.md).
-- **Moderation beyond kick and ban.** Reports, redaction of a chat
-  line, revoking an image, purging a user's recent output: designed in
-  [docs/moderation.md](docs/moderation.md), tables in the schema, no
-  requests yet.
 - **Servers reading a registrar's records.** The registrar itself is
   built — it gives a key a name like `alice@hl.example` and publishes
   revocations, rotations and freezes — but a server does not yet fetch
@@ -740,9 +737,29 @@ rate = 10             # commands a minute, per session
 
 It is what makes a period client able to do things its wire cannot
 express: `/msg <login> <message>` reaches an account whether or not it is
-online, which a 1.5 client's user list has no way to name. `/help`,
-`/block`, `/unblock`, `/blocks` and `/stop` are the rest of what it
-answers today.
+online, which a 1.5 client's user list has no way to name, and
+`/report <nick or login> <reason>` tells the moderators about someone.
+`/help`, `/block`, `/unblock`, `/blocks` and `/stop` are the rest of what
+it answers today.
+
+### Moderation
+
+Always on: kick and ban never needed a database, and neither do reports
+— on a server with none they last until it stops. Where `[inbox]`,
+`[history]` or `[news]` names a database (in that order), the audit
+trail and the reports are kept there. Who moderates is `[extra] moderate`
+in the account file, which defaults to the kick bit (`disconnect_users`).
+The section is optional; these are its defaults. See
+[docs/moderation.md](docs/moderation.md).
+
+```toml
+[moderation]
+evidence_days = 30    # how long a redacted line's words stay readable to moderators
+report_days = 90      # how long a closed report is kept
+pin_days = 7          # how long a reported image may outlive its handle
+notify_legacy = true  # reports as private messages to moderators on the classic wire
+kick_purges = 0       # seconds of a kicked user's output a classic kick takes; 0 = none
+```
 
 ### Voice and video
 
@@ -892,6 +909,26 @@ hxd news-reindex
 It opens the database the server uses, which must already exist, and
 leaves the articles as they are. See [docs/news.md](docs/news.md) §6.4.
 
+### Moderation
+
+Moderators act from an ng client. The same acts, the reports and the
+audit trail are reachable from the command line, as `cli`, against the
+database directly — so they work with the server down, and a running
+server sees the change on its next read:
+
+```sh
+hxd reports                                  # what is open; --all for everything
+hxd reports close 17 --outcome dismissed     # or duplicate --of 12; --note says why
+hxd history redact 4711 --reason "slur"      # blank a public line, keep its words for moderators
+hxd purge bob --since 1h --reason "spam run" # redact bob's lines and delete his articles
+hxd purge bob --since 1h --reason x --dry-run
+hxd moderation log                           # the audit trail, newest first
+```
+
+Images live in the running server's memory, not in the database, so
+revoking one — and a purge's images — is an ng moderator's to do; `hxd
+media revoke` says so rather than pretending.
+
 ### Voice
 
 Voice needs its **UDP** port reachable — the one thing operators most often
@@ -939,7 +976,7 @@ other than this server. The last column is what this server has built.
 | [chat-history.md](docs/chat-history.md) | Scrollback: the chat log, cursor paging on both wires, retention | yes |
 | [news.md](docs/news.md) | Threaded news: the tree, articles and references, the store, the ng requests, search, subscriptions, markdown, and the legacy binding | ng wire |
 | [inline-media.md](docs/inline-media.md) | Images in chat: the re-encode pipeline, handles and relay-time authorisation, 750/751 and the HTTP routes | yes |
-| [moderation.md](docs/moderation.md) | Redaction, revocation, purges and reports: the acts, the audit trail, and what each wire can do | schema only |
+| [moderation.md](docs/moderation.md) | Redaction, revocation, purges and reports: the acts, the audit trail, and what each wire can do | yes, less vouching |
 | [voice.md](docs/voice.md) | The SFU: hand-written SDP, RTP forwarding, and one room across both signalling wires | yes |
 | [capabilities-video.md](docs/capabilities-video.md) | Video: publications, subscriptions, limits, and the renegotiation path | yes |
 | [push-notifications.md](docs/push-notifications.md) | Push: the notify decision in the domain, and the gateway | trait only |

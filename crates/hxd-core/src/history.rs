@@ -6,7 +6,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use crate::inbox::StoreError;
+use crate::inbox::{Mailbox, StoreError};
 
 pub type LineId = u64;
 
@@ -115,10 +115,36 @@ pub struct HistoryPage {
     pub has_more: bool,
 }
 
+/// Did `who` send this line? The mailbox rule over the line's two
+/// columns. A line with neither — a plain guest's — is nobody's, because
+/// `guest` is a login several people share.
+pub fn sent_by(line: &LogLine, who: &Mailbox) -> bool {
+    match (&line.from_login, &line.from_fingerprint) {
+        (None, None) => false,
+        (login, fp) => who.matches(login.as_deref().unwrap_or(""), fp.as_ref()),
+    }
+}
+
 pub trait ChatLog: Send + Sync + 'static {
     fn append(&self, line: &NewLine) -> Result<LineId, StoreError>;
     fn query(&self, query: &HistoryQuery) -> Result<HistoryPage, StoreError>;
-    fn tombstone(&self, id: LineId, at: SystemTime) -> Result<bool, StoreError>;
+    /// One line by id, tombstone or not: what a redaction reads before it
+    /// clears the line, and what a report names.
+    fn line(&self, id: LineId) -> Result<Option<LogLine>, StoreError>;
+    /// Every live line `who` sent into `channel` at or after `since`,
+    /// oldest first ([`sent_by`]'s rule): what a purge selects
+    /// (`docs/moderation.md` §3.3). By sender identity rather than by
+    /// uid, because the sender may be gone and the uid someone else's.
+    fn lines_by(
+        &self,
+        channel: u32,
+        who: &Mailbox,
+        since: SystemTime,
+    ) -> Result<Vec<LogLine>, StoreError>;
+    /// Clear a line down to its tombstone: id and time stay, nick and
+    /// text go. `by` is who did it, the column's fast answer to what the
+    /// moderation record says at length.
+    fn tombstone(&self, id: LineId, by: &str, at: SystemTime) -> Result<bool, StoreError>;
     fn prune(
         &self,
         max_lines: usize,
@@ -186,7 +212,32 @@ impl ChatLog for MemoryLog {
         })
     }
 
-    fn tombstone(&self, id: LineId, at: SystemTime) -> Result<bool, StoreError> {
+    fn line(&self, id: LineId) -> Result<Option<LogLine>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.lines.iter().find(|line| line.id == id).cloned())
+    }
+
+    fn lines_by(
+        &self,
+        channel: u32,
+        who: &Mailbox,
+        since: SystemTime,
+    ) -> Result<Vec<LogLine>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .lines
+            .iter()
+            .filter(|line| {
+                line.channel == channel
+                    && line.at >= since
+                    && !line.flags.contains(LineFlags::DELETED)
+                    && sent_by(line, who)
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn tombstone(&self, id: LineId, by: &str, at: SystemTime) -> Result<bool, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let Some(line) = inner.lines.iter_mut().find(|line| line.id == id) else {
             return Ok(false);
@@ -194,9 +245,10 @@ impl ChatLog for MemoryLog {
         line.from_nick.clear();
         line.text.clear();
         line.flags = line.flags.with(LineFlags::DELETED);
-        // The public timestamp is the original receive time. `at` is the
-        // deletion time and will be persisted by the moderation store.
-        let _ = at;
+        // The public timestamp is the original receive time; who and
+        // when are the moderation record's, which this store has no
+        // column for.
+        let _ = (by, at);
         Ok(true)
     }
 
@@ -258,6 +310,8 @@ pub mod conformance {
         tombstones_keep_the_cursor(new_log());
         pruning_combines_age_and_count(new_log());
         media_attaches_without_changing_the_line(new_log());
+        a_line_is_found_by_id_tombstone_or_not(new_log());
+        a_senders_lines_are_found_by_the_mailbox_rule(new_log());
     }
 
     fn fill(log: &dyn ChatLog, count: u64) {
@@ -372,7 +426,7 @@ pub mod conformance {
 
     fn tombstones_keep_the_cursor(log: Box<dyn ChatLog>) {
         fill(&*log, 3);
-        assert!(log.tombstone(2, SystemTime::now()).unwrap());
+        assert!(log.tombstone(2, "carol", SystemTime::now()).unwrap());
         let page = log
             .query(&HistoryQuery {
                 channel: 0,
@@ -427,6 +481,52 @@ pub mod conformance {
             })
             .unwrap();
         assert_eq!(page.lines[0].media.as_ref(), Some(&media));
+    }
+
+    fn a_line_is_found_by_id_tombstone_or_not(log: Box<dyn ChatLog>) {
+        fill(&*log, 2);
+        assert_eq!(log.line(1).unwrap().unwrap().text, "line-1");
+        assert!(log.tombstone(2, "carol", SystemTime::now()).unwrap());
+        let gone = log.line(2).unwrap().unwrap();
+        assert!(gone.flags.contains(LineFlags::DELETED));
+        assert!(gone.text.is_empty());
+        assert!(log.line(3).unwrap().is_none());
+    }
+
+    fn a_senders_lines_are_found_by_the_mailbox_rule(log: Box<dyn ChatLog>) {
+        // Lines 1..=4 from four different senders, then two more from
+        // sender 3, one of which is redacted, and a guest's.
+        fill(&*log, 4);
+        let later = |n: u64| NewLine {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(200 + n),
+            ..line(3)
+        };
+        assert_eq!(log.append(&later(1)).unwrap(), 5);
+        assert_eq!(log.append(&later(2)).unwrap(), 6);
+        assert!(log.tombstone(6, "carol", SystemTime::now()).unwrap());
+        let guest = NewLine {
+            from_login: None,
+            from_fingerprint: None,
+            ..line(7)
+        };
+        assert_eq!(log.append(&guest).unwrap(), 7);
+        let ids = |who: &Mailbox, since: u64| {
+            log.lines_by(0, who, SystemTime::UNIX_EPOCH + Duration::from_secs(since))
+                .unwrap()
+                .iter()
+                .map(|l| l.id)
+                .collect::<Vec<_>>()
+        };
+        // By fingerprint whatever the login says, live lines only, oldest
+        // first, and bounded by time.
+        let three = Mailbox::identified("renamed", [3; 32]);
+        assert_eq!(ids(&three, 0), [3, 5]);
+        assert_eq!(ids(&three, 150), [5]);
+        // A bare login does not claim an identified sender's lines, and
+        // nobody claims a guest's.
+        assert!(ids(&Mailbox::login("login-3"), 0).is_empty());
+        assert!(ids(&Mailbox::login(""), 0).is_empty());
+        assert!(ids(&Mailbox::login("guest"), 0).is_empty());
     }
 
     #[cfg(test)]

@@ -73,6 +73,7 @@ fn attach_boxed(core: &Core, nick: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
             },
             has_inbox: true,
             attach_news: false,
+            moderate: false,
             is_person: true,
             reads_on_delivery: false,
             identity: None,
@@ -112,6 +113,7 @@ fn attach_with(
             },
             has_inbox: false,
             attach_news: false,
+            moderate: false,
             is_person: false,
             reads_on_delivery: false,
             identity: None,
@@ -482,6 +484,28 @@ fn a_reported_handle_can_outlive_its_ttl() {
         "a pinned handle is fetchable by a moderator added to its set"
     );
     assert_eq!(core.media_sweep(), 0, "a pin survives the sweeper");
+}
+
+#[test]
+fn a_pin_in_force_is_kept_rather_than_extended() {
+    // A second report cannot hold an image longer than the first one
+    // pinned it for: filing again, or reconnecting and filing again, is
+    // no way to keep an image forever.
+    let core = core_with(MediaConfig {
+        handle_ttl: Duration::ZERO,
+        upload_interval: Duration::ZERO,
+        ..Default::default()
+    });
+    let (alice, _ra) = attach(&core, "alice", Ipv4Addr::LOCALHOST);
+    let handle = upload(&core, alice, b"an image").unwrap().id.unwrap();
+    assert!(core.media_pin(&handle, Duration::from_millis(100)));
+    assert!(core.media_pin(&handle, Duration::from_secs(3600)));
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        core.media_sweep(),
+        1,
+        "the first pin's end is the end, whatever the second asked"
+    );
 }
 
 #[test]
