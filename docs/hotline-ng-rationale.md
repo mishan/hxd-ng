@@ -24,7 +24,7 @@ Three decisions were taken up front:
 
 - **WebSocket-only transport, with in-band auth.** No HTTP framework until
   media, history or push needed one. Authentication was the first to need
-  one (`hotline-ng-auth.md` §4), and the ng port now carries a small HTTP
+  one (`hotline-ng-auth-rationale.md` §2), and the ng port now carries a small HTTP
   router in front of the upgrade.
 - **Detached sessions with resume are in the MVP.** They are the point of
   the phase, and they cost no persistence.
