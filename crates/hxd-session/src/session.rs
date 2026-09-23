@@ -1274,7 +1274,7 @@ async fn login_phase(
 /// timeout and `synchronous = FULL` fsyncs. On a tokio worker one slow
 /// disk stalls every session that worker carries. This file already does
 /// exactly this for `authenticate`.
-async fn off_reactor<T: Send + 'static>(
+pub(crate) async fn off_reactor<T: Send + 'static>(
     core: &Arc<hxd_core::Core>,
     f: impl FnOnce(&hxd_core::Core) -> T + Send + 'static,
 ) -> Option<T> {

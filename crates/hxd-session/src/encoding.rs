@@ -197,7 +197,7 @@ fn is_continuation(b: u8) -> bool {
 }
 
 /// The largest index `<= max` that is a character boundary of `s`.
-fn floor_char_boundary(s: &str, max: usize) -> usize {
+pub(crate) fn floor_char_boundary(s: &str, max: usize) -> usize {
     if max >= s.len() {
         return s.len();
     }

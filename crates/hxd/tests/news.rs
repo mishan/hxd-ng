@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use futures_util::{SinkExt, StreamExt};
 use hxd_core::{AttachmentPolicy, Core, MarkdownMode, NewsPolicy, NotifyPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
-use hxd_session::caps::Caps;
+use hxd_session::caps::{cap, Caps};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{FlatNews, FlatReply, LegacyNews, ServerConfig, ServerCtx};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
@@ -112,7 +112,9 @@ async fn start_server_with(
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
             stamp_queued: true,
-            caps: Caps::empty(),
+            // Offered, so a client that asks reads and writes UTF-8; one
+            // that does not is Mac Roman, as ever.
+            caps: Caps::empty().with(cap::TEXT_ENCODING),
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             news: legacy_news,
@@ -1971,18 +1973,29 @@ struct Period {
 
 impl Period {
     async fn login(addr: SocketAddr, login: &str) -> Self {
+        Self::login_as(addr, login, false).await
+    }
+
+    /// [`Self::login`], negotiating UTF-8 (capability bit 1) when `utf8`.
+    async fn login_as(addr: SocketAddr, login: &str, utf8: bool) -> Self {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(b"TRTPHOTL\x00\x01\x00\x02").await.unwrap();
         let mut magic = [0; 8];
         stream.read_exact(&mut magic).await.unwrap();
         let obfuscate = |s: &str| s.bytes().map(|b| !b).collect::<Vec<u8>>();
-        let chunks = vec![
+        let mut chunks = vec![
             (tag::LOGIN, obfuscate(login)),
             (tag::PASSWORD, obfuscate("pw")),
             (tag::NAME, login.as_bytes().to_vec()),
             (tag::ICON, 128u16.to_be_bytes().to_vec()),
             (tag::VERSION, 150u16.to_be_bytes().to_vec()),
         ];
+        if utf8 {
+            chunks.push((
+                tag::CAPABILITIES,
+                Caps::empty().with(cap::TEXT_ENCODING).to_wire(),
+            ));
+        }
         stream
             .write_all(&pack_frame(0x6b, 1, 0, &chunks))
             .await
@@ -2376,6 +2389,81 @@ async fn a_period_post_is_a_threaded_article_on_ng() {
 }
 
 #[tokio::test]
+async fn a_period_subject_or_name_is_cut_to_fit_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    category(&mut admin, None, "General").await;
+    let mut mac = Period::login(legacy, "admin").await;
+    let mut utf8 = Period::login_as(legacy, "admin", true).await;
+
+    // A full pstring of accents is 255 characters in Mac Roman and twice
+    // that in UTF-8; the most kana a UTF-8 client can send runs past
+    // 255 bytes at the 86th. Each is cut at a character, not refused.
+    let accented = "\u{e9}".repeat(127);
+    let kana = "\u{3042}".repeat(85);
+    let posting = |subject: Vec<u8>| {
+        vec![
+            news_path(&[b"General"]),
+            (tag::NEWSSUBJECT, subject),
+            (tag::NEWSDATA, b"body".to_vec()),
+        ]
+    };
+    mac.ok(POST_THREAD, posting(vec![0x8e; 255])).await;
+    let posted = alice
+        .event("news_posted", |d| {
+            d["subject"]
+                .as_str()
+                .is_some_and(|s| s.starts_with('\u{e9}'))
+        })
+        .await;
+    assert_eq!(posted["data"]["subject"], accented.as_str());
+    utf8.ok(POST_THREAD, posting("\u{3042}".repeat(100).into_bytes()))
+        .await;
+    let posted = alice
+        .event("news_posted", |d| {
+            d["subject"]
+                .as_str()
+                .is_some_and(|s| s.starts_with('\u{3042}'))
+        })
+        .await;
+    assert_eq!(posted["data"]["subject"], kana.as_str());
+
+    mac.ok(MKCATEGORY, vec![(tag::CATEGORY, vec![0x8e; 255])])
+        .await;
+    utf8.ok(
+        MKDIR,
+        vec![(tag::FILE_NAME, "\u{3042}".repeat(100).into_bytes())],
+    )
+    .await;
+    let tree = alice.ok("news_tree", json!({})).await;
+    let names: Vec<&str> = tree["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&accented.as_str()), "{names:?}");
+    assert!(names.contains(&kana.as_str()), "{names:?}");
+
+    // A markdown post with no subject takes one from what it reads as.
+    mac.ok(
+        POST_THREAD,
+        vec![
+            news_path(&[b"General"]),
+            (tag::NEWSTYPE, b"text/markdown".to_vec()),
+            (tag::NEWSSUBJECT, Vec::new()),
+            (tag::NEWSDATA, b"# Release **notes**\r\rThe body.".to_vec()),
+        ],
+    )
+    .await;
+    alice
+        .event("news_posted", |d| d["subject"] == "Release notes")
+        .await;
+}
+
+#[tokio::test]
 async fn a_period_client_keeps_house() {
     let dir = tempfile::tempdir().unwrap();
     let (legacy, ng) = start_server(dir.path(), Some(news_server())).await;
@@ -2465,6 +2553,18 @@ async fn a_period_client_keeps_house() {
         alice_period.refused(DELETE_THREAD, delete(other, 0)).await,
         "No such article."
     );
+    // A tombstone is not deleted twice, but what still hangs under it is
+    // cleared in one request.
+    alice_period.ok(DELETE_THREAD, delete(root, 0)).await;
+    assert_eq!(
+        admin.refused(DELETE_THREAD, delete(root, 0)).await,
+        "No such article."
+    );
+    admin.ok(DELETE_THREAD, delete(root, 1)).await;
+    assert_eq!(
+        alice.ok("news_article", json!({ "id": beside })).await["article"]["deleted"],
+        true
+    );
 
     assert_eq!(
         admin
@@ -2491,7 +2591,6 @@ fn flat_general() -> LegacyNews {
             category: vec!["General".into()],
             articles: 100,
             reply: FlatReply::NewestThread,
-            default_subject: "(no subject)".into(),
             masthead: None,
         }),
         ..LegacyNews::default()
@@ -2611,6 +2710,36 @@ async fn a_1_2_client_reads_one_category_and_posts_into_it() {
     let at = |id: u64| doc.find(&format!("]  #{id}\r")).unwrap();
     assert!(at(news) < at(lost_id) && at(lost_id) < at(thanks_id) && at(thanks_id) < at(welcome));
     assert!(!doc.contains("Not here."));
+}
+
+#[tokio::test]
+async fn a_1_2_subject_past_the_limit_is_cut_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng, _) = start_server_with(dir.path(), Some(news_server()), flat_general()).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    category(&mut admin, None, "General").await;
+
+    // Three hundred accents are 600 bytes of UTF-8 and the domain keeps
+    // 255: the subject is cut at a character, and the post goes in.
+    let mut bob = Period::login(legacy, "bob").await;
+    let mut body = b"Subject: ".to_vec();
+    body.extend([0x8e; 300]);
+    body.extend(b"\r\rAll accents.");
+    bob.ok(NEWSFILE_POST, vec![(tag::BODY, body)]).await;
+    let posted = alice
+        .event("news_posted", |d| {
+            d["subject"]
+                .as_str()
+                .is_some_and(|s| s.starts_with('\u{e9}'))
+        })
+        .await;
+    assert_eq!(posted["data"]["subject"], "\u{e9}".repeat(127).as_str());
+    let id = posted["data"]["id"].as_u64().unwrap();
+    assert_eq!(
+        alice.ok("news_article", json!({ "id": id })).await["article"]["body"],
+        "All accents."
+    );
 }
 
 #[tokio::test]

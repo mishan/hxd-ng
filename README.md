@@ -563,7 +563,8 @@ browses the same tree over the threaded-news transactions, reading a
 markdown article's plain-text part. A 1.2 client reads and posts into the
 one category `flat_category` names, rendered newest first as a single
 document; without it, a 1.2 client is told this server's news is
-threaded. See [docs/news.md](docs/news.md) §12.
+threaded. `flat_category` splits on `/`, so a category whose own name
+contains one cannot be named there. See [docs/news.md](docs/news.md) §12.
 
 ```toml
 [news]                    # presence turns it on
@@ -586,7 +587,8 @@ flat_category = "General" # the 1.2 view: names from the root, "Bundle/Category"
 flat_articles = 100       # entries in the 1.2 document; 65 535 bytes usually decides
 flat_reply = "newest_thread"   # where a post with no Re: goes, or "new_thread"
 flat_default_subject = "(no subject)"
-# flat_masthead = "..."   # the line above the entries; absent = built in, "" = none
+# flat_masthead = "..."   # the line above the entries; absent = built in, "" = none;
+                          # at most 4096 bytes
 
 blobs = "news-blobs"      # durable content-addressed attachment bytes
 [news.attach]              # absent = attachments off

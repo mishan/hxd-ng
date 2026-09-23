@@ -16,6 +16,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hxd_core::access::bit;
+use hxd_core::news::MAX_NODE_NAME;
 use hxd_core::{
     Article, ArticleId, BodyType, Core, Listed, NewsError, Node, NodeId, NodeKind, PostRequest,
     TextLen, ThreadQuery, Uid,
@@ -23,9 +24,9 @@ use hxd_core::{
 use hxproto::messages::{tag, ClientHdr};
 use tracing::warn;
 
-use crate::encoding::TextEncoding;
+use crate::encoding::{floor_char_boundary, TextEncoding};
 use crate::files;
-use crate::session::civil;
+use crate::session::{civil, off_reactor};
 
 /// What a chunk can hold, and so the most any one news text may be on
 /// this wire: an article part, a flat-news document, a pushed entry and a
@@ -40,6 +41,13 @@ const DIVIDER: &str = "_________________________________________________________
 /// is cut at a word, in characters. A subject line, not a paragraph.
 const DERIVED_SUBJECT: usize = 60;
 
+/// The most a configured masthead may be, in bytes: `flat_masthead` is
+/// refused past it at startup, and a masthead is cut to it all the same.
+/// A line or two of welcome is a few hundred bytes; this is generous for
+/// that and still leaves the entries almost all of a chunk, which is what
+/// the document is for.
+pub const MASTHEAD_MAX: usize = 4096;
+
 /// A `CATEGORYITEM`'s `ntype`: a bundle and a category.
 const NTYPE_BUNDLE: u16 = 2;
 const NTYPE_CATEGORY: u16 = 3;
@@ -49,6 +57,9 @@ const NTYPE_CATEGORY: u16 = 3;
 pub struct LegacyNews {
     /// The most articles one 1.5 category listing carries (§12.3).
     pub catlist_max: usize,
+    /// The subject of a post, from either period wire, that sends none
+    /// and whose body gives none to derive (§12.4, §12.5).
+    pub default_subject: String,
     /// The category 1.2 clients read and post into, or `None` for a
     /// server whose 1.2 clients are told its news is threaded (§12.5).
     pub flat: Option<FlatNews>,
@@ -58,6 +69,7 @@ impl Default for LegacyNews {
     fn default() -> Self {
         LegacyNews {
             catlist_max: 2000,
+            default_subject: "(no subject)".into(),
             flat: None,
         }
     }
@@ -73,8 +85,6 @@ pub struct FlatNews {
     /// decides first.
     pub articles: usize,
     pub reply: FlatReply,
-    /// The subject of a post whose body gives none to derive.
-    pub default_subject: String,
     /// The line above the entries: `None` for the built-in one, `Some("")`
     /// for none at all.
     pub masthead: Option<String>,
@@ -138,9 +148,8 @@ pub(crate) async fn transaction(
     ty: u32,
     fields: Chunks,
 ) -> Result<Chunks, &'static str> {
-    let core = core.clone();
     let cfg = cfg.clone();
-    tokio::task::spawn_blocking(move || answer(&core, &cfg, who, ty, &fields))
+    off_reactor(core, move |core| answer(core, &cfg, who, ty, &fields))
         .await
         .unwrap_or(Err("Server error."))
 }
@@ -180,7 +189,7 @@ fn answer(
             let mime = field(fields, tag::NEWSTYPE).unwrap_or_default();
             get_thread(core, who, path, id, mime)
         }
-        t if t == ClientHdr::PostThread.as_u32() => post_thread(core, who, path, fields),
+        t if t == ClientHdr::PostThread.as_u32() => post_thread(core, cfg, who, path, fields),
         t if t == ClientHdr::DeleteThread.as_u32() => {
             let id = thread_id(fields)?;
             let replies = uint(fields, tag::DELETEREPLIES).is_some_and(|v| v != 0);
@@ -388,8 +397,13 @@ fn fit(enc: TextEncoding, mut bytes: Vec<u8>, max: usize) -> Vec<u8> {
     if bytes.len() <= max {
         return bytes;
     }
-    let ellipsis = enc.encode("\u{2026}");
-    let room = max.saturating_sub(ellipsis.len());
+    let mut ellipsis = enc.encode("\u{2026}");
+    // No room for the ellipsis either: the cut alone, so what comes back
+    // is never longer than `max`.
+    if ellipsis.len() > max {
+        ellipsis.clear();
+    }
+    let room = max - ellipsis.len();
     let cut = match enc {
         TextEncoding::MacRoman => room,
         TextEncoding::Utf8 => {
@@ -403,6 +417,26 @@ fn fit(enc: TextEncoding, mut bytes: Vec<u8>, max: usize) -> Vec<u8> {
     bytes.truncate(cut);
     bytes.extend_from_slice(&ellipsis);
     bytes
+}
+
+/// `text` trimmed and cut to `max` UTF-8 bytes at a character, which is
+/// how the domain measures a subject and a name. The wire's caps count
+/// characters, or Mac Roman bytes, and either can be several bytes of
+/// UTF-8; what a period client was allowed to send is cut here rather
+/// than refused there.
+fn within(text: &str, max: usize) -> String {
+    let text = text.trim();
+    text[..floor_char_boundary(text, max)]
+        .trim_end()
+        .to_string()
+}
+
+/// The domain's `max_subject`. News is on by the time anything asks.
+fn max_subject(core: &Core) -> usize {
+    core.news_policy()
+        .map_or(hxd_core::NewsPolicy::default().max_subject, |p| {
+            p.max_subject
+        })
 }
 
 /// The parts an article lists (§12.3): the plain text every client asks
@@ -577,6 +611,7 @@ fn get_thread(
 
 fn post_thread(
     core: &Core,
+    cfg: &LegacyNews,
     who: Asker,
     path: Option<&[u8]>,
     fields: &Chunks,
@@ -599,9 +634,16 @@ fn post_thread(
         .enc
         .decode_chars(field(fields, tag::NEWSSUBJECT).unwrap_or_default(), 255);
     // A post is not refused for a subject it did not send: the 1.2 rule,
-    // which asks nothing a 1.5 client could not also have left out.
+    // which asks nothing a 1.5 client could not also have left out. A
+    // markdown body's subject comes from what it reads as, not from its
+    // syntax.
     let subject = if subject.trim().is_empty() {
-        derived_subject(&body).unwrap_or_else(|| "(no subject)".into())
+        let plain = match mime {
+            BodyType::Markdown => core.news_downgrade(&body),
+            BodyType::Plain => None,
+        };
+        derived_subject(plain.as_deref().unwrap_or(&body))
+            .unwrap_or_else(|| cfg.default_subject.clone())
     } else {
         subject
     };
@@ -610,7 +652,7 @@ fn post_thread(
         PostRequest {
             category,
             parent,
-            subject,
+            subject: within(&subject, max_subject(core)),
             body,
             mime,
             attachments: Vec::new(),
@@ -634,7 +676,10 @@ fn delete_thread(
     replies: bool,
 ) -> Result<(), NewsError> {
     let article = article_in(core, who, path, id)?;
-    if article.deleted {
+    // A tombstone has nothing left to delete, but its replies do: a 1.5
+    // client lists it, and clearing what hangs under it is one request
+    // there as anywhere else.
+    if article.deleted && !replies {
         return Err(NewsError::NoSuchArticle);
     }
     let mut under = Vec::new();
@@ -664,7 +709,9 @@ fn delete_thread(
             }
         }
     }
-    core.news_delete(who.uid, id)?;
+    if !article.deleted {
+        core.news_delete(who.uid, id)?;
+    }
     for reply in under {
         match core.news_delete(who.uid, reply) {
             // Deleted meanwhile by someone else: gone either way.
@@ -703,7 +750,7 @@ fn make_node(
         who.uid,
         parent.map(|n| n.id),
         kind,
-        &who.enc.decode_chars(name, 255),
+        &within(&who.enc.decode_chars(name, 255), MAX_NODE_NAME),
     )?;
     Ok(Vec::new())
 }
@@ -752,16 +799,23 @@ fn flat_document(core: &Core, cfg: &LegacyNews, who: Asker) -> Result<Chunks, Ne
 /// `articles` is newest first and may be one longer than `flat.articles`,
 /// which is how "more than fits" is known without a count.
 pub(crate) fn render_document(enc: TextEncoding, flat: &FlatNews, articles: &[Article]) -> Vec<u8> {
-    let mut out = match flat.masthead.as_deref() {
-        Some("") => Vec::new(),
-        Some(line) => enc.body(&format!("{line}\n{DIVIDER}\n")),
-        None => enc.body(&format!(
+    let masthead = match flat.masthead.as_deref() {
+        Some("") => None,
+        Some(line) => Some(line.to_string()),
+        None => Some(format!(
             "News from \"{}\", newest first. To set a subject or reply to an \
              article, begin a post with Subject: and Re: #<number> lines, as the \
-             entries below do.\n{DIVIDER}\n",
+             entries below do.",
             flat.category.join("/")
         )),
     };
+    // Cut to its ceiling even though startup refuses a longer one, so no
+    // masthead can crowd the entries out of the chunk, or past it.
+    let mut out = masthead.map_or_else(Vec::new, |line| {
+        let mut out = fit(enc, enc.body(&line), MASTHEAD_MAX);
+        out.extend(enc.body(&format!("\n{DIVIDER}\n")));
+        out
+    });
     // Room for the notice at its longest, so adding it can never push the
     // document past the chunk.
     let reserve = enc.body(&older_notice(ArticleId::MAX)).len();
@@ -966,7 +1020,8 @@ fn flat_post(core: &Core, cfg: &LegacyNews, who: Asker, text: &str) -> Result<()
         .subject
         .clone()
         .or_else(|| derived_subject(&post.body))
-        .unwrap_or_else(|| flat.default_subject.clone());
+        .unwrap_or_else(|| cfg.default_subject.clone());
+    let subject = within(&subject, max_subject(core));
     let fallback = match flat.reply {
         FlatReply::NewThread => None,
         FlatReply::NewestThread => newest_live_root(core, who.uid, category)?,
@@ -1040,11 +1095,10 @@ pub(crate) async fn flat_push(
     category: NodeId,
 ) -> Option<Vec<u8>> {
     let names = cfg.flat.as_ref()?.category.clone();
-    let core = core.clone();
-    tokio::task::spawn_blocking(move || {
+    off_reactor(core, move |core| {
         // Asked of every post by every connection, so a missing category
         // is not warned about here: reading the news says so once.
-        if find_category(&core, who.uid, &names).ok()?? != category {
+        if find_category(core, who.uid, &names).ok()?? != category {
             return None;
         }
         let article = core.news_article(who.uid, id).ok()?;
@@ -1055,7 +1109,6 @@ pub(crate) async fn flat_push(
         ))
     })
     .await
-    .ok()
     .flatten()
 }
 
@@ -1102,7 +1155,6 @@ mod tests {
             category: vec!["General".into()],
             articles,
             reply: FlatReply::NewestThread,
-            default_subject: "(no subject)".into(),
             masthead: Some(String::new()),
         }
     }
@@ -1288,6 +1340,45 @@ mod tests {
         f.masthead = Some(String::new());
         let text = String::from_utf8(render_document(MR, &f, &a)).unwrap();
         assert!(text.starts_with("From Alice"));
+    }
+
+    #[test]
+    fn no_masthead_crowds_the_news_out_of_the_chunk() {
+        let a = [article(1, None, "s", &"x".repeat(60_000))];
+        let mut f = flat(10);
+        for enc in [MR, U8] {
+            f.masthead = Some("\u{e9}".repeat(70_000));
+            let doc = render_document(enc, &f, &a);
+            assert!(doc.len() <= CHUNK_MAX, "{}", doc.len());
+            let text = enc.decode(&doc);
+            assert!(text.contains("]  #1"), "the entry is there");
+            let divider = doc
+                .windows(DIVIDER.len())
+                .position(|w| w == DIVIDER.as_bytes())
+                .unwrap();
+            assert!(
+                divider <= MASTHEAD_MAX + 1,
+                "the masthead, cut, and a break"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cut_too_small_for_its_ellipsis_is_never_longer_than_asked() {
+        for enc in [MR, U8] {
+            assert!(fit(enc, b"abcdef".to_vec(), 0).is_empty());
+            assert_eq!(fit(enc, b"abcdef".to_vec(), 1).len(), 1);
+        }
+        assert_eq!(fit(U8, b"abcdef".to_vec(), 2), b"ab");
+        assert_eq!(fit(U8, b"abcdef".to_vec(), 4), "a\u{2026}".as_bytes());
+    }
+
+    #[test]
+    fn a_subject_or_name_is_cut_to_the_domains_bytes_at_a_character() {
+        assert_eq!(within("  caf\u{e9}  ", 255), "caf\u{e9}");
+        assert_eq!(within(&"\u{e9}".repeat(200), 255), "\u{e9}".repeat(127));
+        assert_eq!(within(&"\u{3042}".repeat(100), 255), "\u{3042}".repeat(85));
+        assert_eq!(within("ab   cd", 4), "ab");
     }
 
     #[test]

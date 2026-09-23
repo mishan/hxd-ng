@@ -407,7 +407,8 @@ pub struct NewsSection {
     pub legacy_catlist_max: usize,
     /// The category 1.2 clients read and post into (§12.5), by its names
     /// from the root with `/` between. Absent: a 1.2 client is told this
-    /// server's news is threaded.
+    /// server's news is threaded. A category whose own name contains `/`
+    /// cannot be named here; rename it, or pick another.
     #[serde(default)]
     pub flat_category: Option<String>,
     /// The most entries in the 1.2 document; 65 535 bytes usually decides
@@ -419,11 +420,13 @@ pub struct NewsSection {
     /// own, for an announcements feed).
     #[serde(default = "default_news_flat_reply")]
     pub flat_reply: String,
-    /// The subject of a 1.2 post whose body gives none to derive.
+    /// The subject of a post whose body gives none to derive: a 1.2
+    /// post, or a 1.5 one that sends no subject, flat view or not.
     #[serde(default = "default_news_flat_default_subject")]
     pub flat_default_subject: String,
     /// The line above the 1.2 document's entries. Absent: a built-in one
-    /// naming the category and the two headers. `""`: none at all.
+    /// naming the category and the two headers. `""`: none at all. At
+    /// most `hxd_session::news::MASTHEAD_MAX` bytes.
     #[serde(default)]
     pub flat_masthead: Option<String>,
 }
@@ -567,6 +570,7 @@ impl NewsSection {
     pub fn to_legacy(&self) -> hxd_session::LegacyNews {
         hxd_session::LegacyNews {
             catlist_max: self.legacy_catlist_max,
+            default_subject: self.flat_default_subject.clone(),
             flat: self
                 .flat_category
                 .as_deref()
@@ -576,7 +580,6 @@ impl NewsSection {
                     // `check` has refused any other spelling by now.
                     reply: hxd_session::FlatReply::from_name(&self.flat_reply)
                         .unwrap_or(hxd_session::FlatReply::NewestThread),
-                    default_subject: self.flat_default_subject.clone(),
                     masthead: self.flat_masthead.clone(),
                 }),
         }
@@ -643,6 +646,19 @@ impl NewsSection {
         }
         if !(1..=1000).contains(&self.flat_articles) {
             return Err("[news] flat_articles must be between 1 and 1000".into());
+        }
+        // The document it heads is one chunk, and a masthead near it
+        // would leave no room for the news.
+        if self
+            .flat_masthead
+            .as_ref()
+            .is_some_and(|m| m.len() > hxd_session::news::MASTHEAD_MAX)
+        {
+            return Err(format!(
+                "[news] flat_masthead must be at most {} bytes: it heads a document \
+                 that is one 65535-byte chunk, and the news needs the room",
+                hxd_session::news::MASTHEAD_MAX
+            ));
         }
         if hxd_session::FlatReply::from_name(&self.flat_reply).is_none() {
             return Err(format!(
@@ -3193,10 +3209,8 @@ sync = "full"
         assert_eq!(flat.category, ["Projects", "General"]);
         assert_eq!(flat.reply, hxd_session::FlatReply::NewThread);
         assert_eq!(flat.masthead.as_deref(), Some(""));
-        assert_eq!(
-            (flat.articles, flat.default_subject.as_str()),
-            (100, "(no subject)")
-        );
+        assert_eq!(flat.articles, 100);
+        assert_eq!(legacy.default_subject, "(no subject)");
         let unflat = parse("[news]\ndb = \"n.sqlite\"\n").unwrap();
         assert!(unflat.news.unwrap().to_legacy().flat.is_none());
         for bad in [
@@ -3209,6 +3223,18 @@ sync = "full"
             let cfg = parse(&format!("[news]\ndb = \"n.sqlite\"\n{bad}\n")).unwrap();
             assert!(check_config(&cfg).is_err(), "{bad} is refused");
         }
+        let masthead = |len: usize| {
+            parse(&format!(
+                "[news]\ndb = \"n.sqlite\"\nflat_category = \"General\"\n\
+                 flat_masthead = \"{}\"\n",
+                "x".repeat(len)
+            ))
+            .unwrap()
+        };
+        let max = hxd_session::news::MASTHEAD_MAX;
+        check_config(&masthead(max)).unwrap();
+        let err = check_config(&masthead(max + 1)).unwrap_err();
+        assert!(err.contains("flat_masthead"), "{err}");
     }
 
     #[cfg(feature = "inbox")]

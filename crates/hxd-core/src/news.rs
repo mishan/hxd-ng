@@ -1405,6 +1405,28 @@ impl Core {
         }
     }
 
+    /// What a markdown `body` would read as once posted: the downgrade
+    /// [`Self::news_post`] would store, or `None` where it would store
+    /// none (no parser, a mode that does not parse, a body the parser
+    /// refuses). For a frontend that derives something from a body before
+    /// posting it, and so should derive it from the words and not the
+    /// syntax.
+    pub fn news_downgrade(&self, body: &str) -> Option<String> {
+        let policy = self.news_policy;
+        match (policy.markdown, self.body_renderer.as_ref()) {
+            (MarkdownMode::Render, Some(renderer)) => {
+                // As `news_post` hands it over: LF, whatever the wire sent.
+                let body = normalize_newlines(body);
+                if renderer.refuses(&body).is_some() {
+                    return None;
+                }
+                let limit = policy.max_body.saturating_mul(DOWNGRADE_ROOM);
+                Some(renderer.render(&body, limit).plain)
+            }
+            _ => None,
+        }
+    }
+
     pub fn news_enabled(&self) -> bool {
         self.news.is_some()
     }

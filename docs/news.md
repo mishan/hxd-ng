@@ -1918,8 +1918,19 @@ sends, seconds since 2000, which reaches past the 1904 epoch's 2040.
 mhxd; here each becomes a tombstone. Replies are anyone's, so asking for
 them takes `delete_articles` whoever wrote the article itself, and a
 request that cannot be done whole is refused before anything is touched
-rather than half done. A post whose `NEWSSUBJECT` is empty is given the
-1.2 wire's derived subject (§12.5) rather than refused.
+rather than half done. Asked of an article that is already a tombstone,
+it clears the live replies under it; without `DELETEREPLIES` a
+tombstone is not there to delete. A post whose `NEWSSUBJECT` is empty
+is given the 1.2 wire's derived subject (§12.5) rather than refused —
+from a markdown body's downgrade, not its syntax, and
+`flat_default_subject` when the body is empty too, whether or not there
+is a flat view.
+
+A subject and a node name are cut at the edge, at a character, to what
+the domain takes — `max_subject` and 255 bytes of UTF-8 — rather than
+refused there. The wire's pstring counts Mac Roman bytes, or characters
+for a client that negotiated UTF-8, and a legal 255 of either can be
+several times that in UTF-8.
 
 Every request is addressed by `NEWSPATH`, which is the file area's
 directory encoding (mhxd's `hldir_to_path`, shared with `FileList`'s
@@ -2076,7 +2087,9 @@ Nothing has to be explained in a manual nobody has.
 `[news] flat_masthead` puts one line and a divider at the top of the
 document for the case where that inference does not land. Left out, it
 is a built-in sentence naming the category and the two headers; set to a
-string, it is that string; set to `""`, there is no masthead.
+string, it is that string; set to `""`, there is no masthead. It may be
+at most 4096 bytes, which startup checks: the document is one chunk,
+and the chunk is for the news.
 
 #### Reading
 
@@ -2131,7 +2144,7 @@ The rules are small on purpose:
   first line that does not is where the body starts, and one blank line
   between the two is consumed if present.
 - `Subject: <text>` sets the subject, trimmed and capped at
-  `max_subject`. `Re: <id>` sets the parent and accepts `#398` or `398`;
+  `max_subject` bytes of UTF-8, cut at a character. `Re: <id>` sets the parent and accepts `#398` or `398`;
   a `Re:` followed by anything but an id (`Re: your post`) is not a
   header, and so is where the body starts.
 - A second `Subject:` or `Re:` is body. So is a header nobody
@@ -2185,8 +2198,8 @@ grows the 1996 pane. The entry pushed is rendered exactly as the read
 format renders it, so a client that prepends the delta and a client that
 refetches the document see the same text.
 
-`HTLS_HDR_NEWSFILE_POST` is the third opcode `hxproto`'s `ServerHdr`
-does not yet name (§1); it goes into the same hx-libs change.
+`hxproto`'s `ServerHdr` names it `NewsFilePost`, from the hx-libs change
+that opened W9 (§1).
 
 ### 12.6 Importing an mhxd tree
 
@@ -2231,12 +2244,14 @@ legacy_catlist_max = 2000       # articles in one 1.5 category reply
 
 # 1.2 flat news (§12.5) — one category, read and written by 1.2 clients.
 flat_category = "General"       # names from the root, "Bundle/Category" when nested;
-                                # absent = 1.2 clients are told news is threaded
+                                # absent = 1.2 clients are told news is threaded.
+                                # A name containing "/" cannot be named here.
 flat_articles = 100             # ceiling; 65 535 bytes usually decides first
 flat_reply = "newest_thread"    # or "new_thread": every 1.2 post stands alone
-flat_default_subject = "(no subject)"
+flat_default_subject = "(no subject)"  # also a 1.5 post's, with no subject or body
 # flat_masthead = "…"           # absent = a built-in line naming the category
-                                # and the two headers; "" = no masthead at all
+                                # and the two headers; "" = no masthead at all;
+                                # at most 4096 bytes
 
 [news.notify]                   # absent = no subscriptions, no notifications
 auto_subscribe = "participated" # or "own_thread", or "off"
