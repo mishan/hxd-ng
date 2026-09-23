@@ -52,15 +52,16 @@ been exercised on newer toolchains; CI runs stable.
 |---|---|
 | `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation, the news tree, access bits, auth traits. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket. |
-| `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the WebSocket-as-byte-stream adapter (`tunnel.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
-| `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
+| `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the WebSocket-as-byte-stream adapter (`tunnel.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
+| `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs, and the registrar's requests, records and signed lists (with the one record verifier they all share) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
 | `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy + `[identity]` link), first-run guest bootstrap. Identity links are written back with `toml_edit` so hand-edited files keep their comments; fingerprint lookups scan the directory. |
 | `hxd-media` | The inline-media pipeline (`docs/inline-media.md`): magic-byte sniff, hand-written JPEG/PNG/GIF container walkers that refuse polyglots, a bounded decode and a re-encode that strips every byte of metadata by construction. Behind `hxd-core`'s `MediaCodec` trait and the `media` Cargo feature, and knows nothing about Hotline. |
 | `hxd-markdown` | Markdown news bodies (`docs/news.md` §5): pulldown-cmark, built without its HTML writer, folded into the plain-text downgrade that search and legacy clients read, and the references a body makes. Text in, text out — nothing here ever produces markup. Behind `hxd-core`'s `BodyRenderer` trait and the `markdown` Cargo feature. |
 | `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
-| `hxd-store-sqlite` | The durable store for the private-message inbox, chat history and news: one SQLite file, WAL, the schema and migrations of `docs/private-messages.md` §5 and `docs/news.md` §4, and the conformance suites both stores of each kind are run against. Behind `hxd-core`'s `MessageStore`, `ChatLog` and `NewsStore` traits and the `inbox` Cargo feature; the in-memory stores beside them in `hxd-core` are what the domain tests use. |
+| `hxd-registrar` | The identity registrar (`docs/identity-registrar.md`): handles and their lifecycle, attestations, the records it publishes (revocation, rotation, freeze), the issuance log and stats, rate limits and replay, the operator's freeze, revoke and recover. Signed bytes in, signed bytes out; no HTTP, no roster, no account table beyond the reserved names it is handed. Its `RegistrarStore` trait, an in-memory store and the conformance suite live here. |
+| `hxd-store-sqlite` | The durable store for the private-message inbox, chat history and news: one SQLite file, WAL, the schema and migrations of `docs/private-messages.md` §5 and `docs/news.md` §4, and the conformance suites both stores of each kind are run against. Behind `hxd-core`'s `MessageStore`, `ChatLog` and `NewsStore` traits and the `inbox` Cargo feature; the in-memory stores beside them in `hxd-core` are what the domain tests use. The registrar's store is here too, in a file and a schema of its own. |
 | `hxd-push-webpush` | The push sender (`docs/webpush-gateway.md`): a VAPID keypair and its RFC 8292 token, RFC 8291 payload encryption, RFC 8030's headers, the destination check a client-chosen URL demands, and a per-origin circuit breaker. Behind `hxd-core`'s `NotificationGateway` trait, reading the devices out of its `PushStore`, and knowing nothing about Hotline. |
-| `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1). |
+| `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1); `register`, `revoke` and `rotate` talk to a registrar. |
 | `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing. Its `tests/` hold the e2e suites. |
 
 `tools/ng-client.mjs` is an interactive ng test client (Node 22+, or
@@ -178,12 +179,17 @@ Three layers, all `cargo test --workspace`:
   and chunked upload, sliced downloads, a capable and a classic client
   in one room, a photo crossing each way, and a revocation),
   `inbox.rs` (offline private messages across both wires: queue, flush
-  at login, resync, blocks, retention) and `news.rs` (threaded news on
+  at login, resync, blocks, retention), `news.rs` (threaded news on
   the ng wire: the tree and its containment rules, threads in reading
   order and paged both ways, references and backlinks, tombstones, who
   hears that the news changed and who hears that it is theirs, following
   and muting — with a classic client in the room to show the legacy wire
-  is untouched).
+  is untouched) and `registrar.rs` (the registrar built from a real
+  `[registrar]` section: discovery under its own host only, handles,
+  rotations published under both keys, a card's commitment, invites from
+  the file and the command, the operator's commands on the running
+  store, and `hlid register`, `revoke` and `rotate` driven as a user
+  would).
 - The scripted legacy client packs and parses with the same pinned
   `hxproto` revision GtkHx uses, so e2e doubles as wire-compat
   checking.
@@ -269,7 +275,9 @@ ROADMAP.md carries live status. In brief: the legacy server covers login,
 presence, chat, private chats, PMs, broadcast, and moderation; the
 Hotline-ng MVP (roster + chat + PMs with detach/resume) is complete and
 cross-tested; voice and video are implemented on both wires, sharing one
-room and one SFU. The large open fronts, in rough order: HOPE + ciphers on the
+room and one SFU; the identity registrar is built, and a server applying
+what a registrar publishes (`docs/identity-registrar.md` §7) is next on
+that front. The large open fronts, in rough order: HOPE + ciphers on the
 legacy wire (`hxcrypto` currently lives in GtkHx), the ng rate-limit and
 client-quickstart polish, files/HTXF, the
 rest of news (the domain, store, search, subscriptions, markdown bodies

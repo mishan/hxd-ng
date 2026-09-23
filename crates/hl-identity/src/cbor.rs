@@ -1,7 +1,8 @@
 //! The CBOR subset the identity objects use, with deterministic encoding.
 //!
 //! Identity objects are maps of text keys to unsigned integers, byte
-//! strings, text strings, arrays and nested maps — five major types. That is
+//! strings, text strings, arrays, nested maps and the two booleans — five
+//! major types and two simple values. That is
 //! small enough that a purpose-built codec is shorter than the glue around a
 //! general one, and it lets the crate own the property that matters most:
 //! every object has exactly one valid encoding (RFC 8949 §4.2.1), so a
@@ -24,6 +25,9 @@ pub enum Value {
     /// Entries in encoded order. [`encode`] sorts them; [`decode_canonical`]
     /// guarantees they arrived sorted.
     Map(Vec<(Value, Value)>),
+    /// `false` and `true`, simple values 20 and 21 — the registrar's
+    /// freeze and a record list's `more` are the objects that need them.
+    Bool(bool),
 }
 
 /// Why a byte string failed to decode.
@@ -34,7 +38,8 @@ pub enum CborError {
     /// Trailing bytes after the top-level item.
     Trailing,
     /// A major type or additional-information value outside the subset
-    /// (negative integers, floats, tags, indefinite lengths, simple values).
+    /// (negative integers, floats, tags, indefinite lengths, and every
+    /// simple value but the two booleans).
     Unsupported(u8),
     /// A text string that wasn't UTF-8.
     Utf8,
@@ -115,6 +120,7 @@ fn encode_into(v: &Value, out: &mut Vec<u8>) {
                 encode_into(v, out);
             }
         }
+        Value::Bool(b) => out.push(if *b { 0xf5 } else { 0xf4 }),
     }
 }
 
@@ -164,6 +170,20 @@ impl<'a> Reader<'a> {
             return Err(CborError::TooDeep);
         }
         let start = self.pos;
+        // The booleans are one byte each, and are read before `head`
+        // because major type 7's additional information means something
+        // else there: 25–27 are floats, not lengths.
+        match self.buf.get(self.pos) {
+            Some(0xf4) => {
+                self.pos += 1;
+                return Ok(Value::Bool(false));
+            }
+            Some(0xf5) => {
+                self.pos += 1;
+                return Ok(Value::Bool(true));
+            }
+            _ => {}
+        }
         let (major, n) = self.head()?;
         let len = |n: u64| usize::try_from(n).map_err(|_| CborError::Truncated);
         match major {
@@ -327,7 +347,12 @@ mod tests {
     #[test]
     fn unsupported_types_are_rejected() {
         assert_eq!(decode_canonical(&[0x20]), Err(CborError::Unsupported(0x20))); // -1
-        assert_eq!(decode_canonical(&[0xf5]), Err(CborError::Unsupported(0xf5))); // true
+        assert_eq!(decode_canonical(&[0xf6]), Err(CborError::Unsupported(0xf6))); // null
+        assert_eq!(decode_canonical(&[0xf7]), Err(CborError::Unsupported(0xf7))); // undefined
+        assert_eq!(
+            decode_canonical(&[0xf9, 0x3c, 0x00]),
+            Err(CborError::Unsupported(0xf9))
+        ); // half-float 1.0
         assert_eq!(
             decode_canonical(&[0x5f, 0xff]),
             Err(CborError::Unsupported(0x5f))
@@ -336,6 +361,19 @@ mod tests {
             decode_canonical(&[0xc0, 0x00]),
             Err(CborError::Unsupported(0xc0))
         ); // tag
+    }
+
+    #[test]
+    fn booleans_are_one_byte_each() {
+        assert_eq!(encode(&Value::Bool(false)), [0xf4]);
+        assert_eq!(encode(&Value::Bool(true)), [0xf5]);
+        assert_eq!(decode_canonical(&[0xf5]), Ok(Value::Bool(true)));
+        // The two-byte simple-value form of 21 is not the deterministic
+        // encoding, and is not one this codec reads at all.
+        assert_eq!(
+            decode_canonical(&[0xf8, 0x15]),
+            Err(CborError::Unsupported(0xf8))
+        );
     }
 
     #[test]

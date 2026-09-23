@@ -116,6 +116,7 @@ async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<Rec
         tunnel: None,
         enroll: None,
         files: None,
+        registrar: None,
         push: None,
     };
 

@@ -110,6 +110,7 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
         tunnel: None,
         enroll: None,
         files: None,
+        registrar: None,
         push: None,
     };
 

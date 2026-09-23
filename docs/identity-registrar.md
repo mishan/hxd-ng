@@ -1,9 +1,20 @@
 # Identity registrar — handles, revocation, rotation and key backup
 
-Status: draft; one piece built. The server-local revocation list of
+Status: draft; the registrar is built, the verifying server is not.
+hxd-ng is a registrar when `[registrar]` is configured (§11): discovery
+(§3), the objects of §4 in `hl-identity` with their test vectors (§15),
+handles and their lifecycle (§5, with `signup = open`, `proof` by invite,
+or `closed`), every endpoint of §6 but the envelopes, the operator's
+freeze, revocation and recovery (§8), the ceilings of §10, and `hlid
+register`, `revoke` and `rotate`. The server-local revocation list of
 §7.3 — `[identity] revoked_identities` and `revoked_devices`, written by
-`hxd identity revoke` and re-read on SIGHUP — is in hxd-ng, because it needs no registrar. Everything a
-registrar publishes is unimplemented. This is the document `hotline-ng-identity.md`
+`hxd identity revoke` and re-read on SIGHUP — is built too, because it
+needs no registrar. Not built: the rest of §7, a server fetching and
+applying a registrar's records (so a server trusts attestations only
+through `[identity.registrar_keys]`, and publishes records nobody reads
+yet); key backup (§9); `proof` by `email`, `oidc` or `vouch`, and vouches
+in the record lists; and reports (§6.7, deferred by design). This is the
+document `hotline-ng-identity.md`
 calls "the registrar spec" and its §5.2 step 4, §8.5 and §12 wait on. It
 is deliberately the smallest registrar that closes those gaps: a first
 document that unblocks revocation and nothing more. The optional §9 is
@@ -100,7 +111,9 @@ A registrar fills the `registrar` block of `GET /.well-known/hotline`
 ```
 
 `host` MUST equal the hostname the document was fetched from, lowercase,
-with no port. An attestation names its registrar by this string (§3.5 of
+with no port. A server that is a registrar withholds the block — sends
+`null` — when the document is asked for under any other name, so a
+verifier can never find the key under a host that did not publish it. An attestation names its registrar by this string (§3.5 of
 the identity spec, hostname syntax), and a verifier resolves it to a key
 by fetching `https://<host>/.well-known/hotline` — so a registrar lives
 on the HTTPS default port at the name it signs with. A deployment that
@@ -287,6 +300,11 @@ A registrar revoking its own attestation makes the identity unattested
 This is how a name moves on recovery or rotation, and how a registrar
 withdraws its word from an abuser without touching the key.
 
+Because `≤` includes the revocation's own second, a registrar that
+reissues the handle to the same identity in that second MUST give the
+attestation an `issued` later than the revocation's `time`, or the
+attestation is void as it leaves.
+
 ### 4.9 Record list
 
 Domain `hl-identity/records/v1`, signed by the registrar key. What the
@@ -298,7 +316,7 @@ Domain `hl-identity/records/v1`, signed by the registrar key. What the
 | `registrar` | tstr | yes | |
 | `issued` | uint | yes | |
 | `expires` | uint | yes | `issued + records_max_age`. A cache serves it until then |
-| `identity` | bstr(32) | no | Present on a per-identity list: every entry concerns this key |
+| `fingerprint` | bstr(32) | no | Present on a per-identity list: `SHA-256` of the key it was asked for, and every entry concerns that key. The fingerprint rather than the key, because the list for a key the registrar has never seen can name it no other way |
 | `since` | uint | no | Present on a delta: entries have `seq > since` |
 | `more` | bool | no | `true` when the page was cut at the size bound; fetch again with `since` = the last `seq` |
 | `entries` | array | yes | Each `[seq, record]`: a registrar-assigned `uint`, monotonic across the registrar, and the record's encoded bytes as `bstr` |
@@ -437,7 +455,10 @@ address for the identity, otherwise 0) and notify the identity through
 that address, so that a rotation signed by a thief before the owner
 noticed can be met with a freeze (§8.1) before any server acts on it.
 During the delay the rotation is pending: a freeze cancels it, and a
-second rotation is refused.
+second rotation is refused. When the delay ends, the registrar checks
+it again as if it had just been posted, and drops it if it no longer
+passes: the successor may have been revoked or rotated on meanwhile,
+and handles moved to it then could never be renewed.
 
 Step 3 is the sentence that makes the card's commitment worth
 publishing before any server has anchored it. A thief with the identity
@@ -496,7 +517,8 @@ next `auth`. Nothing here writes the card for the client.
 ### 6.2 `records`
 
 `GET <records>/<fingerprint>` — the per-identity list (§4.9 with
-`identity` set): every unpruned record naming this key as `identity`,
+`fingerprint` set), served as the signed object itself,
+`application/cbor`, as a card is: every unpruned record naming this key as `identity`,
 `device`'s owner, predecessor **or successor** of a rotation. This is
 the call a verifying server makes. `ETag` is the list's `issued`;
 `Cache-Control: max-age` is `records_max_age`. An unknown fingerprint is
@@ -1058,7 +1080,10 @@ ceiling is a setting with a default.
 | Pending rotations | 1 per identity | second refused `bad_request` |
 
 Signed requests are replay-checked by `time` and a seen-set of request
-digests held for the skew window, as the transport does for proofs.
+digests held for the skew window, as the transport does for proofs. A
+registration request seen again inside the window is answered with the
+reply it got the first time and issues nothing, so a client that lost
+the reply can resend it; records are idempotent by digest (§6.2).
 
 ---
 
@@ -1070,25 +1095,29 @@ startup error, as `[identity]` without `[ng]` is.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `host` | *required* | The `host` of §3. Checked against the `Host` the discovery document is served under |
+| `host` | *required* | The `host` of §3: a lowercase hostname, no port. Discovery carries the `registrar` block only when asked for under this `Host` |
 | `key` | `registrar.key` | Ed25519 seed file; generated on first run, mode 0600 |
 | `retiring` | empty | `[{ key = "…", until = … }]` for §4.1 key rotation |
 | `store` | `registrar.db` | SQLite file (§12) |
 | `signup` | `proof` | `open`, `proof`, `closed`. The default is the one that does not make a fresh install a sybil factory |
-| `proof` | `invite` | `invite`, `email`, `oidc`, `vouch`, or `none` with `signup = open` |
-| `invites` | `registrar-invites` | For `proof = invite`: a file of codes, one per line, each consumed on use |
+| `proof` | `invite`, or `none` with `signup = open` | `invite`, `email`, `oidc`, `vouch`, or `none` with `signup = open`. hxd-ng checks `invite` and refuses the other three at startup |
+| `proof_url` | none | Where to get an invite; returned as `url` with `proof_required` |
+| `invites` | `registrar-invites` | For `proof = invite`: a file of codes, one per line, `#` comments allowed. Imported into the store at start and on SIGHUP, and spent there; `hxd registrar invites --add` appends to it |
 | `level` | `2` when `proof = invite`, else per §5.3 | Written into attestations; a startup error if it exceeds what `proof` supports |
 | `attestation_days` | `365` | |
 | `hold_days` | `365` | §5.2 |
 | `handle_min`, `handle_max` | `3`, `32` | §5.1 |
-| `reserved` | built-in list | Additional reserved local parts; the built-in list is `guest`, `admin`, `administrator`, `root`, `system`, `server`, `registrar`, `postmaster`, `abuse`, plus every account login on this server |
-| `rotation_delay` | `86400` when a contact exists, else `0` | §5.4 |
+| `reserved` | built-in list | Additional reserved local parts; the built-in list is `guest`, `admin`, `administrator`, `root`, `system`, `server`, `registrar`, `postmaster`, `abuse`, plus the system account's login and every account login on this server, re-read on SIGHUP |
+| `rotation_delay` | `86400` when a contact exists, else `0` | §5.4. hxd-ng holds no contacts, so its default is `0` |
 | `records_max_age` | `3600` | §4.9 |
 | `reporting_servers` | empty | §6.7; *(deferred)* servers whose vouch reports are believed, keyed by `server_key` |
 | `vouch_reports` | `2` | §6.7; distinct reporting servers before `proof = vouch` is refused from a voucher |
-| `envelopes` | `false` | §9 |
+| `envelopes` | `false` | §9. Not built: `true` is a startup error |
 | `envelope_max` | `1024` | bytes |
-| `rate.*` | §10's column | one key per row of §10 |
+| `rate.*` | §10's column | one key per row of §10: `registrations_per_address`, `registrations_per_hour`, `records_per_identity`, `lookups_per_minute`, `device_revocations_kept` |
+
+The clock-skew tolerance is `[identity] clock_skew`: one server, one
+clock.
 
 Additions to `[identity]`, replacing the two rows the identity spec
 marks *(not implemented)*:
@@ -1113,33 +1142,46 @@ Server operator tools, in `hxd`, built:
 hxd identity revoke    <fingerprint> [--device] [--lift]   # §7.3's local list
 ```
 
-Registrar operator tools, in `hxd`:
+Registrar operator tools, in `hxd`, built. They act on the store the
+running server uses, and never create a registrar key of their own:
 
 ```sh
 hxd registrar freeze   <fingerprint> [--lift]
-hxd registrar revoke   <handle> --reason abuse
+hxd registrar revoke   <handle> --reason abuse|lapsed|unspecified   # abuse also bars the holder
 hxd registrar recover  <handle> --identity <new fingerprint> [--keep-age]
 hxd registrar invites  --add 10
 hxd registrar inspect  <host>            # §6.6: fetch log and stats, print the last month
 ```
 
-User tools, in `hlid`:
+User tools, in `hlid`. The first three are built; `--registrar` also
+takes a full URL, for a test rig:
 
 ```sh
 hlid register    --registrar hl.example --handle alice [--proof CODE] [--successor-commit]
-hlid revoke      --device <fingerprint> [--reason stolen]
-hlid revoke      --identity
-hlid rotate      --to <successor key file>
+hlid revoke      --registrar hl.example (--device-cert FILE | --device-pub HEX) [--reason stolen] [--by-device]
+hlid revoke      --registrar hl.example --identity-revoke --yes
+hlid rotate      --registrar hl.example --to <successor key file>
 hlid backup      --registrar hl.example [--recovery-code]
 hlid restore     alice@hl.example
 ```
+
+A device revocation names the device's *key*, which a fingerprint
+cannot give back, so `hlid revoke` takes its certificate — whose
+`expires` is then the record's `until` — or its public key. `register`
+puts the attestation into the card, re-signs it and publishes it at the
+registrar; `--successor-commit` makes a successor key beside the
+identity key and commits the card and the registration to it.
 
 ---
 
 ## 12. Storage and implementation notes
 
 - **One store, SQLite**, behind a `RegistrarStore` trait in the shape of
-  `hxd-store-sqlite`: `identity` (pubkey, fingerprint, commitment,
+  `hxd-store-sqlite` — built as `hxd-registrar`'s trait, an in-memory
+  store for its tests, and `SqliteRegistrarStore` in a file of its own,
+  held to one conformance suite. The trait is shaped around the two
+  writes, an issuance and a publication with its effects, rather than
+  around the tables: `identity` (pubkey, fingerprint, commitment,
   frozen, revoked, rotated_to, contact, created), `handle` (canonical,
   identity, registered, state, lapsed_at), `attestation` (identity,
   handle, issued, expires, bytes), `record` (seq, kind, identity,
@@ -1152,9 +1194,11 @@ hlid restore     alice@hl.example
   calls it on every list entry, and `hlid` calls it before posting. A
   record the registrar would accept is one every server would, by
   construction.
-- **Per-identity lists are signed on demand and cached** for
-  `records_max_age` keyed by fingerprint, so a burst of admissions for
-  one identity costs one signature. The full list is signed per page.
+- **Per-identity lists are signed on demand.** A cache keyed by
+  fingerprint for `records_max_age` would make a burst of admissions for
+  one identity cost one signature; hxd-ng signs each time, because one
+  Ed25519 signature is cheaper than the invalidation a freeze would need.
+  The full list is signed per page.
 - **Freeze, revoke and recover are transactions** with the record write:
   a freeze that is recorded but not published is the failure that
   matters most, so the row and the record are one commit.
@@ -1165,9 +1209,18 @@ hlid restore     alice@hl.example
   reserved-name list, which reads account logins once at startup and
   on reload. The feature mounts under the ng listener beside the identity
   endpoints and can be built with the rest of the server off.
-- **hlid** gains the codecs for §4.2 and §4.4–§4.6, the envelope codec
-  and derivation (`argon2` and `chacha20poly1305` are the two new
-  dependencies), and the commands of §11.
+- **hlid** gains the codecs for §4.2 and §4.4–§4.6 (built, through
+  `hl-identity`), the envelope codec and derivation (`argon2` and
+  `chacha20poly1305` are the two new dependencies, with §9), and the
+  commands of §11.
+- **A pending rotation has no timer.** It is published by the first
+  read or write of the registrar after its delay, under the write lock,
+  so there is nothing to miss across a restart.
+- **The write lock spans processes.** The operator's commands open the
+  server's store from a process of their own. Each decision and the
+  writes it leads to run in one store transaction (`BEGIN IMMEDIATE`
+  in SQLite), so neither side acts on a state the other is halfway
+  through changing.
 
 ---
 
@@ -1252,9 +1305,10 @@ new codecs; the envelope derivation.
 
 ## 15. Test vectors
 
-To be added to `identity-test-vectors.json`, generated by the same tool
-as the existing ones, with the same identity, device and registrar keys
-so that the objects chain:
+In `identity-test-vectors.json`, with the same identity, device and
+registrar keys as the rest so that the objects chain, and checked by
+`hl-identity`'s `tests/vectors.rs`. All but the envelopes are there;
+those wait on §9:
 
 - `register`: a first registration with `successor`, and a reissue.
 - `revoke_device`: one signed by the identity key; one signed by a

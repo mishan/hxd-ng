@@ -14,6 +14,7 @@ pub mod news;
 mod news_blob;
 pub mod proto;
 pub mod push;
+mod registrar;
 mod registry;
 mod tunnel;
 
@@ -242,6 +243,11 @@ pub struct NgCtx {
     /// `None` means the capability is absent, the login reply has no
     /// `push` block, and `push_register` answers `not_available`.
     pub push: Option<Arc<push::PushInfo>>,
+    /// The registrar, when `[registrar]` is configured. `None` means the
+    /// `/registrar` routes 404 and discovery's `registrar` block is
+    /// `null`. Beside `identity` rather than inside it for the mailbox's
+    /// reason: it reads no account and knows no session.
+    pub registrar: Option<Arc<hxd_registrar::Registrar>>,
 }
 
 /// Accept loop: one connection task per socket. Each is HTTP until it

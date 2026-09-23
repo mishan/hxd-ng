@@ -165,6 +165,7 @@ async fn start_both(dir: &Path, video: bool) -> Server {
         tunnel: None,
         enroll: None,
         files: None,
+        registrar: None,
         push: None,
     };
 

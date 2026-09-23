@@ -1,4 +1,5 @@
-//! The private-message inbox and public-chat history on SQLite.
+//! The private-message inbox and public-chat history on SQLite — and,
+//! in a file of its own, the registrar's store ([`SqliteRegistrarStore`]).
 //!
 //! A [`MessageStore`] backed by one file, so a server gains offline
 //! messages without gaining an operations problem. Design and the
@@ -55,8 +56,10 @@ impl Synchronous {
 mod blobs;
 mod news;
 mod push;
+mod registrar;
 
 pub use blobs::FileBlobStore;
+pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].

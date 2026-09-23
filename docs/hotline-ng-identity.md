@@ -3,11 +3,12 @@
 Status: partial. Built in hxd-ng: the identity objects (§3,
 `crates/hl-identity`, with test vectors in `identity-test-vectors.json`),
 the profile's part of authentication (§5), cards (§7), account
-association including `trtp_login` (§8), the `hlid` tool, and the
+association including `trtp_login` (§8), the `hlid` tool, the
 server-local revocation list of `identity-registrar.md` §7.3 (§12's
-`revoked_identities` and `revoked_devices`). Design only: the
-registrar's published revocation, rotation and freeze (`identity-registrar.md`,
-which §5.2 step 4, §8.5 and §12 now cite), vouching (`identity-vouch.md`), the
+`revoked_identities` and `revoked_devices`), and the registrar itself —
+handles, attestations and the records it publishes (`identity-registrar.md`
+§3–§6). Design only: a server fetching and applying those records
+(`identity-registrar.md` §7, which §5.2 step 4, §8.5 and §12 now cite), vouching (`identity-vouch.md`), the
 system account (`system-account.md`), reserved-name enforcement, and
 everything in the federation spec, which does not exist yet. The
 identity object set is frozen at `v = 1` until the registrar's

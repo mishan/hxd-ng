@@ -23,6 +23,7 @@ use serde::Deserialize;
 
 pub mod files;
 pub mod push;
+pub mod registrar;
 pub mod voice;
 pub use files::Files;
 pub use push::Push;
@@ -72,6 +73,10 @@ pub struct Config {
     /// no gateway, no `push` capability, and `push_register` answered
     /// `not_available`.
     pub push: Option<PushSection>,
+    /// The identity registrar (`docs/identity-registrar.md` §11). Absent
+    /// = not a registrar: discovery's `registrar` block is `null` and
+    /// the `/registrar` routes 404. Needs `[identity]`.
+    pub registrar: Option<registrar::RegistrarSection>,
 }
 
 /// `[push]`: where a notification goes when nobody is watching.
@@ -1495,32 +1500,46 @@ impl TunnelSink for LegacyTunnel {
     }
 }
 
-/// Load or create the server's identity key. Created with mode 0600 on
-/// Unix; the file is a 32-byte seed, hex-encoded, so it can be backed up
-/// with the account directory.
-fn load_server_key(path: &Path) -> Result<ServerKey, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let hex = text.trim();
-            let bytes = (0..hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("zz"), 16))
-                .collect::<Result<Vec<u8>, _>>()
-                .map_err(|_| format!("{}: not a hex seed", path.display()))?;
-            let seed: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| format!("{}: seed must be 32 bytes", path.display()))?;
-            Ok(ServerKey::from_seed(&seed))
-        }
+/// Load or create a signing key: the server's identity key, or the
+/// registrar's. Created with mode 0600 on Unix; the file is a 32-byte
+/// seed, hex-encoded, so it can be backed up with the account directory.
+pub(crate) fn load_key(path: &Path, what: &str) -> Result<ServerKey, String> {
+    match std::fs::metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let key = ServerKey::generate();
             let hex: String = key.seed().iter().map(|b| format!("{b:02x}")).collect();
             write_private(path, &hex).map_err(|e| format!("{}: {e}", path.display()))?;
-            tracing::info!("generated server identity key at {}", path.display());
+            tracing::info!("generated {what} key at {}", path.display());
             Ok(key)
         }
-        Err(e) => Err(format!("{}: {e}", path.display())),
+        _ => read_key(path),
     }
+}
+
+/// Read a key [`load_key`] wrote, failing if there is none.
+pub(crate) fn read_key(path: &Path) -> Result<ServerKey, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let hex = text.trim();
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("zz"), 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .map_err(|_| format!("{}: not a hex seed", path.display()))?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| format!("{}: seed must be 32 bytes", path.display()))?;
+    Ok(ServerKey::from_seed(&seed))
+}
+
+/// A public key as configuration and discovery spell it: base64url, 32
+/// bytes.
+pub(crate) fn decode_key(b64: &str) -> Result<[u8; 32], String> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(b64.trim())
+        .map_err(|_| "not base64url".to_string())?
+        .try_into()
+        .map_err(|_| "key must be 32 bytes".to_string())
 }
 
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
@@ -1742,8 +1761,7 @@ fn build_identity(
     auth: Arc<dyn hxd_core::AuthBackend>,
     core: Arc<Core>,
 ) -> Result<IdentityState, String> {
-    use base64::Engine;
-    let key = load_server_key(&section.key)?;
+    let key = load_key(&section.key, "server identity")?;
     let new_accounts = match section.new_accounts.as_str() {
         "deny" => NewAccounts::Deny,
         "guest" => NewAccounts::Guest,
@@ -1758,12 +1776,7 @@ fn build_identity(
     };
     let mut registrar_keys = HashMap::new();
     for (host, b64) in &section.registrar_keys {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(b64)
-            .map_err(|_| format!("[identity] registrar_keys.{host}: not base64url"))?;
-        let key: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| format!("[identity] registrar_keys.{host}: key must be 32 bytes"))?;
+        let key = decode_key(b64).map_err(|e| format!("[identity] registrar_keys.{host}: {e}"))?;
         registrar_keys.insert(host.to_lowercase(), key);
     }
     let default_access = match &section.default_access {
@@ -1830,6 +1843,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     if let Some(identity) = &config.identity {
         identity.revocations()?;
     }
+    registrar::check(config)?;
     if let Some(inbox) = &config.inbox {
         hxd_core::InboxPolicy {
             max_queued: inbox.max_queued,
@@ -2400,7 +2414,7 @@ pub fn news_reindex(_config: &Config) -> Result<u64, String> {
 /// tooling that tells the operator to run this prints that form, and
 /// requiring hex meant `rm alice.toml` left the mailbox unpurgeable.
 // Not behind `inbox`: `hxd identity revoke` reads fingerprints too.
-fn parse_fingerprint(text: &str) -> Result<[u8; 32], String> {
+pub(crate) fn parse_fingerprint(text: &str) -> Result<[u8; 32], String> {
     let text = text.trim();
     if let Some(fp) = hl_identity::Fingerprint::parse(text) {
         return Ok(fp.0);
@@ -2537,16 +2551,16 @@ pub fn build_ng_ctx(
     let Some(ng) = config.ng.as_ref() else {
         return Ok(None);
     };
+    let registrar = registrar::build(config)?;
     let identity = match config.identity.as_ref() {
         Some(section) => {
             // Installed before anything can connect, so there is no
             // session yet for it to end.
             legacy.core.set_revocations(section.revocations()?);
-            Some(Arc::new(build_identity(
-                section,
-                legacy.auth.clone(),
-                legacy.core.clone(),
-            )?))
+            Some(Arc::new(
+                build_identity(section, legacy.auth.clone(), legacy.core.clone())?
+                    .with_registrar(registrar.clone()),
+            ))
         }
         None => None,
     };
@@ -2584,6 +2598,7 @@ pub fn build_ng_ctx(
         enroll,
         files: files.map(|value| value.service.clone()),
         push: push.and_then(Push::info),
+        registrar,
     }))
 }
 

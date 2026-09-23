@@ -254,6 +254,7 @@ async fn start_server_inner(
         tunnel: Some(tunnel),
         enroll: enroll.map(|c| Arc::new(hxd_ng_session::enroll::Mailbox::new(c))),
         files: None,
+        registrar: None,
         push: devices.map(|_| {
             Arc::new(hxd_ng_session::push::PushInfo {
                 vapid: "BEl6…".into(),
@@ -2652,6 +2653,7 @@ async fn a_token_offered_to_a_server_without_identity_is_refused() {
         tunnel: None,
         enroll: None,
         files: None,
+        registrar: None,
         push: None,
     };
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
