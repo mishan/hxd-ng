@@ -1227,6 +1227,11 @@ async fn card_etag_successor_commitment_and_downstream_cleartext() {
     );
     let r = try_authenticate(ng, &t, json!({ "downstream": "wat" })).await;
     assert_eq!(r.status, 400);
+    // Not a string at all is the same mistake, not a quiet `local`.
+    for bad in [json!(null), json!(1), json!(true)] {
+        let r = try_authenticate(ng, &t, json!({ "downstream": bad })).await;
+        assert_eq!(r.status, 400, "downstream {bad}");
+    }
 }
 
 // --- The mTLS binding (§5.3) ---------------------------------------------
