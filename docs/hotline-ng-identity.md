@@ -871,7 +871,7 @@ to run on a server that also serves the legacy port.
   page is open, or longer because four paste ceremonies a year is what
   will stop people using it?
 - ~~**SSO through a registrar.** The transport's open questions
-  (`hotline-ng-auth.md` §13) weigh OIDC as a transport binding; the
+  (`hotline-ng-auth-rationale.md` §10) weigh OIDC as a transport binding; the
   alternative that keeps users on keys is an OIDC-backed registrar.~~
   **Answered by `identity-registrar.md` §5.3, `proof = oidc`:** the
   registrar takes the provider's id_token as signup proof and issues an

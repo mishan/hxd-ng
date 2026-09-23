@@ -264,7 +264,8 @@ max_detached_per_addr = 2
 
 # Proxies only. The address walk skips whatever is listed here, and the
 # mTLS binding header (X-Hotline-Client-Cert) is believed from these hosts
-# and nowhere else.
+# and nowhere else. Caddy and nginx configurations that set that header
+# correctly: docs/hotline-ng-auth-rationale.md §6.1.
 # trusted_proxies = ["127.0.0.1"]
 
 # Which header that proxy writes the client address into:
@@ -836,6 +837,7 @@ other than this server. The last column is what this server has built.
 | [hotline-ng.md](docs/hotline-ng.md) | The ng protocol: framing, the login/resume/sync handshake, the request and event tables, seq accounting | yes |
 | [hotline-ng-rationale.md](docs/hotline-ng-rationale.md) | The reasoning behind the ng protocol, its domain-layer changes and the order it was built in | yes |
 | [hotline-ng-auth.md](docs/hotline-ng-auth.md) | Transport authentication: the principal, the challenge and mTLS bindings, transport tokens, the TRTP tunnel, cleartext marking, tunnels and relays | yes |
+| [hotline-ng-auth-rationale.md](docs/hotline-ng-auth-rationale.md) | The reasoning behind transport authentication, and working Caddy and nginx configurations for the mTLS binding | yes |
 | [hotline-ng-identity.md](docs/hotline-ng-identity.md) | Portable identity: the signed objects, the identity profile at authentication, cards, account association | yes, to the registrar stub |
 | [identity-enrollment.md](docs/identity-enrollment.md) | Certifying a device through a mailbox and a pairing code instead of a paste; renewal | server side |
 | [identity-registrar.md](docs/identity-registrar.md) | The registrar: handles, revocation, rotation, freeze, key backup, transparency; what a server does with it | the server-local revocation list |

@@ -388,7 +388,8 @@ names; `vouch` is a signed vouch from an identity attested here
 (`identity-vouch.md` §5). A request that needs one and lacks it is answered
 `proof_required` with a `text` and, when there is somewhere to go, a
 `url`. This is the smallest hook that lets an OIDC-backed registrar
-exist (`hotline-ng-auth.md` §13) without this document defining OIDC.
+exist (`hotline-ng-auth-rationale.md` §10) without this document
+defining OIDC.
 
 `level` is the number the attestation carries and what a server's
 operator reads when deciding whom to trust and how long to keep their
