@@ -504,6 +504,12 @@ The pieces:
    UnifiedPush / WebPush behind it) plus a device-token registry. DM or
    mention while detached → push. Notification content policy (full text vs.
    "you have a message") is a config knob — self-hosters differ on this.
+   **Built as in-process Web Push**
+   ([docs/webpush-gateway.md](docs/webpush-gateway.md)): the server is its
+   own sender, with no sidecar and no vendor account, and hx-ng receives
+   private messages and news replies while closed. Mentions are not a
+   notification kind yet, and the APNs / FCM sidecar waits for a native
+   app.
 4. **The persistence slice arrives here** (moved from the old Phase 7):
    durable storage behind `AccountStore` and the new session/token, inbox,
    and push-registration stores. Detached sessions, offline messages and

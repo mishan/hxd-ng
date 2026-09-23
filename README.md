@@ -57,6 +57,7 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 | **Video** — camera and screen share on the voice connection, opt-in per stream | — | when GtkHx adds it | yes |
 | **The file area** — browse, Get Info, download; upload into upload folders and drop boxes | yes | yes, plus files over 4 GiB and verified resume | browse and download |
 | **Threaded news** — markdown, references between articles, follows, search | not yet | not yet | yes |
+| **Push notifications** — a private message or a news reply while the app is closed | — | — | yes, as Web Push |
 | **Portable identity** — an Ed25519 key that is you on any server that runs this | through a local tunnel | through a local tunnel | yes |
 | Kick and ban | yes | yes | yes |
 | **Tracker listing** — announced to HTRK v1 and v3 trackers | found through the tracker | found through the tracker | — (connects by address) |
@@ -79,7 +80,6 @@ GtkHx when its rendering lands.
   line, revoking an image, purging a user's recent output: designed in
   [docs/moderation.md](docs/moderation.md), tables in the schema, no
   requests yet.
-- **Push notifications** to a phone with the app closed.
 - **The identity registrar**, which is what gives a key a name like
   `alice@hl.example` and publishes revocations. Designed
   ([docs/identity-registrar.md](docs/identity-registrar.md)), not built;
@@ -96,7 +96,7 @@ GtkHx — this is the only server that has it.
 The [roadmap](ROADMAP.md) in one paragraph: folder transfers and the rest
 of the file area, then the legacy news bindings, so that a period client gets
 everything a period server gave it. Then the pieces that make the ng
-wire a real mobile experience — push, the registrar, and the enrollment
+wire a real mobile experience — the registrar, and the enrollment
 flow that certifies a phone without a paste. Then federation: signed
 ban lists a server can subscribe to, vouches that let a member bring
 someone in without opening the door

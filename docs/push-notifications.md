@@ -1,9 +1,8 @@
 # Push notifications: delegating the device registry to uniqush-push
 
-Status: design; only the `NotificationGateway` trait exists. The first
-gateway to build is decided below, and it is not the one this document
-was written around: it is in-process Web Push, whose own design is
-[`webpush-gateway.md`](webpush-gateway.md). What that document does not
+Status: the first gateway is built. It is not the one this document was
+written around: it is in-process Web Push, whose own design is
+[`webpush-gateway.md`](webpush-gateway.md), and which hx-ng receives. What that document does not
 restate — the seam (§4), the subscriber model (§5, §5.1), when a push
 happens and what it may contain (§6), and the protocol additions (§8,
 §8.1) — is normative here for either gateway. The uniqush sidecar of
