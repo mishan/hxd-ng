@@ -210,7 +210,10 @@ There are three message shapes, told apart by their keys:
   whose `params` are present but malformed MUST be answered
   `bad_request`.
 - The server MUST answer every request with exactly one reply, and MUST
-  answer requests in the order they were received (rationale §5).
+  answer requests in the order they were received (rationale §5). A
+  request still outstanding when the connection closes — lost, or closed
+  by the server after `kicked` — goes unanswered; a client MUST treat it
+  as failed.
 - A server MUST ignore fields in `params` it does not recognize. A client
   MUST ignore fields in `ok`, in `error` and in event `data` it does not
   recognize.
