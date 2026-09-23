@@ -1,0 +1,18 @@
+# Build context for the Dockerfile: sources only. Local build output,
+# a developer's runtime state and their cargo overrides stay out — a
+# `.cargo/config.toml` patching hx-libs to a local path would break the
+# build inside the container.
+target/
+.cargo/
+.git/
+.worktrees/
+.claude/
+accounts/
+config.toml
+hxd-ng.toml
+agreement.txt
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+**/node_modules/

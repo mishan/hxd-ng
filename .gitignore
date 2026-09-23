@@ -23,3 +23,7 @@ Cargo.lock.orig
 *.sqlite-journal
 *.sqlite-shm
 *.sqlite-wal
+
+# Compose's variables for docker/compose.yaml, which hold the first admin
+# password.
+/docker/.env

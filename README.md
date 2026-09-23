@@ -162,6 +162,10 @@ Every config key is optional, and a server with no config file at all is a
 working legacy-only server. The first run creates `accounts/` (mode 0700)
 with a guest account; add more as TOML files in that directory.
 
+To run it as a service instead, the `Dockerfile` builds an image
+configured from environment variables, meant to sit behind nginx or
+another TLS-terminating proxy: [docs/docker.md](docs/docker.md).
+
 ### Say hello
 
 The best end-to-end check is a real client, and there is one for each

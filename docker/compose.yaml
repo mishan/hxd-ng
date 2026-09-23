@@ -1,0 +1,34 @@
+# hxd-ng with Docker Compose, behind a proxy on the host (docker/nginx.conf).
+#
+#   docker compose -f docker/compose.yaml up -d --build
+#
+# docs/docker.md lists every variable.
+
+services:
+  hxd-ng:
+    build:
+      context: ..
+    image: hxd-ng
+    restart: unless-stopped
+    ports:
+      - "5500:5500"             # legacy Hotline
+      - "5501:5501"             # HTXF file transfers: legacy port + 1
+      # - "5504:5504/udp"       # voice media, with HXD_VOICE_ADVERTISE
+      - "127.0.0.1:5700:5700"   # ng: only the proxy on this host reaches it
+    environment:
+      HXD_NAME: "My Hotline Server"
+      HXD_ADMIN_LOGIN: admin
+      # Read from the shell or docker/.env, and only on the first start:
+      # once accounts/admin.toml exists, change the password there.
+      HXD_ADMIN_PASSWORD: ${HXD_ADMIN_PASSWORD:?set HXD_ADMIN_PASSWORD in docker/.env}
+      # HXD_IDENTITY_WEB: "https://hl.example/app/"
+      # HXD_PUSH_CONTACT: "mailto:admin@hl.example"
+      # HXD_VOICE_ADVERTISE: "203.0.113.5"
+      # HXD_FILES_ROOT: /srv/files
+      # HXD_TRACKERS: "hltracker.com"
+    volumes:
+      - hxd-ng:/var/lib/hxd-ng
+      # - /srv/hotline/files:/srv/files
+
+volumes:
+  hxd-ng:

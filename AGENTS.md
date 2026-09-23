@@ -68,6 +68,11 @@ been exercised on newer toolchains; CI runs stable.
 `npm install` in tools/ for the `ws` fallback) — `/drop` exercises
 detach/resume, `/msg` PMs by nick or uid.
 
+`Dockerfile` and `docker/` are the operator's image: `entrypoint.sh`
+writes a config from `HXD_*` variables at each start unless one is
+mounted, and `docs/docker.md` lists them. A config key worth an
+operator's variable gets one there.
+
 ## Invariants that matter
 
 **The domain is UTF-8 and wire-free.** A legacy connection's encoding
