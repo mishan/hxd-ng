@@ -584,8 +584,8 @@ credentials (§7). That is why the gateway keeps its own device index
 calls, and we never call `/subscriptions` in normal operation at all.
 
 The login reply grows `caps: ["push"]` when a gateway is configured —
-this is the moment hotline-ng.md §11 anticipated for the capability list,
-so it arrives here rather than being retrofitted.
+this is the moment the ng MVP anticipated for the capability list (now
+hotline-ng.md §4), so it arrives here rather than being retrofitted.
 
 `logout` does **not** unregister devices. Logging out of the app is the
 single most common moment to want a push about what you're missing; only

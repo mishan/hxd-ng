@@ -1,7 +1,7 @@
 //! Hotline-ng end-to-end tests: a WebSocket client and a legacy scripted
 //! client sharing one server — one roster, one chat, two wire eras.
 //! Covers the frontend and the cross-frontend scenarios from
-//! docs/hotline-ng.md §10.
+//! docs/hotline-ng-rationale.md §7.
 
 use std::net::SocketAddr;
 use std::path::Path;

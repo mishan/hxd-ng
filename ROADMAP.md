@@ -450,8 +450,9 @@ In rough order of value-for-effort:
 section. **Opened early, in parallel with the legacy phases**, 2026-08:
 rather than finishing full server parity first, the MVP — user list + chat,
 enough for an immediately usable mobile app — is designed in
-[docs/hotline-ng.md](docs/hotline-ng.md), which is the protocol spec and
-staging plan. The full Phase 7 scope below remains the destination.)*
+[docs/hotline-ng.md](docs/hotline-ng.md), the protocol spec, with its
+reasoning and staging plan in
+[docs/hotline-ng-rationale.md](docs/hotline-ng-rationale.md). The full Phase 7 scope below remains the destination.)*
 
 A second protocol frontend speaking to the *same* domain services as the
 legacy one, so both populations share one chat, one user list, one file

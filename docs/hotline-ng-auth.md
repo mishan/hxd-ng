@@ -89,8 +89,9 @@ means:
   wire.
 
 The cost is that hxd-ng grows a small HTTP router on the ng listener, which
-`hotline-ng.md` deferred "until media/history/push need one." Authentication
-needs one. It is a handful of routes.
+the ng MVP deferred "until media/history/push need one"
+(`hotline-ng-rationale.md` §1). Authentication needs one. It is a handful
+of routes.
 
 ---
 
@@ -853,7 +854,7 @@ the `[identity]` section because hxd-ng has one profile and one switch.
 
 - The ng listener needs to route a few HTTP paths before the upgrade. Any
   minimal HTTP layer over the existing `tokio-tungstenite` accept works;
-  this is the point at which `hotline-ng.md`'s "no HTTP framework yet"
+  this is the point at which the ng MVP's "no HTTP framework yet"
   decision expires, and it should be revisited with media and history in
   mind rather than solved just for authentication. hxd-ng uses hyper
   directly.

@@ -391,7 +391,7 @@ Everything else on this wire is plain chunk assembly.
 
 A transliteration of the same six messages into the request/event shapes
 of [hotline-ng.md](hotline-ng.md) §5. The login reply's `caps` list
-(anticipated in hotline-ng.md §11 and by the push design) gains
+(hotline-ng.md §4) gains
 `"voice"` when the SFU is wired.
 
 | `req` | params | ok | errors |

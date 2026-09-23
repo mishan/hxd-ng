@@ -12,7 +12,8 @@
 //! per-session monotonic sequence number. With a connection attached the
 //! event goes straight out on a channel; detached, it buffers (bounded —
 //! overflow marks the buffer broken and a resume then requires a fresh
-//! sync). See `docs/hotline-ng.md` §4/§6.
+//! sync). See `docs/hotline-ng.md` §3 and §6, and
+//! `docs/hotline-ng-rationale.md` §4/D3.
 //!
 //! **The domain is UTF-8.** Nicks, chat text, subjects — everything textual
 //! is a `String`. The legacy frontend converts Mac Roman ↔ UTF-8 at its

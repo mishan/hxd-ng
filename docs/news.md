@@ -1080,7 +1080,7 @@ Every bit this needs is already allocated and already parsed:
 | Delete a bundle | `DELETE_NEWS_BUNDLES` (37) |
 
 Two things the bitmap does not cover, both config rather than squatted
-bits, for the reason hotline-ng.md §4/D5 gives:
+bits, for the reason hotline-ng-rationale.md §4/D5 gives:
 
 - **`[extra] attach_news`**, defaulting to the account's `SEND_MEDIA`
   (57). Someone trusted to put an image in chat is trusted to put one

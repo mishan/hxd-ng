@@ -37,7 +37,7 @@ session on the roster**. That was the whole delivery model, and it had
 three consequences worth naming before changing any of them.
 
 - A detached session is on the roster, so a PM to one is accepted and
-  buffers in its outbox. This is real and it works — `docs/hotline-ng.md`
+  buffers in its outbox. This is real and it works — `docs/hotline-ng-rationale.md`
   §1 calls it "the closest thing the grace window offers to offline
   delivery." But the buffer is capped at `OUTBOX_BUFFER_CAP`, it dies
   when the grace window lapses, and it dies with the process.
@@ -69,7 +69,7 @@ excluded them would have keyed a mailbox nobody could own.
 should be read and changed together (`hxd-auth-file`, `into_account`).
 
 This is the second `[extra]` key of its kind, which is the point of that
-section (`docs/hotline-ng.md` §4/D5): server-local policy that never
+section (`docs/hotline-ng-rationale.md` §4/D5): server-local policy that never
 crosses the wire, deliberately not a bit in the shared access bitmap.
 
 ## 3. Store always, not only on a miss

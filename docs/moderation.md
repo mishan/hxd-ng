@@ -67,7 +67,7 @@ moderator with no file edits, and the key lets an operator hand
 redaction to someone who may not kick, or withhold it from someone who
 may.
 
-It is `[extra]` and not an access bit for the reason hotline-ng.md §4/D5
+It is `[extra]` and not an access bit for the reason hotline-ng-rationale.md §4/D5
 gives: server-local policy that never crosses the wire as a bit. It does
 cross the ng wire as a fact — the login reply's `self` gains
 `"moderator": true` so a client can show the controls — which is a
