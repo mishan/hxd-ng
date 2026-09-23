@@ -3,9 +3,11 @@
 Status: partial. Built in hxd-ng: the identity objects (§3,
 `crates/hl-identity`, with test vectors in `identity-test-vectors.json`),
 the profile's part of authentication (§5), cards (§7), account
-association including `trtp_login` (§8), and the `hlid` tool. Design
-only: revocation, rotation and freeze (`identity-registrar.md`, which
-§5.2 step 4, §8.5 and §12 now cite), vouching (`identity-vouch.md`), the
+association including `trtp_login` (§8), the `hlid` tool, and the
+server-local revocation list of `identity-registrar.md` §7.3 (§12's
+`revoked_identities` and `revoked_devices`). Design only: the
+registrar's published revocation, rotation and freeze (`identity-registrar.md`,
+which §5.2 step 4, §8.5 and §12 now cite), vouching (`identity-vouch.md`), the
 system account (`system-account.md`), reserved-name enforcement, and
 everything in the federation spec, which does not exist yet. The
 identity object set is frozen at `v = 1` until the registrar's
@@ -270,9 +272,11 @@ continues in this order and fails on the first error:
    proof — or, on the mTLS binding, the client certificate's key; within
    validity; login capability set;
 3. `card` signature; `identity` matches the certificate;
-4. records fetched per `identity-registrar.md` §7.2 and applied per
-   `identity-registrar.md` §7.3; a stale cache is `[identity]
-   revocation_stale`;
+4. the server-local revocation list first (§12, `identity-registrar.md`
+   §7.3), then records fetched per `identity-registrar.md` §7.2 and
+   applied per §7.3 there; a stale cache is `[identity]
+   revocation_stale`. *(Built: the local list. The fetched records wait
+   on a registrar to fetch them from.)*
 5. attestations verified against trusted registrars, expired or untrusted
    ones discarded, and, after attestation revocations are applied, age
    computed from the oldest surviving `registered`;
@@ -585,11 +589,10 @@ two is the `[identity] trtp_login` setting:
   side: on an account with no password `identity_login` is derived true,
   and a file that sets it false is read as true and named in a warning
   at startup, where an operator is looking. The flag is the account's
-  own only when the account has a password to fall back on. The one
-  legitimate instance is the system account (`system-account.md` §2):
-  an account file marked `system = true` keeps `identity_login = false`
-  with no password, because nobody is meant to reach it, and the
-  startup warning skips it.
+  own only when the account has a password to fall back on. The system
+  account (`system-account.md` §2), the one account meant to be
+  reachable by nobody, is not an exception to this: it has no account
+  file, and its login is refused by the auth backend itself.
 
   A password-less account that is *not* linked has a narrower version of
   the same shape: the plain TCP port admits it (an empty password matches
@@ -615,7 +618,7 @@ guest login, or `trtp_login = trust`.
 | yes | yes | false | the account | `denied` |
 | no | no | derived true | plain TCP: admitted, an empty password matches; tunnel or ng: never self-linked (§8.2), so `new_accounts` decides | `new_accounts` decides |
 | no | yes | derived true | refused, empty password included (§12) | the account |
-| no | yes | false | refused | refused — only `system = true` may be here (system-account.md §2) |
+| no | yes | false | unrepresentable: read as `identity_login = true`, the row above, with a startup warning | |
 
 ### 8.4 Unlinking
 
@@ -756,7 +759,7 @@ section because hxd-ng has one profile and one switch.
 | `[identity] revocation_max_age` | `3600` | *(not implemented)* How long a fetched record list is cached: the smaller of this and the list's own `expires` (`identity-registrar.md` §7.2) |
 | `[identity] revocation_stale` | `cached` | *(not implemented)* `cached`, `guest`, `deny`: what §5.2 step 4 does when the registrar is unreachable and the cache is past its lifetime (`identity-registrar.md` §7.2) |
 | `[identity] frozen` | `deny` | *(not implemented)* `deny`, `guest`: what a frozen identity is admitted as (`identity-registrar.md` §7.3) |
-| `[identity] revoked_devices`, `revoked_identities` | empty | *(not implemented)* Fingerprints refused by hand, consulted before any registrar (`identity-registrar.md` §7.3) |
+| `[identity] revoked_devices`, `revoked_identities` | empty | Fingerprints refused by hand, consulted before any registrar (`identity-registrar.md` §7.3). A revoked identity refuses every device of it; a revoked device, only itself. Refused at `/identity/auth` with `revoked`, and a token minted before the revocation no longer redeems. SIGHUP re-reads these two lists and nothing else, and installing them, at startup or on SIGHUP, ends every session they now refuse, live or detached, on either wire. `hxd identity revoke <fingerprint> [--device] [--lift]` edits them in the config file |
 | `[identity] banned_registrars` | empty | *(not implemented)* Hosts whose identities are refused outright, before the admission policy runs (`identity-registrar.md` §7.3) |
 | `[identity] newcomer_delay` | `120` | *(not implemented)* Seconds before a never-seen `unknown` key may chat, message or post; `0` disables (`identity-registrar.md` §7.3) |
 

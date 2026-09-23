@@ -1785,11 +1785,26 @@ async fn identity_login_false_denies_and_a_created_account_refuses_the_legacy_po
     .unwrap();
     assert_eq!(f.flag, 1, "the login must be refused");
 
-    // `login = false` on the account denies the identity path too.
+    // `login = false` on an account with no password would leave nobody
+    // able to reach it, so it is read as true: the key still works.
     let text = std::fs::read_to_string(&file).unwrap();
     std::fs::write(
         &file,
         text.replace("[identity]", "[identity]\nlogin = false"),
+    )
+    .unwrap();
+    let r = try_authenticate(ng, &p, json!({})).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["outcome"], "linked");
+
+    // With a password to fall back on, the flag is the account's own, and
+    // it denies the identity path.
+    std::fs::write(
+        &file,
+        format!(
+            "password = \"pw\"\n{}",
+            text.replace("[identity]", "[identity]\nlogin = false")
+        ),
     )
     .unwrap();
     let r = try_authenticate(ng, &p, json!({})).await;
@@ -3996,8 +4011,13 @@ async fn an_agent_rotates_past_its_own_per_address_limit() {
     let _ = agent.child.kill();
     let output = agent.reader.join().unwrap();
     let _ = agent.child.wait();
+    // Matched as the refusal is printed, not as a bare "429": the
+    // agent's output carries random enrollment codes, and one such as
+    // S048-429G failed this test on a run that was never limited.
     assert!(
-        !output.contains("rate_limited") && !output.contains("429"),
+        !["rate_limited", "status code 429", "(429)"]
+            .iter()
+            .any(|refusal| output.contains(refusal)),
         "the agent rate-limited itself out of its own mailbox:\n{output}"
     );
 }
@@ -4503,4 +4523,173 @@ async fn a_resumed_session_is_still_the_device_it_logged_in_as() {
         reply["error"]["code"], "no_capability",
         "a web certificate is no more trusted for having dropped its socket: {reply}"
     );
+}
+
+// --- Server-local revocation (identity-registrar.md) ----------------------
+
+fn revoking(identities: &[&IdentityKey], devices: &[&DeviceKey]) -> hxd_core::Revocations {
+    hxd_core::Revocations {
+        identities: identities.iter().map(|k| k.fingerprint().0).collect(),
+        devices: devices.iter().map(|k| k.fingerprint().0).collect(),
+    }
+}
+
+/// Log in over ng with a fresh `/identity/auth` token.
+async fn ng_session(ng: SocketAddr, p: &Person) -> Ng {
+    let token = authenticate(ng, p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng?token={token}"))
+        .await
+        .unwrap();
+    let mut c = Ng::from_ws(ws).await;
+    let reply = c.request("login", json!({})).await;
+    assert!(reply.get("ok").is_some(), "{reply}");
+    c
+}
+
+#[tokio::test]
+async fn revoking_an_identity_ends_its_session_and_refuses_it_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, ctx) = start_server(dir.path()).await;
+    let thief = person(61, "Stolen");
+    let bystander = person(62, "Bystander");
+    let mut stolen = ng_session(ng, &thief).await;
+    let mut other = ng_session(ng, &bystander).await;
+
+    // The key is revoked while its holder is connected: the session is
+    // the thing the attacker has, so the session is what goes.
+    let ended = ctx.core.set_revocations(revoking(&[&thief.id], &[]));
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    stolen.event("kicked").await;
+
+    // And the next attempt is refused by name, on every device.
+    let r = try_authenticate(ng, &thief, json!({})).await;
+    assert_eq!(r.status, 403);
+    assert_eq!(r.json()["error"], "revoked");
+
+    // Nobody else noticed anything but a departure.
+    let v = other.request("ping", json!({})).await;
+    assert!(v.get("ok").is_some(), "the bystander is still here: {v}");
+    authenticate(ng, &bystander).await;
+}
+
+#[tokio::test]
+async fn revoking_a_device_leaves_the_identitys_others_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, ctx) = start_server(dir.path()).await;
+    let phone = person(63, "Two Devices");
+    // The same identity on a second device.
+    let laptop_key = DeviceKey::from_seed(&[213; 32]);
+    let laptop = Person {
+        id: IdentityKey::from_seed(&[63; 32]),
+        cert: DeviceCert::for_device(
+            &phone.id,
+            &laptop_key,
+            now() - 5,
+            cert::RECOMMENDED_LIFETIME,
+        )
+        .unwrap()
+        .sign(&phone.id),
+        dev: laptop_key,
+        card: phone.card.clone(),
+    };
+
+    ctx.core.set_revocations(revoking(&[], &[&phone.dev]));
+    let r = try_authenticate(ng, &phone, json!({})).await;
+    assert_eq!(r.status, 403);
+    assert_eq!(r.json()["error"], "revoked");
+    authenticate(ng, &laptop).await;
+}
+
+#[tokio::test]
+async fn a_token_minted_before_the_revocation_is_not_a_way_round_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, ctx) = start_server(dir.path()).await;
+    let p = person(64, "Early Token");
+    let token = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tunnel_token = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    ctx.core.set_revocations(revoking(&[&p.id], &[]));
+
+    // The ng upgrade redeems the token, and a revoked key's token no
+    // longer redeems.
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{ng}/ng?token={token}"))
+            .await
+            .is_err(),
+        "the upgrade is refused"
+    );
+    // Nor does the tunnel's.
+    let mut req = format!("ws://{ng}/trtp").into_client_request().unwrap();
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {tunnel_token}").parse().unwrap(),
+    );
+    assert!(tokio_tungstenite::connect_async(req).await.is_err());
+}
+
+#[tokio::test]
+async fn a_socket_that_authenticated_first_cannot_log_in_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, ctx) = start_server(dir.path()).await;
+    let p = person(65, "Upgraded Early");
+    let token = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng?token={token}"))
+        .await
+        .unwrap();
+    let mut c = Ng::from_ws(ws).await;
+
+    // Revoked between the upgrade and the login: the socket holds a
+    // verified identity that is no longer good here.
+    ctx.core.set_revocations(revoking(&[&p.id], &[]));
+    let reply = c.request("login", json!({})).await;
+    assert_eq!(reply["error"]["code"], "revoked", "{reply}");
+}
+
+#[tokio::test]
+async fn a_reload_reads_the_lists_and_a_bad_one_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, ctx) = start_server(dir.path()).await;
+    let p = person(66, "Reloaded");
+    let mut s = ng_session(ng, &p).await;
+    let path = dir.path().join("hxd-ng.toml");
+
+    // A typo is refused, and the lists stay as they were.
+    std::fs::write(
+        &path,
+        "[ng]\n[identity]\nrevoked_identities = [\"not-a-fingerprint\"]\n",
+    )
+    .unwrap();
+    let err = hxd::reload_revocations(&ctx.core, &path).unwrap_err();
+    assert!(err.contains("not a fingerprint"), "{err}");
+    authenticate(ng, &p).await;
+
+    std::fs::write(
+        &path,
+        format!(
+            "[ng]\n[identity]\nrevoked_identities = [\"{}\"]\n",
+            p.id.fingerprint()
+        ),
+    )
+    .unwrap();
+    let (listed, ended) = hxd::reload_revocations(&ctx.core, &path).unwrap();
+    assert_eq!((listed, ended.len()), (1, 1));
+    s.event("kicked").await;
+    assert_eq!(try_authenticate(ng, &p, json!({})).await.status, 403);
+
+    // Taking it out of the file and reloading lets the key back in.
+    std::fs::write(&path, "[ng]\n[identity]\n").unwrap();
+    assert_eq!(hxd::reload_revocations(&ctx.core, &path).unwrap().0, 0);
+    authenticate(ng, &p).await;
 }

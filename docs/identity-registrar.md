@@ -1,6 +1,9 @@
 # Identity registrar — handles, revocation, rotation and key backup
 
-Status: draft, unimplemented. This is the document `hotline-ng-identity.md`
+Status: draft; one piece built. The server-local revocation list of
+§7.3 — `[identity] revoked_identities` and `revoked_devices`, written by
+`hxd identity revoke` and re-read on SIGHUP — is in hxd-ng, because it needs no registrar. Everything a
+registrar publishes is unimplemented. This is the document `hotline-ng-identity.md`
 calls "the registrar spec" and its §5.2 step 4, §8.5 and §12 wait on. It
 is deliberately the smallest registrar that closes those gaps: a first
 document that unblocks revocation and nothing more. The optional §9 is
@@ -720,6 +723,15 @@ revoked_devices` and `revoked_identities`, of fingerprints the operator
 has refused by hand. It is consulted first and needs no registrar. It
 exists so that an operator can lock out a stolen key *today*, on the one
 server they run, whatever the registrar does or does not publish.
+Refusing the next login is half of that; the other half is that the
+session the attacker already holds ends too. Installing a list — at
+startup, or when SIGHUP re-reads it — ends every session, connected or
+detached, whose transport key it now refuses, so a resume token is not
+a way back in, and a transport token minted before the revocation no
+longer redeems. What is compared is the key the socket proved, never
+the fingerprint an account is linked to: an account whose linked
+identity is revoked can still be reached with its password, which is
+not the thing that was stolen.
 
 **Banning a registrar.** `[identity] banned_registrars` lists hosts
 whose identities are refused outright, with `denied`, *before* the
@@ -1093,6 +1105,12 @@ marks *(not implemented)*:
 | `[identity.probation] clean_record` | `true` | A moderation action restarts the clock |
 | `[identity.probation] access` | the four in §7.5 | Access mask while on probation, `access-bits.md` key names |
 | `registrar_keys` | empty | Unchanged in meaning; now an override consulted before discovery (§7.1) |
+
+Server operator tools, in `hxd`, built:
+
+```sh
+hxd identity revoke    <fingerprint> [--device] [--lift]   # §7.3's local list
+```
 
 Registrar operator tools, in `hxd`:
 

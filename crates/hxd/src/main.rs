@@ -39,6 +39,31 @@ fn init_tracing() {
         .init();
 }
 
+/// SIGHUP re-reads `[identity]`'s revocation lists, and nothing else
+/// (`docs/identity-registrar.md`): an operator locking out a stolen
+/// key should not have to restart the server and drop everyone else to
+/// do it. `systemctl reload` sends exactly this.
+#[cfg(unix)]
+async fn reload_on_hangup(core: std::sync::Arc<hxd_core::Core>, path: PathBuf) {
+    let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("install SIGHUP handler: {e}; revocations need a restart");
+            return;
+        }
+    };
+    while hangup.recv().await.is_some() {
+        match hxd::reload_revocations(&core, &path) {
+            Ok((listed, ended)) => tracing::info!(
+                "SIGHUP: {listed} revoked keys installed from {}; {} sessions ended",
+                path.display(),
+                ended.len()
+            ),
+            Err(e) => tracing::error!("SIGHUP: {e}; the revocation lists are unchanged"),
+        }
+    }
+}
+
 async fn shutdown_signal() -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -72,18 +97,30 @@ enum Command {
     NewsReindex,
     /// `push rekey`.
     PushRekey,
+    /// `identity revoke <fingerprint> [--device] [--lift]`.
+    IdentityRevoke {
+        fingerprint: String,
+        what: hxd::RevokeWhat,
+        lift: bool,
+    },
 }
 
 const USAGE: &str = "usage:\n  \
 hxd [--config hxd-ng.toml]\n  \
 hxd [--config …] inbox purge <login> [--fingerprint FP] [--dry-run]\n  \
 hxd [--config …] news-reindex\n  \
-hxd [--config …] push rekey\n\n\
+hxd [--config …] push rekey\n  \
+hxd [--config …] identity revoke <fingerprint> [--device] [--lift]\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
 `push rekey` replaces the server's VAPID key and drops every registered\n\
 push device, which the old key's subscriptions were bound to; clients\n\
 re-register at their next login. Stop the server first.\n\n\
+`identity revoke` adds an identity's fingerprint to [identity]\n\
+revoked_identities in the config file, or with --device a device's to\n\
+revoked_devices; --lift takes it out again. Nothing changes in a running\n\
+server until it is sent SIGHUP (`systemctl reload`), which ends every\n\
+session the key holds.\n\n\
 `inbox purge` takes an account's mail, news subscriptions and push\n\
 devices with it when the account is deleted — otherwise the freed\n\
 login's next holder inherits them.\n\
@@ -96,6 +133,8 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut rest = Vec::new();
     let mut fingerprint = None;
     let mut dry_run = false;
+    let mut device = false;
+    let mut lift = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -112,6 +151,8 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                 );
             }
             "--dry-run" => dry_run = true,
+            "--device" => device = true,
+            "--lift" => lift = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -120,7 +161,14 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             other => rest.push(other.to_string()),
         }
     }
-    let command = match rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+    // A flag that belongs to one subcommand is refused on any other, as
+    // `--fingerprint` always was: `hxd --lift identity revok …` should
+    // not quietly start a server.
+    let words = rest.iter().map(String::as_str).collect::<Vec<_>>();
+    if (device || lift) && !matches!(words[..], ["identity", "revoke", _]) {
+        return Err("--device and --lift belong to `identity revoke`".to_string());
+    }
+    let command = match words[..] {
         // A flag that belongs to a subcommand is an error on the way to
         // serving, not something to accept and ignore: an operator who
         // typed `hxd --fingerprint … inbox purge` with a typo in the
@@ -137,6 +185,18 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
         }
         ["push", "rekey"] => Command::PushRekey,
+        ["identity", "revoke", _] if fingerprint.is_some() || dry_run => {
+            return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
+        }
+        ["identity", "revoke", fp] => Command::IdentityRevoke {
+            fingerprint: fp.to_string(),
+            what: if device {
+                hxd::RevokeWhat::Device
+            } else {
+                hxd::RevokeWhat::Identity
+            },
+            lift,
+        },
         ["inbox", "purge", login] => Command::InboxPurge {
             login: login.to_string(),
             fingerprint,
@@ -166,6 +226,36 @@ async fn main() {
                 println!("{n} rows belonging to {login} would be purged");
             } else {
                 println!("purged {n} rows belonging to {login}");
+            }
+            return Ok(());
+        }
+        if let Command::IdentityRevoke {
+            fingerprint,
+            what,
+            lift,
+        } = &command
+        {
+            let (fp, outcome) = hxd::revoke_command(&config_path, fingerprint, *what, *lift)?;
+            let kind = match what {
+                hxd::RevokeWhat::Identity => "identity",
+                hxd::RevokeWhat::Device => "device",
+            };
+            match (outcome, *lift) {
+                (hxd::RevokeOutcome::Unchanged, false) => {
+                    println!("{kind} {fp} is already revoked")
+                }
+                (hxd::RevokeOutcome::Unchanged, true) => println!("{kind} {fp} is not revoked"),
+                (hxd::RevokeOutcome::Changed, false) => println!(
+                    "revoked {kind} {fp} in {}\n\
+                     a running server applies it on SIGHUP (`systemctl reload`), \
+                     which ends every session it holds",
+                    config_path.display()
+                ),
+                (hxd::RevokeOutcome::Changed, true) => println!(
+                    "lifted the revocation of {kind} {fp} in {}\n\
+                     a running server applies it on SIGHUP (`systemctl reload`)",
+                    config_path.display()
+                ),
             }
             return Ok(());
         }
@@ -370,6 +460,8 @@ async fn main() {
         if ctx.core.push_enabled() {
             tokio::spawn(hxd::device_sweeper(ctx.core.clone()));
         }
+        #[cfg(unix)]
+        tokio::spawn(reload_on_hangup(ctx.core.clone(), config_path.clone()));
 
         // The Hotline-ng WebSocket frontend, when configured: its accept
         // loop plus the detached-session sweeper.

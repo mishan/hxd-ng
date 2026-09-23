@@ -414,12 +414,40 @@ enroll_per_address = 4              # open sessions and pending requests, per
 # allow_list = ["alice@hl.example", "<fingerprint>"]
 # registrar_keys = { "hl.example" = "<base64url public key>" }
 
+# Keys refused by hand, no registrar needed: an identity (every device of
+# it) or one device. `hxd identity revoke` below writes these for you.
+# revoked_identities = ["<fingerprint>"]
+# revoked_devices = ["<fingerprint>"]
+
 # Access bits for accounts "create" makes — same key names as an account
 # file's [access]. Absent means whatever guest has, which is rarely right.
 # [identity.default_access]
 # read_chat = true
 # send_chat = true
 ```
+
+**Revoking a stolen key.** The only other remedy for a stolen device key is
+its certificate's expiry, which is months. On this server, today:
+
+```sh
+hxd identity revoke <fingerprint>            # an identity: every device of it
+hxd identity revoke --device <fingerprint>   # one device, leaving the others
+hxd identity revoke --lift <fingerprint>     # undo either
+systemctl reload hxd                         # or kill -HUP: applies it
+```
+
+The command edits the config file in place, keeping its comments, and
+refuses to write one the server would not load. While it runs it holds
+`<config>.revoke` beside the file, so a second one at the same moment is
+refused rather than losing an entry; if a command is killed and leaves
+that file behind, remove it. Fingerprints are the
+52-character form `hlid inspect` and `hlid keygen` print. Nothing changes
+in the running server until SIGHUP, which re-reads these two lists and
+nothing else (a file that fails to load, or has gone missing, leaves the
+lists as they were): every session the key holds, connected or waiting to
+resume, ends then, its next login is refused with `revoked`, and nobody
+else is dropped. An account whose linked identity is revoked can still
+log in with its password.
 
 ### The offline inbox
 
@@ -809,7 +837,7 @@ other than this server. The last column is what this server has built.
 | [hotline-ng-auth.md](docs/hotline-ng-auth.md) | Transport authentication: the principal, the challenge and mTLS bindings, transport tokens, the TRTP tunnel, cleartext marking, tunnels and relays | yes |
 | [hotline-ng-identity.md](docs/hotline-ng-identity.md) | Portable identity: the signed objects, the identity profile at authentication, cards, account association | yes, to the registrar stub |
 | [identity-enrollment.md](docs/identity-enrollment.md) | Certifying a device through a mailbox and a pairing code instead of a paste; renewal | server side |
-| [identity-registrar.md](docs/identity-registrar.md) | The registrar: handles, revocation, rotation, freeze, key backup, transparency; what a server does with it | no |
+| [identity-registrar.md](docs/identity-registrar.md) | The registrar: handles, revocation, rotation, freeze, key backup, transparency; what a server does with it | the server-local revocation list |
 | [identity-vouch.md](docs/identity-vouch.md) | A member lending standing to a key: rules, the local and portable forms, accountability | no |
 | [identity-threat-model.md](docs/identity-threat-model.md) | What identity defends against, and what it deliberately does not | — |
 | [identity-test-vectors.json](docs/identity-test-vectors.json) | Signed objects and reject cases — the contract a second implementation is checked against | yes |

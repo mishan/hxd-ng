@@ -222,7 +222,13 @@ impl AccountFile {
                 .unwrap_or_else(|| access.has(bit::SEND_MEDIA)),
             identity: IdentityLink {
                 fingerprint,
-                identity_login: self.identity.login.unwrap_or(true),
+                // Derived true on an account with no password, whatever
+                // the file says, as the identity spec has it: there the
+                // flag would refuse the only way in, and an account nobody can reach
+                // is a state worth making unrepresentable rather than
+                // warning about. The flag is the account's own only where
+                // a password is left to fall back on.
+                identity_login: !has_password || self.identity.login.unwrap_or(true),
                 allow_self_link: self.identity.allow_self_link.unwrap_or(true),
                 reserve_name: self.identity.reserve_name.unwrap_or(false),
             },
@@ -231,11 +237,11 @@ impl AccountFile {
         }
     }
 
-    /// Is this a combination that locks everyone out (identity spec
-    /// §8.3)? No password refuses every password login, and
-    /// `identity.login = false` refuses the key that was the other way
-    /// in. `unlink` has `would_orphan` to stop the server writing this
-    /// state; nothing stops an operator typing it.
+    /// Is this a combination an operator should be told about at
+    /// startup? An invalid fingerprint on a password-less
+    /// file locks everyone out; `identity.login = false` on one would
+    /// too, so it is read as true, and the operator who wrote it is told
+    /// their setting is not the one in force.
     fn unreachable_reason(&self) -> Option<&'static str> {
         let has_password = !self.password.as_deref().unwrap_or("").is_empty();
         if has_password {
@@ -247,8 +253,8 @@ impl AccountFile {
                  identity login can reach this account; fix the fingerprint or set a password",
             ),
             Some(_) if !self.identity.login.unwrap_or(true) => Some(
-                "no password and identity.login = false, so nothing can log into this account; \
-                 set a password or allow identity login",
+                "identity.login = false is ignored on an account with no password, because it \
+                 would leave nothing able to log in; set a password for it to take effect",
             ),
             _ => None,
         }
@@ -1354,7 +1360,8 @@ mod tests {
         assert!(auth.audit().is_empty(), "a healthy directory says nothing");
 
         // §8.3's lockout: no password, a link, and identity login off.
-        // `unlink` refuses to write this state; an operator can type it.
+        // `unlink` refuses to write this state; an operator can type it,
+        // and it is read as identity login on, and said so.
         write(
             td.path(),
             "kiosk.toml",
@@ -1383,8 +1390,12 @@ mod tests {
         assert!(
             said.iter()
                 .any(|s| s.starts_with("kiosk.toml")
-                    && s.contains("nothing can log into this account")),
+                    && s.contains("identity.login = false is ignored")),
             "{said:?}"
+        );
+        assert!(
+            auth.lookup("kiosk").unwrap().identity.identity_login,
+            "the flag that would lock everyone out is not the one in force"
         );
         assert!(
             said.iter()
@@ -1408,8 +1419,8 @@ mod tests {
             "{said:?}"
         );
 
-        // A password is one way out of it, and allowing identity login
-        // is the other.
+        // A password makes the flag the account's own again: the
+        // password is the way in, and the key is refused.
         write(
             td.path(),
             "kiosk.toml",
@@ -1420,6 +1431,7 @@ mod tests {
             std::fs::remove_file(td.path().join(name)).unwrap();
         }
         assert!(auth.audit().is_empty());
+        assert!(!auth.lookup("kiosk").unwrap().identity.identity_login);
     }
 
     #[test]
@@ -1511,7 +1523,7 @@ mod tests {
         write(
             td.path(),
             "alice.toml",
-            "[identity]\nfingerprint = \"junk\"\nlogin = false\nallow_self_link = false\nreserve_name = true\n",
+            "password = \"pw\"\n[identity]\nfingerprint = \"junk\"\nlogin = false\nallow_self_link = false\nreserve_name = true\n",
         );
         let a = auth.lookup("alice").unwrap();
         assert_eq!(

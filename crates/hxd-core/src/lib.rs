@@ -17,6 +17,7 @@ pub mod media;
 pub mod news;
 pub mod notify;
 pub mod push;
+pub mod revoked;
 pub mod roster;
 pub mod system;
 pub mod video;
@@ -53,6 +54,7 @@ pub use news::{
 };
 pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};
+pub use revoked::Revocations;
 pub use roster::{
     AttachInfo, Core, Event, IdentityTag, InboxPolicy, Resume, SeqEvent, SessionStatus, Transport,
     Uid, UserDetails, UserInfo, OUTBOX_BUFFER_CAP,

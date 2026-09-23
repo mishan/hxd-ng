@@ -283,6 +283,18 @@ export async function startFailing({ config = {}, guest = true } = {}) {
   return { code, output };
 }
 
+/** Run one of `hxd`'s own subcommands against a server's config file,
+ *  the way an operator would beside the running process. Answers the
+ *  exit status and what it printed, since refusing is one of the things
+ *  a subcommand is tested for. */
+export function hxdCommand(server, args) {
+  const r = spawnSync(bin('hxd'), ['--config', join(server.dir, 'hxd-ng.toml'), ...args], {
+    cwd: server.dir,
+    encoding: 'utf8',
+  });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+
 /** Run `hlid` with its own `$HLID_HOME`, so nothing lands in the home
  *  directory of whoever ran the suite — `hlid init` and every file flag
  *  fall back to `~/.hlid`, and a test that wrote there would quietly
