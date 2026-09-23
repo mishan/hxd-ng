@@ -239,6 +239,10 @@ const MAX_DEVICES: usize = 8192;
 const MAX_CARDS: usize = 4096;
 /// Outstanding challenges. Each is 32 bytes for at most `TTL`.
 const MAX_CHALLENGES: usize = 65536;
+/// Unredeemed transport tokens. Each lives at most `TTL`, but any fresh
+/// key can mint one under the default guest policy, so a minute's worth
+/// is still a table an unauthenticated caller grows.
+const MAX_TOKENS: usize = 65536;
 /// Sweep expiry every this many inserts, rather than walking the whole
 /// map on every request — the sweep was O(n) per unauthenticated call.
 const SWEEP_EVERY: usize = 256;
@@ -247,6 +251,11 @@ struct DeviceRecord {
     cert: Vec<u8>,
     identity: PublicKey,
     expires: u64,
+    /// What the device last declared at `/identity/auth` about the hop
+    /// behind it. The key-on-file upgrade makes no declaration of its
+    /// own, so this is what it inherits: without it, a tunnel that said
+    /// `cleartext` came back through its certificate marked encrypted.
+    downstream: Downstream,
     /// When this record was last written, for eviction order.
     seen: Instant,
 }
@@ -755,13 +764,17 @@ impl IdentityState {
             downstream_cleartext: req.downstream == Downstream::Cleartext,
         };
 
-        let token = random32();
+        // A token only for a fresh `/identity/auth`. Re-admitting a device
+        // on file hands its identity straight to the upgrade that asked,
+        // and a token minted there would sit unread in the table for a
+        // minute per upgrade.
+        let token = (assoc == Assoc::Write).then(random32);
         let inst = Instant::now();
         {
             let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-            t.tokens
-                .retain(|_, (_, issued)| inst.duration_since(*issued) < TTL);
-            t.tokens.insert(hash(&token), (ident.clone(), inst));
+            if let Some(token) = &token {
+                remember_token(&mut t.tokens, hash(token), ident.clone(), inst, MAX_TOKENS);
+            }
             remember_device(
                 &mut t.devices,
                 cert.device,
@@ -769,6 +782,7 @@ impl IdentityState {
                     cert: cert_bytes,
                     identity: cert.identity,
                     expires: cert.expires,
+                    downstream: req.downstream,
                     seen: inst,
                 },
                 now,
@@ -788,7 +802,7 @@ impl IdentityState {
         if let Some(s) = card.successor {
             self.anchor(&ident, s);
         }
-        Ok((b64(&token), ident))
+        Ok((token.as_ref().map(|t| b64(t)).unwrap_or_default(), ident))
     }
 
     fn find_linked(&self, fp: &Fingerprint) -> Result<Option<Account>, AuthRefused> {
@@ -1003,21 +1017,20 @@ impl IdentityState {
     ///
     /// Re-admits read-only. The upgrade that lands here is not a fresh
     /// `/identity/auth`, so it doesn't get to repeat that call's side
-    /// effects — no link and no account creation. It shares `admit`'s
-    /// token issue, so a token is minted and dropped unread; that costs
-    /// one map insert, and having one code path decide admission is
-    /// worth more than saving it. Signatures *are* re-checked rather than the
-    /// cache's shape trusted; that's two verifications, which is why
-    /// callers run this on the blocking pool.
+    /// effects — no link, no account creation, and no token. It does
+    /// carry the `downstream` the device last declared there, since it
+    /// has no way to declare one itself. Signatures *are* re-checked
+    /// rather than the cache's shape trusted; that's two verifications,
+    /// which is why callers run this on the blocking pool.
     pub fn identity_for_device(&self, device: &PublicKey) -> Option<TransportIdentity> {
-        let (card_bytes, cert_bytes) = {
+        let (card_bytes, cert_bytes, downstream) = {
             let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
             let rec = t.devices.get(device)?;
             if rec.expires + self.cfg.clock_skew < now_unix() {
                 return None;
             }
             let card = t.cards.get(&Fingerprint::of(&rec.identity))?.bytes.clone();
-            (card, rec.cert.clone())
+            (card, rec.cert.clone(), rec.downstream)
         };
         let (c, dc) = hl_identity::verify_presented(
             &card_bytes,
@@ -1032,7 +1045,10 @@ impl IdentityState {
             dc,
             cert_bytes,
             card_bytes,
-            AuthRequest::default(),
+            AuthRequest {
+                downstream,
+                ..AuthRequest::default()
+            },
             Assoc::ReadOnly,
         )
         .ok()
@@ -1111,6 +1127,30 @@ impl IdentityState {
 
 /// Insert a device record, evicting expired entries and then the
 /// least-recently-seen if the table is at its ceiling.
+/// Insert a transport token, dropping expired ones and then, if the
+/// table is still at `cap`, the oldest. Evicting costs whoever held the
+/// oldest token a 401 and a second `/identity/auth`; refusing would cost
+/// every caller that, for as long as the flood lasts.
+fn remember_token(
+    tokens: &mut HashMap<[u8; 32], (TransportIdentity, Instant)>,
+    key: [u8; 32],
+    ident: TransportIdentity,
+    now: Instant,
+    cap: usize,
+) {
+    tokens.retain(|_, (_, issued)| now.duration_since(*issued) < TTL);
+    if tokens.len() >= cap {
+        if let Some(oldest) = tokens
+            .iter()
+            .min_by_key(|(_, (_, issued))| *issued)
+            .map(|(k, _)| *k)
+        {
+            tokens.remove(&oldest);
+        }
+    }
+    tokens.insert(key, (ident, now));
+}
+
 fn remember_device(
     devices: &mut HashMap<PublicKey, DeviceRecord>,
     key: PublicKey,
@@ -1610,6 +1650,66 @@ mod tests {
         );
         // And the card is cached byte-exactly.
         assert_eq!(st.card(&id.fingerprint()).unwrap().1, card);
+    }
+
+    #[test]
+    fn a_device_on_file_keeps_the_downstream_it_declared() {
+        // A tunnel that said `cleartext` at auth, then upgrades on its
+        // certificate alone, must still be marked cleartext: the upgrade
+        // has nowhere to say it again.
+        let st = state(IdentityConfig {
+            unattested: Unattested::Guest,
+            ..Default::default()
+        });
+        let id = IdentityKey::from_seed(&[21u8; 32]);
+        let dev = DeviceKey::from_seed(&[22u8; 32]);
+        let (card, cert) = objects(&id, &dev);
+        let proof = proof_for(&st, &dev);
+        let req = AuthRequest {
+            downstream: Downstream::Cleartext,
+            ..AuthRequest::default()
+        };
+        st.auth_with_proof(&card, &cert, &proof, req).unwrap();
+
+        let tokens = st.tables.lock().unwrap().tokens.len();
+        let on_file = st.identity_for_device(&dev.public()).unwrap();
+        assert!(on_file.downstream_cleartext);
+        // And re-admitting mints no token nobody will redeem.
+        assert_eq!(st.tables.lock().unwrap().tokens.len(), tokens);
+
+        // A later auth that says `local` is what the device is now.
+        let proof = proof_for(&st, &dev);
+        st.auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .unwrap();
+        assert!(
+            !st.identity_for_device(&dev.public())
+                .unwrap()
+                .downstream_cleartext
+        );
+    }
+
+    #[test]
+    fn the_token_table_is_bounded() {
+        let st = state(IdentityConfig {
+            unattested: Unattested::Guest,
+            ..Default::default()
+        });
+        let id = IdentityKey::from_seed(&[23u8; 32]);
+        let dev = DeviceKey::from_seed(&[24u8; 32]);
+        let (card, cert) = objects(&id, &dev);
+        let proof = proof_for(&st, &dev);
+        let (_, ident) = st
+            .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .unwrap();
+
+        let mut tokens = HashMap::new();
+        let start = Instant::now();
+        for i in 0..3u8 {
+            let at = start + Duration::from_millis(u64::from(i));
+            remember_token(&mut tokens, [i; 32], ident.clone(), at, 2);
+        }
+        assert_eq!(tokens.len(), 2);
+        assert!(!tokens.contains_key(&[0u8; 32]), "the oldest goes first");
     }
 
     #[test]

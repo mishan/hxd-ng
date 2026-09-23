@@ -1337,9 +1337,12 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
             )
         }
     };
-    let downstream = match body.get("downstream").and_then(Value::as_str) {
-        None | Some("local") | Some("loopback") => Downstream::Local,
-        Some("cleartext") => Downstream::Cleartext,
+    // Absent is the default; anything else must be one of the three
+    // strings. A `null` or a number is a client bug, and reading it as
+    // `local` would mark a tunnel that meant to say `cleartext` encrypted.
+    let downstream = match body.get("downstream").map(Value::as_str) {
+        None | Some(Some("local" | "loopback")) => Downstream::Local,
+        Some(Some("cleartext")) => Downstream::Cleartext,
         Some(_) => {
             return plain(
                 StatusCode::BAD_REQUEST,
