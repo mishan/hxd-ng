@@ -1,0 +1,47 @@
+# hxd-ng with Docker Compose, behind a proxy on the host (docker/nginx.conf).
+#
+#   docker compose -f docker/compose.yaml up -d --build
+#
+# docs/docker.md lists every variable.
+
+# Named, so the container is `hxd-ng` whichever directory this is run
+# from, and the commands in docs/docker.md work as written.
+name: hxd-ng
+
+services:
+  hxd-ng:
+    build:
+      context: ..
+    image: hxd-ng
+    container_name: hxd-ng
+    restart: unless-stopped
+    ports:
+      - "5500:5500"             # legacy Hotline
+      - "5501:5501"             # HTXF file transfers: legacy port + 1
+      # - "5504:5504/udp"       # voice media, with HXD_VOICE_ADVERTISE
+      - "127.0.0.1:5700:5700"   # ng: only the proxy on this host reaches it
+    environment:
+      HXD_NAME: "My Hotline Server"
+      # nginx on the host reaches the loopback-published port through
+      # Docker, which connects from the network's gateway. Trusting the
+      # gateway is safe only while 5700 is published on loopback alone:
+      # published on any other address, every client arrives from there.
+      HXD_NG_TRUSTED_PROXIES: "127.0.0.1,::1,gateway"
+      HXD_ADMIN_LOGIN: admin
+      # Read from the shell or docker/.env. The first start needs it, and
+      # refuses to run without it; once accounts/admin.toml exists it is
+      # not read again, so it can be removed, and a new password goes in
+      # that file.
+      HXD_ADMIN_PASSWORD: ${HXD_ADMIN_PASSWORD:-}
+      # HXD_IDENTITY_WEB: "https://hl.example/app/"
+      # HXD_PUSH_CONTACT: "mailto:admin@hl.example"
+      # HXD_VOICE_ADVERTISE: "203.0.113.5"
+      # HXD_FILES_ROOT: /srv/files
+      # HXD_TRACKERS: "hltracker.com"
+      # HXD_REVOKED_IDENTITIES: ""
+    volumes:
+      - hxd-ng:/var/lib/hxd-ng
+      # - /srv/hotline/files:/srv/files
+
+volumes:
+  hxd-ng:

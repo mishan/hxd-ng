@@ -68,6 +68,13 @@ been exercised on newer toolchains; CI runs stable.
 `npm install` in tools/ for the `ws` fallback) — `/drop` exercises
 detach/resume, `/msg` PMs by nick or uid.
 
+`Dockerfile` and `docker/` are the operator's image: `entrypoint.sh`
+writes a config from `HXD_*` variables at each start unless one is
+mounted, and `docs/docker.md` lists them. A config key worth an
+operator's variable gets one there. `.github/workflows/docker.yml`
+builds the image on every PR and runs `docker/smoke-test.sh` against
+it; a merge to main then publishes it to GHCR.
+
 ## Invariants that matter
 
 **The domain is UTF-8 and wire-free.** A legacy connection's encoding
@@ -226,6 +233,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 node --check tools/ng-client.mjs
 cd e2e && npm install && npm test   # needs a sibling ../hx-ng; CI pins it
+docker build -t hxd-ng . && docker/smoke-test.sh hxd-ng
 ```
 
 The best end-to-end check of all: point a real GtkHx at the legacy port
