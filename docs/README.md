@@ -46,7 +46,7 @@ to another project.
 | [system-account.md](system-account.md) — the reserved server account: commands and notifications on the classic wire | partial | all | design |
 | [voice.md](voice.md) — the SFU, one room across both signalling wires | yes | extended, ng | design, implements a fogWraith spec |
 | [capabilities-video.md](capabilities-video.md) — video publications and subscriptions | yes | ng; extended when GtkHx renders | spec, contributed to fogWraith's set |
-| [files-plan.md](files-plan.md) — the file area's first slice | no | all | design |
+| [files-plan.md](files-plan.md) — the file area: browsing, downloads, the local area and uploads | yes, less folders and file management | all (ng browses and downloads) | design |
 | [file-sources.md](file-sources.md) — exploratory background for files | superseded | — | design |
 | [tracker-registration.md](tracker-registration.md) — HTRK v1/v3 server heartbeats, authentication and operator configuration | yes | server infrastructure | design; implements fogWraith specs |
 
