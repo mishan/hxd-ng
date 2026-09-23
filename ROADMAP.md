@@ -398,7 +398,7 @@ In rough order of value-for-effort:
    modern client benefits. **Implemented 2026-09**: bit 1 is always
    offered (nothing needs wiring), a `TextEncoding` fixed at login carries
    every text field in and out, wire byte caps cut at character
-   boundaries, and bodies leave with the reader's line ending. The chat
+   boundaries, inbound caps count characters, and bodies leave with the reader's line ending. The chat
    line's leading `\r` stays on both — it is framing, not text. Not done:
    a `DefaultTextEncoding`-style config (Shift-JIS / Latin-1 legacy
    communities) and HOPE `app_id` sniffing, and file names stay within

@@ -332,6 +332,15 @@ fn wire_nick(enc: TextEncoding, nick: &str) -> Vec<u8> {
     enc.encode_capped(nick, 31)
 }
 
+/// A chat subject, cut to the wire's 255 bytes after conversion. Inbound
+/// the cap is 255 characters, which UTF-8 can carry in up to four times
+/// the bytes, and a subject can come from an ng client with no cap of
+/// this wire's at all; a classic client reads the field as the 255 its
+/// own sends are held to.
+fn wire_subject(enc: TextEncoding, subject: &str) -> Vec<u8> {
+    enc.encode_capped(subject, 255)
+}
+
 /// The legacy color field is a bitfield in practice: bit 1 away, bit 2
 /// admin. The domain stores `admin` + status; the wire form is derived
 /// here and only here.
@@ -1007,12 +1016,13 @@ async fn login_phase(
     // before the backend sees them, so an accented password typed on a
     // legacy client matches the UTF-8 account file, and matches it
     // whichever encoding the client negotiated. (HOPE proofs will need
-    // this same canonical form.) The wire's 31-byte cap applies to what
-    // was sent, as it always has.
+    // this same canonical form.) The wire's cap of 31 applies in
+    // characters, which is bytes for Mac Roman as it always was, so a
+    // password cuts at the same place whichever encoding sent it.
     let auth = ctx.auth.clone();
     let core = ctx.core.clone();
-    let login_str = enc.decode_capped(&req.login, 31);
-    let password = enc.decode_capped(&req.password, 31).into_bytes();
+    let login_str = enc.decode_chars(&req.login, 31);
+    let password = enc.decode_chars(&req.password, 31).into_bytes();
     let identity_fp = transport.identity.as_ref().map(|t| t.fingerprint);
     let policy = ctx.cfg.trtp_login;
     let verdict = tokio::task::spawn_blocking(move || {
@@ -1049,7 +1059,7 @@ async fn login_phase(
     // the client's own nick to stick; otherwise the account name rules.
     let got_name = req.nick.is_some();
     let nick = match (&req.nick, account.access.has(bit::USE_ANY_NAME)) {
-        (Some(n), true) => enc.decode_capped(n, 31),
+        (Some(n), true) => enc.decode_chars(n, 31),
         _ => account.name.clone(),
     };
 
@@ -1322,7 +1332,7 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
                 hdr::CHAT_SUBJECT,
                 vec![
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
-                    (tag::CHAT_SUBJECT, sess.enc.encode(&subject)),
+                    (tag::CHAT_SUBJECT, wire_subject(sess.enc, &subject)),
                 ],
             );
         }
@@ -1572,7 +1582,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .collect();
             chunks.push((
                 tag::CHAT_SUBJECT,
-                sess.enc.encode(&ctx.core.public_subject()),
+                wire_subject(sess.enc, &ctx.core.public_subject()),
             ));
             reply(tx, f.trans, chunks);
             // Optional compatibility replay, only for clients that did
@@ -1612,7 +1622,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::NAME if sess.can(bit::USE_ANY_NAME) => {
-                        nick = Some(sess.enc.decode_capped(c.data, 31));
+                        nick = Some(sess.enc.decode_chars(c.data, 31));
                     }
                     tag::ICON => icon = Some(c.as_uint() as u16),
                     _ => {}
@@ -1630,7 +1640,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::NAME if sess.can(bit::USE_ANY_NAME) => {
-                        nick = Some(sess.enc.decode_capped(c.data, 31));
+                        nick = Some(sess.enc.decode_chars(c.data, 31));
                     }
                     tag::ICON => {
                         let v = c.as_uint() as u16;
@@ -2050,6 +2060,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     transfer_len,
                     large,
                     resume_requested,
+                    comment_utf8: sess.enc == TextEncoding::Utf8,
                 },
             )
             .await;
@@ -2277,8 +2288,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::CHAT_ID => cid = c.as_uint(),
-                    tag::CHAT_SUBJECT => subject = Some(sess.enc.decode_capped(c.data, 255)),
-                    tag::PASSWORD => password = Some(sess.enc.decode_capped(c.data, 31)),
+                    tag::CHAT_SUBJECT => subject = Some(sess.enc.decode_chars(c.data, 255)),
+                    tag::PASSWORD => password = Some(sess.enc.decode_chars(c.data, 31)),
                     _ => {}
                 }
             }
@@ -2369,7 +2380,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             for c in f.chunks() {
                 match c.tag {
                     tag::CHAT_ID => cid = c.as_uint(),
-                    tag::PASSWORD => password = sess.enc.decode_capped(c.data, 31),
+                    tag::PASSWORD => password = sess.enc.decode_chars(c.data, 31),
                     _ => {}
                 }
             }
@@ -2384,7 +2395,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             )
                         })
                         .collect();
-                    chunks.push((tag::CHAT_SUBJECT, sess.enc.encode(&subject)));
+                    chunks.push((tag::CHAT_SUBJECT, wire_subject(sess.enc, &subject)));
                     reply(tx, f.trans, chunks);
                 }
                 Err(e) => reply_error(tx, f.trans, err_text(e)),

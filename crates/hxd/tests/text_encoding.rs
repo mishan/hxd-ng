@@ -34,8 +34,11 @@ const REQ_USER_GETLIST: u32 = 0x12c;
 const KLEIN_NICK: &str = "Zo\u{eb} \u{65e5}\u{672c}";
 /// A name Mac Roman spells exactly.
 const CLASSIC_NICK: &str = "Andr\u{e9}";
-/// Both clients log in with it, each in its own encoding.
-const PASSWORD: &str = "p\u{e4}ss";
+/// Both clients log in with it, each in its own encoding. Twenty-two
+/// characters: 22 bytes in Mac Roman and 36 in UTF-8, past the wire's
+/// cap of 31, which is counted in characters so both get in.
+const PASSWORD: &str =
+    "p\u{e4}ss w\u{f6}rd \u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}\u{e4}";
 
 async fn start_server(dir: &Path, agreement: &str) -> SocketAddr {
     let accounts = dir.join("accounts");
@@ -44,7 +47,8 @@ async fn start_server(dir: &Path, agreement: &str) -> SocketAddr {
         accounts.join("member.toml"),
         format!(
             "name = \"Member\"\npassword = \"{PASSWORD}\"\n[access]\nread_chat = true\n\
-             send_chat = true\nsend_msgs = true\nuse_any_name = true\n"
+             send_chat = true\nsend_msgs = true\nuse_any_name = true\n\
+             create_pchats = true\n"
         ),
     )
     .unwrap();
@@ -293,7 +297,8 @@ async fn a_utf8_nick_is_cut_on_a_character() {
     let td = tempfile::tempdir().unwrap();
     let addr = start_server(td.path(), "hi").await;
     // Eleven three-byte characters: 33 bytes, over the wire's 31. The
-    // server keeps ten whole ones rather than ten and a broken tail.
+    // name is kept whole (eleven characters is under the cap of 31), and
+    // the list sends ten whole ones rather than ten and a broken tail.
     let long = "\u{3042}".repeat(11);
     let mut klein = Client::login(addr, &long, true).await;
     let t = klein.send(REQ_USER_GETLIST, &[]).await;
@@ -306,4 +311,62 @@ async fn a_utf8_nick_is_cut_on_a_character() {
         .next()
         .unwrap();
     assert_eq!(mine, "\u{3042}".repeat(10).as_bytes());
+}
+
+const REQ_CHAT_CREATE: u32 = 0x70;
+const REQ_CHAT_JOIN: u32 = 0x73;
+const REQ_CHAT_SUBJECT: u32 = 0x78;
+
+#[tokio::test]
+async fn a_private_chat_password_and_subject_cross_encodings() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start_server(td.path(), "hi").await;
+    let mut host = Client::login(addr, CLASSIC_NICK, false).await;
+    // Invited, so let in without the password: only there to open the
+    // chat to someone other than the joiner.
+    let guest = Client::login(addr, "guest", false).await;
+    let mut joiner = Client::login(addr, KLEIN_NICK, true).await;
+
+    let t = host
+        .send(
+            REQ_CHAT_CREATE,
+            &[(tag::UID, guest.uid.to_be_bytes().to_vec())],
+        )
+        .await;
+    let created = host.recv_type(HDR_TASK).await;
+    assert_eq!((created.trans, created.flag), (t, 0));
+    let cid = chunk(&created, tag::CHAT_ID).unwrap();
+
+    // Set in Mac Roman: twenty accented letters, which UTF-8 carries in
+    // forty bytes, and a subject of 255, which it carries in 510.
+    let password = "\u{e4}".repeat(20);
+    let subject = "\u{e4}".repeat(255);
+    host.send(
+        REQ_CHAT_SUBJECT,
+        &[
+            (tag::CHAT_ID, cid.clone()),
+            (tag::CHAT_SUBJECT, text::from_utf8(&subject)),
+            (tag::PASSWORD, text::from_utf8(&password)),
+        ],
+    )
+    .await;
+
+    // Typed right, in UTF-8: let in, and handed a subject cut to the
+    // wire's 255 bytes on a character.
+    let t = joiner
+        .send(
+            REQ_CHAT_JOIN,
+            &[
+                (tag::CHAT_ID, cid.clone()),
+                (tag::PASSWORD, password.as_bytes().to_vec()),
+            ],
+        )
+        .await;
+    let joined = joiner.recv_type(HDR_TASK).await;
+    assert_eq!(joined.trans, t);
+    assert_eq!(joined.flag, 0, "the right password in UTF-8 must join");
+    assert_eq!(
+        chunk(&joined, tag::CHAT_SUBJECT).unwrap(),
+        "\u{e4}".repeat(127).as_bytes()
+    );
 }

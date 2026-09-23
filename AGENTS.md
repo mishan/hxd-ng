@@ -75,12 +75,13 @@ through the connection's `TextEncoding`: Mac Roman, or UTF-8 when the
 client negotiated Text-Encoding (capability bit 1). Mac Roman converts on
 ingest (injective, so legacy-origin text round-trips exactly) and converts
 with `?`-for-unmappable on egress; either way the wire's byte caps (31 for
-a nick) apply *after* conversion, at a character boundary, and a body
-leaves with that connection's line ending (CR or LF) whatever the sender
-used. Credentials are canonicalized to UTF-8 from the connection's
-encoding before any auth backend sees them — HOPE proofs must use the
-same canonical form when that lands. Never let a wire
-type or encoding leak into `hxd-core`'s API; that separation is what makes
+a nick) apply *after* conversion, at a character boundary. Inbound, a
+login, password, nick or subject is capped in characters, so one typed
+on either wire cuts at the same place. A body leaves with that
+connection's line ending (CR or LF) whatever the sender used.
+Credentials are canonicalized to UTF-8 from the connection's encoding
+before any auth backend sees them — HOPE proofs must use the same
+canonical form when that lands. Never let a wire type or encoding leak into `hxd-core`'s API; that separation is what makes
 the ng frontend (and any future one) possible.
 
 **Presence is user-scoped, not connection-scoped.** A `UserSession` owns a

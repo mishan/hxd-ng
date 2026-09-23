@@ -44,6 +44,10 @@ pub struct UploadTransfer {
     pub transfer_len: Option<u64>,
     pub large: bool,
     pub resume_requested: bool,
+    /// The uploader's text is UTF-8 (`CAPABILITY_TEXT_ENCODING`). The
+    /// comment is stored as Mac Roman whichever wire it came from, since
+    /// that is what the sidecar holds and what every reader decodes.
+    pub comment_utf8: bool,
 }
 
 pub async fn prepare_legacy(
@@ -127,6 +131,7 @@ pub async fn prepare_upload(
         transfer_len: request.transfer_len,
         large: request.large,
         quote: quote.clone(),
+        comment_utf8: request.comment_utf8,
     }))?;
     Ok((reference, quote))
 }
@@ -406,7 +411,12 @@ async fn receive_legacy(
     spend(&mut budget, info_header.length)?;
     let mut info = vec![0; info_header.length as usize];
     read_exact_timeout(stream, &mut info, timeout).await?;
-    let parsed = ffo::parse_info(&info).map_err(|_| FileError::InvalidPath)?;
+    let mut parsed = ffo::parse_info(&info).map_err(|_| FileError::InvalidPath)?;
+    // Unmappable characters become `?`, as on every other Mac Roman
+    // path; stored raw, a UTF-8 comment would read back as mojibake.
+    if transfer.comment_utf8 {
+        parsed.comment = hxproto::text::from_utf8(&String::from_utf8_lossy(&parsed.comment));
+    }
     let mut data_header = [0; ffo::FORK_HEADER_LEN];
     spend(&mut budget, data_header.len() as u64)?;
     read_exact_timeout(stream, &mut data_header, timeout).await?;

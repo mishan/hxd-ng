@@ -15,10 +15,15 @@
 //! - **Line endings.** A body leaves as CR for Mac Roman and LF for
 //!   UTF-8, whichever the sender's wire gave the domain (the spec's
 //!   normalization; see [`TextEncoding::body`]).
-//! - **Length caps.** The wire's byte limits (31 for a nick, 255 for a
-//!   subject) stay the same, but a UTF-8 cut must land on a character
-//!   boundary or the client receives a broken sequence. Mac Roman is one
-//!   byte per character, so the same code cuts it where it always has.
+//! - **Length caps.** Outbound, the wire's byte limits (31 for a nick,
+//!   255 for a subject) stay the same, but a UTF-8 cut must land on a
+//!   character boundary or the client receives a broken sequence.
+//!   Inbound, a name, password or subject is capped in characters
+//!   ([`TextEncoding::decode_chars`]), so the same text means the same
+//!   thing from either wire: a password of twenty accented letters is
+//!   twenty bytes in Mac Roman and forty in UTF-8, and a byte cap would
+//!   let one client in and turn the other away. Mac Roman is one byte
+//!   per character, so every cap lands where it always has.
 
 use hxproto::text;
 
@@ -143,6 +148,18 @@ impl TextEncoding {
             TextEncoding::Utf8 => {
                 String::from_utf8_lossy(&bytes[..complete_prefix(bytes)]).into_owned()
             }
+        }
+    }
+
+    /// [`Self::decode`] of at most the first `max` characters: for the
+    /// fields whose limit is a length the user sees (a login, a password,
+    /// a nick, a subject), which must cut the same text at the same place
+    /// whichever encoding carried it. The frame's own cap bounds the
+    /// bytes.
+    pub fn decode_chars(self, bytes: &[u8], max: usize) -> String {
+        match self {
+            TextEncoding::MacRoman => text::to_utf8(&bytes[..bytes.len().min(max)]),
+            TextEncoding::Utf8 => String::from_utf8_lossy(bytes).chars().take(max).collect(),
         }
     }
 
@@ -297,6 +314,22 @@ mod tests {
         assert_eq!(MR.decode_capped(b"abc\x8e", 3), "abc");
         // A genuinely broken byte before the cut is still replaced.
         assert_eq!(U8.decode_capped(b"a\xffb\xc3", 4), "a\u{fffd}b");
+    }
+
+    #[test]
+    fn a_character_cap_cuts_the_same_text_from_either_wire() {
+        let password = "\u{e4}".repeat(20);
+        let mac = MR.encode(&password);
+        let utf = U8.encode(&password);
+        assert_eq!((mac.len(), utf.len()), (20, 40));
+        assert_eq!(MR.decode_chars(&mac, 31), password);
+        assert_eq!(U8.decode_chars(&utf, 31), password);
+        // Past the cap, both keep the same first 31 characters.
+        let long = "\u{e4}".repeat(40);
+        let want = "\u{e4}".repeat(31);
+        assert_eq!(MR.decode_chars(&MR.encode(&long), 31), want);
+        assert_eq!(U8.decode_chars(&U8.encode(&long), 31), want);
+        assert_eq!(MR.decode_chars(b"abcdef", 3), "abc");
     }
 
     #[test]
