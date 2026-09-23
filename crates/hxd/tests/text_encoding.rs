@@ -66,6 +66,7 @@ async fn start_server(dir: &Path, agreement: &str) -> SocketAddr {
             caps: Caps::empty().with(cap::TEXT_ENCODING),
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
+            news: Default::default(),
         }),
         files: None,
     };

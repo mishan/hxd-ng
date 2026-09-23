@@ -11,9 +11,9 @@ use std::time::{Duration, SystemTime};
 
 use super::query::{words, Field, Term};
 use super::{
-    Article, ArticleId, ArticlePage, Author, BodyType, Hit, NewNode, NewPost, NewsError, NewsStore,
-    Node, NodeId, NodeKind, Posted, Reference, SearchPage, SearchQuery, SubScope, Subscriber,
-    Subscription, ThreadHead, ThreadPage, ThreadQuery,
+    Article, ArticleId, ArticlePage, Author, BodyType, Hit, Listed, NewNode, NewPost, NewsError,
+    NewsStore, Node, NodeId, NodeKind, Posted, Reference, SearchPage, SearchQuery, SubScope,
+    Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery,
 };
 use crate::inbox::{Mailbox, StoreError};
 
@@ -195,6 +195,15 @@ impl Inner {
         self.nodes.iter_mut().find(|n| n.id == id)
     }
 
+    /// `id` as a category, or why it is not one.
+    fn category(&self, id: NodeId) -> Result<&NodeRow, NewsError> {
+        let node = self.node(id).ok_or(NewsError::NoSuchNode)?;
+        if node.kind != NodeKind::Category {
+            return Err(NewsError::NotACategory);
+        }
+        Ok(node)
+    }
+
     fn row(&self, id: ArticleId) -> Option<&ArticleRow> {
         self.articles.iter().find(|a| a.id == id)
     }
@@ -250,6 +259,7 @@ impl Inner {
             subject: a.subject.clone(),
             body: a.body.clone(),
             mime: a.mime,
+            plain: a.plain.clone(),
             at: a.at,
             deleted: a.deleted,
             refs,
@@ -816,6 +826,63 @@ impl NewsStore for MemoryNews {
     fn reindex(&self) -> Result<u64, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.articles.iter().filter(|a| !a.deleted).count() as u64)
+    }
+
+    fn listing(&self, category: NodeId, limit: usize) -> Result<Vec<Listed>, NewsError> {
+        let inner = self.inner.lock().unwrap();
+        inner.category(category)?;
+        let mut roots: Vec<&ArticleRow> = inner
+            .articles
+            .iter()
+            .filter(|a| a.category == category && a.parent.is_none())
+            .filter(|r| inner.articles.iter().any(|a| a.root == r.id && !a.deleted))
+            .collect();
+        roots.sort_by_key(|a| std::cmp::Reverse(a.id));
+        let mut out = Vec::new();
+        for root in roots {
+            let mut thread: Vec<&ArticleRow> = inner
+                .articles
+                .iter()
+                .filter(|a| a.root == root.id)
+                .collect();
+            thread.sort_by(|a, b| a.path.cmp(&b.path));
+            if !out.is_empty() && out.len() + thread.len() > limit {
+                break;
+            }
+            let room = limit - out.len();
+            out.extend(thread.into_iter().take(room).map(|a| Listed {
+                id: a.id,
+                parent: a.parent,
+                root: a.root,
+                at: a.at,
+                subject: a.subject.clone(),
+                nick: a.author.nick.clone(),
+                mime: a.mime,
+                deleted: a.deleted,
+                body_len: TextLen::of(&a.body),
+                plain_len: a.plain.as_deref().map(TextLen::of),
+            }));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn recent(&self, category: NodeId, limit: usize) -> Result<Vec<Article>, NewsError> {
+        let inner = self.inner.lock().unwrap();
+        inner.category(category)?;
+        let mut rows: Vec<&ArticleRow> = inner
+            .articles
+            .iter()
+            .filter(|a| a.category == category)
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.id));
+        Ok(rows
+            .into_iter()
+            .take(limit)
+            .map(|a| inner.view(a))
+            .collect())
     }
 
     fn subscribe(

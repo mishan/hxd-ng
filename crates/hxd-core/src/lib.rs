@@ -47,10 +47,10 @@ pub use media::{
 };
 pub use news::{
     Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, AttachmentPolicy, Author,
-    AutoFollow, AutoSubscribe, BlobId, BlobStore, BodyRenderer, BodyType, MarkdownMode, MemoryNews,
-    NewsError, NewsPolicy, NewsStore, Node, NodeId, NodeKind, NodeTree, Notified, NotifyPolicy,
-    NotifyReason, PostRequest, Reference, Rendered, StagedAttachment, SubScope, Subscriber,
-    Subscription, ThreadHead, ThreadPage, ThreadQuery,
+    AutoFollow, AutoSubscribe, BlobId, BlobStore, BodyRenderer, BodyType, Listed, MarkdownMode,
+    MemoryNews, NewsError, NewsPolicy, NewsStore, Node, NodeId, NodeKind, NodeTree, Notified,
+    NotifyPolicy, NotifyReason, PostRequest, Reference, Rendered, StagedAttachment, SubScope,
+    Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery,
 };
 pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};

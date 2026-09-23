@@ -54,6 +54,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             caps: hxd_session::Caps::empty(),
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
+            news: Default::default(),
         }),
         files: None,
     };

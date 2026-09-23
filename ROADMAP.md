@@ -356,9 +356,15 @@ and attachments.** These have landed:
 
 Both stores pass the conformance suites, and hx-ng's News view is the
 first client, rendering markdown articles, and chat in GtkHx's dialect.
-Next, in the order `docs/news.md` §16 allows: moderation (W8), and the legacy
-binding that closes this phase (W9).
-`hxd-session` still dispatches no news opcode.
+- the legacy binding (W9): the 1.5 threaded-news transactions over the
+  same tree, with a markdown article's plain-text part beside its
+  source, and 1.2 flat news as a rendering of the one category
+  `flat_category` names — read newest first, posted into with
+  `Subject:` / `Re:` headers, and pushed to every reader whichever wire
+  the post came from.
+
+Left: moderation (W8), and two deferred parts of W9 — the `image/*` part
+a 1.5 client would fetch a derivative by, and the mhxd importer.
 
 ## Phase 5 — Hardening and parity extras
 

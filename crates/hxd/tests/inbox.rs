@@ -88,6 +88,7 @@ async fn start_full(dir: &Path, policy: InboxPolicy, who: &[&str], inbox: bool) 
             caps: hxd_session::Caps::empty(),
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
+            news: Default::default(),
         }),
         files: None,
     };

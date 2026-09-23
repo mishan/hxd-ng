@@ -354,5 +354,7 @@ describe('a news section the server cannot honor', () => {
     assert.match(alone.output, /\[news\] needs db/);
     const none = await startFailing({ config: { news: { db: 'news.sqlite', attach: { max_count: 0 } } } });
     assert.match(none.output, /\[news\.attach\]/);
+    const flat = await startFailing({ config: { news: { db: 'news.sqlite', flat_reply: 'newest' } } });
+    assert.match(flat.output, /flat_reply/);
   });
 });

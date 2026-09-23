@@ -1214,7 +1214,7 @@ dependencies = [
 [[package]]
 name = "hxfiles-xfer"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=630118705b7c081bc1f31748595b53dad7ae7e78#630118705b7c081bc1f31748595b53dad7ae7e78"
+source = "git+https://github.com/mishan/hx-libs.git?rev=e148fa1dcfeb4220fd5416f667935c8a865a8a68#e148fa1dcfeb4220fd5416f667935c8a865a8a68"
 dependencies = [
  "sha2",
 ]
@@ -1222,12 +1222,12 @@ dependencies = [
 [[package]]
 name = "hxhfs"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=630118705b7c081bc1f31748595b53dad7ae7e78#630118705b7c081bc1f31748595b53dad7ae7e78"
+source = "git+https://github.com/mishan/hx-libs.git?rev=e148fa1dcfeb4220fd5416f667935c8a865a8a68#e148fa1dcfeb4220fd5416f667935c8a865a8a68"
 
 [[package]]
 name = "hxproto"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=630118705b7c081bc1f31748595b53dad7ae7e78#630118705b7c081bc1f31748595b53dad7ae7e78"
+source = "git+https://github.com/mishan/hx-libs.git?rev=e148fa1dcfeb4220fd5416f667935c8a865a8a68#e148fa1dcfeb4220fd5416f667935c8a865a8a68"
 
 [[package]]
 name = "hyper"

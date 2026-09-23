@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     ArticleId, Author, AutoFollow, BodyType, CompiledQuery, NewNode, NewPost, NewsError, NewsStore,
-    NodeId, NodeKind, Posted, SearchOrder, SearchQuery, SubScope, ThreadQuery,
+    NodeId, NodeKind, Posted, SearchOrder, SearchQuery, SubScope, TextLen, ThreadQuery,
 };
 use crate::inbox::Mailbox;
 
@@ -60,6 +60,10 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     linking_rotating_and_deleting_move_the_rows(&*new_store());
     rows_go_with_what_they_follow(&*new_store());
     a_listing_is_newest_first_and_says_what_it_follows(&*new_store());
+    // The legacy wire: a category as one 1.5 listing, and as 1.2 news.
+    a_legacy_listing_is_whole_threads_newest_first(&*new_store());
+    a_legacy_listing_measures_rather_than_carries(&*new_store());
+    the_flat_view_is_the_newest_articles_tombstones_and_all(&*new_store());
 }
 
 /// The corpus the search cases share: two categories, three authors, and
@@ -892,10 +896,15 @@ fn a_downgrade_is_what_search_reads(s: &dyn NewsStore) {
         )
     };
     let id = s.post(&marked, 32, 32).unwrap().id;
+    let stored = s.article(id).unwrap().unwrap();
     assert_eq!(
-        s.article(id).unwrap().unwrap().body,
-        "**asterisks** and [a link](https://hl.example/path)",
+        stored.body, "**asterisks** and [a link](https://hl.example/path)",
         "the source is what is stored and served"
+    );
+    assert_eq!(
+        stored.plain.as_deref(),
+        Some("the words a reader sees"),
+        "and the downgrade beside it, for the wire that reads text"
     );
     assert_eq!(found(s, &query("reader")), [id], "the downgrade is indexed");
     assert!(
@@ -1065,6 +1074,7 @@ fn an_article_round_trips_whole(s: &dyn NewsStore) {
     assert_eq!(a.subject, "about hello\nworld");
     assert_eq!(a.body, "hello\nworld");
     assert_eq!(a.mime, BodyType::Plain);
+    assert_eq!(a.plain, None, "a plain body is its own plain text");
     assert_eq!(a.at, t(1_789_000_000));
     assert!(!a.deleted);
     assert!(a.refs.is_empty());
@@ -1364,6 +1374,128 @@ fn a_thread_of_nothing_but_tombstones_is_not_listed(s: &dyn NewsStore) {
     assert_eq!(listed(s), [busy], "a live reply keeps its thread listed");
     s.tombstone(reply, "m", t(5)).unwrap();
     assert!(listed(s).is_empty());
+}
+
+fn a_legacy_listing_is_whole_threads_newest_first(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let elsewhere = category(s, "Elsewhere");
+    let old = post(s, cat, None, "old", 1);
+    let dead = post(s, cat, None, "dead", 2);
+    let busy = post(s, cat, None, "busy", 3);
+    let first = post(s, cat, Some(busy), "first", 4);
+    let late = post(s, cat, Some(old), "late reply to old", 5);
+    let deep = post(s, cat, Some(first), "deep", 6);
+    let second = post(s, cat, Some(busy), "second", 7);
+    post(s, elsewhere, None, "not here", 8);
+    s.tombstone(dead, "m", t(9)).unwrap();
+    s.tombstone(first, "m", t(9)).unwrap();
+
+    let ids = |limit| {
+        s.listing(cat, limit)
+            .unwrap()
+            .iter()
+            .map(|l| l.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(100),
+        [busy, first, deep, second, old, late],
+        "newest thread first, each in preorder, a dead thread left out"
+    );
+    assert_eq!(
+        ids(5),
+        [busy, first, deep, second],
+        "a thread that does not fit is left out whole"
+    );
+    assert_eq!(
+        ids(2),
+        [busy, first],
+        "a first thread that cannot fit is cut in preorder"
+    );
+
+    let all = s.listing(cat, 100).unwrap();
+    let stone = &all[1];
+    assert!(stone.deleted);
+    assert_eq!((stone.subject.as_str(), stone.nick.as_str()), ("", ""));
+    assert_eq!(stone.body_len, TextLen::default());
+    assert_eq!((stone.parent, stone.root), (Some(busy), busy));
+    let reply = &all[2];
+    assert_eq!(
+        (reply.parent, reply.root, reply.at),
+        (Some(first), busy, t(6))
+    );
+    assert_eq!(
+        (reply.subject.as_str(), reply.nick.as_str()),
+        ("about deep", "Alice")
+    );
+
+    assert!(s.listing(elsewhere, 100).unwrap().len() == 1);
+    let bundle = node(s, None, NodeKind::Bundle, "Bundle");
+    assert_eq!(s.listing(bundle, 10), Err(NewsError::NotACategory));
+    assert_eq!(s.listing(9999, 10), Err(NewsError::NoSuchNode));
+}
+
+fn a_legacy_listing_measures_rather_than_carries(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    // Two-byte and three-byte characters, and a NUL, which is where a
+    // count in SQL stops if nothing stops it stopping.
+    let body = "caf\u{e9} \u{2014} a\0b";
+    let plain_id = post(s, cat, None, body, 1);
+    let marked = NewPost {
+        mime: BodyType::Markdown,
+        plain: Some("\u{3042}\u{3044}".into()),
+        ..new_post(cat, None, "**bold**", 2)
+    };
+    let marked_id = s.post(&marked, 32, 32).unwrap().id;
+    let listed = s.listing(cat, 10).unwrap();
+    assert_eq!(listed[0].id, marked_id);
+    assert_eq!(listed[0].mime, BodyType::Markdown);
+    assert_eq!(listed[0].body_len, TextLen::of("**bold**"));
+    assert_eq!(listed[0].plain_len, Some(TextLen { chars: 2, bytes: 6 }));
+    assert_eq!(listed[1].id, plain_id);
+    assert_eq!(listed[1].body_len, TextLen::of(body));
+    assert_eq!(
+        listed[1].body_len,
+        TextLen {
+            chars: 10,
+            bytes: 13
+        }
+    );
+    assert_eq!(listed[1].plain_len, None);
+}
+
+fn the_flat_view_is_the_newest_articles_tombstones_and_all(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let elsewhere = category(s, "Elsewhere");
+    let root = post(s, cat, None, "root", 1);
+    let reply = post(s, cat, Some(root), "reply", 2);
+    post(s, elsewhere, None, "not here", 3);
+    let other = post(s, cat, None, "other", 4);
+    let marked = NewPost {
+        mime: BodyType::Markdown,
+        plain: Some("plainly".into()),
+        ..new_post(cat, Some(other), "*marked*", 5)
+    };
+    let marked = s.post(&marked, 32, 32).unwrap().id;
+    s.tombstone(reply, "m", t(6)).unwrap();
+
+    let recent = s.recent(cat, 10).unwrap();
+    let ids: Vec<ArticleId> = recent.iter().map(|a| a.id).collect();
+    assert_eq!(ids, [marked, other, reply, root], "newest first, by id");
+    assert_eq!(recent[0].plain.as_deref(), Some("plainly"));
+    assert!(recent[2].deleted, "a deletion keeps its place");
+    assert_eq!(recent[2].body, "");
+    assert_eq!(
+        s.recent(cat, 2)
+            .unwrap()
+            .iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>(),
+        [marked, other]
+    );
+    let bundle = node(s, None, NodeKind::Bundle, "Bundle");
+    assert_eq!(s.recent(bundle, 10), Err(NewsError::NotACategory));
+    assert_eq!(s.recent(9999, 10), Err(NewsError::NoSuchNode));
 }
 
 fn deleting_a_category_takes_its_articles_and_a_bundle_must_be_empty(s: &dyn NewsStore) {

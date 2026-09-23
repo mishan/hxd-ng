@@ -338,8 +338,7 @@ fn default_files_upload_timeout() -> u64 {
 
 /// Threaded news (`docs/news.md` §13).
 ///
-/// Only the keys this build acts on. The design's 1.2 flat category arrives
-/// with the stage that honors it; until then naming one is a startup error
+/// Only the keys this build acts on: naming another is a startup error
 /// rather than a promise the server quietly does not keep.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -402,6 +401,54 @@ pub struct NewsSection {
     /// `[news.attach]`: durable image staging and article attachments.
     #[serde(default)]
     pub attach: Option<NewsAttachSection>,
+    /// The most articles one 1.5 category listing carries (§12.3). The
+    /// listing is one chunk, so 65 535 bytes may decide first.
+    #[serde(default = "default_news_legacy_catlist_max")]
+    pub legacy_catlist_max: usize,
+    /// The category 1.2 clients read and post into (§12.5), by its names
+    /// from the root with `/` between. Absent: a 1.2 client is told this
+    /// server's news is threaded. A category whose own name contains `/`
+    /// cannot be named here; rename it, or pick another.
+    #[serde(default)]
+    pub flat_category: Option<String>,
+    /// The most entries in the 1.2 document; 65 535 bytes usually decides
+    /// first.
+    #[serde(default = "default_news_flat_articles")]
+    pub flat_articles: usize,
+    /// Where a 1.2 post with no `Re:` goes: `"newest_thread"` (under the
+    /// root of the newest live thread) or `"new_thread"` (a thread of its
+    /// own, for an announcements feed).
+    #[serde(default = "default_news_flat_reply")]
+    pub flat_reply: String,
+    /// The subject of a post whose body gives none to derive: a 1.2
+    /// post, or a 1.5 one that sends no subject, flat view or not.
+    #[serde(default = "default_news_flat_default_subject")]
+    pub flat_default_subject: String,
+    /// The line above the 1.2 document's entries. Absent: a built-in one
+    /// naming the category and the two headers. `""`: none at all. At
+    /// most `hxd_session::news::MASTHEAD_MAX` bytes.
+    #[serde(default)]
+    pub flat_masthead: Option<String>,
+}
+
+fn default_news_legacy_catlist_max() -> usize {
+    hxd_session::LegacyNews::default().catlist_max
+}
+fn default_news_flat_articles() -> usize {
+    100
+}
+fn default_news_flat_reply() -> String {
+    "newest_thread".into()
+}
+fn default_news_flat_default_subject() -> String {
+    "(no subject)".into()
+}
+
+/// `flat_category`'s names, root first.
+fn flat_names(path: &str) -> Vec<String> {
+    path.split('/')
+        .map(|name| name.trim().to_string())
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -519,6 +566,25 @@ impl NewsSection {
         }
     }
 
+    /// How `[news]` reaches the legacy wire (§12).
+    pub fn to_legacy(&self) -> hxd_session::LegacyNews {
+        hxd_session::LegacyNews {
+            catlist_max: self.legacy_catlist_max,
+            default_subject: self.flat_default_subject.clone(),
+            flat: self
+                .flat_category
+                .as_deref()
+                .map(|path| hxd_session::FlatNews {
+                    category: flat_names(path),
+                    articles: self.flat_articles,
+                    // `check` has refused any other spelling by now.
+                    reply: hxd_session::FlatReply::from_name(&self.flat_reply)
+                        .unwrap_or(hxd_session::FlatReply::NewestThread),
+                    masthead: self.flat_masthead.clone(),
+                }),
+        }
+    }
+
     /// The numbers a `Deserialize` cannot check. Each bound is a wire's:
     /// a body or subject past the legacy one is an article a 1.5 client
     /// truncates, and a page past the ng one is a request nobody sends.
@@ -565,6 +631,50 @@ impl NewsSection {
         }
         if !(1..=600).contains(&self.search_per_minute) {
             return Err("[news] search_per_minute must be between 1 and 600".into());
+        }
+        if !(1..=10_000).contains(&self.legacy_catlist_max) {
+            return Err("[news] legacy_catlist_max must be between 1 and 10000".into());
+        }
+        if let Some(path) = &self.flat_category {
+            let names = flat_names(path);
+            if names.iter().any(|name| name.is_empty()) {
+                return Err(format!(
+                    "[news] flat_category = {path:?}: it is a category's names from \
+                     the root, with / between"
+                ));
+            }
+        }
+        if !(1..=1000).contains(&self.flat_articles) {
+            return Err("[news] flat_articles must be between 1 and 1000".into());
+        }
+        // The document it heads is one chunk, and a masthead near it
+        // would leave no room for the news.
+        if self
+            .flat_masthead
+            .as_ref()
+            .is_some_and(|m| m.len() > hxd_session::news::MASTHEAD_MAX)
+        {
+            return Err(format!(
+                "[news] flat_masthead must be at most {} bytes: it heads a document \
+                 that is one 65535-byte chunk, and the news needs the room",
+                hxd_session::news::MASTHEAD_MAX
+            ));
+        }
+        if hxd_session::FlatReply::from_name(&self.flat_reply).is_none() {
+            return Err(format!(
+                "[news] flat_reply = {:?}: it is \"newest_thread\" or \"new_thread\"",
+                self.flat_reply
+            ));
+        }
+        let subject = self.flat_default_subject.trim();
+        if subject.is_empty()
+            || subject.len() > self.max_subject
+            || subject.chars().any(char::is_control)
+        {
+            return Err(
+                "[news] flat_default_subject must be one line, and no longer than max_subject"
+                    .into(),
+            );
         }
         if let Some(notify) = &self.notify {
             if hxd_core::AutoSubscribe::from_name(&notify.auto_subscribe).is_none() {
@@ -2721,6 +2831,11 @@ pub fn build_ctx(
                     return Err(format!("[identity] trtp_login: unknown value {other:?}"))
                 }
             },
+            news: config
+                .news
+                .as_ref()
+                .map(NewsSection::to_legacy)
+                .unwrap_or_default(),
         }),
         files: files.map(|value| value.service.clone()),
     })
@@ -3075,9 +3190,51 @@ sync = "full"
             assert!(check_config(&zero).unwrap_err().contains("news.attach"));
         }
         assert!(
-            parse("[news]\ndb = \"n.sqlite\"\nflat_category = \"General\"\n").is_err(),
+            parse("[news]\ndb = \"n.sqlite\"\nflat_category = \"General\"\n").is_ok(),
+            "the 1.2 view is built"
+        );
+        assert!(
+            parse("[news]\ndb = \"n.sqlite\"\nimport = \"old-news\"\n").is_err(),
             "a key for a stage this build does not have is refused, not ignored"
         );
+        let legacy = parse(
+            "[news]\ndb = \"n.sqlite\"\nflat_category = \"Projects / General\"\n\
+             flat_reply = \"new_thread\"\nflat_masthead = \"\"\nlegacy_catlist_max = 50\n",
+        )
+        .unwrap();
+        check_config(&legacy).unwrap();
+        let legacy = legacy.news.unwrap().to_legacy();
+        assert_eq!(legacy.catlist_max, 50);
+        let flat = legacy.flat.unwrap();
+        assert_eq!(flat.category, ["Projects", "General"]);
+        assert_eq!(flat.reply, hxd_session::FlatReply::NewThread);
+        assert_eq!(flat.masthead.as_deref(), Some(""));
+        assert_eq!(flat.articles, 100);
+        assert_eq!(legacy.default_subject, "(no subject)");
+        let unflat = parse("[news]\ndb = \"n.sqlite\"\n").unwrap();
+        assert!(unflat.news.unwrap().to_legacy().flat.is_none());
+        for bad in [
+            "flat_category = \"General//Old\"",
+            "flat_reply = \"newest\"",
+            "flat_articles = 0",
+            "flat_default_subject = \"\"",
+            "legacy_catlist_max = 0",
+        ] {
+            let cfg = parse(&format!("[news]\ndb = \"n.sqlite\"\n{bad}\n")).unwrap();
+            assert!(check_config(&cfg).is_err(), "{bad} is refused");
+        }
+        let masthead = |len: usize| {
+            parse(&format!(
+                "[news]\ndb = \"n.sqlite\"\nflat_category = \"General\"\n\
+                 flat_masthead = \"{}\"\n",
+                "x".repeat(len)
+            ))
+            .unwrap()
+        };
+        let max = hxd_session::news::MASTHEAD_MAX;
+        check_config(&masthead(max)).unwrap();
+        let err = check_config(&masthead(max + 1)).unwrap_err();
+        assert!(err.contains("flat_masthead"), "{err}");
     }
 
     #[cfg(feature = "inbox")]

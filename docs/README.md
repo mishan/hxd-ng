@@ -42,7 +42,7 @@ to another project.
 | [chat-history.md](chat-history.md) — server-held scrollback, fogWraith's Get Chat History | yes | extended, ng | design, implements a fogWraith spec |
 | [inline-media.md](inline-media.md) — images in chat, fogWraith's Inline Media | yes | extended, ng (period sees the caption) | design, implements a fogWraith spec |
 | [moderation.md](moderation.md) — reports, redaction, revocation, purge | schema only | all (period can be moderated) | design |
-| [news.md](news.md) — threaded news, references, follows, search, markdown, the legacy bindings | ng wire | ng now; period when §12 lands | design; §9–§10 are the ng spec |
+| [news.md](news.md) — threaded news, references, follows, search, markdown, the legacy bindings | yes, less the image part and the importer | all | design; §9–§10 are the ng spec |
 | [system-account.md](system-account.md) — the reserved server account: commands and notifications on the classic wire | partial | all | design |
 | [voice.md](voice.md) — the SFU, one room across both signalling wires | yes | extended, ng | design, implements a fogWraith spec |
 | [capabilities-video.md](capabilities-video.md) — video publications and subscriptions | yes | ng; extended when GtkHx renders | spec, contributed to fogWraith's set |

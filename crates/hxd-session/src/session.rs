@@ -40,6 +40,7 @@ use crate::encoding::TextEncoding;
 use crate::files;
 use crate::frame::{pack_frame, read_frame, Frame, ReadError, MAX_FRAME_DATA};
 use crate::media;
+use crate::news::{self, LegacyNews};
 use crate::video;
 use crate::voice;
 
@@ -109,6 +110,10 @@ pub struct ServerConfig {
     /// arrived this second is a worse experience than a slightly ugly
     /// one; an operator who disagrees turns it off.
     pub stamp_queued: bool,
+    /// How `[news]` reaches this wire: the 1.5 listing's cap and the 1.2
+    /// flat category (`docs/news.md` §12). Read only when the core has
+    /// news at all.
+    pub news: LegacyNews,
 }
 
 /// See [`ServerConfig::trtp_login`].
@@ -136,6 +141,7 @@ impl Default for ServerConfig {
             mark_cleartext: false,
             trtp_login: TrtpLogin::Verify,
             stamp_queued: true,
+            news: LegacyNews::default(),
         }
     }
 }
@@ -446,17 +452,38 @@ fn err_text(e: ChatError) -> &'static str {
 /// UTC, and said so in the text: the server knows nothing about where the
 /// reader is, and the legacy wire has no way for a client to tell it. A
 /// stamp in an unstated zone would be worse than one in a stated one.
-///
-/// Hand-rolled rather than pulling in a calendar crate for one line of
-/// presentation — this is Howard Hinnant's `civil_from_days`, which is
-/// exact for every date this server will ever format.
 fn stamp(t: SystemTime) -> String {
+    let c = civil(t);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        c.year, c.month, c.day, c.hour, c.minute
+    )
+}
+
+/// A UTC calendar date and time.
+pub(crate) struct Civil {
+    pub year: i64,
+    pub month: i64,
+    pub day: i64,
+    pub hour: i64,
+    pub minute: i64,
+    pub second: i64,
+    /// 0 is Sunday.
+    pub weekday: i64,
+}
+
+/// `t` on the UTC calendar. Hand-rolled rather than pulling in a calendar
+/// crate for a line of presentation — this is Howard Hinnant's
+/// `civil_from_days`, which is exact for every date this server will ever
+/// format. A clock before the epoch reads as the epoch rather than
+/// wrapping.
+pub(crate) fn civil(t: SystemTime) -> Civil {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let (hour, minute) = (rem / 3600, (rem % 3600) / 60);
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
 
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -468,7 +495,16 @@ fn stamp(t: SystemTime) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
 
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+    Civil {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        // 1970-01-01 was a Thursday.
+        weekday: (days + 4).rem_euclid(7),
+    }
 }
 
 // --- Chat line formatting ----------------------------------------------
@@ -1238,7 +1274,7 @@ async fn login_phase(
 /// timeout and `synchronous = FULL` fsyncs. On a tokio worker one slow
 /// disk stalls every session that worker carries. This file already does
 /// exactly this for `authenticate`.
-async fn off_reactor<T: Send + 'static>(
+pub(crate) async fn off_reactor<T: Send + 'static>(
     core: &Arc<hxd_core::Core>,
     f: impl FnOnce(&hxd_core::Core) -> T + Send + 'static,
 ) -> Option<T> {
@@ -1285,7 +1321,7 @@ async fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
 
 /// Encode one domain event onto the wire. Returns `false` when the session
 /// must end (kicked).
-fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
+async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
     match ev {
         Event::Joined(u) | Event::Changed(u) => {
             push(
@@ -1537,16 +1573,32 @@ fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
         // the next 751, which now answers "not found"
         // (moderation.md §6).
         Event::MediaRevoked { .. } => {}
-        // Nothing yet: the legacy news binding is `docs/news.md` W9, and
-        // until it lands this wire has no news to be stale about. The
-        // flat category's `NEWSFILE_POST` push is where the first of
-        // these arms will go.
+        // A post into the flat category grows a 1.2 client's pane, whichever
+        // wire it came from (`docs/news.md` §12.5): mhxd's push, carrying
+        // the one new entry for the client to prepend. Every reader gets
+        // it, the poster included, as on mhxd — this wire has no way to
+        // tell a 1.2 client from a 1.5 one, and GtkHx prepends it too.
+        Event::NewsPosted { id, category, .. } => {
+            let who = news::Asker {
+                uid: sess.uid,
+                enc: sess.enc,
+            };
+            if let Some(entry) = news::flat_push(&ctx.core, &ctx.cfg.news, who, id, category).await
+            {
+                push(
+                    tx,
+                    ServerHdr::NewsFilePost.as_u32(),
+                    vec![(tag::NEWS, entry)],
+                );
+            }
+        }
+        // Nothing to say. A 1.5 client refetches a listing when it opens
+        // one, and the period wire has no push for a threaded change.
         //
-        // `NewsNotify` is the same story told to one person: a legacy
-        // account is notified through a system mailbox with a `stop`
-        // reply, which is a feature of its own (`docs/news.md` §10.11).
-        Event::NewsPosted { .. }
-        | Event::NewsDeleted { .. }
+        // `NewsNotify` is a notice for one person: a legacy account is
+        // notified through a system mailbox with a `stop` reply, which is
+        // a feature of its own (`docs/news.md` §10.11).
+        Event::NewsDeleted { .. }
         | Event::NewsNode(_)
         | Event::NewsNodeDeleted { .. }
         | Event::NewsNotify(_) => {}
@@ -1573,7 +1625,7 @@ async fn session_loop(
             },
             maybe = events.recv() => match maybe {
                 Some(se) => {
-                    if !deliver_event(tx, ctx, sess, se.event) {
+                    if !deliver_event(tx, ctx, sess, se.event).await {
                         info!(uid = sess.uid, "kicked");
                         return;
                     }
@@ -2939,6 +2991,21 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             match ctx.core.video_subscribe(sess.uid, voice_cid(f), &streams) {
                 Ok(()) => reply(tx, f.trans, vec![]),
                 Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+            }
+        }
+
+        // News, both eras of it (`docs/news.md` §12). The domain decides
+        // who may do what; every answer is store I/O, so it happens off
+        // the reactor.
+        t if news::handles(t) => {
+            let who = news::Asker {
+                uid: sess.uid,
+                enc: sess.enc,
+            };
+            let fields = f.chunks().map(|c| (c.tag, c.data.to_vec())).collect();
+            match news::transaction(&ctx.core, &ctx.cfg.news, who, t, fields).await {
+                Ok(chunks) => reply(tx, f.trans, chunks),
+                Err(msg) => reply_error(tx, f.trans, msg),
             }
         }
 

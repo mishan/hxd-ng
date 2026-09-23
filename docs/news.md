@@ -1,9 +1,9 @@
 # Threaded news: articles, attachments, references and search
 
-Status: the ng wire is built — §16 says which stages, and which keys of
-§13 the server accepts. The legacy 1.2 and 1.5 bindings (§12), the
-image part (§12.3) and the mhxd importer (§12.6) are designed and not
-built; the last two are deferred and get status lines of their own when
+Status: the ng wire and the legacy 1.2 and 1.5 bindings (§12) are
+built — §16 says which stages, and which keys of §13 the server accepts.
+The image part (§12.3) and the mhxd importer (§12.6) are designed and not
+built; both are deferred and get status lines of their own when
 scheduled. §10.7's `stale_after` floor is a 2026-09 amendment and is
 built.
 
@@ -122,8 +122,9 @@ this is a design document and not a research one.
   `PostThread` (`0x19a`) — the directory opcodes (`0x172`, `0x173`,
   `0x17c`–`0x17e`) have builders but no enum variants, and `ServerHdr`
   does not name `NEWSFILE_POST` (`0x0066`), the flat-news push. So W9
-  opens with an hx-libs change and a pin bump, which is a deliberate act
-  with a full test run behind it in both consumers.
+  opened with an hx-libs change naming them, and the fields a
+  `GETTHREAD` reply and a `DELETETHREAD` request carry, and a pin bump —
+  a deliberate act with a full test run behind it in both consumers.
 - **The access bits are already allocated and already parsed**:
   `READ_NEWS` (20), `POST_NEWS` (21), `DELETE_ARTICLES` (33),
   `CREATE_CATEGORIES` (34), `DELETE_CATEGORIES` (35),
@@ -1894,14 +1895,42 @@ behavioral reference for anything a 1.2/1.5 client can observe:
 | `NEWS_GETTHREAD` (`0x190`) | `NEWSPATH`, `THREADID`, `NEWSTYPE` | `article(id)`, then the part matching the MIME type |
 | `NEWS_POSTTHREAD` (`0x19a`) | `NEWSPATH`, `NEWSFLAGS`, `NEWSTYPE`, `NEWSSUBJECT`, `NEWSDATA`, `THREADID` | `post(NewPost)`, with `THREADID` as the parent |
 | `NEWS_MKCATEGORY` (`0x17e`) | `NEWSPATH`, `CATEGORY` | `create_node(.., Category, name)` |
-| `NEWS_MKDIR` (`0x17d`) | `NEWSPATH` | `create_node(.., Bundle, name)` |
+| `NEWS_MKDIR` (`0x17d`) | `NEWSPATH`, `FILE_NAME` | `create_node(.., Bundle, name)` |
 | `NEWS_DELETE` (`0x17c`) | `NEWSPATH` | `delete_node(id)` |
-| `NEWS_DELETETHREAD` (`0x19b`) | `NEWSPATH`, `THREADID` | `tombstone(id, ..)` |
+| `NEWS_DELETETHREAD` (`0x19b`) | `NEWSPATH`, `THREADID`, `DELETEREPLIES` | `tombstone(id, ..)` |
 
 The replies are the `NEWSDIRLIST` and `CATLIST` payloads `hxproto`
 already parses; `THREADID` (`0x0146`) is the article id on a fetch or a
 delete and the *parent* on a post, which is the naming trap
-`build_news_post_thread_chunks` documents at length.
+`build_news_post_thread_chunks` documents at length. The two make
+requests carry the new name in a field of its own — `FILE_NAME` for a
+bundle, `CATEGORY` for a category — with `NEWSPATH` naming the parent,
+as mhxd reads them and GtkHx sends them.
+
+A `GETTHREAD` reply carries mhxd's fields in mhxd's order: the part,
+the previous and next article, the parent, the first reply, subject,
+poster, MIME type and date. The neighbors are sent as 0, "none": mhxd's
+are directory order, which says nothing a client's own listing does not
+say better. Dates on this wire are the header format the file area
+sends, seconds since 2000, which reaches past the 1904 epoch's 2040.
+
+`DELETEREPLIES` asks for the article's replies to go with it, as on
+mhxd; here each becomes a tombstone. Replies are anyone's, so asking for
+them takes `delete_articles` whoever wrote the article itself, and a
+request that cannot be done whole is refused before anything is touched
+rather than half done. Asked of an article that is already a tombstone,
+it clears the live replies under it; without `DELETEREPLIES` a
+tombstone is not there to delete. A post whose `NEWSSUBJECT` is empty
+is given the 1.2 wire's derived subject (§12.5) rather than refused —
+from a markdown body's downgrade, not its syntax, and
+`flat_default_subject` when the body is empty too, whether or not there
+is a flat view.
+
+A subject and a node name are cut at the edge, at a character, to what
+the domain takes — `max_subject` and 255 bytes of UTF-8 — rather than
+refused there. The wire's pstring counts Mac Roman bytes, or characters
+for a client that negotiated UTF-8, and a legal 255 of either can be
+several times that in UTF-8.
 
 Every request is addressed by `NEWSPATH`, which is the file area's
 directory encoding (mhxd's `hldir_to_path`, shared with `FileList`'s
@@ -1941,6 +1970,13 @@ the `text/*` parts are not deferred; they are W9.
 then per post `postid`, an 8-byte Mac date, `parentid`, flags,
 `partcount`, a pstring subject, a pstring sender, and then per part a
 pstring MIME type and a **u16 size**.
+
+One chunk is a u16 of bytes, so a listing is whole threads, newest
+first and each in preorder, until the next would pass
+`legacy_catlist_max` articles or 65 535 bytes. A newest thread too long
+on its own is cut in preorder, which leaves no reply listed without its
+parent. A thread whose every article is a tombstone is not listed, as on
+the ng wire.
 
 That per-part MIME type is where everything new in this design meets
 the legacy wire. A markdown article with a screenshot lists three parts:
@@ -2025,7 +2061,7 @@ We keep that frame and put the article's id and two headers inside it:
 
 ```
 From Alice - alice
-[Wed Sep  9 12:00:00 2026]  #412
+[Wed Sep  9 12:00:00 2026 UTC]  #412
 Subject: The derivative and the u16
 Re: #398
 
@@ -2035,9 +2071,13 @@ The part size is a u16, so the full-size PNG cannot ride this wire.
 _________________________________________________________
 ```
 
-`#412` is the article id. `Subject:` and `Re:` are present exactly when
-the article has a subject and a parent — which is nearly always, since
-the posting rules below give every article both.
+`#412` is the article id. The time is C's `%c`, mhxd's default, in UTC
+and saying so, as the queued-message stamp does: the server knows
+nothing about where the reader is. The login after the nick is left out
+for a guest, whose shared `guest` login names nobody. `Subject:` and
+`Re:` are present exactly when the article has a subject and a parent —
+which is nearly always, since the posting rules below give every
+article both.
 
 **The read format is the write format's documentation.** A 1.2 user sees
 `Subject:` and `Re: #398` in every entry they read, and those are
@@ -2047,7 +2087,9 @@ Nothing has to be explained in a manual nobody has.
 `[news] flat_masthead` puts one line and a divider at the top of the
 document for the case where that inference does not land. Left out, it
 is a built-in sentence naming the category and the two headers; set to a
-string, it is that string; set to `""`, there is no masthead.
+string, it is that string; set to `""`, there is no masthead. It may be
+at most 4096 bytes, which startup checks: the document is one chunk,
+and the chunk is for the news.
 
 #### Reading
 
@@ -2065,11 +2107,17 @@ stop there.
   what it cannot see is better than showing it a post that reads as if
   something is missing.
 - A tombstoned article renders as its header block with an empty body,
-  keeping its id and its place.
+  keeping its id and its place, and `From (deleted)` where the author
+  was.
+- An entry too big for the whole budget on its own — the newest, since
+  any later one simply ends the document — is cut at a character with a
+  trailing `…` rather than dropped, so the pane never shows nothing but
+  a notice.
 - Text converts UTF-8 → Mac Roman with `?` for unmappable and LF → CR at
   `hxd-session`'s existing edge; the headers and the divider are ASCII.
 
-When `[news]` is configured but `flat_category` is not, `NEWSFILE_GET`
+When `[news]` is configured but `flat_category` is not — or names a
+category that does not exist, which the log says — `NEWSFILE_GET`
 answers with a **short document explaining that news on this server is
 threaded and needs a 1.5 client**, not a task error. A person running a
 1.2 client deserves to learn why the pane is empty. A task error is for
@@ -2096,7 +2144,9 @@ The rules are small on purpose:
   first line that does not is where the body starts, and one blank line
   between the two is consumed if present.
 - `Subject: <text>` sets the subject, trimmed and capped at
-  `max_subject`. `Re: <id>` sets the parent and accepts `#398` or `398`.
+  `max_subject` bytes of UTF-8, cut at a character. `Re: <id>` sets the parent and accepts `#398` or `398`;
+  a `Re:` followed by anything but an id (`Re: your post`) is not a
+  header, and so is where the body starts.
 - A second `Subject:` or `Re:` is body. So is a header nobody
   recognizes — `Note: this is broken` as a first line makes the block
   empty and the whole thing body, which is the behavior that keeps this
@@ -2114,8 +2164,9 @@ The rules are small on purpose:
   recent live thread in the flat category**, which is the conversation
   the poster was just reading. When the category is empty, or its newest
   root is tombstoned and no live one remains, the post starts a thread.
-- **A `Re:` naming an article that is missing, deleted, or in another
-  category** falls back to that same default — and **leaves the `Re:`
+- **A `Re:` naming an article that is missing, deleted, in another
+  category, or too deep to answer under `max_depth`** falls back to that
+  same default — and **leaves the `Re:`
   line in the body**, so what the person meant survives in what everyone
   reads. A mis-threaded post is recoverable; a silently swallowed
   intention is not.
@@ -2147,8 +2198,8 @@ grows the 1996 pane. The entry pushed is rendered exactly as the read
 format renders it, so a client that prepends the delta and a client that
 refetches the document see the same text.
 
-`HTLS_HDR_NEWSFILE_POST` is the third opcode `hxproto`'s `ServerHdr`
-does not yet name (§1); it goes into the same hx-libs change.
+`hxproto`'s `ServerHdr` names it `NewsFilePost`, from the hx-libs change
+that opened W9 (§1).
 
 ### 12.6 Importing an mhxd tree
 
@@ -2192,12 +2243,15 @@ self_delete = true              # authors may delete their own; false = period b
 legacy_catlist_max = 2000       # articles in one 1.5 category reply
 
 # 1.2 flat news (§12.5) — one category, read and written by 1.2 clients.
-flat_category = "General"       # absent = 1.2 clients are told news is threaded
+flat_category = "General"       # names from the root, "Bundle/Category" when nested;
+                                # absent = 1.2 clients are told news is threaded.
+                                # A name containing "/" cannot be named here.
 flat_articles = 100             # ceiling; 65 535 bytes usually decides first
 flat_reply = "newest_thread"    # or "new_thread": every 1.2 post stands alone
-flat_default_subject = "(no subject)"
+flat_default_subject = "(no subject)"  # also a 1.5 post's, with no subject or body
 # flat_masthead = "…"           # absent = a built-in line naming the category
-                                # and the two headers; "" = no masthead at all
+                                # and the two headers; "" = no masthead at all;
+                                # at most 4096 bytes
 
 [news.notify]                   # absent = no subscriptions, no notifications
 auto_subscribe = "participated" # or "own_thread", or "off"
@@ -2311,7 +2365,9 @@ builds.
   at the byte budget with the notice and the oldest id it carried; a
   markdown article contributing its downgrade; an attachment rendered as
   its name.
-- **Cross-wire e2e**, once W9 lands: a markdown article posted from ng
+- **Cross-wire e2e**, built with W9 in `crates/hxd/tests/news.rs` and,
+  from a real config file and an independent 1.5 client, in
+  `e2e/legacy-news.test.mjs`: a markdown article posted from ng
   read by a scripted 1.5 client as the right two parts with the right
   thread parentage, and a plain `see #51` posted from the legacy client
   arriving at an ng client as a resolved reference; a 1.2 client reading
@@ -2368,7 +2424,7 @@ Each lands separately with tests, roughly a branch apiece.
    edges, the 1.2 flat view of §12.5 — renderer, header-block parser,
    defaults and the push — and `hxd import-mhxd-news`.
 
-**Landed:** W1 through W7. Markdown is `hxd-markdown` on pulldown-cmark behind
+**Landed:** W1 through W7, and W9 without its two deferred parts. Markdown is `hxd-markdown` on pulldown-cmark behind
 `BodyRenderer` and the `markdown` feature. It has the three modes of
 §5.5, the downgrade stored in `plain` (which the index and the
 notification excerpt read instead of the source), and references from
@@ -2392,10 +2448,22 @@ authenticated ng upload/download routes, and attachment names in FTS.
 hx-ng stages them in its composer and renders authenticated blob URLs in articles. `[news]` accepts only the
 keys those stages honor; naming another, or another markdown mode, is a
 startup error until its stage lands. Not in it: §8's moderation ladder
-(W8), `order: "recent"` (§18), and the legacy binding (W9). The ng e2e is
+(W8) and `order: "recent"` (§18). The ng e2e is
 `crates/hxd/tests/news.rs`, the out-of-process one `e2e/news.test.mjs`,
 and the first client is hx-ng's News view, which follows, mutes, badges
 and says "seen".
+
+W9 is the legacy binding of §12: the hx-libs opcodes and the pin bump,
+path resolution in `hxd-session`, the eight 1.5 transactions with
+`CATEGORYITEM` and `CATLIST`, parts by MIME type with the Mac Roman and
+UTF-8 edges, and the 1.2 flat view — renderer, header-block parser,
+defaults and the `NEWSFILE_POST` push — behind `legacy_catlist_max` and
+the `flat_*` keys. The store gained the two reads the legacy wire needs
+and the ng wire does not: a category as one listing, measured rather
+than carried, and a category's newest articles. Not in it: the `image/*`
+part (§12.3) and `hxd import-mhxd-news` (§12.6), both deferred. The
+legacy e2e is in `crates/hxd/tests/news.rs` beside the ng one, and
+`e2e/legacy-news.test.mjs` reads the keys from a real config file.
 
 W1–W2 is threaded news with plain bodies — small, and worth landing on
 its own. W1–W7 is the whole thing for the ng wire and a mobile client,

@@ -10,9 +10,9 @@ use std::time::{Duration, SystemTime};
 use futures_util::{SinkExt, StreamExt};
 use hxd_core::{AttachmentPolicy, Core, MarkdownMode, NewsPolicy, NotifyPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
-use hxd_session::caps::Caps;
+use hxd_session::caps::{cap, Caps};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
-use hxd_session::{ServerConfig, ServerCtx};
+use hxd_session::{FlatNews, FlatReply, LegacyNews, ServerConfig, ServerCtx};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
 use hxproto::messages::tag;
 use serde_json::{json, Value};
@@ -42,6 +42,15 @@ async fn start_server(dir: &Path, news: Option<NewsPolicy>) -> (SocketAddr, Sock
 async fn start_server_core(
     dir: &Path,
     news: Option<NewsPolicy>,
+) -> (SocketAddr, SocketAddr, Arc<Core>) {
+    start_server_with(dir, news, LegacyNews::default()).await
+}
+
+/// [`start_server_core`], with the legacy wire's `[news]` keys as well.
+async fn start_server_with(
+    dir: &Path,
+    news: Option<NewsPolicy>,
+    legacy_news: LegacyNews,
 ) -> (SocketAddr, SocketAddr, Arc<Core>) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -103,9 +112,12 @@ async fn start_server_core(
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
             stamp_queued: true,
-            caps: Caps::empty(),
+            // Offered, so a client that asks reads and writes UTF-8; one
+            // that does not is Mac Roman, as ever.
+            caps: Caps::empty().with(cap::TEXT_ENCODING),
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
+            news: legacy_news,
         }),
         files: None,
     };
@@ -1307,8 +1319,9 @@ async fn readers_hear_that_the_news_changed_and_nobody_else_does() {
     let (mut admin, _) = Ng::login(ng, "admin").await;
     let (mut lurker, _) = Ng::login(ng, "lurker").await;
     let (mut outsider, _) = Ng::login(ng, "outsider").await;
-    // A 1.5 client in the same room. The legacy news binding is a later
-    // stage; until then this wire must simply not notice any of it.
+    // A 1.5 client in the same room, on a server with no 1.2 view: the
+    // period wire has no push for threaded news, so nothing here reaches
+    // it.
     let mut classic = Classic::login(legacy, "classic").await;
 
     let cat = category(&mut admin, None, "General").await;
@@ -1942,5 +1955,826 @@ impl Classic {
             .unwrap();
         let echo = self.recv(0x6a).await;
         assert!(echo.chunks().any(|c| c.tag == tag::BODY));
+    }
+}
+
+// --- The legacy binding (docs/news.md §12) --------------------------------
+
+/// A 1.5 client logged into an account, speaking the news transactions
+/// the way GtkHx does.
+struct Period {
+    stream: TcpStream,
+    trans: u32,
+    /// Server-initiated frames that arrived while a reply was awaited.
+    pushed: Vec<Frame>,
+    /// Flat-news entries [`Self::entry`] read.
+    seen: Vec<String>,
+}
+
+impl Period {
+    async fn login(addr: SocketAddr, login: &str) -> Self {
+        Self::login_as(addr, login, false).await
+    }
+
+    /// [`Self::login`], negotiating UTF-8 (capability bit 1) when `utf8`.
+    async fn login_as(addr: SocketAddr, login: &str, utf8: bool) -> Self {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"TRTPHOTL\x00\x01\x00\x02").await.unwrap();
+        let mut magic = [0; 8];
+        stream.read_exact(&mut magic).await.unwrap();
+        let obfuscate = |s: &str| s.bytes().map(|b| !b).collect::<Vec<u8>>();
+        let mut chunks = vec![
+            (tag::LOGIN, obfuscate(login)),
+            (tag::PASSWORD, obfuscate("pw")),
+            (tag::NAME, login.as_bytes().to_vec()),
+            (tag::ICON, 128u16.to_be_bytes().to_vec()),
+            (tag::VERSION, 150u16.to_be_bytes().to_vec()),
+        ];
+        if utf8 {
+            chunks.push((
+                tag::CAPABILITIES,
+                Caps::empty().with(cap::TEXT_ENCODING).to_wire(),
+            ));
+        }
+        stream
+            .write_all(&pack_frame(0x6b, 1, 0, &chunks))
+            .await
+            .unwrap();
+        let mut client = Self {
+            stream,
+            trans: 1,
+            pushed: Vec::new(),
+            seen: Vec::new(),
+        };
+        let reply = client.reply(1).await;
+        assert_eq!(reply.flag, 0, "{login} logs in");
+        client
+    }
+
+    async fn read(&mut self) -> Frame {
+        timeout(Duration::from_secs(5), read_frame(&mut self.stream))
+            .await
+            .expect("legacy timed out")
+            .expect("legacy closed")
+    }
+
+    async fn reply(&mut self, trans: u32) -> Frame {
+        loop {
+            let frame = self.read().await;
+            if frame.ty == 0x0001_0000 && frame.trans == trans {
+                return frame;
+            }
+            self.pushed.push(frame);
+        }
+    }
+
+    async fn request(&mut self, ty: u32, chunks: Vec<(u16, Vec<u8>)>) -> Frame {
+        self.trans += 1;
+        self.stream
+            .write_all(&pack_frame(ty, self.trans, 0, &chunks))
+            .await
+            .unwrap();
+        self.reply(self.trans).await
+    }
+
+    async fn ok(&mut self, ty: u32, chunks: Vec<(u16, Vec<u8>)>) -> Frame {
+        let reply = self.request(ty, chunks).await;
+        assert_eq!(
+            reply.flag,
+            0,
+            "{ty:#x} was refused: {:?}",
+            String::from_utf8_lossy(&field(&reply, tag::TASK_ERROR))
+        );
+        reply
+    }
+
+    async fn refused(&mut self, ty: u32, chunks: Vec<(u16, Vec<u8>)>) -> String {
+        let reply = self.request(ty, chunks).await;
+        assert_eq!(reply.flag, 1, "{ty:#x} was not refused");
+        String::from_utf8(field(&reply, tag::TASK_ERROR)).unwrap()
+    }
+
+    /// The next server push of type `ty`, looking first at what arrived
+    /// while replies were awaited.
+    async fn pushed(&mut self, ty: u32) -> Frame {
+        if let Some(i) = self.pushed.iter().position(|f| f.ty == ty) {
+            return self.pushed.remove(i);
+        }
+        loop {
+            let frame = self.read().await;
+            if frame.ty == ty {
+                return frame;
+            }
+            self.pushed.push(frame);
+        }
+    }
+
+    /// The flat-news push carrying article `id`'s entry. Every push read
+    /// on the way is kept in `seen`, so a test can say what else arrived.
+    async fn entry(&mut self, id: u64) -> String {
+        loop {
+            let entry = news_text(&self.pushed(NEWSFILE_PUSH).await);
+            self.seen.push(entry.clone());
+            if entry.contains(&format!("]  #{id}\r")) {
+                return entry;
+            }
+        }
+    }
+}
+
+/// A `NEWSPATH`: the file area's encoding of a list of names.
+fn news_path(names: &[&[u8]]) -> (u16, Vec<u8>) {
+    let mut v = (names.len() as u16).to_be_bytes().to_vec();
+    for name in names {
+        v.extend_from_slice(&[0, 0, name.len() as u8]);
+        v.extend_from_slice(name);
+    }
+    (tag::NEWSPATH, v)
+}
+
+fn field(frame: &Frame, t: u16) -> Vec<u8> {
+    frame
+        .chunks()
+        .find(|c| c.tag == t)
+        .map(|c| c.data.to_vec())
+        .unwrap_or_default()
+}
+
+fn u32_field(frame: &Frame, t: u16) -> u32 {
+    u32::from_be_bytes(field(frame, t).try_into().expect("a u32 field"))
+}
+
+fn id_field(t: u16, id: u64) -> (u16, Vec<u8>) {
+    (t, (id as u32).to_be_bytes().to_vec())
+}
+
+/// A reply's chunks as the whole message hxproto's parsers walk.
+fn repacked(frame: &Frame) -> Vec<u8> {
+    let chunks: Vec<(u16, Vec<u8>)> = frame.chunks().map(|c| (c.tag, c.data.to_vec())).collect();
+    pack_frame(frame.ty, frame.trans, frame.flag, &chunks)
+}
+
+fn dir_names(frame: &Frame) -> Vec<(bool, Vec<u8>)> {
+    let bytes = repacked(frame);
+    hxproto::parse::parse_dirlist(&bytes, bytes.len())
+        .entries
+        .into_iter()
+        .map(|e| (e.kind == hxproto::parse::NewsDirKind::Folder, e.name))
+        .collect()
+}
+
+fn catlist(frame: &Frame) -> Vec<hxproto::parse::CatPost> {
+    let bytes = repacked(frame);
+    hxproto::parse::parse_catlist(&bytes, bytes.len())
+        .expect("a CATLIST a client parses")
+        .posts
+}
+
+const LIST_DIR: u32 = 0x172;
+const LIST_CATEGORY: u32 = 0x173;
+const NEWS_DELETE: u32 = 0x17c;
+const MKDIR: u32 = 0x17d;
+const MKCATEGORY: u32 = 0x17e;
+const GET_THREAD: u32 = 0x190;
+const POST_THREAD: u32 = 0x19a;
+const DELETE_THREAD: u32 = 0x19b;
+const NEWSFILE_GET: u32 = 0x65;
+const NEWSFILE_POST: u32 = 0x67;
+const NEWSFILE_PUSH: u32 = 0x66;
+
+#[tokio::test]
+async fn a_period_client_reads_the_tree_an_ng_client_built() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let projects = admin
+        .ok(
+            "news_node_create",
+            json!({ "kind": "bundle", "name": "Projects" }),
+        )
+        .await["node"]["id"]
+        .as_u64()
+        .unwrap();
+    category(&mut admin, Some(projects), "hxd-ng").await;
+    let general = category(&mut admin, None, "General").await;
+    let source = "**Bold** words\n\nand a caf\u{e9}";
+    let article = alice
+        .ok(
+            "news_post",
+            json!({ "category": general, "subject": "Caf\u{e9} news", "body": source,
+                    "mime": "text/markdown" }),
+        )
+        .await["id"]
+        .as_u64()
+        .unwrap();
+    let reply = post(
+        &mut alice,
+        general,
+        Some(article),
+        "Re: news",
+        "Plain reply.",
+    )
+    .await;
+    let nick = alice.ok("news_article", json!({ "id": article })).await["article"]["from"]["nick"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut period = Period::login(legacy, "lurker").await;
+    let top = period.ok(LIST_DIR, vec![]).await;
+    assert_eq!(
+        dir_names(&top),
+        [(false, b"General".to_vec()), (true, b"Projects".to_vec())],
+        "the root, by name, a bundle as a folder"
+    );
+    let inside = period.ok(LIST_DIR, vec![news_path(&[b"Projects"])]).await;
+    assert_eq!(dir_names(&inside), [(false, b"hxd-ng".to_vec())]);
+    assert_eq!(
+        period
+            .refused(LIST_DIR, vec![news_path(&[b"Nowhere"])])
+            .await,
+        "No such news bundle or category."
+    );
+
+    let listing = period
+        .ok(LIST_CATEGORY, vec![news_path(&[b"General"])])
+        .await;
+    let posts = catlist(&listing);
+    assert_eq!(posts.len(), 2);
+    let (first, second) = (&posts[0], &posts[1]);
+    assert_eq!((first.postid, first.parentid), (article as u32, 0));
+    assert_eq!(
+        (second.postid, second.parentid),
+        (reply as u32, article as u32)
+    );
+    assert_eq!(first.subject, b"Caf\x8e news", "Mac Roman on this wire");
+    assert_eq!(first.sender, nick.as_bytes());
+    let parts: Vec<&[u8]> = first.parts.iter().map(|p| p.mime_type.as_slice()).collect();
+    assert_eq!(parts, [&b"text/plain"[..], b"text/markdown"]);
+    assert_eq!(second.parts.len(), 1, "a plain body is one part");
+
+    let plain = period
+        .ok(
+            GET_THREAD,
+            vec![
+                news_path(&[b"General"]),
+                id_field(tag::THREADID, article),
+                (tag::NEWSTYPE, b"text/plain".to_vec()),
+            ],
+        )
+        .await;
+    let text = field(&plain, tag::NEWSDATA);
+    assert!(!text.windows(2).any(|w| w == b"**"), "{text:?}");
+    assert!(text.windows(4).any(|w| w == b"caf\x8e"), "{text:?}");
+    assert!(!text.contains(&b'\n'), "CR line endings: {text:?}");
+    assert_eq!(field(&plain, tag::NEWSTYPE), b"text/plain");
+    assert_eq!(
+        first.parts[0].size as usize,
+        text.len(),
+        "the listing's size"
+    );
+    assert_eq!(field(&plain, tag::NEWSSUBJECT), b"Caf\x8e news");
+    assert_eq!(u32_field(&plain, tag::PARENTTHREADID), 0);
+
+    let marked = period
+        .ok(
+            GET_THREAD,
+            vec![
+                news_path(&[b"General"]),
+                id_field(tag::THREADID, article),
+                (tag::NEWSTYPE, b"text/markdown".to_vec()),
+            ],
+        )
+        .await;
+    let source = field(&marked, tag::NEWSDATA);
+    assert_eq!(source, b"**Bold** words\r\rand a caf\x8e");
+    assert_eq!(first.parts[1].size as usize, source.len());
+    let answer = period
+        .ok(
+            GET_THREAD,
+            vec![
+                news_path(&[b"General"]),
+                id_field(tag::THREADID, reply),
+                (tag::NEWSTYPE, b"text/plain".to_vec()),
+            ],
+        )
+        .await;
+    assert_eq!(field(&answer, tag::NEWSDATA), b"Plain reply.");
+    assert_eq!(u32_field(&answer, tag::PARENTTHREADID), article as u32);
+
+    // An article is found where it is, and only there.
+    assert_eq!(
+        period
+            .refused(
+                GET_THREAD,
+                vec![
+                    news_path(&[b"Projects", b"hxd-ng"]),
+                    id_field(tag::THREADID, article),
+                ],
+            )
+            .await,
+        "No such article."
+    );
+    assert_eq!(
+        period
+            .refused(LIST_CATEGORY, vec![news_path(&[b"Projects"])])
+            .await,
+        "That is not a news category."
+    );
+
+    // A deletion keeps its place in the listing, with nothing in it.
+    alice.ok("news_delete", json!({ "id": article })).await;
+    let posts = catlist(
+        &period
+            .ok(LIST_CATEGORY, vec![news_path(&[b"General"])])
+            .await,
+    );
+    assert_eq!(posts[0].postid, article as u32);
+    assert_eq!((posts[0].subject.len(), posts[0].sender.len()), (0, 0));
+    assert_eq!(posts[0].parts.len(), 1);
+    assert_eq!(posts[0].parts[0].size, 0);
+    assert_eq!(
+        posts[1].parentid, article as u32,
+        "its reply stays under it"
+    );
+}
+
+#[tokio::test]
+async fn a_period_post_is_a_threaded_article_on_ng() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let general = category(&mut admin, None, "General").await;
+    let question = post(&mut alice, general, None, "Question", "Anyone?").await;
+
+    let mut bob = Period::login(legacy, "bob").await;
+    bob.ok(
+        POST_THREAD,
+        vec![
+            news_path(&[b"General"]),
+            (tag::NEWSFLAGS, 0u32.to_be_bytes().to_vec()),
+            (tag::NEWSTYPE, b"text/plain".to_vec()),
+            (tag::NEWSSUBJECT, b"Re: Caf\x8e".to_vec()),
+            (
+                tag::NEWSDATA,
+                format!("see #{question}\rsecond line").into_bytes(),
+            ),
+            id_field(tag::THREADID, question),
+        ],
+    )
+    .await;
+
+    let posted = alice
+        .event("news_posted", |d| d["parent"] == question)
+        .await;
+    let id = posted["data"]["id"].as_u64().unwrap();
+    assert_eq!(posted["data"]["subject"], "Re: Caf\u{e9}");
+    let article = alice.ok("news_article", json!({ "id": id })).await["article"].clone();
+    assert_eq!(article["body"], format!("see #{question}\nsecond line"));
+    assert_eq!(
+        ids(&article["refs"], ""),
+        [question],
+        "the shorthand typed in a 1996 client is a link on ng"
+    );
+    // And the person asked hears that it is theirs.
+    alice.event("news_notify", |d| d["article"] == id).await;
+
+    // A starter, from `THREADID` 0, and no subject is not a refusal.
+    bob.ok(
+        POST_THREAD,
+        vec![
+            news_path(&[b"General"]),
+            (tag::NEWSSUBJECT, Vec::new()),
+            (tag::NEWSDATA, b"A thought of my own\rwith more".to_vec()),
+            id_field(tag::THREADID, 0),
+        ],
+    )
+    .await;
+    let started = alice
+        .event("news_posted", |d| {
+            d["parent"].is_null() && d["id"] != question
+        })
+        .await;
+    assert_eq!(started["data"]["subject"], "A thought of my own");
+
+    let mut lurker = Period::login(legacy, "lurker").await;
+    assert_eq!(
+        lurker
+            .refused(
+                POST_THREAD,
+                vec![
+                    news_path(&[b"General"]),
+                    (tag::NEWSSUBJECT, b"s".to_vec()),
+                    (tag::NEWSDATA, b"b".to_vec()),
+                ],
+            )
+            .await,
+        "You are not allowed to do that."
+    );
+    assert_eq!(
+        bob.refused(
+            POST_THREAD,
+            vec![
+                news_path(&[b"General"]),
+                (tag::NEWSSUBJECT, b"s".to_vec()),
+                (tag::NEWSDATA, b"b".to_vec()),
+                id_field(tag::THREADID, 99_999),
+            ],
+        )
+        .await,
+        "No such article."
+    );
+}
+
+#[tokio::test]
+async fn a_period_subject_or_name_is_cut_to_fit_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    category(&mut admin, None, "General").await;
+    let mut mac = Period::login(legacy, "admin").await;
+    let mut utf8 = Period::login_as(legacy, "admin", true).await;
+
+    // A full pstring of accents is 255 characters in Mac Roman and twice
+    // that in UTF-8; the most kana a UTF-8 client can send runs past
+    // 255 bytes at the 86th. Each is cut at a character, not refused.
+    let accented = "\u{e9}".repeat(127);
+    let kana = "\u{3042}".repeat(85);
+    let posting = |subject: Vec<u8>| {
+        vec![
+            news_path(&[b"General"]),
+            (tag::NEWSSUBJECT, subject),
+            (tag::NEWSDATA, b"body".to_vec()),
+        ]
+    };
+    mac.ok(POST_THREAD, posting(vec![0x8e; 255])).await;
+    let posted = alice
+        .event("news_posted", |d| {
+            d["subject"]
+                .as_str()
+                .is_some_and(|s| s.starts_with('\u{e9}'))
+        })
+        .await;
+    assert_eq!(posted["data"]["subject"], accented.as_str());
+    utf8.ok(POST_THREAD, posting("\u{3042}".repeat(100).into_bytes()))
+        .await;
+    let posted = alice
+        .event("news_posted", |d| {
+            d["subject"]
+                .as_str()
+                .is_some_and(|s| s.starts_with('\u{3042}'))
+        })
+        .await;
+    assert_eq!(posted["data"]["subject"], kana.as_str());
+
+    mac.ok(MKCATEGORY, vec![(tag::CATEGORY, vec![0x8e; 255])])
+        .await;
+    utf8.ok(
+        MKDIR,
+        vec![(tag::FILE_NAME, "\u{3042}".repeat(100).into_bytes())],
+    )
+    .await;
+    let tree = alice.ok("news_tree", json!({})).await;
+    let names: Vec<&str> = tree["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&accented.as_str()), "{names:?}");
+    assert!(names.contains(&kana.as_str()), "{names:?}");
+
+    // A markdown post with no subject takes one from what it reads as.
+    mac.ok(
+        POST_THREAD,
+        vec![
+            news_path(&[b"General"]),
+            (tag::NEWSTYPE, b"text/markdown".to_vec()),
+            (tag::NEWSSUBJECT, Vec::new()),
+            (tag::NEWSDATA, b"# Release **notes**\r\rThe body.".to_vec()),
+        ],
+    )
+    .await;
+    alice
+        .event("news_posted", |d| d["subject"] == "Release notes")
+        .await;
+}
+
+#[tokio::test]
+async fn a_period_client_keeps_house() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let mut admin = Period::login(legacy, "admin").await;
+
+    admin
+        .ok(
+            MKDIR,
+            vec![news_path(&[]), (tag::FILE_NAME, b"Projects".to_vec())],
+        )
+        .await;
+    admin
+        .ok(
+            MKCATEGORY,
+            vec![
+                news_path(&[b"Projects"]),
+                (tag::CATEGORY, b"hxd-ng".to_vec()),
+            ],
+        )
+        .await;
+    admin
+        .ok(MKCATEGORY, vec![(tag::CATEGORY, b"General".to_vec())])
+        .await;
+    let tree = alice.ok("news_tree", json!({ "depth": 2 })).await;
+    let names: Vec<&str> = tree["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["General", "Projects"]);
+    assert_eq!(tree["nodes"][1]["children"][0]["name"], "hxd-ng");
+    assert_eq!(
+        admin
+            .refused(
+                MKCATEGORY,
+                vec![news_path(&[b"General"]), (tag::CATEGORY, b"Inner".to_vec())],
+            )
+            .await,
+        "A category holds only articles."
+    );
+    assert_eq!(
+        admin
+            .refused(MKDIR, vec![(tag::FILE_NAME, b"General".to_vec())])
+            .await,
+        "That name is already in use there."
+    );
+
+    let general = tree["nodes"][0]["id"].as_u64().unwrap();
+    let root = post(&mut alice, general, None, "Thread", "start").await;
+    let first = post(&mut alice, general, Some(root), "r", "first").await;
+    let deep = post(&mut alice, general, Some(first), "r", "deep").await;
+    let beside = post(&mut alice, general, Some(root), "r", "beside").await;
+    let other = post(&mut alice, general, None, "Other", "alone").await;
+
+    // Replies are anyone's, so asking for them takes the bit, and a
+    // request that cannot be done whole is not done at all.
+    let mut bob = Period::login(legacy, "bob").await;
+    let delete = |id: u64, replies: u32| {
+        vec![
+            news_path(&[b"General"]),
+            id_field(tag::THREADID, id),
+            (tag::DELETEREPLIES, replies.to_be_bytes().to_vec()),
+        ]
+    };
+    assert_eq!(
+        bob.refused(DELETE_THREAD, delete(first, 1)).await,
+        "You are not allowed to do that."
+    );
+    assert_eq!(
+        alice.ok("news_article", json!({ "id": deep })).await["article"]["deleted"],
+        false
+    );
+    admin.ok(DELETE_THREAD, delete(first, 1)).await;
+    for (id, gone) in [(root, false), (first, true), (deep, true), (beside, false)] {
+        assert_eq!(
+            alice.ok("news_article", json!({ "id": id })).await["article"]["deleted"],
+            gone,
+            "{id}"
+        );
+    }
+    // An author deletes their own over this wire as over any other.
+    let mut alice_period = Period::login(legacy, "alice").await;
+    alice_period.ok(DELETE_THREAD, delete(other, 0)).await;
+    assert_eq!(
+        alice_period.refused(DELETE_THREAD, delete(other, 0)).await,
+        "No such article."
+    );
+    // A tombstone is not deleted twice, but what still hangs under it is
+    // cleared in one request.
+    alice_period.ok(DELETE_THREAD, delete(root, 0)).await;
+    assert_eq!(
+        admin.refused(DELETE_THREAD, delete(root, 0)).await,
+        "No such article."
+    );
+    admin.ok(DELETE_THREAD, delete(root, 1)).await;
+    assert_eq!(
+        alice.ok("news_article", json!({ "id": beside })).await["article"]["deleted"],
+        true
+    );
+
+    assert_eq!(
+        admin
+            .refused(NEWS_DELETE, vec![news_path(&[b"Projects"])])
+            .await,
+        "That bundle is not empty."
+    );
+    admin
+        .ok(NEWS_DELETE, vec![news_path(&[b"Projects", b"hxd-ng"])])
+        .await;
+    admin.ok(NEWS_DELETE, vec![news_path(&[b"Projects"])]).await;
+    assert_eq!(
+        bob.refused(NEWS_DELETE, vec![news_path(&[b"General"])])
+            .await,
+        "You are not allowed to do that."
+    );
+    let tree = alice.ok("news_tree", json!({})).await;
+    assert_eq!(tree["nodes"].as_array().unwrap().len(), 1);
+}
+
+fn flat_general() -> LegacyNews {
+    LegacyNews {
+        flat: Some(FlatNews {
+            category: vec!["General".into()],
+            articles: 100,
+            reply: FlatReply::NewestThread,
+            masthead: None,
+        }),
+        ..LegacyNews::default()
+    }
+}
+
+fn news_text(frame: &Frame) -> String {
+    hxproto::text::to_utf8(&field(frame, tag::NEWS))
+}
+
+#[tokio::test]
+async fn a_1_2_client_reads_one_category_and_posts_into_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng, _) = start_server_with(dir.path(), Some(news_server()), flat_general()).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let general = category(&mut admin, None, "General").await;
+    let elsewhere = category(&mut admin, None, "Elsewhere").await;
+    let welcome = alice
+        .ok(
+            "news_post",
+            json!({ "category": general, "subject": "Welcome", "body": "**Hello** world",
+                    "mime": "text/markdown" }),
+        )
+        .await["id"]
+        .as_u64()
+        .unwrap();
+
+    let mut bob = Period::login(legacy, "bob").await;
+    let doc = news_text(&bob.ok(NEWSFILE_GET, vec![]).await);
+    assert!(doc.starts_with("News from \"General\""), "{doc}");
+    assert!(
+        doc.contains(&format!("]  #{welcome}\rSubject: Welcome\r\rHello world\r")),
+        "{doc}"
+    );
+    assert!(
+        !doc.contains("**"),
+        "the downgrade, never the source: {doc}"
+    );
+
+    // A header block sets the subject and the parent, and is not body.
+    bob.ok(
+        NEWSFILE_POST,
+        vec![(
+            tag::BODY,
+            format!("Subject: Thanks\rRe: #{welcome}\r\rGlad to be here.").into_bytes(),
+        )],
+    )
+    .await;
+    let thanks = alice
+        .event("news_posted", |d| d["subject"] == "Thanks")
+        .await["data"]
+        .clone();
+    assert_eq!(thanks["parent"], welcome);
+    let thanks_id = thanks["id"].as_u64().unwrap();
+    let body =
+        alice.ok("news_article", json!({ "id": thanks_id })).await["article"]["body"].clone();
+    assert_eq!(body, "Glad to be here.");
+    // The poster hears it too, as mhxd pushes it, rendered as the
+    // document renders it.
+    let entry = bob.entry(thanks_id).await;
+    assert!(entry.starts_with("From bob - bob\r["), "{entry}");
+    assert!(
+        entry.contains(&format!(
+            "#{thanks_id}\rSubject: Thanks\rRe: #{welcome}\r\rGlad to be here.\r"
+        )),
+        "{entry}"
+    );
+
+    // No headers: a subject from the first line, and a reply to the
+    // newest thread's root — depth 1, never deeper.
+    bob.ok(
+        NEWSFILE_POST,
+        vec![(tag::BODY, b"Just chatting\rmore".to_vec())],
+    )
+    .await;
+    let chat = alice
+        .event("news_posted", |d| d["subject"] == "Just chatting")
+        .await;
+    assert_eq!(chat["data"]["parent"], welcome);
+    // A `Re:` naming nothing falls back, and keeps its line as prose.
+    bob.ok(
+        NEWSFILE_POST,
+        vec![(tag::BODY, b"Re: #99999\rlost".to_vec())],
+    )
+    .await;
+    let lost = alice.event("news_posted", |d| d["subject"] == "lost").await;
+    assert_eq!(lost["data"]["parent"], welcome);
+    let lost_id = lost["data"]["id"].as_u64().unwrap();
+    assert_eq!(
+        alice.ok("news_article", json!({ "id": lost_id })).await["article"]["body"],
+        "Re: #99999\nlost"
+    );
+
+    // A post from the phone grows the 1996 pane; one elsewhere does not.
+    // Pushes of bob's own posts may still be arriving, so each wait reads
+    // past what it is not waiting for; and since one session's events are
+    // delivered in order, a later flat post is the fence that says the
+    // one elsewhere was passed over.
+    let news = post(&mut alice, general, None, "From the phone", "Hello, pane.").await;
+    let entry = bob.entry(news).await;
+    assert!(
+        entry.contains("Subject: From the phone\r\rHello, pane.\r"),
+        "{entry}"
+    );
+    post(&mut alice, elsewhere, None, "Not flat", "Not here.").await;
+    let fence = post(&mut alice, general, None, "Fence", "After it.").await;
+    bob.entry(fence).await;
+    assert!(
+        !bob.seen.iter().any(|e| e.contains("Not here.")),
+        "{:?}",
+        bob.seen
+    );
+
+    // Newest first.
+    let doc = news_text(&bob.ok(NEWSFILE_GET, vec![]).await);
+    let at = |id: u64| doc.find(&format!("]  #{id}\r")).unwrap();
+    assert!(at(news) < at(lost_id) && at(lost_id) < at(thanks_id) && at(thanks_id) < at(welcome));
+    assert!(!doc.contains("Not here."));
+}
+
+#[tokio::test]
+async fn a_1_2_subject_past_the_limit_is_cut_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng, _) = start_server_with(dir.path(), Some(news_server()), flat_general()).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    category(&mut admin, None, "General").await;
+
+    // Three hundred accents are 600 bytes of UTF-8 and the domain keeps
+    // 255: the subject is cut at a character, and the post goes in.
+    let mut bob = Period::login(legacy, "bob").await;
+    let mut body = b"Subject: ".to_vec();
+    body.extend([0x8e; 300]);
+    body.extend(b"\r\rAll accents.");
+    bob.ok(NEWSFILE_POST, vec![(tag::BODY, body)]).await;
+    let posted = alice
+        .event("news_posted", |d| {
+            d["subject"]
+                .as_str()
+                .is_some_and(|s| s.starts_with('\u{e9}'))
+        })
+        .await;
+    assert_eq!(posted["data"]["subject"], "\u{e9}".repeat(127).as_str());
+    let id = posted["data"]["id"].as_u64().unwrap();
+    assert_eq!(
+        alice.ok("news_article", json!({ "id": id })).await["article"]["body"],
+        "All accents."
+    );
+}
+
+#[tokio::test]
+async fn a_1_2_client_is_told_what_this_server_has() {
+    // Threaded news and no flat view: a document saying so, not an error.
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, _) = start_server(dir.path(), Some(news_server())).await;
+    let mut bob = Period::login(legacy, "bob").await;
+    let doc = news_text(&bob.ok(NEWSFILE_GET, vec![]).await);
+    assert!(doc.contains("threaded"), "{doc}");
+    assert!(bob
+        .refused(NEWSFILE_POST, vec![(tag::BODY, b"hello".to_vec())])
+        .await
+        .contains("threaded"));
+    let mut outsider = Period::login(legacy, "outsider").await;
+    assert_eq!(
+        outsider.refused(NEWSFILE_GET, vec![]).await,
+        "You are not allowed to do that."
+    );
+
+    // A flat category that does not exist yet reads the same way.
+    let missing = tempfile::tempdir().unwrap();
+    let (legacy, _, _) =
+        start_server_with(missing.path(), Some(news_server()), flat_general()).await;
+    let mut bob = Period::login(legacy, "bob").await;
+    assert!(news_text(&bob.ok(NEWSFILE_GET, vec![]).await).contains("threaded"));
+
+    // No news at all is the error.
+    let none = tempfile::tempdir().unwrap();
+    let (legacy, _) = start_server(none.path(), None).await;
+    let mut bob = Period::login(legacy, "bob").await;
+    for ty in [NEWSFILE_GET, LIST_DIR] {
+        assert_eq!(
+            bob.refused(ty, vec![]).await,
+            "News is not available on this server."
+        );
     }
 }

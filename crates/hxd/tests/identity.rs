@@ -216,6 +216,7 @@ async fn start_server_inner(
             mark_cleartext: true,
             stamp_queued: true,
             trtp_login,
+            news: Default::default(),
         }),
         files: None,
     };

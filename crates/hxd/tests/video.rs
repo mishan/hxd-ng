@@ -138,6 +138,7 @@ async fn start_both(dir: &Path, video: bool) -> Server {
             caps,
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
+            news: Default::default(),
         }),
         files: None,
     };

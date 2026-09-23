@@ -10,9 +10,11 @@
  * from Node, and this file is the conversation.
  *
  * It speaks only as much of the wire as the cross-wire tests need:
- * login, the user list, chat, private messages, a nick change and a
- * kick. Files, news and the private-chat room family are not here, and
- * should not be until something wants them.
+ * login, the user list, chat, private messages, a nick change, a kick,
+ * and news — the flat 1.2 document and a 1.5 category listing, parsed
+ * here from the format rather than by `hxproto`'s `parse_catlist`. Files
+ * and the private-chat room family are not here, and should not be until
+ * something wants them.
  */
 
 import { connect as tcpConnect } from 'node:net';
@@ -22,6 +24,8 @@ import { toBytes, toText } from './macroman.mjs';
 
 /** Client → server. `hotline.h`'s `HTLC_HDR_*`. */
 export const req = {
+  NEWSFILE_GET: 0x65,
+  NEWSFILE_POST: 0x67,
   CHAT: 0x69,
   LOGIN: 0x6b,
   MSG: 0x6c,
@@ -30,11 +34,14 @@ export const req = {
   USER_GETLIST: 0x12c,
   USER_CHANGE: 0x130,
   PING: 0x1f4,
+  NEWS_LISTCATEGORY: 0x173,
+  NEWS_GETTHREAD: 0x190,
 };
 
 /** Server → client. `HTLS_HDR_*`, plus the task reply. */
 export const hdr = {
   TASK: 0x0001_0000,
+  NEWSFILE_POST: 0x66,
   MSG: 0x68,
   CHAT: 0x6a,
   AGREEMENT: 0x6d,
@@ -61,7 +68,61 @@ export const tag = {
   CHAT_ID: 0x72,
   VERSION: 0xa0,
   USER_LIST: 0x12c,
+  NEWS_CATLIST: 0x141,
+  NEWS_PATH: 0x145,
+  NEWS_THREADID: 0x146,
+  NEWS_MIMETYPE: 0x147,
+  NEWS_DATA: 0x14d,
+  NEWS_PARENT: 0x14f,
 };
+
+/** A `NEWSPATH`: a count, then per name two zero bytes, a length and
+ *  the name — the file area's directory encoding. */
+export function newsPath(...names) {
+  const parts = [u16(names.length)];
+  for (const name of names) {
+    const bytes = toBytes(name);
+    parts.push(Buffer.from([0, 0, bytes.length]), bytes);
+  }
+  return Buffer.concat(parts);
+}
+
+/**
+ * A `CATLIST`, from mhxd's `hl_news_threadlist_hdr` and
+ * `hl_news_thread_hdr`: ten bytes of header holding the count, then per
+ * article its id, an eight-byte date, its parent, four bytes of flags,
+ * the part count, the subject and the poster as pstrings, and per part a
+ * pstring MIME type and a u16 size.
+ */
+export function parseCatlist(data) {
+  let at = 4;
+  const count = data.readUInt32BE(at);
+  at = 10;
+  const pstring = () => {
+    const len = data[at];
+    const text = toText(data.subarray(at + 1, at + 1 + len));
+    at += 1 + len;
+    return text;
+  };
+  const posts = [];
+  for (let i = 0; i < count; i++) {
+    const id = data.readUInt32BE(at);
+    const parent = data.readUInt32BE(at + 12);
+    const partCount = data.readUInt16BE(at + 20);
+    at += 22;
+    const subject = pstring();
+    const poster = pstring();
+    const parts = [];
+    for (let p = 0; p < partCount; p++) {
+      const mime = pstring();
+      parts.push({ mime, size: data.readUInt16BE(at) });
+      at += 2;
+    }
+    posts.push({ id, parent, subject, poster, parts });
+  }
+  if (at !== data.length) throw new Error(`CATLIST has ${data.length - at} bytes past its last article`);
+  return posts;
+}
 
 /**
  * Credentials are one's-complement on the wire.
@@ -223,6 +284,12 @@ export class LegacyClient {
    */
   chat(text) {
     this.send(req.CHAT, [[tag.BODY, toBytes(text)]]);
+  }
+
+  /** Any transaction, answered: the reply frame, error or not. */
+  async request(type, chunks = []) {
+    const trans = this.send(type, chunks);
+    return this.waitFor((f) => f.type === hdr.TASK && f.trans === trans);
   }
 
   async msg(uid, text) {
