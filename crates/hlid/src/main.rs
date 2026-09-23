@@ -26,6 +26,11 @@
 //! hlid tunnel  --server URL [--device K] [--card FILE] [--cert FILE] [--listen ADDR]
 //!              [--allow-remote-listen] [--create]
 //!              local TCP port for a classic client, TRTP over WebSocket upstream
+//! hlid register --registrar HOST --handle S [--proof CODE] [--successor-commit]
+//!              an attestation from a registrar, put into the card
+//! hlid revoke  --registrar HOST (--device-cert FILE | --device-pub HEX) [--reason R] [--by-device]
+//! hlid revoke  --registrar HOST --identity-revoke --yes
+//! hlid rotate  --registrar HOST --to SUCCESSOR_KEY
 //! ```
 //!
 //! `--password` puts a secret on the command line, where anyone on the
@@ -46,6 +51,7 @@
 //! thrown away.
 
 mod enroll;
+mod registrar;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -78,6 +84,9 @@ fn main() {
         "link" => link_cmd(&args[1..]),
         "unlink" => unlink_cmd(&args[1..]),
         "tunnel" => tunnel_cmd(&args[1..]),
+        "register" => registrar::register_cmd(&args[1..]),
+        "revoke" => registrar::revoke_cmd(&args[1..]),
+        "rotate" => registrar::rotate_cmd(&args[1..]),
         _ => usage(),
     };
     if let Err(e) = r {
@@ -102,6 +111,10 @@ fn usage() -> ! {
         "  hlid link --server URL [--device K] [--card FILE] [--cert FILE] --login L [--password P | --password-file F | --password-stdin]\n",
         "  hlid unlink --server URL [--device K] [--card FILE] [--cert FILE]\n",
         "  hlid tunnel --server URL [--device K] [--card FILE] [--cert FILE] [--listen 127.0.0.1:5500] [--allow-remote-listen] [--create]\n",
+        "  hlid register --registrar HOST|URL --handle S [--proof CODE] [--successor-commit [--successor-key FILE]] [--identity K] [--card FILE] [--no-put]\n",
+        "  hlid revoke --registrar HOST|URL (--device-cert FILE | --device-pub HEX) [--reason lost|stolen|retired] [--by-device]\n",
+        "  hlid revoke --registrar HOST|URL --identity-revoke --yes [--reason retired|compromised]\n",
+        "  hlid rotate --registrar HOST|URL --to SUCCESSOR_KEY [--identity K]\n",
         "\n",
         "`hlid init` writes identity.key, device.key, cert.bin and card.bin into\n",
         "$HLID_HOME (default ~/.hlid), and --identity, --device, --cert and --card\n",
@@ -129,6 +142,15 @@ fn usage() -> ! {
         "that and owns the machine; --renew deny holds no standing session, so\n",
         "renewals arrive through a code like a first enrollment, and are answered\n",
         "like one — the prompt defaults to no.\n",
+        "\n",
+        "`hlid register` asks a registrar for a handle, checks the attestation\n",
+        "against the registrar's published key, puts it in your card, and\n",
+        "publishes the card there. --successor-commit makes a successor identity\n",
+        "key (successor.key beside the identity key) and commits the card to it,\n",
+        "which is what lets `hlid rotate` move your names to it later and stops a\n",
+        "thief with your identity key from moving them anywhere else. `revoke`\n",
+        "publishes a device's revocation, or with --identity-revoke the\n",
+        "identity's own, which is final.\n",
         "\n",
         "--bundle writes the certificate and the identity's card as one object\n",
         "instead of the certificate alone — the same thing enrollment carries, so\n",
@@ -158,6 +180,11 @@ pub(crate) struct Args {
 /// needed a dummy value nothing documented.
 const BARE: &[&str] = &[
     "allow-remote-listen",
+    "successor-commit",
+    "no-put",
+    "by-device",
+    "identity-revoke",
+    "yes",
     "bundle",
     "show-url",
     "password-stdin",
@@ -308,7 +335,7 @@ pub(crate) fn hex(b: &[u8]) -> String {
 /// Hex to bytes, over bytes rather than characters: `&s[i..i + 2]` on a
 /// `&str` panics when the split lands inside a multi-byte character, so
 /// a key file with an accent in it aborted the tool instead of failing.
-fn unhex(s: &str) -> R<Vec<u8>> {
+pub(crate) fn unhex(s: &str) -> R<Vec<u8>> {
     let s = s.trim().as_bytes();
     if s.len() % 2 != 0 {
         return Err("odd-length hex".into());
@@ -357,7 +384,7 @@ pub(crate) fn read_seed(path: &Path) -> R<[u8; 32]> {
         .map_err(|_| format!("{}: seed must be 32 bytes", path.display()))
 }
 
-fn write_private(path: &Path, text: &str) -> R<()> {
+pub(crate) fn write_private(path: &Path, text: &str) -> R<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -808,6 +835,8 @@ fn inspect(args: &[String]) -> R<()> {
             "type": "login_proof",
             "device": hex(&p.device), "challenge": hex(&p.challenge), "server_key": hex(&p.server_key), "time": p.time,
         })
+    } else if let Some(doc) = registrar::describe(&bytes) {
+        doc
     } else {
         // Say which parser got furthest: the first error that isn't "wrong
         // object" is the useful one.
@@ -982,6 +1011,32 @@ fn post_with_token(base: &str, c: &Credentials, path: &str, body: Value) -> R<Va
             resp.into_string().unwrap_or_default()
         )),
         Err(e) => Err(format!("{path}: {e}")),
+    }
+}
+
+/// `PUT /identity/card` (identity spec §7) with a transport token from
+/// this machine's device.
+pub(crate) fn put_card(base: &str, a: &Args, card: &[u8]) -> R<()> {
+    let mut c = credentials(a)?;
+    // Authenticate with the card being put: the server caches what `auth`
+    // shows it, so the PUT that follows is the explicit form of the same.
+    c.card = card.to_vec();
+    let token = authenticate(base, &c)?;
+    let token = token["token"].as_str().ok_or("auth reply had no token")?;
+    match ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .put(&format!("{base}/identity/card"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/cbor")
+        .send_bytes(card)
+    {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, resp)) => Err(format!(
+            "card refused ({code}): {}",
+            resp.into_string().unwrap_or_default()
+        )),
+        Err(e) => Err(e.to_string()),
     }
 }
 

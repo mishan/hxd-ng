@@ -80,11 +80,14 @@ GtkHx when its rendering lands.
   line, revoking an image, purging a user's recent output: designed in
   [docs/moderation.md](docs/moderation.md), tables in the schema, no
   requests yet.
-- **The identity registrar**, which is what gives a key a name like
-  `alice@hl.example` and publishes revocations. Designed
-  ([docs/identity-registrar.md](docs/identity-registrar.md)), not built;
-  until then every identity is unattested and admitted as the
-  `unattested` policy says.
+- **Servers reading a registrar's records.** The registrar itself is
+  built — it gives a key a name like `alice@hl.example` and publishes
+  revocations, rotations and freezes — but a server does not yet fetch
+  and apply what a registrar publishes
+  ([docs/identity-registrar.md](docs/identity-registrar.md) §7). Until it
+  does, a server trusts attestations only from the registrars named in
+  `[identity] registrar_keys`, and a registrar's revocations stop a key
+  only at the registrar.
 
 If you need a complete classic Hotline server today,
 [Mobius](https://github.com/jhalter/mobius) is the one to run. If you want
@@ -452,6 +455,75 @@ lists as they were): every session the key holds, connected or waiting to
 resume, ends then, its next login is refused with `revoked`, and nobody
 else is dropped. An account whose linked identity is revoked can still
 log in with its password.
+
+### The registrar
+
+A server can also be an identity registrar: it lends keys handles like
+`alice@hl.example`, and publishes the revocations, rotations and freezes
+that concern them. Needs `[identity]`. See
+[docs/identity-registrar.md](docs/identity-registrar.md).
+
+```toml
+[registrar]
+host = "hl.example"          # the name attestations carry; this server's
+                             # discovery must be reachable at
+                             # https://hl.example/.well-known/hotline
+key = "registrar.key"        # its own signing key, apart from the server
+                             # key; generated on first run
+store = "registrar.db"       # SQLite, a file of its own
+signup = "proof"             # open | proof | closed
+# proof = "invite"           # what signup = proof asks for; "none" with open
+invites = "registrar-invites"  # codes, one per line; read at start and SIGHUP
+# proof_url = "https://hl.example/invite"   # where to ask for one
+# level = 2                  # written into attestations; 2 for invites, 0 open
+attestation_days = 365
+hold_days = 365              # how long a lapsed name waits for its owner
+handle_min = 3
+handle_max = 32
+# reserved = ["staff"]       # beside the built-in list and every account login
+# rotation_delay = 86400     # hold a rotation back so a freeze can meet it
+
+# [registrar.rate]
+# registrations_per_address = 5     # an hour
+# registrations_per_hour = 120      # registrar-wide; renewals don't count
+# records_per_identity = 20         # an hour
+# lookups_per_minute = 60           # per address
+```
+
+The operator's side, acting on the store the running server uses:
+
+```sh
+hxd registrar invites --add 10                  # print ten new invite codes
+hxd registrar freeze <fingerprint>              # a holder reports a theft
+hxd registrar freeze --lift <fingerprint>
+hxd registrar revoke <handle> --reason abuse    # withdraw the name
+hxd registrar recover <handle> --identity <fingerprint> [--keep-age]
+hxd registrar inspect other.example             # verify another registrar's
+                                                # log and stats, and show its
+                                                # last month
+```
+
+And the user's, with `hlid`:
+
+```sh
+hlid register --registrar hl.example --handle alice --proof ABCD-EFGH-JKMN-PQRS --successor-commit
+hlid revoke --registrar hl.example --device-cert lost-phone.cert --reason stolen
+hlid rotate --registrar hl.example --to ~/.hlid/successor.key
+```
+
+`register` puts the attestation into your card and publishes the card
+at the registrar. `--successor-commit` makes a successor key and commits
+to it, which is what lets you rotate to it later — and stops a thief
+with your identity key from rotating anywhere else. A server that
+should trust the registrar's names lists its key in
+`[identity] registrar_keys`.
+
+Discovery names the registrar only when it is asked for under `host`,
+so a verifier never finds the key under a name that did not publish it.
+Behind a reverse proxy that means forwarding the `Host` header as the
+client sent it (`proxy_set_header Host $host;` in nginx); a proxy that
+rewrites it to the backend's address leaves the `registrar` block
+`null`.
 
 ### The offline inbox
 

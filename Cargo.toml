@@ -17,6 +17,7 @@ members = [
     "crates/hxd-voice",
     "crates/hxd-ng-session",
     "crates/hxd-push-webpush",
+    "crates/hxd-registrar",
     "crates/hxd-store-sqlite",
     "crates/hxd",
     "crates/hlid",
@@ -46,6 +47,7 @@ hxd-markdown = { path = "crates/hxd-markdown" }
 hxd-voice = { path = "crates/hxd-voice" }
 hxd-push-webpush = { path = "crates/hxd-push-webpush" }
 hxd-store-sqlite = { path = "crates/hxd-store-sqlite" }
+hxd-registrar = { path = "crates/hxd-registrar" }
 
 # External.
 tokio = { version = "1", default-features = false, features = [

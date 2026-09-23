@@ -408,6 +408,7 @@ async fn run_service(service: Arc<FileService>, access: &str) -> Running {
         tunnel: None,
         enroll: None,
         files: Some(service.clone()),
+        registrar: None,
         push: None,
     };
     let legacy = TcpListener::bind("127.0.0.1:0").await.unwrap();

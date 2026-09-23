@@ -52,6 +52,65 @@ impl Envelope {
     }
 }
 
+/// An object with two signers (`identity-registrar.md` §4.1): `sig` by
+/// the first and `ack` by the second, both over the map with *both*
+/// removed, the second under the domain with `/ack` appended. Neither
+/// signature covers the other, so the two parties can sign in either
+/// order, and neither can be lifted onto a different object.
+pub(crate) struct AckedEnvelope {
+    pub value: Value,
+    pub signed_bytes: Vec<u8>,
+    pub sig: [u8; 64],
+    pub ack: [u8; 64],
+}
+
+impl AckedEnvelope {
+    pub fn from_value(value: Value) -> Result<AckedEnvelope, Error> {
+        if !matches!(value, Value::Map(_)) {
+            return Err(Error::NotAMap);
+        }
+        let v = uint(&value, "v")?;
+        if v != VERSION {
+            return Err(Error::UnsupportedVersion(v));
+        }
+        let sig = bytes32x2(&value, "sig")?;
+        let ack = bytes32x2(&value, "ack")?;
+        let signed_bytes = cbor::encode(&value.without("sig").without("ack"));
+        Ok(AckedEnvelope {
+            value,
+            signed_bytes,
+            sig,
+            ack,
+        })
+    }
+
+    pub fn verify(&self, first: &PublicKey, second: &PublicKey, domain: &str) -> Result<(), Error> {
+        verify_domain(first, domain, &self.signed_bytes, &self.sig)?;
+        verify_domain(second, &ack_domain(domain), &self.signed_bytes, &self.ack)
+    }
+}
+
+pub(crate) fn ack_domain(domain: &str) -> String {
+    format!("{domain}/ack")
+}
+
+/// [`seal`] for a two-signer object.
+pub(crate) fn seal_acked(
+    unsigned: Value,
+    sign: impl FnOnce(&[u8]) -> [u8; 64],
+    ack: impl FnOnce(&[u8]) -> [u8; 64],
+) -> Vec<u8> {
+    let body = cbor::encode(&unsigned);
+    let sig = sign(&body);
+    let ack = ack(&body);
+    let Value::Map(mut entries) = unsigned else {
+        unreachable!("seal_acked is only called with maps")
+    };
+    entries.push((Value::Text("sig".into()), Value::Bytes(sig.to_vec())));
+    entries.push((Value::Text("ack".into()), Value::Bytes(ack.to_vec())));
+    cbor::encode(&Value::Map(entries))
+}
+
 /// Attach a signature to an unsigned map and encode it.
 pub(crate) fn seal(unsigned: Value, sign: impl FnOnce(&[u8]) -> [u8; 64]) -> Vec<u8> {
     let body = cbor::encode(&unsigned);
@@ -142,6 +201,22 @@ pub(crate) fn text(v: &Value, key: &'static str) -> Result<String, Error> {
 pub(crate) fn opt_text(v: &Value, key: &'static str) -> Result<Option<String>, Error> {
     match v.get(key) {
         Some(Value::Text(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(Error::BadField(key)),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn boolean(v: &Value, key: &'static str) -> Result<bool, Error> {
+    match v.get(key) {
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(Error::BadField(key)),
+        None => Err(Error::MissingField(key)),
+    }
+}
+
+pub(crate) fn opt_bool(v: &Value, key: &'static str) -> Result<Option<bool>, Error> {
+    match v.get(key) {
+        Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(_) => Err(Error::BadField(key)),
         None => Ok(None),
     }

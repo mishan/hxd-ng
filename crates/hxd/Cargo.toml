@@ -51,6 +51,7 @@ hxd-media = { workspace = true, optional = true }
 hxd-markdown = { workspace = true, optional = true }
 hxd-voice = { workspace = true, optional = true }
 hl-identity = { workspace = true }
+hxd-registrar = { workspace = true }
 base64 = "0.22"
 hxd-store-sqlite = { workspace = true, optional = true }
 hxd-push-webpush = { workspace = true, optional = true }
@@ -65,6 +66,10 @@ toml_edit = "0.22"
 hmac = { workspace = true }
 sha2 = { workspace = true }
 rand_core = { workspace = true }
+# `hxd registrar inspect` fetches a registrar's log and stats over HTTPS.
+# The same client, and so the same TLS stack, `hlid` already uses.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+serde_json = "1"
 
 [dev-dependencies]
 hxfiles-xfer = { workspace = true }
@@ -88,5 +93,4 @@ sha2 = "0.10"
 str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false }
-serde_json = "1"
 tempfile = "3"

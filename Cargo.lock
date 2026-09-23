@@ -1031,6 +1031,7 @@ dependencies = [
  "hxd-media",
  "hxd-ng-session",
  "hxd-push-webpush",
+ "hxd-registrar",
  "hxd-session",
  "hxd-store-sqlite",
  "hxd-voice",
@@ -1050,6 +1051,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
@@ -1128,6 +1130,7 @@ dependencies = [
  "http-body-util",
  "hxd-core",
  "hxd-files",
+ "hxd-registrar",
  "hyper",
  "hyper-tungstenite",
  "hyper-util",
@@ -1164,6 +1167,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hxd-registrar"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "hl-identity",
+ "sha2",
+ "tracing",
+]
+
+[[package]]
 name = "hxd-session"
 version = "0.1.0"
 dependencies = [
@@ -1181,6 +1194,7 @@ name = "hxd-store-sqlite"
 version = "0.1.0"
 dependencies = [
  "hxd-core",
+ "hxd-registrar",
  "rusqlite",
  "sha2",
  "tempfile",

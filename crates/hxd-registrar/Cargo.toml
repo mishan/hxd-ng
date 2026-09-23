@@ -1,0 +1,16 @@
+[package]
+name = "hxd-registrar"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The identity registrar: handles, attestations, published records (docs/identity-registrar.md)"
+publish = false
+
+[dependencies]
+hl-identity = { workspace = true }
+sha2 = { workspace = true }
+# The OS CSPRNG, for invite codes. The same source hl-identity draws keys
+# from.
+getrandom = "0.2"
+tracing = { workspace = true }

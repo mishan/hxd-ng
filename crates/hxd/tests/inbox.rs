@@ -117,6 +117,7 @@ async fn start_full(dir: &Path, policy: InboxPolicy, who: &[&str], inbox: bool) 
         tunnel: None,
         enroll: None,
         files: None,
+        registrar: None,
         push: None,
     };
 

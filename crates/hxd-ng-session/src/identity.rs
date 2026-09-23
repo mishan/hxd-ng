@@ -318,6 +318,11 @@ pub struct IdentityState {
     /// when the operator configured no path, in which case anchoring is
     /// per-process and `docs/hotline-ng-identity.md` §12 says so.
     anchors: Option<Anchors>,
+    /// This server's registrar, when it is one. The commitments it holds
+    /// bind a card shown here as the anchors do (§3.4): its `PUT` path
+    /// checks them, and admission must too, or `auth` with the card is a
+    /// way around the check.
+    registrar: Option<Arc<hxd_registrar::Registrar>>,
 }
 
 /// Credentials a client may add to `/identity/auth` (§5.4) to verify a
@@ -429,7 +434,14 @@ impl IdentityState {
                 created: Vec::new(),
             }),
             anchors,
+            registrar: None,
         }
+    }
+
+    /// Hold cards to `registrar`'s commitments as well as the anchors'.
+    pub fn with_registrar(mut self, registrar: Option<Arc<hxd_registrar::Registrar>>) -> Self {
+        self.registrar = registrar;
+        self
     }
 
     pub fn config(&self) -> &IdentityConfig {
@@ -588,6 +600,22 @@ impl IdentityState {
         if successor_changed(self.committed_successor(&fingerprint), &card) {
             debug!(fingerprint = %fingerprint.short(), "card changes a committed successor");
             return Err(AuthRefused::BadCard);
+        }
+        if let Some(reg) = &self.registrar {
+            match reg.check_card(&card) {
+                Ok(()) => {}
+                Err(hxd_registrar::Refusal::SuccessorMismatch) => {
+                    debug!(
+                        fingerprint = %fingerprint.short(),
+                        "card changes the successor this server's registrar holds"
+                    );
+                    return Err(AuthRefused::BadCard);
+                }
+                Err(e) => {
+                    tracing::warn!("registrar could not check a card: {e}");
+                    return Err(AuthRefused::Backend);
+                }
+            }
         }
 
         // Step 6: policy.

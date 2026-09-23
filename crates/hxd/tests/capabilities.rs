@@ -65,6 +65,7 @@ async fn start_server(dir: &Path, supported: Caps, ng_caps: &[&str]) -> (SocketA
         tunnel: None,
         enroll: None,
         files: None,
+        registrar: None,
         push: None,
     };
 

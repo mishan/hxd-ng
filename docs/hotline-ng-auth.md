@@ -211,8 +211,9 @@ future binding MUST get a block of its own, with its own `endpoints`.
 Everything else under `identity` is the profile's
 (`hotline-ng-identity.md` §4), except `endpoints.enroll` and `web`, which
 are `identity-enrollment.md` §3's. `registrar` is a registrar's own
-block (`identity-registrar.md` §3), or `null`; *hxd-ng* always sends
-`null`.
+block (`identity-registrar.md` §3), or `null`; *hxd-ng* sends it when
+it is configured as a registrar, and only when the document is asked
+for under the registrar's own host.
 
 A client MUST ignore fields it does not recognize, and MAY cache the
 document for the life of a connection; a relay MAY cache it per

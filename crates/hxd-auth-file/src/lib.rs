@@ -338,6 +338,24 @@ impl FileAuth {
         self.reserved.as_deref() == Some(login)
     }
 
+    /// Every login with an account file, lowercased — what a registrar
+    /// on this server reserves, so that nobody is issued a handle that
+    /// `new_accounts = create` would turn into an existing account's
+    /// name (`identity-registrar.md` §5.2). A directory that cannot be
+    /// read yields nothing, and says so.
+    pub fn logins(&self) -> Vec<String> {
+        match self.entries() {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|(login, _)| login.to_ascii_lowercase())
+                .collect(),
+            Err(e) => {
+                tracing::warn!("{}: {e}", self.dir.display());
+                Vec::new()
+            }
+        }
+    }
+
     /// Read every account file and report what an operator would want to
     /// know: files that do not parse, unreachable accounts, filenames that
     /// lookup canonicalization cannot reach, and ignored identity/access

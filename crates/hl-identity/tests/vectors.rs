@@ -4,9 +4,15 @@
 //! back to the stated fields, the composed login verifies, and every
 //! reject fails with the named error.
 
+use hl_identity::registrar::{
+    FREEZE_DOMAIN, RECORDS_DOMAIN, REGISTER_DOMAIN, REVOKE_ATTESTATION_DOMAIN,
+    REVOKE_DEVICE_DOMAIN, REVOKE_IDENTITY_DOMAIN, ROTATE_DOMAIN,
+};
 use hl_identity::{
-    attestation, card, cert, enroll, proof, Attestation, Bundle, Card, DeviceCert, DeviceKey,
-    EnrollRequest, IdentityKey, LoginContext, LoginProof, ServerKey, SessionClaim,
+    attestation, card, cert, enroll, proof, Attestation, AttestationRevocation, Bundle, Card,
+    DeviceCert, DeviceKey, DeviceRevocation, EnrollRequest, Freeze, IdentityKey,
+    IdentityRevocation, ListKind, LoginContext, LoginProof, Record, RegisterRequest, RegistrarKeys,
+    Rotation, ServerKey, SessionClaim, SignedList,
 };
 use serde_json::Value as Json;
 
@@ -281,6 +287,8 @@ fn rejects() {
             "attestation" => Attestation::parse(&bytes).unwrap_err(),
             "card" => Card::parse(&bytes).unwrap_err(),
             "login_proof" => LoginProof::parse(&bytes).unwrap_err(),
+            "revoke_device" => DeviceRevocation::parse(&bytes).unwrap_err(),
+            "rotate" => Rotation::parse(&bytes).unwrap_err(),
             other => panic!("unknown object kind {other}"),
         };
         assert_eq!(
@@ -399,4 +407,224 @@ fn bundle_vector() {
     let (opened_cert, opened_card) = Bundle::parse(&encoded).unwrap().open().unwrap();
     assert_eq!(opened_cert, DeviceCert::parse(&cert).unwrap());
     assert_eq!(opened_card.identity, opened_cert.identity);
+}
+
+// --- The registrar's objects (identity-registrar.md §15) -----------------
+
+fn key_of(v: &Json, name: &str) -> IdentityKey {
+    let k = &v["keys"][name];
+    let key = IdentityKey::from_seed(&unhex32(str_of(k, "seed_hex")));
+    assert_eq!(
+        key.public(),
+        unhex32(str_of(k, "public_hex")),
+        "keys.{name}"
+    );
+    assert_eq!(
+        key.fingerprint().to_string(),
+        str_of(k, "fingerprint"),
+        "keys.{name}"
+    );
+    key
+}
+
+fn opt32(f: &Json, k: &str) -> Option<[u8; 32]> {
+    f[k].as_str().map(unhex32)
+}
+
+#[test]
+fn register_vectors() {
+    let v = vectors();
+    let k = keys(&v);
+    let succ = key_of(&v, "successor");
+    for name in ["register", "register_reissue"] {
+        let e = &v[name];
+        let f = &e["fields"];
+        assert_eq!(str_of(e, "domain"), REGISTER_DOMAIN);
+        let r = RegisterRequest {
+            identity: unhex32(str_of(f, "identity")),
+            registrar: str_of(f, "registrar").to_owned(),
+            handle: str_of(f, "handle").to_owned(),
+            time: u64_of(f, "time"),
+            successor: opt32(f, "successor"),
+            proof: f["proof"].as_str().map(str::to_owned),
+        };
+        let signed = unhex(str_of(e, "signed_hex"));
+        assert_eq!(
+            r.sign(&k.id).unwrap(),
+            signed,
+            "{name} re-signs to the vector bytes"
+        );
+        assert_eq!(RegisterRequest::parse(&signed).unwrap(), r);
+        assert_eq!(
+            r.successor,
+            Some(succ.fingerprint().0),
+            "{name} commits to keys.successor"
+        );
+        check_signed(e, REGISTER_DOMAIN, &k.id.public(), &signed);
+    }
+}
+
+#[test]
+fn record_vectors() {
+    let v = vectors();
+    let k = keys(&v);
+    let succ = key_of(&v, "successor");
+    let other = key_of(&v, "other");
+    let lost = unhex32(str_of(&v["keys"]["lost_device"], "public_hex"));
+    let reg_keys = [k.reg.public()];
+    let rk = RegistrarKeys {
+        host: "hl.example",
+        keys: &reg_keys,
+    };
+    let parse = |name: &str| {
+        let e = &v[name];
+        let signed = unhex(str_of(e, "signed_hex"));
+        let rec = Record::parse(&signed, Some(rk)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        (e, signed, rec)
+    };
+
+    let (e, signed, rec) = parse("revoke_device");
+    let f = &e["fields"];
+    let r = DeviceRevocation {
+        identity: k.id.public(),
+        device: lost,
+        time: u64_of(f, "time"),
+        until: u64_of(f, "until"),
+        reason: f["reason"].as_u64(),
+        signer: None,
+        signer_cert: None,
+    };
+    assert_eq!(r.sign(&k.id).unwrap(), signed);
+    assert_eq!(rec, Record::RevokeDevice(r));
+    check_signed(e, REVOKE_DEVICE_DOMAIN, &k.id.public(), &signed);
+
+    // Signed by the device, so the signature checks against `signer`.
+    let (e, signed, rec) = parse("revoke_device_by_device");
+    let f = &e["fields"];
+    let cert = unhex(str_of(f, "signer_cert"));
+    let r = DeviceRevocation {
+        identity: k.id.public(),
+        device: lost,
+        time: u64_of(f, "time"),
+        until: u64_of(f, "until"),
+        reason: f["reason"].as_u64(),
+        signer: None,
+        signer_cert: None,
+    };
+    assert_eq!(r.sign_as_device(&k.dev, cert).unwrap(), signed);
+    let Record::RevokeDevice(back) = rec else {
+        panic!("not a device revocation")
+    };
+    assert_eq!(back.signer, Some(k.dev.public()));
+    check_signed(e, REVOKE_DEVICE_DOMAIN, &k.dev.public(), &signed);
+
+    let (e, signed, rec) = parse("revoke_identity");
+    let f = &e["fields"];
+    let r = IdentityRevocation {
+        identity: other.public(),
+        time: u64_of(f, "time"),
+        reason: f["reason"].as_u64(),
+    };
+    assert_eq!(r.sign(&other).unwrap(), signed);
+    assert_eq!(rec, Record::RevokeIdentity(r));
+    check_signed(e, REVOKE_IDENTITY_DOMAIN, &other.public(), &signed);
+
+    // Two signatures over one input, under two domains.
+    let (e, signed, rec) = parse("rotate");
+    let f = &e["fields"];
+    let r = Rotation {
+        identity: k.id.public(),
+        successor: succ.public(),
+        time: u64_of(f, "time"),
+    };
+    assert_eq!(r.sign(&k.id, &succ).unwrap(), signed);
+    assert_eq!(rec, Record::Rotate(r));
+    let value = hl_identity::cbor::decode_canonical(&signed).unwrap();
+    let unsigned = unhex(str_of(e, "unsigned_hex"));
+    assert_eq!(
+        hl_identity::cbor::encode(&value.without("sig").without("ack")),
+        unsigned
+    );
+    let mut sig_input = ROTATE_DOMAIN.as_bytes().to_vec();
+    sig_input.push(0);
+    sig_input.extend_from_slice(&unsigned);
+    assert_eq!(unhex(str_of(e, "signature_input_hex")), sig_input);
+    let mut ack_input = format!("{ROTATE_DOMAIN}/ack").into_bytes();
+    ack_input.push(0);
+    ack_input.extend_from_slice(&unsigned);
+    assert_eq!(unhex(str_of(e, "ack_input_hex")), ack_input);
+    let sig: [u8; 64] = unhex(str_of(e, "signature_hex")).try_into().unwrap();
+    let ack: [u8; 64] = unhex(str_of(e, "ack_hex")).try_into().unwrap();
+    hl_identity::keys::verify_domain(&k.id.public(), ROTATE_DOMAIN, &unsigned, &sig).unwrap();
+    hl_identity::keys::verify_domain(
+        &succ.public(),
+        &format!("{ROTATE_DOMAIN}/ack"),
+        &unsigned,
+        &ack,
+    )
+    .unwrap();
+
+    let (e, signed, rec) = parse("freeze");
+    let f = &e["fields"];
+    let r = Freeze {
+        identity: k.id.public(),
+        registrar: str_of(f, "registrar").to_owned(),
+        frozen: f["frozen"].as_bool().unwrap(),
+        time: u64_of(f, "time"),
+    };
+    assert_eq!(r.sign(&k.reg), signed);
+    assert_eq!(rec, Record::Freeze(r));
+    check_signed(e, FREEZE_DOMAIN, &k.reg.public(), &signed);
+
+    let (e, signed, rec) = parse("revoke_attestation");
+    let f = &e["fields"];
+    let r = AttestationRevocation {
+        identity: k.id.public(),
+        registrar: str_of(f, "registrar").to_owned(),
+        handle: str_of(f, "handle").to_owned(),
+        time: u64_of(f, "time"),
+        reason: f["reason"].as_u64(),
+    };
+    assert_eq!(r.sign(&k.reg), signed);
+    assert_eq!(rec, Record::RevokeAttestation(r));
+    check_signed(e, REVOKE_ATTESTATION_DOMAIN, &k.reg.public(), &signed);
+}
+
+#[test]
+fn record_list_vectors() {
+    let v = vectors();
+    let k = keys(&v);
+    let other = key_of(&v, "other");
+    let reg_keys = [k.reg.public()];
+    let rk = RegistrarKeys {
+        host: "hl.example",
+        keys: &reg_keys,
+    };
+
+    let e = &v["records"];
+    let signed = unhex(str_of(e, "signed_hex"));
+    let list = SignedList::parse(&signed, ListKind::Records, rk).unwrap();
+    assert_eq!(list.fingerprint, Some(k.id.fingerprint().0));
+    assert_eq!(list.sign(ListKind::Records, &k.reg), signed);
+    check_signed(e, RECORDS_DOMAIN, &k.reg.public(), &signed);
+    // Every entry is the vector of the same name, byte for byte.
+    let named = [
+        "revoke_device",
+        "revoke_device_by_device",
+        "rotate",
+        "freeze",
+        "revoke_attestation",
+    ];
+    assert_eq!(list.entries.len(), named.len());
+    for ((_, bytes), name) in list.entries.iter().zip(named) {
+        assert_eq!(bytes, &unhex(str_of(&v[name], "signed_hex")), "{name}");
+        assert!(Record::parse(bytes, Some(rk)).is_ok(), "{name}");
+    }
+
+    let e = &v["records_empty"];
+    let signed = unhex(str_of(e, "signed_hex"));
+    let list = SignedList::parse(&signed, ListKind::Records, rk).unwrap();
+    assert_eq!(list.fingerprint, Some(other.fingerprint().0));
+    assert!(list.entries.is_empty());
+    check_signed(e, RECORDS_DOMAIN, &k.reg.public(), &signed);
 }

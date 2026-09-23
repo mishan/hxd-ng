@@ -265,6 +265,7 @@ async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool, history: bool) ->
         tunnel: None,
         enroll: None,
         files: None,
+        registrar: None,
         push: None,
     };
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

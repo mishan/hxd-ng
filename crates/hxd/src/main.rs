@@ -39,12 +39,17 @@ fn init_tracing() {
         .init();
 }
 
-/// SIGHUP re-reads `[identity]`'s revocation lists, and nothing else
-/// (`docs/identity-registrar.md`): an operator locking out a stolen
+/// SIGHUP re-reads `[identity]`'s revocation lists, and — on a
+/// registrar — the names it reserves and its invites file, and nothing
+/// else (`docs/identity-registrar.md`): an operator locking out a stolen
 /// key should not have to restart the server and drop everyone else to
 /// do it. `systemctl reload` sends exactly this.
 #[cfg(unix)]
-async fn reload_on_hangup(core: std::sync::Arc<hxd_core::Core>, path: PathBuf) {
+async fn reload_on_hangup(
+    core: std::sync::Arc<hxd_core::Core>,
+    registrar: Option<std::sync::Arc<hxd_registrar::Registrar>>,
+    path: PathBuf,
+) {
     let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         Ok(s) => s,
         Err(e) => {
@@ -60,6 +65,14 @@ async fn reload_on_hangup(core: std::sync::Arc<hxd_core::Core>, path: PathBuf) {
                 ended.len()
             ),
             Err(e) => tracing::error!("SIGHUP: {e}; the revocation lists are unchanged"),
+        }
+        if let Some(reg) = registrar.as_deref() {
+            match hxd::registrar::reload(reg, &path) {
+                Ok((reserved, invites)) => tracing::info!(
+                    "SIGHUP: registrar reserves {reserved} names; {invites} new invites"
+                ),
+                Err(e) => tracing::error!("SIGHUP: registrar: {e}"),
+            }
         }
     }
 }
@@ -103,6 +116,30 @@ enum Command {
         what: hxd::RevokeWhat,
         lift: bool,
     },
+    /// `registrar freeze <fingerprint> [--lift]`.
+    RegistrarFreeze {
+        fingerprint: String,
+        lift: bool,
+    },
+    /// `registrar revoke <handle> --reason R`.
+    RegistrarRevoke {
+        handle: String,
+        reason: String,
+    },
+    /// `registrar recover <handle> --identity FP [--keep-age]`.
+    RegistrarRecover {
+        handle: String,
+        identity: String,
+        keep_age: bool,
+    },
+    /// `registrar invites --add N`.
+    RegistrarInvites {
+        add: usize,
+    },
+    /// `registrar inspect <host>`.
+    RegistrarInspect {
+        target: String,
+    },
 }
 
 const USAGE: &str = "usage:\n  \
@@ -110,7 +147,12 @@ hxd [--config hxd-ng.toml]\n  \
 hxd [--config …] inbox purge <login> [--fingerprint FP] [--dry-run]\n  \
 hxd [--config …] news-reindex\n  \
 hxd [--config …] push rekey\n  \
-hxd [--config …] identity revoke <fingerprint> [--device] [--lift]\n\n\
+hxd [--config …] identity revoke <fingerprint> [--device] [--lift]\n  \
+hxd [--config …] registrar freeze <fingerprint> [--lift]\n  \
+hxd [--config …] registrar revoke <handle> --reason abuse|lapsed|unspecified\n  \
+hxd [--config …] registrar recover <handle> --identity <fingerprint> [--keep-age]\n  \
+hxd [--config …] registrar invites --add N\n  \
+hxd registrar inspect <host>\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
 `push rekey` replaces the server's VAPID key and drops every registered\n\
@@ -121,6 +163,14 @@ revoked_identities in the config file, or with --device a device's to\n\
 revoked_devices; --lift takes it out again. Nothing changes in a running\n\
 server until it is sent SIGHUP (`systemctl reload`), which ends every\n\
 session the key holds.\n\n\
+`registrar freeze` publishes a signed freeze of an identity this\n\
+registrar attests (--lift publishes the lift); `revoke` withdraws the\n\
+attestations of a handle, and with --reason abuse keeps its holder from\n\
+reissuing it; `recover` gives a handle to a new key after the holder\n\
+proved themselves out of band; `invites --add` prints new invite codes\n\
+and appends them to the invites file. All of them act on the running\n\
+server's store directly. `inspect` fetches another registrar's log and\n\
+stats, verifies them, and prints the shape of the last month.\n\n\
 `inbox purge` takes an account's mail, news subscriptions and push\n\
 devices with it when the account is deleted — otherwise the freed\n\
 login's next holder inherits them.\n\
@@ -135,6 +185,10 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut dry_run = false;
     let mut device = false;
     let mut lift = false;
+    let mut reason = None;
+    let mut identity = None;
+    let mut keep_age = false;
+    let mut add = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -153,6 +207,27 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             "--dry-run" => dry_run = true,
             "--device" => device = true,
             "--lift" => lift = true,
+            "--keep-age" => keep_age = true,
+            "--reason" => {
+                reason = Some(
+                    args.next()
+                        .ok_or_else(|| "--reason needs a value".to_string())?,
+                );
+            }
+            "--identity" => {
+                identity = Some(
+                    args.next()
+                        .ok_or_else(|| "--identity needs a fingerprint".to_string())?,
+                );
+            }
+            "--add" => {
+                add = Some(
+                    args.next()
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| "--add needs a positive number".to_string())?,
+                );
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -165,8 +240,28 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     // `--fingerprint` always was: `hxd --lift identity revok …` should
     // not quietly start a server.
     let words = rest.iter().map(String::as_str).collect::<Vec<_>>();
-    if (device || lift) && !matches!(words[..], ["identity", "revoke", _]) {
-        return Err("--device and --lift belong to `identity revoke`".to_string());
+    if device && !matches!(words[..], ["identity", "revoke", _]) {
+        return Err("--device belongs to `identity revoke`".to_string());
+    }
+    if lift
+        && !matches!(
+            words[..],
+            ["identity", "revoke", _] | ["registrar", "freeze", _]
+        )
+    {
+        return Err("--lift belongs to `identity revoke` and `registrar freeze`".to_string());
+    }
+    if reason.is_some() && !matches!(words[..], ["registrar", "revoke", _]) {
+        return Err("--reason belongs to `registrar revoke`".to_string());
+    }
+    if (identity.is_some() || keep_age) && !matches!(words[..], ["registrar", "recover", _]) {
+        return Err("--identity and --keep-age belong to `registrar recover`".to_string());
+    }
+    if add.is_some() && !matches!(words[..], ["registrar", "invites"]) {
+        return Err("--add belongs to `registrar invites`".to_string());
+    }
+    if (fingerprint.is_some() || dry_run) && words.first() == Some(&"registrar") {
+        return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string());
     }
     let command = match words[..] {
         // A flag that belongs to a subcommand is an error on the way to
@@ -197,6 +292,27 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             },
             lift,
         },
+        ["registrar", "freeze", fp] => Command::RegistrarFreeze {
+            fingerprint: fp.to_string(),
+            lift,
+        },
+        ["registrar", "revoke", handle] => Command::RegistrarRevoke {
+            handle: handle.to_string(),
+            reason: reason
+                .ok_or("`registrar revoke` needs --reason: abuse, lapsed or unspecified")?,
+        },
+        ["registrar", "recover", handle] => Command::RegistrarRecover {
+            handle: handle.to_string(),
+            identity: identity
+                .ok_or("`registrar recover` needs --identity <the new key's fingerprint>")?,
+            keep_age,
+        },
+        ["registrar", "invites"] => Command::RegistrarInvites {
+            add: add.ok_or("`registrar invites` needs --add N")?,
+        },
+        ["registrar", "inspect", target] => Command::RegistrarInspect {
+            target: target.to_string(),
+        },
         ["inbox", "purge", login] => Command::InboxPurge {
             login: login.to_string(),
             fingerprint,
@@ -213,6 +329,15 @@ async fn main() {
 
     let result = async {
         let (config_path, command) = parse_args()?;
+        // Another registrar's business, not this server's: no config.
+        if let Command::RegistrarInspect { target } = &command {
+            let target = target.clone();
+            let report = tokio::task::spawn_blocking(move || hxd::registrar::inspect(&target))
+                .await
+                .map_err(|e| e.to_string())??;
+            print!("{report}");
+            return Ok(());
+        }
         let config = Config::load(&config_path)?;
         hxd::check_config(&config)?;
         if let Command::InboxPurge {
@@ -258,6 +383,49 @@ async fn main() {
                 ),
             }
             return Ok(());
+        }
+        match &command {
+            Command::RegistrarFreeze { fingerprint, lift } => {
+                let seq = hxd::registrar::freeze(&config, fingerprint, *lift)?;
+                println!(
+                    "{} {fingerprint}: published as record {seq}",
+                    if *lift {
+                        "lifted the freeze of"
+                    } else {
+                        "froze"
+                    }
+                );
+                return Ok(());
+            }
+            Command::RegistrarRevoke { handle, reason } => {
+                let seq = hxd::registrar::revoke(&config, handle, reason)?;
+                println!("revoked the attestations of {handle} ({reason}): record {seq}");
+                return Ok(());
+            }
+            Command::RegistrarRecover {
+                handle,
+                identity,
+                keep_age,
+            } => {
+                let seq = hxd::registrar::recover(&config, handle, identity, *keep_age)?;
+                println!(
+                    "{handle}'s attestations to the old key are revoked (record {seq}); its \
+                     next registration from {identity} is a reissue{}",
+                    if *keep_age {
+                        ", keeping its age"
+                    } else {
+                        " with a fresh age"
+                    }
+                );
+                return Ok(());
+            }
+            Command::RegistrarInvites { add } => {
+                for code in hxd::registrar::invites_add(&config, *add)? {
+                    println!("{code}");
+                }
+                return Ok(());
+            }
+            _ => {}
         }
         if let Command::PushRekey = command {
             let (dropped, public) = hxd::push::rekey(&config)?;
@@ -461,7 +629,11 @@ async fn main() {
             tokio::spawn(hxd::device_sweeper(ctx.core.clone()));
         }
         #[cfg(unix)]
-        tokio::spawn(reload_on_hangup(ctx.core.clone(), config_path.clone()));
+        tokio::spawn(reload_on_hangup(
+            ctx.core.clone(),
+            ng_ctx.as_ref().and_then(|n| n.registrar.clone()),
+            config_path.clone(),
+        ));
 
         // The Hotline-ng WebSocket frontend, when configured: its accept
         // loop plus the detached-session sweeper.

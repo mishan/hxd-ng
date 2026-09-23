@@ -28,6 +28,15 @@ fn is_host_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '.')
 }
 
+/// A registrar host as every object that names one carries it:
+/// lowercase hostname syntax, bounded.
+pub(crate) fn is_host(host: &str) -> bool {
+    host == host.to_lowercase()
+        && !host.is_empty()
+        && host.len() <= MAX_HOST_BYTES
+        && host.chars().all(is_host_char)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attestation {
     pub identity: PublicKey,
@@ -112,11 +121,7 @@ impl Attestation {
             expires: signed::uint(v, "expires")?,
             level: signed::opt_uint(v, "level")?,
         };
-        if a.registrar != a.registrar.to_lowercase()
-            || a.registrar.is_empty()
-            || a.registrar.len() > MAX_HOST_BYTES
-            || !a.registrar.chars().all(is_host_char)
-        {
+        if !is_host(&a.registrar) {
             return Err(Error::BadField("registrar"));
         }
         // `handle` and `registrar` are rendered next to user-chosen names

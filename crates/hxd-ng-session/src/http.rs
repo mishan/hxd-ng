@@ -18,6 +18,7 @@
 //! | `GET  /media/<id>` | the canonical bytes |
 //! | `POST /news/blob` | stage a durable news image |
 //! | `GET  /news/blob/<id>` | an authorized news image |
+//! | `/registrar/…` | the registrar, `identity-registrar.md` §6 (`registrar.rs`) |
 //! | `GET  /ng` (and `/`) | upgrade → the JSON protocol |
 //! | `GET  /trtp` | upgrade → the TRTP tunnel |
 //!
@@ -184,8 +185,21 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         return cors(resp);
     }
 
+    if path == crate::registrar::PREFIX || path.starts_with("/registrar/") {
+        let resp = match ctx.registrar.clone() {
+            Some(reg) => boxed(crate::registrar::route(req, client.ip(), reg).await),
+            None => plain(StatusCode::NOT_FOUND, "this server is not a registrar"),
+        };
+        return cors(resp);
+    }
+
+    let host = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let resp = match (req.method(), path.as_str()) {
-        (&Method::GET, "/.well-known/hotline") => discovery(&ctx),
+        (&Method::GET, "/.well-known/hotline") => discovery(&ctx, host.as_deref()),
         (&Method::POST, "/identity/challenge") => challenge(&ctx),
         (&Method::POST, "/identity/auth") => auth(req, peer, &ctx).await,
         (&Method::POST, "/identity/link") => link(req, peer, &ctx).await,
@@ -403,6 +417,7 @@ fn cors_route(path: &str) -> bool {
         || path.starts_with("/files/")
         || path == "/news/blob"
         || path.starts_with("/news/blob/")
+        || path.starts_with("/registrar/")
 }
 
 /// `*` rather than an echo of `Origin`: there is no cookie or other
@@ -984,7 +999,7 @@ fn base64_any(s: &str) -> Option<Vec<u8>> {
 
 // --- Identity endpoints -----------------------------------------------
 
-fn discovery(ctx: &NgCtx) -> Resp {
+fn discovery(ctx: &NgCtx, host: Option<&str>) -> Resp {
     let identity = match ctx.identity.as_ref() {
         Some(st) => {
             let cfg = st.config();
@@ -1039,7 +1054,7 @@ fn discovery(ctx: &NgCtx) -> Resp {
         "server_key": ctx.identity.as_ref().map(|i| b64(&i.server_key())),
         "ng": ng,
         "identity": identity,
-        "registrar": Value::Null,
+        "registrar": crate::registrar::discovery(ctx.registrar.as_deref(), host),
     });
     json_resp(StatusCode::OK, doc)
 }
@@ -1383,6 +1398,8 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     // The state does signature checks and, with credentials or a
     // create policy, file I/O: off the reactor.
     let st = st.clone();
+    let registrar = ctx.registrar.clone();
+    let presented = card.clone();
     let result = tokio::task::spawn_blocking(move || {
         let classic = login
             .as_deref()
@@ -1396,11 +1413,22 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
             downstream,
             create,
         };
-        match (proof, device_from_cert) {
+        let result = match (proof, device_from_cert) {
             (Some(proof), _) => st.auth_with_proof(&card, &cert, &proof, req),
             (None, Some(device)) => st.auth_presented(&card, &cert, &device, req),
             (None, None) => unreachable!("checked above"),
+        };
+        // A card shown at `auth` is cached like one that was `PUT`, so a
+        // registrar records its commitment the same way (§5.4) — and
+        // holds it to one it already has, which admission checked.
+        if let (Ok(_), Some(reg)) = (&result, &registrar) {
+            if let Ok(card) = hl_identity::Card::parse(&presented) {
+                if let Err(e) = reg.note_card(&card) {
+                    warn!("registrar could not record a card's commitment: {e}");
+                }
+            }
         }
+        result
     })
     .await;
     let Ok(result) = result else {
@@ -1552,9 +1580,35 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
         return plain(StatusCode::BAD_REQUEST, "expected a CBOR body");
     };
     let state = st.clone();
-    let updated = tokio::task::spawn_blocking(move || state.update_card(&ident, &bytes)).await;
-    let Ok(updated) = updated else {
-        return plain(StatusCode::INTERNAL_SERVER_ERROR, "card update task failed");
+    let registrar = ctx.registrar.clone();
+    let updated = tokio::task::spawn_blocking(move || {
+        // A registrar is the card's home of record, and anchors its
+        // successor as its own commitment (`identity-registrar.md` §5.4,
+        // §6.4): a card that changes or drops one it holds is refused
+        // here, and one that makes the first is recorded once accepted.
+        // A card that does not parse is the identity state's to refuse.
+        let card = registrar
+            .as_ref()
+            .and_then(|_| hl_identity::Card::parse(&bytes).ok());
+        if let (Some(reg), Some(card)) = (&registrar, &card) {
+            reg.check_card(card)?;
+        }
+        let updated = state.update_card(&ident, &bytes);
+        if let (Ok(true), Some(reg), Some(card)) = (&updated, &registrar, &card) {
+            reg.note_card(card)?;
+        }
+        Ok::<_, hxd_registrar::Refusal>(updated)
+    })
+    .await;
+    let updated = match updated {
+        Ok(Ok(updated)) => updated,
+        Ok(Err(e)) => {
+            return json_resp(
+                StatusCode::from_u16(e.status()).unwrap(),
+                json!({ "error": e.code(), "text": e.text() }),
+            )
+        }
+        Err(_) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "card update task failed"),
     };
     match updated {
         Ok(true) => {

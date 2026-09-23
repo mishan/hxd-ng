@@ -77,6 +77,7 @@ async fn start_with(dir: &Path, push: bool, policy: hxd_core::push::PushPolicy) 
         tunnel: None,
         enroll: None,
         files: None,
+        registrar: None,
         push: push.then(|| {
             Arc::new(PushInfo {
                 vapid: "BEl6…".into(),
