@@ -388,6 +388,12 @@ pub(crate) struct UserSession {
     /// Account policy: may this session survive its connection? (The
     /// `[extra] can_detach` flag; guests default to no.)
     pub(crate) can_detach: bool,
+    /// Moderation kicked this session. Its `Kicked` event may still be in
+    /// the channel, or may have failed to send, when the connection
+    /// drops: set, this makes `connection_lost` end the session rather
+    /// than park it, and `resume` refuse it, so a kick is never undone
+    /// by the socket dying at the wrong moment.
+    pub(crate) kicked: bool,
     /// Account policy: may private messages be stored for this account
     /// and delivered later? (The `[extra] inbox` flag; guests default to
     /// no.) It doubles as "is this session a repliable identity" — the
@@ -886,6 +892,7 @@ impl Core {
                 addr: info.addr,
                 connected_at: Instant::now(),
                 can_detach: info.can_detach,
+                kicked: false,
                 has_inbox: info.has_inbox,
                 attach_news: info.attach_news,
                 is_person: info.is_person,
@@ -969,7 +976,7 @@ impl Core {
         // A revoked key's session never parks: its `Kicked` may not have
         // reached the frontend before the socket failed, and a detached
         // session would keep a resume token alive for whoever stole it.
-        if !sess.can_detach || self.refuses_session(sess) {
+        if !sess.can_detach || sess.kicked || self.refuses_session(sess) {
             r.end_session(uid);
             return false;
         }
@@ -1029,8 +1036,9 @@ impl Core {
             return Resume::Gone;
         };
         // The backstop to `connection_lost`'s check: a token is no way
-        // back for a key revoked since it was issued.
-        if self.refuses_session(sess) {
+        // back for a key revoked since it was issued, or into a session
+        // that was kicked while another connection held it.
+        if sess.kicked || self.refuses_session(sess) {
             r.end_session(uid);
             return Resume::Gone;
         }
@@ -1517,5 +1525,33 @@ mod tests {
         core.chat_public(b, "hi".into(), 0, None).unwrap();
         assert!(rx_old.try_recv().is_err());
         assert_eq!(drain(&mut rx_new).len(), 1);
+    }
+
+    #[test]
+    fn a_kicked_session_does_not_detach_when_its_socket_dies() {
+        // The `Kicked` event is in the channel, but the socket failed
+        // before the frontend read it (or while sending it): the kick
+        // must still end the session, whatever the account's policy.
+        let core = Core::new();
+        let (a, _ra) = ng_attach(&core, "app", "10.0.0.1");
+        core.kick(a, None).unwrap();
+        assert!(!core.connection_lost(a, 8));
+        assert!(matches!(core.resume(a, 0), Resume::Gone));
+        assert!(core.snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_kicked_session_cannot_be_taken_over() {
+        // Kicked while a connection holds it, and resumed from another
+        // before the first connection acts on the kick: the resume must
+        // not inherit the session and leave the kick in a dead channel.
+        let core = Core::new();
+        let (a, mut rx) = ng_attach(&core, "app", "10.0.0.1");
+        let last_seq = std::iter::from_fn(|| rx.try_recv().ok())
+            .last()
+            .map_or(0, |se| se.seq);
+        core.kick(a, None).unwrap();
+        assert!(matches!(core.resume(a, last_seq), Resume::Gone));
+        assert!(core.snapshot().is_empty());
     }
 }

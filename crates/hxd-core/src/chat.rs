@@ -1585,6 +1585,9 @@ impl Core {
             };
             r.bans.push(ban);
         }
+        if let Some(sess) = r.users.get_mut(&target) {
+            sess.kicked = true;
+        }
         r.send_to(target, Event::Kicked);
         // A detached session has no connection to observe the event; the
         // kick must end it here or it would linger on the roster.

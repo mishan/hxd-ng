@@ -69,7 +69,7 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
     match req.req.as_str() {
         "push_register" => register(ctx, state, req).await,
         "push_unregister" => unregister(ctx, state, req).await,
-        _ => reply_err(req.id, "bad_request", "No such request."),
+        _ => reply_err(req.id, "unknown_method", "Unknown request."),
     }
 }
 
