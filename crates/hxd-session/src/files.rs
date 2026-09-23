@@ -1,10 +1,17 @@
 //! Legacy-wire names, paths, and file reply payloads.
+//!
+//! A wire name is spelled in the connection's encoding, and it is also
+//! how the client names the entry back: a path the client sends is matched
+//! against the names this connection was listed, byte for byte. So one
+//! encoding has to run through listing and resolving alike, and each
+//! function here takes the connection's.
 
 use std::collections::{HashMap, HashSet};
 
 use hxd_core::{FileEntry, FileError, FileInfo, FileKind, FilePath, FileSource};
-use hxproto::text;
 use sha2::{Digest, Sha256};
+
+use crate::encoding::TextEncoding;
 
 pub(crate) const LIST_TAG: u16 = 0x00c8;
 // The transfer-size field includes FILP, INFO, DATA, and MACR framing.
@@ -23,6 +30,7 @@ pub(crate) async fn list(
     source: &dyn FileSource,
     path: &FilePath,
     large: bool,
+    enc: TextEncoding,
 ) -> Result<Vec<WireEntry>, FileError> {
     let entries = source.list(path).await?;
     let visible: Vec<_> = entries
@@ -33,7 +41,7 @@ pub(crate) async fn list(
     let bases: Vec<_> = visible
         .iter()
         .map(|entry| {
-            let base = base_name(&entry.name);
+            let base = base_name(enc, &entry.name);
             *base_counts.entry(base.clone()).or_default() += 1;
             base
         })
@@ -46,9 +54,9 @@ pub(crate) async fn list(
             let preferred = if base_counts[&base] == 1 {
                 base
             } else {
-                hashed_name(&entry.name)
+                hashed_name(enc, &entry.name)
             };
-            let name = unique_name(&entry.name, preferred, &mut used);
+            let name = unique_name(enc, &entry.name, preferred, &mut used);
             Ok(WireEntry {
                 path: path.join(&entry.name)?,
                 entry,
@@ -62,6 +70,7 @@ pub(crate) async fn resolve_dir(
     source: &dyn FileSource,
     bytes: Option<&[u8]>,
     large: bool,
+    enc: TextEncoding,
 ) -> Result<FilePath, FileError> {
     let components = match bytes {
         Some(bytes) => parse_dir(bytes)?,
@@ -69,7 +78,7 @@ pub(crate) async fn resolve_dir(
     };
     let mut path = FilePath::root();
     for component in components {
-        let found = list(source, &path, large)
+        let found = list(source, &path, large, enc)
             .await?
             .into_iter()
             .find(|entry| entry.entry.kind == FileKind::Folder && entry.name == component)
@@ -84,8 +93,9 @@ pub(crate) async fn resolve_file(
     dir: Option<&[u8]>,
     name: &[u8],
     large: bool,
+    enc: TextEncoding,
 ) -> Result<(FilePath, FileInfo, Vec<u8>), FileError> {
-    resolve_named(source, dir, name, large, Some(FileKind::File)).await
+    resolve_named(source, dir, name, large, enc, Some(FileKind::File)).await
 }
 
 /// A named entry of either kind: Get Info asks about folders too.
@@ -94,8 +104,9 @@ pub(crate) async fn resolve_entry(
     dir: Option<&[u8]>,
     name: &[u8],
     large: bool,
+    enc: TextEncoding,
 ) -> Result<(FilePath, FileInfo, Vec<u8>), FileError> {
-    resolve_named(source, dir, name, large, None).await
+    resolve_named(source, dir, name, large, enc, None).await
 }
 
 async fn resolve_named(
@@ -103,10 +114,11 @@ async fn resolve_named(
     dir: Option<&[u8]>,
     name: &[u8],
     large: bool,
+    enc: TextEncoding,
     kind: Option<FileKind>,
 ) -> Result<(FilePath, FileInfo, Vec<u8>), FileError> {
-    let parent = resolve_dir(source, dir, large).await?;
-    let found = list(source, &parent, large)
+    let parent = resolve_dir(source, dir, large, enc).await?;
+    let found = list(source, &parent, large, enc)
         .await?
         .into_iter()
         .find(|entry| kind.is_none_or(|kind| entry.entry.kind == kind) && entry.name == name)
@@ -133,12 +145,13 @@ pub(crate) async fn resolve_upload(
     dir: Option<&[u8]>,
     name: &[u8],
     large: bool,
+    enc: TextEncoding,
 ) -> Result<FilePath, FileError> {
     if name.is_empty() || name.len() > 128 {
         return Err(FileError::InvalidPath);
     }
-    let parent = resolve_dir(source, dir, large).await?;
-    parent.join(&text::to_utf8(name))
+    let parent = resolve_dir(source, dir, large, enc).await?;
+    parent.join(&enc.decode(name))
 }
 
 pub(crate) fn list_payload(entry: &WireEntry) -> Vec<u8> {
@@ -181,37 +194,37 @@ pub(crate) fn date(value: Option<u32>) -> Vec<u8> {
     out
 }
 
-fn base_name(name: &str) -> Vec<u8> {
-    let mut bytes = text::from_utf8(name);
-    // GtkHx can display slash-separated paths; keep a literal classic-Mac
-    // delimiter from being mistaken for navigation by period clients.
-    for byte in &mut bytes {
-        if *byte == b':' {
-            *byte = b'-';
-        }
-    }
-    bytes.truncate(31);
-    bytes
+/// `name` on the wire, cut to `max` bytes at a character boundary.
+///
+/// GtkHx can display slash-separated paths; keep a literal classic-Mac
+/// delimiter from being mistaken for navigation by period clients. The
+/// swap is before the conversion and `:` is ASCII, so it is the same in
+/// either encoding.
+fn wire_name(enc: TextEncoding, name: &str, max: usize) -> Vec<u8> {
+    enc.encode_capped(&name.replace(':', "-"), max)
 }
 
-fn hashed_name(name: &str) -> Vec<u8> {
+fn base_name(enc: TextEncoding, name: &str) -> Vec<u8> {
+    wire_name(enc, name, 31)
+}
+
+fn hashed_name(enc: TextEncoding, name: &str) -> Vec<u8> {
     let digest = Sha256::digest(name.as_bytes());
     let suffix = format!(
         "~{:02x}{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2], digest[3]
     );
-    let mut bytes = text::from_utf8(name);
-    for byte in &mut bytes {
-        if *byte == b':' {
-            *byte = b'-';
-        }
-    }
-    bytes.truncate(31 - suffix.len());
+    let mut bytes = wire_name(enc, name, 31 - suffix.len());
     bytes.extend_from_slice(suffix.as_bytes());
     bytes
 }
 
-fn unique_name(name: &str, preferred: Vec<u8>, used: &mut HashSet<Vec<u8>>) -> Vec<u8> {
+fn unique_name(
+    enc: TextEncoding,
+    name: &str,
+    preferred: Vec<u8>,
+    used: &mut HashSet<Vec<u8>>,
+) -> Vec<u8> {
     if used.insert(preferred.clone()) {
         return preferred;
     }
@@ -221,13 +234,7 @@ fn unique_name(name: &str, preferred: Vec<u8>, used: &mut HashSet<Vec<u8>>) -> V
             "~{:02x}{:02x}{:02x}{:02x}-{attempt}",
             digest[0], digest[1], digest[2], digest[3]
         );
-        let mut candidate = text::from_utf8(name);
-        for byte in &mut candidate {
-            if *byte == b':' {
-                *byte = b'-';
-            }
-        }
-        candidate.truncate(31usize.saturating_sub(suffix.len()));
+        let mut candidate = wire_name(enc, name, 31usize.saturating_sub(suffix.len()));
         candidate.extend_from_slice(suffix.as_bytes());
         if used.insert(candidate.clone()) {
             return candidate;
@@ -287,17 +294,41 @@ mod tests {
 
     #[test]
     fn collision_suffix_is_stable_and_bounded() {
-        let a = hashed_name("abcdefghijklmnopqrstuvwxyz-long-a");
-        let b = hashed_name("abcdefghijklmnopqrstuvwxyz-long-b");
+        let mr = TextEncoding::MacRoman;
+        let a = hashed_name(mr, "abcdefghijklmnopqrstuvwxyz-long-a");
+        let b = hashed_name(mr, "abcdefghijklmnopqrstuvwxyz-long-b");
         assert_eq!(a.len(), 31);
         assert_eq!(b.len(), 31);
         assert_ne!(a, b);
-        assert_eq!(hashed_name("same"), hashed_name("same"));
+        assert_eq!(hashed_name(mr, "same"), hashed_name(mr, "same"));
 
-        let preferred = hashed_name("abcdefghijklmnopqrstuvwxyz-long-a");
+        let preferred = hashed_name(mr, "abcdefghijklmnopqrstuvwxyz-long-a");
         let mut used = HashSet::from([preferred.clone()]);
-        let recovered = unique_name("abcdefghijklmnopqrstuvwxyz-long-a", preferred, &mut used);
+        let recovered = unique_name(
+            mr,
+            "abcdefghijklmnopqrstuvwxyz-long-a",
+            preferred,
+            &mut used,
+        );
         assert_eq!(recovered.len(), 31);
         assert_eq!(used.len(), 2);
+    }
+
+    #[test]
+    fn a_utf8_wire_name_is_cut_on_a_character() {
+        let u8 = TextEncoding::Utf8;
+        let mr = TextEncoding::MacRoman;
+        // Eleven three-byte characters are 33 bytes: the 31-byte field
+        // holds ten of them, not ten and two-thirds.
+        let name = "\u{3042}".repeat(11);
+        assert_eq!(base_name(u8, &name), "\u{3042}".repeat(10).as_bytes());
+        assert_eq!(base_name(mr, &name), b"?".repeat(11));
+        // The delimiter swap is the same in both.
+        assert_eq!(base_name(u8, "a:b\u{e9}"), "a-b\u{e9}".as_bytes());
+        assert_eq!(base_name(mr, "a:b\u{e9}"), b"a-b\x8e");
+        // A hashed name still fits, and still ends in its suffix.
+        let hashed = hashed_name(u8, &name);
+        assert!(hashed.len() <= 31);
+        assert!(std::str::from_utf8(&hashed).is_ok());
     }
 }

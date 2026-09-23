@@ -395,8 +395,14 @@ In rough order of value-for-effort:
    this is edge work in `hxd-session`: a per-connection encoding flag
    gating the conversion calls, CR↔LF normalization, and the capability
    echo. Do it early in this phase — it's the cheapest extension and every
-   modern client benefits. A `DefaultTextEncoding`-style config (Shift-JIS
-   / Latin-1 legacy communities) and HOPE `app_id` sniffing can follow.
+   modern client benefits. **Implemented 2026-09**: bit 1 is always
+   offered (nothing needs wiring), a `TextEncoding` fixed at login carries
+   every text field in and out, wire byte caps cut at character
+   boundaries, inbound caps count characters, and bodies leave with the reader's line ending. The chat
+   line's leading `\r` stays on both — it is framing, not text. Not done:
+   a `DefaultTextEncoding`-style config (Shift-JIS / Latin-1 legacy
+   communities) and HOPE `app_id` sniffing, and file names stay within
+   the 31-byte field on UTF-8 too.
 3. **GIF icons, inline media, colored nicknames, emoji shortcodes** — mostly
    relay + capability bits, cheap once the capability negotiation exists.
    Inline media is the exception: the relay is cheap, the server-side

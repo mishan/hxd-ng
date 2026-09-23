@@ -335,8 +335,8 @@ suggested figure) or "Slow down."; `off_reactor` into
 Encoding an entry is the mirror of `parse_history_entry` in the shared
 crate, and lands beside it in `hxproto` as `build_history_entry`
 so the two cannot disagree about a byte. Nick and body pass through the
-session's text conversion — Mac Roman today, UTF-8 once Text-Encoding
-lands — with the lengths taken **after** conversion; the nick was
+session's text conversion — Mac Roman, or UTF-8 for a client that
+negotiated Text-Encoding — with the lengths taken **after** conversion; the nick was
 truncated to 31 characters on the way in, so it fits, and a body is at
 most 4096 bytes, so an entry is far under the 65 535 the field can
 carry even with the media sub-fields of §8. Flags map one to one from

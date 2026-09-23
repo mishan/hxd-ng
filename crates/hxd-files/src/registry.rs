@@ -68,6 +68,9 @@ pub struct PreparedUpload {
     pub transfer_len: Option<u64>,
     pub large: bool,
     pub quote: Option<UploadQuote>,
+    /// The uploader negotiated UTF-8 text, so the comment in its INFO
+    /// fork is UTF-8 and is converted to the sidecar's Mac Roman.
+    pub comment_utf8: bool,
 }
 
 impl std::fmt::Debug for PreparedUpload {
@@ -661,6 +664,7 @@ mod tests {
                 owner: "first".into(),
                 transfer_len: Some(10),
                 large: false,
+                comment_utf8: false,
                 quote: Some(UploadQuote {
                     data_offset: 3,
                     resource_offset: 2,
@@ -697,6 +701,7 @@ mod tests {
             owner: "first".into(),
             transfer_len,
             large: true,
+            comment_utf8: false,
             quote,
         })
     }

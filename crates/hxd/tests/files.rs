@@ -386,7 +386,9 @@ async fn run_service(service: Arc<FileService>, access: &str) -> Running {
             agreement: None,
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
-            caps: Caps::empty().with(cap::LARGE_FILES),
+            caps: Caps::empty()
+                .with(cap::LARGE_FILES)
+                .with(cap::TEXT_ENCODING),
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             stamp_queued: true,
@@ -991,6 +993,67 @@ async fn ng_request(ws: &mut Ws, id: u64, req: &str, params: Value) -> Value {
     .await
     .unwrap();
     reply(ws, id).await
+}
+
+#[tokio::test]
+async fn an_upload_comment_is_stored_the_same_from_either_encoding() {
+    let (server, _root, source) = start_local().await;
+    let classic = Legacy::login(server.legacy, false).await;
+    let utf8 = Legacy::connect(
+        server.legacy,
+        vec![
+            (tag::VERSION, 195u16.to_be_bytes().to_vec()),
+            (
+                tag::CAPABILITIES,
+                Caps::empty().with(cap::TEXT_ENCODING).to_wire(),
+            ),
+        ],
+    )
+    .await;
+    // The same comment, each in its own client's bytes. The sidecar is
+    // Mac Roman, so the cup, which it cannot spell, is stored as `?`.
+    let comment = "caf\u{e9} \u{2615}";
+    for (mut client, name, bytes) in [
+        (classic, "classic.txt", hxproto::text::from_utf8(comment)),
+        (utf8, "utf8.txt", comment.as_bytes().to_vec()),
+    ] {
+        let encoded = ffo::encode(
+            &ffo::Metadata {
+                name: b"ignored",
+                type_code: *b"TEXT",
+                creator: *b"ttxt",
+                comment: &bytes,
+                create_time: 0,
+                modify_time: 0,
+            },
+            ffo::Forks {
+                data_len: 2,
+                data_offset: 0,
+                resource_len: 0,
+                resource_offset: 0,
+            },
+            false,
+        )
+        .unwrap();
+        let mut object = encoded.prefix;
+        object.extend_from_slice(b"hi");
+        let put = client
+            .request(
+                FILE_PUT,
+                &[
+                    (tag::FILE_NAME, name.as_bytes().to_vec()),
+                    (tag::HTXF_SIZE, (object.len() as u32).to_be_bytes().to_vec()),
+                ],
+            )
+            .await;
+        assert_eq!(put.flag & 1, 0);
+        upload(server.htxf, reference_of(&put), object.len(), &object).await;
+        let info = source
+            .info(&hxd_core::FilePath::parse(name).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(info.comment.as_deref(), Some("caf\u{e9} ?"), "{name}");
+    }
 }
 
 #[tokio::test]

@@ -4,6 +4,7 @@
 //! extension of it — both speak to `hxd-core`.
 
 pub mod caps;
+pub mod encoding;
 mod files;
 pub mod frame;
 pub mod media;
@@ -12,4 +13,5 @@ pub mod video;
 pub mod voice;
 
 pub use caps::{cap, Caps};
+pub use encoding::TextEncoding;
 pub use session::{run_session, serve, ServerConfig, ServerCtx, TrtpLogin};

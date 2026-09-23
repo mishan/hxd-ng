@@ -51,7 +51,7 @@ been exercised on newer toolchains; CI runs stable.
 | Crate | Role |
 |---|---|
 | `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation, the news tree, access bits, auth traits. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
-| `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman ↔ UTF-8 at its edges. `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket. |
+| `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket. |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the WebSocket-as-byte-stream adapter (`tunnel.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
 | `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy + `[identity]` link), first-run guest bootstrap. Identity links are written back with `toml_edit` so hand-edited files keep their comments; fingerprint lookups scan the directory. |
@@ -69,13 +69,19 @@ detach/resume, `/msg` PMs by nick or uid.
 
 ## Invariants that matter
 
-**The domain is UTF-8 and wire-free.** Mac Roman exists only at
-`hxd-session`'s edges: convert on ingest (injective, so legacy-origin text
-round-trips exactly), convert + `?`-for-unmappable on egress, truncate
-nicks to the wire's 31 bytes *after* conversion. Credentials are
-canonicalized Mac Roman → UTF-8 before any auth backend sees them — HOPE
-proofs must use the same canonical form when that lands. Never let a wire
-type or encoding leak into `hxd-core`'s API; that separation is what makes
+**The domain is UTF-8 and wire-free.** A legacy connection's encoding
+exists only at `hxd-session`'s edges, and every text field crosses them
+through the connection's `TextEncoding`: Mac Roman, or UTF-8 when the
+client negotiated Text-Encoding (capability bit 1). Mac Roman converts on
+ingest (injective, so legacy-origin text round-trips exactly) and converts
+with `?`-for-unmappable on egress; either way the wire's byte caps (31 for
+a nick) apply *after* conversion, at a character boundary. Inbound, a
+login, password, nick or subject is capped in characters, so one typed
+on either wire cuts at the same place. A body leaves with that
+connection's line ending (CR or LF) whatever the sender used.
+Credentials are canonicalized to UTF-8 from the connection's encoding
+before any auth backend sees them — HOPE proofs must use the same
+canonical form when that lands. Never let a wire type or encoding leak into `hxd-core`'s API; that separation is what makes
 the ng frontend (and any future one) possible.
 
 **Presence is user-scoped, not connection-scoped.** A `UserSession` owns a
@@ -265,8 +271,7 @@ Hotline-ng MVP (roster + chat + PMs with detach/resume) is complete and
 cross-tested; voice and video are implemented on both wires, sharing one
 room and one SFU. The large open fronts, in rough order: HOPE + ciphers on the
 legacy wire (`hxcrypto` currently lives in GtkHx), the ng rate-limit and
-client-quickstart polish, the fogWraith Text-Encoding capability (cheap —
-the UTF-8 interior already satisfies its core mandate), files/HTXF, the
+client-quickstart polish, files/HTXF, the
 rest of news (the domain, store, search, subscriptions, markdown bodies
 and the ng wire have landed; attachments, moderation and the legacy
 binding are staged in `docs/news.md` §16), the push gateway itself
