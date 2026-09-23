@@ -9,7 +9,10 @@
 #   hxd-entrypoint registrar invites --add 5
 #   hxd-entrypoint news-reindex             any hxd subcommand, same config
 #   hxd-entrypoint hlid inspect card.cbor   anything else runs as given
-set -eu
+#
+# No pathname expansion anywhere: lists are split on commas unquoted, and
+# an IPv6 address in brackets is a glob pattern.
+set -euf
 
 DATA=/var/lib/hxd-ng
 HXD_CONFIG=${HXD_CONFIG:-/etc/hxd-ng/hxd-ng.toml}
@@ -89,6 +92,14 @@ str() {
     [ -z "$v" ] || kv "$2" "$v"
 }
 
+# A warning for a variable whose feature is off, so it does nothing.
+unused() {
+    var=$1
+    shift
+    eval "v=\${$var:-}"
+    [ -z "$v" ] || echo "hxd-entrypoint: $var ignored: $*" >&2
+}
+
 # The container's default gateway: the address a proxy on the host is
 # seen from when it reaches the ng port through a published port.
 gateway() {
@@ -99,8 +110,11 @@ gateway() {
         "0x$(echo "$hex" | cut -c3-4)" "0x$(echo "$hex" | cut -c1-2)"
 }
 
-# The addresses the ng port should believe X-Forwarded-For from, with
-# `gateway` standing for the container's default gateway.
+# The addresses the ng port should believe X-Forwarded-For and
+# X-Hotline-Client-Cert from, with `gateway` standing for the container's
+# default gateway. Never by default: the gateway is where the host's
+# docker-proxy connects from on behalf of every client of a port
+# published on all addresses, and on the host network it is the router.
 trusted_proxies() {
     out=
     old_ifs=$IFS
@@ -109,12 +123,38 @@ trusted_proxies() {
         item=$(printf '%s' "$item" | tr -d '[:space:]')
         case $item in
             "" | none) continue ;;
-            gateway) item=$(gateway) && [ -n "$item" ] || continue ;;
+            gateway)
+                item=$(gateway)
+                if [ -z "$item" ]; then
+                    echo "hxd-entrypoint: HXD_NG_TRUSTED_PROXIES: no default gateway to trust" >&2
+                    continue
+                fi
+                echo "hxd-entrypoint: trusting the gateway, $item, as a proxy" >&2
+                ;;
         esac
         out="${out:+$out,}$item"
     done
     IFS=$old_ifs
     kvlist trusted_proxies "$out"
+}
+
+# `key = [...]` of fingerprints from a variable, checked here so a typo is
+# named after the variable rather than the generated file. hxd checks the
+# rest, the padding bits included, and refuses to start on a bad one.
+fingerprints() {
+    eval "v=\${$1:-}"
+    old_ifs=$IFS
+    IFS=,
+    for fp in $v; do
+        fp=$(printf '%s' "$fp" | tr -d '[:space:]')
+        case $fp in
+            "") ;;
+            *[!0-9A-TV-Za-tv-z]*) die "$1: $fp is not a fingerprint: give the 52-character form hlid prints" ;;
+            *) [ ${#fp} -eq 52 ] || die "$1: $fp is not a fingerprint: give the 52-character form hlid prints" ;;
+        esac
+    done
+    IFS=$old_ifs
+    kvlist "$2" "$v"
 }
 
 generate() {
@@ -141,10 +181,10 @@ generate() {
     if $ng; then
         echo
         echo "[ng]"
-        echo 'bind = "0.0.0.0:5700"'
+        kv bind "${HXD_NG_BIND:-0.0.0.0:5700}"
         num HXD_NG_GRACE grace
         num HXD_NG_MAX_DETACHED_PER_ADDR max_detached_per_addr
-        trusted_proxies "${HXD_NG_TRUSTED_PROXIES-127.0.0.1,::1,gateway}"
+        trusted_proxies "${HXD_NG_TRUSTED_PROXIES-127.0.0.1,::1}"
         str HXD_NG_FORWARDED_HEADER forwarded_header
     fi
 
@@ -158,6 +198,13 @@ generate() {
         str HXD_IDENTITY_NEW_ACCOUNTS new_accounts
         str HXD_IDENTITY_UNATTESTED unattested
         str HXD_IDENTITY_WEB web
+        # The generated file is rewritten at every start, so these are the
+        # only lists that last; `hxd identity revoke` is refused below.
+        fingerprints HXD_REVOKED_IDENTITIES revoked_identities
+        fingerprints HXD_REVOKED_DEVICES revoked_devices
+    else
+        unused HXD_REVOKED_IDENTITIES "HXD_IDENTITY is off"
+        unused HXD_REVOKED_DEVICES "HXD_IDENTITY is off"
     fi
 
     # One SQLite file holds everything. The first section that is on names
@@ -207,6 +254,8 @@ generate() {
         echo
         echo "[system]"
         str HXD_SYSTEM_NICK nick
+    else
+        unused HXD_SYSTEM_NICK "HXD_SYSTEM is off"
     fi
 
     if [ -n "${HXD_FILES_ROOT:-}" ]; then
@@ -243,6 +292,9 @@ generate() {
             echo
             echo "[voice.video]"
         fi
+    else
+        unused HXD_VOICE_MAX_PER_ROOM "voice is off without HXD_VOICE_ADVERTISE"
+        unused HXD_VIDEO "voice is off without HXD_VOICE_ADVERTISE"
     fi
 
     if [ -n "${HXD_TRACKERS:-}" ]; then
@@ -261,44 +313,38 @@ generate() {
             echo 'protocol = "v1"'
         done
         IFS=$old_ifs
+    else
+        unused HXD_TRACKER_DESCRIPTION "no HXD_TRACKERS"
+        unused HXD_TRACKER_ADVERTISED_PORT "no HXD_TRACKERS"
     fi
 
     if [ -n "${HXD_EXTRA_CONFIG:-}" ]; then
         [ -f "$HXD_EXTRA_CONFIG" ] || die "HXD_EXTRA_CONFIG $HXD_EXTRA_CONFIG does not exist"
+        # Appended after whichever table was written last, a key before
+        # the fragment's first header would land in that table: in [media]
+        # on one start and [tracker] on the next. Refused instead.
+        awk '/^[[:space:]]*(#|$)/ { next } /^[[:space:]]*\[/ { exit 0 } { exit 1 }' \
+            "$HXD_EXTRA_CONFIG" ||
+            die "HXD_EXTRA_CONFIG $HXD_EXTRA_CONFIG: put every key under a [section] header"
         echo
         echo "# From $HXD_EXTRA_CONFIG."
         cat "$HXD_EXTRA_CONFIG"
     fi
 }
 
-# An account with every named bit, written once and never overwritten, so
-# a fresh volume has someone who can administer it. hxd only bootstraps
-# the guest account into a directory that does not exist yet, so on a
-# first start this writes that guest too (FileAuth::bootstrap's).
-admin() {
-    login=$HXD_ADMIN_LOGIN
-    case $login in
-        .* | *[!A-Za-z0-9_.@-]*) die "HXD_ADMIN_LOGIN $login: letters, digits and _ - . @ only" ;;
-    esac
-    [ ${#login} -le 31 ] || die "HXD_ADMIN_LOGIN is longer than 31 characters"
-    if [ -n "${HXD_ADMIN_PASSWORD_FILE:-}" ]; then
-        password=$(cat "$HXD_ADMIN_PASSWORD_FILE")
-    else
-        password=${HXD_ADMIN_PASSWORD:-}
-    fi
-    [ -n "$password" ] || die "HXD_ADMIN_LOGIN needs HXD_ADMIN_PASSWORD or HXD_ADMIN_PASSWORD_FILE"
-    case $password in
-        *'
-'*) die "the admin password may not contain a newline" ;;
-    esac
-
+# A fresh volume's accounts directory, before hxd sees it. hxd bootstraps
+# the guest account only into a directory that does not exist yet, so
+# leaving guests out is creating it empty, and writing the admin into it
+# means writing the guest too. That copy mirrors FileAuth::bootstrap's
+# text because no hxd subcommand bootstraps without serving; keep the two
+# in step.
+first_start() {
     accounts=$DATA/accounts
-    [ ! -e "$accounts/$login.toml" ] || return 0
-    umask 077
-    if [ ! -d "$accounts" ]; then
-        mkdir -p "$accounts"
-        if on HXD_GUEST on; then
-            cat >"$accounts/guest.toml" <<'EOF'
+    [ ! -e "$accounts" ] || return 0
+    if on HXD_GUEST on; then
+        [ -n "${HXD_ADMIN_LOGIN:-}" ] || return 0
+        (umask 077 && mkdir "$accounts")
+        (umask 077 && cat >"$accounts/guest.toml") <<'EOF'
 # Default guest account, created on first run. Delete this file
 # to disable guest logins.
 name = "guest"
@@ -316,12 +362,42 @@ use_any_name = true
 # that lets a stranger put a picture on everyone's screen.
 # send_media = true
 EOF
-        fi
+    else
+        (umask 077 && mkdir "$accounts")
     fi
+}
+
+# An account with every named bit, written once and never overwritten, so
+# a fresh volume has someone who can administer it. Once it exists the
+# password is not read, so the variables holding it can go.
+admin() {
+    login=$HXD_ADMIN_LOGIN
+    case $login in
+        .* | *[!A-Za-z0-9_.@-]*) die "HXD_ADMIN_LOGIN $login: letters, digits and _ - . @ only" ;;
+    esac
+    [ ${#login} -le 31 ] || die "HXD_ADMIN_LOGIN is longer than 31 characters"
+    # FileAuth folds a login to lower case before it looks for the file.
+    login=$(printf '%s' "$login" | tr '[:upper:]' '[:lower:]')
+    accounts=$DATA/accounts
+    [ ! -e "$accounts/$login.toml" ] || return 0
+
+    if [ -n "${HXD_ADMIN_PASSWORD_FILE:-}" ]; then
+        password=$(cat "$HXD_ADMIN_PASSWORD_FILE")
+    else
+        password=${HXD_ADMIN_PASSWORD:-}
+    fi
+    [ -n "$password" ] || die "HXD_ADMIN_LOGIN needs HXD_ADMIN_PASSWORD or HXD_ADMIN_PASSWORD_FILE on the start that writes accounts/$login.toml"
+    case $password in
+        *'
+'*) die "the admin password may not contain a newline" ;;
+    esac
+
+    first_start
+    umask 077
     {
         echo "# Written by hxd-entrypoint from HXD_ADMIN_LOGIN on first start;"
         echo "# the variables are not read again once this file exists."
-        kv name "$login"
+        kv name "$HXD_ADMIN_LOGIN"
         kv password "$password"
         echo
         echo "[access]"
@@ -346,7 +422,23 @@ if [ -f "$HXD_CONFIG" ]; then
         echo "hxd-entrypoint: HXD_ADMIN_LOGIN ignored: $HXD_CONFIG is mounted" >&2
     config=$HXD_CONFIG
 else
-    [ -z "${HXD_ADMIN_LOGIN:-}" ] || admin
+    # Edits to the generated file are lost at the next start, which would
+    # be a revocation reported done and then quietly lifted.
+    words=
+    for arg; do
+        case $arg in
+            -*) ;;
+            *) words="$words $arg" ;;
+        esac
+    done
+    case $words in
+        " identity revoke"*) die "identity revoke edits the config file, and this one is written from HXD_* variables at every start. List the fingerprint in HXD_REVOKED_IDENTITIES, or HXD_REVOKED_DEVICES for one device, and recreate the container" ;;
+    esac
+    if [ -n "${HXD_ADMIN_LOGIN:-}" ]; then
+        admin
+    else
+        first_start
+    fi
     tmp=$(mktemp "$GENERATED.XXXXXX")
     trap 'rm -f "$tmp"' EXIT
     generate >"$tmp"

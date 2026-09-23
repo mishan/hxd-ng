@@ -164,7 +164,8 @@ with a guest account; add more as TOML files in that directory.
 
 To run it as a service instead, the `Dockerfile` builds an image
 configured from environment variables, meant to sit behind nginx or
-another TLS-terminating proxy: [docs/docker.md](docs/docker.md).
+another TLS-terminating proxy; each merge to main publishes it as
+`ghcr.io/mishan/hxd-ng`. [docs/docker.md](docs/docker.md) has the rest.
 
 ### Say hello
 
@@ -945,6 +946,7 @@ cargo test --workspace
 node --check tools/ng-client.mjs
 ```
 
-That is what CI runs. [AGENTS.md](AGENTS.md) is the map of the workspace —
+That is what CI runs, beside the e2e suite and a build and smoke test
+of the Docker image. [AGENTS.md](AGENTS.md) is the map of the workspace —
 which crate owns what, the invariants that matter, and the conventions this
 repo is written to.

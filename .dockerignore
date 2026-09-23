@@ -1,7 +1,10 @@
 # Build context for the Dockerfile: sources only. Local build output,
 # a developer's runtime state and their cargo overrides stay out — a
 # `.cargo/config.toml` patching hx-libs to a local path would break the
-# build inside the container.
+# build inside the container. So do secrets: Compose's `.env` files hold
+# the first admin password, and the keys a locally-run server writes are
+# its identity and its push subscriptions. The build stage copies the
+# whole context, so anything left in would sit in its layers.
 target/
 .cargo/
 .git/
@@ -16,3 +19,9 @@ agreement.txt
 *.sqlite
 *.sqlite-*
 **/node_modules/
+**/.env
+**/.env.*
+*.key
+*.pem
+identity-successors/
+news-blobs/

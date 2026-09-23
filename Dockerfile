@@ -9,7 +9,8 @@
 #   docker build -t hxd-ng .
 #   docker run -d --name hxd-ng -v hxd-ng:/var/lib/hxd-ng \
 #     -p 5500-5501:5500-5501 -p 127.0.0.1:5700:5700 \
-#     -e HXD_NAME="My Server" hxd-ng
+#     -e HXD_NAME="My Server" \
+#     -e HXD_NG_TRUSTED_PROXIES=127.0.0.1,::1,gateway hxd-ng
 
 ARG RUST_VERSION=1
 ARG DEBIAN_RELEASE=trixie
@@ -51,13 +52,15 @@ RUN apt-get update \
     && install -d -m 0755 /etc/hxd-ng
 
 COPY --from=build /out/hxd /out/hlid /usr/local/bin/
-COPY docker/entrypoint.sh /usr/local/bin/hxd-entrypoint
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/hxd-entrypoint
 
 # Accounts, the identity and VAPID keys, and the SQLite store all live
 # here. Back it up as a whole: the keys are not recoverable.
 VOLUME /var/lib/hxd-ng
 WORKDIR /var/lib/hxd-ng
-USER hxd
+# By number, so a runtime can tell it is not root without reading
+# /etc/passwd. A bind mount at /var/lib/hxd-ng must be owned by it.
+USER 10001:10001
 # Logs go to `docker logs` and whatever collects it, not a terminal.
 ENV NO_COLOR=1
 
@@ -66,7 +69,14 @@ ENV NO_COLOR=1
 EXPOSE 5500/tcp 5501/tcp 5504/udp 5700/tcp
 
 # SIGTERM shuts down cleanly; SIGHUP (`docker kill -s HUP`) re-reads the
-# revocation lists without dropping anyone.
+# revocation lists of a mounted config without a restart.
 STOPSIGNAL SIGTERM
+
+# The legacy port accepts a connection, which is all this asks: bash's
+# /dev/tcp needs nothing the base image lacks. A mounted config that
+# moves the legacy port wants `--health-cmd` or `--no-healthcheck`.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5500"]
+
 ENTRYPOINT ["hxd-entrypoint"]
 CMD []
