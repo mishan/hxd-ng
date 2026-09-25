@@ -28,7 +28,7 @@ use std::time::Duration;
 use hxd_core::{AuthBackend, Core, LinkAuthority, Transport};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tracing::{info, Instrument};
+use tracing::{info, warn, Instrument};
 
 pub use identity::{
     AuthRequest, ClassicLogin, Downstream, IdentityConfig, IdentityState, NewAccounts, Unattested,
@@ -252,10 +252,26 @@ pub struct NgCtx {
 }
 
 /// Accept loop: one connection task per socket. Each is HTTP until it
-/// upgrades (`http.rs`).
-pub async fn serve(listener: TcpListener, ctx: NgCtx) -> std::io::Result<()> {
+/// upgrades (`http.rs`). Never returns: an accept error — descriptors
+/// exhausted, most often, which anyone able to hold enough idle
+/// connections open can cause — is waited out. Returned, it ended this
+/// task, and the ng port stopped answering while the rest of the server
+/// ran on without it.
+pub async fn serve(listener: TcpListener, ctx: NgCtx) {
+    let mut backoff = Duration::from_millis(10);
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => {
+                backoff = Duration::from_millis(10);
+                accepted
+            }
+            Err(e) => {
+                warn!("ng accept failed; retrying: {e}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(1));
+                continue;
+            }
+        };
         let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
         tokio::spawn(async move {
