@@ -296,7 +296,15 @@ generate() {
     fi
 
     if [ -n "${HXD_VOICE_ADVERTISE:-}" ]; then
-        # A bare address gets the container's voice port.
+        # A concrete bind lets the server tell which advertised address a
+        # datagram arrived on, so it can offer a LAN address beside the
+        # WAN one; the wildcard allows one address per family.
+        voice_bind=${HXD_VOICE_BIND:-0.0.0.0:5504}
+        voice_port=${voice_bind##*:}
+        case $voice_port in
+            "" | *[!0-9]*) die "HXD_VOICE_BIND must be address:port, got $voice_bind" ;;
+        esac
+        # A bare address gets the voice port.
         advertise=
         old_ifs=$IFS
         IFS=,
@@ -306,14 +314,14 @@ generate() {
                 "") continue ;;
                 \[*\]:* | *.*:*) ;;
                 *:*) die "HXD_VOICE_ADVERTISE: write an IPv6 address as [addr]:port, got $a" ;;
-                *) a=$a:5504 ;;
+                *) a=$a:$voice_port ;;
             esac
             advertise="${advertise:+$advertise,}$a"
         done
         IFS=$old_ifs
         echo
         echo "[voice]"
-        echo 'bind = "0.0.0.0:5504"'
+        kv bind "$voice_bind"
         kvlist advertise "$advertise"
         num HXD_VOICE_MAX_PER_ROOM max_per_room
         if on HXD_VIDEO off; then
@@ -321,6 +329,7 @@ generate() {
             echo "[voice.video]"
         fi
     else
+        unused HXD_VOICE_BIND "voice is off without HXD_VOICE_ADVERTISE"
         unused HXD_VOICE_MAX_PER_ROOM "voice is off without HXD_VOICE_ADVERTISE"
         unused HXD_VIDEO "voice is off without HXD_VOICE_ADVERTISE"
     fi

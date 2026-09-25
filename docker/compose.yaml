@@ -44,6 +44,10 @@ services:
       # HXD_IDENTITY_WEB: "https://hl.example/app/"
       # HXD_PUSH_CONTACT: "mailto:admin@hl.example"
       # HXD_VOICE_ADVERTISE: "203.0.113.5"
+      # With network_mode: host, a LAN address beside the WAN one, so
+      # clients on the LAN need no hairpin NAT (docs/docker.md, "Ports"):
+      # HXD_VOICE_BIND: "192.168.1.10:5504"
+      # HXD_VOICE_ADVERTISE: "203.0.113.5,192.168.1.10"
       # HXD_FILES_ROOT: /srv/files
       # A CA's certificate (Let's Encrypt) where the server has a name;
       # HXD_TLS_SELF_SIGNED: "on" otherwise. These are paths in the
