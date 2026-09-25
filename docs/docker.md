@@ -93,6 +93,25 @@ adding one to the port it connected to: `-p 6500-6501:5500-5501` works,
 `HXD_VOICE_ADVERTISE` names, so publish `-p 6504:5504/udp` and advertise
 port 6504 to match.
 
+**Voice from the LAN as well as the internet.** A server behind NAT
+advertises its WAN address, and a client on the same LAN then has to
+reach it through the router's hairpin NAT, which many routers do for
+TCP but not for UDP: the call connects from outside and stalls from
+inside. Offer the LAN address too. With the default wildcard bind the
+server cannot tell which of two IPv4 addresses a datagram arrived on,
+and hxd refuses the pair, so bind the LAN address itself — under
+`--network host`, where the container has the host's addresses:
+
+```sh
+-e HXD_VOICE_BIND=192.168.1.10:5504 \
+-e HXD_VOICE_ADVERTISE=203.0.113.5,192.168.1.10
+```
+
+Clients try every address offered and keep the one that answers. Those
+outside also see the LAN address, which is harmless. On a bridge
+network the container's own address is Docker's, not the LAN's, so this
+needs host networking.
+
 Publish 5700 on loopback only (`127.0.0.1:5700:5700`), so the proxy is the
 only way in. The proxy is trusted to say who each client is, and anyone
 who can reach the port around it can claim to be anyone.
@@ -253,7 +272,8 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_TLS_CERT` | | Turns on the TLS ports: a PEM certificate chain, leaf first, mounted into the container — Let's Encrypt's `fullchain.pem` where the server has a DNS name ([below](#tls-certificates)). `docker kill -s HUP hxd-ng` re-reads a renewed certificate without dropping anyone. |
 | `HXD_TLS_KEY` | | Its PEM private key, readable by uid 10001. |
 | `HXD_TLS_SELF_SIGNED` | `off` | Turns on the TLS ports with a self-signed certificate made in the volume on first start and kept, for a server with no name a CA will certify. Clients ask users to trust it on first connect; the fingerprint is in the log to publish. `HXD_TLS_CERT` wins when both are set. |
-| `HXD_VOICE_ADVERTISE` | | Turns on voice: the public addresses clients send media to, comma-separated. A bare IPv4 address gets port 5504; write IPv6 as `[addr]:port`. Publish the UDP port to match. |
+| `HXD_VOICE_ADVERTISE` | | Turns on voice: the public addresses clients send media to, comma-separated. A bare IPv4 address gets the port of `HXD_VOICE_BIND`, 5504 by default; write IPv6 as `[addr]:port`. Publish the UDP port to match. |
+| `HXD_VOICE_BIND` | `0.0.0.0:5504` | The UDP address voice listens on inside the container. A concrete address lets `HXD_VOICE_ADVERTISE` name a LAN address beside the WAN one ([voice from the LAN](#ports)). |
 | `HXD_VOICE_MAX_PER_ROOM` | 16 | Voice participants per room. |
 | `HXD_VIDEO` | `off` | Video on top of voice. |
 | `HXD_TRACKERS` | | Trackers to list the server on, comma-separated `host` or `host:port`, over HTRK v1. Use `HXD_EXTRA_CONFIG` for v3 ([tracker-registration.md](tracker-registration.md)). |
