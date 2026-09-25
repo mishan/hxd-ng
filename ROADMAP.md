@@ -371,8 +371,14 @@ fetch a derivative by, and the mhxd importer.
 
 ## Phase 5 — Hardening and parity extras
 
-- TLS on a dedicated port (rustls server-side), same TLS-from-byte-zero model
-  GtkHx already speaks. Reject HOPE-on-TLS as redundant, same as the client.
+- **TLS on the legacy wire — implemented 2026-09.** A dedicated control
+  port (rustls, ring) with the unchanged protocol inside, the same
+  TLS-from-byte-zero model GtkHx speaks, and a TLS HTXF port one above
+  it; sessions on it are marked encrypted. A CA's certificate
+  (Let's Encrypt, documented) or, opt-in, a self-signed one made on
+  first start and kept; reloaded on SIGHUP; v3 tracker listings carry the port.
+  HOPE-on-TLS stays refused as redundant when HOPE lands, as the client
+  refuses it.
 - **Tracker registration — implemented 2026-09.** Independent UDP heartbeat
   loops for explicitly configured v1 and v3 targets; live user/capability
   metadata, HMAC nonces, acknowledgments and per-target tokens, and v3

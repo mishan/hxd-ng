@@ -153,6 +153,7 @@ mod tests {
             push: None,
             registrar: None,
             moderation: None,
+            tls: None,
             system: None,
         }
     }

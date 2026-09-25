@@ -61,6 +61,7 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 | **Push notifications** — a private message or a news reply while the app is closed | — | — | yes, as Web Push |
 | **Portable identity** — an Ed25519 key that is you on any server that runs this | through a local tunnel | through a local tunnel | yes |
 | Kick and ban | yes | yes | yes |
+| **TLS** on the classic wire, on a port of its own | — | yes | — (always TLS, through the proxy) |
 | **Tracker listing** — announced to HTRK v1 and v3 trackers | found through the tracker | found through the tracker | — (connects by address) |
 
 No official Hotline software ever had voice or video; they are community
@@ -233,6 +234,59 @@ accounts = "accounts"
 agreement = "agreement.txt"
 ```
 
+### TLS on the legacy wire
+
+An optional `[tls]` section opens a second control port that speaks TLS
+from its first byte and the unchanged Hotline protocol inside it — the
+separate-port model GtkHx, Janus and Mobius share. Period clients keep
+the plaintext port; a client that speaks TLS connects here instead, and
+its session is marked encrypted, as a tunnelled one is. With `[files]`,
+a TLS transfer port sits one above the TLS control port, where a client
+looks for it.
+
+```toml
+[tls]
+bind = "0.0.0.0:5600"
+cert = "/etc/letsencrypt/live/hl.example/fullchain.pem"  # PEM chain, leaf first
+key = "/etc/letsencrypt/live/hl.example/privkey.pem"
+# files_bind = "0.0.0.0:5601"  # default: bind's port + 1
+# self_signed = false          # see below
+```
+
+**Use a certificate from Let's Encrypt when you can.** A server with a
+DNS name can have one for free, and a client checks it against the CAs
+it already trusts, so users connect without being asked anything and a
+changed certificate is not a warning they learn to click through.
+certbot issues it (`--standalone` as below, or `--webroot` when
+something already serves port 80); renewal comes every
+couple of months, and a deploy hook that sends SIGHUP puts the new one
+in service without dropping anyone:
+
+```sh
+certbot certonly --standalone -d hl.example \
+  --deploy-hook 'systemctl reload hxd'   # or: pkill -HUP -x hxd
+```
+
+The key certbot writes is readable by root alone, so a server running
+as its own user needs a copy it can read — make it in the same hook,
+with `install -m 600 -o hxd`, and point `key` at the copy.
+
+**Self-signed, when there is no name.** A server reached only by
+address cannot get a CA's certificate, and a client can then only pin
+the one it is shown on first connect. `self_signed = true` makes a pair
+at `cert` and `key` on the first start that finds neither, and keeps it
+after, so the pin stays good across restarts. It is off by default,
+and a pin is only as good as the fingerprint users compare it against.
+Replacing both files with a CA's pair later is all it takes to move
+off it — clients that pinned the old one will warn once.
+
+The server logs the certificate's SHA-256 fingerprint at start; with a
+self-signed certificate, publish it so users can check the pin their
+client makes. SIGHUP re-reads both
+files, so a renewed certificate reaches the next connection without
+dropping anyone. A v3 tracker listing carries the TLS port
+(`advertised_tls_port` in `[tracker]` overrides it).
+
 ### Tracker registration
 
 An optional `[tracker]` section announces the server over UDP using classic
@@ -246,6 +300,7 @@ metadata and security configuration.
 description = "A small Hotline community"
 interval = 300
 # advertised_port = 5500  # only when NAT maps a different public port
+# advertised_tls_port = 5600  # the same for [tls], on v3 targets
 
 [[tracker.targets]]
 address = "hltracker.example" # UDP/5499 when the port is omitted

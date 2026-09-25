@@ -50,6 +50,8 @@ const TLV_TIMEZONE_OFFSET: u16 = 0x020c;
 const TLV_CONTACT_URL: u16 = 0x020d;
 const TLV_SERVER_LAUNCHED: u16 = 0x020e;
 const TLV_PROTOCOL_VERSION: u16 = 0x0300;
+const TLV_SUPPORTS_TLS: u16 = 0x0302;
+const TLV_TLS_PORT: u16 = 0x0303;
 const TLV_SUPPORTS_INLINE_MEDIA: u16 = 0x0304;
 const TLV_SUPPORTS_VOICE: u16 = 0x0305;
 const TLV_SUPPORTS_LARGE_FILES: u16 = 0x0306;
@@ -80,6 +82,9 @@ pub struct TrackerSection {
     /// Public legacy TCP port. Absent means the port actually bound by the
     /// legacy listener; set it when a NAT maps a different external port.
     pub advertised_port: Option<u16>,
+    /// Public TLS control port, on v3 targets. Absent means the port the
+    /// TLS listener actually bound; ignored without `[tls]`.
+    pub advertised_tls_port: Option<u16>,
     /// How long to wait for an optional v3 acknowledgment.
     #[serde(default = "default_ack_timeout_ms")]
     pub ack_timeout_ms: u64,
@@ -180,6 +185,9 @@ impl TrackerSection {
         if self.advertised_port == Some(0) {
             return Err("[tracker] advertised_port must not be 0".into());
         }
+        if self.advertised_tls_port == Some(0) {
+            return Err("[tracker] advertised_tls_port must not be 0".into());
+        }
 
         let need_v1 = self
             .targets
@@ -220,6 +228,7 @@ impl TrackerSection {
                     name: server_name.to_owned(),
                     description: self.description.clone(),
                     port: self.advertised_port.unwrap_or(1),
+                    tls_port: Some(self.advertised_tls_port.unwrap_or(1)),
                     protocol_version: 0,
                     inline_media: true,
                     voice: true,
@@ -400,6 +409,9 @@ pub struct Advertisement {
     pub name: String,
     pub description: String,
     pub port: u16,
+    /// The TLS control port, when `[tls]` is on (v3 only: v1 has no
+    /// field for it).
+    pub tls_port: Option<u16>,
     pub protocol_version: u16,
     pub inline_media: bool,
     pub voice: bool,
@@ -787,6 +799,10 @@ fn build_v3(
             .as_secs()
             .min(u32::MAX as u64) as u32;
         push_tlv(&mut packet, &mut count, TLV_UPTIME, &uptime.to_be_bytes())?;
+        if let Some(port) = advertisement.tls_port {
+            push_tlv(&mut packet, &mut count, TLV_SUPPORTS_TLS, &[1])?;
+            push_tlv(&mut packet, &mut count, TLV_TLS_PORT, &port.to_be_bytes())?;
+        }
         if advertisement.inline_media {
             push_tlv(&mut packet, &mut count, TLV_SUPPORTS_INLINE_MEDIA, &[1])?;
         }
@@ -1058,6 +1074,7 @@ mod tests {
             name: "Café".into(),
             description: "A test".into(),
             port: 5500,
+            tls_port: Some(5600),
             protocol_version: 185,
             inline_media: true,
             voice: false,
@@ -1145,6 +1162,28 @@ mod tests {
     }
 
     #[test]
+    fn v3_names_no_tls_port_without_one() {
+        let plain = Advertisement {
+            tls_port: None,
+            ..advertisement()
+        };
+        let packet = build_v3(
+            &plain,
+            &TrackerV3Metadata::default(),
+            1,
+            2,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let ids: Vec<u16> = packet_tlvs(&packet).into_iter().map(|(id, _)| id).collect();
+        assert!(!ids.contains(&TLV_SUPPORTS_TLS));
+        assert!(!ids.contains(&TLV_TLS_PORT));
+    }
+
+    #[test]
     fn v3_operator_metadata_uses_the_spec_ids_and_integer_widths() {
         let ipv6: Ipv6Addr = "2001:db8::10".parse().unwrap();
         let metadata = TrackerV3Metadata {
@@ -1178,6 +1217,8 @@ mod tests {
         );
         assert_eq!(fields[&TLV_PROTOCOL_VERSION], 185u16.to_be_bytes());
         assert_eq!(fields[&TLV_UPTIME].len(), 4);
+        assert_eq!(fields[&TLV_SUPPORTS_TLS], [1]);
+        assert_eq!(fields[&TLV_TLS_PORT], 5600u16.to_be_bytes());
         assert_eq!(fields[&TLV_SUPPORTS_INLINE_MEDIA], [1]);
         assert!(!fields.contains_key(&TLV_SUPPORTS_VOICE));
         assert_eq!(fields[&TLV_SUPPORTS_LARGE_FILES], [1]);
@@ -1293,6 +1334,7 @@ mod tests {
             description: "A test".into(),
             interval: 30,
             advertised_port: None,
+            advertised_tls_port: None,
             ack_timeout_ms: 100,
             v3: TrackerV3Metadata::default(),
             targets: vec![
@@ -1364,6 +1406,7 @@ mod tests {
             description: String::new(),
             interval: 300,
             advertised_port: None,
+            advertised_tls_port: None,
             ack_timeout_ms: 2_000,
             v3: TrackerV3Metadata::default(),
             targets: vec![target("tracker.example".into(), TrackerProtocol::V1)],
@@ -1390,6 +1433,7 @@ mod tests {
             description: String::new(),
             interval: 300,
             advertised_port: None,
+            advertised_tls_port: None,
             ack_timeout_ms: 2_000,
             v3: TrackerV3Metadata::default(),
             targets: vec![target("tracker.example".into(), TrackerProtocol::V1)],

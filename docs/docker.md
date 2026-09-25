@@ -45,6 +45,8 @@ when it is dangerous. Leave it out when no proxy runs on the host.
 |---|---|---|---|
 | 5500 | TCP | no | Legacy Hotline. 1.x clients have no TLS; publish it directly. |
 | 5501 | TCP | no | HTXF file transfers, with `HXD_FILES_ROOT`. |
+| 5600 | TCP | no | Legacy Hotline over TLS, with `HXD_TLS_CERT` or `HXD_TLS_SELF_SIGNED`, for clients that speak it (GtkHx, Hotline Navigator). hxd terminates this TLS itself. |
+| 5601 | TCP | no | HTXF over TLS, with TLS on and `HXD_FILES_ROOT`. |
 | 5504 | UDP | no | Voice and video media, with `HXD_VOICE_ADVERTISE`. |
 | 5700 | TCP | **yes** | The ng WebSocket, the `/trtp` tunnel, discovery, identity, media and file downloads. |
 
@@ -52,9 +54,10 @@ The container listens on these (the ng port on `HXD_NG_BIND`); choose
 the public side with `-p`. Keep the legacy and HTXF ports adjacent on
 the public side too, since a classic client finds the transfer port by
 adding one to the port it connected to: `-p 6500-6501:5500-5501` works,
-`-p 6500:5500 -p 5501:5501` does not. The voice port is free: clients
-send media to the addresses `HXD_VOICE_ADVERTISE` names, so publish
-`-p 6504:5504/udp` and advertise port 6504 to match.
+`-p 6500:5500 -p 5501:5501` does not, and the same holds for 5600 and
+5601. The voice port is free: clients send media to the addresses
+`HXD_VOICE_ADVERTISE` names, so publish `-p 6504:5504/udp` and advertise
+port 6504 to match.
 
 Publish 5700 on loopback only (`127.0.0.1:5700:5700`), so the proxy is the
 only way in. The proxy is trusted to say who each client is, and anyone
@@ -213,6 +216,9 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_SYSTEM_NICK` | `Server` | Its nick. |
 | `HXD_FILES_ROOT` | | A directory in the container to serve as the file area; mount one there. Uploads go into folders named `Uploads` or `Drop Box`. It must be writable by uid 10001 for uploads. |
 | `HXD_FILES_MAX_FILE_SIZE` | 64 GiB | Bytes per file. |
+| `HXD_TLS_CERT` | | Turns on the TLS ports: a PEM certificate chain, leaf first, mounted into the container — Let's Encrypt's `fullchain.pem` where the server has a DNS name ([below](#tls-certificates)). `docker kill -s HUP hxd-ng` re-reads a renewed certificate without dropping anyone. |
+| `HXD_TLS_KEY` | | Its PEM private key, readable by uid 10001. |
+| `HXD_TLS_SELF_SIGNED` | `off` | Turns on the TLS ports with a self-signed certificate made in the volume on first start and kept, for a server with no name a CA will certify. Clients ask users to trust it on first connect; the fingerprint is in the log to publish. `HXD_TLS_CERT` wins when both are set. |
 | `HXD_VOICE_ADVERTISE` | | Turns on voice: the public addresses clients send media to, comma-separated. A bare IPv4 address gets port 5504; write IPv6 as `[addr]:port`. Publish the UDP port to match. |
 | `HXD_VOICE_MAX_PER_ROOM` | 16 | Voice participants per room. |
 | `HXD_VIDEO` | `off` | Video on top of voice. |
@@ -220,6 +226,35 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_TRACKER_DESCRIPTION` | | The description trackers show. |
 | `HXD_TRACKER_ADVERTISED_PORT` | | The public legacy port, when it isn't the one the server listens on. |
 | `HXD_DEBUG` | | `proto` for the wire trace, `all` for everything. `RUST_LOG` wins when set. |
+
+### TLS certificates
+
+A certificate from a public CA is the one to use: clients check it
+against the roots they already trust and connect without a prompt. The
+one the proxy already holds for the ng port names the same host, so
+there is usually nothing new to issue. The files under
+`/etc/letsencrypt/live` are symlinks into a directory only root can
+read, so rather than mounting them, copy the pair where the container
+can read it and tell the server — at every renewal, from a certbot
+deploy hook, `/etc/letsencrypt/renewal-hooks/deploy/hxd-ng.sh`:
+
+```sh
+#!/bin/sh
+live=/etc/letsencrypt/live/hl.example
+install -D -m 644 -o 10001 "$live/fullchain.pem" /srv/hxd-ng/tls/fullchain.pem
+install -D -m 600 -o 10001 "$live/privkey.pem" /srv/hxd-ng/tls/privkey.pem
+docker kill -s HUP hxd-ng 2>/dev/null || true
+```
+
+Make it executable and run it once by hand for the first copy, then
+run the container with `-v /srv/hxd-ng/tls:/etc/hxd-ng/tls:ro`,
+`HXD_TLS_CERT=/etc/hxd-ng/tls/fullchain.pem` and
+`HXD_TLS_KEY=/etc/hxd-ng/tls/privkey.pem`, and publish 5600-5601.
+
+A server reached only by address cannot get one; `HXD_TLS_SELF_SIGNED=on`
+is for that case. The pair lives in `/var/lib/hxd-ng/tls` and belongs in
+the backups: a new one means every client that pinned the old one
+warns.
 
 ## State and backups
 

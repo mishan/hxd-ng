@@ -626,7 +626,8 @@ news body is different: it declares its own type (news.md §5).
 
 - **TLS.** In production the WebSocket MUST be `wss://`. A server that
   speaks plaintext SHOULD listen only on loopback by default, behind a
-  proxy that terminates TLS. *hxd-ng* never speaks TLS itself.
+  proxy that terminates TLS. *hxd-ng* never speaks TLS on this port
+  itself (its TLS listener is for the classic wire).
 - **Tokens.** A session token MUST come from a CSPRNG with at least 128
   bits of entropy, and SHOULD be stored server-side only as a hash and
   compared in constant time. A token is a bearer credential for one

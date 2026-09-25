@@ -10,10 +10,12 @@ pub mod frame;
 pub mod media;
 pub mod news;
 pub mod session;
+pub mod tls;
 pub mod video;
 pub mod voice;
 
 pub use caps::{cap, Caps};
 pub use encoding::TextEncoding;
 pub use news::{FlatNews, FlatReply, LegacyNews};
-pub use session::{run_session, serve, ServerConfig, ServerCtx, TrtpLogin};
+pub use session::{run_session, serve, serve_tls, ServerConfig, ServerCtx, TrtpLogin};
+pub use tls::LegacyTls;

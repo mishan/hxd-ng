@@ -19,6 +19,7 @@ fall back. Each target therefore names its wire version explicitly:
 description = "A small Hotline community"
 interval = 300
 # advertised_port = 5500   # defaults to the legacy listener's actual port
+# advertised_tls_port = 5600  # defaults to the [tls] listener's; v3 only
 # ack_timeout_ms = 2000
 
 [[tracker.targets]]
@@ -40,7 +41,7 @@ guess which was meant.
 
 The server name comes from `[server] name`; the tracker section adds its
 description. `advertised_port` is for a public NAT mapping that differs from
-the local listener. Each target is independent: DNS, send, or acknowledgment
+the local listener, and `advertised_tls_port` is the same for `[tls]`'s. Each target is independent: DNS, send, or acknowledgment
 failure for one is logged and retried without delaying another or stopping
 the Hotline server.
 
@@ -78,6 +79,8 @@ these live fields without operator duplication:
   started;
 - large-file (64-bit) transfer support, whenever the Files service was built —
   the same condition under which both wires echo the large-file capability;
+- TLS support and the TLS port, whenever `[tls]` is configured and its
+  listener bound;
 - current visible-session count in the fixed header.
 
 The optional `[tracker.v3]` table supplies operator facts:
@@ -105,7 +108,7 @@ listing_language_strict = false
 ```
 
 Fields with no truthful source are omitted. In particular, hxd-ng does not
-invent content totals, rolling user statistics, TLS/HOPE support, or activity
+invent content totals, rolling user statistics, HOPE support, or activity
 timestamps. `MAX_USERS` and `MIN_PROTOCOL_VERSION` are not configurable
 either: the specification defines them as limits the server enforces at
 login, and hxd-ng has no user cap or client-version floor to report. They

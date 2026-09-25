@@ -267,6 +267,34 @@ generate() {
         num HXD_FILES_MAX_FILE_SIZE max_file_size
     fi
 
+    # Both files or neither: a certificate without its key is a mistake
+    # worth stopping for, not a TLS port quietly left off. A mounted pair
+    # wins over a self-signed one, so moving to a CA's certificate is
+    # setting the two variables.
+    if [ -n "${HXD_TLS_CERT:-}${HXD_TLS_KEY:-}" ]; then
+        [ -n "${HXD_TLS_CERT:-}" ] || die "HXD_TLS_KEY needs HXD_TLS_CERT"
+        [ -n "${HXD_TLS_KEY:-}" ] || die "HXD_TLS_CERT needs HXD_TLS_KEY"
+        [ -r "$HXD_TLS_CERT" ] || die "HXD_TLS_CERT $HXD_TLS_CERT is not readable; mount it there"
+        [ -r "$HXD_TLS_KEY" ] || die "HXD_TLS_KEY $HXD_TLS_KEY is not readable by uid $(id -u); mount it there"
+        on HXD_TLS_SELF_SIGNED off &&
+            echo "hxd-entrypoint: HXD_TLS_SELF_SIGNED ignored: HXD_TLS_CERT is set" >&2
+        echo
+        echo "[tls]"
+        echo 'bind = "0.0.0.0:5600"'
+        kv cert "$HXD_TLS_CERT"
+        kv key "$HXD_TLS_KEY"
+    elif on HXD_TLS_SELF_SIGNED off; then
+        # hxd makes the pair on the first start and keeps it in the
+        # volume, so the certificate clients pinned survives a recreate.
+        (umask 077 && mkdir -p "$DATA/tls")
+        echo
+        echo "[tls]"
+        echo 'bind = "0.0.0.0:5600"'
+        echo "cert = \"$DATA/tls/cert.pem\""
+        echo "key = \"$DATA/tls/key.pem\""
+        echo "self_signed = true"
+    fi
+
     if [ -n "${HXD_VOICE_ADVERTISE:-}" ]; then
         # A bare address gets the container's voice port.
         advertise=

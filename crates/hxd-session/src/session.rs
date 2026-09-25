@@ -178,6 +178,50 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) -> std::io::Result<()>
     }
 }
 
+/// Accept loop for the TLS port: the same sessions as [`serve`], each
+/// behind a handshake that must finish within the login timeout. The
+/// handshake runs on the connection's own task, so a client that stalls
+/// in it holds up nobody else's accept. A session here is encrypted and
+/// carries no identity — a client certificate is not asked for.
+pub async fn serve_tls(
+    listener: TcpListener,
+    ctx: ServerCtx,
+    tls: Arc<crate::LegacyTls>,
+) -> std::io::Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        // A banned address costs no handshake.
+        if ctx.core.is_banned(peer.ip()) {
+            info!(%peer, "refusing banned address");
+            continue;
+        }
+        let _ = stream.set_nodelay(true);
+        let ctx = ctx.clone();
+        let acceptor = tls.acceptor();
+        tokio::spawn(async move {
+            let span = tracing::info_span!("session", %peer, tls = true);
+            let stream = match timeout(ctx.cfg.login_timeout, acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    debug!(parent: &span, "TLS handshake failed: {e}");
+                    return;
+                }
+                Err(_) => {
+                    debug!(parent: &span, "TLS handshake timed out");
+                    return;
+                }
+            };
+            let transport = Transport {
+                encrypted: true,
+                ..Transport::default()
+            };
+            run_connection(stream, peer, ctx, transport, LinkAuthority::default(), true)
+                .instrument(span)
+                .await;
+        });
+    }
+}
+
 /// One outbound frame, typed by who stamps the transaction id.
 enum Outbound {
     /// Reply to a client request: `trans` echoes the request.
@@ -1036,7 +1080,9 @@ async fn login_phase(
     let req = parse_login(&f);
     if req.hope_probe {
         // HOPE arrives with the secure-login work; refuse it cleanly
-        // rather than desync.
+        // rather than desync. When it lands it stays refused on the TLS
+        // port (`transport.encrypted`): the same protection twice buys
+        // nothing, and GtkHx refuses the combination from its side too.
         reply_error(tx, f.trans, "Secure login (HOPE) is not supported yet.");
         return None;
     }

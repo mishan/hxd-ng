@@ -66,7 +66,7 @@ ENV NO_COLOR=1
 
 # Legacy Hotline, HTXF files (legacy + 1), voice media (legacy + 4, UDP),
 # and the ng HTTP/WebSocket port the proxy forwards to.
-EXPOSE 5500/tcp 5501/tcp 5504/udp 5700/tcp
+EXPOSE 5500/tcp 5501/tcp 5504/udp 5600/tcp 5601/tcp 5700/tcp
 
 # SIGTERM shuts down cleanly; SIGHUP (`docker kill -s HUP`) re-reads the
 # revocation lists of a mounted config without a restart.
