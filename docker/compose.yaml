@@ -46,9 +46,14 @@ services:
       # HXD_TLS_KEY: /etc/hxd-ng/tls/privkey.pem
       # HXD_TRACKERS: "hltracker.com"
       # HXD_REVOKED_IDENTITIES: ""
+    # The named volume keeps state in Docker's storage. For a directory
+    # on the host instead, owned by uid 10001, swap in the bind mount and
+    # drop the top-level volumes: docs/docker.md, "Where things live".
     volumes:
       - hxd-ng:/var/lib/hxd-ng
-      # - /srv/hotline/files:/srv/files
+      # - /srv/hxd-ng/data:/var/lib/hxd-ng
+      # - /srv/hxd-ng/tls:/etc/hxd-ng/tls:ro
+      # - /srv/hxd-ng/files:/srv/files
 
 volumes:
   hxd-ng:

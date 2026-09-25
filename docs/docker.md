@@ -39,6 +39,39 @@ with either.
 vouch for its clients; [the proxy](#the-proxy) says why it is needed and
 when it is dangerous. Leave it out when no proxy runs on the host.
 
+## Where things live
+
+The paths inside the container are fixed; where they come from on the
+host is the operator's choice.
+
+`-v hxd-ng:/var/lib/hxd-ng` in the quick start is a **named volume**:
+`hxd-ng` there is a name, not a directory, and Docker keeps the data in
+its own storage (`docker volume inspect hxd-ng` shows where). It needs
+nothing done first, and it is what `docker/compose.yaml` uses. To keep
+the state in a directory on the host instead, bind-mount one — a source
+with a `/` in it is a path. The examples in this document all use one
+layout under `/srv/hxd-ng`:
+
+| On the host | In the container | What | Mounted |
+|---|---|---|---|
+| `/srv/hxd-ng/data` | `/var/lib/hxd-ng` | All state: accounts, the SQLite store, news blobs, the identity, VAPID and self-signed TLS keys. | Always, or the named volume instead. |
+| `/srv/hxd-ng/etc` | `/etc/hxd-ng` | A config file of the operator's own. | Only for [a mounted config](#configuration). |
+| `/srv/hxd-ng/tls` | `/etc/hxd-ng/tls`, read-only | A certificate and key from a CA. | Only for [TLS certificates](#tls-certificates). |
+| `/srv/hxd-ng/files` | `/srv/files` | The file area, with `HXD_FILES_ROOT=/srv/files`. | Only for files. |
+
+A directory the server writes to must exist and be owned by uid 10001,
+which is who the server runs as:
+
+```sh
+install -d -o 10001 -g 10001 -m 0700 /srv/hxd-ng/data
+docker run -d --name hxd-ng --restart unless-stopped \
+  -v /srv/hxd-ng/data:/var/lib/hxd-ng \
+  ...
+```
+
+and the same for `files` if it takes uploads. `tls` only needs to be
+readable by 10001.
+
 ## Ports
 
 | Port | Protocol | Through the proxy? | What |
@@ -214,7 +247,7 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 |---|---|---|
 | `HXD_SYSTEM` | `off` | The server account on the user list, and its commands ([system-account.md](system-account.md)). |
 | `HXD_SYSTEM_NICK` | `Server` | Its nick. |
-| `HXD_FILES_ROOT` | | A directory in the container to serve as the file area; mount one there. Uploads go into folders named `Uploads` or `Drop Box`. It must be writable by uid 10001 for uploads. |
+| `HXD_FILES_ROOT` | | A directory in the container to serve as the file area (`/srv/files` in the examples); mount one there. Uploads go into folders named `Uploads` or `Drop Box`. It must be writable by uid 10001 for uploads. |
 | `HXD_FILES_MAX_FILE_SIZE` | 64 GiB | Bytes per file. |
 | `HXD_TLS_CERT` | | Turns on the TLS ports: a PEM certificate chain, leaf first, mounted into the container — Let's Encrypt's `fullchain.pem` where the server has a DNS name ([below](#tls-certificates)). `docker kill -s HUP hxd-ng` re-reads a renewed certificate without dropping anyone. |
 | `HXD_TLS_KEY` | | Its PEM private key, readable by uid 10001. |
@@ -264,13 +297,13 @@ cannot be regenerated without every client noticing, so back up the
 whole volume, not just the database.
 
 A named volume is ready as it is. A bind-mounted directory must be owned
-by uid 10001 (`chown -R 10001:10001 /srv/hxd-ng/data`), which is who the
-server runs as; so must a directory mounted for `HXD_FILES_ROOT` if it
-takes uploads.
+by uid 10001 ([where things live](#where-things-live)); one that already
+holds state from elsewhere can be given over with
+`chown -R 10001:10001 /srv/hxd-ng/data`.
 
 The store runs in WAL mode, so copying the files of a running server can
 catch it mid-write. The image has no `sqlite3`; stop the container and
-copy the volume:
+copy the state. From a named volume:
 
 ```sh
 docker stop hxd-ng
@@ -279,8 +312,11 @@ docker run --rm -v hxd-ng:/data:ro -v "$PWD":/backup debian:trixie-slim \
 docker start hxd-ng
 ```
 
-or, to keep it running, point a `sqlite3` on the host at the database
-in the volume (`docker volume inspect hxd-ng` gives its path) and use
+From a bind-mounted directory, the same with
+`tar -C /srv/hxd-ng/data -czf hxd-ng-backup.tar.gz .` on the host.
+
+Or, to keep it running, point a `sqlite3` on the host at the database
+(`docker volume inspect hxd-ng` gives a named volume's path) and use
 `.backup`, then copy everything else beside it.
 
 **Other users, read-only root.** The generated config goes in
