@@ -425,7 +425,7 @@ fn voice_cid(f: &Frame) -> u32 {
 /// is refused rather than truncated into a kind it didn't name.
 fn video_kind(f: &Frame) -> Option<VideoKind> {
     f.chunks()
-        .find(|c| c.tag == video::field::VIDEO_KIND)
+        .find(|c| c.tag == tag::VIDEO_KIND)
         .and_then(|c| u16::try_from(c.as_uint()).ok())
         .and_then(VideoKind::from_wire)
 }
@@ -1573,17 +1573,14 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
             }
             notify(
                 tx,
-                video::trans::VIDEO_STATUS,
+                ServerHdr::VideoStatus as u32,
                 vec![
                     video::chat_id(cid),
                     (
-                        video::field::VIDEO_PUBLISHERS,
+                        tag::VIDEO_PUBLISHERS,
                         video::publishers_payload(&publications),
                     ),
-                    (
-                        video::field::VIDEO_CODEC,
-                        ctx.core.video_codec().as_bytes().to_vec(),
-                    ),
+                    (tag::VIDEO_CODEC, ctx.core.video_codec().as_bytes().to_vec()),
                 ],
             );
         }
@@ -2948,7 +2945,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         // second, this frontend the first. SDP and ICE are not repeated:
         // a video renegotiation is a 602/603 on the same peer connection,
         // handled above without knowing video exists.
-        t if t == video::trans::VIDEO_START => {
+        t if t == ClientHdr::VideoStart.as_u32() => {
             if !sess.has_cap(cap::VIDEO) {
                 reply_error(tx, f.trans, "Video is not available on this server.");
                 return;
@@ -2989,14 +2986,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     vec![
                         video::chat_id(cid),
                         video::kind_chunk(kind),
-                        (video::field::VIDEO_CODEC, codec.as_bytes().to_vec()),
+                        (tag::VIDEO_CODEC, codec.as_bytes().to_vec()),
                     ],
                 ),
                 Err(e) => reply_error(tx, f.trans, video::err_text(e)),
             }
         }
 
-        t if t == video::trans::VIDEO_STOP => {
+        t if t == ClientHdr::VideoStop.as_u32() => {
             if !sess.has_cap(cap::VIDEO) {
                 reply_error(tx, f.trans, "Video is not available on this server.");
                 return;
@@ -3005,7 +3002,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // everything this client is publishing in the room.
             let kind = f
                 .chunks()
-                .find(|c| c.tag == video::field::VIDEO_KIND)
+                .find(|c| c.tag == tag::VIDEO_KIND)
                 .map(|c| VideoKind::from_wire(u16::try_from(c.as_uint()).ok()?));
             let kind = match kind {
                 Some(None) => {
@@ -3021,7 +3018,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
         }
 
-        t if t == video::trans::VIDEO_STATE => {
+        t if t == ClientHdr::VideoState.as_u32() => {
             if !sess.has_cap(cap::VIDEO) {
                 reply_error(tx, f.trans, "Video is not available on this server.");
                 return;
@@ -3032,7 +3029,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             };
             let paused = f
                 .chunks()
-                .find(|c| c.tag == video::field::VIDEO_PAUSED)
+                .find(|c| c.tag == tag::VIDEO_PAUSED)
                 .is_some_and(|c| c.as_uint() != 0);
             match ctx.core.video_state(sess.uid, voice_cid(f), kind, paused) {
                 Ok(()) => reply(tx, f.trans, vec![]),
@@ -3040,7 +3037,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
         }
 
-        t if t == video::trans::VIDEO_SUBSCRIBE => {
+        t if t == ClientHdr::VideoSubscribe.as_u32() => {
             if !sess.has_cap(cap::VIDEO) {
                 reply_error(tx, f.trans, "Video is not available on this server.");
                 return;
@@ -3053,7 +3050,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // started in.
             let streams = f
                 .chunks()
-                .find(|c| c.tag == video::field::VIDEO_SUBSCRIPTIONS)
+                .find(|c| c.tag == tag::VIDEO_SUBSCRIPTIONS)
                 .map(|c| video::parse_subscriptions(c.data))
                 .unwrap_or_default();
             match ctx.core.video_subscribe(sess.uid, voice_cid(f), &streams) {

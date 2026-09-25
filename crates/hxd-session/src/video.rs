@@ -13,96 +13,60 @@
 //! server-initiated notification carrying **task id 0**, not the push
 //! counter the rest of this frontend uses.
 //!
-//! **The opcodes and field ids live here rather than in `hxproto`.**
-//! The shared crate carries the voice extension's because GtkHx speaks
-//! it; nothing in the gtkhx tree speaks video yet, and inventing the
-//! constants there would mean advancing a shared-crate pin ahead of any client
-//! that could use them. They move to `hxproto::messages` in the
-//! same change that teaches GtkHx to render video, which is where the
-//! two halves get tested against each other.
+//! The opcodes (`ClientHdr::Video*`, `ServerHdr::VideoStatus`), the field
+//! ids (`tag::VIDEO_*`) and the byte layouts come from `hxproto`, the
+//! crate GtkHx speaks video through, so the two ends of the wire read and
+//! write one codec. What stays here is the mapping between that codec's
+//! types and `hxd_core`'s, which is transport-free and keeps its own.
+//!
+//! 607–611 continue the voice extension's 600-block; 612–619 are reserved
+//! for later revisions of the extension — simulcast most likely — and
+//! `0x0220`–`0x023F` is video's field block. Neither may be squatted on.
 
 use hxd_core::video::{
     VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,
 };
 use hxproto::messages::tag;
+use hxproto::video as wire;
 
-/// Client → server transaction opcodes.
-///
-/// 607–611 continue the voice extension's 600-block, which makes the 600s
-/// as a whole the media-signalling block: clear of the base protocol
-/// (101–355), the keepalive (500), chat history (700–709), inline media
-/// (750–751) and GIF icons (1861–1864). 612–619 are reserved for later
-/// revisions of the extension — simulcast most likely — and must not be
-/// squatted on.
-pub mod trans {
-    /// Begin publishing a stream of a given kind.
-    pub const VIDEO_START: u32 = 607;
-    /// End a publication and release its slot.
-    pub const VIDEO_STOP: u32 = 608;
-    /// Pause or resume a publication. No renegotiation.
-    pub const VIDEO_STATE: u32 = 609;
-    /// Declare the complete set of streams this client wishes to receive.
-    pub const VIDEO_SUBSCRIBE: u32 = 610;
-    /// Server → client: the room's publications and their state.
-    /// A notification — task id 0, no reply expected.
-    pub const VIDEO_STATUS: u32 = 611;
+/// `hxd_core`'s kind as the codec's. Both define the same two, so the
+/// conversion cannot fail; the panic guards a later revision that grows
+/// one side before the other.
+fn to_wire(kind: VideoKind) -> wire::VideoKind {
+    wire::VideoKind::from_wire(kind.wire()).expect("hxproto defines every hxd_core video kind")
 }
 
-/// Field ids. `0x0220`–`0x023F` belong to this extension; the unallocated
-/// tail is reserved and must not be reused for anything else. The block
-/// starts at `0x0220` because `0x01F5`–`0x01F9` are voice's, `0x01FA` is
-/// the large-file extension's resume digest, and `0x0201`–`0x021F` are
-/// inline media's.
-pub mod field {
-    /// Stream kind (u16 BE).
-    pub const VIDEO_KIND: u16 = 0x0220;
-    /// Paused state (u16 BE): 0 live, 1 paused.
-    pub const VIDEO_PAUSED: u16 = 0x0221;
-    /// Packed array of publication entries.
-    pub const VIDEO_PUBLISHERS: u16 = 0x0222;
-    /// Active video codec name for the room (ASCII).
-    pub const VIDEO_CODEC: u16 = 0x0223;
-    /// Server limits for one stream kind. Repeated, once per kind.
-    pub const VIDEO_LIMITS: u16 = 0x0224;
-    /// Packed array of the streams this client wishes to receive.
-    pub const VIDEO_SUBSCRIPTIONS: u16 = 0x0225;
+/// The codec's kind as `hxd_core`'s. `None` for a kind the codec knows
+/// and this server does not, which the caller drops like any other
+/// unknown kind.
+fn from_wire(kind: wire::VideoKind) -> Option<VideoKind> {
+    VideoKind::from_wire(kind.wire())
 }
-
-/// VP8's id in the publishers blob's codec field.
-///
-/// **A separate number space from voice's.** Codec id 0 is PCMU in
-/// `DATA_VOICE_PARTICIPANTS` and VP8 in `DATA_VIDEO_PUBLISHERS`; the two
-/// fields are never interchangeable and nothing may share a lookup table
-/// between them.
-const CODEC_VP8: u16 = 0;
-
-/// Flags bit 0 of a publication entry.
-const FLAG_PAUSED: u16 = 0x0001;
-
-/// Bytes per `DATA_VIDEO_PUBLISHERS` entry.
-const PUBLISHER_STRIDE: usize = 8;
-
-/// Bytes per `DATA_VIDEO_SUBSCRIPTIONS` entry.
-const SUBSCRIPTION_STRIDE: usize = 4;
 
 /// The `DATA_VIDEO_PUBLISHERS` (`0x0222`) payload: a packed array of
-/// eight-byte entries, `uid | kind | flags | codec id`, all big-endian.
-/// A participant publishing both a camera and a screen produces two.
+/// eight-byte entries, `uid | kind | flags | codec id`. A participant
+/// publishing both a camera and a screen produces two.
 ///
 /// **A new field, not a widening of `DATA_VOICE_PARTICIPANTS`.** That
 /// blob has a six-byte stride and deployed voice clients derive its count
 /// by dividing the field length by six; growing the stride would
 /// misparse silently in every one of them. Audio state stays there, video
 /// state here, and a client correlates the two by user id.
+///
+/// Every entry says VP8. Video codec ids are their own number space: id 0
+/// is PCMU in the voice participants blob and VP8 here.
 pub fn publishers_payload(ps: &[VideoPublication]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(ps.len() * PUBLISHER_STRIDE);
-    for p in ps {
-        v.extend_from_slice(&p.uid.to_be_bytes());
-        v.extend_from_slice(&p.kind.wire().to_be_bytes());
-        v.extend_from_slice(&(if p.paused { FLAG_PAUSED } else { 0 }).to_be_bytes());
-        v.extend_from_slice(&CODEC_VP8.to_be_bytes());
-    }
-    v
+    ps.iter()
+        .flat_map(|p| {
+            wire::Publication {
+                user_id: p.uid,
+                kind: to_wire(p.kind),
+                flags: if p.paused { wire::FLAG_PAUSED } else { 0 },
+                codec_id: wire::CODEC_VP8,
+            }
+            .to_bytes()
+        })
+        .collect()
 }
 
 /// Read a `DATA_VIDEO_SUBSCRIPTIONS` (`0x0225`) payload: the client's
@@ -114,31 +78,31 @@ pub fn publishers_payload(ps: &[VideoPublication]) -> Vec<u8> {
 /// not its whole subscription set. An absent or empty field is "no video
 /// at all", which is the state every participant starts in.
 pub fn parse_subscriptions(data: &[u8]) -> Vec<VideoStream> {
-    data.chunks_exact(SUBSCRIPTION_STRIDE)
-        .filter_map(|e| {
-            let uid = u16::from_be_bytes([e[0], e[1]]);
-            let kind = VideoKind::from_wire(u16::from_be_bytes([e[2], e[3]]))?;
-            Some(VideoStream { uid, kind })
+    wire::parse_video_subscriptions(data)
+        .filter_map(|s| {
+            Some(VideoStream {
+                uid: s.user_id,
+                kind: from_wire(s.kind)?,
+            })
         })
         .collect()
 }
 
 /// One `DATA_VIDEO_LIMITS` (`0x0224`) field: the server's ceiling for one
-/// stream kind, sixteen bytes in this revision.
-///
-/// A parser must accept a longer field and ignore the excess, so a later
-/// revision can append; this encoder writes exactly the sixteen and
-/// zeroes the reserved pair.
+/// stream kind, sixteen bytes in this revision with the reserved pair
+/// zeroed. A parser must accept a longer field, so a later revision can
+/// append.
 pub fn limits_payload(kind: VideoKind, l: &VideoLimits) -> Vec<u8> {
-    let mut v = Vec::with_capacity(16);
-    v.extend_from_slice(&kind.wire().to_be_bytes());
-    v.extend_from_slice(&l.max_width.to_be_bytes());
-    v.extend_from_slice(&l.max_height.to_be_bytes());
-    v.extend_from_slice(&l.max_fps.to_be_bytes());
-    v.extend_from_slice(&l.max_bitrate.to_be_bytes());
-    v.extend_from_slice(&l.max_per_room.to_be_bytes());
-    v.extend_from_slice(&0u16.to_be_bytes());
-    v
+    wire::Limits {
+        kind: to_wire(kind),
+        max_width: l.max_width,
+        max_height: l.max_height,
+        max_fps: l.max_fps,
+        max_bitrate: l.max_bitrate,
+        max_per_room: l.max_per_room,
+    }
+    .to_bytes()
+    .to_vec()
 }
 
 /// The `DATA_VIDEO_LIMITS` chunks for a login reply — one per kind the
@@ -147,7 +111,7 @@ pub fn limits_payload(kind: VideoKind, l: &VideoLimits) -> Vec<u8> {
 pub fn limits_chunks(config: &VideoConfig) -> Vec<(u16, Vec<u8>)> {
     VideoKind::ALL
         .iter()
-        .map(|k| (field::VIDEO_LIMITS, limits_payload(*k, &config.limits(*k))))
+        .map(|k| (tag::VIDEO_LIMITS, limits_payload(*k, &config.limits(*k))))
         .collect()
 }
 
@@ -180,25 +144,37 @@ pub fn chat_id(cid: u32) -> (u16, Vec<u8>) {
 
 /// The `DATA_VIDEO_KIND` chunk.
 pub fn kind_chunk(kind: VideoKind) -> (u16, Vec<u8>) {
-    (field::VIDEO_KIND, kind.wire().to_be_bytes().to_vec())
+    (tag::VIDEO_KIND, kind.wire().to_be_bytes().to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hxd_core::access::bit;
+    use hxproto::messages::{ClientHdr, ServerHdr};
 
     #[test]
     fn the_transaction_numbers_continue_the_voice_block() {
         // 600-606 are voice's; video picks up at 607 and stops at 611,
         // leaving 612-619 reserved.
-        assert_eq!(trans::VIDEO_START, 607);
-        assert_eq!(trans::VIDEO_STOP, 608);
-        assert_eq!(trans::VIDEO_STATE, 609);
-        assert_eq!(trans::VIDEO_SUBSCRIBE, 610);
-        assert_eq!(trans::VIDEO_STATUS, 611);
+        assert_eq!(ClientHdr::VideoStart.as_u32(), 607);
+        assert_eq!(ClientHdr::VideoStop.as_u32(), 608);
+        assert_eq!(ClientHdr::VideoState.as_u32(), 609);
+        assert_eq!(ClientHdr::VideoSubscribe.as_u32(), 610);
+        assert_eq!(ServerHdr::VideoStatus as u32, 611);
         // And the field block starts clear of inline media's 0x0201-0x021F.
-        assert_eq!(field::VIDEO_KIND, 0x0220);
-        assert_eq!(field::VIDEO_SUBSCRIPTIONS, 0x0225);
+        assert_eq!(tag::VIDEO_KIND, 0x0220);
+        assert_eq!(tag::VIDEO_SUBSCRIPTIONS, 0x0225);
+    }
+
+    #[test]
+    fn the_gates_agree_with_the_shared_codec() {
+        // The capability and access bits are this server's own, shared
+        // with the ng wire; the client reads hxproto's. They must name
+        // the same bits.
+        assert_eq!(1u64 << crate::caps::cap::VIDEO, wire::CAP_VIDEO);
+        assert_eq!(u32::from(bit::VIDEO_CHAT), wire::ACCESS_VIDEO_CHAT);
+        assert_eq!(u32::from(bit::SCREEN_SHARE), wire::ACCESS_SCREEN_SHARE);
     }
 
     #[test]
@@ -291,7 +267,7 @@ mod tests {
         // the login reply.
         let chunks = limits_chunks(&VideoConfig::default());
         assert_eq!(chunks.len(), 2);
-        assert!(chunks.iter().all(|(t, _)| *t == field::VIDEO_LIMITS));
+        assert!(chunks.iter().all(|(t, _)| *t == tag::VIDEO_LIMITS));
         assert_eq!(chunks[1].1[0..2], [0, 2], "the screen kind follows");
     }
 }
