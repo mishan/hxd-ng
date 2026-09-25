@@ -18,6 +18,7 @@
  */
 
 import { connect as tcpConnect } from 'node:net';
+import { connect as tlsConnect } from 'node:tls';
 
 import { CLIENT_MAGIC, Framer, SERVER_MAGIC, pack } from './frame.mjs';
 import { toBytes, toText } from './macroman.mjs';
@@ -167,16 +168,21 @@ export class LegacyClient {
     this.closed = false;
   }
 
-  /** The TRTP hello, then whatever the caller wants to say. */
-  async open() {
-    this.sock = tcpConnect({ host: '127.0.0.1', port: this.server.ports.legacy });
+  /** The TRTP hello, then whatever the caller wants to say. With
+   *  `tls: { port, ca }` the hello goes inside a TLS session on that
+   *  port, trusting only `ca` — the separate-port model, TLS from the
+   *  first byte and the same conversation inside it. */
+  async open({ tls } = {}) {
+    this.sock = tls
+      ? tlsConnect({ host: '127.0.0.1', port: tls.port, ca: tls.ca, servername: 'localhost' })
+      : tcpConnect({ host: '127.0.0.1', port: this.server.ports.legacy });
     const framer = new Framer();
     let greeted = false;
     let pending = Buffer.alloc(0);
 
     await new Promise((resolve, reject) => {
       this.sock.once('error', reject);
-      this.sock.once('connect', resolve);
+      this.sock.once(tls ? 'secureConnect' : 'connect', resolve);
     });
     this.sock.on('error', () => {
       this.closed = true;
@@ -400,10 +406,10 @@ export class LegacyClient {
   }
 }
 
-/** Connect and log in, the ordinary case. */
-export async function legacyLogin(server, creds) {
+/** Connect and log in, the ordinary case; `via` is {@link LegacyClient.open}'s. */
+export async function legacyLogin(server, creds, via) {
   const client = new LegacyClient(server, creds.nick ?? creds.login ?? 'legacy');
-  await client.open();
+  await client.open(via);
   await client.login(creds);
   return client;
 }

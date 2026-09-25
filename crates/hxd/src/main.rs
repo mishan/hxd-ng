@@ -43,11 +43,14 @@ fn init_tracing() {
 /// registrar — the names it reserves and its invites file, and nothing
 /// else (`docs/identity-registrar.md`): an operator locking out a stolen
 /// key should not have to restart the server and drop everyone else to
-/// do it. `systemctl reload` sends exactly this.
+/// do it. `systemctl reload` sends exactly this. It also re-reads
+/// `[tls]`'s certificate and key from the paths the server started with,
+/// so a renewal reaches the next handshake without dropping a session.
 #[cfg(unix)]
 async fn reload_on_hangup(
     core: std::sync::Arc<hxd_core::Core>,
     registrar: Option<std::sync::Arc<hxd_registrar::Registrar>>,
+    tls: Option<std::sync::Arc<hxd_session::LegacyTls>>,
     path: PathBuf,
 ) {
     let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -72,6 +75,14 @@ async fn reload_on_hangup(
                     "SIGHUP: registrar reserves {reserved} names; {invites} new invites"
                 ),
                 Err(e) => tracing::error!("SIGHUP: registrar: {e}"),
+            }
+        }
+        if let Some(tls) = tls.as_deref() {
+            match tls.reload() {
+                Ok(()) => tracing::info!("SIGHUP: TLS certificate {}", tls.fingerprint()),
+                Err(e) => {
+                    tracing::error!("SIGHUP: [tls] {e}; the certificate in use is unchanged")
+                }
             }
         }
     }
@@ -654,6 +665,7 @@ async fn main() {
         }
         let voice = hxd::voice::build(&config)?;
         let files = hxd::files::build(&config)?;
+        let tls = hxd::tls::build(&config)?;
         // The push configuration is checked here; the VAPID key is read
         // in `build_ctx`, once the device registry is open to say whether
         // a missing key is a first start — and still before anything
@@ -667,6 +679,14 @@ async fn main() {
                 TcpListener::bind(&files.bind)
                     .await
                     .map_err(|e| format!("files bind {}: {e}", files.bind))?,
+            ),
+            None => None,
+        };
+        let tls_files_listener = match tls.as_ref().and_then(|t| t.files_bind.as_ref()) {
+            Some(bind) => Some(
+                TcpListener::bind(bind)
+                    .await
+                    .map_err(|e| format!("[tls] files bind {bind}: {e}"))?,
             ),
             None => None,
         };
@@ -696,6 +716,28 @@ async fn main() {
         let legacy_addr = listener
             .local_addr()
             .map_err(|e| format!("legacy listener address: {e}"))?;
+        let tls_listener = match tls.as_ref() {
+            Some(tls) => {
+                let listener = TcpListener::bind(&tls.bind)
+                    .await
+                    .map_err(|e| format!("[tls] bind {}: {e}", tls.bind))?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|e| format!("TLS listener address: {e}"))?
+                    .port();
+                tracing::info!(
+                    "legacy TLS on {}{} — certificate {}",
+                    tls.bind,
+                    tls.files_bind
+                        .as_ref()
+                        .map(|b| format!(", HTXF over TLS on {b}"))
+                        .unwrap_or_default(),
+                    tls.tls.fingerprint()
+                );
+                Some((listener, port))
+            }
+            None => None,
+        };
         tracing::info!(
             "hxd-ng listening on {} (server name {:?}, version {})",
             config.server.bind,
@@ -722,16 +764,29 @@ async fn main() {
                 })
                 .expect("validated Files source");
             tracing::info!("Files from {} with HTXF on {}", source, files.bind);
-            let service = files.service.clone();
-            let core = ctx.core.clone();
+            // One pool of transfer connections, whichever port they came in on.
+            let slots = hxd_files::HtxfSlots::default();
+            let registry = files.service.transfers.clone();
             let timeouts = files.timeouts;
-            tokio::spawn(async move {
-                if let Err(error) =
-                    hxd_files::serve_htxf(listener, service.transfers.clone(), core, timeouts).await
-                {
-                    tracing::error!("HTXF accept loop: {error}");
-                }
-            });
+            tokio::spawn(hxd_files::serve_htxf_with(
+                listener,
+                slots.clone(),
+                |stream| std::future::ready(Ok(stream)),
+                registry.clone(),
+                ctx.core.clone(),
+                timeouts,
+            ));
+            if let (Some(tls), Some(listener)) = (tls.as_ref(), tls_files_listener) {
+                let tls = tls.tls.clone();
+                tokio::spawn(hxd_files::serve_htxf_with(
+                    listener,
+                    slots,
+                    move |stream| tls.acceptor().accept(stream),
+                    registry,
+                    ctx.core.clone(),
+                    timeouts,
+                ));
+            }
         }
 
         // Bind every configured listener before telling a tracker this
@@ -760,6 +815,9 @@ async fn main() {
                         name: config.server.name.clone(),
                         description: section.description.clone(),
                         port: advertised_port,
+                        tls_port: tls_listener
+                            .as_ref()
+                            .map(|(_, port)| section.advertised_tls_port.unwrap_or(*port)),
                         protocol_version: config.server.version,
                         inline_media: config.media.is_some() && cfg!(feature = "media"),
                         voice: voice.is_some(),
@@ -849,6 +907,7 @@ async fn main() {
         tokio::spawn(reload_on_hangup(
             ctx.core.clone(),
             ng_ctx.as_ref().and_then(|n| n.registrar.clone()),
+            tls.as_ref().map(|t| t.tls.clone()),
             config_path.clone(),
         ));
 
@@ -878,9 +937,16 @@ async fn main() {
             tokio::spawn(hxd_ng_session::serve(ng_listener, ng_ctx));
         }
 
+        if let (Some((listener, _)), Some(tls)) = (tls_listener, tls.as_ref()) {
+            tokio::spawn(hxd_session::serve_tls(
+                listener,
+                ctx.clone(),
+                tls.tls.clone(),
+            ));
+        }
         let outcome = tokio::select! {
-            r = hxd_session::serve(listener, ctx) => {
-                r.map_err(|e| format!("accept loop: {e}"))
+            () = hxd_session::serve(listener, ctx) => {
+                unreachable!("the accept loop waits out its errors and never returns")
             }
             signal = shutdown_signal() => {
                 signal?;

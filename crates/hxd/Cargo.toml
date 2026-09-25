@@ -69,6 +69,9 @@ rand_core = { workspace = true }
 # `hxd registrar inspect` fetches a registrar's log and stats over HTTPS.
 # The same client, and so the same TLS stack, `hlid` already uses.
 ureq = { version = "2", default-features = false, features = ["tls"] }
+# `[tls] self_signed`: the certificate made on first start. ring, as the
+# TLS listener itself uses.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 serde_json = "1"
 
 [dev-dependencies]
@@ -94,3 +97,5 @@ str0m = { version = "0.23", default-features = false, features = ["rust-crypto"]
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false }
 tempfile = "3"
+# The TLS e2e connects as a client would.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

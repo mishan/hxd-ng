@@ -261,7 +261,8 @@ export async function startServer({ config = {}, accounts = {}, guest = true } =
 export async function startFailing({ config = {}, guest = true } = {}) {
   const ports = await findBlock();
   const nonce = `hxd-e2e-${randomUUID().slice(0, 8)}`;
-  const { dir } = materialize({ config, ports, name: nonce, guest });
+  const resolvedConfig = typeof config === 'function' ? config(ports) : config;
+  const { dir } = materialize({ config: resolvedConfig, ports, name: nonce, guest });
   const proc = launch(dir);
   let output = '';
   proc.stdout.on('data', (d) => (output += d));

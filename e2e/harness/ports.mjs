@@ -26,6 +26,8 @@ import { readFileSync } from 'node:fs';
  *     base+1   [ng]      WebSocket and HTTP
  *     base+2   [files]   legacy HTXF
  *     base+4   [voice]   UDP, *derived* rather than configured
+ *     base+5   [tls]     legacy over TLS, when a test configures it
+ *     base+6   [tls]     HTXF over TLS, *derived* as base+5 plus one
  *
  * The gap is not padding. `voice::build` defaults the media port to the
  * legacy port plus four when `[voice] bind` is absent, so a block laid
@@ -76,7 +78,7 @@ function udpFree(port) {
 }
 
 /**
- * A block whose three interesting ports are free right now.
+ * A block whose interesting ports are free right now.
  *
  * "Right now" is the honest limit of what this can promise: between the
  * probe and `hxd`'s bind, anything could take one. That race is closed
@@ -90,14 +92,16 @@ export async function findBlock() {
       (await tcpFree(base)) &&
       (await tcpFree(base + 1)) &&
       (await tcpFree(base + 2)) &&
-      (await udpFree(base + 4))
+      (await udpFree(base + 4)) &&
+      (await tcpFree(base + 5)) &&
+      (await tcpFree(base + 6))
     ) {
-      return { base, legacy: base, ng: base + 1, files: base + 2, voice: base + 4 };
+      return { base, legacy: base, ng: base + 1, files: base + 2, voice: base + 4, tls: base + 5 };
     }
     if (process.env.HXD_E2E_PORT_BASE) {
       throw new Error(
         `HXD_E2E_PORT_BASE=${base} is not free ` +
-          `(needs ${base}, ${base + 1}, ${base + 2}, udp ${base + 4})`,
+          `(needs ${base}, ${base + 1}, ${base + 2}, udp ${base + 4}, ${base + 5}, ${base + 6})`,
       );
     }
   }

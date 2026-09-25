@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -145,14 +146,58 @@ pub struct HtxfTimeouts {
     pub idle: Duration,
 }
 
+/// A byte stream HTXF can run over: a TCP socket, or a TLS session on one.
+pub trait HtxfStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HtxfStream for S {}
+
+/// The transfer connections one server holds at once, across every HTXF
+/// listener it runs: a TLS transfer port is more of the same capacity,
+/// not another helping of it.
+#[derive(Clone)]
+pub struct HtxfSlots(Arc<Semaphore>);
+
+impl Default for HtxfSlots {
+    fn default() -> Self {
+        const MAX_HTXF_CONNECTIONS: usize = 256;
+        Self(Arc::new(Semaphore::new(MAX_HTXF_CONNECTIONS)))
+    }
+}
+
+/// The plaintext transfer listener, with capacity of its own.
 pub async fn serve_htxf(
     listener: TcpListener,
     registry: Arc<TransferRegistry>,
     core: Arc<Core>,
     timeouts: HtxfTimeouts,
 ) -> std::io::Result<()> {
-    const MAX_HTXF_CONNECTIONS: usize = 256;
-    let connection_slots = Arc::new(Semaphore::new(MAX_HTXF_CONNECTIONS));
+    serve_htxf_with(
+        listener,
+        HtxfSlots::default(),
+        |stream| std::future::ready(Ok(stream)),
+        registry,
+        core,
+        timeouts,
+    )
+    .await
+}
+
+/// A transfer listener whose accepted sockets pass through `wrap` before
+/// the handshake is read — a TLS accept, for the TLS transfer port.
+/// `wrap` runs on the connection's own task, inside the handshake
+/// timeout, so a client that stalls in it holds one slot and no more.
+pub async fn serve_htxf_with<W, F, S>(
+    listener: TcpListener,
+    slots: HtxfSlots,
+    wrap: W,
+    registry: Arc<TransferRegistry>,
+    core: Arc<Core>,
+    timeouts: HtxfTimeouts,
+) -> std::io::Result<()>
+where
+    W: Fn(TcpStream) -> F,
+    F: Future<Output = std::io::Result<S>> + Send + 'static,
+    S: HtxfStream,
+{
     let mut accept_backoff = Duration::from_millis(10);
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -167,7 +212,14 @@ pub async fn serve_htxf(
                 continue;
             }
         };
-        let permit = match connection_slots.clone().try_acquire_owned() {
+        // A banned address takes no slot, and so no TLS handshake either:
+        // the pool is shared, and its idle connections would crowd out
+        // everyone else's transfers on both ports.
+        if core.is_banned(peer.ip()) {
+            debug!(%peer, "HTXF connection refused from a banned address");
+            continue;
+        }
+        let permit = match slots.0.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 debug!(%peer, "HTXF connection refused while transfer capacity is full");
@@ -176,8 +228,20 @@ pub async fn serve_htxf(
         };
         let registry = registry.clone();
         let core = core.clone();
+        let wrapped = wrap(stream);
         tokio::spawn(async move {
             let _permit = permit;
+            let stream = match tokio::time::timeout(timeouts.handshake, wrapped).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    debug!(%peer, %error, "HTXF connection refused before its handshake");
+                    return;
+                }
+                Err(_) => {
+                    debug!(%peer, "HTXF connection timed out before its handshake");
+                    return;
+                }
+            };
             if let Err(error) = serve_one(stream, peer, &registry, core, timeouts).await {
                 debug!(%peer, %error, "HTXF transfer refused");
             }
@@ -185,8 +249,8 @@ pub async fn serve_htxf(
     }
 }
 
-async fn serve_one(
-    mut stream: TcpStream,
+async fn serve_one<S: HtxfStream>(
+    mut stream: S,
     peer: SocketAddr,
     registry: &TransferRegistry,
     core: Arc<Core>,
@@ -234,8 +298,8 @@ async fn serve_one(
     }
 }
 
-async fn serve_download(
-    mut stream: TcpStream,
+async fn serve_download<S: HtxfStream>(
+    mut stream: S,
     transfer: PreparedDownload,
     alive: &Liveness,
     idle: Duration,
@@ -279,8 +343,8 @@ async fn serve_download(
     Ok(())
 }
 
-async fn serve_upload(
-    mut stream: TcpStream,
+async fn serve_upload<S: HtxfStream>(
+    mut stream: S,
     transfer: PreparedUpload,
     preamble: htxf::Preamble,
     alive: &Liveness,
@@ -337,8 +401,8 @@ async fn on_disk<T: Send + 'static>(
         .map_err(|error| FileError::Unavailable(format!("local file worker: {error}")))?
 }
 
-async fn receive_large(
-    stream: &mut TcpStream,
+async fn receive_large<S: HtxfStream>(
+    stream: &mut S,
     transfer: &PreparedUpload,
     preamble: &htxf::Preamble,
     files: &crate::local::UploadFiles,
@@ -377,8 +441,8 @@ async fn receive_large(
     Ok(hxhfs::HfsInfo::default())
 }
 
-async fn receive_legacy(
-    stream: &mut TcpStream,
+async fn receive_legacy<S: HtxfStream>(
+    stream: &mut S,
     transfer: &PreparedUpload,
     preamble: &htxf::Preamble,
     files: &crate::local::UploadFiles,

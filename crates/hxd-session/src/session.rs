@@ -30,7 +30,7 @@ use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::text;
 use hxproto::HL_DATA_HDR_LEN;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
@@ -155,11 +155,32 @@ pub struct ServerCtx {
     pub files: Option<Arc<hxd_files::FileService>>,
 }
 
-/// Accept loop: one [`run_session`] task per connection. Plain TCP, so
-/// the transport is cleartext and carries no identity.
-pub async fn serve(listener: TcpListener, ctx: ServerCtx) -> std::io::Result<()> {
+/// The next connection, however long that takes. An accept error —
+/// descriptors exhausted, most often, which anyone able to open enough
+/// idle connections can cause — is waited out rather than returned: a
+/// returned error ends the process, taking every session with it.
+async fn accept(listener: &TcpListener, backoff: &mut Duration) -> (TcpStream, SocketAddr) {
     loop {
-        let (stream, peer) = listener.accept().await?;
+        match listener.accept().await {
+            Ok(accepted) => {
+                *backoff = Duration::from_millis(10);
+                return accepted;
+            }
+            Err(e) => {
+                warn!("accept failed; retrying: {e}");
+                tokio::time::sleep(*backoff).await;
+                *backoff = (*backoff * 2).min(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+/// Accept loop: one [`run_session`] task per connection. Plain TCP, so
+/// the transport is cleartext and carries no identity. Never returns.
+pub async fn serve(listener: TcpListener, ctx: ServerCtx) {
+    let mut backoff = Duration::from_millis(10);
+    loop {
+        let (stream, peer) = accept(&listener, &mut backoff).await;
         let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
         tokio::spawn(async move {
@@ -174,6 +195,61 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) -> std::io::Result<()>
             )
             .instrument(span)
             .await;
+        });
+    }
+}
+
+/// TLS handshakes in progress at once. Past it a new connection is
+/// closed unanswered: a handshake costs the server real work, and a
+/// client that opens connections and never finishes one should run out
+/// of room here rather than run the process out of descriptors.
+const MAX_TLS_HANDSHAKES: usize = 256;
+
+/// Accept loop for the TLS port: the same sessions as [`serve`], each
+/// behind a handshake that must finish within the login timeout. The
+/// handshake runs on the connection's own task, so a client that stalls
+/// in it holds up nobody else's accept. A session here is encrypted and
+/// carries no identity — a client certificate is not asked for. Never
+/// returns.
+pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::LegacyTls>) {
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_TLS_HANDSHAKES));
+    let mut backoff = Duration::from_millis(10);
+    loop {
+        let (stream, peer) = accept(&listener, &mut backoff).await;
+        // A banned address costs no handshake.
+        if ctx.core.is_banned(peer.ip()) {
+            info!(%peer, "refusing banned address");
+            continue;
+        }
+        let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+            debug!(%peer, "TLS handshakes at capacity; closing");
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let ctx = ctx.clone();
+        let acceptor = tls.acceptor();
+        tokio::spawn(async move {
+            let span = tracing::info_span!("session", %peer, tls = true);
+            let handshake = timeout(ctx.cfg.login_timeout, acceptor.accept(stream)).await;
+            drop(permit);
+            let stream = match handshake {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    debug!(parent: &span, "TLS handshake failed: {e}");
+                    return;
+                }
+                Err(_) => {
+                    debug!(parent: &span, "TLS handshake timed out");
+                    return;
+                }
+            };
+            let transport = Transport {
+                encrypted: true,
+                ..Transport::default()
+            };
+            run_connection(stream, peer, ctx, transport, LinkAuthority::default(), true)
+                .instrument(span)
+                .await;
         });
     }
 }
@@ -1036,7 +1112,9 @@ async fn login_phase(
     let req = parse_login(&f);
     if req.hope_probe {
         // HOPE arrives with the secure-login work; refuse it cleanly
-        // rather than desync.
+        // rather than desync. When it lands it stays refused on the TLS
+        // port (`transport.encrypted`): the same protection twice buys
+        // nothing, and GtkHx refuses the combination from its side too.
         reply_error(tx, f.trans, "Secure login (HOPE) is not supported yet.");
         return None;
     }

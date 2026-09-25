@@ -18,6 +18,8 @@ services:
     ports:
       - "5500:5500"             # legacy Hotline
       - "5501:5501"             # HTXF file transfers: legacy port + 1
+      # - "5600-5601:5600-5601" # legacy over TLS, with HXD_TLS_CERT/KEY
+      #                         # (or HXD_TLS_SELF_SIGNED)
       # - "5504:5504/udp"       # voice media, with HXD_VOICE_ADVERTISE
       - "127.0.0.1:5700:5700"   # ng: only the proxy on this host reaches it
     environment:
@@ -37,6 +39,11 @@ services:
       # HXD_PUSH_CONTACT: "mailto:admin@hl.example"
       # HXD_VOICE_ADVERTISE: "203.0.113.5"
       # HXD_FILES_ROOT: /srv/files
+      # A CA's certificate (Let's Encrypt) where the server has a name;
+      # docs/docker.md says how to mount one. HXD_TLS_SELF_SIGNED: "on"
+      # otherwise.
+      # HXD_TLS_CERT: /etc/hxd-ng/tls/fullchain.pem
+      # HXD_TLS_KEY: /etc/hxd-ng/tls/privkey.pem
       # HXD_TRACKERS: "hltracker.com"
       # HXD_REVOKED_IDENTITIES: ""
     volumes:

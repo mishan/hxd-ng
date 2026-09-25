@@ -25,6 +25,7 @@ pub mod files;
 pub mod moderation;
 pub mod push;
 pub mod registrar;
+pub mod tls;
 pub mod voice;
 pub use files::Files;
 pub use push::Push;
@@ -83,6 +84,9 @@ pub struct Config {
     /// always on, its trail kept in the database `[inbox]`, `[history]`
     /// or `[news]` names, and in memory on a server with none.
     pub moderation: Option<moderation::ModerationSection>,
+    /// The legacy wire over TLS, on a port of its own. Absent = the
+    /// plaintext port only, as every Hotline server has always had.
+    pub tls: Option<tls::TlsSection>,
 }
 
 /// `[push]`: where a notification goes when nobody is watching.
@@ -1960,6 +1964,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
         identity.revocations()?;
     }
     registrar::check(config)?;
+    tls::check(config)?;
     if let Some(inbox) = &config.inbox {
         hxd_core::InboxPolicy {
             max_queued: inbox.max_queued,
