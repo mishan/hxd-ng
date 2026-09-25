@@ -937,26 +937,16 @@ async fn main() {
             tokio::spawn(hxd_ng_session::serve(ng_listener, ng_ctx));
         }
 
-        // The TLS accept loop ends the process on the same terms as the
-        // plaintext one; without `[tls]` it never finishes.
-        let tls_serve = {
-            let ctx = ctx.clone();
-            let tls = tls.as_ref().map(|t| t.tls.clone());
-            async move {
-                match (tls_listener, tls) {
-                    (Some((listener, _)), Some(tls)) => {
-                        hxd_session::serve_tls(listener, ctx, tls).await
-                    }
-                    _ => std::future::pending().await,
-                }
-            }
-        };
+        if let (Some((listener, _)), Some(tls)) = (tls_listener, tls.as_ref()) {
+            tokio::spawn(hxd_session::serve_tls(
+                listener,
+                ctx.clone(),
+                tls.tls.clone(),
+            ));
+        }
         let outcome = tokio::select! {
-            r = hxd_session::serve(listener, ctx) => {
-                r.map_err(|e| format!("accept loop: {e}"))
-            }
-            r = tls_serve => {
-                r.map_err(|e| format!("TLS accept loop: {e}"))
+            () = hxd_session::serve(listener, ctx) => {
+                unreachable!("the accept loop waits out its errors and never returns")
             }
             signal = shutdown_signal() => {
                 signal?;

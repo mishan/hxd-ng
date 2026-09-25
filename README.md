@@ -247,8 +247,8 @@ looks for it.
 ```toml
 [tls]
 bind = "0.0.0.0:5600"
-cert = "/etc/letsencrypt/live/hl.example/fullchain.pem"  # PEM chain, leaf first
-key = "/etc/letsencrypt/live/hl.example/privkey.pem"
+cert = "/etc/hxd-ng/tls/fullchain.pem"  # PEM chain, leaf first
+key = "/etc/hxd-ng/tls/privkey.pem"
 # files_bind = "0.0.0.0:5601"  # default: bind's port + 1
 # self_signed = false          # see below
 ```
@@ -257,19 +257,24 @@ key = "/etc/letsencrypt/live/hl.example/privkey.pem"
 DNS name can have one for free, and a client checks it against the CAs
 it already trusts, so users connect without being asked anything and a
 changed certificate is not a warning they learn to click through.
-certbot issues it (`--standalone` as below, or `--webroot` when
-something already serves port 80); renewal comes every
-couple of months, and a deploy hook that sends SIGHUP puts the new one
-in service without dropping anyone:
+certbot issues it (`certbot certonly --standalone -d hl.example`, or
+`--webroot` when something already serves port 80), and renews it every
+couple of months.
+
+certbot keeps its files where only root can read them, so a server
+running as its own user reads a copy. A deploy hook makes the copy at
+every renewal and sends SIGHUP, which puts the new certificate in
+service without dropping anyone. Save it as
+`/etc/letsencrypt/renewal-hooks/deploy/hxd-ng.sh`, make it executable,
+and run it once by hand for the first copy:
 
 ```sh
-certbot certonly --standalone -d hl.example \
-  --deploy-hook 'systemctl reload hxd'   # or: pkill -HUP -x hxd
+#!/bin/sh
+live=/etc/letsencrypt/live/hl.example
+install -D -m 644 -o hxd "$live/fullchain.pem" /etc/hxd-ng/tls/fullchain.pem
+install -D -m 600 -o hxd "$live/privkey.pem" /etc/hxd-ng/tls/privkey.pem
+systemctl reload hxd 2>/dev/null || pkill -HUP -x hxd || true
 ```
-
-The key certbot writes is readable by root alone, so a server running
-as its own user needs a copy it can read — make it in the same hook,
-with `install -m 600 -o hxd`, and point `key` at the copy.
 
 **Self-signed, when there is no name.** A server reached only by
 address cannot get a CA's certificate, and a client can then only pin

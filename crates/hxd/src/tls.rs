@@ -1,7 +1,7 @@
 //! `[tls]`: the legacy wire over TLS, on ports of its own.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hxd_session::LegacyTls;
@@ -53,8 +53,24 @@ pub struct Tls {
 
 pub fn check(config: &Config) -> Result<(), String> {
     let Some(section) = config.tls.as_ref() else {
+        if config
+            .tracker
+            .as_ref()
+            .is_some_and(|t| t.advertised_tls_port.is_some())
+        {
+            return Err(
+                "[tracker] advertised_tls_port needs [tls]: there is no TLS port to \
+                 advertise without it"
+                    .into(),
+            );
+        }
         return Ok(());
     };
+    // One file can hold both halves of an operator's pair, but a pair
+    // made here would write the certificate over the key it belongs to.
+    if section.self_signed && section.cert == section.key {
+        return Err("[tls] self_signed needs cert and key to be two different files".into());
+    }
     if section.files_bind.is_some() && config.files.is_none() {
         return Err(
             "[tls] files_bind needs [files]: there are no transfers to carry without it".into(),
@@ -71,7 +87,13 @@ pub fn build(config: &Config) -> Result<Option<Tls>, String> {
     if section.self_signed {
         provision(section, &config.server.name)?;
     }
-    let tls = LegacyTls::load(&section.cert, &section.key).map_err(|e| format!("[tls] {e}"))?;
+    let tls = LegacyTls::load(&section.cert, &section.key).map_err(|e| {
+        if section.self_signed {
+            format!("[tls] {e}; remove both files to have a new self-signed pair made")
+        } else {
+            format!("[tls] {e}")
+        }
+    })?;
     let files_bind = match (&config.files, &section.files_bind) {
         (None, _) => None,
         (Some(_), Some(bind)) => Some(bind.clone()),
@@ -102,13 +124,11 @@ fn provision(section: &TlsSection, server_name: &str) -> Result<(), String> {
         }
     }
     let (cert, key) = self_signed(server_name)?;
-    // The key first and owner-only; a start that dies between the two
-    // writes leaves the one-without-the-other case above, not a
-    // certificate whose key is gone.
-    crate::write_private(&section.key, &key)
-        .map_err(|e| format!("[tls] {}: {e}", section.key.display()))?;
-    std::fs::write(&section.cert, cert)
-        .map_err(|e| format!("[tls] {}: {e}", section.cert.display()))?;
+    // Each file lands whole or not at all, and the key first: a start
+    // that dies between the two leaves the one-without-the-other case
+    // above, never a truncated file beside a complete one.
+    write_whole(&section.key, key.as_bytes(), true)?;
+    write_whole(&section.cert, cert.as_bytes(), false)?;
     tracing::warn!(
         "[tls] made a self-signed certificate at {}: clients will ask their users to \
          trust it on first connect. A certificate from Let's Encrypt avoids that for a \
@@ -116,6 +136,51 @@ fn provision(section: &TlsSection, server_name: &str) -> Result<(), String> {
         section.cert.display()
     );
     Ok(())
+}
+
+/// Write `bytes` to a temporary file beside `path` and rename it into
+/// place, making the directory (owner-only) if it is not there yet.
+fn write_whole(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
+    use std::io::Write;
+    let fail = |e: std::io::Error| format!("[tls] {}: {e}", path.display());
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    if !dir.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(dir).map_err(fail)?;
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("[tls] {} names no file", path.display()))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(".tmp");
+    let tmp = dir.join(tmp_name);
+    // Left by a start that died mid-write; it was never renamed, so
+    // nothing refers to it.
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut file = opts.open(&tmp).map_err(fail)?;
+    file.write_all(bytes).map_err(fail)?;
+    file.sync_all().map_err(fail)?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(fail)
 }
 
 /// A certificate naming the server, for the prompt a client shows. The
@@ -139,6 +204,10 @@ fn transfer_bind(control: &str) -> Result<String, String> {
     let mut address: SocketAddr = control.parse().map_err(|_| {
         "[tls] files_bind is required when [tls] bind is not a numeric socket address".to_string()
     })?;
+    // Port 0 is the system's choice, and the port after it is not one.
+    if address.port() == 0 {
+        return Err("[tls] files_bind is required when [tls] bind's port is 0".into());
+    }
     let port = address
         .port()
         .checked_add(1)
@@ -159,6 +228,7 @@ mod tests {
             "[tls] bind port has no following HTXF port"
         );
         assert!(transfer_bind("localhost:5600").is_err());
+        assert!(transfer_bind("127.0.0.1:0").is_err());
     }
 
     #[test]
@@ -201,6 +271,48 @@ mod tests {
         std::fs::remove_file(dir.path().join("key.pem")).unwrap();
         let err = build(&config).err().unwrap();
         assert!(err.contains("without the other"), "{err}");
+        // A pair that is there but unusable says how to start over.
+        std::fs::write(dir.path().join("key.pem"), "truncated").unwrap();
+        let err = build(&config).err().unwrap();
+        assert!(err.contains("remove both files"), "{err}");
+    }
+
+    #[test]
+    fn self_signed_makes_the_directory_it_writes_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: Config = toml::from_str(&format!(
+            "[tls]\ncert = \"{0}/tls/cert.pem\"\nkey = \"{0}/tls/key.pem\"\nself_signed = true\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        build(&config).unwrap();
+        assert!(dir.path().join("tls/key.pem").exists());
+        assert!(!dir.path().join("tls/.key.pem.tmp").exists());
+    }
+
+    #[test]
+    fn self_signed_refuses_one_file_for_both_halves() {
+        let config: Config =
+            toml::from_str("[tls]\ncert = \"pair.pem\"\nkey = \"pair.pem\"\nself_signed = true\n")
+                .unwrap();
+        assert!(check(&config).unwrap_err().contains("two different files"));
+        // Without self_signed, one file holding both is an operator's
+        // choice and not this check's business.
+        let config: Config =
+            toml::from_str("[tls]\ncert = \"pair.pem\"\nkey = \"pair.pem\"\n").unwrap();
+        check(&config).unwrap();
+    }
+
+    #[test]
+    fn an_advertised_tls_port_without_tls_is_refused() {
+        let config: Config = toml::from_str(
+            "[tracker]\nadvertised_tls_port = 5600\n[[tracker.targets]]\naddress = \"t.example\"\n\
+             protocol = \"v3\"\n",
+        )
+        .unwrap();
+        assert!(check(&config)
+            .unwrap_err()
+            .contains("advertised_tls_port needs [tls]"));
     }
 
     #[test]

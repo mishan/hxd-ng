@@ -212,6 +212,13 @@ where
                 continue;
             }
         };
+        // A banned address takes no slot, and so no TLS handshake either:
+        // the pool is shared, and its idle connections would crowd out
+        // everyone else's transfers on both ports.
+        if core.is_banned(peer.ip()) {
+            debug!(%peer, "HTXF connection refused from a banned address");
+            continue;
+        }
         let permit = match slots.0.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {

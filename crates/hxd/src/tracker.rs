@@ -197,6 +197,12 @@ impl TrackerSection {
             .targets
             .iter()
             .any(|target| target.protocol == TrackerProtocol::V3);
+        if self.advertised_tls_port.is_some() && !need_v3 {
+            return Err(
+                "[tracker] advertised_tls_port is sent only to v3 targets, and none is configured"
+                    .into(),
+            );
+        }
         if need_v1 {
             check_legacy_string("[server] name", server_name)?;
             check_legacy_string("[tracker] description", &self.description)?;
@@ -1425,6 +1431,16 @@ mod tests {
             .check("server")
             .unwrap_err()
             .contains("listing_category"));
+        section.v3.listing_category = None;
+        section.targets[0].hmac_secret = None;
+        section.targets[0].protocol = TrackerProtocol::V1;
+        section.advertised_tls_port = Some(5600);
+        assert!(section
+            .check("server")
+            .unwrap_err()
+            .contains("only to v3 targets"));
+        section.targets[0].protocol = TrackerProtocol::V3;
+        section.check("server").unwrap();
     }
 
     #[test]

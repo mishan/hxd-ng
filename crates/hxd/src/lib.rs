@@ -1662,7 +1662,7 @@ pub(crate) fn decode_key(b64: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "key must be 32 bytes".to_string())
 }
 
-pub(crate) fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);

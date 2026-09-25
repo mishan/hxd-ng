@@ -31,6 +31,7 @@ const CHAT: u32 = 0x006a;
 const SELFINFO: u32 = 0x0162;
 const GET_USER_LIST: u32 = 0x012c;
 const FILE_GET: u32 = 0x00ca;
+const FILE_PUT: u32 = 0x00cb;
 
 /// Color bit 4: the link is cleartext.
 const CLEARTEXT: u16 = 16;
@@ -44,6 +45,10 @@ struct Running {
     tls_htxf: SocketAddr,
     /// The certificate, for the client's trust store.
     cert: CertificateDer<'static>,
+    core: Arc<Core>,
+    /// The file area.
+    root: std::path::PathBuf,
+    login_timeout: Duration,
     _temp: tempfile::TempDir,
 }
 
@@ -54,12 +59,13 @@ async fn start(login_timeout: Duration) -> Running {
     std::fs::write(
         accounts.join("guest.toml"),
         "name = \"guest\"\n[access]\nread_chat = true\nsend_chat = true\n\
-         download_files = true\nuse_any_name = true\n",
+         download_files = true\nupload_files = true\nuse_any_name = true\n",
     )
     .unwrap();
     let root = temp.path().join("files");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("sealed.txt"), b"over the wire, under wraps").unwrap();
+    std::fs::create_dir(root.join("Uploads")).unwrap();
 
     let issued = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let (cert_path, key_path) = (temp.path().join("cert.pem"), temp.path().join("key.pem"));
@@ -107,6 +113,9 @@ async fn start(login_timeout: Duration) -> Running {
         tls: secure.local_addr().unwrap(),
         tls_htxf: htxf.local_addr().unwrap(),
         cert: issued.cert.der().clone(),
+        core: core.clone(),
+        root,
+        login_timeout,
         _temp: temp,
     };
     tokio::spawn(hxd_session::serve(plain, ctx.clone()));
@@ -310,11 +319,19 @@ async fn the_tls_port_says_nothing_to_a_plaintext_client() {
 async fn a_stalled_handshake_is_dropped_at_the_login_timeout() {
     let server = start(Duration::from_millis(500)).await;
     let mut stream = TcpStream::connect(server.tls).await.unwrap();
+    let began = std::time::Instant::now();
     let mut byte = [0; 1];
     let read = timeout(Duration::from_secs(5), stream.read(&mut byte))
         .await
         .expect("the server hangs up on a client that never says hello");
     assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    // At the timeout, not before: a server that hung up at once would
+    // pass the read above and prove nothing about the wait.
+    let waited = began.elapsed();
+    assert!(
+        waited >= server.login_timeout - Duration::from_millis(100),
+        "hung up after {waited:?}"
+    );
 }
 
 #[tokio::test]
@@ -348,13 +365,109 @@ async fn a_download_crosses_the_tls_transfer_port() {
     stream.write_all(&preamble.encode().unwrap()).await.unwrap();
     stream.flush().await.unwrap();
     let mut bytes = Vec::new();
-    let _ = timeout(Duration::from_secs(5), stream.read_to_end(&mut bytes))
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut bytes))
         .await
-        .expect("the transfer finishes");
+        .expect("the transfer finishes")
+        .expect("the server ends the transfer with a TLS close, not a cut connection");
     assert!(
         bytes
             .windows(26)
             .any(|w| w == b"over the wire, under wraps"),
         "the file arrives"
     );
+}
+
+/// A classic two-fork object as a client uploads one: INFO, then DATA.
+fn two_fork_object(data: &[u8]) -> Vec<u8> {
+    let encoded = hxfiles_xfer::ffo::encode(
+        &hxfiles_xfer::ffo::Metadata {
+            name: b"ignored",
+            type_code: *b"TEXT",
+            creator: *b"ttxt",
+            comment: b"",
+            create_time: 0,
+            modify_time: 0,
+        },
+        hxfiles_xfer::ffo::Forks {
+            data_len: data.len() as u64,
+            data_offset: 0,
+            resource_len: 0,
+            resource_offset: 0,
+        },
+        false,
+    )
+    .unwrap();
+    let mut object = encoded.prefix;
+    object[22..24].copy_from_slice(&2u16.to_be_bytes());
+    object.extend_from_slice(data);
+    object
+}
+
+/// A DIR field naming one folder below the root.
+fn dir(name: &[u8]) -> Vec<u8> {
+    let mut out = vec![0, 1, 0, 0, name.len() as u8];
+    out.extend_from_slice(name);
+    out
+}
+
+#[tokio::test]
+async fn an_upload_crosses_the_tls_transfer_port() {
+    let server = start(Duration::from_secs(5)).await;
+    let mut client = Client::tls(&server, "sender").await;
+    let put = client
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"sent.txt".to_vec()),
+                (tag::DIR, dir(b"Uploads")),
+            ],
+        )
+        .await;
+    assert_eq!(put.flag & 1, 0, "the upload is granted");
+    let reference = u32::from_be_bytes(field(&put, tag::HTXF_REF).unwrap().try_into().unwrap());
+    let object = two_fork_object(b"sealed on the way up");
+
+    let mut stream = tls_stream(&server, server.tls_htxf).await;
+    let preamble = htxf::Preamble {
+        reference,
+        transfer_len: object.len() as u64,
+        type_code: 0,
+        flags: 0,
+        resume_digest: None,
+    };
+    stream.write_all(&preamble.encode().unwrap()).await.unwrap();
+    stream.write_all(&object).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut rest = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut rest))
+        .await
+        .expect("the server ends the upload")
+        .ok();
+    assert_eq!(
+        std::fs::read(server.root.join("Uploads/sent.txt")).unwrap(),
+        b"sealed on the way up"
+    );
+}
+
+#[tokio::test]
+async fn a_banned_address_gets_no_handshake_on_either_tls_port() {
+    let server = start(Duration::from_secs(5)).await;
+    let victim = Client::tls(&server, "banned").await;
+    server
+        .core
+        .kick(victim.uid, Some(Duration::from_secs(60)))
+        .unwrap();
+    for port in [server.tls, server.tls_htxf] {
+        let tcp = TcpStream::connect(port).await.unwrap();
+        let handshake = timeout(
+            Duration::from_secs(5),
+            connector(&server.cert).connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        .expect("the server hangs up rather than waiting");
+        assert!(
+            handshake.is_err(),
+            "no handshake for a banned address on {port}"
+        );
+    }
 }
