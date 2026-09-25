@@ -279,10 +279,22 @@ install -D -m 600 -o 10001 "$live/privkey.pem" /srv/hxd-ng/tls/privkey.pem
 docker kill -s HUP hxd-ng 2>/dev/null || true
 ```
 
-Make it executable and run it once by hand for the first copy, then
-run the container with `-v /srv/hxd-ng/tls:/etc/hxd-ng/tls:ro`,
-`HXD_TLS_CERT=/etc/hxd-ng/tls/fullchain.pem` and
-`HXD_TLS_KEY=/etc/hxd-ng/tls/privkey.pem`, and publish 5600-5601.
+Make it executable and run it once by hand for the first copy. The
+hook writes to the host's `/srv/hxd-ng/tls`; the server reads the same
+files as `/etc/hxd-ng/tls`, where the mount puts them, so the variables
+name the container's side ([where things live](#where-things-live)):
+
+```sh
+docker run ... \
+  -v /srv/hxd-ng/tls:/etc/hxd-ng/tls:ro \
+  -e HXD_TLS_CERT=/etc/hxd-ng/tls/fullchain.pem \
+  -e HXD_TLS_KEY=/etc/hxd-ng/tls/privkey.pem \
+  -p 5600-5601:5600-5601 \
+  ...
+```
+
+In `docker/compose.yaml`, uncomment the `tls` volume, the two
+variables, and the 5600-5601 ports line.
 
 A server reached only by address cannot get one; `HXD_TLS_SELF_SIGNED=on`
 is for that case. The pair lives in `/var/lib/hxd-ng/tls` and belongs in
