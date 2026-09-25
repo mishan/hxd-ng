@@ -33,7 +33,8 @@ with your host name and certificate, and reload nginx. Classic clients
 connect to port 5500; ng clients to `wss://hl.example/`.
 [`docker/compose.yaml`](../docker/compose.yaml) is the same thing for
 Compose, and names the container `hxd-ng` so the commands below work
-with either.
+with either. It runs the published image, so it can be copied anywhere
+on its own; uncommenting its `build:` lines builds a checkout instead.
 
 `gateway` in `HXD_NG_TRUSTED_PROXIES` is what lets nginx on the host
 vouch for its clients; [the proxy](#the-proxy) says why it is needed and
