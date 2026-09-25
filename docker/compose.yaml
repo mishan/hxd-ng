@@ -1,14 +1,20 @@
 # hxd-ng with Docker Compose, behind a proxy on the host (docker/nginx.conf).
 #
-#   docker compose -f docker/compose.yaml up -d --build
+#   docker compose -f docker/compose.yaml up -d
 #
-# docs/docker.md lists every variable.
+# This file stands alone: it runs the published image, so it can be
+# copied anywhere without the checkout. docs/docker.md lists every
+# variable.
 
 services:
   hxd-ng:
-    build:
-      context: ..
-    image: hxd-ng
+    image: ghcr.io/mishan/hxd-ng:latest
+    # To run a checkout's own build instead, uncomment the two lines
+    # below, set image: to hxd-ng so the build is not tagged as the
+    # published image, and add --build to `up`. The context is the
+    # checkout's root, so this file must stay in its docker/ directory.
+    # build:
+    #   context: ..
     # The container and the volume are named outright, not through a
     # top-level `name:`, which the older standalone docker-compose
     # refuses: either way they are `hxd-ng` whichever directory this is
