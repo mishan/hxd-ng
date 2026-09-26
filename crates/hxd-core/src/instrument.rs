@@ -268,6 +268,13 @@ impl Tally {
     }
 }
 
+/// An attached session's client fell a whole channel behind; its
+/// connection is dropped.
+pub fn outbox_lagged() {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_outbox_lagged_total").increment(1);
+}
+
 /// A detached session's buffer overflowed; its resume will be a resync.
 pub fn outbox_broken() {
     #[cfg(feature = "metrics")]

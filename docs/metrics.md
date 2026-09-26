@@ -105,6 +105,7 @@ a scrape's own render.
 | `hxd_fanout_recipients` | `event` | how many that was |
 | `hxd_events_pushed_total` | `sink` | `live` onto a connection, `buffered` for a detached session, `dropped` by a broken buffer |
 | `hxd_outbox_broken_total` | | detached buffers that overflowed |
+| `hxd_outbox_lagged_total` | | attached sessions whose client fell a whole channel behind and was cut off |
 | `hxd_voice_media_seconds` | `op` | each call into the SFU, all made under the roster lock |
 
 A fan-out runs under the roster lock, and so does its recording: once
@@ -137,7 +138,10 @@ The reasons: `eof`, `io_error` and `malformed` from the socket,
 `closed` for a WebSocket close, `banned` for an address refused at
 the door, `handshake` and `login` for a connection that never got a
 session, `kicked`, `logout`, `replaced`,
-`send_failed` and `pong_deadline`.
+`send_failed`, `pong_deadline`, and `slow_consumer` for a client that
+stopped taking what was sent to it: a classic writer's queue past its
+bound or a write that made no progress for a minute, or either wire's
+session a whole channel behind.
 
 ### Read at scrape time
 
@@ -146,6 +150,7 @@ session, `kicked`, `logout`, `replaced`,
 | `hxd_sessions` | `state` | `attached`, `detached`, `hidden` (on the roster, not yet announced), and `system` for the server account; each session is in exactly one |
 | `hxd_detached_buffered_events` | `of` | events held for detached sessions, `sum` and `max` |
 | `hxd_detached_broken` | | detached sessions whose buffer has broken |
+| `hxd_sessions_lagging` | | attached sessions cut off for falling behind, not yet gone (counted in `attached` too) |
 | `hxd_private_chats` | | rooms open |
 | `hxd_process_open_fds`, `hxd_process_resident_bytes` | | from `/proc` |
 | `hxd_runtime_workers`, `hxd_runtime_alive_tasks`, `hxd_runtime_global_queue_depth` | | tokio's stable runtime metrics |

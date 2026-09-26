@@ -6,12 +6,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc::UnboundedReceiver;
+use crate::Events;
 
 use super::*;
 use crate::inbox::MemoryStore;
 use crate::notify::{Notification, NotificationGateway};
-use crate::roster::{drain, AttachInfo, SeqEvent, Transport};
+use crate::roster::{drain, AttachInfo, Transport};
 use crate::{AccountDirectory, InboxPolicy};
 
 /// Accounts as a file backend answers for them, with bits that can change
@@ -130,29 +130,20 @@ impl Server {
 
     /// A session with an account behind it, and its events. `guest` is
     /// the one login with no mailbox, as a real login makes it.
-    fn login(&self, login: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    fn login(&self, login: &str) -> (Uid, Events) {
         self.login_as(login, None)
     }
 
-    fn login_as(
-        &self,
-        login: &str,
-        identity: Option<[u8; 32]>,
-    ) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    fn login_as(&self, login: &str, identity: Option<[u8; 32]>) -> (Uid, Events) {
         self.attach(login, identity, false)
     }
 
     /// A session on the legacy wire, which drops `news_notify`.
-    fn login_classic(&self, login: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    fn login_classic(&self, login: &str) -> (Uid, Events) {
         self.attach(login, None, true)
     }
 
-    fn attach(
-        &self,
-        login: &str,
-        identity: Option<[u8; 32]>,
-        classic: bool,
-    ) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    fn attach(&self, login: &str, identity: Option<[u8; 32]>, classic: bool) -> (Uid, Events) {
         let (uid, rx) = self
             .core
             .attach(AttachInfo {
@@ -212,7 +203,7 @@ impl Server {
     }
 }
 
-fn notices(rx: &mut UnboundedReceiver<SeqEvent>) -> Vec<Notified> {
+fn notices(rx: &mut Events) -> Vec<Notified> {
     drain(rx)
         .into_iter()
         .filter_map(|e| match e {

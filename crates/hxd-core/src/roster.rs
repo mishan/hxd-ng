@@ -31,7 +31,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, error::TrySendError};
 
 use crate::access::{bit, AccessBits};
 use crate::chat::{Ban, PrivateChat};
@@ -43,6 +43,24 @@ pub type Uid = u16;
 /// How many events a detached session's outbox holds before it gives up
 /// and demands a resync.
 pub const OUTBOX_BUFFER_CAP: usize = 512;
+
+/// How many events an attached session's channel holds before its client
+/// is judged not to be keeping up.
+///
+/// **A client that will not drain is disconnected, not buffered for.**
+/// Before this bound a connection that stopped reading made the server
+/// hold every event addressed to it, for as long as the socket stayed
+/// open, and one such client was enough to grow the server without
+/// limit. The frontends drain this channel as fast as they can write:
+/// the classic one into its writer's queue, which has a bound of its
+/// own, and the ng one straight to the socket. So what fills it is a
+/// client whose socket has stopped taking bytes, and at this size that
+/// is seconds of the busiest room's traffic, not a slow link's
+/// ordinary backlog.
+pub const LIVE_QUEUE_CAP: usize = 8192;
+
+/// A session's event stream, as the frontend attached to it reads it.
+pub type Events = mpsc::Receiver<SeqEvent>;
 
 /// A session's presence state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -385,7 +403,13 @@ pub struct SeqEvent {
 /// Where a session's events currently go.
 enum Sink {
     /// A connection is attached; events flow on the channel.
-    Live(UnboundedSender<SeqEvent>),
+    Live(mpsc::Sender<SeqEvent>),
+    /// A connection is attached, but fell [`LIVE_QUEUE_CAP`] events
+    /// behind. Its channel is closed — the frontend sees the stream end
+    /// once it has drained what was sent, and asks [`Core::is_lagging`]
+    /// why — and every event from here on is lost to it, seq and all. A
+    /// resume can therefore only be a resync.
+    Lagged,
     /// Detached: events buffer for replay.
     Buffering {
         /// When the connection was lost (grace accounting).
@@ -408,7 +432,7 @@ pub(crate) struct Outbox {
 }
 
 impl Outbox {
-    fn live(tx: UnboundedSender<SeqEvent>) -> Self {
+    fn live(tx: mpsc::Sender<SeqEvent>) -> Self {
         Outbox {
             next_seq: 1,
             sink: Sink::Live(tx),
@@ -420,10 +444,18 @@ impl Outbox {
         self.next_seq += 1;
         let se = SeqEvent { seq, event };
         match &mut self.sink {
-            Sink::Live(tx) => {
-                let _ = tx.send(se);
-                instrument::Pushed::Live
-            }
+            Sink::Live(tx) => match tx.try_send(se) {
+                Ok(()) => instrument::Pushed::Live,
+                Err(TrySendError::Full(_)) => {
+                    // Dropping the sender is what closes the channel.
+                    self.sink = Sink::Lagged;
+                    instrument::outbox_lagged();
+                    instrument::Pushed::Dropped
+                }
+                // The frontend is gone and has not said so yet.
+                Err(TrySendError::Closed(_)) => instrument::Pushed::Dropped,
+            },
+            Sink::Lagged => instrument::Pushed::Dropped,
             Sink::Buffering { buf, broken, .. } => {
                 if *broken {
                     return instrument::Pushed::Dropped;
@@ -558,12 +590,12 @@ pub struct AttachInfo {
 pub enum Resume {
     /// The buffer covered the gap: replay these, then live events follow
     /// on the channel.
-    Replayed(UnboundedReceiver<SeqEvent>, Vec<SeqEvent>),
+    Replayed(Events, Vec<SeqEvent>),
     /// The session is alive and the channel is attached, but the gap can't
     /// be replayed (overflow, or `last_seq` predates the buffer). The
     /// client must do a fresh sync; events flow from the session's current
     /// seq onward.
-    ResyncRequired(UnboundedReceiver<SeqEvent>),
+    ResyncRequired(Events),
     /// No such session (grace lapsed, ended, or never existed).
     Gone,
 }
@@ -885,6 +917,9 @@ pub struct Census {
     pub system: usize,
     /// Detached sessions whose buffer overflowed.
     pub broken: usize,
+    /// Attached sessions whose client fell behind and whose connection
+    /// is about to end (counted in `attached` too).
+    pub lagging: usize,
     /// Events waiting in detached sessions' buffers, in all and at most.
     pub buffered: usize,
     pub buffered_max: usize,
@@ -986,7 +1021,7 @@ impl Core {
     /// that authenticated before a revocation arrived, and it is asked
     /// under the roster lock so a revocation's sweep cannot miss a
     /// session that attaches while it runs.
-    pub fn attach(&self, info: AttachInfo) -> Option<(Uid, UnboundedReceiver<SeqEvent>)> {
+    pub fn attach(&self, info: AttachInfo) -> Option<(Uid, Events)> {
         let mut r = self.roster.lock().unwrap();
         if info
             .transport
@@ -999,7 +1034,7 @@ impl Core {
         let uid = r.next_uid()?;
         r.last_serial += 1;
         let serial = r.last_serial;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(LIVE_QUEUE_CAP);
         r.users.insert(
             uid,
             UserSession {
@@ -1120,11 +1155,14 @@ impl Core {
         // the socket that just died. So the order is load-bearing, and
         // it is also what makes the buffer's voice content exactly the
         // tail of this departure and nothing else.
+        // A connection that lost events to lagging has nothing a resume
+        // could replay from: the buffer starts broken.
+        let lagged = matches!(sess.outbox.sink, Sink::Lagged);
         sess.outbox.sink = Sink::Buffering {
             since: Instant::now(),
             start_seq: sess.outbox.next_seq,
             buf: VecDeque::new(),
-            broken: false,
+            broken: lagged,
         };
         let addr = sess.addr;
         r.voice_part(uid);
@@ -1144,7 +1182,7 @@ impl Core {
                     .filter(|(_, s)| s.addr == Some(addr))
                     .filter_map(|(u, s)| match s.outbox.sink {
                         Sink::Buffering { since, .. } => Some((*u, since)),
-                        Sink::Live(_) => None,
+                        Sink::Live(_) | Sink::Lagged => None,
                     })
                     .collect();
                 if detached.len() <= max_detached_per_addr {
@@ -1171,7 +1209,7 @@ impl Core {
             r.end_session(uid);
             return Resume::Gone;
         }
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(LIVE_QUEUE_CAP);
         let old = std::mem::replace(&mut sess.outbox.sink, Sink::Live(tx));
         let next_seq = sess.outbox.next_seq;
         let outcome = match old {
@@ -1200,6 +1238,8 @@ impl Core {
                     Resume::ResyncRequired(rx)
                 }
             }
+            // Taking over a connection that lagged: what it lost is lost.
+            Sink::Lagged => Resume::ResyncRequired(rx),
         };
         r.set_status(uid, SessionStatus::Active);
         outcome
@@ -1251,6 +1291,10 @@ impl Core {
             }
             match &sess.outbox.sink {
                 Sink::Live(_) => c.attached += 1,
+                Sink::Lagged => {
+                    c.attached += 1;
+                    c.lagging += 1;
+                }
                 Sink::Buffering { buf, broken, .. } => {
                     c.detached += 1;
                     c.broken += usize::from(*broken);
@@ -1260,6 +1304,19 @@ impl Core {
             }
         }
         c
+    }
+
+    /// Did this session's connection fall [`LIVE_QUEUE_CAP`] events
+    /// behind? What a frontend asks when its event stream ends: if so, the
+    /// client is not keeping up and the connection is to be dropped as
+    /// lost (`slow_consumer`), rather than having been taken over.
+    pub fn is_lagging(&self, uid: Uid) -> bool {
+        self.roster
+            .lock()
+            .unwrap()
+            .users
+            .get(&uid)
+            .is_some_and(|s| matches!(s.outbox.sink, Sink::Lagged))
     }
 
     /// Is this session currently detached? (Moderation and tests.)
@@ -1362,11 +1419,7 @@ pub(crate) fn is_buffering(sess: &UserSession) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn test_attach(
-    core: &Core,
-    nick: &str,
-    access: AccessBits,
-) -> (Uid, UnboundedReceiver<SeqEvent>) {
+pub(crate) fn test_attach(core: &Core, nick: &str, access: AccessBits) -> (Uid, Events) {
     let (uid, rx) = core
         .attach(AttachInfo {
             nick: nick.to_string(),
@@ -1391,7 +1444,7 @@ pub(crate) fn test_attach(
 }
 
 #[cfg(test)]
-pub(crate) fn drain(rx: &mut UnboundedReceiver<SeqEvent>) -> Vec<Event> {
+pub(crate) fn drain(rx: &mut Events) -> Vec<Event> {
     let mut out = Vec::new();
     while let Ok(se) = rx.try_recv() {
         out.push(se.event);
@@ -1403,7 +1456,7 @@ pub(crate) fn drain(rx: &mut UnboundedReceiver<SeqEvent>) -> Vec<Event> {
 mod tests {
     use super::*;
 
-    fn ng_attach(core: &Core, nick: &str, addr: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    fn ng_attach(core: &Core, nick: &str, addr: &str) -> (Uid, Events) {
         let (uid, rx) = core
             .attach(AttachInfo {
                 nick: nick.to_string(),
@@ -1640,6 +1693,45 @@ mod tests {
             Resume::ResyncRequired(_rx) => {}
             _ => panic!("pre-buffer last_seq must demand resync"),
         }
+    }
+
+    #[test]
+    fn a_client_that_falls_a_channel_behind_is_cut_off_and_resumes_into_a_resync() {
+        let core = Core::new();
+        let (slow, mut rx) = ng_attach(&core, "slow", "10.0.0.1");
+        let (busy, mut busy_rx) = ng_attach(&core, "busy", "10.0.0.2");
+        // Everything `busy` does is an event for `slow`, which reads none
+        // of them; `busy` hears its own too, and keeps up.
+        for i in 0..LIVE_QUEUE_CAP + 10 {
+            core.update(busy, Some(format!("n{i}")), None);
+            while busy_rx.try_recv().is_ok() {}
+        }
+        assert!(core.is_lagging(slow));
+        assert!(!core.is_lagging(busy));
+        assert_eq!(core.census().lagging, 1);
+        // What was queued is still there to read, in order; then the
+        // stream ends, where a takeover would end it too.
+        let mut seqs = Vec::new();
+        while let Ok(se) = rx.try_recv() {
+            seqs.push(se.seq);
+        }
+        assert_eq!(seqs.len(), LIVE_QUEUE_CAP);
+        assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        // The events it missed still took their seqs.
+        let before = core.current_seq(slow).unwrap();
+        core.update(busy, Some("more".into()), None);
+        assert_eq!(core.current_seq(slow).unwrap(), before + 1);
+
+        // Its connection goes as lost; the session detaches with nothing
+        // it could replay, so the resume is a resync.
+        let last = *seqs.last().unwrap();
+        assert!(core.connection_lost(slow, 2));
+        assert!(!core.is_lagging(slow));
+        assert!(matches!(core.resume(slow, last), Resume::ResyncRequired(_)));
     }
 
     #[test]

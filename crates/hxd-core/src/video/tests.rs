@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use super::*;
 use crate::access::AccessBits;
-use crate::roster::{drain, test_attach, SeqEvent};
+use crate::roster::{drain, test_attach};
 use crate::voice::fake::{MediaCall, RecordingMedia};
 use crate::voice::DEFAULT_MAX_PER_ROOM;
 use crate::Core;
-use tokio::sync::mpsc::UnboundedReceiver;
+use crate::Events;
 
 fn videoed() -> (Core, Arc<RecordingMedia>) {
     let media = Arc::new(RecordingMedia::new());
@@ -23,14 +23,14 @@ fn videoed() -> (Core, Arc<RecordingMedia>) {
     (core, media)
 }
 
-fn quiet(core: &Core, nick: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
+fn quiet(core: &Core, nick: &str) -> (Uid, Events) {
     test_attach(core, nick, AccessBits::empty())
 }
 
 /// Join voice, answer the initial offer, and start from a quiet outbox —
 /// the state every video test begins in, because video needs a voice
 /// session under it.
-fn in_voice(core: &Core, media: &RecordingMedia, uid: Uid, rx: &mut UnboundedReceiver<SeqEvent>) {
+fn in_voice(core: &Core, media: &RecordingMedia, uid: Uid, rx: &mut Events) {
     let join = core.voice_join(uid, 0).unwrap();
     core.voice_answer(uid, 0, format!("answer to {}", join.sdp))
         .unwrap();
@@ -47,11 +47,7 @@ fn in_voice(core: &Core, media: &RecordingMedia, uid: Uid, rx: &mut UnboundedRec
 /// instead of getting its own offer. That is correct behaviour and it is
 /// exactly what these tests must not accidentally be measuring, so the
 /// room is settled before any of them starts.
-fn joined(
-    core: &Core,
-    media: &RecordingMedia,
-    users: &mut [(Uid, &mut UnboundedReceiver<SeqEvent>)],
-) {
+fn joined(core: &Core, media: &RecordingMedia, users: &mut [(Uid, &mut Events)]) {
     for (uid, rx) in users.iter_mut() {
         let join = core.voice_join(*uid, 0).unwrap();
         core.voice_answer(*uid, 0, format!("answer to {}", join.sdp))
@@ -83,7 +79,7 @@ fn joined(
 /// serialisation rule out of the way — a peer still owing an answer has
 /// its next change deferred into a consolidated follow-up rather than
 /// getting an offer of its own.
-fn answer_offers(core: &Core, uid: Uid, rx: &mut UnboundedReceiver<SeqEvent>) {
+fn answer_offers(core: &Core, uid: Uid, rx: &mut Events) {
     for ev in drain(rx) {
         if let Event::VoiceOffer { cid, sdp } = ev {
             core.voice_answer(uid, cid, format!("answer to {sdp}"))
@@ -240,12 +236,12 @@ fn the_camera_cap_is_room_wide_and_a_paused_camera_still_holds_its_slot() {
     // stop would simply be false.
     let (core, media) = videoed();
     let cap = VideoConfig::default().camera.max_per_room as usize;
-    let mut sessions: Vec<(Uid, UnboundedReceiver<SeqEvent>)> = (0..=cap)
+    let mut sessions: Vec<(Uid, Events)> = (0..=cap)
         .map(|i| quiet(&core, &format!("user{i}")))
         .collect();
     let uids: Vec<Uid> = sessions.iter().map(|(uid, _)| *uid).collect();
     {
-        let mut users: Vec<(Uid, &mut UnboundedReceiver<SeqEvent>)> =
+        let mut users: Vec<(Uid, &mut Events)> =
             sessions.iter_mut().map(|(uid, rx)| (*uid, rx)).collect();
         joined(&core, &media, &mut users);
     }
@@ -812,9 +808,9 @@ fn watched_share(
     media: &RecordingMedia,
     cid: u32,
     a: Uid,
-    rx_a: &mut UnboundedReceiver<SeqEvent>,
+    rx_a: &mut Events,
     b: Uid,
-    rx_b: &mut UnboundedReceiver<SeqEvent>,
+    rx_b: &mut Events,
 ) {
     for (uid, rx) in [(a, &mut *rx_a), (b, &mut *rx_b)] {
         let join = core.voice_join(uid, cid).unwrap();

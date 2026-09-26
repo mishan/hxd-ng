@@ -164,6 +164,15 @@ send failure after attach routes through `end_session` (login) or
 `connection_lost` (resume). A ghost on the roster with a dropped receiver
 is the bug class to fear here.
 
+**A client that will not drain is disconnected, not buffered for.**
+Everything held for a connection is bounded: an attached session's
+channel (`LIVE_QUEUE_CAP` events — past it the domain closes the
+channel and marks the session lagging, and the frontend drops the
+connection as `slow_consumer`), the classic writer's queue (bytes), and
+each classic write (no progress for a minute). One client that stops
+reading must cost the server a bounded amount and everyone else
+nothing; `crates/hxd/tests/slow_consumer.rs` is the check.
+
 **`assert!` over `debug_assert!`** for wire invariants — release builds
 must not skip them.
 
@@ -210,7 +219,10 @@ Three layers, all `cargo test --workspace`:
   rotations published under both keys, a card's commitment, invites from
   the file and the command, the operator's commands on the running
   store, and `hlid register`, `revoke` and `rotate` driven as a user
-  would) and `metrics.rs` (`GET /metrics` from a config's `[metrics]`:
+  would), `slow_consumer.rs` (a room flooded while one client reads
+  nothing: on each wire it is dropped promptly, the reader hears every
+  line, and the ng one resumes into a resync) and `metrics.rs` (`GET
+  /metrics` from a config's `[metrics]`:
   a scrape that accounts for a client on each wire and for their
   leaving, and the scrapes it refuses — built only with
   `--features metrics`).

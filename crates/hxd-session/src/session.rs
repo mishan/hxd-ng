@@ -15,6 +15,7 @@
 //! commented.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -23,8 +24,8 @@ use hxd_core::instrument::{self, Dir, Kind};
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, FileEntry, FileKind,
-    FilePrincipal, LinkAuthority, LinkOutcome, Proof, SeqEvent, SessionStatus, Transport, Uid,
+    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Events, FileEntry,
+    FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof, SessionStatus, Transport, Uid,
     UserInfo,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
@@ -33,6 +34,7 @@ use hxproto::HL_DATA_HDR_LEN;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
@@ -312,15 +314,104 @@ impl Outbound {
     }
 }
 
-type Tx = UnboundedSender<Outbound>;
+/// The most one connection's writer may have queued, in bytes.
+///
+/// **A client that will not drain is disconnected, not buffered for.**
+/// Every frame for a connection waits here until its socket takes it,
+/// and before this bound a client that stopped reading made the server
+/// hold everything addressed to it for as long as the socket stayed open.
+/// This is minutes of a slow link's backlog even in a busy room, so an
+/// old client on a modem that is merely behind is not what trips it; a
+/// client that has stopped reading is. What does trip it ends the
+/// session (`slow_consumer`).
+const MAX_SEND_QUEUE: usize = 4 << 20;
+
+/// How long one write may go without the socket taking a single byte.
+/// Progress of any size resets it, so a slow link is never cut off for
+/// being slow; a peer that stops reading is, once the kernel's buffers
+/// in both directions have filled.
+const WRITE_STALL: Duration = Duration::from_secs(60);
+
+/// How long a finished session's writer gets to send what is still
+/// queued — a kick's message, say — before it is stopped.
+const WRITER_FLUSH: Duration = Duration::from_secs(5);
+
+/// The sending side of a connection: the writer's queue, and what the
+/// queue shares with the writer and the session.
+#[derive(Clone)]
+struct Tx {
+    out: UnboundedSender<Outbound>,
+    backlog: Arc<Backlog>,
+}
+
+#[derive(Default)]
+struct Backlog {
+    /// Bytes queued and not yet written.
+    bytes: AtomicUsize,
+    /// The client stopped keeping up: the queue passed its bound, or a
+    /// write stalled. Nothing more is queued once it is set.
+    lagging: AtomicBool,
+    /// Wakes the session loop when `lagging` is set.
+    lagged: Notify,
+    /// Tells the writer to stop, whatever it is in the middle of.
+    stop: Notify,
+}
+
+impl Backlog {
+    fn lag(&self) {
+        if !self.lagging.swap(true, Ordering::AcqRel) {
+            self.lagged.notify_one();
+        }
+    }
+}
 
 /// Queue a frame for the writer. Every frame goes through here, so the
-/// write-queue gauges count what the writer later takes off them.
+/// bound and the write-queue gauges count what the writer later takes
+/// off the queue.
 fn enqueue(tx: &Tx, out: Outbound) {
-    let len = out.wire_len() as i64;
-    instrument::write_queued(WIRE, 1, len);
-    if tx.send(out).is_err() {
-        instrument::write_queued(WIRE, -1, -len);
+    let b = &tx.backlog;
+    if b.lagging.load(Ordering::Acquire) {
+        return; // The session is ending; its client is not reading.
+    }
+    let len = out.wire_len();
+    if b.bytes.fetch_add(len, Ordering::AcqRel) + len > MAX_SEND_QUEUE {
+        b.bytes.fetch_sub(len, Ordering::AcqRel);
+        b.lag();
+        return;
+    }
+    instrument::write_queued(WIRE, 1, len as i64);
+    if tx.out.send(out).is_err() {
+        b.bytes.fetch_sub(len, Ordering::AcqRel);
+        instrument::write_queued(WIRE, -1, -(len as i64));
+    }
+}
+
+/// Why a write did not finish.
+enum WriteFailed {
+    /// The socket took nothing for [`WRITE_STALL`].
+    Stalled,
+    /// The socket is gone.
+    Closed,
+}
+
+/// `write_all` and `flush`, each step bounded by [`WRITE_STALL`] of no
+/// progress rather than by a deadline for the whole: a large frame on a
+/// slow link takes as long as it takes.
+async fn write_stalling<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    mut bytes: &[u8],
+) -> Result<(), WriteFailed> {
+    while !bytes.is_empty() {
+        match timeout(WRITE_STALL, wr.write(bytes)).await {
+            Err(_) => return Err(WriteFailed::Stalled),
+            Ok(Ok(0)) | Ok(Err(_)) => return Err(WriteFailed::Closed),
+            Ok(Ok(n)) => bytes = &bytes[n..],
+        }
+    }
+    match timeout(WRITE_STALL, wr.flush()).await {
+        Err(_) => Err(WriteFailed::Stalled),
+        Ok(Err(_)) => Err(WriteFailed::Closed),
+        Ok(Ok(())) => Ok(()),
     }
 }
 
@@ -378,11 +469,22 @@ fn type_label(ty: u32) -> Kind<'static> {
     }
 }
 
-async fn writer_task<W: AsyncWrite + Unpin>(mut wr: W, mut rx: UnboundedReceiver<Outbound>) {
+async fn writer_task<W: AsyncWrite + Unpin>(
+    mut wr: W,
+    mut rx: UnboundedReceiver<Outbound>,
+    backlog: Arc<Backlog>,
+) {
     // Server pushes count their own transactions, starting at 1 (mhxd's
     // convention; clients ignore the value everywhere but task replies).
     let mut push_trans: u32 = 1;
-    while let Some(out) = rx.recv().await {
+    loop {
+        let out = tokio::select! {
+            out = rx.recv() => match out {
+                Some(out) => out,
+                None => break,
+            },
+            _ = backlog.stop.notified() => break,
+        };
         instrument::queue_depth(WIRE, rx.len());
         let queued = out.wire_len() as i64;
         let label = match &out {
@@ -411,21 +513,33 @@ async fn writer_task<W: AsyncWrite + Unpin>(mut wr: W, mut rx: UnboundedReceiver
             }
         };
         let took = instrument::Timer::start();
-        let written = wr.write_all(&bytes).await.is_ok() && wr.flush().await.is_ok();
+        let written = tokio::select! {
+            written = write_stalling(&mut wr, &bytes) => written,
+            _ = backlog.stop.notified() => Err(WriteFailed::Closed),
+        };
         instrument::socket_write(WIRE, took);
         instrument::write_queued(WIRE, -1, -queued);
-        if !written {
-            break; // Reader will observe the dead socket and clean up.
+        backlog.bytes.fetch_sub(queued as usize, Ordering::AcqRel);
+        match written {
+            Ok(()) => instrument::frame(WIRE, Dir::Out, label, bytes.len()),
+            // The peer stopped reading: the session ends as a slow
+            // consumer rather than waiting on it for good.
+            Err(WriteFailed::Stalled) => {
+                backlog.lag();
+                break;
+            }
+            Err(WriteFailed::Closed) => break, // The reader sees the dead socket.
         }
-        instrument::frame(WIRE, Dir::Out, label, bytes.len());
     }
     // What was queued and will now never be written leaves the gauges
     // with the connection.
     rx.close();
     while let Ok(out) = rx.try_recv() {
-        instrument::write_queued(WIRE, -1, -(out.wire_len() as i64));
+        let len = out.wire_len();
+        backlog.bytes.fetch_sub(len, Ordering::AcqRel);
+        instrument::write_queued(WIRE, -1, -(len as i64));
     }
-    let _ = wr.shutdown().await;
+    let _ = timeout(Duration::from_secs(1), wr.shutdown()).await;
 }
 
 /// Reader task: frames the socket into a bounded channel (backpressure for
@@ -1057,7 +1171,11 @@ async fn run_connection<S>(
         return;
     }
 
-    let (tx, out_rx) = mpsc::unbounded_channel();
+    let (out, out_rx) = mpsc::unbounded_channel();
+    let tx = Tx {
+        out,
+        backlog: Arc::new(Backlog::default()),
+    };
     let mut wr_for_magic = wr;
     // TCP needs no flush; a tunnelled stream buffers frames until one
     // (`WsByteStream`), so flush after every write on the generic path.
@@ -1065,7 +1183,7 @@ async fn run_connection<S>(
         instrument::disconnect(WIRE, "handshake");
         return;
     }
-    let writer = tokio::spawn(writer_task(wr_for_magic, out_rx));
+    let mut writer = tokio::spawn(writer_task(wr_for_magic, out_rx, tx.backlog.clone()));
     let (frames_tx, mut frames) = mpsc::channel(32);
     let mut reader = tokio::spawn(reader_task(rd, frames_tx));
 
@@ -1099,8 +1217,19 @@ async fn run_connection<S>(
     };
     instrument::disconnect(WIRE, reason);
     reader.abort();
+    // The writer sends what is left — a kick's message, say — unless the
+    // client not reading is why the session ended, and never for longer
+    // than a moment: a peer that has stopped reading holds a writer that
+    // waits on it forever, and its task and socket with it.
+    let backlog = tx.backlog.clone();
     drop(tx);
-    let _ = writer.await;
+    if reason == "slow_consumer" {
+        backlog.stop.notify_one();
+    }
+    if timeout(WRITER_FLUSH, &mut writer).await.is_err() {
+        backlog.stop.notify_one();
+        let _ = writer.await;
+    }
 }
 
 /// Does this login name the guest account? Empty is guest by convention
@@ -1259,7 +1388,7 @@ async fn login_phase(
     peer: SocketAddr,
     transport: Transport,
     link: LinkAuthority,
-) -> Option<(Session, UnboundedReceiver<SeqEvent>)> {
+) -> Option<(Session, Events)> {
     let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
         Ok(Some(f)) => f,
         _ => return None, // timeout or reader gone
@@ -1932,7 +2061,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
 
 async fn session_loop(
     frames: &mut Receiver<Frame>,
-    events: &mut UnboundedReceiver<SeqEvent>,
+    events: &mut Events,
     tx: &Tx,
     ctx: &ServerCtx,
     sess: &mut Session,
@@ -1953,8 +2082,18 @@ async fn session_loop(
                         return Some("kicked");
                     }
                 }
-                None => return Some("replaced"), // Detached elsewhere; shouldn't happen.
+                // The domain closed the stream: this client fell a whole
+                // channel behind (`LIVE_QUEUE_CAP`). A classic session
+                // cannot be taken over, so nothing else closes it.
+                None => {
+                    info!(uid = sess.uid, "not keeping up; disconnecting");
+                    return Some("slow_consumer");
+                }
             },
+            _ = tx.backlog.lagged.notified() => {
+                info!(uid = sess.uid, "not keeping up; disconnecting");
+                return Some("slow_consumer");
+            }
         }
     }
 }

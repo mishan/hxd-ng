@@ -530,12 +530,12 @@ impl Core {
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::mpsc::UnboundedReceiver;
+    use crate::Events;
 
     use super::*;
     use crate::account::AccountDirectory;
     use crate::inbox::MemoryStore;
-    use crate::roster::{drain, SeqEvent};
+    use crate::roster::drain;
     use crate::{AccessBits, InboxPolicy};
 
     /// Accounts by login, so `msg_login` and the block list have
@@ -581,15 +581,11 @@ mod tests {
     }
 
     impl Server {
-        fn login(&self, login: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
+        fn login(&self, login: &str) -> (Uid, Events) {
             self.login_with(login, member())
         }
 
-        fn login_with(
-            &self,
-            login: &str,
-            access: AccessBits,
-        ) -> (Uid, UnboundedReceiver<SeqEvent>) {
+        fn login_with(&self, login: &str, access: AccessBits) -> (Uid, Events) {
             let (uid, rx) = self
                 .core
                 .attach(AttachInfo {
@@ -616,7 +612,7 @@ mod tests {
     }
 
     /// What the system account said, in order.
-    fn answers(rx: &mut UnboundedReceiver<SeqEvent>) -> Vec<String> {
+    fn answers(rx: &mut Events) -> Vec<String> {
         drain(rx)
             .into_iter()
             .filter_map(|e| match e {
@@ -626,7 +622,7 @@ mod tests {
             .collect()
     }
 
-    fn command(s: &Server, from: Uid, rx: &mut UnboundedReceiver<SeqEvent>, text: &str) -> String {
+    fn command(s: &Server, from: Uid, rx: &mut Events, text: &str) -> String {
         let to = s.core.system_uid().expect("the account is on the roster");
         s.core.msg(from, to, text.into(), None, None).unwrap();
         let said = answers(rx);
