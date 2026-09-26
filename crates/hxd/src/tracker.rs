@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use hxd_core::Core;
+use hxproto::tracker::registration::{self, Ack, AckStatus, Auth, Registration, MAX_DATAGRAM};
+use hxproto::tracker::tlv::{id, TlvWriter};
+use hxproto::tracker::{Category, Maturity, TrackerMeta};
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -20,51 +23,13 @@ use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-const VERSION_V1: u16 = 0x0001;
-const VERSION_V3: u16 = 0x0003;
-const V3_MAGIC: u16 = 0x4833;
 const DEFAULT_TRACKER_PORT: u16 = 5499;
 const DEFAULT_INTERVAL: u64 = 300;
 const DEFAULT_ACK_TIMEOUT_MS: u64 = 2_000;
 const MIN_INTERVAL: u64 = 30;
 const MAX_INTERVAL: u64 = 86_400;
-const MAX_DATAGRAM: usize = 65_507;
 const MAX_ACK: usize = 4_096;
 const MAX_TOKEN: usize = 1_024;
-
-const TLV_DEREGISTER: u16 = 0x0010;
-const TLV_ADDRESS_IPV6: u16 = 0x0100;
-const TLV_HOSTNAME: u16 = 0x0101;
-const TLV_SERVER_SOFTWARE: u16 = 0x0200;
-const TLV_COUNTRY_CODE: u16 = 0x0201;
-const TLV_REGION: u16 = 0x0202;
-const TLV_LANGUAGE: u16 = 0x0203;
-const TLV_MATURITY: u16 = 0x0205;
-const TLV_UPTIME: u16 = 0x0206;
-const TLV_RULES_URL: u16 = 0x0207;
-const TLV_BANNER_URL: u16 = 0x0208;
-const TLV_ICON_URL: u16 = 0x0209;
-const TLV_LINK_DOWN_MBIT: u16 = 0x020a;
-const TLV_LINK_UP_MBIT: u16 = 0x020b;
-const TLV_TIMEZONE_OFFSET: u16 = 0x020c;
-const TLV_CONTACT_URL: u16 = 0x020d;
-const TLV_SERVER_LAUNCHED: u16 = 0x020e;
-const TLV_PROTOCOL_VERSION: u16 = 0x0300;
-const TLV_SUPPORTS_TLS: u16 = 0x0302;
-const TLV_TLS_PORT: u16 = 0x0303;
-const TLV_SUPPORTS_INLINE_MEDIA: u16 = 0x0304;
-const TLV_SUPPORTS_VOICE: u16 = 0x0305;
-const TLV_SUPPORTS_LARGE_FILES: u16 = 0x0306;
-const TLV_SUPPORTS_IPV6: u16 = 0x0307;
-const TLV_TAGS: u16 = 0x0310;
-const TLV_PRIVATE_LISTING: u16 = 0x0500;
-const TLV_LISTING_CATEGORY: u16 = 0x0501;
-const TLV_LISTING_LANGUAGE_STRICT: u16 = 0x0502;
-const TLV_REG_TOKEN: u16 = 0x0800;
-const TLV_HMAC_SHA256: u16 = 0x0801;
-const TLV_NONCE: u16 = 0x0802;
-const TLV_ERROR_MSG: u16 = 0x0810;
-const TLV_TRACKER_NAME: u16 = 0x0811;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -749,15 +714,15 @@ fn build_v1(
     let name = hxproto::text::from_utf8(&advertisement.name);
     let description = hxproto::text::from_utf8(&advertisement.description);
     let password = password.map(hxproto::text::from_utf8).unwrap_or_default();
-    build_base(
-        VERSION_V1,
-        advertisement.port,
+    registration::build_v1(&Registration {
+        port: advertisement.port,
         users,
         pass_id,
-        &name,
-        &description,
-        &password,
-    )
+        name: &name,
+        description: &description,
+        password: &password,
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -771,85 +736,88 @@ fn build_v3(
     token: Option<&[u8]>,
     deregister: bool,
 ) -> Result<Vec<u8>, String> {
-    let mut packet = build_base(
-        VERSION_V3,
-        advertisement.port,
+    let mut fields = TlvWriter::new();
+    if deregister {
+        fields
+            .push_flag(id::DEREGISTER)
+            .map_err(|error| error.to_string())?;
+    } else {
+        advertised_meta(advertisement, metadata)
+            .encode(&mut fields)
+            .map_err(|error| error.to_string())?;
+    }
+    let registration = Registration {
+        port: advertisement.port,
         users,
         pass_id,
-        advertisement.name.as_bytes(),
-        advertisement.description.as_bytes(),
-        password.unwrap_or("").as_bytes(),
-    )?;
-    packet.extend_from_slice(&V3_MAGIC.to_be_bytes());
-    let count_at = packet.len();
-    packet.extend_from_slice(&0u16.to_be_bytes());
-    let mut count = 0u16;
-
-    if deregister {
-        push_tlv(&mut packet, &mut count, TLV_DEREGISTER, &[1])?;
-    } else {
-        push_tlv(
-            &mut packet,
-            &mut count,
-            TLV_SERVER_SOFTWARE,
-            format!("hxd-ng/{}", env!("CARGO_PKG_VERSION")).as_bytes(),
-        )?;
-        push_tlv(
-            &mut packet,
-            &mut count,
-            TLV_PROTOCOL_VERSION,
-            &advertisement.protocol_version.to_be_bytes(),
-        )?;
-        let uptime = Instant::now()
-            .duration_since(process_start())
-            .as_secs()
-            .min(u32::MAX as u64) as u32;
-        push_tlv(&mut packet, &mut count, TLV_UPTIME, &uptime.to_be_bytes())?;
-        if let Some(port) = advertisement.tls_port {
-            push_tlv(&mut packet, &mut count, TLV_SUPPORTS_TLS, &[1])?;
-            push_tlv(&mut packet, &mut count, TLV_TLS_PORT, &port.to_be_bytes())?;
-        }
-        if advertisement.inline_media {
-            push_tlv(&mut packet, &mut count, TLV_SUPPORTS_INLINE_MEDIA, &[1])?;
-        }
-        if advertisement.voice {
-            push_tlv(&mut packet, &mut count, TLV_SUPPORTS_VOICE, &[1])?;
-        }
-        if advertisement.large_files {
-            push_tlv(&mut packet, &mut count, TLV_SUPPORTS_LARGE_FILES, &[1])?;
-        }
-        push_metadata(&mut packet, &mut count, metadata)?;
-    }
-    if let Some(token) = token {
-        push_tlv(&mut packet, &mut count, TLV_REG_TOKEN, token)?;
-    }
-
-    let hmac_value_at = if let Some(secret) = hmac_secret {
-        let mut nonce = [0u8; 8];
-        OsRng
-            .try_fill_bytes(&mut nonce)
-            .map_err(|error| format!("tracker nonce randomness: {error}"))?;
-        push_tlv(&mut packet, &mut count, TLV_NONCE, &nonce)?;
-        let before = packet.len();
-        push_tlv(&mut packet, &mut count, TLV_HMAC_SHA256, &[0; 32])?;
-        Some((before + 4, secret))
-    } else {
-        None
+        name: advertisement.name.as_bytes(),
+        description: advertisement.description.as_bytes(),
+        password: password.unwrap_or("").as_bytes(),
     };
-    packet[count_at..count_at + 2].copy_from_slice(&count.to_be_bytes());
-    if packet.len() > MAX_DATAGRAM {
-        return Err(format!(
-            "tracker registration is {} bytes; UDP permits at most {MAX_DATAGRAM}",
-            packet.len()
-        ));
+    let mut sign = |bytes: &[u8]| -> [u8; registration::HMAC_LEN] {
+        let secret = hmac_secret.unwrap_or_default();
+        let mut mac =
+            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC takes a key of any length");
+        mac.update(bytes);
+        mac.finalize().into_bytes().into()
+    };
+    let auth = match hmac_secret {
+        Some(_) => {
+            let mut nonce = [0u8; registration::NONCE_LEN];
+            OsRng
+                .try_fill_bytes(&mut nonce)
+                .map_err(|error| format!("tracker nonce randomness: {error}"))?;
+            Some(Auth {
+                nonce,
+                sign: &mut sign,
+            })
+        }
+        None => None,
+    };
+    registration::build_v3(&registration, &fields, token, auth).map_err(|error| error.to_string())
+}
+
+/// The v3 fields this server advertises: what the running server knows
+/// about itself, plus what the operator declared.
+fn advertised_meta(advertisement: &Advertisement, metadata: &TrackerV3Metadata) -> TrackerMeta {
+    let uptime = Instant::now()
+        .duration_since(process_start())
+        .as_secs()
+        .min(u32::MAX as u64) as u32;
+    TrackerMeta {
+        server_software: Some(format!("hxd-ng/{}", env!("CARGO_PKG_VERSION"))),
+        protocol_version: Some(advertisement.protocol_version),
+        uptime_secs: Some(uptime),
+        supports_tls: advertisement.tls_port.is_some(),
+        tls_port: advertisement.tls_port,
+        supports_inline_media: advertisement.inline_media,
+        supports_voice: advertisement.voice,
+        supports_large_files: advertisement.large_files,
+
+        ipv6: metadata.ipv6.map(|address| address.octets()),
+        supports_ipv6: metadata.ipv6.is_some(),
+        hostname: metadata.hostname.clone(),
+        country_code: metadata.country_code.clone(),
+        region: metadata.region.clone(),
+        language: metadata.language.clone(),
+        maturity: metadata.maturity.map(Maturity::from_wire),
+        rules_url: metadata.rules_url.clone(),
+        banner_url: metadata.banner_url.clone(),
+        icon_url: metadata.icon_url.clone(),
+        link_down_mbit: metadata.link_down_mbit,
+        link_up_mbit: metadata.link_up_mbit,
+        timezone_offset_min: metadata.timezone_offset_min,
+        contact_url: metadata.contact_url.clone(),
+        server_launched: metadata.server_launched,
+        tags: metadata.tags.clone(),
+        private_listing: metadata.private_listing,
+        listing_category: metadata
+            .listing_category
+            .filter(|value| *value != 0)
+            .map(Category::from_wire),
+        language_strict: metadata.listing_language_strict,
+        ..TrackerMeta::default()
     }
-    if let Some((value_at, secret)) = hmac_value_at {
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-            .map_err(|_| "invalid tracker HMAC secret".to_string())?;
-        mac.update(&packet);
-        packet[value_at..value_at + 32].copy_from_slice(&mac.finalize().into_bytes());
-    }
-    Ok(packet)
 }
 
 fn process_start() -> Instant {
@@ -858,216 +826,19 @@ fn process_start() -> Instant {
     *START.get_or_init(Instant::now)
 }
 
-fn build_base(
-    version: u16,
-    port: u16,
-    users: u16,
-    pass_id: u32,
-    name: &[u8],
-    description: &[u8],
-    password: &[u8],
-) -> Result<Vec<u8>, String> {
-    for (field, value) in [
-        ("name", name),
-        ("description", description),
-        ("password", password),
-    ] {
-        if value.len() > u8::MAX as usize {
-            return Err(format!("tracker {field} exceeds 255 bytes"));
-        }
-    }
-    let mut packet = Vec::with_capacity(15 + name.len() + description.len() + password.len());
-    packet.extend_from_slice(&version.to_be_bytes());
-    packet.extend_from_slice(&port.to_be_bytes());
-    packet.extend_from_slice(&users.to_be_bytes());
-    packet.extend_from_slice(&0u16.to_be_bytes());
-    packet.extend_from_slice(&pass_id.to_be_bytes());
-    push_pascal(&mut packet, name);
-    push_pascal(&mut packet, description);
-    push_pascal(&mut packet, password);
-    Ok(packet)
-}
-
-fn push_pascal(packet: &mut Vec<u8>, value: &[u8]) {
-    assert!(value.len() <= u8::MAX as usize);
-    packet.push(value.len() as u8);
-    packet.extend_from_slice(value);
-}
-
-fn push_tlv(packet: &mut Vec<u8>, count: &mut u16, id: u16, value: &[u8]) -> Result<(), String> {
-    let length = u16::try_from(value.len())
-        .map_err(|_| format!("tracker v3 field 0x{id:04x} exceeds 65535 bytes"))?;
-    packet.extend_from_slice(&id.to_be_bytes());
-    packet.extend_from_slice(&length.to_be_bytes());
-    packet.extend_from_slice(value);
-    *count = count
-        .checked_add(1)
-        .ok_or_else(|| "too many tracker v3 fields".to_string())?;
-    Ok(())
-}
-
-fn push_metadata(
-    packet: &mut Vec<u8>,
-    count: &mut u16,
-    metadata: &TrackerV3Metadata,
-) -> Result<(), String> {
-    macro_rules! string {
-        ($field:ident, $id:expr) => {
-            if let Some(value) = &metadata.$field {
-                push_tlv(packet, count, $id, value.as_bytes())?;
-            }
-        };
-    }
-    macro_rules! number {
-        ($field:ident, $id:expr) => {
-            if let Some(value) = metadata.$field {
-                push_tlv(packet, count, $id, &value.to_be_bytes())?;
-            }
-        };
-    }
-    if let Some(value) = metadata.ipv6 {
-        push_tlv(packet, count, TLV_ADDRESS_IPV6, &value.octets())?;
-    }
-    string!(hostname, TLV_HOSTNAME);
-    string!(country_code, TLV_COUNTRY_CODE);
-    string!(region, TLV_REGION);
-    string!(language, TLV_LANGUAGE);
-    if let Some(value) = metadata.maturity {
-        push_tlv(packet, count, TLV_MATURITY, &[value])?;
-    }
-    string!(rules_url, TLV_RULES_URL);
-    string!(banner_url, TLV_BANNER_URL);
-    string!(icon_url, TLV_ICON_URL);
-    number!(link_down_mbit, TLV_LINK_DOWN_MBIT);
-    number!(link_up_mbit, TLV_LINK_UP_MBIT);
-    number!(timezone_offset_min, TLV_TIMEZONE_OFFSET);
-    string!(contact_url, TLV_CONTACT_URL);
-    number!(server_launched, TLV_SERVER_LAUNCHED);
-    string!(tags, TLV_TAGS);
-    if metadata.ipv6.is_some() {
-        push_tlv(packet, count, TLV_SUPPORTS_IPV6, &[1])?;
-    }
-    if metadata.private_listing {
-        push_tlv(packet, count, TLV_PRIVATE_LISTING, &[1])?;
-    }
-    if let Some(category) = metadata.listing_category.filter(|value| *value != 0) {
-        push_tlv(packet, count, TLV_LISTING_CATEGORY, &[category])?;
-    }
-    if metadata.listing_language_strict {
-        push_tlv(packet, count, TLV_LISTING_LANGUAGE_STRICT, &[1])?;
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AckStatus {
-    Ok,
-    Denied,
-    Banned,
-    Quota,
-    Full,
-    Invalid,
-    Error,
-}
-
-impl AckStatus {
-    fn parse(value: u8) -> Result<Self, String> {
-        match value {
-            0x00 => Ok(Self::Ok),
-            0x01 => Ok(Self::Denied),
-            0x02 => Ok(Self::Banned),
-            0x03 => Ok(Self::Quota),
-            0x04 => Ok(Self::Full),
-            0x05 => Ok(Self::Invalid),
-            0xff => Ok(Self::Error),
-            _ => Err(format!("unknown v3 acknowledgment status 0x{value:02x}")),
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Denied => "denied",
-            Self::Banned => "banned",
-            Self::Quota => "quota",
-            Self::Full => "full",
-            Self::Invalid => "invalid",
-            Self::Error => "error",
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct Ack {
-    status: AckStatus,
-    interval: u16,
-    token: Option<Vec<u8>>,
-    error: Option<String>,
-    tracker_name: Option<String>,
-}
-
+/// Read a v3 acknowledgment, holding the token to this server's bound.
 fn parse_ack(packet: &[u8]) -> Result<Ack, String> {
-    if packet.len() < 7 {
-        return Err("v3 acknowledgment is shorter than 7 bytes".into());
-    }
-    if u16::from_be_bytes([packet[0], packet[1]]) != V3_MAGIC {
-        return Err("v3 acknowledgment has bad magic".into());
-    }
-    let status = AckStatus::parse(packet[2])?;
-    let interval = u16::from_be_bytes([packet[3], packet[4]]);
-    let count = u16::from_be_bytes([packet[5], packet[6]]);
-    let mut offset = 7usize;
-    let mut token = None;
-    let mut error = None;
-    let mut tracker_name = None;
-    for _ in 0..count {
-        let header = packet
-            .get(offset..offset + 4)
-            .ok_or_else(|| "v3 acknowledgment has a truncated TLV header".to_string())?;
-        let id = u16::from_be_bytes([header[0], header[1]]);
-        let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
-        offset += 4;
-        let value = packet
-            .get(offset..offset + length)
-            .ok_or_else(|| format!("v3 acknowledgment field 0x{id:04x} is truncated"))?;
-        offset += length;
-        match id {
-            TLV_REG_TOKEN if value.len() <= MAX_TOKEN => token = Some(value.to_vec()),
-            TLV_REG_TOKEN => {
-                return Err(format!(
-                    "v3 acknowledgment registration token exceeds {MAX_TOKEN} bytes"
-                ))
-            }
-            TLV_ERROR_MSG => {
-                error = Some(
-                    std::str::from_utf8(value)
-                        .map_err(|_| "v3 acknowledgment error message is not UTF-8")?
-                        .to_owned(),
-                )
-            }
-            TLV_TRACKER_NAME => {
-                tracker_name = Some(
-                    std::str::from_utf8(value)
-                        .map_err(|_| "v3 acknowledgment tracker name is not UTF-8")?
-                        .to_owned(),
-                )
-            }
-            _ => {}
-        }
-    }
-    if offset != packet.len() {
+    let ack = registration::parse_ack(packet).map_err(|error| error.to_string())?;
+    if ack
+        .token
+        .as_ref()
+        .is_some_and(|token| token.len() > MAX_TOKEN)
+    {
         return Err(format!(
-            "v3 acknowledgment has {} trailing bytes",
-            packet.len() - offset
+            "v3 acknowledgment registration token exceeds {MAX_TOKEN} bytes"
         ));
     }
-    Ok(Ack {
-        status,
-        interval,
-        token,
-        error,
-        tracker_name,
-    })
+    Ok(ack)
 }
 
 #[cfg(test)]
@@ -1137,7 +908,7 @@ mod tests {
             .any(|window| window == "Café".as_bytes()));
         assert!(packet
             .windows(2)
-            .any(|window| window == V3_MAGIC.to_be_bytes()));
+            .any(|window| window == hxproto::tracker::tlv::EXT_MAGIC.to_be_bytes()));
         assert!(packet
             .windows(9)
             .any(|window| window == b"\x08\x00\x00\x05token"));
@@ -1185,8 +956,8 @@ mod tests {
         )
         .unwrap();
         let ids: Vec<u16> = packet_tlvs(&packet).into_iter().map(|(id, _)| id).collect();
-        assert!(!ids.contains(&TLV_SUPPORTS_TLS));
-        assert!(!ids.contains(&TLV_TLS_PORT));
+        assert!(!ids.contains(&id::SUPPORTS_TLS));
+        assert!(!ids.contains(&id::TLS_PORT));
     }
 
     #[test]
@@ -1218,35 +989,35 @@ mod tests {
             .map(|(id, value)| (id, value.to_vec()))
             .collect();
         assert_eq!(
-            fields[&TLV_SERVER_SOFTWARE],
+            fields[&id::SERVER_SOFTWARE],
             format!("hxd-ng/{}", env!("CARGO_PKG_VERSION")).as_bytes()
         );
-        assert_eq!(fields[&TLV_PROTOCOL_VERSION], 185u16.to_be_bytes());
-        assert_eq!(fields[&TLV_UPTIME].len(), 4);
-        assert_eq!(fields[&TLV_SUPPORTS_TLS], [1]);
-        assert_eq!(fields[&TLV_TLS_PORT], 5600u16.to_be_bytes());
-        assert_eq!(fields[&TLV_SUPPORTS_INLINE_MEDIA], [1]);
-        assert!(!fields.contains_key(&TLV_SUPPORTS_VOICE));
-        assert_eq!(fields[&TLV_SUPPORTS_LARGE_FILES], [1]);
-        assert_eq!(fields[&TLV_ADDRESS_IPV6], ipv6.octets());
-        assert_eq!(fields[&TLV_HOSTNAME], b"hl.example");
-        assert_eq!(fields[&TLV_COUNTRY_CODE], b"US");
-        assert_eq!(fields[&TLV_REGION], b"California");
-        assert_eq!(fields[&TLV_LANGUAGE], b"en");
-        assert_eq!(fields[&TLV_MATURITY], [2]);
-        assert_eq!(fields[&TLV_RULES_URL], b"https://hl.example/rules");
-        assert_eq!(fields[&TLV_BANNER_URL], b"https://hl.example/banner.png");
-        assert_eq!(fields[&TLV_ICON_URL], b"https://hl.example/icon.png");
-        assert_eq!(fields[&TLV_LINK_DOWN_MBIT], 1_000u32.to_be_bytes());
-        assert_eq!(fields[&TLV_LINK_UP_MBIT], 100u32.to_be_bytes());
-        assert_eq!(fields[&TLV_TIMEZONE_OFFSET], (-420i16).to_be_bytes());
-        assert_eq!(fields[&TLV_CONTACT_URL], b"mailto:admin@hl.example");
-        assert_eq!(fields[&TLV_SERVER_LAUNCHED], 1_700_000_000u32.to_be_bytes());
-        assert_eq!(fields[&TLV_TAGS], b"chat,retro");
-        assert_eq!(fields[&TLV_SUPPORTS_IPV6], [1]);
-        assert_eq!(fields[&TLV_PRIVATE_LISTING], [1]);
-        assert_eq!(fields[&TLV_LISTING_CATEGORY], [10]);
-        assert_eq!(fields[&TLV_LISTING_LANGUAGE_STRICT], [1]);
+        assert_eq!(fields[&id::PROTOCOL_VERSION], 185u16.to_be_bytes());
+        assert_eq!(fields[&id::UPTIME].len(), 4);
+        assert_eq!(fields[&id::SUPPORTS_TLS], [1]);
+        assert_eq!(fields[&id::TLS_PORT], 5600u16.to_be_bytes());
+        assert_eq!(fields[&id::SUPPORTS_INLINE_MEDIA], [1]);
+        assert!(!fields.contains_key(&id::SUPPORTS_VOICE));
+        assert_eq!(fields[&id::SUPPORTS_LARGE_FILES], [1]);
+        assert_eq!(fields[&id::ADDRESS_IPV6], ipv6.octets());
+        assert_eq!(fields[&id::HOSTNAME], b"hl.example");
+        assert_eq!(fields[&id::COUNTRY_CODE], b"US");
+        assert_eq!(fields[&id::REGION], b"California");
+        assert_eq!(fields[&id::LANGUAGE], b"en");
+        assert_eq!(fields[&id::MATURITY], [2]);
+        assert_eq!(fields[&id::RULES_URL], b"https://hl.example/rules");
+        assert_eq!(fields[&id::BANNER_URL], b"https://hl.example/banner.png");
+        assert_eq!(fields[&id::ICON_URL], b"https://hl.example/icon.png");
+        assert_eq!(fields[&id::LINK_DOWN_MBIT], 1_000u32.to_be_bytes());
+        assert_eq!(fields[&id::LINK_UP_MBIT], 100u32.to_be_bytes());
+        assert_eq!(fields[&id::TIMEZONE_OFFSET], (-420i16).to_be_bytes());
+        assert_eq!(fields[&id::CONTACT_URL], b"mailto:admin@hl.example");
+        assert_eq!(fields[&id::SERVER_LAUNCHED], 1_700_000_000u32.to_be_bytes());
+        assert_eq!(fields[&id::TAGS], b"chat,retro");
+        assert_eq!(fields[&id::SUPPORTS_IPV6], [1]);
+        assert_eq!(fields[&id::PRIVATE_LISTING], [1]);
+        assert_eq!(fields[&id::LISTING_CATEGORY], [10]);
+        assert_eq!(fields[&id::LANGUAGE_STRICT], [1]);
     }
 
     fn verify_hmac(packet: &[u8], secret: &[u8]) {
@@ -1267,9 +1038,9 @@ mod tests {
         let fields = packet_tlvs_with_offsets(packet);
         let hmac = fields
             .iter()
-            .find(|(id, _, _)| *id == TLV_HMAC_SHA256)
+            .find(|(id, _, _)| *id == id::HMAC_SHA256)
             .unwrap();
-        let nonce = fields.iter().find(|(id, _, _)| *id == TLV_NONCE).unwrap();
+        let nonce = fields.iter().find(|(id, _, _)| *id == id::NONCE).unwrap();
         (hmac.1, nonce.2)
     }
 
@@ -1288,7 +1059,7 @@ mod tests {
         }
         assert_eq!(
             u16::from_be_bytes([packet[offset], packet[offset + 1]]),
-            V3_MAGIC
+            hxproto::tracker::tlv::EXT_MAGIC
         );
         let count = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
         offset += 4;
@@ -1307,8 +1078,8 @@ mod tests {
     #[test]
     fn acknowledgment_parser_is_bounded_and_forward_compatible() {
         let mut packet = vec![0x48, 0x33, 0x00, 0x01, 0x2c, 0x00, 0x03];
-        append_tlv(&mut packet, TLV_REG_TOKEN, b"token");
-        append_tlv(&mut packet, TLV_TRACKER_NAME, b"Argus");
+        append_tlv(&mut packet, id::REG_TOKEN, b"token");
+        append_tlv(&mut packet, id::TRACKER_NAME, b"Argus");
         append_tlv(&mut packet, 0xf123, b"future");
         assert_eq!(
             parse_ack(&packet).unwrap(),
@@ -1384,14 +1155,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(&buf[..2], &VERSION_V1.to_be_bytes());
+        assert_eq!(&buf[..2], &hxproto::tracker::VERSION_V1.to_be_bytes());
         assert_eq!(&buf[4..6], &1u16.to_be_bytes());
         assert!(v1_len >= 15);
         let v3_len = tokio::time::timeout(Duration::from_secs(1), v3_receiver.recv(&mut buf))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(&buf[..2], &VERSION_V3.to_be_bytes());
+        assert_eq!(&buf[..2], &hxproto::tracker::VERSION_V3.to_be_bytes());
         assert_eq!(&buf[4..6], &1u16.to_be_bytes());
         assert!(v3_len >= 19);
 
@@ -1400,7 +1171,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(&buf[..2], &VERSION_V3.to_be_bytes());
+        assert_eq!(&buf[..2], &hxproto::tracker::VERSION_V3.to_be_bytes());
         assert!(buf[..dereg_len]
             .windows(5)
             .any(|window| window == [0x00, 0x10, 0x00, 0x01, 0x01]));
