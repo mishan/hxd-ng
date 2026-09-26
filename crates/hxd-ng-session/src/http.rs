@@ -166,6 +166,17 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         return cors(resp);
     }
 
+    if path == "/avatar" || path.starts_with("/avatars/") {
+        let resp = match (req.method(), path.strip_prefix("/avatars/")) {
+            (&Method::PUT, None) => boxed(crate::avatar::upload(req, &ctx).await),
+            (&Method::GET, Some(id)) if !id.is_empty() && !id.contains('/') => {
+                boxed(crate::avatar::download(id, req, &ctx).await)
+            }
+            _ => plain(StatusCode::NOT_FOUND, "not found"),
+        };
+        return cors(resp);
+    }
+
     if path == crate::banner::BANNER_PATH {
         let resp = match *req.method() {
             Method::GET => boxed(crate::banner::download(req, &ctx).await),
@@ -424,6 +435,8 @@ fn cors_route(path: &str) -> bool {
         || path.starts_with("/identity/")
         || path == "/media"
         || path.starts_with("/media/")
+        || path == "/avatar"
+        || path.starts_with("/avatars/")
         || path == crate::banner::BANNER_PATH
         || path.starts_with("/files/")
         || path == "/news/blob"

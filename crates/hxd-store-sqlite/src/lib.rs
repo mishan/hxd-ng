@@ -53,6 +53,7 @@ impl Synchronous {
     }
 }
 
+mod avatar;
 mod blobs;
 mod moderation;
 mod news;
@@ -64,7 +65,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -364,6 +365,24 @@ CREATE UNIQUE INDEX push_device_login ON push_device (owner, devid) WHERE owner_
 CREATE INDEX push_device_expires ON push_device (expires) WHERE expires IS NOT NULL;
 ";
 
+/// Avatars (`docs/avatars.md` §2): one row per owner, keyed `a:<login>`
+/// or `i:<fingerprint hex>`, holding both renditions. Small enough to
+/// live in the row; the id index is what `GET /avatars/{id}` reads when
+/// nobody on the roster shows the picture.
+const SCHEMA_V9: &str = "
+CREATE TABLE avatar (
+  owner      TEXT    PRIMARY KEY,
+  id         BLOB    NOT NULL,
+  mime       TEXT    NOT NULL,
+  width      INTEGER NOT NULL,
+  height     INTEGER NOT NULL,
+  bytes      BLOB    NOT NULL,
+  legacy_gif BLOB,
+  set_at     INTEGER NOT NULL
+);
+CREATE INDEX avatar_id ON avatar (id);
+";
+
 /// Moderation (`docs/moderation.md` §7, `docs/news.md` §11). Version 2
 /// reserved the audit trail, the reports and the block list; this is
 /// what filling them needed besides. An article is a target of both an
@@ -623,6 +642,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 8 {
         steps.push_str(SCHEMA_V8);
+    }
+    if version < 9 {
+        steps.push_str(SCHEMA_V9);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"

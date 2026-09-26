@@ -722,6 +722,25 @@ bits in [docs/access-bits.md](docs/access-bits.md). An article is its
 author's to delete only when one person is behind the account, a password
 or a linked identity; a guest's belongs to nobody.
 
+### Avatars
+
+An optional `[avatars]` section lets users set a picture that every
+client can show without an icon set: fogWraith's GIF Icons extension on
+the legacy wire, the `avatars` capability on the ng one, and one avatar
+crossing between them. An avatar belongs to the account (or to a guest's
+proven identity) and is kept in the shared database, so it is there at
+the next login. Uploads go through the inline-media pipeline, so this
+needs the `media` feature. See [docs/avatars.md](docs/avatars.md).
+
+```toml
+[avatars]                 # presence turns it on
+max_bytes = 262144        # the largest upload, on either wire
+max_dimension = 128       # what an avatar is fitted to
+legacy_max_bytes = 32768  # the GIF legacy clients are sent
+set_interval = 10         # seconds between one session's changes
+# db = "avatars.db"       # default: [inbox], [history] or [news]'s database
+```
+
 ### Inline media
 
 Absent means no images: the legacy wire never confirms capability bit 3

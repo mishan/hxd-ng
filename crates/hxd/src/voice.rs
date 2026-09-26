@@ -156,6 +156,7 @@ mod tests {
             tls: None,
             system: None,
             banner: None,
+            avatars: None,
         }
     }
 

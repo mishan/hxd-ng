@@ -62,6 +62,15 @@ mod hdr {
     pub const CHAT_USER_CHANGE: u32 = 0x0000_0075;
     pub const CHAT_USER_PART: u32 = 0x0000_0076;
     pub const CHAT_SUBJECT: u32 = 0x0000_0077;
+    pub const ICON_CHANGE: u32 = 0x0000_0748;
+}
+
+/// fogWraith's GIF Icons extension (`docs/avatars.md` §3): client
+/// opcodes hxproto routes no enum for.
+mod gif_icons {
+    pub const GET_LIST: u32 = 0x0000_0745;
+    pub const SET: u32 = 0x0000_0746;
+    pub const GET: u32 = 0x0000_0747;
 }
 
 /// Data tags hxproto has no constants for (the gtkhx client ignores
@@ -807,6 +816,10 @@ struct Session {
     /// tunnelled session's peer is whoever terminated its WebSocket, so it
     /// binds nothing.
     transfer_addr: Option<IpAddr>,
+    /// This session has used the GIF Icons extension, so it is sent Icon
+    /// Change. The extension has no capability bit; a client that never
+    /// asked is not handed a transaction it may not know.
+    gif_icons: bool,
     /// Whether this session has been sent the banner, which happens once.
     banner_sent: bool,
     /// The image this session was told of and may still download: once,
@@ -1348,6 +1361,7 @@ async fn login_phase(
         media_refill: Instant::now(),
         media_stream: None,
         transfer_addr: None,
+        gif_icons: false,
         banner_sent: false,
         banner_image: None,
     };
@@ -1399,6 +1413,13 @@ async fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             );
         }
     }
+    // The owner's avatar, before anyone is told the session exists. A
+    // store read, so off the reactor — and only on a server with avatars,
+    // so one without has nothing between the login and the join.
+    if ctx.core.avatar_policy().is_some() {
+        let uid = sess.uid;
+        off_reactor(&ctx.core, move |c| c.restore_avatar(uid)).await;
+    }
     ctx.core.announce(sess.uid);
     sess.announced = true;
     // Mail waiting from before this login, now that the roster is
@@ -1435,12 +1456,30 @@ fn system_msg(tx: &Tx, ctx: &ServerCtx, sess: &Session, text: &str) {
 /// must end (kicked).
 async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
     match ev {
-        Event::Joined(u) | Event::Changed(u) => {
+        Event::Changed(u) => {
             push(
                 tx,
                 hdr::USER_CHANGE,
                 user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc),
             );
+        }
+        Event::Joined(u) => {
+            push(
+                tx,
+                hdr::USER_CHANGE,
+                user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc),
+            );
+            // A user list row cannot carry a picture, and a GIF-icon client
+            // fetches one only on Icon Change: someone who joins already
+            // wearing an avatar is announced as a change, as they were on
+            // mhxd, where the client set it again after every login.
+            if sess.gif_icons && u.avatar.is_some() {
+                push(
+                    tx,
+                    hdr::ICON_CHANGE,
+                    vec![(tag::UID, u.uid.to_be_bytes().to_vec())],
+                );
+            }
         }
         Event::Parted(uid) => {
             push(
@@ -1448,6 +1487,15 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
                 hdr::USER_PART,
                 vec![(tag::UID, uid.to_be_bytes().to_vec())],
             );
+        }
+        Event::AvatarChanged(u) => {
+            if sess.gif_icons {
+                push(
+                    tx,
+                    hdr::ICON_CHANGE,
+                    vec![(tag::UID, u.uid.to_be_bytes().to_vec())],
+                );
+            }
         }
         Event::Chat {
             cid,
@@ -3234,11 +3282,120 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             reply_error(tx, f.trans, "Already logged in.");
         }
 
+        // --- GIF Icons (`docs/avatars.md` §3) --------------------------
+        // Without `[avatars]` these fall through to the unknown-transaction
+        // error below, which is how a probing client learns the server has
+        // no support.
+        gif_icons::GET_LIST if ctx.core.avatar_policy().is_some() => {
+            sess.gif_icons = true;
+            let (entries, left_out) = icon_list(&ctx.core.avatars());
+            reply(tx, f.trans, entries);
+            // What did not fit is announced as changed, which is what makes
+            // a GIF-icon client fetch a user's icon on its own.
+            for uid in left_out {
+                push(
+                    tx,
+                    hdr::ICON_CHANGE,
+                    vec![(tag::UID, uid.to_be_bytes().to_vec())],
+                );
+            }
+        }
+
+        gif_icons::GET if ctx.core.avatar_policy().is_some() => {
+            sess.gif_icons = true;
+            let Some(uid) = f
+                .chunks()
+                .find(|c| c.tag == tag::UID)
+                .and_then(|c| u16::try_from(c.as_uint()).ok())
+                .filter(|uid| ctx.core.user_details(*uid).is_some())
+            else {
+                reply_error(tx, f.trans, "No such user.");
+                return;
+            };
+            let gif = ctx
+                .core
+                .avatar_of(uid)
+                .and_then(|a| a.legacy_gif)
+                .map(|g| g.to_vec())
+                .unwrap_or_default();
+            reply(
+                tx,
+                f.trans,
+                vec![(tag::ICON_GIF, gif), (tag::UID, uid.to_be_bytes().to_vec())],
+            );
+        }
+
+        gif_icons::SET if ctx.core.avatar_policy().is_some() => {
+            sess.gif_icons = true;
+            let gif = f
+                .chunks()
+                .find(|c| c.tag == tag::ICON_GIF)
+                .map(|c| c.data.to_vec())
+                .unwrap_or_default();
+            // The extension's own rule, and the first thing this server
+            // checks: anything else is refused before it reaches the codec.
+            if !gif.is_empty() && !hxproto::gif_icons::is_gif(&gif) {
+                reply_error(tx, f.trans, "An icon must be a GIF.");
+                return;
+            }
+            let uid = sess.uid;
+            let outcome = off_reactor(&ctx.core, move |c| {
+                if gif.is_empty() {
+                    c.clear_avatar(uid).map(|_| ())
+                } else {
+                    c.set_avatar(uid, &gif).map(|_| ())
+                }
+            })
+            .await;
+            match outcome {
+                Some(Ok(())) => reply(tx, f.trans, vec![]),
+                Some(Err(e)) => reply_error(tx, f.trans, e.text()),
+                None => reply_error(tx, f.trans, hxd_core::media::MediaReject::Busy.text()),
+            }
+        }
+
         other => {
             debug!("unimplemented transaction {other:#x}");
             reply_error(tx, f.trans, "Not implemented.");
         }
     }
+}
+
+/// The most a Get Icon List reply carries. GtkHx and mhxd's own client
+/// both accept a transaction of up to 1 MiB (`MAX_HOTLINE_PACKET_LEN` on
+/// the client side, `0x100000`), which holds a large roster's icons.
+const ICON_LIST_BUDGET: usize = 0x10_0000;
+
+/// The Get Icon List reply: one packed entry per user with a legacy GIF,
+/// in uid order, until the next would pass [`ICON_LIST_BUDGET`] — and the
+/// uids that did not fit, which the caller announces one by one instead
+/// (`docs/avatars.md` §3).
+fn icon_list(avatars: &[(Uid, hxd_core::Avatar)]) -> (Vec<(u16, Vec<u8>)>, Vec<Uid>) {
+    let mut budget = ICON_LIST_BUDGET - 2;
+    let mut chunks = Vec::new();
+    let mut left_out = Vec::new();
+    for (uid, avatar) in avatars {
+        let Some(gif) = &avatar.legacy_gif else {
+            continue;
+        };
+        // A GIF too long for the entry's two-byte length: the config's
+        // ceiling keeps this from happening, and it is skipped if it does.
+        let Ok(len) = u16::try_from(gif.len() + 4) else {
+            continue;
+        };
+        let cost = 4 + usize::from(len);
+        if cost > budget {
+            left_out.push(*uid);
+            continue;
+        }
+        budget -= cost;
+        let mut entry = Vec::with_capacity(usize::from(len));
+        entry.extend_from_slice(&uid.to_be_bytes());
+        entry.extend_from_slice(&(gif.len() as u16).to_be_bytes());
+        entry.extend_from_slice(gif);
+        chunks.push((tag::ICON_LIST, entry));
+    }
+    (chunks, left_out)
 }
 
 fn file_error_text(error: &hxd_core::FileError) -> &'static str {
@@ -3263,6 +3420,37 @@ mod tests {
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn avatar(uid: u8, gif_len: usize) -> (Uid, hxd_core::Avatar) {
+        let mut a = hxd_core::avatar::conformance::avatar(uid, hxd_core::media::MediaType::Gif);
+        a.legacy_gif = Some(vec![uid; gif_len].into());
+        (u16::from(uid), a)
+    }
+
+    #[test]
+    fn the_icon_list_fits_one_transaction_and_names_what_did_not() {
+        // 40 GIFs at the 32 KiB default pass 1 MiB: some must be left out,
+        // and every one is either listed or named.
+        let all: Vec<_> = (1..=40).map(|n| avatar(n, 32 * 1024)).collect();
+        let (entries, left_out) = icon_list(&all);
+        let total: usize = 2 + entries.iter().map(|(_, e)| 4 + e.len()).sum::<usize>();
+        assert!(total <= ICON_LIST_BUDGET, "{total}");
+        assert!(!left_out.is_empty());
+        assert_eq!(entries.len() + left_out.len(), all.len());
+        let (first, rest) = entries[0].1.split_at(4);
+        assert_eq!(first, [0, 1, 0x80, 0x00], "uid 1, length 32768");
+        assert_eq!(rest.len(), 32 * 1024);
+
+        // A user with no legacy rendition is neither listed nor named.
+        let mut none = avatar(9, 10);
+        none.1.legacy_gif = None;
+        assert_eq!(icon_list(&[none]), (vec![], vec![]));
+
+        // The largest GIF an entry can carry fits its two-byte field.
+        let (entries, left_out) = icon_list(&[avatar(3, 65_531)]);
+        assert!(left_out.is_empty());
+        assert_eq!(entries[0].1.len(), 65_535);
     }
 
     #[test]

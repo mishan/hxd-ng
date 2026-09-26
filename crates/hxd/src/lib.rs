@@ -91,6 +91,74 @@ pub struct Config {
     /// The server banner. Absent = none, as on a server that never had
     /// one: the login reply's banner id is 0 either way.
     pub banner: Option<banner::BannerSection>,
+    /// Avatars on both wires (`docs/avatars.md` §6). Absent = neither wire
+    /// offers them. Needs the `media` feature.
+    pub avatars: Option<AvatarsSection>,
+}
+
+/// `[avatars]`: a user's picture, on both wires.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AvatarsSection {
+    /// The largest upload, on either wire.
+    #[serde(default = "default_avatar_max_bytes")]
+    pub max_bytes: usize,
+    /// What an avatar is fitted to, on its longer side.
+    #[serde(default = "default_avatar_max_dimension")]
+    pub max_dimension: u32,
+    /// The legacy GIF rendition's ceiling: the GIF Icons extension's
+    /// recommendation, and what GtkHx accepts.
+    #[serde(default = "default_avatar_legacy_max_bytes")]
+    pub legacy_max_bytes: usize,
+    /// Seconds between one session's changes; each is pushed to everyone.
+    #[serde(default = "default_avatar_set_interval")]
+    pub set_interval: u64,
+    /// Where owners' avatars are kept. Defaults to the database `[inbox]`,
+    /// `[history]` or `[news]` names; with none, avatars last until the
+    /// server stops.
+    pub db: Option<PathBuf>,
+}
+
+fn default_avatar_max_bytes() -> usize {
+    256 * 1024
+}
+fn default_avatar_max_dimension() -> u32 {
+    128
+}
+fn default_avatar_legacy_max_bytes() -> usize {
+    32 * 1024
+}
+fn default_avatar_set_interval() -> u64 {
+    10
+}
+
+impl AvatarsSection {
+    fn check(&self) -> Result<(), String> {
+        // A GIF Icons entry carries the GIF's length in two bytes, inside
+        // a field whose own length is two bytes with the four-byte header.
+        if !(1024..=65_531).contains(&self.legacy_max_bytes) {
+            return Err("[avatars] legacy_max_bytes must be between 1024 and 65531".into());
+        }
+        if !(16..=1024).contains(&self.max_dimension) {
+            return Err("[avatars] max_dimension must be between 16 and 1024".into());
+        }
+        if !(1024..=16 * 1024 * 1024).contains(&self.max_bytes) {
+            return Err("[avatars] max_bytes must be between 1 KiB and 16 MiB".into());
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "media"), allow(dead_code))]
+    fn to_policy(&self) -> hxd_core::AvatarPolicy {
+        hxd_core::AvatarPolicy {
+            limits: hxd_core::AvatarLimits {
+                max_bytes: self.max_bytes,
+                max_dimension: self.max_dimension,
+                legacy_max_bytes: self.legacy_max_bytes,
+            },
+            set_interval: Duration::from_secs(self.set_interval),
+        }
+    }
 }
 
 /// `[push]`: where a notification goes when nobody is watching.
@@ -1513,9 +1581,15 @@ fn ng_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>) -> Vec
     caps
 }
 
-/// Give the domain an image pipeline when `[media]` asks for one.
+/// Give the domain an image pipeline when `[media]` asks for one, and
+/// avatars when `[avatars]` does — the same pipeline, so the same decode
+/// budget.
 #[cfg(feature = "media")]
-fn with_media(core: Core, config: &Config) -> Result<Core, String> {
+fn with_media(
+    core: Core,
+    config: &Config,
+    avatars: Option<Arc<dyn hxd_core::AvatarStore>>,
+) -> Result<Core, String> {
     let media = config
         .media
         .as_ref()
@@ -1527,6 +1601,14 @@ fn with_media(core: Core, config: &Config) -> Result<Core, String> {
     // `max_concurrent_decodes` hold for both (`docs/news.md` §7.1).
     let codec = hxd_media::Codec::new(media.as_ref().map_or_else(Default::default, |m| m.codec));
     let core = with_news_attachments(core, config, &codec)?;
+    let core = match config.avatars.as_ref() {
+        Some(section) => core.with_avatars(
+            avatars.unwrap_or_else(|| Arc::new(hxd_core::MemoryAvatars::default())),
+            Arc::new(codec.with_max_bytes(section.max_bytes)),
+            section.to_policy(),
+        ),
+        None => core,
+    };
     Ok(match media {
         Some(cfg) => core.with_media(Arc::new(codec), cfg),
         None => core,
@@ -1586,7 +1668,18 @@ fn with_markdown(core: Core, _config: &Config) -> Core {
 /// section is an operator promising their users something this binary
 /// cannot do. Say so at startup rather than at the first upload.
 #[cfg(not(feature = "media"))]
-fn with_media(core: Core, config: &Config) -> Result<Core, String> {
+fn with_media(
+    core: Core,
+    config: &Config,
+    _avatars: Option<Arc<dyn hxd_core::AvatarStore>>,
+) -> Result<Core, String> {
+    if config.avatars.is_some() {
+        return Err(
+            "[avatars] is configured, but this build has no image pipeline \
+                    (built without the `media` feature)"
+                .into(),
+        );
+    }
     if config.media.is_some() {
         return Err(
             "[media] is configured, but this build has no image pipeline \
@@ -2119,6 +2212,9 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     if let Some(tracker) = &config.tracker {
         tracker.check(&config.server.name)?;
     }
+    if let Some(avatars) = &config.avatars {
+        avatars.check()?;
+    }
     Ok(())
 }
 
@@ -2167,6 +2263,7 @@ struct RuntimeStores {
     news: Option<Arc<dyn hxd_core::NewsStore>>,
     devices: Option<Arc<dyn hxd_core::PushStore>>,
     moderation: Option<Arc<dyn hxd_core::ModerationStore>>,
+    avatars: Option<Arc<dyn hxd_core::AvatarStore>>,
 }
 
 /// Open the databases the config names, **one store object per file**
@@ -2246,12 +2343,24 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         Some(p) => Some(open(&p, Synchronous::Normal)? as Arc<dyn hxd_core::ModerationStore>),
         None => None,
     };
+    // Avatars share whatever file there is, like devices.
+    let avatars_path = config.avatars.as_ref().and_then(|a| {
+        a.db.clone()
+            .or_else(|| inbox_path.as_ref().map(|(p, _)| p.clone()))
+            .or_else(|| history_path.as_ref().map(|(p, _)| p.clone()))
+            .or_else(|| news_path.as_ref().map(|(p, _)| p.clone()))
+    });
+    let avatars = match keyed(&avatars_path)? {
+        Some(p) => Some(open(&p, Synchronous::Normal)? as Arc<dyn hxd_core::AvatarStore>),
+        None => None,
+    };
     Ok(RuntimeStores {
         inbox,
         history,
         news,
         devices,
         moderation,
+        avatars,
     })
 }
 
@@ -2287,6 +2396,7 @@ struct RuntimeStores {
     news: Option<Arc<dyn hxd_core::NewsStore>>,
     devices: Option<Arc<dyn hxd_core::PushStore>>,
     moderation: Option<Arc<dyn hxd_core::ModerationStore>>,
+    avatars: Option<Arc<dyn hxd_core::AvatarStore>>,
 }
 
 #[cfg(not(feature = "inbox"))]
@@ -2302,12 +2412,20 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
                 .into(),
         );
     }
+    if config.avatars.as_ref().is_some_and(|a| a.db.is_some()) {
+        return Err(
+            "[avatars] db is configured, but this build has no SQLite store \
+                    (built without the `inbox` feature)"
+                .into(),
+        );
+    }
     Ok(RuntimeStores {
         inbox: None,
         history: None,
         news: None,
         devices: None,
         moderation: None,
+        avatars: None,
     })
 }
 
@@ -2888,7 +3006,7 @@ pub fn build_ctx(
         None => core,
     };
     let core = with_markdown(core, config);
-    let core = with_media(core, config)?;
+    let core = with_media(core, config, stores.avatars)?;
     // After media, so the durable block list reaches the image store.
     // Always on: kick and ban never needed a database, and reports on a
     // server with none are kept until it stops.

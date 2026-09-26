@@ -4,6 +4,7 @@
 //! frontend); both speak to the same domain core, so legacy and ng users
 //! share one roster and one chat.
 
+pub mod avatar;
 pub mod banner;
 mod conn;
 pub mod enroll;

@@ -260,6 +260,7 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_NEWS` | `on` | Threaded news ([news.md](news.md)). |
 | `HXD_NEWS_RETAIN_DAYS` | 0 | A thread's life after its last post; 0 is forever. |
 | `HXD_MEDIA` | `on` | Images in chat ([inline-media.md](inline-media.md)). Sending one needs the `send_media` bit: the account `HXD_ADMIN_LOGIN` writes has it, and any other account only if its file grants it. |
+| `HXD_AVATARS` | `on` | Users' pictures on both wires ([avatars.md](avatars.md)), kept in the database. |
 | `HXD_PUSH_CONTACT` | | Turns on Web Push; a `mailto:` or `https:` contact for push services ([webpush-gateway.md](webpush-gateway.md)). The VAPID key is generated into the volume, and losing it silently breaks every subscription — back it up. |
 | `HXD_PUSH_CONTENT` | `sender` | `full`, `sender` or `generic`. |
 

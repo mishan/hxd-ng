@@ -239,6 +239,11 @@ generate() {
         echo
         echo "[media]"
     fi
+    # Kept in the shared database, which [avatars] finds without being told.
+    if on HXD_AVATARS on; then
+        echo
+        echo "[avatars]"
+    fi
 
     if [ -n "${HXD_PUSH_CONTACT:-}" ]; then
         $ng || die "HXD_PUSH_CONTACT needs HXD_NG: devices register over the ng wire"

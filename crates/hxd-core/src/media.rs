@@ -240,6 +240,17 @@ pub trait MediaCodec: Send + Sync + 'static {
     ) -> Result<Option<Canonical>, MediaReject> {
         Ok(None)
     }
+
+    /// Make an avatar (`docs/avatars.md` §1): the canonical rendition,
+    /// fitted to `limits.max_dimension`, and the legacy GIF when one fits
+    /// `limits.legacy_max_bytes`. Implementations without avatars refuse.
+    fn avatar(
+        &self,
+        _input: &[u8],
+        _limits: &crate::avatar::AvatarLimits,
+    ) -> Result<crate::avatar::AvatarImages, MediaReject> {
+        Err(MediaReject::Unsupported)
+    }
 }
 
 /// Who a download is for. Never a bare uid: uids recycle, and a set

@@ -409,6 +409,11 @@ pub fn user_json(u: &UserInfo) -> Value {
     if u.system {
         v["system"] = json!(true);
     }
+    // Present only when there is one, like `identity`: a change that
+    // clears it is a `user_changed` without the key (`docs/avatars.md`).
+    if let Some(avatar) = &u.avatar {
+        v["avatar"] = crate::avatar::avatar_json(avatar);
+    }
     if let Some(id) = &u.transport.identity {
         v["identity"] = json!({
             "fingerprint": hl_identity::Fingerprint(id.fingerprint).to_string(),
@@ -428,7 +433,11 @@ pub fn user_json(u: &UserInfo) -> Value {
 pub fn event_json(se: &SeqEvent) -> String {
     let (ev, data) = match &se.event {
         Event::Joined(u) => ("user_joined", json!({ "user": user_json(u) })),
-        Event::Changed(u) => ("user_changed", json!({ "user": user_json(u) })),
+        // An avatar change is a change to the user object on this wire;
+        // only the legacy one says it with a transaction of its own.
+        Event::Changed(u) | Event::AvatarChanged(u) => {
+            ("user_changed", json!({ "user": user_json(u) }))
+        }
         Event::Parted(uid) => ("user_parted", json!({ "uid": uid })),
         Event::Chat {
             cid: 0,
