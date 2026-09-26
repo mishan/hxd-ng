@@ -115,6 +115,7 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
         registrar: None,
         push: None,
         banner: None,
+        metrics: None,
     };
 
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

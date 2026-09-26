@@ -31,6 +31,11 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// The frame's size on the wire: `buf` holds the header too.
+    pub fn wire_len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Iterate the data chunks.
     pub fn chunks(&self) -> ChunkIter<'_> {
         ChunkIter::over_message(&self.buf, self.buf.len())

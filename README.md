@@ -1057,6 +1057,11 @@ markdown parser, no TLS client — and the matching config section, or for
 `markdown` the `render` mode, then becomes a startup error rather than a
 promise the build cannot keep.
 
+`metrics` is off by default: it serves the server's own numbers at
+`GET /metrics` on the ng port, for load tests and dashboards, once a
+`[metrics]` section asks for them (`docs/metrics.md`). `console` adds
+tokio-console, and needs `RUSTFLAGS="--cfg tokio_unstable"` as well.
+
 ## Documentation
 
 The ng protocol documents are written to be implemented by someone

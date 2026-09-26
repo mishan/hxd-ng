@@ -271,6 +271,7 @@ async fn start_server_inner(
             })
         }),
         banner: None,
+        metrics: None,
     };
     tokio::spawn(hxd_session::serve(l1, legacy_ctx));
     tokio::spawn(hxd_ng_session::serve(l2, ng_ctx.clone()));
@@ -2666,6 +2667,7 @@ async fn a_token_offered_to_a_server_without_identity_is_refused() {
         registrar: None,
         push: None,
         banner: None,
+        metrics: None,
     };
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = l.local_addr().unwrap();

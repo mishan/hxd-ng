@@ -35,6 +35,15 @@ markdown = ["dep:hxd-markdown"]
 # silently ignored promise. Needs `inbox`: the devices live in that
 # store.
 push = ["dep:hxd-push-webpush", "inbox"]
+# `GET /metrics` on the ng port (`docs/metrics.md`): lock, store, pool
+# and fan-out timings, frame and disconnect counters, the roster's
+# census. Off by default, since every lock then reads the clock twice;
+# a load test or an operator who wants the numbers builds with it, and
+# without it a `[metrics]` section is a startup error.
+metrics = ["hxd-core/metrics", "dep:metrics", "dep:metrics-exporter-prometheus"]
+# tokio-console. Needs `RUSTFLAGS="--cfg tokio_unstable"` as well, which
+# is why it is a feature of its own rather than part of `metrics`.
+console = ["dep:console-subscriber"]
 
 [[bin]]
 name = "hxd"
@@ -73,6 +82,11 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # TLS listener itself uses.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 serde_json = "1"
+metrics = { version = "0.24", optional = true }
+# The recorder and its text format only: `/metrics` is served by the ng
+# listener, not by an HTTP server of the exporter's own.
+metrics-exporter-prometheus = { version = "0.18", default-features = false, optional = true }
+console-subscriber = { version = "0.5", optional = true }
 
 [dev-dependencies]
 hxfiles-xfer = { workspace = true }

@@ -16,8 +16,8 @@
 //! a client chose — is stored as `i64::MAX`, which compares the same
 //! against any clock this will run under.
 
+use hxd_core::instrument::TimedMutex;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use hxd_registrar::store::entry_cost;
@@ -201,7 +201,7 @@ fn page_of(rows: &mut rusqlite::Rows<'_>, budget: usize) -> Result<Page, StoreEr
 
 #[derive(Debug)]
 pub struct SqliteRegistrarStore {
-    conn: Mutex<Connection>,
+    conn: TimedMutex<Connection>,
 }
 
 impl SqliteRegistrarStore {
@@ -215,7 +215,7 @@ impl SqliteRegistrarStore {
         sql(conn.pragma_update(None, "synchronous", sync.pragma()))?;
         migrate(&conn)?;
         Ok(SqliteRegistrarStore {
-            conn: Mutex::new(conn),
+            conn: TimedMutex::named("sqlite_registrar", conn),
         })
     }
 

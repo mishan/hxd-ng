@@ -130,7 +130,7 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
     // with the awaiting side giving up before the client does.
     let outcome = tokio::time::timeout(
         budget,
-        tokio::task::spawn_blocking(move || {
+        crate::spawn_blocking("media", move || {
             core.media_upload_part(
                 uid,
                 UploadPart {

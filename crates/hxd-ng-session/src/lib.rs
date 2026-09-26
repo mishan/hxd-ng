@@ -12,6 +12,7 @@ mod files;
 mod http;
 pub mod identity;
 pub mod media;
+pub mod metrics;
 pub mod moderation;
 pub mod news;
 mod news_blob;
@@ -272,6 +273,9 @@ pub struct NgCtx {
     /// The server banner, when `[banner]` is configured. `None` means the
     /// `banner` capability is absent and `GET /banner` is 404.
     pub banner: Option<Arc<dyn banner::BannerSource>>,
+    /// The server's numbers, when built with the `metrics` feature and
+    /// `[metrics]` is configured. `None` means `GET /metrics` is 404.
+    pub metrics: Option<Arc<dyn metrics::MetricsSource>>,
 }
 
 /// Accept loop: one connection task per socket. Each is HTTP until it
@@ -333,6 +337,15 @@ pub async fn sweeper(
             }
         }
     }
+}
+
+/// `tokio::task::spawn_blocking`, with the pool's queue time and
+/// occupancy reported under `what` (`hxd_core::instrument::blocking`).
+pub(crate) fn spawn_blocking<R: Send + 'static>(
+    what: &'static str,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> tokio::task::JoinHandle<R> {
+    tokio::task::spawn_blocking(hxd_core::instrument::blocking(what, f))
 }
 
 #[cfg(test)]

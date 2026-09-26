@@ -18,8 +18,8 @@
 //! at the epoch rather than failing — a clock set before 1970 should not
 //! be able to refuse a message.
 
+use hxd_core::instrument::TimedMutex;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hxd_core::history::{
@@ -434,7 +434,7 @@ fn bind(m: &Mailbox) -> String {
 
 #[derive(Debug)]
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    conn: TimedMutex<Connection>,
 }
 
 impl SqliteStore {
@@ -506,7 +506,7 @@ impl SqliteStore {
                 )));
             }
             return Ok(SqliteStore {
-                conn: Mutex::new(conn),
+                conn: TimedMutex::named("sqlite", conn),
             });
         }
         let conn = Connection::open(path).map_err(StoreError::new)?;
@@ -525,7 +525,7 @@ impl SqliteStore {
             .map_err(StoreError::new)?;
         migrate(&conn)?;
         Ok(SqliteStore {
-            conn: Mutex::new(conn),
+            conn: TimedMutex::named("sqlite", conn),
         })
     }
 

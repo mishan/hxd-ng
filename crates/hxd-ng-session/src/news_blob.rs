@@ -48,8 +48,10 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
         Err(_) => return reject(MediaReject::Generic),
     };
     let core = ctx.core.clone();
-    let result =
-        tokio::task::spawn_blocking(move || core.news_stage_attachment(uid, &body, name)).await;
+    let result = crate::spawn_blocking("news_blob", move || {
+        core.news_stage_attachment(uid, &body, name)
+    })
+    .await;
     match result {
         Ok(Ok(staged)) => {
             let a = staged.attachment;
@@ -130,8 +132,10 @@ pub async fn download(id: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
         .query()
         .is_some_and(|q| q.split('&').any(|part| part == "size=legacy"));
     let core = ctx.core.clone();
-    let found =
-        tokio::task::spawn_blocking(move || core.news_attachment(uid, &handle, legacy)).await;
+    let found = crate::spawn_blocking("news_blob", move || {
+        core.news_attachment(uid, &handle, legacy)
+    })
+    .await;
     let Ok(Ok(Some((attachment, blob, bytes)))) = found else {
         return not_found();
     };

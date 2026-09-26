@@ -57,8 +57,16 @@ jobs:
       - name: Clippy without default features
         run: cargo clippy -p hxd --no-default-features -- -D warnings
 
+      # `metrics` is off by default, and every recording call compiles to
+      # something else with it on.
+      - name: Clippy with metrics
+        run: cargo clippy -p hxd --features metrics --all-targets -- -D warnings
+
       - name: Tests
         run: cargo test --workspace
+
+      - name: Tests with metrics
+        run: cargo test -p hxd --features metrics --lib --test metrics
 
   node-client:
     runs-on: ubuntu-latest
