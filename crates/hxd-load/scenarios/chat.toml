@@ -1,0 +1,23 @@
+# S3: public chat on both wires. Every reader must hear every line,
+# once, in order; latency is from when a line was due to when each
+# reader heard it.
+#
+#   hxd-load run chat.toml --out chat.json
+
+[target]
+legacy = "127.0.0.1:5500"
+ng = "127.0.0.1:5700"
+metrics = true            # needs `--features metrics` and a [metrics] section
+# log = "hxd.log"         # tailed for panics and ERROR lines
+
+[run]
+scenario = "chat"
+duration = 30
+
+[chat]
+readers_legacy = 100
+readers_ng = 100
+talkers_legacy = 5
+talkers_ng = 5
+rate = 100                # lines a second, the whole room
+line_bytes = 64

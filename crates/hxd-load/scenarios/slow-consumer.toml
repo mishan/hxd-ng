@@ -1,0 +1,25 @@
+# S5: the chat room, plus clients that log in and never read again.
+# Passing means the server disconnects them and holds a bounded amount
+# for them meanwhile; everyone else must not notice them at all.
+
+[target]
+legacy = "127.0.0.1:5500"
+ng = "127.0.0.1:5700"
+metrics = true            # the memory and queue samples need it
+
+[run]
+scenario = "slow_consumer"
+duration = 60
+
+[chat]
+readers_legacy = 20
+readers_ng = 20
+talkers_legacy = 2
+talkers_ng = 2
+rate = 500
+line_bytes = 1000
+
+[slow_consumer]
+stalled_legacy = 2
+stalled_ng = 2
+max_queued_bytes = 16777216

@@ -1247,6 +1247,7 @@ dependencies = [
  "hxd-registrar",
  "hxd-session",
  "hxd-store-sqlite",
+ "hxd-testclient",
  "hxd-voice",
  "hxfiles-xfer",
  "hxproto",
@@ -1317,6 +1318,23 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "hxd-load"
+version = "0.1.0"
+dependencies = [
+ "hdrhistogram",
+ "hxd",
+ "hxd-ng-session",
+ "hxd-session",
+ "hxd-testclient",
+ "hxproto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -1420,6 +1438,18 @@ dependencies = [
  "sha2",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "hxd-testclient"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "hxproto",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
 ]
 
 [[package]]
