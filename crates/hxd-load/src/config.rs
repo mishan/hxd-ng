@@ -47,19 +47,71 @@ impl Scenario {
     }
 
     pub fn check(&self) -> Result<(), String> {
-        if self.run.duration <= 0.0 {
-            return Err("[run] duration must be positive".into());
+        // Every time is used as a duration and some as a divisor or a
+        // mean; none of them may be zero, negative or not a number.
+        let positive = [
+            ("[run] duration", self.run.duration),
+            ("[login_storm] ramp_every", self.login_storm.ramp_every),
+            (
+                "[slow_consumer] sample_every",
+                self.slow_consumer.sample_every,
+            ),
+            ("[churn] cycle", self.churn.cycle),
+            ("[churn] kick_every", self.churn.kick_every),
+        ];
+        let not_negative = [
+            ("[run] settle", self.run.settle),
+            ("[run] teardown", self.run.teardown),
+            ("[login_storm] linger", self.login_storm.linger),
+            ("[login_storm] ramp_step", self.login_storm.ramp_step),
+            ("[churn] away", self.churn.away),
+            ("[churn] chat_rate", self.churn.chat_rate),
+            ("[chat] rate", self.chat.rate),
+        ];
+        for (name, v) in positive {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(format!("{name} must be a positive number of seconds"));
+            }
+        }
+        for (name, v) in not_negative {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(format!("{name} must not be negative"));
+            }
+        }
+        if self.run.scenario == Kind::LoginStorm
+            && (self.login_storm.rate <= 0.0 || !self.login_storm.rate.is_finite())
+        {
+            return Err("[login_storm] rate must be positive".into());
+        }
+        if self.run.scenario == Kind::LoginStorm
+            && self.login_storm.accounts
+            && self.target.accounts.is_none()
+        {
+            return Err("[login_storm] accounts = true needs [target] accounts".into());
+        }
+        if self.run.scenario == Kind::Churn
+            && self.target.admin.is_some()
+            && self.target.ng.is_none()
+        {
+            return Err("[target] admin kicks from the ng port, and [target] names none".into());
         }
         let needs_legacy = match self.run.scenario {
             Kind::LoginStorm => self.login_storm.legacy > 0,
-            Kind::Chat | Kind::SlowConsumer => {
-                self.chat.readers_legacy + self.chat.talkers_legacy > 0
+            Kind::Chat => self.chat.readers_legacy + self.chat.talkers_legacy > 0,
+            Kind::SlowConsumer => {
+                self.chat.readers_legacy
+                    + self.chat.talkers_legacy
+                    + self.slow_consumer.stalled_legacy
+                    > 0
             }
             Kind::Churn => self.churn.legacy > 0,
         };
         let needs_ng = match self.run.scenario {
             Kind::LoginStorm => self.login_storm.ng > 0,
-            Kind::Chat | Kind::SlowConsumer => self.chat.readers_ng + self.chat.talkers_ng > 0,
+            Kind::Chat => self.chat.readers_ng + self.chat.talkers_ng > 0,
+            Kind::SlowConsumer => {
+                self.chat.readers_ng + self.chat.talkers_ng + self.slow_consumer.stalled_ng > 0
+            }
             Kind::Churn => self.churn.ng > 0,
         };
         if needs_legacy && self.target.legacy.is_none() {
@@ -179,7 +231,11 @@ pub struct Run {
     pub duration: f64,
     /// Seeds every random choice, so a run repeats.
     pub seed: u64,
-    /// Seconds of quiet after the load before the roster is compared.
+    /// Seconds readers may still take to hear the last lines once the
+    /// talking stops. A line not heard by then counts as not heard at
+    /// all (`chat.all_heard`), and its latency is not in the report: a
+    /// server slower than this looks like one that loses lines, so a run
+    /// that expects a slow server sets it higher.
     pub settle: f64,
     /// Seconds the server has to empty its roster after everyone leaves.
     pub teardown: f64,
@@ -194,7 +250,7 @@ impl Default for Run {
             scenario: Kind::Chat,
             duration: 10.0,
             seed: 1,
-            settle: 1.0,
+            settle: 5.0,
             teardown: 10.0,
             prefix: "lt".into(),
         }
@@ -349,6 +405,28 @@ mod tests {
     fn an_unknown_key_is_refused_rather_than_ignored() {
         let err = Scenario::parse("[chat]\nreaders = 5\n").unwrap_err();
         assert!(err.contains("readers"), "{err}");
+    }
+
+    #[test]
+    fn a_time_that_would_panic_or_spin_is_refused() {
+        let target = "[target]\nng = \"127.0.0.1:1\"\nlegacy = \"127.0.0.1:2\"\n";
+        for bad in [
+            "[login_storm]\nramp_every = 0\n",
+            "[run]\nsettle = -1\n",
+            "[churn]\nkick_every = 0\n",
+            "[slow_consumer]\nsample_every = 0\n",
+            "[run]\nscenario = \"login_storm\"\n[login_storm]\nrate = 0\n",
+        ] {
+            assert!(Scenario::parse(&format!("{target}{bad}")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_slow_run_with_stalled_classic_clients_needs_the_classic_port() {
+        let text = "[target]\nng = \"127.0.0.1:1\"\n[run]\nscenario = \"slow_consumer\"\n\
+                    [chat]\nreaders_legacy = 0\ntalkers_legacy = 0\n";
+        let err = Scenario::parse(text).unwrap_err();
+        assert!(err.contains("legacy"), "{err}");
     }
 
     #[test]

@@ -130,20 +130,32 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame> {
     })
 }
 
-/// A whole frame off the front of `buf`, if one is there.
-fn cut_frame(buf: &mut Vec<u8>) -> Result<Option<Frame>> {
-    let Some(h) = decode_header_full(buf, MAX_FRAME) else {
+/// A whole frame off the front of `buf[*pos..]`, if one is there,
+/// advancing `pos` past it. The buffer is compacted only when a frame is
+/// incomplete or all of it is consumed, so cutting a run of small frames
+/// out of one large read costs each frame's bytes and no more.
+fn cut_frame(buf: &mut Vec<u8>, pos: &mut usize) -> Result<Option<Frame>> {
+    let unread = &buf[*pos..];
+    let Some(h) = decode_header_full(unread, MAX_FRAME) else {
+        buf.drain(..*pos);
+        *pos = 0;
         return Ok(None);
     };
     if h.wire_len > MAX_FRAME {
         return Err(Error::Protocol(format!("frame of {} bytes", h.wire_len)));
     }
     let len = HL_HDR_LEN + h.body_len as usize;
-    if buf.len() < len {
+    if unread.len() < len {
+        buf.drain(..*pos);
+        *pos = 0;
         return Ok(None);
     }
-    let rest = buf.split_off(len);
-    let frame = std::mem::replace(buf, rest);
+    let frame = unread[..len].to_vec();
+    *pos += len;
+    if *pos == buf.len() {
+        buf.clear();
+        *pos = 0;
+    }
     Ok(Some(Frame {
         ty: h.type_,
         trans: h.trans,
@@ -238,6 +250,9 @@ impl UserRow {
 pub struct Sender {
     wr: WriteHalf<Box<dyn Io>>,
     trans: u32,
+    /// How long one write may take: a server that has stopped reading
+    /// must not hold a sender forever.
+    pub timeout: Duration,
 }
 
 impl Sender {
@@ -251,8 +266,13 @@ impl Sender {
 
     /// Send raw bytes: a malformed frame, a half header.
     pub async fn send_raw(&mut self, bytes: &[u8]) -> Result<()> {
-        self.wr.write_all(bytes).await?;
-        self.wr.flush().await?;
+        let write = async {
+            self.wr.write_all(bytes).await?;
+            self.wr.flush().await
+        };
+        timeout(self.timeout, write)
+            .await
+            .map_err(|_| Error::Timeout)??;
         Ok(())
     }
 
@@ -280,6 +300,8 @@ impl Sender {
 pub struct Receiver {
     rd: ReadHalf<Box<dyn Io>>,
     buf: Vec<u8>,
+    /// Where the unread part of `buf` starts.
+    pos: usize,
     backlog: VecDeque<Frame>,
     pub timeout: Duration,
 }
@@ -308,9 +330,16 @@ impl Receiver {
             .map_err(|_| Error::Timeout)?
     }
 
+    /// The next frame off the socket, by `deadline`.
+    async fn read_by(&mut self, deadline: tokio::time::Instant) -> Result<Frame> {
+        tokio::time::timeout_at(deadline, self.read_whole())
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+
     async fn read_whole(&mut self) -> Result<Frame> {
         loop {
-            if let Some(f) = cut_frame(&mut self.buf)? {
+            if let Some(f) = cut_frame(&mut self.buf, &mut self.pos)? {
                 return Ok(f);
             }
             let mut chunk = [0u8; 16 * 1024];
@@ -323,13 +352,15 @@ impl Receiver {
     }
 
     /// The first frame matching `pred`, backlog first; everything else
-    /// stays in the backlog in order.
+    /// stays in the backlog in order. The timeout is for the whole wait,
+    /// so steady unrelated traffic cannot stretch it.
     pub async fn recv_where(&mut self, pred: impl Fn(&Frame) -> bool) -> Result<Frame> {
         if let Some(i) = self.backlog.iter().position(&pred) {
             return Ok(self.backlog.remove(i).expect("position is in range"));
         }
+        let deadline = tokio::time::Instant::now() + self.timeout;
         loop {
-            let f = self.read().await?;
+            let f = self.read_by(deadline).await?;
             if pred(&f) {
                 return Ok(f);
             }
@@ -364,7 +395,9 @@ pub struct Client {
 impl Client {
     /// Connect over TCP and exchange the TRTP magic.
     pub async fn connect(addr: SocketAddr) -> Result<Client> {
-        let stream = TcpStream::connect(addr).await?;
+        let stream = timeout(DEFAULT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| Error::Timeout)??;
         stream.set_nodelay(true)?;
         Client::over(Box::new(stream)).await
     }
@@ -375,11 +408,15 @@ impl Client {
         server_name: &str,
         config: Arc<ClientConfig>,
     ) -> Result<Client> {
-        let tcp = TcpStream::connect(addr).await?;
-        tcp.set_nodelay(true)?;
         let name = ServerName::try_from(server_name.to_owned())
             .map_err(|e| Error::Protocol(format!("server name: {e}")))?;
-        let tls = TlsConnector::from(config).connect(name, tcp).await?;
+        let tls = timeout(DEFAULT_TIMEOUT, async {
+            let tcp = TcpStream::connect(addr).await?;
+            tcp.set_nodelay(true)?;
+            TlsConnector::from(config).connect(name, tcp).await
+        })
+        .await
+        .map_err(|_| Error::Timeout)??;
         Client::over(Box::new(tls)).await
     }
 
@@ -396,10 +433,15 @@ impl Client {
         }
         let (rd, wr) = tokio::io::split(stream);
         Ok(Client {
-            tx: Sender { wr, trans: 0 },
+            tx: Sender {
+                wr,
+                trans: 0,
+                timeout: DEFAULT_TIMEOUT,
+            },
             rx: Receiver {
                 rd,
                 buf: Vec::new(),
+                pos: 0,
                 backlog: VecDeque::new(),
                 timeout: DEFAULT_TIMEOUT,
             },
@@ -520,15 +562,19 @@ mod tests {
         let one = pack(0x6a, 1, 0, &[(tag::BODY, b"first".to_vec())]);
         let two = pack(0x6a, 2, 0, &[(tag::BODY, b"second".to_vec())]);
         let mut buf = one[..10].to_vec();
-        assert!(cut_frame(&mut buf).unwrap().is_none());
+        let mut pos = 0;
+        assert!(cut_frame(&mut buf, &mut pos).unwrap().is_none());
         buf.extend_from_slice(&one[10..]);
         buf.extend_from_slice(&two[..5]);
-        let f = cut_frame(&mut buf).unwrap().unwrap();
-        assert_eq!(
-            (f.trans, f.bytes(tag::BODY).unwrap()),
-            (1, b"first".to_vec())
-        );
-        assert_eq!(buf, two[..5]);
+        let f = cut_frame(&mut buf, &mut pos).unwrap().unwrap();
+        assert_eq!(f.trans, 1);
+        assert_eq!(f.bytes(tag::BODY).unwrap(), b"first");
+        assert!(cut_frame(&mut buf, &mut pos).unwrap().is_none());
+        assert_eq!((&buf[pos..], pos), (&two[..5], 0));
+        buf.extend_from_slice(&two[5..]);
+        let f = cut_frame(&mut buf, &mut pos).unwrap().unwrap();
+        assert_eq!(f.trans, 2);
+        assert!(buf.is_empty());
     }
 
     #[test]

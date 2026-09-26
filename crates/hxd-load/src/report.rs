@@ -33,6 +33,19 @@ pub struct Report {
     pub metrics_after: Option<Scrape>,
 }
 
+/// The scenario as it ran, less its passwords: a report is made to be
+/// shared and compared.
+fn redacted(s: &Scenario) -> Scenario {
+    let mut s = s.clone();
+    if let Some(a) = s.target.accounts.as_mut() {
+        a.password = "(redacted)".into();
+    }
+    if let Some(a) = s.target.admin.as_mut() {
+        a.password = "(redacted)".into();
+    }
+    s
+}
+
 #[derive(Serialize)]
 pub struct Harness {
     pub version: &'static str,
@@ -57,7 +70,7 @@ impl Report {
                 run: ctx.run.clone(),
             },
             host: Host::read(),
-            scenario: ctx.scenario.clone(),
+            scenario: redacted(&ctx.scenario),
             started: started
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),

@@ -130,13 +130,25 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
 
     // Everyone this run brought has left; the roster should say so.
     member::no_ghosts(&ctx, before.as_ref()).await;
-    let after = scrape(&ctx).await?;
-
+    // From here a failure is a finding, not a reason to lose the report:
+    // a server that died under load is the run most worth keeping.
+    let after = match scrape(&ctx).await {
+        Ok(after) => after,
+        Err(e) => {
+            ctx.checks
+                .violated("server.reachable", format!("after the run: {e}"));
+            None
+        }
+    };
     if let Some(log) = log {
-        let lines = log.alarming()?;
-        ctx.checks.check("server.log_clean", lines.is_empty(), || {
-            format!("{} alarming lines, first: {}", lines.len(), lines[0])
-        });
+        match log.alarming() {
+            Ok(lines) => ctx.checks.check("server.log_clean", lines.is_empty(), || {
+                format!("{} alarming lines, first: {}", lines.len(), lines[0])
+            }),
+            Err(e) => ctx
+                .checks
+                .violated("server.log_clean", format!("unreadable: {e}")),
+        }
     }
     Ok(report::Report::new(&ctx, started, extra, before, after))
 }

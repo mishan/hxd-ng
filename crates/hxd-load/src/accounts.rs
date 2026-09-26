@@ -6,7 +6,8 @@ use std::path::Path;
 /// `<prefix>0` up to `<prefix><count - 1>`, each with `password`, allowed
 /// to chat and to use any nick; an account with a password may detach by
 /// default. With `admin`, one more account by that name, allowed to
-/// disconnect users. An existing file is never overwritten.
+/// disconnect users. If any of the files exists already, none is
+/// written.
 pub fn write(
     dir: &Path,
     prefix: &str,
@@ -38,6 +39,16 @@ pub fn write(
                 "disconnect_users = true\ncant_be_disconnected = true\n",
             ),
         ));
+    }
+    // All or nothing: a clash found halfway would leave half a set.
+    for (login, _) in &files {
+        let path = dir.join(format!("{login}.toml"));
+        if path.exists() {
+            return Err(format!(
+                "{} already exists; nothing written",
+                path.display()
+            ));
+        }
     }
     for (login, text) in files {
         let path = dir.join(format!("{login}.toml"));

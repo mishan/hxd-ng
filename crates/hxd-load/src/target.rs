@@ -102,10 +102,33 @@ impl LogTail {
         f.read_to_string(&mut text).map_err(|e| e.to_string())?;
         Ok(text
             .lines()
+            .map(plain)
             .filter(|l| l.contains("panicked") || l.contains(" ERROR "))
-            .map(str::to_owned)
             .collect())
     }
+}
+
+/// A log line without its terminal colors: `tracing` colors the level
+/// when it thinks it is writing to a terminal, and a redirect does not
+/// always change its mind.
+fn plain(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI: ESC [ parameters, then one final byte in @..~.
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// What a result is not comparable without.
@@ -149,4 +172,14 @@ pub fn revision() -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_colored_level_is_read_as_the_level() {
+        let colored = "2026-09-26T00:00:00Z \u{1b}[31mERROR\u{1b}[0m hxd: it broke";
+        let line = super::plain(colored);
+        assert!(line.contains(" ERROR "), "{line:?}");
+    }
 }

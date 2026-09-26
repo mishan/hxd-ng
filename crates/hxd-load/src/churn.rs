@@ -10,8 +10,9 @@
 //!
 //! What must hold: seqs stay gapless across resumes and never go back
 //! across a resync; a detached session is still there when it comes back
-//! unless it was kicked; an attached one ends only by a kick; and, once
-//! everyone has gone, nobody is left behind.
+//! unless it was kicked; an attached connection is lost only to a kick,
+//! and only a kicked session is told so; and, once everyone has gone,
+//! nobody is left behind.
 //!
 //! What is measured rather than held: how many resumes replayed and how
 //! many were told to resync. The protocol allows a resync not only when
@@ -95,7 +96,7 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
     }
     if let Some(admin) = ctx.scenario.target.admin.clone() {
         let creds = Some((admin.login, admin.password));
-        let m = Member::join(ctx, Wire::Ng, 0, creds)
+        let m = Member::join_as(ctx, Wire::Ng, ctx.nick('M', 0), creds)
             .await
             .map_err(|e| format!("the admin could not log in: {e}"))?;
         tasks.push(tokio::spawn(moderator(
@@ -150,6 +151,12 @@ async fn talker(
 }
 
 /// One ng account session, dropping and resuming until the run ends.
+///
+/// A session is only ever given up when it is over: kicked, or expired
+/// on the server's word. Anything else — a lost connection, a resume
+/// that timed out — goes back through `resume` rather than a fresh
+/// login, which would leave the old session detached on the roster for
+/// the server's whole grace window and blame the server for the ghost.
 async fn ng_churner(ctx: Arc<Ctx>, i: usize, targets: Targets, mut stop: watch::Receiver<bool>) {
     let addr = ctx.scenario.target.ng.expect("checked by the scenario");
     let accounts = ctx
@@ -164,15 +171,14 @@ async fn ng_churner(ctx: Arc<Ctx>, i: usize, targets: Targets, mut stop: watch::
     let mut session: Option<(ng::Client, Arc<AtomicBool>)> = None;
     loop {
         if *stop.borrow() {
-            // Whatever session is held — one just resumed, say — ends here
-            // rather than detaching, or it would outlive the run.
+            // Whatever session is held ends here rather than detaching,
+            // or it would outlive the run.
             if let Some((c, kicked)) = session.take() {
-                finish(&ctx, &nick, &c, &kicked, &targets, false);
-                let _ = c.logout().await;
+                finish(&ctx, &nick, &c.rx.seq_faults, &kicked, &targets);
+                leave(&ctx, addr, c).await;
             }
             break;
         }
-        // Log in if there is no session to resume.
         let (mut c, kicked) = match session.take() {
             Some(s) => s,
             None => match login(&ctx, addr, &params, &targets).await {
@@ -186,14 +192,17 @@ async fn ng_churner(ctx: Arc<Ctx>, i: usize, targets: Targets, mut stop: watch::
 
         // Attached: read for a while.
         let until = tokio::time::Instant::now() + ctx.exp(ctx.scenario.churn.cycle);
-        let mut ended = false;
+        let mut lost = false;
         loop {
             tokio::select! {
                 _ = stop.changed() => break,
                 _ = tokio::time::sleep_until(until) => break,
                 got = c.rx.next_forever() => match got {
                     Ok(Incoming::Event(e)) if e.ev == "kicked" => {
-                        ended = true;
+                        ctx.checks.check("churn.ended_only_by_kick", kicked.load(Ordering::SeqCst), || {
+                            format!("{nick} was told it was kicked, and nobody kicked it")
+                        });
+                        lost = true;
                         break;
                     }
                     Ok(_) => {}
@@ -204,29 +213,31 @@ async fn ng_churner(ctx: Arc<Ctx>, i: usize, targets: Targets, mut stop: watch::
                                 format!("{nick} lost an attached connection: {e}"),
                             );
                         }
-                        ended = true;
+                        lost = true;
                         break;
                     }
                 },
             }
         }
-        if ended {
-            finish(&ctx, &nick, &c, &kicked, &targets, true);
+        if lost && kicked.load(Ordering::SeqCst) {
+            // Over: kicked sessions end, attached or not.
+            finish(&ctx, &nick, &c.rx.seq_faults, &kicked, &targets);
             continue;
         }
-        if *stop.borrow() {
-            finish(&ctx, &nick, &c, &kicked, &targets, false);
-            let _ = c.logout().await;
-            break;
+        if !lost && *stop.borrow() {
+            session = Some((c, kicked));
+            continue;
         }
 
         // Read up to a ping's reply, so what was sent before it has been
-        // accounted for; then drop the connection, stay away a moment,
-        // and come back.
-        if let Err(e) = c.request("ping", Value::Null).await {
-            ctx.stats.error("churn.ping", &e.to_string());
+        // accounted for; then drop the connection (if it is not gone
+        // already), stay away a moment, and come back.
+        if !lost {
+            if let Err(e) = c.request("ping", Value::Null).await {
+                ctx.stats.error("churn.ping", &e.to_string());
+            }
+            c.rx.take_backlog();
         }
-        c.rx.take_backlog();
         let from = c.session.clone().expect("a logged-in session has one");
         let (last_seq, faults) = (c.rx.last_seq, c.rx.seq_faults.clone());
         if ctx.random() < 0.5 {
@@ -235,12 +246,33 @@ async fn ng_churner(ctx: Arc<Ctx>, i: usize, targets: Targets, mut stop: watch::
             drop(c);
         }
         tokio::time::sleep(ctx.exp(ctx.scenario.churn.away)).await;
+        session = come_back(&ctx, addr, &nick, from, last_seq, faults, kicked, &targets).await;
+    }
+}
+
+/// Resume a dropped session, a few times if need be. `None` when the
+/// session is over — expired, on the server's word — or out of reach.
+#[allow(clippy::too_many_arguments)]
+async fn come_back(
+    ctx: &Ctx,
+    addr: std::net::SocketAddr,
+    nick: &str,
+    from: (String, String),
+    last_seq: u64,
+    faults: Vec<ng::SeqFault>,
+    kicked: Arc<AtomicBool>,
+    targets: &Targets,
+) -> Option<(ng::Client, Arc<AtomicBool>)> {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let took = std::time::Instant::now();
-        match ng::Client::resume(addr, from, last_seq, faults).await {
+        match ng::Client::resume(addr, from.clone(), last_seq, faults.clone()).await {
             Ok((c, Resumed::Replayed(_))) => {
                 ctx.stats.record("churn.resume.replayed", took.elapsed());
                 ctx.checks.held("churn.resumed");
-                session = Some((c, kicked));
+                return Some((c, kicked));
             }
             Ok((mut c, Resumed::ResyncRequired)) => match c.sync().await {
                 Ok(ok) => {
@@ -250,7 +282,7 @@ async fn ng_churner(ctx: Arc<Ctx>, i: usize, targets: Targets, mut stop: watch::
                         .check("churn.seq_never_back", now >= last_seq, || {
                             format!("{nick} resynced to seq {now}, having had {last_seq}")
                         });
-                    session = Some((c, kicked));
+                    return Some((c, kicked));
                 }
                 Err(e) => ctx.stats.error("churn.sync", &e.to_string()),
             },
@@ -262,11 +294,35 @@ async fn ng_churner(ctx: Arc<Ctx>, i: usize, targets: Targets, mut stop: watch::
                          check [ng] max_detached_per_addr and grace"
                     )
                 });
-                record_faults(&ctx, &nick, &[]);
-                deregister(&targets, &kicked);
+                finish(ctx, nick, &faults, &kicked, targets);
+                return None;
             }
             Err(e) => ctx.stats.error("churn.resume", &e.to_string()),
         }
+    }
+    // Out of reach: its seqs are still accounted for, and the error
+    // counts above say why the session could not be brought back.
+    finish(ctx, nick, &faults, &kicked, targets);
+    None
+}
+
+/// Log a session out; if its connection is already gone, resume it
+/// first, so that it ends instead of detaching.
+async fn leave(ctx: &Ctx, addr: std::net::SocketAddr, c: ng::Client) {
+    let from = c.session.clone();
+    let last_seq = c.rx.last_seq;
+    if c.logout().await.is_ok() {
+        return;
+    }
+    let Some(from) = from else { return };
+    match ng::Client::resume(addr, from, last_seq, Vec::new()).await {
+        Ok((c, _)) => {
+            if let Err(e) = c.logout().await {
+                ctx.stats.error("churn.logout", &e.to_string());
+            }
+        }
+        Err(Error::Refused { code, .. }) if code == "session_expired" => {}
+        Err(e) => ctx.stats.error("churn.logout", &e.to_string()),
     }
 }
 
@@ -300,19 +356,11 @@ async fn login(
 fn finish(
     ctx: &Ctx,
     nick: &str,
-    c: &ng::Client,
+    faults: &[ng::SeqFault],
     kicked: &Arc<AtomicBool>,
     targets: &Targets,
-    ended: bool,
 ) {
-    record_faults(ctx, nick, &c.rx.seq_faults);
-    if ended {
-        ctx.checks.check(
-            "churn.ended_only_by_kick",
-            kicked.load(Ordering::SeqCst),
-            || format!("{nick}'s session ended without a kick"),
-        );
-    }
+    record_faults(ctx, nick, faults);
     deregister(targets, kicked);
 }
 

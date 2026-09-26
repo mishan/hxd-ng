@@ -45,6 +45,9 @@ pub struct Heard {
     /// separately.
     pub own: Option<usize>,
     last: HashMap<usize, u64>,
+    /// Lines heard in order, counted here and handed to the checks at
+    /// the end: every line heard would otherwise take their shared lock.
+    in_order: u64,
     pub delivery: Histogram<u64>,
     pub echo: Histogram<u64>,
 }
@@ -55,6 +58,7 @@ impl Heard {
             me,
             own,
             last: HashMap::new(),
+            in_order: 0,
             delivery: stats::local(),
             echo: stats::local(),
         }
@@ -72,7 +76,7 @@ impl Heard {
         stats::sample(&mut self.delivery, late);
         let last = self.last.entry(sender).or_insert(0);
         if seq == *last + 1 {
-            checks.held("chat.in_order_once");
+            self.in_order += 1;
         } else if seq <= *last {
             checks.violated(
                 "chat.in_order_once",
@@ -103,6 +107,7 @@ impl Heard {
 
     /// At the end: every line of every sender, all of them heard.
     pub fn account(&self, sent: &[u64], checks: &Checks) {
+        checks.held_n("chat.in_order_once", self.in_order);
         for (sender, &n) in sent.iter().enumerate() {
             let got = self.last.get(&sender).copied().unwrap_or(0);
             checks.check("chat.all_heard", got == n, || {
@@ -135,10 +140,10 @@ mod tests {
         for seq in [1, 2, 2, 5] {
             h.hear("r", &line("r", 0, seq, Duration::ZERO, 0), t0, &checks);
         }
+        assert_eq!(checks.report()["chat.in_order_once"].violated, 2);
+        h.account(&[6], &checks);
         let r = checks.report();
         assert_eq!(r["chat.in_order_once"].held, 2);
-        assert_eq!(r["chat.in_order_once"].violated, 2);
-        h.account(&[6], &checks);
-        assert_eq!(checks.report()["chat.all_heard"].violated, 1);
+        assert_eq!(r["chat.all_heard"].violated, 1);
     }
 }

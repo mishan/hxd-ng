@@ -59,6 +59,9 @@ pub enum Resumed {
 pub struct Sender {
     sink: SplitSink<Ws, Message>,
     next_id: u64,
+    /// How long one send may take: a server that has stopped reading
+    /// must not hold a sender forever.
+    pub timeout: Duration,
 }
 
 impl Sender {
@@ -70,9 +73,9 @@ impl Sender {
         if !params.is_null() {
             req["params"] = params;
         }
-        self.sink
-            .send(Message::Text(req.to_string()))
+        timeout(self.timeout, self.sink.send(Message::Text(req.to_string())))
             .await
+            .map_err(|_| Error::Timeout)?
             .map_err(ws_error)?;
         Ok(id)
     }
@@ -121,8 +124,10 @@ impl Receiver {
     /// The reply to `id`; events meanwhile go to the backlog, and an
     /// error reply is `Err(Refused)`.
     pub async fn reply(&mut self, id: u64) -> Result<Value> {
+        // For the whole wait: steady events must not stretch it.
+        let deadline = tokio::time::Instant::now() + self.timeout;
         loop {
-            let got = timeout(self.timeout, self.read())
+            let got = tokio::time::timeout_at(deadline, self.read())
                 .await
                 .map_err(|_| Error::Timeout)??;
             match got {
@@ -145,8 +150,9 @@ impl Receiver {
         {
             return Ok(self.backlog.remove(i).expect("position is in range"));
         }
+        let deadline = tokio::time::Instant::now() + self.timeout;
         loop {
-            let got = timeout(self.timeout, self.read())
+            let got = tokio::time::timeout_at(deadline, self.read())
                 .await
                 .map_err(|_| Error::Timeout)??;
             match got {
@@ -230,7 +236,9 @@ pub struct Client {
 impl Client {
     /// `ws://addr/ng`.
     pub async fn connect(addr: SocketAddr) -> Result<Client> {
-        let tcp = TcpStream::connect(addr).await?;
+        let tcp = timeout(DEFAULT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| Error::Timeout)??;
         tcp.set_nodelay(true)?;
         Client::over(Box::new(tcp), &format!("ws://{addr}/ng")).await
     }
@@ -242,11 +250,15 @@ impl Client {
         host: &str,
         config: Arc<ClientConfig>,
     ) -> Result<Client> {
-        let tcp = TcpStream::connect(addr).await?;
-        tcp.set_nodelay(true)?;
         let name = ServerName::try_from(host.to_owned())
             .map_err(|e| Error::Protocol(format!("server name: {e}")))?;
-        let tls = TlsConnector::from(config).connect(name, tcp).await?;
+        let tls = timeout(DEFAULT_TIMEOUT, async {
+            let tcp = TcpStream::connect(addr).await?;
+            tcp.set_nodelay(true)?;
+            TlsConnector::from(config).connect(name, tcp).await
+        })
+        .await
+        .map_err(|_| Error::Timeout)??;
         Client::over(Box::new(tls), &format!("wss://{host}/ng")).await
     }
 
@@ -261,7 +273,11 @@ impl Client {
         .map_err(|e| Error::Protocol(format!("upgrade: {e}")))?;
         let (sink, stream) = ws.split();
         Ok(Client {
-            tx: Sender { sink, next_id: 1 },
+            tx: Sender {
+                sink,
+                next_id: 1,
+                timeout: DEFAULT_TIMEOUT,
+            },
             rx: Receiver {
                 stream,
                 backlog: VecDeque::new(),

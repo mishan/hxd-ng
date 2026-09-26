@@ -46,9 +46,18 @@ from its own output.
   ng port, `metrics`, the server's `log`, the `accounts` and the `admin`
   account the churn uses.
 - `[run]`: `scenario`, `duration` in seconds, `seed` for every random
-  choice, `settle` (how long readers may take to hear the last line),
-  `teardown` (how long the server has to empty its roster), and the
-  nick `prefix`.
+  choice, `settle` (how long readers may take to hear the last line;
+  five seconds by default), `teardown` (how long the server has to
+  empty its roster), and the nick `prefix`.
+
+`settle` is where open-loop measurement stops: a line not heard within
+it counts as not heard at all, and its latency is missing from the
+report. A server slower than `settle` therefore shows as one that loses
+lines (`chat.all_heard`), and a run that expects one should raise it.
+
+Every time is checked before the run starts; one that would divide by
+zero, spin, or make no sense is refused, as is a scenario that needs a
+port or an account the target does not name.
 - One section per scenario, below.
 
 Every nick and chat line carries a tag unique to the run, so the checks
@@ -98,7 +107,13 @@ everything the chat scenario holds it to.
 
 - `ng` account sessions that read for a while (mean `cycle` seconds),
   drop their connection, stay away (mean `away`), and resume; a
-  session that was kicked logs in again.
+  session that was kicked logs in again. A session is given up only
+  when it is over — kicked, or expired on the server's word. A lost
+  connection or a resume that failed goes back through `resume`, a few
+  times, rather than a fresh login that would leave the old session
+  detached on the roster and blame the server for the ghost. At the
+  end every session logs out, resuming first if its connection is
+  gone.
 - `legacy` guests that come and go in four ways: gone after the magic,
   gone with a login sent and unanswered, logged in and leaving
   cleanly, logged in and vanishing.
@@ -132,14 +147,15 @@ a rule the protocol does not make.
 | `chat.stayed` | Nobody in the room lost their connection or was kicked. |
 | `ng.seq_gapless` | Every ng session's seqs went up by one, across every resume. |
 | `churn.connection_kept` | An attached ng connection was lost only after a kick. |
-| `churn.ended_only_by_kick` | An ng session ended only when it was kicked. |
+| `churn.ended_only_by_kick` | Only a session that was kicked is told it was. |
 | `churn.session_kept` | A detached session was still there when it came back, unless it was kicked. |
 | `churn.seq_never_back` | A resync never took a session's seq backwards. |
 | `roster.agrees` | Once things are quiet, every client's user list shows exactly the run's clients still present. |
-| `roster.no_ghosts` | After everyone has left, a fresh client's list shows none of them. |
+| `roster.no_ghosts` | After everyone has left, a fresh client's list shows none of them. The observer has a nick of its own, as does the churn's moderator, so neither hides a client's ghost. |
 | `roster.sessions_return` | With metrics, the server's own session count returns to where it was. |
-| `server.log_clean` | With `log`, the server wrote no panic and no `ERROR` line during the run. |
-| `slow.disconnected`, `slow.bounded` | The slow consumer's verdicts, above. |
+| `server.log_clean` | With `log`, the server wrote no panic and no `ERROR` line during the run (terminal colors stripped). |
+| `server.reachable` | With metrics, the server still answers once the run is over. A run whose server died still writes its report. |
+| `slow.disconnected`, `slow.bounded` | The slow consumer's verdicts, above. Its roster check takes the stalled clients as listed or not, since a server that does the right thing has dropped them. |
 
 ## 5. Its own tests
 

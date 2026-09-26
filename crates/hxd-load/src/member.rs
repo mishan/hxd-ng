@@ -54,7 +54,17 @@ impl Member {
     /// Connect client `i` on `wire` and log in: to an account when given
     /// one, else as a guest.
     pub async fn join(ctx: &Ctx, wire: Wire, i: usize, creds: Creds) -> Result<Member, Error> {
-        let nick = ctx.nick(wire.letter(), i);
+        Member::join_as(ctx, wire, ctx.nick(wire.letter(), i), creds).await
+    }
+
+    /// The same, under a nick the caller chose: the observer's and the
+    /// moderator's, which must not be any client's the checks look for.
+    pub async fn join_as(
+        ctx: &Ctx,
+        wire: Wire,
+        nick: String,
+        creds: Creds,
+    ) -> Result<Member, Error> {
         let t = &ctx.scenario.target;
         let conn = match wire {
             Wire::Legacy | Wire::LegacyTls => {
@@ -241,18 +251,18 @@ impl Rx {
 }
 
 /// Once things are quiet, every member's user list shows exactly this
-/// run's clients who are still here — `members`, and `also`, whose lists
-/// are not asked for — with nobody missing and nobody extra.
-pub async fn roster_agrees(ctx: &Ctx, members: &mut [Member], also: &[String]) {
-    let expect: BTreeSet<String> = members
-        .iter()
-        .map(|m| m.nick.clone())
-        .chain(also.iter().cloned())
-        .collect();
+/// run's `members`, with nobody missing and nobody extra. `either` are
+/// this run's clients that may or may not still be listed — stalled ones
+/// the server may rightly have disconnected — and are not looked for.
+pub async fn roster_agrees(ctx: &Ctx, members: &mut [Member], either: &[String]) {
+    let expect: BTreeSet<String> = members.iter().map(|m| m.nick.clone()).collect();
     for m in members.iter_mut() {
         match m.nicks().await {
             Ok(nicks) => {
-                let ours: BTreeSet<String> = nicks.into_iter().filter(|n| ctx.ours(n)).collect();
+                let ours: BTreeSet<String> = nicks
+                    .into_iter()
+                    .filter(|n| ctx.ours(n) && !either.contains(n))
+                    .collect();
                 ctx.checks.check("roster.agrees", ours == expect, || {
                     let missing: Vec<_> = expect.difference(&ours).collect();
                     let extra: Vec<_> = ours.difference(&expect).collect();
@@ -275,7 +285,7 @@ pub async fn no_ghosts(ctx: &Ctx, before: Option<&crate::target::Scrape>) {
     } else {
         Wire::Legacy
     };
-    match Member::join(ctx, wire, 0, None).await {
+    match Member::join_as(ctx, wire, ctx.nick('O', 0), None).await {
         Ok(mut observer) => {
             let observer_nick = observer.nick.clone();
             let mut left = BTreeSet::new();
