@@ -288,6 +288,13 @@ async fn serve_one<S: HtxfStream>(
             let alive = Liveness::new(core, transfer.principal);
             serve_download(stream, transfer, &alive, timeouts.idle).await
         }
+        PreparedTransfer::Banner(banner) => {
+            write_idle(&mut stream, &banner.bytes, timeouts.idle).await?;
+            tokio::time::timeout(timeouts.idle, stream.shutdown())
+                .await
+                .map_err(|_| stalled())?
+                .map_err(|e| FileError::Unavailable(e.to_string()))
+        }
         PreparedTransfer::Upload(transfer) => {
             let alive = Liveness::new(core, transfer.principal);
             let timeout = transfer.source.limits().upload_timeout;

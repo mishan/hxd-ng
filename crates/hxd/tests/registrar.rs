@@ -45,7 +45,7 @@ async fn start(dir: &Path, registrar_extra: &str) -> Server {
     std::fs::write(&config_path, &text).unwrap();
     let config = hxd::Config::load(&config_path).unwrap();
     hxd::check_config(&config).unwrap();
-    let ctx = hxd::build_ctx(&config, None, None, None).unwrap();
+    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
     let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
         .unwrap()
         .unwrap();

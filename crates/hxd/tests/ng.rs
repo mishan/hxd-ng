@@ -57,6 +57,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
             news: Default::default(),
         }),
         files: None,
+        banner: None,
     };
     let ng_ctx = NgCtx {
         core,

@@ -87,10 +87,37 @@ impl std::fmt::Debug for PreparedUpload {
     }
 }
 
+/// The server banner, fetched raw: mhxd sends a banner's bytes with no
+/// FILP framing around them (`htxf.c`, the `preview` path), and every
+/// client that asks for one reads exactly that.
+#[derive(Clone)]
+pub struct PreparedBanner {
+    pub principal: FilePrincipal,
+    pub account: String,
+    /// As for [`PreparedDownload::peer`].
+    pub peer: Option<IpAddr>,
+    /// The image as it was when the reference was issued, so the size in
+    /// the reply is the size that arrives even if the banner is reloaded
+    /// in between.
+    pub bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for PreparedBanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedBanner")
+            .field("principal", &self.principal)
+            .field("account", &self.account)
+            .field("peer", &self.peer)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PreparedTransfer {
     Download(PreparedDownload),
     Upload(PreparedUpload),
+    Banner(PreparedBanner),
 }
 
 impl PreparedTransfer {
@@ -98,6 +125,7 @@ impl PreparedTransfer {
         match self {
             PreparedTransfer::Download(value) => value.principal,
             PreparedTransfer::Upload(value) => value.principal,
+            PreparedTransfer::Banner(value) => value.principal,
         }
     }
 
@@ -105,6 +133,7 @@ impl PreparedTransfer {
         match self {
             PreparedTransfer::Download(value) => &value.account,
             PreparedTransfer::Upload(value) => &value.owner,
+            PreparedTransfer::Banner(value) => &value.account,
         }
     }
 
@@ -112,6 +141,7 @@ impl PreparedTransfer {
         match self {
             PreparedTransfer::Download(value) => value.peer,
             PreparedTransfer::Upload(value) => value.peer,
+            PreparedTransfer::Banner(value) => value.peer,
         }
     }
 }
@@ -249,10 +279,17 @@ impl TransferRegistry {
         if !live || !from_peer {
             return Err(FileError::NotFound);
         }
-        if preamble.type_code != 0 {
-            return Err(FileError::InvalidPath);
-        }
         let (declined_quote, resolved_len) = match &entry.transfer {
+            // A banner handshake names HTXF_TYPE_BANNER, which mhxd never
+            // reads: the reference alone says what is being fetched, so
+            // any type is taken. Nothing resumes a banner.
+            PreparedTransfer::Banner(_) => {
+                if preamble.flags & htxf::FLAG_RESUME != 0 {
+                    return Err(FileError::InvalidPath);
+                }
+                (false, None)
+            }
+            _ if preamble.type_code != 0 => return Err(FileError::InvalidPath),
             PreparedTransfer::Download(transfer) => {
                 // The download handshake's Data size is not consulted. The
                 // protocol has the client send 0 there (Hotline.md,

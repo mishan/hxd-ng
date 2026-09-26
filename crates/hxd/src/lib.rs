@@ -21,6 +21,7 @@ use hxd_ng_session::{
 use hxd_session::{cap, Caps, ServerConfig, ServerCtx, TrtpLogin};
 use serde::Deserialize;
 
+pub mod banner;
 pub mod files;
 pub mod moderation;
 pub mod push;
@@ -87,6 +88,9 @@ pub struct Config {
     /// The legacy wire over TLS, on a port of its own. Absent = the
     /// plaintext port only, as every Hotline server has always had.
     pub tls: Option<tls::TlsSection>,
+    /// The server banner. Absent = none, as on a server that never had
+    /// one: the login reply's banner id is 0 either way.
+    pub banner: Option<banner::BannerSection>,
 }
 
 /// `[push]`: where a notification goes when nobody is watching.
@@ -1965,6 +1969,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     }
     registrar::check(config)?;
     tls::check(config)?;
+    banner::check(config)?;
     if let Some(inbox) = &config.inbox {
         hxd_core::InboxPolicy {
             max_queued: inbox.max_queued,
@@ -2743,6 +2748,7 @@ pub fn build_ctx(
     voice: Option<&Voice>,
     files: Option<&Files>,
     push: Option<&Push>,
+    banner: Option<Arc<hxd_session::Banner>>,
 ) -> Result<ServerCtx, String> {
     FileAuth::bootstrap(&config.paths.accounts)
         .map_err(|e| format!("{}: {e}", config.paths.accounts.display()))?;
@@ -2871,6 +2877,7 @@ pub fn build_ctx(
                 .unwrap_or_default(),
         }),
         files: files.map(|value| value.service.clone()),
+        banner,
     })
 }
 

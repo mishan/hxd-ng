@@ -45,12 +45,14 @@ fn init_tracing() {
 /// key should not have to restart the server and drop everyone else to
 /// do it. `systemctl reload` sends exactly this. It also re-reads
 /// `[tls]`'s certificate and key from the paths the server started with,
-/// so a renewal reaches the next handshake without dropping a session.
+/// so a renewal reaches the next handshake without dropping a session,
+/// and `[banner]`'s file, which the next client to agree is shown.
 #[cfg(unix)]
 async fn reload_on_hangup(
     core: std::sync::Arc<hxd_core::Core>,
     registrar: Option<std::sync::Arc<hxd_registrar::Registrar>>,
     tls: Option<std::sync::Arc<hxd_session::LegacyTls>>,
+    banner: Option<std::sync::Arc<hxd_session::Banner>>,
     path: PathBuf,
 ) {
     let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -83,6 +85,16 @@ async fn reload_on_hangup(
                 Err(e) => {
                     tracing::error!("SIGHUP: [tls] {e}; the certificate in use is unchanged")
                 }
+            }
+        }
+        if let Some(banner) = banner.as_deref().filter(|b| b.image_len().is_some()) {
+            match banner.reload() {
+                Ok(()) => tracing::info!(
+                    "SIGHUP: banner {} ({} bytes)",
+                    String::from_utf8_lossy(&banner.kind()),
+                    banner.image_len().unwrap_or_default()
+                ),
+                Err(e) => tracing::error!("SIGHUP: [banner] {e}; the banner in use is unchanged"),
             }
         }
     }
@@ -665,6 +677,8 @@ async fn main() {
         }
         let voice = hxd::voice::build(&config)?;
         let files = hxd::files::build(&config)?;
+        let htxf = hxd::files::htxf(&config, files.as_ref())?;
+        let banner = hxd::banner::build(&config, htxf.as_ref().map(|h| &h.registry))?;
         let tls = hxd::tls::build(&config)?;
         // The push configuration is checked here; the VAPID key is read
         // in `build_ctx`, once the device registry is open to say whether
@@ -674,11 +688,11 @@ async fn main() {
         // Bind HTXF before either frontend advertises Files. A configured
         // but unavailable transfer port is a startup failure, never a
         // capability promise that downloads cannot fulfill.
-        let files_listener = match files.as_ref() {
-            Some(files) => Some(
-                TcpListener::bind(&files.bind)
+        let htxf_listener = match htxf.as_ref() {
+            Some(htxf) => Some(
+                TcpListener::bind(&htxf.bind)
                     .await
-                    .map_err(|e| format!("files bind {}: {e}", files.bind))?,
+                    .map_err(|e| format!("files bind {}: {e}", htxf.bind))?,
             ),
             None => None,
         };
@@ -690,7 +704,13 @@ async fn main() {
             ),
             None => None,
         };
-        let ctx = build_ctx(&config, voice.as_ref(), files.as_ref(), push.as_ref())?;
+        let ctx = build_ctx(
+            &config,
+            voice.as_ref(),
+            files.as_ref(),
+            push.as_ref(),
+            banner.clone(),
+        )?;
         // The reserved account takes its uid before any client can
         // connect: a period client needs a real uid on a private
         // message for a window to open, and needs it to still be there
@@ -750,7 +770,7 @@ async fn main() {
         let ng_ctx =
             hxd::build_ng_ctx(&config, &ctx, voice.as_ref(), files.as_ref(), push.as_ref())?;
 
-        if let (Some(files), Some(listener)) = (files.as_ref(), files_listener) {
+        if let Some(files) = files.as_ref() {
             let section = config.files.as_ref().expect("Files service has config");
             let source = section
                 .root
@@ -764,10 +784,22 @@ async fn main() {
                 })
                 .expect("validated Files source");
             tracing::info!("Files from {} with HTXF on {}", source, files.bind);
+        }
+        if let Some(banner) = banner.as_deref() {
+            match (banner.image_len(), htxf.as_ref()) {
+                (Some(len), Some(htxf)) => tracing::info!(
+                    "banner {} ({len} bytes) with HTXF on {}",
+                    String::from_utf8_lossy(&banner.kind()),
+                    htxf.bind
+                ),
+                _ => tracing::info!("banner from its URL"),
+            }
+        }
+        if let (Some(htxf), Some(listener)) = (htxf.as_ref(), htxf_listener) {
             // One pool of transfer connections, whichever port they came in on.
             let slots = hxd_files::HtxfSlots::default();
-            let registry = files.service.transfers.clone();
-            let timeouts = files.timeouts;
+            let registry = htxf.registry.clone();
+            let timeouts = htxf.timeouts;
             tokio::spawn(hxd_files::serve_htxf_with(
                 listener,
                 slots.clone(),
@@ -908,6 +940,7 @@ async fn main() {
             ctx.core.clone(),
             ng_ctx.as_ref().and_then(|n| n.registrar.clone()),
             tls.as_ref().map(|t| t.tls.clone()),
+            banner,
             config_path.clone(),
         ));
 

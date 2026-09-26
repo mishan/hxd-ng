@@ -3,6 +3,7 @@
 //! Hotline-ng protocol frontend will be a sibling of this crate, not an
 //! extension of it — both speak to `hxd-core`.
 
+pub mod banner;
 pub mod caps;
 pub mod encoding;
 mod files;
@@ -14,6 +15,7 @@ pub mod tls;
 pub mod video;
 pub mod voice;
 
+pub use banner::Banner;
 pub use caps::{cap, Caps};
 pub use encoding::TextEncoding;
 pub use news::{FlatNews, FlatReply, LegacyNews};

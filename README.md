@@ -234,15 +234,33 @@ accounts = "accounts"
 agreement = "agreement.txt"
 ```
 
+### Banner
+
+An optional `[banner]` section gives the server a banner, the image a
+1.5+ client shows above its windows. It is sent after the agreement,
+as mhxd sends it. A banner file is held here and fetched over HTXF, on
+the files port whether or not `[files]` is on (and on the TLS transfer
+port with `[tls]`); a URL alone has the client fetch the image itself.
+
+```toml
+[banner]
+file = "banner.jpg"               # JPEG, GIF or PNG, at most 1 MiB
+url = "https://hl.example/"       # with file: where a click goes;
+                                  # alone: where the image is
+```
+
+Classic clients show JPEG and GIF. The file is re-read on SIGHUP, and
+one that no longer loads leaves the banner in use as it was.
+
 ### TLS on the legacy wire
 
 An optional `[tls]` section opens a second control port that speaks TLS
 from its first byte and the unchanged Hotline protocol inside it — the
 separate-port model GtkHx, Janus and Mobius share. Period clients keep
 the plaintext port; a client that speaks TLS connects here instead, and
-its session is marked encrypted, as a tunnelled one is. With `[files]`,
-a TLS transfer port sits one above the TLS control port, where a client
-looks for it.
+its session is marked encrypted, as a tunnelled one is. With `[files]`
+or a banner file, a TLS transfer port sits one above the TLS control
+port, where a client looks for it.
 
 ```toml
 [tls]

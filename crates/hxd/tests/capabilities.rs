@@ -46,6 +46,7 @@ async fn start_server(dir: &Path, supported: Caps, ng_caps: &[&str]) -> (SocketA
             news: Default::default(),
         }),
         files: None,
+        banner: None,
     };
     let ng_ctx = NgCtx {
         core: ctx.core.clone(),
