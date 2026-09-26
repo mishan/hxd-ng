@@ -41,6 +41,13 @@ deviations from mhxd are commented in `hxd-session/src/banner.rs` and
 | `type` | For a banner held here, its media type at login. The response's `Content-Type` is the one to believe: a SIGHUP may change the file under the same path. |
 | `link` | Where a click on the banner goes. Absent means nowhere. It is the operator's to write and may be any URL — a classic banner often links to a `hotline://` — so a client MUST check its scheme as it would a link in chat, and SHOULD open it outside itself. |
 
+`"/banner"` is a path on the ng endpoint's own HTTP origin — the
+WebSocket URL's, with `ws` read as `http` and `wss` as `https` — and
+never on the origin of a page a browser client was loaded from, which
+may be somewhere else entirely. Since it needs `Authorization`, a
+browser fetches it and shows the bytes from a blob: an `<img src>`
+cannot carry the bearer.
+
 ### 3.2 `GET /banner`
 
 ```

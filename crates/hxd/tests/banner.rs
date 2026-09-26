@@ -441,8 +441,18 @@ async fn ng_login(address: SocketAddr) -> (Value, String) {
 
 /// `GET path` with these headers: the status, the headers and the body.
 async fn get(address: SocketAddr, path: &str, headers: &[(&str, &str)]) -> (u16, String, Vec<u8>) {
+    request(address, "GET", path, headers).await
+}
+
+async fn request(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (u16, String, Vec<u8>) {
     let mut stream = TcpStream::connect(address).await.unwrap();
-    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
     for (name, value) in headers {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -578,4 +588,64 @@ async fn a_page_elsewhere_may_fetch_the_banner() {
     assert_eq!(status, 401);
     let error: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(error["error"]["code"], "not_logged_in");
+}
+
+#[tokio::test]
+async fn a_browser_preflight_for_the_banner_is_answered() {
+    // A page sends this before any fetch that carries `Authorization`;
+    // without an answer, it never sends the fetch.
+    let server = start(Shown::File(&gif(64), None)).await;
+    let (status, head, _) = request(
+        server.ng,
+        "OPTIONS",
+        "/banner",
+        &[
+            ("Origin", "https://web.example"),
+            ("Access-Control-Request-Method", "GET"),
+            (
+                "Access-Control-Request-Headers",
+                "authorization, if-none-match",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(status, 204);
+    assert!(header(&head, "access-control-allow-methods")
+        .unwrap()
+        .contains("get"));
+    let allowed = header(&head, "access-control-allow-headers").unwrap();
+    assert!(
+        allowed.contains("authorization") && allowed.contains("if-none-match"),
+        "{allowed}"
+    );
+}
+
+#[tokio::test]
+async fn the_binary_gives_the_ng_frontend_the_same_banner() {
+    // Built as `hxd` builds a server from its config, not by hand: the
+    // wiring between the two frontends is what this is about.
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    let text = format!(
+        "[server]\nbind = \"127.0.0.1:0\"\n[paths]\naccounts = \"{d}/accounts\"\n\
+         [ng]\nbind = \"127.0.0.1:0\"\n\
+         [banner]\nurl = \"https://hl.example/banner.jpg\"\n"
+    );
+    let path = dir.path().join("hxd-ng.toml");
+    std::fs::write(&path, text).unwrap();
+    let config = hxd::Config::load(&path).unwrap();
+    hxd::check_config(&config).unwrap();
+    let banner = hxd::banner::build(&config, None).unwrap();
+    let ctx = hxd::build_ctx(&config, None, None, None, banner).unwrap();
+    let ng = hxd::build_ng_ctx(&config, &ctx, None, None, None)
+        .unwrap()
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(hxd_ng_session::serve(listener, ng));
+    let (ok, _) = ng_login(address).await;
+    assert_eq!(
+        ok["banner"],
+        json!({ "url": "https://hl.example/banner.jpg" })
+    );
 }
