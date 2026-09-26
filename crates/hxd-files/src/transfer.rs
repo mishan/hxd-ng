@@ -288,6 +288,9 @@ async fn serve_one<S: HtxfStream>(
             let alive = Liveness::new(core, transfer.principal);
             serve_download(stream, transfer, &alive, timeouts.idle).await
         }
+        // No `Liveness` check: a banner is at most 1 MiB, already in memory,
+        // and finishes within `idle`; a kick mid-banner costs nothing worth
+        // interrupting it for.
         PreparedTransfer::Banner(banner) => {
             write_idle(&mut stream, &banner.bytes, timeouts.idle).await?;
             tokio::time::timeout(timeouts.idle, stream.shutdown())

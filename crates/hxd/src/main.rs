@@ -87,8 +87,13 @@ async fn reload_on_hangup(
                 }
             }
         }
-        if let Some(banner) = banner.as_deref().filter(|b| b.image_len().is_some()) {
-            match banner.reload() {
+        if let Some(banner) = banner.as_ref().filter(|b| b.image_len().is_some()) {
+            // A file read, so on the blocking pool rather than this task.
+            let reloading = banner.clone();
+            let reloaded = tokio::task::spawn_blocking(move || reloading.reload())
+                .await
+                .unwrap_or_else(|e| Err(format!("reload task: {e}")));
+            match reloaded {
                 Ok(()) => tracing::info!(
                     "SIGHUP: banner {} ({} bytes)",
                     String::from_utf8_lossy(&banner.kind()),
@@ -692,7 +697,7 @@ async fn main() {
             Some(htxf) => Some(
                 TcpListener::bind(&htxf.bind)
                     .await
-                    .map_err(|e| format!("files bind {}: {e}", htxf.bind))?,
+                    .map_err(|e| format!("transfer (HTXF) bind {}: {e}", htxf.bind))?,
             ),
             None => None,
         };

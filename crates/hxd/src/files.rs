@@ -140,7 +140,13 @@ pub fn htxf(config: &Config, files: Option<&Files>) -> Result<Option<Htxf>, Stri
                 per_account: crate::default_files_max_references_per_account(),
             },
         )),
-        bind: transfer_bind(&config.server.bind)?,
+        // Only a banner brings this listener up, so the error says so
+        // rather than pointing at a [files] section that is not there.
+        bind: transfer_bind(&config.server.bind).map_err(|_| {
+            "a [banner] file is fetched on the control port plus one, which needs a numeric \
+             [server] bind (an address, not a host name)"
+                .to_string()
+        })?,
         timeouts: HtxfTimeouts {
             handshake: Duration::from_secs(crate::default_files_handshake_timeout()),
             idle: Duration::from_secs(crate::default_files_idle_timeout()),
@@ -173,6 +179,14 @@ mod tests {
         let url = config("[banner]\nurl = \"https://hl.example/b.gif\"\n");
         assert!(htxf(&url, None).unwrap().is_none());
         assert!(htxf(&config(""), None).unwrap().is_none());
+        // A host name cannot be added to, and the error says why, and
+        // not in terms of a [files] section there is none of.
+        let named = config("[server]\nbind = \"localhost:5500\"\n[banner]\nfile = \"b.gif\"\n");
+        let error = htxf(&named, None).err().unwrap();
+        assert!(
+            error.contains("[banner]") && !error.contains("[files]"),
+            "{error}"
+        );
     }
 
     #[test]

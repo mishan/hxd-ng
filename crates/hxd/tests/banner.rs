@@ -28,9 +28,12 @@ const HTXF_TYPE_BANNER: u16 = 2;
 
 struct Running {
     legacy: SocketAddr,
+    /// The same server, reached as through the `/trtp` tunnel.
+    tunnelled: SocketAddr,
     htxf: SocketAddr,
     core: Arc<Core>,
-    _temp: tempfile::TempDir,
+    banner: Option<Arc<Banner>>,
+    temp: tempfile::TempDir,
 }
 
 enum Shown<'a> {
@@ -71,14 +74,32 @@ async fn start(shown: Shown<'_>) -> Running {
         files: None,
         banner: banner.map(Arc::new),
     };
+    let banner = ctx.banner.clone();
     let legacy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let transfer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tunnel = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let running = Running {
         legacy: legacy.local_addr().unwrap(),
+        tunnelled: tunnel.local_addr().unwrap(),
         htxf: transfer.local_addr().unwrap(),
         core: core.clone(),
-        _temp: temp,
+        banner,
+        temp,
     };
+    // `run_session` is what the ng frontend hands a tunnelled stream to:
+    // the protocol is the same, and the peer is not the client's address.
+    let tunnel_ctx = ctx.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, peer)) = tunnel.accept().await {
+            tokio::spawn(hxd_session::run_session(
+                stream,
+                peer,
+                tunnel_ctx.clone(),
+                Default::default(),
+                Default::default(),
+            ));
+        }
+    });
     tokio::spawn(hxd_session::serve(legacy, ctx));
     tokio::spawn(hxd_files::serve_htxf(
         transfer,
@@ -253,7 +274,7 @@ async fn a_banner_past_64k_states_its_size_in_four_bytes() {
 }
 
 #[tokio::test]
-async fn another_session_cannot_redeem_a_banner_reference() {
+async fn a_banner_reference_ends_with_its_session() {
     let image = gif(64);
     let server = start(Shown::File(&image, None)).await;
     let mut client = Client::login(server.legacy, 190).await;
@@ -308,4 +329,51 @@ async fn a_client_that_never_agrees_is_never_sent_one() {
     assert!(pushed.iter().all(|f| f.ty != BANNER && f.ty != AGREEMENT));
     let trans = client.send(DOWNLOAD_BANNER, &[]).await;
     assert_eq!(client.task(trans).await.flag & 1, 1);
+}
+
+#[tokio::test]
+async fn a_reload_between_the_push_and_the_download_serves_what_was_pushed() {
+    let image = gif(300);
+    let server = start(Shown::File(&image, None)).await;
+    let mut client = Client::login(server.legacy, 190).await;
+    let banners = client.agree().await;
+    assert_eq!(field(&banners[0], tag::BANNER_TYPE).unwrap(), b"GIFf");
+
+    // The operator swaps in a JPEG and reloads.
+    let path = server.temp.path().join("banner");
+    std::fs::write(&path, [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]).unwrap();
+    server.banner.as_ref().unwrap().reload().unwrap();
+
+    let trans = client.send(DOWNLOAD_BANNER, &[]).await;
+    let reply = client.task(trans).await;
+    let size = uint(&field(&reply, tag::HTXF_SIZE).unwrap());
+    let reference = uint(&field(&reply, tag::HTXF_REF).unwrap());
+    assert_eq!(
+        fetch(server.htxf, reference, size).await,
+        image,
+        "the GIF it was told of"
+    );
+
+    // The next login is told of the JPEG.
+    let mut next = Client::login(server.legacy, 190).await;
+    assert_eq!(
+        field(&next.agree().await[0], tag::BANNER_TYPE).unwrap(),
+        b"JPEG"
+    );
+}
+
+#[tokio::test]
+async fn a_tunnelled_client_is_not_told_of_a_banner_it_cannot_fetch() {
+    let image = gif(64);
+    let server = start(Shown::File(&image, Some("https://hl.example/"))).await;
+    let mut tunnelled = Client::login(server.tunnelled, 190).await;
+    assert!(tunnelled.agree().await.is_empty());
+    let trans = tunnelled.send(DOWNLOAD_BANNER, &[]).await;
+    assert_eq!(tunnelled.task(trans).await.flag & 1, 1);
+
+    // A banner fetched from its URL needs no transfer port.
+    let server = start(Shown::Url("https://hl.example/b.jpg")).await;
+    let mut tunnelled = Client::login(server.tunnelled, 190).await;
+    let banners = tunnelled.agree().await;
+    assert_eq!(field(&banners[0], tag::BANNER_TYPE).unwrap(), b"URL ");
 }

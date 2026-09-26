@@ -809,9 +809,10 @@ struct Session {
     transfer_addr: Option<IpAddr>,
     /// Whether this session has been sent the banner, which happens once.
     banner_sent: bool,
-    /// Whether it may still download the banner it was sent: once, as on
-    /// mhxd, which is all a client showing it needs.
-    banner_fetch: bool,
+    /// The image this session was told of and may still download: once,
+    /// as on mhxd, which is all a client showing it needs. Kept rather
+    /// than read again, so the bytes are the ones the push described.
+    banner_image: Option<crate::banner::Image>,
 }
 
 impl Session {
@@ -1348,7 +1349,7 @@ async fn login_phase(
         media_stream: None,
         transfer_addr: None,
         banner_sent: false,
-        banner_fetch: false,
+        banner_image: None,
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -1868,16 +1869,25 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // is. Once per session, however often the client agrees.
             if let Some(banner) = ctx.banner.as_ref().filter(|_| !sess.banner_sent) {
                 sess.banner_sent = true;
-                sess.banner_fetch = banner.image().is_some();
-                push(tx, hdr::BANNER, banner.push_chunks());
+                let offer = banner.offer();
+                // A tunnelled session has no transfer port to fetch a held
+                // banner from: `hlid tunnel` carries the control stream
+                // only, and the client would dial port + 1 on its own end
+                // of the tunnel. It is told of no banner rather than of one
+                // it cannot show. A banner fetched from its URL is fine.
+                let reachable = offer.image.is_none() || sess.transfer_addr.is_some();
+                if reachable {
+                    sess.banner_image = offer.image;
+                    push(tx, hdr::BANNER, offer.chunks);
+                }
             }
         }
 
         // No access bit, as on mhxd: the banner is the server's own
         // decoration, shown to every account that was sent it.
         t if t == ClientHdr::DownloadBanner.as_u32() => {
-            let image = ctx.banner.as_ref().and_then(|banner| banner.image());
-            let Some((image, transfers)) = image.filter(|_| sess.banner_fetch) else {
+            let transfers = ctx.banner.as_ref().and_then(|banner| banner.transfers());
+            let (Some(image), Some(transfers)) = (sess.banner_image.clone(), transfers) else {
                 // mhxd leaves this unanswered; a task error is kinder to a
                 // client waiting on its reply.
                 reply_error(tx, f.trans, "There is no banner to download.");
@@ -1906,7 +1916,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     return;
                 }
             };
-            sess.banner_fetch = false;
+            sess.banner_image = None;
             // mhxd sends the size in two bytes, truncating any banner past
             // 64 KiB. Those bytes exactly whenever they are right, and four
             // when they would not be: a client reads the field as an

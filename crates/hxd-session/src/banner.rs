@@ -77,6 +77,7 @@ impl Banner {
     /// do for a banner that is only a URL.
     pub fn reload(&self) -> Result<(), String> {
         if let Some(file) = &self.file {
+            // Read before the lock, so no push waits on the disk.
             let image = load(&file.path)?;
             *file.current.write().unwrap() = image;
         }
@@ -96,14 +97,22 @@ impl Banner {
         self.image().map(|(image, _)| image.bytes.len())
     }
 
-    /// The `HTLS_HDR_BANNER` payload: the type always, the URL when there
-    /// is one, which is what mhxd sends.
-    pub(crate) fn push_chunks(&self) -> Vec<(u16, Vec<u8>)> {
-        let mut chunks = vec![(tag::BANNER_TYPE, self.kind().to_vec())];
+    /// What one session is shown: the `HTLS_HDR_BANNER` payload — the
+    /// type always, the URL when there is one, which is what mhxd sends —
+    /// and the image that type describes, read together so a reload
+    /// between the push and the download cannot send one image under
+    /// another's type.
+    pub(crate) fn offer(&self) -> Offer {
+        let image = self
+            .file
+            .as_ref()
+            .map(|file| file.current.read().unwrap().clone());
+        let kind = image.as_ref().map_or(TYPE_URL, |i| i.kind);
+        let mut chunks = vec![(tag::BANNER_TYPE, kind.to_vec())];
         if let Some(url) = &self.url {
             chunks.push((tag::BANNER_URL, url.as_bytes().to_vec()));
         }
-        chunks
+        Offer { chunks, image }
     }
 
     /// The image held here and the registry its transfers are issued from.
@@ -115,6 +124,18 @@ impl Banner {
             )
         })
     }
+
+    /// The registry a held banner's transfers are issued from.
+    pub(crate) fn transfers(&self) -> Option<&TransferRegistry> {
+        self.file.as_ref().map(|file| file.transfers.as_ref())
+    }
+}
+
+/// See [`Banner::offer`].
+pub(crate) struct Offer {
+    pub chunks: Vec<(u16, Vec<u8>)>,
+    /// The image to download, for a banner held here.
+    pub image: Option<Image>,
 }
 
 /// Read a banner file, refusing one too large to serve or in a format no
@@ -176,10 +197,8 @@ mod tests {
         ))
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hxd-banner-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+    fn scratch(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        dir.path().join(name)
     }
 
     #[test]
@@ -196,7 +215,7 @@ mod tests {
     fn a_url_banner_sends_its_type_and_url() {
         let banner = Banner::url("https://hl.example/b.jpg".into());
         assert_eq!(
-            banner.push_chunks(),
+            banner.offer().chunks,
             vec![
                 (tag::BANNER_TYPE, b"URL ".to_vec()),
                 (tag::BANNER_URL, b"https://hl.example/b.jpg".to_vec()),
@@ -208,11 +227,12 @@ mod tests {
 
     #[test]
     fn a_file_banner_is_typed_by_its_image_and_keeps_its_link() {
-        let path = scratch("link.gif");
+        let dir = tempfile::tempdir().unwrap();
+        let path = scratch(&dir, "link.gif");
         std::fs::write(&path, b"GIF89a-body").unwrap();
         let banner = Banner::file(&path, Some("https://hl.example/".into()), registry()).unwrap();
         assert_eq!(
-            banner.push_chunks(),
+            banner.offer().chunks,
             vec![
                 (tag::BANNER_TYPE, b"GIFf".to_vec()),
                 (tag::BANNER_URL, b"https://hl.example/".to_vec()),
@@ -222,14 +242,15 @@ mod tests {
 
         let bare = Banner::file(&path, None, registry()).unwrap();
         assert_eq!(
-            bare.push_chunks(),
+            bare.offer().chunks,
             vec![(tag::BANNER_TYPE, b"GIFf".to_vec())]
         );
     }
 
     #[test]
     fn files_too_large_or_of_no_known_format_are_refused() {
-        let path = scratch("big.jpg");
+        let dir = tempfile::tempdir().unwrap();
+        let path = scratch(&dir, "big.jpg");
         let mut big = vec![0xff, 0xd8, 0xff];
         big.resize(MAX_BANNER_BYTES + 1, 0);
         std::fs::write(&path, &big).unwrap();
@@ -244,18 +265,19 @@ mod tests {
             Some(MAX_BANNER_BYTES)
         );
 
-        let path = scratch("banner.jpg");
+        let path = scratch(&dir, "banner.jpg");
         std::fs::write(&path, b"not an image").unwrap();
         assert!(Banner::file(&path, None, registry())
             .err()
             .unwrap()
             .contains("JPEG, GIF or PNG"));
-        assert!(Banner::file(&scratch("missing.jpg"), None, registry()).is_err());
+        assert!(Banner::file(&scratch(&dir, "missing.jpg"), None, registry()).is_err());
     }
 
     #[test]
     fn a_reload_takes_the_new_image_or_keeps_the_old_one() {
-        let path = scratch("reload");
+        let dir = tempfile::tempdir().unwrap();
+        let path = scratch(&dir, "reload");
         std::fs::write(&path, b"GIF89a-old").unwrap();
         let banner = Banner::file(&path, None, registry()).unwrap();
 
