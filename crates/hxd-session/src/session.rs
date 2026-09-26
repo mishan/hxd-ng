@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use hxd_core::access::bit;
+use hxd_core::instrument::{self, Dir, Kind};
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
@@ -233,6 +234,7 @@ pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::Le
         // A banned address costs no handshake.
         if ctx.core.is_banned(peer.ip()) {
             info!(%peer, "refusing banned address");
+            instrument::disconnect(WIRE, "banned");
             continue;
         }
         let Ok(permit) = handshakes.clone().try_acquire_owned() else {
@@ -295,13 +297,99 @@ enum Outbound {
     },
 }
 
+impl Outbound {
+    /// What this frame will take on the wire, near enough: the header,
+    /// and each chunk's four bytes of tag and length plus its data. For
+    /// the write-queue gauges, which only need to be the same number on
+    /// the way in and on the way out.
+    fn wire_len(&self) -> usize {
+        let chunks = match self {
+            Outbound::Reply { chunks, .. }
+            | Outbound::Push { chunks, .. }
+            | Outbound::Notify { chunks, .. } => chunks,
+        };
+        hxproto::HL_HDR_LEN + chunks.iter().map(|(_, d)| 4 + d.len()).sum::<usize>()
+    }
+}
+
 type Tx = UnboundedSender<Outbound>;
+
+/// Queue a frame for the writer. Every frame goes through here, so the
+/// write-queue gauges count what the writer later takes off them.
+fn enqueue(tx: &Tx, out: Outbound) {
+    let len = out.wire_len() as i64;
+    instrument::write_queued(WIRE, 1, len);
+    if tx.send(out).is_err() {
+        instrument::write_queued(WIRE, -1, -len);
+    }
+}
+
+/// This frontend's name in the metrics.
+const WIRE: &str = "legacy";
+
+/// Inbound transaction types the session answers: what an inbound frame
+/// may be labeled as (`hxd_core::instrument`). Anything else, whatever a
+/// client sends, is `other`, so a client cannot mint series.
+const HANDLED: &[ClientHdr] = &[
+    ClientHdr::AgreementAgree,
+    ClientHdr::Chat,
+    ClientHdr::ChatCreate,
+    ClientHdr::ChatDecline,
+    ClientHdr::ChatInvite,
+    ClientHdr::ChatJoin,
+    ClientHdr::ChatPart,
+    ClientHdr::ChatSubject,
+    ClientHdr::DownloadBanner,
+    ClientHdr::FileGet,
+    ClientHdr::FileGetInfo,
+    ClientHdr::FileList,
+    ClientHdr::FilePut,
+    ClientHdr::GetChatHistory,
+    ClientHdr::Login,
+    ClientHdr::Msg,
+    ClientHdr::MsgBroadcast,
+    ClientHdr::Ping,
+    ClientHdr::UserChange,
+    ClientHdr::UserGetInfo,
+    ClientHdr::UserGetList,
+    ClientHdr::UserKick,
+    ClientHdr::VideoStart,
+    ClientHdr::VideoState,
+    ClientHdr::VideoStop,
+    ClientHdr::VideoSubscribe,
+    ClientHdr::VoiceIce,
+    ClientHdr::VoiceJoin,
+    ClientHdr::VoiceLeave,
+    ClientHdr::VoiceMute,
+    ClientHdr::VoiceSdpAnswer,
+];
+
+/// An inbound frame's type as a metric label.
+fn type_label(ty: u32) -> Kind<'static> {
+    let known = HANDLED.iter().any(|h| h.as_u32() == ty)
+        || news::handles(ty)
+        || ty == media::trans::UPLOAD_MEDIA
+        || ty == media::trans::DOWNLOAD_MEDIA
+        || matches!(ty, gif_icons::GET_LIST | gif_icons::GET | gif_icons::SET);
+    if known {
+        Kind::Type(ty)
+    } else {
+        Kind::Name("other")
+    }
+}
 
 async fn writer_task<W: AsyncWrite + Unpin>(mut wr: W, mut rx: UnboundedReceiver<Outbound>) {
     // Server pushes count their own transactions, starting at 1 (mhxd's
     // convention; clients ignore the value everywhere but task replies).
     let mut push_trans: u32 = 1;
     while let Some(out) = rx.recv().await {
+        instrument::queue_depth(WIRE, rx.len());
+        let queued = out.wire_len() as i64;
+        let label = match &out {
+            Outbound::Reply { .. } => Kind::Name("reply"),
+            // The server's own push types: a set the code fixes.
+            Outbound::Push { ty, .. } | Outbound::Notify { ty, .. } => Kind::Type(*ty),
+        };
         let bytes = match out {
             Outbound::Reply {
                 trans,
@@ -322,31 +410,45 @@ async fn writer_task<W: AsyncWrite + Unpin>(mut wr: W, mut rx: UnboundedReceiver
                 pack_frame(ty, 0, 0, &chunks)
             }
         };
-        if wr.write_all(&bytes).await.is_err() || wr.flush().await.is_err() {
+        let took = instrument::Timer::start();
+        let written = wr.write_all(&bytes).await.is_ok() && wr.flush().await.is_ok();
+        instrument::socket_write(WIRE, took);
+        instrument::write_queued(WIRE, -1, -queued);
+        if !written {
             break; // Reader will observe the dead socket and clean up.
         }
+        instrument::frame(WIRE, Dir::Out, label, bytes.len());
+    }
+    // What was queued and will now never be written leaves the gauges
+    // with the connection.
+    rx.close();
+    while let Ok(out) = rx.try_recv() {
+        instrument::write_queued(WIRE, -1, -(out.wire_len() as i64));
     }
     let _ = wr.shutdown().await;
 }
 
 /// Reader task: frames the socket into a bounded channel (backpressure for
 /// a flooding client). Exits on EOF, error, or a malformed frame.
-async fn reader_task<R: AsyncRead + Unpin>(mut rd: R, frames: Sender<Frame>) {
+/// Returns why it stopped, which is why the connection did when it was
+/// the reader that ended it.
+async fn reader_task<R: AsyncRead + Unpin>(mut rd: R, frames: Sender<Frame>) -> &'static str {
     loop {
         match read_frame(&mut rd).await {
             Ok(f) => {
+                instrument::frame(WIRE, Dir::In, type_label(f.ty), f.wire_len());
                 if frames.send(f).await.is_err() {
-                    return; // Session loop is gone.
+                    return "closed"; // Session loop is gone.
                 }
             }
-            Err(ReadError::Eof) => return,
+            Err(ReadError::Eof) => return "eof",
             Err(ReadError::Io(e)) => {
                 debug!("read error: {e}");
-                return;
+                return "io_error";
             }
             Err(ReadError::Malformed(why)) => {
                 warn!("malformed frame: {why}");
-                return;
+                return "malformed";
             }
         }
     }
@@ -375,11 +477,14 @@ fn trace_in(f: &Frame) {
 }
 
 fn reply(tx: &Tx, trans: u32, chunks: Vec<(u16, Vec<u8>)>) {
-    let _ = tx.send(Outbound::Reply {
-        trans,
-        error: false,
-        chunks,
-    });
+    enqueue(
+        tx,
+        Outbound::Reply {
+            trans,
+            error: false,
+            chunks,
+        },
+    );
 }
 
 /// Task error texts are the server's own words and ASCII, which is the
@@ -388,11 +493,14 @@ fn reply(tx: &Tx, trans: u32, chunks: Vec<(u16, Vec<u8>)>) {
 /// text that needed the connection's encoding would have to be passed it.
 fn reply_error(tx: &Tx, trans: u32, msg: &str) {
     debug_assert!(msg.is_ascii(), "task error text must be ASCII: {msg:?}");
-    let _ = tx.send(Outbound::Reply {
-        trans,
-        error: true,
-        chunks: vec![(tag::TASK_ERROR, text::from_utf8(msg))],
-    });
+    enqueue(
+        tx,
+        Outbound::Reply {
+            trans,
+            error: true,
+            chunks: vec![(tag::TASK_ERROR, text::from_utf8(msg))],
+        },
+    );
 }
 
 /// A task error carrying extra fields beside its text — the shape the
@@ -402,22 +510,25 @@ fn reply_error_with(tx: &Tx, trans: u32, msg: &str, extra: Vec<(u16, Vec<u8>)>) 
     debug_assert!(msg.is_ascii(), "task error text must be ASCII: {msg:?}");
     let mut chunks = vec![(tag::TASK_ERROR, text::from_utf8(msg))];
     chunks.extend(extra);
-    let _ = tx.send(Outbound::Reply {
-        trans,
-        error: true,
-        chunks,
-    });
+    enqueue(
+        tx,
+        Outbound::Reply {
+            trans,
+            error: true,
+            chunks,
+        },
+    );
 }
 
 fn push(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
-    let _ = tx.send(Outbound::Push { ty, chunks });
+    enqueue(tx, Outbound::Push { ty, chunks });
 }
 
 /// A server-initiated notification with task id 0 — see
 /// [`Outbound::Notify`]. The voice extension's 602/604/605 and the video
 /// extension's 611 use it.
 fn notify(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
-    let _ = tx.send(Outbound::Notify { ty, chunks });
+    enqueue(tx, Outbound::Notify { ty, chunks });
 }
 
 /// The domain is UTF-8; this edge speaks the connection's encoding. On
@@ -922,6 +1033,7 @@ async fn run_connection<S>(
 {
     if ctx.core.is_banned(peer.ip()) {
         info!("refusing banned address");
+        instrument::disconnect(WIRE, "banned");
         return;
     }
     let (mut rd, wr): (ReadHalf<S>, WriteHalf<S>) = tokio::io::split(stream);
@@ -930,13 +1042,18 @@ async fn run_connection<S>(
     // Read exactly the 12 client-hello bytes; anything the client pipelined
     // behind them (old hx logs in without waiting) stays in the socket
     // buffer and is handled by the normal frame loop.
+    let began = instrument::Timer::start();
     let mut magic = [0u8; 12];
     match timeout(ctx.cfg.login_timeout, rd.read_exact(&mut magic)).await {
         Ok(Ok(_)) => {}
-        _ => return,
+        _ => {
+            instrument::disconnect(WIRE, "handshake");
+            return;
+        }
     }
     if magic != CLIENT_MAGIC {
         debug!("bad client magic, dropping");
+        instrument::disconnect(WIRE, "handshake");
         return;
     }
 
@@ -945,22 +1062,42 @@ async fn run_connection<S>(
     // TCP needs no flush; a tunnelled stream buffers frames until one
     // (`WsByteStream`), so flush after every write on the generic path.
     if wr_for_magic.write_all(&SERVER_MAGIC).await.is_err() || wr_for_magic.flush().await.is_err() {
+        instrument::disconnect(WIRE, "handshake");
         return;
     }
     let writer = tokio::spawn(writer_task(wr_for_magic, out_rx));
     let (frames_tx, mut frames) = mpsc::channel(32);
-    let reader = tokio::spawn(reader_task(rd, frames_tx));
+    let mut reader = tokio::spawn(reader_task(rd, frames_tx));
 
     // --- Login, then the session loop -----------------------------------
+    let identified = transport.identity.is_some();
     let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport, link).await;
-    if let Some((mut sess, mut events)) = outcome {
+    let ended = if let Some((mut sess, mut events)) = outcome {
+        let auth = if identified {
+            "identity"
+        } else if names_guest(&sess.account.login) {
+            "guest"
+        } else {
+            "password"
+        };
+        instrument::login(WIRE, auth, began);
         sess.transfer_addr = direct.then(|| peer.ip());
         let uid = sess.uid;
         info!(uid, login = %sess.account.login, "logged in");
-        session_loop(&mut frames, &mut events, &tx, &ctx, &mut sess).await;
+        let ended = session_loop(&mut frames, &mut events, &tx, &ctx, &mut sess).await;
         ctx.core.end_session(uid);
         info!(uid, "disconnected");
-    }
+        ended
+    } else {
+        Some("login")
+    };
+    // `None` is the session loop saying the reader ended it, and the
+    // reader knows why.
+    let reason = match ended {
+        Some(reason) => reason,
+        None => (&mut reader).await.unwrap_or("closed"),
+    };
+    instrument::disconnect(WIRE, reason);
     reader.abort();
     drop(tx);
     let _ = writer.await;
@@ -1164,7 +1301,7 @@ async fn login_phase(
     let password = enc.decode_chars(&req.password, 31).into_bytes();
     let identity_fp = transport.identity.as_ref().map(|t| t.fingerprint);
     let policy = ctx.cfg.trtp_login;
-    let verdict = tokio::task::spawn_blocking(move || {
+    let verdict = tokio::task::spawn_blocking(instrument::blocking("login", move || {
         reconcile_login(
             &*auth,
             &core,
@@ -1174,7 +1311,7 @@ async fn login_phase(
             policy,
             link,
         )
-    })
+    }))
     .await
     .ok()?;
 
@@ -1386,7 +1523,9 @@ pub(crate) async fn off_reactor<T: Send + 'static>(
     f: impl FnOnce(&hxd_core::Core) -> T + Send + 'static,
 ) -> Option<T> {
     let core = core.clone();
-    tokio::task::spawn_blocking(move || f(&core)).await.ok()
+    tokio::task::spawn_blocking(instrument::blocking(WIRE, move || f(&core)))
+        .await
+        .ok()
 }
 
 /// The "loginupdate" moment: hand the client its self-info and make it
@@ -1797,7 +1936,7 @@ async fn session_loop(
     tx: &Tx,
     ctx: &ServerCtx,
     sess: &mut Session,
-) {
+) -> Option<&'static str> {
     loop {
         tokio::select! {
             maybe = frames.recv() => match maybe {
@@ -1805,16 +1944,16 @@ async fn session_loop(
                     trace_in(&f);
                     dispatch(&f, tx, ctx, sess).await;
                 }
-                None => return, // Reader exited: EOF, error, or bad frame.
+                None => return None, // Reader exited: EOF, error, or bad frame.
             },
             maybe = events.recv() => match maybe {
                 Some(se) => {
                     if !deliver_event(tx, ctx, sess, se.event).await {
                         info!(uid = sess.uid, "kicked");
-                        return;
+                        return Some("kicked");
                     }
                 }
-                None => return, // Detached elsewhere; shouldn't happen.
+                None => return Some("replaced"), // Detached elsewhere; shouldn't happen.
             },
         }
     }
@@ -2876,8 +3015,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 let why = if ban { "banned" } else { "kicked" };
                 let core = ctx.core.clone();
                 let purged =
-                    tokio::task::spawn_blocking(move || core.purge_sender(by, &who, window, why))
-                        .await;
+                    tokio::task::spawn_blocking(instrument::blocking("purge", move || {
+                        core.purge_sender(by, &who, window, why)
+                    }))
+                    .await;
                 if let Ok(Err(e)) = purged {
                     debug!(target, "kick purge skipped: {e:?}");
                 }
@@ -3470,5 +3611,35 @@ mod tests {
             stamp(SystemTime::UNIX_EPOCH - Duration::from_secs(60)),
             "1970-01-01 00:00 UTC"
         );
+    }
+
+    /// Every type `dispatch` answers by name is in `HANDLED`. Read from
+    /// this file's source, so that a transaction added to `dispatch`
+    /// without a label fails here rather than counting as `other`.
+    #[test]
+    fn every_dispatched_type_has_a_label() {
+        let src = include_str!("session.rs");
+        let start = src.find("async fn dispatch(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let mut seen = 0;
+        for line in body.lines() {
+            let Some(rest) = line.strip_prefix("        t if t == ClientHdr::") else {
+                continue;
+            };
+            let name = &rest[..rest.find('.').unwrap()];
+            let listed = format!("    ClientHdr::{name},");
+            assert!(
+                src.contains(&listed),
+                "{name} is dispatched but not in HANDLED"
+            );
+            seen += 1;
+        }
+        assert!(seen > 10, "the dispatcher's arms were not found");
+        assert!(matches!(
+            type_label(ClientHdr::Chat.as_u32()),
+            Kind::Type(_)
+        ));
+        assert!(matches!(type_label(gif_icons::GET), Kind::Type(_)));
+        assert!(matches!(type_label(0x7ff), Kind::Name("other")));
     }
 }

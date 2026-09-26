@@ -227,6 +227,63 @@ pub trait VoiceMedia: Send + Sync + 'static {
     fn set_subscriptions(&self, uid: Uid, cid: u32, streams: &[VideoStream]);
 }
 
+/// A [`VoiceMedia`] that times every call it passes on
+/// (`crate::instrument::voice_call`).
+#[cfg(feature = "metrics")]
+struct TimedVoice(Arc<dyn VoiceMedia>);
+
+#[cfg(feature = "metrics")]
+impl TimedVoice {
+    fn time<R>(&self, op: &'static str, f: impl FnOnce(&dyn VoiceMedia) -> R) -> R {
+        let took = crate::instrument::Timer::start();
+        let out = f(&*self.0);
+        crate::instrument::voice_call(op, took);
+        out
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl VoiceMedia for TimedVoice {
+    fn codec(&self) -> &'static str {
+        self.0.codec()
+    }
+    fn join(&self, uid: Uid, cid: u32) {
+        self.time("join", |m| m.join(uid, cid))
+    }
+    fn leave(&self, uid: Uid, cid: u32) {
+        self.time("leave", |m| m.leave(uid, cid))
+    }
+    fn offer(&self, uid: Uid, cid: u32) -> Option<String> {
+        self.time("offer", |m| m.offer(uid, cid))
+    }
+    fn answer(&self, uid: Uid, cid: u32, sdp: &str) -> Result<(), VoiceError> {
+        self.time("answer", |m| m.answer(uid, cid, sdp))
+    }
+    fn remote_ice(&self, uid: Uid, cid: u32, candidate: &IceCandidate) {
+        self.time("remote_ice", |m| m.remote_ice(uid, cid, candidate))
+    }
+    fn set_muted(&self, uid: Uid, cid: u32, muted: bool) {
+        self.time("set_muted", |m| m.set_muted(uid, cid, muted))
+    }
+    fn video_codec(&self) -> &'static str {
+        self.0.video_codec()
+    }
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> bool {
+        self.time("publish", |m| m.publish(uid, cid, kind))
+    }
+    fn unpublish(&self, uid: Uid, cid: u32, kind: VideoKind) {
+        self.time("unpublish", |m| m.unpublish(uid, cid, kind))
+    }
+    fn set_paused(&self, uid: Uid, cid: u32, kind: VideoKind, paused: bool) {
+        self.time("set_paused", |m| m.set_paused(uid, cid, kind, paused))
+    }
+    fn set_subscriptions(&self, uid: Uid, cid: u32, streams: &[VideoStream]) {
+        self.time("set_subscriptions", |m| {
+            m.set_subscriptions(uid, cid, streams)
+        })
+    }
+}
+
 /// Something the media plane noticed, on its way back into the domain.
 /// Delivered by the SFU's own task through [`Core::voice_media_event`],
 /// never by a call from inside a [`VoiceMedia`] method.
@@ -506,6 +563,11 @@ impl Core {
     #[must_use]
     pub fn with_voice(self, media: Arc<dyn VoiceMedia>, max_per_room: usize) -> Self {
         {
+            // Every call into the media plane is made under the roster
+            // lock, so its time is the roster's too; with metrics on,
+            // each one reports it.
+            #[cfg(feature = "metrics")]
+            let media: Arc<dyn VoiceMedia> = Arc::new(TimedVoice(media));
             let mut r = self.roster.lock().unwrap();
             r.voice.media = Some(media);
             r.voice.max_per_room = max_per_room.max(1);

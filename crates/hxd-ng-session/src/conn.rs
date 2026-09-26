@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use futures_util::{SinkExt, StreamExt};
 use hxd_core::access::bit;
 use hxd_core::inbox::MessageGuid;
+use hxd_core::instrument::{self, Dir, Kind};
 use hxd_core::video::VideoKind;
 use hxd_core::voice::IceCandidate;
 use hxd_core::{
@@ -36,6 +37,54 @@ use crate::proto::{
     VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
+
+/// This frontend's name in the metrics.
+const WIRE: &str = "ng";
+
+/// A request name as a metric label: the name when the server knows it,
+/// the family for the families handled elsewhere, and `other` for
+/// anything a client made up, so a client cannot mint series
+/// (`hxd_core::instrument`).
+fn req_label(req: &str) -> &'static str {
+    const KNOWN: &[&str] = &[
+        "avatar_clear",
+        "block",
+        "blocks",
+        "chat",
+        "history",
+        "inbox",
+        "login",
+        "logout",
+        "msg",
+        "msg_read",
+        "nick",
+        "ping",
+        "resume",
+        "sync",
+        "unblock",
+        "video_start",
+        "video_state",
+        "video_stop",
+        "video_subscribe",
+        "voice_answer",
+        "voice_ice",
+        "voice_join",
+        "voice_leave",
+        "voice_mute",
+    ];
+    if let Some(k) = KNOWN.iter().find(|k| **k == req) {
+        return k;
+    }
+    for family in ["news_", "push_", "files_"] {
+        if req.starts_with(family) {
+            return family.trim_end_matches('_');
+        }
+    }
+    if crate::moderation::handles(req) {
+        return "moderation";
+    }
+    "other"
+}
 
 /// How often a quiet connection is pinged, and how long it may stay
 /// silent before the ping is treated as unanswered. The deadline is
@@ -64,10 +113,11 @@ pub(crate) struct SessState {
 
 /// Why the connection loop ended, deciding the session's fate.
 enum Exit {
-    /// Socket died or closed without logout → detach if permitted.
-    ConnectionLost,
+    /// Socket died or closed without logout → detach if permitted. The
+    /// reason is for the disconnect counter.
+    ConnectionLost(&'static str),
     /// Clean logout or kick → session already ended; registry cleaned.
-    SessionOver,
+    SessionOver(&'static str),
     /// The outbox channel closed under us: another connection took the
     /// session over (or it ended elsewhere). Not ours anymore.
     Replaced,
@@ -79,21 +129,41 @@ enum Exit {
 /// the upgrade.
 pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<TransportIdentity>) {
     let (mut ws_tx, mut ws_rx) = ws.split();
+    let began = instrument::Timer::start();
 
     // --- Handshake: the first request must be login or resume. ----------
-    let first = match timeout(ctx.cfg.login_timeout, next_request(&mut ws_rx)).await {
+    let (first, first_len) = match timeout(ctx.cfg.login_timeout, next_request(&mut ws_rx)).await {
         Ok(Some(req)) => req,
-        _ => return,
+        _ => {
+            instrument::disconnect(WIRE, "handshake");
+            return;
+        }
+    };
+    instrument::frame(WIRE, Dir::In, Kind::Name(req_label(&first.req)), first_len);
+    let auth = match first.req.as_str() {
+        "resume" => "resume",
+        _ if identity.is_some() => "identity",
+        _ => match first.params.get("login").and_then(Value::as_str) {
+            None | Some("") => "guest",
+            Some(l) if l.eq_ignore_ascii_case("guest") => "guest",
+            Some(_) => "password",
+        },
     };
 
     let (state, mut events) = match first.req.as_str() {
         "login" => match handle_login(&ctx, peer, &first, identity.as_ref(), &mut ws_tx).await {
             Some(v) => v,
-            None => return,
+            None => {
+                instrument::disconnect(WIRE, "login");
+                return;
+            }
         },
         "resume" => match handle_resume(&ctx, &first, &mut ws_tx).await {
             Some(v) => v,
-            None => return,
+            None => {
+                instrument::disconnect(WIRE, "login");
+                return;
+            }
         },
         _ => {
             let _ = send_frame(
@@ -105,9 +175,11 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                 )),
             )
             .await;
+            instrument::disconnect(WIRE, "login");
             return;
         }
     };
+    instrument::login(WIRE, auth, began);
     info!(uid = state.uid, session = %state.session_id, "ng session attached");
 
     // --- Main loop -------------------------------------------------------
@@ -140,16 +212,17 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
             biased;
             ev = events.recv() => match ev {
                 Some(se) => {
+                    instrument::queue_depth(WIRE, events.len());
                     let kicked = matches!(se.event, hxd_core::Event::Kicked);
                     let sent = send_frame(&mut ws_tx, Message::Text(event_json(&se))).await;
                     // A kick ends the session whether or not the client
                     // heard about it: failing the send is no way to stay.
                     if kicked {
                         end_kicked(&ctx, &state, &mut ws_tx).await;
-                        break Exit::SessionOver;
+                        break Exit::SessionOver("kicked");
                     }
                     if !sent {
-                        break Exit::ConnectionLost;
+                        break Exit::ConnectionLost("send_failed");
                     }
                 }
                 None => break Exit::Replaced,
@@ -159,8 +232,9 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                     heard = tokio::time::Instant::now();
                     let Ok(req) = serde_json::from_str::<ReqEnvelope>(&text) else {
                         debug!("unparseable request frame");
-                        break Exit::ConnectionLost;
+                        break Exit::ConnectionLost("malformed");
                     };
+                    instrument::frame(WIRE, Dir::In, Kind::Name(req_label(&req.req)), text.len());
                     // `sync` is the one request that needs the event
                     // channel itself; see `handle_sync`.
                     let flow = if req.req == "sync" {
@@ -170,35 +244,42 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                     };
                     match flow {
                         Flow::Continue => {}
-                        Flow::LoggedOut => break Exit::SessionOver,
-                        Flow::Dead => break Exit::ConnectionLost,
+                        Flow::LoggedOut => break Exit::SessionOver("logout"),
+                        Flow::Dead => break Exit::ConnectionLost("send_failed"),
                         Flow::Replaced => break Exit::Replaced,
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => break Exit::ConnectionLost,
+                Some(Ok(Message::Close(_))) | None => break Exit::ConnectionLost("closed"),
                 // A pong (or anything else) is the peer answering the
                 // keep-alive; nothing to do with it but note that it
                 // came.
                 Some(Ok(_)) => heard = tokio::time::Instant::now(),
                 Some(Err(e)) => {
                     debug!("ws error: {e}");
-                    break Exit::ConnectionLost;
+                    break Exit::ConnectionLost("io_error");
                 }
             },
             _ = ping.tick() => {
                 if heard.elapsed() >= PONG_DEADLINE {
                     info!(uid = state.uid, "ng connection silent past the pong deadline");
-                    break Exit::ConnectionLost;
+                    break Exit::ConnectionLost("pong_deadline");
                 }
                 if !send_frame(&mut ws_tx, Message::Ping(Vec::new())).await {
-                    break Exit::ConnectionLost;
+                    break Exit::ConnectionLost("send_failed");
                 }
             }
         }
     };
 
+    instrument::disconnect(
+        WIRE,
+        match exit {
+            Exit::ConnectionLost(why) | Exit::SessionOver(why) => why,
+            Exit::Replaced => "replaced",
+        },
+    );
     match exit {
-        Exit::ConnectionLost => {
+        Exit::ConnectionLost(_) => {
             let survived = ctx
                 .core
                 .connection_lost(state.uid, ctx.cfg.max_detached_per_addr);
@@ -209,7 +290,7 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                 info!(uid = state.uid, "ng session ended (no detach)");
             }
         }
-        Exit::SessionOver => {
+        Exit::SessionOver(_) => {
             info!(uid = state.uid, "ng session ended");
         }
         Exit::Replaced => {
@@ -226,12 +307,15 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
     }
 }
 
-/// Read frames until a parseable request arrives (or the stream ends).
-async fn next_request(ws_rx: &mut futures_util::stream::SplitStream<Ws>) -> Option<ReqEnvelope> {
+/// Read frames until a parseable request arrives (or the stream ends),
+/// and how long its frame was.
+async fn next_request(
+    ws_rx: &mut futures_util::stream::SplitStream<Ws>,
+) -> Option<(ReqEnvelope, usize)> {
     while let Some(msg) = ws_rx.next().await {
         match msg {
             Ok(Message::Text(text)) => match serde_json::from_str(&text) {
-                Ok(req) => return Some(req),
+                Ok(req) => return Some((req, text.len())),
                 Err(e) => {
                     debug!("bad handshake frame: {e}");
                     return None;
@@ -295,7 +379,7 @@ async fn handle_login(
     };
     let ident = identity.cloned();
     let core = ctx.core.clone();
-    let verdict = tokio::task::spawn_blocking(move || {
+    let verdict = crate::spawn_blocking("login", move || {
         let account = if let (Some(i), Some(st)) = (ident.as_ref(), identity_state.as_ref()) {
             match st.account_for(i) {
                 Ok(Some(account)) => Ok(account),
@@ -732,11 +816,12 @@ async fn handle_resume(
     // its account. An account that can no longer be read gets neither.
     let auth = ctx.auth.clone();
     let login = ctx.core.user_details(uid).map(|details| details.login);
-    let account =
-        tokio::task::spawn_blocking(move || login.and_then(|login| auth.lookup(&login).ok()))
-            .await
-            .ok()
-            .flatten();
+    let account = crate::spawn_blocking("login", move || {
+        login.and_then(|login| auth.lookup(&login).ok())
+    })
+    .await
+    .ok()
+    .flatten();
     let state = SessState {
         uid,
         session_id: p.session.clone(),
@@ -818,7 +903,7 @@ pub(crate) async fn off_reactor<T: Send + 'static>(
     f: impl FnOnce(&hxd_core::Core) -> T + Send + 'static,
 ) -> Option<T> {
     let core = core.clone();
-    tokio::task::spawn_blocking(move || f(&core)).await.ok()
+    crate::spawn_blocking("ng", move || f(&core)).await.ok()
 }
 
 /// Parse a request's `params` where every field is optional, so that
@@ -865,7 +950,20 @@ enum Flow {
 /// `false` means the connection is gone, which every caller already
 /// treats as the end of it.
 async fn send_frame(ws_tx: &mut WsTx, msg: Message) -> bool {
-    match timeout(PONG_DEADLINE, ws_tx.send(msg)).await {
+    let (kind, len) = match &msg {
+        Message::Text(t) => ("text", t.len()),
+        Message::Binary(b) => ("binary", b.len()),
+        Message::Ping(_) | Message::Pong(_) => ("ping", 0),
+        Message::Close(_) => ("close", 0),
+        Message::Frame(_) => ("frame", 0),
+    };
+    let took = instrument::Timer::start();
+    let sent = timeout(PONG_DEADLINE, ws_tx.send(msg)).await;
+    instrument::socket_write(WIRE, took);
+    if matches!(sent, Ok(Ok(()))) {
+        instrument::frame(WIRE, Dir::Out, Kind::Name(kind), len);
+    }
+    match sent {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
             debug!("ng send failed: {e}");
@@ -1718,5 +1816,33 @@ mod tests {
         let mut text = "é".repeat(10);
         text.truncate_to_char_boundary(5);
         assert_eq!(text, "éé");
+    }
+
+    /// Every request the dispatcher answers by name has a label of its
+    /// own. Read from this file's source, so that a request added to
+    /// `dispatch` without one fails here rather than counting as
+    /// `other` in every scrape from then on.
+    #[test]
+    fn every_dispatched_request_has_a_label() {
+        let src = include_str!("conn.rs");
+        let start = src.find("async fn dispatch(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let mut seen = 0;
+        for line in body.lines() {
+            let Some(arm) = line.strip_prefix("        \"") else {
+                continue;
+            };
+            for name in std::iter::once(arm)
+                .chain(line.split("| \"").skip(1))
+                .map(|a| &a[..a.find('"').unwrap()])
+            {
+                assert_eq!(req_label(name), name, "{name} has no metric label");
+                seen += 1;
+            }
+        }
+        assert!(seen > 10, "the dispatcher's arms were not found");
+        assert_eq!(req_label("sync"), "sync");
+        assert_eq!(req_label("news_post"), "news");
+        assert_eq!(req_label("made_up_by_a_client"), "other");
     }
 }

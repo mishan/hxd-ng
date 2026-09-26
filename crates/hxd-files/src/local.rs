@@ -1062,7 +1062,7 @@ impl FileSource for LocalFileSource {
         let path = path.clone();
         Box::pin(async move {
             let _permit = source.acquire_io_permit().await?;
-            tokio::task::spawn_blocking(move || {
+            crate::spawn_blocking("files", move || {
                 let dir = source.open_dir(&path)?;
                 let mut entries = Vec::new();
                 for entry in dir
@@ -1106,7 +1106,7 @@ impl FileSource for LocalFileSource {
         let path = path.clone();
         Box::pin(async move {
             let _permit = source.acquire_io_permit().await?;
-            tokio::task::spawn_blocking(move || source.info_sync(&path))
+            crate::spawn_blocking("files", move || source.info_sync(&path))
                 .await
                 .map_err(|error| FileError::Unavailable(format!("local file worker: {error}")))?
         })
@@ -1153,7 +1153,7 @@ impl LocalFileSource {
         let permit = self.acquire_io_permit().await?;
         let source = self.clone();
         let path = path.clone();
-        let (file, len) = tokio::task::spawn_blocking(move || {
+        let (file, len) = crate::spawn_blocking("files", move || {
             let file = if resource {
                 source.stat(&path)?;
                 let name = format!("{}.rsrc", Self::metadata_key(&path));

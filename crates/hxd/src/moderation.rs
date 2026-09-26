@@ -118,7 +118,7 @@ pub async fn pruner(core: Arc<Core>) {
     loop {
         tick.tick().await;
         let core = core.clone();
-        let (scrubbed, pruned) = tokio::task::spawn_blocking(move || core.prune_moderation())
+        let (scrubbed, pruned) = crate::spawn_blocking("prune", move || core.prune_moderation())
             .await
             .unwrap_or((0, 0));
         if scrubbed + pruned > 0 {

@@ -84,7 +84,7 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
         Err(_) => return reject(MediaReject::Generic),
     };
     let core = ctx.core.clone();
-    match tokio::task::spawn_blocking(move || core.set_avatar(uid, &body)).await {
+    match crate::spawn_blocking("avatar", move || core.set_avatar(uid, &body)).await {
         Ok(Ok(avatar)) => json_resp(StatusCode::OK, json!({ "avatar": avatar_json(&avatar) })),
         Ok(Err(e)) => {
             debug!(target: "avatar", uid, code = e.code(), "upload refused");
@@ -128,7 +128,8 @@ pub async fn download(id: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
             .unwrap();
     }
     let core = ctx.core.clone();
-    let Ok(Some(avatar)) = tokio::task::spawn_blocking(move || core.avatar_by_id(&id)).await else {
+    let Ok(Some(avatar)) = crate::spawn_blocking("avatar", move || core.avatar_by_id(&id)).await
+    else {
         return not_found();
     };
     // `nosniff` and the sandbox CSP for the same reason as `/media`: the

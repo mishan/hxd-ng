@@ -88,6 +88,7 @@ async fn start(dir: &Path, avatars: Option<AvatarPolicy>) -> Server {
         registrar: None,
         push: None,
         banner: None,
+        metrics: None,
     };
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

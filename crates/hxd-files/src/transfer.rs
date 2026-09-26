@@ -105,7 +105,7 @@ pub async fn prepare_upload(
     let transfer_len = request.transfer_len;
     let large = request.large;
     let resume_requested = request.resume_requested;
-    let quote = tokio::task::spawn_blocking(move || {
+    let quote = crate::spawn_blocking("files", move || {
         quote_source.prepare_upload(&owner, &path, transfer_len, large, resume_requested)
     })
     .await
@@ -343,6 +343,7 @@ async fn serve_download<S: HtxfStream>(
     alive: &Liveness,
     idle: Duration,
 ) -> Result<(), FileError> {
+    let _open = hxd_core::instrument::transfer_open("download");
     // A resume at the very end of a fork has nothing left to fetch from
     // it, and the transfer carries that fork's header alone, as mhxd
     // sends it.
@@ -388,6 +389,7 @@ async fn serve_upload<S: HtxfStream>(
     preamble: htxf::Preamble,
     alive: &Liveness,
 ) -> Result<(), FileError> {
+    let _open = hxd_core::instrument::transfer_open("upload");
     // Local I/O permits are taken around each piece of disk work rather
     // than for the whole upload: a client trickling bytes must not hold
     // capacity that listings and downloads share.
@@ -435,7 +437,7 @@ async fn on_disk<T: Send + 'static>(
 ) -> Result<T, FileError> {
     let _permit = source.acquire_io_permit().await?;
     let source = source.clone();
-    tokio::task::spawn_blocking(move || work(&source))
+    crate::spawn_blocking("files", move || work(&source))
         .await
         .map_err(|error| FileError::Unavailable(format!("local file worker: {error}")))?
 }

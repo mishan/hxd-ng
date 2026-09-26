@@ -151,6 +151,7 @@ async fn start_full(dir: &Path, policy: ModerationPolicy, handle_ttl: Duration) 
         registrar: None,
         push: None,
         banner: None,
+        metrics: None,
     };
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

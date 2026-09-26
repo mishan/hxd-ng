@@ -35,6 +35,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::access::{bit, AccessBits};
 use crate::chat::{Ban, PrivateChat};
+use crate::instrument::{self, TimedMutex};
 
 /// A user id, as seen on the wire (16-bit, never 0 for a real user).
 pub type Uid = u16;
@@ -337,6 +338,41 @@ pub enum Event {
     NewsNotify(crate::news::Notified),
 }
 
+impl Event {
+    /// The event's name as a metric label (`crate::instrument`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Event::Joined(..) => "joined",
+            Event::Changed(..) => "changed",
+            Event::Parted(..) => "parted",
+            Event::AvatarChanged(..) => "avatar_changed",
+            Event::Chat { .. } => "chat",
+            Event::Notice { .. } => "notice",
+            Event::ChatSubject { .. } => "chat_subject",
+            Event::ChatPassword { .. } => "chat_password",
+            Event::ChatInvite { .. } => "chat_invite",
+            Event::ChatUserJoined { .. } => "chat_user_joined",
+            Event::ChatUserParted { .. } => "chat_user_parted",
+            Event::Msg { .. } => "msg",
+            Event::Broadcast { .. } => "broadcast",
+            Event::Kicked => "kicked",
+            Event::ChatRedacted { .. } => "chat_redacted",
+            Event::Report(..) => "report",
+            Event::ReportClosed { .. } => "report_closed",
+            Event::MediaRevoked { .. } => "media_revoked",
+            Event::VoiceOffer { .. } => "voice_offer",
+            Event::VoiceIce { .. } => "voice_ice",
+            Event::VoiceStatus { .. } => "voice_status",
+            Event::VideoStatus { .. } => "video_status",
+            Event::NewsPosted { .. } => "news_posted",
+            Event::NewsDeleted { .. } => "news_deleted",
+            Event::NewsNode(..) => "news_node",
+            Event::NewsNodeDeleted { .. } => "news_node_deleted",
+            Event::NewsNotify(..) => "news_notify",
+        }
+    }
+}
+
 /// An event stamped with its position in the session's stream. `seq` is
 /// per-session, monotonic from 1, gapless — the resume protocol's
 /// substrate.
@@ -379,24 +415,27 @@ impl Outbox {
         }
     }
 
-    fn push(&mut self, event: Event) {
+    fn push(&mut self, event: Event) -> instrument::Pushed {
         let seq = self.next_seq;
         self.next_seq += 1;
         let se = SeqEvent { seq, event };
         match &mut self.sink {
             Sink::Live(tx) => {
                 let _ = tx.send(se);
+                instrument::Pushed::Live
             }
             Sink::Buffering { buf, broken, .. } => {
                 if *broken {
-                    return;
+                    return instrument::Pushed::Dropped;
                 }
                 if buf.len() >= OUTBOX_BUFFER_CAP {
                     *broken = true;
                     buf.clear(); // Nothing partial is replayable; free it.
-                    return;
+                    instrument::outbox_broken();
+                    return instrument::Pushed::Dropped;
                 }
                 buf.push_back(se);
+                instrument::Pushed::Buffered
             }
         }
     }
@@ -585,7 +624,9 @@ impl RosterInner {
 
     pub(crate) fn send_to(&mut self, uid: Uid, ev: Event) {
         if let Some(sess) = self.users.get_mut(&uid) {
-            sess.outbox.push(ev);
+            let mut tally = instrument::Tally::default();
+            tally.add(sess.outbox.push(ev));
+            tally.record();
         }
     }
 
@@ -596,12 +637,20 @@ impl RosterInner {
         skip: Option<Uid>,
         pred: F,
     ) {
+        let took = instrument::Timer::start();
+        let mut tally = instrument::Tally::default();
+        let mut reached = 0;
         for (uid, sess) in self.users.iter_mut() {
             if Some(*uid) == skip || !sess.visible || !pred(sess) {
                 continue;
             }
-            sess.outbox.push(ev.clone());
+            tally.add(sess.outbox.push(ev.clone()));
+            reached += 1;
         }
+        // Once per fan-out, whatever its reach: still under the lock, but
+        // a constant rather than a cost per recipient.
+        instrument::fanout(ev.kind(), reached, took);
+        tally.record();
     }
 
     fn broadcast(&mut self, ev: &Event, skip: Option<Uid>) {
@@ -729,7 +778,7 @@ impl InboxPolicy {
 /// The domain core. One per server; shared across sessions.
 #[derive(Default)]
 pub struct Core {
-    pub(crate) roster: Mutex<RosterInner>,
+    pub(crate) roster: TimedMutex<RosterInner>,
     /// The durable private-message inbox, or `None` — in which case
     /// private messaging behaves exactly as it did before the inbox
     /// existed, which is what a server that configures no database gets.
@@ -799,7 +848,7 @@ pub struct Core {
     /// Makes persisted id order and live fan-out order the same fact.
     /// Nothing but public chat takes this lock; order is it first, then
     /// (briefly) `roster`.
-    pub(crate) log_serial: Mutex<()>,
+    pub(crate) log_serial: TimedMutex<LogSerial>,
     /// Keys the operator has refused by hand (`crate::revoked`). Read
     /// under the roster lock by `attach`, and written with nothing held,
     /// so the order is roster first, then this.
@@ -822,6 +871,31 @@ pub struct Core {
     /// interval). Its own lock, taken with nothing else held.
     pub(crate) avatar_turns: Mutex<HashMap<crate::avatar::Turn, Instant>>,
 }
+
+/// [`Core::census`]: the roster in numbers. `system` is the reserved
+/// server account, counted apart so that "nobody is on" reads as zero
+/// attached and zero detached whether or not the server has one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Census {
+    pub attached: usize,
+    pub detached: usize,
+    /// On the roster but not yet announced (mid-login), and counted in
+    /// neither of the two above.
+    pub hidden: usize,
+    pub system: usize,
+    /// Detached sessions whose buffer overflowed.
+    pub broken: usize,
+    /// Events waiting in detached sessions' buffers, in all and at most.
+    pub buffered: usize,
+    pub buffered_max: usize,
+    /// Private chat rooms open.
+    pub chats: usize,
+}
+
+/// What `Core::log_serial` guards: nothing but an order. A type of its
+/// own so the lock's metrics carry a name (`TimedMutex`'s default).
+#[derive(Default)]
+pub(crate) struct LogSerial;
 
 impl Core {
     pub fn new() -> Self {
@@ -1156,6 +1230,36 @@ impl Core {
     pub fn status_of(&self, uid: Uid) -> Option<SessionStatus> {
         let r = self.roster.lock().unwrap();
         r.users.get(&uid).map(|s| s.info.status)
+    }
+
+    /// Who is on the roster, counted, for a metrics scrape. One pass
+    /// under the lock, nothing cloned.
+    pub fn census(&self) -> Census {
+        let r = self.roster.lock().unwrap();
+        let mut c = Census {
+            chats: r.chats.len(),
+            ..Census::default()
+        };
+        for sess in r.users.values() {
+            if sess.info.system {
+                c.system += 1;
+                continue;
+            }
+            if !sess.visible {
+                c.hidden += 1;
+                continue;
+            }
+            match &sess.outbox.sink {
+                Sink::Live(_) => c.attached += 1,
+                Sink::Buffering { buf, broken, .. } => {
+                    c.detached += 1;
+                    c.broken += usize::from(*broken);
+                    c.buffered += buf.len();
+                    c.buffered_max = c.buffered_max.max(buf.len());
+                }
+            }
+        }
+        c
     }
 
     /// Is this session currently detached? (Moderation and tests.)
@@ -1536,6 +1640,30 @@ mod tests {
             Resume::ResyncRequired(_rx) => {}
             _ => panic!("pre-buffer last_seq must demand resync"),
         }
+    }
+
+    #[test]
+    fn census_counts_attached_detached_and_what_the_detached_hold() {
+        let core = Core::new();
+        assert_eq!(core.census(), Census::default());
+        let (a, _ra) = ng_attach(&core, "one", "10.0.0.1");
+        let (b, _rb) = ng_attach(&core, "two", "10.0.0.2");
+        let (third, _rc) = ng_attach(&core, "three", "10.0.0.3");
+        assert!(core.connection_lost(a, 2));
+        assert!(core.connection_lost(b, 2));
+        // What becomes of `b` is buffered for `a`, and `b` is gone.
+        core.end_session(b);
+        let c = core.census();
+        assert_eq!((c.attached, c.detached, c.hidden, c.system), (1, 1, 0, 0));
+        assert!(c.buffered > 0);
+        assert_eq!((c.buffered_max, c.broken), (c.buffered, 0));
+
+        // Overflow breaks the buffer, which then holds nothing.
+        for i in 0..=OUTBOX_BUFFER_CAP {
+            core.update(third, Some(format!("n{i}")), None);
+        }
+        let c = core.census();
+        assert_eq!((c.detached, c.broken, c.buffered), (1, 1, 0));
     }
 
     #[test]

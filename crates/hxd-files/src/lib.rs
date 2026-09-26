@@ -51,3 +51,12 @@ impl FileService {
     }
 }
 pub use local::{LocalFileSource, LocalLimits};
+
+/// `tokio::task::spawn_blocking`, with the pool's queue time and
+/// occupancy reported under `what` (`hxd_core::instrument::blocking`).
+pub(crate) fn spawn_blocking<R: Send + 'static>(
+    what: &'static str,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> tokio::task::JoinHandle<R> {
+    tokio::task::spawn_blocking(hxd_core::instrument::blocking(what, f))
+}

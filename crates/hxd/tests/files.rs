@@ -413,6 +413,7 @@ async fn run_service(service: Arc<FileService>, access: &str) -> Running {
         registrar: None,
         push: None,
         banner: None,
+        metrics: None,
     };
     let legacy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = TcpListener::bind("127.0.0.1:0").await.unwrap();

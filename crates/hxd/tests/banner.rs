@@ -100,6 +100,7 @@ async fn start(shown: Shown<'_>) -> Running {
         banner: ctx.banner.clone().map(|b| {
             Arc::new(hxd::banner::NgBanner(b)) as Arc<dyn hxd_ng_session::banner::BannerSource>
         }),
+        metrics: None,
     };
     let legacy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let transfer = TcpListener::bind("127.0.0.1:0").await.unwrap();

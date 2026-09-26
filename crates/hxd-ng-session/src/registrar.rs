@@ -232,11 +232,13 @@ pub async fn route(req: Request<Incoming>, client: IpAddr, reg: Arc<Registrar>) 
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, Refusal> + Send + 'static,
 ) -> Result<T, Refusal> {
-    tokio::task::spawn_blocking(f).await.unwrap_or_else(|_| {
-        Err(Refusal::Store(hxd_registrar::StoreError(
-            "task failed".into(),
-        )))
-    })
+    crate::spawn_blocking("registrar", f)
+        .await
+        .unwrap_or_else(|_| {
+            Err(Refusal::Store(hxd_registrar::StoreError(
+                "task failed".into(),
+            )))
+        })
 }
 
 /// A JSON body with one base64url field holding a signed object.

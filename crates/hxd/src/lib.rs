@@ -23,6 +23,7 @@ use serde::Deserialize;
 
 pub mod banner;
 pub mod files;
+pub mod metrics;
 pub mod moderation;
 pub mod push;
 pub mod registrar;
@@ -94,6 +95,9 @@ pub struct Config {
     /// Avatars on both wires (`docs/avatars.md` §6). Absent = neither wire
     /// offers them. Needs the `media` feature.
     pub avatars: Option<AvatarsSection>,
+    /// `GET /metrics` on the ng port (`docs/metrics.md`). Absent = no
+    /// route. Needs the `metrics` feature and `[ng]`.
+    pub metrics: Option<metrics::MetricsSection>,
 }
 
 /// `[avatars]`: a user's picture, on both wires.
@@ -2119,6 +2123,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     registrar::check(config)?;
     tls::check(config)?;
     banner::check(config)?;
+    metrics::check(config)?;
     if let Some(inbox) = &config.inbox {
         hxd_core::InboxPolicy {
             max_queued: inbox.max_queued,
@@ -2761,7 +2766,7 @@ pub async fn inbox_pruner(core: Arc<Core>, unread: Duration, read: Duration) {
         // `sqlite3` holding a write lock would otherwise stall every
         // session the reactor thread is carrying.
         let core = core.clone();
-        let gone = tokio::task::spawn_blocking(move || core.prune_inbox(unread, read))
+        let gone = crate::spawn_blocking("prune", move || core.prune_inbox(unread, read))
             .await
             .unwrap_or(0);
         if gone > 0 {
@@ -2778,10 +2783,11 @@ pub async fn history_pruner(core: Arc<Core>, max_lines: u32, max_days: u32) {
         tick.tick().await;
         let core = core.clone();
         let max_age = (max_days != 0).then(|| Duration::from_secs(u64::from(max_days) * 24 * 3600));
-        let gone =
-            tokio::task::spawn_blocking(move || core.prune_history(max_lines as usize, max_age))
-                .await
-                .unwrap_or(0);
+        let gone = crate::spawn_blocking("prune", move || {
+            core.prune_history(max_lines as usize, max_age)
+        })
+        .await
+        .unwrap_or(0);
         if gone > 0 {
             tracing::debug!(gone, "chat-history lines pruned");
         }
@@ -2798,7 +2804,7 @@ pub async fn news_pruner(core: Arc<Core>) {
     loop {
         tick.tick().await;
         let core = core.clone();
-        let gone = tokio::task::spawn_blocking(move || {
+        let gone = crate::spawn_blocking("prune", move || {
             let gone = core.prune_news();
             match core.news_expire_attachments(SystemTime::now()) {
                 // A server without `[news.attach]`, which prunes anyway.
@@ -2825,7 +2831,7 @@ pub async fn device_sweeper(core: Arc<Core>) {
     loop {
         tick.tick().await;
         let core = core.clone();
-        let gone = tokio::task::spawn_blocking(move || core.sweep_devices())
+        let gone = crate::spawn_blocking("prune", move || core.sweep_devices())
             .await
             .unwrap_or(0);
         if gone > 0 {
@@ -2915,6 +2921,7 @@ pub fn build_ng_ctx(
         banner: legacy.banner.clone().map(|b| {
             Arc::new(banner::NgBanner(b)) as Arc<dyn hxd_ng_session::banner::BannerSource>
         }),
+        metrics: metrics::build(config, &legacy.core)?,
     }))
 }
 
@@ -3056,6 +3063,15 @@ pub fn build_ctx(
         files: files.map(|value| value.service.clone()),
         banner,
     })
+}
+
+/// `tokio::task::spawn_blocking`, with the pool's queue time and
+/// occupancy reported under `what` (`hxd_core::instrument::blocking`).
+pub(crate) fn spawn_blocking<R: Send + 'static>(
+    what: &'static str,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> tokio::task::JoinHandle<R> {
+    tokio::task::spawn_blocking(hxd_core::instrument::blocking(what, f))
 }
 
 #[cfg(test)]

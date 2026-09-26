@@ -329,7 +329,7 @@ impl Inner {
         // made from async code in this server is.
         let store = self.devices.clone();
         let who = to.clone();
-        let devices = match tokio::task::spawn_blocking(move || store.devices(&who, now)).await {
+        let devices = match crate::spawn_blocking("push", move || store.devices(&who, now)).await {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
                 warn!("push: reading {}'s devices: {e}", to.login);
@@ -447,7 +447,7 @@ impl Inner {
             Outcome::Accepted => {
                 self.breaker_record(origin, false, now);
                 let (store, to, devid) = (self.devices.clone(), to.clone(), device.devid.clone());
-                tokio::task::spawn_blocking(move || {
+                crate::spawn_blocking("push", move || {
                     if let Err(e) = store.touch(&to, &devid, SystemTime::now()) {
                         debug!("push: stamping a device: {e}");
                     }
@@ -500,7 +500,7 @@ impl Inner {
     fn retire(&self, to: &Mailbox, device: &Device) {
         let store = self.devices.clone();
         let (to, devid, endpoint) = (to.clone(), device.devid.clone(), device.endpoint.clone());
-        tokio::task::spawn_blocking(move || {
+        crate::spawn_blocking("push", move || {
             if let Err(e) = store.retire(&to, &devid, &endpoint) {
                 warn!("push: retiring a device of {}: {e}", to.login);
             }
@@ -555,6 +555,15 @@ impl NotificationGateway for WebPushGateway {
             .clone()
             .spawn(inner.deliver(to, built, Kind::of(n)));
     }
+}
+
+/// `tokio::task::spawn_blocking`, with the pool's queue time and
+/// occupancy reported under `what` (`hxd_core::instrument::blocking`).
+pub(crate) fn spawn_blocking<R: Send + 'static>(
+    what: &'static str,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> tokio::task::JoinHandle<R> {
+    tokio::task::spawn_blocking(hxd_core::instrument::blocking(what, f))
 }
 
 #[cfg(test)]

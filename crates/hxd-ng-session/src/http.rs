@@ -17,6 +17,7 @@
 //! | `POST /media` | inline media, `inline-media.md` §8.2 |
 //! | `GET  /media/<id>` | the canonical bytes |
 //! | `GET  /banner` | the server banner, `banner.md` §3 |
+//! | `GET  /metrics` | the server's numbers, `metrics.md` (loopback by default) |
 //! | `POST /news/blob` | stage a durable news image |
 //! | `GET  /news/blob/<id>` | an authorized news image |
 //! | `/registrar/…` | the registrar, `identity-registrar.md` §6 (`registrar.rs`) |
@@ -92,6 +93,7 @@ const MAX_BUNDLE_BYTES: usize = 4 * 1024 + 16 * 1024 + 256;
 pub(crate) async fn serve_connection(stream: TcpStream, peer: SocketAddr, ctx: NgCtx) {
     if ctx.core.is_banned(peer.ip()) {
         info!("refusing banned address");
+        hxd_core::instrument::disconnect("ng", "banned");
         return;
     }
     let io = TokioIo::new(stream);
@@ -220,6 +222,10 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let resp = match (req.method(), path.as_str()) {
+        (&Method::GET, crate::metrics::METRICS_PATH) if ctx.metrics.is_some() => {
+            let source = ctx.metrics.clone().expect("checked by the guard");
+            return boxed(crate::metrics::scrape(&req, peer, client, source, &ctx).await);
+        }
         (&Method::GET, "/.well-known/hotline") => discovery(&ctx, host.as_deref()),
         (&Method::POST, "/identity/challenge") => challenge(&ctx),
         (&Method::POST, "/identity/auth") => auth(req, peer, &ctx).await,
@@ -725,7 +731,7 @@ async fn transport_identity(
             )));
         }
         let state = state.clone();
-        let found = tokio::task::spawn_blocking(move || state.identity_for_device(&device))
+        let found = crate::spawn_blocking("identity", move || state.identity_for_device(&device))
             .await
             .map_err(|_| {
                 Box::new(plain(
@@ -1458,7 +1464,7 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     let st = st.clone();
     let registrar = ctx.registrar.clone();
     let presented = card.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::spawn_blocking("identity", move || {
         let classic = login
             .as_deref()
             .zip(password.as_deref())
@@ -1542,8 +1548,10 @@ async fn link(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
         );
     };
     let st = st.clone();
-    let result =
-        tokio::task::spawn_blocking(move || st.link(&ident, &login, password.as_bytes())).await;
+    let result = crate::spawn_blocking("identity", move || {
+        st.link(&ident, &login, password.as_bytes())
+    })
+    .await;
     match result {
         Ok(Ok(account)) => json_resp(
             StatusCode::OK,
@@ -1570,7 +1578,7 @@ async fn unlink(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
         Err(resp) => return *resp,
     };
     let st = st.clone();
-    let result = tokio::task::spawn_blocking(move || st.unlink(&ident)).await;
+    let result = crate::spawn_blocking("identity", move || st.unlink(&ident)).await;
     match result {
         Ok(Ok((account, stays))) => json_resp(
             StatusCode::OK,
@@ -1639,7 +1647,7 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
     };
     let state = st.clone();
     let registrar = ctx.registrar.clone();
-    let updated = tokio::task::spawn_blocking(move || {
+    let updated = crate::spawn_blocking("identity", move || {
         // A registrar is the card's home of record, and anchors its
         // successor as its own commitment (`identity-registrar.md` §5.4,
         // §6.4): a card that changes or drops one it holds is refused

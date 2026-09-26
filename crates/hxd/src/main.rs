@@ -33,10 +33,26 @@ fn init_tracing() {
     } else {
         EnvFilter::new("info")
     };
+    #[cfg(not(feature = "console"))]
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+    // tokio-console's layer beside the usual one. The filter goes on the
+    // log layer alone: the console needs the runtime's own spans, which
+    // no `HXD_DEBUG` category would let through.
+    #[cfg(feature = "console")]
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(console_subscriber::spawn())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_filter(filter),
+            )
+            .init();
+    }
 }
 
 /// SIGHUP re-reads `[identity]`'s revocation lists, and — on a

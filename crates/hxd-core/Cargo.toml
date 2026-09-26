@@ -7,6 +7,12 @@ rust-version.workspace = true
 description = "hxd-ng domain layer: presence roster, access bits, auth traits"
 publish = false
 
+[features]
+# Timings, counters and gauges through the `metrics` facade
+# (`crate::instrument`). Off by default: without it every recording
+# call is an empty function.
+metrics = ["dep:metrics"]
+
 [dependencies]
 # tokio::sync only — the domain layer schedules nothing itself.
 tokio = { version = "1", default-features = false, features = ["sync"] }
@@ -18,3 +24,4 @@ getrandom = "0.2"
 # Canonical media hashes, which is what a moderator's re-upload block is
 # keyed on. Same version the identity crates use.
 sha2 = "0.10"
+metrics = { version = "0.24", optional = true }
