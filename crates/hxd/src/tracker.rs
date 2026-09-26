@@ -754,19 +754,20 @@ fn build_v3(
         description: advertisement.description.as_bytes(),
         password: password.unwrap_or("").as_bytes(),
     };
-    let mut sign = |bytes: &[u8]| -> [u8; registration::HMAC_LEN] {
-        let secret = hmac_secret.unwrap_or_default();
-        let mut mac =
-            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC takes a key of any length");
-        mac.update(bytes);
-        mac.finalize().into_bytes().into()
-    };
+    // Only built when there is a secret, so there is no empty-key path.
+    let mut sign;
     let auth = match hmac_secret {
-        Some(_) => {
+        Some(secret) => {
             let mut nonce = [0u8; registration::NONCE_LEN];
             OsRng
                 .try_fill_bytes(&mut nonce)
                 .map_err(|error| format!("tracker nonce randomness: {error}"))?;
+            sign = move |bytes: &[u8]| -> [u8; registration::HMAC_LEN] {
+                let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+                    .expect("HMAC takes a key of any length");
+                mac.update(bytes);
+                mac.finalize().into_bytes().into()
+            };
             Some(Auth {
                 nonce,
                 sign: &mut sign,
