@@ -43,14 +43,20 @@ pub fn check(config: &Config) -> Result<(), String> {
                  percent-encode anything else"
             ));
         }
-        // A client fetches it or opens it from wherever it is, which only
-        // an absolute address names; a path would be read against the
-        // client's own idea of where it is.
+        // Alone, the URL is where every client fetches the image from, so
+        // it must be an absolute address they can all fetch: a path would
+        // be read against the client's own idea of where it is. Beside a
+        // file it is only where a click goes, and a classic banner may
+        // send it to a `hotline://`.
         let scheme = url.split_once("://");
-        if !matches!(scheme, Some((s, host)) if (s.eq_ignore_ascii_case("http")
-            || s.eq_ignore_ascii_case("https")) && !host.is_empty() && !host.starts_with('/'))
-        {
-            return Err("[banner] url must be an absolute http:// or https:// address".into());
+        let fetchable = matches!(scheme, Some((s, host)) if (s.eq_ignore_ascii_case("http")
+            || s.eq_ignore_ascii_case("https")) && !host.is_empty() && !host.starts_with('/'));
+        if section.file.is_none() && !fetchable {
+            return Err(
+                "[banner] url must be an absolute http:// or https:// address when there \
+                 is no file; it is where clients fetch the image from"
+                    .into(),
+            );
         }
     }
     Ok(())
@@ -129,5 +135,10 @@ mod tests {
         for good in ["http://hl.example/b.gif", "HTTPS://hl.example/"] {
             check(&config(&format!("[banner]\nurl = {good:?}\n"))).unwrap();
         }
+        // Beside a file it is only where a click goes.
+        check(&config(
+            "[banner]\nfile = \"b.gif\"\nurl = \"hotline://hl.example/\"\n",
+        ))
+        .unwrap();
     }
 }
