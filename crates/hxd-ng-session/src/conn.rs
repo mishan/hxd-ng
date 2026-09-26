@@ -564,6 +564,10 @@ async fn handle_login(
     if ctx.core.avatar_policy().is_some() && !caps.iter().any(|c| c == "avatars") {
         caps.push("avatars".into());
     }
+    // And `banner`, whenever there is one to show.
+    if ctx.banner.is_some() && !caps.iter().any(|c| c == "banner") {
+        caps.push("banner".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
@@ -650,6 +654,9 @@ async fn handle_login(
     // so it is never asked for a notification permission.
     if let Some(push) = crate::push::login_json(ctx, account.has_inbox) {
         ok["push"] = push;
+    }
+    if let Some(banner) = ctx.banner.as_deref() {
+        ok["banner"] = crate::banner::login_json(banner);
     }
     if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
         // The client never learned it was logged in; a ghost session with

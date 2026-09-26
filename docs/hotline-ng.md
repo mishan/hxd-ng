@@ -167,6 +167,7 @@ over them.
 | `identity` | The server has the identity endpoints of hotline-ng-auth.md | hotline-ng-identity.md §6.1 | fields in `self`, on a socket that authenticated with one |
 | `push` | Push device registration | push-notifications.md §8; webpush-gateway.md §7 | `push` |
 | `avatars` | Users' pictures: `avatar` on the `user` object, `avatar_clear`, bytes over HTTP | avatars.md §4 | `avatars` |
+| `banner` | The server banner: where its image is, where a click goes, and `GET /banner` | banner.md §3 | `banner` |
 
 - `video` MUST NOT appear without `voice`.
 - A login reply block is present exactly when its capability is, except

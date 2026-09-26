@@ -206,7 +206,7 @@ is off (`HXD_VIDEO` without voice, say) is reported and ignored.
 |---|---|---|
 | `HXD_NAME` | `hxd-ng` | The server name clients show. |
 | `HXD_AGREEMENT_FILE` | `/var/lib/hxd-ng/agreement.txt` when it exists | The agreement shown at login (UTF-8). |
-| `HXD_BANNER_FILE` | | A JPEG, GIF or PNG of at most 1 MiB, mounted into the container, shown to clients as the server banner. Publish 5501 for it. `docker kill -s HUP hxd-ng` re-reads it. |
+| `HXD_BANNER_FILE` | | A JPEG, GIF or PNG of at most 1 MiB, mounted into the container, shown to clients as the server banner. Publish 5501 for classic clients to fetch it; ng clients fetch it over 5700. `docker kill -s HUP hxd-ng` re-reads it. |
 | `HXD_BANNER_URL` | | With `HXD_BANNER_FILE`, where a click on the banner goes. Alone, where clients fetch the banner from. |
 | `HXD_BAN_TIME` | 1800 | Seconds a kick-with-ban holds the address. |
 | `HXD_LOGIN_TIMEOUT` | 10 | Seconds a connection has to log in. |

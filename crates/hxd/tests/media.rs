@@ -268,6 +268,7 @@ async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool, history: bool) ->
         files: None,
         registrar: None,
         push: None,
+        banner: None,
     };
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

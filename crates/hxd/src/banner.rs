@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use hxd_files::TransferRegistry;
+use hxd_ng_session::banner::{BannerSource, BannerView};
+use hxd_session::banner::Held;
 use hxd_session::Banner;
 use serde::Deserialize;
 
@@ -85,6 +87,27 @@ pub fn build(
     Ok(Some(Arc::new(banner)))
 }
 
+/// The legacy frontend's banner, read by the ng frontend: one banner, and
+/// one SIGHUP re-reads it for both wires.
+pub struct NgBanner(pub Arc<Banner>);
+
+impl BannerSource for NgBanner {
+    fn view(&self) -> BannerView {
+        match self.0.held() {
+            Some(Held { mime, bytes, etag }) => BannerView::Held {
+                mime,
+                bytes,
+                etag,
+                link: self.0.link().map(String::from),
+            },
+            // A banner with no file is built only with a URL.
+            None => BannerView::Remote {
+                url: self.0.link().unwrap_or_default().to_owned(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +124,24 @@ mod tests {
         check(&config("[banner]\nurl = \"https://hl.example/b.gif\"\n")).unwrap();
         check(&config("[banner]\nfile = \"b.gif\"\n")).unwrap();
         check(&config("")).unwrap();
+    }
+
+    #[test]
+    fn a_url_alone_is_one_every_client_can_fetch() {
+        for bad in [
+            "/img/banner.gif",
+            "banner.gif",
+            "hotline://hl.example/",
+            "javascript:x",
+        ] {
+            let toml = format!("[banner]\nurl = {bad:?}\n");
+            assert!(check(&config(&toml)).unwrap_err().contains("http"), "{bad}");
+        }
+        // Beside a file it is only where a click goes.
+        check(&config(
+            "[banner]\nfile = \"b.gif\"\nurl = \"hotline://hl.example/\"\n",
+        ))
+        .unwrap();
     }
 
     #[test]

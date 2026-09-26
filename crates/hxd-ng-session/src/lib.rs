@@ -5,6 +5,7 @@
 //! share one roster and one chat.
 
 pub mod avatar;
+pub mod banner;
 mod conn;
 pub mod enroll;
 mod files;
@@ -268,6 +269,9 @@ pub struct NgCtx {
     /// `null`. Beside `identity` rather than inside it for the mailbox's
     /// reason: it reads no account and knows no session.
     pub registrar: Option<Arc<hxd_registrar::Registrar>>,
+    /// The server banner, when `[banner]` is configured. `None` means the
+    /// `banner` capability is absent and `GET /banner` is 404.
+    pub banner: Option<Arc<dyn banner::BannerSource>>,
 }
 
 /// Accept loop: one connection task per socket. Each is HTTP until it
