@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 
 use hxd_files::TransferRegistry;
 use hxproto::messages::tag;
+use sha2::{Digest, Sha256};
 
 /// The largest banner file served. A classic banner is a 468×60 JPEG of a
 /// few kilobytes; this is GtkHx's own ceiling, so no banner this server
@@ -35,11 +36,23 @@ struct BannerFile {
     current: RwLock<Image>,
 }
 
-/// A banner image as loaded: its type code and its bytes.
+/// A banner image as loaded: its type code, its bytes, and the ETag the
+/// ng wire serves it under — a digest of the bytes, taken once here
+/// rather than on every fetch.
 #[derive(Clone)]
 pub(crate) struct Image {
     pub kind: [u8; 4],
     pub bytes: Arc<[u8]>,
+    pub etag: Arc<str>,
+}
+
+/// The banner held here as another frontend serves it: over HTTP rather
+/// than HTXF, so with a media type rather than a type code.
+pub struct Held {
+    pub mime: &'static str,
+    pub bytes: Arc<[u8]>,
+    /// A strong ETag, quoted, that changes exactly when the bytes do.
+    pub etag: Arc<str>,
 }
 
 impl Banner {
@@ -95,6 +108,21 @@ impl Banner {
     /// The size of the banner held here, when there is one.
     pub fn image_len(&self) -> Option<usize> {
         self.image().map(|(image, _)| image.bytes.len())
+    }
+
+    /// With a banner file, where a click on it goes; alone, where the
+    /// image is.
+    pub fn link(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    /// The banner held here, as it is now.
+    pub fn held(&self) -> Option<Held> {
+        self.image().map(|(image, _)| Held {
+            mime: mime(image.kind),
+            bytes: image.bytes,
+            etag: image.etag,
+        })
     }
 
     /// What one session is shown: the `HTLS_HDR_BANNER` payload — the
@@ -159,9 +187,14 @@ fn load(path: &Path) -> Result<Image, String> {
             path.display()
         )
     })?;
+    let etag: String = Sha256::digest(&bytes)[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     Ok(Image {
         kind,
         bytes: bytes.into(),
+        etag: format!("\"{etag}\"").into(),
     })
 }
 
@@ -177,6 +210,16 @@ fn sniff(bytes: &[u8]) -> Option<[u8; 4]> {
         Some(*b"PNGf")
     } else {
         None
+    }
+}
+
+/// The media type of a type code [`sniff`] produced.
+fn mime(kind: [u8; 4]) -> &'static str {
+    match &kind {
+        b"JPEG" => "image/jpeg",
+        b"GIFf" => "image/gif",
+        b"PNGf" => "image/png",
+        _ => "application/octet-stream",
     }
 }
 
@@ -239,6 +282,11 @@ mod tests {
             ]
         );
         assert_eq!(&*banner.image().unwrap().0.bytes, b"GIF89a-body");
+        let held = banner.held().unwrap();
+        assert_eq!(
+            (held.mime, &*held.bytes),
+            ("image/gif", &b"GIF89a-body"[..])
+        );
 
         let bare = Banner::file(&path, None, registry()).unwrap();
         assert_eq!(
@@ -272,6 +320,32 @@ mod tests {
             .unwrap()
             .contains("JPEG, GIF or PNG"));
         assert!(Banner::file(&scratch(&dir, "missing.jpg"), None, registry()).is_err());
+    }
+
+    #[test]
+    fn each_format_is_served_under_its_own_media_type() {
+        assert_eq!(mime(*b"JPEG"), "image/jpeg");
+        assert_eq!(mime(*b"GIFf"), "image/gif");
+        assert_eq!(mime(*b"PNGf"), "image/png");
+    }
+
+    #[test]
+    fn the_etag_follows_the_bytes_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = scratch(&dir, "etag");
+        std::fs::write(&path, b"GIF89a-one").unwrap();
+        let banner = Banner::file(&path, None, registry()).unwrap();
+        let first = banner.held().unwrap().etag;
+        assert!(first.starts_with('"') && first.ends_with('"'), "{first}");
+        banner.reload().unwrap();
+        assert_eq!(
+            banner.held().unwrap().etag,
+            first,
+            "a reload of the same bytes"
+        );
+        std::fs::write(&path, b"GIF89a-two").unwrap();
+        banner.reload().unwrap();
+        assert_ne!(banner.held().unwrap().etag, first);
     }
 
     #[test]

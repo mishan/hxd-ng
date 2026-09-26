@@ -84,6 +84,7 @@ async fn start_with(dir: &Path, push: bool, policy: hxd_core::push::PushPolicy) 
                 content: "sender".into(),
             })
         }),
+        banner: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = listener.local_addr().unwrap();

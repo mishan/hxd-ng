@@ -246,14 +246,17 @@ port with `[tls]`); a URL alone has the client fetch the image itself.
 [banner]
 file = "banner.jpg"               # JPEG, GIF or PNG, at most 1 MiB
 url = "https://hl.example/"       # with file: where a click goes;
-                                  # alone: where the image is
+                                  # alone: where the image is, and
+                                  # then it must be http(s)
 ```
 
 Classic clients show JPEG and GIF. The file is re-read on SIGHUP, and
 one that no longer loads leaves the banner in use as it was. A client
 connected through the `/trtp` tunnel has no transfer port to fetch a
 held banner from, so it is shown a banner only when there is no file
-and the `url` is the image.
+and the `url` is the image. ng clients are told of the banner in the
+login reply and fetch a held one with `GET /banner` on the ng port
+(`docs/banner.md`).
 
 ### TLS on the legacy wire
 

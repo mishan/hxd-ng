@@ -1,20 +1,25 @@
 //! The server banner over the legacy wire: the push that follows a 1.5+
 //! client's agreement, and a banner held here fetched over HTXF the way
-//! GtkHx and mhxd's own client fetch one.
+//! GtkHx and mhxd's own client fetch one. And the same banner on the ng
+//! wire: the login reply's `banner` block and `GET /banner`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use hxd_core::Core;
 use hxd_files::{EntryLimits, HtxfTimeouts, TransferRegistry};
+use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{Banner, ServerConfig, ServerCtx};
 use hxfiles_xfer::htxf;
 use hxproto::messages::tag;
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::Message;
 
 const TASK: u32 = 0x0001_0000;
 const LOGIN: u32 = 0x6b;
@@ -31,8 +36,11 @@ struct Running {
     /// The same server, reached as through the `/trtp` tunnel.
     tunnelled: SocketAddr,
     htxf: SocketAddr,
+    ng: SocketAddr,
     core: Arc<Core>,
-    banner: Option<Arc<Banner>>,
+    /// The banner, and the file it was read from, for a SIGHUP's worth
+    /// of rewriting.
+    banner: Option<(Arc<Banner>, std::path::PathBuf)>,
     temp: tempfile::TempDir,
 }
 
@@ -54,15 +62,16 @@ async fn start(shown: Shown<'_>) -> Running {
             per_account: 16,
         },
     ));
+    let path = temp.path().join("banner");
     let banner = match shown {
         Shown::Nothing => None,
         Shown::Url(url) => Some(Banner::url(url.into())),
         Shown::File(bytes, url) => {
-            let path = temp.path().join("banner");
             std::fs::write(&path, bytes).unwrap();
             Some(Banner::file(&path, url.map(String::from), transfers.clone()).unwrap())
         }
-    };
+    }
+    .map(Arc::new);
     let core = Arc::new(Core::new());
     let ctx = ServerCtx {
         core: core.clone(),
@@ -72,18 +81,37 @@ async fn start(shown: Shown<'_>) -> Running {
             ..Default::default()
         }),
         files: None,
-        banner: banner.map(Arc::new),
+        banner: banner.clone(),
     };
-    let banner = ctx.banner.clone();
+    let ng_ctx = NgCtx {
+        core: core.clone(),
+        auth: ctx.auth.clone(),
+        cfg: Arc::new(NgConfig {
+            server_name: "banner".into(),
+            ..Default::default()
+        }),
+        registry: Arc::new(Registry::new()),
+        identity: None,
+        tunnel: None,
+        enroll: None,
+        files: None,
+        registrar: None,
+        push: None,
+        banner: ctx.banner.clone().map(|b| {
+            Arc::new(hxd::banner::NgBanner(b)) as Arc<dyn hxd_ng_session::banner::BannerSource>
+        }),
+    };
     let legacy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let transfer = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tunnel = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ng = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let running = Running {
         legacy: legacy.local_addr().unwrap(),
         tunnelled: tunnel.local_addr().unwrap(),
         htxf: transfer.local_addr().unwrap(),
+        ng: ng.local_addr().unwrap(),
         core: core.clone(),
-        banner,
+        banner: banner.map(|b| (b, path)),
         temp,
     };
     // `run_session` is what the ng frontend hands a tunnelled stream to:
@@ -101,6 +129,7 @@ async fn start(shown: Shown<'_>) -> Running {
         }
     });
     tokio::spawn(hxd_session::serve(legacy, ctx));
+    tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
     tokio::spawn(hxd_files::serve_htxf(
         transfer,
         transfers,
@@ -342,7 +371,7 @@ async fn a_reload_between_the_push_and_the_download_serves_what_was_pushed() {
     // The operator swaps in a JPEG and reloads.
     let path = server.temp.path().join("banner");
     std::fs::write(&path, [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]).unwrap();
-    server.banner.as_ref().unwrap().reload().unwrap();
+    server.banner.as_ref().unwrap().0.reload().unwrap();
 
     let trans = client.send(DOWNLOAD_BANNER, &[]).await;
     let reply = client.task(trans).await;
@@ -376,4 +405,177 @@ async fn a_tunnelled_client_is_not_told_of_a_banner_it_cannot_fetch() {
     let mut tunnelled = Client::login(server.tunnelled, 190).await;
     let banners = tunnelled.agree().await;
     assert_eq!(field(&banners[0], tag::BANNER_TYPE).unwrap(), b"URL ");
+}
+
+// --- The ng wire ----------------------------------------------------------
+
+/// A guest login on the ng wire: the reply's `ok`, and the bearer for HTTP.
+async fn ng_login(address: SocketAddr) -> (Value, String) {
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    let login = json!({ "id": 1, "req": "login" }).to_string();
+    ws.send(Message::Text(login)).await.unwrap();
+    loop {
+        let msg = timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("ng timed out")
+            .expect("ng closed")
+            .unwrap();
+        let Message::Text(text) = msg else { continue };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        if value["reply"] == 1 {
+            let ok = value["ok"].clone();
+            assert!(!ok.is_null(), "{value}");
+            let bearer = format!(
+                "Bearer {}.{}",
+                ok["session"].as_str().unwrap(),
+                ok["token"].as_str().unwrap()
+            );
+            // The session lives as long as its socket does.
+            tokio::spawn(async move { while ws.next().await.is_some() {} });
+            return (ok, bearer);
+        }
+    }
+}
+
+/// `GET path` with these headers: the status, the headers and the body.
+async fn get(address: SocketAddr, path: &str, headers: &[(&str, &str)]) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut raw))
+        .await
+        .unwrap()
+        .unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, head, raw[split + 4..].to_vec())
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+        .map(str::trim)
+}
+
+#[tokio::test]
+async fn ng_is_told_of_a_banner_held_here_and_fetches_it_with_its_bearer() {
+    let image = gif(300);
+    let server = start(Shown::File(&image, Some("https://hl.example/"))).await;
+    let (ok, bearer) = ng_login(server.ng).await;
+    assert!(ok["caps"].as_array().unwrap().contains(&json!("banner")));
+    assert_eq!(
+        ok["banner"],
+        json!({ "url": "/banner", "type": "image/gif", "link": "https://hl.example/" })
+    );
+
+    let (status, _, _) = get(server.ng, "/banner", &[]).await;
+    assert_eq!(status, 401, "a bearer is required");
+
+    let (status, head, body) = get(server.ng, "/banner", &[("Authorization", &bearer)]).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, image);
+    assert_eq!(header(&head, "content-type"), Some("image/gif"));
+    assert_eq!(header(&head, "cache-control"), Some("private, no-cache"));
+    // Unlike the legacy download, as often as a client likes, and
+    // revalidated from the digest.
+    let etag = header(&head, "etag").unwrap().to_owned();
+    let (status, _, body) = get(
+        server.ng,
+        "/banner",
+        &[("Authorization", &bearer), ("If-None-Match", &etag)],
+    )
+    .await;
+    assert_eq!((status, body.len()), (304, 0));
+}
+
+#[tokio::test]
+async fn ng_is_sent_a_url_banner_to_fetch_itself() {
+    let server = start(Shown::Url("https://hl.example/banner.jpg")).await;
+    let (ok, bearer) = ng_login(server.ng).await;
+    assert!(ok["caps"].as_array().unwrap().contains(&json!("banner")));
+    assert_eq!(
+        ok["banner"],
+        json!({ "url": "https://hl.example/banner.jpg" })
+    );
+    let (status, _, _) = get(server.ng, "/banner", &[("Authorization", &bearer)]).await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn ng_without_a_banner_has_no_capability_and_no_block() {
+    let server = start(Shown::Nothing).await;
+    let (ok, bearer) = ng_login(server.ng).await;
+    assert!(!ok["caps"].as_array().unwrap().contains(&json!("banner")));
+    assert!(ok.get("banner").is_none());
+    let (status, _, _) = get(server.ng, "/banner", &[("Authorization", &bearer)]).await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn ng_is_not_sent_a_link_the_banner_does_not_have() {
+    let image = gif(64);
+    let server = start(Shown::File(&image, None)).await;
+    let (ok, _) = ng_login(server.ng).await;
+    assert_eq!(
+        ok["banner"],
+        json!({ "url": "/banner", "type": "image/gif" })
+    );
+}
+
+#[tokio::test]
+async fn a_sighup_reaches_the_next_ng_fetch() {
+    let server = start(Shown::File(&gif(64), None)).await;
+    let (_, bearer) = ng_login(server.ng).await;
+    let auth = ("Authorization", bearer.as_str());
+    let (_, head, _) = get(server.ng, "/banner", &[auth]).await;
+    let old = header(&head, "etag").unwrap().to_owned();
+
+    let (banner, path) = server.banner.as_ref().unwrap();
+    let jpeg = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3];
+    std::fs::write(path, jpeg).unwrap();
+    banner.reload().unwrap();
+
+    // The tag the client holds is stale now: the whole new file, typed.
+    let (status, head, body) = get(server.ng, "/banner", &[auth, ("If-None-Match", &old)]).await;
+    assert_eq!((status, body.as_slice()), (200, &jpeg[..]));
+    assert_eq!(header(&head, "content-type"), Some("image/jpeg"));
+    let new = header(&head, "etag").unwrap().to_owned();
+    assert_ne!(new, old);
+    // And a proxy that weakened the new one still gets its 304.
+    let weak = format!("W/{new}");
+    let (status, head, _) = get(server.ng, "/banner", &[auth, ("If-None-Match", &weak)]).await;
+    assert_eq!(status, 304);
+    assert_eq!(header(&head, "etag"), Some(new.as_str()));
+    assert_eq!(header(&head, "cache-control"), Some("private, no-cache"));
+}
+
+#[tokio::test]
+async fn a_page_elsewhere_may_fetch_the_banner() {
+    let server = start(Shown::File(&gif(64), None)).await;
+    let (_, bearer) = ng_login(server.ng).await;
+    let origin = ("Origin", "https://web.example");
+    let (status, head, _) = get(server.ng, "/banner", &[origin, ("Authorization", &bearer)]).await;
+    assert_eq!(status, 200);
+    assert!(
+        header(&head, "access-control-allow-origin").is_some(),
+        "{head}"
+    );
+    // A stale or forged bearer is refused as a missing one is.
+    let (status, _, body) = get(
+        server.ng,
+        "/banner",
+        &[origin, ("Authorization", "Bearer s_0.nope")],
+    )
+    .await;
+    assert_eq!(status, 401);
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error"]["code"], "not_logged_in");
 }

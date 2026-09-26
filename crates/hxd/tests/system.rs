@@ -95,6 +95,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, Arc<Core>) {
         files: None,
         registrar: None,
         push: None,
+        banner: None,
     };
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
