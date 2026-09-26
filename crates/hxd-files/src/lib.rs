@@ -7,12 +7,12 @@ mod transfer;
 
 pub use manifest::{HttpManifestSource, ManifestLimits};
 pub use registry::{
-    DownloadGrant, DownloadTokens, EntryLimits, PreparedDownload, PreparedTransfer, PreparedUpload,
-    TransferRegistry, UploadQuote,
+    DownloadGrant, DownloadTokens, EntryLimits, PreparedBanner, PreparedDownload, PreparedTransfer,
+    PreparedUpload, TransferRegistry, UploadQuote,
 };
 pub use transfer::{
-    prepare_legacy, prepare_upload, pump, serve_htxf, serve_htxf_with, HtxfSlots, HtxfStream,
-    HtxfTimeouts, LegacyTransfer, Liveness, UploadTransfer,
+    prepare_legacy, prepare_upload, pump, serve_htxf, serve_htxf_with, serve_tunnelled, HtxfSlots,
+    HtxfStream, HtxfTimeouts, LegacyTransfer, Liveness, UploadTransfer,
 };
 
 use std::sync::Arc;

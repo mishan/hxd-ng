@@ -25,7 +25,8 @@
 //! hlid unlink  --server URL [--device K] [--card FILE] [--cert FILE]
 //! hlid tunnel  --server URL [--device K] [--card FILE] [--cert FILE] [--listen ADDR]
 //!              [--allow-remote-listen] [--create]
-//!              local TCP port for a classic client, TRTP over WebSocket upstream
+//!              local TCP port for a classic client, TRTP over WebSocket upstream,
+//!              and the port after it for its file transfers and banner (HTXF)
 //! hlid register --registrar HOST --handle S [--proof CODE] [--successor-commit]
 //!              an attestation from a registrar, put into the card
 //! hlid revoke  --registrar HOST (--device-cert FILE | --device-pub HEX) [--reason R] [--by-device]
@@ -1103,11 +1104,51 @@ fn tunnel_cmd(args: &[String]) -> R<()> {
         );
         let ws_base = format!("ws{}", &base[4..]); // http → ws, https → wss
         let c = std::sync::Arc::new(c);
+        // A classic client dials the control port plus one for a file or
+        // the banner, so the tunnel listens there too and carries each
+        // connection to `/htxf` (hotline-ng-auth.md §7.4) — when the
+        // server has one. Without it, or without the port, the tunnel
+        // still carries everything else.
+        let transfer_listen = transfer_addr(&listener);
+        let serves_htxf = {
+            let base = base.clone();
+            tokio::task::spawn_blocking(move || discovered_htxf(&base))
+                .await
+                .unwrap_or(false)
+        };
+        if let (true, Some(addr)) = (serves_htxf, transfer_listen) {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(transfers) => {
+                    eprintln!("tunnelling file transfers {addr} → {base}/htxf");
+                    let (base, ws_base, c) = (base.clone(), ws_base.clone(), c.clone());
+                    tokio::spawn(async move {
+                        loop {
+                            let (sock, peer) = match transfers.accept().await {
+                                Ok(accepted) => accepted,
+                                Err(e) => {
+                                    eprintln!("transfer accept: {e}");
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    continue;
+                                }
+                            };
+                            let (base, ws_base, c) = (base.clone(), ws_base.clone(), c.clone());
+                            tokio::spawn(async move {
+                                if let Err(e) = tunnel_one(sock, &base, &ws_base, "/htxf", &c).await
+                                {
+                                    eprintln!("transfer {peer}: {e}");
+                                }
+                            });
+                        }
+                    });
+                }
+                Err(e) => eprintln!("{addr}: {e}; file transfers and banners will not work"),
+            }
+        }
         loop {
             let (sock, peer) = listener.accept().await.map_err(|e| e.to_string())?;
             let (base, ws_base, c) = (base.clone(), ws_base.clone(), c.clone());
             tokio::spawn(async move {
-                if let Err(e) = tunnel_one(sock, &base, &ws_base, &c).await {
+                if let Err(e) = tunnel_one(sock, &base, &ws_base, "/trtp", &c).await {
                     eprintln!("tunnel {peer}: {e}");
                 }
             });
@@ -1115,11 +1156,33 @@ fn tunnel_cmd(args: &[String]) -> R<()> {
     })
 }
 
-/// One legacy connection: fresh token, WebSocket to /trtp, pump both ways.
+/// The local port a classic client looks for transfers on: the one after
+/// the control port it connected to.
+fn transfer_addr(listener: &tokio::net::TcpListener) -> Option<std::net::SocketAddr> {
+    let mut addr = listener.local_addr().ok()?;
+    addr.set_port(addr.port().checked_add(1)?);
+    Some(addr)
+}
+
+/// Whether the server's discovery document offers `/htxf`.
+fn discovered_htxf(base: &str) -> bool {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .get(&format!("{base}/.well-known/hotline"))
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<Value>().ok())
+        .is_some_and(|d| d["ng"]["htxf"].is_string())
+}
+
+/// One legacy connection — the control stream on `/trtp`, or one file
+/// transfer on `/htxf`: fresh token, WebSocket, pump both ways.
 async fn tunnel_one(
     sock: tokio::net::TcpStream,
     base: &str,
     ws_base: &str,
+    path: &str,
     c: &Credentials,
 ) -> R<()> {
     let _ = sock.set_nodelay(true);
@@ -1133,7 +1196,7 @@ async fn tunnel_one(
         .as_str()
         .ok_or("auth reply had no token")?
         .to_owned();
-    let mut req = format!("{ws_base}/trtp")
+    let mut req = format!("{ws_base}{path}")
         .into_client_request()
         .map_err(|e| e.to_string())?;
     req.headers_mut()

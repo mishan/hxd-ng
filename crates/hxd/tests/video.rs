@@ -141,6 +141,7 @@ async fn start_both(dir: &Path, video: bool) -> Server {
             news: Default::default(),
         }),
         files: None,
+        banner: None,
     };
     let ng_caps = if video {
         vec!["voice".to_string(), "video".to_string()]

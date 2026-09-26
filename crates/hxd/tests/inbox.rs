@@ -91,6 +91,7 @@ async fn start_full(dir: &Path, policy: InboxPolicy, who: &[&str], inbox: bool) 
             news: Default::default(),
         }),
         files: None,
+        banner: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),

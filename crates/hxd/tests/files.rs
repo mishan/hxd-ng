@@ -395,6 +395,7 @@ async fn run_service(service: Arc<FileService>, access: &str) -> Running {
             news: Default::default(),
         }),
         files: Some(service.clone()),
+        banner: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),

@@ -103,6 +103,7 @@ async fn start(login_timeout: Duration) -> Running {
             news: Default::default(),
         }),
         files: Some(service.clone()),
+        banner: None,
     };
 
     let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();

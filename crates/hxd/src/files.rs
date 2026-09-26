@@ -104,6 +104,56 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
     }))
 }
 
+/// The HTXF listener: where it binds, what it redeems, and how long it
+/// waits.
+pub struct Htxf {
+    pub registry: Arc<TransferRegistry>,
+    pub bind: String,
+    pub timeouts: HtxfTimeouts,
+}
+
+/// Whether anything is fetched over HTXF: files, or a banner held here.
+pub fn wants_htxf(config: &Config) -> bool {
+    config.files.is_some() || config.banner.as_ref().is_some_and(|b| b.file.is_some())
+}
+
+/// The HTXF listener `[files]` configures, or — on a server whose only
+/// transfer is its banner — one on the port a client derives from the
+/// control port, with `[files]`'s defaults.
+pub fn htxf(config: &Config, files: Option<&Files>) -> Result<Option<Htxf>, String> {
+    if let Some(files) = files {
+        return Ok(Some(Htxf {
+            registry: files.service.transfers.clone(),
+            bind: files.bind.clone(),
+            timeouts: files.timeouts,
+        }));
+    }
+    if !wants_htxf(config) {
+        return Ok(None);
+    }
+    Ok(Some(Htxf {
+        registry: Arc::new(TransferRegistry::new(
+            Duration::from_secs(crate::default_files_reference_ttl()),
+            EntryLimits {
+                total: crate::default_files_max_references(),
+                per_session: crate::default_files_max_references_per_session(),
+                per_account: crate::default_files_max_references_per_account(),
+            },
+        )),
+        // Only a banner brings this listener up, so the error says so
+        // rather than pointing at a [files] section that is not there.
+        bind: transfer_bind(&config.server.bind).map_err(|_| {
+            "a [banner] file is fetched on the control port plus one, which needs a numeric \
+             [server] bind (an address, not a host name)"
+                .to_string()
+        })?,
+        timeouts: HtxfTimeouts {
+            handshake: Duration::from_secs(crate::default_files_handshake_timeout()),
+            idle: Duration::from_secs(crate::default_files_idle_timeout()),
+        },
+    }))
+}
+
 fn transfer_bind(control: &str) -> Result<String, String> {
     let mut address: SocketAddr = control.parse().map_err(|_| {
         "[files] bind is required when [server] bind is not a numeric socket address".to_string()
@@ -119,6 +169,25 @@ fn transfer_bind(control: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_banner_file_opens_a_transfer_listener_without_files() {
+        let config = |toml: &str| -> Config { toml::from_str(toml).unwrap() };
+        let banner = config("[server]\nbind = \"127.0.0.1:5500\"\n[banner]\nfile = \"b.gif\"\n");
+        assert_eq!(htxf(&banner, None).unwrap().unwrap().bind, "127.0.0.1:5501");
+        // A banner fetched from its URL transfers nothing here.
+        let url = config("[banner]\nurl = \"https://hl.example/b.gif\"\n");
+        assert!(htxf(&url, None).unwrap().is_none());
+        assert!(htxf(&config(""), None).unwrap().is_none());
+        // A host name cannot be added to, and the error says why, and
+        // not in terms of a [files] section there is none of.
+        let named = config("[server]\nbind = \"localhost:5500\"\n[banner]\nfile = \"b.gif\"\n");
+        let error = htxf(&named, None).err().unwrap();
+        assert!(
+            error.contains("[banner]") && !error.contains("[files]"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn transfer_listener_follows_the_control_port() {

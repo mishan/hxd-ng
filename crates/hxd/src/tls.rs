@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::Config;
 
 /// A TLS control port beside the plaintext one, and a TLS transfer port
-/// beside the plaintext HTXF one when there are files. Nothing inside
+/// beside the plaintext HTXF one when there are files or a banner file. Nothing inside
 /// the stream differs from the plaintext ports, so every legacy feature
 /// works on both.
 #[derive(Debug, Deserialize)]
@@ -32,7 +32,8 @@ pub struct TlsSection {
     /// only as good as the fingerprint its users compare it against.
     #[serde(default)]
     pub self_signed: bool,
-    /// The TLS transfer listener, when `[files]` is on. Omitted means
+    /// The TLS transfer listener, when `[files]` is on or `[banner]` has
+    /// a file. Omitted means
     /// the TLS control port plus one, which is where GtkHx looks: it
     /// derives the transfer port rather than asking, so a port anywhere
     /// else is one its downloads will not find.
@@ -47,7 +48,7 @@ fn default_bind() -> String {
 pub struct Tls {
     pub tls: Arc<LegacyTls>,
     pub bind: String,
-    /// Present exactly when `[files]` is.
+    /// Present exactly when there is a plaintext HTXF listener.
     pub files_bind: Option<String>,
 }
 
@@ -71,9 +72,11 @@ pub fn check(config: &Config) -> Result<(), String> {
     if section.self_signed && section.cert == section.key {
         return Err("[tls] self_signed needs cert and key to be two different files".into());
     }
-    if section.files_bind.is_some() && config.files.is_none() {
+    if section.files_bind.is_some() && !crate::files::wants_htxf(config) {
         return Err(
-            "[tls] files_bind needs [files]: there are no transfers to carry without it".into(),
+            "[tls] files_bind needs [files] or a [banner] file: there are no transfers \
+             to carry without one"
+                .into(),
         );
     }
     Ok(())
@@ -94,10 +97,10 @@ pub fn build(config: &Config) -> Result<Option<Tls>, String> {
             format!("[tls] {e}")
         }
     })?;
-    let files_bind = match (&config.files, &section.files_bind) {
-        (None, _) => None,
-        (Some(_), Some(bind)) => Some(bind.clone()),
-        (Some(_), None) => Some(transfer_bind(&section.bind)?),
+    let files_bind = match (crate::files::wants_htxf(config), &section.files_bind) {
+        (false, _) => None,
+        (true, Some(bind)) => Some(bind.clone()),
+        (true, None) => Some(transfer_bind(&section.bind)?),
     };
     Ok(Some(Tls {
         tls: Arc::new(tls),
@@ -242,6 +245,22 @@ mod tests {
         let section = config.tls.as_ref().unwrap();
         assert_eq!(section.bind, "0.0.0.0:5600");
         check(&config).unwrap();
+    }
+
+    #[test]
+    fn a_banner_file_is_a_transfer_the_tls_port_carries() {
+        let config: Config = toml::from_str(
+            "[tls]\ncert = \"c.pem\"\nkey = \"k.pem\"\nfiles_bind = \"0.0.0.0:5611\"\n\
+             [banner]\nfile = \"b.gif\"\n",
+        )
+        .unwrap();
+        check(&config).unwrap();
+        let config: Config = toml::from_str(
+            "[tls]\ncert = \"c.pem\"\nkey = \"k.pem\"\nfiles_bind = \"0.0.0.0:5611\"\n\
+             [banner]\nurl = \"https://hl.example/b.gif\"\n",
+        )
+        .unwrap();
+        assert!(check(&config).unwrap_err().contains("needs [files]"));
     }
 
     #[test]

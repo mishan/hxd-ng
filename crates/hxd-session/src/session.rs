@@ -35,6 +35,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSend
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
+use crate::banner::Banner;
 use crate::caps::{cap, Caps};
 use crate::encoding::TextEncoding;
 use crate::files;
@@ -50,6 +51,7 @@ use crate::voice;
 mod hdr {
     pub const TASK: u32 = 0x0001_0000;
     pub const AGREEMENT: u32 = 0x0000_006d;
+    pub const BANNER: u32 = 0x0000_007a;
     pub const USER_CHANGE: u32 = 0x0000_012d;
     pub const USER_PART: u32 = 0x0000_012e;
     pub const USER_SELFINFO: u32 = 0x0000_0162;
@@ -153,6 +155,9 @@ pub struct ServerCtx {
     pub auth: Arc<dyn AuthBackend>,
     pub cfg: Arc<ServerConfig>,
     pub files: Option<Arc<hxd_files::FileService>>,
+    /// The banner every 1.5+ client is shown after its agreement. Absent =
+    /// none, and no `HTLS_HDR_BANNER` is ever sent.
+    pub banner: Option<Arc<Banner>>,
 }
 
 /// The next connection, however long that takes. An accept error —
@@ -802,6 +807,12 @@ struct Session {
     /// tunnelled session's peer is whoever terminated its WebSocket, so it
     /// binds nothing.
     transfer_addr: Option<IpAddr>,
+    /// Whether this session has been sent the banner, which happens once.
+    banner_sent: bool,
+    /// The image this session was told of and may still download: once,
+    /// as on mhxd, which is all a client showing it needs. Kept rather
+    /// than read again, so the bytes are the ones the push described.
+    banner_image: Option<crate::banner::Image>,
 }
 
 impl Session {
@@ -1337,6 +1348,8 @@ async fn login_phase(
         media_refill: Instant::now(),
         media_stream: None,
         transfer_addr: None,
+        banner_sent: false,
+        banner_image: None,
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -1851,6 +1864,71 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             if !sess.announced {
                 complete_login(tx, ctx, sess).await;
             }
+            // The banner follows the agreement, as on mhxd: only a 1.5+
+            // client agrees, and only one of those knows what a banner
+            // is. Once per session, however often the client agrees.
+            if let Some(banner) = ctx.banner.as_ref().filter(|_| !sess.banner_sent) {
+                sess.banner_sent = true;
+                // A tunnelled session fetches a held banner through the
+                // tunnel's `/htxf` (`hotline-ng-auth.md` §7.4), which
+                // `hlid tunnel` serves on its own port + 1, where a classic
+                // client looks.
+                let offer = banner.offer();
+                sess.banner_image = offer.image;
+                push(tx, hdr::BANNER, offer.chunks);
+            }
+        }
+
+        // No access bit, as on mhxd: the banner is the server's own
+        // decoration, shown to every account that was sent it.
+        t if t == ClientHdr::DownloadBanner.as_u32() => {
+            let transfers = ctx.banner.as_ref().and_then(|banner| banner.transfers());
+            let (Some(image), Some(transfers)) = (sess.banner_image.clone(), transfers) else {
+                // mhxd leaves this unanswered; a task error is kinder to a
+                // client waiting on its reply.
+                reply_error(tx, f.trans, "There is no banner to download.");
+                return;
+            };
+            let Some(serial) = ctx.core.session_serial(sess.uid) else {
+                reply_error(tx, f.trans, "Session ended.");
+                return;
+            };
+            let size = image.bytes.len() as u32;
+            let issued = transfers.issue(hxd_files::PreparedTransfer::Banner(
+                hxd_files::PreparedBanner {
+                    principal: FilePrincipal {
+                        uid: sess.uid,
+                        serial,
+                    },
+                    account: sess.account.login.clone(),
+                    peer: sess.transfer_addr,
+                    bytes: image.bytes,
+                },
+            ));
+            let reference = match issued {
+                Ok(reference) => reference,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            sess.banner_image = None;
+            // mhxd sends the size in two bytes, truncating any banner past
+            // 64 KiB. Those bytes exactly whenever they are right, and four
+            // when they would not be: a client reads the field as an
+            // integer of either width.
+            let size = match u16::try_from(size) {
+                Ok(short) => short.to_be_bytes().to_vec(),
+                Err(_) => size.to_be_bytes().to_vec(),
+            };
+            reply(
+                tx,
+                f.trans,
+                vec![
+                    (tag::HTXF_SIZE, size),
+                    (tag::HTXF_REF, reference.to_be_bytes().to_vec()),
+                ],
+            );
         }
 
         // --- Read-only Files -----------------------------------------

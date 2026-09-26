@@ -93,6 +93,7 @@ async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<Rec
             news: Default::default(),
         }),
         files: None,
+        banner: None,
     };
     let ng_ctx = NgCtx {
         core: ctx.core.clone(),

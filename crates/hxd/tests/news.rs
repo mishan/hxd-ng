@@ -125,6 +125,7 @@ async fn start_server_with(
             news: legacy_news,
         }),
         files: None,
+        banner: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),
