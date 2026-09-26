@@ -43,6 +43,15 @@ pub fn check(config: &Config) -> Result<(), String> {
                  percent-encode anything else"
             ));
         }
+        // A client fetches it or opens it from wherever it is, which only
+        // an absolute address names; a path would be read against the
+        // client's own idea of where it is.
+        let scheme = url.split_once("://");
+        if !matches!(scheme, Some((s, host)) if (s.eq_ignore_ascii_case("http")
+            || s.eq_ignore_ascii_case("https")) && !host.is_empty() && !host.starts_with('/'))
+        {
+            return Err("[banner] url must be an absolute http:// or https:// address".into());
+        }
     }
     Ok(())
 }
@@ -99,5 +108,26 @@ mod tests {
         }
         let long = format!("[banner]\nurl = \"https://{}\"\n", "a".repeat(MAX_URL));
         assert!(check(&config(&long)).is_err());
+    }
+
+    #[test]
+    fn a_url_is_absolute_http() {
+        for bad in [
+            "banner.jpg",
+            "/img/b.jpg",
+            "//cdn.example/b.jpg",
+            "ftp://h/b.jpg",
+            "https://",
+            "https:///b",
+        ] {
+            let toml = format!("[banner]\nurl = {bad:?}\n");
+            assert!(
+                check(&config(&toml)).unwrap_err().contains("absolute"),
+                "{bad}"
+            );
+        }
+        for good in ["http://hl.example/b.gif", "HTTPS://hl.example/"] {
+            check(&config(&format!("[banner]\nurl = {good:?}\n"))).unwrap();
+        }
     }
 }
