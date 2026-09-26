@@ -1622,6 +1622,62 @@ impl TunnelSink for LegacyTunnel {
             .await
         })
     }
+
+    fn transfer(
+        &self,
+        stream: TunnelStream,
+        peer: SocketAddr,
+        identity: [u8; 32],
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+        let ctx = self.0.clone();
+        let (_, timeouts) = tunnel_transfers(&ctx)?;
+        Some(Box::pin(async move {
+            let (registry, _) = tunnel_transfers(&ctx).expect("checked above");
+            let served = hxd_files::serve_tunnelled(
+                stream,
+                peer,
+                registry,
+                ctx.core.clone(),
+                timeouts,
+                identity,
+            )
+            .await;
+            if let Err(error) = served {
+                tracing::debug!(%peer, %error, "tunnelled HTXF transfer refused");
+            }
+        }))
+    }
+
+    fn has_transfers(&self) -> bool {
+        tunnel_transfers(&self.0).is_some()
+    }
+}
+
+/// The registry a tunnelled session's transfers were issued from — the
+/// files', or a banner-only server's — and the timeouts to serve them
+/// under: the files' own, or the defaults a banner-only listener has.
+fn tunnel_transfers(
+    ctx: &ServerCtx,
+) -> Option<(&hxd_files::TransferRegistry, hxd_files::HtxfTimeouts)> {
+    match (ctx.files.as_deref(), ctx.banner.as_deref()) {
+        (Some(files), _) => Some((
+            &files.transfers,
+            hxd_files::HtxfTimeouts {
+                handshake: Duration::from_secs(default_files_handshake_timeout()),
+                idle: files.idle_timeout,
+            },
+        )),
+        (None, Some(banner)) => banner.transfers().map(|registry| {
+            (
+                registry,
+                hxd_files::HtxfTimeouts {
+                    handshake: Duration::from_secs(default_files_handshake_timeout()),
+                    idle: Duration::from_secs(default_files_idle_timeout()),
+                },
+            )
+        }),
+        (None, None) => None,
+    }
 }
 
 /// Load or create a signing key: the server's identity key, or the

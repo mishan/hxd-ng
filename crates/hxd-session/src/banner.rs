@@ -154,7 +154,7 @@ impl Banner {
     }
 
     /// The registry a held banner's transfers are issued from.
-    pub(crate) fn transfers(&self) -> Option<&TransferRegistry> {
+    pub fn transfers(&self) -> Option<&TransferRegistry> {
         self.file.as_ref().map(|file| file.transfers.as_ref())
     }
 }

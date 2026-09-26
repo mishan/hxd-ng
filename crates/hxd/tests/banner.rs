@@ -392,19 +392,15 @@ async fn a_reload_between_the_push_and_the_download_serves_what_was_pushed() {
 }
 
 #[tokio::test]
-async fn a_tunnelled_client_is_not_told_of_a_banner_it_cannot_fetch() {
+async fn a_tunnelled_client_is_told_of_the_banner_as_anyone_is() {
+    // It fetches a held one through `/htxf` (identity.rs covers that).
     let image = gif(64);
     let server = start(Shown::File(&image, Some("https://hl.example/"))).await;
     let mut tunnelled = Client::login(server.tunnelled, 190).await;
-    assert!(tunnelled.agree().await.is_empty());
-    let trans = tunnelled.send(DOWNLOAD_BANNER, &[]).await;
-    assert_eq!(tunnelled.task(trans).await.flag & 1, 1);
-
-    // A banner fetched from its URL needs no transfer port.
-    let server = start(Shown::Url("https://hl.example/b.jpg")).await;
-    let mut tunnelled = Client::login(server.tunnelled, 190).await;
     let banners = tunnelled.agree().await;
-    assert_eq!(field(&banners[0], tag::BANNER_TYPE).unwrap(), b"URL ");
+    assert_eq!(field(&banners[0], tag::BANNER_TYPE).unwrap(), b"GIFf");
+    let trans = tunnelled.send(DOWNLOAD_BANNER, &[]).await;
+    assert_eq!(tunnelled.task(trans).await.flag & 1, 0);
 }
 
 // --- The ng wire ----------------------------------------------------------

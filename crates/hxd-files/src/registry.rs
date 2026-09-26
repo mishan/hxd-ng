@@ -121,7 +121,7 @@ pub enum PreparedTransfer {
 }
 
 impl PreparedTransfer {
-    fn principal(&self) -> FilePrincipal {
+    pub(crate) fn principal(&self) -> FilePrincipal {
         match self {
             PreparedTransfer::Download(value) => value.principal,
             PreparedTransfer::Upload(value) => value.principal,

@@ -1869,17 +1869,13 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // is. Once per session, however often the client agrees.
             if let Some(banner) = ctx.banner.as_ref().filter(|_| !sess.banner_sent) {
                 sess.banner_sent = true;
+                // A tunnelled session fetches a held banner through the
+                // tunnel's `/htxf` (`hotline-ng-auth.md` §7.4), which
+                // `hlid tunnel` serves on its own port + 1, where a classic
+                // client looks.
                 let offer = banner.offer();
-                // A tunnelled session has no transfer port to fetch a held
-                // banner from: `hlid tunnel` carries the control stream
-                // only, and the client would dial port + 1 on its own end
-                // of the tunnel. It is told of no banner rather than of one
-                // it cannot show. A banner fetched from its URL is fine.
-                let reachable = offer.image.is_none() || sess.transfer_addr.is_some();
-                if reachable {
-                    sess.banner_image = offer.image;
-                    push(tx, hdr::BANNER, offer.chunks);
-                }
+                sess.banner_image = offer.image;
+                push(tx, hdr::BANNER, offer.chunks);
             }
         }
 

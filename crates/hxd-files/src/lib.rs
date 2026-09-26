@@ -11,8 +11,8 @@ pub use registry::{
     PreparedUpload, TransferRegistry, UploadQuote,
 };
 pub use transfer::{
-    prepare_legacy, prepare_upload, pump, serve_htxf, serve_htxf_with, HtxfSlots, HtxfStream,
-    HtxfTimeouts, LegacyTransfer, Liveness, UploadTransfer,
+    prepare_legacy, prepare_upload, pump, serve_htxf, serve_htxf_with, serve_tunnelled, HtxfSlots,
+    HtxfStream, HtxfTimeouts, LegacyTransfer, Liveness, UploadTransfer,
 };
 
 use std::sync::Arc;
