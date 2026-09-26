@@ -16,6 +16,7 @@
 //! | `/identity/enroll/…` | the enrollment mailbox, `identity-enrollment.md` §5 |
 //! | `POST /media` | inline media, `inline-media.md` §8.2 |
 //! | `GET  /media/<id>` | the canonical bytes |
+//! | `GET  /banner` | the server banner, `banner.md` §3 |
 //! | `POST /news/blob` | stage a durable news image |
 //! | `GET  /news/blob/<id>` | an authorized news image |
 //! | `/registrar/…` | the registrar, `identity-registrar.md` §6 (`registrar.rs`) |
@@ -160,6 +161,14 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
             (&Method::GET, Some(id)) if !id.is_empty() && !id.contains('/') => {
                 boxed(crate::media::download(id, req, &ctx).await)
             }
+            _ => plain(StatusCode::NOT_FOUND, "not found"),
+        };
+        return cors(resp);
+    }
+
+    if path == crate::banner::BANNER_PATH {
+        let resp = match *req.method() {
+            Method::GET => boxed(crate::banner::download(req, &ctx).await),
             _ => plain(StatusCode::NOT_FOUND, "not found"),
         };
         return cors(resp);
@@ -415,6 +424,7 @@ fn cors_route(path: &str) -> bool {
         || path.starts_with("/identity/")
         || path == "/media"
         || path.starts_with("/media/")
+        || path == crate::banner::BANNER_PATH
         || path.starts_with("/files/")
         || path == "/news/blob"
         || path.starts_with("/news/blob/")

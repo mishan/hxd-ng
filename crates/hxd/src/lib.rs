@@ -2794,6 +2794,9 @@ pub fn build_ng_ctx(
         files: files.map(|value| value.service.clone()),
         push: push.and_then(Push::info),
         registrar,
+        banner: legacy.banner.clone().map(|b| {
+            Arc::new(banner::NgBanner(b)) as Arc<dyn hxd_ng_session::banner::BannerSource>
+        }),
     }))
 }
 

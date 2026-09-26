@@ -169,6 +169,7 @@ async fn start_both(dir: &Path, video: bool) -> Server {
         files: None,
         registrar: None,
         push: None,
+        banner: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
