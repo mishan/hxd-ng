@@ -241,6 +241,7 @@ async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool, history: bool) ->
             news: Default::default(),
         }),
         files: None,
+        banner: None,
     };
     let ng_ctx = NgCtx {
         core,

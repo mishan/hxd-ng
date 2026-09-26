@@ -234,15 +234,35 @@ accounts = "accounts"
 agreement = "agreement.txt"
 ```
 
+### Banner
+
+An optional `[banner]` section gives the server a banner, the image a
+1.5+ client shows above its windows. It is sent after the agreement,
+as mhxd sends it. A banner file is held here and fetched over HTXF, on
+the files port whether or not `[files]` is on (and on the TLS transfer
+port with `[tls]`); a URL alone has the client fetch the image itself.
+
+```toml
+[banner]
+file = "banner.jpg"               # JPEG, GIF or PNG, at most 1 MiB
+url = "https://hl.example/"       # with file: where a click goes;
+                                  # alone: where the image is
+```
+
+Classic clients show JPEG and GIF. The file is re-read on SIGHUP, and
+one that no longer loads leaves the banner in use as it was. A client
+connected through the `/trtp` tunnel fetches a held banner through
+`/htxf`, which `hlid tunnel` serves on its own port plus one.
+
 ### TLS on the legacy wire
 
 An optional `[tls]` section opens a second control port that speaks TLS
 from its first byte and the unchanged Hotline protocol inside it — the
 separate-port model GtkHx, Janus and Mobius share. Period clients keep
 the plaintext port; a client that speaks TLS connects here instead, and
-its session is marked encrypted, as a tunnelled one is. With `[files]`,
-a TLS transfer port sits one above the TLS control port, where a client
-looks for it.
+its session is marked encrypted, as a tunnelled one is. With `[files]`
+or a banner file, a TLS transfer port sits one above the TLS control
+port, where a client looks for it.
 
 ```toml
 [tls]
@@ -945,7 +965,9 @@ hlid tunnel --server http://127.0.0.1:5700 --device dev.key --card card.cbor --c
 ```
 
 After `hlid tunnel`, point any 1.x client at `127.0.0.1:5500` and it logs in
-through the tunnel with your identity. That login can link an account too
+through the tunnel with your identity. The tunnel also listens on the port
+after it (`127.0.0.1:5501`), where the client looks for file transfers and
+the banner, and carries each of those to the server's `/htxf`. That login can link an account too
 (§8.3), which is why the certificate above carries `manage`; a tunnel used
 with an account that is already linked wants `--caps login,message`.
 

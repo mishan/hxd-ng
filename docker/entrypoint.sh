@@ -272,6 +272,17 @@ generate() {
         num HXD_FILES_MAX_FILE_SIZE max_file_size
     fi
 
+    # A banner file is fetched over HTXF, so it opens 5501 (and 5601 with
+    # TLS) whether or not there is a file area.
+    if [ -n "${HXD_BANNER_FILE:-}${HXD_BANNER_URL:-}" ]; then
+        [ -z "${HXD_BANNER_FILE:-}" ] || [ -r "$HXD_BANNER_FILE" ] ||
+            die "HXD_BANNER_FILE $HXD_BANNER_FILE is not readable; mount it there"
+        echo
+        echo "[banner]"
+        str HXD_BANNER_FILE file
+        str HXD_BANNER_URL url
+    fi
+
     # Both files or neither: a certificate without its key is a mistake
     # worth stopping for, not a TLS port quietly left off. A mounted pair
     # wins over a self-signed one, so moving to a CA's certificate is

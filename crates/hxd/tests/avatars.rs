@@ -71,6 +71,7 @@ async fn start(dir: &Path, avatars: Option<AvatarPolicy>) -> Server {
             ..Default::default()
         }),
         files: None,
+        banner: None,
     };
     let ng_ctx = NgCtx {
         core,

@@ -91,6 +91,7 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
             news: Default::default(),
         }),
         files: None,
+        banner: None,
     };
     let ng_ctx = NgCtx {
         core,

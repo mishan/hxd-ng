@@ -138,6 +138,7 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
             {
                 upgrade(&mut req, peer, client, ctx, Proto::Trtp).await
             }
+            "/htxf" if serves_htxf(&ctx) => upgrade(&mut req, peer, client, ctx, Proto::Htxf).await,
             _ => plain(StatusCode::NOT_FOUND, "no such WebSocket path"),
         };
     }
@@ -483,6 +484,15 @@ fn preflight() -> Resp {
 enum Proto {
     Json,
     Trtp,
+    /// One HTXF transfer for a tunnelled session (§7.4).
+    Htxf,
+}
+
+/// `/htxf` rides on `/trtp`: it carries the transfers of tunnelled
+/// sessions, so it is offered exactly when there are both.
+fn serves_htxf(ctx: &NgCtx) -> bool {
+    ctx.identity.as_ref().is_some_and(|i| i.config().trtp)
+        && ctx.tunnel.as_ref().is_some_and(|t| t.has_transfers())
 }
 
 /// Whether presenting a transport token spends it.
@@ -537,6 +547,18 @@ async fn upgrade(
         // socket stays HTTP and the future above is dropped unpolled.
         Err(resp) => return *resp,
     };
+    // A transfer is claimed by a reference and bound to an identity, so a
+    // socket that proved none has nothing to present.
+    let htxf_identity = match (&proto, identity.as_ref()) {
+        (Proto::Htxf, Some(i)) => Some(i.fingerprint.0),
+        (Proto::Htxf, None) => {
+            return plain(
+                StatusCode::UNAUTHORIZED,
+                "/htxf needs a transport token (§7.4)",
+            )
+        }
+        _ => None,
+    };
     tokio::spawn(async move {
         let ws = match websocket.await {
             Ok(ws) => ws,
@@ -547,6 +569,16 @@ async fn upgrade(
         };
         match proto {
             Proto::Json => conn::run(ws, peer, ctx, identity).await,
+            Proto::Htxf => {
+                let (Some(sink), Some(fp)) = (ctx.tunnel.as_ref(), htxf_identity) else {
+                    return;
+                };
+                if let Some(serve) =
+                    sink.transfer(Box::new(tunnel::WsByteStream::new(ws)), peer, fp)
+                {
+                    serve.await;
+                }
+            }
             Proto::Trtp => {
                 let Some(sink) = ctx.tunnel.as_ref() else {
                     return;
@@ -1060,6 +1092,9 @@ fn discovery(ctx: &NgCtx, host: Option<&str>) -> Resp {
     let mut ng = json!({ "ws": "/ng" });
     if ctx.identity.as_ref().is_some_and(|i| i.config().trtp) && ctx.tunnel.is_some() {
         ng["trtp"] = json!("/trtp");
+    }
+    if serves_htxf(ctx) {
+        ng["htxf"] = json!("/htxf");
     }
     let doc = json!({
         "v": 1,

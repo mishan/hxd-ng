@@ -1194,6 +1194,7 @@ dependencies = [
  "hxproto",
  "rcgen",
  "sha2",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tracing",

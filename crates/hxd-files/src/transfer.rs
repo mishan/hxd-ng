@@ -242,11 +242,28 @@ where
                     return;
                 }
             };
-            if let Err(error) = serve_one(stream, peer, &registry, core, timeouts).await {
+            if let Err(error) = serve_one(stream, peer, &registry, core, timeouts, None).await {
                 debug!(%peer, %error, "HTXF transfer refused");
             }
         });
     }
+}
+
+/// One transfer arriving through the `/htxf` tunnel (`hotline-ng-auth.md`
+/// §7.4) rather than on a transfer port. `identity` is the one the
+/// tunnel's socket proved, and the reference must have been issued to a
+/// session with that same identity: a tunnelled session's reference is
+/// bound to no address, since its peer is whoever terminated the
+/// WebSocket, and this is what binds it instead.
+pub async fn serve_tunnelled<S: HtxfStream>(
+    stream: S,
+    peer: SocketAddr,
+    registry: &TransferRegistry,
+    core: Arc<Core>,
+    timeouts: HtxfTimeouts,
+    identity: [u8; 32],
+) -> Result<(), FileError> {
+    serve_one(stream, peer, registry, core, timeouts, Some(identity)).await
 }
 
 async fn serve_one<S: HtxfStream>(
@@ -255,6 +272,7 @@ async fn serve_one<S: HtxfStream>(
     registry: &TransferRegistry,
     core: Arc<Core>,
     timeouts: HtxfTimeouts,
+    identity: Option<[u8; 32]>,
 ) -> Result<(), FileError> {
     let mut base = [0; htxf::BASE_LEN];
     tokio::time::timeout(timeouts.handshake, stream.read_exact(&mut base))
@@ -283,10 +301,31 @@ async fn serve_one<S: HtxfStream>(
         return Err(FileError::InvalidPath);
     }
     let transfer = registry.claim(&core, &preamble, peer.ip())?;
+    // Claimed first, so a presentation under the wrong identity spends the
+    // reference as a wrong address does.
+    if let Some(identity) = identity {
+        let owner = core
+            .user(transfer.principal().uid)
+            .and_then(|u| u.transport.identity)
+            .map(|tag| tag.fingerprint);
+        if owner != Some(identity) {
+            return Err(FileError::NotFound);
+        }
+    }
     match transfer {
         PreparedTransfer::Download(transfer) => {
             let alive = Liveness::new(core, transfer.principal);
             serve_download(stream, transfer, &alive, timeouts.idle).await
+        }
+        // No `Liveness` check: a banner is at most 1 MiB, already in memory,
+        // and finishes within `idle`; a kick mid-banner costs nothing worth
+        // interrupting it for.
+        PreparedTransfer::Banner(banner) => {
+            write_idle(&mut stream, &banner.bytes, timeouts.idle).await?;
+            tokio::time::timeout(timeouts.idle, stream.shutdown())
+                .await
+                .map_err(|_| stalled())?
+                .map_err(|e| FileError::Unavailable(e.to_string()))
         }
         PreparedTransfer::Upload(transfer) => {
             let alive = Liveness::new(core, transfer.principal);

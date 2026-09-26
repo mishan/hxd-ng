@@ -57,6 +57,24 @@ pub trait TunnelSink: Send + Sync {
         // `transport`, which is descriptive; this authorizes.
         link: LinkAuthority,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    /// Serve one file transfer a tunnelled session was issued, arriving
+    /// on `/htxf` (`hotline-ng-auth.md` §7.4) from a socket that proved
+    /// `identity`. `None` when this server has no transfers to serve, and
+    /// then the path is not offered.
+    fn transfer(
+        &self,
+        _stream: TunnelStream,
+        _peer: SocketAddr,
+        _identity: [u8; 32],
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+        None
+    }
+
+    /// Whether [`TunnelSink::transfer`] has anything to serve.
+    fn has_transfers(&self) -> bool {
+        false
+    }
 }
 
 /// Configuration for the ng listener.

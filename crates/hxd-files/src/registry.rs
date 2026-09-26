@@ -87,17 +87,45 @@ impl std::fmt::Debug for PreparedUpload {
     }
 }
 
+/// The server banner, fetched raw: mhxd sends a banner's bytes with no
+/// FILP framing around them (`htxf.c`, the `preview` path), and every
+/// client that asks for one reads exactly that.
+#[derive(Clone)]
+pub struct PreparedBanner {
+    pub principal: FilePrincipal,
+    pub account: String,
+    /// As for [`PreparedDownload::peer`].
+    pub peer: Option<IpAddr>,
+    /// The image as it was when the reference was issued, so the size in
+    /// the reply is the size that arrives even if the banner is reloaded
+    /// in between.
+    pub bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for PreparedBanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedBanner")
+            .field("principal", &self.principal)
+            .field("account", &self.account)
+            .field("peer", &self.peer)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PreparedTransfer {
     Download(PreparedDownload),
     Upload(PreparedUpload),
+    Banner(PreparedBanner),
 }
 
 impl PreparedTransfer {
-    fn principal(&self) -> FilePrincipal {
+    pub(crate) fn principal(&self) -> FilePrincipal {
         match self {
             PreparedTransfer::Download(value) => value.principal,
             PreparedTransfer::Upload(value) => value.principal,
+            PreparedTransfer::Banner(value) => value.principal,
         }
     }
 
@@ -105,6 +133,7 @@ impl PreparedTransfer {
         match self {
             PreparedTransfer::Download(value) => &value.account,
             PreparedTransfer::Upload(value) => &value.owner,
+            PreparedTransfer::Banner(value) => &value.account,
         }
     }
 
@@ -112,6 +141,7 @@ impl PreparedTransfer {
         match self {
             PreparedTransfer::Download(value) => value.peer,
             PreparedTransfer::Upload(value) => value.peer,
+            PreparedTransfer::Banner(value) => value.peer,
         }
     }
 }
@@ -176,14 +206,26 @@ impl TransferRegistry {
     pub fn issue(&self, transfer: PreparedTransfer) -> Result<u32, FileError> {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|_, value| value.expires > Instant::now());
-        if !self.limits.admits(
-            entries.len(),
-            entries
-                .values()
-                .map(|entry| (entry.transfer.principal(), entry.transfer.account())),
-            transfer.principal(),
-            transfer.account(),
-        ) {
+        // A banner is one reference per login, fetched or not, and many
+        // guests share one account: counted against the file limits, a
+        // burst of logins whose clients never dial the transfer port would
+        // leave the account no room to download. The session hands out one
+        // at most, so only the total bounds them.
+        let is_banner = |t: &PreparedTransfer| matches!(t, PreparedTransfer::Banner(_));
+        let admitted = if is_banner(&transfer) {
+            entries.len() < self.limits.total
+        } else {
+            self.limits.admits(
+                entries.len(),
+                entries
+                    .values()
+                    .filter(|entry| !is_banner(&entry.transfer))
+                    .map(|entry| (entry.transfer.principal(), entry.transfer.account())),
+                transfer.principal(),
+                transfer.account(),
+            )
+        };
+        if !admitted {
             return Err(FileError::Busy);
         }
         for _ in 0..64 {
@@ -249,10 +291,17 @@ impl TransferRegistry {
         if !live || !from_peer {
             return Err(FileError::NotFound);
         }
-        if preamble.type_code != 0 {
-            return Err(FileError::InvalidPath);
-        }
         let (declined_quote, resolved_len) = match &entry.transfer {
+            // A banner handshake names HTXF_TYPE_BANNER, which mhxd never
+            // reads: the reference alone says what is being fetched, so
+            // any type is taken. Nothing resumes a banner.
+            PreparedTransfer::Banner(_) => {
+                if preamble.flags & htxf::FLAG_RESUME != 0 {
+                    return Err(FileError::InvalidPath);
+                }
+                (false, None)
+            }
+            _ if preamble.type_code != 0 => return Err(FileError::InvalidPath),
             PreparedTransfer::Download(transfer) => {
                 // The download handshake's Data size is not consulted. The
                 // protocol has the client send 0 there (Hotline.md,
@@ -606,6 +655,113 @@ mod tests {
         registry
             .claim(&core, &handshake(reference, 0), ELSEWHERE)
             .expect("a tunnelled session's reference has no address to match");
+    }
+
+    fn banner(principal: FilePrincipal, account: &str) -> PreparedTransfer {
+        PreparedTransfer::Banner(PreparedBanner {
+            principal,
+            account: account.into(),
+            peer: Some(HERE),
+            bytes: b"GIF89a".as_slice().into(),
+        })
+    }
+
+    #[test]
+    fn a_banner_reference_is_bound_like_a_download_but_takes_its_own_type() {
+        let core = Core::new();
+        let principal = attach(&core, "first");
+        let other = attach(&core, "second");
+        let registry = TransferRegistry::new(Duration::from_secs(30), limits(8, 4, 4));
+        let mut banner_type = handshake(0, 6);
+        banner_type.type_code = 2;
+
+        // HTXF_TYPE_BANNER, as GtkHx and mhxd's client send it, and 0.
+        for type_code in [2, 0] {
+            let reference = registry.issue(banner(principal, "first")).unwrap();
+            let claimed = registry
+                .claim(
+                    &core,
+                    &htxf::Preamble {
+                        reference,
+                        type_code,
+                        ..banner_type.clone()
+                    },
+                    HERE,
+                )
+                .unwrap();
+            assert!(matches!(claimed, PreparedTransfer::Banner(_)));
+        }
+
+        // The banner's type is the banner's alone.
+        let reference = registry.issue(prepared(other, "second")).unwrap();
+        assert_eq!(
+            registry
+                .claim(
+                    &core,
+                    &htxf::Preamble {
+                        reference,
+                        ..banner_type.clone()
+                    },
+                    HERE
+                )
+                .unwrap_err(),
+            FileError::InvalidPath
+        );
+
+        // From another address, spent.
+        let reference = registry.issue(banner(principal, "first")).unwrap();
+        let from = |r| htxf::Preamble {
+            reference: r,
+            ..banner_type.clone()
+        };
+        assert_eq!(
+            registry
+                .claim(&core, &from(reference), ELSEWHERE)
+                .unwrap_err(),
+            FileError::NotFound
+        );
+        assert_eq!(
+            registry.claim(&core, &from(reference), HERE).unwrap_err(),
+            FileError::NotFound
+        );
+
+        // Nothing resumes a banner, and asking spends the reference.
+        let reference = registry.issue(banner(principal, "first")).unwrap();
+        let mut resume = from(reference);
+        resume.flags = htxf::FLAG_LARGE_FILE | htxf::FLAG_RESUME;
+        resume.resume_digest = Some([0; htxf::RESUME_DIGEST_LEN]);
+        assert_eq!(
+            registry.claim(&core, &resume, HERE).unwrap_err(),
+            FileError::InvalidPath
+        );
+        assert_eq!(
+            registry.claim(&core, &from(reference), HERE).unwrap_err(),
+            FileError::NotFound
+        );
+    }
+
+    #[test]
+    fn banners_leave_an_accounts_file_references_alone() {
+        let core = Core::new();
+        let guest = attach(&core, "guest");
+        let registry = TransferRegistry::new(Duration::from_secs(30), limits(8, 2, 2));
+        for _ in 0..4 {
+            registry.issue(banner(guest, "guest")).unwrap();
+        }
+        registry.issue(prepared(guest, "guest")).unwrap();
+        registry.issue(prepared(guest, "guest")).unwrap();
+        assert_eq!(
+            registry.issue(prepared(guest, "guest")).unwrap_err(),
+            FileError::Busy,
+            "the file limit still holds for files"
+        );
+        // The total bounds banners too.
+        registry.issue(banner(guest, "guest")).unwrap();
+        registry.issue(banner(guest, "guest")).unwrap();
+        assert_eq!(
+            registry.issue(banner(guest, "guest")).unwrap_err(),
+            FileError::Busy
+        );
     }
 
     #[test]
