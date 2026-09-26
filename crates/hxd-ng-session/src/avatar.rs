@@ -21,8 +21,8 @@ use hxd_core::avatar::{AvatarId, AvatarPolicy, AvatarRef};
 use hxd_core::media::MediaReject;
 use hyper::body::Incoming;
 use hyper::header::{
-    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
-    ETAG, IF_NONE_MATCH,
+    HeaderValue, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY,
+    CONTENT_TYPE, ETAG, IF_NONE_MATCH, RETRY_AFTER,
 };
 use hyper::{Request, Response, StatusCode};
 use serde_json::json;
@@ -88,7 +88,14 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
         Ok(Ok(avatar)) => json_resp(StatusCode::OK, json!({ "avatar": avatar_json(&avatar) })),
         Ok(Err(e)) => {
             debug!(target: "avatar", uid, code = e.code(), "upload refused");
-            reject(e)
+            let mut resp = reject(e);
+            // The allowance is the server's own interval, not media's.
+            if e == MediaReject::RateLimited {
+                let secs = policy.set_interval.as_secs().max(1).to_string();
+                resp.headers_mut()
+                    .insert(RETRY_AFTER, HeaderValue::from_str(&secs).unwrap());
+            }
+            resp
         }
         Err(_) => reject(MediaReject::Busy),
     }

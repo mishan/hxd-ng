@@ -20,14 +20,15 @@ pipeline it is **fitted**: scaled down, keeping its aspect ratio, until
 neither side exceeds `max_dimension` (128 by default). Format follows
 source, as for inline media: JPEG stays JPEG, PNG and a still GIF
 become PNG, and an animated GIF stays an animated GIF, every frame
-fitted.
+fitted — unless re-encoding it (every frame at full canvas) comes out
+larger than `max_bytes`, in which case the avatar is its first frame.
 
 Each avatar has two renditions:
 
 | Rendition | For | Rule |
 |---|---|---|
 | **canonical** | ng clients | As above. |
-| **legacy GIF** | GIF-icon clients on the legacy wire | The canonical bytes when they are already a GIF within `legacy_max_bytes` (32 KiB, the extension's recommendation). Otherwise a GIF this server makes from the first frame, scaled down until it fits. An avatar that cannot fit has none, and legacy clients see no avatar for that user. |
+| **legacy GIF** | GIF-icon clients on the legacy wire | At most 256 pixels a side, which is as large as GtkHx decodes one, and within `legacy_max_bytes` (32 KiB, the extension's recommendation): the canonical animation when it is both, the animation fitted again to 256 when only the canvas is too large, and otherwise a GIF this server makes from the first frame, scaled down until it fits. An avatar that cannot fit has none, and legacy clients see no avatar for that user. |
 
 An avatar's **id** is the SHA-256 of its canonical bytes, in lowercase
 hex. The same picture uploaded twice is the same id, and a given id
@@ -75,6 +76,11 @@ Where this server differs, on purpose:
   as the extension says a server should check, and must go through the
   pipeline like any other image. mhxd stores whatever arrives.
   A refusal is a task error with readable text.
+- **A user who joins already wearing an avatar is announced with Icon
+  Change**, after the join. A user-list row cannot carry a picture, and
+  a GIF-icon client fetches one only when told of a change; on mhxd the
+  change came from the client, which set its icon again after every
+  login.
 - **Icon Change is sent only to sessions that have used the
   extension.** A session becomes GIF-icon aware the first time it sends
   1861, 1862 or 1863 — which GtkHx does right after login, since the
@@ -85,11 +91,12 @@ Where this server differs, on purpose:
   unanswered.
 - **An empty entry is omitted from the list**, which the extension
   allows, rather than listed at length zero as mhxd does.
-- **The list fits one transaction.** mhxd refuses any transaction over
-  256 KiB (`MAX_HOTLINE_PACKET_LEN`), and a client built on it may too,
-  so the reply stops adding entries before it would pass that; a client
-  gets the rest one at a time with Get Icon. mhxd sends every entry,
-  however many.
+- **The list fits one transaction.** GtkHx and mhxd's own client accept
+  a transaction of up to 1 MiB (`MAX_HOTLINE_PACKET_LEN` on the client
+  side), so the reply stops adding entries before it would pass that,
+  and each user left out is announced with Icon Change straight after
+  it, which is what makes a GIF-icon client fetch them one at a time.
+  mhxd sends every entry, however many.
 
 ## 4. The ng wire
 
@@ -138,11 +145,15 @@ GET /avatars/{id}
 
 `PUT /avatar` sets the calling session's owner's avatar. Refusals use
 the media routes' statuses and error bodies (`docs/inline-media.md`
-§8.2): 413, 415, 429 with `Retry-After`, 503. A session gets one
+§8.2): 413, 415, 429 with `Retry-After`, 503. An owner gets one
 attempt per `set_interval` (10 s) — refused or not, since a refused one
-still cost a decode — and another inside it is 429: each change is
-pushed to every session on the server. `avatar_clear` shares the
-allowance.
+still cost a decode — and another inside it is 429 with `Retry-After`
+set to the interval. The allowance is the owner's and not the
+session's, because a change is shown on every session of the owner and
+each of those is announced to everyone; a session-only guest is its own
+owner. `avatar_clear` shares the allowance. A session that ends while
+its upload is being decoded changes nothing: the change is pinned to
+the session that asked, not to its uid.
 
 `GET /avatars/{id}` answers for any avatar held by a session on the
 roster, or stored for an owner; anything else is 404. Any session may

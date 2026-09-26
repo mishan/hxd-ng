@@ -204,6 +204,32 @@ pub(crate) struct AvatarState {
     pub(crate) policy: AvatarPolicy,
 }
 
+/// Whether `owner` is the owner of `sess`'s avatar: [`owner_of`] without
+/// the allocation, for the loop over the whole roster.
+fn owns(sess: &UserSession, owner: &AvatarOwner) -> bool {
+    if sess.system {
+        return false;
+    }
+    match owner {
+        AvatarOwner::Account(login) => sess.is_person && sess.login == *login,
+        AvatarOwner::Identity(fp) => !sess.is_person && sess.identity.as_ref() == Some(fp),
+    }
+}
+
+/// The session a change is for, pinned by serial.
+struct Changer {
+    uid: Uid,
+    serial: u64,
+    owner: Option<AvatarOwner>,
+}
+
+/// What a change allowance is kept against.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Turn {
+    Owner(AvatarOwner),
+    Session(Uid, u64),
+}
+
 /// The owner a session's avatar belongs to, or `None` for a guest with
 /// nothing durable to key it on.
 pub(crate) fn owner_of(sess: &UserSession) -> Option<AvatarOwner> {
@@ -284,12 +310,11 @@ impl Core {
         if input.len() > state.policy.limits.max_bytes {
             return Err(MediaReject::TooLarge);
         }
-        self.take_avatar_turn(uid, state.policy.set_interval)?;
+        let who = self.avatar_turn(uid, state.policy.set_interval)?;
         let images = state.codec.avatar(input, &state.policy.limits)?;
         let avatar = Avatar::from_images(images);
         let meta = avatar.meta.clone();
-        self.change_avatar(uid, Some(avatar))
-            .map_err(|_| MediaReject::Generic)?;
+        self.change_avatar(&who, Some(avatar))?;
         Ok(meta)
     }
 
@@ -306,48 +331,72 @@ impl Core {
         if !had {
             return Ok(false);
         }
-        self.take_avatar_turn(uid, state.policy.set_interval)?;
-        self.change_avatar(uid, None)
-            .map_err(|_| MediaReject::Generic)?;
+        let who = self.avatar_turn(uid, state.policy.set_interval)?;
+        self.change_avatar(&who, None)?;
         Ok(true)
     }
 
-    /// One change per `interval` per session.
-    fn take_avatar_turn(&self, uid: Uid, interval: Duration) -> Result<(), MediaReject> {
-        let mut r = self.roster.lock().unwrap();
-        let sess = r.users.get_mut(&uid).ok_or(MediaReject::Generic)?;
+    /// Who is asking, and whether they may change an avatar now: one
+    /// change per `interval` **per owner**, because a change is shown on
+    /// every session of the owner and each is announced to everyone — an
+    /// account open five times must not get five turns to make twenty-five
+    /// announcements. A session-only guest is its own owner. The turn is
+    /// spent before the decode, so a refused upload costs one too.
+    fn avatar_turn(&self, uid: Uid, interval: Duration) -> Result<Changer, MediaReject> {
+        let who = {
+            let r = self.roster.lock().unwrap();
+            let sess = r.users.get(&uid).ok_or(MediaReject::Generic)?;
+            Changer {
+                uid,
+                serial: sess.serial,
+                owner: owner_of(sess),
+            }
+        };
+        let key = match &who.owner {
+            Some(owner) => Turn::Owner(owner.clone()),
+            None => Turn::Session(uid, who.serial),
+        };
         let now = Instant::now();
-        if sess
-            .avatar_changed_at
-            .is_some_and(|at| now.duration_since(at) < interval)
-        {
+        let mut turns = self.avatar_turns.lock().unwrap();
+        // Everything older than the interval has no say; dropping it keeps
+        // the map to the owners who changed something recently.
+        turns.retain(|_, at| now.duration_since(*at) < interval);
+        if turns.contains_key(&key) {
             return Err(MediaReject::RateLimited);
         }
-        sess.avatar_changed_at = Some(now);
-        Ok(())
+        turns.insert(key, now);
+        Ok(who)
     }
 
     /// Store the change, then show it on every live session of the owner.
-    fn change_avatar(&self, uid: Uid, avatar: Option<Avatar>) -> Result<(), StoreError> {
+    /// The session that asked must still be the one it was: a uid recycles,
+    /// and a picture uploaded by one session must never land on the next
+    /// holder of its uid. `Generic` when it is gone.
+    fn change_avatar(&self, who: &Changer, avatar: Option<Avatar>) -> Result<(), MediaReject> {
         let state = self.avatars.as_ref().expect("checked by the caller");
         let _serial = self.avatar_serial.lock().unwrap();
-        let owner = {
+        let still_here = {
             let r = self.roster.lock().unwrap();
-            let Some(sess) = r.users.get(&uid) else {
-                return Ok(());
-            };
-            owner_of(sess)
+            r.users
+                .get(&who.uid)
+                .is_some_and(|s| s.serial == who.serial)
         };
-        if let Some(owner) = &owner {
-            state.store.save(owner, avatar.as_ref())?;
+        if !still_here {
+            return Err(MediaReject::Generic);
+        }
+        if let Some(owner) = &who.owner {
+            state.store.save(owner, avatar.as_ref()).map_err(|e| {
+                tracing::warn!(target: "avatar", uid = who.uid, "save: {e}");
+                MediaReject::Generic
+            })?;
         }
         let mut r = self.roster.lock().unwrap();
         let meta = avatar.as_ref().map(|a| a.meta.clone());
         let mut changed = Vec::new();
         for (u, sess) in r.users.iter_mut() {
-            let mine = match &owner {
-                Some(owner) => owner_of(sess).as_ref() == Some(owner),
-                None => *u == uid,
+            let mine = match &who.owner {
+                Some(owner) => owns(sess, owner),
+                None => *u == who.uid && sess.serial == who.serial,
             };
             if !mine || sess.avatar == avatar {
                 continue;

@@ -454,9 +454,6 @@ pub(crate) struct UserSession {
     pub(crate) visible: bool,
     /// The avatar `info.avatar` describes, with its bytes.
     pub(crate) avatar: Option<crate::avatar::Avatar>,
-    /// When this session last changed its avatar (`AvatarPolicy`'s
-    /// interval).
-    pub(crate) avatar_changed_at: Option<Instant>,
     pub(crate) outbox: Outbox,
 }
 
@@ -821,6 +818,9 @@ pub struct Core {
     /// held until the roster shows the change, so the two agree. Order
     /// is it first, then `roster`.
     pub(crate) avatar_serial: Mutex<()>,
+    /// When each owner last changed its avatar (`AvatarPolicy`'s
+    /// interval). Its own lock, taken with nothing else held.
+    pub(crate) avatar_turns: Mutex<HashMap<crate::avatar::Turn, Instant>>,
 }
 
 impl Core {
@@ -959,7 +959,6 @@ impl Core {
                 search_tokens: f64::from(self.news_policy.search_per_minute),
                 visible: false,
                 avatar: None,
-                avatar_changed_at: None,
                 outbox: Outbox::live(tx),
             },
         );

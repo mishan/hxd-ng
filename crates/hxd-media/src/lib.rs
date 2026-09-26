@@ -61,6 +61,12 @@ use walk::{Format, WalkError};
 /// that the canonical bytes are usually smaller than what arrived.
 const JPEG_QUALITY: u8 = 85;
 
+/// The largest side of an avatar's legacy GIF. GtkHx decodes a GIF-icon
+/// avatar up to 256 pixels a side and refuses anything larger, so a
+/// server that fits its avatars larger still sends legacy clients one
+/// within this.
+const LEGACY_MAX_DIMENSION: u32 = 256;
+
 /// The pipeline. One per server, shared: it carries the limits and the
 /// decode permits.
 pub struct Codec {
@@ -317,12 +323,40 @@ impl Codec {
         let _permit = self.permits.acquire(self.limits.permit_wait)?;
         if walked.format == Format::Gif && walked.frames > 1 {
             let (canonical, first) = codec.fit_animation(input, limits.max_dimension)?;
+            // Every frame is written at full canvas, so a delta-coded GIF
+            // can come out many times its size. Past the upload ceiling,
+            // the avatar is its first frame.
+            if canonical.bytes.len() > limits.max_bytes {
+                let img = DynamicImage::ImageRgba8(first);
+                let legacy_gif = still_gif(
+                    fit(img.clone(), LEGACY_MAX_DIMENSION),
+                    limits.legacy_max_bytes,
+                )?;
+                return Ok(AvatarImages {
+                    canonical: Canonical {
+                        mime: MediaType::Png,
+                        width: img.width(),
+                        height: img.height(),
+                        bytes: encode_png(&img)?,
+                    },
+                    legacy_gif,
+                });
+            }
             // An animation that fits is its own legacy rendition; one that
-            // does not is represented by its first frame, still.
-            let legacy_gif = if canonical.bytes.len() <= limits.legacy_max_bytes {
-                Some(canonical.bytes.clone())
+            // is too large a canvas for a legacy client is fitted again,
+            // and one that is still too many bytes is its first frame.
+            let legacy = if canonical.width.max(canonical.height) <= LEGACY_MAX_DIMENSION {
+                canonical.clone()
             } else {
-                still_gif(DynamicImage::ImageRgba8(first), limits.legacy_max_bytes)?
+                codec.fit_animation(input, LEGACY_MAX_DIMENSION)?.0
+            };
+            let legacy_gif = if legacy.bytes.len() <= limits.legacy_max_bytes {
+                Some(legacy.bytes)
+            } else {
+                still_gif(
+                    fit(DynamicImage::ImageRgba8(first), LEGACY_MAX_DIMENSION),
+                    limits.legacy_max_bytes,
+                )?
             };
             return Ok(AvatarImages {
                 canonical,
@@ -341,7 +375,7 @@ impl Codec {
             height: img.height(),
             bytes,
         };
-        let legacy_gif = still_gif(img, limits.legacy_max_bytes)?;
+        let legacy_gif = still_gif(fit(img, LEGACY_MAX_DIMENSION), limits.legacy_max_bytes)?;
         Ok(AvatarImages {
             canonical,
             legacy_gif,

@@ -133,3 +133,64 @@ fn the_avatar_ceiling_is_its_own_and_the_gates_still_hold() {
         .iter()
         .any(|k| k.contains("comment")));
 }
+
+#[test]
+fn the_legacy_gif_is_never_larger_than_a_legacy_client_decodes() {
+    // Room enough in bytes that the animation case is about the canvas.
+    let wide = AvatarLimits {
+        max_dimension: 512,
+        legacy_max_bytes: 65_531,
+        ..limits()
+    };
+    let out = codec().avatar(&png(&rgba(600, 300)), &wide).unwrap();
+    assert_eq!((out.canonical.width, out.canonical.height), (512, 256));
+    let gif = out.legacy_gif.expect("a gradient fits");
+    let dims = image::load_from_memory(&gif).unwrap();
+    assert!(dims.width() <= 256 && dims.height() <= 256);
+
+    let out = codec()
+        .avatar(&animated_gif(3, 100, 400, 400), &wide)
+        .unwrap();
+    assert_eq!(out.canonical.mime, MediaType::Gif);
+    assert_eq!((out.canonical.width, out.canonical.height), (400, 400));
+    let gif = out.legacy_gif.expect("the animation, fitted again");
+    assert_eq!(frames_of(&gif), 3, "fitted, not flattened");
+    let dims = image::load_from_memory(&gif).unwrap();
+    assert_eq!((dims.width(), dims.height()), (256, 256));
+}
+
+/// A delta-coded animation: one full frame, then many tiny ones. Small on
+/// the wire, and every frame full canvas once decoded.
+fn delta_gif(frames: u32, side: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+        enc.set_repeat(image::codecs::gif::Repeat::Infinite)
+            .unwrap();
+        let delay = image::Delay::from_numer_denom_ms(50, 1);
+        let base = noise(side, side).to_rgba8();
+        enc.encode_frame(image::Frame::from_parts(base, 0, 0, delay))
+            .unwrap();
+        for n in 1..frames {
+            let dot = RgbaImage::from_pixel(2, 2, image::Rgba([n as u8, 0, 0, 0xff]));
+            enc.encode_frame(image::Frame::from_parts(dot, n % side, n % side, delay))
+                .unwrap();
+        }
+    }
+    out
+}
+
+#[test]
+fn an_animation_that_outgrows_the_ceiling_becomes_its_first_frame() {
+    let input = delta_gif(60, 96);
+    let tight = AvatarLimits {
+        max_bytes: input.len() + 1,
+        ..limits()
+    };
+    let out = codec().avatar(&input, &tight).unwrap();
+    // A still, whose size its dimensions bound, where the animation's
+    // was bounded only by its frame count.
+    assert_eq!(out.canonical.mime, MediaType::Png);
+    assert_eq!((out.canonical.width, out.canonical.height), (96, 96));
+    assert!(out.legacy_gif.is_some());
+}

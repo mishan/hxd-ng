@@ -576,15 +576,19 @@ async fn an_avatar_belongs_to_the_account_and_outlives_the_server() {
     let avatar = put.json()["avatar"].clone();
     assert_eq!(alice.request("logout", json!({})).await["ok"], json!({}));
 
-    // The same account on the other wire joins with it.
+    // The same account on the other wire joins with it, and a GIF-icon
+    // client already here is told so: Icon Change is the only thing that
+    // makes GtkHx fetch an icon after its first list.
     let mut bob = Legacy::login(server.legacy, "bob").await;
+    assert!(bob.icon_list().await.is_empty());
     let alice_legacy = Legacy::login(server.legacy, "alice").await;
-    // Her login reply comes before her join; the list is asked after it.
     bob.joined(alice_legacy.uid).await;
-    let list = bob.icon_list().await;
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0].0, alice_legacy.uid);
+    bob.icon_change(alice_legacy.uid).await;
+    assert!(bob.icon_of(alice_legacy.uid).await.starts_with(b"GIF89a"));
     drop(alice_legacy);
+    // The same on a join from the ng wire.
+    let (alice_ng, _) = Ng::login(server.ng, "alice").await;
+    bob.icon_change(alice_ng.uid as u16).await;
 
     // A new process on the same database still has it, and a fetch by id
     // answers with nobody on the roster wearing it.
@@ -627,7 +631,7 @@ async fn refusals_come_back_as_statuses_and_task_errors() {
     // refused, is one change.
     let limited = put_avatar(server.ng, &alice.bearer, &png(8, 8)).await;
     assert_eq!(limited.status, 429);
-    assert!(limited.header("retry-after").is_some());
+    assert_eq!(limited.header("retry-after"), Some("10"), "set_interval");
 
     let unknown = "0".repeat(64);
     assert_eq!(

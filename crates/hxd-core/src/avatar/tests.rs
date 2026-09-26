@@ -186,21 +186,85 @@ fn a_clear_is_announced_once_and_clearing_nothing_is_quiet() {
 }
 
 #[test]
-fn changes_are_rationed_per_session() {
+fn changes_are_rationed_per_owner() {
     let core = Core::new().with_avatars(
         Arc::new(MemoryAvatars::default()),
         Arc::new(FakeCodec),
         AvatarPolicy::default(),
     );
     let (alice, _) = join(&core, Who::Account("alice"));
+    let (alice_too, _) = join(&core, Who::Account("alice"));
     let (bob, _) = join(&core, Who::Account("bob"));
+    let (guest, _) = join(&core, Who::Guest(None));
+    let (other_guest, _) = join(&core, Who::Guest(None));
     core.set_avatar(alice, b"one").unwrap();
     assert_eq!(
         core.set_avatar(alice, b"two"),
         Err(MediaReject::RateLimited)
     );
     assert_eq!(core.clear_avatar(alice), Err(MediaReject::RateLimited));
+    // Another session of the same account is the same owner.
+    assert_eq!(
+        core.set_avatar(alice_too, b"two"),
+        Err(MediaReject::RateLimited)
+    );
     core.set_avatar(bob, b"one").unwrap();
+    // Guests without an identity are each their own.
+    core.set_avatar(guest, b"one").unwrap();
+    core.set_avatar(other_guest, b"one").unwrap();
+    assert_eq!(
+        core.set_avatar(guest, b"two"),
+        Err(MediaReject::RateLimited)
+    );
+}
+
+/// Ends the session it is decoding for, as a kick or a logout would
+/// during a slow decode.
+struct EndingCodec {
+    core: std::sync::OnceLock<std::sync::Weak<Core>>,
+    victim: std::sync::atomic::AtomicU16,
+}
+
+impl MediaCodec for EndingCodec {
+    fn canonicalize(&self, _input: &[u8]) -> Result<Canonical, MediaReject> {
+        Err(MediaReject::Unsupported)
+    }
+
+    fn avatar(&self, input: &[u8], limits: &AvatarLimits) -> Result<AvatarImages, MediaReject> {
+        let core = self.core.get().unwrap().upgrade().unwrap();
+        core.end_session(self.victim.load(std::sync::atomic::Ordering::SeqCst));
+        FakeCodec.avatar(input, limits)
+    }
+}
+
+#[test]
+fn a_session_that_ends_during_the_decode_changes_nothing() {
+    let store = Arc::new(MemoryAvatars::default());
+    let codec = Arc::new(EndingCodec {
+        core: Default::default(),
+        victim: Default::default(),
+    });
+    let core = Arc::new(Core::new().with_avatars(
+        store.clone(),
+        codec.clone(),
+        AvatarPolicy {
+            set_interval: Duration::ZERO,
+            ..Default::default()
+        },
+    ));
+    codec.core.set(Arc::downgrade(&core)).unwrap();
+    let (alice, _) = join(&core, Who::Account("alice"));
+    codec
+        .victim
+        .store(alice, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(core.set_avatar(alice, b"late"), Err(MediaReject::Generic));
+    assert_eq!(
+        store.load(&AvatarOwner::Account("alice".into())).unwrap(),
+        None,
+        "nothing stored for a session that was gone"
+    );
+    // And a uid with no session at all is refused before any decode.
+    assert_eq!(core.set_avatar(alice, b"x"), Err(MediaReject::Generic));
 }
 
 #[test]

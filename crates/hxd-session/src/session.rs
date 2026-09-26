@@ -1443,12 +1443,30 @@ fn system_msg(tx: &Tx, ctx: &ServerCtx, sess: &Session, text: &str) {
 /// must end (kicked).
 async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
     match ev {
-        Event::Joined(u) | Event::Changed(u) => {
+        Event::Changed(u) => {
             push(
                 tx,
                 hdr::USER_CHANGE,
                 user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc),
             );
+        }
+        Event::Joined(u) => {
+            push(
+                tx,
+                hdr::USER_CHANGE,
+                user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc),
+            );
+            // A user list row cannot carry a picture, and a GIF-icon client
+            // fetches one only on Icon Change: someone who joins already
+            // wearing an avatar is announced as a change, as they were on
+            // mhxd, where the client set it again after every login.
+            if sess.gif_icons && u.avatar.is_some() {
+                push(
+                    tx,
+                    hdr::ICON_CHANGE,
+                    vec![(tag::UID, u.uid.to_be_bytes().to_vec())],
+                );
+            }
         }
         Event::Parted(uid) => {
             push(
@@ -3192,7 +3210,17 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         // no support.
         gif_icons::GET_LIST if ctx.core.avatar_policy().is_some() => {
             sess.gif_icons = true;
-            reply(tx, f.trans, icon_list(&ctx.core.avatars()));
+            let (entries, left_out) = icon_list(&ctx.core.avatars());
+            reply(tx, f.trans, entries);
+            // What did not fit is announced as changed, which is what makes
+            // a GIF-icon client fetch a user's icon on its own.
+            for uid in left_out {
+                push(
+                    tx,
+                    hdr::ICON_CHANGE,
+                    vec![(tag::UID, uid.to_be_bytes().to_vec())],
+                );
+            }
         }
 
         gif_icons::GET if ctx.core.avatar_policy().is_some() => {
@@ -3200,8 +3228,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             let Some(uid) = f
                 .chunks()
                 .find(|c| c.tag == tag::UID)
-                .map(|c| c.as_uint() as u16)
-                .filter(|uid| ctx.core.user(*uid).is_some())
+                .and_then(|c| u16::try_from(c.as_uint()).ok())
+                .filter(|uid| ctx.core.user_details(*uid).is_some())
             else {
                 reply_error(tx, f.trans, "No such user.");
                 return;
@@ -3255,22 +3283,32 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
     }
 }
 
+/// The most a Get Icon List reply carries. GtkHx and mhxd's own client
+/// both accept a transaction of up to 1 MiB (`MAX_HOTLINE_PACKET_LEN` on
+/// the client side, `0x100000`), which holds a large roster's icons.
+const ICON_LIST_BUDGET: usize = 0x10_0000;
+
 /// The Get Icon List reply: one packed entry per user with a legacy GIF,
-/// in uid order, stopping before the transaction would pass mhxd's own
-/// size cap (`docs/avatars.md` §3).
-fn icon_list(avatars: &[(Uid, hxd_core::Avatar)]) -> Vec<(u16, Vec<u8>)> {
-    let mut budget = MAX_FRAME_DATA as usize - 2;
+/// in uid order, until the next would pass [`ICON_LIST_BUDGET`] — and the
+/// uids that did not fit, which the caller announces one by one instead
+/// (`docs/avatars.md` §3).
+fn icon_list(avatars: &[(Uid, hxd_core::Avatar)]) -> (Vec<(u16, Vec<u8>)>, Vec<Uid>) {
+    let mut budget = ICON_LIST_BUDGET - 2;
     let mut chunks = Vec::new();
+    let mut left_out = Vec::new();
     for (uid, avatar) in avatars {
         let Some(gif) = &avatar.legacy_gif else {
             continue;
         };
+        // A GIF too long for the entry's two-byte length: the config's
+        // ceiling keeps this from happening, and it is skipped if it does.
         let Ok(len) = u16::try_from(gif.len() + 4) else {
             continue;
         };
         let cost = 4 + usize::from(len);
         if cost > budget {
-            break;
+            left_out.push(*uid);
+            continue;
         }
         budget -= cost;
         let mut entry = Vec::with_capacity(usize::from(len));
@@ -3279,7 +3317,7 @@ fn icon_list(avatars: &[(Uid, hxd_core::Avatar)]) -> Vec<(u16, Vec<u8>)> {
         entry.extend_from_slice(gif);
         chunks.push((tag::ICON_LIST, entry));
     }
-    chunks
+    (chunks, left_out)
 }
 
 fn file_error_text(error: &hxd_core::FileError) -> &'static str {
@@ -3304,6 +3342,37 @@ mod tests {
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn avatar(uid: u8, gif_len: usize) -> (Uid, hxd_core::Avatar) {
+        let mut a = hxd_core::avatar::conformance::avatar(uid, hxd_core::media::MediaType::Gif);
+        a.legacy_gif = Some(vec![uid; gif_len].into());
+        (u16::from(uid), a)
+    }
+
+    #[test]
+    fn the_icon_list_fits_one_transaction_and_names_what_did_not() {
+        // 40 GIFs at the 32 KiB default pass 1 MiB: some must be left out,
+        // and every one is either listed or named.
+        let all: Vec<_> = (1..=40).map(|n| avatar(n, 32 * 1024)).collect();
+        let (entries, left_out) = icon_list(&all);
+        let total: usize = 2 + entries.iter().map(|(_, e)| 4 + e.len()).sum::<usize>();
+        assert!(total <= ICON_LIST_BUDGET, "{total}");
+        assert!(!left_out.is_empty());
+        assert_eq!(entries.len() + left_out.len(), all.len());
+        let (first, rest) = entries[0].1.split_at(4);
+        assert_eq!(first, [0, 1, 0x80, 0x00], "uid 1, length 32768");
+        assert_eq!(rest.len(), 32 * 1024);
+
+        // A user with no legacy rendition is neither listed nor named.
+        let mut none = avatar(9, 10);
+        none.1.legacy_gif = None;
+        assert_eq!(icon_list(&[none]), (vec![], vec![]));
+
+        // The largest GIF an entry can carry fits its two-byte field.
+        let (entries, left_out) = icon_list(&[avatar(3, 65_531)]);
+        assert!(left_out.is_empty());
+        assert_eq!(entries[0].1.len(), 65_535);
     }
 
     #[test]
