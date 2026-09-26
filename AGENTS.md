@@ -36,7 +36,8 @@ cargo run --bin hxd           # config: hxd-ng.toml (all keys optional)
 ```
 
 The [hx-libs](https://github.com/mishan/hx-libs) workspace provides
-`hxproto` as a pinned git dependency shared with GtkHx. Rules:
+`hxproto` (the wire format, including the tracker protocol), `hxfiles-xfer`
+and `hxhfs` as pinned git dependencies shared with GtkHx. Rules:
 
 - Advancing the pin is a deliberate act with a full test run behind it.
 - API changes in shared crates land in hx-libs first, then each consumer
