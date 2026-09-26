@@ -1,0 +1,19 @@
+[package]
+name = "hxd-testclient"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Scripted Hotline clients, classic and ng, for hxd-ng's e2e suites and load harness"
+publish = false
+
+[dependencies]
+# The client packs and parses with the same pinned hxproto GtkHx uses and
+# never with the server's own framer, so a framing bug on either side
+# shows up as a disagreement rather than cancelling out.
+hxproto = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+serde_json = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

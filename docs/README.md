@@ -50,6 +50,7 @@ to another project.
 | [file-sources.md](file-sources.md) — exploratory background for files | superseded | — | design |
 | [tracker-registration.md](tracker-registration.md) — HTRK v1/v3 server heartbeats, authentication and operator configuration | yes | server infrastructure | design; implements fogWraith specs |
 | [metrics.md](metrics.md) — `GET /metrics`: locks, the store, the blocking pool, fan-out, the wires, the roster's census | yes, behind the `metrics` feature | operators | design |
+| [load-testing.md](load-testing.md) — `hxd-load`: scenarios on both wires, open-loop, with the invariants checked under load | yes: login storm, chat, slow consumer, churn | operators, developers | design |
 
 ## Proposals
 
