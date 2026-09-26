@@ -251,9 +251,8 @@ url = "https://hl.example/"       # with file: where a click goes;
 
 Classic clients show JPEG and GIF. The file is re-read on SIGHUP, and
 one that no longer loads leaves the banner in use as it was. A client
-connected through the `/trtp` tunnel has no transfer port to fetch a
-held banner from, so it is shown a banner only when there is no file
-and the `url` is the image.
+connected through the `/trtp` tunnel fetches a held banner through
+`/htxf`, which `hlid tunnel` serves on its own port plus one.
 
 ### TLS on the legacy wire
 
@@ -947,7 +946,9 @@ hlid tunnel --server http://127.0.0.1:5700 --device dev.key --card card.cbor --c
 ```
 
 After `hlid tunnel`, point any 1.x client at `127.0.0.1:5500` and it logs in
-through the tunnel with your identity. That login can link an account too
+through the tunnel with your identity. The tunnel also listens on the port
+after it (`127.0.0.1:5501`), where the client looks for file transfers and
+the banner, and carries each of those to the server's `/htxf`. That login can link an account too
 (§8.3), which is why the certificate above carries `manage`; a tunnel used
 with an account that is already linked wants `--caps login,message`.
 

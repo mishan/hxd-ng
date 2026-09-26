@@ -64,6 +64,7 @@ async fn start_server_forwarded(dir: &Path, proxies: &[&str]) -> (SocketAddr, So
         Some(Default::default()),
         None,
         None,
+        None,
     )
     .await
 }
@@ -81,6 +82,7 @@ async fn start_server_with_inbox(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) 
         Some(Default::default()),
         None,
         None,
+        None,
     )
     .await
 }
@@ -94,6 +96,7 @@ async fn start_server_without_mailbox(dir: &Path) -> (SocketAddr, SocketAddr, Ng
         &[],
         false,
         hxd_ng_session::ForwardedHeader::default(),
+        None,
         None,
         None,
         None,
@@ -114,6 +117,7 @@ async fn start_server_with_web_client(dir: &Path) -> (SocketAddr, SocketAddr, Ng
         Some(Default::default()),
         Some("http://{ng}/app/"),
         None,
+        None,
     )
     .await
 }
@@ -132,6 +136,7 @@ async fn start_server_with_small_mailbox(
         false,
         hxd_ng_session::ForwardedHeader::default(),
         Some(cfg),
+        None,
         None,
         None,
     )
@@ -154,6 +159,7 @@ async fn start_server_full(
         Some(Default::default()),
         None,
         None,
+        None,
     )
     .await
 }
@@ -169,6 +175,7 @@ async fn start_server_inner(
     enroll: Option<hxd_ng_session::enroll::MailboxConfig>,
     web_client: Option<&str>,
     devices: Option<Arc<hxd_core::push::MemoryDevices>>,
+    banner: Option<Arc<hxd_session::Banner>>,
 ) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -219,7 +226,7 @@ async fn start_server_inner(
             news: Default::default(),
         }),
         files: None,
-        banner: None,
+        banner,
     };
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4270,6 +4277,7 @@ async fn a_web_client_the_server_names_off_its_own_origin_gets_no_qr_code() {
         Some(Default::default()),
         Some("https://evil.test/app/"),
         None,
+        None,
     )
     .await;
     let hlid = hlid_binary();
@@ -4342,6 +4350,7 @@ async fn start_server_with_push(dir: &Path) -> (SocketAddr, Arc<hxd_core::push::
         Some(Default::default()),
         None,
         Some(devices.clone()),
+        None,
     )
     .await;
     (ng, devices)
@@ -4701,4 +4710,188 @@ async fn a_reload_reads_the_lists_and_a_bad_one_changes_nothing() {
     std::fs::write(&path, "[ng]\n[identity]\n").unwrap();
     assert_eq!(hxd::reload_revocations(&ctx.core, &path).unwrap().0, 0);
     authenticate(ng, &p).await;
+}
+
+// --- File transfers through the tunnel (hotline-ng-auth.md §7.4) --------
+
+/// A server with a banner held here and the registry its transfers are
+/// issued from: a tunnelled session's transfer has to cross `/htxf`.
+async fn start_server_with_banner(dir: &Path, image: &[u8]) -> (SocketAddr, NgCtx) {
+    let registry = Arc::new(hxd_files::TransferRegistry::new(
+        Duration::from_secs(30),
+        hxd_files::EntryLimits {
+            total: 16,
+            per_session: 4,
+            per_account: 16,
+        },
+    ));
+    let path = dir.join("banner.gif");
+    std::fs::write(&path, image).unwrap();
+    let banner = hxd_session::Banner::file(&path, None, registry).unwrap();
+    let (_, ng, ctx) = start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        None,
+        None,
+        Some(Arc::new(banner)),
+    )
+    .await;
+    (ng, ctx)
+}
+
+/// Opens `/htxf` as `hlid tunnel` does for one connection on its port + 1,
+/// sends the handshake a classic client sends for the banner, and reads
+/// until the server closes the socket.
+async fn htxf_fetch(ng: SocketAddr, token: &str, reference: u32, size: u32) -> Vec<u8> {
+    let mut req = format!("ws://{ng}/htxf").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let preamble = hxfiles_xfer::htxf::Preamble {
+        reference,
+        transfer_len: u64::from(size),
+        type_code: 2,
+        flags: 0,
+        resume_digest: None,
+    };
+    ws.send(Message::Binary(preamble.encode().unwrap()))
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    while let Ok(Some(Ok(msg))) = timeout(Duration::from_secs(5), ws.next()).await {
+        match msg {
+            Message::Binary(b) => bytes.extend_from_slice(&b),
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    bytes
+}
+
+fn be_uint(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0, |n, b| (n << 8) | u32::from(*b))
+}
+
+#[tokio::test]
+async fn a_tunnelled_client_fetches_the_banner_through_htxf() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut image = b"GIF89a".to_vec();
+    image.extend((0..2000u32).map(|n| n as u8));
+    let (ng, _ctx) = start_server_with_banner(dir.path(), &image).await;
+
+    let disc = http(ng, "GET", "/.well-known/hotline", &[], &[])
+        .await
+        .json();
+    assert_eq!(disc["ng"]["htxf"], "/htxf");
+
+    let p = person(9, "Tunnelled");
+    let token = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut req = format!("ws://{ng}/trtp").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let mut t = Tunnel::new(ws);
+    t.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
+    t.read_exact(8).await;
+    t.send(REQ_LOGIN, &[(tag::VERSION, 190u16.to_be_bytes().to_vec())])
+        .await;
+    t.recv_type(HDR_TASK).await;
+    // The banner follows the agreement, as on the TCP port.
+    t.send(0x79, &[(tag::NAME, b"Tunnelled".to_vec())]).await;
+    let pushed = t.recv_type(0x7a).await;
+    assert_eq!(
+        pushed
+            .chunks()
+            .find(|c| c.tag == tag::BANNER_TYPE)
+            .unwrap()
+            .data,
+        b"GIFf"
+    );
+    t.send(0xd4, &[]).await;
+    let reply = t.recv_type(HDR_TASK).await;
+    assert_eq!(reply.flag & 1, 0);
+    let field = |tg| {
+        reply
+            .chunks()
+            .find(|c| c.tag == tg)
+            .map(|c| be_uint(c.data))
+            .unwrap()
+    };
+    let (size, reference) = (field(tag::HTXF_SIZE), field(tag::HTXF_REF));
+
+    // Someone else's identity cannot redeem it, and trying spends it.
+    let stranger = person(10, "Stranger");
+    let theirs = authenticate(ng, &stranger).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(htxf_fetch(ng, &theirs, reference, size).await.is_empty());
+    let mine = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(htxf_fetch(ng, &mine, reference, size).await.is_empty());
+
+    // A fresh download, redeemed under the session's own identity.
+    let mut next = Tunnel::new({
+        let token = authenticate(ng, &p).await["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut req = format!("ws://{ng}/trtp").into_client_request().unwrap();
+        req.headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        tokio_tungstenite::connect_async(req).await.unwrap().0
+    });
+    next.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
+    next.read_exact(8).await;
+    next.send(REQ_LOGIN, &[(tag::VERSION, 190u16.to_be_bytes().to_vec())])
+        .await;
+    next.recv_type(HDR_TASK).await;
+    next.send(0x79, &[(tag::NAME, b"Again".to_vec())]).await;
+    next.recv_type(0x7a).await;
+    next.send(0xd4, &[]).await;
+    let reply = next.recv_type(HDR_TASK).await;
+    let reference = reply
+        .chunks()
+        .find(|c| c.tag == tag::HTXF_REF)
+        .map(|c| be_uint(c.data))
+        .unwrap();
+    let mine = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(htxf_fetch(ng, &mine, reference, size).await, image);
+}
+
+#[tokio::test]
+async fn htxf_needs_a_token_and_a_server_with_transfers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ng, _ctx) = start_server_with_banner(dir.path(), b"GIF89a-banner").await;
+    let refused = tokio_tungstenite::connect_async(format!("ws://{ng}/htxf")).await;
+    assert!(
+        matches!(&refused, Err(tokio_tungstenite::tungstenite::Error::Http(r)) if r.status() == 401),
+        "{refused:?}"
+    );
+
+    // A server with nothing to transfer does not offer the path.
+    let dir = tempfile::tempdir().unwrap();
+    let (_, ng, _) = start_server(dir.path()).await;
+    let disc = http(ng, "GET", "/.well-known/hotline", &[], &[])
+        .await
+        .json();
+    assert!(disc["ng"].get("htxf").is_none());
+    let refused = tokio_tungstenite::connect_async(format!("ws://{ng}/htxf")).await;
+    assert!(
+        matches!(&refused, Err(tokio_tungstenite::tungstenite::Error::Http(r)) if r.status() == 404),
+        "{refused:?}"
+    );
 }

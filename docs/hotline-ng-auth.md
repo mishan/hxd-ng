@@ -170,7 +170,7 @@ authentication, as `application/json`:
   "v": 1,
   "name": "My Server",
   "server_key": "…base64url 32 bytes…",
-  "ng": { "ws": "/ng", "trtp": "/trtp" },
+  "ng": { "ws": "/ng", "trtp": "/trtp", "htxf": "/htxf" },
   "identity": {
     "enabled": true,
     "bindings": [ "challenge", "mtls" ],
@@ -201,6 +201,7 @@ This document owns:
 | `server_key` | The server key (§4.3), base64url. MUST be present when `identity.enabled` is true. *hxd-ng* sends `null` when identity is disabled. |
 | `ng.ws` | The path of the ng JSON protocol (§7.2). |
 | `ng.trtp` | The path of TRTP over WebSocket (§7.3). Present only when the server serves it. |
+| `ng.htxf` | The path of HTXF over WebSocket (§7.4). Present only when the server serves it, which is only beside `ng.trtp`. |
 | `identity.enabled` | Whether this listener authenticates (§6). When `false`, the rest of the `identity` block MAY be absent, and so it is in hxd-ng. |
 | `identity.bindings` | The bindings of §6 this server accepts: `challenge`, `mtls`. |
 | `identity.association` | `server` when the listener can associate accounts with principals (§9); `none` on a relay (§10.2). |
@@ -516,6 +517,32 @@ connection to the classic port would carry, in both directions.
   have no idle traffic of their own, so this is what notices a peer that
   has gone and what keeps a NAT mapping alive. A tunnel answers pings as
   any WebSocket library does.
+
+### 7.4 HTXF over WebSocket (`ng.htxf`)
+
+A classic client fetches a file, an upload's destination and the
+server banner on a second TCP connection, to the control port plus one
+(HTXF). A client inside a §7.3 tunnel has no such port: the tunnel
+carries the control stream alone. This path carries the other.
+
+- The socket carries **one** transfer, exactly as a TCP connection to
+  the transfer port would: the client's HTXF handshake, then the
+  transfer's bytes in whichever direction it runs. Binary frames, with
+  boundaries that carry no meaning, as in §7.3.
+- The upgrade MUST authenticate a principal (§6); one without is
+  refused with 401. A token is spent by one upgrade, so each transfer
+  takes one.
+- The reference in the handshake MUST have been issued to a session
+  whose transport identity is the principal on this socket. A tunnelled
+  session's reference is bound to no address — its peer is whoever
+  terminated the WebSocket — and this binding stands in for that one.
+  A reference presented under any other principal is refused, and is
+  spent, as one presented from the wrong address is on the transfer
+  port.
+- A tunnel offers it on its own local port plus one, where a classic
+  client looks (*hlid tunnel* does, when discovery lists `ng.htxf`).
+- A server that has no transfers — no file area and no banner held
+  here — does not serve the path.
 
 ## 8. Cleartext sessions and the legacy wire
 
