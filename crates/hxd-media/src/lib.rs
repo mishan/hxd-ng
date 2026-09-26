@@ -43,12 +43,16 @@ pub mod walk;
 use std::io::Cursor;
 use std::sync::{Condvar, Mutex};
 
+use hxd_core::avatar::{AvatarImages, AvatarLimits};
 use hxd_core::media::{Canonical, CodecLimits, MediaCodec, MediaReject, MediaType};
 use image::codecs::gif::{GifDecoder, GifEncoder};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
-use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageEncoder, ImageReader, Limits};
+use image::{
+    AnimationDecoder, DynamicImage, Frame, ImageDecoder, ImageEncoder, ImageReader, Limits,
+    RgbaImage,
+};
 use tracing::debug;
 use walk::{Format, WalkError};
 
@@ -201,6 +205,10 @@ impl Codec {
 }
 
 impl MediaCodec for Codec {
+    fn avatar(&self, input: &[u8], limits: &AvatarLimits) -> Result<AvatarImages, MediaReject> {
+        self.make_avatar(input, limits)
+    }
+
     fn canonicalize(&self, input: &[u8]) -> Result<Canonical, MediaReject> {
         let walked = self.inspect(input)?;
         // Only the expensive half needs a permit: everything above is
@@ -296,6 +304,105 @@ impl MediaCodec for Codec {
 }
 
 impl Codec {
+    /// `MediaCodec::avatar` for this pipeline (`docs/avatars.md` §1): the
+    /// same gates as any upload, under the avatar's own byte ceiling, then
+    /// fitted rather than kept at size.
+    fn make_avatar(
+        &self,
+        input: &[u8],
+        limits: &AvatarLimits,
+    ) -> Result<AvatarImages, MediaReject> {
+        let codec = self.with_max_bytes(limits.max_bytes);
+        let walked = codec.inspect(input)?;
+        let _permit = self.permits.acquire(self.limits.permit_wait)?;
+        if walked.format == Format::Gif && walked.frames > 1 {
+            let (canonical, first) = codec.fit_animation(input, limits.max_dimension)?;
+            // An animation that fits is its own legacy rendition; one that
+            // does not is represented by its first frame, still.
+            let legacy_gif = if canonical.bytes.len() <= limits.legacy_max_bytes {
+                Some(canonical.bytes.clone())
+            } else {
+                still_gif(DynamicImage::ImageRgba8(first), limits.legacy_max_bytes)?
+            };
+            return Ok(AvatarImages {
+                canonical,
+                legacy_gif,
+            });
+        }
+        let img = fit(codec.decode_still(input, &walked)?, limits.max_dimension);
+        let (mime, bytes) = match walked.format {
+            Format::Jpeg => (MediaType::Jpeg, encode_jpeg(&img)?),
+            Format::Png | Format::Gif => (MediaType::Png, encode_png(&img)?),
+            _ => return Err(MediaReject::Unsupported),
+        };
+        let canonical = Canonical {
+            mime,
+            width: img.width(),
+            height: img.height(),
+            bytes,
+        };
+        let legacy_gif = still_gif(img, limits.legacy_max_bytes)?;
+        Ok(AvatarImages {
+            canonical,
+            legacy_gif,
+        })
+    }
+
+    /// Every frame of an animation fitted to `max_dimension`, re-encoded
+    /// as `reencode_gif` does, and the first frame for a still fallback.
+    fn fit_animation(
+        &self,
+        input: &[u8],
+        max_dimension: u32,
+    ) -> Result<(Canonical, RgbaImage), MediaReject> {
+        let mut decoder = GifDecoder::new(Cursor::new(input)).map_err(decode_failed)?;
+        decoder
+            .set_limits(self.image_limits())
+            .map_err(decode_failed)?;
+        let (width, height) = fitted(decoder.dimensions(), max_dimension);
+        let mut out = Vec::new();
+        let mut first = None;
+        let mut count = 0u32;
+        {
+            let mut encoder = GifEncoder::new(Cursor::new(&mut out));
+            encoder
+                .set_repeat(image::codecs::gif::Repeat::Infinite)
+                .map_err(encode_failed)?;
+            // `image` composites each frame onto the full canvas, so every
+            // one scales by the same factor and lands at the origin.
+            for frame in decoder.into_frames() {
+                if count >= self.limits.max_frames {
+                    return Err(MediaReject::TooLarge);
+                }
+                let frame = frame.map_err(decode_failed)?;
+                let delay = frame.delay();
+                let buffer = frame.into_buffer();
+                let buffer = if buffer.dimensions() == (width, height) {
+                    buffer
+                } else {
+                    image::imageops::resize(&buffer, width, height, FilterType::Triangle)
+                };
+                if first.is_none() {
+                    first = Some(buffer.clone());
+                }
+                encoder
+                    .encode_frame(Frame::from_parts(buffer, 0, 0, delay))
+                    .map_err(encode_failed)?;
+                count += 1;
+            }
+        }
+        let first = first.ok_or(MediaReject::Unsupported)?;
+        Ok((
+            Canonical {
+                mime: MediaType::Gif,
+                width,
+                height,
+                bytes: out,
+            },
+            first,
+        ))
+    }
+
     /// An animation survives as an animation. Frames are collected under
     /// the same allocation ceiling as a still and re-encoded into a GIF
     /// this crate wrote — which is what drops the comment blocks,
@@ -335,6 +442,54 @@ impl Codec {
             height,
             bytes: out,
         })
+    }
+}
+
+/// `(w, h)` scaled down, keeping its aspect ratio, until neither side
+/// exceeds `max`. Never up, and never to zero.
+fn fitted((w, h): (u32, u32), max: u32) -> (u32, u32) {
+    let longest = w.max(h);
+    if longest <= max {
+        return (w, h);
+    }
+    let scale = f64::from(max) / f64::from(longest);
+    (
+        ((f64::from(w) * scale).round() as u32).clamp(1, max),
+        ((f64::from(h) * scale).round() as u32).clamp(1, max),
+    )
+}
+
+fn fit(img: DynamicImage, max: u32) -> DynamicImage {
+    let (w, h) = fitted((img.width(), img.height()), max);
+    if (w, h) == (img.width(), img.height()) {
+        img
+    } else {
+        img.resize_exact(w, h, FilterType::Triangle)
+    }
+}
+
+/// A one-frame GIF of `img` within `max_bytes`, shrinking by quarters
+/// until it fits. `None` once it is too small to be worth showing.
+fn still_gif(mut img: DynamicImage, max_bytes: usize) -> Result<Option<Vec<u8>>, MediaReject> {
+    loop {
+        let mut out = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(Cursor::new(&mut out));
+            encoder
+                .encode_frame(Frame::new(img.to_rgba8()))
+                .map_err(encode_failed)?;
+        }
+        if out.len() <= max_bytes {
+            return Ok(Some(out));
+        }
+        if img.width().max(img.height()) <= 16 {
+            return Ok(None);
+        }
+        img = img.resize(
+            (img.width() * 3 / 4).max(1),
+            (img.height() * 3 / 4).max(1),
+            FilterType::Triangle,
+        );
     }
 }
 

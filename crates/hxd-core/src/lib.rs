@@ -9,6 +9,7 @@
 
 pub mod access;
 pub mod account;
+pub mod avatar;
 pub mod chat;
 pub mod files;
 pub mod history;
@@ -28,6 +29,10 @@ pub use access::AccessBits;
 pub use account::{
     Account, AccountDirectory, AuthBackend, AuthError, IdentityLink, LinkAuthority, LinkOutcome,
     Proof, UnlinkOutcome,
+};
+pub use avatar::{
+    Avatar, AvatarId, AvatarImages, AvatarLimits, AvatarOwner, AvatarPolicy, AvatarRef,
+    AvatarStore, MemoryAvatars,
 };
 pub use chat::{ChatError, MsgOutcome};
 pub use files::{

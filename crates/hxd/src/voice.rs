@@ -155,6 +155,7 @@ mod tests {
             moderation: None,
             tls: None,
             system: None,
+            avatars: None,
         }
     }
 

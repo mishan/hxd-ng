@@ -110,6 +110,9 @@ pub struct UserInfo {
     /// is the closest that wire has to "not a person".
     pub system: bool,
     pub status: SessionStatus,
+    /// The picture shown in place of the icon by a client that can show
+    /// one (`docs/avatars.md`). The icon is still what the rest see.
+    pub avatar: Option<crate::avatar::AvatarRef>,
 }
 
 /// The fuller view one session may request of another (the user-info op).
@@ -133,6 +136,12 @@ pub enum Event {
     Changed(UserInfo),
     /// A visible session left. Not delivered to the leaver.
     Parted(Uid),
+    /// A visible session's avatar was set, replaced or cleared. Delivered
+    /// to everyone, the changer included. Its own event rather than a
+    /// [`Event::Changed`], because the legacy wire says it with a
+    /// transaction of its own (GIF Icons' Icon Change) and nothing about
+    /// the user-list row changed.
+    AvatarChanged(UserInfo),
     /// A chat line (semantic: unformatted). `cid` 0 is the public chat.
     /// `style` 1 is an action (`/me`). Delivered to the sender too.
     Chat {
@@ -443,6 +452,11 @@ pub(crate) struct UserSession {
     /// Whether this session has been announced (shows on the user list,
     /// generates events). False between login and login-completion.
     pub(crate) visible: bool,
+    /// The avatar `info.avatar` describes, with its bytes.
+    pub(crate) avatar: Option<crate::avatar::Avatar>,
+    /// When this session last changed its avatar (`AvatarPolicy`'s
+    /// interval).
+    pub(crate) avatar_changed_at: Option<Instant>,
     pub(crate) outbox: Outbox,
 }
 
@@ -801,6 +815,12 @@ pub struct Core {
     /// What each reporter has left of their hourly reports. Its own
     /// lock, taken with nothing else held.
     pub(crate) report_rate: Mutex<crate::moderation::ReportRates>,
+    /// Avatars, or `None` when no `[avatars]` section asked for them.
+    pub(crate) avatars: Option<crate::avatar::AvatarState>,
+    /// Serializes avatar changes: taken before the store is written and
+    /// held until the roster shows the change, so the two agree. Order
+    /// is it first, then `roster`.
+    pub(crate) avatar_serial: Mutex<()>,
 }
 
 impl Core {
@@ -918,6 +938,7 @@ impl Core {
                     system: info.system,
                     admin: info.admin,
                     status: SessionStatus::Active,
+                    avatar: None,
                 },
                 access: info.access,
                 login: info.login,
@@ -937,6 +958,8 @@ impl Core {
                 search_refill: Instant::now(),
                 search_tokens: f64::from(self.news_policy.search_per_minute),
                 visible: false,
+                avatar: None,
+                avatar_changed_at: None,
                 outbox: Outbox::live(tx),
             },
         );

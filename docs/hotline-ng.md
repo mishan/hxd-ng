@@ -166,6 +166,7 @@ over them.
 | `files` | The read-only file area | §7.2 here | — |
 | `identity` | The server has the identity endpoints of hotline-ng-auth.md | hotline-ng-identity.md §6.1 | fields in `self`, on a socket that authenticated with one |
 | `push` | Push device registration | push-notifications.md §8; webpush-gateway.md §7 | `push` |
+| `avatars` | Users' pictures: `avatar` on the `user` object, `avatar_clear`, bytes over HTTP | avatars.md §4 | `avatars` |
 
 - `video` MUST NOT appear without `voice`.
 - A login reply block is present exactly when its capability is, except
@@ -584,6 +585,8 @@ counts in §3's sequence.
     "fingerprint": "6htgz65…",     // 52 characters, Crockford base32
     "handle": "alice@hl.example"   // null when no attestation was accepted
   },
+  "avatar": { "id": "9f86d081…", "type": "image/png",  // absent unless the user has one
+              "width": 128, "height": 96 },
   "system": true                   // only on the server's own account
 }
 ```
@@ -596,6 +599,7 @@ counts in §3's sequence.
 | `status` | §2. |
 | `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. |
 | `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1). It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. |
+| `avatar` | Present only when the user has one, on a server with the `avatars` capability (avatars.md §4.2). Clients SHOULD show it in place of the icon when they can, and fall back to `icon`. |
 | `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
 
 ## 8. Text and limits

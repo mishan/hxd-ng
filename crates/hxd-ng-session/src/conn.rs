@@ -467,7 +467,10 @@ async fn handle_login(
         return None;
     };
     // ng has no agreement dance: announce immediately (the snapshot below
-    // then includes self).
+    // then includes self), with the owner's avatar already on it.
+    if ctx.core.avatar_policy().is_some() {
+        off_reactor(&ctx.core, move |c| c.restore_avatar(uid)).await;
+    }
     ctx.core.announce(uid);
 
     // Whose device this session is, for the requests that are about a
@@ -557,6 +560,10 @@ async fn handle_login(
     if ctx.push.is_some() && !caps.iter().any(|c| c == "push") {
         caps.push("push".into());
     }
+    // And `avatars`, whenever the domain has them: `PUT /avatar` answers.
+    if ctx.core.avatar_policy().is_some() && !caps.iter().any(|c| c == "avatars") {
+        caps.push("avatars".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
@@ -618,6 +625,9 @@ async fn handle_login(
     // find out (`docs/inline-media.md` §8.1).
     if let Some(cfg) = ctx.core.media_config() {
         ok["media"] = crate::media::limits_json(cfg);
+    }
+    if let Some(policy) = ctx.core.avatar_policy() {
+        ok["avatars"] = crate::avatar::limits_json(&policy);
     }
     // What this session may do with the news, and the ceilings it will
     // be held to. Present exactly when the `news` cap is. Off the
@@ -1626,6 +1636,15 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         }
 
         "login" | "resume" => reply_err(req.id, "bad_request", "Already logged in."),
+
+        "avatar_clear" if ctx.core.avatar_policy().is_some() => {
+            let uid = state.uid;
+            match off_reactor(&ctx.core, move |c| c.clear_avatar(uid)).await {
+                Some(Ok(_)) => reply_ok(req.id, json!({})),
+                Some(Err(e)) => reply_err(req.id, crate::media::reject_status(e).1, e.text()),
+                None => reply_err(req.id, "server_busy", "Server busy"),
+            }
+        }
 
         _ => reply_err(req.id, "unknown_method", "Unknown request."),
     };

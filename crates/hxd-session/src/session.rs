@@ -60,6 +60,15 @@ mod hdr {
     pub const CHAT_USER_CHANGE: u32 = 0x0000_0075;
     pub const CHAT_USER_PART: u32 = 0x0000_0076;
     pub const CHAT_SUBJECT: u32 = 0x0000_0077;
+    pub const ICON_CHANGE: u32 = 0x0000_0748;
+}
+
+/// fogWraith's GIF Icons extension (`docs/avatars.md` §3): client
+/// opcodes hxproto routes no enum for.
+mod gif_icons {
+    pub const GET_LIST: u32 = 0x0000_0745;
+    pub const SET: u32 = 0x0000_0746;
+    pub const GET: u32 = 0x0000_0747;
 }
 
 /// Data tags hxproto has no constants for (the gtkhx client ignores
@@ -802,6 +811,10 @@ struct Session {
     /// tunnelled session's peer is whoever terminated its WebSocket, so it
     /// binds nothing.
     transfer_addr: Option<IpAddr>,
+    /// This session has used the GIF Icons extension, so it is sent Icon
+    /// Change. The extension has no capability bit; a client that never
+    /// asked is not handed a transaction it may not know.
+    gif_icons: bool,
 }
 
 impl Session {
@@ -1337,6 +1350,7 @@ async fn login_phase(
         media_refill: Instant::now(),
         media_stream: None,
         transfer_addr: None,
+        gif_icons: false,
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -1385,6 +1399,13 @@ async fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 ],
             );
         }
+    }
+    // The owner's avatar, before anyone is told the session exists. A
+    // store read, so off the reactor — and only on a server with avatars,
+    // so one without has nothing between the login and the join.
+    if ctx.core.avatar_policy().is_some() {
+        let uid = sess.uid;
+        off_reactor(&ctx.core, move |c| c.restore_avatar(uid)).await;
     }
     ctx.core.announce(sess.uid);
     sess.announced = true;
@@ -1435,6 +1456,15 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
                 hdr::USER_PART,
                 vec![(tag::UID, uid.to_be_bytes().to_vec())],
             );
+        }
+        Event::AvatarChanged(u) => {
+            if sess.gif_icons {
+                push(
+                    tx,
+                    hdr::ICON_CHANGE,
+                    vec![(tag::UID, u.uid.to_be_bytes().to_vec())],
+                );
+            }
         }
         Event::Chat {
             cid,
@@ -3156,11 +3186,100 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             reply_error(tx, f.trans, "Already logged in.");
         }
 
+        // --- GIF Icons (`docs/avatars.md` §3) --------------------------
+        // Without `[avatars]` these fall through to the unknown-transaction
+        // error below, which is how a probing client learns the server has
+        // no support.
+        gif_icons::GET_LIST if ctx.core.avatar_policy().is_some() => {
+            sess.gif_icons = true;
+            reply(tx, f.trans, icon_list(&ctx.core.avatars()));
+        }
+
+        gif_icons::GET if ctx.core.avatar_policy().is_some() => {
+            sess.gif_icons = true;
+            let Some(uid) = f
+                .chunks()
+                .find(|c| c.tag == tag::UID)
+                .map(|c| c.as_uint() as u16)
+                .filter(|uid| ctx.core.user(*uid).is_some())
+            else {
+                reply_error(tx, f.trans, "No such user.");
+                return;
+            };
+            let gif = ctx
+                .core
+                .avatar_of(uid)
+                .and_then(|a| a.legacy_gif)
+                .map(|g| g.to_vec())
+                .unwrap_or_default();
+            reply(
+                tx,
+                f.trans,
+                vec![(tag::ICON_GIF, gif), (tag::UID, uid.to_be_bytes().to_vec())],
+            );
+        }
+
+        gif_icons::SET if ctx.core.avatar_policy().is_some() => {
+            sess.gif_icons = true;
+            let gif = f
+                .chunks()
+                .find(|c| c.tag == tag::ICON_GIF)
+                .map(|c| c.data.to_vec())
+                .unwrap_or_default();
+            // The extension's own rule, and the first thing this server
+            // checks: anything else is refused before it reaches the codec.
+            if !gif.is_empty() && !hxproto::gif_icons::is_gif(&gif) {
+                reply_error(tx, f.trans, "An icon must be a GIF.");
+                return;
+            }
+            let uid = sess.uid;
+            let outcome = off_reactor(&ctx.core, move |c| {
+                if gif.is_empty() {
+                    c.clear_avatar(uid).map(|_| ())
+                } else {
+                    c.set_avatar(uid, &gif).map(|_| ())
+                }
+            })
+            .await;
+            match outcome {
+                Some(Ok(())) => reply(tx, f.trans, vec![]),
+                Some(Err(e)) => reply_error(tx, f.trans, e.text()),
+                None => reply_error(tx, f.trans, hxd_core::media::MediaReject::Busy.text()),
+            }
+        }
+
         other => {
             debug!("unimplemented transaction {other:#x}");
             reply_error(tx, f.trans, "Not implemented.");
         }
     }
+}
+
+/// The Get Icon List reply: one packed entry per user with a legacy GIF,
+/// in uid order, stopping before the transaction would pass mhxd's own
+/// size cap (`docs/avatars.md` §3).
+fn icon_list(avatars: &[(Uid, hxd_core::Avatar)]) -> Vec<(u16, Vec<u8>)> {
+    let mut budget = MAX_FRAME_DATA as usize - 2;
+    let mut chunks = Vec::new();
+    for (uid, avatar) in avatars {
+        let Some(gif) = &avatar.legacy_gif else {
+            continue;
+        };
+        let Ok(len) = u16::try_from(gif.len() + 4) else {
+            continue;
+        };
+        let cost = 4 + usize::from(len);
+        if cost > budget {
+            break;
+        }
+        budget -= cost;
+        let mut entry = Vec::with_capacity(usize::from(len));
+        entry.extend_from_slice(&uid.to_be_bytes());
+        entry.extend_from_slice(&(gif.len() as u16).to_be_bytes());
+        entry.extend_from_slice(gif);
+        chunks.push((tag::ICON_LIST, entry));
+    }
+    chunks
 }
 
 fn file_error_text(error: &hxd_core::FileError) -> &'static str {
