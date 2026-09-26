@@ -112,29 +112,36 @@ impl<T> Drop for TimedGuard<'_, T> {
     }
 }
 
+/// The clock readings a guard carries. Both are recorded in `finish`,
+/// after the lock is released: formatting the site and looking up the
+/// histograms is not free, and done while holding the lock it would be
+/// counted in the very hold it measures, and paid by every waiter.
 #[cfg(feature = "metrics")]
 struct Held {
     lock: &'static str,
     site: &'static Location<'static>,
+    asked: Instant,
     got: Instant,
 }
 
 #[cfg(feature = "metrics")]
 impl Held {
     fn start(lock: &'static str, site: &'static Location<'static>, asked: Instant) -> Self {
-        let got = Instant::now();
-        metrics::histogram!("hxd_lock_wait_seconds", "lock" => lock, "site" => site_label(site))
-            .record(got - asked);
-        Held { lock, site, got }
+        Held {
+            lock,
+            site,
+            asked,
+            got: Instant::now(),
+        }
     }
 
     fn finish(&self) {
-        metrics::histogram!(
-            "hxd_lock_hold_seconds",
-            "lock" => self.lock,
-            "site" => site_label(self.site),
-        )
-        .record(self.got.elapsed());
+        let held = self.got.elapsed();
+        let site = site_label(self.site);
+        metrics::histogram!("hxd_lock_wait_seconds", "lock" => self.lock, "site" => site.clone())
+            .record(self.got - self.asked);
+        metrics::histogram!("hxd_lock_hold_seconds", "lock" => self.lock, "site" => site)
+            .record(held);
     }
 }
 
@@ -228,18 +235,37 @@ pub enum Pushed {
     Dropped,
 }
 
-pub fn event_pushed(to: Pushed) {
-    #[cfg(feature = "metrics")]
-    {
-        let sink = match to {
-            Pushed::Live => "live",
-            Pushed::Buffered => "buffered",
-            Pushed::Dropped => "dropped",
-        };
-        metrics::counter!("hxd_events_pushed_total", "sink" => sink).increment(1);
+/// Events pushed, tallied by the caller and recorded once: a fan-out
+/// runs under the roster lock, and one recorder lookup per recipient
+/// there would be paid by everyone waiting for it.
+#[derive(Clone, Copy, Default)]
+pub struct Tally {
+    live: u64,
+    buffered: u64,
+    dropped: u64,
+}
+
+impl Tally {
+    pub fn add(&mut self, to: Pushed) {
+        match to {
+            Pushed::Live => self.live += 1,
+            Pushed::Buffered => self.buffered += 1,
+            Pushed::Dropped => self.dropped += 1,
+        }
     }
-    #[cfg(not(feature = "metrics"))]
-    let _ = to;
+
+    pub fn record(self) {
+        #[cfg(feature = "metrics")]
+        for (sink, n) in [
+            ("live", self.live),
+            ("buffered", self.buffered),
+            ("dropped", self.dropped),
+        ] {
+            if n > 0 {
+                metrics::counter!("hxd_events_pushed_total", "sink" => sink).increment(n);
+            }
+        }
+    }
 }
 
 /// A detached session's buffer overflowed; its resume will be a resync.

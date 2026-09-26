@@ -34,10 +34,15 @@ struct Server {
 
 /// A server built the way `hxd` builds one, from a config file.
 async fn start(dir: &Path, metrics: &str) -> Server {
+    start_with(dir, "", metrics).await
+}
+
+/// The same, with more of `[ng]`.
+async fn start_with(dir: &Path, ng: &str, metrics: &str) -> Server {
     let d = dir.display();
     let text = format!(
         "[paths]\naccounts = \"{d}/accounts\"\n\
-         [ng]\nbind = \"127.0.0.1:0\"\n\
+         [ng]\nbind = \"127.0.0.1:0\"\n{ng}\n\
          {metrics}\n"
     );
     let path = dir.join("hxd-ng.toml");
@@ -262,11 +267,15 @@ async fn a_scrape_accounts_for_both_wires_and_for_their_leaving() {
                 "hxd_disconnects_total",
                 &["wire=\"ng\"", "reason=\"closed\""],
             )
+            // Only this test runs legacy clients in this process, so the
+            // queue gauges are its own: whatever was queued for them has
+            // been written or given back.
+            && value(t, "hxd_write_queued_frames{wire=\"legacy\"}") == Some(0.0)
+            && value(t, "hxd_write_queued_bytes{wire=\"legacy\"}") == Some(0.0)
     })
     .await;
     assert_eq!(value(&text, "hxd_sessions{state=\"detached\"}"), Some(0.0));
-    // Whatever the legacy writer had queued left the gauge with it.
-    assert!(value(&text, "hxd_write_queued_frames{wire=\"legacy\"}").is_some());
+    assert_eq!(value(&text, "hxd_sessions{state=\"hidden\"}"), Some(0.0));
 }
 
 #[tokio::test]
@@ -286,6 +295,38 @@ async fn a_proxy_the_server_does_not_trust_is_refused_even_on_loopback() {
     for header in ["X-Forwarded-For", "Forwarded", "X-Real-IP"] {
         let (status, _) = get(server.ng, "/metrics", &[(header, "203.0.113.9")]).await;
         assert_eq!(status, 403, "{header}");
+    }
+}
+
+#[tokio::test]
+async fn a_trusted_proxy_must_name_the_client_it_forwards() {
+    let td = tempfile::tempdir().unwrap();
+    // The proxy is this host; the one client allowed is out there.
+    let server = start_with(
+        td.path(),
+        "trusted_proxies = [\"127.0.0.1\"]",
+        "[metrics]\nallow = [\"127.0.0.1\", \"203.0.113.9\"]",
+    )
+    .await;
+    // Named, in the header this server reads: that client's own answer.
+    let (status, body) = get(server.ng, "/metrics", &[("X-Forwarded-For", "203.0.113.9")]).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = get(
+        server.ng,
+        "/metrics",
+        &[("X-Forwarded-For", "198.51.100.4")],
+    )
+    .await;
+    assert_eq!(status, 403);
+    // Named nobody it could read: the proxy's own loopback address is
+    // standing in for whoever that was, and it is refused.
+    for extra in [
+        &[][..],
+        &[("X-Real-IP", "203.0.113.9")][..],
+        &[("X-Forwarded-For", "not an address")][..],
+    ] {
+        let (status, _) = get(server.ng, "/metrics", extra).await;
+        assert_eq!(status, 403, "{extra:?}");
     }
 }
 

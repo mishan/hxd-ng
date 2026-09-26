@@ -250,7 +250,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p hxd --no-default-features -- -D warnings
 cargo clippy -p hxd --features metrics --all-targets -- -D warnings
 cargo test --workspace
-cargo test -p hxd --features metrics --lib --test metrics
+cargo test --workspace --features hxd/metrics --lib
+cargo test -p hxd --features metrics --test metrics
 node --check tools/ng-client.mjs
 cd e2e && npm install && npm test   # needs a sibling ../hx-ng; CI pins it
 docker build -t hxd-ng . && docker/smoke-test.sh hxd-ng

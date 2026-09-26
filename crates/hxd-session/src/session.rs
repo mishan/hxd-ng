@@ -234,6 +234,7 @@ pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::Le
         // A banned address costs no handshake.
         if ctx.core.is_banned(peer.ip()) {
             info!(%peer, "refusing banned address");
+            instrument::disconnect(WIRE, "banned");
             continue;
         }
         let Ok(permit) = handshakes.clone().try_acquire_owned() else {
@@ -326,12 +327,51 @@ fn enqueue(tx: &Tx, out: Outbound) {
 /// This frontend's name in the metrics.
 const WIRE: &str = "legacy";
 
-/// A legacy transaction type as a metric label: the number, for any type
-/// below the highest a Hotline extension has used, and `other` above it,
-/// so a client inventing types cannot invent series
-/// (`hxd_core::instrument`).
+/// Inbound transaction types the session answers: what an inbound frame
+/// may be labeled as (`hxd_core::instrument`). Anything else, whatever a
+/// client sends, is `other`, so a client cannot mint series.
+const HANDLED: &[ClientHdr] = &[
+    ClientHdr::AgreementAgree,
+    ClientHdr::Chat,
+    ClientHdr::ChatCreate,
+    ClientHdr::ChatDecline,
+    ClientHdr::ChatInvite,
+    ClientHdr::ChatJoin,
+    ClientHdr::ChatPart,
+    ClientHdr::ChatSubject,
+    ClientHdr::DownloadBanner,
+    ClientHdr::FileGet,
+    ClientHdr::FileGetInfo,
+    ClientHdr::FileList,
+    ClientHdr::FilePut,
+    ClientHdr::GetChatHistory,
+    ClientHdr::Login,
+    ClientHdr::Msg,
+    ClientHdr::MsgBroadcast,
+    ClientHdr::Ping,
+    ClientHdr::UserChange,
+    ClientHdr::UserGetInfo,
+    ClientHdr::UserGetList,
+    ClientHdr::UserKick,
+    ClientHdr::VideoStart,
+    ClientHdr::VideoState,
+    ClientHdr::VideoStop,
+    ClientHdr::VideoSubscribe,
+    ClientHdr::VoiceIce,
+    ClientHdr::VoiceJoin,
+    ClientHdr::VoiceLeave,
+    ClientHdr::VoiceMute,
+    ClientHdr::VoiceSdpAnswer,
+];
+
+/// An inbound frame's type as a metric label.
 fn type_label(ty: u32) -> Kind<'static> {
-    if ty < 0x800 {
+    let known = HANDLED.iter().any(|h| h.as_u32() == ty)
+        || news::handles(ty)
+        || ty == media::trans::UPLOAD_MEDIA
+        || ty == media::trans::DOWNLOAD_MEDIA
+        || matches!(ty, gif_icons::GET_LIST | gif_icons::GET | gif_icons::SET);
+    if known {
         Kind::Type(ty)
     } else {
         Kind::Name("other")
@@ -347,7 +387,8 @@ async fn writer_task<W: AsyncWrite + Unpin>(mut wr: W, mut rx: UnboundedReceiver
         let queued = out.wire_len() as i64;
         let label = match &out {
             Outbound::Reply { .. } => Kind::Name("reply"),
-            Outbound::Push { ty, .. } | Outbound::Notify { ty, .. } => type_label(*ty),
+            // The server's own push types: a set the code fixes.
+            Outbound::Push { ty, .. } | Outbound::Notify { ty, .. } => Kind::Type(*ty),
         };
         let bytes = match out {
             Outbound::Reply {
@@ -992,6 +1033,7 @@ async fn run_connection<S>(
 {
     if ctx.core.is_banned(peer.ip()) {
         info!("refusing banned address");
+        instrument::disconnect(WIRE, "banned");
         return;
     }
     let (mut rd, wr): (ReadHalf<S>, WriteHalf<S>) = tokio::io::split(stream);
@@ -1020,6 +1062,7 @@ async fn run_connection<S>(
     // TCP needs no flush; a tunnelled stream buffers frames until one
     // (`WsByteStream`), so flush after every write on the generic path.
     if wr_for_magic.write_all(&SERVER_MAGIC).await.is_err() || wr_for_magic.flush().await.is_err() {
+        instrument::disconnect(WIRE, "handshake");
         return;
     }
     let writer = tokio::spawn(writer_task(wr_for_magic, out_rx));
@@ -3568,5 +3611,35 @@ mod tests {
             stamp(SystemTime::UNIX_EPOCH - Duration::from_secs(60)),
             "1970-01-01 00:00 UTC"
         );
+    }
+
+    /// Every type `dispatch` answers by name is in `HANDLED`. Read from
+    /// this file's source, so that a transaction added to `dispatch`
+    /// without a label fails here rather than counting as `other`.
+    #[test]
+    fn every_dispatched_type_has_a_label() {
+        let src = include_str!("session.rs");
+        let start = src.find("async fn dispatch(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let mut seen = 0;
+        for line in body.lines() {
+            let Some(rest) = line.strip_prefix("        t if t == ClientHdr::") else {
+                continue;
+            };
+            let name = &rest[..rest.find('.').unwrap()];
+            let listed = format!("    ClientHdr::{name},");
+            assert!(
+                src.contains(&listed),
+                "{name} is dispatched but not in HANDLED"
+            );
+            seen += 1;
+        }
+        assert!(seen > 10, "the dispatcher's arms were not found");
+        assert!(matches!(
+            type_label(ClientHdr::Chat.as_u32()),
+            Kind::Type(_)
+        ));
+        assert!(matches!(type_label(gif_icons::GET), Kind::Type(_)));
+        assert!(matches!(type_label(0x7ff), Kind::Name("other")));
     }
 }

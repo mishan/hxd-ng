@@ -65,8 +65,12 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # Every crate's unit tests with the recording compiled in, and the
+      # endpoint's own e2e suite.
       - name: Tests with metrics
-        run: cargo test -p hxd --features metrics --lib --test metrics
+        run: |
+          cargo test --workspace --features hxd/metrics --lib
+          cargo test -p hxd --features metrics --test metrics
 
   node-client:
     runs-on: ubuntu-latest

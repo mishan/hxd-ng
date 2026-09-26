@@ -36,20 +36,31 @@ the server is and how long its locks take, which is exactly what
 someone timing a flood would like to know. So a scrape is answered only
 for an address `allow` names, and the address asked about is the
 client's as the rest of the ng layer reads it: through a proxy listed
-in `[ng] trusted_proxies`, the forwarded one. A request that carries
-`Forwarded`, `X-Forwarded-For` or `X-Real-IP` from a peer that is
-*not* a trusted proxy is refused whatever its address, because that
-peer is most likely a reverse proxy on this same host, and its
-loopback address would otherwise let everyone through it.
+in `[ng] trusted_proxies`, the forwarded one. Two cases are refused
+before that question is asked, because in both the socket's address,
+most likely this host's own, is standing in for a client nobody named:
+
+- a request carrying `Forwarded`, `X-Forwarded-For` or `X-Real-IP`
+  from a peer that is *not* a trusted proxy;
+- a request from a trusted proxy that did not name a client in the
+  header `[ng] forwarded_header` says it writes: no header, the other
+  one, or a value that is not an address.
+
+What no rule can see is a forwarder that adds nothing at all: an onion
+service, stunnel, a TCP-mode proxy or an SSH tunnel on this host.
+Behind one of those every connection arrives from loopback, and the
+default `allow` then lets everyone scrape. Such a server should name
+something narrower in `allow` than this host.
 
 ## 2. What is measured
 
 Every name here is written in one place, `hxd_core::instrument`, and
 every label value is either fixed in the code or bounded by it. A
 transaction type from the wire becomes a label only when the server
-knows it (the legacy number below `0x800`, or an ng request name the
-dispatcher handles, or its family); anything a client invents is
-`other`. A label value is a series the recorder keeps for the life of
+knows it (the number of a legacy transaction the session answers, or
+an ng request name the dispatcher handles, or its family); anything a
+client invents is `other`. Tests read each dispatcher's arms from its
+source and fail if one has no label. A label value is a series the recorder keeps for the life of
 the process, and a client must not be able to mint them.
 
 ### Locks
@@ -68,8 +79,11 @@ SQLite locks the site is the store operation, and the hold is its time
 on the disk.
 
 The locks are `TimedMutex`, a `std::sync::Mutex` that reads the clock
-on the way in and out. The hold is recorded after the lock is released,
-so the recording is never part of what it measures.
+on the way in and out. Both the wait and the hold are recorded after
+the lock is released, so the recording is never part of what it
+measures. It is not free, though: with the feature built in, every
+acquisition formats its site label on the way out, whether or not a
+`[metrics]` section installed anything to record it.
 
 ### The blocking pool
 
@@ -80,7 +94,8 @@ so the recording is never part of what it measures.
 
 `what` is the kind of work: `legacy` and `ng` for the frontends'
 store calls, `login`, `purge`, `identity`, `media`, `avatar`,
-`news_blob`, `registrar`, `files`, `push`, `prune`.
+`news_blob`, `registrar`, `files`, `push`, `prune`, and `metrics` for
+a scrape's own render.
 
 ### Fan-out and the outboxes
 
@@ -91,6 +106,10 @@ store calls, `login`, `purge`, `identity`, `media`, `avatar`,
 | `hxd_events_pushed_total` | `sink` | `live` onto a connection, `buffered` for a detached session, `dropped` by a broken buffer |
 | `hxd_outbox_broken_total` | | detached buffers that overflowed |
 | `hxd_voice_media_seconds` | `op` | each call into the SFU, all made under the roster lock |
+
+A fan-out runs under the roster lock, and so does its recording: once
+per event, whatever its reach, so the cost inside the hold is a
+constant rather than one per recipient.
 
 ### The wires
 
@@ -115,15 +134,16 @@ in the domain's channel and `hxd_outbox_depth{wire="ng"}` is where it
 shows.
 
 The reasons: `eof`, `io_error` and `malformed` from the socket,
-`closed` for a WebSocket close, `handshake` and `login` for a
-connection that never got a session, `kicked`, `logout`, `replaced`,
+`closed` for a WebSocket close, `banned` for an address refused at
+the door, `handshake` and `login` for a connection that never got a
+session, `kicked`, `logout`, `replaced`,
 `send_failed` and `pong_deadline`.
 
 ### Read at scrape time
 
 | Metric | Labels | |
 |---|---|---|
-| `hxd_sessions` | `state` | `attached`, `detached`, `hidden` (not yet announced), and `system` for the server account |
+| `hxd_sessions` | `state` | `attached`, `detached`, `hidden` (on the roster, not yet announced), and `system` for the server account; each session is in exactly one |
 | `hxd_detached_buffered_events` | `of` | events held for detached sessions, `sum` and `max` |
 | `hxd_detached_broken` | | detached sessions whose buffer has broken |
 | `hxd_private_chats` | | rooms open |

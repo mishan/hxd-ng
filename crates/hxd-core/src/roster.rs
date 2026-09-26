@@ -415,29 +415,27 @@ impl Outbox {
         }
     }
 
-    fn push(&mut self, event: Event) {
+    fn push(&mut self, event: Event) -> instrument::Pushed {
         let seq = self.next_seq;
         self.next_seq += 1;
         let se = SeqEvent { seq, event };
         match &mut self.sink {
             Sink::Live(tx) => {
                 let _ = tx.send(se);
-                instrument::event_pushed(instrument::Pushed::Live);
+                instrument::Pushed::Live
             }
             Sink::Buffering { buf, broken, .. } => {
                 if *broken {
-                    instrument::event_pushed(instrument::Pushed::Dropped);
-                    return;
+                    return instrument::Pushed::Dropped;
                 }
                 if buf.len() >= OUTBOX_BUFFER_CAP {
                     *broken = true;
                     buf.clear(); // Nothing partial is replayable; free it.
-                    instrument::event_pushed(instrument::Pushed::Dropped);
                     instrument::outbox_broken();
-                    return;
+                    return instrument::Pushed::Dropped;
                 }
                 buf.push_back(se);
-                instrument::event_pushed(instrument::Pushed::Buffered);
+                instrument::Pushed::Buffered
             }
         }
     }
@@ -626,7 +624,9 @@ impl RosterInner {
 
     pub(crate) fn send_to(&mut self, uid: Uid, ev: Event) {
         if let Some(sess) = self.users.get_mut(&uid) {
-            sess.outbox.push(ev);
+            let mut tally = instrument::Tally::default();
+            tally.add(sess.outbox.push(ev));
+            tally.record();
         }
     }
 
@@ -638,15 +638,19 @@ impl RosterInner {
         pred: F,
     ) {
         let took = instrument::Timer::start();
+        let mut tally = instrument::Tally::default();
         let mut reached = 0;
         for (uid, sess) in self.users.iter_mut() {
             if Some(*uid) == skip || !sess.visible || !pred(sess) {
                 continue;
             }
-            sess.outbox.push(ev.clone());
+            tally.add(sess.outbox.push(ev.clone()));
             reached += 1;
         }
+        // Once per fan-out, whatever its reach: still under the lock, but
+        // a constant rather than a cost per recipient.
         instrument::fanout(ev.kind(), reached, took);
+        tally.record();
     }
 
     fn broadcast(&mut self, ev: &Event, skip: Option<Uid>) {
@@ -875,7 +879,8 @@ pub struct Core {
 pub struct Census {
     pub attached: usize,
     pub detached: usize,
-    /// Attached or detached, but not yet announced (mid-login).
+    /// On the roster but not yet announced (mid-login), and counted in
+    /// neither of the two above.
     pub hidden: usize,
     pub system: usize,
     /// Detached sessions whose buffer overflowed.
@@ -1227,7 +1232,6 @@ impl Core {
         r.users.get(&uid).map(|s| s.info.status)
     }
 
-    /// Is this session currently detached? (Moderation and tests.)
     /// Who is on the roster, counted, for a metrics scrape. One pass
     /// under the lock, nothing cloned.
     pub fn census(&self) -> Census {
@@ -1241,6 +1245,10 @@ impl Core {
                 c.system += 1;
                 continue;
             }
+            if !sess.visible {
+                c.hidden += 1;
+                continue;
+            }
             match &sess.outbox.sink {
                 Sink::Live(_) => c.attached += 1,
                 Sink::Buffering { buf, broken, .. } => {
@@ -1250,11 +1258,11 @@ impl Core {
                     c.buffered_max = c.buffered_max.max(buf.len());
                 }
             }
-            c.hidden += usize::from(!sess.visible);
         }
         c
     }
 
+    /// Is this session currently detached? (Moderation and tests.)
     pub fn is_detached(&self, uid: Uid) -> bool {
         let r = self.roster.lock().unwrap();
         r.users

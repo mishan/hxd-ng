@@ -93,6 +93,7 @@ const MAX_BUNDLE_BYTES: usize = 4 * 1024 + 16 * 1024 + 256;
 pub(crate) async fn serve_connection(stream: TcpStream, peer: SocketAddr, ctx: NgCtx) {
     if ctx.core.is_banned(peer.ip()) {
         info!("refusing banned address");
+        hxd_core::instrument::disconnect("ng", "banned");
         return;
     }
     let io = TokioIo::new(stream);
@@ -222,8 +223,8 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         .map(str::to_owned);
     let resp = match (req.method(), path.as_str()) {
         (&Method::GET, crate::metrics::METRICS_PATH) if ctx.metrics.is_some() => {
-            let source = ctx.metrics.as_deref().expect("checked by the guard");
-            return boxed(crate::metrics::scrape(&req, peer, client, source, &ctx));
+            let source = ctx.metrics.clone().expect("checked by the guard");
+            return boxed(crate::metrics::scrape(&req, peer, client, source, &ctx).await);
         }
         (&Method::GET, "/.well-known/hotline") => discovery(&ctx, host.as_deref()),
         (&Method::POST, "/identity/challenge") => challenge(&ctx),
