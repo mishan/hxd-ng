@@ -15,12 +15,12 @@ use hxd_core::instrument::{self, Dir, Kind};
 use hxd_core::video::VideoKind;
 use hxd_core::voice::IceCandidate;
 use hxd_core::{
-    AccessBits, AttachInfo, AuthError, ChatError, MsgOutcome, Proof, Resume, SeqEvent, Uid,
+    AccessBits, AttachInfo, AuthError, ChatError, Events, MsgOutcome, Proof, Resume, Uid,
 };
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
-use tokio::sync::mpsc::UnboundedReceiver;
+
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
@@ -225,6 +225,13 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                         break Exit::ConnectionLost("send_failed");
                     }
                 }
+                // Closed by the domain: another connection took the
+                // session over, or this client fell a whole channel
+                // behind (`LIVE_QUEUE_CAP`) and is to be dropped.
+                None if ctx.core.is_lagging(state.uid) => {
+                    info!(uid = state.uid, "not keeping up; disconnecting");
+                    break Exit::ConnectionLost("slow_consumer");
+                }
                 None => break Exit::Replaced,
             },
             msg = ws_rx.next() => match msg {
@@ -247,6 +254,7 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                         Flow::LoggedOut => break Exit::SessionOver("logout"),
                         Flow::Dead => break Exit::ConnectionLost("send_failed"),
                         Flow::Replaced => break Exit::Replaced,
+                        Flow::Lagged => break Exit::ConnectionLost("slow_consumer"),
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => break Exit::ConnectionLost("closed"),
@@ -346,7 +354,7 @@ async fn handle_login(
     req: &ReqEnvelope,
     identity: Option<&TransportIdentity>,
     ws_tx: &mut WsTx,
-) -> Option<(SessState, UnboundedReceiver<SeqEvent>)> {
+) -> Option<(SessState, Events)> {
     // Absent params is a guest login; *malformed* params is an error, like
     // every other handler — never mistake a client bug for a guest.
     let p: LoginParams = if req.params.is_null() {
@@ -771,7 +779,7 @@ async fn handle_resume(
     ctx: &NgCtx,
     req: &ReqEnvelope,
     ws_tx: &mut WsTx,
-) -> Option<(SessState, UnboundedReceiver<SeqEvent>)> {
+) -> Option<(SessState, Events)> {
     let Ok(p) = serde_json::from_value::<ResumeParams>(req.params.clone()) else {
         let _ = send_frame(
             ws_tx,
@@ -935,6 +943,8 @@ enum Flow {
     LoggedOut,
     Dead,
     Replaced,
+    /// The client fell a whole channel behind; the connection goes.
+    Lagged,
 }
 
 /// Write one frame, giving up if the socket will not take it.
@@ -1007,7 +1017,7 @@ async fn handle_sync(
     state: &SessState,
     req: &ReqEnvelope,
     ws_tx: &mut WsTx,
-    events: &mut UnboundedReceiver<SeqEvent>,
+    events: &mut Events,
 ) -> Flow {
     // `Outbox::push` assigns the seq and sends the event while holding the
     // same roster lock `current_seq` takes. Therefore every event at or
@@ -1026,7 +1036,11 @@ async fn handle_sync(
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                return Flow::Replaced;
+                return if ctx.core.is_lagging(state.uid) {
+                    Flow::Lagged
+                } else {
+                    Flow::Replaced
+                };
             }
         }
     }

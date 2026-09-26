@@ -1806,12 +1806,12 @@ mod inbox_tests {
 
     use std::sync::{Arc, Mutex, Weak};
 
-    use tokio::sync::mpsc::UnboundedReceiver;
+    use crate::Events;
 
     use super::*;
     use crate::access::bit;
     use crate::inbox::MemoryStore;
-    use crate::roster::{drain, AttachInfo, InboxPolicy, SeqEvent};
+    use crate::roster::{drain, AttachInfo, InboxPolicy};
     use crate::{AccessBits, AccountDirectory, Resume};
 
     /// The accounts that exist and take mail, and the identity each is
@@ -1868,7 +1868,7 @@ mod inbox_tests {
         core: &Core,
         login: &str,
         fingerprint: [u8; 32],
-    ) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    ) -> (Uid, Events) {
         let (uid, rx) = core
             .attach(AttachInfo {
                 nick: login.to_string(),
@@ -1894,11 +1894,7 @@ mod inbox_tests {
         (uid, rx)
     }
 
-    pub(super) fn attach(
-        core: &Core,
-        login: &str,
-        has_inbox: bool,
-    ) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    pub(super) fn attach(core: &Core, login: &str, has_inbox: bool) -> (Uid, Events) {
         let (uid, rx) = core
             .attach(AttachInfo {
                 nick: login.to_string(),
@@ -2848,7 +2844,7 @@ mod inbox_tests {
 
         // Dave's phone comes back exactly while the message is being
         // written — after the decision to store, before delivery.
-        let resumed: Arc<Mutex<Option<UnboundedReceiver<SeqEvent>>>> = Arc::new(Mutex::new(None));
+        let resumed: Arc<Mutex<Option<Events>>> = Arc::new(Mutex::new(None));
         let weak: Weak<Core> = Arc::downgrade(&core);
         let slot = resumed.clone();
         *store.during_push.lock().unwrap() = Some(Box::new(move || {
@@ -2885,7 +2881,7 @@ mod inbox_tests {
         let core = Arc::new(Core::new().with_inbox(store.clone(), dir, InboxPolicy::default()));
         let (a, _ra) = attach(&core, "alice", true);
 
-        let arrived: Arc<Mutex<Option<UnboundedReceiver<SeqEvent>>>> = Arc::new(Mutex::new(None));
+        let arrived: Arc<Mutex<Option<Events>>> = Arc::new(Mutex::new(None));
         let weak: Weak<Core> = Arc::downgrade(&core);
         let slot = arrived.clone();
         *store.during_push.lock().unwrap() = Some(Box::new(move || {

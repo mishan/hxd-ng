@@ -6,8 +6,8 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use super::*;
 use crate::access::AccessBits;
-use crate::roster::{AttachInfo, SeqEvent, Transport};
-use tokio::sync::mpsc::UnboundedReceiver;
+use crate::roster::{AttachInfo, Transport};
+use crate::Events;
 
 /// Accepts anything non-empty. Its canonical bytes are the input
 /// reversed, and its legacy GIF the input as given, so a test can tell
@@ -53,7 +53,7 @@ enum Who<'a> {
 
 /// A visible session, with its owner's avatar restored as the frontends
 /// do before announcing it.
-fn join(core: &Core, who: Who) -> (Uid, UnboundedReceiver<SeqEvent>) {
+fn join(core: &Core, who: Who) -> (Uid, Events) {
     let (login, is_person, identity) = match who {
         Who::Account(login) => (login.to_string(), true, None),
         Who::Guest(identity) => ("guest".to_string(), false, identity),
@@ -83,7 +83,7 @@ fn join(core: &Core, who: Who) -> (Uid, UnboundedReceiver<SeqEvent>) {
 }
 
 /// The avatar changes a session has been told about, in order.
-fn changes(rx: &mut UnboundedReceiver<SeqEvent>) -> Vec<(Uid, Option<AvatarRef>)> {
+fn changes(rx: &mut Events) -> Vec<(Uid, Option<AvatarRef>)> {
     let mut out = Vec::new();
     while let Ok(se) = rx.try_recv() {
         if let Event::AvatarChanged(info) = se.event {

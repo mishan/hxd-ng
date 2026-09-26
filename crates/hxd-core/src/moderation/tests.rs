@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc::UnboundedReceiver;
+use crate::Events;
 
 use super::*;
 use crate::access::{bit, AccessBits};
@@ -17,7 +17,7 @@ use crate::media::{
 };
 use crate::news::{BodyType, MemoryNews, NewsPolicy, NodeKind, PostRequest};
 use crate::roster::InboxPolicy;
-use crate::roster::{drain, AttachInfo, SeqEvent, Transport};
+use crate::roster::{drain, AttachInfo, Transport};
 
 /// Accounts nobody is logged into: login → (identity, access).
 #[derive(Default)]
@@ -135,7 +135,7 @@ fn guest() -> Who {
     }
 }
 
-fn attach(core: &Core, who: Who) -> (Uid, UnboundedReceiver<SeqEvent>) {
+fn attach(core: &Core, who: Who) -> (Uid, Events) {
     let (uid, rx) = core
         .attach(AttachInfo {
             nick: who.login.to_uppercase(),

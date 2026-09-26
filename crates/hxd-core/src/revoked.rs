@@ -108,9 +108,9 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc::UnboundedReceiver;
+    use crate::Events;
 
-    use crate::roster::{drain, AttachInfo, SeqEvent, Transport};
+    use crate::roster::{drain, AttachInfo, Transport};
 
     fn tag(identity: u8, device: u8) -> IdentityTag {
         IdentityTag {
@@ -120,11 +120,7 @@ mod tests {
         }
     }
 
-    fn attach(
-        core: &Core,
-        nick: &str,
-        identity: Option<IdentityTag>,
-    ) -> Option<(Uid, UnboundedReceiver<SeqEvent>)> {
+    fn attach(core: &Core, nick: &str, identity: Option<IdentityTag>) -> Option<(Uid, Events)> {
         let (uid, rx) = core.attach(AttachInfo {
             nick: nick.into(),
             icon: 0,

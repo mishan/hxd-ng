@@ -140,6 +140,11 @@ the session.
   MAY be bounded (*hxd-ng:* 512 events). When a bounded buffer overflows,
   the server MUST mark the session as unable to replay: a later `resume`
   is answered `resync_required` (§6.2), never a partial replay.
+- A server MAY bound what it holds for an attached connection too, and
+  close a connection whose client does not keep up. The session is then
+  as if the connection had been lost, except that the events sent to it
+  unread cannot be replayed: a later `resume` is answered
+  `resync_required`. *hxd-ng:* 8192 events behind.
 
 Replies do not carry `seq` and are not counted.
 
