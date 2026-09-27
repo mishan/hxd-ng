@@ -166,7 +166,8 @@ is the bug class to fear here.
 
 **A client that will not drain is disconnected, not buffered for.**
 Everything held for a connection is bounded: an attached session's
-channel (`LIVE_QUEUE_CAP` events — past it the domain closes the
+channel (`LIVE_QUEUE_CAP` events or `LIVE_QUEUE_BYTES`, whichever comes
+first, weighed by `Event::weight` — past it the domain closes the
 channel and signals the connection, and the frontend drops it as
 `slow_consumer`, mid-send if need be), the classic writer's queue
 (bytes), and each classic write (no progress for a minute). One client
