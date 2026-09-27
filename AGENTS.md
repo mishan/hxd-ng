@@ -189,6 +189,20 @@ no domain operation may push a session anywhere near the cap in one
 go: a purge of thousands of lines sends nothing to a wire that cannot
 show redactions (`Transport::redactions`).
 
+**Past capacity a login is refused, not queued.** Every login costs
+everyone present a join and later a part, so a server admitting logins
+faster than it can tell the room about them falls further behind with
+each one. `Core::admit_login` bounds the logins in progress
+(`[server] logins_in_flight`, a quarter of it per address), from the
+login request to the join, so a client slow to send one holds no place;
+past it both wires refuse at once as busy (`rate_limited` with
+`retry_after` on ng). A 1.5 client that answers the agreement before
+joining joins outside the bound. A new login path takes a permit too.
+And a connection writes what is already queued for it in one go, one
+being sent a trickle of events at most every couple of milliseconds
+(`COALESCE`), because one write per event was most of what a storm
+cost; a task reply never waits.
+
 **`assert!` over `debug_assert!`** for wire invariants — release builds
 must not skip them.
 

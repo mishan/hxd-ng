@@ -118,10 +118,11 @@ constant rather than one per recipient.
 |---|---|---|
 | `hxd_frames_total` | `wire`, `dir`, `type` | frames in and out |
 | `hxd_frame_bytes_total` | `wire`, `dir` | their bytes |
-| `hxd_socket_write_seconds` | `wire` | one write, call to flush: a peer that stops reading turns into time here |
+| `hxd_socket_write_seconds` | `wire` | one write, call to flush: a peer that stops reading turns into time here. A busy connection writes what is queued together, so one write may carry many frames |
 | `hxd_outbox_depth` | `wire` | items waiting when the consumer took the next one |
 | `hxd_write_queued_frames`, `hxd_write_queued_bytes` | `wire` | queued for the legacy writers, all connections together |
 | `hxd_login_seconds` | `wire`, `auth` | first byte to a session on the roster; `auth` is `guest`, `password`, `identity` or `resume` |
+| `hxd_logins_refused_busy_total` | | logins refused because the server was already working on `[server] logins_in_flight` of them |
 | `hxd_disconnects_total` | `wire`, `reason` | why a connection ended |
 | `hxd_transfers_open` | `dir` | file transfers in progress |
 

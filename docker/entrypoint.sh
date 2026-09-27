@@ -170,6 +170,7 @@ generate() {
     num HXD_BAN_TIME ban_time
     num HXD_LOGIN_TIMEOUT login_timeout
     num HXD_QUEUE_BUDGET_MB queue_budget_mb
+    num HXD_LOGINS_IN_FLIGHT logins_in_flight
     echo
     echo "[paths]"
     echo "accounts = \"$DATA/accounts\""
