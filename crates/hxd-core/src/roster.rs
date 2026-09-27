@@ -1089,6 +1089,8 @@ pub struct Core {
     /// Nothing but public chat takes this lock; order is it first, then
     /// (briefly) `roster`.
     pub(crate) log_serial: TimedMutex<LogSerial>,
+    /// Public lines waiting to be committed together (`crate::chat`).
+    pub(crate) chat_commit: crate::chat::ChatCommit,
     /// Keys the operator has refused by hand (`crate::revoked`). Read
     /// under the roster lock by `attach`, and written with nothing held,
     /// so the order is roster first, then this.

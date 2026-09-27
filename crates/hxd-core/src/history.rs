@@ -127,6 +127,13 @@ pub fn sent_by(line: &LogLine, who: &Mailbox) -> bool {
 
 pub trait ChatLog: Send + Sync + 'static {
     fn append(&self, line: &NewLine) -> Result<LineId, StoreError>;
+    /// Several lines at once, in order, all or none: what public chat
+    /// commits when lines arrive faster than one commit each can keep up
+    /// with (`Core::chat_public`). A store that can make them one
+    /// transaction should; this one is a line at a time.
+    fn append_all(&self, lines: &[NewLine]) -> Result<Vec<LineId>, StoreError> {
+        lines.iter().map(|line| self.append(line)).collect()
+    }
     fn query(&self, query: &HistoryQuery) -> Result<HistoryPage, StoreError>;
     /// One line by id, tombstone or not: what a redaction reads before it
     /// clears the line, and what a report names.
@@ -312,6 +319,28 @@ pub mod conformance {
         media_attaches_without_changing_the_line(new_log());
         a_line_is_found_by_id_tombstone_or_not(new_log());
         a_senders_lines_are_found_by_the_mailbox_rule(new_log());
+        lines_appended_together_keep_their_order(new_log());
+    }
+
+    /// Several lines at once are logged as a line at a time would log
+    /// them: an id each, rising, and the lines in that order.
+    fn lines_appended_together_keep_their_order(log: Box<dyn ChatLog>) {
+        fill(&*log, 2);
+        let lines: Vec<NewLine> = (3..=7).map(line).collect();
+        assert_eq!(log.append_all(&lines).unwrap(), vec![3, 4, 5, 6, 7]);
+        assert_eq!(log.append(&line(8)).unwrap(), 8);
+        let page = log
+            .query(&HistoryQuery {
+                channel: 0,
+                before: None,
+                after: None,
+                limit: 50,
+            })
+            .unwrap();
+        let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        let want: Vec<String> = (1..=8).map(|n| format!("line-{n}")).collect();
+        assert_eq!(texts, want);
+        assert_eq!(log.append_all(&[]).unwrap(), Vec::<LineId>::new());
     }
 
     fn fill(log: &dyn ChatLog, count: u64) {

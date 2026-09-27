@@ -71,7 +71,9 @@ the process, and a client must not be able to mint them.
 | `hxd_lock_hold_seconds` | `lock`, `site` | from holding it to letting go |
 
 `lock` is the name of what the lock guards: `RosterInner` for the
-roster, `LogSerial` for the order public chat is persisted in, `sqlite`
+roster, `LogSerial` for the order public chat is persisted in (held
+once per commit, which may carry many lines, and by each redaction and
+purge), `sqlite`
 and `sqlite_registrar` for the two databases' connections. `site` is
 the file and line that took it (`hxd-core/src/chat.rs:256`), so the
 worst holder is named without anyone instrumenting it by hand. For the
@@ -96,6 +98,27 @@ acquisition formats its site label on the way out, whether or not a
 store calls, `login`, `purge`, `identity`, `media`, `avatar`,
 `news_blob`, `registrar`, `files`, `push`, `prune`, and `metrics` for
 a scrape's own render.
+
+### The database
+
+| Metric | Labels | |
+|---|---|---|
+| `hxd_sqlite_checkpoint_seconds` | `db`, `kind` | one WAL checkpoint on the checkpointer's own connection: a `passive` pass, or a `rewind` that emptied the log |
+| `hxd_sqlite_wal_pages` | `db` | pages in the WAL when the last passive pass began |
+| `hxd_sqlite_rewind_busy_total` | `db` | rewinds a reader held off |
+
+`db` is the database's file name. Each store's WAL is folded back into
+its database by a thread with a connection of its own, every second,
+never by the commit that happens to cross SQLite's threshold: that
+commit is usually a chat line, holding the log's lock and everyone
+behind it. A passive pass waits for nobody. Past a threshold the
+checkpointer also rewinds the log, which holds the write lock while it
+copies, syncs and waits for readers on the old log, so it is tried only
+when the passive pass copied everything back. A pass that fell short
+means a reader outside the server (an operator's shell, a backup) is
+holding a snapshot, and then nothing is tried: the refusal is counted,
+and the log grows on disk rather than holding up a commit. A rewind
+that is tried waits a tenth of a second at most for a reader.
 
 ### Fan-out and the outboxes
 
