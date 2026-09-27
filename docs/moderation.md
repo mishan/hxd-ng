@@ -318,15 +318,21 @@ Events:
 | `report_closed` | `{ "id", "outcome", "yours" }` | the reporter (`yours: true`), if they have a mailbox and a session; and moderators |
 
 A redaction of a few lines is told one `chat_redacted` per line. A
-purge of more than a few is told as `chat_purged`, each carrying up to
-a thousand ids in the order the lines were logged. *hxd-ng:* more than
-64 lines. A purge is what a moderator answers a flood with, and one
-event per line would be thousands of events to every reader at once:
-more than a server that bounds what it holds for a connection
-(hotline-ng.md §3) holds for anyone, the moderator included. A client
-that does not recognize `chat_purged` ignores it, as it must any
-unknown `ev`, and still counts its `seq`; it shows the purged lines
-until it next reads `history`, which returns them as tombstones.
+purge of more than a few is told as `chat_purged`, in as many events
+as it takes, with the ids in the order the lines were logged. A client
+must not assume a bound on how many ids one event carries. *hxd-ng:*
+more than 64 lines, and at most a thousand ids an event. A purge is
+what a moderator answers a flood with, and one event per line would be
+thousands of events to every reader at once: more than a server that
+bounds what it holds for a connection (hotline-ng.md §3) holds for
+anyone, the moderator included. A client that does not recognize
+`chat_purged` ignores it, as it must any unknown `ev`, and still counts
+its `seq`; it shows the purged lines until it next reads `history`,
+which returns them as tombstones.
+
+The articles a purge deletes are told the same way, for the same
+reason: a few as one `news_deleted` each, more as `news_purged`
+(news.md §9.3). *hxd-ng:* the same thresholds as the lines'.
 
 `history` returns a redacted line as the tombstone chat-history.md §7.2
 describes: `deleted: true`, empty `text`, no `from.nick`. A redacted

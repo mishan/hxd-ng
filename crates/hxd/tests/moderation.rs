@@ -1078,6 +1078,51 @@ async fn a_moderators_news_delete_is_on_the_record() {
     assert!(act["evidence"].as_str().unwrap().contains("you all suck"));
 }
 
+/// A purge of more articles than are told one by one is told as
+/// `news_purged`: every article, with its category, and no
+/// `news_deleted` beside it.
+#[tokio::test]
+async fn a_purge_of_many_articles_is_told_as_news_purged() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start(dir.path()).await;
+    let (mut carol, _) = Ng::login(srv.ng, "carol").await;
+    let (mut alice, _) = Ng::login(srv.ng, "alice").await;
+    let (mut bob, _) = Ng::login(srv.ng, "bob").await;
+    let cat = carol
+        .ok(
+            "news_node_create",
+            json!({ "kind": "category", "name": "General" }),
+        )
+        .await["node"]["id"]
+        .as_u64()
+        .unwrap();
+    let mut posted = Vec::new();
+    for i in 0..=hxd_core::moderation::PURGE_SINGLY {
+        let id = bob
+            .ok(
+                "news_post",
+                json!({ "category": cat, "subject": format!("buy {i}"), "body": "buy now" }),
+            )
+            .await["id"]
+            .clone();
+        posted.push(json!({ "id": id, "category": cat }));
+    }
+    alice.ok("ping", json!({})).await;
+    alice.events.clear();
+
+    carol
+        .ok(
+            "purge",
+            json!({ "login": "bob", "since": 3600, "reason": "flood" }),
+        )
+        .await;
+    let purged = alice.event("news_purged").await;
+    assert_eq!(purged["articles"], Value::Array(posted));
+    alice.none("news_deleted").await;
+    let threads = alice.ok("news_threads", json!({ "category": cat })).await;
+    assert_eq!(threads["threads"], json!([]), "every thread is gone");
+}
+
 /// What one reader heard while a flood and its purge went by.
 #[derive(Default, Debug)]
 struct Heard {

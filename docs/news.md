@@ -1277,8 +1277,16 @@ category list or a thread on screen has the same staleness problem a
 |---|---|
 | `news_posted` | `{ "id", "category", "root", "parent", "subject", "from": { "nick" }, "at", "attachments": 1 }` |
 | `news_deleted` | `{ "id", "category" }` |
+| `news_purged` | `{ "articles": [{ "id", "category" }, …] }` — many deleted at once |
 | `news_node` | `{ "node": { … } }` — created or renamed |
 | `news_node_deleted` | `{ "id" }` |
+
+`news_purged` is `news_deleted` for a moderator's purge
+(moderation.md §5): a purge of a flood of posts would otherwise be one
+event per article to every reader at once. A client applies each entry
+as it would a `news_deleted`. One that does not know the event ignores
+it, and shows the purged articles until it next refetches what it has
+on screen, which no longer carries them.
 
 They go to every session holding `READ_NEWS`, which means they consume
 a seq in every such session's outbox — including detached ones, where

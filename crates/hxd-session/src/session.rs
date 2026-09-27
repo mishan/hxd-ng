@@ -2051,6 +2051,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
         // notified through a system mailbox with a `stop` reply, which is
         // a feature of its own (`docs/news.md` §10.11).
         Event::NewsDeleted { .. }
+        | Event::NewsPurged { .. }
         | Event::NewsNode(_)
         | Event::NewsNodeDeleted { .. }
         | Event::NewsNotify(_) => {}

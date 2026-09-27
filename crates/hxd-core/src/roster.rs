@@ -473,6 +473,13 @@ pub enum Event {
         id: crate::news::ArticleId,
         category: crate::news::NodeId,
     },
+    /// A moderator's purge tombstoned these articles, each an `(id,
+    /// category)` pair: what [`Event::NewsDeleted`] would be one per
+    /// article (`docs/news.md` §9.3). At most
+    /// [`crate::moderation::PURGE_EVENT_IDS`] each.
+    NewsPurged {
+        articles: Vec<(crate::news::ArticleId, crate::news::NodeId)>,
+    },
     /// A node was created or renamed.
     NewsNode(crate::news::Node),
     NewsNodeDeleted {
@@ -511,6 +518,10 @@ impl Event {
             } => subject.len() + from_nick.len(),
             Event::Joined(u) | Event::Changed(u) | Event::AvatarChanged(u) => u.nick.len(),
             Event::ChatPurged { ids } => ids.len() * std::mem::size_of::<crate::history::LineId>(),
+            Event::NewsPurged { articles } => {
+                articles.len()
+                    * std::mem::size_of::<(crate::news::ArticleId, crate::news::NodeId)>()
+            }
             _ => 0,
         };
         std::mem::size_of::<SeqEvent>() + text
@@ -544,6 +555,7 @@ impl Event {
             Event::VideoStatus { .. } => "video_status",
             Event::NewsPosted { .. } => "news_posted",
             Event::NewsDeleted { .. } => "news_deleted",
+            Event::NewsPurged { .. } => "news_purged",
             Event::NewsNode(..) => "news_node",
             Event::NewsNodeDeleted { .. } => "news_node_deleted",
             Event::NewsNotify(..) => "news_notify",
