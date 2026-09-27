@@ -8,6 +8,11 @@ and
 [tracker protocol v3](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Tracker/Tracker-Protocol-v3.md).
 It does not make hxd-ng a tracker and does not fetch tracker listings.
 
+The wire format — datagrams, v3 fields, the HMAC slot, the acknowledgment —
+comes from `hxproto::tracker` in hx-libs, the same module GtkHx decodes
+listings with. This repo keeps the configuration, the timing, and the policy
+limits (the acknowledgment and registration-token size caps).
+
 ## 1. Configuration is the version negotiation
 
 Tracker registration is UDP. A v1 tracker normally sends no response, so a

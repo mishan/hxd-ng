@@ -64,16 +64,15 @@ is:
   ours. Also unknowns: where HOPE/ciphers live, extension scope, tests,
   license. His tracker daemon covers a component we lack entirely.
 
-The initial extraction deliberately moved only the crate both projects use.
-Other pure Rust crates should move when a second consumer needs them, rather
-than speculatively:
+The initial extraction moved only the crate both projects used. Others move
+when a second consumer needs them, rather than speculatively:
 
 | Crate | Why the server needs it |
 |---|---|
-| `hxproto` | **Moved.** Symmetric parse and build, framing, Mac Roman ↔ UTF-8, HL dates, login, sanitising and dispatch tables. |
+| `hxproto` | **Moved.** Symmetric parse and build, framing, Mac Roman ↔ UTF-8, HL dates, login, sanitising and dispatch tables — and the tracker protocol for every role (`hxproto::tracker`), which replaced the registration codec this repo built by hand. |
+| `hxhfs` | **Moved.** The file area's resource-fork sidecars. |
+| `hxfiles-xfer` | **Moved.** The HTXF and fork-header codec. |
 | `hxcrypto` | Candidate when hxd-ng implements HOPE and legacy ciphers. |
-| `hxhfs` | Candidate when the server's file area needs shared resource-fork sidecars. |
-| `hxfiles-xfer` | Candidate when the server implements HTXF. |
 
 **What stays behind, and why:**
 
@@ -458,9 +457,8 @@ In rough order of value-for-effort:
    voice SFU, peer connection, room and SDP path wholesale — the new wire
    surface is five control transactions and a status notification — and it
    degrades per client, so a voice-only or classic client is unaffected by
-   a room that has video in it. Not started; the largest new pieces are
-   keyframe/PLI plumbing (no analogue in an audio SFU) and, on the client
-   side, video rendering.
+   a room that has video in it. **Implemented 2026-09**, on both wires; the
+   legacy control transactions come from `hxproto::video`.
 
 ## Phase 7 — Hotline-ng: the HTTP-era protocol, and the presence paradigm shift
 
@@ -476,10 +474,11 @@ A second protocol frontend speaking to the *same* domain services as the
 legacy one, so both populations share one chat, one user list, one file
 area. This is the payoff of keeping wire types out of `hxd-core`'s API.
 
-GtkHx's roadmap parks the successor-protocol idea as a social problem — a new
-protocol needs a server. hxd-ng **is** the server, which un-parks it: design
-the protocol here, implement it here, and clients (including a future mobile
-app, and GtkHx itself) follow. Spec lives in this repo when the phase opens.
+GtkHx's roadmap used to park the successor-protocol idea as a social problem —
+a new protocol needs a server. hxd-ng **is** the server, which un-parks it:
+design the protocol here, implement it here, and clients follow. hx-ng is
+the client being built for it now; GtkHx lists speaking Hotline-ng as a
+longer-term goal. Spec lives in this repo when the phase opens.
 
 **The paradigm shift: sessions decouple from connections.** Being "on the
 server" means holding an authenticated session, not a live socket. A user
@@ -575,8 +574,9 @@ resist the reorder.
 
 ## Testing
 
-- **Unit + wire tiers** live with the code as usual; wire fixtures come from
-  the shared `hotline-rs` corpus.
+- **Unit + wire tiers** live with the code as usual. A wire-fixture corpus
+  shared with GtkHx, kept in hx-libs and run by both projects' CI, is the
+  plan; until then each side's fixtures live with its code.
 - **The killer asset: GtkHx's Tier 3 suite.** Its many integration tests
   already exercise login, chat, files, news, and tracker against real
   servers via Docker, and its multi-server matrix design anticipates adding
@@ -595,8 +595,11 @@ resist the reorder.
 
 ## Decisions locked in
 
-1. **Shared crates live in `hotline-rs`**, consumed by git-pin; gtkhx
-   migrates onto it in Phase 0. (Decided 2026-08.)
+1. ~~**Shared crates live in `hotline-rs`**, consumed by git-pin; gtkhx
+   migrates onto it in Phase 0. (Decided 2026-08.)~~ **Superseded:** shared
+   crates live in [`hx-libs`](https://github.com/mishan/hx-libs), consumed by
+   git-pin from both projects. Whether to converge on the third-party
+   `hotline-rs` crates is the evaluation Phase 0 describes.
 2. **v1 milestone = chat core** (Phase 2). Files, news, extensions follow.
 3. **Cluster stack: PostgreSQL + Valkey**, behind traits that ship with an
    in-memory/flat-file implementation first.
@@ -613,11 +616,11 @@ resist the reorder.
 
 ## Open questions
 
-- Repo/crate naming: `hotline-rs` and `hxd-ng` are working names.
+- Repo naming: `hxd-ng` is a working name.
 - Whether HOPE handshake logic gets promoted out of `hxnet` into a shared
   crate or reimplemented server-side (decide when Phase 2 starts, with the
   code open).
-- Whether to publish the `hotline-rs` crates to crates.io (separate from
+- Whether to publish the `hx-libs` crates to crates.io (separate from
   extraction; no rush while `publish = false`).
 - Detached-user rendering on the legacy wire: away flag, hidden, or a
   distinct "sleeping" nickname decoration — and whether legacy admins can
