@@ -229,7 +229,7 @@ async fn ng_case() {
     let reader = listen(classic(server.legacy, "reader").await, n + 1);
     let talker = classic(server.legacy, "talker").await;
     let talking = tokio::spawn(flood(talker, n));
-    let (heard, _) = timeout(Duration::from_secs(120), reader)
+    let (heard, _) = timeout(Duration::from_secs(30), reader)
         .await
         .unwrap()
         .unwrap();
@@ -278,7 +278,7 @@ async fn ng_case() {
     let mut last_seq = 0u64;
     let mut lines = 0usize;
     loop {
-        match timeout(Duration::from_secs(120), ws.next()).await.unwrap() {
+        match timeout(Duration::from_secs(30), ws.next()).await.unwrap() {
             Some(Ok(Message::Text(t))) => {
                 let v: Value = serde_json::from_str(&t).unwrap();
                 if let Some(seq) = v["seq"].as_u64() {

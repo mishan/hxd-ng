@@ -144,7 +144,8 @@ the session.
   close a connection whose client does not keep up. The session is then
   as if the connection had been lost, except that the events sent to it
   unread cannot be replayed: a later `resume` is answered
-  `resync_required`. *hxd-ng:* 8192 events behind.
+  `resync_required`. *hxd-ng:* 8192 events or 16 MiB behind, whichever
+  comes first.
 
 Replies do not carry `seq` and are not counted.
 

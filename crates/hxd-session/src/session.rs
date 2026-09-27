@@ -3782,4 +3782,90 @@ mod tests {
         assert!(matches!(type_label(gif_icons::GET), Kind::Type(_)));
         assert!(matches!(type_label(0x7ff), Kind::Name("other")));
     }
+
+    /// A peer that takes nothing for `WRITE_STALL` stalls the write.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_nobody_reads_stalls_after_the_deadline() {
+        let (mut ours, _theirs) = tokio::io::duplex(64);
+        let began = tokio::time::Instant::now();
+        let got = write_stalling(&mut ours, &[0u8; 1024]).await;
+        assert!(matches!(got, Err(WriteFailed::Stalled)));
+        assert!(began.elapsed() >= WRITE_STALL);
+    }
+
+    /// Progress of any size resets the clock: a link far slower than the
+    /// write is long is never cut off for being slow.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_reader_that_keeps_reading_never_stalls() {
+        let (mut ours, mut theirs) = tokio::io::duplex(64);
+        let reader = tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let mut total = 0;
+            while total < 4096 {
+                tokio::time::sleep(WRITE_STALL / 2).await;
+                total += theirs.read(&mut buf).await.unwrap();
+            }
+        });
+        let began = tokio::time::Instant::now();
+        assert!(write_stalling(&mut ours, &[0u8; 4096]).await.is_ok());
+        // Far longer than one deadline in all, and never one without a byte.
+        assert!(began.elapsed() > WRITE_STALL * 10);
+        reader.await.unwrap();
+    }
+
+    /// The writer that stalls marks its connection lagging — which ends
+    /// the session as a slow consumer — and leaves nothing counted as
+    /// queued behind it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_writer_lags_its_connection_and_gives_back_its_queue() {
+        let (ours, _theirs) = tokio::io::duplex(64);
+        let (out, rx) = mpsc::unbounded_channel();
+        let tx = Tx {
+            out,
+            backlog: Arc::new(Backlog::default()),
+        };
+        for _ in 0..8 {
+            enqueue(
+                &tx,
+                Outbound::Push {
+                    ty: 0x6a,
+                    chunks: vec![(tag::BODY, vec![b'x'; 1000])],
+                },
+            );
+        }
+        assert!(tx.backlog.bytes.load(Ordering::Acquire) > 0);
+        let writer = tokio::spawn(writer_task(ours, rx, tx.backlog.clone()));
+        tx.backlog.lagged.notified().await;
+        assert!(tx.backlog.lagging.load(Ordering::Acquire));
+        writer.await.unwrap();
+        assert_eq!(tx.backlog.bytes.load(Ordering::Acquire), 0);
+        // And a lagging connection queues nothing more.
+        enqueue(
+            &tx,
+            Outbound::Push {
+                ty: 0x6a,
+                chunks: vec![],
+            },
+        );
+        assert_eq!(tx.backlog.bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// The bound on the queue: past `MAX_SEND_QUEUE` the connection lags,
+    /// and what would have gone past it is not queued.
+    #[test]
+    fn a_queue_past_its_bound_lags_its_connection() {
+        let (out, _rx) = mpsc::unbounded_channel();
+        let tx = Tx {
+            out,
+            backlog: Arc::new(Backlog::default()),
+        };
+        let frame = || Outbound::Push {
+            ty: 0x6a,
+            chunks: vec![(tag::BODY, vec![b'x'; 60_000])],
+        };
+        while !tx.backlog.lagging.load(Ordering::Acquire) {
+            enqueue(&tx, frame());
+        }
+        assert!(tx.backlog.bytes.load(Ordering::Acquire) <= MAX_SEND_QUEUE);
+    }
 }

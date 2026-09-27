@@ -59,6 +59,14 @@ pub const OUTBOX_BUFFER_CAP: usize = 512;
 /// ordinary backlog.
 pub const LIVE_QUEUE_CAP: usize = 8192;
 
+/// And how many bytes, near enough ([`Event::weight`]). The event count
+/// alone would let one stalled connection hold 8192 chat lines of 4 KB
+/// each; this keeps what any one client can cost the server to a figure
+/// that does not depend on what the room is saying. A classic writer's
+/// queue has a byte bound of its own (4 MiB); this one is the larger
+/// because an ng client is sent JSON.
+pub const LIVE_QUEUE_BYTES: usize = 16 << 20;
+
 /// A session's event stream, as the one connection attached to it reads
 /// it: the channel, and the connection's own signal that the domain has
 /// cut it off for falling behind.
@@ -80,6 +88,9 @@ pub struct Events {
 pub(crate) struct ConnState {
     lagged: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
+    /// What the queued events weigh ([`Event::weight`]): added when one
+    /// is sent, taken off when the frontend receives it.
+    bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl ConnState {
@@ -101,11 +112,21 @@ impl Events {
     /// The next event; `None` once the stream has ended — this connection
     /// was taken over, or cut off ([`Events::lagged`] says which).
     pub async fn recv(&mut self) -> Option<SeqEvent> {
-        self.rx.recv().await
+        let se = self.rx.recv().await?;
+        self.took(&se);
+        Some(se)
     }
 
     pub fn try_recv(&mut self) -> Result<SeqEvent, mpsc::error::TryRecvError> {
-        self.rx.try_recv()
+        let se = self.rx.try_recv()?;
+        self.took(&se);
+        Ok(se)
+    }
+
+    fn took(&self, se: &SeqEvent) {
+        self.conn
+            .bytes
+            .fetch_sub(se.event.weight(), std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Events waiting.
@@ -465,6 +486,35 @@ pub enum Event {
 }
 
 impl Event {
+    /// Roughly what this event holds, in bytes: its own size and the text
+    /// that dominates it. For the live channel's byte budget, which needs
+    /// the same number on the way in and on the way out and a fair
+    /// estimate, not an exact one.
+    pub fn weight(&self) -> usize {
+        let text = match self {
+            Event::Chat { text, from, .. } => text.len() + from.nick.len(),
+            Event::Notice { text, .. } => text.len(),
+            Event::ChatSubject { subject, .. } => subject.len(),
+            Event::Msg {
+                from_nick,
+                text,
+                from_login,
+                ..
+            } => from_nick.len() + text.len() + from_login.as_ref().map_or(0, String::len),
+            Event::Broadcast {
+                from_nick, text, ..
+            } => from_nick.len() + text.len(),
+            Event::Report(r) => r.reason.len() + r.evidence.as_ref().map_or(0, String::len),
+            Event::VoiceOffer { sdp, .. } => sdp.len(),
+            Event::NewsPosted {
+                subject, from_nick, ..
+            } => subject.len() + from_nick.len(),
+            Event::Joined(u) | Event::Changed(u) | Event::AvatarChanged(u) => u.nick.len(),
+            _ => 0,
+        };
+        std::mem::size_of::<SeqEvent>() + text
+    }
+
     /// The event's name as a metric label (`crate::instrument`).
     pub fn kind(&self) -> &'static str {
         match self {
@@ -553,21 +603,39 @@ impl Outbox {
         self.next_seq += 1;
         let se = SeqEvent { seq, event };
         match &mut self.sink {
-            Sink::Live(tx, conn) => match tx.try_send(se) {
-                Ok(()) => instrument::Pushed::Live,
-                Err(TrySendError::Full(_)) => {
-                    let conn = conn.clone();
-                    conn.lag();
-                    // Dropping the sender is what closes the channel.
-                    self.sink = Sink::Lagged(conn);
-                    instrument::outbox_lagged();
-                    instrument::Pushed::Dropped
+            Sink::Live(tx, conn) => {
+                let weight = se.event.weight();
+                let queued = conn
+                    .bytes
+                    .fetch_add(weight, std::sync::atomic::Ordering::AcqRel);
+                // Past the byte budget is the same verdict as a full
+                // channel, reached by a different road.
+                let over = queued + weight > LIVE_QUEUE_BYTES;
+                let sent = if over {
+                    Err(TrySendError::Full(se))
+                } else {
+                    tx.try_send(se)
+                };
+                if sent.is_err() {
+                    conn.bytes
+                        .fetch_sub(weight, std::sync::atomic::Ordering::AcqRel);
                 }
-                // Nobody reads this channel: a frontend that is gone and
-                // has not said so yet, or the server account, which reads
-                // nothing.
-                Err(TrySendError::Closed(_)) => instrument::Pushed::Closed,
-            },
+                match sent {
+                    Ok(()) => instrument::Pushed::Live,
+                    Err(TrySendError::Full(_)) => {
+                        let conn = conn.clone();
+                        conn.lag();
+                        // Dropping the sender is what closes the channel.
+                        self.sink = Sink::Lagged(conn);
+                        instrument::outbox_lagged();
+                        instrument::Pushed::Dropped
+                    }
+                    // Nobody reads this channel: a frontend that is gone and
+                    // has not said so yet, or the server account, which reads
+                    // nothing.
+                    Err(TrySendError::Closed(_)) => instrument::Pushed::Closed,
+                }
+            }
             Sink::Lagged(_) => instrument::Pushed::Dropped,
             Sink::Buffering { buf, broken, .. } => {
                 if *broken {
@@ -1879,6 +1947,49 @@ mod tests {
         assert!(core.connection_lost(slow, 2));
         assert!(!core.is_lagging(slow));
         assert!(matches!(core.resume(slow, last), Resume::ResyncRequired(_)));
+    }
+
+    #[test]
+    fn big_lines_cut_off_on_bytes_long_before_the_event_count() {
+        let core = Core::new();
+        let (_slow, mut slow_rx) = ng_attach(&core, "slow", "10.0.0.1");
+        let (_steady, mut steady_rx) = ng_attach(&core, "steady", "10.0.0.2");
+        let (talker, mut talker_rx) = ng_attach(&core, "talker", "10.0.0.3");
+        let line = "x".repeat(4000);
+        // The joins it has heard so far, so the budget starts empty.
+        while slow_rx.try_recv().is_ok() {}
+        let mut sent = 0;
+        while !slow_rx.lagged() {
+            core.chat_public(talker, line.clone(), 0, None).unwrap();
+            sent += 1;
+            // These two keep up: what they have taken off their channel is
+            // off their budget too.
+            while talker_rx.try_recv().is_ok() {}
+            while steady_rx.try_recv().is_ok() {}
+            assert!(sent < LIVE_QUEUE_CAP, "never cut off on bytes");
+        }
+        let weight = Event::Chat {
+            cid: 0,
+            from: core.user(talker).unwrap(),
+            text: line.clone(),
+            style: 0,
+            id: None,
+            at: SystemTime::now(),
+            media: None,
+        }
+        .weight();
+        assert_eq!(
+            sent - 1,
+            LIVE_QUEUE_BYTES / weight,
+            "cut at the byte budget"
+        );
+        assert!(!steady_rx.lagged() && !talker_rx.lagged());
+        // What was queued for it is still there, then the end.
+        let mut got = 0;
+        while slow_rx.try_recv().is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, sent - 1);
     }
 
     #[test]

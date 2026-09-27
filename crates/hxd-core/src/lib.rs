@@ -68,7 +68,8 @@ pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};
 pub use revoked::Revocations;
 pub use roster::{
     AttachInfo, Census, Core, Event, Events, IdentityTag, InboxPolicy, Lag, Resume, SeqEvent,
-    SessionStatus, Transport, Uid, UserDetails, UserInfo, LIVE_QUEUE_CAP, OUTBOX_BUFFER_CAP,
+    SessionStatus, Transport, Uid, UserDetails, UserInfo, LIVE_QUEUE_BYTES, LIVE_QUEUE_CAP,
+    OUTBOX_BUFFER_CAP,
 };
 pub use system::SystemPolicy;
 pub use video::{VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream};
