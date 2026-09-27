@@ -383,7 +383,13 @@ pub fn reply_ok(id: u64, ok: Value) -> String {
 
 /// [`reply_ok`] for a reply that carries the roster as `users`, written
 /// from the domain's records rather than built as a tree first.
-pub fn reply_ok_with_users(id: u64, ok: Value, users: &[UserInfo]) -> String {
+pub fn reply_ok_with_users(id: u64, mut ok: Value, users: &[UserInfo]) -> String {
+    // `users` is this function's to write: one in `ok` would be written
+    // twice, and a reply that is not an object has nowhere to put it.
+    assert!(ok.is_object(), "a reply carrying the roster is an object");
+    if let Some(ok) = ok.as_object_mut() {
+        ok.remove("users");
+    }
     #[derive(serde::Serialize)]
     struct Ok<'a> {
         #[serde(flatten)]
@@ -402,7 +408,7 @@ pub fn reply_ok_with_users(id: u64, ok: Value, users: &[UserInfo]) -> String {
             users: users.iter().map(UserOut).collect(),
         },
     })
-    .unwrap_or_default()
+    .expect("these types always serialize")
 }
 
 pub fn reply_err(id: u64, code: &str, text: &str) -> String {
@@ -508,7 +514,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             ev,
             data,
         })
-        .unwrap_or_default()
+        .expect("these types always serialize")
     };
     match &se.event {
         Event::Joined(u) => return out("user_joined", UserData { user: UserOut(u) }),
@@ -525,7 +531,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             ev: "user_parted",
             data: UidData { uid: *uid },
         })
-        .unwrap_or_default();
+        .expect("these types always serialize");
     }
     let (ev, data) = match &se.event {
         Event::Chat {

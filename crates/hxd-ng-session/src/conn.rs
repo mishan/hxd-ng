@@ -405,7 +405,7 @@ async fn handle_login(
     // Past the logins the server takes at once, refused at once (§10's
     // `rate_limited`), rather than queued behind the others. Held until
     // the answer is ready, not while it is sent.
-    let Some(permit) = ctx.core.admit_login() else {
+    let Some(permit) = ctx.core.admit_login(Some(peer.ip())) else {
         let _ = send_frame(
             ws_tx,
             Message::Text(reply_err_retry(req.id, "rate_limited", "Server busy.", 1)),

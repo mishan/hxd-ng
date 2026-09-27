@@ -1151,22 +1151,57 @@ pub const LOGINS_IN_FLIGHT: usize = 32;
 /// logins faster than it can tell the room about them falls further
 /// behind with each: they take longer, the sessions they leave stay
 /// longer, and every join then goes to more people. The load baseline
-/// saw logins go from 34 ms to five seconds within one step of the
-/// rate, and not come back while arrivals continued. Bounding the work
+/// saw logins go from fast to seconds within one step of the rate, and
+/// not come back while arrivals continued. Bounding the work
 /// in progress bounds that: when logins slow down, fewer are admitted,
 /// and the ones refused are told to come back rather than left waiting.
 /// Only the server's own work holds a place, from the login request to
-/// its answer, so a client that is slow to send one holds nothing.
-pub(crate) struct LoginGate(Arc<tokio::sync::Semaphore>);
+/// its answer, so a client that is slow to send one holds nothing. And one
+/// address holds at most a quarter of the places, so a storm from one
+/// source leaves room for everyone else.
+pub(crate) struct LoginGate(Arc<GateInner>);
+
+pub(crate) struct GateInner {
+    places: Arc<tokio::sync::Semaphore>,
+    per_addr: usize,
+    by_addr: std::sync::Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl LoginGate {
+    fn new(n: usize) -> LoginGate {
+        LoginGate(Arc::new(GateInner {
+            places: Arc::new(tokio::sync::Semaphore::new(n)),
+            per_addr: (n / 4).max(1),
+            by_addr: Default::default(),
+        }))
+    }
+}
 
 impl Default for LoginGate {
     fn default() -> Self {
-        LoginGate(Arc::new(tokio::sync::Semaphore::new(LOGINS_IN_FLIGHT)))
+        LoginGate::new(LOGINS_IN_FLIGHT)
     }
 }
 
 /// A place among the logins in progress; dropping it gives it back.
-pub struct LoginPermit(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
+pub struct LoginPermit {
+    _place: tokio::sync::OwnedSemaphorePermit,
+    addr: Option<(Arc<GateInner>, IpAddr)>,
+}
+
+impl Drop for LoginPermit {
+    fn drop(&mut self) {
+        if let Some((gate, addr)) = self.addr.take() {
+            let mut by = gate.by_addr.lock().unwrap();
+            if let Some(n) = by.get_mut(&addr) {
+                *n -= 1;
+                if *n == 0 {
+                    by.remove(&addr);
+                }
+            }
+        }
+    }
+}
 
 /// What `Core::log_serial` guards: nothing but an order. A type of its
 /// own so the lock's metrics carry a name (`TimedMutex`'s default).
@@ -1203,20 +1238,40 @@ impl Core {
     /// Work on at most `n` logins at once rather than
     /// [`LOGINS_IN_FLIGHT`].
     pub fn with_logins_in_flight(mut self, n: usize) -> Self {
-        self.login_gate = LoginGate(Arc::new(tokio::sync::Semaphore::new(n)));
+        self.login_gate = LoginGate::new(n);
         self
     }
 
-    /// A place for one login, or `None` when the server is already
-    /// working on as many as it takes: the frontend refuses the login as
-    /// busy ([`LoginGate`]). Held from the login request until its
-    /// answer is on its way.
-    pub fn admit_login(&self) -> Option<LoginPermit> {
-        let permit = self.login_gate.0.clone().try_acquire_owned().ok();
+    /// A place for one login from `addr`, or `None` when the server is
+    /// already working on as many as it takes, or on as many from that
+    /// address as one may have: the frontend refuses the login as busy
+    /// ([`LoginGate`]). Held from the login request until the session is
+    /// announced.
+    pub fn admit_login(&self, addr: Option<IpAddr>) -> Option<LoginPermit> {
+        let gate = &self.login_gate.0;
+        let permit = (|| {
+            let place = gate.places.clone().try_acquire_owned().ok()?;
+            let Some(addr) = addr else {
+                return Some(LoginPermit {
+                    _place: place,
+                    addr: None,
+                });
+            };
+            let mut by = gate.by_addr.lock().unwrap();
+            let n = by.entry(addr).or_insert(0);
+            if *n >= gate.per_addr {
+                return None;
+            }
+            *n += 1;
+            Some(LoginPermit {
+                _place: place,
+                addr: Some((gate.clone(), addr)),
+            })
+        })();
         if permit.is_none() {
             instrument::login_refused_busy();
         }
-        permit.map(LoginPermit)
+        permit
     }
 
     /// The budget, for a frontend's queues to draw on too.
@@ -2154,11 +2209,24 @@ mod tests {
     #[test]
     fn logins_past_the_gate_are_refused_until_a_place_frees() {
         let core = Core::new().with_logins_in_flight(2);
-        let a = core.admit_login().expect("a place");
-        let _b = core.admit_login().expect("a place");
-        assert!(core.admit_login().is_none(), "the gate is full");
+        let a = core.admit_login(None).expect("a place");
+        let _b = core.admit_login(None).expect("a place");
+        assert!(core.admit_login(None).is_none(), "the gate is full");
         drop(a);
-        assert!(core.admit_login().is_some(), "and a place came back");
+        assert!(core.admit_login(None).is_some(), "and a place came back");
+    }
+
+    #[test]
+    fn one_address_holds_at_most_a_quarter_of_the_places() {
+        let core = Core::new().with_logins_in_flight(8);
+        let one: IpAddr = "10.0.0.1".parse().unwrap();
+        let other: IpAddr = "10.0.0.2".parse().unwrap();
+        let a = core.admit_login(Some(one)).expect("a place");
+        let _b = core.admit_login(Some(one)).expect("a place");
+        assert!(core.admit_login(Some(one)).is_none(), "its share is taken");
+        assert!(core.admit_login(Some(other)).is_some(), "not everyone's");
+        drop(a);
+        assert!(core.admit_login(Some(one)).is_some(), "and it came back");
     }
 
     #[test]

@@ -2144,8 +2144,10 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     if let Some(identity) = &config.identity {
         identity.revocations()?;
     }
-    if config.server.logins_in_flight == 0 {
-        return Err("[server] logins_in_flight must be at least 1".into());
+    if config.server.logins_in_flight == 0
+        || config.server.logins_in_flight > tokio::sync::Semaphore::MAX_PERMITS
+    {
+        return Err("[server] logins_in_flight must be at least 1, and not absurd".into());
     }
     if config.server.queue_budget() == 0 {
         return Err(

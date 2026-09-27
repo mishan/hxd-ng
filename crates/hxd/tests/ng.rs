@@ -637,7 +637,7 @@ async fn logins_past_capacity_are_refused_as_busy_on_both_wires() {
     let (legacy_addr, ng_addr, ctx) = start_server(td.path()).await;
     // Every place taken, as a storm would take them.
     let mut held = Vec::new();
-    while let Some(permit) = ctx.core.admit_login() {
+    while let Some(permit) = ctx.core.admit_login(None) {
         held.push(permit);
     }
     assert!(!held.is_empty());

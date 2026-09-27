@@ -500,11 +500,21 @@ async fn writer_task<W: AsyncWrite + Unpin>(
         // is one being sent a trickle: let what is on its way catch up with
         // this frame, and write them together. One with a backlog already
         // writes at once, or waiting would cap what it can be sent.
+        // A task reply never waits: it answers a request, and a client
+        // walking a tree or logging in is waiting on each one in turn.
         let recent = last_write.and_then(|at| COALESCE.checked_sub(at.elapsed()));
-        if let Some(wait) = recent.filter(|_| rx.is_empty()) {
+        let reply = matches!(out, Outbound::Reply { .. });
+        if let Some(wait) = recent.filter(|_| rx.is_empty() && !reply) {
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
-                _ = backlog.stop.notified() => break,
+                _ = backlog.stop.notified() => {
+                    // What was taken for this write leaves the gauges
+                    // with the rest of the queue, below.
+                    let len = out.wire_len();
+                    backlog.share.give(len);
+                    instrument::write_queued(WIRE, -1, -(len as i64));
+                    break;
+                }
             }
         }
         instrument::queue_depth(WIRE, rx.len());
@@ -1486,7 +1496,7 @@ async fn login_phase(
     }
     // Past the logins the server takes at once, refused at once with a
     // reason the client shows, rather than queued behind the others.
-    let Some(_permit) = ctx.core.admit_login() else {
+    let Some(permit) = ctx.core.admit_login(Some(peer.ip())) else {
         reply_error(tx, f.trans, "The server is busy. Try again in a moment.");
         return None;
     };
@@ -1717,7 +1727,7 @@ async fn login_phase(
     // A 1.5+ client that sent no name finishes its login via
     // AGREEMENTAGREE or USER_CHANGE; everyone else is done now.
     if req.clientversion < 150 || got_name {
-        complete_login(tx, ctx, &mut sess).await;
+        complete_login(tx, ctx, &mut sess, Some(permit)).await;
     }
     Some((sess, events))
 }
@@ -1741,7 +1751,18 @@ pub(crate) async fn off_reactor<T: Send + 'static>(
 
 /// The "loginupdate" moment: hand the client its self-info and make it
 /// visible (which broadcasts the join to everyone else).
-async fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
+/// `permit` is the login's place ([`hxd_core::Core::admit_login`]), when
+/// this is the login finishing at once: given back as soon as the room
+/// has been told, before the inbox is flushed, which is store work the
+/// room does not wait on. A 1.5 client that answers the agreement first
+/// comes here from the session loop with none: its login's place went
+/// with `login_phase`, so its join is outside the bound.
+async fn complete_login(
+    tx: &Tx,
+    ctx: &ServerCtx,
+    sess: &mut Session,
+    permit: Option<hxd_core::LoginPermit>,
+) {
     if sess.announced {
         return;
     }
@@ -1772,6 +1793,7 @@ async fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
     }
     ctx.core.announce(sess.uid);
     sess.announced = true;
+    drop(permit);
     // Mail waiting from before this login, now that the roster is
     // coherent. On this wire each one opens a window, which is why the
     // domain caps a single flush and leaves the rest for next time.
@@ -2248,7 +2270,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             ctx.core.update(sess.uid, nick, icon);
             if !sess.announced {
-                complete_login(tx, ctx, sess).await;
+                complete_login(tx, ctx, sess, None).await;
             }
             // No reply — USER_CHANGE is fire-and-forget on the wire.
         }
@@ -2272,7 +2294,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             reply(tx, f.trans, vec![]); // ack first, like the reference
             ctx.core.update(sess.uid, nick, icon);
             if !sess.announced {
-                complete_login(tx, ctx, sess).await;
+                complete_login(tx, ctx, sess, None).await;
             }
             // The banner follows the agreement, as on mhxd: only a 1.5+
             // client agrees, and only one of those knows what a banner
@@ -4035,7 +4057,44 @@ mod tests {
             read_frame(&mut theirs).await.unwrap();
         }
         writer.await.unwrap();
+        // At most the one pause a last straggler may take.
+        assert!(began.elapsed() <= COALESCE, "{:?}", began.elapsed());
+    }
+
+    /// A task reply is never held back to gather company: it answers a
+    /// request someone is waiting on.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_after_a_recent_write_is_not_held_back() {
+        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+        let (out, rx) = mpsc::unbounded_channel();
+        let tx = Tx {
+            out,
+            backlog: Arc::new(Backlog::new(hxd_core::QueueBudget::new(usize::MAX).share())),
+        };
+        let backlog = tx.backlog.clone();
+        let writer = tokio::spawn(writer_task(ours, rx, backlog));
+        enqueue(
+            &tx,
+            Outbound::Push {
+                ty: 0x6a,
+                chunks: vec![],
+            },
+        );
+        read_frame(&mut theirs).await.unwrap();
+        let began = tokio::time::Instant::now();
+        enqueue(
+            &tx,
+            Outbound::Reply {
+                trans: 7,
+                error: false,
+                chunks: vec![],
+            },
+        );
+        let f = read_frame(&mut theirs).await.unwrap();
+        assert_eq!(f.trans, 7);
         assert!(began.elapsed() < COALESCE, "{:?}", began.elapsed());
+        drop(tx);
+        writer.await.unwrap();
     }
 
     /// A client that has kept up is not cut off for one large answer —
