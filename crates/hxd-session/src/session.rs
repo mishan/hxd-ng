@@ -487,6 +487,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
     // Server pushes count their own transactions, starting at 1 (mhxd's
     // convention; clients ignore the value everywhere but task replies).
     let mut push_trans: u32 = 1;
+    let mut last_write: Option<tokio::time::Instant> = None;
     loop {
         let out = tokio::select! {
             out = rx.recv() => match out {
@@ -495,43 +496,77 @@ async fn writer_task<W: AsyncWrite + Unpin>(
             },
             _ = backlog.stop.notified() => break,
         };
+        // A connection that wrote a moment ago and has nothing else queued
+        // is one being sent a trickle: let what is on its way catch up with
+        // this frame, and write them together. One with a backlog already
+        // writes at once, or waiting would cap what it can be sent.
+        // A task reply never waits: it answers a request, and a client
+        // walking a tree or logging in is waiting on each one in turn.
+        let recent = last_write.and_then(|at| COALESCE.checked_sub(at.elapsed()));
+        let reply = matches!(out, Outbound::Reply { .. });
+        if let Some(wait) = recent.filter(|_| rx.is_empty() && !reply) {
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = backlog.stop.notified() => {
+                    // What was taken for this write leaves the gauges
+                    // with the rest of the queue, below.
+                    let len = out.wire_len();
+                    backlog.share.give(len);
+                    instrument::write_queued(WIRE, -1, -(len as i64));
+                    break;
+                }
+            }
+        }
         instrument::queue_depth(WIRE, rx.len());
-        let queued = out.wire_len() as i64;
-        let label = match &out {
-            Outbound::Reply { .. } => Kind::Name("reply"),
-            // The server's own push types: a set the code fixes.
-            Outbound::Push { ty, .. } | Outbound::Notify { ty, .. } => Kind::Type(*ty),
-        };
-        let bytes = match out {
-            Outbound::Reply {
-                trans,
-                error,
-                chunks,
-            } => {
-                trace_out(hdr::TASK, trans, error as u32, &chunks);
-                pack_frame(hdr::TASK, trans, error as u32, &chunks)
+        // Whatever else is already waiting goes out in the same write.
+        // One write and one flush per frame was the cost of a login
+        // storm: every join and every part is a frame to everyone
+        // present, and at a few hundred logins a second the server spent
+        // most of its time in the system calls for them. An idle
+        // connection's frame still goes out on its own, at once.
+        let mut bytes = Vec::new();
+        // Frames by kind, for the metrics: one count per kind per write.
+        let mut frames: Vec<(Kind<'static>, usize, usize)> = Vec::new();
+        let mut queued = 0;
+        let mut next = Some(out);
+        while let Some(out) = next {
+            queued += out.wire_len();
+            let (label, frame) = pack_out(out, &mut push_trans);
+            let same = |k: &Kind| match (k, &label) {
+                (Kind::Name(a), Kind::Name(b)) => a == b,
+                (Kind::Type(a), Kind::Type(b)) => a == b,
+                _ => false,
+            };
+            match frames.iter_mut().find(|(k, ..)| same(k)) {
+                Some((_, n, len)) => {
+                    *n += 1;
+                    *len += frame.len();
+                }
+                None => frames.push((label, 1, frame.len())),
             }
-            Outbound::Push { ty, chunks } => {
-                let trans = push_trans;
-                push_trans = push_trans.wrapping_add(1);
-                trace_out(ty, trans, 0, &chunks);
-                pack_frame(ty, trans, 0, &chunks)
-            }
-            Outbound::Notify { ty, chunks } => {
-                trace_out(ty, 0, 0, &chunks);
-                pack_frame(ty, 0, 0, &chunks)
-            }
-        };
+            bytes.extend_from_slice(&frame);
+            next = if bytes.len() < WRITE_BATCH {
+                rx.try_recv().ok()
+            } else {
+                None
+            };
+        }
         let took = instrument::Timer::start();
         let written = tokio::select! {
             written = write_stalling(&mut wr, &bytes) => written,
             _ = backlog.stop.notified() => Err(WriteFailed::Closed),
         };
         instrument::socket_write(WIRE, took);
-        instrument::write_queued(WIRE, -1, -queued);
-        backlog.share.give(queued as usize);
+        last_write = Some(tokio::time::Instant::now());
+        let count: usize = frames.iter().map(|(_, n, _)| n).sum();
+        instrument::write_queued(WIRE, -(count as i64), -(queued as i64));
+        backlog.share.give(queued);
         match written {
-            Ok(()) => instrument::frame(WIRE, Dir::Out, label, bytes.len()),
+            Ok(()) => {
+                for (label, n, len) in frames {
+                    instrument::frames(WIRE, Dir::Out, label, n, len);
+                }
+            }
             // The peer stopped reading: the session ends as a slow
             // consumer rather than waiting on it for good.
             Err(WriteFailed::Stalled) => {
@@ -550,6 +585,47 @@ async fn writer_task<W: AsyncWrite + Unpin>(
         instrument::write_queued(WIRE, -1, -(len as i64));
     }
     let _ = timeout(Duration::from_secs(1), wr.shutdown()).await;
+}
+
+/// Past this many bytes a write takes no more of what is queued behind
+/// it: enough frames to make the system calls cheap, and not so many
+/// that one write holds a large buffer of its own.
+const WRITE_BATCH: usize = 64 << 10;
+
+/// How long after one write a connection being sent a trickle waits
+/// before the next, to write what arrives meanwhile with it. A frame to
+/// an idle connection goes at once, and so does a backlog; one frame at a
+/// time in quick succession, which is what a login storm is to everyone
+/// present, is written at most this often, and a system call per event
+/// was most of what the storm cost.
+const COALESCE: Duration = Duration::from_millis(2);
+
+/// One queued frame on the wire, and what the metrics call it.
+fn pack_out(out: Outbound, push_trans: &mut u32) -> (Kind<'static>, Vec<u8>) {
+    match out {
+        Outbound::Reply {
+            trans,
+            error,
+            chunks,
+        } => {
+            trace_out(hdr::TASK, trans, error as u32, &chunks);
+            (
+                Kind::Name("reply"),
+                pack_frame(hdr::TASK, trans, error as u32, &chunks),
+            )
+        }
+        // The server's own push types: a set the code fixes.
+        Outbound::Push { ty, chunks } => {
+            let trans = *push_trans;
+            *push_trans = push_trans.wrapping_add(1);
+            trace_out(ty, trans, 0, &chunks);
+            (Kind::Type(ty), pack_frame(ty, trans, 0, &chunks))
+        }
+        Outbound::Notify { ty, chunks } => {
+            trace_out(ty, 0, 0, &chunks);
+            (Kind::Type(ty), pack_frame(ty, 0, 0, &chunks))
+        }
+    }
 }
 
 /// Reader task: frames the socket into a bounded channel (backpressure for
@@ -1418,6 +1494,12 @@ async fn login_phase(
         reply_error(tx, f.trans, "Secure login (HOPE) is not supported yet.");
         return None;
     }
+    // Past the logins the server takes at once, refused at once with a
+    // reason the client shows, rather than queued behind the others.
+    let Some(permit) = ctx.core.admit_login(Some(peer.ip())) else {
+        reply_error(tx, f.trans, "The server is busy. Try again in a moment.");
+        return None;
+    };
 
     // The encoding comes from the same frame as the credentials, so it is
     // settled before anything in that frame is read as text. Bit 1 needs
@@ -1645,7 +1727,7 @@ async fn login_phase(
     // A 1.5+ client that sent no name finishes its login via
     // AGREEMENTAGREE or USER_CHANGE; everyone else is done now.
     if req.clientversion < 150 || got_name {
-        complete_login(tx, ctx, &mut sess).await;
+        complete_login(tx, ctx, &mut sess, Some(permit)).await;
     }
     Some((sess, events))
 }
@@ -1669,7 +1751,18 @@ pub(crate) async fn off_reactor<T: Send + 'static>(
 
 /// The "loginupdate" moment: hand the client its self-info and make it
 /// visible (which broadcasts the join to everyone else).
-async fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
+/// `permit` is the login's place ([`hxd_core::Core::admit_login`]), when
+/// this is the login finishing at once: given back as soon as the room
+/// has been told, before the inbox is flushed, which is store work the
+/// room does not wait on. A 1.5 client that answers the agreement first
+/// comes here from the session loop with none: its login's place went
+/// with `login_phase`, so its join is outside the bound.
+async fn complete_login(
+    tx: &Tx,
+    ctx: &ServerCtx,
+    sess: &mut Session,
+    permit: Option<hxd_core::LoginPermit>,
+) {
     if sess.announced {
         return;
     }
@@ -1700,6 +1793,7 @@ async fn complete_login(tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
     }
     ctx.core.announce(sess.uid);
     sess.announced = true;
+    drop(permit);
     // Mail waiting from before this login, now that the roster is
     // coherent. On this wire each one opens a window, which is why the
     // domain caps a single flush and leaves the rest for next time.
@@ -2176,7 +2270,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             ctx.core.update(sess.uid, nick, icon);
             if !sess.announced {
-                complete_login(tx, ctx, sess).await;
+                complete_login(tx, ctx, sess, None).await;
             }
             // No reply — USER_CHANGE is fire-and-forget on the wire.
         }
@@ -2200,7 +2294,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             reply(tx, f.trans, vec![]); // ack first, like the reference
             ctx.core.update(sess.uid, nick, icon);
             if !sess.announced {
-                complete_login(tx, ctx, sess).await;
+                complete_login(tx, ctx, sess, None).await;
             }
             // The banner follows the agreement, as on mhxd: only a 1.5+
             // client agrees, and only one of those knows what a banner
@@ -3902,6 +3996,105 @@ mod tests {
         }
         assert!(tx.backlog.share.held() <= 256 << 10);
         assert_eq!(budget.held(), tx.backlog.share.held());
+    }
+
+    /// Frames queued together are written together: in order, each whole,
+    /// the pushes numbered as they would have been one by one.
+    #[tokio::test]
+    async fn frames_queued_together_go_out_in_order() {
+        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+        let (out, rx) = mpsc::unbounded_channel();
+        let tx = Tx {
+            out,
+            backlog: Arc::new(Backlog::new(hxd_core::QueueBudget::new(usize::MAX).share())),
+        };
+        for i in 0..5u8 {
+            enqueue(
+                &tx,
+                Outbound::Push {
+                    ty: 0x6a,
+                    chunks: vec![(tag::BODY, vec![i; 10])],
+                },
+            );
+        }
+        let backlog = tx.backlog.clone();
+        drop(tx);
+        writer_task(ours, rx, backlog.clone()).await;
+        for i in 0..5u8 {
+            let f = read_frame(&mut theirs).await.unwrap();
+            assert_eq!((f.ty, f.trans), (0x6a, u32::from(i) + 1));
+            assert_eq!(f.chunks().next().unwrap().data, &[i; 10]);
+        }
+        assert_eq!(backlog.share.held(), 0);
+    }
+
+    /// A backlog is written as fast as the socket takes it: the pause that
+    /// gathers a trickle into one write never holds up a queue that is
+    /// already full, or it would cap what a connection can be sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_backlog_is_written_without_pausing() {
+        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+        let (out, rx) = mpsc::unbounded_channel();
+        let tx = Tx {
+            out,
+            backlog: Arc::new(Backlog::new(hxd_core::QueueBudget::new(usize::MAX).share())),
+        };
+        let n = 16 * WRITE_BATCH / 4096;
+        for _ in 0..n {
+            enqueue(
+                &tx,
+                Outbound::Push {
+                    ty: 0x6a,
+                    chunks: vec![(tag::BODY, vec![b'x'; 4096])],
+                },
+            );
+        }
+        let backlog = tx.backlog.clone();
+        drop(tx);
+        let began = tokio::time::Instant::now();
+        let writer = tokio::spawn(writer_task(ours, rx, backlog));
+        for _ in 0..n {
+            read_frame(&mut theirs).await.unwrap();
+        }
+        writer.await.unwrap();
+        // At most the one pause a last straggler may take.
+        assert!(began.elapsed() <= COALESCE, "{:?}", began.elapsed());
+    }
+
+    /// A task reply is never held back to gather company: it answers a
+    /// request someone is waiting on.
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_after_a_recent_write_is_not_held_back() {
+        let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+        let (out, rx) = mpsc::unbounded_channel();
+        let tx = Tx {
+            out,
+            backlog: Arc::new(Backlog::new(hxd_core::QueueBudget::new(usize::MAX).share())),
+        };
+        let backlog = tx.backlog.clone();
+        let writer = tokio::spawn(writer_task(ours, rx, backlog));
+        enqueue(
+            &tx,
+            Outbound::Push {
+                ty: 0x6a,
+                chunks: vec![],
+            },
+        );
+        read_frame(&mut theirs).await.unwrap();
+        let began = tokio::time::Instant::now();
+        enqueue(
+            &tx,
+            Outbound::Reply {
+                trans: 7,
+                error: false,
+                chunks: vec![],
+            },
+        );
+        let f = read_frame(&mut theirs).await.unwrap();
+        assert_eq!(f.trans, 7);
+        assert!(began.elapsed() < COALESCE, "{:?}", began.elapsed());
+        drop(tx);
+        writer.await.unwrap();
     }
 
     /// A client that has kept up is not cut off for one large answer —

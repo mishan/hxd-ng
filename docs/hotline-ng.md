@@ -315,6 +315,7 @@ Errors:
 | `revoked` | The socket's identity or device key was revoked on this server after it authenticated (identity-registrar.md §7.3). |
 | `banned` | The address or identity is banned. *hxd-ng* refuses a banned address before the upgrade — closing the TCP connection at accept, or answering the HTTP request 403 — and never sends this code. |
 | `server_full` | No uid is free. |
+| `rate_limited` | The server is taking logins as fast as it can. Retry after `retry_after` seconds. *hxd-ng:* past `[server] logins_in_flight` logins in progress. |
 | `server_error` | The server could not complete the login. |
 
 ### 6.2 Resume

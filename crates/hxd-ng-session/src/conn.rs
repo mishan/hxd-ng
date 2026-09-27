@@ -31,10 +31,11 @@ use tracing::{debug, info, warn};
 use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
     blocked_json, event_json, history_line_json, parse_streams, participants_json, reply_err,
-    reply_ok, stored_msg_json, user_json, video_err, video_limits_json, voice_err, BlockParams,
-    ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams,
-    ReqEnvelope, ResumeParams, VideoStartParams, VideoStateParams, VideoStopParams,
-    VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
+    reply_err_retry, reply_ok, reply_ok_with_users, stored_msg_json, user_json, video_err,
+    video_limits_json, voice_err, BlockParams, ChatParams, HistoryParams, InboxParams, LoginParams,
+    MsgParams, MsgReadParams, NickParams, ReqEnvelope, ResumeParams, VideoStartParams,
+    VideoStateParams, VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams,
+    VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -197,6 +198,7 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
     let mut heard = tokio::time::Instant::now();
 
     let lag = events.lag();
+    let mut last_write: Option<tokio::time::Instant> = None;
     let exit = loop {
         tokio::select! {
             // Biased, events first: a reply must never overtake an event
@@ -223,12 +225,33 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
             }
             ev = events.recv() => match ev {
                 Some(se) => {
+                    // A connection that wrote a moment ago and has nothing
+                    // else queued: let what is on its way catch up
+                    // (`COALESCE`). One with a backlog sends at once.
+                    let recent = last_write.and_then(|at| COALESCE.checked_sub(at.elapsed()));
+                    if let Some(wait) = recent.filter(|_| events.is_empty()) {
+                        tokio::time::sleep(wait).await;
+                    }
                     instrument::queue_depth(WIRE, events.len());
-                    let kicked = matches!(se.event, hxd_core::Event::Kicked);
+                    // Whatever else is already waiting goes out with it,
+                    // in one flush: one per event was most of what a login
+                    // storm cost, every join and part being an event to
+                    // everyone present. A kick is the batch's last word.
+                    let mut kicked = matches!(se.event, hxd_core::Event::Kicked);
+                    let mut batch = vec![event_json(&se)];
+                    let mut bytes = batch[0].len();
+                    while !kicked && bytes < WRITE_BATCH {
+                        let Ok(se) = events.try_recv() else { break };
+                        kicked = matches!(se.event, hxd_core::Event::Kicked);
+                        let text = event_json(&se);
+                        bytes += text.len();
+                        batch.push(text);
+                    }
                     // The cut can come while this send is blocked on the
                     // very client it is about.
+                    last_write = Some(tokio::time::Instant::now());
                     let sent = tokio::select! {
-                        sent = send_frame(&mut ws_tx, Message::Text(event_json(&se))) => sent,
+                        sent = send_texts(&mut ws_tx, batch) => sent,
                         _ = lag.wait() => {
                             info!(uid = state.uid, "not keeping up; disconnecting");
                             break Exit::ConnectionLost("slow_consumer");
@@ -379,6 +402,17 @@ async fn handle_login(
     identity: Option<&TransportIdentity>,
     ws_tx: &mut WsTx,
 ) -> Option<(SessState, Events)> {
+    // Past the logins the server takes at once, refused at once (§10's
+    // `rate_limited`), rather than queued behind the others. Held until
+    // the answer is ready, not while it is sent.
+    let Some(permit) = ctx.core.admit_login(Some(peer.ip())) else {
+        let _ = send_frame(
+            ws_tx,
+            Message::Text(reply_err_retry(req.id, "rate_limited", "Server busy.", 1)),
+        )
+        .await;
+        return None;
+    };
     // Absent params is a guest login; *malformed* params is an error, like
     // every other handler — never mistake a client bug for a guest.
     let p: LoginParams = if req.params.is_null() {
@@ -780,9 +814,10 @@ async fn handle_login(
     if let Some(banner) = ctx.banner.as_deref() {
         ok["banner"] = crate::banner::login_json(banner);
     }
-    ok["users"] = users.iter().map(user_json).collect();
+    let reply = reply_ok_with_users(req.id, ok, &users);
     drop(users);
-    if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
+    drop(permit);
+    if !send_frame(ws_tx, Message::Text(reply)).await {
         // The client never learned it was logged in; a ghost session with
         // no transport (and a leaked token) must not linger.
         ctx.core.end_session(uid);
@@ -991,6 +1026,49 @@ enum Flow {
 ///
 /// `false` means the connection is gone, which every caller already
 /// treats as the end of it.
+/// Past this many bytes a batch of events takes no more of what is
+/// queued behind it (`run`).
+const WRITE_BATCH: usize = 64 << 10;
+
+/// How long after one batch of events a connection being sent a trickle
+/// waits before the next, to send what arrives meanwhile with it. A frame
+/// to an idle connection goes at once, and so does a backlog; a flush per
+/// event was most of what a login storm cost.
+const COALESCE: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Send several text frames with one flush, all of it bounded by the pong
+/// deadline as one send is.
+async fn send_texts(ws_tx: &mut WsTx, texts: Vec<String>) -> bool {
+    if texts.len() == 1 {
+        let text = texts.into_iter().next().unwrap_or_default();
+        return send_frame(ws_tx, Message::Text(text)).await;
+    }
+    let (count, bytes) = (texts.len(), texts.iter().map(String::len).sum());
+    let took = instrument::Timer::start();
+    let sent = timeout(PONG_DEADLINE, async {
+        for text in texts {
+            ws_tx.feed(Message::Text(text)).await?;
+        }
+        ws_tx.flush().await
+    })
+    .await;
+    instrument::socket_write(WIRE, took);
+    match sent {
+        Ok(Ok(())) => {
+            instrument::frames(WIRE, Dir::Out, Kind::Name("text"), count, bytes);
+            true
+        }
+        Ok(Err(e)) => {
+            debug!("ng send failed: {e}");
+            false
+        }
+        Err(_) => {
+            info!("ng send blocked past the pong deadline");
+            false
+        }
+    }
+}
+
 async fn send_frame(ws_tx: &mut WsTx, msg: Message) -> bool {
     let (kind, len) = match &msg {
         Message::Text(t) => ("text", t.len()),
@@ -1080,17 +1158,16 @@ async fn handle_sync(
         end_kicked(ctx, state, ws_tx).await;
         return Flow::LoggedOut;
     }
-    let users: Vec<_> = ctx.core.snapshot().iter().map(user_json).collect();
-    let out = reply_ok(
+    let out = reply_ok_with_users(
         req.id,
         json!({
             "server": {
                 "name": ctx.cfg.server_name,
                 "subject": ctx.core.public_subject(),
             },
-            "users": users,
             "seq": seq,
         }),
+        &ctx.core.snapshot(),
     );
     if !send_frame(ws_tx, Message::Text(out)).await {
         return Flow::Dead;
