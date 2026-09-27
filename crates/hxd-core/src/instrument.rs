@@ -287,15 +287,28 @@ pub fn outbox_lagged(bound: &'static str) {
     let _ = bound;
 }
 
-/// One WAL checkpoint, and how many pages the log held when it began.
-pub fn checkpoint(took: Timer, wal_pages: u64) {
+/// One WAL checkpoint of the database `db`: a `passive` pass and the
+/// pages the log held when it began, or a `rewind` that emptied it.
+pub fn checkpoint(db: &str, kind: &'static str, took: Timer, wal_pages: u64) {
     #[cfg(feature = "metrics")]
     {
-        metrics::histogram!("hxd_sqlite_checkpoint_seconds").record(took.elapsed());
-        metrics::gauge!("hxd_sqlite_wal_pages").set(wal_pages as f64);
+        let db = db.to_owned();
+        metrics::histogram!("hxd_sqlite_checkpoint_seconds", "db" => db.clone(), "kind" => kind)
+            .record(took.elapsed());
+        if kind == "passive" {
+            metrics::gauge!("hxd_sqlite_wal_pages", "db" => db).set(wal_pages as f64);
+        }
     }
     #[cfg(not(feature = "metrics"))]
-    let _ = (took, wal_pages);
+    let _ = (db, kind, took, wal_pages);
+}
+
+/// A rewind of `db`'s log that a reader outside the server held off.
+pub fn checkpoint_busy(db: &str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_sqlite_rewind_busy_total", "db" => db.to_owned()).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = db;
 }
 
 /// A detached session's buffer overflowed; its resume will be a resync.

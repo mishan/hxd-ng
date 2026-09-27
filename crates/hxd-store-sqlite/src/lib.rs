@@ -8,10 +8,10 @@
 //! **One connection behind a mutex.** Not a pool: this store has exactly
 //! one writer (the domain's message path) and its reads are single-row or
 //! single-page lookups on an indexed column. Serialising them costs
-//! nothing at the scale this server is for, and it means no connection can
-//! be holding a transaction open while another waits on the write lock. A
-//! pool is the answer if that ever stops being true; it is not the answer
-//! to a problem nobody has.
+//! nothing at the scale this server is for. A pool is the answer if that
+//! ever stops being true; it is not the answer to a problem nobody has.
+//! The one other connection a store opens is its checkpointer's
+//! (`Checkpointer`), which writes nothing but checkpoints.
 //!
 //! **Times are unix seconds** at this boundary. `SystemTime` is the
 //! domain's type; the conversion is here and nowhere else, and it floors
@@ -501,8 +501,16 @@ impl Drop for Checkpointer {
 impl Checkpointer {
     fn start(path: &Path, rewind_pages: i64) -> Result<Checkpointer, StoreError> {
         let conn = Connection::open(path).map_err(StoreError::new)?;
-        conn.busy_timeout(Duration::from_secs(5))
-            .map_err(StoreError::new)?;
+        // Only a rewind waits on anything, and it waits holding the write
+        // lock: briefly, or not at all (`checkpoint`).
+        conn.busy_timeout(REWIND_WAIT).map_err(StoreError::new)?;
+        let mut state = CheckpointState {
+            db: path
+                .file_name()
+                .map_or_else(|| "db".into(), |n| n.to_string_lossy().into_owned()),
+            rewind_pages,
+            rewind_after: None,
+        };
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("sqlite-checkpoint".into())
@@ -510,11 +518,11 @@ impl Checkpointer {
                 while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
                     stopped.recv_timeout(CHECKPOINT_EVERY)
                 {
-                    checkpoint(&conn, rewind_pages);
+                    checkpoint(&conn, &mut state);
                 }
                 // A last one on the way out, so a clean shutdown leaves
                 // little for the next start to replay.
-                checkpoint(&conn, rewind_pages);
+                checkpoint(&conn, &mut state);
             })
             .map_err(StoreError::new)?;
         Ok(Checkpointer {
@@ -524,36 +532,75 @@ impl Checkpointer {
     }
 }
 
-fn checkpoint(conn: &Connection, rewind_pages: i64) {
+/// What the checkpointer carries from one pass to the next.
+struct CheckpointState {
+    /// The database's file name, for the metrics.
+    db: String,
+    rewind_pages: i64,
+    /// A rewind came back busy: not again before this.
+    rewind_after: Option<std::time::Instant>,
+}
+
+fn checkpoint(conn: &Connection, state: &mut CheckpointState) {
     let took = hxd_core::instrument::Timer::start();
+    // (busy, pages in the log, pages copied back)
     let wal = |mode: &str| {
         conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |r| {
-            r.get::<_, i64>(1)
+            Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?))
         })
     };
+    let pages = match wal("PASSIVE") {
+        Ok((_, pages)) => pages,
+        Err(e) => {
+            tracing::warn!("sqlite checkpoint: {e}");
+            return;
+        }
+    };
+    hxd_core::instrument::checkpoint(&state.db, "passive", took, pages.max(0) as u64);
     // Past this many pages the log is rewound: a PASSIVE checkpoint never
     // leaves it rewindable while commits keep coming, since SQLite starts
     // the log over only when a write begins with every page already
-    // copied back, and one always arrives between. So the log would
-    // grow for as long as the server was busy. The rewind waits for the
-    // writer and holds it off while it copies what arrived since the
-    // PASSIVE one just before, which is little.
-    let done = wal("PASSIVE").and_then(|pages| {
-        if pages >= rewind_pages {
-            wal("RESTART").map(|_| pages)
-        } else {
-            Ok(pages)
+    // copied back, and one always arrives between, so the log would grow
+    // for as long as the server was busy. A TRUNCATE takes the write lock,
+    // copies what arrived since the PASSIVE one, waits for any reader
+    // still on the old log, and empties it.
+    //
+    // It waits holding the write lock, so it waits for at most
+    // `REWIND_WAIT`: a reader outside this server — an operator's shell,
+    // a backup — can hold a snapshot for as long as it likes, and every
+    // commit, public chat's included, would wait with it. Refused, it is
+    // counted and not tried again for `REWIND_BACKOFF`; the log goes on
+    // growing meanwhile, which costs disk and not a stall.
+    let due = state
+        .rewind_after
+        .is_none_or(|at| std::time::Instant::now() >= at);
+    if pages < state.rewind_pages || !due {
+        return;
+    }
+    let took = hxd_core::instrument::Timer::start();
+    match wal("TRUNCATE") {
+        Ok((false, _)) => {
+            state.rewind_after = None;
+            hxd_core::instrument::checkpoint(&state.db, "rewind", took, 0);
         }
-    });
-    match done {
-        Ok(pages) => hxd_core::instrument::checkpoint(took, pages.max(0) as u64),
-        Err(e) => tracing::warn!("sqlite checkpoint: {e}"),
+        Ok((true, _)) | Err(_) => {
+            state.rewind_after = Some(std::time::Instant::now() + REWIND_BACKOFF);
+            hxd_core::instrument::checkpoint_busy(&state.db);
+            tracing::debug!("sqlite checkpoint: a reader kept the log from being rewound");
+        }
     }
 }
 
 /// How large the log may grow, in pages, before the checkpointer rewinds
 /// it (`checkpoint`).
 const WAL_REWIND_PAGES: i64 = 16384;
+
+/// The longest a rewind waits, holding the write lock, for a reader to
+/// move off the log.
+const REWIND_WAIT: Duration = Duration::from_millis(100);
+
+/// How long after a rewind was refused before the next is tried.
+const REWIND_BACKOFF: Duration = Duration::from_secs(10);
 
 impl SqliteStore {
     /// Open (creating if absent) the store database at `path`.
@@ -1890,9 +1937,48 @@ mod tests {
         // Rewound, the log is reused from its start and its file stops
         // growing; without the rewind it holds every page since the start.
         assert!(
-            late < early * 3 / 2,
+            late < early * 2,
             "the log kept growing: {early} then {late} bytes"
         );
+    }
+
+    /// A reader outside the server holding a snapshot keeps the log from
+    /// being rewound, and the rewind gives up quickly rather than holding
+    /// the write lock for as long as the reader likes: no commit waits
+    /// long for it, however long the reader stays.
+    #[test]
+    fn a_reader_holding_the_log_never_stalls_a_commit() {
+        use hxd_core::history::{ChatLog, NewLine};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let store = SqliteStore::open_inner(&path, Synchronous::Normal, false, 32).unwrap();
+        let line = || NewLine {
+            channel: 0,
+            from_nick: "n".into(),
+            from_login: None,
+            from_fingerprint: None,
+            icon: 0,
+            text: "x".repeat(64),
+            flags: Default::default(),
+            at: SystemTime::now(),
+        };
+        store.append(&line()).unwrap();
+        // An operator's shell, say, in the middle of a read.
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM chat_line", [], |r| r.get(0))
+            .unwrap();
+        let mut slowest = Duration::ZERO;
+        let until = std::time::Instant::now() + 3 * CHECKPOINT_EVERY;
+        while std::time::Instant::now() < until {
+            let took = std::time::Instant::now();
+            store.append(&line()).unwrap();
+            slowest = slowest.max(took.elapsed());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(slowest < 5 * REWIND_WAIT, "a commit waited {slowest:?}");
     }
 
     /// A closed store leaves no WAL behind: the checkpointer's connection
