@@ -457,10 +457,13 @@ fn bind(m: &Mailbox) -> String {
 
 #[derive(Debug)]
 pub struct SqliteStore {
-    conn: TimedMutex<Connection>,
-    /// The WAL's checkpointer, for a file-backed store; stops when the
-    /// store is dropped.
+    /// The WAL's checkpointer, for a file-backed store. Dropping it stops
+    /// and joins its thread, so its connection is closed by the time the
+    /// store is gone: whichever of the two closes last takes the WAL and
+    /// its index with it, and a thread still running left them behind a
+    /// closed store.
     _checkpointer: Option<Checkpointer>,
+    conn: TimedMutex<Connection>,
 }
 
 /// How often the checkpointer folds the WAL back into the database.
@@ -482,7 +485,17 @@ const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
 struct Checkpointer {
     /// Dropped with the store: the thread's wait ends, and so does the
     /// thread.
-    _stop: std::sync::mpsc::Sender<()>,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Checkpointer {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Checkpointer {
@@ -491,7 +504,7 @@ impl Checkpointer {
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(StoreError::new)?;
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("sqlite-checkpoint".into())
             .spawn(move || {
                 while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
@@ -504,7 +517,10 @@ impl Checkpointer {
                 checkpoint(&conn, rewind_pages);
             })
             .map_err(StoreError::new)?;
-        Ok(Checkpointer { _stop: stop })
+        Ok(Checkpointer {
+            stop: Some(stop),
+            thread: Some(thread),
+        })
     }
 }
 
@@ -609,8 +625,8 @@ impl SqliteStore {
                 )));
             }
             return Ok(SqliteStore {
-                conn: TimedMutex::named("sqlite", conn),
                 _checkpointer: None,
+                conn: TimedMutex::named("sqlite", conn),
             });
         }
         let path = path.as_ref();
@@ -638,8 +654,8 @@ impl SqliteStore {
             None
         };
         Ok(SqliteStore {
-            conn: TimedMutex::named("sqlite", conn),
             _checkpointer: checkpointer,
+            conn: TimedMutex::named("sqlite", conn),
         })
     }
 
@@ -1877,6 +1893,20 @@ mod tests {
             late < early * 3 / 2,
             "the log kept growing: {early} then {late} bytes"
         );
+    }
+
+    /// A closed store leaves no WAL behind: the checkpointer's connection
+    /// is closed before the store's, which, last to close, removes both
+    /// sidecars. Asked of every store, every time, not left to timing.
+    #[test]
+    fn a_dropped_store_leaves_no_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        for _ in 0..20 {
+            drop(SqliteStore::open(&path, Synchronous::Normal).unwrap());
+            assert!(!dir.path().join("server.db-wal").exists());
+            assert!(!dir.path().join("server.db-shm").exists());
+        }
     }
 
     #[test]
