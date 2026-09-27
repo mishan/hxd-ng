@@ -287,6 +287,17 @@ pub fn outbox_lagged(bound: &'static str) {
     let _ = bound;
 }
 
+/// One WAL checkpoint, and how many pages the log held when it began.
+pub fn checkpoint(took: Timer, wal_pages: u64) {
+    #[cfg(feature = "metrics")]
+    {
+        metrics::histogram!("hxd_sqlite_checkpoint_seconds").record(took.elapsed());
+        metrics::gauge!("hxd_sqlite_wal_pages").set(wal_pages as f64);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (took, wal_pages);
+}
+
 /// A detached session's buffer overflowed; its resume will be a resync.
 pub fn outbox_broken() {
     #[cfg(feature = "metrics")]

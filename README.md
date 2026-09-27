@@ -626,6 +626,13 @@ retain_read = 604800     # seconds; 7 days, from when it was read
 sync = "normal"          # or "full": fsync every commit
 ```
 
+`full` costs more than it sounds: public chat is written one line at a
+time, in order, so every line waits for the one before it to reach the
+disk. On an NVMe drive that syncs in 5 ms, public chat tops out near
+200 lines a second; on a disk that syncs in 10 ms, near 100. `normal`
+loses at most the last moments before a power cut, never a line that
+reached the disk, and never the database.
+
 ### Chat history
 
 Absent means no server-held scrollback. When `db` is omitted, history uses

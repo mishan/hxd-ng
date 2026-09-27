@@ -97,6 +97,21 @@ store calls, `login`, `purge`, `identity`, `media`, `avatar`,
 `news_blob`, `registrar`, `files`, `push`, `prune`, and `metrics` for
 a scrape's own render.
 
+### The database
+
+| Metric | Labels | |
+|---|---|---|
+| `hxd_sqlite_checkpoint_seconds` | | one WAL checkpoint, on the checkpointer's own connection |
+| `hxd_sqlite_wal_pages` | | pages in the WAL when the last checkpoint began |
+
+The store's WAL is folded back into the database by a thread with a
+connection of its own, every second, never by the commit that happens
+to cross SQLite's threshold: that commit is usually a chat line, holding
+the log's lock and everyone behind it. When the WAL has grown past a
+threshold the checkpointer also rewinds it, which waits for the writer
+and holds it off while it copies what arrived since its last pass. Under
+steady writes that is the one stall left, rarer the lighter the load.
+
 ### Fan-out and the outboxes
 
 | Metric | Labels | |
