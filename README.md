@@ -227,6 +227,8 @@ stamp_queued = true     # stamp a message that waited in the inbox with its
 queue_budget_mb = 128   # what the server may hold for its clients, all
                         # together; past it, the furthest behind are dropped
                         # (docs/metrics.md, the budget)
+logins_in_flight = 32   # logins worked on at once; past it a login is
+                        # refused as busy, and the client tries again
 
 # Set User Flags bit 4 on unencrypted legacy sessions (docs/hotline-ng-auth.md §8).
 # Off until that bit is confirmed free against 1.8/1.9 clients.

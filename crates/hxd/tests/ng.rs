@@ -627,3 +627,51 @@ async fn takeover_closes_the_older_connection() {
     // The second is fully functional.
     second.request_ok("ping", json!({})).await;
 }
+
+/// Past the logins the server works on at once, a login on either wire
+/// is refused at once, with a reason the client can act on, and one after
+/// a place frees is taken as ever.
+#[tokio::test]
+async fn logins_past_capacity_are_refused_as_busy_on_both_wires() {
+    let td = tempfile::tempdir().unwrap();
+    let (legacy_addr, ng_addr, ctx) = start_server(td.path()).await;
+    // Every place taken, as a storm would take them.
+    let mut held = Vec::new();
+    while let Some(permit) = ctx.core.admit_login() {
+        held.push(permit);
+    }
+    assert!(!held.is_empty());
+
+    let mut classic = TcpStream::connect(legacy_addr).await.unwrap();
+    classic
+        .write_all(b"TRTPHOTL\x00\x01\x00\x02")
+        .await
+        .unwrap();
+    let mut magic = [0u8; 8];
+    tokio::io::AsyncReadExt::read_exact(&mut classic, &mut magic)
+        .await
+        .unwrap();
+    let login = pack_frame(REQ_LOGIN, 1, 0, &[(tag::NAME, b"early".to_vec())]);
+    classic.write_all(&login).await.unwrap();
+    let reply = timeout(Duration::from_secs(5), read_frame(&mut classic))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((reply.ty, reply.trans, reply.flag), (HDR_TASK, 1, 1));
+    let text = chunk(&reply, tag::TASK_ERROR).unwrap();
+    assert!(String::from_utf8_lossy(&text).contains("busy"));
+
+    let mut app = Ng::connect(ng_addr).await;
+    let v = app.request("login", json!({ "nick": "early" })).await;
+    assert_eq!(v["error"]["code"], "rate_limited", "{v}");
+    assert_eq!(v["error"]["retry_after"], 1);
+
+    drop(held);
+    let _alice = Legacy::login(legacy_addr, "alice").await;
+    let (_bob, hello) = Ng::login(ng_addr, "bob", "s3cret", "Bob").await;
+    assert!(hello["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|u| u["nick"] == "alice"));
+}

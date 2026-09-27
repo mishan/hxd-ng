@@ -381,8 +381,38 @@ pub fn reply_ok(id: u64, ok: Value) -> String {
     json!({ "reply": id, "ok": ok }).to_string()
 }
 
+/// [`reply_ok`] for a reply that carries the roster as `users`, written
+/// from the domain's records rather than built as a tree first.
+pub fn reply_ok_with_users(id: u64, ok: Value, users: &[UserInfo]) -> String {
+    #[derive(serde::Serialize)]
+    struct Ok<'a> {
+        #[serde(flatten)]
+        rest: Value,
+        users: Vec<UserOut<'a>>,
+    }
+    #[derive(serde::Serialize)]
+    struct Reply<'a> {
+        reply: u64,
+        ok: Ok<'a>,
+    }
+    serde_json::to_string(&Reply {
+        reply: id,
+        ok: Ok {
+            rest: ok,
+            users: users.iter().map(UserOut).collect(),
+        },
+    })
+    .unwrap_or_default()
+}
+
 pub fn reply_err(id: u64, code: &str, text: &str) -> String {
     json!({ "reply": id, "error": { "code": code, "text": text } }).to_string()
+}
+
+/// [`reply_err`] with the seconds to wait before asking again (§10).
+pub fn reply_err_retry(id: u64, code: &str, text: &str, retry_after: u64) -> String {
+    json!({ "reply": id, "error": { "code": code, "text": text, "retry_after": retry_after } })
+        .to_string()
 }
 
 pub fn status_str(s: SessionStatus) -> &'static str {
@@ -394,33 +424,72 @@ pub fn status_str(s: SessionStatus) -> &'static str {
 }
 
 pub fn user_json(u: &UserInfo) -> Value {
-    let mut v = json!({
-        "uid": u.uid,
-        "nick": u.nick,
-        "icon": u.icon,
-        "admin": u.admin,
-        "status": status_str(u.status),
+    serde_json::to_value(UserOut(u)).unwrap_or(Value::Null)
+}
+
+/// A `user` object as it is written, without building it as a
+/// [`Value`] first. The roster in every login reply and every join goes
+/// through here: once per login for everyone present, and once per
+/// person present for every login, which a login storm multiplies.
+pub struct UserOut<'a>(pub &'a UserInfo);
+
+impl serde::Serialize for UserOut<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let u = self.0;
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("uid", &u.uid)?;
+        m.serialize_entry("nick", &u.nick)?;
+        m.serialize_entry("icon", &u.icon)?;
+        m.serialize_entry("admin", &u.admin)?;
+        m.serialize_entry("status", status_str(u.status))?;
         // `docs/hotline-ng-auth.md` §7.2, §8: what other users may
         // know about this session's link.
-        "transport": if u.transport.encrypted { "encrypted" } else { "cleartext" },
-    });
-    // Present only where it is true, so a roster row costs nothing for
-    // the 65,534 sessions that are people.
-    if u.system {
-        v["system"] = json!(true);
+        let transport = if u.transport.encrypted {
+            "encrypted"
+        } else {
+            "cleartext"
+        };
+        m.serialize_entry("transport", transport)?;
+        // Present only where it is true, so a roster row costs nothing for
+        // the 65,534 sessions that are people.
+        if u.system {
+            m.serialize_entry("system", &true)?;
+        }
+        // Present only when there is one, like `identity`: a change that
+        // clears it is a `user_changed` without the key (`docs/avatars.md`).
+        if let Some(avatar) = &u.avatar {
+            m.serialize_entry("avatar", &crate::avatar::avatar_json(avatar))?;
+        }
+        if let Some(id) = &u.transport.identity {
+            m.serialize_entry(
+                "identity",
+                &json!({
+                    "fingerprint": hl_identity::Fingerprint(id.fingerprint).to_string(),
+                    "handle": id.handle,
+                }),
+            )?;
+        }
+        m.end()
     }
-    // Present only when there is one, like `identity`: a change that
-    // clears it is a `user_changed` without the key (`docs/avatars.md`).
-    if let Some(avatar) = &u.avatar {
-        v["avatar"] = crate::avatar::avatar_json(avatar);
-    }
-    if let Some(id) = &u.transport.identity {
-        v["identity"] = json!({
-            "fingerprint": hl_identity::Fingerprint(id.fingerprint).to_string(),
-            "handle": id.handle,
-        });
-    }
-    v
+}
+
+/// An event on the wire, written as it goes.
+#[derive(serde::Serialize)]
+struct EventOut<'a, D: serde::Serialize> {
+    seq: u64,
+    ev: &'a str,
+    data: D,
+}
+
+#[derive(serde::Serialize)]
+struct UserData<'a> {
+    user: UserOut<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct UidData {
+    uid: hxd_core::Uid,
 }
 
 /// Encode one domain event as a wire event frame.
@@ -431,14 +500,34 @@ pub fn user_json(u: &UserInfo) -> Value {
 /// instead, which clients ignore per the unknown-`ev` rule, keeping
 /// `last_seq` accounting exact.
 pub fn event_json(se: &SeqEvent) -> String {
-    let (ev, data) = match &se.event {
-        Event::Joined(u) => ("user_joined", json!({ "user": user_json(u) })),
+    // The presence events first, written without a tree: every login and
+    // every departure is one of these to everyone present.
+    let out = |ev, data| {
+        serde_json::to_string(&EventOut {
+            seq: se.seq,
+            ev,
+            data,
+        })
+        .unwrap_or_default()
+    };
+    match &se.event {
+        Event::Joined(u) => return out("user_joined", UserData { user: UserOut(u) }),
         // An avatar change is a change to the user object on this wire;
         // only the legacy one says it with a transaction of its own.
         Event::Changed(u) | Event::AvatarChanged(u) => {
-            ("user_changed", json!({ "user": user_json(u) }))
+            return out("user_changed", UserData { user: UserOut(u) })
         }
-        Event::Parted(uid) => ("user_parted", json!({ "uid": uid })),
+        _ => {}
+    }
+    if let Event::Parted(uid) = &se.event {
+        return serde_json::to_string(&EventOut {
+            seq: se.seq,
+            ev: "user_parted",
+            data: UidData { uid: *uid },
+        })
+        .unwrap_or_default();
+    }
+    let (ev, data) = match &se.event {
         Event::Chat {
             cid: 0,
             from,
@@ -682,4 +771,88 @@ pub fn stored_msg_json(m: &hxd_core::StoredMessage, media: Option<&MediaRef>) ->
         value["media"] = crate::media::media_json(media);
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hxd_core::avatar::{AvatarId, AvatarRef};
+    use hxd_core::media::MediaType;
+    use hxd_core::{IdentityTag, Transport};
+
+    fn user(full: bool) -> UserInfo {
+        UserInfo {
+            uid: 7,
+            transport: Transport {
+                encrypted: full,
+                identity: full.then(|| IdentityTag {
+                    fingerprint: [1; 32],
+                    device: [2; 32],
+                    handle: Some("ann@example.org".into()),
+                }),
+                ..Default::default()
+            },
+            nick: "Ann \"the\" Admin".into(),
+            icon: 128,
+            admin: full,
+            system: full,
+            status: SessionStatus::Idle,
+            avatar: full.then_some(AvatarRef {
+                id: AvatarId([3; 32]),
+                mime: MediaType::Png,
+                width: 64,
+                height: 32,
+            }),
+        }
+    }
+
+    /// Written as it goes, a user object is the object the tree made:
+    /// every field, the optional ones only where they apply.
+    #[test]
+    fn a_user_object_is_written_as_the_tree_would_have_built_it() {
+        for full in [false, true] {
+            let u = user(full);
+            let mut want = json!({
+                "uid": 7, "nick": u.nick, "icon": 128, "admin": full, "status": "idle",
+                "transport": if full { "encrypted" } else { "cleartext" },
+            });
+            if full {
+                want["system"] = json!(true);
+                want["avatar"] = crate::avatar::avatar_json(u.avatar.as_ref().unwrap());
+                want["identity"] = json!({
+                    "fingerprint": hl_identity::Fingerprint([1; 32]).to_string(),
+                    "handle": "ann@example.org",
+                });
+            }
+            assert_eq!(user_json(&u), want);
+            let joined: Value = serde_json::from_str(&event_json(&SeqEvent {
+                seq: 9,
+                event: Event::Joined(u.clone()),
+            }))
+            .unwrap();
+            assert_eq!(
+                joined,
+                json!({ "seq": 9, "ev": "user_joined", "data": { "user": want } })
+            );
+        }
+        let parted: Value = serde_json::from_str(&event_json(&SeqEvent {
+            seq: 10,
+            event: Event::Parted(7),
+        }))
+        .unwrap();
+        assert_eq!(
+            parted,
+            json!({ "seq": 10, "ev": "user_parted", "data": { "uid": 7 } })
+        );
+    }
+
+    #[test]
+    fn a_reply_with_the_roster_carries_the_rest_beside_it() {
+        let reply: Value =
+            serde_json::from_str(&reply_ok_with_users(3, json!({ "seq": 0 }), &[user(false)]))
+                .unwrap();
+        assert_eq!(reply["reply"], 3);
+        assert_eq!(reply["ok"]["seq"], 0);
+        assert_eq!(reply["ok"]["users"][0], user_json(&user(false)));
+    }
 }

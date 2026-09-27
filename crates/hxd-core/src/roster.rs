@@ -1017,6 +1017,8 @@ pub struct Core {
     /// What every queue waiting on a client draws on (`crate::budget`):
     /// the live channels here, and the frontends' own write queues.
     pub(crate) queue_budget: Arc<crate::budget::QueueBudget>,
+    /// Logins the server is working on at once ([`Core::admit_login`]).
+    pub(crate) login_gate: LoginGate,
     /// The durable private-message inbox, or `None` — in which case
     /// private messaging behaves exactly as it did before the inbox
     /// existed, which is what a server that configures no database gets.
@@ -1139,6 +1141,33 @@ pub struct Census {
     pub live_bytes_max: usize,
 }
 
+/// How many logins the server works on at once, by default.
+pub const LOGINS_IN_FLIGHT: usize = 32;
+
+/// The logins in progress, bounded.
+///
+/// **Past capacity a login is refused at once, not queued.** Every login
+/// costs everyone present a join, and later a part, so a server taking
+/// logins faster than it can tell the room about them falls further
+/// behind with each: they take longer, the sessions they leave stay
+/// longer, and every join then goes to more people. The load baseline
+/// saw logins go from 34 ms to five seconds within one step of the
+/// rate, and not come back while arrivals continued. Bounding the work
+/// in progress bounds that: when logins slow down, fewer are admitted,
+/// and the ones refused are told to come back rather than left waiting.
+/// Only the server's own work holds a place, from the login request to
+/// its answer, so a client that is slow to send one holds nothing.
+pub(crate) struct LoginGate(Arc<tokio::sync::Semaphore>);
+
+impl Default for LoginGate {
+    fn default() -> Self {
+        LoginGate(Arc::new(tokio::sync::Semaphore::new(LOGINS_IN_FLIGHT)))
+    }
+}
+
+/// A place among the logins in progress; dropping it gives it back.
+pub struct LoginPermit(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
+
 /// What `Core::log_serial` guards: nothing but an order. A type of its
 /// own so the lock's metrics carry a name (`TimedMutex`'s default).
 #[derive(Default)]
@@ -1169,6 +1198,25 @@ impl Core {
     pub fn with_queue_budget(mut self, bytes: usize) -> Self {
         self.queue_budget = crate::budget::QueueBudget::new(bytes);
         self
+    }
+
+    /// Work on at most `n` logins at once rather than
+    /// [`LOGINS_IN_FLIGHT`].
+    pub fn with_logins_in_flight(mut self, n: usize) -> Self {
+        self.login_gate = LoginGate(Arc::new(tokio::sync::Semaphore::new(n)));
+        self
+    }
+
+    /// A place for one login, or `None` when the server is already
+    /// working on as many as it takes: the frontend refuses the login as
+    /// busy ([`LoginGate`]). Held from the login request until its
+    /// answer is on its way.
+    pub fn admit_login(&self) -> Option<LoginPermit> {
+        let permit = self.login_gate.0.clone().try_acquire_owned().ok();
+        if permit.is_none() {
+            instrument::login_refused_busy();
+        }
+        permit.map(LoginPermit)
     }
 
     /// The budget, for a frontend's queues to draw on too.
@@ -2101,6 +2149,16 @@ mod tests {
         assert_eq!((c.detached, c.broken, c.buffered), (1, 1, 0));
         assert!(core.queue_budget().held() < 4096, "the buffer gave it back");
         assert!(matches!(core.resume(away, 0), Resume::ResyncRequired(_)));
+    }
+
+    #[test]
+    fn logins_past_the_gate_are_refused_until_a_place_frees() {
+        let core = Core::new().with_logins_in_flight(2);
+        let a = core.admit_login().expect("a place");
+        let _b = core.admit_login().expect("a place");
+        assert!(core.admit_login().is_none(), "the gate is full");
+        drop(a);
+        assert!(core.admit_login().is_some(), "and a place came back");
     }
 
     #[test]
