@@ -513,6 +513,7 @@ pub fn event_json(se: &SeqEvent) -> String {
         // A client blanks the line in place (moderation.md §5); history
         // already answers it as the tombstone.
         Event::ChatRedacted { id } => ("chat_redacted", json!({ "id": id })),
+        Event::ChatPurged { ids } => ("chat_purged", json!({ "ids": ids })),
         Event::Report(report) => ("report", crate::moderation::report_json(report)),
         Event::ReportClosed { id, outcome, yours } => (
             "report_closed",

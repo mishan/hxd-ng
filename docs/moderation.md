@@ -312,9 +312,21 @@ Events:
 | `ev` | data | to |
 |---|---|---|
 | `chat_redacted` | `{ "id" }` | everyone reading public chat; a client blanks the line in place |
+| `chat_purged` | `{ "ids": [id, …] }` | the same; a client blanks every line in place |
 | `media_revoked` | `{ "id" }` | everyone who could fetch it; a client drops the image and keeps the placeholder |
 | `report` | the report object | moderators |
 | `report_closed` | `{ "id", "outcome", "yours" }` | the reporter (`yours: true`), if they have a mailbox and a session; and moderators |
+
+A redaction of a few lines is told one `chat_redacted` per line. A
+purge of more than a few is told as `chat_purged`, each carrying up to
+a thousand ids in the order the lines were logged. *hxd-ng:* more than
+64 lines. A purge is what a moderator answers a flood with, and one
+event per line would be thousands of events to every reader at once:
+more than a server that bounds what it holds for a connection
+(hotline-ng.md §3) holds for anyone, the moderator included. A client
+that does not recognize `chat_purged` ignores it, as it must any
+unknown `ev`, and still counts its `seq`; it shows the purged lines
+until it next reads `history`, which returns them as tombstones.
 
 `history` returns a redacted line as the tombstone chat-history.md §7.2
 describes: `deleted: true`, empty `text`, no `from.nick`. A redacted

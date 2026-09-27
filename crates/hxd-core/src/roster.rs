@@ -366,6 +366,12 @@ pub enum Event {
     ChatRedacted {
         id: crate::history::LineId,
     },
+    /// Many public lines blanked at once, by a purge: one event where
+    /// [`Event::ChatRedacted`] would be one per line (`docs/moderation.md`
+    /// §5). At most [`crate::moderation::PURGE_EVENT_IDS`] ids each.
+    ChatPurged {
+        ids: Vec<crate::history::LineId>,
+    },
     /// A report was filed (`docs/moderation.md` §4.5). To moderators
     /// only, and only while it is open.
     Report(crate::moderation::Report),
@@ -477,6 +483,7 @@ impl Event {
             Event::Broadcast { .. } => "broadcast",
             Event::Kicked => "kicked",
             Event::ChatRedacted { .. } => "chat_redacted",
+            Event::ChatPurged { .. } => "chat_purged",
             Event::Report(..) => "report",
             Event::ReportClosed { .. } => "report_closed",
             Event::MediaRevoked { .. } => "media_revoked",

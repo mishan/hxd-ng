@@ -30,7 +30,7 @@ use crate::history::{LineFlags, LineId, LogLine};
 use crate::inbox::{Mailbox, MessageId, StoreError};
 use crate::media::{Handle, Principal};
 use crate::news::{ArticleId, Author, NewsError};
-use crate::roster::{reads_public_chat, Core, Event, Uid};
+use crate::roster::{reads_public_chat, Core, Event, Uid, UserSession};
 
 pub mod conformance;
 mod memory;
@@ -39,6 +39,15 @@ pub use memory::MemoryModeration;
 
 pub type ActId = u64;
 pub type ReportId = u64;
+
+/// A redaction of up to this many lines is told line by line, as
+/// `chat_redacted`, which every ng client understands. Past it the lines
+/// go out batched, as `chat_purged` (`docs/moderation.md` §5).
+pub const PURGE_SINGLY: usize = 64;
+
+/// The most line ids one `chat_purged` carries: a purge of ten thousand
+/// lines is ten events, and none is a frame of unusual size.
+pub const PURGE_EVENT_IDS: usize = 1000;
 
 /// The longest reason an act takes, in characters (§3).
 pub const MAX_ACT_REASON: usize = 512;
@@ -1022,11 +1031,22 @@ impl Core {
                 gone.push(*id);
             }
         }
+        let readers = |s: &UserSession| reads_public_chat(s) && s.info.transport.redactions;
         let mut r = self.roster.lock().unwrap();
-        for id in gone {
-            r.broadcast_where(&Event::ChatRedacted { id }, None, |s| {
-                reads_public_chat(s) && s.info.transport.redactions
-            });
+        if gone.len() <= PURGE_SINGLY {
+            for id in gone {
+                r.broadcast_where(&Event::ChatRedacted { id }, None, readers);
+            }
+        } else {
+            // A purge of a flood is thousands of lines, and one event
+            // each would be thousands of slots in every reader's bounded
+            // channel at once — enough to cut them off, the moderator
+            // who asked included, since their session is not reading
+            // while it waits for this.
+            for ids in gone.chunks(PURGE_EVENT_IDS) {
+                let ev = Event::ChatPurged { ids: ids.to_vec() };
+                r.broadcast_where(&ev, None, readers);
+            }
         }
         Ok(())
     }

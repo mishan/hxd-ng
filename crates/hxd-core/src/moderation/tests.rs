@@ -464,6 +464,66 @@ fn a_redacted_line_takes_its_image_with_it() {
 }
 
 #[test]
+fn a_purge_of_a_flood_goes_out_batched_and_a_small_one_line_by_line() {
+    let s = server();
+    let (bob, _) = attach(
+        &s.core,
+        Who {
+            identity: Some([2; 32]),
+            ..person("bob")
+        },
+    );
+    let (carol, mut carol_rx) = attach(&s.core, moderator("carol"));
+    let (_dave, mut dave_rx) = attach(&s.core, person("dave"));
+    let lines: Vec<LineId> = (0..2500)
+        .map(|i| say(&s.core, bob, &format!("spam {i}")))
+        .collect();
+    drain(&mut carol_rx);
+    drain(&mut dave_rx);
+
+    s.core
+        .purge_sender(
+            Actor::Session(carol),
+            &PersonRef::Fingerprint([2; 32]),
+            Duration::from_secs(3600),
+            "flood",
+        )
+        .unwrap();
+    for rx in [&mut carol_rx, &mut dave_rx] {
+        let events = drain(rx);
+        let batches: Vec<Vec<LineId>> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ChatPurged { ids } => Some(ids.clone()),
+                _ => None,
+            })
+            .collect();
+        // Three events, not 2500, and every line in them, in order.
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1000, 1000, 500]
+        );
+        assert_eq!(batches.concat(), lines);
+        assert!(redactions(events).is_empty());
+    }
+
+    // A handful is still told line by line, which every client reads.
+    let few: Vec<LineId> = (0..3)
+        .map(|i| say(&s.core, bob, &format!("more {i}")))
+        .collect();
+    drain(&mut dave_rx);
+    s.core
+        .purge_sender(
+            Actor::Session(carol),
+            &PersonRef::Fingerprint([2; 32]),
+            Duration::from_secs(3600),
+            "again",
+        )
+        .unwrap();
+    assert_eq!(redactions(drain(&mut dave_rx)), few);
+}
+
+#[test]
 fn a_purge_takes_a_persons_window_across_every_store_and_nothing_else() {
     let s = server();
     let (bob, _) = attach(
