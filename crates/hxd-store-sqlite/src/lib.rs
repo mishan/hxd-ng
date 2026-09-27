@@ -401,6 +401,29 @@ CREATE INDEX moderation_evidence_at ON moderation (at)
 CREATE INDEX report_closed_at ON report (closed_at) WHERE closed_at IS NOT NULL;
 ";
 
+fn insert_line(conn: &Connection, line: &NewLine) -> Result<LineId, StoreError> {
+    conn.prepare_cached(
+        "INSERT INTO chat_line
+           (channel, nick, login, login_fp, icon, flags, body, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )
+    .and_then(|mut stmt| {
+        stmt.execute(params![
+            i64::from(line.channel),
+            line.from_nick,
+            line.from_login,
+            line.from_fingerprint.as_ref().map(fp_hex),
+            i64::from(line.icon),
+            i64::from(line.flags.bits()),
+            line.text,
+            unix(line.at),
+        ])
+    })
+    .map_err(StoreError::new)?;
+    LineId::try_from(conn.last_insert_rowid())
+        .map_err(|_| StoreError::new("SQLite issued a negative chat line id"))
+}
+
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL
 /// predicate over a `(<col>, <col>_fp)` pair — **one shape per kind of
 /// mailbox**, and one bind either way ([`bind`] supplies it).
@@ -1557,24 +1580,21 @@ fn collect_history(
 impl ChatLog for SqliteStore {
     fn append(&self, line: &NewLine) -> Result<LineId, StoreError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO chat_line
-               (channel, nick, login, login_fp, icon, flags, body, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                i64::from(line.channel),
-                line.from_nick,
-                line.from_login,
-                line.from_fingerprint.as_ref().map(fp_hex),
-                i64::from(line.icon),
-                i64::from(line.flags.bits()),
-                line.text,
-                unix(line.at),
-            ],
-        )
-        .map_err(StoreError::new)?;
-        LineId::try_from(conn.last_insert_rowid())
-            .map_err(|_| StoreError::new("SQLite issued a negative chat line id"))
+        insert_line(&conn, line)
+    }
+
+    /// One transaction: one commit, and one write of each page the lines
+    /// touch, where a commit each wrote the table's and its indexes' last
+    /// pages again for every line, and with `sync = "full"` synced them.
+    fn append_all(&self, lines: &[NewLine]) -> Result<Vec<LineId>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(StoreError::new)?;
+        let ids = lines
+            .iter()
+            .map(|line| insert_line(&tx, line))
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().map_err(StoreError::new)?;
+        Ok(ids)
     }
 
     fn query(&self, query: &HistoryQuery) -> Result<HistoryPage, StoreError> {

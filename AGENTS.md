@@ -189,6 +189,13 @@ no domain operation may push a session anywhere near the cap in one
 go: a purge of thousands of lines sends nothing to a wire that cannot
 show redactions (`Transport::redactions`).
 
+**Public chat is committed in groups** (`chat::ChatCommit`): a line
+joins a queue, and whoever finds no commit under way logs everything
+queued in one transaction and relays it in order under `log_serial`,
+then hands the lead on. Queue order is the order lines are logged and
+heard in; anything else that must fall between two lines (a redaction,
+a purge) takes `log_serial` as before, between batches.
+
 **`assert!` over `debug_assert!`** for wire invariants — release builds
 must not skip them.
 

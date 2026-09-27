@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use tracing::warn;
@@ -199,6 +199,148 @@ pub(crate) struct Ban {
     pub(crate) expires: Instant,
 }
 
+/// A public line on its way to the log and the room.
+pub(crate) struct Staged {
+    info: UserInfo,
+    login: Option<String>,
+    fingerprint: Option<[u8; 32]>,
+    principal: crate::media::Principal,
+    text: String,
+    style: u16,
+    media: Option<(crate::media::Handle, crate::media::MediaRef)>,
+    at: SystemTime,
+}
+
+/// The most public lines one commit takes.
+const COMMIT_BATCH: usize = 256;
+
+/// Public chat, committed in groups.
+///
+/// **A line at a time, the log was the ceiling.** Every line was its own
+/// transaction, under the log's lock, so lines went through one commit
+/// after another: with `sync = "full"` one disk sync each, a couple of
+/// hundred lines a second on a fast disk, and with `normal` several pages
+/// of the log written again for every line. Now a line joins a queue,
+/// and whoever finds no commit under way leads one: it takes what is
+/// queued, itself first, logs it in one transaction and relays it in
+/// order, then hands the lead to the next line waiting, if any, and
+/// returns. Lines that arrive while a commit is under way wait for the
+/// next, and share it. A lone line is a batch of one, at once.
+///
+/// Order is the queue's, which is the order lines reached it; the log's
+/// lock is taken per batch, so a redaction or a purge still falls between
+/// two batches and never overtakes a line it names.
+#[derive(Default)]
+pub(crate) struct ChatCommit {
+    state: Mutex<CommitState>,
+}
+
+#[derive(Default)]
+struct CommitState {
+    queue: std::collections::VecDeque<Arc<Pending>>,
+    /// A commit is under way, or its leader is about to start one.
+    leading: bool,
+}
+
+struct Pending {
+    line: Mutex<Option<Staged>>,
+    slot: Mutex<Slot>,
+    ready: Condvar,
+}
+
+enum Slot {
+    Waiting,
+    /// This line is at the head of the queue and leads the next commit.
+    Lead,
+    Done(Result<Option<crate::history::LineId>, ChatError>),
+}
+
+impl Pending {
+    fn set(&self, slot: Slot) {
+        *self.slot.lock().unwrap() = slot;
+        self.ready.notify_one();
+    }
+}
+
+impl ChatCommit {
+    fn submit(
+        &self,
+        core: &Core,
+        line: Staged,
+    ) -> Result<Option<crate::history::LineId>, ChatError> {
+        let me = Arc::new(Pending {
+            line: Mutex::new(Some(line)),
+            slot: Mutex::new(Slot::Waiting),
+            ready: Condvar::new(),
+        });
+        let lead = {
+            let mut st = self.state.lock().unwrap();
+            st.queue.push_back(me.clone());
+            !std::mem::replace(&mut st.leading, true)
+        };
+        if !lead {
+            let mut slot = me.slot.lock().unwrap();
+            loop {
+                match std::mem::replace(&mut *slot, Slot::Waiting) {
+                    Slot::Waiting => slot = me.ready.wait(slot).unwrap(),
+                    Slot::Lead => break,
+                    Slot::Done(result) => return result,
+                }
+            }
+        }
+        // Leading: this line is at the head of the queue.
+        let batch: Vec<Arc<Pending>> = {
+            let mut st = self.state.lock().unwrap();
+            let n = st.queue.len().min(COMMIT_BATCH);
+            st.queue.drain(..n).collect()
+        };
+        let lines = batch
+            .iter()
+            .map(|p| {
+                p.line
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("a line is committed once")
+            })
+            .collect();
+        // A panic in the commit must not strand the lines waiting on it,
+        // or the next ones: they are answered, the lead is handed on, and
+        // only then does the panic go on its way.
+        let (results, panicked) =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                core.chat_commit_batch(lines)
+            })) {
+                Ok(results) => (results, None),
+                Err(panic) => (
+                    batch.iter().map(|_| Err(ChatError::ServerError)).collect(),
+                    Some(panic),
+                ),
+            };
+        let mut mine = None;
+        for (p, result) in batch.iter().zip(results) {
+            if Arc::ptr_eq(p, &me) {
+                mine = Some(result);
+            } else {
+                p.set(Slot::Done(result));
+            }
+        }
+        // The next line waiting leads the next commit; this caller has its
+        // answer and goes.
+        {
+            let mut st = self.state.lock().unwrap();
+            match st.queue.front() {
+                Some(next) => next.set(Slot::Lead),
+                None => st.leading = false,
+            }
+        }
+        if let Some(panic) = panicked {
+            std::panic::resume_unwind(panic);
+        }
+        mine.expect("the leader's line is in its own batch")
+    }
+}
+
 /// Why a chat operation was refused. The frontend maps these to task-error
 /// text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,7 +395,6 @@ impl Core {
         style: u16,
         media: Option<crate::media::Handle>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        let _serial = self.log_serial.lock().unwrap();
         let (info, login, fingerprint, principal) = {
             let r = self.roster.lock().unwrap();
             let Some(sess) = r.users.get(&from) else {
@@ -280,56 +421,93 @@ impl Core {
             )),
             None => None,
         };
-        let at = SystemTime::now();
-        let id = match self.history.as_ref() {
-            Some(log) => Some(
-                log.append(&NewLine {
-                    channel: 0,
-                    from_nick: info.nick.clone(),
-                    from_login: login,
-                    from_fingerprint: fingerprint,
-                    icon: info.icon,
-                    text: text.clone(),
-                    flags: if style == 1 {
-                        LineFlags::ACTION
-                    } else {
-                        LineFlags::default()
-                    },
-                    at,
-                })
-                .map_err(history_store_failed)?,
-            ),
-            None => None,
-        };
-        // The log keeps the canonical metadata beside the line, so a
-        // history entry can still render a placeholder once the bytes
-        // are gone (docs/inline-media.md §9, chat-history.md §8).
-        if let (Some(log), Some(id), Some((_, reference))) = (self.history.as_ref(), id, &media) {
-            if let Err(e) = log.attach_media(id, &reference.to_meta()) {
-                warn!("chat log would not record media: {e}");
+        self.chat_commit.submit(
+            self,
+            Staged {
+                info,
+                login,
+                fingerprint,
+                principal,
+                text,
+                style,
+                media,
+                at: SystemTime::now(),
+            },
+        )
+    }
+
+    /// Log a batch of public lines in one commit and relay them in order,
+    /// under the log's lock, so a line's id order and the order everyone
+    /// hears it in are one fact, as they were a line at a time.
+    fn chat_commit_batch(
+        &self,
+        batch: Vec<Staged>,
+    ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
+        let _serial = self.log_serial.lock().unwrap();
+        let ids = match self.history.as_ref() {
+            Some(log) => {
+                let lines: Vec<NewLine> = batch
+                    .iter()
+                    .map(|s| NewLine {
+                        channel: 0,
+                        from_nick: s.info.nick.clone(),
+                        from_login: s.login.clone(),
+                        from_fingerprint: s.fingerprint,
+                        icon: s.info.icon,
+                        text: s.text.clone(),
+                        flags: if s.style == 1 {
+                            LineFlags::ACTION
+                        } else {
+                            LineFlags::default()
+                        },
+                        at: s.at,
+                    })
+                    .collect();
+                match log.append_all(&lines) {
+                    Ok(ids) => ids.into_iter().map(Some).collect(),
+                    Err(e) => {
+                        let e = history_store_failed(e);
+                        return batch.iter().map(|_| Err(e)).collect();
+                    }
+                }
             }
-        }
-        let ev = Event::Chat {
-            cid: 0,
-            from: info,
-            text,
-            style,
-            id,
-            at,
-            media: media.as_ref().map(|(_, r)| r.clone()),
+            None => vec![None; batch.len()],
         };
+        let mut done = Vec::with_capacity(batch.len());
         let mut r = self.roster.lock().unwrap();
-        r.broadcast_where(&ev, None, reads_public_chat);
-        // The authorization set, fixed at relay time: the sender, and
-        // every session this line just went to whose wire can carry the
-        // reference. Captured under the roster's lock and stored under
-        // the media store's, which is the one order those two are ever
-        // taken in.
-        if let Some((handle, _)) = &media {
-            let audience = r.media_audience(None, reads_public_chat);
-            self.media_capture(handle, audience.into_iter().chain([principal]));
+        for (s, id) in batch.into_iter().zip(ids) {
+            // The log keeps the canonical metadata beside the line, so a
+            // history entry can still render a placeholder once the bytes
+            // are gone (docs/inline-media.md §9, chat-history.md §8).
+            if let (Some(log), Some(id), Some((_, reference))) =
+                (self.history.as_ref(), id, &s.media)
+            {
+                if let Err(e) = log.attach_media(id, &reference.to_meta()) {
+                    warn!("chat log would not record media: {e}");
+                }
+            }
+            let ev = Event::Chat {
+                cid: 0,
+                from: s.info,
+                text: s.text,
+                style: s.style,
+                id,
+                at: s.at,
+                media: s.media.as_ref().map(|(_, r)| r.clone()),
+            };
+            r.broadcast_where(&ev, None, reads_public_chat);
+            // The authorization set, fixed at relay time: the sender, and
+            // every session this line just went to whose wire can carry
+            // the reference. Captured under the roster's lock and stored
+            // under the media store's, which is the one order those two
+            // are ever taken in.
+            if let Some((handle, _)) = &s.media {
+                let audience = r.media_audience(None, reads_public_chat);
+                self.media_capture(handle, audience.into_iter().chain([s.principal]));
+            }
+            done.push(Ok(id));
         }
-        Ok(id)
+        done
     }
 
     /// A private chat line; membership is the only gate.
@@ -1631,6 +1809,118 @@ mod tests {
         AccessBits::empty()
             .with(bit::READ_CHAT)
             .with(bit::SEND_CHAT)
+    }
+
+    /// A log whose commits take a while and that says how many lines each
+    /// one carried.
+    struct SlowLog {
+        inner: crate::history::MemoryLog,
+        commits: Mutex<Vec<usize>>,
+    }
+
+    impl crate::history::ChatLog for SlowLog {
+        fn append(&self, line: &NewLine) -> Result<crate::history::LineId, StoreError> {
+            self.append_all(std::slice::from_ref(line))
+                .map(|ids| ids[0])
+        }
+        fn append_all(&self, lines: &[NewLine]) -> Result<Vec<crate::history::LineId>, StoreError> {
+            std::thread::sleep(Duration::from_millis(5));
+            self.commits.lock().unwrap().push(lines.len());
+            lines.iter().map(|l| self.inner.append(l)).collect()
+        }
+        fn query(&self, q: &HistoryQuery) -> Result<HistoryPage, StoreError> {
+            self.inner.query(q)
+        }
+        fn line(
+            &self,
+            id: crate::history::LineId,
+        ) -> Result<Option<crate::history::LogLine>, StoreError> {
+            self.inner.line(id)
+        }
+        fn lines_by(
+            &self,
+            channel: u32,
+            who: &Mailbox,
+            since: SystemTime,
+        ) -> Result<Vec<crate::history::LogLine>, StoreError> {
+            self.inner.lines_by(channel, who, since)
+        }
+        fn tombstone(
+            &self,
+            id: crate::history::LineId,
+            by: &str,
+            at: SystemTime,
+        ) -> Result<bool, StoreError> {
+            self.inner.tombstone(id, by, at)
+        }
+        fn prune(
+            &self,
+            max_lines: usize,
+            older_than: Option<Duration>,
+            now: SystemTime,
+        ) -> Result<usize, StoreError> {
+            self.inner.prune(max_lines, older_than, now)
+        }
+        fn attach_media(
+            &self,
+            id: crate::history::LineId,
+            media: &crate::history::MediaMeta,
+        ) -> Result<(), StoreError> {
+            self.inner.attach_media(id, media)
+        }
+    }
+
+    /// Lines sent at once share commits, and are still logged and heard in
+    /// one order: every reader hears every line once, ids rising, and every
+    /// sender is told its own lines' ids.
+    #[test]
+    fn lines_sent_at_once_share_commits_and_keep_one_order() {
+        let log = Arc::new(SlowLog {
+            inner: Default::default(),
+            commits: Default::default(),
+        });
+        let core = Arc::new(Core::new().with_history(log.clone(), Default::default()));
+        let (_reader, mut rx) = test_attach(&core, "reader", chatter());
+        let senders: Vec<Uid> = (0..8)
+            .map(|i| test_attach(&core, &format!("s{i}"), chatter()).0)
+            .collect();
+        drain(&mut rx);
+        let threads: Vec<_> = senders
+            .iter()
+            .map(|&uid| {
+                let core = core.clone();
+                std::thread::spawn(move || {
+                    (0..25)
+                        .map(|n| {
+                            let text = format!("{uid} {n}");
+                            (
+                                text.clone(),
+                                core.chat_public(uid, text, 0, None).unwrap().unwrap(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let sent: HashMap<String, crate::history::LineId> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        let heard: Vec<(String, crate::history::LineId)> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Chat { text, id, .. } => Some((text, id.unwrap())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(heard.len(), 8 * 25, "every line, once");
+        assert!(heard.windows(2).all(|w| w[0].1 < w[1].1), "one order");
+        for (text, id) in &heard {
+            assert_eq!(sent[text], *id, "each sender is told its line's id");
+        }
+        let commits = log.commits.lock().unwrap();
+        assert!(commits.len() < heard.len(), "shared: {commits:?}");
+        assert!(commits.iter().all(|&n| n <= COMMIT_BATCH));
     }
 
     #[test]

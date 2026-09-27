@@ -626,12 +626,14 @@ retain_read = 604800     # seconds; 7 days, from when it was read
 sync = "normal"          # or "full": fsync every commit
 ```
 
-`full` costs more than it sounds: public chat is written one line at a
-time, in order, so every line waits for the one before it to reach the
-disk. On an NVMe drive that syncs in 5 ms, public chat tops out near
-200 lines a second; on a disk that syncs in 10 ms, near 100. `normal`
-loses at most the last moments before a power cut, never a line that
-reached the disk, and never the database.
+`full` costs a disk sync per commit. Public chat lines arriving together
+share a commit, so a busy room pays one sync for many lines, but a line
+still waits for the sync of the commit before its own: on a disk that
+syncs in 5 ms, a line takes at least that long to be heard, and one
+talker who waits for each line before sending the next is held to a
+couple of hundred a second. `normal` loses at most the last moments
+before a power cut, never a line that reached the disk, and never the
+database.
 
 ### Chat history
 

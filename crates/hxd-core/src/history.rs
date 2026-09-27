@@ -127,6 +127,13 @@ pub fn sent_by(line: &LogLine, who: &Mailbox) -> bool {
 
 pub trait ChatLog: Send + Sync + 'static {
     fn append(&self, line: &NewLine) -> Result<LineId, StoreError>;
+    /// Several lines at once, in order, all or none: what public chat
+    /// commits when lines arrive faster than one commit each can keep up
+    /// with (`Core::chat_public`). A store that can make them one
+    /// transaction should; this one is a line at a time.
+    fn append_all(&self, lines: &[NewLine]) -> Result<Vec<LineId>, StoreError> {
+        lines.iter().map(|line| self.append(line)).collect()
+    }
     fn query(&self, query: &HistoryQuery) -> Result<HistoryPage, StoreError>;
     /// One line by id, tombstone or not: what a redaction reads before it
     /// clears the line, and what a report names.
