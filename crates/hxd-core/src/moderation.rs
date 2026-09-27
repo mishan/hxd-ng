@@ -30,7 +30,7 @@ use crate::history::{LineFlags, LineId, LogLine};
 use crate::inbox::{Mailbox, MessageId, StoreError};
 use crate::media::{Handle, Principal};
 use crate::news::{ArticleId, Author, NewsError};
-use crate::roster::{reads_public_chat, Core, Event, Uid};
+use crate::roster::{reads_public_chat, Core, Event, Uid, UserSession};
 
 pub mod conformance;
 mod memory;
@@ -39,6 +39,20 @@ pub use memory::MemoryModeration;
 
 pub type ActId = u64;
 pub type ReportId = u64;
+
+/// A redaction of up to this many lines is told line by line, as
+/// `chat_redacted`, which every ng client understands, and a purge of up
+/// to this many articles one `news_deleted` each. Past it they go out
+/// batched, as `chat_purged` and `news_purged` (`docs/moderation.md` §5).
+pub const PURGE_SINGLY: usize = 64;
+
+/// The most ids one `chat_purged` or `news_purged` carries, so that no
+/// batch is a frame of unusual size.
+pub const PURGE_EVENT_IDS: usize = 1000;
+
+/// How many open reports a purge reads at a time, looking for the ones
+/// on what it removed.
+const REPORT_PAGE: usize = 256;
 
 /// The longest reason an act takes, in characters (§3).
 pub const MAX_ACT_REASON: usize = 512;
@@ -980,28 +994,40 @@ impl Core {
             if let Some(record) = self.media_record(handle) {
                 self.revoke_quietly(&acting, handle, record.hash, true);
             }
-            self.close_reports_on(&acting, &ReportTarget::Media(*handle), None);
         }
         if let Some(news) = self.news.as_ref() {
             let now = SystemTime::now();
+            let mut gone = Vec::with_capacity(purged.articles.len());
             for id in &purged.articles {
                 match news.tombstone(*id, &acting.name, now) {
-                    Ok(Some(was)) => self.news_fan_out(Event::NewsDeleted {
-                        id: *id,
-                        category: was.category,
-                    }),
+                    Ok(Some(was)) => gone.push((*id, was.category)),
                     Ok(None) => {}
                     Err(e) => warn!("purge: article {id}: {e}"),
                 }
-                self.close_reports_on(&acting, &ReportTarget::Article(*id), None);
             }
             if !purged.articles.is_empty() {
                 self.news_remove_unreferenced(news);
             }
+            // The same arithmetic as the lines': a flood of posts is as
+            // easy to make as a flood of lines, and every news reader
+            // would be told of each one at once.
+            if gone.len() <= PURGE_SINGLY {
+                for (id, category) in gone {
+                    self.news_fan_out(Event::NewsDeleted { id, category });
+                }
+            } else {
+                for articles in gone.chunks(PURGE_EVENT_IDS) {
+                    let articles = articles.to_vec();
+                    self.news_fan_out(Event::NewsPurged { articles });
+                }
+            }
         }
-        for id in &purged.lines {
-            self.close_reports_on(&acting, &ReportTarget::Line(*id), None);
-        }
+        let targets: HashSet<ReportTarget> =
+            (purged.lines.iter().map(|id| ReportTarget::Line(*id)))
+                .chain(purged.media.iter().map(|h| ReportTarget::Media(*h)))
+                .chain(purged.articles.iter().map(|id| ReportTarget::Article(*id)))
+                .collect();
+        self.close_reports_on_any(&acting, &targets);
         self.close_reports_on(&acting, &ReportTarget::User, Some(&mailbox));
         Ok(purged)
     }
@@ -1022,11 +1048,22 @@ impl Core {
                 gone.push(*id);
             }
         }
+        let readers = |s: &UserSession| reads_public_chat(s) && s.info.transport.redactions;
         let mut r = self.roster.lock().unwrap();
-        for id in gone {
-            r.broadcast_where(&Event::ChatRedacted { id }, None, |s| {
-                reads_public_chat(s) && s.info.transport.redactions
-            });
+        if gone.len() <= PURGE_SINGLY {
+            for id in gone {
+                r.broadcast_where(&Event::ChatRedacted { id }, None, readers);
+            }
+        } else {
+            // A purge of a flood is thousands of lines, and one event
+            // each would be thousands of slots in every reader's bounded
+            // channel at once — enough to cut them off, the moderator
+            // who asked included, since their session is not reading
+            // while it waits for this.
+            for ids in gone.chunks(PURGE_EVENT_IDS) {
+                let ev = Event::ChatPurged { ids: ids.to_vec() };
+                r.broadcast_where(&ev, None, readers);
+            }
         }
         Ok(())
     }
@@ -1563,18 +1600,54 @@ impl Core {
                     continue;
                 }
             }
-            let closed = Closed {
-                at: SystemTime::now(),
-                by: acting.name.clone(),
-                outcome: Outcome::Removed,
-                note: None,
-                duplicate_of: None,
+            self.close_removed(acting, store.as_ref(), &report);
+        }
+    }
+
+    /// [`Self::close_reports_on`] for many targets at once, none of them
+    /// a person: what a purge needs. It reads the open reports, which are
+    /// few, rather than asking after each of thousands of lines.
+    fn close_reports_on_any(&self, acting: &Acting, targets: &HashSet<ReportTarget>) {
+        let Some(store) = self.moderation.as_ref() else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let mut open = Vec::new();
+        let mut before = None;
+        loop {
+            let page = match store.reports(ReportFilter::Open, before, REPORT_PAGE) {
+                Ok(page) => page,
+                Err(e) => {
+                    warn!("moderation store: {e}");
+                    return;
+                }
             };
-            match store.close(report.id, &closed) {
-                Ok(true) => self.announce_closed(&report, Outcome::Removed),
-                Ok(false) => {}
-                Err(e) => warn!("moderation store: {e}"),
+            before = page.last().map(|r| r.id);
+            let last = page.len() < REPORT_PAGE;
+            open.extend(page.into_iter().filter(|r| targets.contains(&r.target)));
+            if last {
+                break;
             }
+        }
+        for report in open.iter().rev() {
+            self.close_removed(acting, store.as_ref(), report);
+        }
+    }
+
+    fn close_removed(&self, acting: &Acting, store: &dyn ModerationStore, report: &Report) {
+        let closed = Closed {
+            at: SystemTime::now(),
+            by: acting.name.clone(),
+            outcome: Outcome::Removed,
+            note: None,
+            duplicate_of: None,
+        };
+        match store.close(report.id, &closed) {
+            Ok(true) => self.announce_closed(report, Outcome::Removed),
+            Ok(false) => {}
+            Err(e) => warn!("moderation store: {e}"),
         }
     }
 

@@ -2001,7 +2001,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
         // The same limit, for a line: a 106 was sent and there is no
         // transaction to unsend it (moderation.md §6). History (700)
         // shows the tombstone, which is what a capable client reads.
-        Event::ChatRedacted { .. } => {}
+        Event::ChatRedacted { .. } | Event::ChatPurged { .. } => {}
         // A report reaches a legacy moderator as a private message from
         // the system account (moderation.md §4.5): a window that opens,
         // and nothing a period client has to understand beyond that.
@@ -2051,6 +2051,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
         // notified through a system mailbox with a `stop` reply, which is
         // a feature of its own (`docs/news.md` §10.11).
         Event::NewsDeleted { .. }
+        | Event::NewsPurged { .. }
         | Event::NewsNode(_)
         | Event::NewsNodeDeleted { .. }
         | Event::NewsNotify(_) => {}

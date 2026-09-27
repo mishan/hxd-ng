@@ -464,6 +464,184 @@ fn a_redacted_line_takes_its_image_with_it() {
 }
 
 #[test]
+fn a_purge_of_a_flood_goes_out_batched_and_a_small_one_line_by_line() {
+    let s = server();
+    let (bob, _) = attach(
+        &s.core,
+        Who {
+            identity: Some([2; 32]),
+            ..person("bob")
+        },
+    );
+    let (carol, mut carol_rx) = attach(&s.core, moderator("carol"));
+    let (_dave, mut dave_rx) = attach(&s.core, person("dave"));
+    let lines: Vec<LineId> = (0..2500)
+        .map(|i| say(&s.core, bob, &format!("spam {i}")))
+        .collect();
+    drain(&mut carol_rx);
+    drain(&mut dave_rx);
+
+    s.core
+        .purge_sender(
+            Actor::Session(carol),
+            &PersonRef::Fingerprint([2; 32]),
+            Duration::from_secs(3600),
+            "flood",
+        )
+        .unwrap();
+    for rx in [&mut carol_rx, &mut dave_rx] {
+        let events = drain(rx);
+        let batches: Vec<Vec<LineId>> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ChatPurged { ids } => Some(ids.clone()),
+                _ => None,
+            })
+            .collect();
+        // Three events, not 2500, and every line in them, in order.
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1000, 1000, 500]
+        );
+        assert_eq!(batches.concat(), lines);
+        assert!(redactions(events).is_empty());
+    }
+
+    // A handful is still told line by line, which every client reads.
+    let few: Vec<LineId> = (0..3)
+        .map(|i| say(&s.core, bob, &format!("more {i}")))
+        .collect();
+    drain(&mut dave_rx);
+    s.core
+        .purge_sender(
+            Actor::Session(carol),
+            &PersonRef::Fingerprint([2; 32]),
+            Duration::from_secs(3600),
+            "again",
+        )
+        .unwrap();
+    assert_eq!(redactions(drain(&mut dave_rx)), few);
+}
+
+/// What a reader hears of a purge of `n` lines: one `chat_redacted` each,
+/// and the sizes of the `chat_purged` batches.
+fn purge_of(n: usize) -> (Vec<LineId>, Vec<usize>, Vec<LineId>) {
+    let s = server();
+    let who = Who {
+        identity: Some([2; 32]),
+        ..person("bob")
+    };
+    let (bob, _) = attach(&s.core, who);
+    let (carol, _) = attach(&s.core, moderator("carol"));
+    let (_dave, mut dave_rx) = attach(&s.core, person("dave"));
+    let lines: Vec<LineId> = (0..n).map(|i| say(&s.core, bob, &format!("{i}"))).collect();
+    drain(&mut dave_rx);
+    s.core
+        .purge_sender(
+            Actor::Session(carol),
+            &PersonRef::Fingerprint([2; 32]),
+            Duration::from_secs(3600),
+            "flood",
+        )
+        .unwrap();
+    let events = drain(&mut dave_rx);
+    let batches = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ChatPurged { ids } => Some(ids.len()),
+            _ => None,
+        })
+        .collect();
+    (redactions(events), batches, lines)
+}
+
+#[test]
+fn a_purge_is_batched_from_just_past_its_threshold_and_split_at_the_batch_size() {
+    let (singly, batches, lines) = purge_of(PURGE_SINGLY);
+    assert_eq!((singly, batches), (lines, vec![]));
+    let (singly, batches, _) = purge_of(PURGE_SINGLY + 1);
+    assert_eq!((singly, batches), (vec![], vec![PURGE_SINGLY + 1]));
+    let (singly, batches, _) = purge_of(PURGE_EVENT_IDS + 1);
+    assert_eq!((singly, batches), (vec![], vec![PURGE_EVENT_IDS, 1]));
+}
+
+/// A flood of articles is as easy to post as a flood of lines, and its
+/// purge is batched the same way: a reader who kept up with the flood is
+/// not cut off by its removal.
+#[test]
+fn a_purge_of_a_news_flood_goes_out_batched_and_cuts_no_reader_off() {
+    let s = server();
+    let who = Who {
+        identity: Some([2; 32]),
+        ..person("bob")
+    };
+    let (bob, _) = attach(&s.core, who);
+    let (carol, mut carol_rx) = attach(
+        &s.core,
+        Who {
+            access: moderator("carol").access.with(bit::CREATE_CATEGORIES),
+            ..moderator("carol")
+        },
+    );
+    let (_dave, mut dave_rx) = attach(&s.core, person("dave"));
+    let cat = s
+        .core
+        .news_node_create(carol, None, NodeKind::Category, "General")
+        .unwrap()
+        .id;
+    let n = crate::LIVE_QUEUE_CAP + PURGE_EVENT_IDS / 2;
+    let mut articles = Vec::with_capacity(n);
+    for i in 0..n {
+        let posted = s
+            .core
+            .news_post(
+                bob,
+                PostRequest {
+                    category: cat,
+                    parent: None,
+                    subject: format!("spam {i}"),
+                    body: "spam".into(),
+                    mime: BodyType::Plain,
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        articles.push((posted, cat));
+        if i % 1000 == 0 {
+            drain(&mut carol_rx);
+            drain(&mut dave_rx);
+        }
+    }
+    drain(&mut carol_rx);
+    drain(&mut dave_rx);
+
+    s.core
+        .purge_sender(
+            Actor::Session(carol),
+            &PersonRef::Fingerprint([2; 32]),
+            Duration::from_secs(3600),
+            "flood",
+        )
+        .unwrap();
+    for (who, rx) in [("carol", &mut carol_rx), ("dave", &mut dave_rx)] {
+        let events = drain(rx);
+        assert!(!rx.lagged(), "{who} was cut off by the purge");
+        let batches: Vec<Vec<_>> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::NewsPurged { articles } => Some(articles.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(batches.iter().all(|b| b.len() <= PURGE_EVENT_IDS));
+        assert_eq!(batches.concat(), articles, "{who} heard of every one");
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::NewsDeleted { .. })));
+    }
+}
+
+#[test]
 fn a_purge_takes_a_persons_window_across_every_store_and_nothing_else() {
     let s = server();
     let (bob, _) = attach(
@@ -507,7 +685,21 @@ fn a_purge_takes_a_persons_window_across_every_store_and_nothing_else() {
     let dave_image = upload(&s.core, dave, b"cat");
     let bob_article = post(bob, "spam article");
     let dave_article = post(dave, "real article");
-    // A report on bob, which the purge answers.
+    // Reports on bob, on a line and an article of his, which
+    // the purge answers; and one on dave's line, which it does not.
+    let (erin, _) = attach(&s.core, person("erin"));
+    let on_line = s
+        .core
+        .report(erin, ReportRequest::Line(bob_lines[0]), "spam", None)
+        .unwrap();
+    let on_article = s
+        .core
+        .report(erin, ReportRequest::Article(bob_article), "spam", None)
+        .unwrap();
+    let on_dave = s
+        .core
+        .report(erin, ReportRequest::Line(dave_line), "rude", None)
+        .unwrap();
     let filed = s
         .core
         .report(
@@ -566,9 +758,15 @@ fn a_purge_takes_a_persons_window_across_every_store_and_nothing_else() {
         .any(|e| matches!(e, Event::NewsDeleted { id, .. } if *id == bob_article)));
     assert_eq!(
         closes_in(events),
-        [(filed.id, Outcome::Removed, false)],
-        "the report on the person is answered by the purge"
+        [
+            (on_line.id, Outcome::Removed, false),
+            (on_article.id, Outcome::Removed, false),
+            (filed.id, Outcome::Removed, false),
+        ],
+        "the reports on the person and on what was removed are answered"
     );
+    let open = s.store.open_on(&ReportTarget::Line(dave_line)).unwrap();
+    assert_eq!(open.iter().map(|r| r.id).collect::<Vec<_>>(), [on_dave.id]);
 
     let acts = s.store.acts(None, 10).unwrap();
     assert_eq!(acts.len(), 1, "one row records the lot");

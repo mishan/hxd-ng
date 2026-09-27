@@ -1077,3 +1077,216 @@ async fn a_moderators_news_delete_is_on_the_record() {
     assert_eq!(act["reason"], "flame war");
     assert!(act["evidence"].as_str().unwrap().contains("you all suck"));
 }
+
+/// A purge of more articles than are told one by one is told as
+/// `news_purged`: every article, with its category, and no
+/// `news_deleted` beside it.
+#[tokio::test]
+async fn a_purge_of_many_articles_is_told_as_news_purged() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start(dir.path()).await;
+    let (mut carol, _) = Ng::login(srv.ng, "carol").await;
+    let (mut alice, _) = Ng::login(srv.ng, "alice").await;
+    let (mut bob, _) = Ng::login(srv.ng, "bob").await;
+    let cat = carol
+        .ok(
+            "news_node_create",
+            json!({ "kind": "category", "name": "General" }),
+        )
+        .await["node"]["id"]
+        .as_u64()
+        .unwrap();
+    let mut posted = Vec::new();
+    for i in 0..=hxd_core::moderation::PURGE_SINGLY {
+        let id = bob
+            .ok(
+                "news_post",
+                json!({ "category": cat, "subject": format!("buy {i}"), "body": "buy now" }),
+            )
+            .await["id"]
+            .clone();
+        posted.push(json!({ "id": id, "category": cat }));
+    }
+    alice.ok("ping", json!({})).await;
+    alice.events.clear();
+
+    carol
+        .ok(
+            "purge",
+            json!({ "login": "bob", "since": 3600, "reason": "flood" }),
+        )
+        .await;
+    let purged = alice.event("news_purged").await;
+    assert_eq!(purged["articles"], Value::Array(posted));
+    alice.none("news_deleted").await;
+    let threads = alice.ok("news_threads", json!({ "category": cat })).await;
+    assert_eq!(threads["threads"], json!([]), "every thread is gone");
+}
+
+/// What one reader heard while a flood and its purge went by.
+#[derive(Default, Debug)]
+struct Heard {
+    lines: Vec<u64>,
+    purged: Vec<u64>,
+    redacted: usize,
+    replies: Vec<Value>,
+    closed: bool,
+}
+
+/// Read an ng socket until `done` says so, keeping up as a live client
+/// does, and account for what went by.
+fn keep_up(
+    mut rx: futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+    done: impl Fn(&Heard) -> bool + Send + 'static,
+    lines_seen: Arc<std::sync::atomic::AtomicUsize>,
+) -> tokio::task::JoinHandle<Heard> {
+    tokio::spawn(async move {
+        let mut heard = Heard::default();
+        while !done(&heard) {
+            match timeout(Duration::from_secs(30), rx.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    match v["ev"].as_str() {
+                        Some("chat") => {
+                            heard.lines.push(v["data"]["id"].as_u64().unwrap());
+                            lines_seen
+                                .store(heard.lines.len(), std::sync::atomic::Ordering::Release);
+                        }
+                        Some("chat_purged") => heard.purged.extend(
+                            v["data"]["ids"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|i| i.as_u64().unwrap()),
+                        ),
+                        Some("chat_redacted") => heard.redacted += 1,
+                        Some(_) => {}
+                        None => heard.replies.push(v),
+                    }
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
+                    heard.closed = true;
+                    return heard;
+                }
+                Ok(Some(Ok(_))) => {}
+                Err(_) => panic!("heard nothing for 30s: {} lines", heard.lines.len()),
+            }
+        }
+        heard
+    })
+}
+
+/// A purge of a flood — more lines than any session's channel holds — is
+/// told to the room in batches, so nobody is cut off by it: not a reader,
+/// not the moderator whose session waits on the purge, and not a classic
+/// client, which is told nothing, having no way to take a line back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_purge_of_a_flood_reaches_everyone_and_cuts_nobody_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start(dir.path()).await;
+    let n = hxd_core::LIVE_QUEUE_CAP + 1000;
+
+    let (carol, _) = Ng::login(srv.ng, "carol").await;
+    let (dave, _) = Ng::login(srv.ng, "dave").await;
+    let (mut carol_tx, carol_rx) = carol.ws.split();
+    let (_dave_tx, dave_rx) = dave.ws.split();
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let carol_heard = keep_up(
+        carol_rx,
+        move |h| h.purged.len() >= n && !h.replies.is_empty(),
+        Arc::new(Default::default()),
+    );
+    let dave_heard = keep_up(dave_rx, move |h| h.purged.len() >= n, seen.clone());
+
+    // A classic reader keeps up too, and counts what it hears.
+    let alice = Legacy::login(srv.legacy, "alice").await;
+    let (mut alice_rd, mut alice_wr) = alice.stream.into_split();
+    let alice_heard = tokio::spawn(async move {
+        let mut lines = 0usize;
+        let mut pong = false;
+        loop {
+            let f = timeout(Duration::from_secs(30), read_frame(&mut alice_rd))
+                .await
+                .expect("the classic reader heard nothing for 30s")
+                .expect("the classic reader was cut off");
+            if f.ty == HDR_CHAT {
+                lines += 1;
+            }
+            // The ping sent after the purge: still connected, still served.
+            if f.ty == HDR_TASK && f.trans == 9999 {
+                pong = true;
+            }
+            if pong && lines >= n {
+                return lines;
+            }
+        }
+    });
+
+    // Bob floods, draining his own echoes as he goes.
+    let bob = Legacy::login(srv.legacy, "bob").await;
+    let (mut bob_rd, mut bob_wr) = bob.stream.into_split();
+    tokio::spawn(async move {
+        let mut sink = vec![0u8; 64 * 1024];
+        while matches!(bob_rd.read(&mut sink).await, Ok(k) if k > 0) {}
+    });
+    for i in 0..n {
+        let frame = pack_frame(
+            REQ_CHAT,
+            i as u32 + 1,
+            0,
+            &[(tag::BODY, format!("spam {i}").into_bytes())],
+        );
+        bob_wr.write_all(&frame).await.unwrap();
+    }
+
+    // Once the room has heard it all, carol purges the lot.
+    let carol_purge = json!({ "id": 9000, "req": "purge",
+        "params": { "login": "bob", "since": 3600, "reason": "flood" } });
+    // Every line is logged before it is fanned out, so once a reader has
+    // heard the whole flood the purge will find all of it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while seen.load(std::sync::atomic::Ordering::Acquire) < n {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the flood never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    carol_tx
+        .send(Message::Text(carol_purge.to_string()))
+        .await
+        .unwrap();
+    alice_wr
+        .write_all(&pack_frame(0x1f4, 9999, 0, &[]))
+        .await
+        .unwrap();
+
+    let carol = timeout(Duration::from_secs(60), carol_heard)
+        .await
+        .unwrap()
+        .unwrap();
+    let dave = timeout(Duration::from_secs(60), dave_heard)
+        .await
+        .unwrap()
+        .unwrap();
+    for (who, h) in [("carol", &carol), ("dave", &dave)] {
+        assert!(!h.closed, "{who} was cut off");
+        assert_eq!(h.lines.len(), n, "{who} heard the flood");
+        // Every line, in batches rather than one event each.
+        assert_eq!(h.purged, h.lines, "{who} was told of every line purged");
+        assert_eq!(h.redacted, 0, "{who} was told line by line");
+    }
+    assert!(carol
+        .replies
+        .iter()
+        .any(|r| r["reply"] == 9000 && r.get("ok").is_some()));
+    let alice = timeout(Duration::from_secs(60), alice_heard)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(alice >= n);
+}

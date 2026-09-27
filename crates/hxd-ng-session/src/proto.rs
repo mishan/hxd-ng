@@ -513,6 +513,7 @@ pub fn event_json(se: &SeqEvent) -> String {
         // A client blanks the line in place (moderation.md §5); history
         // already answers it as the tombstone.
         Event::ChatRedacted { id } => ("chat_redacted", json!({ "id": id })),
+        Event::ChatPurged { ids } => ("chat_purged", json!({ "ids": ids })),
         Event::Report(report) => ("report", crate::moderation::report_json(report)),
         Event::ReportClosed { id, outcome, yours } => (
             "report_closed",
@@ -568,9 +569,18 @@ pub fn event_json(se: &SeqEvent) -> String {
         Event::NewsDeleted { id, category } => {
             ("news_deleted", json!({ "id": id, "category": category }))
         }
+        Event::NewsPurged { articles } => (
+            "news_purged",
+            json!({
+                "articles": articles
+                    .iter()
+                    .map(|(id, category)| json!({ "id": id, "category": category }))
+                    .collect::<Vec<_>>(),
+            }),
+        ),
         Event::NewsNode(node) => ("news_node", json!({ "node": crate::news::node_json(node) })),
         Event::NewsNodeDeleted { id } => ("news_node_deleted", json!({ "id": id })),
-        // Addressed to one account, where the four above go to every
+        // Addressed to one account, where the ones above go to every
         // reader: the one a client raises a badge on (§10.6).
         Event::NewsNotify(n) => ("news_notify", crate::news::notified_json(n)),
         // No ng mapping yet (private-chat family, and any future event this
