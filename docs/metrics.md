@@ -101,16 +101,21 @@ a scrape's own render.
 
 | Metric | Labels | |
 |---|---|---|
-| `hxd_sqlite_checkpoint_seconds` | | one WAL checkpoint, on the checkpointer's own connection |
-| `hxd_sqlite_wal_pages` | | pages in the WAL when the last checkpoint began |
+| `hxd_sqlite_checkpoint_seconds` | `db`, `kind` | one WAL checkpoint on the checkpointer's own connection: a `passive` pass, or a `rewind` that emptied the log |
+| `hxd_sqlite_wal_pages` | `db` | pages in the WAL when the last passive pass began |
+| `hxd_sqlite_rewind_busy_total` | `db` | rewinds a reader held off |
 
-The store's WAL is folded back into the database by a thread with a
-connection of its own, every second, never by the commit that happens
-to cross SQLite's threshold: that commit is usually a chat line, holding
-the log's lock and everyone behind it. When the WAL has grown past a
-threshold the checkpointer also rewinds it, which waits for the writer
-and holds it off while it copies what arrived since its last pass. Under
-steady writes that is the one stall left, rarer the lighter the load.
+`db` is the database's file name. Each store's WAL is folded back into
+its database by a thread with a connection of its own, every second,
+never by the commit that happens to cross SQLite's threshold: that
+commit is usually a chat line, holding the log's lock and everyone
+behind it. A passive pass waits for nobody. Past a threshold the
+checkpointer also rewinds the log, which takes the write lock and waits
+for any reader still on the old log, so it waits a tenth of a second at
+most: a reader outside the server (an operator's shell, a backup) can
+hold a snapshot as long as it likes. A refused rewind is counted and
+tried again later, and meanwhile the log grows on disk rather than
+holding up a commit.
 
 ### Fan-out and the outboxes
 
