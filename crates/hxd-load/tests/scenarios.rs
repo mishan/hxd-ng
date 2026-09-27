@@ -180,9 +180,9 @@ async fn a_slow_consumer_is_measured_and_costs_the_room_nothing() {
         );
     }
     // And both stalled clients were probed. Whether the server hung up on
-    // them is the scenario's finding, not the harness's correctness, so
-    // it is reported rather than asserted here: on this server, today,
-    // neither is disconnected (docs/load-testing.md).
+    // them is the scenario's finding, not the harness's correctness, and a
+    // run this short never queues enough for it to, so it is reported
+    // rather than asserted here (docs/load-testing.md §5).
     let stalled = report.detail["stalled"].as_array().unwrap();
     assert_eq!(stalled.len(), 2);
     assert!(stalled.iter().all(|s| s["drained"].as_u64().unwrap() > 0));

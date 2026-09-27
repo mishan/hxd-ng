@@ -2,8 +2,9 @@
 
 Status: built. `hxd-load` with the login storm, public chat, slow
 consumer and churn scenarios, and the invariant checks; the
-`hxd-testclient` crate it drives both wires with. The other scenarios,
-and a CI smoke run, are next.
+`hxd-testclient` crate it drives both wires with; and the baseline, a
+script that runs them all the same way every time (§7). The other
+scenarios, and a CI smoke run, are next.
 
 The point of loading this server is to find what only breaks under
 load, and where it slows down first; throughput numbers are a side
@@ -30,10 +31,11 @@ after, and its check for sessions left behind compares the server's
 count with the one it started with. Without metrics the harness still
 runs and still checks everything it can see from the clients' side.
 
-For the baseline, put the server and the harness on separate cores
-(`taskset`), raise `ulimit -n` for both, and record the storage the
-database is on: the rate public chat can be persisted at is the disk's
-fsync rate (`docs/metrics.md`, the `LogSerial` lock).
+For numbers worth comparing, put the server and the harness on
+separate cores (`taskset`), raise `ulimit -n` for both, and record the
+storage the database is on: the rate public chat can be persisted at is
+the disk's fsync rate (`docs/metrics.md`, the `LogSerial` lock). The
+baseline script does all of that (§7).
 
 ## 2. The scenario file
 
@@ -165,12 +167,12 @@ config file as `hxd` builds one, on every `cargo test`. They hold the
 harness to its checks on a healthy server, and they are small load runs
 of the server in their own right.
 
-The one thing they do not assert is the slow consumer's verdict. On
-this server, as of this writing, neither wire disconnects a client that
-has stopped reading within a short run, and the classic wire queues for
-it without limit: `slow.disconnected` and `slow.bounded` are violated.
-That is the finding the scenario exists to make, and it is fixed in the
-server, not in the test.
+The one thing they do not assert is the slow consumer's verdict. The
+server disconnects a client that has stopped reading once it has
+queued a bounded amount for it (`docs/metrics.md`, the lagged
+outboxes), and a run of a few seconds at a test's rate never queues
+that much. The baseline's slow consumer does, and holds the server to
+both verdicts.
 
 ## 6. The clients
 
@@ -182,3 +184,33 @@ cancelling out, and reads through a buffer so that a timeout cannot cut
 a frame in half. The ng one checks every event's seq as it arrives.
 Both keep whatever arrives while they wait for something else, so
 nothing a caller has not looked at is ever dropped.
+
+## 7. The baseline
+
+`crates/hxd-load/baseline/sweep.sh` runs every scenario against a
+release build: public chat at rising rates in a small room and a large
+one, chat again with every commit fsynced (`sync =
+"full"`), the slow consumer, churn, and a login storm of guests and of
+accounts. It takes about half an hour.
+
+```sh
+cargo build --release -p hxd --features metrics -p hxd-load
+BIN=target/release crates/hxd-load/baseline/sweep.sh
+```
+
+Each run goes through `baseline/run.sh`, which can run one scenario on
+its own the same way. A run gets a server of its own, with a fresh
+database holding the inbox, history and news, since chat is persisted
+under a lock and a server without history measures a different server.
+The server and the harness are pinned to separate physical cores, so
+neither runs on the other's SMT siblings. Around each run it records the
+server's CPU seconds and peak memory from `/proc`, and the harness's
+CPU time, since a harness that is out of CPU is measuring itself. The
+reports go to `out/`, one JSON and one summary per run.
+
+Two cautions for reading them. The numbers belong to the host: compare
+a run with one from the same machine and storage, never across. And
+one run is an anecdote. A disturbed host shows up as one run that
+disagrees with its neighbors, so a result that matters is repeated
+before it is believed.
+

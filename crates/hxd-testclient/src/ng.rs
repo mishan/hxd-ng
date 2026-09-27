@@ -420,9 +420,14 @@ pub enum Incoming {
 }
 
 fn ws_error(e: tokio_tungstenite::tungstenite::Error) -> Error {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
     use tokio_tungstenite::tungstenite::Error as E;
     match e {
         E::ConnectionClosed | E::AlreadyClosed => Error::Closed,
+        // A server hanging up on a client that stopped reading cannot
+        // send it a close frame first: it would queue behind everything
+        // the client did not read.
+        E::Protocol(ProtocolError::ResetWithoutClosingHandshake) => Error::Closed,
         E::Io(io) => Error::from(io),
         other => Error::Protocol(other.to_string()),
     }
