@@ -510,6 +510,7 @@ impl Event {
                 subject, from_nick, ..
             } => subject.len() + from_nick.len(),
             Event::Joined(u) | Event::Changed(u) | Event::AvatarChanged(u) => u.nick.len(),
+            Event::ChatPurged { ids } => ids.len() * std::mem::size_of::<crate::history::LineId>(),
             _ => 0,
         };
         std::mem::size_of::<SeqEvent>() + text
