@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use super::*;
 use crate::access::{bit, AccessBits};
-use crate::roster::{AttachInfo, SeqEvent, Transport};
-use tokio::sync::mpsc::UnboundedReceiver;
+use crate::roster::{AttachInfo, Transport};
+use crate::Events;
 
 /// A codec that decodes nothing and accepts anything non-empty. Its
 /// "canonical" bytes are the input reversed, so a test can tell what
@@ -47,13 +47,13 @@ fn core() -> Core {
 
 /// A session that may send chat and media, on a wire that can carry a
 /// reference.
-fn attach(core: &Core, nick: &str, addr: Ipv4Addr) -> (Uid, UnboundedReceiver<SeqEvent>) {
+fn attach(core: &Core, nick: &str, addr: Ipv4Addr) -> (Uid, Events) {
     attach_with(core, nick, addr, true, true)
 }
 
 /// The same, for an account that has a mailbox — which is what makes a
 /// private message take the durable path.
-fn attach_boxed(core: &Core, nick: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
+fn attach_boxed(core: &Core, nick: &str) -> (Uid, Events) {
     let (uid, rx) = core
         .attach(AttachInfo {
             nick: nick.into(),
@@ -90,7 +90,7 @@ fn attach_with(
     addr: Ipv4Addr,
     capable: bool,
     may_send: bool,
-) -> (Uid, UnboundedReceiver<SeqEvent>) {
+) -> (Uid, Events) {
     let mut access = AccessBits::empty()
         .with(bit::READ_CHAT)
         .with(bit::SEND_CHAT)
@@ -172,7 +172,7 @@ fn chat_media(events: &[crate::roster::Event]) -> Option<MediaRef> {
     })
 }
 
-fn drain(rx: &mut UnboundedReceiver<SeqEvent>) -> Vec<crate::roster::Event> {
+fn drain(rx: &mut Events) -> Vec<crate::roster::Event> {
     let mut out = Vec::new();
     while let Ok(se) = rx.try_recv() {
         out.push(se.event);

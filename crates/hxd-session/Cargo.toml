@@ -25,4 +25,5 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 [dev-dependencies]
 tempfile = "3"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
-tokio = { workspace = true, features = ["rt", "macros"] }
+# `test-util` pauses the clock, so a minute of write stall takes none.
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

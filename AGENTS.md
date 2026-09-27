@@ -167,6 +167,22 @@ send failure after attach routes through `end_session` (login) or
 `connection_lost` (resume). A ghost on the roster with a dropped receiver
 is the bug class to fear here.
 
+**A client that will not drain is disconnected, not buffered for.**
+Everything held for a connection is bounded: an attached session's
+channel (`LIVE_QUEUE_CAP` events or `LIVE_QUEUE_BYTES`, whichever comes
+first, weighed by `Event::weight` — past it the domain closes the
+channel and signals the connection, and the frontend drops it as
+`slow_consumer`, mid-send if need be), the classic writer's queue
+(bytes), and each classic write (no progress for a minute). One client
+that stops reading must cost the server a bounded amount and everyone
+else nothing; `crates/hxd/tests/slow_consumer.rs` is the check. Two
+corollaries. A lag is the *connection's*, not the session's: `Events`
+carries it, and `connection_lost_from` refuses a connection that has
+been taken over, so an old connection never detaches the new one. And
+no domain operation may push a session anywhere near the cap in one
+go: a purge of thousands of lines sends nothing to a wire that cannot
+show redactions (`Transport::redactions`).
+
 **`assert!` over `debug_assert!`** for wire invariants — release builds
 must not skip them.
 
@@ -213,7 +229,11 @@ Three layers, all `cargo test --workspace`:
   rotations published under both keys, a card's commitment, invites from
   the file and the command, the operator's commands on the running
   store, and `hlid register`, `revoke` and `rotate` driven as a user
-  would) and `metrics.rs` (`GET /metrics` from a config's `[metrics]`:
+  would), `slow_consumer.rs` (a room flooded while one client reads
+  nothing: on each wire it is dropped, the ng one while still silent
+  and well inside the pong deadline; the reader hears every line; the
+  ng one resumes into a resync) and `metrics.rs` (`GET
+  /metrics` from a config's `[metrics]`:
   a scrape that accounts for a client on each wire and for their
   leaving, and the scrapes it refuses — built only with
   `--features metrics`).

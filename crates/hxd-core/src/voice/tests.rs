@@ -11,9 +11,9 @@ use std::sync::Arc;
 use super::fake::{MediaCall, RecordingMedia};
 use super::*;
 use crate::access::AccessBits;
-use crate::roster::{drain, test_attach, SeqEvent};
+use crate::roster::{drain, test_attach};
 use crate::Core;
-use tokio::sync::mpsc::UnboundedReceiver;
+use crate::Events;
 
 fn voiced(cap: usize) -> (Core, Arc<RecordingMedia>) {
     let media = Arc::new(RecordingMedia::new());
@@ -26,7 +26,7 @@ fn voiced(cap: usize) -> (Core, Arc<RecordingMedia>) {
 /// quiet as soon as the next user attaches, so a test whose assertions
 /// need an empty outbox `drain`s it immediately before the call it means
 /// to assert on, not here.
-fn quiet(core: &Core, nick: &str) -> (Uid, UnboundedReceiver<SeqEvent>) {
+fn quiet(core: &Core, nick: &str) -> (Uid, Events) {
     test_attach(core, nick, AccessBits::empty())
 }
 

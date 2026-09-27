@@ -231,8 +231,13 @@ pub enum Pushed {
     Live,
     /// Into a detached session's replay buffer.
     Buffered,
-    /// Nowhere: the buffer was already broken, or broke on this one.
+    /// Nowhere, and lost to it: a detached session's buffer was already
+    /// broken or broke on this one, or its connection fell a whole
+    /// channel behind.
     Dropped,
+    /// Nowhere, and nobody was reading: a connection that is going and
+    /// has not said so yet, or the server account, which reads nothing.
+    Closed,
 }
 
 /// Events pushed, tallied by the caller and recorded once: a fan-out
@@ -243,6 +248,7 @@ pub struct Tally {
     live: u64,
     buffered: u64,
     dropped: u64,
+    closed: u64,
 }
 
 impl Tally {
@@ -251,6 +257,7 @@ impl Tally {
             Pushed::Live => self.live += 1,
             Pushed::Buffered => self.buffered += 1,
             Pushed::Dropped => self.dropped += 1,
+            Pushed::Closed => self.closed += 1,
         }
     }
 
@@ -260,12 +267,20 @@ impl Tally {
             ("live", self.live),
             ("buffered", self.buffered),
             ("dropped", self.dropped),
+            ("closed", self.closed),
         ] {
             if n > 0 {
                 metrics::counter!("hxd_events_pushed_total", "sink" => sink).increment(n);
             }
         }
     }
+}
+
+/// An attached session's client fell a whole channel behind; its
+/// connection is dropped.
+pub fn outbox_lagged() {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_outbox_lagged_total").increment(1);
 }
 
 /// A detached session's buffer overflowed; its resume will be a resync.

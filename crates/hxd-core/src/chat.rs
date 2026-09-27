@@ -31,7 +31,7 @@ use crate::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
     StoreError, StoredMessage,
 };
-use crate::roster::{is_buffering, reads_public_chat, Event, RosterInner, Uid, UserInfo};
+use crate::roster::{is_live, reads_public_chat, Event, RosterInner, Uid, UserInfo};
 use crate::Core;
 
 /// Who a private message is from, resolved once under the roster lock.
@@ -165,7 +165,7 @@ fn session_of(r: &RosterInner, mailbox: &Mailbox) -> Option<Uid> {
 fn attached_session_of(r: &RosterInner, mailbox: &Mailbox) -> Option<Uid> {
     sessions_of(r, mailbox)
         .into_iter()
-        .find(|uid| r.users.get(uid).is_some_and(|s| !is_buffering(s)))
+        .find(|uid| r.users.get(uid).is_some_and(is_live))
 }
 
 /// A store that would not answer is a server-side failure, not the
@@ -882,7 +882,7 @@ impl Core {
             let attached = |uid: &Uid| {
                 r.users
                     .get(uid)
-                    .is_some_and(|s| s.mailbox() == to.mailbox && !is_buffering(s))
+                    .is_some_and(|s| s.mailbox() == to.mailbox && is_live(s))
             };
             // Every candidate is checked against the mailbox as it
             // stands *now*: `msg` resolved this uid under an earlier
@@ -1048,7 +1048,9 @@ impl Core {
         let attentive = {
             let r = self.roster.lock().unwrap();
             sessions_of(&r, &to.mailbox).into_iter().any(|uid| {
-                r.users.get(&uid).map(|s| s.info.status) == Some(crate::SessionStatus::Active)
+                r.users
+                    .get(&uid)
+                    .is_some_and(|s| s.info.status == crate::SessionStatus::Active && is_live(s))
             })
         };
         // A message to yourself from your own other session is not news.
@@ -1208,7 +1210,7 @@ impl Core {
             let attached = |uid: &Uid| {
                 r.users
                     .get(uid)
-                    .is_some_and(|s| s.mailbox() == *mailbox && !is_buffering(s))
+                    .is_some_and(|s| s.mailbox() == *mailbox && is_live(s))
             };
             let uid = match target {
                 Target::Only(uid) => Some(uid).filter(attached),
@@ -1806,12 +1808,12 @@ mod inbox_tests {
 
     use std::sync::{Arc, Mutex, Weak};
 
-    use tokio::sync::mpsc::UnboundedReceiver;
+    use crate::Events;
 
     use super::*;
     use crate::access::bit;
     use crate::inbox::MemoryStore;
-    use crate::roster::{drain, AttachInfo, InboxPolicy, SeqEvent};
+    use crate::roster::{drain, AttachInfo, InboxPolicy};
     use crate::{AccessBits, AccountDirectory, Resume};
 
     /// The accounts that exist and take mail, and the identity each is
@@ -1868,7 +1870,7 @@ mod inbox_tests {
         core: &Core,
         login: &str,
         fingerprint: [u8; 32],
-    ) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    ) -> (Uid, Events) {
         let (uid, rx) = core
             .attach(AttachInfo {
                 nick: login.to_string(),
@@ -1894,11 +1896,7 @@ mod inbox_tests {
         (uid, rx)
     }
 
-    pub(super) fn attach(
-        core: &Core,
-        login: &str,
-        has_inbox: bool,
-    ) -> (Uid, UnboundedReceiver<SeqEvent>) {
+    pub(super) fn attach(core: &Core, login: &str, has_inbox: bool) -> (Uid, Events) {
         let (uid, rx) = core
             .attach(AttachInfo {
                 nick: login.to_string(),
@@ -2848,7 +2846,7 @@ mod inbox_tests {
 
         // Dave's phone comes back exactly while the message is being
         // written — after the decision to store, before delivery.
-        let resumed: Arc<Mutex<Option<UnboundedReceiver<SeqEvent>>>> = Arc::new(Mutex::new(None));
+        let resumed: Arc<Mutex<Option<Events>>> = Arc::new(Mutex::new(None));
         let weak: Weak<Core> = Arc::downgrade(&core);
         let slot = resumed.clone();
         *store.during_push.lock().unwrap() = Some(Box::new(move || {
@@ -2885,7 +2883,7 @@ mod inbox_tests {
         let core = Arc::new(Core::new().with_inbox(store.clone(), dir, InboxPolicy::default()));
         let (a, _ra) = attach(&core, "alice", true);
 
-        let arrived: Arc<Mutex<Option<UnboundedReceiver<SeqEvent>>>> = Arc::new(Mutex::new(None));
+        let arrived: Arc<Mutex<Option<Events>>> = Arc::new(Mutex::new(None));
         let weak: Weak<Core> = Arc::downgrade(&core);
         let slot = arrived.clone();
         *store.during_push.lock().unwrap() = Some(Box::new(move || {

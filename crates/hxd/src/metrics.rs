@@ -151,6 +151,7 @@ impl MetricsSource for Source {
         gauge("hxd_sessions", &[("state", "hidden")], c.hidden as f64);
         gauge("hxd_sessions", &[("state", "system")], c.system as f64);
         gauge("hxd_detached_broken", &[], c.broken as f64);
+        gauge("hxd_sessions_lagging", &[], c.lagging as f64);
         gauge(
             "hxd_detached_buffered_events",
             &[("of", "sum")],

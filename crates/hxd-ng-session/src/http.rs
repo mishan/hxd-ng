@@ -609,6 +609,9 @@ async fn upgrade(
                     // negotiates bit 3 for itself, and the legacy
                     // frontend sets this from that negotiation.
                     inline_media: false,
+                    // Nor can it take a line back: the classic wire has no
+                    // way to.
+                    redactions: false,
                 };
                 // §8.2: the tunnelled login can self-link, which is a
                 // write of an association — so it needs the same `manage`
