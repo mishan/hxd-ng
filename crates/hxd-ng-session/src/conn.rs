@@ -616,7 +616,6 @@ async fn handle_login(
         .await;
         return None;
     };
-    let users: Vec<_> = ctx.core.snapshot().iter().map(user_json).collect();
     let detach = if account.can_detach {
         json!({ "grace": ctx.cfg.grace.as_secs() })
     } else {
@@ -691,7 +690,6 @@ async fn handle_login(
         "token": token,
         "self": me_json,
         "server": server,
-        "users": users,
         "detach": detach,
         // Always present, empty when this build offers no extensions:
         // absent and empty mean the same thing, and one shape is one
@@ -776,6 +774,12 @@ async fn handle_login(
     if let Some(banner) = ctx.banner.as_deref() {
         ok["banner"] = crate::banner::login_json(banner);
     }
+    // The roster last, after every wait above: it is the reply's one
+    // part that grows with the server, and a login storm holding a copy
+    // of it for each login waiting on the blocking pool held gigabytes.
+    // Taken here it is also the roster at the reply, which is what the
+    // reply promises (docs/hotline-ng.md §6.1).
+    ok["users"] = ctx.core.snapshot().iter().map(user_json).collect();
     if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
         // The client never learned it was logged in; a ghost session with
         // no transport (and a leaked token) must not linger.

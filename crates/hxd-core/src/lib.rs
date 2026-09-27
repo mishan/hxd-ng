@@ -10,6 +10,7 @@
 pub mod access;
 pub mod account;
 pub mod avatar;
+pub mod budget;
 pub mod chat;
 pub mod files;
 pub mod history;
@@ -35,6 +36,7 @@ pub use avatar::{
     Avatar, AvatarId, AvatarImages, AvatarLimits, AvatarOwner, AvatarPolicy, AvatarRef,
     AvatarStore, MemoryAvatars,
 };
+pub use budget::{Over, QueueBudget, Share, QUEUE_BUDGET};
 pub use chat::{ChatError, MsgOutcome};
 pub use files::{
     FileBody, FileEntry, FileError, FileFuture, FileInfo, FileKind, FilePath, FilePrincipal,

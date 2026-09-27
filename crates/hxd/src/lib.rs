@@ -1425,6 +1425,11 @@ pub struct ServerSection {
     /// `queued` as fields and renders them itself).
     #[serde(default = "default_stamp_queued")]
     pub stamp_queued: bool,
+    /// MiB the server may hold for its clients, every connection's
+    /// queues together (`hxd_core::budget`). Past it, the connections
+    /// furthest behind are dropped as slow consumers.
+    #[serde(default = "default_queue_budget_mb")]
+    pub queue_budget_mb: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1459,6 +1464,9 @@ fn default_accounts() -> PathBuf {
 fn default_stamp_queued() -> bool {
     true
 }
+fn default_queue_budget_mb() -> usize {
+    hxd_core::QUEUE_BUDGET >> 20
+}
 fn default_max_queued() -> usize {
     200
 }
@@ -1488,6 +1496,7 @@ impl Default for ServerSection {
             ban_time: default_ban_time(),
             mark_cleartext: false,
             stamp_queued: default_stamp_queued(),
+            queue_budget_mb: default_queue_budget_mb(),
         }
     }
 }
@@ -2119,6 +2128,9 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     }
     if let Some(identity) = &config.identity {
         identity.revocations()?;
+    }
+    if config.server.queue_budget_mb == 0 {
+        return Err("[server] queue_budget_mb must be at least 1".into());
     }
     registrar::check(config)?;
     tls::check(config)?;
@@ -2942,9 +2954,12 @@ pub fn build_ctx(
         None => None,
     };
 
+    let budget = config.server.queue_budget_mb << 20;
     let core = match voice {
         Some(v) => {
-            let core = Core::new().with_voice(v.media(), v.max_per_room());
+            let core = Core::new()
+                .with_queue_budget(budget)
+                .with_voice(v.media(), v.max_per_room());
             // `with_video` is a no-op without a media layer, so the
             // dependency holds even if this ordering ever changes.
             if video_enabled(config) {
@@ -2958,7 +2973,7 @@ pub fn build_ctx(
                 core
             }
         }
-        None => Core::new(),
+        None => Core::new().with_queue_budget(budget),
     };
 
     // The reserved login is refused at the one place every frontend's

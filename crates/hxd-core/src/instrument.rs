@@ -276,11 +276,15 @@ impl Tally {
     }
 }
 
-/// An attached session's client fell a whole channel behind; its
-/// connection is dropped.
-pub fn outbox_lagged() {
+/// An attached session's client fell behind and its connection is
+/// dropped: its channel filled (`count`), passed its own byte bound
+/// (`own`), or held more than its share of the server's budget once that
+/// was spent (`server`, `crate::budget`).
+pub fn outbox_lagged(bound: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_outbox_lagged_total").increment(1);
+    metrics::counter!("hxd_outbox_lagged_total", "bound" => bound).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = bound;
 }
 
 /// A detached session's buffer overflowed; its resume will be a resync.

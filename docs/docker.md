@@ -210,6 +210,7 @@ is off (`HXD_VIDEO` without voice, say) is reported and ignored.
 | `HXD_BANNER_URL` | | With `HXD_BANNER_FILE`, where a click on the banner goes. Alone, where clients fetch the banner from. |
 | `HXD_BAN_TIME` | 1800 | Seconds a kick-with-ban holds the address. |
 | `HXD_LOGIN_TIMEOUT` | 10 | Seconds a connection has to log in. |
+| `HXD_QUEUE_BUDGET_MB` | 128 | MiB the server may queue for its clients, all together. Past it, the clients furthest behind are dropped. The allocator holds a few times this, so keep it to a fraction of the container's memory. |
 
 ### First administrator
 
