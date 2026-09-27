@@ -112,12 +112,13 @@ its database by a thread with a connection of its own, every second,
 never by the commit that happens to cross SQLite's threshold: that
 commit is usually a chat line, holding the log's lock and everyone
 behind it. A passive pass waits for nobody. Past a threshold the
-checkpointer also rewinds the log, which takes the write lock and waits
-for any reader still on the old log, so it waits a tenth of a second at
-most: a reader outside the server (an operator's shell, a backup) can
-hold a snapshot as long as it likes. A refused rewind is counted and
-tried again later, and meanwhile the log grows on disk rather than
-holding up a commit.
+checkpointer also rewinds the log, which holds the write lock while it
+copies, syncs and waits for readers on the old log, so it is tried only
+when the passive pass copied everything back. A pass that fell short
+means a reader outside the server (an operator's shell, a backup) is
+holding a snapshot, and then nothing is tried: the refusal is counted,
+and the log grows on disk rather than holding up a commit. A rewind
+that is tried waits a tenth of a second at most for a reader.
 
 ### Fan-out and the outboxes
 
