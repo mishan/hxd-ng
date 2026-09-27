@@ -62,6 +62,8 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-store-sqlite` | The durable store for the private-message inbox, chat history, news and the moderation trail: one SQLite file, WAL, the schema and migrations of `docs/private-messages.md` §5, `docs/news.md` §4 and `docs/moderation.md` §7, and the conformance suites both stores of each kind are run against. Behind `hxd-core`'s `MessageStore`, `ChatLog`, `NewsStore`, `ModerationStore` and `AvatarStore` traits and the `inbox` Cargo feature; the in-memory stores beside them in `hxd-core` are what the domain tests use. The registrar's store is here too, in a file and a schema of its own. |
 | `hxd-push-webpush` | The push sender (`docs/webpush-gateway.md`): a VAPID keypair and its RFC 8292 token, RFC 8291 payload encryption, RFC 8030's headers, the destination check a client-chosen URL demands, and a per-origin circuit breaker. Behind `hxd-core`'s `NotificationGateway` trait, reading the devices out of its `PushStore`, and knowing nothing about Hotline. |
 | `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1), and on the port after it for the client's file transfers and banner, carried to `/htxf`; `register`, `revoke` and `rotate` talk to a registrar. |
+| `hxd-testclient` | Scripted clients for the server's own tests: the classic wire over TCP or TLS, framed with the pinned `hxproto` rather than the server's framer and read through a buffer so a timeout cannot cut a frame, and the ng wire with every event's seq checked as it arrives. Both keep what arrives while they wait for something else. Shared by `hxd-load` and the e2e suites. |
+| `hxd-load` | The load harness (`docs/load-testing.md`): scenarios from TOML — the login storm, public chat, the slow consumer, churn — open-loop, timed from when each thing was due, with the server's invariants checked under load and a JSON report. `hxd-load accounts` writes the accounts churn logs in to. Its `tests/` run each scenario small against a real server. |
 | `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing, and behind the `metrics` feature the recorder `GET /metrics` renders (`metrics.rs`, `docs/metrics.md`). Its `tests/` hold the e2e suites. |
 
 `tools/ng-client.mjs` is an interactive ng test client (Node 22+, or
@@ -216,7 +218,13 @@ Three layers, all `cargo test --workspace`:
   `--features metrics`).
 - The scripted legacy client packs and parses with the same pinned
   `hxproto` revision GtkHx uses, so e2e doubles as wire-compat
-  checking.
+  checking. `hxd-testclient` is that client made shared; the suites
+  predate it and carry their own copies, and move onto it as they are
+  touched (`metrics.rs` has).
+- **Load**, in `crates/hxd-load/tests/scenarios.rs`: each scenario for
+  a few seconds against a real server in process, on every `cargo
+  test`, held to its invariants. Real runs are `hxd-load run` against a
+  release build with `metrics` (`docs/load-testing.md`).
 - **End-to-end, out of process**, in `e2e/` — `cd e2e && npm test`.
   These start the *binary*: a real config file `hxd` parses itself, a
   real directory it bootstraps into, real sockets. That is a layer the

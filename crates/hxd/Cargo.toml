@@ -89,6 +89,8 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, opti
 console-subscriber = { version = "0.5", optional = true }
 
 [dev-dependencies]
+# The scripted clients the e2e suites and the load harness share.
+hxd-testclient = { workspace = true }
 hxfiles-xfer = { workspace = true }
 # The media e2e stands real WebRTC clients up against the real SFU.
 hxd-voice = { workspace = true }

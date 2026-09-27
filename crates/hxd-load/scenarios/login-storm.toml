@@ -1,0 +1,22 @@
+# S1: logins at a rising rate. Each step is reported on its own; the
+# knee is the first whose p99 doubles the first step's, or whose
+# failures pass one in a hundred.
+
+[target]
+legacy = "127.0.0.1:5500"
+ng = "127.0.0.1:5700"
+# legacy_tls = "127.0.0.1:5600"
+metrics = true
+
+[run]
+scenario = "login_storm"
+duration = 60
+
+[login_storm]
+rate = 50
+ramp_step = 50
+ramp_every = 10
+linger = 1.0
+legacy = 1
+legacy_tls = 0
+ng = 1

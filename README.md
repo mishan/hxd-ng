@@ -1102,6 +1102,8 @@ node --check tools/ng-client.mjs
 ```
 
 That is what CI runs, beside the e2e suite and a build and smoke test
-of the Docker image. [AGENTS.md](AGENTS.md) is the map of the workspace —
+of the Docker image. Load testing — `hxd-load`, its scenarios and the
+invariants it checks under load — is in
+[docs/load-testing.md](docs/load-testing.md). [AGENTS.md](AGENTS.md) is the map of the workspace —
 which crate owns what, the invariants that matter, and the conventions this
 repo is written to.

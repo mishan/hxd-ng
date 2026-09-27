@@ -14,18 +14,13 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use hxd_session::frame::{pack_frame, read_frame, Frame};
-use hxproto::messages::tag;
-use serde_json::{json, Value};
+use hxd_testclient::legacy::{self, Login};
+use hxd_testclient::ng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
 
-const HDR_TASK: u32 = 0x0001_0000;
 const HDR_LOGIN: u32 = 0x6b;
-const HDR_GETLIST: u32 = 0x12c;
 
 struct Server {
     legacy: SocketAddr,
@@ -104,67 +99,6 @@ fn has(text: &str, metric: &str, labels: &[&str]) -> bool {
         .any(|l| labels.iter().all(|want| l.contains(want)))
 }
 
-async fn legacy_guest(addr: SocketAddr, nick: &str) -> TcpStream {
-    let mut s = TcpStream::connect(addr).await.unwrap();
-    s.write_all(b"TRTPHOTL\x00\x01\x00\x02").await.unwrap();
-    let mut magic = [0u8; 8];
-    s.read_exact(&mut magic).await.unwrap();
-    let login = pack_frame(
-        HDR_LOGIN,
-        1,
-        0,
-        &[
-            (tag::NAME, nick.as_bytes().to_vec()),
-            (tag::ICON, 1u16.to_be_bytes().to_vec()),
-        ],
-    );
-    s.write_all(&login).await.unwrap();
-    task_reply(&mut s, 1).await;
-    s.write_all(&pack_frame(HDR_GETLIST, 2, 0, &[]))
-        .await
-        .unwrap();
-    task_reply(&mut s, 2).await;
-    s
-}
-
-async fn task_reply(s: &mut TcpStream, trans: u32) -> Frame {
-    loop {
-        let f = timeout(Duration::from_secs(5), read_frame(s))
-            .await
-            .expect("timed out waiting for a reply")
-            .expect("connection closed");
-        if f.ty == HDR_TASK && f.trans == trans {
-            assert_eq!(f.flag, 0, "task {trans} failed");
-            return f;
-        }
-    }
-}
-
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-async fn ng_guest(addr: SocketAddr, nick: &str) -> Ws {
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ng"))
-        .await
-        .unwrap();
-    let login = json!({"id": 1, "req": "login", "params": {"nick": nick}});
-    ws.send(Message::Text(login.to_string())).await.unwrap();
-    loop {
-        let msg = timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("timed out waiting for the login reply")
-            .unwrap()
-            .unwrap();
-        if let Message::Text(t) = msg {
-            let v: Value = serde_json::from_str(&t).unwrap();
-            if v["reply"] == 1 {
-                assert!(v.get("ok").is_some(), "login should succeed: {v}");
-                return ws;
-            }
-        }
-    }
-}
-
 /// Scrape until `pred` holds: a departure is noticed by the server's
 /// own tasks, a moment after the socket closes.
 async fn scrape_until(server: &Server, pred: impl Fn(&str) -> bool) -> String {
@@ -186,8 +120,11 @@ async fn a_scrape_accounts_for_both_wires_and_for_their_leaving() {
     let text = scrape(&server).await;
     assert_eq!(value(&text, "hxd_sessions{state=\"attached\"}"), Some(0.0));
 
-    let mut legacy = legacy_guest(server.legacy, "classic").await;
-    let mut ng = ng_guest(server.ng, "modern").await;
+    let mut legacy = legacy::Client::login_at(server.legacy, &Login::guest("classic"))
+        .await
+        .unwrap();
+    legacy.user_list().await.unwrap();
+    let (ng, _) = ng::Client::guest(server.ng, "modern").await.unwrap();
 
     let text = scrape_until(&server, |t| {
         value(t, "hxd_sessions{state=\"attached\"}") == Some(2.0)
@@ -252,7 +189,7 @@ async fn a_scrape_accounts_for_both_wires_and_for_their_leaving() {
     // receive buffer is a reset, which counts as `io_error`.) A guest
     // never detaches, so leaving is ending.
     legacy.shutdown().await.unwrap();
-    ng.close(None).await.unwrap();
+    ng.close().await.unwrap();
     // The roster lets go first and the counter is told after, so wait
     // for both.
     let text = scrape_until(&server, |t| {
