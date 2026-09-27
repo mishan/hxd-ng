@@ -3903,4 +3903,31 @@ mod tests {
         assert!(tx.backlog.share.held() <= 256 << 10);
         assert_eq!(budget.held(), tx.backlog.share.held());
     }
+
+    /// A client that has kept up is not cut off for one large answer —
+    /// the user list of a crowded server — however spent the budget is.
+    #[test]
+    fn a_caught_up_queue_takes_one_large_reply_past_the_budget() {
+        let budget = hxd_core::QueueBudget::new(256 << 10);
+        let stalled = budget.share();
+        stalled.take(256 << 10, usize::MAX).unwrap();
+        // Idle connections, which bring the average down to well under
+        // the answer's size.
+        let _idle: Vec<_> = (0..8).map(|_| budget.share()).collect();
+        let (out, _rx) = mpsc::unbounded_channel();
+        let tx = Tx {
+            out,
+            backlog: Arc::new(Backlog::new(budget.share())),
+        };
+        enqueue(
+            &tx,
+            Outbound::Reply {
+                trans: 1,
+                error: false,
+                chunks: vec![(tag::BODY, vec![b'x'; 120_000])],
+            },
+        );
+        assert!(!tx.backlog.lagging.load(Ordering::Acquire));
+        assert!(tx.backlog.share.held() > 120_000);
+    }
 }

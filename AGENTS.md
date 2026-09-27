@@ -176,11 +176,13 @@ channel and signals the connection, and the frontend drops it as
 (bytes), and each classic write (no progress for a minute). One client
 that stops reading must cost the server a bounded amount and everyone
 else nothing; `crates/hxd/tests/slow_consumer.rs` is the check. And a
-bound per connection is that bound times the connections, so every
-queue also draws a `Share` of one server-wide `QueueBudget`
+bound per connection is that bound times the connections, so the
+live channels, the classic writers' queues and the detached sessions'
+buffers also draw a `Share` of one server-wide `QueueBudget`
 (`hxd_core::budget`, `[server] queue_budget_mb`): past it, a queue
-holding more than the queues do on average is dropped the same way. A
-new queue that waits on a client draws on it too. Two corollaries. A lag is the *connection's*, not the session's: `Events`
+holding more than the queues do on average is dropped the same way,
+and a detached buffer breaks. A new queue that can grow with a
+client's backlog draws on it too. Two corollaries. A lag is the *connection's*, not the session's: `Events`
 carries it, and `connection_lost_from` refuses a connection that has
 been taken over, so an old connection never detaches the new one. And
 no domain operation may push a session anywhere near the cap in one

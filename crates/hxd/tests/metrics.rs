@@ -168,6 +168,10 @@ async fn a_scrape_accounts_for_both_wires_and_for_their_leaving() {
         "hxd_frames_total",
         &["wire=\"ng\"", "dir=\"in\"", "type=\"login\""]
     ));
+    // The queues' budget, and what they hold of it.
+    assert!(has(&text, "hxd_queue_budget_bytes", &["of=\"limit\""]));
+    assert!(has(&text, "hxd_queue_budget_bytes", &["of=\"held\""]));
+    assert!(has(&text, "hxd_live_queued_events", &[]));
     // A task reply is a reply, whatever it answers.
     assert!(has(
         &text,

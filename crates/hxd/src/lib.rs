@@ -1486,6 +1486,13 @@ fn default_history_max_page() -> usize {
     200
 }
 
+impl ServerSection {
+    /// `queue_budget_mb` in bytes, or 0 for none a machine could count.
+    pub fn queue_budget(&self) -> usize {
+        self.queue_budget_mb.checked_mul(1 << 20).unwrap_or(0)
+    }
+}
+
 impl Default for ServerSection {
     fn default() -> Self {
         ServerSection {
@@ -2129,8 +2136,11 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     if let Some(identity) = &config.identity {
         identity.revocations()?;
     }
-    if config.server.queue_budget_mb == 0 {
-        return Err("[server] queue_budget_mb must be at least 1".into());
+    if config.server.queue_budget() == 0 {
+        return Err(
+            "[server] queue_budget_mb must be at least 1, and small enough to count in bytes"
+                .into(),
+        );
     }
     registrar::check(config)?;
     tls::check(config)?;
@@ -2954,7 +2964,7 @@ pub fn build_ctx(
         None => None,
     };
 
-    let budget = config.server.queue_budget_mb << 20;
+    let budget = config.server.queue_budget();
     let core = match voice {
         Some(v) => {
             let core = Core::new()
@@ -3278,6 +3288,19 @@ hmac_secret = "new secret"
         let typo =
             parse("[tracker]\n[[tracker.targets]]\naddress = \"example.com\"\nprotocol = \"v4\"\n");
         assert!(typo.is_err());
+    }
+
+    #[test]
+    fn the_queue_budget_is_counted_in_bytes_and_refused_when_it_cannot_be() {
+        let cfg = parse("[server]\nqueue_budget_mb = 64\n").unwrap();
+        check_config(&cfg).unwrap();
+        assert_eq!(cfg.server.queue_budget(), 64 << 20);
+        let default = parse("").unwrap();
+        assert_eq!(default.server.queue_budget(), hxd_core::QUEUE_BUDGET);
+        for bad in ["0", &(usize::MAX >> 10).to_string()] {
+            let cfg = parse(&format!("[server]\nqueue_budget_mb = {bad}\n")).unwrap();
+            assert!(check_config(&cfg).unwrap_err().contains("queue_budget_mb"));
+        }
     }
 
     #[test]

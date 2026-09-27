@@ -163,13 +163,17 @@ A server nobody is on reads zero attached and zero detached, with or
 without a server account. That is the load harness's check for ghosts
 after its clients have gone.
 
-**The budget.** Every queue that waits on a client, a live channel or a
-classic writer's, draws on one server-wide budget as well as having
-its own bound: a per-connection bound is that bound times the
+**The budget.** The queues that grow with a client's backlog, the live
+channels, the classic writers' queues and the detached sessions'
+buffers, draw on one server-wide budget as well as having their own
+bounds: a per-connection bound is that bound times the
 connections, and a login storm held gigabytes without any one queue
 near its own. Past the budget, a queue that holds more than the queues
 do on average is cut off as a slow consumer, which is the connections
-furthest behind and not one in the middle of a burst. The sizes are the
+furthest behind and not one in the middle of a burst; a detached
+buffer breaks, and its resume is a resync. A queue that had kept up
+may still take one large item, such as the user list of a crowded
+server. The sizes are the
 queues' own estimates (an event's weight, a frame's wire length); what
 the allocator holds for them runs to a few times as much, so size
 `queue_budget_mb` to a fraction of the memory the server may use.

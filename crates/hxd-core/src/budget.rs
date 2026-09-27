@@ -103,7 +103,12 @@ impl Share {
     /// small enough to catch a reader in the middle of a burst, where the
     /// average is still set by the stalled. And someone always holds at
     /// least the average, so the queues past it go and the total stops
-    /// growing.
+    /// growing. And a queue that had kept up, holding less than half the
+    /// average before this item, may take it however large it is, up to
+    /// its own bound: a reader that asks for the user list of a crowded
+    /// server is not cut off for the size of the answer. Only half,
+    /// because queues that all fall behind together each hold about the
+    /// average, and they must still be stopped.
     pub fn take(&self, bytes: usize, own: usize) -> Result<(), Over> {
         let mine = self.held.fetch_add(bytes, Ordering::AcqRel) + bytes;
         if mine > own {
@@ -114,7 +119,7 @@ impl Share {
         let all = b.held.fetch_add(bytes, Ordering::AcqRel) + bytes;
         if all > b.limit {
             let average = all / b.shares.load(Ordering::Acquire).max(1);
-            if mine > average {
+            if mine > average && mine - bytes > average / 2 {
                 b.held.fetch_sub(bytes, Ordering::AcqRel);
                 self.held.fetch_sub(bytes, Ordering::AcqRel);
                 return Err(Over::Server);
@@ -191,15 +196,28 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_that_has_kept_up_may_take_one_large_item_past_the_budget() {
+        let budget = QueueBudget::new(1000);
+        let stalled = budget.share();
+        let others: Vec<Share> = (0..9).map(|_| budget.share()).collect();
+        stalled.take(1000, usize::MAX).unwrap();
+        // Well past the average, and held by nothing before it: taken.
+        assert_eq!(others[0].take(400, usize::MAX), Ok(()));
+        // The next one is not.
+        assert_eq!(others[0].take(10, usize::MAX), Err(Over::Server));
+        assert_eq!(stalled.take(10, usize::MAX), Err(Over::Server));
+    }
+
+    #[test]
     fn a_dropped_share_returns_what_it_held() {
         let budget = QueueBudget::new(1000);
         let a = budget.share();
         let b = budget.share();
         a.take(300, usize::MAX).unwrap();
-        b.take(200, usize::MAX).unwrap();
-        assert_eq!(b.take(600, usize::MAX), Err(Over::Server));
+        b.take(400, usize::MAX).unwrap();
+        assert_eq!(b.take(400, usize::MAX), Err(Over::Server));
         drop(a);
-        assert_eq!(budget.held(), 200);
-        assert_eq!(b.take(600, usize::MAX), Ok(()), "back under the budget");
+        assert_eq!(budget.held(), 400);
+        assert_eq!(b.take(400, usize::MAX), Ok(()), "back under the budget");
     }
 }

@@ -364,9 +364,9 @@ async fn stalled_clients_past_the_servers_budget_are_dropped() {
 async fn budget_case() {
     let td = tempfile::tempdir().unwrap();
     let server = start_with(td.path(), "queue_budget_mb = 4").await;
-    // Well short of any one connection's bounds, once the socket buffers
-    // have taken their part: without the budget nobody is dropped.
-    let n = 4000;
+    // Well short of any one connection's bounds, socket buffers or not:
+    // without the budget nobody is dropped.
+    let n = 2000;
 
     let mut stalled = Vec::new();
     for i in 0..4 {

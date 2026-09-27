@@ -595,6 +595,9 @@ enum Sink {
         /// start_seq` predates the buffer and cannot be replayed.
         start_seq: u64,
         buf: VecDeque<SeqEvent>,
+        /// What the buffer weighs, drawn on the server's budget like a
+        /// live channel ([`crate::budget`]). Refused, the buffer breaks.
+        share: crate::budget::Share,
         /// The buffer overflowed; replay is impossible, a fresh sync is
         /// needed. The buffer is dropped when this trips.
         broken: bool,
@@ -649,13 +652,20 @@ impl Outbox {
                 }
             }
             Sink::Lagged(_) => instrument::Pushed::Dropped,
-            Sink::Buffering { buf, broken, .. } => {
+            Sink::Buffering {
+                buf, share, broken, ..
+            } => {
                 if *broken {
                     return instrument::Pushed::Dropped;
                 }
-                if buf.len() >= OUTBOX_BUFFER_CAP {
+                // Past its count, or past the server's budget while holding
+                // more than its share: either way the resume is a resync.
+                if buf.len() >= OUTBOX_BUFFER_CAP
+                    || share.take(se.event.weight(), usize::MAX).is_err()
+                {
                     *broken = true;
                     buf.clear(); // Nothing partial is replayable; free it.
+                    share.give(share.held());
                     instrument::outbox_broken();
                     return instrument::Pushed::Dropped;
                 }
@@ -1380,6 +1390,7 @@ impl Core {
             since: Instant::now(),
             start_seq: sess.outbox.next_seq,
             buf: VecDeque::new(),
+            share: self.queue_budget.share(),
             broken: lagged,
         };
         let addr = sess.addr;
@@ -2071,6 +2082,25 @@ mod tests {
             }
         }
         assert!(core.queue_budget().held() < 4096);
+    }
+
+    /// A detached session's buffer draws on the budget too, and past it
+    /// breaks, as it does past its count: the resume is a resync.
+    #[test]
+    fn a_detached_buffer_past_the_server_budget_breaks() {
+        let core = Core::new().with_queue_budget(16 << 10);
+        let (away, _away_rx) = ng_attach(&core, "away", "10.0.0.1");
+        let (talker, mut talker_rx) = ng_attach(&core, "talker", "10.0.0.2");
+        assert!(core.connection_lost(away, 2));
+        let line = "x".repeat(1000);
+        for _ in 0..(OUTBOX_BUFFER_CAP / 4) {
+            core.chat_public(talker, line.clone(), 0, None).unwrap();
+            while talker_rx.try_recv().is_ok() {}
+        }
+        let c = core.census();
+        assert_eq!((c.detached, c.broken, c.buffered), (1, 1, 0));
+        assert!(core.queue_budget().held() < 4096, "the buffer gave it back");
+        assert!(matches!(core.resume(away, 0), Resume::ResyncRequired(_)));
     }
 
     #[test]
