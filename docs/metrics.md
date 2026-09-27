@@ -72,8 +72,8 @@ the process, and a client must not be able to mint them.
 
 `lock` is the name of what the lock guards: `RosterInner` for the
 roster, `LogSerial` for the order public chat is persisted in (held
-once per commit, which may carry many lines, so fewer holds than lines
-means lines are sharing commits), `sqlite`
+once per commit, which may carry many lines, and by each redaction and
+purge), `sqlite`
 and `sqlite_registrar` for the two databases' connections. `site` is
 the file and line that took it (`hxd-core/src/chat.rs:256`), so the
 worst holder is named without anyone instrumenting it by hand. For the

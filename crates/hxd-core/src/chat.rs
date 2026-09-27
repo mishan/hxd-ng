@@ -441,51 +441,92 @@ impl Core {
     /// hears it in are one fact, as they were a line at a time.
     fn chat_commit_batch(
         &self,
-        batch: Vec<Staged>,
+        mut batch: Vec<Staged>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
         let _serial = self.log_serial.lock().unwrap();
-        let ids = match self.history.as_ref() {
+        let mut results: Vec<Option<Result<Option<crate::history::LineId>, ChatError>>> =
+            vec![None; batch.len()];
+        // A line waited in the queue, and the room may have moved on: its
+        // sender kicked and purged, gone, renamed, or its image revoked.
+        // Asked again now, under the log's lock, a line from a session
+        // that is no longer there is not logged, so a purge between two
+        // batches misses nothing; and a line goes out under the name its
+        // sender has now, or with an image only if the image is still
+        // theirs to send.
+        {
+            let r = self.roster.lock().unwrap();
+            for (s, result) in batch.iter_mut().zip(results.iter_mut()) {
+                let crate::media::Principal::Session { uid, serial } = s.principal else {
+                    continue;
+                };
+                match r.users.get(&uid) {
+                    Some(sess) if sess.serial == serial => s.info = sess.info.clone(),
+                    _ => *result = Some(Err(ChatError::NoSuchUser)),
+                }
+            }
+        }
+        for (s, result) in batch.iter_mut().zip(results.iter_mut()) {
+            if let (None, Some((handle, _))) = (&result, &s.media) {
+                match self.media_for_send(s.info.uid, handle) {
+                    Ok(reference) => s.media = Some((*handle, reference)),
+                    Err(_) => *result = Some(Err(ChatError::NoSuchMedia)),
+                }
+            }
+        }
+        let live: Vec<usize> = (0..batch.len()).filter(|&i| results[i].is_none()).collect();
+        let ids: Vec<Option<crate::history::LineId>> = match self.history.as_ref() {
             Some(log) => {
-                let lines: Vec<NewLine> = batch
+                let lines: Vec<NewLine> = live
                     .iter()
-                    .map(|s| NewLine {
-                        channel: 0,
-                        from_nick: s.info.nick.clone(),
-                        from_login: s.login.clone(),
-                        from_fingerprint: s.fingerprint,
-                        icon: s.info.icon,
-                        text: s.text.clone(),
-                        flags: if s.style == 1 {
-                            LineFlags::ACTION
-                        } else {
-                            LineFlags::default()
-                        },
-                        at: s.at,
+                    .map(|&i| {
+                        let s = &batch[i];
+                        NewLine {
+                            channel: 0,
+                            from_nick: s.info.nick.clone(),
+                            from_login: s.login.clone(),
+                            from_fingerprint: s.fingerprint,
+                            icon: s.info.icon,
+                            text: s.text.clone(),
+                            flags: if s.style == 1 {
+                                LineFlags::ACTION
+                            } else {
+                                LineFlags::default()
+                            },
+                            at: s.at,
+                        }
                     })
                     .collect();
                 match log.append_all(&lines) {
-                    Ok(ids) => ids.into_iter().map(Some).collect(),
+                    Ok(ids) => {
+                        // One id a line, or the lines past the end would
+                        // wait for an answer that never comes.
+                        assert_eq!(ids.len(), lines.len(), "one id for each line logged");
+                        ids.into_iter().map(Some).collect()
+                    }
                     Err(e) => {
                         let e = history_store_failed(e);
-                        return batch.iter().map(|_| Err(e)).collect();
+                        return results.into_iter().map(|r| r.unwrap_or(Err(e))).collect();
                     }
                 }
             }
-            None => vec![None; batch.len()],
+            None => vec![None; live.len()],
         };
-        let mut done = Vec::with_capacity(batch.len());
-        let mut r = self.roster.lock().unwrap();
-        for (s, id) in batch.into_iter().zip(ids) {
-            // The log keeps the canonical metadata beside the line, so a
-            // history entry can still render a placeholder once the bytes
-            // are gone (docs/inline-media.md §9, chat-history.md §8).
-            if let (Some(log), Some(id), Some((_, reference))) =
-                (self.history.as_ref(), id, &s.media)
-            {
-                if let Err(e) = log.attach_media(id, &reference.to_meta()) {
-                    warn!("chat log would not record media: {e}");
+        // The log keeps the canonical metadata beside the line, so a
+        // history entry can still render a placeholder once the bytes are
+        // gone (docs/inline-media.md §9, chat-history.md §8). A store
+        // write, so before the roster is taken, not under it.
+        if let Some(log) = self.history.as_ref() {
+            for (&i, id) in live.iter().zip(&ids) {
+                if let (Some(id), Some((_, reference))) = (id, &batch[i].media) {
+                    if let Err(e) = log.attach_media(*id, &reference.to_meta()) {
+                        warn!("chat log would not record media: {e}");
+                    }
                 }
             }
+        }
+        let mut batch: Vec<Option<Staged>> = batch.into_iter().map(Some).collect();
+        for (i, id) in live.into_iter().zip(ids) {
+            let s = batch[i].take().expect("each line relayed once");
             let ev = Event::Chat {
                 cid: 0,
                 from: s.info,
@@ -495,6 +536,10 @@ impl Core {
                 at: s.at,
                 media: s.media.as_ref().map(|(_, r)| r.clone()),
             };
+            // The roster a line at a time, so a long batch does not hold
+            // everyone else's roster work for all of it: the log's lock is
+            // what keeps the lines in order.
+            let mut r = self.roster.lock().unwrap();
             r.broadcast_where(&ev, None, reads_public_chat);
             // The authorization set, fixed at relay time: the sender, and
             // every session this line just went to whose wire can carry
@@ -505,9 +550,13 @@ impl Core {
                 let audience = r.media_audience(None, reads_public_chat);
                 self.media_capture(handle, audience.into_iter().chain([s.principal]));
             }
-            done.push(Ok(id));
+            drop(r);
+            results[i] = Some(Ok(id));
         }
-        done
+        results
+            .into_iter()
+            .map(|r| r.expect("every line answered"))
+            .collect()
     }
 
     /// A private chat line; membership is the only gate.
@@ -1921,6 +1970,123 @@ mod tests {
         let commits = log.commits.lock().unwrap();
         assert!(commits.len() < heard.len(), "shared: {commits:?}");
         assert!(commits.iter().all(|&n| n <= COMMIT_BATCH));
+    }
+
+    /// A log whose commits wait at a gate the test opens.
+    struct GatedLog {
+        inner: crate::history::MemoryLog,
+        gate: Mutex<bool>,
+        opened: Condvar,
+    }
+
+    impl crate::history::ChatLog for GatedLog {
+        fn append(&self, line: &NewLine) -> Result<crate::history::LineId, StoreError> {
+            self.append_all(std::slice::from_ref(line))
+                .map(|ids| ids[0])
+        }
+        fn append_all(&self, lines: &[NewLine]) -> Result<Vec<crate::history::LineId>, StoreError> {
+            let mut open = self.gate.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+            lines.iter().map(|l| self.inner.append(l)).collect()
+        }
+        fn query(&self, q: &HistoryQuery) -> Result<HistoryPage, StoreError> {
+            self.inner.query(q)
+        }
+        fn line(
+            &self,
+            id: crate::history::LineId,
+        ) -> Result<Option<crate::history::LogLine>, StoreError> {
+            self.inner.line(id)
+        }
+        fn lines_by(
+            &self,
+            channel: u32,
+            who: &Mailbox,
+            since: SystemTime,
+        ) -> Result<Vec<crate::history::LogLine>, StoreError> {
+            self.inner.lines_by(channel, who, since)
+        }
+        fn tombstone(
+            &self,
+            id: crate::history::LineId,
+            by: &str,
+            at: SystemTime,
+        ) -> Result<bool, StoreError> {
+            self.inner.tombstone(id, by, at)
+        }
+        fn prune(
+            &self,
+            max_lines: usize,
+            older_than: Option<Duration>,
+            now: SystemTime,
+        ) -> Result<usize, StoreError> {
+            self.inner.prune(max_lines, older_than, now)
+        }
+        fn attach_media(
+            &self,
+            id: crate::history::LineId,
+            media: &crate::history::MediaMeta,
+        ) -> Result<(), StoreError> {
+            self.inner.attach_media(id, media)
+        }
+    }
+
+    /// A line that waited in the queue is asked about again when its turn
+    /// comes: one whose sender has gone is not logged or heard — a kick
+    /// with a purge between two batches misses nothing — and one whose
+    /// sender was renamed goes out under the new name.
+    #[test]
+    fn a_waiting_line_is_asked_about_again_when_its_commit_comes() {
+        let log = Arc::new(GatedLog {
+            inner: Default::default(),
+            gate: Mutex::new(false),
+            opened: Condvar::new(),
+        });
+        let core = Arc::new(Core::new().with_history(log.clone(), Default::default()));
+        let (_reader, mut rx) = test_attach(&core, "reader", chatter());
+        let (first, _) = test_attach(&core, "first", chatter());
+        let (leaving, _) = test_attach(&core, "leaving", chatter());
+        let (renamed, _) = test_attach(&core, "renamed", chatter());
+        drain(&mut rx);
+        let send = |uid, text: &'static str| {
+            let core = core.clone();
+            std::thread::spawn(move || core.chat_public(uid, text.into(), 0, None))
+        };
+        // The first line leads a commit that waits at the gate; the others
+        // queue behind it.
+        let a = send(first, "one");
+        while !core.chat_commit.state.lock().unwrap().leading {
+            std::thread::yield_now();
+        }
+        let b = send(leaving, "two");
+        let c = send(renamed, "three");
+        while core.chat_commit.state.lock().unwrap().queue.len() < 2 {
+            std::thread::yield_now();
+        }
+        core.end_session(leaving);
+        core.update(renamed, Some("new name".into()), None);
+        *log.gate.lock().unwrap() = true;
+        log.opened.notify_all();
+
+        assert!(a.join().unwrap().is_ok());
+        assert_eq!(b.join().unwrap(), Err(ChatError::NoSuchUser));
+        assert!(c.join().unwrap().is_ok());
+        let heard: Vec<(String, String)> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Chat { text, from, .. } => Some((text, from.nick)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            heard,
+            [
+                ("one".to_string(), "first".to_string()),
+                ("three".to_string(), "new name".to_string())
+            ]
+        );
     }
 
     #[test]
