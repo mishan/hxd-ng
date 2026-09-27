@@ -41,9 +41,10 @@ The pieces the design needs already exist:
   `ServerConfig::caps`; the ng login reply's `caps` list.
 - **Access bit 56** is already pinned as `bit::CHAT_HISTORY` in
   `hxd-core/src/access.rs`, from the same fogWraith allocation table.
-- **The store crate** and its conventions: one connection behind a mutex,
-  WAL, unix-seconds at the boundary, `SCHEMA_VERSION` with a migration
-  arm per bump.
+- **The store crate** and its conventions: one connection behind a mutex
+  to a store (public chat has since been given a store of its own, beside
+  the inbox's where the two share a file), WAL, unix-seconds at the
+  boundary, `SCHEMA_VERSION` with a migration arm per bump.
 - **The hourly sweeper** in the binary that runs inbox retention.
 - **The client side**: GtkHx parses `DATA_HISTORY_ENTRY` with
   `hxproto::parse::parse_history_entry`, fetches an initial batch

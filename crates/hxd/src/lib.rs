@@ -1013,7 +1013,8 @@ fn default_upload_sessions() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct HistorySection {
     /// SQLite file. May be omitted when `[inbox]` exists; both then share
-    /// the inbox database and one connection.
+    /// the inbox database, and public chat writes on a connection of its
+    /// own beside the inbox's.
     pub db: Option<PathBuf>,
     #[serde(default = "default_history_max_lines")]
     pub max_lines: u32,
@@ -2263,6 +2264,15 @@ fn open_sqlite(
     path: &Path,
     sync: hxd_store_sqlite::Synchronous,
 ) -> Result<Arc<hxd_store_sqlite::SqliteStore>, String> {
+    open_sqlite_with(path, |p| hxd_store_sqlite::SqliteStore::open(p, sync))
+}
+
+/// [`open_sqlite`], with the store opened by `open`.
+#[cfg(feature = "inbox")]
+fn open_sqlite_with(
+    path: &Path,
+    open: impl FnOnce(&Path) -> Result<hxd_store_sqlite::SqliteStore, hxd_core::StoreError>,
+) -> Result<Arc<hxd_store_sqlite::SqliteStore>, String> {
     // History and inbox bodies are both cleartext. Create the main file
     // private before SQLite opens it, then apply the same mode to WAL
     // sidecars after migration.
@@ -2276,10 +2286,7 @@ fn open_sqlite(
             .open(path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
-    let store = Arc::new(
-        hxd_store_sqlite::SqliteStore::open(path, sync)
-            .map_err(|e| format!("{}: {e}", path.display()))?,
-    );
+    let store = Arc::new(open(path).map_err(|e| format!("{}: {e}", path.display()))?);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2304,13 +2311,21 @@ struct RuntimeStores {
     devices: Option<Arc<dyn hxd_core::PushStore>>,
     moderation: Option<Arc<dyn hxd_core::ModerationStore>>,
     avatars: Option<Arc<dyn hxd_core::AvatarStore>>,
+    /// The chat log's store as itself, for the tests to ask how it was
+    /// opened.
+    #[cfg(test)]
+    history_sqlite: Option<Arc<hxd_store_sqlite::SqliteStore>>,
 }
 
 /// Open the databases the config names, **one store object per file**
-/// however many sections name it. Two objects on one file would be two
-/// schema owners, each migrating on open and each holding its own
-/// connection mutex — the one-writer design the store rests on, undone
-/// by a config that spelled a path twice.
+/// however many sections name it, public chat's excepted. Two objects
+/// opened alike on one file would be two checkpointers taking turns at
+/// its checkpoint lock, and two connections whose writes wait five
+/// seconds for each other where one mutex waited as long as it took —
+/// for no better reason than a config that spelled a path twice. Public
+/// chat's second store on a file is opened for its own sake, and as the
+/// second: `SqliteStore::open_beside`, which leaves the checkpoints to
+/// the first and waits for its writes.
 #[cfg(feature = "inbox")]
 fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
     use hxd_store_sqlite::{SqliteStore, Synchronous};
@@ -2365,26 +2380,6 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         Some(p) => Some(open(p, inbox_sync)? as Arc<dyn hxd_core::MessageStore>),
         None => None,
     };
-    // Public chat gets a connection of its own, on a shared file too:
-    // every line is committed under the log's lock, and on the shared
-    // connection it waited behind whatever else the file was doing — a
-    // news search, an inbox flush, a report listing — for as long as that
-    // took. With a connection of its own it waits only for another write
-    // to commit, which is what SQLite serializes; reads never block it.
-    // `synchronous` is a connection's, not a file's: the inbox's where
-    // the two share a file, which is what the shared connection had.
-    let history = match &history_path {
-        Some((path, key)) => {
-            let shares_inbox = inbox_path.as_ref().is_some_and(|(_, k)| k == key);
-            let sync = if shares_inbox {
-                inbox_sync
-            } else {
-                Synchronous::Normal
-            };
-            Some(open_sqlite(path, sync)? as Arc<dyn hxd_core::ChatLog>)
-        }
-        None => None,
-    };
     let news = match &news_path {
         Some(p) => Some(open(p, Synchronous::Normal)? as Arc<dyn hxd_core::NewsStore>),
         None => None,
@@ -2410,9 +2405,42 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         Some(p) => Some(open(&p, Synchronous::Normal)? as Arc<dyn hxd_core::AvatarStore>),
         None => None,
     };
+    // Public chat gets a connection of its own, on a shared file too:
+    // every line is committed under the log's lock, and on the shared
+    // connection it waited behind whatever else the file was doing — a
+    // news search, an inbox flush, a report listing — for as long as that
+    // took. With a connection of its own it waits only for another write
+    // to commit, which is what SQLite serializes; reads never block it.
+    // `synchronous` is a connection's, not a file's: the inbox's where
+    // the two share a file, which is what the shared connection had.
+    //
+    // Opened last, so it knows whether any other section's store is on
+    // its file, and is then opened beside that one: no checkpointer of
+    // its own, and a wait for that store's writes as long as the shared
+    // mutex's was, rather than a failed commit (`open_beside`).
+    let history = match &history_path {
+        Some((path, key)) => {
+            let shares_inbox = inbox_path.as_ref().is_some_and(|(_, k)| k == key);
+            let sync = if shares_inbox {
+                inbox_sync
+            } else {
+                Synchronous::Normal
+            };
+            let store = match opened.iter().find(|(k, _)| k == key) {
+                Some((_, first)) => {
+                    open_sqlite_with(path, |p| SqliteStore::open_beside(p, sync, first))?
+                }
+                None => open_sqlite(path, sync)?,
+            };
+            Some(store)
+        }
+        None => None,
+    };
     Ok(RuntimeStores {
         inbox,
-        history,
+        #[cfg(test)]
+        history_sqlite: history.clone(),
+        history: history.map(|h| h as Arc<dyn hxd_core::ChatLog>),
         news,
         devices,
         moderation,
@@ -3411,10 +3439,11 @@ sync = "full"
     fn the_chat_log_has_a_connection_of_its_own_on_a_shared_file() {
         use hxd_core::history::{HistoryQuery, NewLine};
         use hxd_core::inbox::Mailbox;
+        use hxd_store_sqlite::Synchronous;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.sqlite");
         let cfg = parse(&format!(
-            "[inbox]\ndb = {:?}\n[history]\n",
+            "[inbox]\ndb = {:?}\nsync = \"full\"\n[history]\n",
             path.to_string_lossy()
         ))
         .unwrap();
@@ -3426,6 +3455,11 @@ sync = "full"
             Arc::as_ptr(&history) as *const (),
             "public chat commits on a connection nothing else waits on"
         );
+        // Beside the inbox's store: its checkpointer is the file's only
+        // one, and a commit is as durable on either connection.
+        let sqlite = stores.history_sqlite.unwrap();
+        assert!(!sqlite.checkpoints());
+        assert_eq!(sqlite.synchronous().unwrap(), Synchronous::Full);
         // One file, two connections, each writing and reading its own.
         let id = history
             .append(&NewLine {
@@ -3624,6 +3658,58 @@ sync = "full"
             database_path(Path::new("server.sqlite")).unwrap(),
             std::env::current_dir().unwrap().join("server.sqlite")
         );
+
+        // The chat log, spelled the other way, still finds the inbox's
+        // file: it opens beside the inbox's store, with its `sync`.
+        let cfg = parse(&format!(
+            "[inbox]\ndb = {:?}\nsync = \"full\"\n[history]\ndb = {:?}\n",
+            plain.to_string_lossy(),
+            dotted.to_string_lossy()
+        ))
+        .unwrap();
+        let history = open_runtime_stores(&cfg).unwrap().history_sqlite.unwrap();
+        assert!(!history.checkpoints(), "one checkpointer to a file");
+        assert_eq!(
+            history.synchronous().unwrap(),
+            hxd_store_sqlite::Synchronous::Full
+        );
+    }
+
+    /// A chat log on a file of its own checkpoints it, at the default
+    /// `sync`, whatever the inbox asked of its own file; news on the
+    /// chat log's file keeps a store of its own, and the chat log opens
+    /// beside it.
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn a_chat_log_on_its_own_file_checkpoints_it() {
+        use hxd_store_sqlite::Synchronous;
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox.sqlite");
+        let history = dir.path().join("history.sqlite");
+        let cfg = parse(&format!(
+            "[inbox]\ndb = {:?}\nsync = \"full\"\n[history]\ndb = {:?}\n",
+            inbox.to_string_lossy(),
+            history.to_string_lossy()
+        ))
+        .unwrap();
+        let log = open_runtime_stores(&cfg).unwrap().history_sqlite.unwrap();
+        assert!(log.checkpoints());
+        assert_eq!(log.synchronous().unwrap(), Synchronous::Normal);
+        drop(log);
+
+        let cfg = parse(&format!(
+            "[history]\ndb = {:?}\n[news]\ndb = {:?}\n",
+            history.to_string_lossy(),
+            history.to_string_lossy()
+        ))
+        .unwrap();
+        let stores = open_runtime_stores(&cfg).unwrap();
+        let log = stores.history_sqlite.unwrap();
+        assert_ne!(
+            Arc::as_ptr(&log) as *const (),
+            Arc::as_ptr(&stores.news.unwrap()) as *const ()
+        );
+        assert!(!log.checkpoints(), "the news store checkpoints the file");
     }
 
     #[cfg(feature = "inbox")]

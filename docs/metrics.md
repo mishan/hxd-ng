@@ -107,17 +107,19 @@ a scrape's own render.
 | `hxd_sqlite_wal_pages` | `db` | pages in the WAL when the last passive pass began |
 | `hxd_sqlite_rewind_busy_total` | `db` | rewinds a reader held off |
 
-`db` is the database's file name. Each store's WAL is folded back into
-its database by a thread with a connection of its own, every second,
+`db` is the database's file name. Each file's WAL is folded back into
+its database by a thread with a connection of its own, every second —
+one thread to a file, however many of the server's stores share it —
 never by the commit that happens to cross SQLite's threshold: that
 commit is usually a chat line, holding the log's lock and everyone
 behind it. A passive pass waits for nobody. Past a threshold the
 checkpointer also rewinds the log, which holds the write lock while it
 copies, syncs and waits for readers on the old log, so it is tried only
 when the passive pass copied everything back. A pass that fell short
-means a reader outside the server (an operator's shell, a backup) is
-holding a snapshot, and then nothing is tried: the refusal is counted,
-and the log grows on disk rather than holding up a commit. A rewind
+means a reader is holding a snapshot (a long read on another of the
+server's connections to the file, or a reader outside the server: an
+operator's shell, a backup), and then nothing is tried: the refusal is
+counted, and the log grows on disk rather than holding up a commit. A rewind
 that is tried waits a tenth of a second at most for a reader.
 
 ### Fan-out and the outboxes
