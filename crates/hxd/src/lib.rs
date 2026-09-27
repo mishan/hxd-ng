@@ -1425,6 +1425,11 @@ pub struct ServerSection {
     /// `queued` as fields and renders them itself).
     #[serde(default = "default_stamp_queued")]
     pub stamp_queued: bool,
+    /// MiB the server may hold for its clients, every connection's
+    /// queues together (`hxd_core::budget`). Past it, the connections
+    /// furthest behind are dropped as slow consumers.
+    #[serde(default = "default_queue_budget_mb")]
+    pub queue_budget_mb: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1459,6 +1464,9 @@ fn default_accounts() -> PathBuf {
 fn default_stamp_queued() -> bool {
     true
 }
+fn default_queue_budget_mb() -> usize {
+    hxd_core::QUEUE_BUDGET >> 20
+}
 fn default_max_queued() -> usize {
     200
 }
@@ -1478,6 +1486,13 @@ fn default_history_max_page() -> usize {
     200
 }
 
+impl ServerSection {
+    /// `queue_budget_mb` in bytes, or 0 for none a machine could count.
+    pub fn queue_budget(&self) -> usize {
+        self.queue_budget_mb.checked_mul(1 << 20).unwrap_or(0)
+    }
+}
+
 impl Default for ServerSection {
     fn default() -> Self {
         ServerSection {
@@ -1488,6 +1503,7 @@ impl Default for ServerSection {
             ban_time: default_ban_time(),
             mark_cleartext: false,
             stamp_queued: default_stamp_queued(),
+            queue_budget_mb: default_queue_budget_mb(),
         }
     }
 }
@@ -2119,6 +2135,12 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     }
     if let Some(identity) = &config.identity {
         identity.revocations()?;
+    }
+    if config.server.queue_budget() == 0 {
+        return Err(
+            "[server] queue_budget_mb must be at least 1, and small enough to count in bytes"
+                .into(),
+        );
     }
     registrar::check(config)?;
     tls::check(config)?;
@@ -2942,9 +2964,12 @@ pub fn build_ctx(
         None => None,
     };
 
+    let budget = config.server.queue_budget();
     let core = match voice {
         Some(v) => {
-            let core = Core::new().with_voice(v.media(), v.max_per_room());
+            let core = Core::new()
+                .with_queue_budget(budget)
+                .with_voice(v.media(), v.max_per_room());
             // `with_video` is a no-op without a media layer, so the
             // dependency holds even if this ordering ever changes.
             if video_enabled(config) {
@@ -2958,7 +2983,7 @@ pub fn build_ctx(
                 core
             }
         }
-        None => Core::new(),
+        None => Core::new().with_queue_budget(budget),
     };
 
     // The reserved login is refused at the one place every frontend's
@@ -3263,6 +3288,19 @@ hmac_secret = "new secret"
         let typo =
             parse("[tracker]\n[[tracker.targets]]\naddress = \"example.com\"\nprotocol = \"v4\"\n");
         assert!(typo.is_err());
+    }
+
+    #[test]
+    fn the_queue_budget_is_counted_in_bytes_and_refused_when_it_cannot_be() {
+        let cfg = parse("[server]\nqueue_budget_mb = 64\n").unwrap();
+        check_config(&cfg).unwrap();
+        assert_eq!(cfg.server.queue_budget(), 64 << 20);
+        let default = parse("").unwrap();
+        assert_eq!(default.server.queue_budget(), hxd_core::QUEUE_BUDGET);
+        for bad in ["0", &(usize::MAX >> 10).to_string()] {
+            let cfg = parse(&format!("[server]\nqueue_budget_mb = {bad}\n")).unwrap();
+            assert!(check_config(&cfg).unwrap_err().contains("queue_budget_mb"));
+        }
     }
 
     #[test]

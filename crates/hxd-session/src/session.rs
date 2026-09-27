@@ -15,7 +15,7 @@
 //! commented.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,8 +25,8 @@ use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
     Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Events, FileEntry,
-    FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof, SessionStatus, Transport, Uid,
-    UserInfo,
+    FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof, SessionStatus, Share, Transport,
+    Uid, UserInfo,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::text;
@@ -344,10 +344,10 @@ struct Tx {
     backlog: Arc<Backlog>,
 }
 
-#[derive(Default)]
 struct Backlog {
-    /// Bytes queued and not yet written.
-    bytes: AtomicUsize,
+    /// Bytes queued and not yet written, drawn on the server's budget
+    /// (`hxd_core::budget`).
+    share: Share,
     /// The client stopped keeping up: the queue passed its bound, or a
     /// write stalled. Nothing more is queued once it is set.
     lagging: AtomicBool,
@@ -358,6 +358,15 @@ struct Backlog {
 }
 
 impl Backlog {
+    fn new(share: Share) -> Backlog {
+        Backlog {
+            share,
+            lagging: AtomicBool::new(false),
+            lagged: Notify::new(),
+            stop: Notify::new(),
+        }
+    }
+
     fn lag(&self) {
         if !self.lagging.swap(true, Ordering::AcqRel) {
             self.lagged.notify_one();
@@ -374,14 +383,15 @@ fn enqueue(tx: &Tx, out: Outbound) {
         return; // The session is ending; its client is not reading.
     }
     let len = out.wire_len();
-    if b.bytes.fetch_add(len, Ordering::AcqRel) + len > MAX_SEND_QUEUE {
-        b.bytes.fetch_sub(len, Ordering::AcqRel);
+    // Past its own bound, or past the server's budget while holding more
+    // than its share of it.
+    if b.share.take(len, MAX_SEND_QUEUE).is_err() {
         b.lag();
         return;
     }
     instrument::write_queued(WIRE, 1, len as i64);
     if tx.out.send(out).is_err() {
-        b.bytes.fetch_sub(len, Ordering::AcqRel);
+        b.share.give(len);
         instrument::write_queued(WIRE, -1, -(len as i64));
     }
 }
@@ -519,7 +529,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
         };
         instrument::socket_write(WIRE, took);
         instrument::write_queued(WIRE, -1, -queued);
-        backlog.bytes.fetch_sub(queued as usize, Ordering::AcqRel);
+        backlog.share.give(queued as usize);
         match written {
             Ok(()) => instrument::frame(WIRE, Dir::Out, label, bytes.len()),
             // The peer stopped reading: the session ends as a slow
@@ -536,7 +546,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
     rx.close();
     while let Ok(out) = rx.try_recv() {
         let len = out.wire_len();
-        backlog.bytes.fetch_sub(len, Ordering::AcqRel);
+        backlog.share.give(len);
         instrument::write_queued(WIRE, -1, -(len as i64));
     }
     let _ = timeout(Duration::from_secs(1), wr.shutdown()).await;
@@ -1174,7 +1184,7 @@ async fn run_connection<S>(
     let (out, out_rx) = mpsc::unbounded_channel();
     let tx = Tx {
         out,
-        backlog: Arc::new(Backlog::default()),
+        backlog: Arc::new(Backlog::new(ctx.core.queue_budget().share())),
     };
     let mut wr_for_magic = wr;
     // TCP needs no flush; a tunnelled stream buffers frames until one
@@ -3823,7 +3833,7 @@ mod tests {
         let (out, rx) = mpsc::unbounded_channel();
         let tx = Tx {
             out,
-            backlog: Arc::new(Backlog::default()),
+            backlog: Arc::new(Backlog::new(hxd_core::QueueBudget::new(usize::MAX).share())),
         };
         for _ in 0..8 {
             enqueue(
@@ -3834,12 +3844,12 @@ mod tests {
                 },
             );
         }
-        assert!(tx.backlog.bytes.load(Ordering::Acquire) > 0);
+        assert!(tx.backlog.share.held() > 0);
         let writer = tokio::spawn(writer_task(ours, rx, tx.backlog.clone()));
         tx.backlog.lagged.notified().await;
         assert!(tx.backlog.lagging.load(Ordering::Acquire));
         writer.await.unwrap();
-        assert_eq!(tx.backlog.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(tx.backlog.share.held(), 0);
         // And a lagging connection queues nothing more.
         enqueue(
             &tx,
@@ -3848,7 +3858,7 @@ mod tests {
                 chunks: vec![],
             },
         );
-        assert_eq!(tx.backlog.bytes.load(Ordering::Acquire), 0);
+        assert_eq!(tx.backlog.share.held(), 0);
     }
 
     /// The bound on the queue: past `MAX_SEND_QUEUE` the connection lags,
@@ -3858,7 +3868,7 @@ mod tests {
         let (out, _rx) = mpsc::unbounded_channel();
         let tx = Tx {
             out,
-            backlog: Arc::new(Backlog::default()),
+            backlog: Arc::new(Backlog::new(hxd_core::QueueBudget::new(usize::MAX).share())),
         };
         let frame = || Outbound::Push {
             ty: 0x6a,
@@ -3867,6 +3877,57 @@ mod tests {
         while !tx.backlog.lagging.load(Ordering::Acquire) {
             enqueue(&tx, frame());
         }
-        assert!(tx.backlog.bytes.load(Ordering::Acquire) <= MAX_SEND_QUEUE);
+        assert!(tx.backlog.share.held() <= MAX_SEND_QUEUE);
+    }
+
+    /// And a queue that holds more than its share of the server's budget
+    /// once that is spent lags long before its own bound.
+    #[test]
+    fn a_queue_past_its_share_of_the_server_budget_lags_its_connection() {
+        let budget = hxd_core::QueueBudget::new(256 << 10);
+        let _keeping_up = budget.share();
+        let (out, _rx) = mpsc::unbounded_channel();
+        let tx = Tx {
+            out,
+            backlog: Arc::new(Backlog::new(budget.share())),
+        };
+        while !tx.backlog.lagging.load(Ordering::Acquire) {
+            enqueue(
+                &tx,
+                Outbound::Push {
+                    ty: 0x6a,
+                    chunks: vec![(tag::BODY, vec![b'x'; 60_000])],
+                },
+            );
+        }
+        assert!(tx.backlog.share.held() <= 256 << 10);
+        assert_eq!(budget.held(), tx.backlog.share.held());
+    }
+
+    /// A client that has kept up is not cut off for one large answer —
+    /// the user list of a crowded server — however spent the budget is.
+    #[test]
+    fn a_caught_up_queue_takes_one_large_reply_past_the_budget() {
+        let budget = hxd_core::QueueBudget::new(256 << 10);
+        let stalled = budget.share();
+        stalled.take(256 << 10, usize::MAX).unwrap();
+        // Idle connections, which bring the average down to well under
+        // the answer's size.
+        let _idle: Vec<_> = (0..8).map(|_| budget.share()).collect();
+        let (out, _rx) = mpsc::unbounded_channel();
+        let tx = Tx {
+            out,
+            backlog: Arc::new(Backlog::new(budget.share())),
+        };
+        enqueue(
+            &tx,
+            Outbound::Reply {
+                trans: 1,
+                error: false,
+                chunks: vec![(tag::BODY, vec![b'x'; 120_000])],
+            },
+        );
+        assert!(!tx.backlog.lagging.load(Ordering::Acquire));
+        assert!(tx.backlog.share.held() > 120_000);
     }
 }

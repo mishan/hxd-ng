@@ -84,13 +84,13 @@ pub struct Events {
 }
 
 /// What one connection shares with its session's sink.
-#[derive(Default)]
 pub(crate) struct ConnState {
     lagged: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
-    /// What the queued events weigh ([`Event::weight`]): added when one
-    /// is sent, taken off when the frontend receives it.
-    bytes: std::sync::atomic::AtomicUsize,
+    /// What the queued events weigh ([`Event::weight`]), drawn on the
+    /// server's budget ([`crate::budget`]): taken when one is sent, given
+    /// back when the frontend receives it.
+    share: crate::budget::Share,
 }
 
 impl ConnState {
@@ -103,9 +103,15 @@ impl ConnState {
 }
 
 impl Events {
-    fn channel() -> (mpsc::Sender<SeqEvent>, Arc<ConnState>, Events) {
+    fn channel(
+        budget: &Arc<crate::budget::QueueBudget>,
+    ) -> (mpsc::Sender<SeqEvent>, Arc<ConnState>, Events) {
         let (tx, rx) = mpsc::channel(LIVE_QUEUE_CAP);
-        let conn = Arc::new(ConnState::default());
+        let conn = Arc::new(ConnState {
+            lagged: Default::default(),
+            notify: Default::default(),
+            share: budget.share(),
+        });
         (tx, conn.clone(), Events { rx, conn })
     }
 
@@ -124,9 +130,7 @@ impl Events {
     }
 
     fn took(&self, se: &SeqEvent) {
-        self.conn
-            .bytes
-            .fetch_sub(se.event.weight(), std::sync::atomic::Ordering::AcqRel);
+        self.conn.share.give(se.event.weight());
     }
 
     /// Events waiting.
@@ -591,6 +595,9 @@ enum Sink {
         /// start_seq` predates the buffer and cannot be replayed.
         start_seq: u64,
         buf: VecDeque<SeqEvent>,
+        /// What the buffer weighs, drawn on the server's budget like a
+        /// live channel ([`crate::budget`]). Refused, the buffer breaks.
+        share: crate::budget::Share,
         /// The buffer overflowed; replay is impossible, a fresh sync is
         /// needed. The buffer is dropped when this trips.
         broken: bool,
@@ -618,45 +625,47 @@ impl Outbox {
         match &mut self.sink {
             Sink::Live(tx, conn) => {
                 let weight = se.event.weight();
-                let queued = conn
-                    .bytes
-                    .fetch_add(weight, std::sync::atomic::Ordering::AcqRel);
-                // Past the byte budget is the same verdict as a full
-                // channel, reached by a different road.
-                let over = queued + weight > LIVE_QUEUE_BYTES;
-                let sent = if over {
-                    Err(TrySendError::Full(se))
-                } else {
-                    tx.try_send(se)
+                // Past the connection's byte bound, or past the server's
+                // budget while holding more than its share of it, is the
+                // same verdict as a full channel, reached by another road.
+                let sent = match conn.share.take(weight, LIVE_QUEUE_BYTES) {
+                    Err(over) => Err((TrySendError::Full(se), over.label())),
+                    Ok(()) => tx.try_send(se).map_err(|e| {
+                        conn.share.give(weight);
+                        (e, "count")
+                    }),
                 };
-                if sent.is_err() {
-                    conn.bytes
-                        .fetch_sub(weight, std::sync::atomic::Ordering::AcqRel);
-                }
                 match sent {
                     Ok(()) => instrument::Pushed::Live,
-                    Err(TrySendError::Full(_)) => {
+                    Err((TrySendError::Full(_), bound)) => {
                         let conn = conn.clone();
                         conn.lag();
                         // Dropping the sender is what closes the channel.
                         self.sink = Sink::Lagged(conn);
-                        instrument::outbox_lagged();
+                        instrument::outbox_lagged(bound);
                         instrument::Pushed::Dropped
                     }
                     // Nobody reads this channel: a frontend that is gone and
                     // has not said so yet, or the server account, which reads
                     // nothing.
-                    Err(TrySendError::Closed(_)) => instrument::Pushed::Closed,
+                    Err((TrySendError::Closed(_), _)) => instrument::Pushed::Closed,
                 }
             }
             Sink::Lagged(_) => instrument::Pushed::Dropped,
-            Sink::Buffering { buf, broken, .. } => {
+            Sink::Buffering {
+                buf, share, broken, ..
+            } => {
                 if *broken {
                     return instrument::Pushed::Dropped;
                 }
-                if buf.len() >= OUTBOX_BUFFER_CAP {
+                // Past its count, or past the server's budget while holding
+                // more than its share: either way the resume is a resync.
+                if buf.len() >= OUTBOX_BUFFER_CAP
+                    || share.take(se.event.weight(), usize::MAX).is_err()
+                {
                     *broken = true;
                     buf.clear(); // Nothing partial is replayable; free it.
+                    share.give(share.held());
                     instrument::outbox_broken();
                     return instrument::Pushed::Dropped;
                 }
@@ -1005,6 +1014,9 @@ impl InboxPolicy {
 #[derive(Default)]
 pub struct Core {
     pub(crate) roster: TimedMutex<RosterInner>,
+    /// What every queue waiting on a client draws on (`crate::budget`):
+    /// the live channels here, and the frontends' own write queues.
+    pub(crate) queue_budget: Arc<crate::budget::QueueBudget>,
     /// The durable private-message inbox, or `None` — in which case
     /// private messaging behaves exactly as it did before the inbox
     /// existed, which is what a server that configures no database gets.
@@ -1119,6 +1131,12 @@ pub struct Census {
     pub buffered_max: usize,
     /// Private chat rooms open.
     pub chats: usize,
+    /// Events waiting in attached connections' channels, hidden sessions'
+    /// included, and what they weigh ([`Event::weight`]), in all and at
+    /// most.
+    pub live: usize,
+    pub live_bytes: usize,
+    pub live_bytes_max: usize,
 }
 
 /// What `Core::log_serial` guards: nothing but an order. A type of its
@@ -1144,6 +1162,18 @@ impl Core {
         self.directory = Some(directory);
         self.inbox_policy = policy;
         self
+    }
+
+    /// Bound what the server holds for its clients, all together, to
+    /// `bytes` rather than [`crate::QUEUE_BUDGET`].
+    pub fn with_queue_budget(mut self, bytes: usize) -> Self {
+        self.queue_budget = crate::budget::QueueBudget::new(bytes);
+        self
+    }
+
+    /// The budget, for a frontend's queues to draw on too.
+    pub fn queue_budget(&self) -> &Arc<crate::budget::QueueBudget> {
+        &self.queue_budget
     }
 
     /// Let the domain ask about accounts nobody is logged into, without an
@@ -1228,7 +1258,7 @@ impl Core {
         let uid = r.next_uid()?;
         r.last_serial += 1;
         let serial = r.last_serial;
-        let (tx, conn, rx) = Events::channel();
+        let (tx, conn, rx) = Events::channel(&self.queue_budget);
         r.users.insert(
             uid,
             UserSession {
@@ -1360,6 +1390,7 @@ impl Core {
             since: Instant::now(),
             start_seq: sess.outbox.next_seq,
             buf: VecDeque::new(),
+            share: self.queue_budget.share(),
             broken: lagged,
         };
         let addr = sess.addr;
@@ -1407,7 +1438,7 @@ impl Core {
             r.end_session(uid);
             return Resume::Gone;
         }
-        let (tx, conn, rx) = Events::channel();
+        let (tx, conn, rx) = Events::channel(&self.queue_budget);
         let old = std::mem::replace(&mut sess.outbox.sink, Sink::Live(tx, conn));
         let next_seq = sess.outbox.next_seq;
         let outcome = match old {
@@ -1482,6 +1513,12 @@ impl Core {
             if sess.info.system {
                 c.system += 1;
                 continue;
+            }
+            if let Sink::Live(tx, conn) = &sess.outbox.sink {
+                let bytes = conn.share.held();
+                c.live += tx.max_capacity() - tx.capacity();
+                c.live_bytes += bytes;
+                c.live_bytes_max = c.live_bytes_max.max(bytes);
             }
             if !sess.visible {
                 c.hidden += 1;
@@ -2003,6 +2040,67 @@ mod tests {
             got += 1;
         }
         assert_eq!(got, sent - 1);
+    }
+
+    /// Connections each well inside their own bounds are cut off once
+    /// what they hold together passes the server's budget: the ones
+    /// behind, and not the ones keeping up.
+    #[test]
+    fn past_the_server_budget_the_connections_behind_are_cut_off() {
+        let budget = 64 << 10;
+        let core = Core::new().with_queue_budget(budget);
+        let mut stalled: Vec<_> = (0..3)
+            .map(|i| ng_attach(&core, &format!("stalled{i}"), "10.0.0.1").1)
+            .collect();
+        let (_reader, mut reader_rx) = ng_attach(&core, "reader", "10.0.0.2");
+        let (talker, mut talker_rx) = ng_attach(&core, "talker", "10.0.0.3");
+        for rx in stalled.iter_mut() {
+            while rx.try_recv().is_ok() {}
+        }
+        let line = "x".repeat(1000);
+        let mut sent = 0;
+        while !stalled.iter().all(Events::lagged) {
+            core.chat_public(talker, line.clone(), 0, None).unwrap();
+            sent += 1;
+            while talker_rx.try_recv().is_ok() {}
+            while reader_rx.try_recv().is_ok() {}
+            assert!(
+                core.queue_budget().held() <= budget + 2 * line.len() + 512,
+                "held to the budget"
+            );
+            assert!(sent < 1000, "never cut off by the budget");
+        }
+        // Each was far inside its own bounds when it went.
+        assert!(sent * 1100 < LIVE_QUEUE_BYTES && sent < LIVE_QUEUE_CAP);
+        assert!(!reader_rx.lagged() && !talker_rx.lagged());
+        // And what they held goes back once their connections end.
+        let uids: Vec<Uid> = core.snapshot().iter().map(|u| u.uid).collect();
+        drop(stalled);
+        for uid in uids {
+            if core.is_lagging(uid) {
+                core.end_session(uid);
+            }
+        }
+        assert!(core.queue_budget().held() < 4096);
+    }
+
+    /// A detached session's buffer draws on the budget too, and past it
+    /// breaks, as it does past its count: the resume is a resync.
+    #[test]
+    fn a_detached_buffer_past_the_server_budget_breaks() {
+        let core = Core::new().with_queue_budget(16 << 10);
+        let (away, _away_rx) = ng_attach(&core, "away", "10.0.0.1");
+        let (talker, mut talker_rx) = ng_attach(&core, "talker", "10.0.0.2");
+        assert!(core.connection_lost(away, 2));
+        let line = "x".repeat(1000);
+        for _ in 0..(OUTBOX_BUFFER_CAP / 4) {
+            core.chat_public(talker, line.clone(), 0, None).unwrap();
+            while talker_rx.try_recv().is_ok() {}
+        }
+        let c = core.census();
+        assert_eq!((c.detached, c.broken, c.buffered), (1, 1, 0));
+        assert!(core.queue_budget().held() < 4096, "the buffer gave it back");
+        assert!(matches!(core.resume(away, 0), Resume::ResyncRequired(_)));
     }
 
     #[test]

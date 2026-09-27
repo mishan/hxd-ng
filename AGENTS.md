@@ -175,8 +175,14 @@ channel and signals the connection, and the frontend drops it as
 `slow_consumer`, mid-send if need be), the classic writer's queue
 (bytes), and each classic write (no progress for a minute). One client
 that stops reading must cost the server a bounded amount and everyone
-else nothing; `crates/hxd/tests/slow_consumer.rs` is the check. Two
-corollaries. A lag is the *connection's*, not the session's: `Events`
+else nothing; `crates/hxd/tests/slow_consumer.rs` is the check. And a
+bound per connection is that bound times the connections, so the
+live channels, the classic writers' queues and the detached sessions'
+buffers also draw a `Share` of one server-wide `QueueBudget`
+(`hxd_core::budget`, `[server] queue_budget_mb`): past it, a queue
+holding more than the queues do on average is dropped the same way,
+and a detached buffer breaks. A new queue that can grow with a
+client's backlog draws on it too. Two corollaries. A lag is the *connection's*, not the session's: `Events`
 carries it, and `connection_lost_from` refuses a connection that has
 been taken over, so an old connection never detaches the new one. And
 no domain operation may push a session anywhere near the cap in one
@@ -232,7 +238,9 @@ Three layers, all `cargo test --workspace`:
   would), `slow_consumer.rs` (a room flooded while one client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the
-  ng one resumes into a resync) and `metrics.rs` (`GET
+  ng one resumes into a resync; and clients each inside their own
+  bounds dropped once together they pass the server's budget) and
+  `metrics.rs` (`GET
   /metrics` from a config's `[metrics]`:
   a scrape that accounts for a client on each wire and for their
   leaving, and the scrapes it refuses — built only with

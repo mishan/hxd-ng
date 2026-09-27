@@ -105,7 +105,7 @@ a scrape's own render.
 | `hxd_fanout_recipients` | `event` | how many that was |
 | `hxd_events_pushed_total` | `sink` | `live` onto a connection, `buffered` for a detached session, `dropped` and lost to it (a broken buffer, or a connection cut off for falling behind), `closed` when nobody reads the channel (a connection on its way out, or the server account) |
 | `hxd_outbox_broken_total` | | detached buffers that overflowed |
-| `hxd_outbox_lagged_total` | | attached sessions whose client fell a whole channel behind (8192 events or 16 MiB) and was cut off |
+| `hxd_outbox_lagged_total` | `bound` | attached sessions whose client fell behind and was cut off: `count` for a whole channel (8192 events), `own` for its 16 MiB, `server` for more than the queues hold on average once the server's budget was spent |
 | `hxd_voice_media_seconds` | `op` | each call into the SFU, all made under the roster lock |
 
 A fan-out runs under the roster lock, and so does its recording: once
@@ -140,8 +140,9 @@ the door, `handshake` and `login` for a connection that never got a
 session, `kicked`, `logout`, `replaced`,
 `send_failed`, `pong_deadline`, and `slow_consumer` for a client that
 stopped taking what was sent to it: a classic writer's queue past its
-bound or a write that made no progress for a minute, or either wire's
-session a whole channel behind.
+bound or a write that made no progress for a minute, either wire's
+session a whole channel behind, or either wire's queue among the
+furthest behind once the server's budget is spent (below).
 
 ### Read at scrape time
 
@@ -152,12 +153,34 @@ session a whole channel behind.
 | `hxd_detached_broken` | | detached sessions whose buffer has broken |
 | `hxd_sessions_lagging` | | attached sessions cut off for falling behind, not yet gone (counted in `attached` too) |
 | `hxd_private_chats` | | rooms open |
+| `hxd_queue_budget_bytes` | `of` | what every connection's queues hold together (`held`), against `[server] queue_budget_mb` (`limit`) |
+| `hxd_live_queued_events` | | events waiting in attached connections' channels |
+| `hxd_live_queued_bytes` | `of` | what those weigh, `sum` and `max` |
 | `hxd_process_open_fds`, `hxd_process_resident_bytes` | | from `/proc` |
 | `hxd_runtime_workers`, `hxd_runtime_alive_tasks`, `hxd_runtime_global_queue_depth` | | tokio's stable runtime metrics |
 
 A server nobody is on reads zero attached and zero detached, with or
 without a server account. That is the load harness's check for ghosts
 after its clients have gone.
+
+**The budget.** The queues that grow with a client's backlog, the live
+channels, the classic writers' queues and the detached sessions'
+buffers, draw on one server-wide budget as well as having their own
+bounds: a per-connection bound is that bound times the
+connections, and a login storm held gigabytes without any one queue
+near its own. Past the budget, a queue that holds more than the queues
+do on average is cut off as a slow consumer, which is the connections
+furthest behind and not one in the middle of a burst; a detached
+buffer breaks, and its resume is a resync. A queue that had kept up
+may still take one large item, such as the user list of a crowded
+server. The sizes are the
+queues' own estimates (an event's weight, a frame's wire length); what
+the allocator holds for them runs to a few times as much, so size
+`queue_budget_mb` to a fraction of the memory the server may use.
+
+Histograms keep their samples until they are folded into buckets, which
+a scrape does and so does a clock, every few seconds: a server nobody
+scraped used to hold every sample since the last scrape.
 
 ## 3. Profiling
 

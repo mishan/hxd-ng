@@ -102,6 +102,9 @@ mod recorder {
 
     static INSTALLED: Mutex<Option<PrometheusHandle>> = Mutex::new(None);
 
+    /// How often histogram samples are folded into their buckets.
+    const UPKEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
     /// The process's recorder, installed on first use. One per process
     /// because the `metrics` facade has one global recorder; every server
     /// a test starts in one process shares it, which is also true of the
@@ -123,6 +126,20 @@ mod recorder {
             .build_recorder();
         let handle = recorder.handle();
         metrics::set_global_recorder(recorder).map_err(|e| format!("metrics recorder: {e}"))?;
+        // A histogram keeps every sample until upkeep folds it into the
+        // buckets, and a scrape is not the only upkeep there must be: a
+        // server nobody scraped for a while held every lock hold and every
+        // socket write since, which under load is millions of samples a
+        // minute. So it is folded on a clock too, whether or not anyone
+        // is looking.
+        let upkeep = handle.clone();
+        std::thread::Builder::new()
+            .name("metrics-upkeep".into())
+            .spawn(move || loop {
+                std::thread::sleep(UPKEEP_EVERY);
+                upkeep.run_upkeep();
+            })
+            .map_err(|e| format!("metrics upkeep: {e}"))?;
         *installed = Some(handle.clone());
         Ok(handle)
     }
@@ -163,6 +180,28 @@ impl MetricsSource for Source {
             c.buffered_max as f64,
         );
         gauge("hxd_private_chats", &[], c.chats as f64);
+        let budget = self.core.queue_budget();
+        gauge(
+            "hxd_queue_budget_bytes",
+            &[("of", "held")],
+            budget.held() as f64,
+        );
+        gauge(
+            "hxd_queue_budget_bytes",
+            &[("of", "limit")],
+            budget.limit() as f64,
+        );
+        gauge("hxd_live_queued_events", &[], c.live as f64);
+        gauge(
+            "hxd_live_queued_bytes",
+            &[("of", "sum")],
+            c.live_bytes as f64,
+        );
+        gauge(
+            "hxd_live_queued_bytes",
+            &[("of", "max")],
+            c.live_bytes_max as f64,
+        );
 
         if let Some(fds) = open_fds() {
             gauge("hxd_process_open_fds", &[], fds as f64);

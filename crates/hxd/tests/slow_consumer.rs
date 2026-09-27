@@ -1,6 +1,7 @@
 //! A client that stops reading is disconnected, and costs everyone else
-//! nothing: the classic wire's bounded write queue, and the domain's
-//! bounded live channel behind the ng wire (`LIVE_QUEUE_CAP`).
+//! nothing: the classic wire's bounded write queue, the domain's
+//! bounded live channel behind the ng wire (`LIVE_QUEUE_CAP`), and the
+//! budget they share (`[server] queue_budget_mb`).
 //!
 //! Each case floods a room from a classic talker while one client reads
 //! everything and another reads nothing at all, then checks that the
@@ -37,8 +38,15 @@ struct Server {
 }
 
 async fn start(dir: &Path) -> Server {
+    start_with(dir, "").await
+}
+
+/// With `server` lines for the config's `[server]` section.
+async fn start_with(dir: &Path, server: &str) -> Server {
     let d = dir.display();
-    let text = format!("[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n");
+    let text = format!(
+        "[server]\n{server}\n[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n"
+    );
     let path = dir.join("hxd-ng.toml");
     std::fs::write(&path, &text).unwrap();
     let config = hxd::Config::load(&path).unwrap();
@@ -132,6 +140,17 @@ fn line_number(text: &str) -> Option<usize> {
 /// stays open afterwards: closed with its echoes unread, it would be
 /// reset, and the reset takes its last lines with it.
 async fn flood(talker: TcpStream, n: usize) -> tokio::net::tcp::OwnedWriteHalf {
+    flood_paced(talker, n, None).await
+}
+
+/// [`flood`], pausing a moment every `pace` lines: a room busy enough to
+/// bury a client that reads nothing, and slow enough that one that reads
+/// everything is never behind.
+async fn flood_paced(
+    talker: TcpStream,
+    n: usize,
+    pace: Option<usize>,
+) -> tokio::net::tcp::OwnedWriteHalf {
     let (mut rd, mut wr) = talker.into_split();
     tokio::spawn(async move {
         let mut sink = vec![0u8; 64 * 1024];
@@ -142,6 +161,9 @@ async fn flood(talker: TcpStream, n: usize) -> tokio::net::tcp::OwnedWriteHalf {
         let text = format!("line {i} {pad}");
         let frame = pack_frame(HDR_CHAT, i as u32, 0, &[(tag::BODY, text.into_bytes())]);
         wr.write_all(&frame).await.unwrap();
+        if pace.is_some_and(|p| i % p == 0) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
     wr
 }
@@ -327,4 +349,68 @@ async fn ng_case() {
     };
     let seq = synced["ok"]["seq"].as_u64().unwrap();
     assert!(seq > last_seq, "sync at {seq}, having had {last_seq}");
+}
+
+/// Clients each far inside their own bounds are dropped all the same
+/// once what the server holds for them together passes its budget
+/// (`[server] queue_budget_mb`), and the room goes on as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn stalled_clients_past_the_servers_budget_are_dropped() {
+    timeout(PROMPTLY, budget_case())
+        .await
+        .expect("the stalled clients were not dropped promptly");
+}
+
+async fn budget_case() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start_with(td.path(), "queue_budget_mb = 4").await;
+    // Well short of any one connection's bounds, socket buffers or not:
+    // without the budget nobody is dropped.
+    let n = 2000;
+
+    let mut stalled = Vec::new();
+    for i in 0..4 {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/ng", server.ng))
+            .await
+            .unwrap();
+        let login = json!({ "id": 1, "req": "login", "params": { "nick": format!("stalled{i}") } });
+        ws.send(Message::Text(login.to_string())).await.unwrap();
+        loop {
+            let Message::Text(t) = ws.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["reply"] == 1 {
+                assert!(v.get("ok").is_some(), "{v}");
+                break;
+            }
+        }
+        stalled.push(ws);
+    }
+    let reader = listen(classic(server.legacy, "reader").await, n + 1);
+    let talker = classic(server.legacy, "talker").await;
+    let talking = tokio::spawn(flood_paced(talker, n, Some(2)));
+    let (heard, _) = timeout(Duration::from_secs(30), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_all_in_order(&heard, n);
+
+    // Now each stalled client reads: some of the room, then the end.
+    for (i, mut ws) in stalled.into_iter().enumerate() {
+        let mut lines = 0usize;
+        let closed = loop {
+            match timeout(Duration::from_secs(5), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    lines += usize::from(t.contains("\"ev\":\"chat\""));
+                }
+                Ok(Some(Ok(Message::Close(_))) | None | Some(Err(_))) => break true,
+                Ok(Some(Ok(_))) => {}
+                Err(_) => break false,
+            }
+        };
+        assert!(closed, "stalled{i} was kept, having heard {lines} lines");
+        assert!(lines < n, "stalled{i} heard {lines} of {n} lines");
+    }
+    drop(talking);
 }

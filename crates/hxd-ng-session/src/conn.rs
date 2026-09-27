@@ -616,7 +616,12 @@ async fn handle_login(
         .await;
         return None;
     };
-    let users: Vec<_> = ctx.core.snapshot().iter().map(user_json).collect();
+    // The roster here, before anything is awaited, so it is the roster
+    // the events from seq 1 change (docs/hotline-ng.md §6.1). Kept as
+    // the domain's own records and made JSON only at the end: a login
+    // storm holding a JSON tree of every user for each login waiting on
+    // the blocking pool below held gigabytes.
+    let users = ctx.core.snapshot();
     let detach = if account.can_detach {
         json!({ "grace": ctx.cfg.grace.as_secs() })
     } else {
@@ -691,7 +696,6 @@ async fn handle_login(
         "token": token,
         "self": me_json,
         "server": server,
-        "users": users,
         "detach": detach,
         // Always present, empty when this build offers no extensions:
         // absent and empty mean the same thing, and one shape is one
@@ -776,6 +780,8 @@ async fn handle_login(
     if let Some(banner) = ctx.banner.as_deref() {
         ok["banner"] = crate::banner::login_json(banner);
     }
+    ok["users"] = users.iter().map(user_json).collect();
+    drop(users);
     if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
         // The client never learned it was logged in; a ghost session with
         // no transport (and a leaked token) must not linger.
