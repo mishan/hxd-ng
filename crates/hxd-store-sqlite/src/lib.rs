@@ -523,11 +523,15 @@ fn checkpoint(conn: &Connection, state: &mut CheckpointState) {
     // (busy, pages in the log, pages copied back)
     let wal = |mode: &str| {
         conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |r| {
-            Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?))
+            Ok((
+                r.get::<_, i64>(0)? != 0,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })
     };
-    let pages = match wal("PASSIVE") {
-        Ok((_, pages)) => pages,
+    let (pages, copied) = match wal("PASSIVE") {
+        Ok((_, pages, copied)) => (pages, copied),
         Err(e) => {
             tracing::warn!("sqlite checkpoint: {e}");
             return;
@@ -542,25 +546,36 @@ fn checkpoint(conn: &Connection, state: &mut CheckpointState) {
     // copies what arrived since the PASSIVE one, waits for any reader
     // still on the old log, and empties it.
     //
-    // It waits holding the write lock, so it waits for at most
-    // `REWIND_WAIT`: a reader outside this server — an operator's shell,
-    // a backup — can hold a snapshot for as long as it likes, and every
-    // commit, public chat's included, would wait with it. Refused, it is
-    // counted and not tried again for `REWIND_BACKOFF`; the log goes on
-    // growing meanwhile, which costs disk and not a stall.
+    // It holds the write lock for all of that, so it is only tried when
+    // the PASSIVE pass copied everything back. A pass cannot copy past a
+    // page some reader still reads the old version of, so a pass that
+    // fell short means a reader outside this server — an operator's
+    // shell, a backup — is holding a snapshot as long as it likes, and a
+    // rewind would hold every commit, public chat's included, while it
+    // copied, synced and waited. Nothing is tried then: the log goes on
+    // growing, which costs disk and not a stall, and the refusal is
+    // counted. And a rewind that is tried waits `REWIND_WAIT` at most for
+    // a reader that arrived since, then backs off for `REWIND_BACKOFF`.
+    if pages < state.rewind_pages {
+        return;
+    }
+    if copied < pages {
+        hxd_core::instrument::checkpoint_busy(&state.db);
+        return;
+    }
     let due = state
         .rewind_after
         .is_none_or(|at| std::time::Instant::now() >= at);
-    if pages < state.rewind_pages || !due {
+    if !due {
         return;
     }
     let took = hxd_core::instrument::Timer::start();
     match wal("TRUNCATE") {
-        Ok((false, _)) => {
+        Ok((false, ..)) => {
             state.rewind_after = None;
             hxd_core::instrument::checkpoint(&state.db, "rewind", took, 0);
         }
-        Ok((true, _)) | Err(_) => {
+        Ok((true, ..)) | Err(_) => {
             state.rewind_after = Some(std::time::Instant::now() + REWIND_BACKOFF);
             hxd_core::instrument::checkpoint_busy(&state.db);
             tracing::debug!("sqlite checkpoint: a reader kept the log from being rewound");
