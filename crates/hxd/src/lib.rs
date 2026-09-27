@@ -2365,8 +2365,24 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         Some(p) => Some(open(p, inbox_sync)? as Arc<dyn hxd_core::MessageStore>),
         None => None,
     };
+    // Public chat gets a connection of its own, on a shared file too:
+    // every line is committed under the log's lock, and on the shared
+    // connection it waited behind whatever else the file was doing — a
+    // news search, an inbox flush, a report listing — for as long as that
+    // took. With a connection of its own it waits only for another write
+    // to commit, which is what SQLite serializes; reads never block it.
+    // `synchronous` is a connection's, not a file's: the inbox's where
+    // the two share a file, which is what the shared connection had.
     let history = match &history_path {
-        Some(p) => Some(open(p, Synchronous::Normal)? as Arc<dyn hxd_core::ChatLog>),
+        Some((path, key)) => {
+            let shares_inbox = inbox_path.as_ref().is_some_and(|(_, k)| k == key);
+            let sync = if shares_inbox {
+                inbox_sync
+            } else {
+                Synchronous::Normal
+            };
+            Some(open_sqlite(path, sync)? as Arc<dyn hxd_core::ChatLog>)
+        }
         None => None,
     };
     let news = match &news_path {
@@ -3392,7 +3408,9 @@ sync = "full"
 
     #[cfg(feature = "inbox")]
     #[test]
-    fn inbox_and_history_share_one_store_when_their_path_is_shared() {
+    fn the_chat_log_has_a_connection_of_its_own_on_a_shared_file() {
+        use hxd_core::history::{HistoryQuery, NewLine};
+        use hxd_core::inbox::Mailbox;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.sqlite");
         let cfg = parse(&format!(
@@ -3403,11 +3421,38 @@ sync = "full"
         let stores = open_runtime_stores(&cfg).unwrap();
         let inbox = stores.inbox.unwrap();
         let history = stores.history.unwrap();
-        assert_eq!(
+        assert_ne!(
             Arc::as_ptr(&inbox) as *const (),
             Arc::as_ptr(&history) as *const (),
-            "one SQLite object must own the shared schema and connection"
+            "public chat commits on a connection nothing else waits on"
         );
+        // One file, two connections, each writing and reading its own.
+        let id = history
+            .append(&NewLine {
+                channel: 0,
+                from_nick: "n".into(),
+                from_login: None,
+                from_fingerprint: None,
+                icon: 0,
+                text: "hello".into(),
+                flags: Default::default(),
+                at: SystemTime::now(),
+            })
+            .unwrap();
+        let page = history
+            .query(&HistoryQuery {
+                channel: 0,
+                before: None,
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(page.lines.last().map(|l| l.id), Some(id));
+        let bob = Mailbox {
+            login: "bob".into(),
+            fingerprint: None,
+        };
+        assert_eq!(inbox.purge_count(&bob).unwrap(), 0);
     }
 
     #[test]
@@ -3536,8 +3581,9 @@ sync = "full"
         .unwrap();
         let stores = open_runtime_stores(&cfg).unwrap();
         let inbox = Arc::as_ptr(&stores.inbox.unwrap()) as *const ();
-        assert_eq!(inbox, Arc::as_ptr(&stores.history.unwrap()) as *const ());
         assert_eq!(inbox, Arc::as_ptr(&stores.news.unwrap()) as *const ());
+        // Public chat excepted: the file, and a connection of its own.
+        assert_ne!(inbox, Arc::as_ptr(&stores.history.unwrap()) as *const ());
 
         let apart = dir.path().join("news.sqlite");
         let cfg = parse(&format!(
@@ -3561,17 +3607,17 @@ sync = "full"
         let plain = dir.path().join("server.sqlite");
         let dotted = dir.path().join(".").join("server.sqlite");
         let cfg = parse(&format!(
-            "[inbox]\ndb = {:?}\n[history]\ndb = {:?}\n",
+            "[inbox]\ndb = {:?}\n[news]\ndb = {:?}\n",
             plain.to_string_lossy(),
             dotted.to_string_lossy()
         ))
         .unwrap();
         let stores = open_runtime_stores(&cfg).unwrap();
         let inbox = stores.inbox.unwrap();
-        let history = stores.history.unwrap();
+        let news = stores.news.unwrap();
         assert_eq!(
             Arc::as_ptr(&inbox) as *const (),
-            Arc::as_ptr(&history) as *const (),
+            Arc::as_ptr(&news) as *const (),
             "equivalent paths must not create two schema owners"
         );
         assert_eq!(

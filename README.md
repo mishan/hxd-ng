@@ -641,8 +641,9 @@ database.
 ### Chat history
 
 Absent means no server-held scrollback. When `db` is omitted, history uses
-the inbox database and shares its SQLite connection; without an inbox it is
-required. See [docs/chat-history.md](docs/chat-history.md).
+the inbox database; without an inbox it is required. Either way public chat
+is written on a connection of its own, so the inbox, news and moderation
+never hold it up. See [docs/chat-history.md](docs/chat-history.md).
 
 ```toml
 [history]
@@ -657,8 +658,8 @@ replay = 0                # plain chat lines replayed to old legacy clients
 
 Absent means no news: the ng wire never offers the `news` cap, and a news
 request is answered the way a server without the feature answers it. When
-`db` is omitted, news uses the database `[inbox]` or `[history]` names and
-shares its SQLite connection; with neither it is required. A 1.5 client
+`db` is omitted, news uses the database `[inbox]` or `[history]` names, on
+the inbox's connection where there is one; with neither it is required. A 1.5 client
 browses the same tree over the threaded-news transactions, reading a
 markdown article's plain-text part. A 1.2 client reads and posts into the
 one category `flat_category` names, rendered newest first as a single
