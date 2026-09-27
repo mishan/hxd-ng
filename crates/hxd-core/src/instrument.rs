@@ -311,6 +311,13 @@ pub fn checkpoint_busy(db: &str) {
     let _ = db;
 }
 
+/// A login refused because the server was already working on as many as
+/// it takes (`Core::admit_login`).
+pub fn login_refused_busy() {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_logins_refused_busy_total").increment(1);
+}
+
 /// A detached session's buffer overflowed; its resume will be a resync.
 pub fn outbox_broken() {
     #[cfg(feature = "metrics")]
@@ -367,6 +374,14 @@ pub enum Kind<'a> {
 /// One frame on a wire. The caller passes a [`Kind`] the server knows,
 /// or `Name("other")`: see the module note on label values.
 pub fn frame(wire: &'static str, dir: Dir, kind: Kind<'_>, bytes: usize) {
+    frames(wire, dir, kind, 1, bytes);
+}
+
+/// `count` frames of one kind, `bytes` between them: what one write of a
+/// batch records, once per kind in it rather than once per frame, since
+/// finding a labeled counter is the cost here and a login storm writes
+/// millions of frames.
+pub fn frames(wire: &'static str, dir: Dir, kind: Kind<'_>, count: usize, bytes: usize) {
     #[cfg(feature = "metrics")]
     {
         let dir = match dir {
@@ -378,12 +393,12 @@ pub fn frame(wire: &'static str, dir: Dir, kind: Kind<'_>, bytes: usize) {
             Kind::Type(ty) => ty.to_string(),
         };
         metrics::counter!("hxd_frames_total", "wire" => wire, "dir" => dir, "type" => kind)
-            .increment(1);
+            .increment(count as u64);
         metrics::counter!("hxd_frame_bytes_total", "wire" => wire, "dir" => dir)
             .increment(bytes as u64);
     }
     #[cfg(not(feature = "metrics"))]
-    let _ = (wire, dir, kind, bytes);
+    let _ = (wire, dir, kind, count, bytes);
 }
 
 /// From the first byte of a connection to a session on the roster.

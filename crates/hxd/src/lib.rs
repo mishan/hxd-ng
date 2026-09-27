@@ -1430,6 +1430,10 @@ pub struct ServerSection {
     /// furthest behind are dropped as slow consumers.
     #[serde(default = "default_queue_budget_mb")]
     pub queue_budget_mb: usize,
+    /// Logins the server works on at once; past it a login is refused
+    /// as busy rather than queued (`hxd_core::LOGINS_IN_FLIGHT`).
+    #[serde(default = "default_logins_in_flight")]
+    pub logins_in_flight: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1463,6 +1467,9 @@ fn default_accounts() -> PathBuf {
 }
 fn default_stamp_queued() -> bool {
     true
+}
+fn default_logins_in_flight() -> usize {
+    hxd_core::LOGINS_IN_FLIGHT
 }
 fn default_queue_budget_mb() -> usize {
     hxd_core::QUEUE_BUDGET >> 20
@@ -1504,6 +1511,7 @@ impl Default for ServerSection {
             mark_cleartext: false,
             stamp_queued: default_stamp_queued(),
             queue_budget_mb: default_queue_budget_mb(),
+            logins_in_flight: default_logins_in_flight(),
         }
     }
 }
@@ -2135,6 +2143,11 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     }
     if let Some(identity) = &config.identity {
         identity.revocations()?;
+    }
+    if config.server.logins_in_flight == 0
+        || config.server.logins_in_flight > tokio::sync::Semaphore::MAX_PERMITS
+    {
+        return Err("[server] logins_in_flight must be at least 1, and not absurd".into());
     }
     if config.server.queue_budget() == 0 {
         return Err(
@@ -2969,6 +2982,7 @@ pub fn build_ctx(
         Some(v) => {
             let core = Core::new()
                 .with_queue_budget(budget)
+                .with_logins_in_flight(config.server.logins_in_flight)
                 .with_voice(v.media(), v.max_per_room());
             // `with_video` is a no-op without a media layer, so the
             // dependency holds even if this ordering ever changes.
@@ -2983,7 +2997,9 @@ pub fn build_ctx(
                 core
             }
         }
-        None => Core::new().with_queue_budget(budget),
+        None => Core::new()
+            .with_queue_budget(budget)
+            .with_logins_in_flight(config.server.logins_in_flight),
     };
 
     // The reserved login is refused at the one place every frontend's
