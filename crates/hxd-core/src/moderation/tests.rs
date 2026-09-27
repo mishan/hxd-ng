@@ -107,6 +107,8 @@ struct Who {
     identity: Option<[u8; 32]>,
     person: bool,
     addr: Option<std::net::IpAddr>,
+    /// On the classic wire, which cannot take a line back.
+    classic: bool,
 }
 
 fn person(login: &'static str) -> Who {
@@ -117,6 +119,7 @@ fn person(login: &'static str) -> Who {
         identity: None,
         person: true,
         addr: None,
+        classic: false,
     }
 }
 
@@ -147,6 +150,7 @@ fn attach(core: &Core, who: Who) -> (Uid, Events) {
             can_detach: false,
             transport: Transport {
                 inline_media: true,
+                redactions: !who.classic,
                 ..Default::default()
             },
             has_inbox: who.person,
@@ -261,8 +265,16 @@ fn a_redacted_line_keeps_its_id_and_loses_its_words_everywhere() {
             ..person("mute")
         },
     );
+    let (_erin, mut erin_rx) = attach(
+        &s.core,
+        Who {
+            classic: true,
+            ..person("erin")
+        },
+    );
     let line = say(&s.core, bob, "a slur");
     drain(&mut dave_rx);
+    drain(&mut erin_rx);
     s.core
         .redact_line(Actor::Session(carol), line, "slur")
         .unwrap();
@@ -274,6 +286,12 @@ fn a_redacted_line_keeps_its_id_and_loses_its_words_everywhere() {
     assert!(
         redactions(drain(&mut mute_rx)).is_empty(),
         "someone who never reads chat is not"
+    );
+    // Nor is a classic reader, whose wire cannot take the line back: an
+    // event it would drop unread would only take room in its channel.
+    assert!(
+        redactions(drain(&mut erin_rx)).is_empty(),
+        "a reader who cannot blank the line is not"
     );
 
     let (acts, more) = s

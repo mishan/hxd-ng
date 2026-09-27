@@ -1024,7 +1024,9 @@ impl Core {
         }
         let mut r = self.roster.lock().unwrap();
         for id in gone {
-            r.broadcast_where(&Event::ChatRedacted { id }, None, reads_public_chat);
+            r.broadcast_where(&Event::ChatRedacted { id }, None, |s| {
+                reads_public_chat(s) && s.info.transport.redactions
+            });
         }
         Ok(())
     }

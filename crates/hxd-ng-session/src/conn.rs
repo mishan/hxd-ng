@@ -118,8 +118,9 @@ enum Exit {
     ConnectionLost(&'static str),
     /// Clean logout or kick → session already ended; registry cleaned.
     SessionOver(&'static str),
-    /// The outbox channel closed under us: another connection took the
-    /// session over (or it ended elsewhere). Not ours anymore.
+    /// The outbox channel closed under us, and not because this
+    /// connection lagged: another connection took the session over (or it
+    /// ended elsewhere). Not ours anymore.
     Replaced,
 }
 
@@ -195,6 +196,7 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
     // hands them up), so a client that talks at all never sees this.
     let mut heard = tokio::time::Instant::now();
 
+    let lag = events.lag();
     let exit = loop {
         tokio::select! {
             // Biased, events first: a reply must never overtake an event
@@ -209,12 +211,29 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
             // requests (including the ping tick). Each write is bounded by
             // the pong deadline, though, so a dead peer still ends after at
             // most the buffered backlog plus that deadline.
+            //
+            // A client the domain has cut off for falling behind goes at
+            // once, ahead of everything, rather than after the events
+            // already queued for it have been pushed at a socket that is
+            // not taking them.
             biased;
+            _ = lag.wait() => {
+                info!(uid = state.uid, "not keeping up; disconnecting");
+                break Exit::ConnectionLost("slow_consumer");
+            }
             ev = events.recv() => match ev {
                 Some(se) => {
                     instrument::queue_depth(WIRE, events.len());
                     let kicked = matches!(se.event, hxd_core::Event::Kicked);
-                    let sent = send_frame(&mut ws_tx, Message::Text(event_json(&se))).await;
+                    // The cut can come while this send is blocked on the
+                    // very client it is about.
+                    let sent = tokio::select! {
+                        sent = send_frame(&mut ws_tx, Message::Text(event_json(&se))) => sent,
+                        _ = lag.wait() => {
+                            info!(uid = state.uid, "not keeping up; disconnecting");
+                            break Exit::ConnectionLost("slow_consumer");
+                        }
+                    };
                     // A kick ends the session whether or not the client
                     // heard about it: failing the send is no way to stay.
                     if kicked {
@@ -226,9 +245,9 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                     }
                 }
                 // Closed by the domain: another connection took the
-                // session over, or this client fell a whole channel
-                // behind (`LIVE_QUEUE_CAP`) and is to be dropped.
-                None if ctx.core.is_lagging(state.uid) => {
+                // session over, or this one fell a whole channel behind
+                // (`LIVE_QUEUE_CAP`) and is to be dropped.
+                None if events.lagged() => {
                     info!(uid = state.uid, "not keeping up; disconnecting");
                     break Exit::ConnectionLost("slow_consumer");
                 }
@@ -288,14 +307,19 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
     );
     match exit {
         Exit::ConnectionLost(_) => {
-            let survived = ctx
+            // Asked as this connection: one that was taken over while it
+            // drained, and then failed, must not detach the session out
+            // from under the connection that holds it now.
+            match ctx
                 .core
-                .connection_lost(state.uid, ctx.cfg.max_detached_per_addr);
-            if survived {
-                info!(uid = state.uid, "ng session detached");
-            } else {
-                ctx.registry.remove(&state.session_id);
-                info!(uid = state.uid, "ng session ended (no detach)");
+                .connection_lost_from(&events, state.uid, ctx.cfg.max_detached_per_addr)
+            {
+                Some(true) => info!(uid = state.uid, "ng session detached"),
+                Some(false) => {
+                    ctx.registry.remove(&state.session_id);
+                    info!(uid = state.uid, "ng session ended (no detach)");
+                }
+                None => info!(uid = state.uid, "ng connection lost after a takeover"),
             }
         }
         Exit::SessionOver(_) => {
@@ -506,6 +530,8 @@ async fn handle_login(
         // `downstream`). A client may make itself look less safe than it
         // is, never more, and the `/trtp` path already honoured this.
         transport: hxd_core::Transport {
+            // Blanking a rendered line is part of this wire.
+            redactions: true,
             encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
             identity: identity.map(TransportIdentity::tag),
             // Always, when the server has a pipeline at all: an ng
@@ -1036,7 +1062,7 @@ async fn handle_sync(
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                return if ctx.core.is_lagging(state.uid) {
+                return if events.lagged() {
                     Flow::Lagged
                 } else {
                     Flow::Replaced

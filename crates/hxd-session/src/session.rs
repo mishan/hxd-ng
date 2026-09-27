@@ -333,7 +333,7 @@ const MAX_SEND_QUEUE: usize = 4 << 20;
 const WRITE_STALL: Duration = Duration::from_secs(60);
 
 /// How long a finished session's writer gets to send what is still
-/// queued — a kick's message, say — before it is stopped.
+/// queued — the last replies and pushes — before it is stopped.
 const WRITER_FLUSH: Duration = Duration::from_secs(5);
 
 /// The sending side of a connection: the writer's queue, and what the
@@ -2083,12 +2083,13 @@ async fn session_loop(
                     }
                 }
                 // The domain closed the stream: this client fell a whole
-                // channel behind (`LIVE_QUEUE_CAP`). A classic session
-                // cannot be taken over, so nothing else closes it.
-                None => {
+                // channel behind (`LIVE_QUEUE_CAP`), or the session was
+                // ended elsewhere.
+                None if events.lagged() => {
                     info!(uid = sess.uid, "not keeping up; disconnecting");
                     return Some("slow_consumer");
                 }
+                None => return Some("replaced"),
             },
             _ = tx.backlog.lagged.notified() => {
                 info!(uid = sess.uid, "not keeping up; disconnecting");

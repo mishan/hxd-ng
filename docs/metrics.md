@@ -103,7 +103,7 @@ a scrape's own render.
 |---|---|---|
 | `hxd_fanout_seconds` | `event` | one event delivered to every session it reaches, under the roster lock |
 | `hxd_fanout_recipients` | `event` | how many that was |
-| `hxd_events_pushed_total` | `sink` | `live` onto a connection, `buffered` for a detached session, `dropped` by a broken buffer |
+| `hxd_events_pushed_total` | `sink` | `live` onto a connection, `buffered` for a detached session, `dropped` and lost to it (a broken buffer, or a connection cut off for falling behind), `closed` when nobody reads the channel (a connection on its way out, or the server account) |
 | `hxd_outbox_broken_total` | | detached buffers that overflowed |
 | `hxd_outbox_lagged_total` | | attached sessions whose client fell a whole channel behind and was cut off |
 | `hxd_voice_media_seconds` | `op` | each call into the SFU, all made under the roster lock |

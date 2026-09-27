@@ -59,8 +59,100 @@ pub const OUTBOX_BUFFER_CAP: usize = 512;
 /// ordinary backlog.
 pub const LIVE_QUEUE_CAP: usize = 8192;
 
-/// A session's event stream, as the frontend attached to it reads it.
-pub type Events = mpsc::Receiver<SeqEvent>;
+/// A session's event stream, as the one connection attached to it reads
+/// it: the channel, and the connection's own signal that the domain has
+/// cut it off for falling behind.
+///
+/// **The signal is the connection's, not the session's.** A session
+/// outlives its connections — a resume attaches a new one and the old one
+/// drains what it was sent and ends — so "is this session lagging?" can be
+/// the new connection's news reaching the old one. Each attach and resume
+/// makes a fresh `Events`, and every question a frontend asks about its
+/// own connection ([`Events::lagged`], [`Core::connection_lost_from`])
+/// goes through it.
+pub struct Events {
+    rx: mpsc::Receiver<SeqEvent>,
+    conn: Arc<ConnState>,
+}
+
+/// What one connection shares with its session's sink.
+#[derive(Default)]
+pub(crate) struct ConnState {
+    lagged: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ConnState {
+    fn lag(&self) {
+        self.lagged
+            .store(true, std::sync::atomic::Ordering::Release);
+        // A stored permit: the frontend may not be waiting right now.
+        self.notify.notify_one();
+    }
+}
+
+impl Events {
+    fn channel() -> (mpsc::Sender<SeqEvent>, Arc<ConnState>, Events) {
+        let (tx, rx) = mpsc::channel(LIVE_QUEUE_CAP);
+        let conn = Arc::new(ConnState::default());
+        (tx, conn.clone(), Events { rx, conn })
+    }
+
+    /// The next event; `None` once the stream has ended — this connection
+    /// was taken over, or cut off ([`Events::lagged`] says which).
+    pub async fn recv(&mut self) -> Option<SeqEvent> {
+        self.rx.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<SeqEvent, mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    /// Events waiting.
+    pub fn len(&self) -> usize {
+        self.rx.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rx.is_empty()
+    }
+
+    /// Did the domain cut this connection off for falling
+    /// [`LIVE_QUEUE_CAP`] events behind?
+    pub fn lagged(&self) -> bool {
+        self.conn.lagged.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// This connection's lag signal, apart from the channel, for a
+    /// `select!` that also receives from it.
+    pub fn lag(&self) -> Lag {
+        Lag(self.conn.clone())
+    }
+}
+
+/// One connection's signal that the domain has cut it off for falling
+/// behind ([`Events::lag`]).
+#[derive(Clone)]
+pub struct Lag(Arc<ConnState>);
+
+impl Lag {
+    /// Resolves once the connection has been cut off. Cancel-safe, and
+    /// meant for a `select!` beside whatever the connection is blocked on
+    /// — a send to a client that is not reading, most of all — so that the
+    /// cut takes effect at once rather than after the events already
+    /// queued have been pushed at it.
+    pub async fn wait(&self) {
+        loop {
+            // Registered before the check, so a lag between the two is not
+            // missed.
+            let notified = self.0.notify.notified();
+            if self.0.lagged.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 /// A session's presence state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -98,6 +190,16 @@ pub struct Transport {
     /// supports. Everything else about per-recipient capability stays in
     /// the frontends, where each connection's encoder already lives.
     pub inline_media: bool,
+    /// This link can blank a chat line it already rendered, so a
+    /// redaction is worth telling it about.
+    ///
+    /// A classic client cannot: nothing on its wire takes a line back, so
+    /// the classic frontend drops the event unread. Sending it anyway
+    /// costs a slot in the session's bounded channel per line, and a
+    /// purge of thousands of lines is thousands of slots at once — enough
+    /// to cut a period client off over events it would never show. The
+    /// ng frontend sets it; nothing else does.
+    pub redactions: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and
@@ -403,13 +505,13 @@ pub struct SeqEvent {
 /// Where a session's events currently go.
 enum Sink {
     /// A connection is attached; events flow on the channel.
-    Live(mpsc::Sender<SeqEvent>),
+    Live(mpsc::Sender<SeqEvent>, Arc<ConnState>),
     /// A connection is attached, but fell [`LIVE_QUEUE_CAP`] events
     /// behind. Its channel is closed — the frontend sees the stream end
     /// once it has drained what was sent, and asks [`Core::is_lagging`]
     /// why — and every event from here on is lost to it, seq and all. A
     /// resume can therefore only be a resync.
-    Lagged,
+    Lagged(Arc<ConnState>),
     /// Detached: events buffer for replay.
     Buffering {
         /// When the connection was lost (grace accounting).
@@ -432,10 +534,10 @@ pub(crate) struct Outbox {
 }
 
 impl Outbox {
-    fn live(tx: mpsc::Sender<SeqEvent>) -> Self {
+    fn live(tx: mpsc::Sender<SeqEvent>, conn: Arc<ConnState>) -> Self {
         Outbox {
             next_seq: 1,
-            sink: Sink::Live(tx),
+            sink: Sink::Live(tx, conn),
         }
     }
 
@@ -444,18 +546,22 @@ impl Outbox {
         self.next_seq += 1;
         let se = SeqEvent { seq, event };
         match &mut self.sink {
-            Sink::Live(tx) => match tx.try_send(se) {
+            Sink::Live(tx, conn) => match tx.try_send(se) {
                 Ok(()) => instrument::Pushed::Live,
                 Err(TrySendError::Full(_)) => {
+                    let conn = conn.clone();
+                    conn.lag();
                     // Dropping the sender is what closes the channel.
-                    self.sink = Sink::Lagged;
+                    self.sink = Sink::Lagged(conn);
                     instrument::outbox_lagged();
                     instrument::Pushed::Dropped
                 }
-                // The frontend is gone and has not said so yet.
-                Err(TrySendError::Closed(_)) => instrument::Pushed::Dropped,
+                // Nobody reads this channel: a frontend that is gone and
+                // has not said so yet, or the server account, which reads
+                // nothing.
+                Err(TrySendError::Closed(_)) => instrument::Pushed::Closed,
             },
-            Sink::Lagged => instrument::Pushed::Dropped,
+            Sink::Lagged(_) => instrument::Pushed::Dropped,
             Sink::Buffering { buf, broken, .. } => {
                 if *broken {
                     return instrument::Pushed::Dropped;
@@ -1034,7 +1140,7 @@ impl Core {
         let uid = r.next_uid()?;
         r.last_serial += 1;
         let serial = r.last_serial;
-        let (tx, rx) = mpsc::channel(LIVE_QUEUE_CAP);
+        let (tx, conn, rx) = Events::channel();
         r.users.insert(
             uid,
             UserSession {
@@ -1068,7 +1174,7 @@ impl Core {
                 search_tokens: f64::from(self.news_policy.search_per_minute),
                 visible: false,
                 avatar: None,
-                outbox: Outbox::live(tx),
+                outbox: Outbox::live(tx, conn),
             },
         );
         Some((uid, rx))
@@ -1134,6 +1240,10 @@ impl Core {
     /// Returns `true` when the session survives detached.
     pub fn connection_lost(&self, uid: Uid, max_detached_per_addr: usize) -> bool {
         let mut r = self.roster.lock().unwrap();
+        self.lose(&mut r, uid, max_detached_per_addr)
+    }
+
+    fn lose(&self, r: &mut RosterInner, uid: Uid, max_detached_per_addr: usize) -> bool {
         let Some(sess) = r.users.get_mut(&uid) else {
             return false;
         };
@@ -1157,7 +1267,7 @@ impl Core {
         // tail of this departure and nothing else.
         // A connection that lost events to lagging has nothing a resume
         // could replay from: the buffer starts broken.
-        let lagged = matches!(sess.outbox.sink, Sink::Lagged);
+        let lagged = matches!(sess.outbox.sink, Sink::Lagged(_));
         sess.outbox.sink = Sink::Buffering {
             since: Instant::now(),
             start_seq: sess.outbox.next_seq,
@@ -1182,7 +1292,7 @@ impl Core {
                     .filter(|(_, s)| s.addr == Some(addr))
                     .filter_map(|(u, s)| match s.outbox.sink {
                         Sink::Buffering { since, .. } => Some((*u, since)),
-                        Sink::Live(_) | Sink::Lagged => None,
+                        Sink::Live(..) | Sink::Lagged(_) => None,
                     })
                     .collect();
                 if detached.len() <= max_detached_per_addr {
@@ -1209,8 +1319,8 @@ impl Core {
             r.end_session(uid);
             return Resume::Gone;
         }
-        let (tx, rx) = mpsc::channel(LIVE_QUEUE_CAP);
-        let old = std::mem::replace(&mut sess.outbox.sink, Sink::Live(tx));
+        let (tx, conn, rx) = Events::channel();
+        let old = std::mem::replace(&mut sess.outbox.sink, Sink::Live(tx, conn));
         let next_seq = sess.outbox.next_seq;
         let outcome = match old {
             Sink::Buffering {
@@ -1231,7 +1341,7 @@ impl Core {
             // so the old connection sees a closed event stream and shuts
             // down ("last device wins"). Events already sent to the old
             // channel can't be replayed.
-            Sink::Live(_) => {
+            Sink::Live(..) => {
                 if last_seq + 1 == next_seq {
                     Resume::Replayed(rx, Vec::new())
                 } else {
@@ -1239,7 +1349,7 @@ impl Core {
                 }
             }
             // Taking over a connection that lagged: what it lost is lost.
-            Sink::Lagged => Resume::ResyncRequired(rx),
+            Sink::Lagged(_) => Resume::ResyncRequired(rx),
         };
         r.set_status(uid, SessionStatus::Active);
         outcome
@@ -1290,8 +1400,8 @@ impl Core {
                 continue;
             }
             match &sess.outbox.sink {
-                Sink::Live(_) => c.attached += 1,
-                Sink::Lagged => {
+                Sink::Live(..) => c.attached += 1,
+                Sink::Lagged(_) => {
                     c.attached += 1;
                     c.lagging += 1;
                 }
@@ -1316,7 +1426,28 @@ impl Core {
             .unwrap()
             .users
             .get(&uid)
-            .is_some_and(|s| matches!(s.outbox.sink, Sink::Lagged))
+            .is_some_and(|s| matches!(s.outbox.sink, Sink::Lagged(_)))
+    }
+
+    /// [`Core::connection_lost`], asked by the connection that lost it:
+    /// `None`, and nothing done, when `events` is no longer the session's
+    /// connection — it was taken over, and the session belongs to the
+    /// connection that took it. Without this, an old connection that
+    /// failed while draining would detach the new one out from under it.
+    pub fn connection_lost_from(
+        &self,
+        events: &Events,
+        uid: Uid,
+        max_detached_per_addr: usize,
+    ) -> Option<bool> {
+        // One hold of the lock for the look and the act, so that a resume
+        // cannot take the session over in between.
+        let mut r = self.roster.lock().unwrap();
+        let ours = r.users.get(&uid).is_some_and(|s| match &s.outbox.sink {
+            Sink::Live(_, c) | Sink::Lagged(c) => Arc::ptr_eq(c, &events.conn),
+            Sink::Buffering { .. } => false,
+        });
+        ours.then(|| self.lose(&mut r, uid, max_detached_per_addr))
     }
 
     /// Is this session currently detached? (Moderation and tests.)
@@ -1416,6 +1547,15 @@ pub(crate) fn reads_public_chat(sess: &UserSession) -> bool {
 /// paths inside the lock.
 pub(crate) fn is_buffering(sess: &UserSession) -> bool {
     matches!(sess.outbox.sink, Sink::Buffering { .. })
+}
+
+/// Does an event pushed to this session now reach a connection? Not when
+/// it is detached, and not when its connection has been cut off for
+/// falling behind and is on its way out: what is decided on delivery —
+/// mail stamped delivered, a notification skipped — must not be decided
+/// on a sink that drops.
+pub(crate) fn is_live(sess: &UserSession) -> bool {
+    matches!(sess.outbox.sink, Sink::Live(..))
 }
 
 #[cfg(test)]
@@ -1732,6 +1872,70 @@ mod tests {
         assert!(core.connection_lost(slow, 2));
         assert!(!core.is_lagging(slow));
         assert!(matches!(core.resume(slow, last), Resume::ResyncRequired(_)));
+    }
+
+    #[test]
+    fn only_the_connection_that_holds_a_session_can_lose_it() {
+        let core = Core::new();
+        let (uid, old) = ng_attach(&core, "two-devices", "10.0.0.1");
+        // A second connection takes the session over; the first drains
+        // what it was sent and then fails, as a dead socket does.
+        let new = match core.resume(uid, 0) {
+            Resume::Replayed(rx, _) | Resume::ResyncRequired(rx) => rx,
+            Resume::Gone => panic!("the session is there"),
+        };
+        assert_eq!(core.connection_lost_from(&old, uid, 2), None);
+        assert!(
+            !core.is_detached(uid),
+            "the old connection detached the new"
+        );
+        // The new connection's own loss still counts.
+        assert_eq!(core.connection_lost_from(&new, uid, 2), Some(true));
+        assert!(core.is_detached(uid));
+    }
+
+    #[test]
+    fn a_lag_is_the_connections_that_lagged_and_no_other() {
+        let core = Core::new();
+        let (uid, old) = ng_attach(&core, "slow", "10.0.0.1");
+        let (busy, mut busy_rx) = ng_attach(&core, "busy", "10.0.0.2");
+        let new = match core.resume(uid, 0) {
+            Resume::Replayed(rx, _) | Resume::ResyncRequired(rx) => rx,
+            Resume::Gone => panic!("the session is there"),
+        };
+        for i in 0..LIVE_QUEUE_CAP + 10 {
+            core.update(busy, Some(format!("n{i}")), None);
+            while busy_rx.try_recv().is_ok() {}
+        }
+        // The new connection lagged; the old one, taken over before it
+        // saw any of this, did not, and must not read the news as its own.
+        assert!(new.lagged());
+        assert!(!old.lagged());
+        assert_eq!(core.connection_lost_from(&old, uid, 2), None);
+        assert_eq!(core.connection_lost_from(&new, uid, 2), Some(true));
+    }
+
+    #[test]
+    fn a_lag_wakes_whoever_waits_on_it() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let core = Core::new();
+            let (_slow, rx) = ng_attach(&core, "slow", "10.0.0.1");
+            let (busy, mut busy_rx) = ng_attach(&core, "busy", "10.0.0.2");
+            let lag = rx.lag();
+            let waiting = tokio::time::timeout(std::time::Duration::from_millis(50), lag.wait());
+            assert!(waiting.await.is_err(), "no lag yet");
+            for i in 0..LIVE_QUEUE_CAP + 1 {
+                core.update(busy, Some(format!("n{i}")), None);
+                while busy_rx.try_recv().is_ok() {}
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), lag.wait())
+                .await
+                .expect("the lag is signalled");
+        });
     }
 
     #[test]

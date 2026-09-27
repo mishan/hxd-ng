@@ -155,9 +155,11 @@ fn assert_all_in_order(heard: &[usize], n: usize) {
 /// Each case must finish well inside the ng pong deadline (90 s): a
 /// server that only noticed a stalled client when that ran out would
 /// pass the ng case eventually, having buffered for it all the while.
+/// The ng case also checks the drop happened while the client was still
+/// silent, before it read anything.
 const PROMPTLY: Duration = Duration::from_secs(60);
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_classic_client_that_stops_reading_is_disconnected() {
     timeout(PROMPTLY, classic_case())
         .await
@@ -194,7 +196,7 @@ async fn classic_case() {
     drop(talking);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_ng_client_that_stops_reading_is_dropped_and_resumes_into_a_resync() {
     timeout(PROMPTLY, ng_case())
         .await
@@ -232,6 +234,45 @@ async fn ng_case() {
         .unwrap()
         .unwrap();
     assert_all_in_order(&heard, n);
+
+    // Still without its having read a byte, the server has already let it
+    // go: the session shows as detached to everyone else. Not after the
+    // pong deadline — the connection was cut when it fell a channel
+    // behind, in the middle of a send it was not taking.
+    let (mut watcher, _) = tokio_tungstenite::connect_async(format!("ws://{}/ng", server.ng))
+        .await
+        .unwrap();
+    let hello = json!({ "id": 1, "req": "login", "params": { "nick": "watcher" } });
+    watcher
+        .send(Message::Text(hello.to_string()))
+        .await
+        .unwrap();
+    let mut id = 1;
+    loop {
+        let reply = loop {
+            let Message::Text(t) = watcher.next().await.unwrap().unwrap() else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["reply"] == id {
+                break v;
+            }
+        };
+        let users = &reply["ok"]["users"];
+        let sleepy = users
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["nick"] == "sleepy")
+            .cloned();
+        if sleepy.is_some_and(|u| u["status"] == "detached") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        id += 1;
+        let sync = json!({ "id": id, "req": "sync" });
+        watcher.send(Message::Text(sync.to_string())).await.unwrap();
+    }
 
     // Now the stalled client reads: some of the room, then the close.
     let mut last_seq = 0u64;

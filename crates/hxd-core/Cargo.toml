@@ -25,3 +25,7 @@ getrandom = "0.2"
 # keyed on. Same version the identity crates use.
 sha2 = "0.10"
 metrics = { version = "0.24", optional = true }
+
+[dev-dependencies]
+# A test waits on a lag signal, which takes a runtime and a clock.
+tokio = { version = "1", default-features = false, features = ["sync", "rt", "time"] }
