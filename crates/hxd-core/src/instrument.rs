@@ -303,7 +303,8 @@ pub fn checkpoint(db: &str, kind: &'static str, took: Timer, wal_pages: u64) {
     let _ = (db, kind, took, wal_pages);
 }
 
-/// A rewind of `db`'s log that a reader outside the server held off.
+/// A rewind of `db`'s log that a reader held off: a long read on one of
+/// the server's own connections to the file, or a reader outside it.
 pub fn checkpoint_busy(db: &str) {
     #[cfg(feature = "metrics")]
     metrics::counter!("hxd_sqlite_rewind_busy_total", "db" => db.to_owned()).increment(1);

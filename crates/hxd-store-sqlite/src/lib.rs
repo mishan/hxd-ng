@@ -5,13 +5,16 @@
 //! messages without gaining an operations problem. Design and the
 //! rusqlite-rather-than-sqlx reasoning: `docs/private-messages.md` §4.
 //!
-//! **One connection behind a mutex.** Not a pool: this store has exactly
-//! one writer (the domain's message path) and its reads are single-row or
-//! single-page lookups on an indexed column. Serialising them costs
-//! nothing at the scale this server is for. A pool is the answer if that
-//! ever stops being true; it is not the answer to a problem nobody has.
-//! The one other connection a store opens is its checkpointer's
-//! (`Checkpointer`), which writes nothing but checkpoints.
+//! **One connection behind a mutex.** Not a pool: a store's reads are
+//! single-row or single-page lookups on an indexed column, and
+//! serializing them costs nothing at the scale this server is for. A pool
+//! is the answer if that ever stops being true; it is not the answer to a
+//! problem nobody has. The one other connection a store opens is its
+//! checkpointer's (`Checkpointer`), which writes nothing but checkpoints.
+//! One file can have a second store beside the first
+//! (`SqliteStore::open_beside`) — the binary gives public chat one, so
+//! its commits wait for no other store's reads — and then the file has
+//! two writers, which SQLite serializes, and still one checkpointer.
 //!
 //! **Times are unix seconds** at this boundary. `SystemTime` is the
 //! domain's type; the conversion is here and nowhere else, and it floors
@@ -541,7 +544,26 @@ struct CheckpointState {
     rewind_after: Option<std::time::Instant>,
 }
 
-fn checkpoint(conn: &Connection, state: &mut CheckpointState) {
+/// What one pass of the checkpointer did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// Another checkpoint held the file's checkpoint lock, so nothing ran
+    /// and nothing is recorded.
+    Collided,
+    /// The checkpoint failed outright.
+    Failed,
+    /// A passive pass, and nothing more.
+    Passive,
+    /// The log was due a rewind, and a reader kept the passive pass
+    /// short, so none was tried.
+    Refused,
+    /// The log was rewound.
+    Rewound,
+    /// A rewind was tried and came back busy.
+    RewindBusy,
+}
+
+fn checkpoint(conn: &Connection, state: &mut CheckpointState) -> Pass {
     let took = hxd_core::instrument::Timer::start();
     // (busy, pages in the log, pages copied back)
     let wal = |mode: &str| {
@@ -554,10 +576,16 @@ fn checkpoint(conn: &Connection, state: &mut CheckpointState) {
         })
     };
     let (pages, copied) = match wal("PASSIVE") {
-        Ok((_, pages, copied)) => (pages, copied),
+        // Busy, for a passive pass, means another checkpoint holds the
+        // file's checkpoint lock — another process's store, a CLI command
+        // on a running server's file — and the pass did nothing at all:
+        // its page counts are -1, not a log that emptied. Recording it
+        // would be a sample of nothing and a gauge reading zero.
+        Ok((true, ..)) => return Pass::Collided,
+        Ok((false, pages, copied)) => (pages, copied),
         Err(e) => {
             tracing::warn!("sqlite checkpoint: {e}");
-            return;
+            return Pass::Failed;
         }
     };
     hxd_core::instrument::checkpoint(&state.db, "passive", took, pages.max(0) as u64);
@@ -572,39 +600,57 @@ fn checkpoint(conn: &Connection, state: &mut CheckpointState) {
     // It holds the write lock for all of that, so it is only tried when
     // the PASSIVE pass copied everything back. A pass cannot copy past a
     // page some reader still reads the old version of, so a pass that
-    // fell short means a reader outside this server — an operator's
-    // shell, a backup — is holding a snapshot as long as it likes, and a
-    // rewind would hold every commit, public chat's included, while it
-    // copied, synced and waited. Nothing is tried then: the log goes on
-    // growing, which costs disk and not a stall, and the refusal is
-    // counted. And a rewind that is tried waits `REWIND_WAIT` at most for
-    // a reader that arrived since, then backs off for `REWIND_BACKOFF`.
+    // fell short means a reader is holding a snapshot: a long read on
+    // one of the server's own connections, or a reader outside it — an
+    // operator's shell, a backup — for as long as it likes. A rewind
+    // would hold every commit, public chat's included, while it copied,
+    // synced and waited. Nothing is tried then: the log goes on growing,
+    // which costs disk and not a stall, and the refusal is counted. And
+    // a rewind that is tried waits `REWIND_WAIT` at most for a reader
+    // that arrived since, then backs off for `REWIND_BACKOFF`.
     if pages < state.rewind_pages {
-        return;
+        return Pass::Passive;
     }
     if copied < pages {
         hxd_core::instrument::checkpoint_busy(&state.db);
-        return;
+        return Pass::Refused;
     }
     let due = state
         .rewind_after
         .is_none_or(|at| std::time::Instant::now() >= at);
     if !due {
-        return;
+        return Pass::Passive;
     }
     let took = hxd_core::instrument::Timer::start();
     match wal("TRUNCATE") {
         Ok((false, ..)) => {
             state.rewind_after = None;
             hxd_core::instrument::checkpoint(&state.db, "rewind", took, 0);
+            Pass::Rewound
         }
         Ok((true, ..)) | Err(_) => {
             state.rewind_after = Some(std::time::Instant::now() + REWIND_BACKOFF);
             hxd_core::instrument::checkpoint_busy(&state.db);
             tracing::debug!("sqlite checkpoint: a reader kept the log from being rewound");
+            Pass::RewindBusy
         }
     }
 }
+
+/// Who checkpoints a store's file.
+#[derive(Debug, Clone, Copy)]
+enum Checkpoints {
+    /// The store's own checkpointer, rewinding the log past this many
+    /// pages.
+    Own(i64),
+    /// Another store's (`SqliteStore::open_beside`), or nobody's, for a
+    /// store that only reads.
+    Others,
+}
+
+/// How long two stores on one file wait for each other's writes
+/// (`SqliteStore::open_beside`).
+const SHARED_WRITE_WAIT: Duration = Duration::from_secs(600);
 
 /// How large the log may grow, in pages, before the checkpointer rewinds
 /// it (`checkpoint`).
@@ -620,7 +666,38 @@ const REWIND_BACKOFF: Duration = Duration::from_secs(10);
 impl SqliteStore {
     /// Open (creating if absent) the store database at `path`.
     pub fn open(path: impl AsRef<Path>, sync: Synchronous) -> Result<Self, StoreError> {
-        Self::open_inner(path, sync, false, WAL_REWIND_PAGES)
+        Self::open_inner(path, sync, false, Checkpoints::Own(WAL_REWIND_PAGES))
+    }
+
+    /// Open a second store on the file `beside` already has open, in this
+    /// process: a connection of its own, for writes that should not wait
+    /// behind the other store's reads (public chat's, in the binary).
+    ///
+    /// It starts no checkpointer. `beside`'s already folds the file's log
+    /// back, and a second would only collide with it: two threads taking
+    /// turns at one checkpoint lock, each reporting under the file's name.
+    ///
+    /// And the two connections wait `SHARED_WRITE_WAIT` for each other's
+    /// writes, where a store alone waits five seconds. On one connection
+    /// they waited on its mutex, without limit, however long the other's
+    /// write took — an hour's prune of a large inbox, a purge, a commit
+    /// with `sync = "full"` on a slow disk. Five seconds of SQLite's busy
+    /// handler would turn that wait into a failed write, and a failed
+    /// chat commit refuses its whole batch. The wait is bounded all the
+    /// same, so a file something has truly wedged is an error in the end
+    /// rather than a hang.
+    pub fn open_beside(
+        path: impl AsRef<Path>,
+        sync: Synchronous,
+        beside: &SqliteStore,
+    ) -> Result<Self, StoreError> {
+        beside
+            .conn
+            .lock()
+            .unwrap()
+            .busy_timeout(SHARED_WRITE_WAIT)
+            .map_err(StoreError::new)?;
+        Self::open_inner(path, sync, false, Checkpoints::Others)
     }
 
     /// Open an existing database without changing it: no migration, no
@@ -642,14 +719,14 @@ impl SqliteStore {
     /// afford them takes the path that needs neither — see
     /// `can_use_immutable`.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::open_inner(path, Synchronous::Normal, true, WAL_REWIND_PAGES)
+        Self::open_inner(path, Synchronous::Normal, true, Checkpoints::Others)
     }
 
     fn open_inner(
         path: impl AsRef<Path>,
         sync: Synchronous,
         read_only: bool,
-        rewind_pages: i64,
+        checkpoints: Checkpoints,
     ) -> Result<Self, StoreError> {
         if read_only {
             use rusqlite::OpenFlags;
@@ -695,9 +772,14 @@ impl SqliteStore {
         let conn = Connection::open(path).map_err(StoreError::new)?;
         // A write should wait for a concurrent one rather than failing the
         // send; five seconds is far longer than any statement here takes,
-        // so hitting it means something is genuinely wrong.
-        conn.busy_timeout(Duration::from_secs(5))
-            .map_err(StoreError::new)?;
+        // so hitting it means something is genuinely wrong. Beside another
+        // store, its writes are ones this store used to wait out on a
+        // mutex (`open_beside`).
+        let wait = match checkpoints {
+            Checkpoints::Own(_) => Duration::from_secs(5),
+            Checkpoints::Others => SHARED_WRITE_WAIT,
+        };
+        conn.busy_timeout(wait).map_err(StoreError::new)?;
         // journal_mode returns the mode it settled on, so it is a query
         // rather than an exec. In-memory databases answer "memory" and
         // that is fine — there is no WAL to want.
@@ -707,11 +789,15 @@ impl SqliteStore {
         conn.pragma_update(None, "synchronous", sync.pragma())
             .map_err(StoreError::new)?;
         migrate(&conn)?;
-        // The checkpoints move off this connection (`Checkpointer`).
+        // The checkpoints move off this connection (`Checkpointer`), and
+        // off every connection but one checkpointer's on the file.
         let checkpointer = if mode.eq_ignore_ascii_case("wal") {
             conn.pragma_update(None, "wal_autocheckpoint", 0)
                 .map_err(StoreError::new)?;
-            Some(Checkpointer::start(path, rewind_pages)?)
+            match checkpoints {
+                Checkpoints::Own(rewind_pages) => Some(Checkpointer::start(path, rewind_pages)?),
+                Checkpoints::Others => None,
+            }
         } else {
             None
         };
@@ -719,6 +805,27 @@ impl SqliteStore {
             _checkpointer: checkpointer,
             conn: TimedMutex::named("sqlite", conn),
         })
+    }
+
+    /// The `synchronous` this store's connection commits with.
+    pub fn synchronous(&self) -> Result<Synchronous, StoreError> {
+        let level: i64 = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .map_err(StoreError::new)?;
+        match level {
+            1 => Ok(Synchronous::Normal),
+            2 => Ok(Synchronous::Full),
+            n => Err(StoreError::new(format!("synchronous is {n}"))),
+        }
+    }
+
+    /// Whether this store checkpoints its file: every file-backed store
+    /// but one opened [`beside`](Self::open_beside) another.
+    pub fn checkpoints(&self) -> bool {
+        self._checkpointer.is_some()
     }
 
     /// An in-memory database. For tests, and for anyone who wants the
@@ -1923,7 +2030,9 @@ mod tests {
         let path = dir.path().join("server.db");
         let wal = dir.path().join("server.db-wal");
         let rewind = 256;
-        let store = SqliteStore::open_inner(&path, Synchronous::Normal, false, rewind).unwrap();
+        let store =
+            SqliteStore::open_inner(&path, Synchronous::Normal, false, Checkpoints::Own(rewind))
+                .unwrap();
         let text = "x".repeat(64);
         let size = || std::fs::metadata(&wal).map_or(0, |m| m.len());
         let began = std::time::Instant::now();
@@ -1966,7 +2075,9 @@ mod tests {
         use hxd_core::history::{ChatLog, NewLine};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.db");
-        let store = SqliteStore::open_inner(&path, Synchronous::Normal, false, 32).unwrap();
+        let store =
+            SqliteStore::open_inner(&path, Synchronous::Normal, false, Checkpoints::Own(32))
+                .unwrap();
         let line = || NewLine {
             channel: 0,
             from_nick: "n".into(),
@@ -1994,6 +2105,130 @@ mod tests {
         }
         reader.execute_batch("COMMIT").unwrap();
         assert!(slowest < 5 * REWIND_WAIT, "a commit waited {slowest:?}");
+    }
+
+    /// A passive pass that meets another checkpoint in progress did
+    /// nothing, and records nothing: no sample, no gauge at zero, no
+    /// refusal counted, no backoff.
+    #[test]
+    fn a_pass_that_meets_another_checkpoint_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE t(x); INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+        // A reader on the log, which a TRUNCATE must wait out, holding
+        // the file's checkpoint lock while it does.
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        let other = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let conn = Connection::open(&path).unwrap();
+                conn.busy_timeout(Duration::from_secs(3)).unwrap();
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        let conn = Connection::open(&path).unwrap();
+        let mut state = CheckpointState {
+            db: "server.db".into(),
+            rewind_pages: 0,
+            rewind_after: None,
+        };
+        assert_eq!(checkpoint(&conn, &mut state), Pass::Collided);
+        assert_eq!(state.rewind_after, None);
+        reader.execute_batch("COMMIT").unwrap();
+        other.join().unwrap();
+        // With the other checkpoint gone, a pass runs as ever.
+        assert_ne!(checkpoint(&conn, &mut state), Pass::Collided);
+    }
+
+    /// A store opened beside another on its file leaves the checkpoints
+    /// to the first, and the two wait for each other's writes as long as
+    /// one mutex would have.
+    #[test]
+    fn a_store_beside_another_leaves_it_the_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let first = SqliteStore::open(&path, Synchronous::Full).unwrap();
+        assert!(first.checkpoints());
+        let beside = SqliteStore::open_beside(&path, Synchronous::Full, &first).unwrap();
+        assert!(!beside.checkpoints());
+        assert_eq!(beside.synchronous().unwrap(), Synchronous::Full);
+        for store in [&first, &beside] {
+            let wait: i64 = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(wait, SHARED_WRITE_WAIT.as_millis() as i64);
+        }
+    }
+
+    /// A chat commit on the connection beside waits out a write the
+    /// other connection has open, and lands once it commits.
+    #[test]
+    fn a_write_beside_another_waits_for_it() {
+        use hxd_core::history::{ChatLog, HistoryQuery, NewLine};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let first = std::sync::Arc::new(SqliteStore::open(&path, Synchronous::Normal).unwrap());
+        let beside = SqliteStore::open_beside(&path, Synchronous::Normal, &first).unwrap();
+        let held = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let holder = {
+            let (first, held) = (first.clone(), held.clone());
+            std::thread::spawn(move || {
+                let conn = first.conn.lock().unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                conn.execute(
+                    "INSERT INTO chat_line (channel, nick, icon, flags, body, at)
+                     VALUES (0, 'first', 0, 0, 'held', 0)",
+                    [],
+                )
+                .unwrap();
+                held.wait();
+                std::thread::sleep(Duration::from_millis(300));
+                conn.execute_batch("COMMIT").unwrap();
+            })
+        };
+        held.wait();
+        let line = NewLine {
+            channel: 0,
+            from_nick: "n".into(),
+            from_login: None,
+            from_fingerprint: None,
+            icon: 0,
+            text: "beside".into(),
+            flags: Default::default(),
+            at: SystemTime::now(),
+        };
+        let began = std::time::Instant::now();
+        let ids = beside.append_all(&[line.clone(), line]).unwrap();
+        assert!(began.elapsed() >= Duration::from_millis(200));
+        holder.join().unwrap();
+        let page = first
+            .query(&HistoryQuery {
+                channel: 0,
+                before: None,
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        let bodies: Vec<_> = page.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(bodies, ["held", "beside", "beside"]);
+        assert_eq!(page.lines.last().map(|l| l.id), ids.last().copied());
     }
 
     /// A closed store leaves no WAL behind: the checkpointer's connection
