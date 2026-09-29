@@ -45,6 +45,7 @@ chat_lines = 0
 spam_points = 0
 ng_requests = 0
 news_posts = 0
+reconnect_seconds = 0
 [inbox]
 db = "$D/server.db"
 sync = "$SYNC"

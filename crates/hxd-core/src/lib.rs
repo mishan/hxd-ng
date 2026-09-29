@@ -39,7 +39,7 @@ pub use avatar::{
     AvatarStore, MemoryAvatars,
 };
 pub use budget::{Over, QueueBudget, Share, QUEUE_BUDGET};
-pub use chat::{ChatError, Flooded, KickBan, MsgOutcome, SpamBan};
+pub use chat::{ChatError, Flooded, KickBan, Kicked, MsgOutcome, SpamBan};
 pub use files::{
     FileBody, FileEntry, FileError, FileFuture, FileInfo, FileKind, FilePath, FilePrincipal,
     FileSource,
@@ -53,8 +53,8 @@ pub use inbox::{
     StoreError, StoredMessage,
 };
 pub use limits::{
-    AddrSet, ChatLimits, ConnGate, ConnLimits, ConnPermit, ConnRefused, FloodLimits, LoginAttempt,
-    LoginLimits, RateBucket, RateGate, RequestLimits,
+    AccountRefused, AddrSet, ChatLimits, ConnGate, ConnLimits, ConnPermit, ConnRefused,
+    FloodLimits, LoginAttempt, LoginLimits, RateBucket, RateGate, RequestLimits, SharedPlace,
 };
 pub use media::{
     Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRecord,

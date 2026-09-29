@@ -28,6 +28,7 @@
 //! ([`subs`]).
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -39,6 +40,7 @@ use crate::inbox::{Mailbox, StoreError};
 use crate::roster::{Core, Event, Uid, UserSession};
 
 pub mod conformance;
+mod guest;
 pub mod memory;
 
 #[cfg(test)]
@@ -50,6 +52,7 @@ mod subs;
 #[cfg(test)]
 mod subs_tests;
 
+pub use guest::{GuestKey, GuestKeyer, GUEST_SECRET_LEN};
 pub use memory::MemoryNews;
 pub use query::{CompiledQuery, Field, Term};
 
@@ -421,6 +424,21 @@ pub struct ThreadHead {
     pub last_id: ArticleId,
 }
 
+/// Whose live articles [`NewsStore::written_by`] counts: one author's
+/// share of the news ceilings (§7.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Writer {
+    /// An account that is one person, by [`Author::is`].
+    Account(Mailbox),
+    /// The guests from one address, by the key [`GuestKeyer`] makes of
+    /// it: a shared `guest` login names nobody, and counting every guest
+    /// together let one of them spend the allowance for all. `None` is
+    /// the guests whose address is not known — articles written before
+    /// the store kept one, and a session no transport gave an address —
+    /// which are a pool of their own that no addressed guest spends from.
+    Guest(Option<GuestKey>),
+}
+
 /// A post on its way into the store. Everything about it has been
 /// checked except what only the store can check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +446,14 @@ pub struct NewPost {
     pub category: NodeId,
     pub parent: Option<ArticleId>,
     pub author: Author,
+    /// For a guest's post, the key of the address it came from
+    /// ([`GuestKeyer`]: the address as [`crate::limits::limit_key`] has
+    /// it — IPv4 as itself, IPv6 as its /64 — hashed under the server's
+    /// secret), which is whose share of `max_per_author` the article is
+    /// (§7.4). `None` for an account's, and for a guest whose transport
+    /// gave no address. Kept beside the article while it is live and
+    /// never shown to anyone; a tombstone clears it with the author.
+    pub guest: Option<GuestKey>,
     pub subject: String,
     pub body: String,
     pub mime: BodyType,
@@ -804,7 +830,8 @@ pub enum NewsError {
     NewsFull,
     /// The author already has `[news] max_per_author` live articles.
     /// `guests` when the author is a guest, whose allowance is the one
-    /// every guest shares, so the words cannot say it is theirs.
+    /// every guest from its address shares, so the words cannot say it
+    /// is theirs.
     TooManyArticles {
         guests: bool,
     },
@@ -893,10 +920,10 @@ pub trait NewsStore: Send + Sync + 'static {
     /// post would read the archive per post. Tombstones hold nothing.
     fn usage(&self) -> Result<NewsUsage, StoreError>;
 
-    /// How many live articles `who` wrote, by [`Author::is`]; `None`
-    /// counts those no account wrote — every guest's together, since a
-    /// shared `guest` login names nobody in particular (§3.1).
-    fn written_by(&self, who: Option<&Mailbox>) -> Result<u64, StoreError>;
+    /// How many live articles `who` wrote: an account's by
+    /// [`Author::is`], and the guests' from one address by the key
+    /// [`NewPost::guest`] recorded (§7.4).
+    fn written_by(&self, who: &Writer) -> Result<u64, StoreError>;
 
     /// Retention: remove every thread whose newest article is older than
     /// `max_age`, whole — pruning a starter out from under its live
@@ -1374,6 +1401,17 @@ fn author_of(sess: &UserSession) -> Author {
     }
 }
 
+/// Whose share of the news a session's posts are when it is not one
+/// person: its address, as [`crate::limits::limit_key`] keys it, the
+/// rule guest media quotas follow. `None` for a person, and for a guest
+/// with no address. What the store keeps of it is [`GuestKeyer::key`].
+fn guest_addr(sess: &UserSession) -> Option<IpAddr> {
+    if sess.is_person {
+        return None;
+    }
+    sess.addr.map(crate::limits::limit_key)
+}
+
 /// What one request needs to know about the session making it, copied
 /// out so the roster lock is released before the store is touched.
 struct Asker {
@@ -1392,6 +1430,9 @@ struct Asker {
     blockable: Option<Mailbox>,
     login: String,
     attach_news: bool,
+    /// Whose share of the ceilings a guest's post is: see
+    /// [`NewPost::guest`].
+    guest: Option<GuestKey>,
 }
 
 /// Is there room for `post` under the ceilings (§7.4)? The author's
@@ -1400,13 +1441,16 @@ struct Asker {
 fn news_room(store: &dyn NewsStore, post: &NewPost, policy: NewsPolicy) -> Result<(), NewsError> {
     let failed = |e: StoreError| store_failed(e.into());
     if policy.max_per_author > 0 {
-        let who = post.author.login.as_ref().map(|login| Mailbox {
-            login: login.clone(),
-            fingerprint: post.author.fingerprint,
-        });
-        if store.written_by(who.as_ref()).map_err(failed)? >= policy.max_per_author {
+        let who = match &post.author.login {
+            Some(login) => Writer::Account(Mailbox {
+                login: login.clone(),
+                fingerprint: post.author.fingerprint,
+            }),
+            None => Writer::Guest(post.guest),
+        };
+        if store.written_by(&who).map_err(failed)? >= policy.max_per_author {
             return Err(NewsError::TooManyArticles {
-                guests: who.is_none(),
+                guests: matches!(who, Writer::Guest(_)),
             });
         }
     }
@@ -1444,6 +1488,15 @@ impl Core {
     pub fn with_news(mut self, store: Arc<dyn NewsStore>, policy: NewsPolicy) -> Self {
         self.news = Some(store);
         self.news_policy = policy;
+        self
+    }
+
+    /// Key guests' shares of the news under `keyer` rather than a secret
+    /// this process made up and forgets when it stops: a server keeps
+    /// its secret, so a guest's articles are still its address's after
+    /// a restart (§7.4).
+    pub fn with_news_guest_keyer(mut self, keyer: GuestKeyer) -> Self {
+        self.news_guest_keyer = keyer;
         self
     }
 
@@ -1581,6 +1634,7 @@ impl Core {
             blockable: (sess.has_inbox || sess.identity.is_some()).then(|| sess.mailbox()),
             login: sess.login.clone(),
             attach_news: sess.attach_news,
+            guest: guest_addr(sess).map(|a| self.news_guest_keyer.key(a)),
         })
     }
 
@@ -2021,7 +2075,12 @@ impl Core {
         Some(match (sess.is_person, sess.identity) {
             (true, Some(fp)) => crate::limits::PostKey::Account(Some(fp), String::new()),
             (true, None) => crate::limits::PostKey::Account(None, sess.login.clone()),
-            (false, _) => crate::limits::PostKey::Session(sess.serial),
+            // A guest by its address, as its share of the articles is, so
+            // logging in again is not a fresh allowance.
+            (false, _) => match guest_addr(sess) {
+                Some(addr) => crate::limits::PostKey::Guest(addr),
+                None => crate::limits::PostKey::Session(sess.serial),
+            },
         })
     }
 
@@ -2058,6 +2117,7 @@ impl Core {
             parent: req.parent,
             refs,
             author: asker.author.clone(),
+            guest: asker.guest,
             subject,
             body,
             mime: req.mime,

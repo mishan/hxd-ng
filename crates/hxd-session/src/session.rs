@@ -24,9 +24,9 @@ use hxd_core::instrument::{self, Dir, Kind};
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, ConnPermit, Core, Event, Events,
-    FileEntry, FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof, SessionStatus, Share,
-    Transport, Uid, UserInfo,
+    Account, AccountRefused, AttachInfo, AuthBackend, AuthError, ChatError, ConnPermit, Core,
+    Event, Events, FileEntry, FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof,
+    SessionStatus, Share, Transport, Uid, UserInfo,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::text;
@@ -161,7 +161,10 @@ pub struct ServerConfig {
     pub agreement: Option<String>,
     /// How long a connection may exist before completing its login.
     pub login_timeout: Duration,
-    /// How long a kick-with-ban keeps the address banned.
+    /// How long a kick-with-ban's ban lasts: on the person kicked (the
+    /// account's login, or the identity a guest proved) and on their
+    /// address unless `[limits] exempt` holds it, so a plain guest on an
+    /// exempt address is only kicked (`docs/moderation.md` §3.5).
     pub ban_time: Duration,
     /// The `DATA_CAPABILITIES` bits this server can actually honor. A
     /// session negotiates the intersection of these and what the client
@@ -204,7 +207,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             name: "hxd-ng".into(),
-            version: 185,
+            version: 254,
             agreement: None,
             login_timeout: Duration::from_secs(10),
             ban_time: Duration::from_secs(1800),
@@ -1194,6 +1197,43 @@ fn parse_login(f: &Frame) -> LoginRequest {
     req
 }
 
+/// What a classic client whose account may not set an icon is told.
+const SET_ICON_REFUSED: &str = "You are not allowed to set an icon.";
+
+/// Does this login look like GtkHx 1.2 through 1.4.0, whose re-send of
+/// the saved icon after login goes out without a task of its own? Those
+/// releases get the Set Icon stopgap (the `gif_icons::SET` arm).
+///
+/// The identification is positive, not a version threshold. GtkHx 1.2
+/// through 1.4.0 send no name of their own on a plaintext login, but
+/// they send version 185 on every path and a capability field whose
+/// shape nobody else's has: large files, text encoding, inline media and
+/// chat history always, voice when built with it, video only beside
+/// voice, and nothing else. Version 185 alone would also catch the
+/// official 1.8.5 client (mhxd names it "1.8.5 compatible"), but no
+/// official client sends `DATA_CAPABILITIES` at all, so it is the pair
+/// that identifies. A false positive costs what every client cost
+/// before: a refused set answered as done.
+///
+/// GtkHx releases after 1.4.0 send version 254, a number of hxd-ng's and
+/// GtkHx's own (185 is also the official 1.8.5 client's and server's,
+/// and Pitbull Pro's, in the public client and server version
+/// registry), and are answered with the real refusal, which they take
+/// quietly. So the gate stays at 185: it describes releases that exist
+/// and will not change, and nothing newer ever needs it.
+fn resends_icon_untasked(req: &LoginRequest) -> bool {
+    const ALWAYS: u64 = 1 << cap::LARGE_FILES
+        | 1 << cap::TEXT_ENCODING
+        | 1 << cap::INLINE_MEDIA
+        | 1 << cap::CHAT_HISTORY;
+    const OPTIONAL: u64 = 1 << cap::VOICE | 1 << cap::VIDEO;
+    let bits = req.caps.bits();
+    req.clientversion == 185
+        && bits & ALWAYS == ALWAYS
+        && bits & !(ALWAYS | OPTIONAL) == 0
+        && (!req.caps.has(cap::VIDEO) || req.caps.has(cap::VOICE))
+}
+
 /// Per-session protocol state after a successful login.
 struct Session {
     uid: Uid,
@@ -1230,6 +1270,10 @@ struct Session {
     /// Change. The extension has no capability bit; a client that never
     /// asked is not handed a transaction it may not know.
     gif_icons: bool,
+    /// The login looked like GtkHx 1.4.0 or older
+    /// ([`resends_icon_untasked`]), so a Set Icon this session may not
+    /// make is answered as done rather than refused.
+    quiet_icon_refusal: bool,
     /// Get Icon List's allowance ([`ICON_LISTS`]), refilled continuously.
     icon_list_tokens: f64,
     icon_list_refill: Instant,
@@ -1330,7 +1374,8 @@ impl Session {
 /// ([`Core::admit_connection`]), taken by the caller before it accepted
 /// the stream — the ng frontend asks at the upgrade, so a refused client
 /// hears a 429 and keeps its token — and held here for the session's
-/// life.
+/// life, moved to its account's count if it logs in as a person
+/// ([`Core::admit_account`]).
 pub async fn run_session<S>(
     stream: S,
     peer: SocketAddr,
@@ -1393,8 +1438,10 @@ async fn run_connection<S>(
         instrument::disconnect(WIRE, "banned");
         return;
     }
-    // One place per connection, however it came to be taken.
-    let (_place, direct) = match direct {
+    // One place per connection, however it came to be taken: its
+    // address's until it logs in, and its account's after if it logs in
+    // as a person.
+    let (mut place, direct) = match direct {
         Direct::Admitted(place) => (place, true),
         Direct::Tunnelled(place) => (place, false),
         Direct::Admit => match admit(&ctx, peer) {
@@ -1441,7 +1488,7 @@ async fn run_connection<S>(
 
     // --- Login, then the session loop -----------------------------------
     let identified = transport.identity.is_some();
-    let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport, link).await;
+    let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport, link, &mut place).await;
     let ended = if let Some((mut sess, mut events)) = outcome {
         let auth = if identified {
             "identity"
@@ -1483,6 +1530,15 @@ async fn run_connection<S>(
         let _ = writer.await;
     }
 }
+
+/// The refusal a login is given when its account already holds as many
+/// connections as `[limits] connections_per_account` lets it.
+const ACCOUNT_FULL: &str =
+    "This account is already connected as many times as it may be. Disconnect one and try again.";
+
+/// A login refused because its account has been logging in faster than
+/// `[limits] reconnect_seconds` lets it.
+const ACCOUNT_TOO_FAST: &str = "This account is logging in too often. Try again shortly.";
 
 /// Does this login name the guest account? Empty is guest by convention
 /// (`AuthBackend::authenticate`), and so is the name itself.
@@ -1565,7 +1621,7 @@ fn reconcile_login(
         let attempt = match held {
             Some(attempt) => attempt,
             None => core
-                .login_attempt(addr, password)
+                .login_attempt(addr, login, password)
                 .map_err(LoginRefused::Throttled)?,
         };
         let verdict = auth.authenticate(login, Proof::Plain(password));
@@ -1601,7 +1657,7 @@ fn reconcile_login(
     let held = match policy {
         TrtpLogin::Trust => None,
         TrtpLogin::Verify => Some(
-            core.login_attempt(addr, password)
+            core.login_attempt(addr, login, password)
                 .map_err(LoginRefused::Throttled)?,
         ),
     };
@@ -1732,6 +1788,8 @@ fn reconcile_login(
 }
 
 /// Wait for the LOGIN transaction and run the login flow. `None` = close.
+/// `place` is the connection's place in its address's count, moved to
+/// its account's if the login is a person's.
 async fn login_phase(
     frames: &mut Receiver<Frame>,
     tx: &Tx,
@@ -1739,6 +1797,7 @@ async fn login_phase(
     peer: SocketAddr,
     transport: Transport,
     link: LinkAuthority,
+    place: &mut ConnPermit,
 ) -> Option<(Session, Events)> {
     let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
         Ok(Some(f)) => f,
@@ -1761,7 +1820,7 @@ async fn login_phase(
     }
     // Past the logins the server takes at once, refused at once with a
     // reason the client shows, rather than queued behind the others.
-    let Some(permit) = ctx.core.admit_login(Some(peer.ip())) else {
+    let Some(mut permit) = ctx.core.admit_login(Some(peer.ip())) else {
         reply_error(tx, f.trans, "The server is busy. Try again in a moment.");
         return None;
     };
@@ -1876,6 +1935,26 @@ async fn login_phase(
         info!(login = %account.login, ban = hit.id, "login refused: banned");
         reply_error(tx, f.trans, &banned_text(&hit.reason));
         return None;
+    }
+    // From here the connection is a person's, and counts against its
+    // account rather than its address (`hxd_core::limits`) — or is
+    // refused, in the error reply every failed login already gets, when
+    // the account holds as many connections as it may, or has been
+    // logging in faster than it may. A guest stays its address's.
+    if let Err(refused) = ctx
+        .core
+        .admit_account(place, &account.login, account.is_person())
+    {
+        info!(login = %account.login, reason = refused.reason(), "login refused by its account's limits");
+        let text = match refused {
+            AccountRefused::Full => ACCOUNT_FULL,
+            AccountRefused::TooFast(_) => ACCOUNT_TOO_FAST,
+        };
+        reply_error(tx, f.trans, text);
+        return None;
+    }
+    if account.is_person() {
+        permit.logged_in();
     }
 
     // Resolve the visible name: the account must grant use_any_name for
@@ -2056,6 +2135,7 @@ async fn login_phase(
         media_stream: None,
         transfer_addr: None,
         gif_icons: false,
+        quiet_icon_refusal: resends_icon_untasked(&req),
         icon_list_tokens: ICON_LISTS,
         icon_list_refill: Instant::now(),
         banner_sent: false,
@@ -3705,13 +3785,17 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .await
                 .unwrap_or(Err(ChatError::ServerError));
             match kicked {
-                Ok(nick) => {
+                Ok(hxd_core::Kicked { nick, banned }) => {
                     reply(tx, f.trans, vec![]);
                     // The public-chat announcement, in the reference
                     // server's wording (each frontend adds its own framing
-                    // — this edge renders it as `\r<text>`).
+                    // — this edge renders it as `\r<text>`). "Banned"
+                    // only when a ban was placed: a guest on an address
+                    // `[limits] exempt` holds to nothing is only kicked
+                    // (`Core::kick_ban_targets`), where mhxd bans the
+                    // address and says so.
                     let by = ctx.core.user(sess.uid).map(|u| u.nick).unwrap_or_default();
-                    let verb = if ban { "banned" } else { "kicked" };
+                    let verb = if banned { "banned" } else { "kicked" };
                     ctx.core
                         .chat_notice(0, sess.uid, format!("{nick} has been {verb} by {by}"));
                 }
@@ -4202,23 +4286,27 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             .await;
             match outcome {
                 Some(Ok(())) => reply(tx, f.trans, vec![]),
-                // `[extra] set_avatar`: answered as the success a set
+                // `[extra] set_avatar`, for a login that looked like
+                // GtkHx 1.4.0 or older: answered as the success a set
                 // gets, and not applied — the core refused it before any
                 // decode or turn, so nothing is stored or announced. A
-                // deliberate stopgap for GtkHx 1.2 through 1.4.0 (every
-                // release so far), which re-send the saved icon after
-                // every login untasked, so a task error here is a toast
-                // at each one for every guest. The fix came after 1.4.0,
-                // on GtkHx's development line, so no release through
-                // 1.4.0 has it: releases after 1.4.0 send it under a task
-                // of its own and only log a refusal, and do not need
-                // this; a set their user makes by hand would show the
-                // refusal, as it should. The ng wire still answers
-                // `access_denied`, since a modern client can handle a
-                // refusal.
-                Some(Err(hxd_core::media::MediaReject::NotAuthorized)) => {
+                // deliberate stopgap for GtkHx 1.2 through 1.4.0, which
+                // re-send the saved icon after every login untasked, so
+                // a task error here is a toast at each one for every
+                // guest. GtkHx after 1.4.0 sends it under a task of its
+                // own and only logs a refusal. Every other client is
+                // refused, and the ng wire answers `access_denied`.
+                Some(Err(hxd_core::media::MediaReject::NotAuthorized))
+                    if sess.quiet_icon_refusal =>
+                {
                     debug!(uid, "set icon not allowed; answered as done, not applied");
                     reply(tx, f.trans, vec![])
+                }
+                // The core's text for this is "Media rejected", which is
+                // shared with every media refusal and says nothing about
+                // why; the icon has words of its own.
+                Some(Err(hxd_core::media::MediaReject::NotAuthorized)) => {
+                    reply_error(tx, f.trans, SET_ICON_REFUSED)
                 }
                 Some(Err(e)) => reply_error(tx, f.trans, e.text()),
                 None => reply_error(tx, f.trans, hxd_core::media::MediaReject::Busy.text()),
@@ -4299,6 +4387,32 @@ fn file_error_text(error: &hxd_core::FileError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_gtkhxs_login_shape_gets_the_quiet_icon_refusal() {
+        let login = |version: u16, caps: Option<u64>| LoginRequest {
+            clientversion: version,
+            caps: caps.map(Caps::from_bits).unwrap_or_default(),
+            ..LoginRequest::default()
+        };
+        // GtkHx 1.2 through 1.4.0: without voice, with it, and with
+        // video beside it.
+        for caps in [0x1b, 0x1f, 0x41f] {
+            assert!(resends_icon_untasked(&login(185, Some(caps))), "{caps:#x}");
+        }
+        // The official 1.8.5 client sends the same version and no
+        // capabilities; 1.5 and 1.9 send other versions.
+        assert!(!resends_icon_untasked(&login(185, None)));
+        assert!(!resends_icon_untasked(&login(151, None)));
+        assert!(!resends_icon_untasked(&login(190, None)));
+        // GtkHx after 1.4.0, which sends a version of its own.
+        assert!(!resends_icon_untasked(&login(254, Some(0x41f))));
+        // Some other client's capabilities at 185: a bit GtkHx never
+        // sends, one it always does missing, video without voice.
+        assert!(!resends_icon_untasked(&login(185, Some(0x3f))));
+        assert!(!resends_icon_untasked(&login(185, Some(0x17))));
+        assert!(!resends_icon_untasked(&login(185, Some(0x41b))));
+    }
 
     #[test]
     fn fetching_icons_is_free_and_setting_one_is_not() {

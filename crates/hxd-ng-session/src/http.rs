@@ -47,8 +47,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, Limited, StreamBody};
 use hxd_core::{
-    AddrSet, ConnGate, ConnLimits, ConnPermit, FileError, FileKind, IdentityTag, LinkAuthority,
-    RateGate, Transport,
+    AddrSet, ConnGate, ConnLimits, FileError, FileKind, IdentityTag, LinkAuthority, RateGate,
+    SharedPlace, Transport,
 };
 use hyper::body::{Frame as BodyFrame, Incoming};
 use hyper::header::{
@@ -103,7 +103,7 @@ const EXEMPT_RESERVE: usize = 16;
 /// The port's own counts ([`crate::HttpLimits`]) and its request rates.
 /// One per listener, built by `serve`.
 pub(crate) struct Gates {
-    /// Connections each address holds to the port.
+    /// Connections each address, and each IPv6 /48, holds to the port.
     per_addr: ConnGate,
     /// Connections everyone holds; `None` is no ceiling.
     ceiling: Option<Arc<Semaphore>>,
@@ -121,14 +121,22 @@ pub(crate) struct Gates {
 
 impl Gates {
     pub(crate) fn new(ctx: &NgCtx) -> Gates {
-        let l = ctx.cfg.http_limits;
-        let exempt = ctx.core.limits_exempt().clone();
+        Gates::with(ctx.cfg.http_limits, ctx.core.limits_exempt().clone())
+    }
+
+    /// The gates for `l`, exempting `exempt`.
+    fn with(l: crate::HttpLimits, exempt: AddrSet) -> Gates {
         Gates {
             per_addr: ConnGate::new(ConnLimits {
                 per_addr: l.connections_per_addr,
+                per_v6_48: l.connections_per_v6_48,
                 // A rate would refuse the second of a page's parallel
                 // requests; the rates that matter are the requests'.
                 reconnect: Duration::ZERO,
+                // A socket that logs in leaves this count for the core's
+                // count of its account (`Places`); nothing here is ever
+                // an account's.
+                per_account: 0,
                 exempt: exempt.clone(),
             }),
             ceiling: (l.connections != 0).then(|| Arc::new(Semaphore::new(l.connections))),
@@ -153,49 +161,61 @@ impl Gates {
     /// connections are everyone's, and would fill it for the flood.
     fn admit(&self, peer: SocketAddr, ctx: &NgCtx) -> Option<Places> {
         let proxy = ctx.cfg.trusted_proxies.contains(peer.ip());
+        match self.places(peer.ip(), proxy) {
+            Ok(places) => Some(places),
+            Err("full") => {
+                info!("refusing a connection: the ng port holds as many as it may");
+                hxd_core::instrument::disconnect("http", "full");
+                None
+            }
+            Err(reason) => {
+                info!(
+                    reason,
+                    "refusing a connection past its address's limit on the ng port"
+                );
+                hxd_core::instrument::disconnect("http", reason);
+                None
+            }
+        }
+    }
+
+    /// [`Gates::admit`]'s places for a connection from `ip`, which is a
+    /// trusted proxy's when `proxy` is, or the reason it is refused:
+    /// `full` past the ceiling, or the per-address count's own.
+    fn places(&self, ip: IpAddr, proxy: bool) -> Result<Places, &'static str> {
         let total = match &self.ceiling {
             Some(ceiling) => match ceiling.clone().try_acquire_owned().or_else(|e| {
-                if !proxy && self.exempt.contains(peer.ip()) {
+                if !proxy && self.exempt.contains(ip) {
                     self.reserve.clone().try_acquire_owned()
                 } else {
                     Err(e)
                 }
             }) {
                 Ok(place) => Some(place),
-                Err(_) => {
-                    info!("refusing a connection: the ng port holds as many as it may");
-                    hxd_core::instrument::disconnect("http", "full");
-                    return None;
-                }
+                Err(_) => return Err("full"),
             },
             None => None,
         };
         let addr = if proxy {
             None
         } else {
-            match self.per_addr.admit(peer.ip()) {
-                Ok(place) => Some(place),
-                Err(refused) => {
-                    info!(
-                        reason = refused.reason(),
-                        "refusing a connection past its address's limit on the ng port"
-                    );
-                    hxd_core::instrument::disconnect("http", refused.reason());
-                    return None;
-                }
-            }
+            Some(self.per_addr.admit(ip).map_err(|r| r.reason())?)
         };
-        Some(Places {
+        Ok(Places {
             _total: total,
-            _addr: addr,
+            addr: SharedPlace::new(addr),
         })
     }
 }
 
-/// A connection's places in the port's counts, given back when it closes.
+/// A connection's places in the port's counts, given back when it closes
+/// — or, for the per-address one, when a session the connection carries
+/// logs in as a person ([`hxd_core::ConnPermit::carry`]): from there the socket is
+/// its account's to count, not its address's. The place among everyone's
+/// is kept for the socket's life, since it is what bounds descriptors.
 struct Places {
     _total: Option<OwnedSemaphorePermit>,
-    _addr: Option<ConnPermit>,
+    addr: SharedPlace,
 }
 
 /// The socket and its places, together: an upgrade takes the socket to
@@ -266,6 +286,7 @@ pub(crate) async fn serve_connection(
     let Some(places) = gates.admit(peer, &ctx) else {
         return;
     };
+    let addr_place = places.addr.clone();
     let io = TokioIo::new(Held {
         stream,
         _places: places,
@@ -274,7 +295,8 @@ pub(crate) async fn serve_connection(
     let svc = hyper::service::service_fn(move |req| {
         let ctx = ctx.clone();
         let gates = gates.clone();
-        async move { Ok::<_, std::convert::Infallible>(route(req, peer, ctx, &gates).await) }
+        let addr_place = addr_place.clone();
+        async move { Ok::<_, std::convert::Infallible>(route(req, peer, ctx, &gates, addr_place).await) }
     });
     // hyper's default 30 s header timeout is silently inert without a
     // timer, so a half-open `GET /ng` would hold a task forever. On the
@@ -294,7 +316,15 @@ pub(crate) async fn serve_connection(
     }
 }
 
-async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx, gates: &Gates) -> Resp {
+/// `addr_place` is the connection's place in the port's per-address
+/// count, for a socket it upgrades to to give up at login.
+async fn route(
+    mut req: Request<Incoming>,
+    peer: SocketAddr,
+    ctx: NgCtx,
+    gates: &Gates,
+    addr_place: SharedPlace,
+) -> Resp {
     let path = req.uri().path().to_owned();
 
     // Everything keyed on an address — bans, `max_detached_per_addr`,
@@ -312,14 +342,16 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx, gates: 
 
     if hyper_tungstenite::is_upgrade_request(&req) {
         return match path.as_str() {
-            "/" | "/ng" => upgrade(&mut req, peer, client, ctx, Proto::Json).await,
+            "/" | "/ng" => upgrade(&mut req, peer, client, ctx, Proto::Json, addr_place).await,
             "/trtp"
                 if ctx.identity.as_ref().is_some_and(|i| i.config().trtp)
                     && ctx.tunnel.is_some() =>
             {
-                upgrade(&mut req, peer, client, ctx, Proto::Trtp).await
+                upgrade(&mut req, peer, client, ctx, Proto::Trtp, addr_place).await
             }
-            "/htxf" if serves_htxf(&ctx) => upgrade(&mut req, peer, client, ctx, Proto::Htxf).await,
+            "/htxf" if serves_htxf(&ctx) => {
+                upgrade(&mut req, peer, client, ctx, Proto::Htxf, addr_place).await
+            }
             _ => plain(StatusCode::NOT_FOUND, "no such WebSocket path"),
         };
     }
@@ -725,6 +757,9 @@ async fn upgrade(
     peer: SocketAddr,
     ctx: NgCtx,
     proto: Proto,
+    // The socket's place in the port's per-address count, which a
+    // session it carries gives up with its address's place at login.
+    addr_place: SharedPlace,
 ) -> Resp {
     let config = WebSocketConfig {
         max_message_size: Some(256 * 1024),
@@ -751,10 +786,16 @@ async fn upgrade(
     // to try again with, rather than running the challenge dance again —
     // and a refused connection costs no verification. The place taken
     // here is the connection's for its life; a tunnelled session is
-    // handed it rather than taking a second.
+    // handed it rather than taking a second. It is its address's until
+    // the session logs in, and its account's after if that is a person
+    // (`Core::admit_account`), when the socket's place in this port's
+    // per-address count goes with the address's.
     let place = match proto {
         Proto::Json | Proto::Trtp => match ctx.core.admit_connection(peer.ip()) {
-            Ok(place) => Some(place),
+            Ok(mut place) => {
+                place.carry(addr_place);
+                Some(place)
+            }
             Err(refused) => {
                 info!(%peer, reason = refused.reason(), "refusing a connection past its address's limit");
                 let wire = match proto {
@@ -798,8 +839,10 @@ async fn upgrade(
         };
         match proto {
             Proto::Json => {
-                let _place = place;
-                conn::run(ws, peer, ctx, identity).await
+                let Some(place) = place else {
+                    return;
+                };
+                conn::run(ws, peer, ctx, identity, place).await
             }
             Proto::Htxf => {
                 let (Some(sink), Some(fp)) = (ctx.tunnel.as_ref(), htxf_identity) else {
@@ -1704,10 +1747,15 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx:
     // nothing but the check itself is left to refuse the request: a
     // request refused above had its password looked at by no one.
     let attempt = match password.as_deref() {
-        Some(pw) => match ctx.core.login_attempt(client.ip(), pw.as_bytes()) {
-            Ok(attempt) => Some(attempt),
-            Err(wait) => return slow_down(wait, "too many failed logins from this address"),
-        },
+        Some(pw) => {
+            match ctx
+                .core
+                .login_attempt(client.ip(), login.as_deref().unwrap_or(""), pw.as_bytes())
+            {
+                Ok(attempt) => Some(attempt),
+                Err(wait) => return slow_down(wait, "too many failed logins from this address"),
+            }
+        }
         None => None,
     };
     // The state does signature checks and, with credentials or a
@@ -1818,7 +1866,10 @@ async fn link(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx:
     };
     // The password is checked here as it is at `auth`, and held to the
     // same count of failures.
-    let attempt = match ctx.core.login_attempt(client.ip(), password.as_bytes()) {
+    let attempt = match ctx
+        .core
+        .login_attempt(client.ip(), &login, password.as_bytes())
+    {
         Ok(attempt) => attempt,
         Err(wait) => return slow_down(wait, "too many failed logins from this address"),
     };
@@ -2060,6 +2111,40 @@ impl From<&TransportIdentity> for IdentityTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ports_48_count_is_held_beside_each_64s() {
+        let gates = Gates::with(
+            crate::HttpLimits {
+                connections_per_addr: 16,
+                connections_per_v6_48: 2,
+                ..crate::HttpLimits::RECOMMENDED
+            },
+            AddrSet::default(),
+        );
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let a = gates.places(ip("2001:db8:1:1::1"), false).unwrap();
+        let _b = gates.places(ip("2001:db8:1:2::1"), false).unwrap();
+        // Each /64 is far inside its own count; their /48 is full.
+        assert_eq!(
+            gates.places(ip("2001:db8:1:3::1"), false).err(),
+            Some("too_many_48")
+        );
+        assert!(
+            gates.places(ip("2001:db8:2:1::1"), false).is_ok(),
+            "another /48"
+        );
+        assert!(gates.places(ip("192.0.2.1"), false).is_ok(), "IPv4");
+        assert!(
+            gates.places(ip("2001:db8:1:3::1"), true).is_ok(),
+            "a trusted proxy's connection is counted by no address"
+        );
+        drop(a);
+        assert!(
+            gates.places(ip("2001:db8:1:3::1"), false).is_ok(),
+            "a place came back to the /48"
+        );
+    }
 
     #[test]
     fn download_names_are_safe_and_preserve_utf8() {

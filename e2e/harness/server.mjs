@@ -157,7 +157,7 @@ function baseConfig(ports, name) {
     server: {
       bind: `127.0.0.1:${ports.legacy}`,
       name,
-      version: 185,
+      version: 254,
       login_timeout: 10,
     },
     paths: { accounts: 'accounts' },
@@ -174,11 +174,13 @@ function baseConfig(ports, name) {
     },
     // Off, for the same reason: loopback is exempt from the per-address
     // limits but not from these, which are a session's and an account's
-    // (`[limits]`), and one account posting all of a file's news, or one
-    // client driven as fast as a script drives it, is not a flood.
+    // (`[limits]`), and one account posting all of a file's news, or
+    // logging in and resuming as often as a file does, or one client
+    // driven as fast as a script drives it, is not a flood.
     limits: {
       ng_requests: 0,
       news_posts: 0,
+      reconnect_seconds: 0,
     },
   };
 }

@@ -20,7 +20,7 @@ use hxd_core::news::{
     Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, Author, BlobId, BodyType, Listed,
     NewNode, NewPost, NewsError, NewsStore, NewsUsage, Node, NodeId, NodeKind, Posted, Reference,
     StagedAttachment, SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage,
-    ThreadQuery,
+    ThreadQuery, Writer,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
@@ -407,6 +407,15 @@ fn release_attachments(conn: &Connection, which: &str, arg: i64) -> Result<(), S
         params![arg],
     ))?;
     Ok(())
+}
+
+/// What a post's `guest_key` column holds: the key of the address a
+/// guest's article came from (`hxd_core::news::GuestKeyer`), in hex, and
+/// nothing for an account's, whose share is its login's.
+fn guest_key(p: &NewPost) -> Option<String> {
+    p.guest
+        .filter(|_| p.author.login.is_none() && p.author.fingerprint.is_none())
+        .map(|key| key.to_hex())
 }
 
 fn bump_delete_sn(conn: &Connection, category: i64) -> Result<(), StoreError> {
@@ -938,8 +947,8 @@ impl NewsStore for SqliteStore {
         sql(tx.execute(
             "INSERT INTO news_article
                (category, parent, root, path, depth, nick, login, login_fp,
-                subject, body, mime, plain, at)
-             VALUES (?1, ?2, 0, X'', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                subject, body, mime, plain, at, guest_key)
+             VALUES (?1, ?2, 0, X'', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 clamp_node(p.category),
                 p.parent.map(i64::from),
@@ -952,6 +961,7 @@ impl NewsStore for SqliteStore {
                 p.mime.mime(),
                 p.plain,
                 unix(p.at),
+                guest_key(p),
             ],
         ))?;
         // Past u32 is an article the legacy wire cannot name (§3.2). The
@@ -1225,7 +1235,8 @@ impl NewsStore for SqliteStore {
         sql(tx.execute(
             "UPDATE news_article
                 SET subject = '', body = '', plain = NULL, attach_names = NULL, nick = '',
-                    login = NULL, login_fp = NULL, deleted_at = ?1, deleted_by = ?2
+                    login = NULL, login_fp = NULL, guest_key = NULL,
+                    deleted_at = ?1, deleted_by = ?2
               WHERE id = ?3",
             params![unix(at), by, i64::from(id)],
         ))?;
@@ -1269,12 +1280,15 @@ impl NewsStore for SqliteStore {
         })
     }
 
-    fn written_by(&self, who: Option<&Mailbox>) -> Result<u64, StoreError> {
+    fn written_by(&self, who: &Writer) -> Result<u64, StoreError> {
         let conn = self.conn.lock().unwrap();
         // `news_article_author` again, led by the author's key, and for
-        // the guests by the two NULLs every guest row carries.
+        // the guests `news_article_guest` (schema version 13), led by the
+        // address's key over the rows carrying the two NULLs every guest
+        // row does. `IS` rather than `=`, so the guests with no key are
+        // a pool of their own rather than nobody's.
         let n: i64 = match who {
-            Some(who) => {
+            Writer::Account(who) => {
                 let query = format!(
                     "SELECT COUNT(*) FROM news_article WHERE {} AND deleted_at IS NULL",
                     mailbox_sql(who, "login", 1)
@@ -1283,12 +1297,15 @@ impl NewsStore for SqliteStore {
                     .prepare_cached(&query)
                     .and_then(|mut stmt| stmt.query_row(params![bind(who)], |r| r.get(0))))?
             }
-            None => sql(conn
+            Writer::Guest(key) => sql(conn
                 .prepare_cached(
                     "SELECT COUNT(*) FROM news_article
-                      WHERE login_fp IS NULL AND login IS NULL AND deleted_at IS NULL",
+                      WHERE login_fp IS NULL AND login IS NULL AND guest_key IS ?1
+                        AND deleted_at IS NULL",
                 )
-                .and_then(|mut stmt| stmt.query_row([], |r| r.get(0))))?,
+                .and_then(|mut stmt| {
+                    stmt.query_row(params![key.map(|k| k.to_hex())], |r| r.get(0))
+                }))?,
         };
         Ok(n.max(0) as u64)
     }

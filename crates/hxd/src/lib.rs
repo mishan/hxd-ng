@@ -450,6 +450,13 @@ pub struct NewsSection {
     /// Filesystem root for durable content-addressed attachment bytes.
     #[serde(default = "default_news_blobs")]
     pub blobs: PathBuf,
+    /// The secret a guest's address is kept under beside its articles
+    /// (`docs/news.md` §7.4): 32 bytes in hex, created owner-only on
+    /// first start. Absent, `news-guest.key` in the database's directory.
+    /// Kept out of the database on purpose, so a copy of it is not a
+    /// list of where guests posted from; lost or replaced, it leaves the
+    /// guests' articles already kept counted under no address.
+    pub guest_secret: Option<PathBuf>,
     /// The legacy `NEWSDATA` ceiling. ↓ freely, ↑ never: 65 535 is what
     /// the 1.5 wire can carry in one chunk (§12.4).
     #[serde(default = "default_news_max_body")]
@@ -488,8 +495,8 @@ pub struct NewsSection {
     /// hold together; a post past it is refused. 0 for no ceiling.
     #[serde(default = "default_news_max_text_bytes")]
     pub max_text_bytes: u64,
-    /// Live articles one author may hold, every guest counted as one. 0
-    /// for no ceiling.
+    /// Live articles one author may hold, the guests from one address
+    /// counted as one. 0 for no ceiling.
     #[serde(default = "default_news_max_per_author")]
     pub max_per_author: u64,
     /// May an author delete their own article? `false` is the period
@@ -645,6 +652,25 @@ fn default_news_stale_after() -> u64 {
 }
 
 impl NewsSection {
+    /// Where the guests' secret lives: `guest_secret`, or
+    /// `news-guest.key` in the directory of the database the news is
+    /// kept in, which is where an operator backing the data up will find
+    /// it, and apart from the database file itself.
+    pub fn guest_secret_path(&self, config: &Config) -> PathBuf {
+        if let Some(path) = &self.guest_secret {
+            return path.clone();
+        }
+        let db = self
+            .db
+            .clone()
+            .or_else(|| config.inbox.as_ref().map(|i| i.db.clone()))
+            .or_else(|| config.history.as_ref().and_then(|h| h.db.clone()));
+        db.as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new(""))
+            .join("news-guest.key")
+    }
+
     pub fn to_policy(&self) -> hxd_core::NewsPolicy {
         hxd_core::NewsPolicy {
             max_body: self.max_body,
@@ -1555,13 +1581,17 @@ pub struct ServerSection {
     #[serde(default = "default_name")]
     pub name: String,
     /// Advertised server version; 0 mimics a pre-1.5 server (no agreement
-    /// flow, uid-only login reply).
+    /// flow, uid-only login reply). The default is hxd-ng's own number
+    /// ([`default_version`]).
     #[serde(default = "default_version")]
     pub version: u16,
     /// Seconds a connection may take to complete its login.
     #[serde(default = "default_login_timeout")]
     pub login_timeout: u64,
-    /// Seconds a kick-with-ban keeps the address banned.
+    /// Seconds a kick-with-ban's ban lasts: on the person kicked (the
+    /// account's login, or the identity a guest proved) and on their
+    /// address unless `[limits] exempt` holds it, so a plain guest on an
+    /// exempt address is only kicked (`docs/moderation.md` §3.5).
     #[serde(default = "default_ban_time")]
     pub ban_time: u64,
     /// Set the cleartext marker bit in legacy user flags for unencrypted
@@ -1602,8 +1632,12 @@ fn default_bind() -> String {
 fn default_name() -> String {
     "hxd-ng".into()
 }
+/// 254 (0xFE), the number hxd-ng and GtkHx share. It was 185, which
+/// the public client and server version registry also gives the
+/// official 1.8.5 client and server and Pitbull Pro, so a client could
+/// not tell this server from theirs.
 fn default_version() -> u16 {
-    185
+    254
 }
 fn default_login_timeout() -> u64 {
     10
@@ -1652,14 +1686,31 @@ impl ServerSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsSection {
-    /// Connections one address may hold at once; 0 for no limit.
+    /// Connections one address may hold at once, until they log in; 0
+    /// for no limit. A connection that logs in as an account with one
+    /// person behind it counts against `connections_per_account` from
+    /// there instead, and a guest's goes on counting here.
     #[serde(default = "default_connections_per_addr")]
     pub connections_per_addr: usize,
+    /// Connections the /64s of one IPv6 /48 may hold at once between
+    /// them, each still held to `connections_per_addr`; 0 for no limit.
+    /// IPv4 has no wider count.
+    #[serde(default = "default_connections_per_v6_48")]
+    pub connections_per_v6_48: usize,
     /// Seconds one address waits for each new connection past a burst
     /// of `connections_per_addr` (mhxd's `conn_max` when that is 0); 0
-    /// for no limit.
+    /// for no limit. One account is held to the same rate past a burst
+    /// of `connections_per_account`, from every address, and a login
+    /// spends from its account's burst as well as its address's, so it
+    /// goes no faster than the slower of the two.
     #[serde(default = "default_reconnect_seconds")]
     pub reconnect_seconds: u64,
+    /// Connections one account with one person behind it may hold at
+    /// once, from wherever they come, once they have logged in; 0 for
+    /// no limit. A login past it is refused with a reason on either
+    /// wire. A detached ng session holds none.
+    #[serde(default = "default_connections_per_account")]
+    pub connections_per_account: usize,
     /// Addresses and CIDR blocks held to none of the per-address limits:
     /// connections, failed logins, and the ng port's — and kept a few
     /// places past `ng_connections`. The flood limits are a session's,
@@ -1676,7 +1727,8 @@ pub struct LimitsSection {
     pub chat_seconds: u64,
     /// Spam points one session may spend in each `spam_seconds` window,
     /// every transaction costing what mhxd's table charges it, before it
-    /// is kicked and banned for `[server] ban_time`; 0 for no limit.
+    /// is kicked and banned for `[server] ban_time` as a kick-with-ban
+    /// bans; 0 for no limit.
     /// mhxd's `spam_max` and `spam_time`.
     #[serde(default = "default_spam_points")]
     pub spam_points: u32,
@@ -1704,18 +1756,27 @@ pub struct LimitsSection {
     pub news_posts: u32,
     #[serde(default = "default_news_post_seconds")]
     pub news_post_seconds: u64,
-    /// Wrong passwords one address may give, on either wire, before a
-    /// password from it is refused until it earns one back, one every
-    /// `login_failure_seconds`; 0 for no limit. A login that sends no
-    /// password is not held to it.
+    /// Wrong passwords one address may give for one login, on either
+    /// wire, before a password from it for that login is refused until
+    /// it earns one back, one every `login_failure_seconds`; 0 for no
+    /// limit. A login that sends no password is not held to it.
     #[serde(default = "default_login_failures")]
     pub login_failures: u32,
+    /// Wrong passwords one address may give for every login together,
+    /// earned back at the same rate; 0 for no limit. The ceiling that
+    /// keeps an address from guessing across every account.
+    #[serde(default = "default_login_failures_per_addr")]
+    pub login_failures_per_addr: u32,
     #[serde(default = "default_login_failure_seconds")]
     pub login_failure_seconds: u64,
     /// Connections one address may hold to the ng port, whatever they
     /// carry; 0 for no limit.
     #[serde(default = "default_http_connections_per_addr")]
     pub http_connections_per_addr: usize,
+    /// Connections the /64s of one IPv6 /48 may hold to the ng port
+    /// between them; 0 for no limit.
+    #[serde(default = "default_http_connections_per_v6_48")]
+    pub http_connections_per_v6_48: usize,
     /// Connections everyone together may hold to the ng port; 0 for no
     /// limit. Exempt addresses have a few places past it.
     #[serde(default = "default_ng_connections")]
@@ -1751,11 +1812,17 @@ fn default_news_post_seconds() -> u64 {
 fn default_login_failures() -> u32 {
     hxd_core::LoginLimits::RECOMMENDED.failures
 }
+fn default_login_failures_per_addr() -> u32 {
+    hxd_core::LoginLimits::RECOMMENDED.failures_per_addr
+}
 fn default_login_failure_seconds() -> u64 {
     hxd_core::LoginLimits::RECOMMENDED.every.as_secs()
 }
 fn default_http_connections_per_addr() -> usize {
     hxd_ng_session::HttpLimits::RECOMMENDED.connections_per_addr
+}
+fn default_http_connections_per_v6_48() -> usize {
+    hxd_ng_session::HttpLimits::RECOMMENDED.connections_per_v6_48
 }
 fn default_ng_connections() -> usize {
     hxd_ng_session::HttpLimits::RECOMMENDED.connections
@@ -1783,8 +1850,14 @@ fn default_spam_seconds() -> u64 {
 fn default_connections_per_addr() -> usize {
     hxd_core::limits::CONNECTIONS_PER_ADDR
 }
+fn default_connections_per_v6_48() -> usize {
+    hxd_core::limits::CONNECTIONS_PER_V6_48
+}
 fn default_reconnect_seconds() -> u64 {
     hxd_core::limits::RECONNECT_EVERY.as_secs()
+}
+fn default_connections_per_account() -> usize {
+    hxd_core::limits::CONNECTIONS_PER_ACCOUNT
 }
 fn default_limits_exempt() -> Vec<String> {
     vec!["127.0.0.0/8".into(), "::1".into()]
@@ -1794,7 +1867,9 @@ impl Default for LimitsSection {
     fn default() -> Self {
         LimitsSection {
             connections_per_addr: default_connections_per_addr(),
+            connections_per_v6_48: default_connections_per_v6_48(),
             reconnect_seconds: default_reconnect_seconds(),
+            connections_per_account: default_connections_per_account(),
             exempt: default_limits_exempt(),
             chat_lines: default_chat_lines(),
             chat_seconds: default_chat_seconds(),
@@ -1807,8 +1882,10 @@ impl Default for LimitsSection {
             news_posts: default_news_posts(),
             news_post_seconds: default_news_post_seconds(),
             login_failures: default_login_failures(),
+            login_failures_per_addr: default_login_failures_per_addr(),
             login_failure_seconds: default_login_failure_seconds(),
             http_connections_per_addr: default_http_connections_per_addr(),
+            http_connections_per_v6_48: default_http_connections_per_v6_48(),
             ng_connections: default_ng_connections(),
             challenges_per_minute: default_challenges_per_minute(),
             avatar_fetches_per_minute: default_avatar_fetches_per_minute(),
@@ -1860,29 +1937,61 @@ impl LimitsSection {
         if self.login_failures != 0 && self.login_failure_seconds == 0 {
             return Err("[limits] login_failures needs login_failure_seconds: set both, or login_failures to 0".into());
         }
+        if self.login_failures_per_addr != 0 && self.login_failure_seconds == 0 {
+            return Err("[limits] login_failures_per_addr needs login_failure_seconds: set both, or login_failures_per_addr to 0".into());
+        }
         Ok(hxd_core::LoginLimits {
             failures: self.login_failures,
+            failures_per_addr: self.login_failures_per_addr,
             every: Duration::from_secs(self.login_failure_seconds),
         })
     }
 
-    pub fn http_limits(&self) -> hxd_ng_session::HttpLimits {
-        hxd_ng_session::HttpLimits {
+    pub fn http_limits(&self) -> Result<hxd_ng_session::HttpLimits, String> {
+        wider_than_one(
+            "http_connections_per_v6_48",
+            self.http_connections_per_v6_48,
+            "http_connections_per_addr",
+            self.http_connections_per_addr,
+        )?;
+        Ok(hxd_ng_session::HttpLimits {
             connections_per_addr: self.http_connections_per_addr,
+            connections_per_v6_48: self.http_connections_per_v6_48,
             connections: self.ng_connections,
             challenges_per_minute: self.challenges_per_minute,
             avatar_fetches_per_minute: self.avatar_fetches_per_minute,
-        }
+        })
     }
 
     pub fn conn_limits(&self) -> Result<hxd_core::ConnLimits, String> {
+        wider_than_one(
+            "connections_per_v6_48",
+            self.connections_per_v6_48,
+            "connections_per_addr",
+            self.connections_per_addr,
+        )?;
         Ok(hxd_core::ConnLimits {
             per_addr: self.connections_per_addr,
+            per_v6_48: self.connections_per_v6_48,
             reconnect: Duration::from_secs(self.reconnect_seconds),
+            per_account: self.connections_per_account,
             exempt: hxd_core::AddrSet::parse(&self.exempt)
                 .map_err(|e| format!("[limits] exempt: {e}"))?,
         })
     }
+}
+
+/// A /48's count below one /64's would refuse a single client short of
+/// its own share, which is a typo rather than a policy: the /48 is the
+/// wider of the two. Either at 0 is no limit, and anything goes with it.
+fn wider_than_one(wide: &str, n: usize, one: &str, per: usize) -> Result<(), String> {
+    if n != 0 && per != 0 && n < per {
+        return Err(format!(
+            "[limits] {wide} ({n}) is below {one} ({per}): a /48 holds many addresses, \
+             so set it at least as high, or to 0 for no limit"
+        ));
+    }
+    Ok(())
 }
 
 impl Default for ServerSection {
@@ -2224,6 +2333,31 @@ pub(crate) fn load_key(path: &Path, what: &str) -> Result<ServerKey, String> {
 
 /// Read a key [`load_key`] wrote, failing if there is none.
 pub(crate) fn read_key(path: &Path) -> Result<ServerKey, String> {
+    read_seed(path).map(|seed| ServerKey::from_seed(&seed))
+}
+
+/// The 32-byte secret kept in hex at `path`, made from the OS CSPRNG and
+/// written there owner-only the first time it is asked for, as
+/// [`load_key`] makes a key.
+pub(crate) fn load_secret(path: &Path, what: &str) -> Result<[u8; 32], String> {
+    use rand_core::RngCore;
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut secret = [0u8; 32];
+            rand_core::OsRng
+                .try_fill_bytes(&mut secret)
+                .map_err(|e| format!("{what}: the OS CSPRNG: {e}"))?;
+            let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+            write_private(path, &hex).map_err(|e| format!("{}: {e}", path.display()))?;
+            tracing::info!("generated the {what} at {}", path.display());
+            Ok(secret)
+        }
+        _ => read_seed(path),
+    }
+}
+
+/// 32 bytes in hex, as [`load_key`] and [`load_secret`] write them.
+fn read_seed(path: &Path) -> Result<[u8; 32], String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let hex = text.trim();
     let bytes = (0..hex.len())
@@ -2231,10 +2365,9 @@ pub(crate) fn read_key(path: &Path) -> Result<ServerKey, String> {
         .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("zz"), 16))
         .collect::<Result<Vec<u8>, _>>()
         .map_err(|_| format!("{}: not a hex seed", path.display()))?;
-    let seed: [u8; 32] = bytes
+    bytes
         .try_into()
-        .map_err(|_| format!("{}: seed must be 32 bytes", path.display()))?;
-    Ok(ServerKey::from_seed(&seed))
+        .map_err(|_| format!("{}: seed must be 32 bytes", path.display()))
 }
 
 /// A public key as configuration and discovery spell it: base64url, 32
@@ -2555,6 +2688,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
         return Err("[server] logins_in_flight must be at least 1, and not absurd".into());
     }
     config.limits.conn_limits()?;
+    config.limits.http_limits()?;
     config.limits.flood_limits(config.server.ban_time)?;
     if let Some(voice) = &config.voice {
         voice.voice_limits()?;
@@ -3414,7 +3548,7 @@ pub fn build_ng_ctx(
             caps: ng_caps(config, voice, files),
             trusted_proxies: TrustedProxies::parse(&ng.trusted_proxies)?,
             forwarded_header: ForwardedHeader::parse(&ng.forwarded_header)?,
-            http_limits: config.limits.http_limits(),
+            http_limits: config.limits.http_limits()?,
         }),
         registry: Arc::new(Registry::new()),
         identity,
@@ -3533,6 +3667,10 @@ pub fn build_ctx(
         // account nobody may be logged into (§10.5).
         (Some(store), Some(news)) => core
             .with_news(store, news.to_policy())
+            .with_news_guest_keyer(hxd_core::news::GuestKeyer::new(load_secret(
+                &news.guest_secret_path(config),
+                "news guest secret",
+            )?))
             .with_accounts(auth.clone()),
         (None, None) => core,
         _ => return Err("[news] store was not opened".into()),
@@ -3606,6 +3744,60 @@ pub(crate) fn spawn_blocking<R: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The secret a guest's news share is kept under is made the first
+    /// time, owner-only, and read back unchanged after: the same address
+    /// is the same key across a restart, so a guest's articles stay its
+    /// address's.
+    #[test]
+    fn the_news_guest_secret_is_made_once_owner_only_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("news-guest.key");
+        let first = load_secret(&path, "news guest secret").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "owner-only from its first byte");
+        }
+        let again = load_secret(&path, "news guest secret").unwrap();
+        assert_eq!(first, again, "read back, not made again");
+        let addr: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        assert_eq!(
+            hxd_core::news::GuestKeyer::new(first).key(addr),
+            hxd_core::news::GuestKeyer::new(again).key(addr),
+            "the same address, the same key, after a restart"
+        );
+        assert_ne!(first, [0; 32]);
+        std::fs::write(&path, "not hex\n").unwrap();
+        assert!(load_secret(&path, "news guest secret").is_err());
+    }
+
+    /// Unnamed, the secret lives beside the database the news is kept
+    /// in, and a server built from the config makes it there.
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn the_news_guest_secret_defaults_to_beside_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let text =
+            format!("[paths]\naccounts = \"{d}/accounts\"\n[inbox]\ndb = \"{d}/hx.db\"\n[news]\n");
+        let config: Config = toml::from_str(&text).unwrap();
+        let news = config.news.as_ref().unwrap();
+        let path = dir.path().join("news-guest.key");
+        assert_eq!(news.guest_secret_path(&config), path);
+        assert!(!path.exists());
+        build_ctx(&config, None, None, None, None).unwrap();
+        assert!(path.exists(), "made at start");
+        let named: Config = toml::from_str(&format!(
+            "[news]\ndb = \"{d}/news.db\"\nguest_secret = \"{d}/elsewhere.key\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            named.news.as_ref().unwrap().guest_secret_path(&named),
+            dir.path().join("elsewhere.key")
+        );
+    }
 
     /// `hxd identity revoke` against a file an operator wrote by hand.
     #[test]
@@ -3795,6 +3987,49 @@ hmac_secret = "new secret"
     }
 
     #[test]
+    fn account_and_login_limits_default_and_are_checked() {
+        let cfg = parse("").unwrap();
+        let conn = cfg.limits.conn_limits().unwrap();
+        assert_eq!(conn.per_account, hxd_core::limits::CONNECTIONS_PER_ACCOUNT);
+        assert_eq!(
+            cfg.limits.login_limits().unwrap(),
+            hxd_core::LoginLimits::RECOMMENDED
+        );
+        let cfg = parse(
+            "[limits]\nconnections_per_account = 0\nlogin_failures = 0\n\
+             login_failures_per_addr = 7\n",
+        )
+        .unwrap();
+        check_config(&cfg).unwrap();
+        assert_eq!(cfg.limits.conn_limits().unwrap().per_account, 0);
+        assert_eq!(cfg.limits.login_limits().unwrap().failures_per_addr, 7);
+        let cfg = parse(
+            "[limits]\nlogin_failures = 0\nlogin_failures_per_addr = 7\n\
+             login_failure_seconds = 0\n",
+        )
+        .unwrap();
+        assert!(check_config(&cfg)
+            .unwrap_err()
+            .contains("login_failures_per_addr"));
+        let cfg = parse(
+            "[limits]\nlogin_failures = 0\nlogin_failures_per_addr = 0\n\
+             login_failure_seconds = 0\n",
+        )
+        .unwrap();
+        check_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn the_server_reports_its_own_version_unless_told_otherwise() {
+        assert_eq!(parse("").unwrap().server.version, 254);
+        assert_eq!(ServerSection::default().version, 254);
+        let old = parse("[server]\nversion = 185\n").unwrap();
+        assert_eq!(old.server.version, 185);
+        let pre_15 = parse("[server]\nversion = 0\n").unwrap();
+        assert_eq!(pre_15.server.version, 0);
+    }
+
+    #[test]
     fn the_queue_budget_is_counted_in_bytes_and_refused_when_it_cannot_be() {
         let cfg = parse("[server]\nqueue_budget_mb = 64\n").unwrap();
         check_config(&cfg).unwrap();
@@ -3804,6 +4039,35 @@ hmac_secret = "new secret"
         for bad in ["0", &(usize::MAX >> 10).to_string()] {
             let cfg = parse(&format!("[server]\nqueue_budget_mb = {bad}\n")).unwrap();
             assert!(check_config(&cfg).unwrap_err().contains("queue_budget_mb"));
+        }
+    }
+
+    #[test]
+    fn a_48s_connection_cap_is_no_narrower_than_one_address() {
+        let default = parse("").unwrap();
+        check_config(&default).unwrap();
+        let l = &default.limits;
+        assert!(l.connections_per_v6_48 > l.connections_per_addr);
+        assert!(l.http_connections_per_v6_48 > l.http_connections_per_addr);
+        for ok in [
+            "connections_per_v6_48 = 0",
+            "connections_per_v6_48 = 5",
+            "connections_per_addr = 0\nconnections_per_v6_48 = 1",
+            "http_connections_per_v6_48 = 0",
+            "http_connections_per_addr = 0\nhttp_connections_per_v6_48 = 1",
+        ] {
+            let cfg = parse(&format!("[limits]\n{ok}\n")).unwrap();
+            check_config(&cfg).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+        for (bad, key) in [
+            ("connections_per_v6_48 = 4", "connections_per_v6_48"),
+            (
+                "http_connections_per_v6_48 = 15",
+                "http_connections_per_v6_48",
+            ),
+        ] {
+            let cfg = parse(&format!("[limits]\n{bad}\n")).unwrap();
+            assert!(check_config(&cfg).unwrap_err().contains(key), "{bad:?}");
         }
     }
 

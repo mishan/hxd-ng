@@ -96,9 +96,44 @@ fn main() -> ExitCode {
         // One relay however many addresses it listens on: the limits are
         // shared, not multiplied by the listeners.
         let listeners = listeners.into_iter().map(|(_, l)| l).collect();
-        hlrelay::serve_all(listeners, cfg).await;
-        ExitCode::SUCCESS
+        // SIGTERM ends it, as it ends hxd: as a container's first process
+        // a signal with no handler is ignored, and `docker stop` would
+        // wait out its timeout and kill it. Sockets in flight close with
+        // the process, which is what their clients see of any restart.
+        tokio::select! {
+            _ = hlrelay::serve_all(listeners, cfg) => ExitCode::SUCCESS,
+            result = shutdown_signal() => match result {
+                Ok(()) => {
+                    tracing::info!("shutting down");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("hlrelay: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+        }
     })
+}
+
+async fn shutdown_signal() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| format!("install SIGTERM handler: {e}"))?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(|e| format!("install Ctrl-C handler: {e}"))
+            }
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| format!("install Ctrl-C handler: {e}"))
 }
 
 /// A relay reachable only on loopback is behind a proxy, which is the

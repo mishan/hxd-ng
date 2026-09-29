@@ -4,7 +4,9 @@
 # user, configured from HXD_* environment variables or a mounted
 # hxd-ng.toml. The ng port speaks plaintext HTTP and WebSocket; put a
 # TLS-terminating proxy in front of it. docs/docker.md has the variables,
-# the ports, and an nginx configuration.
+# the ports, and an nginx configuration. With HXD_MODE=relay the same
+# image runs `hlrelay` in front of a classic server instead
+# (docs/relay.md).
 #
 #   docker build -t hxd-ng .
 #   docker run -d --name hxd-ng -v hxd-ng:/var/lib/hxd-ng \
@@ -33,8 +35,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p hxd ${CARGO_FEATURES} \
-    && cargo build --release --locked -p hlid \
-    && install -D -m 0755 target/release/hxd target/release/hlid -t /out/
+    && cargo build --release --locked -p hlid -p hlrelay \
+    && install -D -m 0755 target/release/hxd target/release/hlid \
+        target/release/hlrelay -t /out/
 
 
 FROM debian:${DEBIAN_RELEASE}-slim
@@ -51,7 +54,7 @@ RUN apt-get update \
     && install -d -o hxd -g hxd -m 0700 /run/hxd-ng \
     && install -d -m 0755 /etc/hxd-ng
 
-COPY --from=build /out/hxd /out/hlid /usr/local/bin/
+COPY --from=build /out/hxd /out/hlid /out/hlrelay /usr/local/bin/
 COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/hxd-entrypoint
 
 # Accounts, the identity and VAPID keys, and the SQLite store all live
@@ -66,7 +69,7 @@ ENV NO_COLOR=1
 
 # Legacy Hotline, HTXF files (legacy + 1), voice media (legacy + 4, UDP),
 # the legacy wire and HTXF over TLS (HXD_TLS_*), and the ng
-# HTTP/WebSocket port the proxy forwards to.
+# HTTP/WebSocket port the proxy forwards to, which is also the relay's.
 EXPOSE 5500/tcp 5501/tcp 5504/udp 5600/tcp 5601/tcp 5700/tcp
 
 # SIGTERM shuts down cleanly; SIGHUP (`docker kill -s HUP`) re-reads the
@@ -76,9 +79,11 @@ STOPSIGNAL SIGTERM
 
 # The legacy port accepts a connection, which is all this asks: bash's
 # /dev/tcp needs nothing the base image lacks. A mounted config that
-# moves the legacy port wants `--health-cmd` or `--no-healthcheck`.
+# moves the legacy port wants `--health-cmd` or `--no-healthcheck`. A
+# relay is asked on 127.0.0.1 at the port of the first address it
+# listens on, which must then be a wildcard address or 127.0.0.1.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5500"]
+    CMD ["bash", "-c", "port=5500; if [ \"${HXD_MODE:-server}\" = relay ]; then l=${HXD_RELAY_LISTEN:-0.0.0.0:5700}; l=${l%%[, \t]*}; port=${l##*:}; fi; exec 3<>/dev/tcp/127.0.0.1/$port"]
 
 ENTRYPOINT ["hxd-entrypoint"]
 CMD []

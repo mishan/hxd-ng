@@ -853,7 +853,7 @@ mod tests {
             description: "A test".into(),
             port: 5500,
             tls_port: Some(5600),
-            protocol_version: 185,
+            protocol_version: 254,
             inline_media: true,
             voice: false,
             large_files: true,
@@ -993,7 +993,7 @@ mod tests {
             fields[&id::SERVER_SOFTWARE],
             format!("hxd-ng/{}", env!("CARGO_PKG_VERSION")).as_bytes()
         );
-        assert_eq!(fields[&id::PROTOCOL_VERSION], 185u16.to_be_bytes());
+        assert_eq!(fields[&id::PROTOCOL_VERSION], 254u16.to_be_bytes());
         assert_eq!(fields[&id::UPTIME].len(), 4);
         assert_eq!(fields[&id::SUPPORTS_TLS], [1]);
         assert_eq!(fields[&id::TLS_PORT], 5600u16.to_be_bytes());

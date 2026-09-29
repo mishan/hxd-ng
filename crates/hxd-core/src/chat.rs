@@ -24,7 +24,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::history::{HistoryPage, HistoryQuery, LineFlags, NewLine};
 use crate::inbox::{
@@ -221,8 +221,21 @@ pub struct Flooded {
 #[derive(Debug, PartialEq, Eq)]
 pub struct SpamBan {
     uid: Uid,
-    target: crate::ban::BanTarget,
+    /// Never empty: [`Core::kick_ban_targets`], one act.
+    targets: Vec<crate::ban::BanTarget>,
     for_: Duration,
+}
+
+/// A kick made ([`Core::kick_by`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kicked {
+    /// The kicked session's nick, for the announcement.
+    pub nick: String,
+    /// Whether a ban was placed with it: the announcement says
+    /// "banned" only then. A kick asked to ban may place none, when the
+    /// session had nothing of its own to ban ([`Core::kick_ban_targets`])
+    /// or the store refused it.
+    pub banned: bool,
 }
 
 /// Is `v6` an IPv6 address a kick-ban takes alone, as /128, rather
@@ -824,7 +837,7 @@ impl Core {
     /// chosen now, while the session is on the roster to be read.
     pub fn spend_spam(&self, uid: Uid, points: u32, trans: u32) -> Result<(), Flooded> {
         let limits = self.flood_limits;
-        let (nick, total, target) = {
+        let (nick, total, targets) = {
             let mut r = self.roster.lock().unwrap();
             let Some(sess) = r.users.get_mut(&uid) else {
                 return Ok(());
@@ -839,19 +852,23 @@ impl Core {
             if under {
                 return Ok(());
             }
-            let target = if limits.ban_for.is_zero() {
-                None
+            let targets = if limits.ban_for.is_zero() {
+                Vec::new()
             } else {
-                self.spam_ban_target(sess)
+                self.kick_ban_targets(sess)
             };
             // Kicked under the lock that found it over, so a burst in
             // flight kicks it once; banned once the lock is let go.
             match kick_in(&mut r, uid) {
-                Ok(nick) => (nick, total, target),
+                Ok(nick) => (nick, total, targets),
                 Err(_) => return Err(Flooded { ban: None }),
             }
         };
-        let verb = if target.is_some() { "banned" } else { "kicked" };
+        let verb = if targets.is_empty() {
+            "kicked"
+        } else {
+            "banned"
+        };
         warn!(uid, nick = %nick, total, trans, "{verb} for spam_max");
         crate::instrument::flood_kick("spam");
         // mhxd's `user_kick` with the spammer as its own kicker, and the
@@ -866,37 +883,50 @@ impl Core {
             ),
         );
         Err(Flooded {
-            ban: target.map(|target| SpamBan {
+            ban: (!targets.is_empty()).then_some(SpamBan {
                 uid,
-                target,
+                targets,
                 for_: limits.ban_for,
             }),
         })
     }
 
-    /// What a spam kick of `sess` bans. mhxd bans the address the
-    /// flood came from, and so does this server, with one deliberate
-    /// deviation: never an address `[limits] exempt` holds to nothing.
-    /// Those are the addresses many people share on purpose, loopback
-    /// and whatever proxy an operator has exempted (Docker's userland
-    /// proxy, a TCP proxy that hides its clients), and banning one for
-    /// one person's flood locks everyone behind it out for `ban_time`.
-    /// There the ban is on the person instead: the account's login when
-    /// it is a person's (which bans the identity it links too), else the
-    /// identity the session came with. A guest with neither, on an
-    /// exempt address, is only kicked: there is nothing of theirs alone
-    /// to ban.
-    fn spam_ban_target(&self, sess: &crate::roster::UserSession) -> Option<crate::ban::BanTarget> {
-        let addr = sess.addr?;
-        if !self.conn_gate.exempt(addr) {
-            return self.kick_ban_target(addr);
-        }
-        if sess.is_person {
-            if let Ok(login) = crate::ban::BanTarget::login(&sess.login) {
-                return Some(login);
-            }
-        }
-        sess.identity.map(crate::ban::BanTarget::Identity)
+    /// What a kick-with-ban of `sess` bans, a moderator's or a spam
+    /// kick's: the person, and the address they came from unless it is
+    /// one `[limits] exempt` holds to nothing. Every row belongs to one
+    /// act, so lifting any lifts them all.
+    ///
+    /// mhxd bans the address alone, and so did this server; the
+    /// deviation is deliberate. An exempt address is one many people
+    /// share on purpose (loopback, Docker's userland proxy, a TCP proxy
+    /// that hides its clients, a CGNAT an operator has listed), and
+    /// banning it for one person locks everyone behind it out for the
+    /// ban's length. And an address alone is a ban a person walks out of
+    /// by reconnecting from another one, which the login they came back
+    /// as would not let them.
+    ///
+    /// The person is the account's login when it is a person's
+    /// (`is_person`: which bans the identity it links too,
+    /// `Core::place_ban`), else the identity the session proved, if it
+    /// proved one. A guest with neither, on an exempt address, is only
+    /// kicked: there is nothing of theirs alone to ban.
+    pub(crate) fn kick_ban_targets(
+        &self,
+        sess: &crate::roster::UserSession,
+    ) -> Vec<crate::ban::BanTarget> {
+        use crate::ban::BanTarget;
+        let login = sess
+            .is_person
+            .then(|| BanTarget::login(&sess.login).ok())
+            .flatten()
+            // Everyone's login is no one person's: `place_ban` refuses it.
+            .filter(|t| *t != BanTarget::Login("guest".into()));
+        let person = login.or_else(|| sess.identity.map(BanTarget::Identity));
+        let address = sess
+            .addr
+            .filter(|a| !self.conn_gate.exempt(*a))
+            .and_then(|a| self.address_ban_target(a));
+        person.into_iter().chain(address).collect()
     }
 
     /// Place the ban a spam kick asked for ([`Core::spend_spam`]). A
@@ -905,7 +935,7 @@ impl Core {
     pub fn place_spam_ban(&self, ban: SpamBan) {
         self.place_kick_ban(
             ban.uid,
-            Some(ban.target),
+            ban.targets,
             KickBan {
                 by: crate::moderation::Actor::Operator,
                 for_: ban.for_,
@@ -2130,8 +2160,9 @@ impl Core {
 
     // --- Moderation -----------------------------------------------------
 
-    /// Kick `target`, optionally banning its address for `ban_for`, on
-    /// the operator's word. [`Core::kick_by`] with no one to name.
+    /// Kick `target`, optionally banning it for `ban_for`, on the
+    /// operator's word. [`Core::kick_by`] with no one to name; returns
+    /// the target's nick.
     pub fn kick(&self, target: Uid, ban_for: Option<Duration>) -> Result<String, ChatError> {
         self.kick_by(
             target,
@@ -2141,22 +2172,24 @@ impl Core {
                 reason: "kicked with a ban".into(),
             }),
         )
+        .map(|k| k.nick)
     }
 
-    /// Kick `target`, and with `ban` ban its address too. The target
-    /// session receives [`Event::Kicked`] and its transport closes; the
+    /// Kick `target`, and with `ban` ban it too. The target session
+    /// receives [`Event::Kicked`] and its transport closes; the
     /// public-chat announcement is the caller's job (it owns the
-    /// wording). Returns the target's nick. The cant-be-disconnected
-    /// check is policy and lives in the caller, which has the target's
-    /// access via [`Core::access_of`].
+    /// wording, and [`Kicked::banned`] says which verb). The
+    /// cant-be-disconnected check is policy and lives in the caller,
+    /// which has the target's access via [`Core::access_of`].
     ///
-    /// The ban is a durable one (`crate::ban`), on the address the
-    /// session came from: an IPv4 one alone, an IPv6 one with its
-    /// `[moderation] ban_v6_prefix` block. It ends no other session from
-    /// that block, as the reference server's kick-with-ban does not:
-    /// they are refused at their next connection.
-    pub fn kick_by(&self, target: Uid, ban: Option<KickBan>) -> Result<String, ChatError> {
-        let (nick, addr, serial) = {
+    /// The ban is a durable one (`crate::ban`), on the person and on the
+    /// address the session came from ([`Core::kick_ban_targets`]; an
+    /// IPv4 address alone, an IPv6 one with its `[moderation]
+    /// ban_v6_prefix` block), not on an exempt address. It ends no other
+    /// session, as the reference server's kick-with-ban does not: they
+    /// are refused at their next connection.
+    pub fn kick_by(&self, target: Uid, ban: Option<KickBan>) -> Result<Kicked, ChatError> {
+        let (nick, targets, serial) = {
             let r = self.roster.lock().unwrap();
             let sess = r.users.get(&target).ok_or(ChatError::NoSuchUser)?;
             // The server cannot be kicked off its own roster
@@ -2166,32 +2199,28 @@ impl Core {
             if sess.system {
                 return Err(ChatError::NoSuchUser);
             }
-            (sess.info.nick.clone(), sess.addr, sess.serial)
+            let targets = match ban {
+                Some(_) => self.kick_ban_targets(sess),
+                None => Vec::new(),
+            };
+            (sess.info.nick.clone(), targets, sess.serial)
         };
-        if let Some(ban) = ban {
-            self.ban_kicked(target, addr, ban);
-        }
+        let banned = ban.is_some_and(|ban| self.place_kick_ban(target, targets, ban));
         let mut r = self.roster.lock().unwrap();
         // The roster lock was let go while the ban was written. A target
         // that left meanwhile is gone, and its uid, if it has been given
         // out again, is somebody else's.
         if r.users.get(&target).map(|s| s.serial) != Some(serial) {
-            return Ok(nick);
+            return Ok(Kicked { nick, banned });
         }
-        kick_in(&mut r, target)
-    }
-
-    /// Place the ban a kick of `target`, from `addr`, asks for. Said in
-    /// the log when it cannot be placed, and the kick goes ahead.
-    fn ban_kicked(&self, target: Uid, addr: Option<IpAddr>, ban: KickBan) {
-        self.place_kick_ban(target, addr.and_then(|a| self.kick_ban_target(a)), ban);
+        kick_in(&mut r, target).map(|nick| Kicked { nick, banned })
     }
 
     /// The address block a kick-with-ban from `addr` bans: the address
     /// itself on IPv4, its `[moderation] ban_v6_prefix` block on IPv6.
     /// An IPv6 address whose /64 is no subscriber's block is banned
     /// alone, as /128 ([`v6_stands_alone`]).
-    fn kick_ban_target(&self, addr: IpAddr) -> Option<crate::ban::BanTarget> {
+    fn address_ban_target(&self, addr: IpAddr) -> Option<crate::ban::BanTarget> {
         let prefix = match addr.to_canonical() {
             IpAddr::V4(_) => 32,
             IpAddr::V6(v6) if v6_stands_alone(v6) => 128,
@@ -2202,19 +2231,48 @@ impl Core {
             .ok()
     }
 
-    fn place_kick_ban(&self, uid: Uid, target: Option<crate::ban::BanTarget>, ban: KickBan) {
-        let placed = target.and_then(|target| {
-            let acting = self.acting_kicker(ban.by)?;
-            self.place_ban_as(
+    /// Place a kick's ban on `targets` ([`Core::kick_ban_targets`]), as
+    /// one act. Said in the log when it cannot be placed, and the kick
+    /// goes ahead either way. Whether any of it was placed.
+    fn place_kick_ban(&self, uid: Uid, targets: Vec<crate::ban::BanTarget>, ban: KickBan) -> bool {
+        use crate::ban::BanTarget;
+        if targets.is_empty() {
+            debug!(target = uid, "kicked: nothing of theirs alone to ban");
+            return false;
+        }
+        let placed = self.acting_kicker(ban.by).and_then(|acting| {
+            // A moderator kicking another session of their own does not
+            // ban themselves, which `place_ban` refuses outright: the
+            // address is banned without them. Only a session is anyone
+            // to leave out: the operator's name is no login of its own,
+            // and an account that shares it is banned like any other.
+            let mut targets: Vec<BanTarget> = match acting.uid {
+                Some(_) => targets
+                    .into_iter()
+                    .filter(|t| match t {
+                        BanTarget::Login(l) => *l != acting.name.to_lowercase(),
+                        BanTarget::Identity(fp) => acting.fingerprint.as_ref() != Some(fp),
+                        _ => true,
+                    })
+                    .collect(),
+                None => targets,
+            };
+            if targets.is_empty() {
+                debug!(target = uid, "kicked: nothing but the kicker to ban");
+                return None;
+            }
+            let first = targets.remove(0);
+            self.place_bans_as(
                 &acting,
                 crate::ban::NewBan {
-                    target,
+                    target: first,
                     reason: ban.reason,
                     note: None,
                     // Past what the clock can say is until lifted.
                     expires_at: SystemTime::now().checked_add(ban.for_),
                     source: crate::ban::BanSource::Kick,
                 },
+                targets,
             )
             .map_err(|e| warn!("kick: the ban was not placed: {e:?}"))
             .ok()
@@ -2222,6 +2280,7 @@ impl Core {
         if placed.is_none() {
             warn!(target = uid, "kicked without the ban it asked for");
         }
+        placed.is_some()
     }
 
     /// A user's access bits (for policy checks against a *target*, e.g.
@@ -2824,6 +2883,252 @@ mod tests {
             .starts_with("guest has been kicked by guest"));
     }
 
+    /// The operator acts under a name no reserved login is, and is
+    /// nobody's session: an account that shares the name is banned like
+    /// any other, by the operator's kick and by the spam kick, which
+    /// acts as the operator, and what is announced is what was placed.
+    /// Only a session is left out of its own ban.
+    #[test]
+    fn only_a_session_is_left_out_of_its_own_kick_ban() {
+        let core = Core::new()
+            .with_flood_limits(flood_limits())
+            .with_moderation(
+                Arc::new(crate::moderation::MemoryModeration::default()),
+                crate::moderation::ModerationPolicy::default(),
+            );
+        let shared: IpAddr = "127.0.0.1".parse().unwrap();
+        let attach = |login: &str, moderate: bool| {
+            core.attach(crate::AttachInfo {
+                nick: login.into(),
+                icon: 1,
+                admin: false,
+                access: chatter(),
+                login: login.into(),
+                addr: Some(shared),
+                can_detach: false,
+                transport: Default::default(),
+                has_inbox: false,
+                attach_news: false,
+                set_avatar: false,
+                moderate,
+                can_spam: false,
+                is_person: true,
+                reads_on_delivery: false,
+                identity: None,
+                system: false,
+            })
+            .unwrap()
+        };
+        let kick_ban = |uid, by| {
+            core.kick_by(
+                uid,
+                Some(KickBan {
+                    by,
+                    for_: Duration::from_secs(60),
+                    reason: "spam".into(),
+                }),
+            )
+            .unwrap()
+        };
+        let operator = crate::moderation::OPERATOR;
+
+        let (named, _rx) = attach(operator, false);
+        assert!(
+            kick_ban(named, crate::moderation::Actor::Operator).banned,
+            "an account named {operator} is not the operator"
+        );
+        assert!(core.person_banned(Some(operator), None, None).is_some());
+        for ban in core.list_bans(true, None, 10).unwrap() {
+            core.lift_ban(crate::moderation::Actor::Operator, ban.id)
+                .unwrap();
+        }
+
+        // The spam kick bans as the operator: announced as a ban, and one.
+        let (named, _rx) = attach(operator, false);
+        for _ in 0..4 {
+            core.spend_spam(named, 2, 0x6c).unwrap();
+        }
+        let ban = core.spend_spam(named, 2, 0x6c).unwrap_err().ban;
+        core.place_spam_ban(ban.expect("announced as banned"));
+        assert!(core.person_banned(Some(operator), None, None).is_some());
+        for ban in core.list_bans(true, None, 10).unwrap() {
+            core.lift_ban(crate::moderation::Actor::Operator, ban.id)
+                .unwrap();
+        }
+
+        // A moderator kicking another session of their own, on an address
+        // nobody may ban, has nothing to place, and says so.
+        let (mod_a, _rx_a) = attach("carol", true);
+        let (mod_b, _rx_b) = attach("carol", true);
+        let kicked = kick_ban(mod_b, crate::moderation::Actor::Session(mod_a));
+        assert!(!kicked.banned, "not banned: nothing but herself to ban");
+        assert!(core.person_banned(Some("carol"), None, None).is_none());
+        assert!(core.list_bans(true, None, 10).unwrap().is_empty());
+    }
+
+    /// A store that fails partway through a kick's ban leaves what it
+    /// wrote standing, and the kick says it banned: the person is
+    /// refused, so the announcement is true of them. One that writes
+    /// nothing says it only kicked.
+    #[test]
+    fn a_kick_ban_the_store_half_wrote_is_reported_as_what_stands() {
+        let store = Arc::new(crate::moderation::MemoryModeration::default());
+        let core = Core::new().with_moderation(
+            store.clone(),
+            crate::moderation::ModerationPolicy::default(),
+        );
+        let attach = |login: &str, addr: &str| {
+            core.attach(crate::AttachInfo {
+                nick: login.into(),
+                icon: 1,
+                admin: false,
+                access: chatter(),
+                login: login.into(),
+                addr: Some(addr.parse().unwrap()),
+                can_detach: false,
+                transport: Default::default(),
+                has_inbox: false,
+                attach_news: false,
+                set_avatar: false,
+                moderate: false,
+                can_spam: false,
+                is_person: true,
+                reads_on_delivery: false,
+                identity: None,
+                system: false,
+            })
+            .unwrap()
+        };
+        let kick_ban = |uid| {
+            core.kick_by(
+                uid,
+                Some(KickBan {
+                    by: crate::moderation::Actor::Operator,
+                    for_: Duration::from_secs(60),
+                    reason: "spam".into(),
+                }),
+            )
+            .unwrap()
+        };
+        let (alice, _rx_a) = attach("alice", "192.0.2.7");
+        store.fail_bans_after(1);
+        assert!(kick_ban(alice).banned, "the person's row was written");
+        assert!(core.person_banned(Some("alice"), None, None).is_some());
+        assert!(
+            !core.is_banned("192.0.2.7".parse().unwrap()),
+            "the address's was not"
+        );
+        let (bob, _rx_b) = attach("bob", "192.0.2.8");
+        store.fail_bans_after(0);
+        assert!(!kick_ban(bob).banned, "nothing was written");
+        assert!(core.person_banned(Some("bob"), None, None).is_none());
+    }
+
+    /// A kick-with-ban bans the person, and the address too unless
+    /// `[limits] exempt` holds it (loopback, by default): an account's
+    /// login when it is a person's, else the identity the session
+    /// proved. A plain guest on an exempt address has nothing of its own
+    /// to ban.
+    #[test]
+    fn a_kick_ban_takes_the_person_and_an_address_that_is_not_exempt() {
+        use crate::ban::BanTarget;
+        let core = Core::new().with_moderation(
+            Arc::new(crate::moderation::MemoryModeration::default()),
+            crate::moderation::ModerationPolicy::default(),
+        );
+        let attach = |login: &str, is_person: bool, identity, addr: &str| {
+            core.attach(crate::AttachInfo {
+                nick: login.into(),
+                icon: 1,
+                admin: false,
+                access: chatter(),
+                login: login.into(),
+                addr: Some(addr.parse().unwrap()),
+                can_detach: false,
+                transport: Default::default(),
+                has_inbox: false,
+                attach_news: false,
+                set_avatar: false,
+                moderate: false,
+                can_spam: false,
+                is_person,
+                reads_on_delivery: false,
+                identity,
+                system: false,
+            })
+            .unwrap()
+            .0
+        };
+        let targets = |uid| {
+            let r = core.roster.lock().unwrap();
+            core.kick_ban_targets(&r.users[&uid])
+        };
+        let login = |l: &str| BanTarget::login(l).unwrap();
+        let addr = |a: &str| BanTarget::parse(a, |_| None).unwrap();
+
+        let alice = attach("alice", true, None, "192.0.2.7");
+        assert_eq!(
+            targets(alice),
+            [login("alice"), addr("192.0.2.7")],
+            "the person, and an address nobody exempted"
+        );
+        let alice_here = attach("alice", true, None, "127.0.0.1");
+        assert_eq!(targets(alice_here), [login("alice")], "not loopback");
+        let guest = attach("guest", false, None, "127.0.0.1");
+        assert_eq!(targets(guest), [], "nothing of a plain guest's alone");
+        let far_guest = attach("guest", false, None, "192.0.2.9");
+        assert_eq!(targets(far_guest), [addr("192.0.2.9")], "mhxd's ban");
+        let keyed = attach("guest", false, Some([7; 32]), "127.0.0.1");
+        assert_eq!(targets(keyed), [BanTarget::Identity([7; 32])]);
+        let keyed_far = attach("guest", false, Some([8; 32]), "192.0.2.10");
+        assert_eq!(
+            targets(keyed_far),
+            [BanTarget::Identity([8; 32]), addr("192.0.2.10")]
+        );
+        // A person's `guest` login is everyone's: its identity instead.
+        let odd = attach("guest", true, Some([9; 32]), "127.0.0.1");
+        assert_eq!(targets(odd), [BanTarget::Identity([9; 32])]);
+
+        // Placed, the person and the address are one act, which one lift
+        // undoes whole.
+        let ban = |uid| {
+            core.kick_by(
+                uid,
+                Some(KickBan {
+                    by: crate::moderation::Actor::Operator,
+                    for_: Duration::from_secs(60),
+                    reason: "spam".into(),
+                }),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            ban(guest),
+            Kicked {
+                nick: "guest".into(),
+                banned: false
+            },
+            "only kicked"
+        );
+        assert!(!core.is_banned("127.0.0.1".parse().unwrap()));
+        assert!(ban(alice).banned);
+        assert!(core.is_banned("192.0.2.7".parse().unwrap()));
+        assert!(core.person_banned(Some("alice"), None, None).is_some());
+        assert!(
+            !core.is_banned("127.0.0.1".parse().unwrap()),
+            "alice's other session's address is none of this ban's"
+        );
+        let bans = core.list_bans(true, None, 10).unwrap();
+        assert_eq!(bans.len(), 2);
+        assert_eq!(bans[0].act, bans[1].act);
+        let lifted = core
+            .lift_ban(crate::moderation::Actor::Operator, bans[1].id)
+            .unwrap();
+        assert_eq!(lifted.len(), 2, "lifting one row lifts the act");
+        assert!(!core.is_banned("192.0.2.7".parse().unwrap()));
+        assert!(core.person_banned(Some("alice"), None, None).is_none());
+    }
+
     /// A kick-with-ban of an IPv6 loopback peer bans `::1` alone: its
     /// /64 would be `::/64`, no subscriber's block. So does one of an
     /// address standing for an IPv4 host, whose /64 is every IPv4
@@ -2834,7 +3139,7 @@ mod tests {
             Arc::new(crate::moderation::MemoryModeration::default()),
             crate::moderation::ModerationPolicy::default(),
         );
-        let target = |ip: &str| core.kick_ban_target(ip.parse().unwrap()).unwrap();
+        let target = |ip: &str| core.address_ban_target(ip.parse().unwrap()).unwrap();
         assert_eq!(
             target("::1"),
             crate::ban::BanTarget::parse("::1/128", |_| None).unwrap()

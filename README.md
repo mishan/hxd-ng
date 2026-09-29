@@ -167,6 +167,8 @@ To run it as a service instead, the `Dockerfile` builds an image
 configured from environment variables, meant to sit behind nginx or
 another TLS-terminating proxy; each merge to main publishes it as
 `ghcr.io/mishan/hxd-ng`. [docs/docker.md](docs/docker.md) has the rest.
+The same image runs `hlrelay` in front of a classic server, with
+`HXD_MODE=relay` (`docs/docker.md`, "Relay mode").
 
 ### Say hello
 
@@ -224,9 +226,10 @@ is optional unless noted.
 [server]
 bind = "0.0.0.0:5500"
 name = "My Server"
-version = 185           # 0 mimics a pre-1.5 server
+version = 254           # 0 mimics a pre-1.5 server
 login_timeout = 10
-ban_time = 1800         # seconds a kick-with-ban holds the address; kept
+ban_time = 1800         # seconds a kick-with-ban holds the person, and an
+                        # address [limits] does not exempt; kept
                         # in the [moderation] database, so a restart does
                         # not lift it
 stamp_queued = true     # stamp a message that waited in the inbox with its
@@ -235,9 +238,9 @@ queue_budget_mb = 128   # what the server may hold for its clients, all
                         # together; past it, the furthest behind are dropped
                         # (docs/metrics.md, the budget)
 logins_in_flight = 32   # logins worked on at once, a quarter of them from
-                        # one address at most (not one [limits] exempts);
-                        # past it a login is refused as busy, and its user
-                        # tries again
+                        # one address at most (not one [limits] exempts)
+                        # until each is known to be a person's; past it a
+                        # login is refused as busy, and its user tries again
 
 # Set User Flags bit 4 on unencrypted legacy sessions (docs/hotline-ng-auth.md §8).
 # Off until that bit is confirmed free against 1.8/1.9 clients.
@@ -250,17 +253,22 @@ agreement = "agreement.txt"
 
 ### Limits
 
-What one address, and one session, is held to, on both wires together.
-Always on, at the defaults of mhxd's `nospam`. A connection past either
-connection limit is closed unanswered on the classic ports, as mhxd
-closes one, and refused with HTTP 429 on the ng port, `/trtp` included.
+What one address, one account, and one session, is held to, on both
+wires together. Always on, at the defaults of mhxd's `nospam`. A
+connection past any connection limit is closed unanswered on the
+classic ports, as mhxd closes one, and refused with HTTP 429 on the ng
+port, `/trtp` included.
 
 ```toml
 [limits]
-connections_per_addr = 5     # at once; 0 for no limit
+connections_per_addr = 5     # at once, until they log in; 0 for no limit
 reconnect_seconds = 2        # past a burst of that many new connections
                              # (5 when the line above is 0), one more
                              # each this often; 0 for no limit
+connections_per_v6_48 = 20   # at once from all the /64s of one IPv6 /48
+                             # together, until they log in; 0 for no limit
+connections_per_account = 10 # at once, once logged in as an account with
+                             # a password or an identity; 0 for no limit
 exempt = ["127.0.0.0/8", "::1"]  # addresses and blocks held to none of
                              # the per-address limits, and kept a few
                              # places past ng_connections
@@ -276,11 +284,15 @@ ng_requests = 40             # 0 for no limit, or the request weight one ng
 ng_request_seconds = 2       # session may spend at once, earned back over this
 news_posts = 10              # 0 for no limit, or the news posts one account
 news_post_seconds = 300      # may make at once, earned back over this
-login_failures = 10          # wrong passwords one address may give, on
-login_failure_seconds = 30   # any wire, then one more each this often;
-                             # 0 failures = no limit
+login_failures = 10          # wrong passwords one address may give for
+login_failure_seconds = 30   # one login, on any wire, then one more each
+                             # this often; 0 failures = no limit
+login_failures_per_addr = 50 # and for every login together, earned back
+                             # at the same rate; 0 = no limit
 http_connections_per_addr = 16  # connections to the ng port, whatever
                              # they carry; 0 for no limit
+http_connections_per_v6_48 = 64  # the same, from one IPv6 /48's /64s
+                             # together; 0 for no limit
 ng_connections = 4096        # connections to the ng port from everyone
 challenges_per_minute = 30   # POST /identity/challenge, per address
 avatar_fetches_per_minute = 600  # GET /avatars/{id}, per address
@@ -296,13 +308,13 @@ mhxd's table gives it (a chat line or a private message 2, a user list
 fetching icons, cost nothing), as does an ng request that stands for
 one of them (`chat`, `msg`, `nick`, the news posts, deletes and
 creates, and the file-area changes); a user
-who reaches `spam_points` is kicked and its address banned for
-`[server] ban_time`, and public chat is told as mhxd tells it. An
-address in `exempt` is never banned for it, since everyone behind a
-shared proxy would go with the flooder: there the ban is on the
-account's login (or the identity a guest came with), and a plain guest
-is only kicked. Exempt a proxy that hides its clients' addresses for
-this too. An account
+who reaches `spam_points` is kicked and banned for `[server]
+ban_time`, and public chat is told as mhxd tells it. The ban is on the
+account's login (or the identity a guest came with) and on the
+address, except an address in `exempt`, which is never banned for it,
+since everyone behind a shared proxy would go with the flooder; a plain
+guest there is only kicked. A moderator's kick-with-ban bans the same
+way. Exempt a proxy that hides its clients' addresses for this too. An account
 with `[extra] can_spam = true` is held to neither, which by default is
 every account with the kick bit. A load test from one machine wants
 both at 0.
@@ -321,15 +333,58 @@ allowance is the session's, so a client that drops its socket and
 resumes carries on with what it had left; only a fresh login starts
 full. One
 account's news posts are held to `news_posts`, earned back over
-`news_post_seconds`, the same way; a classic post counts toward it but
-is never refused by it, since mhxd would take it. `can_spam` exempts
+`news_post_seconds`, the same way, and a guest's by its address (an
+IPv6 one's /64), so logging in again does not refill them; a classic
+post counts toward it but is never refused by it, since mhxd would take
+it. `can_spam` exempts
 from these as well. A load test wants `ng_requests` and `news_posts` at
 0 too.
 
-An address that has given `login_failures` wrong passwords — on the
-classic wire, the ng wire's `login`, or `/identity/auth` and
-`/identity/link` — is refused before its next password is checked, the
-right one included, until it has earned one back. Each password counts
+Those two connection limits hold a connection until it logs in.
+Carrier-grade NAT puts many unrelated people behind one IPv4 address,
+mobile carriers most of all, so an address is a fair bound on
+connections nobody has vouched for and a poor one on people: a
+connection that logs in as an account with a password or a linked
+identity stops counting against its address and counts against its
+account instead, held to `connections_per_account` from wherever it
+comes, exempt addresses included. The address gets back its place (and
+its IPv6 /48 the place it held there), and the ng port the socket's
+places in `http_connections_per_addr` and `http_connections_per_v6_48`
+too, but not the new connection it spent: each login costs its address
+one from the address's burst and its account one from a burst of its
+own, `connections_per_account` earned back at `reconnect_seconds` as an
+address's is, so neither logs in faster than the slower of the two
+rates, however many accounts an address logs in as or addresses an
+account logs in from. A
+guest, or any account with neither a password nor an identity, stays
+counted against its address. An account whose password is handed
+around is a person as far as the server can tell, and is held to
+`connections_per_account` like any other; raise it, or set it to 0, on
+a server that gives out such a login. A login past `connections_per_account` is refused: a classic
+client is told so in its login's error text, an ng one gets
+`too_many_connections`, and a resume past it gets the same and leaves
+its session as it was for another try. A login or resume past the
+account's rate is refused the same way, as `rate_limited` with how long
+to wait on the ng wire. A detached ng session holds no
+connection, and a resume that takes over a session from a socket not
+yet known to be dead may go one past the cap for as long as that
+socket takes to close. The share of `logins_in_flight` one address may
+have holds a login the same way, until it is known to be a person's.
+
+An address that has given `login_failures` wrong passwords for one
+login — on the classic wire, the ng wire's `login`, or `/identity/auth`
+and `/identity/link` — is refused before its next password for that
+login is checked, the right one included, until it has earned one back.
+The count is kept for each address and login together, the login read
+as the accounts are (case folded), so someone guessing at one account
+locks that account out from their address and nobody else behind it.
+An address that has given `login_failures_per_addr` wrong passwords
+across every login is refused before any of its passwords is checked,
+the same way: the ceiling that keeps it from guessing at every account
+in turn. Its default is five people's worth of mistakes at once, earned
+back at the rate one login's are, so over any while longer than that
+an address guesses no faster than when failures were counted by
+address alone. Each password counts
 from the moment it is let in and is given back unless it turns out
 wrong — a password that verifies, a login refused for something other
 than its password, and a server that could not check it all give it
@@ -346,10 +401,14 @@ The ng port holds each connection to `http_connections_per_addr` and
 life of a WebSocket; past either it is closed unanswered. The count per
 address is its own rather than `connections_per_addr`, because one
 browser page opens several connections at once beside its socket. An
-ng session's socket counts toward `connections_per_addr` as well.
+ng session's socket counts toward `connections_per_addr` as well, until
+it logs in as a person, when it leaves the per-address and per-/48
+counts on both sides for its account's; it keeps its place in
+`ng_connections`.
 `ng_connections` is what bounds the port's descriptors whoever holds
-them, and a crowd of addresses can fill it — one IPv6 /56, say, whose
-/64s each count as an address of their own. An address `exempt` lists
+them, and a crowd of addresses can fill it; `http_connections_per_v6_48`
+is there so that one IPv6 delegation is not such a crowd by itself (see
+below). An address `exempt` lists
 still gets in when it is full, into a few places kept past it for the
 operator's own tools, such as a `/metrics` scrape; a trusted proxy is
 not given them, exempt or not.
@@ -361,7 +420,22 @@ process's descriptor limit, less what the classic port and the
 databases need. An idle keep-alive connection is closed after
 `[server] login_timeout`, as a request head that never arrives is.
 
-An IPv6 client counts as its /64. An ng client behind a reverse proxy
+An IPv6 client counts as its /64, which is what one subscriber is
+given, and its /48 is counted as well: a subscriber is as often given
+a /56 or a /48, hundreds or tens of thousands of /64s, and each would
+otherwise be an address with a whole allowance of its own. A
+connection must fit under both `connections_per_addr` and
+`connections_per_v6_48` (on the ng port, under
+`http_connections_per_addr` and `http_connections_per_v6_48` as well),
+and one past the /48's is refused exactly as one past its address's
+is. The defaults are four addresses' worth, so a site with a few
+machines on a few /64s gets in and one client walking its /48 is held
+to a few machines' share rather than filling `ng_connections`. IPv4
+has no wider count: one client seldom holds many IPv4 addresses, and
+its neighbors in a /24 are as likely strangers behind a carrier's NAT
+as the same person. An address in `exempt` is not counted toward its
+/48, and a connection that logs in as a person leaves its /48's count
+when it leaves its address's. An ng client behind a reverse proxy
 listed in `[ng] trusted_proxies` counts as the address the proxy
 forwards. A classic client reaching the server through a TCP proxy that
 hides its address counts as the proxy, so every client of that proxy
@@ -655,6 +729,15 @@ enroll_per_address = 4              # open sessions and pending requests, per
 # send_chat = true
 ```
 
+With `new_accounts = "create"`, every identity the server has not seen
+before gets an account of its own, and every such account its own
+`[limits] connections_per_account` once logged in. One address minting
+fresh identities can so hold more logged-in connections than any one
+account may: as many as the accounts it has been let create, which
+`max_new_accounts_per_hour` bounds, and never more than `ng_connections`
+lets the port hold. Each of those logins still costs its address a
+connection at `reconnect_seconds` first.
+
 **Revoking a stolen key.** The only other remedy for a stolen device key is
 its certificate's expiry, which is months. On this server, today:
 
@@ -822,7 +905,7 @@ max_page = 200            # threads in one request
 retain_days = 0           # a thread's life after its last post; 0 = forever
 max_articles = 100000     # live articles the news may hold; 0 = no ceiling
 max_text_bytes = 1073741824  # bytes of their bodies and plain-text parts
-max_per_author = 10000    # live articles one account may hold, guests as one
+max_per_author = 10000    # live articles one account may hold, a guest's address as one
 self_delete = true        # authors may delete their own; false = period behavior
 search = true             # false turns news_search off; the index is kept either way
 search_max_results = 500  # the deepest a search pages
@@ -837,6 +920,8 @@ flat_default_subject = "(no subject)"
                           # at most 4096 bytes
 
 blobs = "news-blobs"      # durable content-addressed attachment bytes
+# guest_secret = "news-guest.key"  # the key a guest's address is hashed under;
+                          # made on first start, mode 0600, beside the db
 [news.attach]              # absent = attachments off
 max_bytes = 2097152        # one uploaded image
 max_count = 8              # images on one article
@@ -1193,7 +1278,16 @@ leaves the articles as they are. See [docs/news.md](docs/news.md) §6.4.
 News is kept until someone deletes it, as a period server keeps it, so
 the ceilings are what bound it: a post past `max_articles`,
 `max_text_bytes` or the author's `max_per_author` is refused, never made
-room for, and the log says so each time. Make room by deleting threads,
+room for, and the log says so each time. A guest's share is its
+address's (an IPv6 one's /64), so one guest cannot fill every guest's.
+What an article keeps of the address is not the address but a keyed
+hash of it, HMAC-SHA-256 under a secret the server makes on first start
+in `news-guest.key` beside the database (`[news] guest_secret` to put it
+elsewhere), owner-only: equal addresses still match, and the database
+alone does not say where a guest posted from. Keep the secret with the
+data, and out of anything that copies the database alone; lose it and
+the guests' articles already kept are counted against no address. A
+tombstone clears the key, and the database zeroes what it leaves behind. Make room by deleting threads,
 by raising a ceiling, or with `retain_days`. See
 [docs/news.md](docs/news.md) §7.4.
 
@@ -1222,8 +1316,13 @@ or an identity (`identity:FINGERPRINT`, whether it logs in with its key
 or as the account it links) at login, with its reason, on both wires.
 A registrar's every identity (`*@HOST`) is refused when a login proves
 one of its handles, which a password login does not. A kick-with-ban is
-one too, on the kicked address for `ban_time`, and disconnects only the
-one kicked, as mhxd's does. A running server applies
+one too, for `ban_time`, and disconnects only the one kicked, as mhxd's
+does. Where mhxd bans the kicked address, this bans the person — the
+account's login, or the identity a guest proved — and the address only
+when `[limits] exempt` does not hold it: behind Docker's userland proxy,
+a TCP proxy or a CGNAT, an address ban would lock out everyone. A plain
+guest on an exempt address is only kicked. Lifting either row lifts
+both. A running server applies
 `hxd ban` on SIGHUP, ending the sessions a new ban refuses.
 
 Images live in the running server's memory, not in the database, so

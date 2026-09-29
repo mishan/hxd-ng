@@ -1,10 +1,12 @@
 //! What the ng port's HTTP layer holds one address, and everyone, to
 //! (`[limits]`, `hxd_ng_session::HttpLimits`): so many connections from
 //! one address and so many from everyone, whatever they carry and before
-//! a byte is read; an idle keep-alive connection closed; so many
+//! a byte is read, and so many from one IPv6 /48 whatever /64s it
+//! comes from; an idle keep-alive connection closed; so many
 //! challenges and avatar fetches a minute from one address; and a count
 //! of failed logins shared by `/identity/auth` and both wires' password
-//! logins, refused past it until one is earned back.
+//! logins, kept for each login an address guesses at and for the address
+//! as a whole, refused past either until one is earned back.
 //!
 //! Each case builds a real server from a config file that takes loopback
 //! off the exempt list, which is what makes the test's own address one
@@ -322,6 +324,76 @@ async fn an_exempt_address_is_kept_places_past_the_ceiling_and_no_more() {
     );
 }
 
+/// Open an ng socket through the trusted proxy the test stands for, on
+/// behalf of `client`: the socket, or the status it was refused with.
+async fn ws_for(
+    ng: SocketAddr,
+    client: &str,
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, u16> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Error;
+    let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("X-Forwarded-For", client.parse().unwrap());
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(Error::Http(resp)) => Err(resp.status().as_u16()),
+        Err(e) => panic!("{client}: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn the_64s_of_one_48_share_a_wider_connection_cap() {
+    let td = tempfile::tempdir().unwrap();
+    // The proxy is this host, and the clients it speaks for are IPv6
+    // ones out there, each on a /64 of its own and every one of them in
+    // 2001:db8:1::/48.
+    let server = start(
+        td.path(),
+        "trusted_proxies = [\"127.0.0.1\"]\n",
+        "connections_per_addr = 2\nconnections_per_v6_48 = 3\nreconnect_seconds = 0",
+    )
+    .await;
+    let mut held = Vec::new();
+    for n in 1..=3 {
+        held.push(
+            ws_for(server.ng, &format!("2001:db8:1:{n}::1"))
+                .await
+                .unwrap_or_else(|s| panic!("/64 number {n} refused {s}")),
+        );
+    }
+    // A /64 never seen before, with its own share untouched, is refused
+    // as one past its address's count would be.
+    assert_eq!(
+        ws_for(server.ng, "2001:db8:1:99::1").await.err(),
+        Some(429),
+        "the /48 is full"
+    );
+    // Another /48 is counted apart, and so is IPv4.
+    let _other = ws_for(server.ng, "2001:db8:2:1::1")
+        .await
+        .expect("another /48");
+    let _v4 = [
+        ws_for(server.ng, "198.51.100.1").await.expect("IPv4"),
+        ws_for(server.ng, "198.51.100.2").await.expect("IPv4"),
+        ws_for(server.ng, "198.51.100.3").await.expect("IPv4"),
+    ];
+    // A socket closed gives its /48 a place back.
+    drop(held.pop());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match ws_for(server.ng, "2001:db8:1:99::1").await {
+            Ok(_) => break,
+            Err(status) => assert_eq!(status, 429),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the place never came back"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn an_idle_keep_alive_connection_is_closed() {
     let td = tempfile::tempdir().unwrap();
@@ -529,6 +601,113 @@ async fn failed_logins_on_any_wire_lock_the_address_out_until_it_earns_one_back(
     tokio::time::sleep(Duration::from_millis(2100)).await;
     assert_eq!(classic_login(server.legacy, "pw").await, None);
     let r = ng_login(server.ng, "pw").await;
+    assert!(r.get("ok").is_some(), "{r}");
+}
+
+/// A classic password login as `login`: its error text, or `None` when
+/// it succeeded.
+async fn classic_login_as(addr: SocketAddr, login: &str, password: &str) -> Option<String> {
+    let l = legacy::Login {
+        version: 0,
+        ..legacy::Login::account(login, login, password)
+    };
+    let mut c = legacy::Client::connect(addr).await.unwrap();
+    match c.login(&l).await {
+        Ok(_) => None,
+        Err(hxd_testclient::Error::Refused { text, .. }) => Some(text),
+        Err(e) => panic!("classic login: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn a_guesser_locks_out_the_login_it_guesses_and_not_its_neighbors() {
+    // Carrier-grade NAT puts many people behind one address. Someone
+    // there guessing at alice's password locks alice out from it, and
+    // nobody else: bob, behind the same address, logs in on either wire.
+    let td = tempfile::tempdir().unwrap();
+    let server = start(
+        td.path(),
+        "",
+        "login_failures = 2\nlogin_failure_seconds = 600\n\
+         connections_per_addr = 0\nreconnect_seconds = 0",
+    )
+    .await;
+    std::fs::write(
+        td.path().join("accounts/bob.toml"),
+        "name = \"Bob\"\npassword = \"hunter2\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        classic_login(server.legacy, "wrong").await.as_deref(),
+        Some("Login failed.")
+    );
+    let r = ng_login(server.ng, "wrong").await;
+    assert_eq!(r["error"]["code"], "login_failed", "{r}");
+    // Alice is locked out, on both wires and however her login is cased.
+    let text = classic_login(server.legacy, "pw")
+        .await
+        .expect("alice is locked out");
+    assert!(text.starts_with("Too many failed logins."), "{text}");
+    let r = ng_login_as(server.ng, "ALICE", "pw").await;
+    assert_eq!(r["error"]["code"], "rate_limited", "{r}");
+    // Bob is not.
+    assert_eq!(
+        classic_login_as(server.legacy, "bob", "hunter2").await,
+        None
+    );
+    let r = ng_login_as(server.ng, "bob", "hunter2").await;
+    assert!(r.get("ok").is_some(), "{r}");
+    // And a mistake of bob's is his own to make.
+    assert_eq!(
+        classic_login_as(server.legacy, "bob", "hunter3")
+            .await
+            .as_deref(),
+        Some("Login failed.")
+    );
+    assert_eq!(
+        classic_login_as(server.legacy, "bob", "hunter2").await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_address_guessing_across_logins_is_held_to_its_ceiling() {
+    // Counted by login alone, an address could guess at every account
+    // there is. Past `login_failures_per_addr` wrong passwords between
+    // them, every password from it is refused, the right one for a login
+    // it never guessed at included, on either wire.
+    let td = tempfile::tempdir().unwrap();
+    let server = start(
+        td.path(),
+        "",
+        "login_failures = 2\nlogin_failures_per_addr = 3\nlogin_failure_seconds = 600\n\
+         connections_per_addr = 0\nreconnect_seconds = 0",
+    )
+    .await;
+    std::fs::write(
+        td.path().join("accounts/bob.toml"),
+        "name = \"Bob\"\npassword = \"hunter2\"\n",
+    )
+    .unwrap();
+    for login in ["carol", "dave"] {
+        assert_eq!(
+            classic_login_as(server.legacy, login, "guess")
+                .await
+                .as_deref(),
+            Some("Login failed.")
+        );
+    }
+    let r = ng_login_as(server.ng, "erin", "guess").await;
+    assert_eq!(r["error"]["code"], "login_failed", "{r}");
+    let text = classic_login_as(server.legacy, "bob", "hunter2")
+        .await
+        .expect("the address is locked out");
+    assert!(text.starts_with("Too many failed logins."), "{text}");
+    let r = ng_login(server.ng, "pw").await;
+    assert_eq!(r["error"]["code"], "rate_limited", "{r}");
+    assert!(r["error"]["retry_after"].as_u64().unwrap() >= 1);
+    // A guest makes no guess, and is let in still.
+    let r = ng_login_as(server.ng, "", "").await;
     assert!(r.get("ok").is_some(), "{r}");
 }
 

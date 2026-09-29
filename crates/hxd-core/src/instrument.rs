@@ -338,10 +338,13 @@ pub fn login_refused_busy() {
     metrics::counter!("hxd_logins_refused_busy_total").increment(1);
 }
 
-/// Something refused for coming too fast or too often from one address,
-/// before any work was done on it: `login` (an address past its failed
-/// logins), `challenge` (`/identity/challenge`), `fetch` (an avatar or a
-/// news image), `upload` (an upload refused before its body was read).
+/// Something refused for coming too fast or too often from one address
+/// or account, before any work was done on it: `login` (an address past
+/// its failed logins, at one login or at all of them), `account` (a
+/// login or resume past its account's connections, or its account's
+/// rate), `challenge`
+/// (`/identity/challenge`), `fetch` (an avatar or a news image),
+/// `upload` (an upload refused before its body was read).
 pub fn throttled(what: &'static str) {
     #[cfg(feature = "metrics")]
     metrics::counter!("hxd_throttled_total", "what" => what).increment(1);

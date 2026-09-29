@@ -20,6 +20,10 @@ struct Inner {
     blocked: Vec<[u8; 32]>,
     bans: Vec<crate::ban::Ban>,
     last_ban: crate::ban::BanId,
+    /// Bans still to write before every later one fails, for the tests
+    /// of a store that fails partway.
+    #[cfg(test)]
+    bans_before_failing: Option<usize>,
 }
 
 /// A [`ModerationStore`] in memory.
@@ -34,6 +38,14 @@ fn names(r: &Report, target: &ReportTarget) -> bool {
     match (target, r.target) {
         (ReportTarget::User, ReportTarget::User) => true,
         (t, rt) => *t == rt,
+    }
+}
+
+#[cfg(test)]
+impl MemoryModeration {
+    /// Write `n` more bans, then fail every one after.
+    pub(crate) fn fail_bans_after(&self, n: usize) {
+        self.inner.lock().unwrap().bans_before_failing = Some(n);
     }
 }
 
@@ -167,6 +179,13 @@ impl ModerationStore for MemoryModeration {
 
     fn ban(&self, ban: &crate::ban::Ban) -> Result<crate::ban::Ban, StoreError> {
         let mut inner = self.inner.lock().unwrap();
+        #[cfg(test)]
+        if let Some(n) = inner.bans_before_failing.as_mut() {
+            if *n == 0 {
+                return Err(StoreError::new("the disk is full"));
+            }
+            *n -= 1;
+        }
         if let Some(old) = inner
             .bans
             .iter_mut()

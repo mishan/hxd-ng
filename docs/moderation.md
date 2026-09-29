@@ -243,13 +243,27 @@ its check and joining the roster is caught as it joins. SIGHUP ends
 the sessions refused by a ban it has not seen before, and no others,
 so a session spared once is not ended by a reread.
 
-A kick-with-ban, on either wire, bans the kicked address — its /32, or
-its `[moderation] ban_v6_prefix` block on IPv6 (default /64, what one
-subscriber is given) — for `[server] ban_time`, with source `kick`. It
-used to last until the server stopped; now a restart does not lift it.
+A kick-with-ban, on either wire, bans the person kicked for `[server]
+ban_time`, with source `kick`: the account's login when the account is
+a person's (a password or a linked identity, and the login ban takes
+that identity too), else the identity the session proved, if it proved
+one. It bans the kicked address as well — its /32, or its
+`[moderation] ban_v6_prefix` block on IPv6 (default /64, what one
+subscriber is given) — unless that address is one `[limits] exempt`
+holds to nothing. Every row is one act, so lifting any lifts them all.
+This deviates from the reference server, which bans the address
+alone, on purpose: an exempt address is loopback, Docker's userland
+proxy, a TCP proxy that hides its clients or a CGNAT the operator
+listed, one many people share, and banning it for one person would
+lock out everyone behind it; and an address alone is a ban a person
+leaves by reconnecting from somewhere else, which the login they come
+back as does not let them. A plain guest on an exempt address has
+nothing of its own to ban and is only kicked, and public chat hears
+"kicked" rather than "banned". A ban used to last until the server
+stopped; now a restart does not lift it.
 It disconnects only the one kicked, as the reference server's does:
-anyone else behind that address is refused at their next connection,
-not thrown off with them. Some IPv6 addresses are banned alone, as a
+anyone else it refuses is refused at their next connection, not
+thrown off with them. Some IPv6 addresses are banned alone, as a
 /128, since their /64 is no subscriber's: loopback (`::1`), the
 unspecified address (`::`), and those that stand for an IPv4 host —
 the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`, and the
@@ -257,15 +271,19 @@ IPv4-compatible `::/96` — whose /64 is every IPv4 client behind the
 translator. An address ban matches only its own family, so no IPv6
 block refuses an IPv4 client.
 
-The automatic kick past `[limits] spam_points` bans the same way, with
-one deviation from the reference server: never an address `[limits]
-exempt` holds to nothing, which is loopback and whatever shared proxy
-the operator exempted, and banning which would lock out everyone
-behind it for one person's flood. There it bans the account's login
-(and so the identity it links), or the identity a guest came with; a
-plain guest is only kicked, and public chat hears "kicked" rather than
-"banned".
-Refused: banning `guest`, the system account, or yourself.
+The automatic kick past `[limits] spam_points` bans the same things
+the same way, the person and the address that is not exempt, and
+public chat hears it in the reference server's words.
+Refused: banning `guest`, the system account, or yourself; a
+moderator kicking another session of their own account bans the
+address without them, and is told they only kicked when there is no
+address to ban. Only a session is ever "yourself": the operator's
+command line and the automatic kick act under a name of their own that
+is no one's login, and an account that happens to share it is banned
+like any other. A store that fails partway through a ban leaves the
+rows it wrote standing, says so in the log, and reports what stands: a
+kick announces "banned" when any row was written, and "kicked" when
+none was.
 
 ## 4. Reports
 

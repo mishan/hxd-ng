@@ -1,6 +1,7 @@
 # The operator's image (Dockerfile, docker/): built on every pull
-# request and started once by docker/smoke-test.sh, which checks that the
-# legacy port answers the handshake and the ng port answers discovery.
+# request and started by docker/smoke-test.sh, which checks that the
+# legacy port answers the handshake and the ng port answers discovery,
+# and that the image in relay mode carries /trtp to the server.
 # A push to main does the same and then publishes the image to GHCR as
 # `latest` and `sha-<commit>`.
 #

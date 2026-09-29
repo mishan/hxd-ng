@@ -1,12 +1,16 @@
 # Running hxd-ng in Docker
 
-The image in the repository's `Dockerfile` is for operators: `hxd` and
-`hlid` on Debian slim, running as an unprivileged user (uid 10001), with
-every piece of state in one volume and the configuration taken from
-environment variables. It is meant to sit behind a TLS-terminating
-reverse proxy — nginx, Caddy, or whatever already fronts the host —
-because the ng port speaks plaintext HTTP and WebSocket
-([hotline-ng.md](hotline-ng.md)).
+The image in the repository's `Dockerfile` is for operators: `hxd`,
+`hlid` and `hlrelay` on Debian slim, running as an unprivileged user
+(uid 10001), with every piece of state in one volume and the
+configuration taken from environment variables. It is meant to sit
+behind a TLS-terminating reverse proxy — nginx, Caddy, or whatever
+already fronts the host — because the ng port speaks plaintext HTTP and
+WebSocket ([hotline-ng.md](hotline-ng.md)).
+
+It runs the server unless told otherwise. `HXD_MODE=relay` runs
+`hlrelay` instead, in front of a classic server that is not hxd-ng
+([relay mode](#relay-mode)).
 
 ## Quick start
 
@@ -55,7 +59,7 @@ layout under `/srv/hxd-ng`:
 
 | On the host | In the container | What | Mounted |
 |---|---|---|---|
-| `/srv/hxd-ng/data` | `/var/lib/hxd-ng` | All state: accounts, the SQLite store, news blobs, the identity, VAPID and self-signed TLS keys. | Always, or the named volume instead. |
+| `/srv/hxd-ng/data` | `/var/lib/hxd-ng` | All state: accounts, the SQLite store, news blobs, the identity, VAPID and self-signed TLS keys, and the secret guests' news is counted under. | Always, or the named volume instead. |
 | `/srv/hxd-ng/etc` | `/etc/hxd-ng` | A config file of the operator's own. | Only for [a mounted config](#configuration). |
 | `/srv/hxd-ng/tls` | `/etc/hxd-ng/tls`, read-only | A certificate and key from a CA. | Only for [TLS certificates](#tls-certificates). |
 | `/srv/hxd-ng/files` | `/srv/files` | The file area, with `HXD_FILES_ROOT=/srv/files`. | Only for files. |
@@ -208,19 +212,23 @@ is off (`HXD_VIDEO` without voice, say) is reported and ignored.
 | `HXD_AGREEMENT_FILE` | `/var/lib/hxd-ng/agreement.txt` when it exists | The agreement shown at login (UTF-8). |
 | `HXD_BANNER_FILE` | | A JPEG, GIF or PNG of at most 1 MiB, mounted into the container, shown to clients as the server banner. Publish 5501 for classic clients to fetch it; ng clients fetch it over 5700. `docker kill -s HUP hxd-ng` re-reads it. |
 | `HXD_BANNER_URL` | | With `HXD_BANNER_FILE`, where a click on the banner goes. Alone, where clients fetch the banner from. |
-| `HXD_BAN_TIME` | 1800 | Seconds a kick-with-ban holds the address. Kept in the database, when there is one, across restarts. |
+| `HXD_BAN_TIME` | 1800 | Seconds a kick-with-ban holds the person, and their address unless `HXD_LIMITS_EXEMPT` holds it. Kept in the database, when there is one, across restarts. |
 | `HXD_LOGIN_TIMEOUT` | 10 | Seconds a connection has to log in. |
-| `HXD_CONNECTIONS_PER_ADDR` | 5 | Connections one address may hold at once, on both wires together; 0 for no limit. Past it a connection is closed unanswered on the classic ports and refused with HTTP 429 on 5700. |
-| `HXD_RECONNECT_SECONDS` | 2 | Once an address has made that many connections in a burst (5 when `HXD_CONNECTIONS_PER_ADDR` is 0), how long it waits for each new one; 0 for no limit. |
+| `HXD_CONNECTIONS_PER_ADDR` | 5 | Connections one address may hold at once, on both wires together, until they log in; 0 for no limit. Past it a connection is closed unanswered on the classic ports and refused with HTTP 429 on 5700. A connection that logs in as an account with a password or a linked identity counts against `HXD_CONNECTIONS_PER_ACCOUNT` from then on instead, so the many people a mobile carrier puts behind one address are not refused for each other; a guest's goes on counting here. |
+| `HXD_CONNECTIONS_PER_V6_48` | 20 | Connections the /64s of one IPv6 /48 may hold at once between them, each still held to `HXD_CONNECTIONS_PER_ADDR`, until they log in; 0 for no limit. Refused as one past its address's is. IPv4 has no wider count. |
+| `HXD_RECONNECT_SECONDS` | 2 | Once an address has made that many connections in a burst (5 when `HXD_CONNECTIONS_PER_ADDR` is 0), how long it waits for each new one; 0 for no limit. An account is held to the same rate past a burst of `HXD_CONNECTIONS_PER_ACCOUNT`, from wherever it logs in, and a login costs both its address and its account a connection, so it goes no faster than the slower of the two. |
+| `HXD_CONNECTIONS_PER_ACCOUNT` | 10 | Connections one account with a password or a linked identity may hold at once once they have logged in, from wherever they come (exempt addresses included); 0 for no limit. A login past it is refused with a reason on either wire. A detached ng session holds none. |
 | `HXD_LIMITS_EXEMPT` | `127.0.0.0/8,::1` | Addresses and blocks the per-address limits in this table do not apply to, `gateway` standing for the network's gateway; the flood limits are a user's, and hold everywhere. Setting it replaces the default rather than adding to it, so keep loopback when adding to it: `127.0.0.0/8,::1,gateway`. When clients reach the container through Docker's userland proxy they all arrive from the gateway and would share one address's limit, classic clients and ng ones alike: exempt `gateway` then ([the README](../README.md#limits)). |
 | `HXD_CHAT_LINES`, `HXD_CHAT_SECONDS` | 20, 5 | Chat lines one user may send in each window of that many seconds before being kicked for flooding; 0 lines for no limit. |
-| `HXD_SPAM_POINTS`, `HXD_SPAM_SECONDS` | 100, 5 | Spam points one user may spend in each window of that many seconds, every request costing what mhxd charges it, before being kicked and its address banned for `[server] ban_time` (the account, not the address, when that address is exempt); 0 points for no limit. |
+| `HXD_SPAM_POINTS`, `HXD_SPAM_SECONDS` | 100, 5 | Spam points one user may spend in each window of that many seconds, every request costing what mhxd charges it, before being kicked and banned for `[server] ban_time` as a kick-with-ban bans: the person (the account, or the identity a guest proved) and the address, the person alone when that address is in `HXD_LIMITS_EXEMPT`, and a plain guest on an exempt address only kicked; 0 points for no limit. |
 | `HXD_PRIVATE_CHATS_PER_USER` | 16 | Private chats one session may have opened and still open; 0 for no limit. Counted per session, so a user with several sessions is bounded by `HXD_PRIVATE_CHATS`. |
 | `HXD_PRIVATE_CHATS` | 4096 | Private chats open on the whole server; 0 for no limit. |
 | `HXD_NG_REQUESTS`, `HXD_NG_REQUEST_SECONDS` | 40, 2 | Request weight one ng session may spend at once, earned back over that many seconds; past it a request is answered `rate_limited` with how long to wait. 0 for no limit. |
 | `HXD_NEWS_POSTS`, `HXD_NEWS_POST_SECONDS` | 10, 300 | News posts one account may make at once, earned back over that many seconds; past it an ng post is answered `rate_limited`. 0 for no limit. |
-| `HXD_LOGIN_FAILURES`, `HXD_LOGIN_FAILURE_SECONDS` | 10, 30 | Wrong passwords one address may give, on any wire, before its password logins are refused until it earns one back, one every that many seconds; 0 failures for no limit. |
+| `HXD_LOGIN_FAILURES`, `HXD_LOGIN_FAILURE_SECONDS` | 10, 30 | Wrong passwords one address may give for one login, on any wire, before its password logins as that login are refused until it earns one back, one every that many seconds; 0 failures for no limit. Someone guessing at one account locks out that account from their address, and nobody else behind it. |
+| `HXD_LOGIN_FAILURES_PER_ADDR` | 50 | Wrong passwords one address may give for every login together, earned back at the same rate, before all its password logins are refused; 0 for no limit. The ceiling that keeps one address from guessing across every account. |
 | `HXD_HTTP_CONNECTIONS_PER_ADDR` | 16 | Connections one address may hold to the ng port, whatever they carry; 0 for no limit. Past it a connection is closed unanswered. A trusted proxy's connections are not counted per address. |
+| `HXD_HTTP_CONNECTIONS_PER_V6_48` | 64 | Connections the /64s of one IPv6 /48 may hold to the ng port between them; 0 for no limit. |
 | `HXD_NG_CONNECTIONS` | 4096 | Connections everyone together may hold to the ng port; 0 for no limit. Keep it below the container's descriptor limit, less a few: addresses in `HXD_LIMITS_EXEMPT` are kept places past it. |
 | `HXD_CHALLENGES_PER_MINUTE` | 30 | `POST /identity/challenge` one address may make a minute; 0 for no limit. |
 | `HXD_AVATAR_FETCHES_PER_MINUTE` | 600 | `GET /avatars/{id}` one address may make a minute; 0 for no limit. |
@@ -279,7 +287,7 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_NEWS_RETAIN_DAYS` | 0 | A thread's life after its last post; 0 is forever. |
 | `HXD_NEWS_MAX_ARTICLES` | 100000 | Articles the news may hold; past it a post is refused. 0 for no ceiling. |
 | `HXD_NEWS_MAX_TEXT_BYTES` | 1073741824 | Bytes of article text it may hold, likewise. |
-| `HXD_NEWS_MAX_PER_AUTHOR` | 10000 | Articles one account may hold, the guests counted together. |
+| `HXD_NEWS_MAX_PER_AUTHOR` | 10000 | Articles one account may hold, the guests from one address counted together. |
 | `HXD_MEDIA` | `on` | Images in chat ([inline-media.md](inline-media.md)). Sending one needs the `send_media` bit: the account `HXD_ADMIN_LOGIN` writes has it, and any other account only if its file grants it. |
 | `HXD_AVATARS` | `on` | Users' pictures on both wires ([avatars.md](avatars.md)), kept in the database. |
 | `HXD_PUSH_CONTACT` | | Turns on Web Push; a `mailto:` or `https:` contact for push services ([webpush-gateway.md](webpush-gateway.md)). The VAPID key is generated into the volume, and losing it silently breaks every subscription — back it up. |
@@ -414,8 +422,106 @@ Anything that is not a subcommand runs as given, so
 SIGTERM, which hxd handles; there is no need for `--init`.
 
 The image's health check opens a connection to the legacy port from
-inside the container. A mounted config that moves that port needs
-`--health-cmd` to match, or `--no-healthcheck`.
+inside the container (a relay's, to its own port). A mounted config that
+moves that port needs `--health-cmd` to match, or `--no-healthcheck`.
+
+## Relay mode
+
+With `HXD_MODE=relay` the image runs `hlrelay` ([relay.md](relay.md))
+rather than the server: a WebSocket front for a classic Hotline server
+that has none — hxd 0.x, mhxd, Janus, Mobius — so that a web client can
+reach it. hxd-ng does not need one; its ng port serves the same paths.
+
+A relay has no config file and no state. At each start the entry point
+turns the variables below into `hlrelay`'s flags, and writes nothing.
+Flags given after the image name follow them, so a flag given there once
+wins over its variable, and a repeatable one adds to the list:
+`docker run ... ghcr.io/mishan/hxd-ng:latest --max-pending 64`. None of
+the server's variables apply, and the `HXD_RELAY_*` variables are
+reported and ignored when the image runs the server.
+
+| Variable | Default | |
+|---|---|---|
+| `HXD_MODE` | `server` | `relay` runs `hlrelay`; `server`, or leaving it unset, runs `hxd` as above. |
+| `HXD_RELAY_UPSTREAM` | required | The classic server's `HOST:PORT` (`--upstream`). Resolved at each connection, so a container name works. |
+| `HXD_RELAY_TRANSFER` | the upstream's port plus one | Its transfer port, when it is not the next one (`--transfer`). |
+| `HXD_RELAY_TRANSFERS` | `on` | `off` serves no `/htxf` (`--no-transfers`), for a server with no files and no banner. Setting `HXD_RELAY_TRANSFER` as well is refused. |
+| `HXD_RELAY_LISTEN` | `0.0.0.0:5700` | Where it listens inside the container, comma- or space-separated (`--listen`, once for each). |
+| `HXD_RELAY_NAME` | `hlrelay` | The server's name in discovery (`--name`). Set it: a relay cannot ask the server its name. |
+| `HXD_RELAY_MAX_CONNECTIONS` | 512 | Sockets relayed at once, control and transfer together (`--max-connections`). |
+| `HXD_RELAY_MAX_PENDING` | 128 | Connections accepted and not yet upgraded (`--max-pending`). |
+| `HXD_RELAY_MAX_PER_ADDRESS` | 16 | Connections one client address holds at once; 0 for no limit (`--max-per-address`). |
+| `HXD_RELAY_TRUSTED_PROXIES` | none | Proxies whose forwarded header is believed, comma- or space-separated addresses and CIDR blocks (`--trusted-proxy`, once for each). `gateway` is the container's default gateway, as in `HXD_NG_TRUSTED_PROXIES` ([the proxy](#the-proxy)); `none` believes nobody. |
+| `HXD_RELAY_FORWARDED_HEADER` | `x-forwarded-for` | Or `forwarded`, or `none` (`--forwarded-header`). |
+| `RUST_LOG` | `info` | The log level. |
+
+**The listen address.** `hlrelay` on its own listens on
+`127.0.0.1:5700`, for a proxy on the same host; inside a container
+nothing else can reach loopback, so the image listens on `0.0.0.0:5700`
+and `-p` chooses what the host publishes. Publish it on loopback, as the
+server's ng port is, when a proxy on the host fronts it — which a
+browser needs, since the relay speaks plain HTTP. One consequence: the
+warning `hlrelay` gives at startup when it listens only on loopback with
+no trusted proxy never appears in the container, though the case it
+warns about is the usual one here. A proxy on the host reaches the
+relay through Docker from the gateway, and unless
+`HXD_RELAY_TRUSTED_PROXIES` names it every client behind the proxy
+shares one address's limit. Trusting `gateway` is safe only while 5700
+is published on loopback alone, for the reasons [the proxy](#the-proxy)
+gives.
+
+**Reaching the server.** Inside the container `127.0.0.1` is the
+container. A classic server on the host is `host.docker.internal` with
+`--add-host host.docker.internal:host-gateway`, and must listen on an
+address the container can reach, not loopback alone; a server in
+another container is its name on a network the two share. Every relayed
+client then arrives at the server from one address — the gateway, or
+the relay container's own — which the server should exempt from its
+per-address limits ([relay.md](relay.md#what-it-changes-for-the-server)).
+Keep the relay on the server's host: the hop between them is plain TCP.
+
+```sh
+docker run -d --name hlrelay --restart unless-stopped \
+  -p 127.0.0.1:5700:5700 \
+  --add-host host.docker.internal:host-gateway \
+  -e HXD_MODE=relay \
+  -e HXD_RELAY_UPSTREAM=host.docker.internal:5500 \
+  -e HXD_RELAY_NAME="My Hotline Server" \
+  -e HXD_RELAY_TRUSTED_PROXIES=gateway \
+  ghcr.io/mishan/hxd-ng:latest
+```
+
+The same with Compose:
+
+```yaml
+services:
+  hlrelay:
+    image: ghcr.io/mishan/hxd-ng:latest
+    container_name: hlrelay
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5700:5700"   # only the proxy on this host reaches it
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      HXD_MODE: relay
+      HXD_RELAY_UPSTREAM: "host.docker.internal:5500"
+      HXD_RELAY_NAME: "My Hotline Server"
+      HXD_RELAY_TRUSTED_PROXIES: "gateway"
+```
+
+The proxy in front is the server's: `docker/nginx.conf` works as it
+is, its line about `X-Hotline-Client-Cert` doing nothing, since a relay
+never reads that header. Clients look for a relay on the classic port plus 200
+([relay.md](relay.md#where-clients-find-it)), so a server on 5500 wants
+the proxy on 5700.
+
+The image declares a volume for the server's state. A relay mounts
+none, so Docker gives it an anonymous one it never writes to;
+`docker rm -v` removes it with the container. The health check asks the
+port of the first `HXD_RELAY_LISTEN` address on 127.0.0.1, so a first
+address other than a wildcard address or 127.0.0.1 needs `--health-cmd`.
+`docker stop` ends the relay cleanly, closing the sockets it carries.
 
 ## Building
 
@@ -433,7 +539,9 @@ serve is a startup error rather than a silently ignored promise.
 `RUST_VERSION` and `DEBIAN_RELEASE` pick the toolchain image and the base.
 
 CI builds the image on every pull request and starts it once, checking
-that the legacy port and the ng discovery endpoint answer; a merge to
+that the legacy port and the ng discovery endpoint answer, then again in
+relay mode in front of the first, checking that the relay answers
+discovery and carries `/trtp` to the classic port; a merge to
 `main` does the same and then publishes it
 (`.github/workflows/docker.yml`). The published image is linux/amd64
 only: building the Rust workspace for arm64 under emulation would take

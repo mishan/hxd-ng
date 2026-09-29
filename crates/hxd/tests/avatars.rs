@@ -172,17 +172,36 @@ impl Legacy {
     }
 
     async fn login_with(addr: SocketAddr, login: &str, password: &str) -> Self {
+        Self::login_as(addr, login, password, 190, None).await
+    }
+
+    /// The bootstrap guest, logging in as GtkHx does: `version`, and the
+    /// capabilities a build with voice and video sends.
+    async fn gtkhx_guest(addr: SocketAddr, version: u16) -> Self {
+        Self::login_as(addr, "guest", "", version, Some(0x041f)).await
+    }
+
+    async fn login_as(
+        addr: SocketAddr,
+        login: &str,
+        password: &str,
+        version: u16,
+        caps: Option<u16>,
+    ) -> Self {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(b"TRTPHOTL\x00\x01\x00\x02").await.unwrap();
         let mut magic = [0; 8];
         stream.read_exact(&mut magic).await.unwrap();
-        let chunks = vec![
+        let mut chunks = vec![
             (tag::NAME, login.as_bytes().to_vec()),
             (tag::ICON, 128u16.to_be_bytes().to_vec()),
-            (tag::VERSION, 190u16.to_be_bytes().to_vec()),
+            (tag::VERSION, version.to_be_bytes().to_vec()),
             (tag::LOGIN, xor(login.as_bytes())),
             (tag::PASSWORD, xor(password.as_bytes())),
         ];
+        if let Some(caps) = caps {
+            chunks.push((tag::CAPABILITIES, caps.to_be_bytes().to_vec()));
+        }
         stream
             .write_all(&pack_frame(LOGIN, 1, 0, &chunks))
             .await
@@ -712,10 +731,11 @@ async fn a_guest_sets_no_avatar_on_either_wire_until_its_file_says_so() {
     let mut bob = Legacy::login(server.legacy, "bob").await;
     assert!(bob.icon_list().await.is_empty());
 
-    // The classic wire: answered as a set is, so a client re-sending its
-    // saved icon at login shows no error — and not applied: the icon
-    // stays unset and nobody is told anything changed.
-    let mut guest = Legacy::guest(server.legacy).await;
+    // The classic wire, from a login that looks like GtkHx 1.4.0 or
+    // older: answered as a set is, so its re-send of the saved icon at
+    // login shows no error — and not applied: the icon stays unset and
+    // nobody is told anything changed.
+    let mut guest = Legacy::gtkhx_guest(server.legacy, 185).await;
     assert!(guest.icon_list().await.is_empty());
     let quiet = guest
         .call(ICON_SET, &[(tag::ICON_GIF, gif(1, 16, 16))])
@@ -726,6 +746,22 @@ async fn a_guest_sets_no_avatar_on_either_wire_until_its_file_says_so() {
     // Clearing is never refused.
     let clear = guest.call(ICON_SET, &[(tag::ICON_GIF, vec![])]).await;
     assert_eq!(clear.flag, 0);
+
+    // Every other classic client is refused with readable text: one that
+    // logs in as the official clients do, and GtkHx after 1.4.0, which
+    // sends version 254.
+    let official = Legacy::guest(server.legacy).await;
+    let newer_gtkhx = Legacy::gtkhx_guest(server.legacy, 254).await;
+    for mut refused in [official, newer_gtkhx] {
+        let set = refused
+            .call(ICON_SET, &[(tag::ICON_GIF, gif(1, 16, 16))])
+            .await;
+        assert_eq!(set.flag, 1);
+        assert_eq!(error_text(&set), "You are not allowed to set an icon.");
+        assert!(bob.icon_of(refused.uid).await.is_empty());
+        let clear = refused.call(ICON_SET, &[(tag::ICON_GIF, vec![])]).await;
+        assert_eq!(clear.flag, 0);
+    }
 
     // The ng wire: 403, and `avatar_clear` still answers.
     let (mut ng_guest, ok) = Ng::login_with(server.ng, "guest", "").await;
