@@ -29,6 +29,7 @@ fn editor(core: &Core) -> Uid {
             has_inbox: true,
             attach_news: false,
             moderate: false,
+            can_spam: false,
             is_person: true,
             reads_on_delivery: false,
             identity: None,

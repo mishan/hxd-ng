@@ -368,6 +368,10 @@ pub enum ChatError {
     /// revoked. One answer for all three, so a sender cannot use a chat
     /// send to test whether someone else's handle exists.
     NoSuchMedia,
+    /// The sender talked faster than it may (`crate::limits`) and has
+    /// been kicked for it, or had been kicked already and is on its way
+    /// out.
+    Flooding,
     /// The server couldn't complete the operation — a chat id the OS
     /// CSPRNG refused to produce, or an inbox that would not write. Not
     /// the client's fault and not something it can retry usefully.
@@ -395,6 +399,7 @@ impl Core {
         style: u16,
         media: Option<crate::media::Handle>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
+        self.chat_flood_check(from, 0, &text)?;
         let (info, login, fingerprint, principal) = {
             let r = self.roster.lock().unwrap();
             let Some(sess) = r.users.get(&from) else {
@@ -587,6 +592,9 @@ impl Core {
                 serial: sess.serial,
             }
         };
+        // After membership, as mhxd's `rcv_chat` drops a line to a room
+        // its sender is not in before `hxd_rcv_chat` counts it.
+        self.chat_flood_check(from, cid, &text)?;
         let media = match media {
             Some(handle) => Some((
                 handle,
@@ -695,12 +703,128 @@ impl Core {
             .unwrap_or(0)
     }
 
+    /// Count a chat send's lines against `uid`'s `chat_lines`, as
+    /// mhxd's `hxd_rcv_chat` counts them (`crate::limits::chat_lines`),
+    /// or kick it. Past the window's allowance the session is kicked,
+    /// without a ban, the send is refused whole — mhxd overwrites the
+    /// lines it had formatted with the notice — and the room it was sent
+    /// to hears mhxd's `\r *** X was kicked for chat spamming`, from the
+    /// spammer. A session whose account `can_spam`, and the server
+    /// account, spend nothing; a uid not on the roster spends nothing
+    /// either, since the caller refuses it for that.
+    ///
+    /// mhxd skips the count for a line that starts with `/`, because it
+    /// runs that line as a command instead of relaying it. This server
+    /// has no chat commands and relays such a line like any other, so it
+    /// counts like any other.
+    pub(crate) fn chat_flood_check(&self, uid: Uid, cid: u32, text: &str) -> Result<(), ChatError> {
+        let nick = {
+            let mut r = self.roster.lock().unwrap();
+            let Some(sess) = r.users.get_mut(&uid) else {
+                return Ok(());
+            };
+            // On its way out: every line it had in flight would kick it
+            // again and tell the room again.
+            if sess.kicked {
+                return Err(ChatError::Flooding);
+            }
+            if sess.can_spam || sess.info.system {
+                return Ok(());
+            }
+            let lines = crate::limits::chat_lines(text);
+            if sess
+                .flood
+                .chat(lines, &self.flood_limits, std::time::Instant::now())
+            {
+                return Ok(());
+            }
+            match kick_in(&mut r, uid, None) {
+                Ok(nick) => nick,
+                Err(_) => return Err(ChatError::Flooding),
+            }
+        };
+        warn!(uid, nick = %nick, "kicked for chat spamming");
+        crate::instrument::flood_kick("chat");
+        self.notice(
+            cid,
+            uid,
+            format!("{nick} was kicked for chat spamming"),
+            true,
+        );
+        Err(ChatError::Flooding)
+    }
+
+    /// Spend `points` of `uid`'s spam points on a transaction it sent,
+    /// mhxd's `spam_update` at the top of `hxd_rcv`: `trans` is the
+    /// transaction's type on the classic wire, or the type of the one an
+    /// ng request stands for there, and only the announcement uses it.
+    /// When the window's total reaches `spam_points` the session is
+    /// kicked, its address banned for `ban_for` (only kicked when that is
+    /// zero), and public chat hears mhxd's `<X has been banned by X:
+    /// spam_max exceeded: …>`; the transaction is refused, and so is
+    /// every one after it from a session already kicked, which is neither
+    /// kicked nor announced again. A session whose account `can_spam`,
+    /// and the server account, spend nothing.
+    pub fn spend_spam(&self, uid: Uid, points: u32, trans: u32) -> Result<(), ChatError> {
+        let limits = self.flood_limits;
+        let (nick, total) = {
+            let mut r = self.roster.lock().unwrap();
+            let Some(sess) = r.users.get_mut(&uid) else {
+                return Ok(());
+            };
+            if sess.kicked {
+                return Err(ChatError::Flooding);
+            }
+            if sess.can_spam || sess.info.system {
+                return Ok(());
+            }
+            let (total, under) = sess.flood.spam(points, &limits, std::time::Instant::now());
+            if under {
+                return Ok(());
+            }
+            let ban = (!limits.ban_for.is_zero()).then_some(limits.ban_for);
+            match kick_in(&mut r, uid, ban) {
+                Ok(nick) => (nick, total),
+                Err(_) => return Err(ChatError::Flooding),
+            }
+        };
+        let verb = if limits.ban_for.is_zero() {
+            "kicked"
+        } else {
+            "banned"
+        };
+        warn!(uid, nick = %nick, total, trans, "{verb} for spam_max");
+        crate::instrument::flood_kick("spam");
+        // mhxd's `user_kick` with the spammer as its own kicker, and the
+        // reason its `hxd_rcv` gives.
+        self.chat_notice(
+            0,
+            uid,
+            format!(
+                "{nick} has been {verb} by {nick}: spam_max exceeded: {total} >= {}, \
+                 last transaction: 0x{trans:x}",
+                limits.spam_points
+            ),
+        );
+        Err(ChatError::Flooding)
+    }
+
     /// A server notice into a chat (kick announcements and the like).
     /// Semantic text — each frontend formats it. Public delivery honors the
     /// read-chat filter.
     pub fn chat_notice(&self, cid: u32, from: Uid, text: String) {
+        self.notice(cid, from, text, false);
+    }
+
+    /// [`Core::chat_notice`], in the action form when `action` is set.
+    fn notice(&self, cid: u32, from: Uid, text: String, action: bool) {
         let mut r = self.roster.lock().unwrap();
-        let ev = Event::Notice { cid, from, text };
+        let ev = Event::Notice {
+            cid,
+            from,
+            text,
+            action,
+        };
         if cid == 0 {
             r.broadcast_where(&ev, None, reads_public_chat);
         } else if let Some(members) = r.chats.get(&cid).map(|c| c.members.clone()) {
@@ -1516,6 +1640,7 @@ impl Core {
                         cid: 0,
                         from: 0,
                         text: format!("{n} more queued messages are waiting."),
+                        action: false,
                     },
                 );
             }
@@ -1797,36 +1922,7 @@ impl Core {
     /// target's nick. The cant-be-disconnected check is policy and lives in
     /// the caller, which has the target's access via [`Core::access_of`].
     pub fn kick(&self, target: Uid, ban_for: Option<Duration>) -> Result<String, ChatError> {
-        let mut r = self.roster.lock().unwrap();
-        let sess = r.users.get(&target).ok_or(ChatError::NoSuchUser)?;
-        // The server cannot be kicked off its own roster
-        // (`docs/system-account.md` §2). Refused the same way a kick of
-        // somebody who is not there is refused, because from the
-        // moderator's point of view there is nobody there to kick.
-        if sess.system {
-            return Err(ChatError::NoSuchUser);
-        }
-        let nick = sess.info.nick.clone();
-        if let Some(dur) = ban_for {
-            let ban = Ban {
-                addr: sess.addr,
-                expires: Instant::now() + dur,
-            };
-            r.bans.push(ban);
-        }
-        if let Some(sess) = r.users.get_mut(&target) {
-            sess.kicked = true;
-        }
-        r.send_to(target, Event::Kicked);
-        // A detached session has no connection to observe the event; the
-        // kick must end it here or it would linger on the roster.
-        if r.users
-            .get(&target)
-            .is_some_and(crate::roster::is_buffering)
-        {
-            r.end_session(target);
-        }
-        Ok(nick)
+        kick_in(&mut self.roster.lock().unwrap(), target, ban_for)
     }
 
     /// A user's access bits (for policy checks against a *target*, e.g.
@@ -1844,6 +1940,43 @@ impl Core {
         r.bans.retain(|b| b.expires > now);
         r.bans.iter().any(|b| b.addr == Some(addr))
     }
+}
+
+/// [`Core::kick`], under a roster lock the caller already holds.
+fn kick_in(
+    r: &mut RosterInner,
+    target: Uid,
+    ban_for: Option<Duration>,
+) -> Result<String, ChatError> {
+    let sess = r.users.get(&target).ok_or(ChatError::NoSuchUser)?;
+    // The server cannot be kicked off its own roster
+    // (`docs/system-account.md` §2). Refused the same way a kick of
+    // somebody who is not there is refused, because from the
+    // moderator's point of view there is nobody there to kick.
+    if sess.system {
+        return Err(ChatError::NoSuchUser);
+    }
+    let nick = sess.info.nick.clone();
+    if let Some(dur) = ban_for {
+        let ban = Ban {
+            addr: sess.addr,
+            expires: Instant::now() + dur,
+        };
+        r.bans.push(ban);
+    }
+    if let Some(sess) = r.users.get_mut(&target) {
+        sess.kicked = true;
+    }
+    r.send_to(target, Event::Kicked);
+    // A detached session has no connection to observe the event; the
+    // kick must end it here or it would linger on the roster.
+    if r.users
+        .get(&target)
+        .is_some_and(crate::roster::is_buffering)
+    {
+        r.end_session(target);
+    }
+    Ok(nick)
 }
 
 #[cfg(test)]
@@ -2087,6 +2220,157 @@ mod tests {
                 ("three".to_string(), "new name".to_string())
             ]
         );
+    }
+
+    fn flood_limits() -> crate::FloodLimits {
+        crate::FloodLimits {
+            chat_lines: 3,
+            chat_per: Duration::from_secs(60),
+            spam_points: 10,
+            spam_per: Duration::from_secs(60),
+            ban_for: Duration::from_secs(60),
+        }
+    }
+
+    fn spam_notices(evs: &[Event]) -> Vec<(u32, Uid, String, bool)> {
+        evs.iter()
+            .filter_map(|e| match e {
+                Event::Notice {
+                    cid,
+                    from,
+                    text,
+                    action,
+                } if text.contains("spam") => Some((*cid, *from, text.clone(), *action)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Past `chat_lines` a session is kicked and the room told, in mhxd's
+    /// action form and from the spammer; every line of a multi-line send
+    /// counts, and a send that crosses the limit is refused whole, as
+    /// mhxd drops the lines it had formatted. Everything it had in flight
+    /// after that is refused too, without a second kick or notice.
+    #[test]
+    fn a_session_past_its_chat_lines_is_kicked_once_and_the_room_told() {
+        let core = Core::new().with_flood_limits(flood_limits());
+        let (spammer, mut rx_s) = test_attach(&core, "spammer", chatter());
+        let (admin, _rx_a) = test_attach(&core, "admin", chatter());
+        let (_reader, mut rx_r) = test_attach(&core, "reader", chatter());
+        core.roster
+            .lock()
+            .unwrap()
+            .users
+            .get_mut(&admin)
+            .unwrap()
+            .can_spam = true;
+        drain(&mut rx_s);
+        drain(&mut rx_r);
+        core.chat_public(spammer, "one\rtwo".into(), 0, None)
+            .unwrap();
+        assert_eq!(
+            core.chat_public(spammer, "three\rfour".into(), 0, None),
+            Err(ChatError::Flooding),
+            "two more lines are one too many"
+        );
+        for i in 0..50 {
+            assert_eq!(
+                core.chat_public(spammer, format!("{i}"), 0, None),
+                Err(ChatError::Flooding)
+            );
+        }
+        let mine = drain(&mut rx_s);
+        assert_eq!(mine.iter().filter(|e| **e == Event::Kicked).count(), 1);
+        let heard = drain(&mut rx_r);
+        assert_eq!(
+            spam_notices(&heard),
+            [(
+                0,
+                spammer,
+                "spammer was kicked for chat spamming".to_string(),
+                true
+            )],
+            "one notice, in the action form, from the spammer"
+        );
+        let lines: Vec<_> = heard
+            .iter()
+            .filter_map(|e| match e {
+                Event::Chat { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, ["one\rtwo"], "nothing of the send that crossed it");
+
+        for i in 0..10 {
+            core.chat_public(admin, format!("{i}"), 0, None).unwrap();
+        }
+    }
+
+    /// A flood in a private chat is announced to that chat, as mhxd's
+    /// `snd_chat(chat, …)` sends it, and not to public chat.
+    #[test]
+    fn a_private_chat_flood_is_announced_in_that_chat() {
+        let core = Core::new().with_flood_limits(flood_limits());
+        let (spammer, mut rx_s) = test_attach(&core, "spammer", chatter());
+        let (member, mut rx_m) = test_attach(&core, "member", chatter());
+        let (_outsider, mut rx_o) = test_attach(&core, "outsider", chatter());
+        let (cid, _) = core.chat_create(spammer, member).unwrap();
+        core.chat_join(cid, member, "").unwrap();
+        drain(&mut rx_s);
+        drain(&mut rx_m);
+        drain(&mut rx_o);
+        assert_eq!(
+            core.chat_private(cid, spammer, "a\rb\rc\rd".into(), 0, None),
+            Err(ChatError::Flooding)
+        );
+        assert_eq!(
+            spam_notices(&drain(&mut rx_m)),
+            [(
+                cid,
+                spammer,
+                "spammer was kicked for chat spamming".to_string(),
+                true
+            )]
+        );
+        assert!(spam_notices(&drain(&mut rx_o)).is_empty());
+    }
+
+    /// mhxd's spam points: a transaction that brings the window to the
+    /// budget kicks and bans its sender, and public chat hears mhxd's
+    /// announcement; nothing after it spends, kicks or announces again.
+    #[test]
+    fn a_session_that_spends_its_spam_points_is_banned_once() {
+        let core = Core::new().with_flood_limits(flood_limits());
+        let (talker, mut rx_t) = test_attach(&core, "talker", chatter());
+        let (_reader, mut rx_r) = test_attach(&core, "reader", chatter());
+        drain(&mut rx_t);
+        drain(&mut rx_r);
+        for _ in 0..4 {
+            core.spend_spam(talker, 2, 0x6c).unwrap();
+        }
+        assert_eq!(core.spend_spam(talker, 2, 0x6c), Err(ChatError::Flooding));
+        for _ in 0..20 {
+            assert_eq!(core.spend_spam(talker, 2, 0x6c), Err(ChatError::Flooding));
+        }
+        assert_eq!(
+            drain(&mut rx_t)
+                .iter()
+                .filter(|e| **e == Event::Kicked)
+                .count(),
+            1
+        );
+        assert_eq!(
+            spam_notices(&drain(&mut rx_r)),
+            [(
+                0,
+                talker,
+                "talker has been banned by talker: spam_max exceeded: 10 >= 10, \
+                 last transaction: 0x6c"
+                    .to_string(),
+                false
+            )]
+        );
+        assert_eq!(core.roster.lock().unwrap().bans.len(), 1, "one ban");
     }
 
     #[test]
@@ -2342,6 +2626,7 @@ mod inbox_tests {
                 has_inbox: true,
                 attach_news: false,
                 moderate: false,
+                can_spam: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: Some(fingerprint),
@@ -2368,6 +2653,7 @@ mod inbox_tests {
                 has_inbox,
                 attach_news: false,
                 moderate: false,
+                can_spam: false,
                 is_person: has_inbox,
                 reads_on_delivery: false,
                 identity: None,
@@ -3062,6 +3348,7 @@ mod inbox_tests {
                 has_inbox: false,
                 attach_news: false,
                 moderate: false,
+                can_spam: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(3)),
@@ -3103,6 +3390,7 @@ mod inbox_tests {
                 has_inbox: false,
                 attach_news: false,
                 moderate: false,
+                can_spam: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(7)),

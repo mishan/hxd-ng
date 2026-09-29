@@ -165,6 +165,9 @@ struct ExtraTable {
     /// May this account redact, revoke, purge and read reports? Default:
     /// the disconnect_users (kick) bit (`docs/moderation.md` §2).
     moderate: Option<bool>,
+    /// Is this account held to no flood limit? mhxd's `can_spam`.
+    /// Default: the disconnect_users (kick) bit.
+    can_spam: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -226,6 +229,10 @@ impl AccountFile {
             moderate: self
                 .extra
                 .moderate
+                .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
+            can_spam: self
+                .extra
+                .can_spam
                 .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
             identity: IdentityLink {
                 fingerprint,

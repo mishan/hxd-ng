@@ -66,6 +66,10 @@ pub struct Account {
     /// someone trusted to disconnect a person is trusted to take down
     /// what they posted.
     pub moderate: bool,
+    /// Is this account held to no flood limit (`crate::limits`)? mhxd's
+    /// `can_spam` extra, the `[extra] can_spam` key. Backend default: the
+    /// disconnect-users (kick) bit, as mhxd's administrators have it.
+    pub can_spam: bool,
     /// Portable-identity association (`docs/hotline-ng-identity.md` §8).
     /// Its `fingerprint` is the durable half of a
     /// [`crate::inbox::Mailbox`]: a login can be renamed and

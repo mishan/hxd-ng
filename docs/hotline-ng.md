@@ -664,6 +664,17 @@ news body is different: it declares its own type (news.md §5).
   `news_search`, media and news-attachment uploads, media downloads, and
   enrollment; the general per-connection and login-attempt limits are not
   yet built.
+- **Flooding.** A server MAY instead kick a session that sends faster
+  than anyone is allowed to, answering the request that crossed the line
+  `flooding` before the `kicked` event (§10). *hxd-ng* holds a session to
+  the budgets mhxd's `nospam` does, one session on either wire the same
+  (`[limits]`): so many lines of `chat` in a window, every line of a
+  multi-line `text` counted, and so many spam points, which `chat` and
+  `msg` spend at the price mhxd charges its Chat and Message
+  transactions. Past the first the session is kicked and its room told;
+  past the second it is kicked and its address banned for `[server]
+  ban_time`, and public chat told. An account with `[extra] can_spam` is
+  held to neither.
 - **Roster pollution** is bounded by the detach rules of §2: permission
   per account and off for guests, a per-address cap, and moderation that
   ends a detached session on the spot.
@@ -679,6 +690,7 @@ news body is different: it declares its own type (news.md §5).
 | `bad_request` | `params` malformed, a required param missing, or a combination this document forbids. |
 | `access_denied` | The session lacks the privilege this request needs. |
 | `rate_limited` | Over a limit (§9). Retry later; MAY carry `retry_after`. |
+| `flooding` | The session sent faster than the server allows anyone to, and has been kicked for it (§9). **Fatal**, unlike `rate_limited`: a `kicked` event follows and the session ends. Retrying is what got it kicked. |
 | `server_error` | The server failed. Not the client's fault; MAY be retried. |
 
 **Core** — from §6 and §7:

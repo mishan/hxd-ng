@@ -314,6 +314,11 @@ pub enum Event {
         cid: u32,
         from: Uid,
         text: String,
+        /// Said in the action form (legacy: `\r *** text`) rather than
+        /// as a notice: mhxd's own chat-spamming notice is, and the
+        /// classic wire says it byte for byte. The ng wire does not
+        /// tell the two apart.
+        action: bool,
     },
     /// A chat (or, for cid 0, server) subject change.
     ChatSubject {
@@ -704,6 +709,10 @@ pub(crate) struct UserSession {
     pub(crate) attach_news: bool,
     /// See [`AttachInfo::moderate`].
     pub(crate) moderate: bool,
+    /// See [`AttachInfo::can_spam`].
+    pub(crate) can_spam: bool,
+    /// What this session has spent of its flood allowances.
+    pub(crate) flood: crate::limits::Flood,
     /// See [`AttachInfo::is_person`].
     pub(crate) is_person: bool,
     /// See [`AttachInfo::reads_on_delivery`].
@@ -750,6 +759,10 @@ pub struct AttachInfo {
     /// May this session moderate (`docs/moderation.md` §2)? The
     /// account's `[extra] moderate`, which defaults to the kick bit.
     pub moderate: bool,
+    /// Is this session held to no flood limit (`crate::limits`)? The
+    /// account's `[extra] can_spam`, mhxd's, which defaults to the kick
+    /// bit.
+    pub can_spam: bool,
     /// Is exactly one person behind this account? [`Account::is_person`]:
     /// what news records authorship against, independent of `has_inbox`.
     ///
@@ -1021,6 +1034,8 @@ pub struct Core {
     pub(crate) login_gate: LoginGate,
     /// Connections each address holds ([`Core::admit_connection`]).
     pub(crate) conn_gate: crate::limits::ConnGate,
+    /// How fast one session may talk (`crate::limits`).
+    pub(crate) flood_limits: crate::limits::FloodLimits,
     /// The durable private-message inbox, or `None` — in which case
     /// private messaging behaves exactly as it did before the inbox
     /// existed, which is what a server that configures no database gets.
@@ -1289,6 +1304,13 @@ impl Core {
         self
     }
 
+    /// Hold sessions to `limits` rather than
+    /// [`crate::FloodLimits::default`].
+    pub fn with_flood_limits(mut self, limits: crate::FloodLimits) -> Self {
+        self.flood_limits = limits;
+        self
+    }
+
     /// A place for one connection from `addr`, held for as long as the
     /// connection is open, or why there is none: the frontend closes the
     /// connection unanswered (`crate::limits`). Asked once per
@@ -1411,6 +1433,8 @@ impl Core {
                 has_inbox: info.has_inbox,
                 attach_news: info.attach_news,
                 moderate: info.moderate,
+                can_spam: info.can_spam,
+                flood: Default::default(),
                 is_person: info.is_person,
                 reads_on_delivery: info.reads_on_delivery,
                 system: info.system,
@@ -1827,6 +1851,7 @@ pub(crate) fn test_attach(core: &Core, nick: &str, access: AccessBits) -> (Uid, 
             has_inbox: false,
             attach_news: false,
             moderate: false,
+            can_spam: false,
             is_person: false,
             reads_on_delivery: false,
             identity: None,
@@ -1866,6 +1891,7 @@ mod tests {
                 has_inbox: true,
                 attach_news: false,
                 moderate: false,
+                can_spam: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,
@@ -1945,6 +1971,7 @@ mod tests {
                 has_inbox: false,
                 attach_news: false,
                 moderate: false,
+                can_spam: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: None,

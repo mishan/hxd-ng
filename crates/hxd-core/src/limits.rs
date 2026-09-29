@@ -1,4 +1,5 @@
-//! Limits a single address is held to, whatever it is logged in as.
+//! Limits a single address is held to, whatever it is logged in as, and
+//! those a single session is.
 //!
 //! **Connections.** mhxd's `nospam` defaults are the reference: at most
 //! five connections from one address, and not two within two seconds.
@@ -10,11 +11,20 @@
 //! mhxd does: answering it would mean holding the connection open to
 //! do so, which is what a flood of them wants.
 //!
+//! **Talk.** One session is held to mhxd's two budgets, whatever address
+//! it came from ([`FloodLimits`]): `chat_max` lines of chat in a
+//! `chat_time`-second window, every line of a multi-line send counted,
+//! and `spam_max` spam points in a `spam_time`-second window, which each
+//! transaction it sends spends at the rate mhxd's table charges it. Past
+//! the first it is kicked and its room told, past the second kicked and
+//! banned for `[server] ban_time` with public chat told, both in mhxd's
+//! words. An account that `can_spam` is held to neither.
+//!
 //! **Addresses.** An IPv4 address is itself; an IPv6 one is its /64,
 //! which is what one subscriber is given, so a client cannot step past
 //! the cap by walking its own prefix. An IPv4 address mapped into IPv6
-//! is the IPv4 address. Addresses in `exempt` are not limited at all:
-//! loopback by default, so the tests, the load harness and an operator's
+//! is the IPv4 address. Addresses in `exempt` are held to neither
+//! connection limit: loopback by default, so the tests, the load harness and an operator's
 //! own tools are not refused by their own server.
 
 use std::collections::HashMap;
@@ -213,7 +223,8 @@ impl ConnGate {
         }))
     }
 
-    /// Is `ip` held to no per-address limit (`exempt`)?
+    /// Is `ip` held to no per-address limit (`exempt`)? The flood
+    /// limits hold for it all the same.
     pub(crate) fn exempt(&self, ip: IpAddr) -> bool {
         self.0.limits.exempt.contains(ip)
     }
@@ -277,6 +288,99 @@ fn refill(s: &AddrState, now: Instant, every: Duration, burst: f64) -> f64 {
     }
     let earned = now.duration_since(s.at).as_secs_f64() / every.as_secs_f64();
     (s.tokens + earned).min(burst)
+}
+
+/// How fast one session may talk (`[limits]`), mhxd's `nospam` budgets:
+/// `chat_lines` lines of chat in each `chat_per` window (mhxd's
+/// `chat_max` and `chat_time`), and `spam_points` points in each
+/// `spam_per` window (its `spam_max` and `spam_time`), which every
+/// transaction spends at the rate its table charges. Past the first the
+/// session is kicked; past the second it is kicked and its address
+/// banned for `ban_for`, or only kicked when that is zero, as mhxd's
+/// `ban_time` of 0 has it. A count of 0 is no limit, which is what a
+/// `Core` built by hand has ([`FloodLimits::default`]); a server built
+/// from a config has [`FloodLimits::MHXD`] unless it says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FloodLimits {
+    pub chat_lines: u32,
+    pub chat_per: Duration,
+    pub spam_points: u32,
+    pub spam_per: Duration,
+    pub ban_for: Duration,
+}
+
+impl FloodLimits {
+    /// mhxd's `nospam` defaults, and its `ban_time`.
+    pub const MHXD: FloodLimits = FloodLimits {
+        chat_lines: 20,
+        chat_per: Duration::from_secs(5),
+        spam_points: 100,
+        spam_per: Duration::from_secs(5),
+        ban_for: Duration::from_secs(1800),
+    };
+}
+
+/// How many lines mhxd counts in a chat send: every piece its
+/// `cr_strtok_r` loop cuts the text into at a CR or an LF, the empty
+/// ones included, so one more than the breaks it holds.
+pub(crate) fn chat_lines(text: &str) -> u32 {
+    let breaks = text.bytes().filter(|b| *b == b'\r' || *b == b'\n').count();
+    u32::try_from(breaks).unwrap_or(u32::MAX).saturating_add(1)
+}
+
+/// What one session has spent of its budgets.
+#[derive(Debug, Default)]
+pub(crate) struct Flood {
+    chat: Window,
+    spam: Window,
+}
+
+/// A fixed window, as mhxd keeps one: it starts at the first spend after
+/// the last one ran out, and everything spent in it is forgotten when it
+/// does.
+#[derive(Debug, Default)]
+struct Window {
+    start: Option<Instant>,
+    spent: u32,
+}
+
+impl Window {
+    fn roll(&mut self, per: Duration, now: Instant) {
+        if self.start.is_none_or(|s| now.duration_since(s) >= per) {
+            self.start = Some(now);
+            self.spent = 0;
+        }
+    }
+}
+
+impl Flood {
+    /// Spend `lines` lines of chat: `false`, and nothing spent, when that
+    /// would take the window past `chat_lines`. mhxd kicks at the first
+    /// line past it, before the lines of the send it has formatted so far
+    /// are relayed, so a send that crosses it is refused whole.
+    pub(crate) fn chat(&mut self, lines: u32, limits: &FloodLimits, now: Instant) -> bool {
+        if limits.chat_lines == 0 || limits.chat_per.is_zero() {
+            return true;
+        }
+        self.chat.roll(limits.chat_per, now);
+        if self.chat.spent.saturating_add(lines) > limits.chat_lines {
+            return false;
+        }
+        self.chat.spent += lines;
+        true
+    }
+
+    /// Spend `points` spam points, returning the window's total, and
+    /// whether it is still under `spam_points`: mhxd kicks when a
+    /// transaction brings the total to the budget, not past it.
+    pub(crate) fn spam(&mut self, points: u32, limits: &FloodLimits, now: Instant) -> (u32, bool) {
+        if limits.spam_points == 0 || limits.spam_per.is_zero() {
+            return (0, true);
+        }
+        self.spam.roll(limits.spam_per, now);
+        self.spam.spent = self.spam.spent.saturating_add(points);
+        (self.spam.spent, self.spam.spent < limits.spam_points)
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +480,46 @@ mod tests {
         );
         for _ in 0..10 {
             std::mem::forget(g.admit("127.0.0.1".parse().unwrap()).unwrap());
+        }
+    }
+
+    #[test]
+    fn chat_lines_are_counted_as_mhxd_cuts_them() {
+        assert_eq!(chat_lines("one"), 1);
+        assert_eq!(chat_lines(""), 1);
+        assert_eq!(chat_lines("one\rtwo"), 2);
+        // The empty pieces count too: between a CR and its LF, and after
+        // the last break.
+        assert_eq!(chat_lines("one\r\ntwo\r"), 4);
+    }
+
+    #[test]
+    fn a_session_talks_up_to_its_window_and_then_a_new_one_opens() {
+        let limits = FloodLimits {
+            chat_lines: 3,
+            chat_per: Duration::from_secs(5),
+            spam_points: 10,
+            spam_per: Duration::from_secs(5),
+            ban_for: Duration::ZERO,
+        };
+        let mut f = Flood::default();
+        let t = Instant::now();
+        assert!(f.chat(2, &limits, t));
+        assert!(!f.chat(2, &limits, t), "a send that would cross it");
+        assert!(f.chat(1, &limits, t), "the refused one spent nothing");
+        assert!(!f.chat(1, &limits, t + Duration::from_secs(4)));
+        // A fixed window, not a rate: it all comes back at once.
+        assert!(f.chat(3, &limits, t + Duration::from_secs(5)));
+
+        assert_eq!(f.spam(4, &limits, t), (4, true));
+        assert_eq!(f.spam(4, &limits, t), (8, true));
+        assert_eq!(f.spam(2, &limits, t), (10, false), "reaching it is enough");
+        assert_eq!(f.spam(2, &limits, t + Duration::from_secs(5)), (2, true));
+
+        let none = FloodLimits::default();
+        for _ in 0..1000 {
+            assert!(f.chat(100, &none, t));
+            assert!(f.spam(100, &none, t).1);
         }
     }
 

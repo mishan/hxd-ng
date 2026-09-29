@@ -40,6 +40,9 @@ accounts = "$D/accounts"
 [ng]
 bind = "127.0.0.1:15700"
 max_detached_per_addr = 1024
+[limits]
+chat_lines = 0
+spam_points = 0
 [inbox]
 db = "$D/server.db"
 sync = "$SYNC"

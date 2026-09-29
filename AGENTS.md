@@ -198,7 +198,16 @@ at accept, so the handshake is counted) and at the ng upgrade, before
 its token is redeemed, with the client's address as trusted proxies
 give it. An IPv6
 client is its /64; loopback is exempt by default. A new listener that
-carries sessions takes a permit too.
+carries sessions takes a permit too. And one session talks so fast,
+wherever it connects from, on mhxd's budgets: past `chat_lines` lines
+of chat in a window, every line of a send counted, it is kicked and its
+room told (`Core::chat_flood_check`, in the chat paths); past
+`spam_points`, which every request spends at the price mhxd's table
+gives its transaction, it is kicked and banned
+(`Core::spend_spam`, called by each frontend before it acts on a
+request; a new frontend or an ng request with a classic counterpart
+calls it too). A session already kicked is refused, never kicked
+again. An account that `can_spam` is held to neither.
 
 **Past capacity a login is refused, not queued.** Every login costs
 everyone present a join and later a part, so a server admitting logins
@@ -270,7 +279,9 @@ Three layers, all `cargo test --workspace`:
   store, and `hlid register`, `revoke` and `rotate` driven as a user
   would), `limits.rs` (so many connections from one address across both
   wires, then a burst and a rate, a TLS handshake counted from accept,
-  and an exempt address held to neither), `slow_consumer.rs` (a room flooded while one client reads
+  and an exempt address held to neither; a classic user's multi-line
+  flood kicked once with the room told in mhxd's bytes, and a user past
+  its spam points on each wire banned, the ng one refused `flooding`), `slow_consumer.rs` (a room flooded while one client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the
   ng one resumes into a resync; and clients each inside their own

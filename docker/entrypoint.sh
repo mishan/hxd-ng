@@ -176,6 +176,10 @@ generate() {
     num HXD_CONNECTIONS_PER_ADDR connections_per_addr
     num HXD_RECONNECT_SECONDS reconnect_seconds
     addresses HXD_LIMITS_EXEMPT "${HXD_LIMITS_EXEMPT-127.0.0.0/8,::1}" exempt
+    num HXD_CHAT_LINES chat_lines
+    num HXD_CHAT_SECONDS chat_seconds
+    num HXD_SPAM_POINTS spam_points
+    num HXD_SPAM_SECONDS spam_seconds
     echo
     echo "[paths]"
     echo "accounts = \"$DATA/accounts\""

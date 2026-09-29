@@ -41,8 +41,9 @@ pub mod tracker;
 pub struct Config {
     #[serde(default)]
     pub server: ServerSection,
-    /// What one address is held to (`hxd_core::limits`). Always on, at
-    /// mhxd's `nospam` defaults, with loopback exempt.
+    /// What one address, and one session, is held to
+    /// (`hxd_core::limits`). Always on, at mhxd's `nospam` defaults, with
+    /// loopback exempt from the per-address ones.
     #[serde(default)]
     pub limits: LimitsSection,
     #[serde(default)]
@@ -1516,9 +1517,39 @@ pub struct LimitsSection {
     /// for no limit.
     #[serde(default = "default_reconnect_seconds")]
     pub reconnect_seconds: u64,
-    /// Addresses and CIDR blocks held to none of these.
+    /// Addresses and CIDR blocks held to neither connection limit. The
+    /// flood limits are a session's, and hold everywhere.
     #[serde(default = "default_limits_exempt")]
     pub exempt: Vec<String>,
+    /// Chat lines one session may send in each `chat_seconds` window,
+    /// public and private rooms together and every line of a multi-line
+    /// send counted, before it is kicked; 0 for no limit. mhxd's
+    /// `chat_max` and `chat_time`.
+    #[serde(default = "default_chat_lines")]
+    pub chat_lines: u32,
+    #[serde(default = "default_chat_seconds")]
+    pub chat_seconds: u64,
+    /// Spam points one session may spend in each `spam_seconds` window,
+    /// every transaction costing what mhxd's table charges it, before it
+    /// is kicked and banned for `[server] ban_time`; 0 for no limit.
+    /// mhxd's `spam_max` and `spam_time`.
+    #[serde(default = "default_spam_points")]
+    pub spam_points: u32,
+    #[serde(default = "default_spam_seconds")]
+    pub spam_seconds: u64,
+}
+
+fn default_chat_lines() -> u32 {
+    hxd_core::FloodLimits::MHXD.chat_lines
+}
+fn default_chat_seconds() -> u64 {
+    hxd_core::FloodLimits::MHXD.chat_per.as_secs()
+}
+fn default_spam_points() -> u32 {
+    hxd_core::FloodLimits::MHXD.spam_points
+}
+fn default_spam_seconds() -> u64 {
+    hxd_core::FloodLimits::MHXD.spam_per.as_secs()
 }
 
 fn default_connections_per_addr() -> usize {
@@ -1537,11 +1568,32 @@ impl Default for LimitsSection {
             connections_per_addr: default_connections_per_addr(),
             reconnect_seconds: default_reconnect_seconds(),
             exempt: default_limits_exempt(),
+            chat_lines: default_chat_lines(),
+            chat_seconds: default_chat_seconds(),
+            spam_points: default_spam_points(),
+            spam_seconds: default_spam_seconds(),
         }
     }
 }
 
 impl LimitsSection {
+    /// The flood limits, banning a session past its spam points for
+    /// `ban_time` seconds (`[server] ban_time`).
+    pub fn flood_limits(&self, ban_time: u64) -> Result<hxd_core::FloodLimits, String> {
+        if (self.chat_lines != 0 && self.chat_seconds == 0)
+            || (self.spam_points != 0 && self.spam_seconds == 0)
+        {
+            return Err("[limits] a count needs its seconds: set both, or the count to 0".into());
+        }
+        Ok(hxd_core::FloodLimits {
+            chat_lines: self.chat_lines,
+            chat_per: Duration::from_secs(self.chat_seconds),
+            spam_points: self.spam_points,
+            spam_per: Duration::from_secs(self.spam_seconds),
+            ban_for: Duration::from_secs(ban_time),
+        })
+    }
+
     pub fn conn_limits(&self) -> Result<hxd_core::ConnLimits, String> {
         Ok(hxd_core::ConnLimits {
             per_addr: self.connections_per_addr,
@@ -2203,6 +2255,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
         return Err("[server] logins_in_flight must be at least 1, and not absurd".into());
     }
     config.limits.conn_limits()?;
+    config.limits.flood_limits(config.server.ban_time)?;
     if config.server.queue_budget() == 0 {
         return Err(
             "[server] queue_budget_mb must be at least 1, and small enough to count in bytes"
@@ -3076,10 +3129,12 @@ pub fn build_ctx(
 
     let budget = config.server.queue_budget();
     let conn_limits = config.limits.conn_limits()?;
+    let flood_limits = config.limits.flood_limits(config.server.ban_time)?;
     let core = match voice {
         Some(v) => {
             let core = Core::new()
                 .with_conn_limits(conn_limits)
+                .with_flood_limits(flood_limits)
                 .with_queue_budget(budget)
                 .with_logins_in_flight(config.server.logins_in_flight)
                 .with_voice(v.media(), v.max_per_room());
@@ -3098,6 +3153,7 @@ pub fn build_ctx(
         }
         None => Core::new()
             .with_conn_limits(conn_limits)
+            .with_flood_limits(flood_limits)
             .with_queue_budget(budget)
             .with_logins_in_flight(config.server.logins_in_flight),
     };

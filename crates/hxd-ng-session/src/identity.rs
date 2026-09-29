@@ -1496,6 +1496,7 @@ mod tests {
             has_inbox: password,
             attach_news: false,
             moderate: false,
+            can_spam: false,
             identity: hxd_core::IdentityLink {
                 identity_login: true,
                 allow_self_link: true,

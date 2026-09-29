@@ -76,6 +76,62 @@ mod gif_icons {
     pub const GET: u32 = 0x0000_0747;
 }
 
+/// What a transaction costs of a session's spam points
+/// (`hxd_core::FloodLimits`): mhxd's `spamconf` table, entry for entry,
+/// and its default of 10 for every type the table does not list, those it
+/// handles and those it does not alike. The extensions this server speaks
+/// that mhxd never did — chat history, inline media, voice and video —
+/// cost nothing, a deliberate deviation: mhxd's default would charge
+/// each piece of one photo's upload or one call's ICE trickle 10, and
+/// ban its sender within the window.
+///
+/// Fetching icons costs nothing either, against mhxd's table. A GIF
+/// Icons client asks for every icon in the user list as it logs in, and
+/// at mhxd's price that bans it on any room of a few dozen people: the
+/// client doing what it was built to do is not a flood.
+fn spam_points(ty: u32) -> u32 {
+    let free = [
+        ClientHdr::GetChatHistory,
+        ClientHdr::VoiceJoin,
+        ClientHdr::VoiceLeave,
+        ClientHdr::VoiceSdpAnswer,
+        ClientHdr::VoiceIce,
+        ClientHdr::VoiceMute,
+        ClientHdr::VideoStart,
+        ClientHdr::VideoStop,
+        ClientHdr::VideoState,
+        ClientHdr::VideoSubscribe,
+    ];
+    if free.iter().any(|h| h.as_u32() == ty)
+        || ty == media::trans::UPLOAD_MEDIA
+        || ty == media::trans::DOWNLOAD_MEDIA
+        || ty == gif_icons::GET_LIST
+        || ty == gif_icons::GET
+    {
+        return 0;
+    }
+    match ty {
+        101 | 103 => 20,             // news get, news post
+        105 | 108 => 2,              // chat, message
+        110 => 1,                    // kick
+        112 => 10,                   // chat create
+        113 => 8,                    // chat invite
+        114 | 115 | 120 => 2,        // chat decline, join, subject
+        116 => 1,                    // chat part
+        121 => 4,                    // agreement (mhxd's table: "SetInfo")
+        200 | 202 | 203 => 3,        // file list, get, put
+        204..=209 => 7,              // file delete .. alias
+        210 | 213 => 3,              // folder get, put
+        214 => 1,                    // transfer stop
+        300 | 304 => 20,             // user list, user change
+        303 => 1,                    // user info
+        348..=351 | 353 | 355 => 20, // accounts, broadcast
+        352 => 10,                   // account read
+        1862 => 20,                  // icon set
+        _ => 10,
+    }
+}
+
 /// Data tags hxproto has no constants for (the gtkhx client ignores
 /// or hand-rolls them).
 const TAG_BANNERID: u16 = 0x00a1;
@@ -864,6 +920,7 @@ fn err_text(e: ChatError) -> &'static str {
         // Not theirs, expired, or revoked — one answer for all three, so
         // a send cannot be used to test whether a handle exists.
         ChatError::NoSuchMedia => "Media rejected",
+        ChatError::Flooding => "You were kicked for flooding.",
         ChatError::ServerError => "Server error.",
     }
 }
@@ -1663,6 +1720,7 @@ async fn login_phase(
         has_inbox: account.has_inbox,
         attach_news: account.attach_news,
         moderate: account.moderate,
+        can_spam: account.can_spam,
         is_person: account.is_person(),
         // This wire has no `msg_read` and never will — a private message
         // is a window that opens and nothing comes back — so handing one
@@ -1968,13 +2026,25 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
             }
             push(tx, hdr::CHAT, chunks);
         }
-        Event::Notice { cid, from, text } => {
-            // The legacy rendering of a server notice: `\r<text>`.
-            let mut line = Vec::with_capacity(text.len() + 3);
-            line.push(b'\r');
-            line.push(b'<');
-            line.extend_from_slice(&sess.enc.encode(&text));
-            line.push(b'>');
+        Event::Notice {
+            cid,
+            from,
+            text,
+            action,
+        } => {
+            // The legacy rendering of a server notice: `\r<text>`, or
+            // mhxd's action form, `\r *** text`, for the one notice it
+            // says that way.
+            let mut line = Vec::with_capacity(text.len() + 6);
+            if action {
+                line.extend_from_slice(b"\r *** ");
+                line.extend_from_slice(&sess.enc.encode(&text));
+            } else {
+                line.push(b'\r');
+                line.push(b'<');
+                line.extend_from_slice(&sess.enc.encode(&text));
+                line.push(b'>');
+            }
             let mut chunks = vec![(tag::BODY, line)];
             if cid != 0 {
                 chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
@@ -2244,6 +2314,13 @@ async fn session_loop(
             maybe = frames.recv() => match maybe {
                 Some(f) => {
                     trace_in(&f);
+                    // mhxd charges every transaction after login before
+                    // it looks at it, and one that spends the last of the
+                    // budget is never answered: the kick that follows is
+                    // the reply. Nor is anything after it.
+                    if ctx.core.spend_spam(sess.uid, spam_points(f.ty), f.ty).is_err() {
+                        continue;
+                    }
                     dispatch(&f, tx, ctx, sess).await;
                 }
                 None => return None, // Reader exited: EOF, error, or bad frame.
@@ -2935,6 +3012,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             uid = sess.uid,
                             "chat dropped: media handle is not this sender's"
                         )
+                    }
+                    // Kicked for it; the kick is the answer.
+                    Some(Err(ChatError::Flooding)) => {
+                        debug!(uid = sess.uid, "chat dropped: flooding")
                     }
                     Some(Err(e)) => warn!(uid = sess.uid, "public chat store failed: {e:?}"),
                     _ => {}
@@ -3871,6 +3952,14 @@ fn file_error_text(error: &hxd_core::FileError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetching_icons_is_free_and_setting_one_is_not() {
+        assert_eq!(spam_points(gif_icons::GET_LIST), 0);
+        assert_eq!(spam_points(gif_icons::GET), 0);
+        assert_eq!(spam_points(gif_icons::SET), 20);
+        assert_eq!(spam_points(105), 2, "a chat line, as mhxd prices it");
+    }
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)

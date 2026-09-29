@@ -243,10 +243,10 @@ agreement = "agreement.txt"
 
 ### Limits
 
-What one address is held to, on both wires together. Always on, at the
-defaults of mhxd's `nospam`. A connection past either limit is closed
-unanswered on the classic ports, as mhxd closes one, and refused with
-HTTP 429 on the ng port, `/trtp` included.
+What one address, and one session, is held to, on both wires together.
+Always on, at the defaults of mhxd's `nospam`. A connection past either
+connection limit is closed unanswered on the classic ports, as mhxd
+closes one, and refused with HTTP 429 on the ng port, `/trtp` included.
 
 ```toml
 [limits]
@@ -254,19 +254,37 @@ connections_per_addr = 5     # at once; 0 for no limit
 reconnect_seconds = 2        # past a burst of that many new connections
                              # (5 when the line above is 0), one more
                              # each this often; 0 for no limit
-exempt = ["127.0.0.0/8", "::1"]  # addresses and blocks held to neither
+exempt = ["127.0.0.0/8", "::1"]  # held to neither connection limit
+chat_lines = 20              # 0 for no limit, or the chat lines one user
+chat_seconds = 5             # may send in each window this long, or be kicked
+spam_points = 100            # 0 for no limit, or the spam points one user
+spam_seconds = 5             # may spend in each window this long, or be banned
 ```
+
+The flood limits are mhxd's `chat_max` and `spam_max`, and hold for
+every session wherever it connects from, loopback included. Every line
+of a multi-line chat counts. A user past `chat_lines` is kicked and its
+room is told, in mhxd's words, "X was kicked for chat spamming". Every
+transaction a classic client sends spends spam points at the price
+mhxd's table gives it (a chat line or a private message 2, a user list
+20, anything it does not list 10; the extensions mhxd never had, and
+fetching icons, cost nothing), as does an ng `chat` or `msg`; a user
+who reaches `spam_points` is kicked and its address banned for
+`[server] ban_time`, and public chat is told as mhxd tells it. An account
+with `[extra] can_spam = true` is held to neither, which by default is
+every account with the kick bit. A load test from one machine wants
+both at 0.
 
 An IPv6 client counts as its /64. An ng client behind a reverse proxy
 listed in `[ng] trusted_proxies` counts as the address the proxy
 forwards. A classic client reaching the server through a TCP proxy that
 hides its address counts as the proxy, so every client of that proxy
 shares one allowance: exempt the proxy, or raise the limit. A proxy on
-the same host connects from loopback, which `exempt` holds to no limit
-by default, so every client behind it is exempt too, down to the share
-of logins in flight one address may hold. For limits per client, list
-the proxy in `[ng] trusted_proxies` for the ng port, or take loopback
-out of `exempt` for a TCP proxy to the classic ports.
+the same host connects from loopback, which `exempt` holds to neither
+connection limit by default, so every client behind it is exempt too,
+down to the share of logins in flight one address may hold. For limits
+per client, list the proxy in `[ng] trusted_proxies` for the ng port,
+or take loopback out of `exempt` for a TCP proxy to the classic ports.
 
 ### Banner
 

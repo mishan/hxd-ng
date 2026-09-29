@@ -71,6 +71,7 @@ fn join(core: &Core, who: Who) -> (Uid, Events) {
             has_inbox: false,
             attach_news: false,
             moderate: false,
+            can_spam: false,
             is_person,
             reads_on_delivery: false,
             identity,

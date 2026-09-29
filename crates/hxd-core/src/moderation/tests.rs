@@ -156,6 +156,7 @@ fn attach(core: &Core, who: Who) -> (Uid, Events) {
             has_inbox: who.person,
             attach_news: false,
             moderate: who.moderate,
+            can_spam: false,
             is_person: who.person,
             reads_on_delivery: false,
             identity: who.identity,

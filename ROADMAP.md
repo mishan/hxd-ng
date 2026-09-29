@@ -383,9 +383,9 @@ fetch a derivative by, and the mhxd importer.
   metadata, HMAC nonces, acknowledgments and per-target tokens, and v3
   deregistration on graceful shutdown.
 - Rate limiting, flood protection, connection caps per IP, ban enforcement at
-  accept time. Connection caps per address and a reconnect rate are in, at
-  mhxd's `nospam` defaults (`[limits]`); chat flood limits and durable bans
-  are next.
+  accept time. Connection caps per address, a reconnect rate, and mhxd's
+  chat-line and spam-point flood limits are in, at its `nospam` defaults
+  (`[limits]`); durable bans are next.
 - Fuzz the frame decoder (`cargo-fuzz` against the session layer's read
   path); a server's parser meets far more hostile input than a client's.
 

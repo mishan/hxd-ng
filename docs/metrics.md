@@ -147,6 +147,7 @@ constant rather than one per recipient.
 | `hxd_outbox_depth` | `wire` | items waiting when the consumer took the next one |
 | `hxd_write_queued_frames`, `hxd_write_queued_bytes` | `wire` | queued for the legacy writers, all connections together |
 | `hxd_login_seconds` | `wire`, `auth` | first byte to a session on the roster; `auth` is `guest`, `password`, `identity` or `resume` |
+| `hxd_flood_kicks_total` | `what` | sessions kicked for talking faster than `[limits]` allows: `chat` past `chat_lines`, `spam` past `spam_points` |
 | `hxd_logins_refused_busy_total` | | logins refused because the server was already working on `[server] logins_in_flight` of them |
 | `hxd_disconnects_total` | `wire`, `reason` | why a connection ended |
 | `hxd_transfers_open` | `dir` | file transfers in progress |

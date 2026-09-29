@@ -158,6 +158,7 @@ impl Server {
                 has_inbox: login != "guest",
                 attach_news: false,
                 moderate: false,
+                can_spam: false,
                 is_person: login != "guest",
                 reads_on_delivery: classic,
                 identity,

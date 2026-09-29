@@ -312,6 +312,15 @@ pub fn checkpoint_busy(db: &str) {
     let _ = db;
 }
 
+/// A session kicked for talking faster than it may: `chat` past its
+/// chat lines, `spam` past its spam points.
+pub fn flood_kick(what: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_flood_kicks_total", "what" => what).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = what;
+}
+
 /// A login refused because the server was already working on as many as
 /// it takes (`Core::admit_login`).
 pub fn login_refused_busy() {

@@ -30,6 +30,9 @@ host scrape: the run reads the server's own numbers before, during and
 after, and its check for sessions left behind compares the server's
 count with the one it started with. Without metrics the harness still
 runs and still checks everything it can see from the clients' side.
+Its `[limits]` should set `chat_lines` and `spam_points` to 0: every
+harness client talks far faster than a person, from one address, and
+the flood limits would kick and ban them as mhxd's would.
 
 For numbers worth comparing, put the server and the harness on
 separate cores (`taskset`), raise `ulimit -n` for both, and record the

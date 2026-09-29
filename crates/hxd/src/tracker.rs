@@ -1143,6 +1143,7 @@ mod tests {
                 has_inbox: false,
                 attach_news: false,
                 moderate: false,
+                can_spam: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,

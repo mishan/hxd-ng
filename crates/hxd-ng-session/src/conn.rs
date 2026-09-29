@@ -557,6 +557,7 @@ async fn handle_login(
         can_detach: account.can_detach,
         attach_news: account.attach_news,
         moderate: account.moderate,
+        can_spam: account.can_spam,
         // The plaintext listener is loopback-only and WSS is mandatory in
         // production (`docs/hotline-ng.md` §9), so ng sockets are
         // encrypted by construction — unless the client told us at
@@ -1248,6 +1249,23 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
 
 async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut WsTx) -> Flow {
     let send = |s: String| Message::Text(s);
+    // mhxd's spam points (`hxd_core::FloodLimits`), charged for the
+    // requests that stand for a classic transaction it charges, at its
+    // price: `chat` for its Chat and `msg` for its Message, 2 each, under
+    // those types. Whatever else this wire asks for, it has no classic
+    // counterpart to be priced by.
+    let charge = match req.req.as_str() {
+        "chat" => Some(0x69),
+        "msg" => Some(0x6c),
+        _ => None,
+    };
+    if let Some(trans) = charge {
+        if ctx.core.spend_spam(state.uid, 2, trans).is_err() {
+            // The kick that follows is the session's end; this says why.
+            let out = reply_err(req.id, "flooding", "You were kicked for flooding.");
+            return finish(ws_tx, out).await;
+        }
+    }
     let out = match req.req.as_str() {
         "ping" => reply_ok(req.id, json!({})),
 
@@ -1285,6 +1303,11 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     // test whether someone else's handle exists.
                     Some(Err(ChatError::NoSuchMedia)) => {
                         reply_err(req.id, "bad_request", "No such media.")
+                    }
+                    // The kick that follows is the session's end; this
+                    // says why.
+                    Some(Err(ChatError::Flooding)) => {
+                        reply_err(req.id, "flooding", "You were kicked for flooding.")
                     }
                     _ => reply_err(req.id, "server_error", "Server error."),
                 }
@@ -1461,6 +1484,9 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     // have gone. Nothing was sent.
                     Err(ChatError::NoSuchMedia) => {
                         reply_err(req.id, "bad_request", "No such media.")
+                    }
+                    Err(ChatError::Flooding) => {
+                        reply_err(req.id, "flooding", "You were kicked for flooding.")
                     }
                     // One answer for "no such user", "no such account" and
                     // "that account takes no offline messages", so none of
