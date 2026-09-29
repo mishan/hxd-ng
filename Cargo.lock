@@ -1154,6 +1154,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-tunnel"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "hlid"
 version = "0.1.0"
 dependencies = [
@@ -1166,6 +1175,24 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "ureq",
+]
+
+[[package]]
+name = "hlrelay"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "hl-tunnel",
+ "http-body-util",
+ "hyper",
+ "hyper-tungstenite",
+ "hyper-util",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1236,6 +1263,8 @@ dependencies = [
  "console-subscriber",
  "futures-util",
  "hl-identity",
+ "hl-tunnel",
+ "hlrelay",
  "hmac",
  "hxd-auth-file",
  "hxd-core",
@@ -1363,6 +1392,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hl-identity",
+ "hl-tunnel",
  "http-body-util",
  "hxd-core",
  "hxd-files",

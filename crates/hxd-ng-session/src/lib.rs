@@ -20,7 +20,6 @@ pub mod proto;
 pub mod push;
 mod registrar;
 mod registry;
-mod tunnel;
 
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};

@@ -1,0 +1,30 @@
+[package]
+name = "hlrelay"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A WebSocket front for a classic Hotline server, so a browser can reach it (hotline-ng-auth.md §10.2)"
+publish = false
+
+[[bin]]
+name = "hlrelay"
+path = "src/main.rs"
+
+[dependencies]
+hl-tunnel = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = "1"
+# The same HTTP stack as hxd-ng's ng listener, for the same reason: a
+# handful of routes don't need a framework.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-tungstenite = "0.15"
+http-body-util = "0.1"
+bytes = "1"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }

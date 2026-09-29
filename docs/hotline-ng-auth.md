@@ -2,7 +2,8 @@
 
 Status: partial — built in hxd-ng except the `bindings` setting, rate
 limits on the endpoints (§12), the cleartext restriction policy (§8), and
-any binding other than the two of §6.
+any binding other than the two of §6. `hlrelay` is a relay (§10.2) that
+does not authenticate; a relay that does is not built.
 
 > **Conformance language:** The key words "MUST", "MUST NOT", "REQUIRED",
 > "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and
@@ -62,7 +63,8 @@ The roles this document constrains:
 - **A server** terminates the socket and the application protocol on it.
   A conforming server implements §4–§9 and §12 and at least one binding.
 - **A relay** terminates the socket but forwards its bytes to a legacy
-  server (§10.2). It implements §4–§7 and §10.2, and never §9.
+  server (§10.2). It implements §5, §7 and §10.2 — and §4 and §6 as
+  well when it authenticates — and never §9.
 - **A tunnel** is a client that carries a classic client's bytes to a
   server (§10.1).
 - **A client** follows §5–§7 and the client rules of §8.
@@ -199,7 +201,7 @@ This document owns:
 | `v` | `1`. |
 | `name` | The server's name. |
 | `server_key` | The server key (§4.3), base64url. MUST be present when `identity.enabled` is true. *hxd-ng* sends `null` when identity is disabled. |
-| `ng.ws` | The path of the ng JSON protocol (§7.2). |
+| `ng.ws` | The path of the ng JSON protocol (§7.2). Present only when the listener serves it, which a relay (§10.2) need not. |
 | `ng.trtp` | The path of TRTP over WebSocket (§7.3). Present only when the server serves it. |
 | `ng.htxf` | The path of HTXF over WebSocket (§7.4). Present only when the server serves it, which is only beside `ng.trtp`. |
 | `identity.enabled` | Whether this listener authenticates (§6). When `false`, the rest of the `identity` block MAY be absent, and so it is in hxd-ng. |
@@ -216,10 +218,44 @@ block (`identity-registrar.md` §3), or `null`; *hxd-ng* sends it when
 it is configured as a registrar, and only when the document is asked
 for under the registrar's own host.
 
+Each value under `ng` is a URL reference, resolved against the URL the
+document was fetched from with `http` read as `ws` and `https` as
+`wss`. A path names a route on the same listener; an absolute `ws:` or
+`wss:` URL names one elsewhere, so that the listener serving the
+document need not be the one that carries the socket.
+
+A document with `ng.trtp` and no `ng.ws` describes a server that speaks
+only the classic protocol — a legacy server behind a relay. A client
+opens `ng.trtp` and performs the classic handshake inside it (§7.3).
+
 A client MUST ignore fields it does not recognize, and MAY cache the
 document for the life of a connection; a relay MAY cache it per
 upstream. The same format serves servers, registrars, relays and
 tunnels.
+
+### 5.1 Finding the document for a classic address
+
+Trackers list, and `hotline://` URLs name, a host and a classic port:
+nothing in either says whether a WebSocket listener stands beside it.
+A client that has only a `host` and a classic `port` and cannot open
+TCP — a browser — looks for the document at, in order of preference:
+
+1. `https://host:(port + 200)/.well-known/hotline` — 5700 for a server
+   on the conventional 5500, which is where hxd-ng listens and where a
+   relay listens by default. Keyed to the classic port so that two
+   servers on one host keep separate listeners.
+2. `https://host/.well-known/hotline` — port 443, for a listener that
+   shares a host's web server.
+
+A client SHOULD ask both at once and SHOULD give each only a few
+seconds: a firewall that drops rather than refuses makes a single
+sequential probe hang for as long as the client lets it. When both
+answer, the first is used, since a host's web server may front a
+different Hotline server from the one at `port`. A client that may use
+plain `http` (a page not served from a secure origin, a native client)
+MAY try the same two with `http`. Neither answering means the server
+cannot be reached without TCP; a client SHOULD say so rather than
+retry.
 
 ## 6. Authentication
 
@@ -452,7 +488,7 @@ unauthenticated socket, when:
 
 - the token is unknown, expired or already spent;
 - `Authorization` is present but is not a Bearer token;
-- a token is presented to a server that does not authenticate;
+- a token is presented to a server or relay that does not authenticate;
 - on a server that authenticates, with no token presented, a client
   certificate is presented for a key not on file, or on a request with
   `Origin`.
@@ -510,7 +546,9 @@ connection to the classic port would carry, in both directions.
 - The server treats the session as encrypted for §8, subject to
   `downstream`.
 - A server MAY refuse to negotiate HOPE transport encryption inside the
-  tunnel.
+  tunnel; the client learns it from the login exchange, as it would on
+  TCP. A relay carries HOPE as it carries every other byte: whether it
+  is negotiated is the legacy server's answer (*hxd-ng* refuses it).
 - The server SHOULD send a WebSocket ping on a quiet socket and MAY drop
   one that has sent nothing for several ping periods (*hxd-ng:* a ping
   every 30 seconds, dropped after three silent periods). Classic sessions
@@ -529,16 +567,20 @@ carries the control stream alone. This path carries the other.
   the transfer port would: the client's HTXF handshake, then the
   transfer's bytes in whichever direction it runs. Binary frames, with
   boundaries that carry no meaning, as in §7.3.
-- The upgrade MUST authenticate a principal (§6); one without is
-  refused with 401. A token is spent by one upgrade, so each transfer
-  takes one.
-- The reference in the handshake MUST have been issued to a session
-  whose transport identity is the principal on this socket. A tunnelled
-  session's reference is bound to no address — its peer is whoever
-  terminated the WebSocket — and this binding stands in for that one.
-  A reference presented under any other principal is refused, and is
-  spent, as one presented from the wrong address is on the transfer
-  port.
+- On a server, the upgrade MUST authenticate a principal (§6); one
+  without is refused with 401. A token is spent by one upgrade, so each
+  transfer takes one.
+- On a server, the reference in the handshake MUST have been issued to
+  a session whose transport identity is the principal on this socket.
+  A tunnelled session's reference is bound to no address — its peer is
+  whoever terminated the WebSocket — and this binding stands in for
+  that one. A reference presented under any other principal is refused,
+  and is spent, as one presented from the wrong address is on the
+  transfer port.
+- A relay that does not authenticate serves this path without a
+  principal (§10.2). The legacy server behind it binds the reference to
+  the address it issued it to, as it does for any client, and that
+  address is the relay's.
 - A tunnel offers it on its own local port plus one, where a classic
   client looks (*hlid tunnel* does, when discovery lists `ng.htxf`).
 - A server that has no transfers — no file area and no banner held
@@ -620,13 +662,36 @@ a classic client, and forwards bytes over TRTP over WebSocket (§7.3).
 
 A native client MAY embed a tunnel, and a relay MAY act as one downstream.
 
-### 10.2 Relay: authenticating front for a legacy server
+### 10.2 Relay: a WebSocket front for a legacy server
 
-Runs in front of a server that speaks only TRTP (hxd 0.x, Mobius,
-HLServer). It serves discovery, the `challenge` and `auth` endpoints, the
-profile's public endpoints and the WebSocket paths, and forwards each
-socket's bytes to a TCP connection to the legacy server. It has a
-principal for every socket and no account table.
+Runs in front of a server that speaks only TRTP (hxd 0.x, mhxd, Mobius,
+HLServer), usually on the same host and run by the same operator, so
+that a client that cannot open TCP — a browser — can reach it. It
+serves discovery and the WebSocket paths, and forwards each socket's
+bytes to a TCP connection of its own: `ng.trtp` to the server's port,
+`ng.htxf` to the transfer port after it. One socket is one connection.
+It has no account table.
+
+In either mode:
+
+- It MUST forward bytes verbatim in both directions, and MUST connect
+  only to the server it fronts — its port and its transfer port. It
+  adds nothing to the legacy wire.
+- The legacy server sees every relayed connection as coming from the
+  relay. Its address bans and per-address limits therefore cannot tell
+  relayed clients apart, and cannot reach them at all without banning
+  the relay. A relay SHOULD enforce bans and per-address connection
+  limits on the client's address itself, and SHOULD log that address
+  for each socket.
+- It MUST open a client's transfer connections from the same address
+  as its control connection: the legacy server binds a transfer's
+  reference to the address it issued it to.
+- It MAY offer `ng.ws` only by implementing the ng JSON protocol against
+  TRTP downstream. A relay that offers only `ng.trtp` is complete.
+
+**Authenticating.** A relay that authenticates serves the `challenge`
+and `auth` endpoints and the profile's public endpoints as well, and has
+a principal for every socket.
 
 - It holds its own server key (§4.3) and is, for authentication, the
   server: its allow list, ban list and the profile's admission policy
@@ -638,11 +703,16 @@ principal for every socket and no account table.
 - It MUST NOT associate accounts (§9), and advertises `association:
   "none"`. What the profile's endpoints return on a relay is the
   profile's (`hotline-ng-identity.md` §10).
-- It adds nothing to the legacy wire. Clients connecting through it see
-  principal information only through its discovery and the profile's
-  public endpoints.
-- It MAY offer `ng.ws` only by implementing the ng JSON protocol against
-  TRTP downstream. A relay that offers only `ng.trtp` is complete.
+- Clients connecting through it see principal information only through
+  its discovery and the profile's public endpoints.
+
+**Not authenticating.** A relay MAY run without authentication. Its
+discovery says `identity.enabled: false` and `server_key: null`; it
+serves no identity endpoint, refuses a token as §7.1 requires, and
+opens `ng.trtp` and `ng.htxf` without a principal. That reaches
+nothing the legacy server's own ports do not already offer to anyone
+who can reach them — one server, on two ports — which is why it needs
+no gate of its own beyond the address rules above (rationale §8).
 
 ### 10.3 What a server guarantees them
 
@@ -677,6 +747,9 @@ one profile and one switch.
 | `[identity] bindings` | — | *(not implemented)* The challenge binding is always served, and mTLS whenever `[ng] trusted_proxies` is non-empty. |
 | `[legacy] cleartext`, `cleartext_mask` | — | *(not implemented)* The cleartext policy of §8. |
 
+`hlrelay` takes its settings on its command line; `docs/relay.md` lists
+them.
+
 ## 12. Endpoint requirements
 
 - **CORS.** The HTTP routes a browser client calls — discovery, the
@@ -707,9 +780,6 @@ one profile and one switch.
 
 - **Other methods.** Which of §6.5's methods, if any, to define fully.
   Rationale §10 has the positions: OIDC first if asked.
-- **HOPE inside the tunnel.** Refusing it is simplest; allowing it is
-  harmless but doubles encryption. Should the server advertise it as
-  unsupported on the tunnel path so clients don't try?
 - **User Flags bit 4 on 1.8/1.9.** §8's cleartext marker takes value 16
   in field 112 on the strength of "classic clients ignore unknown bits".
   If 1.8/1.9 already means "automatic response" by that value, the marker

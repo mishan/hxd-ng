@@ -68,7 +68,7 @@ use tracing::{debug, info, warn};
 use crate::identity::{
     b64, unb64, AuthRefused, AuthRequest, ClassicLogin, Downstream, TransportIdentity,
 };
-use crate::{conn, tunnel, ForwardedHeader, NgCtx};
+use crate::{conn, ForwardedHeader, NgCtx};
 
 type RespBody = UnsyncBoxBody<Bytes, io::Error>;
 type Resp = Response<RespBody>;
@@ -806,7 +806,7 @@ async fn upgrade(
                     return;
                 };
                 if let Some(serve) =
-                    sink.transfer(Box::new(tunnel::WsByteStream::new(ws)), peer, fp)
+                    sink.transfer(Box::new(hl_tunnel::WsByteStream::new(ws)), peer, fp)
                 {
                     serve.await;
                 }
@@ -848,7 +848,7 @@ async fn upgrade(
                         .is_none_or(|s| s.config().new_accounts != crate::NewAccounts::Deny),
                 };
                 sink.run(
-                    Box::new(tunnel::WsByteStream::new(ws)),
+                    Box::new(hl_tunnel::WsByteStream::new(ws)),
                     peer,
                     transport,
                     link,
