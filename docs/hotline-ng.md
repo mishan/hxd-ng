@@ -315,7 +315,8 @@ Errors:
 | `revoked` | The socket's identity or device key was revoked on this server after it authenticated (identity-registrar.md §7.3). |
 | `banned` | The address or identity is banned. *hxd-ng* refuses a banned address before the upgrade — closing the TCP connection at accept, or answering the HTTP request 403 — and never sends this code. |
 | `server_full` | No uid is free. |
-| `rate_limited` | The server is taking logins as fast as it can, or this address has failed too many. Retry after `retry_after` seconds. *hxd-ng:* past `[server] logins_in_flight` logins in progress, or past `[limits] login_failures` wrong passwords from the address on any wire (§9). |
+| `too_many_connections` | The account already holds as many connections as the server lets one account hold. Waiting does not help and there is no `retry_after`: closing one of the others does. *hxd-ng:* `[limits] connections_per_account`, for an account with a password or a linked identity (§9). |
+| `rate_limited` | The server is taking logins as fast as it can, this address has failed too many, or this account has been logging in too often. Retry after `retry_after` seconds. *hxd-ng:* past `[server] logins_in_flight` logins in progress, or past `[limits] login_failures` wrong passwords from the address for this login, or `login_failures_per_addr` for every login together, on any wire, or past the account's burst of `connections_per_account` new connections earned back at `reconnect_seconds` (§9). |
 | `server_error` | The server could not complete the login. |
 
 ### 6.2 Resume
@@ -347,6 +348,8 @@ Errors:
 |---|---|
 | `bad_request` | `params` malformed. |
 | `session_expired` | No such session, the token is wrong, or the grace window lapsed. Log in again. |
+| `too_many_connections` | As for `login` (§6.1): the session's account holds as many connections as it may. The session is left as it was, and a resume after one of the others has closed finds it. A resume that takes the session over from a connection not yet known to be dead is not refused for that connection. |
+| `rate_limited` | As for `login` (§6.1): the session's account has been connecting too often. The session is left as it was; retry after `retry_after` seconds. |
 | `resync_required` | The session is alive and **this connection is now attached to it**, but the events after `last_seq` cannot be replayed. Follow with `sync` (§6.3) on this same connection. |
 
 `resync_required` is the one handshake error that does not close the
@@ -736,11 +739,16 @@ news body is different: it declares its own type (news.md §5).
   `history`, `news_search`, media and news-attachment uploads (asked
   before the body is read), media and news-image downloads, avatar
   fetches and enrollment have limits of their own. Login attempts are
-  limited per address: past `[limits] login_failures` wrong passwords — here, on the classic wire, or at
-  `/identity/auth` and `/identity/link` — a password login is refused
-  with `retry_after` until the address earns one back, and a socket
-  that authenticated with an identity, or a guest login that sends no
-  password, is not held to it. Each password is counted as it is let
+  limited per address and login: past `[limits] login_failures` wrong
+  passwords for one login — here, on the classic wire, or at
+  `/identity/auth` and `/identity/link` — a password login as that
+  login is refused with `retry_after` until the address earns one back,
+  so a guesser behind a carrier's shared address locks out the account
+  it guesses at and nobody else there; and past
+  `login_failures_per_addr` for every login together, every password
+  login from the address is, so it cannot guess across every account
+  instead. A socket that authenticated with an identity, or a guest
+  login that sends no password, is not held to either. Each password is counted as it is let
   in and given back unless it turns out wrong (a password that
   verifies, a login refused for something other than its password,
   and a server that could not check it all give it back), so guesses
@@ -749,7 +757,17 @@ news body is different: it declares its own type (news.md §5).
   `Retry-After`, as every HTTP route over its limit does. The port
   holds so many connections from one address and from everyone,
   counted from accept, before a byte is read; past either a
-  connection is closed unanswered.
+  connection is closed unanswered. The per-address counts hold a
+  socket until it logs in: one that logs in, or resumes, as an account
+  with a password or a linked identity counts against that account
+  from then on (`[limits] connections_per_account`), because a mobile
+  carrier puts many unrelated people behind one address, and one past
+  the account's cap is answered `too_many_connections`. A guest's
+  socket goes on counting against its address. The rate at which an
+  address may connect is not given back at login: each login costs its
+  address a new connection and its account one of its own, and one
+  past the account's rate is answered `rate_limited`, so neither goes
+  faster than the slower of the two.
 - **Flooding.** A server MAY instead kick a session that sends faster
   than anyone is allowed to, answering the request that crossed the line
   `flooding` before the `kicked` event (§10). *hxd-ng* holds a session to
@@ -793,6 +811,7 @@ news body is different: it declares its own type (news.md §5).
 | `revoked` | `login` | This identity or device key is revoked here. |
 | `banned` | `login` | Banned (§6.1). |
 | `server_full` | `login` | No uid free. |
+| `too_many_connections` | `login`, `resume` | The account holds as many connections as it may. |
 | `session_expired` | `resume` | Log in again. |
 | `resync_required` | `resume` | Attached; follow with `sync`. |
 | `not_available` | `history`, `files_*`, family requests | The server does not offer this. |

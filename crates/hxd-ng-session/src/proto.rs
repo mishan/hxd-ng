@@ -463,6 +463,29 @@ pub fn reply_err_banned(id: u64, hit: &hxd_core::ban::BanHit) -> String {
     .to_string()
 }
 
+/// A login or resume refused by its account's limits (§6.1). One whose
+/// account already holds as many connections as `[limits]
+/// connections_per_account` lets it is `too_many_connections`, with no
+/// `retry_after`: waiting does not help, closing one of the others does.
+/// One whose account has been logging in faster than
+/// `reconnect_seconds` lets it is `rate_limited`, with how long to wait.
+pub fn reply_err_account(id: u64, refused: hxd_core::AccountRefused) -> String {
+    match refused {
+        hxd_core::AccountRefused::Full => reply_err(
+            id,
+            "too_many_connections",
+            "This account is already connected as many times as it may be. \
+             Disconnect one and try again.",
+        ),
+        hxd_core::AccountRefused::TooFast(wait) => reply_err_retry(
+            id,
+            "rate_limited",
+            "This account is logging in too often. Try again shortly.",
+            crate::conn::retry_secs(wait),
+        ),
+    }
+}
+
 /// [`reply_err`] with the seconds to wait before asking again (§10).
 pub fn reply_err_retry(id: u64, code: &str, text: &str, retry_after: u64) -> String {
     json!({ "reply": id, "error": { "code": code, "text": text, "retry_after": retry_after } })

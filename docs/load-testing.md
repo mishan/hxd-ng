@@ -30,10 +30,13 @@ host scrape: the run reads the server's own numbers before, during and
 after, and its check for sessions left behind compares the server's
 count with the one it started with. Without metrics the harness still
 runs and still checks everything it can see from the clients' side.
-Its `[limits]` should set `chat_lines`, `spam_points`, `ng_requests`
-and `news_posts` to 0: every harness client talks far faster than a
-person, from one address, and the flood limits would kick and ban them
-as mhxd's would, and the request limits slow them down.
+Its `[limits]` should set `chat_lines`, `spam_points`, `ng_requests`,
+`news_posts` and `reconnect_seconds` to 0: every harness client talks
+far faster than a person, from one address, and the flood limits would
+kick and ban them as mhxd's would, and the request limits slow them
+down. The churn logs in and resumes its accounts far faster than a
+person too, and an account is held to its reconnect rate from every
+address, exempt ones included.
 
 For numbers worth comparing, put the server and the harness on
 separate cores (`taskset`), raise `ulimit -n` for both, and record the

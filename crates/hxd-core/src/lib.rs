@@ -53,8 +53,8 @@ pub use inbox::{
     StoreError, StoredMessage,
 };
 pub use limits::{
-    AddrSet, ChatLimits, ConnGate, ConnLimits, ConnPermit, ConnRefused, FloodLimits, LoginAttempt,
-    LoginLimits, RateBucket, RateGate, RequestLimits,
+    AccountRefused, AddrSet, ChatLimits, ConnGate, ConnLimits, ConnPermit, ConnRefused,
+    FloodLimits, LoginAttempt, LoginLimits, RateBucket, RateGate, RequestLimits, SharedPlace,
 };
 pub use media::{
     Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRecord,

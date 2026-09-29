@@ -58,7 +58,9 @@ pub trait TunnelSink: Send + Sync {
         // `transport`, which is descriptive; this authorizes.
         link: LinkAuthority,
         // The connection's place in its address's count, taken at the
-        // upgrade and held for as long as the session runs.
+        // upgrade and held for as long as the session runs, moved to its
+        // account's count if it logs in as a person, and carrying the
+        // socket's place in the port's own per-address count with it.
         place: hxd_core::ConnPermit,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -128,7 +130,11 @@ pub struct NgConfig {
 /// address's shared count, the one the classic wire's connections
 /// count against; the count here is separate and larger, because one
 /// browser page opens several connections at once beside its socket
-/// and would be refused by the classic wire's allowance of five.
+/// and would be refused by the classic wire's allowance of five. A
+/// socket whose session logs in as a person gives up its places in
+/// both per-address counts for one in its account's
+/// (`hxd_core::Core::admit_account`), and keeps its place among
+/// everyone's.
 ///
 /// **Behind a trusted proxy** (`[ng] trusted_proxies`) the connection
 /// at accept is the proxy's, and it carries requests for everyone

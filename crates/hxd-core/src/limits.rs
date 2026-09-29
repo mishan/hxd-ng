@@ -11,6 +11,27 @@
 //! mhxd does: answering it would mean holding the connection open to
 //! do so, which is what a flood of them wants.
 //!
+//! **Accounts.** Those two hold a connection only until it logs in.
+//! Carrier-grade NAT puts many unrelated people behind one IPv4
+//! address, mobile carriers most of all, so an address is a fair bound
+//! on connections nobody has vouched for and a poor one on people who
+//! have: a connection that logs in as an account with one person
+//! behind it ([`crate::Account::is_person`]) gives its address back its
+//! place and holds one in its account's count ([`ConnLimits::per_account`])
+//! for the rest of its life ([`Core::admit_account`]). A guest, or any
+//! account with neither a password nor an identity, is nobody in
+//! particular, and stays counted against its address. An account at its
+//! cap is refused the login, with a reason, on either wire.
+//!
+//! The reconnect rate is not moved the same way. The new connection a
+//! login was made on stays spent from its address's burst, and the login
+//! spends one from its account's as well, so a person reconnects at the
+//! lower of the two rates: an address cannot log in faster than it can
+//! connect however many accounts it spreads its logins over, and an
+//! account cannot log in faster than its own rate from however many
+//! addresses, exempt ones included. A login its account's rate refuses
+//! is told how long to wait, on either wire.
+//!
 //! **Talk.** One session is held to mhxd's two budgets, whatever address
 //! it came from ([`FloodLimits`]): `chat_max` lines of chat in a
 //! `chat_time`-second window, every line of a multi-line send counted,
@@ -39,7 +60,11 @@
 //! one more as each comes due — and one past it is told how long to
 //! wait. Failed logins are one of them, and are counted wherever a
 //! password is checked, whichever wire it arrived on
-//! ([`Core::login_attempt`], [`LoginLimits`]).
+//! ([`Core::login_attempt`], [`LoginLimits`]): by the address and the
+//! login it guessed at, so a guesser behind a shared address locks out
+//! the account it is guessing and not everyone else behind the address,
+//! and by the address alone against a looser ceiling, so one address
+//! cannot guess across every account there is.
 //!
 //! **Addresses.** An IPv4 address is itself; an IPv6 one is its /64,
 //! which is what one subscriber is given, so a client cannot step past
@@ -155,6 +180,14 @@ pub struct ConnLimits {
     /// How often one address earns another new connection once it has
     /// spent its burst; zero is no rate limit.
     pub reconnect: Duration,
+    /// Connections one account may hold at once once they have logged
+    /// in ([`Core::admit_account`]); 0 is no limit. It is also the
+    /// account's own burst of new connections, earned back at
+    /// `reconnect` as an address's is, with [`CONNECTIONS_PER_ACCOUNT`]
+    /// standing in when there is no limit. Held from every address,
+    /// exempt ones included: it is the account's limit, not an
+    /// address's.
+    pub per_account: usize,
     /// Addresses not limited.
     pub exempt: AddrSet,
 }
@@ -164,6 +197,7 @@ impl Default for ConnLimits {
         ConnLimits {
             per_addr: CONNECTIONS_PER_ADDR,
             reconnect: RECONNECT_EVERY,
+            per_account: CONNECTIONS_PER_ACCOUNT,
             exempt: AddrSet::parse(&["127.0.0.0/8", "::1"]).expect("loopback parses"),
         }
     }
@@ -173,6 +207,12 @@ impl Default for ConnLimits {
 pub const CONNECTIONS_PER_ADDR: usize = 5;
 /// mhxd's `reconn_time`.
 pub const RECONNECT_EVERY: Duration = Duration::from_secs(2);
+/// Connections one account may hold. Twice what mhxd let one address
+/// hold, which was a household's worth of one person's machines: a
+/// phone, a laptop and a desktop each with a classic client and an ng
+/// one open fit with room left, and an ng session that has dropped its
+/// socket holds none.
+pub const CONNECTIONS_PER_ACCOUNT: usize = 10;
 
 /// Why a connection was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,9 +233,33 @@ impl ConnRefused {
     }
 }
 
+/// Why a login, or a resume, was refused a place in its account's count
+/// ([`ConnGate::admit_account`]): the frontend refuses it with a reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountRefused {
+    /// The account holds as many connections as it may
+    /// ([`ConnLimits::per_account`]). Waiting does not help; closing one
+    /// of the others does.
+    Full,
+    /// The account has spent its burst of new connections, and earns
+    /// the next one back in this long ([`ConnLimits::reconnect`]).
+    TooFast(Duration),
+}
+
+impl AccountRefused {
+    /// For the metric and the log.
+    pub fn reason(self) -> &'static str {
+        match self {
+            AccountRefused::Full => "too_many",
+            AccountRefused::TooFast(_) => "too_fast",
+        }
+    }
+}
+
 /// The connections each address holds, and what it has spent of its
-/// burst. The core keeps one for every connection that can carry a
-/// session ([`Core::admit_connection`]); a frontend may keep another for
+/// burst, and the same for each account a connection has logged in as.
+/// The core keeps one for every connection that can carry a session
+/// ([`Core::admit_connection`]); a frontend may keep another for
 /// connections of its own that do not.
 #[derive(Default)]
 pub struct ConnGate(Arc<GateInner>);
@@ -206,12 +270,14 @@ pub(crate) struct GateInner {
     by_addr: Mutex<Table>,
 }
 
-/// The addresses the gate remembers, and how large the table may grow
-/// before it is next pruned.
+/// The addresses and accounts the gate remembers, and how large each
+/// table may grow before it is next pruned.
 #[derive(Default)]
 struct Table {
     map: HashMap<IpAddr, AddrState>,
     prune_at: usize,
+    accounts: HashMap<Box<str>, AddrState>,
+    accounts_prune_at: usize,
 }
 
 /// The fewest addresses the table is let grow to before a prune.
@@ -224,20 +290,77 @@ struct AddrState {
     at: Instant,
 }
 
-/// One connection's place in its address's count; dropping it gives the
-/// place back.
+/// One connection's place in its address's count, or once it has
+/// logged in as a person in its account's; dropping it gives the place
+/// back.
 pub struct ConnPermit {
-    gate: Option<(Arc<GateInner>, IpAddr)>,
+    gate: Option<(Arc<GateInner>, Place)>,
+    /// A place the same connection holds in another gate's count, given
+    /// up with the address's at login ([`ConnPermit::carry`]).
+    carried: Option<SharedPlace>,
+}
+
+/// Whose count a [`ConnPermit`] holds a place in.
+enum Place {
+    Addr(IpAddr),
+    Account(Box<str>),
 }
 
 impl Drop for ConnPermit {
     fn drop(&mut self) {
-        if let Some((gate, key)) = self.gate.take() {
+        if let Some((gate, place)) = self.gate.take() {
             let mut by = gate.by_addr.lock().unwrap();
-            if let Some(s) = by.map.get_mut(&key) {
+            let s = match &place {
+                Place::Addr(key) => by.map.get_mut(key),
+                Place::Account(login) => by.accounts.get_mut(login),
+            };
+            if let Some(s) = s {
                 s.live = s.live.saturating_sub(1);
             }
         }
+    }
+}
+
+impl ConnPermit {
+    /// A place in no count: the gate held this connection to nothing.
+    fn free() -> ConnPermit {
+        ConnPermit {
+            gate: None,
+            carried: None,
+        }
+    }
+
+    /// Give up `other` along with this permit's place in its address's
+    /// count when the connection logs in as a person
+    /// ([`ConnGate::admit_account`]). The ng port counts a connection by
+    /// address in a gate of its own from accept, and a socket that has
+    /// logged in is no longer its address's to count there either.
+    pub fn carry(&mut self, other: SharedPlace) {
+        self.carried = Some(other);
+    }
+
+    /// Does this permit hold a place in an account's count?
+    pub fn is_account(&self) -> bool {
+        matches!(self.gate, Some((_, Place::Account(_))))
+    }
+}
+
+/// A connection's place in a count, shared between whoever holds the
+/// connection and whoever may give the place up early: the ng port's
+/// socket holds its per-address place in one, and the session it
+/// carries gives it up at login ([`ConnPermit::carry`]).
+#[derive(Clone, Default)]
+pub struct SharedPlace(Arc<Mutex<Option<ConnPermit>>>);
+
+impl SharedPlace {
+    pub fn new(place: Option<ConnPermit>) -> SharedPlace {
+        SharedPlace(Arc::new(Mutex::new(place)))
+    }
+
+    /// Give the place back now, rather than when the last holder goes.
+    pub fn release(&self) {
+        let place = self.0.lock().unwrap().take();
+        drop(place);
     }
 }
 
@@ -264,7 +387,7 @@ impl ConnGate {
         let gate = &self.0;
         let l = &gate.limits;
         if (l.per_addr == 0 && l.reconnect.is_zero()) || l.exempt.contains(ip) {
-            return Ok(ConnPermit { gate: None });
+            return Ok(ConnPermit::free());
         }
         let key = limit_key(ip);
         let now = Instant::now();
@@ -299,8 +422,88 @@ impl ConnGate {
         }
         s.live += 1;
         Ok(ConnPermit {
-            gate: Some((gate.clone(), key)),
+            gate: Some((gate.clone(), Place::Addr(key))),
+            carried: None,
         })
+    }
+
+    /// Move `place` from its address's count to `login`'s, or refuse
+    /// with [`AccountRefused`] and leave it where it was. `slack` places
+    /// past the cap are allowed: a resume that takes a session over from
+    /// a connection that has not yet noticed it is gone holds one more
+    /// than the account has sessions, for a moment.
+    ///
+    /// The address is given back its place, but not the new connection
+    /// it spent of its burst: the login spends one of the account's too,
+    /// or is refused [`AccountRefused::TooFast`] when the account has
+    /// none left. Each login so costs both, and neither an address
+    /// logging in as many accounts nor an account logging in from many
+    /// addresses goes faster than the slower of its two rates. A place
+    /// given back to an address exempt from its limits, or to a gate
+    /// that holds addresses to none, is nothing given back; the account
+    /// is held to its rate all the same. A permit already in an
+    /// account's count stays where it is.
+    pub fn admit_account(
+        &self,
+        place: &mut ConnPermit,
+        login: &str,
+        slack: usize,
+    ) -> Result<(), AccountRefused> {
+        if place.is_account() {
+            return Ok(());
+        }
+        let gate = &self.0;
+        assert!(
+            place
+                .gate
+                .as_ref()
+                .is_none_or(|(g, _)| Arc::ptr_eq(g, gate)),
+            "a place moves to an account in the gate that counted it"
+        );
+        let l = &gate.limits;
+        let now = Instant::now();
+        let burst_account = burst_of(l.per_account, CONNECTIONS_PER_ACCOUNT);
+        let mut guard = gate.by_addr.lock().unwrap();
+        let by = &mut *guard;
+        // As the address table is: an account that holds nothing and has
+        // its burst back is forgotten, once the table has doubled.
+        if by.accounts.len() >= by.accounts_prune_at.max(PRUNE_FLOOR) {
+            by.accounts.retain(|_, s| {
+                s.live > 0 || refill(s, now, l.reconnect, burst_account) < burst_account
+            });
+            by.accounts_prune_at = by.accounts.len().saturating_mul(2);
+        }
+        let key: Box<str> = login.into();
+        let a = by.accounts.entry(key.clone()).or_insert(AddrState {
+            live: 0,
+            tokens: burst_account,
+            at: now,
+        });
+        a.tokens = refill(a, now, l.reconnect, burst_account);
+        a.at = now;
+        if l.per_account != 0 && a.live >= l.per_account.saturating_add(slack) {
+            return Err(AccountRefused::Full);
+        }
+        if !l.reconnect.is_zero() {
+            if a.tokens < 1.0 {
+                return Err(AccountRefused::TooFast(l.reconnect.mul_f64(1.0 - a.tokens)));
+            }
+            a.tokens -= 1.0;
+        }
+        a.live += 1;
+        if let Some((_, Place::Addr(addr))) = &place.gate {
+            if let Some(s) = by.map.get_mut(addr) {
+                s.live = s.live.saturating_sub(1);
+            }
+        }
+        drop(guard);
+        // The address's place was given back above, under the lock; the
+        // permit now holds the account's, and dropping it gives that back.
+        place.gate = Some((gate.clone(), Place::Account(key)));
+        if let Some(carried) = place.carried.take() {
+            carried.release();
+        }
+        Ok(())
     }
 }
 
@@ -308,8 +511,11 @@ impl ConnGate {
 /// every `every`. Past it the caller is told how long until the next.
 /// A `burst` of 0, or a zero `every`, is no limit; `exempt` addresses are
 /// never limited. What the gate counts is the caller's: a request, or a
-/// failed login ([`RateGate::spend`] after the fact, with
-/// [`RateGate::check`] before it).
+/// failed login ([`RateGate::take`] before it is known, and
+/// [`RateGate::refund`] once it is known not to count). A gate may
+/// count an address as a whole, or an address and a name within it
+/// ([`RateGate::take_named`]) — the login a password was a guess at —
+/// each with a bucket of its own.
 pub struct RateGate {
     burst: f64,
     every: Duration,
@@ -317,11 +523,15 @@ pub struct RateGate {
     by_addr: Mutex<RateTable>,
 }
 
-/// The addresses a [`RateGate`] remembers, and how large the table may
-/// grow before it is next walked.
+/// What a [`RateGate`] counts: an address, as [`limit_key`] has it, and
+/// the name within it when the gate counts by name.
+type RateKey = (IpAddr, Option<Box<str>>);
+
+/// The keys a [`RateGate`] remembers, and how large the table may grow
+/// before it is next walked.
 #[derive(Default)]
 struct RateTable {
-    map: HashMap<IpAddr, AddrBucket>,
+    map: HashMap<RateKey, AddrBucket>,
     prune_at: usize,
     /// How many times the table has been walked, for the tests.
     #[cfg(test)]
@@ -379,29 +589,45 @@ impl RateGate {
     /// Admit one more from `ip` and spend it, or say how long until one
     /// would be admitted.
     pub fn take(&self, ip: IpAddr) -> Result<(), Duration> {
-        self.at(ip, Instant::now(), true)
+        self.at(ip, None, Instant::now(), true)
+    }
+
+    /// [`take`](Self::take), from the bucket `ip` has for `name` rather
+    /// than the one it has as a whole. Each name `ip` uses has a bucket
+    /// of its own, and another address's use of the same name costs
+    /// this one nothing.
+    pub fn take_named(&self, ip: IpAddr, name: &str) -> Result<(), Duration> {
+        self.at(ip, Some(name), Instant::now(), true)
     }
 
     /// Give back one [`take`](Self::take) spent: what it admitted turned
     /// out not to be what the gate counts. The bucket does not go above
     /// its burst.
     pub fn refund(&self, ip: IpAddr) {
+        self.refund_to(ip, None);
+    }
+
+    /// Give back one [`take_named`](Self::take_named) spent.
+    pub fn refund_named(&self, ip: IpAddr, name: &str) {
+        self.refund_to(ip, Some(name));
+    }
+
+    fn refund_to(&self, ip: IpAddr, name: Option<&str>) {
         if self.off(ip) {
             return;
         }
         let now = Instant::now();
         let mut by = self.by_addr.lock().unwrap();
         let burst = self.burst;
-        let b = self.bucket(&mut by, ip, now);
+        let b = self.bucket(&mut by, key_of(ip, name), now);
         b.tokens = (b.tokens + 1.0).min(burst);
     }
 
-    fn bucket<'a>(&self, by: &'a mut RateTable, ip: IpAddr, now: Instant) -> &'a mut AddrBucket {
+    fn bucket<'a>(&self, by: &'a mut RateTable, key: RateKey, now: Instant) -> &'a mut AddrBucket {
         let (burst, every) = (self.burst, self.every);
         let earned = |b: &AddrBucket| {
             (b.tokens + now.duration_since(b.at).as_secs_f64() / every.as_secs_f64()).min(burst)
         };
-        let key = limit_key(ip);
         // An address that has earned its whole burst back is one a fresh
         // bucket describes, so the table holds only addresses that spent
         // something a moment ago. The walk is over the whole table, under
@@ -430,8 +656,8 @@ impl RateGate {
             // address that had not yet been seen.
             let keep = RATE_CAP / 4 * 3;
             if by.map.len() > keep {
-                let mut fill: Vec<(f64, IpAddr)> =
-                    by.map.iter().map(|(k, b)| (earned(b), *k)).collect();
+                let mut fill: Vec<(f64, RateKey)> =
+                    by.map.iter().map(|(k, b)| (earned(b), k.clone())).collect();
                 fill.select_nth_unstable_by(keep, |a, b| a.0.total_cmp(&b.0));
                 for (_, k) in &fill[keep..] {
                     by.map.remove(k);
@@ -448,13 +674,19 @@ impl RateGate {
         b
     }
 
-    fn at(&self, ip: IpAddr, now: Instant, spend: bool) -> Result<(), Duration> {
+    fn at(
+        &self,
+        ip: IpAddr,
+        name: Option<&str>,
+        now: Instant,
+        spend: bool,
+    ) -> Result<(), Duration> {
         if self.off(ip) {
             return Ok(());
         }
         let every = self.every;
         let mut by = self.by_addr.lock().unwrap();
-        let b = self.bucket(&mut by, ip, now);
+        let b = self.bucket(&mut by, key_of(ip, name), now);
         if b.tokens < 1.0 {
             return Err(every.mul_f64(1.0 - b.tokens));
         }
@@ -466,25 +698,53 @@ impl RateGate {
 }
 
 /// How many failed logins one address may make (`[limits]`): a burst of
-/// `failures`, then one more every `every`. Past it the address is
-/// refused before its password is checked, until it has earned one back —
-/// a right password included, or guessing would go on. 0 is no limit,
-/// which is what a `Core` built by hand has; a server built from a config
-/// has [`LoginLimits::RECOMMENDED`] unless it says otherwise.
+/// `failures` at each login it guesses at, then one more every `every`,
+/// and a burst of `failures_per_addr` across every login together, then
+/// one more every `every` too. Past either the address is refused before
+/// its password for that login is checked, until it has earned one back
+/// — a right password included, or guessing would go on. A count of 0
+/// is no limit, which is what a `Core` built by hand has; a server built
+/// from a config has [`LoginLimits::RECOMMENDED`] unless it says
+/// otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LoginLimits {
     pub failures: u32,
+    pub failures_per_addr: u32,
     pub every: Duration,
 }
 
 impl LoginLimits {
-    /// Ten wrong passwords at once, then one every thirty seconds: a
-    /// person who mistypes is never refused, a guesser gets a hundred and
-    /// twenty an hour.
+    /// Ten wrong passwords at once for one login, then one every thirty
+    /// seconds: a person who mistypes is never refused, a guesser gets a
+    /// hundred and twenty an hour at any one account.
+    ///
+    /// Fifty across every login from one address, earned back at the
+    /// same rate. The burst is five people's worth of mistakes, so the
+    /// people behind one carrier's address are not refused for each
+    /// other's typing, and the rate is what the address as a whole was
+    /// held to when failures were counted by address alone: over any
+    /// window longer than the burst, no address guesses faster than it
+    /// could before failures were counted by login, however many
+    /// accounts it spreads its guesses over.
     pub const RECOMMENDED: LoginLimits = LoginLimits {
         failures: 10,
+        failures_per_addr: 50,
         every: Duration::from_secs(30),
     };
+}
+
+/// The name a failed login is counted under: the login as the accounts
+/// backend reads it — ASCII case folded, and an empty one the guest
+/// account, as `AuthBackend::authenticate` has it — cut to a length no
+/// login reaches, so one a client makes up cannot make the table large.
+pub fn login_key(login: &str) -> String {
+    const MAX: usize = 64;
+    let login = if login.is_empty() { "guest" } else { login };
+    let mut end = login.len().min(MAX);
+    while !login.is_char_boundary(end) {
+        end -= 1;
+    }
+    login[..end].to_ascii_lowercase()
 }
 
 /// A password about to be checked, holding the failure it will count
@@ -494,8 +754,9 @@ impl LoginLimits {
 #[derive(Debug)]
 #[must_use = "settle it with Core::login_failed or Core::login_refund"]
 pub struct LoginAttempt {
-    /// The address whose failure was spent; `None` when nothing was.
-    held: Option<IpAddr>,
+    /// The address, and the login within it, whose failure was spent;
+    /// `None` when nothing was.
+    held: Option<(IpAddr, String)>,
 }
 
 impl Core {
@@ -504,13 +765,23 @@ impl Core {
     /// held to none.
     pub fn with_login_limits(mut self, limits: LoginLimits) -> Self {
         self.login_failures = RateGate::new(limits.failures, limits.every, AddrSet::default());
+        self.login_failures_per_addr =
+            RateGate::new(limits.failures_per_addr, limits.every, AddrSet::default());
         self
     }
 
-    /// May `addr` try `password` now? `Err` says how long until it may:
-    /// it has failed as often as it may for now, and the frontend refuses
-    /// the login without checking it. Asked before every password is
-    /// checked, on every wire.
+    /// May `addr` try `password` for `login` now? `Err` says how long
+    /// until it may: it has failed as often as it may for now, at that
+    /// login or at every login together, and the frontend refuses the
+    /// login without checking it. Asked before every password is
+    /// checked, on every wire, with the login the password is for as the
+    /// client sent it (canonicalized here, [`login_key`]).
+    ///
+    /// Counted by login within an address so that a guesser behind a
+    /// carrier's shared address locks out only the account it is
+    /// guessing at, and not everyone else behind the address; and by the
+    /// address as a whole against a looser ceiling so that it cannot
+    /// guess at every account there is instead.
     ///
     /// The failure is spent here, before the password is checked, and
     /// given back when the attempt is settled as anything but a wrong
@@ -521,12 +792,25 @@ impl Core {
     /// could open connections. An empty password is not a guess — it is
     /// how a guest logs in, and it is one value, which trying again
     /// cannot change — so it is neither held to the count nor counted.
-    pub fn login_attempt(&self, addr: IpAddr, password: &[u8]) -> Result<LoginAttempt, Duration> {
+    pub fn login_attempt(
+        &self,
+        addr: IpAddr,
+        login: &str,
+        password: &[u8],
+    ) -> Result<LoginAttempt, Duration> {
         if password.is_empty() || self.conn_gate.exempt(addr) {
             return Ok(LoginAttempt { held: None });
         }
-        match self.login_failures.take(addr) {
-            Ok(()) => Ok(LoginAttempt { held: Some(addr) }),
+        let key = login_key(login);
+        let taken = self.login_failures.take_named(addr, &key).and_then(|()| {
+            self.login_failures_per_addr
+                .take(addr)
+                .inspect_err(|_| self.login_failures.refund_named(addr, &key))
+        });
+        match taken {
+            Ok(()) => Ok(LoginAttempt {
+                held: Some((addr, key)),
+            }),
             Err(wait) => {
                 crate::instrument::throttled("login");
                 Err(wait)
@@ -545,8 +829,9 @@ impl Core {
     /// login was refused for something other than it, or the server
     /// could not tell — and the failure it spent is given back.
     pub fn login_refund(&self, attempt: LoginAttempt) {
-        if let Some(addr) = attempt.held {
-            self.login_failures.refund(addr);
+        if let Some((addr, key)) = attempt.held {
+            self.login_failures.refund_named(addr, &key);
+            self.login_failures_per_addr.refund(addr);
         }
     }
 
@@ -557,11 +842,22 @@ impl Core {
     }
 }
 
+/// `name`'s bucket within `ip`, or `ip`'s own.
+fn key_of(ip: IpAddr, name: Option<&str>) -> RateKey {
+    (limit_key(ip), name.map(Box::from))
+}
+
 /// New connections an address may make at once: its connection cap, or
 /// mhxd's when there is none.
 fn burst(per_addr: usize) -> f64 {
-    match per_addr {
-        0 => CONNECTIONS_PER_ADDR as f64,
+    burst_of(per_addr, CONNECTIONS_PER_ADDR)
+}
+
+/// New connections a count's owner may make at once: its cap, or
+/// `otherwise` when it has none.
+fn burst_of(cap: usize, otherwise: usize) -> f64 {
+    match cap {
+        0 => otherwise as f64,
         n => n as f64,
     }
 }
@@ -908,9 +1204,14 @@ mod tests {
     use super::*;
 
     fn gate(per_addr: usize, reconnect: Duration) -> ConnGate {
+        gate_for(per_addr, reconnect, 0)
+    }
+
+    fn gate_for(per_addr: usize, reconnect: Duration, per_account: usize) -> ConnGate {
         ConnGate::new(ConnLimits {
             per_addr,
             reconnect,
+            per_account,
             exempt: AddrSet::parse(&["127.0.0.0/8"]).unwrap(),
         })
     }
@@ -1049,20 +1350,20 @@ mod tests {
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let t = Instant::now();
         for _ in 0..3 {
-            assert!(g.at(ip, t, true).is_ok());
+            assert!(g.at(ip, None, t, true).is_ok());
         }
-        let wait = g.at(ip, t, true).unwrap_err();
+        let wait = g.at(ip, None, t, true).unwrap_err();
         assert!(
             wait > Duration::from_secs(9) && wait <= Duration::from_secs(10),
             "{wait:?}"
         );
         assert!(
-            g.at("192.0.2.2".parse().unwrap(), t, true).is_ok(),
+            g.at("192.0.2.2".parse().unwrap(), None, t, true).is_ok(),
             "another address"
         );
         let later = t + Duration::from_secs(10);
-        assert!(g.at(ip, later, true).is_ok(), "one earned");
-        assert!(g.at(ip, later, true).is_err());
+        assert!(g.at(ip, None, later, true).is_ok(), "one earned");
+        assert!(g.at(ip, None, later, true).is_err());
         // An IPv6 client is its /64 here too.
         let v6 = RateGate::new(1, Duration::from_secs(60), AddrSet::default());
         assert!(v6.take("2001:db8::1".parse().unwrap()).is_ok());
@@ -1135,34 +1436,38 @@ mod tests {
             })
             .with_login_limits(LoginLimits {
                 failures: 2,
+                failures_per_addr: 0,
                 every: Duration::from_millis(200),
             });
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let pw = b"wrong".as_slice();
-        core.login_failed(core.login_attempt(ip, pw).unwrap());
-        core.login_failed(core.login_attempt(ip, pw).expect("one mistake"));
-        assert!(core.login_attempt(ip, pw).is_err(), "locked out");
+        core.login_failed(core.login_attempt(ip, "alice", pw).unwrap());
+        core.login_failed(core.login_attempt(ip, "alice", pw).expect("one mistake"));
+        assert!(core.login_attempt(ip, "alice", pw).is_err(), "locked out");
         core.login_refund(
-            core.login_attempt("192.0.2.2".parse().unwrap(), pw)
+            core.login_attempt("192.0.2.2".parse().unwrap(), "alice", pw)
                 .unwrap(),
         );
         // An empty password is a guest's, and is neither refused nor
         // counted.
         for _ in 0..5 {
-            core.login_failed(core.login_attempt(ip, b"").expect("no password"));
+            core.login_failed(core.login_attempt(ip, "alice", b"").expect("no password"));
         }
         std::thread::sleep(Duration::from_millis(250));
-        core.login_refund(core.login_attempt(ip, pw).expect("one earned back"));
         core.login_refund(
-            core.login_attempt(ip, pw)
+            core.login_attempt(ip, "alice", pw)
+                .expect("one earned back"),
+        );
+        core.login_refund(
+            core.login_attempt(ip, "alice", pw)
                 .expect("a right password costs nothing"),
         );
         // A core built by hand is not limited.
         let open = Core::new();
         for _ in 0..50 {
-            open.login_failed(open.login_attempt(ip, pw).unwrap());
+            open.login_failed(open.login_attempt(ip, "alice", pw).unwrap());
         }
-        assert!(open.login_attempt(ip, pw).is_ok());
+        assert!(open.login_attempt(ip, "alice", pw).is_ok());
     }
 
     #[test]
@@ -1177,17 +1482,232 @@ mod tests {
             })
             .with_login_limits(LoginLimits {
                 failures: 3,
+                failures_per_addr: 0,
                 every: Duration::from_secs(60),
             });
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let held: Vec<_> = (0..20)
-            .filter_map(|_| core.login_attempt(ip, b"guess").ok())
+            .filter_map(|_| core.login_attempt(ip, "alice", b"guess").ok())
             .collect();
         assert_eq!(held.len(), 3);
         for a in held {
             core.login_failed(a);
         }
-        assert!(core.login_attempt(ip, b"guess").is_err());
+        assert!(core.login_attempt(ip, "alice", b"guess").is_err());
+    }
+
+    #[test]
+    fn a_login_moves_a_connection_from_its_address_to_its_account() {
+        let g = gate_for(2, Duration::ZERO, 3);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let mut a = g.admit(ip).unwrap();
+        let _b = g.admit(ip).unwrap();
+        assert_eq!(g.admit(ip).err(), Some(ConnRefused::TooMany));
+        g.admit_account(&mut a, "alice", 0).unwrap();
+        assert!(a.is_account());
+        // Once more is nothing: the place is the account's already.
+        g.admit_account(&mut a, "alice", 0).unwrap();
+        let mut c = g.admit(ip).expect("the address has its place back");
+        assert_eq!(g.admit(ip).err(), Some(ConnRefused::TooMany));
+        g.admit_account(&mut c, "alice", 0).unwrap();
+        // Many people behind one address: each logged in, none refused.
+        let people: Vec<_> = (0..20)
+            .map(|i| {
+                let mut p = g.admit(ip).expect("a place before login");
+                g.admit_account(&mut p, &format!("person{i}"), 0).unwrap();
+                p
+            })
+            .collect();
+        drop(people);
+        let mut d = g.admit(ip).unwrap();
+        g.admit_account(&mut d, "alice", 0).unwrap();
+        let mut e = g.admit(ip).unwrap();
+        assert_eq!(
+            g.admit_account(&mut e, "alice", 0),
+            Err(AccountRefused::Full),
+            "the account is at its cap"
+        );
+        assert!(!e.is_account(), "a refusal leaves the place where it was");
+        assert_eq!(
+            g.admit(ip).err(),
+            Some(ConnRefused::TooMany),
+            "still the address's"
+        );
+        g.admit_account(&mut e, "alice", 1)
+            .expect("a takeover may go one past");
+        drop((a, e));
+        let mut f = g.admit(ip).unwrap();
+        g.admit_account(&mut f, "alice", 0)
+            .expect("a place came back to the account");
+        // An address the gate does not count still counts its account.
+        let mut local = g.admit("127.0.0.1".parse().unwrap()).unwrap();
+        assert_eq!(
+            g.admit_account(&mut local, "alice", 0),
+            Err(AccountRefused::Full)
+        );
+        g.admit_account(&mut local, "bob", 0).unwrap();
+    }
+
+    #[test]
+    fn one_address_and_one_account_log_in_no_faster_than_the_address_connects() {
+        let every = Duration::from_millis(300);
+        let g = gate_for(2, every, 4);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        // The address's burst of two, each logged in as alice.
+        for _ in 0..2 {
+            let mut p = g.admit(ip).expect("within the address's burst");
+            g.admit_account(&mut p, "alice", 0).unwrap();
+        }
+        assert_eq!(
+            g.admit(ip).err(),
+            Some(ConnRefused::TooFast),
+            "a login gives the address back its place but not its charge"
+        );
+        // Sustained, one address logging in as one account goes no faster
+        // than the address connects: one every interval, not two.
+        let start = Instant::now();
+        let mut logins = 0;
+        while start.elapsed() < every * 4 {
+            if let Ok(mut p) = g.admit(ip) {
+                g.admit_account(&mut p, "alice", 0)
+                    .expect("alice has her own burst left");
+                logins += 1;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(logins <= 5, "{logins} logins in four intervals");
+    }
+
+    #[test]
+    fn an_account_logs_in_no_faster_than_its_own_rate_from_anywhere() {
+        let g = gate_for(0, Duration::from_secs(3600), 2);
+        let mut held = Vec::new();
+        for i in 0..2 {
+            let ip = IpAddr::from([192, 0, 2, i + 1]);
+            let mut p = g.admit(ip).unwrap();
+            g.admit_account(&mut p, "alice", 0).unwrap();
+            held.push(p);
+        }
+        drop(held);
+        let mut p = g.admit("192.0.2.9".parse().unwrap()).unwrap();
+        match g.admit_account(&mut p, "alice", 0) {
+            Err(AccountRefused::TooFast(wait)) => {
+                assert!(wait > Duration::from_secs(3500), "{wait:?}")
+            }
+            other => panic!("alice's burst is spent: {other:?}"),
+        }
+        assert!(!p.is_account(), "a refusal leaves the place where it was");
+        // From an exempt address too: the rate is the account's.
+        let mut local = g.admit("127.0.0.1".parse().unwrap()).unwrap();
+        assert!(matches!(
+            g.admit_account(&mut local, "alice", 0),
+            Err(AccountRefused::TooFast(_))
+        ));
+        g.admit_account(&mut local, "bob", 0)
+            .expect("another account has its own");
+    }
+
+    #[test]
+    fn many_accounts_behind_one_address_share_its_rate_to_connect() {
+        let g = gate_for(0, Duration::from_secs(3600), 2);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        // Each person logs in at a rate of their own, but only on the
+        // connections the address could make before they logged in.
+        let people: Vec<_> = (0..CONNECTIONS_PER_ADDR)
+            .map(|i| {
+                let mut p = g.admit(ip).expect("within the address's burst");
+                g.admit_account(&mut p, &format!("person{i}"), 0).unwrap();
+                p
+            })
+            .collect();
+        assert_eq!(
+            g.admit(ip).err(),
+            Some(ConnRefused::TooFast),
+            "however many accounts it logged in as"
+        );
+        drop(people);
+    }
+
+    #[test]
+    fn a_carried_place_is_given_up_at_login_and_not_before() {
+        let core_gate = gate_for(0, Duration::ZERO, 0);
+        let port = gate(1, Duration::ZERO);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let shared = SharedPlace::new(Some(port.admit(ip).unwrap()));
+        let mut place = core_gate.admit(ip).unwrap();
+        place.carry(shared.clone());
+        assert_eq!(port.admit(ip).err(), Some(ConnRefused::TooMany));
+        core_gate.admit_account(&mut place, "alice", 0).unwrap();
+        let _again = port
+            .admit(ip)
+            .expect("the port's place went with the login");
+        drop(place);
+        drop(shared);
+    }
+
+    #[test]
+    fn a_login_is_counted_as_the_accounts_backend_reads_it() {
+        assert_eq!(login_key("Alice"), "alice");
+        assert_eq!(login_key(""), "guest");
+        assert_eq!(login_key("GUEST"), "guest");
+        let long = "\u{e9}".repeat(40);
+        let key = login_key(&long);
+        assert!(key.len() <= 64 && long.starts_with(&key), "{key}");
+    }
+
+    #[test]
+    fn a_guesser_locks_out_the_login_it_guesses_and_not_its_neighbors() {
+        let core = Core::new()
+            .with_conn_limits(ConnLimits {
+                exempt: AddrSet::default(),
+                ..ConnLimits::default()
+            })
+            .with_login_limits(LoginLimits {
+                failures: 2,
+                failures_per_addr: 5,
+                every: Duration::from_secs(3600),
+            });
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let pw = b"wrong".as_slice();
+        for _ in 0..2 {
+            core.login_failed(core.login_attempt(ip, "alice", pw).unwrap());
+        }
+        assert!(core.login_attempt(ip, "alice", pw).is_err(), "locked out");
+        assert!(
+            core.login_attempt(ip, "ALICE", pw).is_err(),
+            "whatever its case"
+        );
+        core.login_refund(
+            core.login_attempt(ip, "bob", b"right")
+                .expect("bob, behind the same address, is not"),
+        );
+        core.login_refund(
+            core.login_attempt("192.0.2.2".parse().unwrap(), "alice", pw)
+                .expect("nor alice from elsewhere"),
+        );
+        // The ceiling: five wrong guesses from the address in all, over
+        // any number of logins.
+        core.login_failed(core.login_attempt(ip, "bob", pw).unwrap());
+        core.login_failed(core.login_attempt(ip, "carol", pw).unwrap());
+        core.login_failed(core.login_attempt(ip, "dave", pw).unwrap());
+        assert!(
+            core.login_attempt(ip, "erin", pw).is_err(),
+            "the address has guessed as often as it may"
+        );
+        // A right password gives back both.
+        let ceiling = Core::new()
+            .with_conn_limits(ConnLimits {
+                exempt: AddrSet::default(),
+                ..ConnLimits::default()
+            })
+            .with_login_limits(LoginLimits {
+                failures: 10,
+                failures_per_addr: 1,
+                every: Duration::from_secs(3600),
+            });
+        for _ in 0..5 {
+            ceiling.login_refund(ceiling.login_attempt(ip, "alice", b"right").unwrap());
+        }
     }
 
     #[test]

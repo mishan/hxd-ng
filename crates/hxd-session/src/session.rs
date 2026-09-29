@@ -24,9 +24,9 @@ use hxd_core::instrument::{self, Dir, Kind};
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, ConnPermit, Core, Event, Events,
-    FileEntry, FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof, SessionStatus, Share,
-    Transport, Uid, UserInfo,
+    Account, AccountRefused, AttachInfo, AuthBackend, AuthError, ChatError, ConnPermit, Core,
+    Event, Events, FileEntry, FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof,
+    SessionStatus, Share, Transport, Uid, UserInfo,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::text;
@@ -1330,7 +1330,8 @@ impl Session {
 /// ([`Core::admit_connection`]), taken by the caller before it accepted
 /// the stream — the ng frontend asks at the upgrade, so a refused client
 /// hears a 429 and keeps its token — and held here for the session's
-/// life.
+/// life, moved to its account's count if it logs in as a person
+/// ([`Core::admit_account`]).
 pub async fn run_session<S>(
     stream: S,
     peer: SocketAddr,
@@ -1393,8 +1394,10 @@ async fn run_connection<S>(
         instrument::disconnect(WIRE, "banned");
         return;
     }
-    // One place per connection, however it came to be taken.
-    let (_place, direct) = match direct {
+    // One place per connection, however it came to be taken: its
+    // address's until it logs in, and its account's after if it logs in
+    // as a person.
+    let (mut place, direct) = match direct {
         Direct::Admitted(place) => (place, true),
         Direct::Tunnelled(place) => (place, false),
         Direct::Admit => match admit(&ctx, peer) {
@@ -1441,7 +1444,7 @@ async fn run_connection<S>(
 
     // --- Login, then the session loop -----------------------------------
     let identified = transport.identity.is_some();
-    let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport, link).await;
+    let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport, link, &mut place).await;
     let ended = if let Some((mut sess, mut events)) = outcome {
         let auth = if identified {
             "identity"
@@ -1483,6 +1486,15 @@ async fn run_connection<S>(
         let _ = writer.await;
     }
 }
+
+/// The refusal a login is given when its account already holds as many
+/// connections as `[limits] connections_per_account` lets it.
+const ACCOUNT_FULL: &str =
+    "This account is already connected as many times as it may be. Disconnect one and try again.";
+
+/// A login refused because its account has been logging in faster than
+/// `[limits] reconnect_seconds` lets it.
+const ACCOUNT_TOO_FAST: &str = "This account is logging in too often. Try again shortly.";
 
 /// Does this login name the guest account? Empty is guest by convention
 /// (`AuthBackend::authenticate`), and so is the name itself.
@@ -1565,7 +1577,7 @@ fn reconcile_login(
         let attempt = match held {
             Some(attempt) => attempt,
             None => core
-                .login_attempt(addr, password)
+                .login_attempt(addr, login, password)
                 .map_err(LoginRefused::Throttled)?,
         };
         let verdict = auth.authenticate(login, Proof::Plain(password));
@@ -1601,7 +1613,7 @@ fn reconcile_login(
     let held = match policy {
         TrtpLogin::Trust => None,
         TrtpLogin::Verify => Some(
-            core.login_attempt(addr, password)
+            core.login_attempt(addr, login, password)
                 .map_err(LoginRefused::Throttled)?,
         ),
     };
@@ -1732,6 +1744,8 @@ fn reconcile_login(
 }
 
 /// Wait for the LOGIN transaction and run the login flow. `None` = close.
+/// `place` is the connection's place in its address's count, moved to
+/// its account's if the login is a person's.
 async fn login_phase(
     frames: &mut Receiver<Frame>,
     tx: &Tx,
@@ -1739,6 +1753,7 @@ async fn login_phase(
     peer: SocketAddr,
     transport: Transport,
     link: LinkAuthority,
+    place: &mut ConnPermit,
 ) -> Option<(Session, Events)> {
     let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
         Ok(Some(f)) => f,
@@ -1761,7 +1776,7 @@ async fn login_phase(
     }
     // Past the logins the server takes at once, refused at once with a
     // reason the client shows, rather than queued behind the others.
-    let Some(permit) = ctx.core.admit_login(Some(peer.ip())) else {
+    let Some(mut permit) = ctx.core.admit_login(Some(peer.ip())) else {
         reply_error(tx, f.trans, "The server is busy. Try again in a moment.");
         return None;
     };
@@ -1876,6 +1891,26 @@ async fn login_phase(
         info!(login = %account.login, ban = hit.id, "login refused: banned");
         reply_error(tx, f.trans, &banned_text(&hit.reason));
         return None;
+    }
+    // From here the connection is a person's, and counts against its
+    // account rather than its address (`hxd_core::limits`) — or is
+    // refused, in the error reply every failed login already gets, when
+    // the account holds as many connections as it may, or has been
+    // logging in faster than it may. A guest stays its address's.
+    if let Err(refused) = ctx
+        .core
+        .admit_account(place, &account.login, account.is_person())
+    {
+        info!(login = %account.login, reason = refused.reason(), "login refused by its account's limits");
+        let text = match refused {
+            AccountRefused::Full => ACCOUNT_FULL,
+            AccountRefused::TooFast(_) => ACCOUNT_TOO_FAST,
+        };
+        reply_error(tx, f.trans, text);
+        return None;
+    }
+    if account.is_person() {
+        permit.logged_in();
     }
 
     // Resolve the visible name: the account must grant use_any_name for

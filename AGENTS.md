@@ -200,7 +200,18 @@ at accept, so the handshake is counted) and at the ng upgrade, before
 its token is redeemed, with the client's address as trusted proxies
 give it. An IPv6
 client is its /64; loopback is exempt by default. A new listener that
-carries sessions takes a permit too. And one session talks so fast,
+carries sessions takes a permit too. **An address counts a connection
+only until it logs in**: carrier-grade NAT puts many people behind one
+address, so a login or resume that makes a connection a person's
+(`is_person`) moves its permit to its account's count
+(`Core::admit_account`, `Core::admit_resume`, after the credentials
+and the bans and before the attach), giving the address back its place
+but not its reconnect charge, and spending one of the account's too, so
+a login goes no faster than the slower of the two rates; past
+`connections_per_account`, or past the account's rate, the login is
+refused with a reason on both wires. The ng port's per-address place rides along (`ConnPermit::carry`)
+and goes with it. Guests stay their address's. A new login path moves
+the permit too. And one session talks so fast,
 wherever it connects from, on mhxd's budgets: past `chat_lines` lines
 of chat in a window, every line of a send counted, it is kicked and its
 room told (`Core::chat_flood_check`, in the chat paths); past
@@ -221,9 +232,11 @@ never a kick. One account's news posts are held to `news_posts`
 it is refused; `Core::news_post_counted`, after a classic one), which
 the classic wire's posts count toward and are never refused by: that
 wire keeps mhxd's rules. `can_spam` exempts from both, as from the
-budgets. A wrong password counts against its address whichever wire or
-route it came in on (`Core::login_attempt` before, `Core::login_failed`
-after); a new path that checks a password does both. Every connection to
+budgets. A wrong password counts against its address and the login it
+was for, and against its address alone under a looser ceiling,
+whichever wire or route it came in on (`Core::login_attempt` before,
+with the login as the client sent it, `Core::login_failed` after); a
+new path that checks a password does both. Every connection to
 the ng port holds places in that port's own counts (`HttpLimits`) from
 accept, in the socket itself so an upgrade carries them.
 
@@ -231,7 +244,8 @@ accept, in the socket itself so an upgrade carries them.
 everyone present a join and later a part, so a server admitting logins
 faster than it can tell the room about them falls further behind with
 each one. `Core::admit_login` bounds the logins in progress
-(`[server] logins_in_flight`, a quarter of it per address, `[limits]`
+(`[server] logins_in_flight`, a quarter of it per address until the
+login is known to be a person's — `LoginPermit::logged_in` — `[limits]`
 exempt addresses aside), from the
 login request to the join, so a client slow to send one holds no place;
 past it both wires refuse at once as busy (`rate_limited` with

@@ -4,7 +4,8 @@
 //! a byte is read; an idle keep-alive connection closed; so many
 //! challenges and avatar fetches a minute from one address; and a count
 //! of failed logins shared by `/identity/auth` and both wires' password
-//! logins, refused past it until one is earned back.
+//! logins, kept for each login an address guesses at and for the address
+//! as a whole, refused past either until one is earned back.
 //!
 //! Each case builds a real server from a config file that takes loopback
 //! off the exempt list, which is what makes the test's own address one
@@ -529,6 +530,113 @@ async fn failed_logins_on_any_wire_lock_the_address_out_until_it_earns_one_back(
     tokio::time::sleep(Duration::from_millis(2100)).await;
     assert_eq!(classic_login(server.legacy, "pw").await, None);
     let r = ng_login(server.ng, "pw").await;
+    assert!(r.get("ok").is_some(), "{r}");
+}
+
+/// A classic password login as `login`: its error text, or `None` when
+/// it succeeded.
+async fn classic_login_as(addr: SocketAddr, login: &str, password: &str) -> Option<String> {
+    let l = legacy::Login {
+        version: 0,
+        ..legacy::Login::account(login, login, password)
+    };
+    let mut c = legacy::Client::connect(addr).await.unwrap();
+    match c.login(&l).await {
+        Ok(_) => None,
+        Err(hxd_testclient::Error::Refused { text, .. }) => Some(text),
+        Err(e) => panic!("classic login: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn a_guesser_locks_out_the_login_it_guesses_and_not_its_neighbors() {
+    // Carrier-grade NAT puts many people behind one address. Someone
+    // there guessing at alice's password locks alice out from it, and
+    // nobody else: bob, behind the same address, logs in on either wire.
+    let td = tempfile::tempdir().unwrap();
+    let server = start(
+        td.path(),
+        "",
+        "login_failures = 2\nlogin_failure_seconds = 600\n\
+         connections_per_addr = 0\nreconnect_seconds = 0",
+    )
+    .await;
+    std::fs::write(
+        td.path().join("accounts/bob.toml"),
+        "name = \"Bob\"\npassword = \"hunter2\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        classic_login(server.legacy, "wrong").await.as_deref(),
+        Some("Login failed.")
+    );
+    let r = ng_login(server.ng, "wrong").await;
+    assert_eq!(r["error"]["code"], "login_failed", "{r}");
+    // Alice is locked out, on both wires and however her login is cased.
+    let text = classic_login(server.legacy, "pw")
+        .await
+        .expect("alice is locked out");
+    assert!(text.starts_with("Too many failed logins."), "{text}");
+    let r = ng_login_as(server.ng, "ALICE", "pw").await;
+    assert_eq!(r["error"]["code"], "rate_limited", "{r}");
+    // Bob is not.
+    assert_eq!(
+        classic_login_as(server.legacy, "bob", "hunter2").await,
+        None
+    );
+    let r = ng_login_as(server.ng, "bob", "hunter2").await;
+    assert!(r.get("ok").is_some(), "{r}");
+    // And a mistake of bob's is his own to make.
+    assert_eq!(
+        classic_login_as(server.legacy, "bob", "hunter3")
+            .await
+            .as_deref(),
+        Some("Login failed.")
+    );
+    assert_eq!(
+        classic_login_as(server.legacy, "bob", "hunter2").await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_address_guessing_across_logins_is_held_to_its_ceiling() {
+    // Counted by login alone, an address could guess at every account
+    // there is. Past `login_failures_per_addr` wrong passwords between
+    // them, every password from it is refused, the right one for a login
+    // it never guessed at included, on either wire.
+    let td = tempfile::tempdir().unwrap();
+    let server = start(
+        td.path(),
+        "",
+        "login_failures = 2\nlogin_failures_per_addr = 3\nlogin_failure_seconds = 600\n\
+         connections_per_addr = 0\nreconnect_seconds = 0",
+    )
+    .await;
+    std::fs::write(
+        td.path().join("accounts/bob.toml"),
+        "name = \"Bob\"\npassword = \"hunter2\"\n",
+    )
+    .unwrap();
+    for login in ["carol", "dave"] {
+        assert_eq!(
+            classic_login_as(server.legacy, login, "guess")
+                .await
+                .as_deref(),
+            Some("Login failed.")
+        );
+    }
+    let r = ng_login_as(server.ng, "erin", "guess").await;
+    assert_eq!(r["error"]["code"], "login_failed", "{r}");
+    let text = classic_login_as(server.legacy, "bob", "hunter2")
+        .await
+        .expect("the address is locked out");
+    assert!(text.starts_with("Too many failed logins."), "{text}");
+    let r = ng_login(server.ng, "pw").await;
+    assert_eq!(r["error"]["code"], "rate_limited", "{r}");
+    assert!(r["error"]["retry_after"].as_u64().unwrap() >= 1);
+    // A guest makes no guess, and is let in still.
+    let r = ng_login_as(server.ng, "", "").await;
     assert!(r.get("ok").is_some(), "{r}");
 }
 

@@ -1057,8 +1057,11 @@ pub struct Core {
     pub(crate) login_gate: LoginGate,
     /// Connections each address holds ([`Core::admit_connection`]).
     pub(crate) conn_gate: crate::limits::ConnGate,
-    /// Failed logins each address has made ([`Core::login_attempt`]).
+    /// Failed logins each address has made at each login
+    /// ([`Core::login_attempt`]).
     pub(crate) login_failures: crate::limits::RateGate,
+    /// Failed logins each address has made at every login together.
+    pub(crate) login_failures_per_addr: crate::limits::RateGate,
     /// How fast one session may talk (`crate::limits`).
     pub(crate) flood_limits: crate::limits::FloodLimits,
     /// How many private chats may be open (`crate::limits`).
@@ -1224,7 +1227,11 @@ pub const LOGINS_IN_FLIGHT: usize = 32;
 /// Only the server's own work holds a place, from the login request to
 /// its answer, so a client that is slow to send one holds nothing. And one
 /// address holds at most a quarter of the places, so a storm from one
-/// source leaves room for everyone else.
+/// source leaves room for everyone else — until the login is known to be
+/// a person's ([`LoginPermit::logged_in`]), when the address is given its
+/// share back: the people behind one carrier's address are not held to
+/// a quarter of the server between them for any longer than it takes to
+/// tell who they are.
 pub(crate) struct LoginGate(Arc<GateInner>);
 
 pub(crate) struct GateInner {
@@ -1257,6 +1264,22 @@ pub struct LoginPermit {
 
 impl Drop for LoginPermit {
     fn drop(&mut self) {
+        self.release_addr();
+    }
+}
+
+impl LoginPermit {
+    /// The login has authenticated as an account with one person behind
+    /// it: its address's share is given back, and it keeps its place
+    /// among every login in progress until it is done. Its connection
+    /// counts against its account from here ([`Core::admit_account`]),
+    /// and the account's cap bounds how many of its logins can be in
+    /// progress at once.
+    pub fn logged_in(&mut self) {
+        self.release_addr();
+    }
+
+    fn release_addr(&mut self) {
         if let Some((gate, addr)) = self.addr.take() {
             let mut by = gate.by_addr.lock().unwrap();
             if let Some(n) = by.get_mut(&addr) {
@@ -1403,6 +1426,69 @@ impl Core {
         addr: std::net::IpAddr,
     ) -> Result<crate::ConnPermit, crate::ConnRefused> {
         self.conn_gate.admit(addr)
+    }
+
+    /// A connection has logged in as `login`: when the account has one
+    /// person behind it (`is_person`, [`crate::Account::is_person`]),
+    /// move `place` from its address's count to the account's, or refuse
+    /// with [`crate::AccountRefused`] when the account already holds as
+    /// many connections as it may, or has been logging in faster than it
+    /// may (`crate::limits`). A guest, or any
+    /// account with neither a password nor an identity, stays counted
+    /// against its address and is never refused here. Asked once the
+    /// login has authenticated, before the session is attached, on
+    /// every wire.
+    pub fn admit_account(
+        &self,
+        place: &mut crate::ConnPermit,
+        login: &str,
+        is_person: bool,
+    ) -> Result<(), crate::AccountRefused> {
+        if !is_person {
+            return Ok(());
+        }
+        let refused = self.conn_gate.admit_account(place, login, 0);
+        if refused.is_err() {
+            instrument::throttled("account");
+        }
+        refused
+    }
+
+    /// [`Core::admit_account`] for a connection resuming `uid`, whose
+    /// account it takes from the session. A session taken over from a
+    /// connection that has not yet noticed it is gone may go one past
+    /// the cap, for as long as that connection takes to close: the
+    /// account is not holding a connection more than it was, and a
+    /// phone that has changed networks resumes that way. A session that has gone is none of this gate's
+    /// business; the resume answers it.
+    pub fn admit_resume(
+        &self,
+        place: &mut crate::ConnPermit,
+        uid: Uid,
+    ) -> Result<(), crate::AccountRefused> {
+        let who = {
+            let r = self.roster.lock().unwrap();
+            r.users.get(&uid).map(|s| {
+                (
+                    s.login.clone(),
+                    s.is_person,
+                    !matches!(s.outbox.sink, Sink::Buffering { .. }),
+                )
+            })
+        };
+        let Some((login, is_person, live)) = who else {
+            return Ok(());
+        };
+        if !is_person {
+            return Ok(());
+        }
+        let refused = self
+            .conn_gate
+            .admit_account(place, &login, usize::from(live));
+        if refused.is_err() {
+            instrument::throttled("account");
+        }
+        refused
     }
 
     /// The budget, for a frontend's queues to draw on too.
@@ -2387,6 +2473,32 @@ mod tests {
         assert!(core.admit_login(Some(other)).is_some(), "not everyone's");
         drop(a);
         assert!(core.admit_login(Some(one)).is_some(), "and it came back");
+    }
+
+    #[test]
+    fn a_login_known_to_be_a_persons_gives_its_address_its_share_back() {
+        let core = Core::new().with_logins_in_flight(8);
+        let one: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut a = core.admit_login(Some(one)).expect("a place");
+        let mut b = core.admit_login(Some(one)).expect("a place");
+        assert!(core.admit_login(Some(one)).is_none(), "its share is taken");
+        a.logged_in();
+        b.logged_in();
+        let held: Vec<_> = (0..2)
+            .map(|_| core.admit_login(Some(one)).expect("the share is back"))
+            .collect();
+        assert!(core.admit_login(Some(one)).is_none());
+        // Each still holds its place among everyone's.
+        let others: Vec<_> = (0..4)
+            .filter_map(|i| core.admit_login(Some(IpAddr::from([10, 0, 1, i]))))
+            .collect();
+        assert_eq!(others.len(), 4);
+        assert!(
+            core.admit_login(Some("10.0.2.1".parse().unwrap()))
+                .is_none(),
+            "the gate is full"
+        );
+        drop((a, b, held, others));
     }
 
     #[test]

@@ -235,9 +235,9 @@ queue_budget_mb = 128   # what the server may hold for its clients, all
                         # together; past it, the furthest behind are dropped
                         # (docs/metrics.md, the budget)
 logins_in_flight = 32   # logins worked on at once, a quarter of them from
-                        # one address at most (not one [limits] exempts);
-                        # past it a login is refused as busy, and its user
-                        # tries again
+                        # one address at most (not one [limits] exempts)
+                        # until each is known to be a person's; past it a
+                        # login is refused as busy, and its user tries again
 
 # Set User Flags bit 4 on unencrypted legacy sessions (docs/hotline-ng-auth.md §8).
 # Off until that bit is confirmed free against 1.8/1.9 clients.
@@ -250,17 +250,20 @@ agreement = "agreement.txt"
 
 ### Limits
 
-What one address, and one session, is held to, on both wires together.
-Always on, at the defaults of mhxd's `nospam`. A connection past either
-connection limit is closed unanswered on the classic ports, as mhxd
-closes one, and refused with HTTP 429 on the ng port, `/trtp` included.
+What one address, one account, and one session, is held to, on both
+wires together. Always on, at the defaults of mhxd's `nospam`. A
+connection past either connection limit is closed unanswered on the
+classic ports, as mhxd closes one, and refused with HTTP 429 on the ng
+port, `/trtp` included.
 
 ```toml
 [limits]
-connections_per_addr = 5     # at once; 0 for no limit
+connections_per_addr = 5     # at once, until they log in; 0 for no limit
 reconnect_seconds = 2        # past a burst of that many new connections
                              # (5 when the line above is 0), one more
                              # each this often; 0 for no limit
+connections_per_account = 10 # at once, once logged in as an account with
+                             # a password or an identity; 0 for no limit
 exempt = ["127.0.0.0/8", "::1"]  # addresses and blocks held to none of
                              # the per-address limits, and kept a few
                              # places past ng_connections
@@ -276,9 +279,11 @@ ng_requests = 40             # 0 for no limit, or the request weight one ng
 ng_request_seconds = 2       # session may spend at once, earned back over this
 news_posts = 10              # 0 for no limit, or the news posts one account
 news_post_seconds = 300      # may make at once, earned back over this
-login_failures = 10          # wrong passwords one address may give, on
-login_failure_seconds = 30   # any wire, then one more each this often;
-                             # 0 failures = no limit
+login_failures = 10          # wrong passwords one address may give for
+login_failure_seconds = 30   # one login, on any wire, then one more each
+                             # this often; 0 failures = no limit
+login_failures_per_addr = 50 # and for every login together, earned back
+                             # at the same rate; 0 = no limit
 http_connections_per_addr = 16  # connections to the ng port, whatever
                              # they carry; 0 for no limit
 ng_connections = 4096        # connections to the ng port from everyone
@@ -326,10 +331,50 @@ is never refused by it, since mhxd would take it. `can_spam` exempts
 from these as well. A load test wants `ng_requests` and `news_posts` at
 0 too.
 
-An address that has given `login_failures` wrong passwords — on the
-classic wire, the ng wire's `login`, or `/identity/auth` and
-`/identity/link` — is refused before its next password is checked, the
-right one included, until it has earned one back. Each password counts
+Those two connection limits hold a connection until it logs in.
+Carrier-grade NAT puts many unrelated people behind one IPv4 address,
+mobile carriers most of all, so an address is a fair bound on
+connections nobody has vouched for and a poor one on people: a
+connection that logs in as an account with a password or a linked
+identity stops counting against its address and counts against its
+account instead, held to `connections_per_account` from wherever it
+comes, exempt addresses included. The address gets back its place, and
+the ng port the socket's place in `http_connections_per_addr` too, but
+not the new connection it spent: each login costs its address one from
+the address's burst and its account one from a burst of its own,
+`connections_per_account` earned back at `reconnect_seconds` as an
+address's is, so neither logs in faster than the slower of the two
+rates, however many accounts an address logs in as or addresses an
+account logs in from. A
+guest, or any account with neither a password nor an identity, stays
+counted against its address. An account whose password is handed
+around is a person as far as the server can tell, and is held to
+`connections_per_account` like any other; raise it, or set it to 0, on
+a server that gives out such a login. A login past `connections_per_account` is refused: a classic
+client is told so in its login's error text, an ng one gets
+`too_many_connections`, and a resume past it gets the same and leaves
+its session as it was for another try. A login or resume past the
+account's rate is refused the same way, as `rate_limited` with how long
+to wait on the ng wire. A detached ng session holds no
+connection, and a resume that takes over a session from a socket not
+yet known to be dead may go one past the cap for as long as that
+socket takes to close. The share of `logins_in_flight` one address may
+have holds a login the same way, until it is known to be a person's.
+
+An address that has given `login_failures` wrong passwords for one
+login — on the classic wire, the ng wire's `login`, or `/identity/auth`
+and `/identity/link` — is refused before its next password for that
+login is checked, the right one included, until it has earned one back.
+The count is kept for each address and login together, the login read
+as the accounts are (case folded), so someone guessing at one account
+locks that account out from their address and nobody else behind it.
+An address that has given `login_failures_per_addr` wrong passwords
+across every login is refused before any of its passwords is checked,
+the same way: the ceiling that keeps it from guessing at every account
+in turn. Its default is five people's worth of mistakes at once, earned
+back at the rate one login's are, so over any while longer than that
+an address guesses no faster than when failures were counted by
+address alone. Each password counts
 from the moment it is let in and is given back unless it turns out
 wrong — a password that verifies, a login refused for something other
 than its password, and a server that could not check it all give it
@@ -346,7 +391,9 @@ The ng port holds each connection to `http_connections_per_addr` and
 life of a WebSocket; past either it is closed unanswered. The count per
 address is its own rather than `connections_per_addr`, because one
 browser page opens several connections at once beside its socket. An
-ng session's socket counts toward `connections_per_addr` as well.
+ng session's socket counts toward `connections_per_addr` as well, until
+it logs in as a person, when it leaves both per-address counts for its
+account's; it keeps its place in `ng_connections`.
 `ng_connections` is what bounds the port's descriptors whoever holds
 them, and a crowd of addresses can fill it — one IPv6 /56, say, whose
 /64s each count as an address of their own. An address `exempt` lists
@@ -654,6 +701,15 @@ enroll_per_address = 4              # open sessions and pending requests, per
 # read_chat = true
 # send_chat = true
 ```
+
+With `new_accounts = "create"`, every identity the server has not seen
+before gets an account of its own, and every such account its own
+`[limits] connections_per_account` once logged in. One address minting
+fresh identities can so hold more logged-in connections than any one
+account may: as many as the accounts it has been let create, which
+`max_new_accounts_per_hour` bounds, and never more than `ng_connections`
+lets the port hold. Each of those logins still costs its address a
+connection at `reconnect_seconds` first.
 
 **Revoking a stolen key.** The only other remedy for a stolen device key is
 its certificate's expiry, which is months. On this server, today:

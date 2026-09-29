@@ -215,14 +215,15 @@ async fn start_server_inner(
         Some(devices) => core.with_devices(devices.clone()),
         None => core,
     };
-    // Failed logins are counted by address, and loopback is exempt from
-    // that by default — so a case that counts them takes loopback off
-    // the list, and holds it to nothing else.
+    // Failed logins are counted by address and login, and loopback is
+    // exempt from that by default — so a case that counts them takes
+    // loopback off the list, and holds it to nothing else.
     let core = match login_limits {
         Some(l) => core
             .with_conn_limits(hxd_core::ConnLimits {
                 per_addr: 0,
                 reconnect: Duration::ZERO,
+                per_account: 0,
                 exempt: hxd_core::AddrSet::default(),
             })
             .with_login_limits(l),
@@ -1284,6 +1285,7 @@ async fn a_tunnelled_login_refused_by_identity_policy_is_not_a_failed_login() {
         None,
         Some(hxd_core::LoginLimits {
             failures: 2,
+            failures_per_addr: 0,
             every: Duration::from_secs(600),
         }),
     )
@@ -1346,6 +1348,7 @@ async fn a_linked_identitys_guest_login_with_a_password_is_not_a_failed_login() 
         None,
         Some(hxd_core::LoginLimits {
             failures: 2,
+            failures_per_addr: 0,
             every: Duration::from_secs(600),
         }),
     )
@@ -1391,6 +1394,7 @@ async fn an_identity_trust_admits_is_not_held_to_the_failed_login_count() {
         None,
         Some(hxd_core::LoginLimits {
             failures: 1,
+            failures_per_addr: 0,
             every: Duration::from_secs(600),
         }),
     )

@@ -31,11 +31,11 @@ use tracing::{debug, info, warn};
 use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
     blocked_json, event_json, history_line_json, parse_streams, participants_json, reply_err,
-    reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users, stored_msg_json, user_json,
-    video_limits_json, video_reply_err, voice_reply_err, BlockParams, ChatParams, HistoryParams,
-    InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams, ReqEnvelope, ResumeParams,
-    VideoStartParams, VideoStateParams, VideoStopParams, VideoSubscribeParams, VoiceAnswerParams,
-    VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
+    reply_err_account, reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users,
+    stored_msg_json, user_json, video_limits_json, video_reply_err, voice_reply_err, BlockParams,
+    ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams,
+    ReqEnvelope, ResumeParams, VideoStartParams, VideoStateParams, VideoStopParams,
+    VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -157,8 +157,17 @@ enum Exit {
 /// Run the JSON protocol on an upgraded socket. `identity` is the
 /// transport identity the HTTP layer authenticated, if any
 /// (`docs/hotline-ng-auth.md` §7.2); the ban check happened before
-/// the upgrade.
-pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<TransportIdentity>) {
+/// the upgrade. `place` is the socket's place in its address's count,
+/// taken at the upgrade, held for as long as the socket is open, and
+/// moved to its account's count when a login or a resume makes it a
+/// person's (`hxd_core::limits`). A detached session holds none.
+pub(crate) async fn run(
+    ws: Ws,
+    peer: SocketAddr,
+    ctx: NgCtx,
+    identity: Option<TransportIdentity>,
+    mut place: hxd_core::ConnPermit,
+) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let began = instrument::Timer::start();
 
@@ -182,14 +191,23 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
     };
 
     let (state, mut events) = match first.req.as_str() {
-        "login" => match handle_login(&ctx, peer, &first, identity.as_ref(), &mut ws_tx).await {
+        "login" => match handle_login(
+            &ctx,
+            peer,
+            &first,
+            identity.as_ref(),
+            &mut ws_tx,
+            &mut place,
+        )
+        .await
+        {
             Some(v) => v,
             None => {
                 instrument::disconnect(WIRE, "login");
                 return;
             }
         },
-        "resume" => match handle_resume(&ctx, &first, &mut ws_tx).await {
+        "resume" => match handle_resume(&ctx, &first, &mut ws_tx, &mut place).await {
             Some(v) => v,
             None => {
                 instrument::disconnect(WIRE, "login");
@@ -444,11 +462,12 @@ async fn handle_login(
     req: &ReqEnvelope,
     identity: Option<&TransportIdentity>,
     ws_tx: &mut WsTx,
+    place: &mut hxd_core::ConnPermit,
 ) -> Option<(SessState, Events)> {
     // Past the logins the server takes at once, refused at once (§10's
     // `rate_limited`), rather than queued behind the others. Held until
     // the answer is ready, not while it is sent.
-    let Some(permit) = ctx.core.admit_login(Some(peer.ip())) else {
+    let Some(mut permit) = ctx.core.admit_login(Some(peer.ip())) else {
         let _ = send_frame(
             ws_tx,
             Message::Text(reply_err_retry(req.id, "rate_limited", "Server busy.", 1)),
@@ -488,7 +507,10 @@ async fn handle_login(
     // the count.
     let attempt = match identity {
         Some(_) => None,
-        None => match ctx.core.login_attempt(peer.ip(), p.password.as_bytes()) {
+        None => match ctx
+            .core
+            .login_attempt(peer.ip(), &p.login, p.password.as_bytes())
+        {
             Ok(attempt) => Some(attempt),
             Err(wait) => {
                 info!("ng login refused: too many failed logins from this address");
@@ -631,6 +653,21 @@ async fn handle_login(
         info!(login = %account.login, ban = hit.id, "ng login refused: banned");
         let _ = send_frame(ws_tx, Message::Text(reply_err_banned(req.id, &hit))).await;
         return None;
+    }
+    // From here the socket is a person's, and counts against its account
+    // rather than its address (`hxd_core::limits`) — or is refused when
+    // the account holds as many connections as it may, or has been
+    // logging in faster than it may. A guest stays its address's.
+    if let Err(refused) = ctx
+        .core
+        .admit_account(place, &account.login, account.is_person())
+    {
+        info!(login = %account.login, reason = refused.reason(), "ng login refused by its account's limits");
+        let _ = send_frame(ws_tx, Message::Text(reply_err_account(req.id, refused))).await;
+        return None;
+    }
+    if account.is_person() {
+        permit.logged_in();
     }
 
     let mut nick = match (&p.nick, account.access.has(bit::USE_ANY_NAME)) {
@@ -957,6 +994,7 @@ async fn handle_resume(
     ctx: &NgCtx,
     req: &ReqEnvelope,
     ws_tx: &mut WsTx,
+    place: &mut hxd_core::ConnPermit,
 ) -> Option<(SessState, Events)> {
     let Ok(p) = serde_json::from_value::<ResumeParams>(req.params.clone()) else {
         let _ = send_frame(
@@ -987,6 +1025,19 @@ async fn handle_resume(
         ctx.registry.remove(&p.session);
         info!(uid, ban = hit.id, "ng resume refused: banned");
         let _ = send_frame(ws_tx, Message::Text(reply_err_banned(req.id, &hit))).await;
+        return None;
+    }
+    // A resumed session is its account's, as a logged-in one is: this
+    // socket leaves its address's count for the account's, or is refused
+    // and the session is left as it was for another try. Asked before
+    // the session is touched, so a refusal changes nothing about it.
+    if let Err(refused) = ctx.core.admit_resume(place, uid) {
+        info!(
+            uid,
+            reason = refused.reason(),
+            "ng resume refused by its account's limits"
+        );
+        let _ = send_frame(ws_tx, Message::Text(reply_err_account(req.id, refused))).await;
         return None;
     }
     let (events, replay) = match ctx.core.resume(uid, p.last_seq) {

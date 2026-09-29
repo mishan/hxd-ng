@@ -154,7 +154,7 @@ constant rather than one per recipient.
 | `hxd_flood_kicks_total` | `what` | sessions kicked for talking faster than `[limits]` allows: `chat` past `chat_lines`, `spam` past `spam_points` |
 | `hxd_rate_limited_total` | `wire`, `reason` | requests answered `rate_limited`: `requests` past `[limits] ng_requests`, `news_post` past `news_posts`, `history` and `news_search` past their own |
 | `hxd_logins_refused_busy_total` | | logins refused because the server was already working on `[server] logins_in_flight` of them |
-| `hxd_throttled_total` | `what` | refused for coming too often from one address or session, before any work was done on it: `login` (past `[limits] login_failures`), `challenge` (`/identity/challenge`), `fetch` (an avatar or a news or media image), `upload` (an upload refused before its body was read) |
+| `hxd_throttled_total` | `what` | refused for coming too often from one address, account or session, before any work was done on it: `login` (past `[limits] login_failures` for one login, or `login_failures_per_addr` for every login together), `account` (a login or resume past `connections_per_account`, or past its account's rate at `reconnect_seconds`), `challenge` (`/identity/challenge`), `fetch` (an avatar or a news or media image), `upload` (an upload refused before its body was read) |
 | `hxd_disconnects_total` | `wire`, `reason` | why a connection ended |
 | `hxd_transfers_open` | `dir` | file transfers in progress |
 
@@ -170,7 +170,8 @@ shows.
 The reasons: `eof`, `io_error` and `malformed` from the socket,
 `closed` for a WebSocket close, `banned` for an address refused at
 the door, `too_many` and `too_fast` for one past `[limits]` (the
-connections it holds, or how fast it opens them), `full` for a
+connections its address holds, or how fast it opens them; a login past
+its account's is `login`, and counted as `hxd_throttled_total{what="account"}`), `full` for a
 connection past `[limits] ng_connections`, `handshake` and `login` for a connection that never got a
 session, `kicked`, `logout`, `replaced`,
 `send_failed`, `pong_deadline`, and `slow_consumer` for a client that

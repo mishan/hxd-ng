@@ -1,8 +1,10 @@
 //! What one address is held to (`[limits]`, `hxd_core::limits`): so many
 //! connections at once, and new ones no faster than a burst and then a
-//! rate, on the classic wire and the ng one alike, counted together. And
-//! what one session is: mhxd's flood budgets, and on the ng wire its
-//! request limit and its account's news posts.
+//! rate, on the classic wire and the ng one alike, counted together —
+//! until they log in, when a person's connections count against their
+//! account instead, and an account is held to so many. And what one
+//! session is: mhxd's flood budgets, and on the ng wire its request
+//! limit and its account's news posts.
 //!
 //! Each case builds a real server from a config file that takes loopback
 //! off the exempt list, which is what makes the test's own address one
@@ -13,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hxd_testclient::legacy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -233,6 +236,214 @@ async fn an_exempt_address_is_not_limited() {
     for _ in 0..8 {
         held.push(classic(addr).await.expect("loopback is exempt by default"));
     }
+}
+
+// --- Accounts ----------------------------------------------------------
+
+/// Accounts `person0` up to `person{n-1}`, each with password `pw` and
+/// nothing else, beside the ones the server bootstrapped.
+fn people(dir: &Path, n: usize) {
+    let accounts = dir.join("accounts");
+    for i in 0..n {
+        std::fs::write(
+            accounts.join(format!("person{i}.toml")),
+            format!("name = \"Person {i}\"\npassword = \"pw\"\n[access]\nread_chat = true\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// A 1.2-style password login: the session, or the error text it was
+/// refused with.
+async fn classic_person(addr: SocketAddr, login: &str) -> Result<legacy::Client, String> {
+    let mut c = legacy::Client::connect(addr)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let l = legacy::Login {
+        version: 0,
+        ..legacy::Login::account(login, login, "pw")
+    };
+    match c.login(&l).await {
+        Ok(_) => Ok(c),
+        Err(hxd_testclient::Error::Refused { text, .. }) => Err(text),
+        Err(e) => panic!("classic login: {e}"),
+    }
+}
+
+/// An ng password login: the socket and its reply.
+async fn ng_person(addr: SocketAddr, login: &str) -> (Ws, Value) {
+    let mut ws = ng(addr).await.expect("admitted");
+    let reply = ask(
+        &mut ws,
+        1,
+        "login",
+        json!({ "login": login, "password": "pw" }),
+    )
+    .await;
+    (ws, reply)
+}
+
+/// Retry `f` until it answers `Some`, as a client whose place has not
+/// yet come back would, for a few seconds at most.
+async fn eventually<T, F: std::future::Future<Output = Option<T>>>(
+    what: &str,
+    mut f: impl FnMut() -> F,
+) -> T {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(v) = f().await {
+            return v;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Carrier-grade NAT puts many people behind one address. Each of them
+/// who logs in stops counting against it, on either wire, so however
+/// many there are none is refused for the others; the address's places
+/// are still there for connections nobody has vouched for. A guest is
+/// one of those, and is held to them as before. (How fast the address
+/// may connect is not given back at login, so this server holds it to
+/// no rate: the rate is the unit tests' to show.)
+#[tokio::test]
+async fn people_behind_one_address_are_not_held_to_its_connection_cap() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(
+        td.path(),
+        "connections_per_addr = 2\nreconnect_seconds = 0\nhttp_connections_per_addr = 2",
+    )
+    .await;
+    people(td.path(), 6);
+    let mut held = Vec::new();
+    let mut sockets = Vec::new();
+    for i in 0..3 {
+        held.push(
+            classic_person(server.legacy, &format!("person{i}"))
+                .await
+                .expect("a person on the classic wire"),
+        );
+        let (ws, reply) = ng_person(server.ng, &format!("person{}", i + 3)).await;
+        assert!(
+            reply.get("ok").is_some(),
+            "a person on the ng wire: {reply}"
+        );
+        sockets.push(ws);
+    }
+    // Six people in, three on each wire, past every per-address count
+    // there is, and the address still has its own places.
+    let _guest = classic_guest(server.legacy, "guest one").await;
+    let _ng_guest = ng_guest(server.ng, "guest two").await;
+    assert!(
+        classic(server.legacy).await.is_none(),
+        "a third guest, classic"
+    );
+    assert_eq!(ng(server.ng).await.err(), Some(429), "a third guest, ng");
+}
+
+/// An account holds so many connections, from wherever they come, and a
+/// login past it is refused with a reason on either wire. A detached ng
+/// session holds none, and resuming it takes one like a login does.
+#[tokio::test]
+async fn an_account_holds_so_many_connections_on_both_wires() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(
+        td.path(),
+        "connections_per_addr = 0\nreconnect_seconds = 0\nconnections_per_account = 2",
+    )
+    .await;
+    people(td.path(), 1);
+    let (ws, reply) = ng_person(server.ng, "person0").await;
+    let hello = reply["ok"].clone();
+    assert!(hello["detach"].is_object(), "it may detach: {reply}");
+    let _first = classic_person(server.legacy, "person0")
+        .await
+        .expect("the second");
+    let text = classic_person(server.legacy, "person0")
+        .await
+        .err()
+        .expect("a third, classic");
+    assert!(text.contains("already connected"), "{text}");
+    let (_refused, reply) = ng_person(server.ng, "person0").await;
+    assert_eq!(
+        reply["error"]["code"], "too_many_connections",
+        "a third, ng: {reply}"
+    );
+    // A dropped socket leaves its session detached, and holding nothing.
+    drop(ws);
+    let second = eventually("the detached session's place never came back", || async {
+        classic_person(server.legacy, "person0").await.ok()
+    })
+    .await;
+    let resume = || async {
+        let mut ws = ng(server.ng).await.expect("admitted");
+        let reply = ask(
+            &mut ws,
+            1,
+            "resume",
+            json!({ "session": hello["session"], "token": hello["token"], "last_seq": 0 }),
+        )
+        .await;
+        (ws, reply)
+    };
+    let (_ws, reply) = resume().await;
+    assert_eq!(
+        reply["error"]["code"], "too_many_connections",
+        "a resume past the cap: {reply}"
+    );
+    drop(second);
+    let (_ws, reply) = eventually("the resume never found a place", || async {
+        let (ws, reply) = resume().await;
+        (reply["error"]["code"] != "too_many_connections").then_some((ws, reply))
+    })
+    .await;
+    // Attached either way: replayed, or told to sync.
+    assert!(
+        reply.get("ok").is_some() || reply["error"]["code"] == "resync_required",
+        "resumed: {reply}"
+    );
+}
+
+/// An account logs in no faster than its own rate, from an exempt
+/// address too, and a login past it is told so on either wire: in the
+/// classic login's error text, and as `rate_limited` with how long to
+/// wait on ng.
+#[tokio::test]
+async fn an_account_logging_in_too_often_is_told_to_wait_on_both_wires() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start_exempting(
+        td.path(),
+        "[\"127.0.0.0/8\", \"::1\"]",
+        "reconnect_seconds = 600\nconnections_per_account = 2",
+    )
+    .await;
+    people(td.path(), 2);
+    let first = classic_person(server.legacy, "person0")
+        .await
+        .expect("the first");
+    let (second, reply) = ng_person(server.ng, "person0").await;
+    assert!(reply.get("ok").is_some(), "the second: {reply}");
+    drop((first, second));
+    // Both places come back when those two close; the burst does not.
+    let text = eventually("the account's places never came back", || async {
+        classic_person(server.legacy, "person0")
+            .await
+            .err()
+            .filter(|t| !t.contains("already connected"))
+    })
+    .await;
+    assert!(text.contains("too often"), "a third, classic: {text}");
+    let (_refused, reply) = ng_person(server.ng, "person0").await;
+    assert_eq!(
+        reply["error"]["code"], "rate_limited",
+        "a third, ng: {reply}"
+    );
+    let wait = reply["error"]["retry_after"].as_u64().expect("how long");
+    assert!(wait > 0 && wait <= 600, "{reply}");
+    // Another account behind the same address has its own.
+    classic_person(server.legacy, "person1")
+        .await
+        .expect("another account");
 }
 
 // --- Flooding ----------------------------------------------------------

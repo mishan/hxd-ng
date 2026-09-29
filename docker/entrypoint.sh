@@ -175,6 +175,7 @@ generate() {
     echo "[limits]"
     num HXD_CONNECTIONS_PER_ADDR connections_per_addr
     num HXD_RECONNECT_SECONDS reconnect_seconds
+    num HXD_CONNECTIONS_PER_ACCOUNT connections_per_account
     addresses HXD_LIMITS_EXEMPT "${HXD_LIMITS_EXEMPT-127.0.0.0/8,::1}" exempt
     num HXD_CHAT_LINES chat_lines
     num HXD_CHAT_SECONDS chat_seconds
@@ -187,6 +188,7 @@ generate() {
     num HXD_NEWS_POSTS news_posts
     num HXD_NEWS_POST_SECONDS news_post_seconds
     num HXD_LOGIN_FAILURES login_failures
+    num HXD_LOGIN_FAILURES_PER_ADDR login_failures_per_addr
     num HXD_LOGIN_FAILURE_SECONDS login_failure_seconds
     num HXD_HTTP_CONNECTIONS_PER_ADDR http_connections_per_addr
     num HXD_NG_CONNECTIONS ng_connections

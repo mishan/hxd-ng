@@ -1652,14 +1652,26 @@ impl ServerSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsSection {
-    /// Connections one address may hold at once; 0 for no limit.
+    /// Connections one address may hold at once, until they log in; 0
+    /// for no limit. A connection that logs in as an account with one
+    /// person behind it counts against `connections_per_account` from
+    /// there instead, and a guest's goes on counting here.
     #[serde(default = "default_connections_per_addr")]
     pub connections_per_addr: usize,
     /// Seconds one address waits for each new connection past a burst
     /// of `connections_per_addr` (mhxd's `conn_max` when that is 0); 0
-    /// for no limit.
+    /// for no limit. One account is held to the same rate past a burst
+    /// of `connections_per_account`, from every address, and a login
+    /// spends from its account's burst as well as its address's, so it
+    /// goes no faster than the slower of the two.
     #[serde(default = "default_reconnect_seconds")]
     pub reconnect_seconds: u64,
+    /// Connections one account with one person behind it may hold at
+    /// once, from wherever they come, once they have logged in; 0 for
+    /// no limit. A login past it is refused with a reason on either
+    /// wire. A detached ng session holds none.
+    #[serde(default = "default_connections_per_account")]
+    pub connections_per_account: usize,
     /// Addresses and CIDR blocks held to none of the per-address limits:
     /// connections, failed logins, and the ng port's — and kept a few
     /// places past `ng_connections`. The flood limits are a session's,
@@ -1704,12 +1716,17 @@ pub struct LimitsSection {
     pub news_posts: u32,
     #[serde(default = "default_news_post_seconds")]
     pub news_post_seconds: u64,
-    /// Wrong passwords one address may give, on either wire, before a
-    /// password from it is refused until it earns one back, one every
-    /// `login_failure_seconds`; 0 for no limit. A login that sends no
-    /// password is not held to it.
+    /// Wrong passwords one address may give for one login, on either
+    /// wire, before a password from it for that login is refused until
+    /// it earns one back, one every `login_failure_seconds`; 0 for no
+    /// limit. A login that sends no password is not held to it.
     #[serde(default = "default_login_failures")]
     pub login_failures: u32,
+    /// Wrong passwords one address may give for every login together,
+    /// earned back at the same rate; 0 for no limit. The ceiling that
+    /// keeps an address from guessing across every account.
+    #[serde(default = "default_login_failures_per_addr")]
+    pub login_failures_per_addr: u32,
     #[serde(default = "default_login_failure_seconds")]
     pub login_failure_seconds: u64,
     /// Connections one address may hold to the ng port, whatever they
@@ -1751,6 +1768,9 @@ fn default_news_post_seconds() -> u64 {
 fn default_login_failures() -> u32 {
     hxd_core::LoginLimits::RECOMMENDED.failures
 }
+fn default_login_failures_per_addr() -> u32 {
+    hxd_core::LoginLimits::RECOMMENDED.failures_per_addr
+}
 fn default_login_failure_seconds() -> u64 {
     hxd_core::LoginLimits::RECOMMENDED.every.as_secs()
 }
@@ -1786,6 +1806,9 @@ fn default_connections_per_addr() -> usize {
 fn default_reconnect_seconds() -> u64 {
     hxd_core::limits::RECONNECT_EVERY.as_secs()
 }
+fn default_connections_per_account() -> usize {
+    hxd_core::limits::CONNECTIONS_PER_ACCOUNT
+}
 fn default_limits_exempt() -> Vec<String> {
     vec!["127.0.0.0/8".into(), "::1".into()]
 }
@@ -1795,6 +1818,7 @@ impl Default for LimitsSection {
         LimitsSection {
             connections_per_addr: default_connections_per_addr(),
             reconnect_seconds: default_reconnect_seconds(),
+            connections_per_account: default_connections_per_account(),
             exempt: default_limits_exempt(),
             chat_lines: default_chat_lines(),
             chat_seconds: default_chat_seconds(),
@@ -1807,6 +1831,7 @@ impl Default for LimitsSection {
             news_posts: default_news_posts(),
             news_post_seconds: default_news_post_seconds(),
             login_failures: default_login_failures(),
+            login_failures_per_addr: default_login_failures_per_addr(),
             login_failure_seconds: default_login_failure_seconds(),
             http_connections_per_addr: default_http_connections_per_addr(),
             ng_connections: default_ng_connections(),
@@ -1860,8 +1885,12 @@ impl LimitsSection {
         if self.login_failures != 0 && self.login_failure_seconds == 0 {
             return Err("[limits] login_failures needs login_failure_seconds: set both, or login_failures to 0".into());
         }
+        if self.login_failures_per_addr != 0 && self.login_failure_seconds == 0 {
+            return Err("[limits] login_failures_per_addr needs login_failure_seconds: set both, or login_failures_per_addr to 0".into());
+        }
         Ok(hxd_core::LoginLimits {
             failures: self.login_failures,
+            failures_per_addr: self.login_failures_per_addr,
             every: Duration::from_secs(self.login_failure_seconds),
         })
     }
@@ -1879,6 +1908,7 @@ impl LimitsSection {
         Ok(hxd_core::ConnLimits {
             per_addr: self.connections_per_addr,
             reconnect: Duration::from_secs(self.reconnect_seconds),
+            per_account: self.connections_per_account,
             exempt: hxd_core::AddrSet::parse(&self.exempt)
                 .map_err(|e| format!("[limits] exempt: {e}"))?,
         })
@@ -3792,6 +3822,39 @@ hmac_secret = "new secret"
         let typo =
             parse("[tracker]\n[[tracker.targets]]\naddress = \"example.com\"\nprotocol = \"v4\"\n");
         assert!(typo.is_err());
+    }
+
+    #[test]
+    fn account_and_login_limits_default_and_are_checked() {
+        let cfg = parse("").unwrap();
+        let conn = cfg.limits.conn_limits().unwrap();
+        assert_eq!(conn.per_account, hxd_core::limits::CONNECTIONS_PER_ACCOUNT);
+        assert_eq!(
+            cfg.limits.login_limits().unwrap(),
+            hxd_core::LoginLimits::RECOMMENDED
+        );
+        let cfg = parse(
+            "[limits]\nconnections_per_account = 0\nlogin_failures = 0\n\
+             login_failures_per_addr = 7\n",
+        )
+        .unwrap();
+        check_config(&cfg).unwrap();
+        assert_eq!(cfg.limits.conn_limits().unwrap().per_account, 0);
+        assert_eq!(cfg.limits.login_limits().unwrap().failures_per_addr, 7);
+        let cfg = parse(
+            "[limits]\nlogin_failures = 0\nlogin_failures_per_addr = 7\n\
+             login_failure_seconds = 0\n",
+        )
+        .unwrap();
+        assert!(check_config(&cfg)
+            .unwrap_err()
+            .contains("login_failures_per_addr"));
+        let cfg = parse(
+            "[limits]\nlogin_failures = 0\nlogin_failures_per_addr = 0\n\
+             login_failure_seconds = 0\n",
+        )
+        .unwrap();
+        check_config(&cfg).unwrap();
     }
 
     #[test]
