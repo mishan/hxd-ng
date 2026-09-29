@@ -71,21 +71,120 @@ pub(crate) async fn resolve_dir(
     bytes: Option<&[u8]>,
     large: bool,
     enc: TextEncoding,
+    drop_boxes: bool,
 ) -> Result<FilePath, FileError> {
     let components = match bytes {
         Some(bytes) => parse_dir(bytes)?,
         None => Vec::new(),
     };
+    resolve_folders(source, &components, large, enc, drop_boxes).await
+}
+
+/// Whether the path a client spelled, DIR and then a name, names a drop
+/// box: mhxd's `check_dropbox`, asked of the names as they were sent and
+/// before any is looked up, so that the answer cannot turn on what
+/// exists. A DIR that does not parse names nothing; resolving it refuses
+/// it.
+pub(crate) fn spells_drop_box(enc: TextEncoding, dir: Option<&[u8]>, name: Option<&[u8]>) -> bool {
+    let components = dir
+        .and_then(|bytes| parse_dir(bytes).ok())
+        .unwrap_or_default();
+    components
+        .iter()
+        .map(Vec::as_slice)
+        .chain(name)
+        .any(|name| enc.decode(name).to_ascii_lowercase().contains("drop box"))
+}
+
+/// A folder's entries, as a walk that names something inside it sees
+/// them: none, when the folder is a drop box and the asker may not view
+/// drop boxes (`drop_boxes`). What is in one is then "not found" whether
+/// or not it exists, so a name that reaches one without spelling it (a
+/// wire name cut short of "Drop Box") cannot be used to probe it either.
+async fn list_within(
+    source: &dyn FileSource,
+    path: &FilePath,
+    large: bool,
+    enc: TextEncoding,
+    drop_boxes: bool,
+) -> Result<Vec<WireEntry>, FileError> {
+    if path.is_drop_box() && !drop_boxes {
+        return Err(FileError::NotFound);
+    }
+    list(source, path, large, enc).await
+}
+
+/// The folder `components` name, each matched against the wire names its
+/// parent lists.
+pub(crate) async fn resolve_folders(
+    source: &dyn FileSource,
+    components: &[Vec<u8>],
+    large: bool,
+    enc: TextEncoding,
+    drop_boxes: bool,
+) -> Result<FilePath, FileError> {
     let mut path = FilePath::root();
     for component in components {
-        let found = list(source, &path, large, enc)
+        let found = list_within(source, &path, large, enc, drop_boxes)
             .await?
             .into_iter()
-            .find(|entry| entry.entry.kind == FileKind::Folder && entry.name == component)
+            .find(|entry| entry.entry.kind == FileKind::Folder && &entry.name == component)
             .ok_or(FileError::NotFound)?;
         path = found.path;
     }
     Ok(path)
+}
+
+/// The folder and name a request that acts on one entry names: FILE_NAME
+/// in DIR, or, in mhxd's other form of Delete and New Folder, DIR alone,
+/// whose last folder is the entry.
+pub(crate) fn named(
+    dir: Option<&[u8]>,
+    name: Option<&[u8]>,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), FileError> {
+    let mut components = match dir {
+        Some(bytes) => parse_dir(bytes)?,
+        None => Vec::new(),
+    };
+    match name.filter(|name| !name.is_empty()) {
+        Some(name) => Ok((components, name.to_vec())),
+        None => {
+            let last = components.pop().ok_or(FileError::InvalidPath)?;
+            Ok((components, last))
+        }
+    }
+}
+
+/// The listed entry `name` in the folder `components` name.
+pub(crate) async fn resolve_in(
+    source: &dyn FileSource,
+    components: &[Vec<u8>],
+    name: &[u8],
+    large: bool,
+    enc: TextEncoding,
+    drop_boxes: bool,
+) -> Result<(FilePath, FileInfo, Vec<u8>), FileError> {
+    let parent = resolve_folders(source, components, large, enc, drop_boxes).await?;
+    let found = list_within(source, &parent, large, enc, drop_boxes)
+        .await?
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .ok_or(FileError::NotFound)?;
+    let info = source.info(&found.path).await?;
+    Ok((found.path, info, found.name))
+}
+
+/// A name a client gives a new entry, in `parent`. Unlike a name it
+/// selects, it is not matched against a listing: it is decoded.
+pub(crate) fn new_name(
+    parent: &FilePath,
+    name: &[u8],
+    enc: TextEncoding,
+) -> Result<FilePath, FileError> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(FileError::InvalidPath);
+    }
+    parent.join(&enc.decode(name))
 }
 
 pub(crate) async fn resolve_file(
@@ -94,8 +193,18 @@ pub(crate) async fn resolve_file(
     name: &[u8],
     large: bool,
     enc: TextEncoding,
+    drop_boxes: bool,
 ) -> Result<(FilePath, FileInfo, Vec<u8>), FileError> {
-    resolve_named(source, dir, name, large, enc, Some(FileKind::File)).await
+    resolve_named(
+        source,
+        dir,
+        name,
+        large,
+        enc,
+        drop_boxes,
+        Some(FileKind::File),
+    )
+    .await
 }
 
 /// A named entry of either kind: Get Info asks about folders too.
@@ -105,8 +214,9 @@ pub(crate) async fn resolve_entry(
     name: &[u8],
     large: bool,
     enc: TextEncoding,
+    drop_boxes: bool,
 ) -> Result<(FilePath, FileInfo, Vec<u8>), FileError> {
-    resolve_named(source, dir, name, large, enc, None).await
+    resolve_named(source, dir, name, large, enc, drop_boxes, None).await
 }
 
 async fn resolve_named(
@@ -115,10 +225,11 @@ async fn resolve_named(
     name: &[u8],
     large: bool,
     enc: TextEncoding,
+    drop_boxes: bool,
     kind: Option<FileKind>,
 ) -> Result<(FilePath, FileInfo, Vec<u8>), FileError> {
-    let parent = resolve_dir(source, dir, large, enc).await?;
-    let found = list(source, &parent, large, enc)
+    let parent = resolve_dir(source, dir, large, enc, drop_boxes).await?;
+    let found = list_within(source, &parent, large, enc, drop_boxes)
         .await?
         .into_iter()
         .find(|entry| kind.is_none_or(|kind| entry.entry.kind == kind) && entry.name == name)
@@ -146,12 +257,10 @@ pub(crate) async fn resolve_upload(
     name: &[u8],
     large: bool,
     enc: TextEncoding,
+    drop_boxes: bool,
 ) -> Result<FilePath, FileError> {
-    if name.is_empty() || name.len() > 128 {
-        return Err(FileError::InvalidPath);
-    }
-    let parent = resolve_dir(source, dir, large, enc).await?;
-    parent.join(&enc.decode(name))
+    let parent = resolve_dir(source, dir, large, enc, drop_boxes).await?;
+    new_name(&parent, name, enc)
 }
 
 pub(crate) fn list_payload(entry: &WireEntry) -> Vec<u8> {
@@ -290,6 +399,29 @@ mod tests {
         assert_eq!(parse_dir(bytes).unwrap(), [b"a".to_vec(), b"bc".to_vec()]);
         assert!(parse_dir(&bytes[..bytes.len() - 1]).is_err());
         assert!(parse_dir(b"\0\0x").is_err());
+    }
+
+    #[test]
+    fn an_entry_is_named_in_its_folder_or_as_the_last_folder() {
+        let dir = b"\0\x02\0\0\x01a\0\0\x02bc";
+        assert_eq!(
+            named(Some(dir), Some(b"x")).unwrap(),
+            (vec![b"a".to_vec(), b"bc".to_vec()], b"x".to_vec())
+        );
+        assert_eq!(
+            named(None, Some(b"x")).unwrap(),
+            (Vec::new(), b"x".to_vec())
+        );
+        // mhxd's other form: an empty or absent name, and the entry is
+        // DIR's last folder.
+        for name in [None, Some(&b""[..])] {
+            assert_eq!(
+                named(Some(dir), name).unwrap(),
+                (vec![b"a".to_vec()], b"bc".to_vec())
+            );
+        }
+        assert_eq!(named(None, None), Err(FileError::InvalidPath));
+        assert_eq!(named(Some(b"\0\0"), None), Err(FileError::InvalidPath));
     }
 
     #[test]

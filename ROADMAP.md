@@ -252,9 +252,10 @@ background, not a separate implementation contract.
 
 - **Implemented:** manifest-backed HTTP and capability-rooted local areas;
   listing, info, download, single-file upload, CAP metadata/resource forks,
-  and digest-verified Large File resume.
-- Move/rename/delete/mkdir, comments, and drop-box semantics (upload-only
-  folders).
+  and digest-verified Large File resume; drop boxes (upload-only folders);
+  and, on a local area, New Folder, Delete, rename, Move and comments on
+  both wires, each kind of entry under its own access bit. Make Alias is
+  refused: the area never follows or shows a symlink.
 - HTXF folder subchannels with resume (send well-formed RFLT;
   *accept* sloppy ones — gtkhx's old malformed-RFLT bug is exactly the kind
   of client to stay compatible with).
@@ -386,7 +387,8 @@ fetch a derivative by, and the mhxd importer.
   accept time. Connection caps per address, a reconnect rate, and mhxd's
   chat-line and spam-point flood limits are in, at its `nospam` defaults
   (`[limits]`), with ng requests that stand for a classic transaction
-  (chat, messages, nick changes, the news writes) charged at its price.
+  (chat, messages, nick changes, the news writes, the file-area changes)
+  charged at its price.
   So are failed logins, counted per address across both wires and
   `/identity/auth`; on the ng port, connections per address and in all,
   counted from accept, and per-address rates on `/identity/challenge`

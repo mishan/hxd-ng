@@ -56,7 +56,7 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 | **Images in chat**, re-encoded and metadata-stripped by the server | sees the caption | yes | yes |
 | **Voice chat** — one room, one UDP port, no transcoding | — | yes | yes |
 | **Video** — camera and screen share on the voice connection, opt-in per stream | — | when GtkHx adds it | yes |
-| **The file area** — browse, Get Info, download; upload into upload folders and drop boxes | yes | yes, plus files over 4 GiB and verified resume | browse and download |
+| **The file area** — browse, Get Info, download; upload into upload folders and drop boxes; new folder, delete, rename, move, comments | yes | yes, plus files over 4 GiB and verified resume | browse, download, and everything but uploads |
 | **Threaded news** — markdown, references between articles, follows, search | reads and posts as plain text; 1.2 sees one category | reads and posts as plain text | yes |
 | **Push notifications** — a private message or a news reply while the app is closed | — | — | yes, as Web Push |
 | **Portable identity** — an Ed25519 key that is you on any server that runs this | through a local tunnel | through a local tunnel | yes |
@@ -72,10 +72,9 @@ GtkHx when its rendering lands.
 
 **Not built yet, and worth knowing before you run this:**
 
-- **The rest of the file area.** Folder downloads and uploads, and
-  file management — delete, rename, move, new folder, setting a comment —
-  on either wire; uploads on the ng wire. What is built is in
-  [docs/files-plan.md](docs/files-plan.md).
+- **The rest of the file area.** Folder downloads and uploads on either
+  wire, uploads on the ng wire, and aliases, which this server refuses
+  to make. What is built is in [docs/files-plan.md](docs/files-plan.md).
 - **Servers reading a registrar's records.** The registrar itself is
   built — it gives a key a name like `alice@hl.example` and publishes
   revocations, rotations and freezes — but a server does not yet fetch
@@ -289,8 +288,8 @@ transaction a classic client sends spends spam points at the price
 mhxd's table gives it (a chat line or a private message 2, a user list
 20, anything it does not list 10; the extensions mhxd never had, and
 fetching icons, cost nothing), as does an ng request that stands for
-one of them (`chat`, `msg`, `nick`, and the news posts, deletes and
-creates); a user
+one of them (`chat`, `msg`, `nick`, the news posts, deletes and
+creates, and the file-area changes); a user
 who reaches `spam_points` is kicked and its address banned for
 `[server] ban_time`, and public chat is told as mhxd tells it. An
 address in `exempt` is never banned for it, since everyone behind a

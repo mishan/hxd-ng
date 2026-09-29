@@ -68,6 +68,8 @@ pub struct PreparedUpload {
     pub transfer_len: Option<u64>,
     pub large: bool,
     pub quote: Option<UploadQuote>,
+    /// As for [`UploadTransfer::blind`](crate::UploadTransfer::blind).
+    pub blind: bool,
     /// The uploader negotiated UTF-8 text, so the comment in its INFO
     /// fork is UTF-8 and is converted to the sidecar's Mac Roman.
     pub comment_utf8: bool,
@@ -83,6 +85,7 @@ impl std::fmt::Debug for PreparedUpload {
             .field("transfer_len", &self.transfer_len)
             .field("large", &self.large)
             .field("quote", &self.quote)
+            .field("blind", &self.blind)
             .finish_non_exhaustive()
     }
 }
@@ -824,6 +827,7 @@ mod tests {
                 transfer_len: Some(10),
                 large: false,
                 comment_utf8: false,
+                blind: false,
                 quote: Some(UploadQuote {
                     data_offset: 3,
                     resource_offset: 2,
@@ -861,6 +865,7 @@ mod tests {
             transfer_len,
             large: true,
             comment_utf8: false,
+            blind: false,
             quote,
         })
     }

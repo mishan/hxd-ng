@@ -107,7 +107,8 @@ fn request_weight(req: &str) -> u32 {
         "chat" | "msg" | "nick" | "block" | "unblock" | "msg_read" | "avatar_clear"
         | "voice_answer" | "voice_mute" | "video_state" | "news_seen" | "news_subscribe"
         | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
-        | "report_close" | "redact" | "revoke" | "kick" => 2,
+        | "files_mkdir" | "files_delete" | "files_move" | "files_comment" | "report_close"
+        | "redact" | "revoke" | "kick" => 2,
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
         | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge" => 4,
@@ -894,6 +895,11 @@ async fn handle_login(
     if let Some(policy) = ctx.core.avatar_policy() {
         ok["avatars"] = crate::avatar::limits_json(&policy);
     }
+    // What this session may change in the file area. Present exactly
+    // when the `files` cap is.
+    if let Some(files) = ctx.files.as_ref() {
+        ok["files"] = crate::files::login_json(files, account.access);
+    }
     // What this session may do with the news, and the ceilings it will
     // be held to. Present exactly when the `news` cap is. Off the
     // reactor, because its unread badge is a store read.
@@ -1369,9 +1375,10 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
 /// as the table's default prices every one of them. (Its 20 for a post
 /// is the 1.2 flat one's, which an ng post is not, and at that price an
 /// editor who files a few replies in as many seconds is banned for
-/// it.) Whatever else this wire asks for, it has no classic counterpart
-/// to be priced by, and is held to the request limit instead. As
-/// `(type, points)`.
+/// it.) The file-area changes are its Delete File, New Folder, Set File
+/// Info and Move File, 7 each. Whatever else this wire asks for, it has
+/// no classic counterpart to be priced by, and is held to the request
+/// limit instead. As `(type, points)`.
 fn spam_charge(req: &str) -> Option<(u32, u32)> {
     match req {
         "chat" => Some((0x69, 2)),
@@ -1381,6 +1388,10 @@ fn spam_charge(req: &str) -> Option<(u32, u32)> {
         "news_delete" => Some((0x19b, 10)),
         "news_node_create" => Some((0x17e, 10)),
         "news_node_delete" => Some((0x17c, 10)),
+        "files_delete" => Some((0xcc, 7)),
+        "files_mkdir" => Some((0xcd, 7)),
+        "files_comment" => Some((0xcf, 7)),
+        "files_move" => Some((0xd0, 7)),
         _ => None,
     }
 }

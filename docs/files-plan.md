@@ -1,8 +1,10 @@
 # Files implementation plan
 
-Status: first and second slices implemented, 2026-09-12. The first slice is
-read-only manifest-backed HTTP; the second adds a capability-rooted local file
-area and single-file uploads. This document is the execution plan and
+Status: first and second slices implemented, 2026-09-12, and file
+management on the local area since. The first slice is read-only
+manifest-backed HTTP; the second adds a capability-rooted local file area and
+single-file uploads; the third, New Folder, Delete, rename, Move and
+comments. This document is the execution plan and
 acceptance contract for the Files work across hxd-ng and its clients. The
 exploratory notes in
 [`file-sources.md`](file-sources.md) remain useful design background; this
@@ -39,9 +41,28 @@ performs every later lookup relative to that authority. Protocol paths cannot
 name absolute paths, traverse upward, follow symlinks, or reach `.hxd-state`
 by any spelling a case-folding filesystem accepts. Uploads follow mhxd's
 access rule: `upload_files` alone reaches folders whose path names an upload
-folder or a drop box, and `upload_anywhere` reaches the rest. A drop box lists
-only for `view_drop_boxes`. Uploads never overwrite a visible file and are
+folder or a drop box, and `upload_anywhere` reaches the rest. A drop box
+lists, answers Get Info and downloads only for `view_drop_boxes`, as on mhxd,
+and the path a client sends is checked before anything is looked up, so
+asking for a name a drop box does not hold is refused the same way as one it
+does. Uploads never overwrite a visible file and are
 published atomically only after the exact body and FFO structure validate.
+
+An account without `view_drop_boxes` learns nothing of what a drop box
+holds, and that shapes its uploads in two ways mhxd does not. It may upload
+into a drop box itself, which is what one is for, but not into a folder
+inside one: that folder is not found, the same answer as a folder that is
+not there, since it cannot target what it cannot see. (mhxd's
+`rcv_file_put` never asks `check_dropbox`.) And its upload into a drop box
+is blind: a name that is taken is neither refused, as mhxd refuses it, nor
+replaced; the upload is published under the first free name, `name 2.txt`,
+`name 3.txt` and on, the number before any extension, chosen under the tree
+lock as it is published. It is never quoted a partial to resume, and its
+partial is named afresh for each upload and discarded when the transfer
+ends, so it can neither find nor disturb another's; every guest shares one
+account, and a quote would tell one guest what another left half-sent. An
+account that may view drop boxes uploads into them, and into folders inside
+them, as anywhere else it may upload.
 
 Incomplete uploads live under the mode-0700 `.hxd-state` directory. Their
 opaque names bind the canonical account login to the destination path; limits
@@ -58,6 +79,72 @@ partial. A request may leave the upload size out, as mhxd's own client always
 does, and the server then caps the upload by any quoted offset plus the
 length the handshake states.
 HTTP and ng downloads remain read-only even when backed by this local area.
+
+### File management
+
+A local area can be changed as well as filled, on both wires: New Folder
+(205), Delete (204), Set Info (207) for a rename and a comment, and Move
+(208), and on the ng wire `files_mkdir`, `files_delete`, `files_move` and
+`files_comment` (`hotline-ng.md` §7.2). A manifest area refuses them all
+as read-only. mhxd is the reference for what each request carries, with
+two deliberate differences:
+
+- **Each kind of entry asks for its own bit.** mhxd admits an account
+  holding either Delete bit, or either Move bit, and then acts on files
+  and folders alike. Here a file asks `delete_files` and a folder
+  `delete_folders`, and so on down the bitmap, and the kind is checked
+  again under the tree lock, so a file swapped for a folder in between is
+  refused rather than deleted under the file bit.
+- **Make Alias (209) is refused.** An alias would be a symlink, and this
+  area neither follows nor shows one.
+
+As on mhxd, a path naming a drop box is out of reach without
+`view_drop_boxes` for every one of these, as source or destination, and a
+folder is deleted with everything in it. Set Info compares what it is
+sent with what the connection was shown: a Get Info window sends back
+both fields, and an unchanged one is not a change, so an account that
+may rename but not comment can still rename from it. Nothing is ever
+replaced: a new folder, a rename or a move onto a name that is taken is
+refused, a move stays on its filesystem rather than copying, and a delete
+does not reach into a filesystem mounted beneath its folder. Folders nest
+only as deep as a delete or move will walk: New Folder refuses to go
+past it, a move of a folder refuses any destination where it or anything
+inside it would sit past it, in whichever direction it moves, and a
+delete of a folder nested deeper behind the server's back, or holding a
+mount, is refused after checking the whole tree and before removing any
+of it. Every cheaper refusal comes before such a walk, so a request that
+would be refused anyway does not pay for one.
+
+That walk would otherwise tell an account without `view_drop_boxes`
+something of what a drop box holds: which refusal a folder around one
+earns, and at what destination depth, says how deep folders nest inside
+it, or that a filesystem is mounted there. So for such an account a
+move, rename or delete of a folder holding a drop box anywhere beneath
+it is refused outright ("That folder holds a drop box.", `access_denied`
+on the ng wire) the moment the walk reads the drop box's name, before
+opening it; nothing inside can change the answer, and whatever the walk
+answered before reaching it was about folders the account can list.
+This is a deliberate difference from mhxd, which would move or delete
+the folder, drop box and all: an account that may not see into a drop
+box does not get to throw away what was sent to it either. An account
+that may view drop boxes walks into one as into any other folder.
+
+Each act is also refused before anything is looked up when the account
+holds none of the bits it could need, as mhxd's `rcv.c` refuses it:
+Delete without either delete bit, Move without either move bit, and Set
+Info without any of the rename and comment bits. Otherwise "File not
+found." against a refusal would say what exists, and a Set Info that
+changes nothing would succeed for an account that may change nothing.
+
+A comment is kept where an upload's is, in the CAP sidecar, so it is Mac
+Roman there and at most 200 bytes, and a folder may have one too. Sidecars
+are named by path, so a rename or a move carries the sidecars of
+everything beneath it, and a delete removes them. A comment reads back
+with LF line endings whichever wire wrote it. Every change and every
+upload's publication take one lock on the tree, which makes checking that
+a name is free and taking it one step; it is waited for before an I/O
+permit is taken, so a long delete holds up other changes and not the
+listings and downloads beside them.
 
 ## Repository and branch order
 
@@ -205,6 +292,5 @@ The work is complete only when all of these are true:
 The following remain separate milestones:
 
 - folder get/put transactions and their 64-bit aggregate counts;
-- move, rename, delete, mkdir, comments, and drop-box semantics;
 - transfer queueing, per-account quotas, and background origin prefetching;
 - direct origin URLs in the ng client.

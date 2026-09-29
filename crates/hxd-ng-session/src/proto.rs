@@ -119,6 +119,20 @@ pub struct FilesDownloadParams {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct FilesMoveParams {
+    pub path: String,
+    /// The entry's new path: another folder, another name, or both.
+    pub to: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FilesCommentParams {
+    pub path: String,
+    /// Empty clears the comment.
+    pub comment: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct MsgReadParams {
     pub up_to: u64,
 }

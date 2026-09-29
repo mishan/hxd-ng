@@ -41,6 +41,7 @@ use tracing::{debug, info, warn, Instrument};
 use crate::banner::Banner;
 use crate::caps::{cap, Caps};
 use crate::encoding::TextEncoding;
+use crate::file_manage;
 use crate::files;
 use crate::frame::{pack_frame, read_frame, Frame, ReadError, MAX_FRAME_DATA};
 use crate::media;
@@ -545,6 +546,7 @@ const HANDLED: &[ClientHdr] = &[
 fn type_label(ty: u32) -> Kind<'static> {
     let known = HANDLED.iter().any(|h| h.as_u32() == ty)
         || news::handles(ty)
+        || file_manage::handles(ty)
         || ty == media::trans::UPLOAD_MEDIA
         || ty == media::trans::DOWNLOAD_MEDIA
         || matches!(ty, gif_icons::GET_LIST | gif_icons::GET | gif_icons::SET);
@@ -2742,11 +2744,21 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             };
             let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
             let large = sess.has_cap(cap::LARGE_FILES);
+            let drop_boxes = sess.can(bit::VIEW_DROP_BOXES);
+            // mhxd shows a drop box's contents only to accounts that may
+            // view drop boxes (files.c, check_dropbox). Asked first of the
+            // path as spelled, so a folder inside one is refused whether or
+            // not it exists, and again of the path it resolves to.
+            if !drop_boxes && files::spells_drop_box(sess.enc, dir.as_ref().map(|c| c.data), None) {
+                reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
+                return;
+            }
             let path = match files::resolve_dir(
                 service.source.as_ref(),
                 dir.as_ref().map(|chunk| chunk.data),
                 large,
                 sess.enc,
+                drop_boxes,
             )
             .await
             {
@@ -2756,9 +2768,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     return;
                 }
             };
-            // mhxd shows a drop box's contents only to accounts that may
-            // view drop boxes (files.c, check_dropbox).
-            if path.is_drop_box() && !sess.can(bit::VIEW_DROP_BOXES) {
+            if path.is_drop_box() && !drop_boxes {
                 reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
                 return;
             }
@@ -2805,12 +2815,27 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 return;
             };
             let large = sess.has_cap(cap::LARGE_FILES);
-            let (_path, info, wire_name) = match files::resolve_entry(
+            // Get Info on a drop box, or on anything inside one, is for
+            // accounts that may view drop boxes, as mhxd's rcv_file_getinfo
+            // checks it: what a drop box keeps from everyone else is its
+            // contents, the entries inside and their names, sizes, dates
+            // and comments, and the drop box's own dates move as they
+            // arrive. (Its item count is no secret: the parent's File List
+            // shows it, as mhxd's hxd_scandir does.) Asked of the path as
+            // spelled before anything is looked up, and of the one found.
+            let drop_boxes = sess.can(bit::VIEW_DROP_BOXES);
+            let dir = dir.as_ref().map(|chunk| chunk.data);
+            if !drop_boxes && files::spells_drop_box(sess.enc, dir, Some(name.data)) {
+                reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
+                return;
+            }
+            let (path, info, wire_name) = match files::resolve_entry(
                 service.source.as_ref(),
-                dir.as_ref().map(|chunk| chunk.data),
+                dir,
                 name.data,
                 large,
                 sess.enc,
+                drop_boxes,
             )
             .await
             {
@@ -2820,6 +2845,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     return;
                 }
             };
+            if path.is_drop_box() && !drop_boxes {
+                reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
+                return;
+            }
             let entry = FileEntry {
                 name: info.path.name().unwrap_or_default().to_owned(),
                 kind: info.kind,
@@ -2879,12 +2908,21 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 return;
             };
             let large = sess.has_cap(cap::LARGE_FILES);
+            // A drop box takes uploads from anyone and gives them back only
+            // to accounts that may view it, as mhxd's rcv_file_get checks.
+            let drop_boxes = sess.can(bit::VIEW_DROP_BOXES);
+            let dir = dir.as_ref().map(|chunk| chunk.data);
+            if !drop_boxes && files::spells_drop_box(sess.enc, dir, Some(name.data)) {
+                reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
+                return;
+            }
             let (path, info, wire_name) = match files::resolve_file(
                 service.source.as_ref(),
-                dir.as_ref().map(|chunk| chunk.data),
+                dir,
                 name.data,
                 large,
                 sess.enc,
+                drop_boxes,
             )
             .await
             {
@@ -2894,6 +2932,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     return;
                 }
             };
+            if path.is_drop_box() && !drop_boxes {
+                reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
+                return;
+            }
             if info.kind != FileKind::File {
                 reply_error(tx, f.trans, "That path is not a file.");
                 return;
@@ -3020,12 +3062,22 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             };
             let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
             let large = sess.has_cap(cap::LARGE_FILES);
+            // A drop box itself takes uploads from anyone, as mhxd's
+            // rcv_file_put does. A folder inside one does not, for an
+            // account that may not view drop boxes: it is not found, as
+            // though it were not there. This is a deliberate deviation;
+            // mhxd's rcv_file_put never calls check_dropbox, so on mhxd
+            // such an account can upload into a folder inside a drop box
+            // it may not list, and learn from the answer whether that
+            // folder exists. Here it cannot target what it cannot see.
+            let drop_boxes = sess.can(bit::VIEW_DROP_BOXES);
             let path = match files::resolve_upload(
                 service.source.as_ref(),
                 dir.as_ref().map(|chunk| chunk.data),
                 name.data,
                 large,
                 sess.enc,
+                drop_boxes,
             )
             .await
             {
@@ -3046,6 +3098,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "You are not allowed to upload files here.");
                 return;
             }
+            // Nor may such an account learn what a drop box holds from
+            // uploading into it: a name that is taken is neither refused
+            // nor replaced, the upload is published under a free one, and
+            // no partial is offered for resume (UploadTransfer::blind).
+            // mhxd refuses a taken name, and quotes a resume the length
+            // of the file there, which lists the drop box one guess at a
+            // time.
+            let blind = !drop_boxes && path.parent().is_some_and(|folder| folder.is_drop_box());
             // A resume needs the client to ask for one. mhxd writes an upload
             // in place, so an interrupted one is listed and a client offers
             // to resume what it sees; here a partial stays unlisted until it
@@ -3127,6 +3187,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     transfer_len,
                     large,
                     resume_requested,
+                    blind,
                     comment_utf8: sess.enc == TextEncoding::Utf8,
                 },
             )
@@ -4024,6 +4085,24 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
         }
 
+        // File management. Each needs its own access bit, so there is no
+        // one gate here; the replies carry nothing, as mhxd's do.
+        t if file_manage::handles(t) => {
+            let who = file_manage::Asker {
+                account: &sess.account,
+                enc: sess.enc,
+                large: sess.has_cap(cap::LARGE_FILES),
+            };
+            let fields: Vec<_> = f.chunks().map(|c| (c.tag, c.data)).collect();
+            match file_manage::transaction(ctx.files.as_deref(), who, t, &fields).await {
+                Ok(()) => reply(tx, f.trans, vec![]),
+                Err(file_manage::Refusal::Text(msg)) => reply_error(tx, f.trans, msg),
+                Err(file_manage::Refusal::File(error)) => {
+                    reply_error(tx, f.trans, file_error_text(&error))
+                }
+            }
+        }
+
         // News, both eras of it (`docs/news.md` §12). The domain decides
         // who may do what; every answer is store I/O, so it happens off
         // the reactor.
@@ -4209,6 +4288,9 @@ fn file_error_text(error: &hxd_core::FileError) -> &'static str {
         hxd_core::FileError::RangeInvalid => "Invalid file range.",
         hxd_core::FileError::OriginChanged => "The file changed at its origin.",
         hxd_core::FileError::TooLarge => "This file needs Large File support.",
+        hxd_core::FileError::CrossesFilesystems => "That cannot be moved across filesystems.",
+        hxd_core::FileError::TooDeep => "Folders cannot be nested that deeply.",
+        hxd_core::FileError::HoldsDropBox => "That folder holds a drop box.",
         hxd_core::FileError::Busy => "The file service is busy.",
         hxd_core::FileError::Unavailable(_) => "The file service is unavailable.",
     }
