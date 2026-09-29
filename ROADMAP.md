@@ -410,6 +410,12 @@ fetch a derivative by, and the mhxd importer.
   and video changes are allowances, mute and pause flips are debounced,
   inbound RTP is policed against each stream's ceiling, and trickled ICE
   candidates are capped.
+  Avatars are an account's to set (`[extra] set_avatar`, not the
+  bootstrap guest's), rationed per owner and per guest address across
+  reconnects, decoded on a budget apart from chat's, and an identity's
+  ages out once it stops coming back; Get Icon List is rationed per
+  session; and a guest's media quotas are its address's rather than the
+  shared login's.
 - Fuzz the frame decoder (`cargo-fuzz` against the session layer's read
   path); a server's parser meets far more hostile input than a client's.
 

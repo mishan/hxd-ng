@@ -119,9 +119,13 @@ pub struct AvatarsSection {
     /// recommendation, and what GtkHx accepts.
     #[serde(default = "default_avatar_legacy_max_bytes")]
     pub legacy_max_bytes: usize,
-    /// Seconds between one session's changes; each is pushed to everyone.
+    /// Seconds between one owner's changes; each is pushed to everyone.
     #[serde(default = "default_avatar_set_interval")]
     pub set_interval: u64,
+    /// Days an identity's avatar is kept after the identity was last on
+    /// the server; 0 keeps it for good. Accounts' are not aged.
+    #[serde(default = "default_avatar_identity_retain_days")]
+    pub identity_retain_days: u32,
     /// Where owners' avatars are kept. Defaults to the database `[inbox]`,
     /// `[history]` or `[news]` names; with none, avatars last until the
     /// server stops.
@@ -139,6 +143,9 @@ fn default_avatar_legacy_max_bytes() -> usize {
 }
 fn default_avatar_set_interval() -> u64 {
     10
+}
+fn default_avatar_identity_retain_days() -> u32 {
+    90
 }
 
 impl AvatarsSection {
@@ -166,6 +173,9 @@ impl AvatarsSection {
                 legacy_max_bytes: self.legacy_max_bytes,
             },
             set_interval: Duration::from_secs(self.set_interval),
+            identity_retention: Duration::from_secs(
+                u64::from(self.identity_retain_days) * 24 * 3600,
+            ),
         }
     }
 }
@@ -1984,9 +1994,24 @@ fn ng_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>) -> Vec
     caps
 }
 
+/// How many avatar decodes may run at once, apart from `[media]`'s
+/// `max_concurrent_decodes`.
+///
+/// Its own budget, because a shared one lets either kind of traffic
+/// starve the other: avatar changes are rationed per owner and per
+/// guest address, but a handful of accounts churning theirs could still
+/// hold every shared permit and answer chat's images with Busy. One is
+/// enough for the traffic: an avatar change is rare by construction —
+/// once per owner per `set_interval` — and the work is bounded by the
+/// same pixel and allocation caps as chat's, so a queue waits a decode
+/// or two. The server's decode concurrency is `[media]`'s plus this,
+/// still bounded, and a burst of avatar changes costs chat nothing.
+#[cfg(feature = "media")]
+const AVATAR_DECODES: usize = 1;
+
 /// Give the domain an image pipeline when `[media]` asks for one, and
-/// avatars when `[avatars]` does — the same pipeline, so the same decode
-/// budget.
+/// avatars when `[avatars]` does — the same pipeline and caps, with a
+/// decode budget of their own ([`AVATAR_DECODES`]).
 #[cfg(feature = "media")]
 fn with_media(
     core: Core,
@@ -2007,7 +2032,11 @@ fn with_media(
     let core = match config.avatars.as_ref() {
         Some(section) => core.with_avatars(
             avatars.unwrap_or_else(|| Arc::new(hxd_core::MemoryAvatars::default())),
-            Arc::new(codec.with_max_bytes(section.max_bytes)),
+            Arc::new(
+                codec
+                    .with_max_bytes(section.max_bytes)
+                    .with_own_permits(AVATAR_DECODES),
+            ),
             section.to_policy(),
         ),
         None => core,
@@ -3274,6 +3303,24 @@ pub async fn news_pruner(core: Arc<Core>) {
         .unwrap_or(0);
         if gone > 0 {
             tracing::debug!(gone, "news articles pruned");
+        }
+    }
+}
+
+/// Avatar retention: identities' avatars not seen within `[avatars]
+/// identity_retain_days` (`docs/avatars.md` §2). Hourly and on the
+/// blocking pool, like the others.
+pub async fn avatar_pruner(core: Arc<Core>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let core = core.clone();
+        let gone = crate::spawn_blocking("prune", move || core.prune_avatars(SystemTime::now()))
+            .await
+            .unwrap_or(0);
+        if gone > 0 {
+            tracing::debug!(gone, "identity avatars pruned");
         }
     }
 }

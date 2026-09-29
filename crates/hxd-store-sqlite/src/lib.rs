@@ -70,7 +70,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -478,6 +478,16 @@ CREATE INDEX message_sent_fp ON message (sender_fp, sent_at)
   WHERE sender_fp IS NOT NULL;
 CREATE INDEX message_sent_login ON message (sender, sent_at)
   WHERE sender_fp IS NULL AND sender IS NOT NULL;
+";
+
+/// Avatar retention (`docs/avatars.md` §2): when each owner was last on
+/// the server, which is what ages out an identity's picture. A row that
+/// predates the column was last seen when it was set. The index leads
+/// with the owner's kind so the sweep reads identities' rows only.
+const SCHEMA_V12: &str = "
+ALTER TABLE avatar ADD COLUMN seen_at INTEGER NOT NULL DEFAULT 0;
+UPDATE avatar SET seen_at = set_at;
+CREATE INDEX avatar_identity_seen ON avatar (seen_at) WHERE owner LIKE 'i:%';
 ";
 
 /// Moderation (`docs/moderation.md` §7, `docs/news.md` §11). Version 2
@@ -1078,6 +1088,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 11 {
         steps.push_str(SCHEMA_V11);
+    }
+    if version < 12 {
+        steps.push_str(SCHEMA_V12);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -3062,6 +3075,52 @@ mod tests {
             .unwrap()
             .is_empty());
         let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_eleven_migrates_its_avatars_as_last_seen_when_set() {
+        use hxd_core::avatar::{AvatarOwner, AvatarStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            for (owner, set_at) in [("i:01", 1_000), ("i:02", 5_000), ("a:alice", 1_000)] {
+                conn.execute(
+                    "INSERT INTO avatar (owner, id, mime, width, height, bytes, set_at)
+                     VALUES (?1, ?2, 'image/png', 8, 8, x'00', ?3)",
+                    params![owner, [owner.len() as u8; 32].as_slice(), set_at],
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 11).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        // Only the identity set before the cutoff goes; the account set
+        // just as long ago stays.
+        assert_eq!(store.prune_identities(from_unix(2_000)).unwrap(), 1);
+        assert!(store
+            .load(&AvatarOwner::Account("alice".into()))
+            .unwrap()
+            .is_some());
+        let conn = Connection::open(&path).unwrap();
+        let left: Vec<String> = conn
+            .prepare("SELECT owner FROM avatar ORDER BY owner")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, ["a:alice", "i:02"]);
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();

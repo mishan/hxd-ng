@@ -144,6 +144,7 @@ impl Core {
                 // to it is a command, answered and not stored.
                 has_inbox: false,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
                 can_spam: false,
                 is_person: false,
@@ -603,6 +604,7 @@ mod tests {
                     transport: Transport::default(),
                     has_inbox: true,
                     attach_news: false,
+                    set_avatar: false,
                     moderate: false,
                     can_spam: false,
                     is_person: true,
@@ -855,6 +857,7 @@ mod tests {
                 transport: Transport::default(),
                 has_inbox: true,
                 attach_news: false,
+                set_avatar: false,
                 moderate: true,
                 can_spam: false,
                 is_person: true,

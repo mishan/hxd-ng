@@ -60,6 +60,13 @@ pub struct Account {
     /// May this account stage images for news posts? Server-local policy;
     /// defaults to the shared send-media access bit.
     pub attach_news: bool,
+    /// May this account set an avatar (`docs/avatars.md` §2)? Server-local
+    /// policy, the `[extra] set_avatar` key: neither GIF Icons nor the
+    /// access bitmap has a bit for it. Backend default: a password or a
+    /// linked identity, as `can_detach` — a change is decoded by this
+    /// server and announced to every session on it, and a door everyone
+    /// walks through should not be handed either.
+    pub set_avatar: bool,
     /// May this account redact, revoke, purge and read reports
     /// (`docs/moderation.md` §2)? Server-local policy, the `[extra]
     /// moderate` key. Backend default: the disconnect-users (kick) bit —

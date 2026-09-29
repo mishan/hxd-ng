@@ -272,7 +272,9 @@ Three layers, all `cargo test --workspace`:
   in one room, a photo crossing each way, and a revocation),
   `avatars.rs` (a picture set on either wire and shown on the other,
   GIF Icons' probe and Icon Change, an account's avatar surviving a
-  restart), `banner.rs` (the banner push after the agreement, and a
+  restart, a guest refused on both wires until its file allows it, the
+  interval outlasting a reconnect, the icon list rationed, and an
+  identity's avatar aged out of the database), `banner.rs` (the banner push after the agreement, and a
   banner file fetched over HTXF once per login), `inbox.rs` (offline
   private messages across both wires: queue, flush at login, resync,
   blocks, retention, the sender's daily quota refusing only

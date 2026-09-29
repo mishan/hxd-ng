@@ -651,6 +651,7 @@ async fn handle_login(
         addr: Some(peer.ip()),
         can_detach: account.can_detach,
         attach_news: account.attach_news,
+        set_avatar: account.set_avatar,
         moderate: account.moderate,
         can_spam: account.can_spam,
         // The plaintext listener is loopback-only and WSS is mandatory in

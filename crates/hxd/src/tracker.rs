@@ -1142,6 +1142,7 @@ mod tests {
                 transport: hxd_core::Transport::default(),
                 has_inbox: false,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
                 can_spam: false,
                 is_person: true,

@@ -1228,6 +1228,9 @@ struct Session {
     /// Change. The extension has no capability bit; a client that never
     /// asked is not handed a transaction it may not know.
     gif_icons: bool,
+    /// Get Icon List's allowance ([`ICON_LISTS`]), refilled continuously.
+    icon_list_tokens: f64,
+    icon_list_refill: Instant,
     /// Whether this session has been sent the banner, which happens once.
     banner_sent: bool,
     /// The image this session was told of and may still download: once,
@@ -1289,6 +1292,22 @@ impl Session {
             return false;
         }
         self.media_tokens -= 1.0;
+        true
+    }
+
+    /// May this session have another Get Icon List now? See
+    /// [`ICON_LISTS`].
+    fn take_icon_list(&mut self) -> bool {
+        let now = Instant::now();
+        self.icon_list_tokens = (self.icon_list_tokens
+            + now.duration_since(self.icon_list_refill).as_secs_f64()
+                / ICON_LIST_EVERY.as_secs_f64())
+        .min(ICON_LISTS);
+        self.icon_list_refill = now;
+        if self.icon_list_tokens < 1.0 {
+            return false;
+        }
+        self.icon_list_tokens -= 1.0;
         true
     }
 
@@ -1899,6 +1918,7 @@ async fn login_phase(
         can_detach: account.can_detach,
         has_inbox: account.has_inbox,
         attach_news: account.attach_news,
+        set_avatar: account.set_avatar,
         moderate: account.moderate,
         can_spam: account.can_spam,
         is_person: account.is_person(),
@@ -2034,6 +2054,8 @@ async fn login_phase(
         media_stream: None,
         transfer_addr: None,
         gif_icons: false,
+        icon_list_tokens: ICON_LISTS,
+        icon_list_refill: Instant::now(),
         banner_sent: false,
         banner_image: None,
     };
@@ -4027,6 +4049,19 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         // no support.
         gif_icons::GET_LIST if ctx.core.avatar_policy().is_some() => {
             sess.gif_icons = true;
+            // A request of a few bytes whose reply can reach a megabyte.
+            // GtkHx asks once, as its probe right after login, which is
+            // always inside the allowance: an error there would read as
+            // a server without the extension. A client asking in a loop
+            // is told to slow down.
+            if !sess.take_icon_list() {
+                reply_error(
+                    tx,
+                    f.trans,
+                    hxd_core::media::MediaReject::RateLimited.text(),
+                );
+                return;
+            }
             let (entries, left_out) = icon_list(&ctx.core.avatars());
             reply(tx, f.trans, entries);
             // What did not fit is announced as changed, which is what makes
@@ -4088,6 +4123,24 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             .await;
             match outcome {
                 Some(Ok(())) => reply(tx, f.trans, vec![]),
+                // `[extra] set_avatar`: answered as the success a set
+                // gets, and not applied — the core refused it before any
+                // decode or turn, so nothing is stored or announced. A
+                // deliberate stopgap for GtkHx 1.2 through 1.4.0 (every
+                // release so far), which re-send the saved icon after
+                // every login untasked, so a task error here is a toast
+                // at each one for every guest. The fix came after 1.4.0,
+                // on GtkHx's development line, so no release through
+                // 1.4.0 has it: releases after 1.4.0 send it under a task
+                // of its own and only log a refusal, and do not need
+                // this; a set their user makes by hand would show the
+                // refusal, as it should. The ng wire still answers
+                // `access_denied`, since a modern client can handle a
+                // refusal.
+                Some(Err(hxd_core::media::MediaReject::NotAuthorized)) => {
+                    debug!(uid, "set icon not allowed; answered as done, not applied");
+                    reply(tx, f.trans, vec![])
+                }
                 Some(Err(e)) => reply_error(tx, f.trans, e.text()),
                 None => reply_error(tx, f.trans, hxd_core::media::MediaReject::Busy.text()),
             }
@@ -4099,6 +4152,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
     }
 }
+
+/// How many Get Icon Lists a session may have in a burst, and how often
+/// one more comes back ([`ICON_LIST_EVERY`]). The first is always there,
+/// which is GtkHx's probe after login; the rest are for a client that
+/// refreshes, and a reconnect starts a fresh session with a fresh burst,
+/// which the connection limits already ration.
+const ICON_LISTS: f64 = 4.0;
+const ICON_LIST_EVERY: Duration = Duration::from_secs(15);
 
 /// The most a Get Icon List reply carries. GtkHx and mhxd's own client
 /// both accept a transaction of up to 1 MiB (`MAX_HOTLINE_PACKET_LEN` on

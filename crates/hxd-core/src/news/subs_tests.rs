@@ -157,6 +157,7 @@ impl Server {
                 transport: Transport::default(),
                 has_inbox: login != "guest",
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
                 can_spam: false,
                 is_person: login != "guest",

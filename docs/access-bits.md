@@ -215,6 +215,7 @@ key derives a default rather than being false.
 | `file_getinfo` | May this account ask for a file's or folder's info (legacy Get Info, ng `files_info`) | `true`, as for `file_list`. Downloading stays `download_files`, and a known name downloads without either |
 | `can_spam` | Is this account held to no flood or request limit (`[limits]` `chat_lines`, `spam_points`, `ng_requests`, `news_posts`): mhxd's `can_spam` | Tracks `disconnect_users`, as mhxd's administrators have it |
 | `attach_news` | May this account stage durable images for news posts | Tracks `send_media` (bit 57), so image-upload policy has one default on both chat and news while an operator may narrow either account. Either way only an account that is one person stages: a staged handle is its uploader's, and `guest` is several people |
+| `set_avatar` | May this account set an avatar, on either wire (`avatars.md` §2). GIF Icons has no bit for it and the bitmap should not grow one | The same rule as `can_detach`: a password *or* a linked identity. Every change is decoded by this server and announced to every session on it, so the bootstrap guest does not get one. Clearing is never refused |
 | `vouch` | May this account vouch for an identity key — `identity-vouch.md` §3.1, the requests in §3.2 there. *Design; not read by the server yet* | The same rule as `can_detach`: a password *or* a linked identity. An account that was itself created on the strength of a vouch derives `false` until the operator sets it |
 
 ---
@@ -261,7 +262,7 @@ stranger can be trusted with — `read_chat`, `read_chat_history`,
 `send_chat`, `create_pchats`, `send_msgs`, `get_user_info`,
 `use_any_name` — and a commented-out `send_media` with a note saying to
 read `inline-media.md` before uncommenting it. No password, so
-`can_detach` and `inbox` both derive false. Deleting the file disables
+`can_detach`, `inbox` and `set_avatar` all derive false. Deleting the file disables
 guest logins.
 
 **Accounts identity creates.** With `[identity] new_accounts = create`, a

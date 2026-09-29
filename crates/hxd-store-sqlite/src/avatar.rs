@@ -68,12 +68,14 @@ impl AvatarStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         match avatar {
             Some(a) => sql(conn.execute(
-                "INSERT INTO avatar (owner, id, mime, width, height, bytes, legacy_gif, set_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO avatar
+                   (owner, id, mime, width, height, bytes, legacy_gif, set_at, seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
                  ON CONFLICT (owner) DO UPDATE SET
                    id = excluded.id, mime = excluded.mime, width = excluded.width,
                    height = excluded.height, bytes = excluded.bytes,
-                   legacy_gif = excluded.legacy_gif, set_at = excluded.set_at",
+                   legacy_gif = excluded.legacy_gif, set_at = excluded.set_at,
+                   seen_at = excluded.seen_at",
                 params![
                     key(owner),
                     &a.meta.id.0[..],
@@ -100,6 +102,25 @@ impl AvatarStore for SqliteStore {
             )
             .optional())?
         .transpose()
+    }
+
+    fn seen(&self, owner: &AvatarOwner, at: SystemTime) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "UPDATE avatar SET seen_at = ?2 WHERE owner = ?1",
+            params![key(owner), unix(at)],
+        ))?;
+        Ok(())
+    }
+
+    fn prune_identities(&self, before: SystemTime) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // The `LIKE` is the index's own predicate, which is what lets
+        // the planner use it: identities' rows only, oldest first.
+        sql(conn.execute(
+            "DELETE FROM avatar WHERE owner LIKE 'i:%' AND seen_at < ?1",
+            params![unix(before)],
+        ))
     }
 }
 

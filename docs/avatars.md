@@ -46,6 +46,15 @@ it:
 | A guest that proved an identity | The identity's fingerprint | The same, for every guest session of that identity. |
 | Any other guest | None | The session: `guest` is a login many people share, so it cannot own a picture. |
 
+**Who may set one** is the account's `[extra] set_avatar`
+(`docs/access-bits.md` §4). Neither GIF Icons nor the access bitmap has
+a bit for it, and this is server-local policy, so it is not given one.
+It defaults to a password or a linked identity, as `can_detach` does:
+every change is decoded by this server and announced to every session
+on it, and `guest` is a door everyone walks through. An operator who
+wants guests to have pictures says so in `guest.toml`. Clearing is
+never refused.
+
 A session's avatar is its owner's avatar, loaded when the session logs
 in and before anyone is told the session exists, so a join never
 arrives without the picture and is never followed by a change to add
@@ -57,6 +66,14 @@ The durable store is the shared SQLite file (`[avatars] db`, or the
 database `[inbox]`, `[history]` or `[news]` names). A server with none
 keeps avatars in memory, which still carries an account's avatar from
 one session to the next until the process restarts.
+
+**An identity's avatar ages out.** An account is a file an operator
+wrote; an identity is a key anyone can mint, so the rows identities own
+are the ones that can grow without anyone's say. Each is stamped when it
+is set, when its identity logs in, and hourly while its identity is on
+the roster, and one not stamped for `identity_retain_days` (90 by
+default) is deleted by the hourly sweep. An account's avatar is never
+aged out.
 
 ## 3. The legacy wire: GIF Icons
 
@@ -76,6 +93,23 @@ Where this server differs, on purpose:
   as the extension says a server should check, and must go through the
   pipeline like any other image. mhxd stores whatever arrives.
   A refusal is a task error with readable text.
+- **Set Icon is not everyone's.** A session whose account may not set
+  an avatar (§2) is answered as a set is, with an empty reply, and the
+  icon is quietly not applied: nothing is decoded, stored or announced,
+  and no turn is spent. mhxd lets anyone. This is a stopgap for GtkHx
+  1.2 through 1.4.0 (every release so far), which send the saved icon
+  after every login without a task of their own, so a task error there
+  is a pop-up at every login for a guest on a server that keeps the
+  default. The fix came after 1.4.0, on GtkHx's development line, so no
+  release through 1.4.0 has it. Releases after 1.4.0 do not need the
+  stopgap: the login-time send carries its own task and a refusal of it
+  is only logged, while a set the user makes by hand would show its
+  refusal, as it should. The ng wire still answers `access_denied`,
+  since a modern client can handle a refusal.
+- **Get Icon List is rationed.** A session has a few in a burst and
+  one more every 15 seconds; past that it is a task error. A request of
+  a few bytes can be answered with a megabyte, and GtkHx asks once, as
+  its probe right after login, which the burst always covers.
 - **A user who joins already wearing an avatar is announced with Icon
   Change**, after the join. A user-list row cannot carry a picture, and
   a GIF-icon client fetches one only when told of a change; on mhxd the
@@ -145,13 +179,19 @@ GET /avatars/{id}
 
 `PUT /avatar` sets the calling session's owner's avatar. Refusals use
 the media routes' statuses and error bodies (`docs/inline-media.md`
-§8.2): 413, 415, 429 with `Retry-After`, 503. An owner gets one
-attempt per `set_interval` (10 s) — refused or not, since a refused one
-still cost a decode — and another inside it is 429 with `Retry-After`
-set to the interval. The allowance is the owner's and not the
-session's, because a change is shown on every session of the owner and
-each of those is announced to everyone; a session-only guest is its own
-owner. `avatar_clear` shares the allowance. A session that ends while
+§8.2): 403 for a session that may not set one (§2), 413, 415, 429 with
+`Retry-After`, 503. An owner gets one attempt per `set_interval`
+(10 s) — refused or not, since a refused one still cost a decode — and
+another inside it is 429 with `Retry-After` set to the interval. The
+allowance is the owner's and not the session's, because a change is
+shown on every session of the owner and each of those is announced to
+everyone. A guest is held by its address as well (an IPv6 one by its
+/64), and by its identity if it proved one: a reconnect is a new
+session and a new key costs nothing, so neither may be a new turn.
+`avatar_clear` shares the allowance. The decode itself runs on a budget
+of its own, one at a time, apart from `[media]`'s
+`max_concurrent_decodes`: avatar changes cannot keep chat's images
+waiting, nor chat's images avatars. A session that ends while
 its upload is being decoded changes nothing: the change is pinned to
 the session that asked, not to its uid.
 
@@ -190,7 +230,8 @@ always has.
 max_bytes = 262144        # the largest upload, on either wire
 max_dimension = 128       # what an avatar is fitted to
 legacy_max_bytes = 32768  # the legacy GIF rendition's ceiling
-set_interval = 10         # seconds between one session's changes
+set_interval = 10         # seconds between one owner's changes
+identity_retain_days = 90 # an identity's avatar, once it stops logging in; 0 keeps it
 # db = "avatars.db"       # default: the shared database, if any
 ```
 

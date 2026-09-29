@@ -475,7 +475,7 @@ impl Entry {
 
 /// A chunked upload in flight.
 struct Upload {
-    login: String,
+    quota: Quota,
     principal: Principal,
     declared: Option<String>,
     count: u16,
@@ -525,6 +525,22 @@ impl Window {
     }
 }
 
+/// What an uploader's own allowances are kept against: the interval, the
+/// hourly count and the open upload sessions.
+///
+/// An account that is one person is its login, wherever it connects
+/// from. One that is nobody in particular — `guest`, which everyone
+/// walks through — is the address it came from instead, as
+/// [`crate::limits::limit_key`] has it: keying it by the shared login
+/// would let one guest spend every other guest's allowance, which is a
+/// denial of service rather than a throttle. The per-address window
+/// still holds beside it for everyone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Quota {
+    Login(String),
+    Guest(String, IpAddr),
+}
+
 #[derive(Default)]
 struct AccountRate {
     last_upload: Option<Instant>,
@@ -540,7 +556,7 @@ struct StoreInner {
     order: VecDeque<Handle>,
     total_bytes: usize,
     uploads: HashMap<Handle, Upload>,
-    per_account: HashMap<String, AccountRate>,
+    per_account: HashMap<Quota, AccountRate>,
     per_addr: HashMap<IpAddr, Window>,
     /// Canonical hashes a moderator has blocked. Nuisance filtering: the
     /// same file re-uploaded is caught, a recompressed one is not, and
@@ -571,7 +587,9 @@ impl MediaStore {
 struct Uploader {
     login: String,
     mailbox: Option<Mailbox>,
+    /// [`crate::limits::limit_key`] of the session's address.
     addr: Option<IpAddr>,
+    quota: Quota,
     principal: Principal,
 }
 
@@ -653,10 +671,16 @@ impl Core {
         if !sess.access.has(bit::SEND_MEDIA) {
             return Err(MediaReject::NotAuthorized);
         }
+        let addr = sess.addr.map(crate::limits::limit_key);
+        let quota = match addr {
+            Some(addr) if !sess.is_person => Quota::Guest(sess.login.clone(), addr),
+            _ => Quota::Login(sess.login.clone()),
+        };
         Ok(Uploader {
             login: sess.login.clone(),
             mailbox: (sess.is_person || sess.identity.is_some()).then(|| sess.mailbox()),
-            addr: sess.addr,
+            addr,
+            quota,
             principal: Principal::Session {
                 uid,
                 serial: sess.serial,
@@ -1151,7 +1175,7 @@ impl MediaStore {
         let open = inner
             .uploads
             .values()
-            .filter(|u| u.login == who.login)
+            .filter(|u| u.quota == who.quota)
             .count();
         if open >= self.cfg.upload_sessions {
             return Err(MediaReject::Busy);
@@ -1160,7 +1184,7 @@ impl MediaStore {
         inner.uploads.insert(
             token,
             Upload {
-                login: who.login.clone(),
+                quota: who.quota.clone(),
                 principal: who.principal.clone(),
                 declared: part.declared.map(str::to_owned),
                 count,
@@ -1222,7 +1246,7 @@ impl MediaStore {
     ) -> Result<(), MediaReject> {
         self.ask_rate(inner, who, now)?;
         // Nothing can refuse it now, so both buckets pay.
-        let account = inner.per_account.entry(who.login.clone()).or_default();
+        let account = inner.per_account.entry(who.quota.clone()).or_default();
         account.hour.charge(now);
         account.last_upload = Some(now);
         if let Some(addr) = who.addr {
@@ -1242,10 +1266,10 @@ impl MediaStore {
         let hour = Duration::from_secs(3600);
         // Both buckets are *asked* before either is charged. Charging as
         // we go would let a refusal from the second one still spend the
-        // first's allowance, so two guests behind one address could
-        // drain the shared `guest` account's hour without a single
-        // upload landing — the opposite of what a quota is for.
-        let account = inner.per_account.entry(who.login.clone()).or_default();
+        // first's allowance, so a refused attempt could drain an
+        // account's hour without a single upload landing — the opposite
+        // of what a quota is for.
+        let account = inner.per_account.entry(who.quota.clone()).or_default();
         if account
             .last_upload
             .is_some_and(|t| now.duration_since(t) < self.cfg.upload_interval)
@@ -1258,9 +1282,9 @@ impl MediaStore {
         {
             return Err(MediaReject::RateLimited);
         }
-        // Every guest shares the `guest` account's bucket, deliberately:
-        // the shared door is the one that needs the throttle most. The
-        // address bucket is what tells two guests apart.
+        // A guest's own bucket is already its address's ([`Quota`]); this
+        // one is every account's there together, which is what stops one
+        // address from logging in as many accounts to multiply its hour.
         if let Some(addr) = who.addr {
             let per_addr = inner.per_addr.entry(addr).or_default();
             if !per_addr.would_admit(now, hour, self.cfg.upload_per_hour_per_addr) {

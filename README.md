@@ -886,14 +886,18 @@ the legacy wire, the `avatars` capability on the ng one, and one avatar
 crossing between them. An avatar belongs to the account (or to a guest's
 proven identity) and is kept in the shared database, so it is there at
 the next login. Uploads go through the inline-media pipeline, so this
-needs the `media` feature. See [docs/avatars.md](docs/avatars.md).
+needs the `media` feature, and are decoded one at a time on a budget
+apart from `[media]`'s. Setting one is the account's `[extra]
+set_avatar`, which defaults to a password or a linked identity, so the
+bootstrap guest has none. See [docs/avatars.md](docs/avatars.md).
 
 ```toml
 [avatars]                 # presence turns it on
 max_bytes = 262144        # the largest upload, on either wire
 max_dimension = 128       # what an avatar is fitted to
 legacy_max_bytes = 32768  # the GIF legacy clients are sent
-set_interval = 10         # seconds between one session's changes
+set_interval = 10         # seconds between one owner's changes
+identity_retain_days = 90 # an identity's avatar, once it stops logging in; 0 keeps it
 # db = "avatars.db"       # default: [inbox], [history] or [news]'s database
 ```
 
@@ -919,8 +923,8 @@ max_total_bytes = 268435456  # held across all live handles; oldest evicted
 history_access = "recipients" # or "readers": may a scrollback reader fetch?
 
 [media.rate]
-upload_interval = 10          # seconds between one account's uploads
-upload_per_hour = 30          # per account
+upload_interval = 10          # seconds between one account's uploads (a guest's: its address's)
+upload_per_hour = 30          # per account, or per guest address
 upload_per_hour_per_addr = 100
 download_per_minute = 60      # per session
 upload_sessions = 2           # chunked uploads in flight, per account

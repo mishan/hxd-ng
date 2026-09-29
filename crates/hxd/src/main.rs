@@ -1026,6 +1026,13 @@ async fn main() {
         if ctx.core.push_enabled() {
             tokio::spawn(hxd::device_sweeper(ctx.core.clone()));
         }
+        if config
+            .avatars
+            .as_ref()
+            .is_some_and(|a| a.identity_retain_days > 0)
+        {
+            tokio::spawn(hxd::avatar_pruner(ctx.core.clone()));
+        }
         // The audit trail's evidence window and closed reports' retention.
         tokio::spawn(hxd::moderation::pruner(ctx.core.clone()));
         #[cfg(unix)]

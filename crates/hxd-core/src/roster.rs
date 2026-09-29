@@ -707,6 +707,8 @@ pub(crate) struct UserSession {
     /// sender of a stored message is recorded only when it is true.
     pub(crate) has_inbox: bool,
     pub(crate) attach_news: bool,
+    /// See [`AttachInfo::set_avatar`].
+    pub(crate) set_avatar: bool,
     /// See [`AttachInfo::moderate`].
     pub(crate) moderate: bool,
     /// See [`AttachInfo::can_spam`].
@@ -763,6 +765,9 @@ pub struct AttachInfo {
     pub has_inbox: bool,
     /// May this session stage durable news attachments?
     pub attach_news: bool,
+    /// May this session set its owner's avatar? The account's `[extra]
+    /// set_avatar`, which defaults to a password or a linked identity.
+    pub set_avatar: bool,
     /// May this session moderate (`docs/moderation.md` §2)? The
     /// account's `[extra] moderate`, which defaults to the kick bit.
     pub moderate: bool,
@@ -1510,6 +1515,7 @@ impl Core {
                 kicked: false,
                 has_inbox: info.has_inbox,
                 attach_news: info.attach_news,
+                set_avatar: info.set_avatar,
                 moderate: info.moderate,
                 can_spam: info.can_spam,
                 flood: Default::default(),
@@ -1934,6 +1940,7 @@ pub(crate) fn test_attach(core: &Core, nick: &str, access: AccessBits) -> (Uid, 
             transport: Transport::default(),
             has_inbox: false,
             attach_news: false,
+            set_avatar: false,
             moderate: false,
             can_spam: false,
             is_person: false,
@@ -1974,6 +1981,7 @@ mod tests {
                 transport: Transport::default(),
                 has_inbox: true,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
                 can_spam: false,
                 is_person: true,
@@ -2054,6 +2062,7 @@ mod tests {
                 transport: Transport::default(),
                 has_inbox: false,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
                 can_spam: false,
                 is_person: false,
