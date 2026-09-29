@@ -782,11 +782,12 @@ news body is different: it declares its own type (news.md §5).
   User Change, the news writes their 1.5 transactions, `news_post`
   a threaded post, and the file-area changes their Delete File, New
   Folder, Set File Info and Move File. Past the first the session is kicked and its room told;
-  past the second it is kicked and its address banned for `[server]
-  ban_time` (on an address `[limits] exempt` holds to nothing, its
-  account's login or identity instead, and a plain guest is only
-  kicked), and public chat told. An account with `[extra] can_spam` is
-  held to neither.
+  past the second it is kicked and banned for `[server] ban_time` —
+  its account's login or its identity, and its address unless
+  `[limits] exempt` holds that to nothing, so a plain guest on an
+  exempt address is only kicked — and public chat told. A moderator's
+  `kick` with `ban` bans the same way (moderation.md §3.5). An account
+  with `[extra] can_spam` is held to neither.
 - **Roster pollution** is bounded by the detach rules of §2: permission
   per account and off for guests, a per-address cap, and moderation that
   ends a detached session on the spot.

@@ -453,10 +453,20 @@ async fn an_upload_crosses_the_tls_transfer_port() {
 #[tokio::test]
 async fn a_banned_address_gets_no_handshake_on_either_tls_port() {
     let server = start(Duration::from_secs(5)).await;
-    let victim = Client::tls(&server, "banned").await;
+    // Loopback is exempt, so a kick-with-ban would not ban it (only the
+    // person it kicks): the ban is placed on the address itself.
     server
         .core
-        .kick(victim.uid, Some(Duration::from_secs(60)))
+        .place_ban(
+            hxd_core::moderation::Actor::Operator,
+            hxd_core::ban::NewBan {
+                target: hxd_core::ban::BanTarget::parse("127.0.0.1", |_| None).unwrap(),
+                reason: "banned".into(),
+                note: None,
+                expires_at: None,
+                source: hxd_core::ban::BanSource::Moderator,
+            },
+        )
         .unwrap();
     for port in [server.tls, server.tls_htxf] {
         let tcp = TcpStream::connect(port).await.unwrap();

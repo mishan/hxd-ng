@@ -523,11 +523,12 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 .await
                 .unwrap_or(Err(hxd_core::ChatError::ServerError));
             match kicked {
-                Ok(nick) => {
+                Ok(hxd_core::Kicked { nick, banned }) => {
                     // The reference server's wording, which the legacy
-                    // kick uses too: one room, one announcement.
+                    // kick uses too: one room, one announcement, which
+                    // says "banned" only when a ban was placed.
                     let by_nick = core.user(uid).map(|u| u.nick).unwrap_or_default();
-                    let verb = if ban.is_some() { "banned" } else { "kicked" };
+                    let verb = if banned { "banned" } else { "kicked" };
                     core.chat_notice(0, uid, format!("{nick} has been {verb} by {by_nick}"));
                     reply_ok(id, json!({}))
                 }

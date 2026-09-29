@@ -2801,12 +2801,13 @@ async fn a_client_behind_a_proxy_does_not_choose_its_own_address() {
         ok["ok"].clone()
     }
 
-    // One connection through the proxy, banned by uid.
+    // One connection through the proxy, banned by uid: a guest's, so
+    // what the kick bans is its address alone, and bob stays welcome.
     let mut c = as_addr(ng, "203.0.113.7, 10.0.0.7")
         .await
         .expect("a fresh address behind two trusted proxy hops");
-    let ok = login(&mut c).await;
-    let uid = ok["self"]["uid"].as_u64().unwrap() as u16;
+    let ok = c.request("login", json!({ "nick": "guest" })).await;
+    let uid = ok["ok"]["self"]["uid"].as_u64().unwrap() as u16;
     ctx.core.kick(uid, Some(Duration::from_secs(60))).unwrap();
     drop(c);
 
@@ -2891,12 +2892,8 @@ async fn the_rfc_7239_header_is_read_only_where_the_operator_says_so() {
         );
         let (ws, _) = tokio_tungstenite::connect_async(req).await.ok()?;
         let mut c = Ng::from_ws(ws).await;
-        let ok = c
-            .request(
-                "login",
-                json!({ "login": "bob", "password": "s3cret", "nick": "Bob" }),
-            )
-            .await;
+        // A guest, whom a kick-with-ban bans by address alone.
+        let ok = c.request("login", json!({ "nick": "guest" })).await;
         ok["ok"]["self"]["uid"].as_u64()
     }
 

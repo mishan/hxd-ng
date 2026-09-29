@@ -1561,7 +1561,10 @@ pub struct ServerSection {
     /// Seconds a connection may take to complete its login.
     #[serde(default = "default_login_timeout")]
     pub login_timeout: u64,
-    /// Seconds a kick-with-ban keeps the address banned.
+    /// Seconds a kick-with-ban's ban lasts: on the person kicked (the
+    /// account's login, or the identity a guest proved) and on their
+    /// address unless `[limits] exempt` holds it, so a plain guest on an
+    /// exempt address is only kicked (`docs/moderation.md` §3.5).
     #[serde(default = "default_ban_time")]
     pub ban_time: u64,
     /// Set the cleartext marker bit in legacy user flags for unencrypted
@@ -1693,7 +1696,8 @@ pub struct LimitsSection {
     pub chat_seconds: u64,
     /// Spam points one session may spend in each `spam_seconds` window,
     /// every transaction costing what mhxd's table charges it, before it
-    /// is kicked and banned for `[server] ban_time`; 0 for no limit.
+    /// is kicked and banned for `[server] ban_time` as a kick-with-ban
+    /// bans; 0 for no limit.
     /// mhxd's `spam_max` and `spam_time`.
     #[serde(default = "default_spam_points")]
     pub spam_points: u32,

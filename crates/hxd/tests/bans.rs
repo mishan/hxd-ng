@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 const HDR_TASK: u32 = 0x0001_0000;
 const REQ_LOGIN: u32 = 0x6b;
+const REQ_USER_KICK: u32 = 0x6e;
 
 struct Server {
     legacy: SocketAddr,
@@ -56,6 +57,11 @@ impl Server {
 /// A server on `dir`'s config and database, written on first use: a
 /// restart is a second call on the same directory.
 async fn start(dir: &Path) -> Server {
+    start_with(dir, "").await
+}
+
+/// [`start`], with `extra` at the end of a config written now.
+async fn start_with(dir: &Path, extra: &str) -> Server {
     let d = dir.display();
     let path = dir.join("hxd-ng.toml");
     if !path.exists() {
@@ -63,7 +69,7 @@ async fn start(dir: &Path) -> Server {
             &path,
             format!(
                 "[paths]\naccounts = \"{d}/accounts\"\n[inbox]\ndb = \"{d}/hx.db\"\n\
-                 [ng]\nbind = \"127.0.0.1:0\"\n"
+                 [ng]\nbind = \"127.0.0.1:0\"\n{extra}"
             ),
         )
         .unwrap();
@@ -112,19 +118,25 @@ async fn classic_connect(addr: SocketAddr) -> TcpStream {
 }
 
 /// Bob's login on a classic connection: `Ok` or the task error's text.
-async fn classic_login(mut s: TcpStream) -> Result<(), String> {
-    let login = pack_frame(
+async fn classic_login(s: TcpStream) -> Result<(), String> {
+    classic_login_as(s, "bob").await.map(drop)
+}
+
+/// A login to `login`, whose password is `pw`, on a classic connection:
+/// the connection, logged in, or the task error's text.
+async fn classic_login_as(mut s: TcpStream, login: &str) -> Result<TcpStream, String> {
+    let frame = pack_frame(
         REQ_LOGIN,
         1,
         0,
         &[
-            (tag::LOGIN, xor(b"bob")),
+            (tag::LOGIN, xor(login.as_bytes())),
             (tag::PASSWORD, xor(b"pw")),
-            (tag::NAME, b"bob".to_vec()),
+            (tag::NAME, login.as_bytes().to_vec()),
             (tag::ICON, 1u16.to_be_bytes().to_vec()),
         ],
     );
-    s.write_all(&login).await.unwrap();
+    s.write_all(&frame).await.unwrap();
     loop {
         let f = timeout(Duration::from_secs(5), read_frame(&mut s))
             .await
@@ -132,7 +144,7 @@ async fn classic_login(mut s: TcpStream) -> Result<(), String> {
             .expect("closed before the reply");
         if f.ty == HDR_TASK && f.trans == 1 {
             if f.flag == 0 {
-                return Ok(());
+                return Ok(s);
             }
             let text = f
                 .chunks()
@@ -367,4 +379,201 @@ async fn an_address_ban_placed_between_connecting_and_logging_in_ends_the_sessio
         server.core.snapshot().iter().all(|u| u.nick != "bob"),
         "ended as it joined, not left on the roster"
     );
+}
+
+/// A moderator's account, and alice's, beside bob's: every password
+/// `pw`.
+fn more_accounts(dir: &Path) {
+    std::fs::write(
+        dir.join("accounts/mod.toml"),
+        "name = \"mod\"\npassword = \"pw\"\n[access]\nread_chat = true\n\
+         send_chat = true\ndisconnect_users = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("accounts/alice.toml"),
+        "name = \"alice\"\npassword = \"pw\"\n[access]\nread_chat = true\n",
+    )
+    .unwrap();
+}
+
+/// `login`'s ng session, kept open: the connection and its uid.
+async fn ng_session(addr: SocketAddr, login: &str) -> (Ws, u64) {
+    let mut ws = ng_connect(addr).await;
+    let ok = request(
+        &mut ws,
+        "login",
+        json!({ "login": login, "password": "pw", "nick": login }),
+    )
+    .await;
+    let uid = ok["ok"]["self"]["uid"].as_u64().expect("logged in");
+    (ws, uid)
+}
+
+/// Does a connection from here get the classic server's magic?
+async fn classic_answers(addr: SocketAddr) -> bool {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"TRTPHOTL\x00\x01\x00\x02").await.unwrap();
+    let mut magic = [0u8; 8];
+    matches!(
+        timeout(Duration::from_secs(5), s.read_exact(&mut magic)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// A moderator's kick-with-ban bans the person and, unlike mhxd's, the
+/// address only where `[limits] exempt` does not hold it. With loopback
+/// off the list, a classic kick-with-ban of bob refuses his login and
+/// the address both, as one ban that one lift undoes.
+#[tokio::test]
+async fn a_kick_ban_from_an_address_not_exempt_refuses_the_person_and_the_address() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start_with(
+        td.path(),
+        "[limits]\nexempt = []\nconnections_per_addr = 0\nreconnect_seconds = 0\n",
+    )
+    .await;
+    more_accounts(td.path());
+    let (_bob, bob) = ng_session(server.ng, "bob").await;
+    let mut moderator = classic_login_as(classic_connect(server.legacy).await, "mod")
+        .await
+        .expect("the moderator logs in");
+    let kick = pack_frame(
+        REQ_USER_KICK,
+        2,
+        0,
+        &[
+            (tag::UID, (bob as u32).to_be_bytes().to_vec()),
+            (tag::BAN, 1u32.to_be_bytes().to_vec()),
+        ],
+    );
+    moderator.write_all(&kick).await.unwrap();
+    loop {
+        let f = timeout(Duration::from_secs(5), read_frame(&mut moderator))
+            .await
+            .expect("no reply to the kick")
+            .unwrap();
+        if f.ty == HDR_TASK && f.trans == 2 {
+            assert_eq!(f.flag, 0, "the kick is done");
+            break;
+        }
+    }
+
+    assert!(server.core.is_banned("127.0.0.1".parse().unwrap()));
+    assert!(server.core.person_banned(Some("bob"), None, None).is_some());
+    assert!(
+        !classic_answers(server.legacy).await,
+        "the address, refused"
+    );
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{}/ng", server.ng))
+            .await
+            .is_err(),
+        "on both wires"
+    );
+    let bans = server.core.list_bans(true, None, 10).unwrap();
+    assert_eq!(bans.len(), 2, "bob's login and his address: {bans:?}");
+    assert_eq!(bans[0].act, bans[1].act, "one act");
+    assert!(bans
+        .iter()
+        .all(|b| b.source == hxd_core::ban::BanSource::Kick && b.actor == "mod"));
+
+    let lifted = server
+        .core
+        .lift_ban(hxd_core::moderation::Actor::Operator, bans[0].id)
+        .unwrap();
+    assert_eq!(lifted.len(), 2, "lifting either row lifts both");
+    classic(server.legacy).await.expect("bob, lifted");
+    ng(server.ng).await.expect("bob, lifted, on ng");
+}
+
+/// From an address `[limits] exempt` holds (loopback, by default), a
+/// moderator's kick-with-ban refuses the person alone: bob is refused
+/// on both wires, and alice, from the very same address, gets in.
+#[tokio::test]
+async fn a_kick_ban_from_an_exempt_address_refuses_the_person_alone() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path()).await;
+    more_accounts(td.path());
+    let (_bob, bob) = ng_session(server.ng, "bob").await;
+    let (mut moderator, _) = ng_session(server.ng, "mod").await;
+    let kicked = request(&mut moderator, "kick", json!({ "uid": bob, "ban": 60 })).await;
+    assert!(kicked.get("ok").is_some(), "{kicked}");
+
+    assert!(!server.core.is_banned("127.0.0.1".parse().unwrap()));
+    let refused = classic(server.legacy).await.unwrap_err();
+    assert_eq!(
+        refused,
+        "You are banned from this server: banned by a moderator"
+    );
+    assert_eq!(ng(server.ng).await.unwrap_err()["code"], "banned");
+    classic_login_as(classic_connect(server.legacy).await, "alice")
+        .await
+        .expect("another account from the same address");
+
+    let bans = server.core.list_bans(true, None, 10).unwrap();
+    assert_eq!(bans.len(), 1, "bob's login alone: {bans:?}");
+    server
+        .core
+        .lift_ban(hxd_core::moderation::Actor::Operator, bans[0].id)
+        .unwrap();
+    classic(server.legacy).await.expect("bob, lifted");
+}
+
+/// A plain guest on an address `[limits] exempt` holds (loopback, by
+/// default) has nothing of its own to ban: a classic kick-with-ban of
+/// one places no ban, and public chat hears, in the reference server's
+/// bytes, that it was kicked, not banned.
+#[tokio::test]
+async fn a_classic_kick_ban_of_a_plain_guest_on_an_exempt_address_only_kicks() {
+    const HDR_CHAT: u32 = 0x6a;
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path()).await;
+    more_accounts(td.path());
+    let mut guest = ng_connect(server.ng).await;
+    let ok = request(&mut guest, "login", json!({ "nick": "drifter" })).await;
+    let guest_uid = ok["ok"]["self"]["uid"].as_u64().expect("a guest logs in");
+    let mut moderator = classic_login_as(classic_connect(server.legacy).await, "mod")
+        .await
+        .expect("the moderator logs in");
+    let kick = pack_frame(
+        REQ_USER_KICK,
+        2,
+        0,
+        &[
+            (tag::UID, (guest_uid as u32).to_be_bytes().to_vec()),
+            (tag::BAN, 1u32.to_be_bytes().to_vec()),
+        ],
+    );
+    moderator.write_all(&kick).await.unwrap();
+    let mut done = false;
+    let mut announced = None;
+    while !done || announced.is_none() {
+        let f = timeout(Duration::from_secs(5), read_frame(&mut moderator))
+            .await
+            .expect("no reply to the kick, or no announcement")
+            .unwrap();
+        if f.ty == HDR_TASK && f.trans == 2 {
+            assert_eq!(f.flag, 0, "the kick is done");
+            done = true;
+        } else if f.ty == HDR_CHAT {
+            let body = f
+                .chunks()
+                .find(|c| c.tag == tag::BODY)
+                .map(|c| c.data.to_vec())
+                .unwrap_or_default();
+            if body.windows(6).any(|w| w == b"drifte") {
+                announced = Some(body);
+            }
+        }
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&announced.unwrap()),
+        "\r<drifter has been kicked by mod>"
+    );
+    assert!(server.core.list_bans(true, None, 10).unwrap().is_empty());
+    assert!(!server.core.is_banned("127.0.0.1".parse().unwrap()));
+    let mut again = ng_connect(server.ng).await;
+    let back = request(&mut again, "login", json!({ "nick": "drifter" })).await;
+    assert!(back.get("ok").is_some(), "the guest may come back: {back}");
 }

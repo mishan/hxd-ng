@@ -226,7 +226,8 @@ bind = "0.0.0.0:5500"
 name = "My Server"
 version = 185           # 0 mimics a pre-1.5 server
 login_timeout = 10
-ban_time = 1800         # seconds a kick-with-ban holds the address; kept
+ban_time = 1800         # seconds a kick-with-ban holds the person, and an
+                        # address [limits] does not exempt; kept
                         # in the [moderation] database, so a restart does
                         # not lift it
 stamp_queued = true     # stamp a message that waited in the inbox with its
@@ -305,13 +306,13 @@ mhxd's table gives it (a chat line or a private message 2, a user list
 fetching icons, cost nothing), as does an ng request that stands for
 one of them (`chat`, `msg`, `nick`, the news posts, deletes and
 creates, and the file-area changes); a user
-who reaches `spam_points` is kicked and its address banned for
-`[server] ban_time`, and public chat is told as mhxd tells it. An
-address in `exempt` is never banned for it, since everyone behind a
-shared proxy would go with the flooder: there the ban is on the
-account's login (or the identity a guest came with), and a plain guest
-is only kicked. Exempt a proxy that hides its clients' addresses for
-this too. An account
+who reaches `spam_points` is kicked and banned for `[server]
+ban_time`, and public chat is told as mhxd tells it. The ban is on the
+account's login (or the identity a guest came with) and on the
+address, except an address in `exempt`, which is never banned for it,
+since everyone behind a shared proxy would go with the flooder; a plain
+guest there is only kicked. A moderator's kick-with-ban bans the same
+way. Exempt a proxy that hides its clients' addresses for this too. An account
 with `[extra] can_spam = true` is held to neither, which by default is
 every account with the kick bit. A load test from one machine wants
 both at 0.
@@ -1300,8 +1301,13 @@ or an identity (`identity:FINGERPRINT`, whether it logs in with its key
 or as the account it links) at login, with its reason, on both wires.
 A registrar's every identity (`*@HOST`) is refused when a login proves
 one of its handles, which a password login does not. A kick-with-ban is
-one too, on the kicked address for `ban_time`, and disconnects only the
-one kicked, as mhxd's does. A running server applies
+one too, for `ban_time`, and disconnects only the one kicked, as mhxd's
+does. Where mhxd bans the kicked address, this bans the person — the
+account's login, or the identity a guest proved — and the address only
+when `[limits] exempt` does not hold it: behind Docker's userland proxy,
+a TCP proxy or a CGNAT, an address ban would lock out everyone. A plain
+guest on an exempt address is only kicked. Lifting either row lifts
+both. A running server applies
 `hxd ban` on SIGHUP, ending the sessions a new ban refuses.
 
 Images live in the running server's memory, not in the database, so

@@ -386,7 +386,16 @@ async fn pm_broadcast_and_access_gates() {
 #[tokio::test]
 async fn kick_ban_and_untouchable_targets() {
     let td = tempfile::tempdir().unwrap();
-    let (addr, ctx) = start_server(td.path()).await;
+    // Loopback off the exempt list: a kick-with-ban of a guest on an
+    // exempt address bans nothing, and this is mhxd's ban of the address.
+    let core = Core::new().with_conn_limits(hxd_core::ConnLimits {
+        per_addr: 0,
+        per_v6_48: 0,
+        reconnect: Duration::ZERO,
+        per_account: 0,
+        exempt: hxd_core::AddrSet::default(),
+    });
+    let (addr, ctx) = start_server_with(td.path(), core).await;
     let mut admin = Client::login(addr, "root", "admin", "pw").await;
     let mut victim = Client::login(addr, "victim", "", "").await;
     let armored = Client::login(addr, "tank", "armored", "").await;

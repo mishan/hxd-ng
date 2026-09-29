@@ -1667,7 +1667,7 @@ fn kicked(events: Vec<Event>) -> bool {
 }
 
 #[test]
-fn a_kick_with_a_ban_refuses_the_address_and_ends_only_its_target() {
+fn a_kick_with_a_ban_refuses_the_person_and_the_address_and_ends_only_its_target() {
     let s = server();
     let shared: std::net::IpAddr = "192.0.2.7".parse().unwrap();
     let at = |who: Who| Who {
@@ -1720,14 +1720,20 @@ fn a_kick_with_a_ban_refuses_the_address_and_ends_only_its_target() {
     assert!(!kicked(drain(&mut dave_rx)), "nor another address");
     assert!(s.core.is_banned("::ffff:192.0.2.7".parse().unwrap()));
     assert!(!s.core.is_banned("192.0.2.8".parse().unwrap()));
+    assert!(s.core.person_banned(Some("bob"), None, None).is_some());
+    assert!(s.core.person_banned(Some("eve"), None, None).is_none());
 
     let bans = s.core.list_bans(true, None, 10).unwrap();
-    assert_eq!(bans.len(), 1);
-    assert_eq!(bans[0].source, crate::ban::BanSource::Kick);
-    assert_eq!(bans[0].actor, "carol");
-    assert!(bans[0].expires_at.is_some());
+    assert_eq!(bans.len(), 2, "bob's login and his address");
     let act = &s.store.acts(None, 1).unwrap()[0];
-    assert_eq!((act.kind, act.id), (ActKind::Ban, bans[0].act.unwrap()));
+    assert_eq!(act.kind, ActKind::Ban);
+    assert_eq!(act.login.as_deref(), Some("bob"));
+    for ban in &bans {
+        assert_eq!(ban.source, crate::ban::BanSource::Kick);
+        assert_eq!(ban.actor, "carol");
+        assert!(ban.expires_at.is_some());
+        assert_eq!(ban.act, Some(act.id), "one act");
+    }
 }
 
 #[test]

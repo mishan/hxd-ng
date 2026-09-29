@@ -161,7 +161,10 @@ pub struct ServerConfig {
     pub agreement: Option<String>,
     /// How long a connection may exist before completing its login.
     pub login_timeout: Duration,
-    /// How long a kick-with-ban keeps the address banned.
+    /// How long a kick-with-ban's ban lasts: on the person kicked (the
+    /// account's login, or the identity a guest proved) and on their
+    /// address unless `[limits] exempt` holds it, so a plain guest on an
+    /// exempt address is only kicked (`docs/moderation.md` §3.5).
     pub ban_time: Duration,
     /// The `DATA_CAPABILITIES` bits this server can actually honor. A
     /// session negotiates the intersection of these and what the client
@@ -3740,13 +3743,17 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .await
                 .unwrap_or(Err(ChatError::ServerError));
             match kicked {
-                Ok(nick) => {
+                Ok(hxd_core::Kicked { nick, banned }) => {
                     reply(tx, f.trans, vec![]);
                     // The public-chat announcement, in the reference
                     // server's wording (each frontend adds its own framing
-                    // — this edge renders it as `\r<text>`).
+                    // — this edge renders it as `\r<text>`). "Banned"
+                    // only when a ban was placed: a guest on an address
+                    // `[limits] exempt` holds to nothing is only kicked
+                    // (`Core::kick_ban_targets`), where mhxd bans the
+                    // address and says so.
                     let by = ctx.core.user(sess.uid).map(|u| u.nick).unwrap_or_default();
-                    let verb = if ban { "banned" } else { "kicked" };
+                    let verb = if banned { "banned" } else { "kicked" };
                     ctx.core
                         .chat_notice(0, sess.uid, format!("{nick} has been {verb} by {by}"));
                 }

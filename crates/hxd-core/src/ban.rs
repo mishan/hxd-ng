@@ -520,40 +520,75 @@ impl crate::Core {
         acting: &crate::moderation::Acting,
         ban: NewBan,
     ) -> Result<Vec<Ban>, crate::moderation::ModError> {
+        self.place_bans_as(acting, ban, Vec::new())
+    }
+
+    /// [`Core::place_ban_as`], banning each of `also` beside
+    /// `ban.target` in the same act and on the same terms: a kick's ban
+    /// on the person and on their address is one ban, and lifting either
+    /// row lifts both (`Core::lift_ban`). Any target refused refuses
+    /// them all.
+    ///
+    /// A store that fails partway leaves the rows written before it
+    /// standing, and they are what is returned, with the failure in the
+    /// log; only a ban of which no row was written is an error. Undoing
+    /// the rows already written is not clean: one may have extended a
+    /// ban that stood before this act (`ModerationStore::ban`), and the
+    /// store keeps no earlier expiry to put back. So what the caller
+    /// reports is what stands.
+    pub(crate) fn place_bans_as(
+        &self,
+        acting: &crate::moderation::Acting,
+        ban: NewBan,
+        also: Vec<BanTarget>,
+    ) -> Result<Vec<Ban>, crate::moderation::ModError> {
         use crate::moderation::{Act, ActKind, ModError};
         if ban.reason.trim().is_empty() {
             return Err(ModError::BadRequest("a ban needs a reason"));
         }
-        let mut targets = vec![ban.target.clone()];
-        match &ban.target {
-            // `guest` is everyone who walks in, and the server account is
-            // the server: disabling the one and refusing the other are
-            // not bans. Nor is refusing yourself.
-            BanTarget::Login(l) => {
-                if l == "guest" || l.is_empty() || self.is_system_login(l) {
-                    return Err(ModError::BadRequest(
-                        "not that login: disable the account instead",
-                    ));
+        // Only a session can be the one it bans. The operator acts under
+        // a name (`OPERATOR`) that no reserved login is, so an account
+        // that happens to share it is banned like any other.
+        let own_login = acting.uid.map(|_| acting.name.to_lowercase());
+        let own_fp = acting.uid.and(acting.fingerprint);
+        let mut targets: Vec<BanTarget> = Vec::with_capacity(2 + also.len());
+        for target in std::iter::once(ban.target.clone()).chain(also) {
+            let mut twin = None;
+            match &target {
+                // `guest` is everyone who walks in, and the server account
+                // is the server: disabling the one and refusing the other
+                // are not bans. Nor is refusing yourself.
+                BanTarget::Login(l) => {
+                    if l == "guest" || l.is_empty() || self.is_system_login(l) {
+                        return Err(ModError::BadRequest(
+                            "not that login: disable the account instead",
+                        ));
+                    }
+                    if own_login.as_ref() == Some(l) {
+                        return Err(ModError::BadRequest("a moderator does not ban themselves"));
+                    }
+                    // The account as it stands, whether or not it keeps a
+                    // mailbox: an account that takes no mail links a key
+                    // all the same.
+                    twin = self
+                        .directory
+                        .as_ref()
+                        .and_then(|d| d.account(l))
+                        .and_then(|(m, _)| m.fingerprint)
+                        .map(BanTarget::Identity);
                 }
-                if *l == acting.name.to_lowercase() {
-                    return Err(ModError::BadRequest("a moderator does not ban themselves"));
+                BanTarget::Identity(fp) => {
+                    if own_fp.as_ref() == Some(fp) {
+                        return Err(ModError::BadRequest("a moderator does not ban themselves"));
+                    }
                 }
-                // The account as it stands, whether or not it keeps a
-                // mailbox: an account that takes no mail links a key all
-                // the same.
-                let linked = self
-                    .directory
-                    .as_ref()
-                    .and_then(|d| d.account(l))
-                    .and_then(|(m, _)| m.fingerprint);
-                targets.extend(linked.map(BanTarget::Identity));
+                BanTarget::Address { .. } | BanTarget::Registrar(_) => {}
             }
-            BanTarget::Identity(fp) => {
-                if acting.fingerprint.as_ref() == Some(fp) {
-                    return Err(ModError::BadRequest("a moderator does not ban themselves"));
+            for t in std::iter::once(target).chain(twin) {
+                if !targets.contains(&t) {
+                    targets.push(t);
                 }
             }
-            BanTarget::Address { .. } | BanTarget::Registrar(_) => {}
         }
         let now = SystemTime::now();
         let fp_text = |fp: &[u8; 32]| hl_fingerprint(fp);
@@ -569,9 +604,10 @@ impl crate::Core {
             ),
             None => format!("{} until lifted", described.join(", ")),
         });
-        if let BanTarget::Login(l) = &ban.target {
-            act.login = Some(l.clone());
-        }
+        act.login = targets.iter().find_map(|t| match t {
+            BanTarget::Login(l) => Some(l.clone()),
+            _ => None,
+        });
         act.fingerprint = targets.iter().find_map(|t| match t {
             BanTarget::Identity(fp) => Some(*fp),
             _ => None,
@@ -581,6 +617,7 @@ impl crate::Core {
             None => None,
         };
         let mut placed = Vec::with_capacity(targets.len());
+        let wanted = targets.len();
         {
             let _writing = self.ban_writes.lock().unwrap();
             for target in targets {
@@ -598,8 +635,18 @@ impl crate::Core {
                     lifted_by: None,
                     act: act_id,
                 };
-                let row = match self.moderation.as_ref() {
-                    Some(store) => store.ban(&row)?,
+                let row = match self.moderation.as_ref().map(|store| store.ban(&row)) {
+                    Some(Ok(row)) => row,
+                    Some(Err(e)) if placed.is_empty() => return Err(e.into()),
+                    Some(Err(e)) => {
+                        tracing::warn!(
+                            act = act_id,
+                            placed = placed.len(),
+                            wanted,
+                            "ban: the store failed partway, and the rows written stand: {e}"
+                        );
+                        break;
+                    }
                     // With nothing to keep it in, a ban lasts as long as
                     // the process, as every ban did before there was a
                     // store.
@@ -629,7 +676,8 @@ impl crate::Core {
 
     /// Lift a ban as `by`, and with it every standing ban placed in the
     /// same act: a login ban's twin on the identity its account links
-    /// (`Core::place_ban`) is one ban of one person, and lifting only
+    /// (`Core::place_ban`), or a kick's ban on a person and on their
+    /// address (`Core::kick_ban_targets`), is one ban, and lifting only
     /// the row named would leave that person refused while the lift said
     /// they were not. A row the act only extended, standing before it,
     /// is another act's ban and is left as it now stands. Returns every

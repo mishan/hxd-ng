@@ -39,7 +39,7 @@ pub use avatar::{
     AvatarStore, MemoryAvatars,
 };
 pub use budget::{Over, QueueBudget, Share, QUEUE_BUDGET};
-pub use chat::{ChatError, Flooded, KickBan, MsgOutcome, SpamBan};
+pub use chat::{ChatError, Flooded, KickBan, Kicked, MsgOutcome, SpamBan};
 pub use files::{
     FileBody, FileEntry, FileError, FileFuture, FileInfo, FileKind, FilePath, FilePrincipal,
     FileSource,
