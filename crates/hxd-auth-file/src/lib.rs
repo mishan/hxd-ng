@@ -162,9 +162,16 @@ struct ExtraTable {
     /// May this account stage durable news attachments? Default: the
     /// shared send-media access bit.
     attach_news: Option<bool>,
+    /// May this account set an avatar? Default: a password or a linked
+    /// identity, as `can_detach` — the bootstrap guest cannot, since
+    /// every change is decoded here and announced to everyone.
+    set_avatar: Option<bool>,
     /// May this account redact, revoke, purge and read reports? Default:
     /// the disconnect_users (kick) bit (`docs/moderation.md` §2).
     moderate: Option<bool>,
+    /// Is this account held to no flood limit? mhxd's `can_spam`.
+    /// Default: the disconnect_users (kick) bit.
+    can_spam: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -223,9 +230,19 @@ impl AccountFile {
                 .extra
                 .attach_news
                 .unwrap_or_else(|| access.has(bit::SEND_MEDIA)),
+            // A person, by the rule above: a picture set through `guest`
+            // would be decoded on anyone's say-so and shown to everyone.
+            set_avatar: self
+                .extra
+                .set_avatar
+                .unwrap_or(has_password || fingerprint.is_some()),
             moderate: self
                 .extra
                 .moderate
+                .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
+            can_spam: self
+                .extra
+                .can_spam
                 .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
             identity: IdentityLink {
                 fingerprint,
@@ -1082,6 +1099,7 @@ mod tests {
         assert!(!g.set_subject);
         assert!(!g.attach_news);
         assert!(!g.moderate);
+        assert!(!g.set_avatar, "the bootstrap guest sets no avatar");
         // Passworded admin: both derived on.
         write(
             td.path(),
@@ -1092,16 +1110,18 @@ mod tests {
         assert!(r.can_detach);
         assert!(r.set_subject);
         assert!(r.attach_news);
+        assert!(r.set_avatar);
         // The kick bit makes a moderator (`docs/moderation.md` §2).
         assert!(r.moderate);
         // Explicit overrides beat the derivation, both directions.
         write(
             td.path(),
             "kiosk.toml",
-            "[extra]\ncan_detach = true\nset_subject = true\nattach_news = true\nmoderate = true\n",
+            "[extra]\ncan_detach = true\nset_subject = true\nattach_news = true\nmoderate = true\n\
+             set_avatar = true\n",
         );
         let k = auth.authenticate("kiosk", Proof::Plain(b"")).unwrap();
-        assert!(k.can_detach && k.set_subject && k.attach_news && k.moderate);
+        assert!(k.can_detach && k.set_subject && k.attach_news && k.moderate && k.set_avatar);
         write(
             td.path(),
             "bouncer.toml",
@@ -1115,10 +1135,12 @@ mod tests {
         write(
             td.path(),
             "probation.toml",
-            "password = \"pw\"\n[access]\nsend_media = true\n[extra]\ncan_detach = false\nattach_news = false\n",
+            "password = \"pw\"\n[access]\nsend_media = true\n[extra]\ncan_detach = false\nattach_news = false\n\
+             set_avatar = false\n",
         );
         let p = auth.authenticate("probation", Proof::Plain(b"pw")).unwrap();
         assert!(!p.can_detach);
+        assert!(!p.set_avatar);
         assert!(!p.attach_news);
     }
 
@@ -1680,6 +1702,7 @@ mod tests {
             a.can_detach,
             "a linked, password-less account is still a person"
         );
+        assert!(a.set_avatar);
         assert!(a.access.has(bit::SEND_CHAT) && !a.access.has(bit::DELETE_FILES));
         assert_eq!(
             auth.find_by_fingerprint(&fp).unwrap().unwrap().login,

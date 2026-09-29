@@ -617,6 +617,43 @@ async fn http(
     }
 }
 
+/// A request whose body is promised and never sent: the status and
+/// headers, which arrive only if the server answers without reading it.
+async fn unsent_body(
+    addr: SocketAddr,
+    path: &str,
+    extra: &[(&str, &str)],
+    promised: usize,
+) -> (u16, Vec<(String, String)>) {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {promised}\r\n");
+    for (k, v) in extra {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("the server waited for a body it was going to refuse")
+            .unwrap();
+        assert!(n > 0, "closed unanswered");
+        raw.extend_from_slice(&buf[..n]);
+    }
+    let head = String::from_utf8_lossy(&raw).to_string();
+    let mut lines = head.lines();
+    let status = lines.next().unwrap().split_whitespace().nth(1).unwrap();
+    let headers = lines
+        .filter_map(|l| {
+            l.split_once(':')
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+        })
+        .collect();
+    (status.parse().unwrap(), headers)
+}
+
 async fn ng_upload(addr: SocketAddr, bearer: &str, bytes: &[u8]) -> HttpReply {
     http(
         addr,
@@ -1159,6 +1196,40 @@ async fn the_ng_upload_maps_each_refusal_onto_a_status() {
     let denied = ng_upload(ng, &nobody.bearer, &png(8, 8)).await;
     assert_eq!(denied.status, 403);
     assert_eq!(denied.json()["error"]["code"], "access_denied");
+}
+
+#[tokio::test]
+async fn an_upload_past_its_allowance_is_refused_before_its_body_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, ng) = start_server(
+        dir.path(),
+        MediaConfig {
+            upload_interval: Duration::from_secs(60),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (alice, _) = Ng::login(ng, "alice").await;
+    let first = ng_upload(ng, &alice.bearer, &png(8, 8)).await;
+    assert_eq!(first.status, 201);
+    // The second promises a body it never sends, and is answered anyway:
+    // the allowance is asked about before a byte of it is read.
+    let (status, headers) = unsent_body(
+        ng,
+        "/media",
+        &[
+            ("Authorization", &alice.bearer),
+            ("Content-Type", "image/png"),
+        ],
+        100_000,
+    )
+    .await;
+    assert_eq!(status, 429);
+    assert!(headers.iter().any(|(k, _)| k == "retry-after"));
+    // And a client that sends the whole of a large one before reading
+    // the answer still reads it, rather than losing it to a reset.
+    let whole = ng_upload(ng, &alice.bearer, &noisy_png(200, 200)).await;
+    assert_eq!(whole.status, 429);
 }
 
 #[tokio::test]

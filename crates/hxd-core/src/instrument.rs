@@ -312,11 +312,41 @@ pub fn checkpoint_busy(db: &str) {
     let _ = db;
 }
 
+/// A session kicked for talking faster than it may: `chat` past its
+/// chat lines, `spam` past its spam points.
+pub fn flood_kick(what: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_flood_kicks_total", "what" => what).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = what;
+}
+
+/// A request answered `rate_limited` on `wire`: `requests` past its
+/// session's request limit, `news_post` past its account's news
+/// posts, `history` and `news_search` past their own.
+pub fn rate_limited(wire: &'static str, reason: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_rate_limited_total", "wire" => wire, "reason" => reason).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (wire, reason);
+}
+
 /// A login refused because the server was already working on as many as
 /// it takes (`Core::admit_login`).
 pub fn login_refused_busy() {
     #[cfg(feature = "metrics")]
     metrics::counter!("hxd_logins_refused_busy_total").increment(1);
+}
+
+/// Something refused for coming too fast or too often from one address,
+/// before any work was done on it: `login` (an address past its failed
+/// logins), `challenge` (`/identity/challenge`), `fetch` (an avatar or a
+/// news image), `upload` (an upload refused before its body was read).
+pub fn throttled(what: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_throttled_total", "what" => what).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = what;
 }
 
 /// A detached session's buffer overflowed; its resume will be a resync.
@@ -425,6 +455,40 @@ pub fn voice_call(op: &'static str, took: Timer) {
     metrics::histogram!("hxd_voice_media_seconds", "op" => op).record(took.elapsed());
     #[cfg(not(feature = "metrics"))]
     let _ = (op, took);
+}
+
+/// A voice operation refused because the session had spent its
+/// allowance (`crate::voice::VoiceLimits`): `join` or `video`.
+pub fn voice_refused(what: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_voice_refused_total", "what" => what).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = what;
+}
+
+/// Inbound RTP the SFU dropped for arriving faster than its stream may:
+/// `packets` of `stream` (`audio`, `camera`, `screen`).
+pub fn voice_policed(stream: &'static str, packets: u64) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_voice_policed_packets_total", "stream" => stream).increment(packets);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (stream, packets);
+}
+
+/// A stream the SFU ended for staying far over its rate: the session,
+/// for `audio`, or the publication, for `camera` or `screen`.
+pub fn voice_policed_end(stream: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_voice_policed_ends_total", "stream" => stream).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = stream;
+}
+
+/// A client's trickled ICE candidate the SFU ignored because the session
+/// already holds as many as it takes.
+pub fn voice_ice_ignored() {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_voice_ice_ignored_total").increment(1);
 }
 
 /// A file transfer in progress, `download` or `upload`, until the guard

@@ -23,6 +23,15 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
     let Some(uid) = bearer_session(&req, ctx) else {
         return unauthorized();
     };
+    // Asked before the body is read, as `/media` asks
+    // (`crate::media::upload`); spent by the staging after it.
+    if let Err(e) = ctx.core.news_attach_admits(uid) {
+        if e == NewsError::Media(MediaReject::RateLimited) {
+            hxd_core::instrument::throttled("upload");
+        }
+        crate::media::discard(req.into_body(), policy.max_bytes);
+        return refused(&e);
+    }
     if req
         .headers()
         .get(hyper::header::CONTENT_LENGTH)
@@ -124,6 +133,16 @@ pub async fn download(id: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
     let Some(uid) = bearer_session(&req, ctx) else {
         return not_found();
     };
+    // An image fetched by a session, so it draws on the allowance
+    // `/media` does (§9 of the ng spec). A server with news images and
+    // no `[media]` has no allowance configured, and gets the default.
+    let per_minute = ctx.core.media_config().map_or_else(
+        || hxd_core::MediaConfig::default().download_per_minute,
+        |c| c.download_per_minute,
+    );
+    if !crate::media::allow_download(&req, ctx, per_minute) {
+        return reject(MediaReject::RateLimited);
+    }
     let Some(handle) = hxd_core::media::handle_from_str(id) else {
         return not_found();
     };

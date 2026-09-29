@@ -29,18 +29,107 @@
 //! await, and never a call back into [`Core`]. Media-originated events
 //! come back the other way through [`Core::voice_media_event`], from the
 //! SFU's own task.
+//!
+//! **What a session may cost the room.** Every join and leave
+//! renegotiates the whole room, every video start or subscription change
+//! renegotiates the peers it touches, and every mute or pause flip is a
+//! status to everyone in the room — all of it under the roster lock. So
+//! joins and video changes are drawn from per-session allowances
+//! ([`VoiceLimits`]), refused past them with how long to wait, and a
+//! burst of mute and pause flips is coalesced into the one status that
+//! carries where it ended up. What is never refused is the way out: a
+//! leave, a video stop, a narrowed subscription set, a mute and a pause
+//! always work, and none of them needs an allowance, since each undoes
+//! something that spent one or costs the room a status it will get at
+//! most once per debounce window.
 
 pub mod fake;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use crate::limits::Bucket;
 use crate::roster::{Event, RosterInner, Uid};
-use crate::video::{VideoKind, VideoStream};
+use crate::video::{PublishRefusal, VideoKind, VideoStream};
 use crate::Core;
 
 /// The spec's `VoiceMaxPerRoom` default.
 pub const DEFAULT_MAX_PER_ROOM: usize = 16;
+
+/// How much signaling one session may make the room pay for
+/// (`[voice]` and `[voice.video]`).
+///
+/// A count or a period of zero is no limit, which is what a `Core` built
+/// by hand has ([`VoiceLimits::default`]); a server built from a config
+/// has [`VoiceLimits::DEFAULT`] unless it says otherwise. A session whose
+/// account `can_spam` is held to neither allowance, as it is held to none
+/// of the flood limits. No address is exempt: these are per-session
+/// limits, so a shared address costs nobody an allowance, and exempting
+/// a proxy or a container gateway would exempt everyone behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VoiceLimits {
+    /// Joins one session may make in `joins_per`, as a burst that is
+    /// earned back steadily. A join tears down any room the session was
+    /// in and renegotiates both rooms, so it is the dearest thing a
+    /// client can ask of the voice domain.
+    pub joins: u32,
+    pub joins_per: Duration,
+    /// Video starts and subscription changes one session may make in
+    /// `video_changes_per`. Each renegotiates the publisher or the
+    /// subscriber and whoever else the change reaches; a subscription
+    /// change counts only when it adds a publication the room has.
+    pub video_changes: u32,
+    pub video_changes_per: Duration,
+    /// How long a room's status waits after a mute or pause flip, so a
+    /// burst of them reaches the room as one status carrying the final
+    /// state. Zero sends each at once.
+    pub status_debounce: Duration,
+}
+
+impl VoiceLimits {
+    /// The defaults a configured server has.
+    ///
+    /// Five joins in ten seconds covers a person hopping from the public
+    /// room into a private chat and back with room to spare, and holds a
+    /// client looping joins to one every two seconds. Video changes are
+    /// cheaper — the subscriber alone is renegotiated for most of them —
+    /// and a client scrolling a grid of tiles makes several in a row, so
+    /// the allowance is twice as deep. The debounce is the ~100 ms the
+    /// voice and video specs both recommend.
+    pub const DEFAULT: VoiceLimits = VoiceLimits {
+        joins: 5,
+        joins_per: Duration::from_secs(10),
+        video_changes: 10,
+        video_changes_per: Duration::from_secs(10),
+        status_debounce: Duration::from_millis(100),
+    };
+}
+
+/// What one session has spent of its [`VoiceLimits`] allowances. On the
+/// session rather than keyed by uid, so it ends with the session and a
+/// recycled uid does not inherit it.
+#[derive(Debug, Default)]
+pub(crate) struct VoiceFlood {
+    joins: Option<Bucket>,
+    video: Option<Bucket>,
+}
+
+/// Which allowance an operation draws on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Spend {
+    Join,
+    Video,
+}
+
+impl Spend {
+    fn name(self) -> &'static str {
+        match self {
+            Spend::Join => "join",
+            Spend::Video => "video",
+        }
+    }
+}
 
 /// One voice participant, as a room status reports them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +214,9 @@ pub enum VoiceError {
     /// The client's SDP answer was rejected (no PCMU, unparseable). The
     /// peer connection is torn down with it, as the spec requires.
     BadAnswer,
+    /// The session has spent its allowance of joins ([`VoiceLimits`]).
+    /// `retry_after` is the whole seconds until it has one again.
+    RateLimited { retry_after: u64 },
 }
 
 /// The media plane, behind one trait so the domain can be tested without
@@ -196,14 +288,16 @@ pub trait VoiceMedia: Send + Sync + 'static {
     /// Add a send section of `kind` for this peer, so its next offer
     /// carries somewhere to publish on.
     ///
-    /// Returns whether the media layer took it. **A refusal has to be
-    /// reported, not swallowed**: by the time this is called the domain
-    /// has claimed a room slot and is about to announce the publication
-    /// to everyone, so a media layer that quietly declined would leave a
-    /// publication that shows as live, can never carry a frame, and holds
-    /// its slot until the user stops it by hand — with a room's single
-    /// screen slot, that is the room's screen share gone.
-    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> bool;
+    /// Returns whether the media layer took it, and if not, why. **A
+    /// refusal has to be reported, not swallowed**: by the time this is
+    /// called the domain has claimed a room slot and is about to announce
+    /// the publication to everyone, so a media layer that quietly
+    /// declined would leave a publication that shows as live, can never
+    /// carry a frame, and holds its slot until the user stops it by hand
+    /// — with a room's single screen slot, that is the room's screen
+    /// share gone. The reason decides whether the start is charged
+    /// ([`PublishRefusal`]).
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> Result<(), PublishRefusal>;
 
     /// Drop a publication. The section survives as `a=inactive` — mids
     /// are never reassigned and `m=` lines are never deleted — but
@@ -268,7 +362,7 @@ impl VoiceMedia for TimedVoice {
     fn video_codec(&self) -> &'static str {
         self.0.video_codec()
     }
-    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> bool {
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> Result<(), PublishRefusal> {
         self.time("publish", |m| m.publish(uid, cid, kind))
     }
     fn unpublish(&self, uid: Uid, cid: u32, kind: VideoKind) {
@@ -359,6 +453,22 @@ pub(crate) struct VoiceState {
     /// where voice is: the capability bit for it depends on voice's.
     pub(crate) video_enabled: bool,
     pub(crate) video: crate::video::VideoConfig,
+    pub(crate) limits: VoiceLimits,
+    /// Statuses owed to rooms whose mute or pause flips are being
+    /// coalesced, and when each is due ([`Core::voice_flush_status`]).
+    owed: HashMap<u32, Owed>,
+    /// Woken when a room first owes a status, so whatever runs
+    /// [`Core::voice_flush_status`] need not poll an idle server.
+    wake: Arc<tokio::sync::Notify>,
+}
+
+/// A room status held back by the debounce: which of the two lists it
+/// owes, and when.
+#[derive(Debug, Clone, Copy)]
+struct Owed {
+    due: Instant,
+    voice: bool,
+    video: bool,
 }
 
 impl Default for VoiceState {
@@ -370,6 +480,9 @@ impl Default for VoiceState {
             room_of: HashMap::new(),
             video_enabled: false,
             video: crate::video::VideoConfig::default(),
+            limits: VoiceLimits::default(),
+            owed: HashMap::new(),
+            wake: Arc::default(),
         }
     }
 }
@@ -377,6 +490,21 @@ impl Default for VoiceState {
 impl VoiceState {
     pub(crate) fn peer_mut(&mut self, cid: u32, uid: Uid) -> Option<&mut Peer> {
         self.rooms.get_mut(&cid)?.iter_mut().find(|p| p.uid == uid)
+    }
+
+    /// A status for `cid` has just gone out, so the part of it the
+    /// debounce was holding back is no longer owed.
+    pub(crate) fn settled(&mut self, cid: u32, video: bool) {
+        if let Some(o) = self.owed.get_mut(&cid) {
+            if video {
+                o.video = false;
+            } else {
+                o.voice = false;
+            }
+            if !o.voice && !o.video {
+                self.owed.remove(&cid);
+            }
+        }
     }
 
     fn participants(&self, cid: u32) -> Vec<VoiceParticipant> {
@@ -553,6 +681,45 @@ impl RosterInner {
                 },
             );
         }
+        // Whatever mute flips were waiting are in the list just sent.
+        self.voice.settled(cid, false);
+    }
+
+    /// Announce the room's participant list (or, with `video`, its
+    /// publication list) once the debounce window closes, rather than
+    /// now.
+    ///
+    /// The window is fixed from the first flip rather than restarted by
+    /// each one, so a client flapping without pause still has its room
+    /// told where it stands once per window, and never less often. What
+    /// the media layer enforces is not delayed at all: a muted peer's
+    /// audio stops at the flip, only the announcing of it waits.
+    pub(crate) fn status_soon(&mut self, cid: u32, video: bool) {
+        let window = self.voice.limits.status_debounce;
+        if window.is_zero() {
+            if video {
+                self.video_status(cid);
+            } else {
+                self.voice_status(cid);
+            }
+            return;
+        }
+        let fresh = !self.voice.owed.contains_key(&cid);
+        let owed = self.voice.owed.entry(cid).or_insert(Owed {
+            due: Instant::now() + window,
+            voice: false,
+            video: false,
+        });
+        if video {
+            owed.video = true;
+        } else {
+            owed.voice = true;
+        }
+        if fresh {
+            // A stored permit if nobody is waiting yet, so the first
+            // flip after an idle spell is never lost.
+            self.voice.wake.notify_one();
+        }
     }
 }
 
@@ -573,6 +740,103 @@ impl Core {
             r.voice.max_per_room = max_per_room.max(1);
         }
         self
+    }
+
+    /// Hold sessions' voice signaling to `limits` rather than
+    /// [`VoiceLimits::default`], which holds them to nothing.
+    #[must_use]
+    pub fn with_voice_limits(self, limits: VoiceLimits) -> Self {
+        self.roster.lock().unwrap().voice.limits = limits;
+        self
+    }
+
+    /// Spend one of `what` from `uid`'s allowance, or say how many whole
+    /// seconds until there is one. Called with the roster lock held, by
+    /// the operation it is charging, before any of that operation's work.
+    pub(crate) fn voice_spend(
+        &self,
+        r: &mut RosterInner,
+        uid: Uid,
+        what: Spend,
+    ) -> Result<(), u64> {
+        let limits = r.voice.limits;
+        let Some(sess) = r.users.get_mut(&uid) else {
+            return Ok(());
+        };
+        if sess.can_spam || sess.info.system {
+            return Ok(());
+        }
+        let (slot, count, per) = match what {
+            Spend::Join => (&mut sess.voice_flood.joins, limits.joins, limits.joins_per),
+            Spend::Video => (
+                &mut sess.voice_flood.video,
+                limits.video_changes,
+                limits.video_changes_per,
+            ),
+        };
+        Bucket::take(slot, count, per, Instant::now()).map_err(|wait| {
+            crate::instrument::voice_refused(what.name());
+            // Whole seconds, rounded up, and never zero: a client told
+            // to wait no time at all would ask again at once and be
+            // refused again.
+            (wait.as_secs_f64().ceil() as u64).max(1)
+        })
+    }
+
+    /// Give back one of `what` that `uid` spent on an operation which
+    /// then failed on something the session could not have known — a
+    /// full room, a media layer with no session to seat it on. Those cost
+    /// the room nothing it is being protected from, so they cost the
+    /// session nothing either. Called with the roster lock still held, before
+    /// anything else could have spent in between.
+    pub(crate) fn voice_refund(&self, r: &mut RosterInner, uid: Uid, what: Spend) {
+        let limits = r.voice.limits;
+        if let Some(sess) = r.users.get_mut(&uid) {
+            match what {
+                Spend::Join => Bucket::refund(&mut sess.voice_flood.joins, limits.joins),
+                Spend::Video => {
+                    Bucket::refund(&mut sess.voice_flood.video, limits.video_changes);
+                }
+            }
+        }
+    }
+
+    /// Send every status the debounce was holding back whose window has
+    /// closed by `now`, and say when the next one is due, if any is owed.
+    ///
+    /// The domain schedules nothing, so something outside it calls this:
+    /// the binary runs it from a task woken by
+    /// [`Core::voice_status_wake`] and by the deadline this returns.
+    pub fn voice_flush_status(&self, now: Instant) -> Option<Instant> {
+        let mut r = self.roster.lock().unwrap();
+        if r.voice.owed.is_empty() {
+            return None;
+        }
+        let due: Vec<(u32, Owed)> = r
+            .voice
+            .owed
+            .iter()
+            .filter(|(_, o)| o.due <= now)
+            .map(|(cid, o)| (*cid, *o))
+            .collect();
+        for (cid, o) in due {
+            r.voice.owed.remove(&cid);
+            // A room everyone has left is sent nothing: both lists are
+            // built from who is in it.
+            if o.voice {
+                r.voice_status(cid);
+            }
+            if o.video {
+                r.video_status(cid);
+            }
+        }
+        r.voice.owed.values().map(|o| o.due).min()
+    }
+
+    /// Notified when a room first owes a status (see
+    /// [`Core::voice_flush_status`]).
+    pub fn voice_status_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.roster.lock().unwrap().voice.wake.clone()
     }
 
     /// Is an SFU wired in? What the binary asks before advertising the
@@ -609,11 +873,24 @@ impl Core {
                 return Err(VoiceError::NotAMember);
             }
         }
+        // Charged here, once the join is one this user may make and
+        // before any of its work: the teardown of the room it leaves and
+        // the renegotiation of both rooms are what the allowance is for.
+        // It has to be taken before the teardown, since a refused join
+        // must leave the user where they were; so a join that then finds
+        // the room full is refunded below. The teardown it did cost is
+        // not a loop a client can repeat for free: a second attempt finds
+        // the user in no room, and getting back into one is a join that
+        // pays.
+        if let Err(retry_after) = self.voice_spend(&mut r, uid, Spend::Join) {
+            return Err(VoiceError::RateLimited { retry_after });
+        }
 
         r.voice_part(uid);
 
         let occupancy = r.voice.rooms.get(&cid).map_or(0, |p| p.len());
         if occupancy >= r.voice.max_per_room {
+            self.voice_refund(&mut r, uid, Spend::Join);
             return Err(VoiceError::RoomFull);
         }
 
@@ -641,6 +918,7 @@ impl Core {
                     r.voice.rooms.remove(&cid);
                 }
             }
+            self.voice_refund(&mut r, uid, Spend::Join);
             return Err(VoiceError::RoomFull);
         };
         if let Some(p) = r.voice.peer_mut(cid, uid) {
@@ -792,11 +1070,12 @@ impl Core {
         };
         if changed {
             media.set_muted(uid, cid, muted);
-            r.voice_status(cid);
+            r.status_soon(cid, false);
         }
-        // A toggle that changes nothing is acked and nothing else: the
-        // cheap half of the mute-flap debounce the spec recommends, and
-        // push-to-talk produces plenty of these.
+        // A toggle that changes nothing is acked and nothing else, and
+        // one that does is announced once its debounce window closes:
+        // the spec's mute-flap debounce, which push-to-talk exercises
+        // constantly.
         Ok(())
     }
 

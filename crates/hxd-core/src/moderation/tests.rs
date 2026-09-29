@@ -155,7 +155,9 @@ fn attach(core: &Core, who: Who) -> (Uid, Events) {
             },
             has_inbox: who.person,
             attach_news: false,
+            set_avatar: false,
             moderate: who.moderate,
+            can_spam: false,
             is_person: who.person,
             reads_on_delivery: false,
             identity: who.identity,
@@ -1269,7 +1271,42 @@ fn the_sweeper_scrubs_evidence_and_ages_out_closed_reports() {
             }),
         })
         .unwrap();
-    assert_eq!(s.core.prune_moderation(), (1, 1));
+    let ban = |target: &str, expires_at| crate::ban::Ban {
+        id: 0,
+        target: crate::ban::BanTarget::login(target).unwrap(),
+        reason: "x".into(),
+        note: None,
+        actor: "carol".into(),
+        actor_fp: None,
+        source: crate::ban::BanSource::Moderator,
+        created_at: old,
+        expires_at,
+        lifted_at: None,
+        lifted_by: None,
+        act: None,
+    };
+    s.store.ban(&ban("expired", Some(old))).unwrap();
+    let recent = s
+        .store
+        .ban(&ban(
+            "recent",
+            Some(SystemTime::now() - Duration::from_secs(60)),
+        ))
+        .unwrap();
+    let standing = s.store.ban(&ban("standing", None)).unwrap();
+    assert_eq!(s.core.prune_moderation(), (1, 1, 1));
+    let kept: Vec<_> = s
+        .store
+        .bans(None, None, 10)
+        .unwrap()
+        .iter()
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(
+        kept,
+        [standing.id, recent.id],
+        "only a ban ended report_days ago goes; a standing one never does"
+    );
     assert!(s.store.report(id).unwrap().is_none());
     assert_eq!(
         s.store.acts(None, 1).unwrap()[0].evidence.as_deref(),
@@ -1622,5 +1659,405 @@ fn deleting_a_category_is_on_the_record_and_answers_its_reports() {
             .unwrap()
             .outcome,
         Outcome::Removed
+    );
+}
+
+fn kicked(events: Vec<Event>) -> bool {
+    events.iter().any(|e| matches!(e, Event::Kicked))
+}
+
+#[test]
+fn a_kick_with_a_ban_refuses_the_address_and_ends_only_its_target() {
+    let s = server();
+    let shared: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+    let at = |who: Who| Who {
+        addr: Some(shared),
+        ..who
+    };
+    let (carol, mut carol_rx) = attach(&s.core, at(moderator("carol")));
+    let (bob, mut bob_rx) = attach(&s.core, at(person("bob")));
+    let (_, mut eve_rx) = attach(&s.core, at(person("eve")));
+    let (_, mut tank_rx) = attach(
+        &s.core,
+        at(Who {
+            access: member_access().with(bit::CANT_BE_DISCONNECTED),
+            ..person("tank")
+        }),
+    );
+    let (_, mut dave_rx) = attach(
+        &s.core,
+        Who {
+            addr: Some("192.0.2.8".parse().unwrap()),
+            ..person("dave")
+        },
+    );
+    for rx in [
+        &mut carol_rx,
+        &mut bob_rx,
+        &mut eve_rx,
+        &mut tank_rx,
+        &mut dave_rx,
+    ] {
+        drain(rx);
+    }
+    s.core
+        .kick_by(
+            bob,
+            Some(crate::KickBan {
+                by: Actor::Session(carol),
+                for_: Duration::from_secs(3600),
+                reason: "spam".into(),
+            }),
+        )
+        .unwrap();
+    assert!(kicked(drain(&mut bob_rx)));
+    assert!(
+        !kicked(drain(&mut eve_rx)),
+        "a kick's ban ends only whom it kicks, as the reference server's does"
+    );
+    assert!(!kicked(drain(&mut carol_rx)), "not the kicker");
+    assert!(!kicked(drain(&mut tank_rx)), "nor the unkickable");
+    assert!(!kicked(drain(&mut dave_rx)), "nor another address");
+    assert!(s.core.is_banned("::ffff:192.0.2.7".parse().unwrap()));
+    assert!(!s.core.is_banned("192.0.2.8".parse().unwrap()));
+
+    let bans = s.core.list_bans(true, None, 10).unwrap();
+    assert_eq!(bans.len(), 1);
+    assert_eq!(bans[0].source, crate::ban::BanSource::Kick);
+    assert_eq!(bans[0].actor, "carol");
+    assert!(bans[0].expires_at.is_some());
+    let act = &s.store.acts(None, 1).unwrap()[0];
+    assert_eq!((act.kind, act.id), (ActKind::Ban, bans[0].act.unwrap()));
+}
+
+#[test]
+fn a_login_ban_takes_the_linked_key_and_is_lifted_by_id() {
+    let mut directory = Directory::default();
+    directory
+        .0
+        .insert("bob".into(), (Some([9; 32]), member_access()));
+    let s = server_with(directory);
+    let (carol, _) = attach(&s.core, moderator("carol"));
+    let (_, mut bob_rx) = attach(&s.core, person("bob"));
+    drain(&mut bob_rx);
+    let ban = |target| crate::ban::NewBan {
+        target,
+        reason: "no".into(),
+        note: None,
+        expires_at: None,
+        source: crate::ban::BanSource::Moderator,
+    };
+    let login = |l: &str| crate::ban::BanTarget::login(l).unwrap();
+    for refused in ["guest", "Carol"] {
+        assert!(matches!(
+            s.core.place_ban(Actor::Session(carol), ban(login(refused))),
+            Err(ModError::BadRequest(_))
+        ));
+    }
+    let placed = s
+        .core
+        .place_ban(Actor::Session(carol), ban(login("Bob")))
+        .unwrap();
+    assert_eq!(
+        placed.iter().map(|b| b.target.clone()).collect::<Vec<_>>(),
+        [login("bob"), crate::ban::BanTarget::Identity([9; 32])],
+        "the account and the key it links"
+    );
+    assert!(kicked(drain(&mut bob_rx)));
+    assert!(s.core.person_banned(Some("BOB"), None, None).is_some());
+    assert!(
+        s.core
+            .person_banned(Some("robert"), Some(&[9; 32]), None)
+            .is_some(),
+        "the key under another account"
+    );
+
+    // Lifting either row lifts the person: the twin goes with it.
+    let lifted = s
+        .core
+        .lift_ban(Actor::Session(carol), placed[1].id)
+        .unwrap();
+    assert_eq!(
+        lifted.iter().map(|b| b.id).collect::<Vec<_>>(),
+        [placed[1].id, placed[0].id],
+        "the one named, then its twin"
+    );
+    assert!(s
+        .core
+        .person_banned(Some("bob"), Some(&[9; 32]), None)
+        .is_none());
+    assert!(s.core.list_bans(true, None, 10).unwrap().is_empty());
+    assert_eq!(s.core.list_bans(false, None, 10).unwrap().len(), 2);
+    for b in &placed {
+        assert_eq!(
+            s.core.lift_ban(Actor::Session(carol), b.id),
+            Err(ModError::NoSuchBan),
+            "lifted is lifted"
+        );
+    }
+    assert_eq!(s.store.acts(None, 1).unwrap()[0].kind, ActKind::Unban);
+
+    let config = s
+        .core
+        .place_ban(
+            Actor::Operator,
+            crate::ban::NewBan {
+                source: crate::ban::BanSource::Config,
+                ..ban(login("mallory"))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        s.core.lift_ban(Actor::Operator, config[0].id),
+        Err(ModError::ConfigBan)
+    );
+}
+
+#[test]
+fn lifting_a_ban_leaves_a_row_it_only_extended() {
+    let mut directory = Directory::default();
+    directory
+        .0
+        .insert("bob".into(), (Some([9; 32]), member_access()));
+    let s = server_with(directory);
+    let (carol, _) = attach(&s.core, moderator("carol"));
+    let key = crate::ban::BanTarget::Identity([9; 32]);
+    let week = SystemTime::now() + Duration::from_secs(7 * 86400);
+    let ban = |target, expires_at| crate::ban::NewBan {
+        target,
+        reason: "no".into(),
+        note: None,
+        expires_at,
+        source: crate::ban::BanSource::Moderator,
+    };
+    // One act bans the identity for good; a later one bans an account
+    // linking it for a week, which extends the identity's row.
+    let forever = s
+        .core
+        .place_ban(Actor::Operator, ban(key.clone(), None))
+        .unwrap();
+    let placed = s
+        .core
+        .place_ban(
+            Actor::Session(carol),
+            ban(crate::ban::BanTarget::login("bob").unwrap(), Some(week)),
+        )
+        .unwrap();
+    assert_eq!(placed[1].id, forever[0].id, "the identity's one row");
+    assert_eq!(
+        placed[1].act, forever[0].act,
+        "still the act that placed it"
+    );
+    assert_eq!(placed[1].expires_at, None, "until lifted outlasts a week");
+
+    // Lifting the week lifts the login only: the permanent ban stands,
+    // as it now is.
+    let lifted = s
+        .core
+        .lift_ban(Actor::Session(carol), placed[0].id)
+        .unwrap();
+    assert_eq!(
+        lifted.iter().map(|b| b.id).collect::<Vec<_>>(),
+        [placed[0].id]
+    );
+    assert!(s.core.person_banned(Some("bob"), None, None).is_none());
+    assert!(
+        s.core
+            .person_banned(Some("robert"), Some(&[9; 32]), None)
+            .is_some(),
+        "the identity is still banned"
+    );
+    let standing = s.core.list_bans(true, None, 10).unwrap();
+    assert_eq!(standing.len(), 1);
+    assert_eq!(
+        (standing[0].id, standing[0].expires_at),
+        (forever[0].id, None)
+    );
+
+    // And lifting the identity's own ban lifts it alone.
+    let lifted = s.core.lift_ban(Actor::Operator, forever[0].id).unwrap();
+    assert_eq!(
+        lifted.iter().map(|b| b.id).collect::<Vec<_>>(),
+        [forever[0].id]
+    );
+    assert!(s.core.list_bans(true, None, 10).unwrap().is_empty());
+}
+
+#[test]
+fn a_ban_ends_the_sessions_it_refuses_and_a_reread_only_a_new_bans() {
+    let s = server();
+    let shared: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+    let at = |who: Who| Who {
+        addr: Some(shared),
+        ..who
+    };
+    let (carol, mut carol_rx) = attach(&s.core, at(moderator("carol")));
+    let (eve, mut eve_rx) = attach(&s.core, at(person("eve")));
+    let (dave, mut dave_rx) = attach(&s.core, person("dave"));
+    for rx in [&mut carol_rx, &mut eve_rx, &mut dave_rx] {
+        drain(rx);
+    }
+    s.core
+        .place_ban(
+            Actor::Session(carol),
+            crate::ban::NewBan {
+                target: crate::ban::BanTarget::address(shared, 32).unwrap(),
+                reason: "a botnet".into(),
+                note: None,
+                expires_at: None,
+                source: crate::ban::BanSource::Moderator,
+            },
+        )
+        .unwrap();
+    assert!(
+        kicked(drain(&mut eve_rx)),
+        "a moderator's ban ends what it refuses"
+    );
+    assert!(
+        !kicked(drain(&mut carol_rx)),
+        "not the moderator, on its own ban"
+    );
+    let _ = eve;
+
+    // The command line writes to the store; the server hears on SIGHUP.
+    ModerationStore::ban(
+        &*s.store,
+        &crate::ban::Ban {
+            id: 0,
+            target: crate::ban::BanTarget::login("dave").unwrap(),
+            reason: "spam".into(),
+            note: None,
+            actor: OPERATOR.into(),
+            actor_fp: None,
+            source: crate::ban::BanSource::Cli,
+            created_at: std::time::SystemTime::now(),
+            expires_at: None,
+            lifted_at: None,
+            lifted_by: None,
+            act: None,
+        },
+    )
+    .unwrap();
+    s.core.reload_bans();
+    assert!(
+        kicked(drain(&mut dave_rx)),
+        "a new ban ends whom it refuses"
+    );
+    assert!(
+        !kicked(drain(&mut carol_rx)),
+        "a reread does not end whom a ban it held spared"
+    );
+    assert!(s.core.user(carol).is_some());
+    assert!(s.core.person_banned(Some("dave"), None, None).is_some());
+    let _ = dave;
+}
+
+#[test]
+fn a_login_ban_takes_the_key_of_an_account_that_keeps_no_mailbox() {
+    let mut accounts = Directory::default();
+    accounts
+        .0
+        .insert("bob".into(), (Some([9; 32]), member_access()));
+    let s = server_full(Arc::new(NoMail(accounts)), Duration::from_secs(24 * 3600));
+    let placed = s
+        .core
+        .place_ban(
+            Actor::Operator,
+            crate::ban::NewBan {
+                target: crate::ban::BanTarget::login("bob").unwrap(),
+                reason: "no".into(),
+                note: None,
+                expires_at: None,
+                source: crate::ban::BanSource::Cli,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        placed.iter().map(|b| b.target.clone()).collect::<Vec<_>>(),
+        [
+            crate::ban::BanTarget::login("bob").unwrap(),
+            crate::ban::BanTarget::Identity([9; 32])
+        ],
+    );
+}
+
+#[test]
+fn a_ban_that_lands_while_a_session_attaches_ends_it() {
+    let s = server();
+    let (bob, _bob_rx) = attach(&s.core, person("bob"));
+    let (eve, _eve_rx) = attach(&s.core, person("eve"));
+    // Placed after bob's login was checked and before he attached: no
+    // session to end yet, so only the matcher knows.
+    s.core.bans.write().unwrap().insert(&crate::ban::Ban {
+        id: 1,
+        target: crate::ban::BanTarget::login("bob").unwrap(),
+        reason: "spam".into(),
+        note: None,
+        actor: OPERATOR.into(),
+        actor_fp: None,
+        source: crate::ban::BanSource::Cli,
+        created_at: std::time::SystemTime::now(),
+        expires_at: None,
+        lifted_at: None,
+        lifted_by: None,
+        act: None,
+    });
+    assert_eq!(
+        s.core.end_if_banned(bob).map(|hit| hit.reason),
+        Some("spam".into())
+    );
+    assert!(s.core.user(bob).is_none(), "ended, not left behind");
+    assert!(s.core.end_if_banned(eve).is_none());
+    assert!(s.core.user(eve).is_some());
+}
+
+#[test]
+fn a_restarted_server_refuses_whom_it_banned() {
+    let store = Arc::new(MemoryModeration::default());
+    let core = Core::new().with_moderation(store.clone(), ModerationPolicy::default());
+    core.place_ban(
+        Actor::Operator,
+        crate::ban::NewBan {
+            target: crate::ban::BanTarget::parse("2001:db8:1:2::/64", |_| None).unwrap(),
+            reason: "flood".into(),
+            note: None,
+            expires_at: None,
+            source: crate::ban::BanSource::Cli,
+        },
+    )
+    .unwrap();
+    let core = Core::new().with_moderation(store, ModerationPolicy::default());
+    assert!(core.is_banned("2001:db8:1:2:ffff::1".parse().unwrap()));
+    assert!(!core.is_banned("2001:db8:1:3::1".parse().unwrap()));
+}
+
+/// A ration table full of spent buckets makes room by forgetting the
+/// ones that give back least, never by handing everyone a fresh ration:
+/// a reporter who has spent every report stays out of them however many
+/// new keys arrive.
+#[test]
+fn a_full_ration_table_forgets_the_fullest_and_keeps_the_spent() {
+    let core = Core::new();
+    let spent = ReporterKey::Mailbox(None, "spammer".into());
+    for _ in 0..REPORTS_PER_HOUR {
+        assert!(core.report_rate_allows(std::slice::from_ref(&spent)));
+    }
+    assert!(!core.report_rate_allows(std::slice::from_ref(&spent)));
+    // Every other place taken by a bucket one report down: none has
+    // refilled, so the old answer was to clear the lot.
+    {
+        let mut rates = core.report_rate.lock().unwrap();
+        let now = std::time::Instant::now();
+        let almost = f64::from(REPORTS_PER_HOUR) - 1.0;
+        for n in 0..RATES_KEPT as u64 {
+            rates.insert(ReporterKey::Session(n as crate::Uid, n), (now, almost));
+        }
+    }
+    let newcomer = ReporterKey::Mailbox(None, "newcomer".into());
+    assert!(core.report_rate_allows(std::slice::from_ref(&newcomer)));
+    assert!(core.report_rate.lock().unwrap().len() <= RATES_KEPT);
+    assert!(
+        !core.report_rate_allows(std::slice::from_ref(&spent)),
+        "the spent ration survived the room being made"
     );
 }

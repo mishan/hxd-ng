@@ -51,7 +51,7 @@ been exercised on newer toolchains; CI runs stable.
 
 | Crate | Role |
 |---|---|
-| `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation, the news tree, avatars, access bits, auth traits, and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
+| `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation and bans, the news tree, avatars, access bits, auth traits, and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), the server banner (`banner.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the WebSocket-as-byte-stream adapter (`tunnel.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs, and the registrar's requests, records and signed lists (with the one record verifier they all share) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
@@ -60,7 +60,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-markdown` | Markdown news bodies (`docs/news.md` §5): pulldown-cmark, built without its HTML writer, folded into the plain-text downgrade that search and legacy clients read, and the references a body makes. Text in, text out — nothing here ever produces markup. Behind `hxd-core`'s `BodyRenderer` trait and the `markdown` Cargo feature. |
 | `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
 | `hxd-registrar` | The identity registrar (`docs/identity-registrar.md`): handles and their lifecycle, attestations, the records it publishes (revocation, rotation, freeze), the issuance log and stats, rate limits and replay, the operator's freeze, revoke and recover. Signed bytes in, signed bytes out; no HTTP, no roster, no account table beyond the reserved names it is handed. Its `RegistrarStore` trait, an in-memory store and the conformance suite live here. |
-| `hxd-store-sqlite` | The durable store for the private-message inbox, chat history, news and the moderation trail: one SQLite file, WAL checkpointed by a thread and a connection of its own (never inside a commit, and one checkpointer to a file), public chat's log on a connection of its own beside the others' (`open_beside`), the schema and migrations of `docs/private-messages.md` §5, `docs/news.md` §4 and `docs/moderation.md` §7, and the conformance suites both stores of each kind are run against. Behind `hxd-core`'s `MessageStore`, `ChatLog`, `NewsStore`, `ModerationStore` and `AvatarStore` traits and the `inbox` Cargo feature; the in-memory stores beside them in `hxd-core` are what the domain tests use. The registrar's store is here too, in a file and a schema of its own. |
+| `hxd-store-sqlite` | The durable store for the private-message inbox, chat history, news, the moderation trail and the bans: one SQLite file, WAL checkpointed by a thread and a connection of its own (never inside a commit, and one checkpointer to a file), public chat's log on a connection of its own beside the others' (`open_beside`), the schema and migrations of `docs/private-messages.md` §5, `docs/news.md` §4 and `docs/moderation.md` §7, and the conformance suites both stores of each kind are run against. Behind `hxd-core`'s `MessageStore`, `ChatLog`, `NewsStore`, `ModerationStore` and `AvatarStore` traits and the `inbox` Cargo feature; the in-memory stores beside them in `hxd-core` are what the domain tests use. The registrar's store is here too, in a file and a schema of its own. |
 | `hxd-push-webpush` | The push sender (`docs/webpush-gateway.md`): a VAPID keypair and its RFC 8292 token, RFC 8291 payload encryption, RFC 8030's headers, the destination check a client-chosen URL demands, and a per-origin circuit breaker. Behind `hxd-core`'s `NotificationGateway` trait, reading the devices out of its `PushStore`, and knowing nothing about Hotline. |
 | `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1), and on the port after it for the client's file transfers and banner, carried to `/htxf`; `register`, `revoke` and `rotate` talk to a registrar. |
 | `hxd-testclient` | Scripted clients for the server's own tests: the classic wire over TCP or TLS, framed with the pinned `hxproto` rather than the server's framer and read through a buffer so a timeout cannot cut a frame, and the ng wire with every event's seq checked as it arrives. Both keep what arrives while they wait for something else. Shared by `hxd-load` and the e2e suites. |
@@ -189,11 +189,48 @@ no domain operation may push a session anywhere near the cap in one
 go: a purge of thousands of lines sends nothing to a wire that cannot
 show redactions (`Transport::redactions`).
 
+**One address is held to so many connections, and so fast**
+(`hxd_core::limits`, `[limits]`, mhxd's `nospam` defaults): a
+`ConnPermit` from `Core::admit_connection` is held for the life of every
+connection that can carry a session, taken where the classic wire
+checks bans (plain, TLS and the `/trtp` tunnel alike; on the TLS port
+at accept, so the handshake is counted) and at the ng upgrade, before
+its token is redeemed, with the client's address as trusted proxies
+give it. An IPv6
+client is its /64; loopback is exempt by default. A new listener that
+carries sessions takes a permit too. And one session talks so fast,
+wherever it connects from, on mhxd's budgets: past `chat_lines` lines
+of chat in a window, every line of a send counted, it is kicked and its
+room told (`Core::chat_flood_check`, in the chat paths); past
+`spam_points`, which every request spends at the price mhxd's table
+gives its transaction, it is kicked and banned
+(`Core::spend_spam`, called by each frontend before it acts on a
+request; a new frontend or an ng request with a classic counterpart
+calls it too). A session already kicked is refused, never kicked
+again. An account that `can_spam` is held to neither. Most ng requests
+have no classic counterpart to be priced by, so an ng session is also
+held to a token bucket (`ng_requests`, `Core::spend_request`, kept
+with the session so a resume does not refill it), each request
+spending the weight `request_weight` in `conn.rs` gives it; a request
+added to the dispatcher gets a weight there, and one the bucket cannot
+pay for is answered `rate_limited` with `retry_after`, a delay and
+never a kick. One account's news posts are held to `news_posts`
+(`Core::news_post_reserve`, taken before an ng post and given back if
+it is refused; `Core::news_post_counted`, after a classic one), which
+the classic wire's posts count toward and are never refused by: that
+wire keeps mhxd's rules. `can_spam` exempts from both, as from the
+budgets. A wrong password counts against its address whichever wire or
+route it came in on (`Core::login_attempt` before, `Core::login_failed`
+after); a new path that checks a password does both. Every connection to
+the ng port holds places in that port's own counts (`HttpLimits`) from
+accept, in the socket itself so an upgrade carries them.
+
 **Past capacity a login is refused, not queued.** Every login costs
 everyone present a join and later a part, so a server admitting logins
 faster than it can tell the room about them falls further behind with
 each one. `Core::admit_login` bounds the logins in progress
-(`[server] logins_in_flight`, a quarter of it per address), from the
+(`[server] logins_in_flight`, a quarter of it per address, `[limits]`
+exempt addresses aside), from the
 login request to the join, so a client slow to send one holds no place;
 past it both wires refuse at once as busy (`rate_limited` with
 `retry_after` on ng). A 1.5 client that answers the agreement before
@@ -224,7 +261,7 @@ Three layers, all `cargo test --workspace`:
   loopback ports: `login.rs` (legacy login/presence/agreement), `tls.rs`
   (the legacy wire over TLS beside a plaintext client, and HTXF on the
   TLS transfer port), `chat.rs` (chat/PM/moderation over the legacy
-  wire), `ng.rs` (the WebSocket
+  wire, and the private-chat caps), `ng.rs` (the WebSocket
   frontend, **including cross-frontend scenarios** — a scripted 1.5 client
   and a WS client on one server, chat and PMs crossing both wire eras,
   detach showing as the away color, resume replay), `identity.rs` (the
@@ -235,28 +272,58 @@ Three layers, all `cargo test --workspace`:
   in one room, a photo crossing each way, and a revocation),
   `avatars.rs` (a picture set on either wire and shown on the other,
   GIF Icons' probe and Icon Change, an account's avatar surviving a
-  restart), `banner.rs` (the banner push after the agreement, and a
+  restart, a guest refused on both wires until its file allows it, the
+  interval outlasting a reconnect, the icon list rationed, and an
+  identity's avatar aged out of the database), `banner.rs` (the banner push after the agreement, and a
   banner file fetched over HTXF once per login), `inbox.rs` (offline
   private messages across both wires: queue, flush at login, resync,
-  blocks, retention), `news.rs` (threaded news on
+  blocks, retention, the sender's daily quota refusing only
+  what would have to wait), `news.rs` (threaded news on
   the ng wire: the tree and its containment rules, threads in reading
   order and paged both ways, references and backlinks, tombstones, who
   hears that the news changed and who hears that it is theirs, following
   and muting — and on the legacy wire: a scripted 1.5 client walking
   the tree an ng client built, reading both parts of a markdown article,
   posting and keeping house, and a 1.2 client reading the flat category,
-  posting into it and hearing its push), `moderation.rs` (the acts and
+  posting into it and hearing its push, read from the store once
+  however many classic clients hear it; and the news ceilings refused
+  on both wires), `moderation.rs` (the acts and
   reports on both wires against one database: a redaction blanking a
   rendered line and paging as a tombstone on 700 and `history`, a
   revocation and its refused re-upload, a kick with a purge across the
   log and the news, the ladder, a report reaching a legacy moderator
   from the system account and an ng one as an event, `/report`, and a
-  reported image outliving its TTL for the moderator) and `registrar.rs` (the registrar built from a real
+  reported image outliving its TTL for the moderator), `bans.rs` (`hxd
+  ban` against a running server's database and SIGHUP, a banned login
+  refused on both wires, and a ban outliving its server) and
+  `registrar.rs` (the registrar built from a real
   `[registrar]` section: discovery under its own host only, handles,
   rotations published under both keys, a card's commitment, invites from
   the file and the command, the operator's commands on the running
   store, and `hlid register`, `revoke` and `rotate` driven as a user
-  would), `slow_consumer.rs` (a room flooded while one client reads
+  would), `voice.rs` (voice signaling on both wires against a
+  recording media layer: the capability and privilege gates, the chunk
+  and JSON shapes, one room shared by a classic and an ng client, joins
+  past a session's allowance refused on each wire while leaves never
+  are, and a burst of mute flips announced once with its final state),
+  `limits.rs` (so many connections from one address across both
+  wires, then a burst and a rate, a TLS handshake counted from accept,
+  and an exempt address held to neither; a classic user's multi-line
+  flood kicked once with the room told in mhxd's bytes, and a user past
+  its spam points on each wire banned, the ng one refused `flooding`;
+  an ng nick flood banned at User Change's price, a nick that changes
+  nothing told to nobody on either wire, an account past its news posts
+  told how long to wait, and the request limit answering `rate_limited`
+  and then serving again, and still refusing after a resume),
+  `http_limits.rs`
+  (the ng port's own counts: plain HTTP and a WebSocket past an
+  address's connections closed unanswered, the ceiling on everyone's
+  and the reserve an exempt address is kept past it, an idle
+  keep-alive closed; challenges and avatar fetches past their rate
+  answered 429; failed logins on every wire locking the address out of
+  all of them until it earns one back, guesses made at once held to
+  the same count, a request refused before its password is checked
+  not counted, and a login with no password not held to it), `slow_consumer.rs` (a room flooded while one client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the
   ng one resumes into a resync; and clients each inside their own

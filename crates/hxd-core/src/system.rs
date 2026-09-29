@@ -144,7 +144,9 @@ impl Core {
                 // to it is a command, answered and not stored.
                 has_inbox: false,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
+                can_spam: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: None,
@@ -344,6 +346,9 @@ impl Core {
             Err(crate::ChatError::NoSuchUser) => "error: no such account".into(),
             Err(crate::ChatError::Blocked) => "ok: sent".into(),
             Err(crate::ChatError::MailboxFull) => "error: that mailbox is full".into(),
+            Err(crate::ChatError::SendQuota) => {
+                "error: you have sent as much offline mail today as this server allows".into()
+            }
             Err(_) => "error: that did not work".into(),
         }
     }
@@ -599,7 +604,9 @@ mod tests {
                     transport: Transport::default(),
                     has_inbox: true,
                     attach_news: false,
+                    set_avatar: false,
                     moderate: false,
+                    can_spam: false,
                     is_person: true,
                     reads_on_delivery: false,
                     identity: None,
@@ -850,7 +857,9 @@ mod tests {
                 transport: Transport::default(),
                 has_inbox: true,
                 attach_news: false,
+                set_avatar: false,
                 moderate: true,
+                can_spam: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,

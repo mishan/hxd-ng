@@ -132,6 +132,10 @@ that is tried waits a tenth of a second at most for a reader.
 | `hxd_outbox_broken_total` | | detached buffers that overflowed |
 | `hxd_outbox_lagged_total` | `bound` | attached sessions whose client fell behind and was cut off: `count` for a whole channel (8192 events), `own` for its 16 MiB, `server` for more than the queues hold on average once the server's budget was spent |
 | `hxd_voice_media_seconds` | `op` | each call into the SFU, all made under the roster lock |
+| `hxd_voice_refused_total` | `what` | voice operations refused because the session had spent its allowance: `join`, or `video` for a start or a subscription change that adds a live stream (docs/voice.md §13) |
+| `hxd_voice_policed_packets_total` | `stream` | inbound RTP the SFU dropped for arriving faster than its stream may: `audio`, `camera`, `screen` |
+| `hxd_voice_policed_ends_total` | `stream` | streams ended for staying far over their rate: the session for `audio`, the publication for `camera` or `screen` |
+| `hxd_voice_ice_ignored_total` | | trickled ICE candidates ignored because the session already held as many as it takes |
 
 A fan-out runs under the roster lock, and so does its recording: once
 per event, whatever its reach, so the cost inside the hold is a
@@ -147,7 +151,10 @@ constant rather than one per recipient.
 | `hxd_outbox_depth` | `wire` | items waiting when the consumer took the next one |
 | `hxd_write_queued_frames`, `hxd_write_queued_bytes` | `wire` | queued for the legacy writers, all connections together |
 | `hxd_login_seconds` | `wire`, `auth` | first byte to a session on the roster; `auth` is `guest`, `password`, `identity` or `resume` |
+| `hxd_flood_kicks_total` | `what` | sessions kicked for talking faster than `[limits]` allows: `chat` past `chat_lines`, `spam` past `spam_points` |
+| `hxd_rate_limited_total` | `wire`, `reason` | requests answered `rate_limited`: `requests` past `[limits] ng_requests`, `news_post` past `news_posts`, `history` and `news_search` past their own |
 | `hxd_logins_refused_busy_total` | | logins refused because the server was already working on `[server] logins_in_flight` of them |
+| `hxd_throttled_total` | `what` | refused for coming too often from one address or session, before any work was done on it: `login` (past `[limits] login_failures`), `challenge` (`/identity/challenge`), `fetch` (an avatar or a news or media image), `upload` (an upload refused before its body was read) |
 | `hxd_disconnects_total` | `wire`, `reason` | why a connection ended |
 | `hxd_transfers_open` | `dir` | file transfers in progress |
 
@@ -162,13 +169,18 @@ shows.
 
 The reasons: `eof`, `io_error` and `malformed` from the socket,
 `closed` for a WebSocket close, `banned` for an address refused at
-the door, `handshake` and `login` for a connection that never got a
+the door, `too_many` and `too_fast` for one past `[limits]` (the
+connections it holds, or how fast it opens them), `full` for a
+connection past `[limits] ng_connections`, `handshake` and `login` for a connection that never got a
 session, `kicked`, `logout`, `replaced`,
 `send_failed`, `pong_deadline`, and `slow_consumer` for a client that
 stopped taking what was sent to it: a classic writer's queue past its
 bound or a write that made no progress for a minute, either wire's
 session a whole channel behind, or either wire's queue among the
-furthest behind once the server's budget is spent (below).
+furthest behind once the server's budget is spent (below). A connection to the ng
+port refused by `[limits]` before a byte of it is read, past
+`http_connections_per_addr` (`too_many`) or `ng_connections` (`full`),
+is counted as `wire="http"`: it was never a session on either wire.
 
 ### Read at scrape time
 

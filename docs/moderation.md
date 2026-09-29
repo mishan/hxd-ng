@@ -3,8 +3,9 @@
 Status: built, both wires, 2026-09 — chat-history.md's H5, the wire half
 of inline-media.md's M6, and news.md's W8, as one branch. Not built: the
 vouching hooks of §3.3 and §7 (`vouched_banned`, `vouched_by`), which
-wait on identity-vouch.md, and a registrar ban (`*@host`, §6), which
-waits on identity-registrar.md §7. Where the build settled something
+wait on identity-vouch.md, and the ban list on the ng wire and in the
+config (§3.5). Durable bans themselves landed 2026-09. Where the build
+settled something
 this design left open, the section says so. The 2026-09 amendments from
 system-account.md §6 and identity-vouch.md §6 and §10 are folded in.
 
@@ -180,6 +181,92 @@ decision has the voucher's name in front of them (`vouched_by`, §7).
 - **Un-redacting.** No. A redaction was a decision with a reason on
   record; reversing it is a new line.
 
+### 3.5 Ban
+
+A ban is a row in the `ban` table (§7) and an entry in the running
+server's matcher, which is loaded from the table at start. It targets
+one of four things:
+
+- **An address or block**, refused when it connects, before the
+  handshake, as a kick-with-ban always was. IPv4 and IPv6 are one
+  canonical form (an IPv4 address is stored mapped), so `10.0.0.0/8`
+  matches a peer that reached a dual-stack listener as
+  `::ffff:10.1.2.3`.
+- **A login**, refused at login once the account resolves. Banning a
+  login bans the identity the account links too, as a second row, so
+  a person does not walk back in under a fresh account with the same
+  key.
+- **An identity** by fingerprint, refused whatever account it arrives
+  as.
+- **A registrar**, `*@host`: every identity whose handle it issued
+  (identity-registrar.md §7.3), refused when a login proves that
+  handle — an identity login, whose card carries it. An account keeps
+  only its linked identity's fingerprint, so a password login to it is
+  not refused by a registrar ban; an identity ban, which follows the
+  fingerprint, refuses both.
+
+A refused login is told why on the wire it came in on: a task error,
+`You are banned from this server: <reason>`, on the classic wire (the
+reason in ASCII, what cannot be said in it left out), and the error
+`banned` with `reason` and `expires_at` on the ng wire. An address is
+told nothing: answering would mean holding the connection open.
+
+Every ban has a reason, an actor, a source — `kick`, `moderator`, `cli`
+or `config` — and an expiry or none. Placing one is an act of kind
+`ban` in the audit trail and lifting one an act of kind `unban`.
+Lifting leaves the row, with who lifted it and when, so `hxd ban list
+--all` is the record, until `[moderation] report_days` after the ban
+ended (lifted or run out), when the pruner deletes it as it does a
+closed report; the audit trail keeps both acts. Lifting a ban lifts
+every standing row the same act created: a login ban's row or its
+identity twin lifts both, as they are one ban of one person. A target
+holds one row, so banning one already banned extends that row (the
+later expiry, the new reason and actor) rather than adding another,
+and the row keeps the act that created it. Lifting the later act
+leaves the row standing as it now is, extension and all: lifting a
+week's login ban of an account whose identity an earlier act banned
+for good lifts the login alone, and the identity stays banned.
+Bans placed from the config are coming: the
+source is reserved for them, and a ban the config places will be the
+config's to lift.
+
+Placing a ban from the command line or as a moderator ends every
+session it now refuses: a kick to a connected one, and the end of a
+detached one, which has no connection to see a kick. Two are spared.
+The acting session is not ended by its own ban, though an address ban
+may cover it: a moderator behind the same NAT as the one they ban. And
+a session holding `cant_be_disconnected` is not, as no kick ends it
+either. Both are refused at their next connection like anyone else,
+and a detached session's resume is a connection: it is answered
+`banned` and the session ends. A ban placed while a login is between
+its check and joining the roster is caught as it joins. SIGHUP ends
+the sessions refused by a ban it has not seen before, and no others,
+so a session spared once is not ended by a reread.
+
+A kick-with-ban, on either wire, bans the kicked address — its /32, or
+its `[moderation] ban_v6_prefix` block on IPv6 (default /64, what one
+subscriber is given) — for `[server] ban_time`, with source `kick`. It
+used to last until the server stopped; now a restart does not lift it.
+It disconnects only the one kicked, as the reference server's does:
+anyone else behind that address is refused at their next connection,
+not thrown off with them. Some IPv6 addresses are banned alone, as a
+/128, since their /64 is no subscriber's: loopback (`::1`), the
+unspecified address (`::`), and those that stand for an IPv4 host —
+the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`, and the
+IPv4-compatible `::/96` — whose /64 is every IPv4 client behind the
+translator. An address ban matches only its own family, so no IPv6
+block refuses an IPv4 client.
+
+The automatic kick past `[limits] spam_points` bans the same way, with
+one deviation from the reference server: never an address `[limits]
+exempt` holds to nothing, which is loopback and whatever shared proxy
+the operator exempted, and banning which would lock out everyone
+behind it for one person's flood. There it bans the account's login
+(and so the identity it links), or the identity a guest came with; a
+plain guest is only kicked, and public chat hears "kicked" rather than
+"banned".
+Refused: banning `guest`, the system account, or yourself.
+
 ## 4. Reports
 
 ### 4.1 What can be reported
@@ -253,7 +340,10 @@ id) — for a person, the same person by the mailbox rule, which two
 guests never are. A guest pays from its session's ration and from its
 address's, which every guest there shares: a reconnect is a new
 session, and the address is what stays. Accounts are people, and
-people behind one address are not rationed together. Reports are retained `[moderation] report_days` (default 90) after
+people behind one address are not rationed together. The rations are
+kept in a bounded table; when it is full of spent ones it forgets the
+fullest first, never the lot, so a flood of new reporters cannot hand
+anyone a fresh ration. Reports are retained `[moderation] report_days` (default 90) after
 closing.
 
 ### 4.5 Who hears
@@ -355,7 +445,8 @@ line with media returns `media` without `id` and with
   expects it to be chat. `/report <who> <reason…>` exists as a command
   to the system account instead, system-account.md §3, which a 1.2
   client can use because it is a private message.
-- **Kick and ban** are unchanged, and `[moderation] kick_purges =
+- **Kick and ban** are unchanged on the wire, the ban now durable
+  (§3.5), and `[moderation] kick_purges =
   seconds` makes a legacy kick purge the target's recent output as the
   ng `kick { purge }` does — off by default, because a kick over the
   legacy wire has meant one thing for twenty-five years — when the
@@ -418,6 +509,43 @@ ALTER TABLE report ADD COLUMN target_article INTEGER;
 ALTER TABLE report ADD COLUMN target_nick TEXT;
 ```
 
+Version 10 added the bans (§3.5). `kind` is address, login, identity
+or registrar; `target` is the address's sixteen bytes (IPv4 mapped),
+the lowercased login, the fingerprint or the registrar's host; and
+`prefix_len` is set exactly when the target is an address. One standing
+ban per target:
+
+```sql
+CREATE TABLE ban (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind          INTEGER NOT NULL,        -- address | login | identity | registrar
+  target        BLOB    NOT NULL,
+  prefix_len    INTEGER,                 -- addresses only, 0..=128
+  reason        TEXT    NOT NULL,
+  note          TEXT,                    -- the operator's, never shown to the banned
+  actor         TEXT    NOT NULL,        -- login, or 'cli'
+  actor_fp      TEXT,
+  source        INTEGER NOT NULL,        -- kick | moderator | cli | config
+  created_at    INTEGER NOT NULL,
+  expires_at    INTEGER,                 -- NULL for good
+  lifted_at     INTEGER,
+  lifted_by     TEXT,
+  moderation_id INTEGER                  -- the act that placed it
+);
+CREATE UNIQUE INDEX ban_standing
+  ON ban (kind, target, coalesce(prefix_len, -1))
+  WHERE lifted_at IS NULL;
+CREATE INDEX ban_expiry ON ban (expires_at)
+  WHERE lifted_at IS NULL AND expires_at IS NOT NULL;
+```
+
+A second ban on a target already banned extends the standing one to the
+later expiry (none wins) rather than adding a row. A ban that ran out
+without being lifted is not standing: a new ban on its target closes
+it at its expiry (`lifted_at` set, `lifted_by` not, which `hxd ban
+list --all` shows as expired) and adds a row, so the old one's record
+stays as it was.
+
 The `vouched_by` columns sketched above are not in either version: a
 column nothing writes is one a later build has to guess at, and they
 land with vouching.
@@ -441,23 +569,29 @@ hxd media revoke <handle-or-prefix> --reason "…" [--no-block]
 hxd purge <login> [--fingerprint FP] [--since 1h] --reason "…" [--dry-run]
 hxd reports [--all] | hxd reports close <id> --outcome dismissed|duplicate [--note "…"] [--of <id>]
 hxd moderation log [--limit N]
+hxd ban add <address[/prefix]|login:NAME|identity:FP|*@HOST> --reason "…" [--for 7d|all] [--note "…"]
+hxd ban list [--all] | hxd ban lift <id>
 ```
 
 The CLI acts as `cli` in the audit trail and runs against the store
 directly, so it works while the server is down; a running server sees
 the change on its next read (the memory media store is the exception —
 `media revoke` from the CLI needs the server up, and says so, and a
-purge from the CLI takes lines and articles but not images).
+purge from the CLI takes lines and articles but not images). Bans are
+the one thing a running server does not read again on its own: `hxd
+ban` changes the table, and SIGHUP makes the server reread it and end
+the sessions a new ban refuses.
 
 ```toml
 [moderation]                # optional; moderation is always on, kept in the
                             # database [inbox], [history] or [news] names
                             # (in that order), and in memory with none
 evidence_days = 30          # how long a redacted line's text stays readable to moderators
-report_days = 90            # closed reports are kept this long
+report_days = 90            # closed reports, and ended bans, are kept this long
 pin_days = 7                # a reported image outlives its handle TTL up to this
 notify_legacy = true        # reports as server messages to moderators on the legacy wire
 kick_purges = 0             # seconds of a kicked user's output to purge; 0 = none
+ban_v6_prefix = 64          # how wide a kick's ban is on an IPv6 address, in bits (16..=128)
 ```
 
 ## 8. Staging, and upstream
@@ -474,6 +608,9 @@ a sender across both stores; a report from an ng client reaches a
 legacy moderator as a server message and an ng moderator as an event;
 a PM report carries the body and only the recipient may file it; a
 report on a handle keeps it past its TTL and lets a moderator fetch it.
+`crates/hxd/tests/bans.rs` has the bans: `hxd ban` placing and lifting
+a login ban a running server applies on SIGHUP, what each wire is told
+when refused, and a ban outliving the server that placed it.
 
 Upstream, in the same conversation as chat-history.md §11 and
 inline-media.md §14:

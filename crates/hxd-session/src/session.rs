@@ -24,9 +24,9 @@ use hxd_core::instrument::{self, Dir, Kind};
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Events, FileEntry,
-    FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof, SessionStatus, Share, Transport,
-    Uid, UserInfo,
+    Account, AttachInfo, AuthBackend, AuthError, ChatError, ConnPermit, Core, Event, Events,
+    FileEntry, FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof, SessionStatus, Share,
+    Transport, Uid, UserInfo,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::text;
@@ -74,6 +74,62 @@ mod gif_icons {
     pub const GET_LIST: u32 = 0x0000_0745;
     pub const SET: u32 = 0x0000_0746;
     pub const GET: u32 = 0x0000_0747;
+}
+
+/// What a transaction costs of a session's spam points
+/// (`hxd_core::FloodLimits`): mhxd's `spamconf` table, entry for entry,
+/// and its default of 10 for every type the table does not list, those it
+/// handles and those it does not alike. The extensions this server speaks
+/// that mhxd never did — chat history, inline media, voice and video —
+/// cost nothing, a deliberate deviation: mhxd's default would charge
+/// each piece of one photo's upload or one call's ICE trickle 10, and
+/// ban its sender within the window.
+///
+/// Fetching icons costs nothing either, against mhxd's table. A GIF
+/// Icons client asks for every icon in the user list as it logs in, and
+/// at mhxd's price that bans it on any room of a few dozen people: the
+/// client doing what it was built to do is not a flood.
+fn spam_points(ty: u32) -> u32 {
+    let free = [
+        ClientHdr::GetChatHistory,
+        ClientHdr::VoiceJoin,
+        ClientHdr::VoiceLeave,
+        ClientHdr::VoiceSdpAnswer,
+        ClientHdr::VoiceIce,
+        ClientHdr::VoiceMute,
+        ClientHdr::VideoStart,
+        ClientHdr::VideoStop,
+        ClientHdr::VideoState,
+        ClientHdr::VideoSubscribe,
+    ];
+    if free.iter().any(|h| h.as_u32() == ty)
+        || ty == media::trans::UPLOAD_MEDIA
+        || ty == media::trans::DOWNLOAD_MEDIA
+        || ty == gif_icons::GET_LIST
+        || ty == gif_icons::GET
+    {
+        return 0;
+    }
+    match ty {
+        101 | 103 => 20,             // news get, news post
+        105 | 108 => 2,              // chat, message
+        110 => 1,                    // kick
+        112 => 10,                   // chat create
+        113 => 8,                    // chat invite
+        114 | 115 | 120 => 2,        // chat decline, join, subject
+        116 => 1,                    // chat part
+        121 => 4,                    // agreement (mhxd's table: "SetInfo")
+        200 | 202 | 203 => 3,        // file list, get, put
+        204..=209 => 7,              // file delete .. alias
+        210 | 213 => 3,              // folder get, put
+        214 => 1,                    // transfer stop
+        300 | 304 => 20,             // user list, user change
+        303 => 1,                    // user info
+        348..=351 | 353 | 355 => 20, // accounts, broadcast
+        352 => 10,                   // account read
+        1862 => 20,                  // icon set
+        _ => 10,
+    }
 }
 
 /// Data tags hxproto has no constants for (the gtkhx client ignores
@@ -208,7 +264,7 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) {
                 ctx,
                 Transport::default(),
                 LinkAuthority::default(),
-                true,
+                Direct::Admit,
             )
             .instrument(span)
             .await;
@@ -239,9 +295,22 @@ pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::Le
             instrument::disconnect(WIRE, "banned");
             continue;
         }
+        // The handshake slot is taken first: it is shared by every
+        // address, so a connection closed for want of one must not also
+        // spend its address's reconnect allowance, or a client arriving
+        // while others hold every slot is refused `too_fast` once they
+        // are free.
         let Ok(permit) = handshakes.clone().try_acquire_owned() else {
             debug!(%peer, "TLS handshakes at capacity; closing");
             continue;
+        };
+        // Nor does one past its limit cost a handshake, and the place
+        // taken here is the connection's for its whole life, handshake
+        // included: counted only after the handshake, one address could
+        // hold every handshake slot at once.
+        let place = match admit(&ctx, peer) {
+            Some(place) => place,
+            None => continue,
         };
         let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
@@ -265,9 +334,16 @@ pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::Le
                 encrypted: true,
                 ..Transport::default()
             };
-            run_connection(stream, peer, ctx, transport, LinkAuthority::default(), true)
-                .instrument(span)
-                .await;
+            run_connection(
+                stream,
+                peer,
+                ctx,
+                transport,
+                LinkAuthority::default(),
+                Direct::Admitted(place),
+            )
+            .instrument(span)
+            .await;
         });
     }
 }
@@ -703,6 +779,21 @@ fn reply_error(tx: &Tx, trans: u32, msg: &str) {
     );
 }
 
+/// A task error is ASCII (`reply_error`), and a ban's reason is whatever
+/// a moderator typed: what cannot be said in ASCII is left out.
+fn banned_text(reason: &str) -> String {
+    let reason: String = reason
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control())
+        .take(200)
+        .collect();
+    if reason.trim().is_empty() {
+        "You are banned from this server.".into()
+    } else {
+        format!("You are banned from this server: {}", reason.trim())
+    }
+}
+
 /// A task error carrying extra fields beside its text — the shape the
 /// inline-media extension's optional error code needs
 /// (`docs/inline-media.md` §7.2).
@@ -839,11 +930,17 @@ fn err_text(e: ChatError) -> &'static str {
         ChatError::AlreadyThere => "Already there.",
         ChatError::WrongPassword => "Wrong chat password.",
         ChatError::MailboxFull => "That user's mailbox is full.",
+        ChatError::SendQuota => {
+            "That user is not connected, and you have sent as much offline mail today as this \
+             server allows."
+        }
+        ChatError::TooManyChats => "Too many private chats are open. Leave one first.",
         ChatError::Blocked => "That user is not accepting messages from you.",
         ChatError::NoInbox => "This account has no message inbox.",
         // Not theirs, expired, or revoked — one answer for all three, so
         // a send cannot be used to test whether a handle exists.
         ChatError::NoSuchMedia => "Media rejected",
+        ChatError::Flooding => "You were kicked for flooding.",
         ChatError::ServerError => "Server error.",
     }
 }
@@ -1131,6 +1228,9 @@ struct Session {
     /// Change. The extension has no capability bit; a client that never
     /// asked is not handed a transaction it may not know.
     gif_icons: bool,
+    /// Get Icon List's allowance ([`ICON_LISTS`]), refilled continuously.
+    icon_list_tokens: f64,
+    icon_list_refill: Instant,
     /// Whether this session has been sent the banner, which happens once.
     banner_sent: bool,
     /// The image this session was told of and may still download: once,
@@ -1195,6 +1295,22 @@ impl Session {
         true
     }
 
+    /// May this session have another Get Icon List now? See
+    /// [`ICON_LISTS`].
+    fn take_icon_list(&mut self) -> bool {
+        let now = Instant::now();
+        self.icon_list_tokens = (self.icon_list_tokens
+            + now.duration_since(self.icon_list_refill).as_secs_f64()
+                / ICON_LIST_EVERY.as_secs_f64())
+        .min(ICON_LISTS);
+        self.icon_list_refill = now;
+        if self.icon_list_tokens < 1.0 {
+            return false;
+        }
+        self.icon_list_tokens -= 1.0;
+        true
+    }
+
     /// Did this session negotiate capability bit `n`?
     fn has_cap(&self, n: u8) -> bool {
         self.caps.has(n)
@@ -1207,27 +1323,66 @@ impl Session {
 /// the caller knows about the link — encrypted or not, and the transport
 /// identity if the caller authenticated one — and is carried to the
 /// roster untouched. The protocol inside doesn't know which it got.
+///
+/// `place` is the connection's place in its address's count
+/// ([`Core::admit_connection`]), taken by the caller before it accepted
+/// the stream — the ng frontend asks at the upgrade, so a refused client
+/// hears a 429 and keeps its token — and held here for the session's
+/// life.
 pub async fn run_session<S>(
     stream: S,
     peer: SocketAddr,
     ctx: ServerCtx,
     transport: Transport,
     link: LinkAuthority,
+    place: ConnPermit,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    run_connection(stream, peer, ctx, transport, link, false).await
+    run_connection(stream, peer, ctx, transport, link, Direct::Tunnelled(place)).await
 }
 
-/// [`run_session`], told whether `peer` is the client's own TCP address.
-/// Only then can a file transfer be required to come from it.
+/// Whether a connection's `peer` is the client's own TCP address — only
+/// then can a file transfer be required to come from it — and whether
+/// its place in its address's count has been taken yet.
+enum Direct {
+    /// A direct connection; take its place.
+    Admit,
+    /// A direct connection whose place was taken at accept (the TLS
+    /// port, so the handshake counts too).
+    Admitted(ConnPermit),
+    /// A tunnelled one, from the address the tunnel carries, whose place
+    /// the tunnel took before accepting it.
+    Tunnelled(ConnPermit),
+}
+
+/// A place for one connection from `peer`, held for the life of the
+/// connection, or `None` and the refusal counted: closed unanswered past
+/// it, as mhxd closes a connection past `conn_max` (`hxd_core::limits`).
+fn admit(ctx: &ServerCtx, peer: SocketAddr) -> Option<ConnPermit> {
+    match ctx.core.admit_connection(peer.ip()) {
+        Ok(place) => Some(place),
+        Err(refused) => {
+            info!(
+                %peer,
+                reason = refused.reason(),
+                "refusing a connection past its address's limit"
+            );
+            instrument::disconnect(WIRE, refused.reason());
+            None
+        }
+    }
+}
+
+/// [`run_session`], told whether `peer` is the client's own TCP address
+/// and whether its place is already taken ([`Direct`]).
 async fn run_connection<S>(
     stream: S,
     peer: SocketAddr,
     ctx: ServerCtx,
     transport: Transport,
     link: LinkAuthority,
-    direct: bool,
+    direct: Direct,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1236,6 +1391,15 @@ async fn run_connection<S>(
         instrument::disconnect(WIRE, "banned");
         return;
     }
+    // One place per connection, however it came to be taken.
+    let (_place, direct) = match direct {
+        Direct::Admitted(place) => (place, true),
+        Direct::Tunnelled(place) => (place, false),
+        Direct::Admit => match admit(&ctx, peer) {
+            Some(place) => (place, true),
+            None => return,
+        },
+    };
     let (mut rd, wr): (ReadHalf<S>, WriteHalf<S>) = tokio::io::split(stream);
 
     // --- Magic exchange -------------------------------------------------
@@ -1324,18 +1488,49 @@ fn names_guest(login: &str) -> bool {
     login.is_empty() || login.eq_ignore_ascii_case("guest")
 }
 
+/// Why [`reconcile_login`] refused. The client hears "Login failed." for
+/// the first two — which one it was is nothing a guesser should learn —
+/// but only the first is a guess, and only a guess counts against the
+/// address (`Core::login_attempt`).
+#[derive(Debug)]
+enum LoginRefused {
+    /// The backend's answer: a wrong password, an unknown login, or the
+    /// backend itself failing.
+    Auth(AuthError),
+    /// The credentials were not what was wrong: the socket's identity
+    /// may not have the account they named, or may not log in here at
+    /// all (§8.1, §8.3).
+    Policy,
+    /// The address has given as many wrong passwords as it may for now,
+    /// and this one was not checked. Carries how long until it may try.
+    Throttled(Duration),
+    /// An identity socket named a banned account not linked to it.
+    Banned(hxd_core::ban::BanHit),
+}
+
+impl From<AuthError> for LoginRefused {
+    fn from(e: AuthError) -> Self {
+        LoginRefused::Auth(e)
+    }
+}
+
 /// The classic login, reconciled with the socket's transport identity
 /// when it has one (`docs/hotline-ng-identity.md` §8.3). Without an
 /// identity this is just `authenticate`.
+///
+/// A login on an identity socket that names a banned account not linked
+/// to it is [`LoginRefused::Banned`], whatever the account's linking rules.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_login(
     auth: &dyn AuthBackend,
     core: &Core,
+    addr: IpAddr,
     login: &str,
     password: &[u8],
     identity_fp: Option<[u8; 32]>,
     policy: TrtpLogin,
     link: LinkAuthority,
-) -> Result<Account, AuthError> {
+) -> Result<Account, LoginRefused> {
     // Whatever this login resolves to, an account that links an identity
     // has its mail claimed onto the fingerprint before it is handed a
     // session. `claim` is idempotent and does nothing on a mailbox that
@@ -1352,6 +1547,39 @@ fn reconcile_login(
             }
         }
     };
+    // A password is a guess until it verifies. An address that has
+    // guessed wrong as often as it may, on either wire, is refused before
+    // this one is checked — a right one included, or the guessing would
+    // go on. Asked where the password is going to be checked, rather
+    // than before the login is looked at: a login that sends none, and
+    // an identity `trtp_login = trust` admits without reading the one it
+    // sent, make no guess and are not held to it. `held` is an attempt
+    // already taken for this password; `no_account_admits` says that
+    // naming no account is not a refusal here, so it is no guess either.
+    let authenticate = |login: &str,
+                        held: Option<hxd_core::LoginAttempt>,
+                        no_account_admits: bool|
+     -> Result<Account, LoginRefused> {
+        let attempt = match held {
+            Some(attempt) => attempt,
+            None => core
+                .login_attempt(addr, password)
+                .map_err(LoginRefused::Throttled)?,
+        };
+        let verdict = auth.authenticate(login, Proof::Plain(password));
+        match &verdict {
+            // The login goes on to succeed on the identity alone: a
+            // login that succeeds is not a failure.
+            Err(AuthError::NoSuchAccount) if no_account_admits => core.login_refund(attempt),
+            Err(AuthError::NoSuchAccount | AuthError::BadProof) => core.login_failed(attempt),
+            // Verified, or the backend could not say: no guess failed.
+            // What is refused after this — an identity that may not
+            // have the account — is refused for something other than
+            // the password.
+            _ => core.login_refund(attempt),
+        }
+        Ok(verdict?)
+    };
     let Some(fp) = identity_fp else {
         // No transport identity — and the claim still belongs here. The
         // obligation is the *account's*, not the socket's: someone who
@@ -1359,15 +1587,36 @@ fn reconcile_login(
         // their password has a fingerprint-keyed mailbox, and the rows
         // those two windows leave on the bare login would sit there
         // unread forever if the only claim were on the identity paths.
-        let account = auth.authenticate(login, Proof::Plain(password))?;
+        let account = authenticate(login, None, false)?;
         claim(&account);
         return Ok(account);
+    };
+    // Under any policy but `trust` the password is checked whatever the
+    // identity links, so a locked-out address is refused here, before
+    // the accounts directory is scanned for the link. Under `trust` the
+    // scan is what says whether the password is read at all, so the
+    // attempt waits for it.
+    let held = match policy {
+        TrtpLogin::Trust => None,
+        TrtpLogin::Verify => Some(
+            core.login_attempt(addr, password)
+                .map_err(LoginRefused::Throttled)?,
+        ),
     };
     // Unfiltered: "no account links this identity" and "one does but the
     // operator turned identity login off" are different answers, and
     // §8.1 gives them different outcomes. Collapsing them here turned the
     // second into a silent guest session, where the ng path denies it.
-    let linked = auth.find_by_fingerprint(&fp)?;
+    let linked = match auth.find_by_fingerprint(&fp) {
+        Ok(linked) => linked,
+        Err(e) => {
+            // No password was checked.
+            if let Some(attempt) = held {
+                core.login_refund(attempt);
+            }
+            return Err(e.into());
+        }
+    };
     let identity_admits = linked.as_ref().is_some_and(|a| a.identity.identity_login);
     if policy == TrtpLogin::Trust && identity_admits {
         let a = linked.expect("identity_admits implies a linked account");
@@ -1375,14 +1624,18 @@ fn reconcile_login(
         claim(&a);
         return Ok(a);
     }
-    let account = match auth.authenticate(login, Proof::Plain(password)) {
+    let account = match authenticate(login, held, names_guest(login) && identity_admits) {
         Ok(a) => Some(a),
         // Deleting `guest.toml` is the documented way to turn guests
         // off, and it used to refuse a linked identity's guest login on
         // this wire while the JSON wire admitted the same identity on
         // the link alone. Naming no account is a question about the
         // identity; only a linked account that may log in answers it.
-        Err(AuthError::NoSuchAccount) if names_guest(login) && identity_admits => None,
+        Err(LoginRefused::Auth(AuthError::NoSuchAccount))
+            if names_guest(login) && identity_admits =>
+        {
+            None
+        }
         Err(e) => return Err(e),
     };
     if account.as_ref().is_none_or(|a| a.login == "guest") {
@@ -1397,7 +1650,7 @@ fn reconcile_login(
             }
             Some(a) => {
                 info!(login = %a.login, "identity_login is off for the linked account");
-                Err(AuthError::BadProof)
+                Err(LoginRefused::Policy)
             }
             // §8.1 `deny`, decided on this wire as it is on the JSON one:
             // nothing links this identity, so there is no guest to fall
@@ -1407,12 +1660,22 @@ fn reconcile_login(
             // from the upgrade.
             None if !link.unlinked_ok => {
                 info!("new_accounts = deny: an identity with no linked account");
-                Err(AuthError::BadProof)
+                Err(LoginRefused::Policy)
             }
-            None => account.ok_or(AuthError::NoSuchAccount),
+            None => account.ok_or(LoginRefused::Auth(AuthError::NoSuchAccount)),
         };
     }
     let account = account.expect("a named account was authenticated");
+    // A banned account gains no identity: the link would outlive the ban
+    // as a second way in. Refused here, with the ban's reason, and never
+    // handed back unlinked for the caller's ban check: a ban lifted or
+    // run out by then would land this identity on an account it has no
+    // business on unless it may link it.
+    if account.identity.fingerprint.is_none() {
+        if let Some(hit) = core.person_banned(Some(&account.login), None, None) {
+            return Err(LoginRefused::Banned(hit));
+        }
+    }
     match account.identity.fingerprint {
         Some(f) if f == fp => {
             claim(&account);
@@ -1420,7 +1683,7 @@ fn reconcile_login(
         }
         Some(_) => {
             info!(login = %account.login, "tunnelled login names an account linked to another identity");
-            Err(AuthError::BadProof)
+            Err(LoginRefused::Policy)
         }
         // Self-linking here writes an association exactly as
         // `/identity/link` does, so it needs the same `manage`
@@ -1446,7 +1709,7 @@ fn reconcile_login(
                 // unlinked self-linkable one — so this is neither.
                 LinkOutcome::Taken(_) | LinkOutcome::Refused(_) => {
                     info!(login = %account.login, "tunnelled login names an account this identity may not have");
-                    Err(AuthError::BadProof)
+                    Err(LoginRefused::Policy)
                 }
             }
         }
@@ -1461,7 +1724,7 @@ fn reconcile_login(
         // to do with identities belongs.
         None => {
             info!(login = %account.login, "tunnelled login names an account that refuses self-linking");
-            Err(AuthError::BadProof)
+            Err(LoginRefused::Policy)
         }
     }
 }
@@ -1500,7 +1763,6 @@ async fn login_phase(
         reply_error(tx, f.trans, "The server is busy. Try again in a moment.");
         return None;
     };
-
     // The encoding comes from the same frame as the credentials, so it is
     // settled before anything in that frame is read as text. Bit 1 needs
     // nothing wired to be honored, but it is still only honored when the
@@ -1516,16 +1778,32 @@ async fn login_phase(
     // this same canonical form.) The wire's cap of 31 applies in
     // characters, which is bytes for Mac Roman as it always was, so a
     // password cuts at the same place whichever encoding sent it.
+    // A banned identity, or one whose registrar is banned, is refused
+    // before the backend is asked: that may link it to the account the
+    // login names, and a link written for a banned person is a way back
+    // in once the ban on them ends or is evaded.
+    if let Some(t) = transport.identity.as_ref() {
+        if let Some(hit) = ctx
+            .core
+            .person_banned(None, Some(&t.fingerprint), t.handle.as_deref())
+        {
+            info!(ban = hit.id, "tunnelled login refused: banned");
+            reply_error(tx, f.trans, &banned_text(&hit.reason));
+            return None;
+        }
+    }
     let auth = ctx.auth.clone();
     let core = ctx.core.clone();
     let login_str = enc.decode_chars(&req.login, 31);
     let password = enc.decode_chars(&req.password, 31).into_bytes();
     let identity_fp = transport.identity.as_ref().map(|t| t.fingerprint);
     let policy = ctx.cfg.trtp_login;
+    let addr = peer.ip();
     let verdict = tokio::task::spawn_blocking(instrument::blocking("login", move || {
         reconcile_login(
             &*auth,
             &core,
+            addr,
             &login_str,
             &password,
             identity_fp,
@@ -1538,19 +1816,65 @@ async fn login_phase(
 
     let account = match verdict {
         Ok(a) => a,
-        Err(e @ (AuthError::NoSuchAccount | AuthError::BadProof)) => {
+        Err(LoginRefused::Auth(e @ (AuthError::NoSuchAccount | AuthError::BadProof))) => {
             info!(login = %String::from_utf8_lossy(&req.login), "login refused: {e}");
             // The reference server closes with an empty error reply; give
             // the human a reason too — clients render the text.
             reply_error(tx, f.trans, "Login failed.");
             return None;
         }
-        Err(AuthError::Backend(e)) => {
+        // Refused by the identity's policy rather than its password: the
+        // same reply, so the two stay indistinguishable, but no guess was
+        // made and none is counted. A tunnel whose identity may not have
+        // the account would otherwise lock its own address out of the
+        // plain port too, by retrying a password that was right.
+        Err(LoginRefused::Policy) => {
+            info!(login = %String::from_utf8_lossy(&req.login), "login refused by identity policy");
+            reply_error(tx, f.trans, "Login failed.");
+            return None;
+        }
+        Err(LoginRefused::Banned(hit)) => {
+            info!(login = %String::from_utf8_lossy(&req.login), ban = hit.id, "tunnelled login refused: banned");
+            reply_error(tx, f.trans, &banned_text(&hit.reason));
+            return None;
+        }
+        Err(LoginRefused::Auth(AuthError::Backend(e))) => {
             warn!("auth backend failure: {e}");
             reply_error(tx, f.trans, "Server error.");
             return None;
         }
+        // The refusal is the error reply every failed login already gets,
+        // with a reason the client shows, and nothing a 1.2 client has
+        // not seen before.
+        Err(LoginRefused::Throttled(wait)) => {
+            info!("login refused: too many failed logins from this address");
+            let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+            reply_error(
+                tx,
+                f.trans,
+                &format!("Too many failed logins. Try again in {secs} seconds."),
+            );
+            return None;
+        }
     };
+    // A ban on the person (`docs/moderation.md` §3.5): the reference
+    // server's refusal, with the ban's reason.
+    let fp = account
+        .identity
+        .fingerprint
+        .or_else(|| transport.identity.as_ref().map(|t| t.fingerprint));
+    let handle = transport
+        .identity
+        .as_ref()
+        .and_then(|t| t.handle.as_deref());
+    if let Some(hit) = ctx
+        .core
+        .person_banned(Some(&account.login), fp.as_ref(), handle)
+    {
+        info!(login = %account.login, ban = hit.id, "login refused: banned");
+        reply_error(tx, f.trans, &banned_text(&hit.reason));
+        return None;
+    }
 
     // Resolve the visible name: the account must grant use_any_name for
     // the client's own nick to stick; otherwise the account name rules.
@@ -1594,7 +1918,9 @@ async fn login_phase(
         can_detach: account.can_detach,
         has_inbox: account.has_inbox,
         attach_news: account.attach_news,
+        set_avatar: account.set_avatar,
         moderate: account.moderate,
+        can_spam: account.can_spam,
         is_person: account.is_person(),
         // This wire has no `msg_read` and never will — a private message
         // is a window that opens and nothing comes back — so handing one
@@ -1635,6 +1961,14 @@ async fn login_phase(
         );
         return None;
     };
+    // Asked again now the session is on the roster: a ban placed since
+    // the check above found no session to end. Ended here, before the
+    // login is answered or anyone told of the join.
+    if let Some(hit) = ctx.core.end_if_banned(uid) {
+        info!(login = %account.login, ban = hit.id, "login refused: banned while attaching");
+        reply_error(tx, f.trans, &banned_text(&hit.reason));
+        return None;
+    }
 
     // Login reply. A version-0 server sends only the uid (and a 1.0/1.2
     // client wouldn't know what to do with more).
@@ -1720,6 +2054,8 @@ async fn login_phase(
         media_stream: None,
         transfer_addr: None,
         gif_icons: false,
+        icon_list_tokens: ICON_LISTS,
+        icon_list_refill: Instant::now(),
         banner_sent: false,
         banner_image: None,
     };
@@ -1900,13 +2236,25 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
             }
             push(tx, hdr::CHAT, chunks);
         }
-        Event::Notice { cid, from, text } => {
-            // The legacy rendering of a server notice: `\r<text>`.
-            let mut line = Vec::with_capacity(text.len() + 3);
-            line.push(b'\r');
-            line.push(b'<');
-            line.extend_from_slice(&sess.enc.encode(&text));
-            line.push(b'>');
+        Event::Notice {
+            cid,
+            from,
+            text,
+            action,
+        } => {
+            // The legacy rendering of a server notice: `\r<text>`, or
+            // mhxd's action form, `\r *** text`, for the one notice it
+            // says that way.
+            let mut line = Vec::with_capacity(text.len() + 6);
+            if action {
+                line.extend_from_slice(b"\r *** ");
+                line.extend_from_slice(&sess.enc.encode(&text));
+            } else {
+                line.push(b'\r');
+                line.push(b'<');
+                line.extend_from_slice(&sess.enc.encode(&text));
+                line.push(b'>');
+            }
             let mut chunks = vec![(tag::BODY, line)];
             if cid != 0 {
                 chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
@@ -2176,6 +2524,20 @@ async fn session_loop(
             maybe = frames.recv() => match maybe {
                 Some(f) => {
                     trace_in(&f);
+                    // mhxd charges every transaction after login before
+                    // it looks at it, and one that spends the last of the
+                    // budget is never answered: the kick that follows is
+                    // the reply. Nor is anything after it. The kick is
+                    // already made; its ban is a store write, placed off
+                    // the reactor before this connection reads the kick
+                    // and closes, so it stands by the time the client
+                    // can reconnect.
+                    if let Err(flooded) = ctx.core.spend_spam(sess.uid, spam_points(f.ty), f.ty) {
+                        if let Some(ban) = flooded.ban {
+                            off_reactor(&ctx.core, move |c| c.place_spam_ban(ban)).await;
+                        }
+                        continue;
+                    }
                     dispatch(&f, tx, ctx, sess).await;
                 }
                 None => return None, // Reader exited: EOF, error, or bad frame.
@@ -2868,6 +3230,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             "chat dropped: media handle is not this sender's"
                         )
                     }
+                    // Kicked for it; the kick is the answer.
+                    Some(Err(ChatError::Flooding)) => {
+                        debug!(uid = sess.uid, "chat dropped: flooding")
+                    }
                     Some(Err(e)) => warn!(uid = sess.uid, "public chat store failed: {e:?}"),
                     _ => {}
                 }
@@ -3268,7 +3634,16 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     debug!(target, "kick purge skipped: {e:?}");
                 }
             }
-            match ctx.core.kick(target, ban_for) {
+            let kick_ban = ban_for.map(|for_| hxd_core::KickBan {
+                by: hxd_core::Actor::Session(sess.uid),
+                for_,
+                reason: "banned by a moderator".into(),
+            });
+            // A ban is written to the store: off the reactor.
+            let kicked = off_reactor(&ctx.core, move |c| c.kick_by(target, kick_ban))
+                .await
+                .unwrap_or(Err(ChatError::ServerError));
+            match kicked {
                 Ok(nick) => {
                     reply(tx, f.trans, vec![]);
                     // The public-chat announcement, in the reference
@@ -3433,7 +3808,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         ),
                     ],
                 ),
-                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &voice::err_text(e)),
             }
         }
 
@@ -3444,7 +3819,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             match ctx.core.voice_leave(sess.uid, voice_cid(f)) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &voice::err_text(e)),
             }
         }
 
@@ -3472,12 +3847,12 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             let Ok(sdp) = sdp else {
                 debug!(uid = sess.uid, cid, "voice answer is not valid UTF-8");
-                reply_error(tx, f.trans, voice::err_text(VoiceError::BadAnswer));
+                reply_error(tx, f.trans, &voice::err_text(VoiceError::BadAnswer));
                 return;
             };
             match ctx.core.voice_answer(sess.uid, cid, sdp) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &voice::err_text(e)),
             }
         }
 
@@ -3524,7 +3899,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             match ctx.core.voice_mute(sess.uid, cid, muted) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &voice::err_text(e)),
             }
         }
 
@@ -3579,7 +3954,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         (tag::VIDEO_CODEC, codec.as_bytes().to_vec()),
                     ],
                 ),
-                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &video::err_text(e)),
             }
         }
 
@@ -3604,7 +3979,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             };
             match ctx.core.video_stop(sess.uid, voice_cid(f), kind) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &video::err_text(e)),
             }
         }
 
@@ -3623,7 +3998,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .is_some_and(|c| c.as_uint() != 0);
             match ctx.core.video_state(sess.uid, voice_cid(f), kind, paused) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &video::err_text(e)),
             }
         }
 
@@ -3645,7 +4020,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .unwrap_or_default();
             match ctx.core.video_subscribe(sess.uid, voice_cid(f), &streams) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &video::err_text(e)),
             }
         }
 
@@ -3674,6 +4049,19 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         // no support.
         gif_icons::GET_LIST if ctx.core.avatar_policy().is_some() => {
             sess.gif_icons = true;
+            // A request of a few bytes whose reply can reach a megabyte.
+            // GtkHx asks once, as its probe right after login, which is
+            // always inside the allowance: an error there would read as
+            // a server without the extension. A client asking in a loop
+            // is told to slow down.
+            if !sess.take_icon_list() {
+                reply_error(
+                    tx,
+                    f.trans,
+                    hxd_core::media::MediaReject::RateLimited.text(),
+                );
+                return;
+            }
             let (entries, left_out) = icon_list(&ctx.core.avatars());
             reply(tx, f.trans, entries);
             // What did not fit is announced as changed, which is what makes
@@ -3735,6 +4123,24 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             .await;
             match outcome {
                 Some(Ok(())) => reply(tx, f.trans, vec![]),
+                // `[extra] set_avatar`: answered as the success a set
+                // gets, and not applied — the core refused it before any
+                // decode or turn, so nothing is stored or announced. A
+                // deliberate stopgap for GtkHx 1.2 through 1.4.0 (every
+                // release so far), which re-send the saved icon after
+                // every login untasked, so a task error here is a toast
+                // at each one for every guest. The fix came after 1.4.0,
+                // on GtkHx's development line, so no release through
+                // 1.4.0 has it: releases after 1.4.0 send it under a task
+                // of its own and only log a refusal, and do not need
+                // this; a set their user makes by hand would show the
+                // refusal, as it should. The ng wire still answers
+                // `access_denied`, since a modern client can handle a
+                // refusal.
+                Some(Err(hxd_core::media::MediaReject::NotAuthorized)) => {
+                    debug!(uid, "set icon not allowed; answered as done, not applied");
+                    reply(tx, f.trans, vec![])
+                }
                 Some(Err(e)) => reply_error(tx, f.trans, e.text()),
                 None => reply_error(tx, f.trans, hxd_core::media::MediaReject::Busy.text()),
             }
@@ -3746,6 +4152,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
     }
 }
+
+/// How many Get Icon Lists a session may have in a burst, and how often
+/// one more comes back ([`ICON_LIST_EVERY`]). The first is always there,
+/// which is GtkHx's probe after login; the rest are for a client that
+/// refreshes, and a reconnect starts a fresh session with a fresh burst,
+/// which the connection limits already ration.
+const ICON_LISTS: f64 = 4.0;
+const ICON_LIST_EVERY: Duration = Duration::from_secs(15);
 
 /// The most a Get Icon List reply carries. GtkHx and mhxd's own client
 /// both accept a transaction of up to 1 MiB (`MAX_HOTLINE_PACKET_LEN` on
@@ -3803,6 +4217,14 @@ fn file_error_text(error: &hxd_core::FileError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetching_icons_is_free_and_setting_one_is_not() {
+        assert_eq!(spam_points(gif_icons::GET_LIST), 0);
+        assert_eq!(spam_points(gif_icons::GET), 0);
+        assert_eq!(spam_points(gif_icons::SET), 20);
+        assert_eq!(spam_points(105), 2, "a chat line, as mhxd prices it");
+    }
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)

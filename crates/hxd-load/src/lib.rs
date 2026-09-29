@@ -48,6 +48,8 @@ pub struct Ctx {
     pub run: String,
     pub stats: Stats,
     pub checks: Checks,
+    /// Logins the server refused as busy (`member::retry_busy`).
+    pub busy: member::BusyLogins,
     rng: Mutex<Rng>,
 }
 
@@ -63,6 +65,7 @@ impl Ctx {
             run: format!("{:04x}", nanos & 0xffff),
             stats: Stats::default(),
             checks: Checks::default(),
+            busy: member::BusyLogins::default(),
             rng: Mutex::new(Rng::new(seed)),
         })
     }

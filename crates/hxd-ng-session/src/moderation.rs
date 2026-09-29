@@ -50,6 +50,11 @@ pub fn mod_err(e: &ModError) -> (&'static str, &'static str) {
             "That report is about you: another moderator closes it.",
         ),
         ModError::RateLimited => ("rate_limited", "Slow down."),
+        ModError::NoSuchBan => ("no_such_ban", "There is no such ban standing."),
+        ModError::ConfigBan => (
+            "config_ban",
+            "That ban is in the server's configuration; the operator lifts it there.",
+        ),
         ModError::NoSession | ModError::Store(_) => ("server_error", "Server error."),
     }
 }
@@ -503,7 +508,21 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 }
             }
             let ban = p.ban.map(|s| Duration::from_secs(s).min(MAX_BAN));
-            match core.kick(p.uid, ban) {
+            let kick_ban = ban.map(|for_| hxd_core::KickBan {
+                by,
+                for_,
+                reason: p
+                    .reason
+                    .clone()
+                    .filter(|r| !r.trim().is_empty())
+                    .unwrap_or_else(|| "banned by a moderator".into()),
+            });
+            let target = p.uid;
+            // A ban is written to the store: off the reactor.
+            let kicked = off_reactor(core, move |c| c.kick_by(target, kick_ban))
+                .await
+                .unwrap_or(Err(hxd_core::ChatError::ServerError));
+            match kicked {
                 Ok(nick) => {
                     // The reference server's wording, which the legacy
                     // kick uses too: one room, one announcement.

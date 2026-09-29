@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime};
 use super::query::{words, Field, Term};
 use super::{
     Article, ArticleId, ArticlePage, Author, BodyType, Hit, Listed, NewNode, NewPost, NewsError,
-    NewsStore, Node, NodeId, NodeKind, Posted, Reference, SearchPage, SearchQuery, SubScope,
-    Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery,
+    NewsStore, NewsUsage, Node, NodeId, NodeKind, Posted, Reference, SearchPage, SearchQuery,
+    SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery,
 };
 use crate::inbox::{Mailbox, StoreError};
 
@@ -727,6 +727,31 @@ impl NewsStore for MemoryNews {
             .filter(|a| !a.deleted && a.at >= since && a.author.is(who))
             .map(|a| a.id)
             .collect())
+    }
+
+    fn usage(&self) -> Result<NewsUsage, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .articles
+            .iter()
+            .filter(|a| !a.deleted)
+            .fold(NewsUsage::default(), |used, a| NewsUsage {
+                articles: used.articles + 1,
+                bytes: used.bytes + (a.body.len() + a.plain.as_ref().map_or(0, String::len)) as u64,
+            }))
+    }
+
+    fn written_by(&self, who: Option<&Mailbox>) -> Result<u64, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .articles
+            .iter()
+            .filter(|a| !a.deleted)
+            .filter(|a| match who {
+                Some(who) => a.author.is(who),
+                None => a.author.login.is_none(),
+            })
+            .count() as u64)
     }
 
     fn refs_to(&self, id: ArticleId, limit: usize) -> Result<Vec<Reference>, StoreError> {

@@ -706,16 +706,18 @@ The login reply's `caps` list gains `"video"` when the SFU supports video, along
 
 | `req` | params | ok | errors |
 |---|---|---|---|
-| `video_start` | `cid`, `kind` (`"camera"` \| `"screen"`) | `{ "codec": "VP8" }` | `video_disabled`, `access_denied`, `not_in_voice`, `already_publishing`, `video_full` |
+| `video_start` | `cid`, `kind` (`"camera"` \| `"screen"`) | `{ "codec": "VP8" }` | `video_disabled`, `access_denied`, `not_in_voice`, `already_publishing`, `video_full`, `rate_limited` |
 | `video_stop` | `cid`, `kind?` (omit for all) | `{}` | `not_in_voice` |
 | `video_state` | `cid`, `kind`, `paused` (bool) | `{}` | `not_in_voice`, `not_publishing` |
-| `video_subscribe` | `cid`, `streams` (array of `{ uid, kind }`; `[]` for none) | `{}` | `not_in_voice` |
+| `video_subscribe` | `cid`, `streams` (array of `{ uid, kind }`; `[]` for none) | `{}` | `not_in_voice`, `rate_limited` |
 
 **Events:**
 
 | `ev` | data |
 |---|---|
 | `video_status` | `{ cid, publishers: [ { uid, kind, paused } ] }` |
+
+`rate_limited` carries `retry_after`, in whole seconds, as it does everywhere on this wire: a server may bound how often one session starts video or changes its subscriptions, since each renegotiates others. Stop and pause are never refused this way.
 
 `kind` is a string on this wire rather than the classic wire's integer, `paused` is a boolean rather than a flags word, and `streams` is an array of objects rather than a packed blob — for the same reason the voice binding sends a participant array: the transport is already JSON and a mobile client should not be decoding bit fields. `codec` is a string on both wires and needs no translation.
 
@@ -750,6 +752,7 @@ The login reply's `caps` list gains `"video"` when the SFU supports video, along
 - **The answer parser** gains a per-section `a=ssrc` requirement for video and must reject rather than fall back.
 - **Keyframe request plumbing is genuinely new work** — there is no analogue in an audio-only SFU. Budget for the rate limiter as part of it, not as a later optimisation; without it the first eight-person room reveals the problem immediately.
 - **The predictable support question** is a client that publishes happily and sees nothing from anyone, because its author expected streams to arrive unbidden. Implementations SHOULD log a subscription set that stays empty while publications exist, and client authors should reach for Video Subscribe (610) first when video does not appear.
+- **For hxd-ng specifically, on abuse:** inbound video is policed per publication at `[voice] police_factor` times its kind's ceiling, a publication still far over after ten seconds is stopped with the Video Status the bitrate section allows for, video starts and subscription changes that add a stream someone is publishing are drawn from a per-session allowance, and pause flips share voice's debounce. See [voice.md](voice.md) §13.
 - **For hxd-ng specifically:** the `VoiceMedia` trait grows publication methods (`publish`, `unpublish`, `set_paused`) plus `set_subscriptions`, and its `MediaEvent` grows a keyframe-request and a publication-failed variant; the domain gains publication and slot state, and a per-peer subscription set, next to the existing per-room participant state, where the existing four cleanup paths already reach. The subscription set is per (uid, room) and is the natural place for the "retain a subscription to a publication that does not exist yet" rule, since the domain is what learns about publications appearing. The offer template, the answer parser and the forwarding loop are the `hxd-voice` half. Configuration extends the existing `[voice]` section rather than adding a port, since the transport is shared.
 - **For GtkHx specifically:** rendering is the large piece — a decode path and a video widget where none exists — and the GStreamer pipeline gains `vp8enc`/`vp8dec` alongside the existing `mulawenc`/`mulawdec` legs. `hxproto`'s `MidLabel` and its participants parser are shared with hxd-ng and change once, in the shared crate, for both.
 

@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::check::Check;
 use crate::config::Scenario;
+use crate::member::BusySummary;
 use crate::stats::Summary;
 use crate::target::{self, Host, Scrape};
 use crate::Ctx;
@@ -27,6 +28,11 @@ pub struct Report {
     pub ops: BTreeMap<String, Summary>,
     pub checks: BTreeMap<String, Check>,
     pub violations: u64,
+    /// Logins the server refused as busy and the harness tried again.
+    /// Never a violation — the server is right to refuse — but a count
+    /// that climbs from one run to the next, or logins that gave up, is
+    /// what a login gate losing places would look like.
+    pub busy_logins: BusySummary,
     /// What only this scenario measures.
     pub detail: Value,
     pub metrics_before: Option<Scrape>,
@@ -78,14 +84,16 @@ impl Report {
             ops: ctx.stats.summary(),
             violations: checks.values().map(|c| c.violated).sum(),
             checks,
+            busy_logins: ctx.busy.summary(),
             detail,
             metrics_before: before,
             metrics_after: after,
         }
     }
 
-    /// A few lines for a terminal: the verdict, the latencies, and every
-    /// violated check with its first example.
+    /// A few lines for a terminal: the verdict, the latencies, the
+    /// logins refused as busy, and every violated check with its first
+    /// example.
     pub fn summary(&self) -> String {
         let mut out = format!(
             "{:?} for {}s: {}\n",
@@ -104,6 +112,11 @@ impl Report {
                 s.count, s.p50_ms, s.p99_ms, s.p999_ms, s.max_ms
             ));
         }
+        let b = &self.busy_logins;
+        out.push_str(&format!(
+            "  logins refused as busy: {} times across {} logins, {} gave up, longest wait {:.2}ms\n",
+            b.refusals, b.logins, b.gave_up, b.longest_wait_ms
+        ));
         for (name, c) in &self.checks {
             if c.violated > 0 {
                 out.push_str(&format!(

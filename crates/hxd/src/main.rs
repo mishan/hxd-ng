@@ -87,6 +87,10 @@ async fn reload_on_hangup(
             ),
             Err(e) => tracing::error!("SIGHUP: {e}; the revocation lists are unchanged"),
         }
+        // What `hxd ban` placed or lifted meanwhile, and the sessions a
+        // new ban now refuses.
+        core.reload_bans();
+        tracing::info!("SIGHUP: bans reloaded");
         if let Some(reg) = registrar.as_deref() {
             match hxd::registrar::reload(reg, &path) {
                 Ok((reserved, invites)) => tracing::info!(
@@ -214,6 +218,18 @@ enum Command {
     ModerationLog {
         limit: usize,
     },
+    BanAdd {
+        target: String,
+        reason: String,
+        note: Option<String>,
+        for_: Option<std::time::Duration>,
+    },
+    BanList {
+        all: bool,
+    },
+    BanLift {
+        id: u64,
+    },
 }
 
 const USAGE: &str = "usage:\n  \
@@ -232,7 +248,10 @@ hxd [--config …] media revoke <handle> --reason R [--no-block]\n  \
 hxd [--config …] purge <login> [--fingerprint FP] [--since 1h] --reason R [--dry-run]\n  \
 hxd [--config …] reports [--all]\n  \
 hxd [--config …] reports close <id> --outcome dismissed|duplicate [--note N] [--of ID]\n  \
-hxd [--config …] moderation log [--limit N]\n\n\
+hxd [--config …] moderation log [--limit N]\n  \
+hxd [--config …] ban add <target> --reason R [--for 1d] [--note N]\n  \
+hxd [--config …] ban list [--all]\n  \
+hxd [--config …] ban lift <id>\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
 `push rekey` replaces the server's VAPID key and drops every registered\n\
@@ -266,7 +285,15 @@ said; `all` for everything). Images live in the running server's\n\
 memory, so `media revoke` — and a purge's images — are an ng\n\
 moderator's to do. `reports` lists what is open (--all for\n\
 everything) and `reports close` dismisses one or marks it a\n\
-duplicate --of another; `moderation log` is the audit trail.";
+duplicate --of another; `moderation log` is the audit trail.\n\n\
+`ban add` refuses a <target> until --for runs out (until lifted without\n\
+it, or with --for all):\n\
+an address or block (`192.0.2.7`, `10.0.0.0/8`, `2001:db8::/48`),\n\
+`login:NAME`, which bans the identity the account links too,\n\
+`identity:FINGERPRINT`, or `*@HOST` for every identity a registrar\n\
+issued. `ban list` is what stands (--all for the record), `ban lift`\n\
+ends one and every row the same act placed. A running server applies\n\
+either on SIGHUP, ending the sessions a new ban refuses.";
 
 fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut config = PathBuf::from("hxd-ng.toml");
@@ -286,6 +313,7 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut note = None;
     let mut of = None;
     let mut limit = None;
+    let mut ban_for = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -330,6 +358,13 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                     &args
                         .next()
                         .ok_or_else(|| "--since needs a duration".to_string())?,
+                )?);
+            }
+            "--for" => {
+                ban_for = Some(hxd::moderation::parse_ban_for(
+                    &args
+                        .next()
+                        .ok_or_else(|| "--for needs a duration".to_string())?,
                 )?);
             }
             "--no-block" => no_block = true,
@@ -391,11 +426,12 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                 | ["history", "redact", _]
                 | ["media", "revoke", _]
                 | ["purge", _]
+                | ["ban", "add", _]
         )
     {
         return Err(
-            "--reason belongs to `registrar revoke`, `history redact`, `media revoke` and \
-             `purge`"
+            "--reason belongs to `registrar revoke`, `history redact`, `media revoke`, \
+             `purge` and `ban add`"
                 .to_string(),
         );
     }
@@ -405,13 +441,17 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     if no_block && !matches!(words[..], ["media", "revoke", _]) {
         return Err("--no-block belongs to `media revoke`".to_string());
     }
-    if all && !matches!(words[..], ["reports"]) {
-        return Err("--all belongs to `reports`".to_string());
+    if all && !matches!(words[..], ["reports"] | ["ban", "list"]) {
+        return Err("--all belongs to `reports` and `ban list`".to_string());
     }
-    if (outcome.is_some() || note.is_some() || of.is_some())
-        && !matches!(words[..], ["reports", "close", _])
-    {
-        return Err("--outcome, --note and --of belong to `reports close`".to_string());
+    if (outcome.is_some() || of.is_some()) && !matches!(words[..], ["reports", "close", _]) {
+        return Err("--outcome and --of belong to `reports close`".to_string());
+    }
+    if note.is_some() && !matches!(words[..], ["reports", "close", _] | ["ban", "add", _]) {
+        return Err("--note belongs to `reports close` and `ban add`".to_string());
+    }
+    if ban_for.is_some() && !matches!(words[..], ["ban", "add", _]) {
+        return Err("--for belongs to `ban add`".to_string());
     }
     if limit.is_some() && !matches!(words[..], ["moderation", "log"]) {
         return Err("--limit belongs to `moderation log`".to_string());
@@ -419,7 +459,7 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     if (fingerprint.is_some() || dry_run)
         && matches!(
             words.first(),
-            Some(&"history" | &"media" | &"reports" | &"moderation")
+            Some(&"history" | &"media" | &"reports" | &"moderation" | &"ban")
         )
     {
         return Err("--fingerprint and --dry-run belong to `inbox purge` and `purge`".to_string());
@@ -522,6 +562,16 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
         },
         ["moderation", "log"] => Command::ModerationLog {
             limit: limit.unwrap_or(50),
+        },
+        ["ban", "add", target] => Command::BanAdd {
+            target: target.to_string(),
+            reason: reason.ok_or("`ban add` needs --reason: every ban says why")?,
+            note,
+            for_: ban_for.flatten(),
+        },
+        ["ban", "list"] => Command::BanList { all },
+        ["ban", "lift", id] => Command::BanLift {
+            id: id.parse().map_err(|_| format!("{id:?} is not a ban id"))?,
         },
         ["inbox", "purge", login] => Command::InboxPurge {
             login: login.to_string(),
@@ -682,6 +732,26 @@ async fn main() {
             }
             Command::ModerationLog { limit } => {
                 println!("{}", hxd::moderation::log(&config, *limit)?);
+                return Ok(());
+            }
+            Command::BanAdd {
+                target,
+                reason,
+                note,
+                for_,
+            } => {
+                println!(
+                    "{}",
+                    hxd::moderation::ban_add(&config, target, reason, note.clone(), *for_)?
+                );
+                return Ok(());
+            }
+            Command::BanList { all } => {
+                println!("{}", hxd::moderation::ban_list(&config, *all)?);
+                return Ok(());
+            }
+            Command::BanLift { id } => {
+                println!("{}", hxd::moderation::ban_lift(&config, *id)?);
                 return Ok(());
             }
             _ => {}
@@ -896,6 +966,8 @@ async fn main() {
                     tracing::error!("voice media socket: {e}");
                 }
             });
+            // The mute and pause debounce's timer.
+            tokio::spawn(hxd::voice::debounce(ctx.core.clone()));
         }
 
         // Inbox retention, when there is an inbox. Not the ng frontend's
@@ -953,6 +1025,13 @@ async fn main() {
         }
         if ctx.core.push_enabled() {
             tokio::spawn(hxd::device_sweeper(ctx.core.clone()));
+        }
+        if config
+            .avatars
+            .as_ref()
+            .is_some_and(|a| a.identity_retain_days > 0)
+        {
+            tokio::spawn(hxd::avatar_pruner(ctx.core.clone()));
         }
         // The audit trail's evidence window and closed reports' retention.
         tokio::spawn(hxd::moderation::pruner(ctx.core.clone()));

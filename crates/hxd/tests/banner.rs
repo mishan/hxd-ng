@@ -117,15 +117,21 @@ async fn start(shown: Shown<'_>) -> Running {
     };
     // `run_session` is what the ng frontend hands a tunnelled stream to:
     // the protocol is the same, and the peer is not the client's address.
+    // The frontend takes the connection's place before handing it over.
     let tunnel_ctx = ctx.clone();
     tokio::spawn(async move {
         while let Ok((stream, peer)) = tunnel.accept().await {
+            let place = tunnel_ctx
+                .core
+                .admit_connection(peer.ip())
+                .expect("loopback is exempt");
             tokio::spawn(hxd_session::run_session(
                 stream,
                 peer,
                 tunnel_ctx.clone(),
                 Default::default(),
                 Default::default(),
+                place,
             ));
         }
     });

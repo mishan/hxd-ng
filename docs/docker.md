@@ -208,8 +208,22 @@ is off (`HXD_VIDEO` without voice, say) is reported and ignored.
 | `HXD_AGREEMENT_FILE` | `/var/lib/hxd-ng/agreement.txt` when it exists | The agreement shown at login (UTF-8). |
 | `HXD_BANNER_FILE` | | A JPEG, GIF or PNG of at most 1 MiB, mounted into the container, shown to clients as the server banner. Publish 5501 for classic clients to fetch it; ng clients fetch it over 5700. `docker kill -s HUP hxd-ng` re-reads it. |
 | `HXD_BANNER_URL` | | With `HXD_BANNER_FILE`, where a click on the banner goes. Alone, where clients fetch the banner from. |
-| `HXD_BAN_TIME` | 1800 | Seconds a kick-with-ban holds the address. |
+| `HXD_BAN_TIME` | 1800 | Seconds a kick-with-ban holds the address. Kept in the database, when there is one, across restarts. |
 | `HXD_LOGIN_TIMEOUT` | 10 | Seconds a connection has to log in. |
+| `HXD_CONNECTIONS_PER_ADDR` | 5 | Connections one address may hold at once, on both wires together; 0 for no limit. Past it a connection is closed unanswered on the classic ports and refused with HTTP 429 on 5700. |
+| `HXD_RECONNECT_SECONDS` | 2 | Once an address has made that many connections in a burst (5 when `HXD_CONNECTIONS_PER_ADDR` is 0), how long it waits for each new one; 0 for no limit. |
+| `HXD_LIMITS_EXEMPT` | `127.0.0.0/8,::1` | Addresses and blocks the per-address limits in this table do not apply to, `gateway` standing for the network's gateway; the flood limits are a user's, and hold everywhere. Setting it replaces the default rather than adding to it, so keep loopback when adding to it: `127.0.0.0/8,::1,gateway`. When clients reach the container through Docker's userland proxy they all arrive from the gateway and would share one address's limit, classic clients and ng ones alike: exempt `gateway` then ([the README](../README.md#limits)). |
+| `HXD_CHAT_LINES`, `HXD_CHAT_SECONDS` | 20, 5 | Chat lines one user may send in each window of that many seconds before being kicked for flooding; 0 lines for no limit. |
+| `HXD_SPAM_POINTS`, `HXD_SPAM_SECONDS` | 100, 5 | Spam points one user may spend in each window of that many seconds, every request costing what mhxd charges it, before being kicked and its address banned for `[server] ban_time` (the account, not the address, when that address is exempt); 0 points for no limit. |
+| `HXD_PRIVATE_CHATS_PER_USER` | 16 | Private chats one session may have opened and still open; 0 for no limit. Counted per session, so a user with several sessions is bounded by `HXD_PRIVATE_CHATS`. |
+| `HXD_PRIVATE_CHATS` | 4096 | Private chats open on the whole server; 0 for no limit. |
+| `HXD_NG_REQUESTS`, `HXD_NG_REQUEST_SECONDS` | 40, 2 | Request weight one ng session may spend at once, earned back over that many seconds; past it a request is answered `rate_limited` with how long to wait. 0 for no limit. |
+| `HXD_NEWS_POSTS`, `HXD_NEWS_POST_SECONDS` | 10, 300 | News posts one account may make at once, earned back over that many seconds; past it an ng post is answered `rate_limited`. 0 for no limit. |
+| `HXD_LOGIN_FAILURES`, `HXD_LOGIN_FAILURE_SECONDS` | 10, 30 | Wrong passwords one address may give, on any wire, before its password logins are refused until it earns one back, one every that many seconds; 0 failures for no limit. |
+| `HXD_HTTP_CONNECTIONS_PER_ADDR` | 16 | Connections one address may hold to the ng port, whatever they carry; 0 for no limit. Past it a connection is closed unanswered. A trusted proxy's connections are not counted per address. |
+| `HXD_NG_CONNECTIONS` | 4096 | Connections everyone together may hold to the ng port; 0 for no limit. Keep it below the container's descriptor limit, less a few: addresses in `HXD_LIMITS_EXEMPT` are kept places past it. |
+| `HXD_CHALLENGES_PER_MINUTE` | 30 | `POST /identity/challenge` one address may make a minute; 0 for no limit. |
+| `HXD_AVATAR_FETCHES_PER_MINUTE` | 600 | `GET /avatars/{id}` one address may make a minute; 0 for no limit. |
 | `HXD_LOGINS_IN_FLIGHT` | 32 | Logins the server works on at once, a quarter of them from one address at most. Past it a login is refused as busy and its user tries again, rather than every login slowing down together. |
 | `HXD_QUEUE_BUDGET_MB` | 128 | MiB the server may queue for its clients, all together. Past it, the clients furthest behind are dropped. The allocator holds a few times this, so keep it to a fraction of the container's memory. |
 
@@ -256,11 +270,16 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_INBOX_MAX_QUEUED` | 200 | Messages waiting per account. |
 | `HXD_INBOX_RETAIN_UNREAD` | 2592000 | Seconds an unread message is kept. |
 | `HXD_INBOX_RETAIN_READ` | 604800 | Seconds a read one is kept. |
+| `HXD_INBOX_MAX_SENT_PER_DAY` | 1000 | Messages one account may store in a day, delivered or waiting; 0 for no quota. Past it, a message to someone connected still arrives, unstored. |
+| `HXD_INBOX_MAX_SENT_BYTES_PER_DAY` | 8388608 | The same in bytes. |
 | `HXD_HISTORY` | `on` | Chat scrollback ([chat-history.md](chat-history.md)). |
 | `HXD_HISTORY_MAX_LINES` | 10000 | Lines kept; 0 is unlimited. |
 | `HXD_HISTORY_MAX_DAYS` | 0 | Days kept; 0 is unlimited. |
 | `HXD_NEWS` | `on` | Threaded news ([news.md](news.md)). |
 | `HXD_NEWS_RETAIN_DAYS` | 0 | A thread's life after its last post; 0 is forever. |
+| `HXD_NEWS_MAX_ARTICLES` | 100000 | Articles the news may hold; past it a post is refused. 0 for no ceiling. |
+| `HXD_NEWS_MAX_TEXT_BYTES` | 1073741824 | Bytes of article text it may hold, likewise. |
+| `HXD_NEWS_MAX_PER_AUTHOR` | 10000 | Articles one account may hold, the guests counted together. |
 | `HXD_MEDIA` | `on` | Images in chat ([inline-media.md](inline-media.md)). Sending one needs the `send_media` bit: the account `HXD_ADMIN_LOGIN` writes has it, and any other account only if its file grants it. |
 | `HXD_AVATARS` | `on` | Users' pictures on both wires ([avatars.md](avatars.md)), kept in the database. |
 | `HXD_PUSH_CONTACT` | | Turns on Web Push; a `mailto:` or `https:` contact for push services ([webpush-gateway.md](webpush-gateway.md)). The VAPID key is generated into the volume, and losing it silently breaks every subscription — back it up. |

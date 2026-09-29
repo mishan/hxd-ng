@@ -6,6 +6,7 @@
 //! parses a request, clamps what the wire says it clamps, calls the core
 //! off the reactor, and writes the answer down.
 
+use hxd_core::instrument;
 use hxd_core::news::{
     Article, ArticleId, BodyType, Hit, MarkdownMode, NewsError, Node, NodeId, NodeKind, NodeTree,
     Notified, PostRequest, Reference, SearchOrder, SearchRequest, SubScope, Subscription,
@@ -17,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::conn::off_reactor;
-use crate::proto::{reply_err, reply_ok, unix, ReqEnvelope};
+use crate::proto::{reply_err, reply_err_retry, reply_ok, unix, ReqEnvelope};
 use crate::NgCtx;
 
 /// The error code and text for a refused news request. The codes are the
@@ -63,6 +64,14 @@ pub fn news_err(e: &NewsError) -> (&'static str, &'static str) {
             "That post has more attachments than this server allows.",
         ),
         NewsError::NewsFull => ("news_full", "This server's news storage is full."),
+        NewsError::TooManyArticles { guests: false } => (
+            "too_many_articles",
+            "You have as many articles here as this server allows. Delete one first.",
+        ),
+        NewsError::TooManyArticles { guests: true } => (
+            "too_many_articles",
+            "Guests have as many articles here as this server allows.",
+        ),
         NewsError::NoSession | NewsError::Store(_) => ("server_error", "Server error."),
     }
 }
@@ -416,6 +425,9 @@ fn page_size(asked: Option<usize>, default: usize, ceiling: usize) -> Result<usi
 pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
     let id = req.id;
     let refused = |e: NewsError| {
+        if matches!(e, NewsError::RateLimited) {
+            instrument::rate_limited("ng", "news_search");
+        }
         let (code, text) = news_err(&e);
         reply_err(id, code, text)
     };
@@ -633,9 +645,32 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
             if post.attachments.len() != p.attach.len() {
                 return reply_err(id, "no_such_media", "No such media.");
             }
+            // The account's news posts (`hxd_core::RequestLimits`), over
+            // and above the spam points the dispatcher has charged: those
+            // bound a burst, this how many an hour holds. One is taken
+            // now and given back if the post is refused; a session that
+            // may not post is told that instead.
+            let reserved = if core.news_may_post(uid) {
+                if let Err(wait) = core.news_post_reserve(uid) {
+                    instrument::rate_limited("ng", "news_post");
+                    return reply_err_retry(
+                        id,
+                        "rate_limited",
+                        "Slow down.",
+                        crate::conn::retry_secs(wait),
+                    );
+                }
+                true
+            } else {
+                false
+            };
             answer(
                 off_reactor(core, move |c| {
-                    c.news_post(uid, post).map(|id| json!({ "id": id }))
+                    let posted = c.news_post(uid, post);
+                    if posted.is_err() && reserved {
+                        c.news_post_refund(uid);
+                    }
+                    posted.map(|id| json!({ "id": id }))
                 })
                 .await,
             )

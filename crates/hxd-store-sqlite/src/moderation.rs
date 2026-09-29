@@ -5,6 +5,7 @@
 
 use std::time::SystemTime;
 
+use hxd_core::ban::{Ban, BanId, BanSource, BanTarget};
 use hxd_core::inbox::{Mailbox, StoreError};
 use hxd_core::moderation::{
     Act, ActId, ActKind, Closed, ModerationStore, Outcome, Report, ReportFilter, ReportId,
@@ -420,4 +421,182 @@ impl ModerationStore for SqliteStore {
             params![unix(before)],
         ))
     }
+
+    fn ban(&self, ban: &Ban) -> Result<Ban, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction())?;
+        let (target, prefix) = ban.target.to_row();
+        let standing = sql(tx
+            .query_row(
+                &format!(
+                    "SELECT {BAN_COLUMNS} FROM ban
+                      WHERE kind = ?1 AND target = ?2 AND coalesce(prefix_len, -1) = ?3
+                        AND lifted_at IS NULL"
+                ),
+                params![ban.target.kind_i64(), target, prefix.map_or(-1, i64::from)],
+                ban_of,
+            )
+            .optional())?
+        .transpose()?;
+        // Expired, never lifted: closed at its expiry, so the new ban
+        // is a row of its own and the old one's record stays as it was.
+        let standing = match standing {
+            Some(old) if !old.standing(ban.created_at) => {
+                sql(tx.execute(
+                    "UPDATE ban SET lifted_at = expires_at WHERE id = ?1",
+                    params![clamp(old.id)],
+                ))?;
+                None
+            }
+            standing => standing,
+        };
+        let row = match standing {
+            Some(old) => {
+                let row = hxd_core::moderation::extend_ban(&old, ban);
+                sql(tx.execute(
+                    "UPDATE ban SET reason = ?1, note = ?2, actor = ?3, actor_fp = ?4,
+                        source = ?5, expires_at = ?6, moderation_id = ?7 WHERE id = ?8",
+                    params![
+                        row.reason,
+                        row.note,
+                        row.actor,
+                        row.actor_fp.as_ref().map(fp_hex),
+                        row.source.as_i64(),
+                        row.expires_at.map(unix),
+                        row.act.map(clamp),
+                        clamp(row.id),
+                    ],
+                ))?;
+                row
+            }
+            None => {
+                sql(tx.execute(
+                    "INSERT INTO ban (kind, target, prefix_len, reason, note, actor, actor_fp,
+                        source, created_at, expires_at, moderation_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        ban.target.kind_i64(),
+                        target,
+                        prefix.map(i64::from),
+                        ban.reason,
+                        ban.note,
+                        ban.actor,
+                        ban.actor_fp.as_ref().map(fp_hex),
+                        ban.source.as_i64(),
+                        unix(ban.created_at),
+                        ban.expires_at.map(unix),
+                        ban.act.map(clamp),
+                    ],
+                ))?;
+                Ban {
+                    id: id_of(tx.last_insert_rowid(), "ban id")?,
+                    lifted_at: None,
+                    lifted_by: None,
+                    ..ban.clone()
+                }
+            }
+        };
+        sql(tx.commit())?;
+        Ok(row)
+    }
+
+    fn lift_ban(&self, id: BanId, by: &str, at: SystemTime) -> Result<Option<Ban>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = sql(conn.execute(
+            "UPDATE ban SET lifted_at = ?1, lifted_by = ?2 WHERE id = ?3 AND lifted_at IS NULL",
+            params![unix(at), by, clamp(id)],
+        ))?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        sql(conn
+            .query_row(
+                &format!("SELECT {BAN_COLUMNS} FROM ban WHERE id = ?1"),
+                params![clamp(id)],
+                ban_of,
+            )
+            .optional())?
+        .transpose()
+    }
+
+    fn bans(
+        &self,
+        standing_at: Option<SystemTime>,
+        before: Option<BanId>,
+        limit: usize,
+    ) -> Result<Vec<Ban>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let standing = standing_at.is_some();
+        let mut stmt = sql(conn.prepare_cached(&format!(
+            "SELECT {BAN_COLUMNS} FROM ban
+              WHERE id < ?1
+                AND (?2 = 0 OR (lifted_at IS NULL AND (expires_at IS NULL OR expires_at > ?3)))
+              ORDER BY id DESC LIMIT ?4"
+        )))?;
+        let rows = sql(stmt.query_map(
+            params![
+                before.map_or(i64::MAX, clamp),
+                i64::from(standing),
+                standing_at.map_or(0, unix),
+                limit.min(i64::MAX as usize) as i64,
+            ],
+            ban_of,
+        ))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(sql(r)??);
+        }
+        Ok(out)
+    }
+
+    fn prune_bans(&self, before: SystemTime) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "DELETE FROM ban WHERE lifted_at < ?1 OR expires_at < ?1",
+            params![unix(before)],
+        ))
+    }
+}
+
+const BAN_COLUMNS: &str = "id, kind, target, prefix_len, reason, note, actor, actor_fp, source, \
+                           created_at, expires_at, lifted_at, lifted_by, moderation_id";
+
+fn ban_of(r: &Row<'_>) -> rusqlite::Result<Result<Ban, StoreError>> {
+    let id: i64 = r.get(0)?;
+    let kind: i64 = r.get(1)?;
+    let target: Vec<u8> = r.get(2)?;
+    let prefix: Option<i64> = r.get(3)?;
+    let reason: String = r.get(4)?;
+    let note: Option<String> = r.get(5)?;
+    let actor: String = r.get(6)?;
+    let actor_fp: Option<String> = r.get(7)?;
+    let source: i64 = r.get(8)?;
+    let created_at: i64 = r.get(9)?;
+    let expires_at: Option<i64> = r.get(10)?;
+    let lifted_at: Option<i64> = r.get(11)?;
+    let lifted_by: Option<String> = r.get(12)?;
+    let act: Option<i64> = r.get(13)?;
+    Ok((|| {
+        let prefix = prefix
+            .map(|p| {
+                u8::try_from(p).map_err(|_| StoreError::new("a stored prefix is out of range"))
+            })
+            .transpose()?;
+        Ok(Ban {
+            id: id_of(id, "ban id")?,
+            target: BanTarget::from_row(kind, &target, prefix)
+                .ok_or_else(|| StoreError::new(format!("stored ban {id} has a bad target")))?,
+            reason,
+            note,
+            actor,
+            actor_fp: fp(actor_fp)?,
+            source: BanSource::from_i64(source)
+                .ok_or_else(|| StoreError::new(format!("stored ban source {source} is unknown")))?,
+            created_at: from_unix(created_at),
+            expires_at: expires_at.map(from_unix),
+            lifted_at: lifted_at.map(from_unix),
+            lifted_by,
+            act: act.map(|n| id_of(n, "act id")).transpose()?,
+        })
+    })())
 }

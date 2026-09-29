@@ -185,18 +185,62 @@ fn history_store_failed(e: StoreError) -> ChatError {
 /// roster itself, not an entry here.)
 #[derive(Default)]
 pub(crate) struct PrivateChat {
+    /// Who opened it, while that session lasts: what
+    /// [`crate::ChatLimits::per_creator`] counts. Cleared when the
+    /// session ends, so a recycled uid inherits nothing.
+    pub(crate) creator: Option<Uid>,
     pub(crate) members: Vec<Uid>,
     pub(crate) invited: Vec<Uid>,
     pub(crate) subject: String,
     pub(crate) password: String,
 }
 
-/// A ban-list entry. Matching is by address (the reference server also
-/// wildcards name/login in practice, so address is the discriminating key;
-/// per-login bans can join it when the account admin work lands).
-pub(crate) struct Ban {
-    pub(crate) addr: Option<IpAddr>,
-    pub(crate) expires: Instant,
+/// The ban a kick places (`Core::kick_by`).
+#[derive(Debug, Clone)]
+pub struct KickBan {
+    /// Who kicked: named on the ban as its actor.
+    pub by: crate::moderation::Actor,
+    pub for_: Duration,
+    /// Shown to the banned client where its wire can show it.
+    pub reason: String,
+}
+
+/// Why [`Core::spend_spam`] refused a transaction: its sender was
+/// kicked for it, or had been already.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a spam kick's ban is placed only by `Core::place_spam_ban`"]
+pub struct Flooded {
+    /// The ban the kick asks for, when it asks for one: for the caller
+    /// to hand to [`Core::place_spam_ban`] off the reactor, since it is
+    /// a store write.
+    pub ban: Option<SpamBan>,
+}
+
+/// The ban a spam kick places, chosen when the kick was made
+/// (`Core::spend_spam`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct SpamBan {
+    uid: Uid,
+    target: crate::ban::BanTarget,
+    for_: Duration,
+}
+
+/// Is `v6` an IPv6 address a kick-ban takes alone, as /128, rather
+/// than with its `ban_v6_prefix` block? Loopback and the unspecified
+/// address, whose `::/64` is every other address a local client could
+/// come from; and the addresses that stand for an IPv4 host, where the
+/// block is every IPv4 client at once: the NAT64 well-known prefix
+/// `64:ff9b::/96` (RFC 6052), which on a NAT64 or SIIT deployment is
+/// where every IPv4 client appears, its local-use `64:ff9b:1::/48`
+/// (RFC 8215), and the IPv4-compatible `::/96`, which holds loopback
+/// and the unspecified address too. An IPv4-mapped address is an IPv4
+/// one by then (`IpAddr::to_canonical`).
+fn v6_stands_alone(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    let nat64 = s[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
+    let nat64_local = s[..3] == [0x64, 0xff9b, 1];
+    let compatible = s[..6] == [0; 6];
+    v6.is_loopback() || v6.is_unspecified() || nat64 || nat64_local || compatible
 }
 
 /// A public line on its way to the log and the room.
@@ -354,6 +398,13 @@ pub enum ChatError {
     /// delivered and which then quietly disappeared is the failure mode
     /// that destroys trust in a messaging system.
     MailboxFull,
+    /// The recipient is not attached, and the sender has stored as much
+    /// mail today as `[inbox]` allows. Refused the way a full mailbox
+    /// is, and about the sender rather than the recipient.
+    SendQuota,
+    /// The creator has as many private chats open as `[limits]` allows,
+    /// or the server has.
+    TooManyChats,
     /// The recipient has blocked the sender. Named rather than hidden,
     /// matching fogWraith's `Blocked` (reason 3) so the two subsystems
     /// answer alike — see docs/private-messages.md §14 for the argument
@@ -368,6 +419,10 @@ pub enum ChatError {
     /// revoked. One answer for all three, so a sender cannot use a chat
     /// send to test whether someone else's handle exists.
     NoSuchMedia,
+    /// The sender talked faster than it may (`crate::limits`) and has
+    /// been kicked for it, or had been kicked already and is on its way
+    /// out.
+    Flooding,
     /// The server couldn't complete the operation — a chat id the OS
     /// CSPRNG refused to produce, or an inbox that would not write. Not
     /// the client's fault and not something it can retry usefully.
@@ -395,6 +450,7 @@ impl Core {
         style: u16,
         media: Option<crate::media::Handle>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
+        self.chat_flood_check(from, 0, &text)?;
         let (info, login, fingerprint, principal) = {
             let r = self.roster.lock().unwrap();
             let Some(sess) = r.users.get(&from) else {
@@ -587,6 +643,9 @@ impl Core {
                 serial: sess.serial,
             }
         };
+        // After membership, as mhxd's `rcv_chat` drops a line to a room
+        // its sender is not in before `hxd_rcv_chat` counts it.
+        self.chat_flood_check(from, cid, &text)?;
         let media = match media {
             Some(handle) => Some((
                 handle,
@@ -695,12 +754,182 @@ impl Core {
             .unwrap_or(0)
     }
 
+    /// Count a chat send's lines against `uid`'s `chat_lines`, as
+    /// mhxd's `hxd_rcv_chat` counts them (`crate::limits::chat_lines`),
+    /// or kick it. Past the window's allowance the session is kicked,
+    /// without a ban, the send is refused whole — mhxd overwrites the
+    /// lines it had formatted with the notice — and the room it was sent
+    /// to hears mhxd's `\r *** X was kicked for chat spamming`, from the
+    /// spammer. A session whose account `can_spam`, and the server
+    /// account, spend nothing; a uid not on the roster spends nothing
+    /// either, since the caller refuses it for that.
+    ///
+    /// mhxd skips the count for a line that starts with `/`, because it
+    /// runs that line as a command instead of relaying it. This server
+    /// has no chat commands and relays such a line like any other, so it
+    /// counts like any other.
+    pub(crate) fn chat_flood_check(&self, uid: Uid, cid: u32, text: &str) -> Result<(), ChatError> {
+        let nick = {
+            let mut r = self.roster.lock().unwrap();
+            let Some(sess) = r.users.get_mut(&uid) else {
+                return Ok(());
+            };
+            // On its way out: every line it had in flight would kick it
+            // again and tell the room again.
+            if sess.kicked {
+                return Err(ChatError::Flooding);
+            }
+            if sess.can_spam || sess.info.system {
+                return Ok(());
+            }
+            let lines = crate::limits::chat_lines(text);
+            if sess
+                .flood
+                .chat(lines, &self.flood_limits, std::time::Instant::now())
+            {
+                return Ok(());
+            }
+            match kick_in(&mut r, uid) {
+                Ok(nick) => nick,
+                Err(_) => return Err(ChatError::Flooding),
+            }
+        };
+        warn!(uid, nick = %nick, "kicked for chat spamming");
+        crate::instrument::flood_kick("chat");
+        self.notice(
+            cid,
+            uid,
+            format!("{nick} was kicked for chat spamming"),
+            true,
+        );
+        Err(ChatError::Flooding)
+    }
+
+    /// Spend `points` of `uid`'s spam points on a transaction it sent,
+    /// mhxd's `spam_update` at the top of `hxd_rcv`: `trans` is the
+    /// transaction's type on the classic wire, or the type of the one an
+    /// ng request stands for there, and only the announcement uses it.
+    /// When the window's total reaches `spam_points` the session is
+    /// kicked, and public chat hears mhxd's `<X has been banned by X:
+    /// spam_max exceeded: …>` ("kicked" when nothing is banned); the
+    /// transaction is refused, and so is
+    /// every one after it from a session already kicked, which is neither
+    /// kicked nor announced again. A session whose account `can_spam`,
+    /// and the server account, spend nothing.
+    ///
+    /// The kick is made here, at once; the ban it asks for, for
+    /// `ban_for` (none when that is zero), comes back in [`Flooded`]
+    /// for the caller to place off the reactor with
+    /// [`Core::place_spam_ban`], as it is a store write. What it bans is
+    /// chosen now, while the session is on the roster to be read.
+    pub fn spend_spam(&self, uid: Uid, points: u32, trans: u32) -> Result<(), Flooded> {
+        let limits = self.flood_limits;
+        let (nick, total, target) = {
+            let mut r = self.roster.lock().unwrap();
+            let Some(sess) = r.users.get_mut(&uid) else {
+                return Ok(());
+            };
+            if sess.kicked {
+                return Err(Flooded { ban: None });
+            }
+            if sess.can_spam || sess.info.system {
+                return Ok(());
+            }
+            let (total, under) = sess.flood.spam(points, &limits, std::time::Instant::now());
+            if under {
+                return Ok(());
+            }
+            let target = if limits.ban_for.is_zero() {
+                None
+            } else {
+                self.spam_ban_target(sess)
+            };
+            // Kicked under the lock that found it over, so a burst in
+            // flight kicks it once; banned once the lock is let go.
+            match kick_in(&mut r, uid) {
+                Ok(nick) => (nick, total, target),
+                Err(_) => return Err(Flooded { ban: None }),
+            }
+        };
+        let verb = if target.is_some() { "banned" } else { "kicked" };
+        warn!(uid, nick = %nick, total, trans, "{verb} for spam_max");
+        crate::instrument::flood_kick("spam");
+        // mhxd's `user_kick` with the spammer as its own kicker, and the
+        // reason its `hxd_rcv` gives.
+        self.chat_notice(
+            0,
+            uid,
+            format!(
+                "{nick} has been {verb} by {nick}: spam_max exceeded: {total} >= {}, \
+                 last transaction: 0x{trans:x}",
+                limits.spam_points
+            ),
+        );
+        Err(Flooded {
+            ban: target.map(|target| SpamBan {
+                uid,
+                target,
+                for_: limits.ban_for,
+            }),
+        })
+    }
+
+    /// What a spam kick of `sess` bans. mhxd bans the address the
+    /// flood came from, and so does this server, with one deliberate
+    /// deviation: never an address `[limits] exempt` holds to nothing.
+    /// Those are the addresses many people share on purpose, loopback
+    /// and whatever proxy an operator has exempted (Docker's userland
+    /// proxy, a TCP proxy that hides its clients), and banning one for
+    /// one person's flood locks everyone behind it out for `ban_time`.
+    /// There the ban is on the person instead: the account's login when
+    /// it is a person's (which bans the identity it links too), else the
+    /// identity the session came with. A guest with neither, on an
+    /// exempt address, is only kicked: there is nothing of theirs alone
+    /// to ban.
+    fn spam_ban_target(&self, sess: &crate::roster::UserSession) -> Option<crate::ban::BanTarget> {
+        let addr = sess.addr?;
+        if !self.conn_gate.exempt(addr) {
+            return self.kick_ban_target(addr);
+        }
+        if sess.is_person {
+            if let Ok(login) = crate::ban::BanTarget::login(&sess.login) {
+                return Some(login);
+            }
+        }
+        sess.identity.map(crate::ban::BanTarget::Identity)
+    }
+
+    /// Place the ban a spam kick asked for ([`Core::spend_spam`]). A
+    /// store write: called off the reactor. Said in the log when it
+    /// cannot be placed; the kick stands either way.
+    pub fn place_spam_ban(&self, ban: SpamBan) {
+        self.place_kick_ban(
+            ban.uid,
+            Some(ban.target),
+            KickBan {
+                by: crate::moderation::Actor::Operator,
+                for_: ban.for_,
+                reason: "spam_max exceeded".into(),
+            },
+        );
+    }
+
     /// A server notice into a chat (kick announcements and the like).
     /// Semantic text — each frontend formats it. Public delivery honors the
     /// read-chat filter.
     pub fn chat_notice(&self, cid: u32, from: Uid, text: String) {
+        self.notice(cid, from, text, false);
+    }
+
+    /// [`Core::chat_notice`], in the action form when `action` is set.
+    fn notice(&self, cid: u32, from: Uid, text: String, action: bool) {
         let mut r = self.roster.lock().unwrap();
-        let ev = Event::Notice { cid, from, text };
+        let ev = Event::Notice {
+            cid,
+            from,
+            text,
+            action,
+        };
         if cid == 0 {
             r.broadcast_where(&ev, None, reads_public_chat);
         } else if let Some(members) = r.chats.get(&cid).map(|c| c.members.clone()) {
@@ -725,8 +954,23 @@ impl Core {
             .get(&creator)
             .map(|s| s.info.clone())
             .ok_or(ChatError::NoSuchUser)?;
+        // Counted as they stand, under the lock that creates: a chat
+        // stays open, and counted against whoever opened it, until its
+        // last member leaves, whether or not that was the creator.
+        let limits = self.chat_limits;
+        if (limits.total > 0 && r.chats.len() >= limits.total)
+            || (limits.per_creator > 0
+                && r.chats
+                    .values()
+                    .filter(|c| c.creator == Some(creator))
+                    .count()
+                    >= limits.per_creator)
+        {
+            return Err(ChatError::TooManyChats);
+        }
         let cid = r.next_chat_id().ok_or(ChatError::ServerError)?;
         let mut chat = PrivateChat {
+            creator: Some(creator),
             members: vec![creator],
             ..Default::default()
         };
@@ -885,6 +1129,11 @@ impl Core {
     }
 
     pub(crate) fn leave_all_chats(r: &mut RosterInner, uid: Uid) {
+        for chat in r.chats.values_mut() {
+            if chat.creator == Some(uid) {
+                chat.creator = None;
+            }
+        }
         let cids: Vec<u32> = r
             .chats
             .iter()
@@ -1020,6 +1269,31 @@ impl Core {
             text,
             guid,
             media,
+        )
+    }
+
+    /// Has `from` stored its day's allowance of mail, or would `adds`
+    /// more bytes take it past? A rolling day, read from the store, so a
+    /// restart forgets nothing.
+    fn send_quota_spent(
+        &self,
+        store: &dyn MessageStore,
+        from: &Mailbox,
+        adds: usize,
+        now: SystemTime,
+    ) -> Result<bool, ChatError> {
+        let p = self.inbox_policy;
+        if p.max_sent_per_day == 0 && p.max_sent_bytes_per_day == 0 {
+            return Ok(false);
+        }
+        let since = now
+            .checked_sub(Duration::from_secs(24 * 3600))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let sent = store.sent_since(from, since).map_err(store_failed)?;
+        Ok(
+            (p.max_sent_per_day > 0 && sent.messages >= p.max_sent_per_day)
+                || (p.max_sent_bytes_per_day > 0
+                    && sent.bytes.saturating_add(adds as u64) > p.max_sent_bytes_per_day),
         )
     }
 
@@ -1161,6 +1435,70 @@ impl Core {
             .map_err(store_failed)?
         {
             return Err(ChatError::Blocked);
+        }
+
+        // The sender's quota (`docs/private-messages.md` §9): what one
+        // account may *store* in a day, delivered or not, since retention
+        // keeps both. It bounds storage and never conversation. Past it,
+        // a message to someone attached still reaches them — live, with
+        // no row and no id, as it would on mhxd, which stores nothing at
+        // all — and only one that would have to wait is refused.
+        // Checked rather than reserved, so sends in flight at once can
+        // each pass it: a daily ceiling can afford that.
+        //
+        // A retry of a message already stored is not a new message and
+        // stores nothing, so it is not the quota's to refuse: it goes on
+        // to `push`, which recognizes it and answers it as the first
+        // send was answered. Otherwise the client whose last in-quota
+        // message lost its ack would hear `quota_exceeded` for a message
+        // we have, and an attached recipient would be handed it twice,
+        // the second time live with no id. Looked up only once the quota
+        // is spent, so the ordinary send costs nothing more; a retry
+        // racing its own first send past the quota can still miss it,
+        // which is the narrow case the store's own dedupe cannot reach
+        // from here.
+        let retry = |guid: &Option<MessageGuid>| -> Result<bool, ChatError> {
+            match guid {
+                Some(g) => Ok(store
+                    .find_guid(&to.mailbox, Some(&from_mailbox), g)
+                    .map_err(store_failed)?
+                    .is_some()),
+                None => Ok(false),
+            }
+        };
+        if self.send_quota_spent(&**store, &from_mailbox, text.len(), now)? && !retry(&guid)? {
+            let mut r = self.roster.lock().unwrap();
+            let attached = |uid: &Uid| {
+                r.users
+                    .get(uid)
+                    .is_some_and(|s| s.mailbox() == to.mailbox && is_live(s))
+            };
+            // Attached only: a detached session's outbox is not a place
+            // to leave what the store was just refused.
+            let Some(uid) = to
+                .uid
+                .filter(attached)
+                .or_else(|| attached_session_of(&r, &to.mailbox))
+            else {
+                return Err(ChatError::SendQuota);
+            };
+            if let Some(handle) = &image {
+                self.media_capture(handle, audience.clone());
+            }
+            r.send_to(
+                uid,
+                Event::Msg {
+                    from: sender.uid,
+                    from_nick: sender.nick,
+                    from_login: sender.reply_login,
+                    text,
+                    id: None,
+                    sent_at: now,
+                    queued: false,
+                    media,
+                },
+            );
+            return Ok(MsgOutcome::Delivered);
         }
 
         // The store decides both of the questions that used to be asked
@@ -1516,6 +1854,7 @@ impl Core {
                         cid: 0,
                         from: 0,
                         text: format!("{n} more queued messages are waiting."),
+                        action: false,
                     },
                 );
             }
@@ -1791,42 +2130,98 @@ impl Core {
 
     // --- Moderation -----------------------------------------------------
 
-    /// Kick `target`, optionally banning for `ban_for`. The target session
-    /// receives [`Event::Kicked`] and its transport closes; the public-chat
-    /// announcement is the caller's job (it owns the wording). Returns the
-    /// target's nick. The cant-be-disconnected check is policy and lives in
-    /// the caller, which has the target's access via [`Core::access_of`].
+    /// Kick `target`, optionally banning its address for `ban_for`, on
+    /// the operator's word. [`Core::kick_by`] with no one to name.
     pub fn kick(&self, target: Uid, ban_for: Option<Duration>) -> Result<String, ChatError> {
+        self.kick_by(
+            target,
+            ban_for.map(|for_| KickBan {
+                by: crate::moderation::Actor::Operator,
+                for_,
+                reason: "kicked with a ban".into(),
+            }),
+        )
+    }
+
+    /// Kick `target`, and with `ban` ban its address too. The target
+    /// session receives [`Event::Kicked`] and its transport closes; the
+    /// public-chat announcement is the caller's job (it owns the
+    /// wording). Returns the target's nick. The cant-be-disconnected
+    /// check is policy and lives in the caller, which has the target's
+    /// access via [`Core::access_of`].
+    ///
+    /// The ban is a durable one (`crate::ban`), on the address the
+    /// session came from: an IPv4 one alone, an IPv6 one with its
+    /// `[moderation] ban_v6_prefix` block. It ends no other session from
+    /// that block, as the reference server's kick-with-ban does not:
+    /// they are refused at their next connection.
+    pub fn kick_by(&self, target: Uid, ban: Option<KickBan>) -> Result<String, ChatError> {
+        let (nick, addr, serial) = {
+            let r = self.roster.lock().unwrap();
+            let sess = r.users.get(&target).ok_or(ChatError::NoSuchUser)?;
+            // The server cannot be kicked off its own roster
+            // (`docs/system-account.md` §2). Refused the same way a kick
+            // of somebody who is not there is refused, because from the
+            // moderator's point of view there is nobody there to kick.
+            if sess.system {
+                return Err(ChatError::NoSuchUser);
+            }
+            (sess.info.nick.clone(), sess.addr, sess.serial)
+        };
+        if let Some(ban) = ban {
+            self.ban_kicked(target, addr, ban);
+        }
         let mut r = self.roster.lock().unwrap();
-        let sess = r.users.get(&target).ok_or(ChatError::NoSuchUser)?;
-        // The server cannot be kicked off its own roster
-        // (`docs/system-account.md` §2). Refused the same way a kick of
-        // somebody who is not there is refused, because from the
-        // moderator's point of view there is nobody there to kick.
-        if sess.system {
-            return Err(ChatError::NoSuchUser);
+        // The roster lock was let go while the ban was written. A target
+        // that left meanwhile is gone, and its uid, if it has been given
+        // out again, is somebody else's.
+        if r.users.get(&target).map(|s| s.serial) != Some(serial) {
+            return Ok(nick);
         }
-        let nick = sess.info.nick.clone();
-        if let Some(dur) = ban_for {
-            let ban = Ban {
-                addr: sess.addr,
-                expires: Instant::now() + dur,
-            };
-            r.bans.push(ban);
+        kick_in(&mut r, target)
+    }
+
+    /// Place the ban a kick of `target`, from `addr`, asks for. Said in
+    /// the log when it cannot be placed, and the kick goes ahead.
+    fn ban_kicked(&self, target: Uid, addr: Option<IpAddr>, ban: KickBan) {
+        self.place_kick_ban(target, addr.and_then(|a| self.kick_ban_target(a)), ban);
+    }
+
+    /// The address block a kick-with-ban from `addr` bans: the address
+    /// itself on IPv4, its `[moderation] ban_v6_prefix` block on IPv6.
+    /// An IPv6 address whose /64 is no subscriber's block is banned
+    /// alone, as /128 ([`v6_stands_alone`]).
+    fn kick_ban_target(&self, addr: IpAddr) -> Option<crate::ban::BanTarget> {
+        let prefix = match addr.to_canonical() {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(v6) if v6_stands_alone(v6) => 128,
+            IpAddr::V6(_) => self.moderation_policy.ban_v6_prefix,
+        };
+        crate::ban::BanTarget::address(addr, prefix)
+            .map_err(|e| warn!("kick: no ban on {addr}: {e}"))
+            .ok()
+    }
+
+    fn place_kick_ban(&self, uid: Uid, target: Option<crate::ban::BanTarget>, ban: KickBan) {
+        let placed = target.and_then(|target| {
+            let acting = self.acting_kicker(ban.by)?;
+            self.place_ban_as(
+                &acting,
+                crate::ban::NewBan {
+                    target,
+                    reason: ban.reason,
+                    note: None,
+                    // Past what the clock can say is until lifted.
+                    expires_at: SystemTime::now().checked_add(ban.for_),
+                    source: crate::ban::BanSource::Kick,
+                },
+            )
+            .map_err(|e| warn!("kick: the ban was not placed: {e:?}"))
+            .ok()
+        });
+        if placed.is_none() {
+            warn!(target = uid, "kicked without the ban it asked for");
         }
-        if let Some(sess) = r.users.get_mut(&target) {
-            sess.kicked = true;
-        }
-        r.send_to(target, Event::Kicked);
-        // A detached session has no connection to observe the event; the
-        // kick must end it here or it would linger on the roster.
-        if r.users
-            .get(&target)
-            .is_some_and(crate::roster::is_buffering)
-        {
-            r.end_session(target);
-        }
-        Ok(nick)
     }
 
     /// A user's access bits (for policy checks against a *target*, e.g.
@@ -1836,14 +2231,38 @@ impl Core {
         r.users.get(&uid).map(|s| s.access)
     }
 
-    /// Is this address currently banned? Expired entries are pruned on the
-    /// way through.
+    /// Is this address banned (`crate::ban`)?
     pub fn is_banned(&self, addr: IpAddr) -> bool {
-        let mut r = self.roster.lock().unwrap();
-        let now = Instant::now();
-        r.bans.retain(|b| b.expires > now);
-        r.bans.iter().any(|b| b.addr == Some(addr))
+        self.address_banned(addr).is_some()
     }
+}
+
+/// [`Core::kick`], without its ban, under a roster lock the caller
+/// already holds: a ban is written to the store, and that is not done
+/// under the roster's lock.
+fn kick_in(r: &mut RosterInner, target: Uid) -> Result<String, ChatError> {
+    let sess = r.users.get(&target).ok_or(ChatError::NoSuchUser)?;
+    // The server cannot be kicked off its own roster
+    // (`docs/system-account.md` §2). Refused the same way a kick of
+    // somebody who is not there is refused, because from the
+    // moderator's point of view there is nobody there to kick.
+    if sess.system {
+        return Err(ChatError::NoSuchUser);
+    }
+    let nick = sess.info.nick.clone();
+    if let Some(sess) = r.users.get_mut(&target) {
+        sess.kicked = true;
+    }
+    r.send_to(target, Event::Kicked);
+    // A detached session has no connection to observe the event; the
+    // kick must end it here or it would linger on the roster.
+    if r.users
+        .get(&target)
+        .is_some_and(crate::roster::is_buffering)
+    {
+        r.end_session(target);
+    }
+    Ok(nick)
 }
 
 #[cfg(test)]
@@ -2087,6 +2506,371 @@ mod tests {
                 ("three".to_string(), "new name".to_string())
             ]
         );
+    }
+
+    fn flood_limits() -> crate::FloodLimits {
+        crate::FloodLimits {
+            chat_lines: 3,
+            chat_per: Duration::from_secs(60),
+            spam_points: 10,
+            spam_per: Duration::from_secs(60),
+            ban_for: Duration::from_secs(60),
+        }
+    }
+
+    fn spam_notices(evs: &[Event]) -> Vec<(u32, Uid, String, bool)> {
+        evs.iter()
+            .filter_map(|e| match e {
+                Event::Notice {
+                    cid,
+                    from,
+                    text,
+                    action,
+                } if text.contains("spam") => Some((*cid, *from, text.clone(), *action)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Past `chat_lines` a session is kicked and the room told, in mhxd's
+    /// action form and from the spammer; every line of a multi-line send
+    /// counts, and a send that crosses the limit is refused whole, as
+    /// mhxd drops the lines it had formatted. Everything it had in flight
+    /// after that is refused too, without a second kick or notice.
+    #[test]
+    fn a_session_past_its_chat_lines_is_kicked_once_and_the_room_told() {
+        let core = Core::new().with_flood_limits(flood_limits());
+        let (spammer, mut rx_s) = test_attach(&core, "spammer", chatter());
+        let (admin, _rx_a) = test_attach(&core, "admin", chatter());
+        let (_reader, mut rx_r) = test_attach(&core, "reader", chatter());
+        core.roster
+            .lock()
+            .unwrap()
+            .users
+            .get_mut(&admin)
+            .unwrap()
+            .can_spam = true;
+        drain(&mut rx_s);
+        drain(&mut rx_r);
+        core.chat_public(spammer, "one\rtwo".into(), 0, None)
+            .unwrap();
+        assert_eq!(
+            core.chat_public(spammer, "three\rfour".into(), 0, None),
+            Err(ChatError::Flooding),
+            "two more lines are one too many"
+        );
+        for i in 0..50 {
+            assert_eq!(
+                core.chat_public(spammer, format!("{i}"), 0, None),
+                Err(ChatError::Flooding)
+            );
+        }
+        let mine = drain(&mut rx_s);
+        assert_eq!(mine.iter().filter(|e| **e == Event::Kicked).count(), 1);
+        let heard = drain(&mut rx_r);
+        assert_eq!(
+            spam_notices(&heard),
+            [(
+                0,
+                spammer,
+                "spammer was kicked for chat spamming".to_string(),
+                true
+            )],
+            "one notice, in the action form, from the spammer"
+        );
+        let lines: Vec<_> = heard
+            .iter()
+            .filter_map(|e| match e {
+                Event::Chat { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, ["one\rtwo"], "nothing of the send that crossed it");
+
+        for i in 0..10 {
+            core.chat_public(admin, format!("{i}"), 0, None).unwrap();
+        }
+    }
+
+    /// A flood in a private chat is announced to that chat, as mhxd's
+    /// `snd_chat(chat, …)` sends it, and not to public chat.
+    #[test]
+    fn a_private_chat_flood_is_announced_in_that_chat() {
+        let core = Core::new().with_flood_limits(flood_limits());
+        let (spammer, mut rx_s) = test_attach(&core, "spammer", chatter());
+        let (member, mut rx_m) = test_attach(&core, "member", chatter());
+        let (_outsider, mut rx_o) = test_attach(&core, "outsider", chatter());
+        let (cid, _) = core.chat_create(spammer, member).unwrap();
+        core.chat_join(cid, member, "").unwrap();
+        drain(&mut rx_s);
+        drain(&mut rx_m);
+        drain(&mut rx_o);
+        assert_eq!(
+            core.chat_private(cid, spammer, "a\rb\rc\rd".into(), 0, None),
+            Err(ChatError::Flooding)
+        );
+        assert_eq!(
+            spam_notices(&drain(&mut rx_m)),
+            [(
+                cid,
+                spammer,
+                "spammer was kicked for chat spamming".to_string(),
+                true
+            )]
+        );
+        assert!(spam_notices(&drain(&mut rx_o)).is_empty());
+    }
+
+    /// mhxd's spam points: a transaction that brings the window to the
+    /// budget kicks and bans its sender, and public chat hears mhxd's
+    /// announcement; nothing after it spends, kicks or announces again.
+    #[test]
+    fn a_session_that_spends_its_spam_points_is_banned_once() {
+        let core = Core::new().with_flood_limits(flood_limits());
+        let (talker, mut rx_t) = core
+            .attach(crate::AttachInfo {
+                nick: "talker".into(),
+                icon: 1,
+                admin: false,
+                access: chatter(),
+                login: "talker".into(),
+                addr: Some("192.0.2.7".parse().unwrap()),
+                can_detach: false,
+                transport: Default::default(),
+                has_inbox: false,
+                attach_news: false,
+                moderate: false,
+                can_spam: false,
+                set_avatar: false,
+                is_person: false,
+                reads_on_delivery: false,
+                identity: None,
+                system: false,
+            })
+            .unwrap();
+        core.announce(talker);
+        let (_reader, mut rx_r) = test_attach(&core, "reader", chatter());
+        drain(&mut rx_t);
+        drain(&mut rx_r);
+        for _ in 0..4 {
+            core.spend_spam(talker, 2, 0x6c).unwrap();
+        }
+        let ban = core.spend_spam(talker, 2, 0x6c).unwrap_err().ban;
+        assert!(
+            !core.is_banned("192.0.2.7".parse().unwrap()),
+            "the kick is at once, its ban the caller's to place"
+        );
+        core.place_spam_ban(ban.expect("a ban to place"));
+        for _ in 0..20 {
+            assert_eq!(core.spend_spam(talker, 2, 0x6c), Err(Flooded { ban: None }));
+        }
+        assert_eq!(
+            drain(&mut rx_t)
+                .iter()
+                .filter(|e| **e == Event::Kicked)
+                .count(),
+            1
+        );
+        assert_eq!(
+            spam_notices(&drain(&mut rx_r)),
+            [(
+                0,
+                talker,
+                "talker has been banned by talker: spam_max exceeded: 10 >= 10, \
+                 last transaction: 0x6c"
+                    .to_string(),
+                false
+            )]
+        );
+        assert!(core.is_banned("192.0.2.7".parse().unwrap()), "its address");
+    }
+
+    /// The ng request limit is a session's, kept across a detach and
+    /// resume and filled again only by a fresh login, and a `can_spam`
+    /// account is held to none, as it is held to no flood budget; the
+    /// news-post limit is an account's, across its sessions, and a
+    /// guest's is its session's.
+    #[test]
+    fn request_and_post_limits_are_held_by_whom_they_say() {
+        let core = Core::new().with_request_limits(crate::RequestLimits {
+            requests: 4,
+            requests_per: Duration::from_secs(60),
+            news_posts: 1,
+            news_posts_per: Duration::from_secs(60),
+        });
+        let who = |login: &str, can_spam: bool, is_person: bool| crate::AttachInfo {
+            nick: login.into(),
+            icon: 1,
+            admin: false,
+            access: chatter(),
+            login: login.into(),
+            addr: None,
+            can_detach: is_person,
+            transport: Default::default(),
+            has_inbox: false,
+            attach_news: false,
+            set_avatar: false,
+            moderate: false,
+            can_spam,
+            is_person,
+            reads_on_delivery: false,
+            identity: None,
+            system: false,
+        };
+        let (alice, _rx1) = core.attach(who("alice", false, true)).unwrap();
+        let (alice_again, _rx2) = core.attach(who("alice", false, true)).unwrap();
+        let (admin, _rx3) = core.attach(who("admin", true, true)).unwrap();
+        let (guest, _rx4) = core.attach(who("guest", false, false)).unwrap();
+        let (guest_too, _rx5) = core.attach(who("guest", false, false)).unwrap();
+
+        for _ in 0..2 {
+            core.spend_request(alice, 2).unwrap();
+        }
+        assert!(core.spend_request(alice, 1).is_err(), "spent");
+        assert!(core.connection_lost(alice, 8), "detached");
+        assert!(!matches!(core.resume(alice, 0), crate::Resume::Gone));
+        assert!(
+            core.spend_request(alice, 1).is_err(),
+            "a resume is no fresh bucket"
+        );
+        core.spend_request(alice_again, 4)
+            .expect("another login's is its own");
+        for _ in 0..10 {
+            core.spend_request(admin, 4).expect("can_spam");
+        }
+        let unlimited = Core::new();
+        let (bob, _rx6) = unlimited.attach(who("bob", false, true)).unwrap();
+        for _ in 0..10 {
+            unlimited.spend_request(bob, 4).expect("no limit set");
+        }
+
+        core.news_post_reserve(alice).unwrap();
+        assert!(
+            core.news_post_reserve(alice_again).is_err(),
+            "one account, two sessions"
+        );
+        core.news_post_refund(alice);
+        core.news_post_reserve(alice_again)
+            .expect("a post that did not land is given back");
+        for _ in 0..3 {
+            core.news_post_counted(admin);
+        }
+        assert_eq!(core.news_post_reserve(admin), Ok(()), "can_spam");
+        core.news_post_counted(guest);
+        assert_eq!(core.news_post_reserve(guest_too), Ok(()), "another guest");
+        assert!(core.news_post_reserve(guest).is_err());
+    }
+
+    /// Behind an address `[limits] exempt` — loopback here, a shared
+    /// proxy in production — a spam kick bans the person, never the
+    /// address everyone behind it shares, and a guest with nothing of
+    /// its own to ban is only kicked.
+    #[test]
+    fn a_spam_kick_on_an_exempt_address_bans_the_person_not_the_address() {
+        let core = Core::new()
+            .with_flood_limits(flood_limits())
+            .with_moderation(
+                Arc::new(crate::moderation::MemoryModeration::default()),
+                crate::moderation::ModerationPolicy::default(),
+            );
+        let shared: IpAddr = "127.0.0.1".parse().unwrap();
+        let attach = |login: &str, is_person: bool| {
+            core.attach(crate::AttachInfo {
+                nick: login.into(),
+                icon: 1,
+                admin: false,
+                access: chatter(),
+                login: login.into(),
+                addr: Some(shared),
+                can_detach: false,
+                transport: Default::default(),
+                has_inbox: false,
+                attach_news: false,
+                set_avatar: false,
+                moderate: false,
+                can_spam: false,
+                is_person,
+                reads_on_delivery: false,
+                identity: None,
+                system: false,
+            })
+            .unwrap()
+        };
+        let flood = |uid| {
+            for _ in 0..4 {
+                core.spend_spam(uid, 2, 0x6c).unwrap();
+            }
+            core.spend_spam(uid, 2, 0x6c).unwrap_err().ban
+        };
+        let (_reader, mut rx_r) = test_attach(&core, "reader", chatter());
+
+        let (alice, _rx_a) = attach("alice", true);
+        core.announce(alice);
+        drain(&mut rx_r);
+        core.place_spam_ban(flood(alice).expect("alice's login is hers to lose"));
+        assert!(!core.is_banned(shared), "not the address everyone shares");
+        assert!(core.person_banned(Some("alice"), None, None).is_some());
+        assert!(spam_notices(&drain(&mut rx_r))[0]
+            .2
+            .starts_with("alice has been banned by alice"));
+
+        let (guest, _rx_g) = attach("guest", false);
+        core.announce(guest);
+        drain(&mut rx_r);
+        assert_eq!(flood(guest), None, "a guest here has nothing to ban");
+        assert!(!core.is_banned(shared));
+        assert!(spam_notices(&drain(&mut rx_r))[0]
+            .2
+            .starts_with("guest has been kicked by guest"));
+    }
+
+    /// A kick-with-ban of an IPv6 loopback peer bans `::1` alone: its
+    /// /64 would be `::/64`, no subscriber's block. So does one of an
+    /// address standing for an IPv4 host, whose /64 is every IPv4
+    /// client behind the translator.
+    #[test]
+    fn a_kick_ban_of_ipv6_loopback_bans_it_alone() {
+        let core = Core::new().with_moderation(
+            Arc::new(crate::moderation::MemoryModeration::default()),
+            crate::moderation::ModerationPolicy::default(),
+        );
+        let target = |ip: &str| core.kick_ban_target(ip.parse().unwrap()).unwrap();
+        assert_eq!(
+            target("::1"),
+            crate::ban::BanTarget::parse("::1/128", |_| None).unwrap()
+        );
+        assert_eq!(
+            target("2001:db8::7"),
+            crate::ban::BanTarget::parse("2001:db8::/64", |_| None).unwrap()
+        );
+        assert_eq!(
+            target("::ffff:192.0.2.7"),
+            crate::ban::BanTarget::parse("192.0.2.7", |_| None).unwrap()
+        );
+        for alone in [
+            "::",
+            "64:ff9b::c000:207",
+            "64:ff9b:1::c000:207",
+            "64:ff9b:1:ffff::c000:207",
+            "::c000:207",
+        ] {
+            assert_eq!(
+                target(alone),
+                crate::ban::BanTarget::parse(&format!("{alone}/128"), |_| None).unwrap(),
+                "{alone} alone"
+            );
+        }
+        // Just outside the NAT64 prefixes: a subscriber's /64 as usual.
+        for (ip, block) in [
+            ("64:ff9b:0:1::7", "64:ff9b:0:1::/64"),
+            ("64:ff9b:2::7", "64:ff9b:2::/64"),
+        ] {
+            assert_eq!(
+                target(ip),
+                crate::ban::BanTarget::parse(block, |_| None).unwrap(),
+                "{ip}"
+            );
+        }
     }
 
     #[test]
@@ -2341,7 +3125,9 @@ mod inbox_tests {
                 transport: crate::Transport::default(),
                 has_inbox: true,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
+                can_spam: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: Some(fingerprint),
@@ -2367,7 +3153,9 @@ mod inbox_tests {
                 transport: crate::Transport::default(),
                 has_inbox,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
+                can_spam: false,
                 is_person: has_inbox,
                 reads_on_delivery: false,
                 identity: None,
@@ -2830,6 +3618,125 @@ mod inbox_tests {
     }
 
     #[test]
+    fn a_senders_quota_bounds_what_is_stored_and_never_a_live_message() {
+        let (core, store) = server_with(
+            InboxPolicy {
+                max_sent_per_day: 2,
+                max_sent_bytes_per_day: 20,
+                ..InboxPolicy::default()
+            },
+            &["alice", "bob", "dave"],
+        );
+        let (a, _ra) = attach(&core, "alice", true);
+        core.msg_login(a, "dave", "one".into(), None, None).unwrap();
+        // A delivered message counts: retention keeps it all the same.
+        let (m, _rm) = attach(&core, "dave", true);
+        core.msg_login(a, "dave", "two".into(), None, None).unwrap();
+        core.end_session(m);
+        assert_eq!(
+            core.msg_login(a, "dave", "three".into(), None, None),
+            Err(ChatError::SendQuota),
+            "nobody is there, and the day's storage is spent"
+        );
+        assert_eq!(store.all().len(), 2);
+
+        // Someone who is there hears it, with no row kept and no id.
+        let (m, mut rm) = attach(&core, "dave", true);
+        drain(&mut rm);
+        assert_eq!(
+            core.msg_login(a, "dave", "live".into(), None, None),
+            Ok(MsgOutcome::Delivered)
+        );
+        assert!(matches!(
+            &msgs(drain(&mut rm))[..],
+            [Event::Msg { id: None, text, .. }] if text == "live"
+        ));
+        assert_eq!(store.all().len(), 2, "nothing stored past the quota");
+        core.end_session(m);
+
+        // Another sender's day is their own, and bytes count as well as
+        // messages: this one fits the count and not the bytes.
+        let (b, _rb) = attach(&core, "bob", true);
+        core.msg_login(b, "dave", "x".repeat(20), None, None)
+            .unwrap();
+        assert_eq!(
+            core.msg_login(b, "dave", "y".into(), None, None),
+            Err(ChatError::SendQuota)
+        );
+    }
+
+    #[test]
+    fn a_retry_of_a_stored_message_is_answered_past_the_quota() {
+        let (core, store) = server_with(
+            InboxPolicy {
+                max_sent_per_day: 1,
+                ..InboxPolicy::default()
+            },
+            &["alice", "dave"],
+        );
+        let g = crate::inbox::MessageGuid::parse("00000002-0000-4000-8000-000000000000").unwrap();
+        let (a, _ra) = attach(&core, "alice", true);
+        // The last message the day allows, stored while nobody is there;
+        // its ack is what the client lost.
+        let first = core
+            .msg_login(a, "dave", "last one".into(), Some(g.clone()), None)
+            .unwrap();
+        let MsgOutcome::Queued(id) = first else {
+            panic!("queued, got {first:?}");
+        };
+        assert_eq!(
+            core.msg_login(a, "dave", "last one".into(), Some(g.clone()), None),
+            Ok(MsgOutcome::Queued(id)),
+            "the retry is the message we have, not one past the quota"
+        );
+
+        // The recipient attaches before the next retry: they are handed
+        // the stored row once, with its id, and never a live copy beside it.
+        let (m, mut rm) = attach(&core, "dave", true);
+        drain(&mut rm);
+        assert_eq!(
+            core.msg_login(a, "dave", "last one".into(), Some(g), None),
+            Ok(MsgOutcome::Delivered)
+        );
+        assert!(
+            matches!(
+                &msgs(drain(&mut rm))[..],
+                [Event::Msg { id: Some(got), .. }] if *got == id
+            ),
+            "one copy, the stored one"
+        );
+        assert_eq!(store.all().len(), 1);
+        core.end_session(m);
+    }
+
+    #[test]
+    fn private_chats_are_capped_per_creator_and_per_server_until_they_close() {
+        let core = Core::new().with_chat_limits(crate::ChatLimits {
+            per_creator: 2,
+            total: 3,
+        });
+        let anyone = crate::AccessBits::default();
+        let (a, _ra) = crate::roster::test_attach(&core, "alice", anyone);
+        let (b, _rb) = crate::roster::test_attach(&core, "bob", anyone);
+        let (first, _) = core.chat_create(a, b).unwrap();
+        core.chat_create(a, b).unwrap();
+        assert_eq!(core.chat_create(a, b).err(), Some(ChatError::TooManyChats));
+        let (bobs, _) = core.chat_create(b, a).unwrap();
+        assert_eq!(
+            core.chat_create(b, a).err(),
+            Some(ChatError::TooManyChats),
+            "the server's are spent"
+        );
+        // Still open with bob in it after alice walks out: still hers.
+        core.chat_join(first, b, "").unwrap();
+        core.chat_part(first, a);
+        core.chat_part(bobs, b);
+        assert_eq!(core.chat_create(a, b).err(), Some(ChatError::TooManyChats));
+        core.chat_part(first, b);
+        core.chat_create(a, b).unwrap();
+    }
+
+    #[test]
     fn a_full_mailbox_refuses_rather_than_dropping_the_oldest() {
         let (core, store) = server_with(
             InboxPolicy {
@@ -3061,7 +3968,9 @@ mod inbox_tests {
                 transport: crate::Transport::default(),
                 has_inbox: false,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
+                can_spam: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(3)),
@@ -3102,7 +4011,9 @@ mod inbox_tests {
                 transport: crate::Transport::default(),
                 has_inbox: false,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
+                can_spam: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(7)),
@@ -3284,6 +4195,13 @@ mod inbox_tests {
         }
         fn blocked(&self, owner: &Mailbox) -> Result<Vec<Mailbox>, StoreError> {
             self.inner.blocked(owner)
+        }
+        fn sent_since(
+            &self,
+            from: &Mailbox,
+            since: SystemTime,
+        ) -> Result<crate::inbox::Sent, StoreError> {
+            self.inner.sent_since(from, since)
         }
     }
 

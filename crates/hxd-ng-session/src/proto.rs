@@ -358,6 +358,17 @@ pub fn video_err(e: VideoError) -> (&'static str, &'static str) {
             "video_full",
             "This room has as many cameras on as it allows.",
         ),
+        VideoError::RateLimited { .. } => ("rate_limited", "You are changing video too often."),
+    }
+}
+
+/// The error reply for a refused video operation, with `retry_after`
+/// when the refusal was the session's allowance.
+pub fn video_reply_err(id: u64, e: VideoError) -> String {
+    let (code, text) = video_err(e);
+    match e {
+        VideoError::RateLimited { retry_after } => reply_err_retry(id, code, text, retry_after),
+        _ => reply_err(id, code, text),
     }
 }
 
@@ -374,6 +385,17 @@ pub fn voice_err(e: VoiceError) -> (&'static str, &'static str) {
         VoiceError::RoomFull => ("voice_full", "That voice chat is full."),
         VoiceError::NotInVoice => ("not_in_voice", "You are not in that voice chat."),
         VoiceError::BadAnswer => ("bad_answer", "Your client's voice session was rejected."),
+        VoiceError::RateLimited { .. } => ("rate_limited", "You are joining voice chat too often."),
+    }
+}
+
+/// The error reply for a refused voice operation, with `retry_after`
+/// when the refusal was the session's allowance.
+pub fn voice_reply_err(id: u64, e: VoiceError) -> String {
+    let (code, text) = voice_err(e);
+    match e {
+        VoiceError::RateLimited { retry_after } => reply_err_retry(id, code, text, retry_after),
+        _ => reply_err(id, code, text),
     }
 }
 
@@ -413,6 +435,18 @@ pub fn reply_ok_with_users(id: u64, mut ok: Value, users: &[UserInfo]) -> String
 
 pub fn reply_err(id: u64, code: &str, text: &str) -> String {
     json!({ "reply": id, "error": { "code": code, "text": text } }).to_string()
+}
+
+/// A login refused by a ban: `banned`, with the ban's reason and when it
+/// runs out, if it does (`docs/moderation.md` §3.5).
+pub fn reply_err_banned(id: u64, hit: &hxd_core::ban::BanHit) -> String {
+    json!({ "reply": id, "error": {
+        "code": "banned",
+        "text": format!("You are banned: {}", hit.reason),
+        "reason": hit.reason,
+        "expires_at": hit.expires_at.map(unix),
+    } })
+    .to_string()
 }
 
 /// [`reply_err`] with the seconds to wait before asking again (§10).

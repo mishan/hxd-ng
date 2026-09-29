@@ -96,6 +96,21 @@ impl Codec {
         }
     }
 
+    /// This pipeline with a decode budget of its own, `permits` wide, in
+    /// place of the one it shares. For a caller whose traffic must not be
+    /// able to occupy everyone else's permits, nor be kept from its own:
+    /// the concurrency across both is the sum of the two, and each is
+    /// still bounded.
+    pub fn with_own_permits(&self, permits: usize) -> Self {
+        Codec {
+            limits: CodecLimits {
+                max_concurrent_decodes: permits.max(1),
+                ..self.limits
+            },
+            permits: std::sync::Arc::new(Permits::new(permits.max(1))),
+        }
+    }
+
     /// Everything before the decode: the cheap gates, in the order that
     /// makes each next one safe. Separated so the tests can reach it
     /// without a decoder, and so the expensive half has one entry.
@@ -673,6 +688,37 @@ mod derivative_tests {
         );
         drop(held);
         assert!(news.canonicalize(&png).is_ok());
+    }
+
+    #[test]
+    fn a_codec_with_its_own_permits_neither_takes_nor_waits_for_the_shared_ones() {
+        let codec = Codec::new(CodecLimits {
+            max_concurrent_decodes: 1,
+            permit_wait: std::time::Duration::from_millis(10),
+            ..CodecLimits::default()
+        });
+        let apart = codec.with_own_permits(1);
+        let png = encode_png(&DynamicImage::ImageRgba8(image::RgbaImage::from_fn(
+            64,
+            64,
+            |x, y| image::Rgba([(x * 4) as u8, (y * 4) as u8, 0x30, 0xff]),
+        )))
+        .unwrap();
+        let limits = AvatarLimits {
+            max_bytes: 256 * 1024,
+            max_dimension: 32,
+            legacy_max_bytes: 32 * 1024,
+        };
+        // Every shared permit held: the one apart still decodes.
+        let shared = codec.permits.acquire(std::time::Duration::ZERO).unwrap();
+        assert!(apart.avatar(&png, &limits).is_ok());
+        drop(shared);
+        // And its own held: the shared pipeline still decodes, and it is
+        // the one told the server is busy.
+        let own = apart.permits.acquire(std::time::Duration::ZERO).unwrap();
+        assert!(codec.canonicalize(&png).is_ok());
+        assert_eq!(apart.avatar(&png, &limits), Err(MediaReject::Busy));
+        drop(own);
     }
 
     #[test]

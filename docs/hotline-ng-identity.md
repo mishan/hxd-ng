@@ -331,6 +331,7 @@ transport's codes:
 | `revoked`, `no_manage` | 403 | policy, or the device certificate lacks `manage` |
 | `rotated`, `frozen` | 403 | a record applied at §5.2 step 4 (`identity-registrar.md` §7.3); `rotated` carries `successor` in the body |
 | `already_linked`, `would_orphan`, `not_linked` | 409 | conflicts with the account's state (§8.2, §8.4) |
+| `banned` | 403 | a ban on the identity, the registrar that issued its handle, or (at `/identity/link`, or with credentials) the account (`moderation.md` §3.5); nothing is linked or created |
 
 `denied` (403) is the transport's code and is what admission policy (§11)
 answers with.

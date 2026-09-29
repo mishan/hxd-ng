@@ -65,6 +65,11 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
     let media_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let media_addr = media_socket.local_addr().unwrap();
     let (sfu, mut events) = Sfu::new(&[media_addr], VideoConfig::default()).unwrap();
+    // Off, because the burst below is a speaker sending far more than
+    // PCMU can in one go on purpose: what it measures is the pump's
+    // fidelity, and the policer would rightly drop most of it.
+    // `hxd-voice`'s own suite is where policing is tested.
+    sfu.set_police_factor(0.0);
 
     let core = Arc::new(Core::new().with_voice(sfu.clone(), 16));
     let core_for_events = core.clone();

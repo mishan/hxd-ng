@@ -2,11 +2,14 @@
 //! split into halves while it works, rejoined to leave.
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hxd_testclient::legacy::{self, Login};
 use hxd_testclient::{ng, tls, Error};
 use hxproto::messages::tag;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::Ctx;
@@ -65,6 +68,15 @@ impl Member {
         nick: String,
         creds: Creds,
     ) -> Result<Member, Error> {
+        retry_busy(ctx, || {
+            Member::join_once(ctx, wire, nick.clone(), creds.clone())
+        })
+        .await
+    }
+
+    /// One try at it, on a connection of its own: the server closes one
+    /// whose login it refused.
+    async fn join_once(ctx: &Ctx, wire: Wire, nick: String, creds: Creds) -> Result<Member, Error> {
         let t = &ctx.scenario.target;
         let conn = match wire {
             Wire::Legacy | Wire::LegacyTls => {
@@ -330,4 +342,98 @@ pub async fn no_ghosts(ctx: &Ctx, before: Option<&crate::target::Scrape>) {
         now.is_some_and(|n| n <= before),
         || format!("the server counts {now:?} sessions, {before} before the run"),
     );
+}
+
+/// Whether the server refused a login as busy: past the logins it works
+/// on at once, or on at once from one address, which every client of a
+/// run on one machine shares. The ng wire says `rate_limited`; the
+/// classic wire has no codes, only the task error's text.
+pub fn busy(e: &Error) -> bool {
+    match e {
+        Error::Refused { code, .. } if code == "rate_limited" => true,
+        Error::Refused { code, text } => code.is_empty() && text.contains("busy"),
+        _ => false,
+    }
+}
+
+/// How long a login refused as busy keeps trying before the refusal
+/// stands.
+const BUSY_PATIENCE: Duration = Duration::from_secs(15);
+
+/// The logins the server refused as busy over a run, kept apart from the
+/// operations' errors because a refusal the retry absorbs is not one: it
+/// fails nothing, and without its own line in the report a gate that
+/// leaked login places, refusing more and for longer as a run went on,
+/// would show only as latency.
+#[derive(Default)]
+pub struct BusyLogins {
+    refusals: AtomicU64,
+    logins: AtomicU64,
+    gave_up: AtomicU64,
+    longest_wait_us: AtomicU64,
+}
+
+/// `BusyLogins` as the report carries it.
+#[derive(Debug, Clone, Serialize)]
+pub struct BusySummary {
+    /// Every refusal, each one a try that was not the last.
+    pub refusals: u64,
+    /// Logins refused at least once.
+    pub logins: u64,
+    /// Logins still refused after `BUSY_PATIENCE`: those failed.
+    pub gave_up: u64,
+    /// The longest a refused login spent from its first try to its
+    /// last.
+    pub longest_wait_ms: f64,
+}
+
+impl BusyLogins {
+    pub fn summary(&self) -> BusySummary {
+        BusySummary {
+            refusals: self.refusals.load(Ordering::Relaxed),
+            logins: self.logins.load(Ordering::Relaxed),
+            gave_up: self.gave_up.load(Ordering::Relaxed),
+            longest_wait_ms: self.longest_wait_us.load(Ordering::Relaxed) as f64 / 1000.0,
+        }
+    }
+}
+
+/// Run `attempt`, a whole connect-and-log-in, again after a short and
+/// growing wait each time the server refuses it as busy, as a real
+/// client does: the server refuses at once rather than queue a login,
+/// and a harness that took the refusal as final failed runs on a slow
+/// machine for no fault of the server's. Each refusal is counted
+/// (`BusyLogins`), so the report still shows the gate at work. Past
+/// `BUSY_PATIENCE` the refusal is returned like any other error.
+pub async fn retry_busy<T, F, Fut>(ctx: &Ctx, mut attempt: F) -> Result<T, Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Error>>,
+{
+    let started = Instant::now();
+    let give_up = started + BUSY_PATIENCE;
+    let mut wait = Duration::from_millis(20);
+    let mut refused = false;
+    loop {
+        let got = attempt().await;
+        let is_busy = matches!(&got, Err(e) if busy(e));
+        if is_busy {
+            ctx.busy.refusals.fetch_add(1, Ordering::Relaxed);
+            if !refused {
+                refused = true;
+                ctx.busy.logins.fetch_add(1, Ordering::Relaxed);
+            }
+            if Instant::now() + wait < give_up {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(1));
+                continue;
+            }
+            ctx.busy.gave_up.fetch_add(1, Ordering::Relaxed);
+        }
+        if refused {
+            let us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            ctx.busy.longest_wait_us.fetch_max(us, Ordering::Relaxed);
+        }
+        return got;
+    }
 }

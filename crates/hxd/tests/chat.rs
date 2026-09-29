@@ -38,6 +38,10 @@ const REQ_USER_GETINFO: u32 = 0x12f;
 const REQ_USER_KICK: u32 = 0x6e;
 
 async fn start_server(dir: &Path) -> (SocketAddr, ServerCtx) {
+    start_server_with(dir, Core::new()).await
+}
+
+async fn start_server_with(dir: &Path, core: Core) -> (SocketAddr, ServerCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     // An admin account for the moderation tests.
@@ -55,7 +59,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, ServerCtx) {
     )
     .unwrap();
     let ctx = ServerCtx {
-        core: Arc::new(Core::new()),
+        core: Arc::new(core),
         auth: Arc::new(hxd_auth_file::FileAuth::new(accounts)),
         cfg: Arc::new(ServerConfig {
             name: "p2".into(),
@@ -421,11 +425,22 @@ async fn kick_ban_and_untouchable_targets() {
         .await;
     let ack = admin.recv_type(HDR_TASK).await;
     assert_eq!((ack.trans, ack.flag), (t, 0));
-    let chat = admin.recv_type(HDR_CHAT).await;
-    let line = chunk(&chat, tag::BODY).unwrap();
-    assert_eq!(line, b"\r<victim has been banned by root>".to_vec());
-    let part = admin.recv_type(HDR_USER_PART).await;
-    assert_eq!(chunk_u32(&part, tag::UID), Some(victim.uid as u32));
+    // The two race: the part follows the victim's connection down, the
+    // line follows the ack.
+    let (mut line, mut part) = (None, None);
+    for _ in 0..12 {
+        let f = admin.recv().await;
+        match f.ty {
+            HDR_CHAT => line = chunk(&f, tag::BODY),
+            HDR_USER_PART => part = chunk_u32(&f, tag::UID),
+            _ => {}
+        }
+        if line.is_some() && part.is_some() {
+            break;
+        }
+    }
+    assert_eq!(line, Some(b"\r<victim has been banned by root>".to_vec()));
+    assert_eq!(part, Some(victim.uid as u32));
 
     // The victim's socket is dead.
     let end = timeout(Duration::from_secs(5), read_frame(&mut victim.stream)).await;
@@ -465,4 +480,56 @@ async fn kick_ban_and_untouchable_targets() {
     );
 
     let _ = armored; // keep the session alive to the end
+}
+
+/// Private chats are capped per creator and per server, and a period
+/// client meets either cap as the task error any refused create is. A
+/// chat counts until its last member leaves.
+#[tokio::test]
+async fn private_chats_are_capped_per_creator_and_per_server() {
+    let td = tempfile::tempdir().unwrap();
+    let core = Core::new().with_chat_limits(hxd_core::ChatLimits {
+        per_creator: 2,
+        total: 3,
+    });
+    let (addr, _ctx) = start_server_with(td.path(), core).await;
+    let mut a = Client::login(addr, "alice", "", "").await;
+    let mut b = Client::login(addr, "bob", "", "").await;
+    async fn create(c: &mut Client, invitee: u16) -> Frame {
+        let t = c
+            .send(
+                REQ_CHAT_CREATE,
+                &[(tag::UID, u32::from(invitee).to_be_bytes().to_vec())],
+            )
+            .await;
+        loop {
+            let f = c.recv_type(HDR_TASK).await;
+            if f.trans == t {
+                return f;
+            }
+        }
+    }
+    let refused = |f: &Frame| {
+        assert_eq!(f.flag, 1, "the create was refused");
+        String::from_utf8(chunk(f, tag::TASK_ERROR).unwrap()).unwrap()
+    };
+    let first = chunk_u32(&create(&mut a, b.uid).await, tag::CHAT_ID).unwrap();
+    assert_eq!(create(&mut a, b.uid).await.flag, 0);
+    assert_eq!(
+        refused(&create(&mut a, b.uid).await),
+        "Too many private chats are open. Leave one first."
+    );
+    // Bob's first is the server's last.
+    assert_eq!(create(&mut b, a.uid).await.flag, 0);
+    assert_eq!(
+        refused(&create(&mut b, a.uid).await),
+        "Too many private chats are open. Leave one first."
+    );
+    // Leaving the one she is alone in closes it, and that is room.
+    a.send(
+        REQ_CHAT_PART,
+        &[(tag::CHAT_ID, first.to_be_bytes().to_vec())],
+    )
+    .await;
+    assert_eq!(create(&mut a, b.uid).await.flag, 0);
 }

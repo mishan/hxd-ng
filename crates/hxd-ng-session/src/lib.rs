@@ -58,6 +58,9 @@ pub trait TunnelSink: Send + Sync {
         // login change about account association (§8.2) — separate from
         // `transport`, which is descriptive; this authorizes.
         link: LinkAuthority,
+        // The connection's place in its address's count, taken at the
+        // upgrade and held for as long as the session runs.
+        place: hxd_core::ConnPermit,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
     /// Serve one file transfer a tunnelled session was issued, arriving
@@ -111,6 +114,59 @@ pub struct NgConfig {
     /// write (§6.3). Only this one is read, because a header the proxy
     /// doesn't write is one the client gets to choose.
     pub forwarded_header: ForwardedHeader,
+    /// What the HTTP layer holds addresses, and everyone, to.
+    pub http_limits: HttpLimits,
+}
+
+/// What the ng port holds one address to, and everyone together
+/// (`[limits]`), before and beside the limits on the sessions it
+/// carries (`hxd_core::limits`). 0 is no limit, in each.
+///
+/// Every connection to the port holds a place in both counts from
+/// accept until it closes, whatever it turns out to carry — a WebSocket
+/// included, for its whole life — so they bound the descriptors the
+/// port can take. An ng session's socket also holds a place in the
+/// address's shared count, the one the classic wire's connections
+/// count against; the count here is separate and larger, because one
+/// browser page opens several connections at once beside its socket
+/// and would be refused by the classic wire's allowance of five.
+///
+/// **Behind a trusted proxy** (`[ng] trusted_proxies`) the connection
+/// at accept is the proxy's, and it carries requests for everyone
+/// behind it, so the per-address count does not apply to it: the
+/// proxy is the place to limit connections per client. The request
+/// limits still apply, to the forwarded address, as every other
+/// per-address rule on this port does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpLimits {
+    /// Connections one address may hold to the port at once.
+    pub connections_per_addr: usize,
+    /// Connections everyone together may hold to the port at once.
+    /// Past it a new one is closed unanswered; it is what stands
+    /// between a crowd of addresses and the process's descriptors,
+    /// which the classic port and the databases share. Addresses
+    /// `[limits]` exempts have a few places kept past it, so a flood
+    /// does not shut out the operator's own tools.
+    pub connections: usize,
+    /// `POST /identity/challenge` one address may make a minute.
+    pub challenges_per_minute: u32,
+    /// `GET /avatars/{id}` one address may make a minute.
+    pub avatar_fetches_per_minute: u32,
+}
+
+impl HttpLimits {
+    pub const RECOMMENDED: HttpLimits = HttpLimits {
+        connections_per_addr: 16,
+        connections: 4096,
+        challenges_per_minute: 30,
+        avatar_fetches_per_minute: 600,
+    };
+}
+
+impl Default for HttpLimits {
+    fn default() -> Self {
+        HttpLimits::RECOMMENDED
+    }
 }
 
 /// The header a trusted proxy uses to say who it is speaking for.
@@ -156,39 +212,15 @@ impl ForwardedHeader {
 /// an exact `IpAddr` comparison would silently never match — the mTLS
 /// binding would look configured and be off.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TrustedProxies(Vec<(IpAddr, u32)>);
+pub struct TrustedProxies(hxd_core::AddrSet);
 
 impl TrustedProxies {
     /// Parse `"192.0.2.7"`, `"10.0.0.0/8"`, `"2001:db8::/32"`. The error
     /// names the offending entry; it reaches the operator at startup.
     pub fn parse<S: AsRef<str>>(entries: &[S]) -> Result<Self, String> {
-        let mut out = Vec::new();
-        for e in entries {
-            let e = e.as_ref().trim();
-            let (addr, prefix) = match e.split_once('/') {
-                Some((a, p)) => (a, Some(p)),
-                None => (e, None),
-            };
-            let addr: IpAddr = addr
-                .parse()
-                .map_err(|_| format!("trusted_proxies: {e:?} is not an IP address"))?;
-            let addr = addr.to_canonical();
-            let full = if addr.is_ipv4() { 32 } else { 128 };
-            let bits = match prefix {
-                None => full,
-                Some(p) => {
-                    let bits: u32 = p
-                        .parse()
-                        .map_err(|_| format!("trusted_proxies: {e:?} has a bad prefix length"))?;
-                    if bits > full {
-                        return Err(format!("trusted_proxies: {e:?} prefix exceeds {full} bits"));
-                    }
-                    bits
-                }
-            };
-            out.push((addr, bits));
-        }
-        Ok(TrustedProxies(out))
+        hxd_core::AddrSet::parse(entries)
+            .map(TrustedProxies)
+            .map_err(|e| format!("trusted_proxies: {e}"))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -196,33 +228,8 @@ impl TrustedProxies {
     }
 
     pub fn contains(&self, peer: IpAddr) -> bool {
-        let peer = peer.to_canonical();
-        self.0
-            .iter()
-            .any(|(net, bits)| prefix_eq(peer, *net, *bits))
+        self.0.contains(peer)
     }
-}
-
-fn prefix_eq(a: IpAddr, b: IpAddr, bits: u32) -> bool {
-    fn octets(ip: IpAddr) -> Vec<u8> {
-        match ip {
-            IpAddr::V4(v) => v.octets().to_vec(),
-            IpAddr::V6(v) => v.octets().to_vec(),
-        }
-    }
-    if a.is_ipv4() != b.is_ipv4() {
-        return false;
-    }
-    let (a, b) = (octets(a), octets(b));
-    let (whole, rest) = ((bits / 8) as usize, bits % 8);
-    if a[..whole] != b[..whole] {
-        return false;
-    }
-    if rest == 0 {
-        return true;
-    }
-    let mask = 0xffu8 << (8 - rest);
-    a[whole] & mask == b[whole] & mask
 }
 
 impl Default for NgConfig {
@@ -237,6 +244,7 @@ impl Default for NgConfig {
             caps: Vec::new(),
             trusted_proxies: TrustedProxies::default(),
             forwarded_header: ForwardedHeader::default(),
+            http_limits: HttpLimits::default(),
         }
     }
 }
@@ -279,12 +287,14 @@ pub struct NgCtx {
 }
 
 /// Accept loop: one connection task per socket. Each is HTTP until it
-/// upgrades (`http.rs`). Never returns: an accept error — descriptors
-/// exhausted, most often, which anyone able to hold enough idle
-/// connections open can cause — is waited out. Returned, it ended this
-/// task, and the ng port stopped answering while the rest of the server
-/// ran on without it.
+/// upgrades (`http.rs`), and holds its places in [`HttpLimits`]' counts
+/// until it closes. Never returns: an accept error — descriptors
+/// exhausted, most often, which the counts make hard for anyone but a
+/// crowd to cause, and the classic port or the databases might anyway —
+/// is waited out. Returned, it ended this task, and the ng port stopped
+/// answering while the rest of the server ran on without it.
 pub async fn serve(listener: TcpListener, ctx: NgCtx) {
+    let gates = Arc::new(http::Gates::new(&ctx));
     let mut backoff = Duration::from_millis(10);
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -301,9 +311,10 @@ pub async fn serve(listener: TcpListener, ctx: NgCtx) {
         };
         let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
+        let gates = gates.clone();
         tokio::spawn(async move {
             let span = tracing::info_span!("ng", %peer);
-            http::serve_connection(stream, peer, ctx)
+            http::serve_connection(stream, peer, ctx, gates)
                 .instrument(span)
                 .await;
         });

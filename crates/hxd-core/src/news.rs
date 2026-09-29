@@ -797,8 +797,17 @@ pub enum NewsError {
     NoSuchMedia,
     /// The post names more attachments than policy allows.
     AttachmentsFull,
-    /// The durable blob volume is at its configured ceiling.
+    /// The durable blob volume, or the live articles, at a configured
+    /// ceiling: `[news.attach] max_total_bytes`, `[news] max_articles`
+    /// or `max_text_bytes`. About the server, where `TooManyArticles` is
+    /// about you.
     NewsFull,
+    /// The author already has `[news] max_per_author` live articles.
+    /// `guests` when the author is a guest, whose allowance is the one
+    /// every guest shares, so the words cannot say it is theirs.
+    TooManyArticles {
+        guests: bool,
+    },
     Store(StoreError),
 }
 
@@ -876,6 +885,18 @@ pub trait NewsStore: Send + Sync + 'static {
     /// The articles pointing at `id`, newest first. Tombstones are never
     /// among them — a tombstone's references went with its body.
     fn refs_to(&self, id: ArticleId, limit: usize) -> Result<Vec<Reference>, StoreError>;
+
+    /// What the live articles hold: how many, and the bytes of their
+    /// bodies and plain-text downgrades. What `max_articles` and
+    /// `max_text_bytes` are checked against at every post, so it is kept
+    /// rather than counted — a sum over every body in the archive per
+    /// post would read the archive per post. Tombstones hold nothing.
+    fn usage(&self) -> Result<NewsUsage, StoreError>;
+
+    /// How many live articles `who` wrote, by [`Author::is`]; `None`
+    /// counts those no account wrote — every guest's together, since a
+    /// shared `guest` login names nobody in particular (§3.1).
+    fn written_by(&self, who: Option<&Mailbox>) -> Result<u64, StoreError>;
 
     /// Retention: remove every thread whose newest article is older than
     /// `max_age`, whole — pruning a starter out from under its live
@@ -1110,6 +1131,13 @@ pub struct SearchRequest {
     pub limit: usize,
 }
 
+/// What [`NewsStore::usage`] answers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NewsUsage {
+    pub articles: u64,
+    pub bytes: u64,
+}
+
 /// The numbers the domain enforces, filled from `[news]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewsPolicy {
@@ -1130,6 +1158,18 @@ pub struct NewsPolicy {
     pub self_delete: bool,
     /// Days a thread survives its last post; 0 keeps everything.
     pub retain_days: u32,
+    /// Live articles the whole store may hold; 0 for no ceiling. A post
+    /// past it is refused, never made room for: evicting the oldest
+    /// thread would gut the archive to make room for whoever posts most
+    /// (§7.4).
+    pub max_articles: u64,
+    /// Bytes of body and downgrade the live articles may hold together;
+    /// 0 for no ceiling. Refused, like `max_articles`.
+    pub max_text_bytes: u64,
+    /// Live articles one author may hold, the guests counted as one; 0
+    /// for no ceiling. What keeps one account from spending the two
+    /// above for everyone.
+    pub max_per_author: u64,
     /// Is `news_search` answered? The index is kept either way, so
     /// turning search back on needs no rebuild.
     pub search: bool,
@@ -1171,6 +1211,9 @@ impl Default for NewsPolicy {
             max_page: 200,
             self_delete: true,
             retain_days: 0,
+            max_articles: 100_000,
+            max_text_bytes: 1 << 30,
+            max_per_author: 10_000,
             search: true,
             search_max_results: 500,
             search_per_minute: 30,
@@ -1349,6 +1392,43 @@ struct Asker {
     blockable: Option<Mailbox>,
     login: String,
     attach_news: bool,
+}
+
+/// Is there room for `post` under the ceilings (§7.4)? The author's
+/// first, since that refusal is the one the poster can do something
+/// about. Refused, never made room for, as the blob cap is.
+fn news_room(store: &dyn NewsStore, post: &NewPost, policy: NewsPolicy) -> Result<(), NewsError> {
+    let failed = |e: StoreError| store_failed(e.into());
+    if policy.max_per_author > 0 {
+        let who = post.author.login.as_ref().map(|login| Mailbox {
+            login: login.clone(),
+            fingerprint: post.author.fingerprint,
+        });
+        if store.written_by(who.as_ref()).map_err(failed)? >= policy.max_per_author {
+            return Err(NewsError::TooManyArticles {
+                guests: who.is_none(),
+            });
+        }
+    }
+    if policy.max_articles > 0 || policy.max_text_bytes > 0 {
+        let used = store.usage().map_err(failed)?;
+        let adds = (post.body.len() + post.plain.as_ref().map_or(0, String::len)) as u64;
+        let full = (policy.max_articles > 0 && used.articles >= policy.max_articles)
+            || (policy.max_text_bytes > 0
+                && used.bytes.saturating_add(adds) > policy.max_text_bytes);
+        if full {
+            // A server at its ceiling needs an operator, so the log says
+            // so every time rather than once.
+            warn!(
+                articles = used.articles,
+                bytes = used.bytes,
+                "news is full: a post was refused; raise [news] max_articles or \
+                 max_text_bytes, set retain_days, or delete threads"
+            );
+            return Err(NewsError::NewsFull);
+        }
+    }
+    Ok(())
 }
 
 fn store_failed(e: NewsError) -> NewsError {
@@ -1535,6 +1615,27 @@ impl Core {
         {
             bucket.1 = (bucket.1 + 1.0).min(f64::from(per_hour));
         }
+    }
+
+    /// Would an image this session stages now be admitted? The questions
+    /// [`Core::news_stage_attachment`] asks before it decodes anything,
+    /// asked without spending the allowance, so a frontend can refuse an
+    /// upload before it reads the bytes.
+    pub fn news_attach_admits(&self, uid: Uid) -> Result<(), NewsError> {
+        use crate::media::MediaReject;
+
+        self.news_store()?;
+        let asker = self.news_reader(uid)?;
+        let policy = self.news_policy.attach.ok_or(NewsError::Disabled)?;
+        if !asker.access.has(bit::POST_NEWS) || !asker.attach_news {
+            return Err(NewsError::AccessDenied);
+        }
+        let owner = Self::attachment_owner(&asker).ok_or(NewsError::NoMailbox)?;
+        let rate = self.news_attach_rate.lock().unwrap();
+        if !subs::would_spend(&rate, &subs::budget_key(&owner), policy.per_hour) {
+            return Err(NewsError::Media(MediaReject::RateLimited));
+        }
+        Ok(())
     }
 
     /// Validate, canonicalize, persist and stage one news image (§7.3).
@@ -1873,6 +1974,57 @@ impl Core {
         store.recent(category, limit).map_err(store_failed)
     }
 
+    /// Take one of the posts `uid`'s account may make
+    /// ([`crate::RequestLimits::news_posts`]), or say how long until one
+    /// is there: asked by a frontend that refuses a post with that wait,
+    /// before it posts. Taken rather than looked at, so two sessions of
+    /// one account posting at once are not both let through on the one
+    /// that was left; a post then refused for what it says gives it back
+    /// ([`Self::news_post_refund`]). A session whose account
+    /// `can_spam`, and the server account, are held to none, as they are
+    /// held to no flood budget.
+    pub fn news_post_reserve(&self, uid: Uid) -> Result<(), Duration> {
+        match self.post_key(uid) {
+            Some(key) => {
+                self.post_rates
+                    .reserve(key, &self.request_limits, std::time::Instant::now())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Give back what [`Self::news_post_reserve`] took, for a post that
+    /// did not land.
+    pub fn news_post_refund(&self, uid: Uid) {
+        if let Some(key) = self.post_key(uid) {
+            self.post_rates.refund(&key, std::time::Instant::now());
+        }
+    }
+
+    /// Count a post of `uid`'s that landed against what its account may
+    /// post, from a wire held to its reference server's rules, which has
+    /// no such limit and is never refused by it.
+    pub fn news_post_counted(&self, uid: Uid) {
+        if let Some(key) = self.post_key(uid) {
+            self.post_rates
+                .count(key, &self.request_limits, std::time::Instant::now());
+        }
+    }
+
+    /// Whose posts `uid`'s count as, or `None` when they count as nobody's.
+    fn post_key(&self, uid: Uid) -> Option<crate::limits::PostKey> {
+        let r = self.roster.lock().unwrap();
+        let sess = r.users.get(&uid)?;
+        if sess.can_spam || sess.info.system {
+            return None;
+        }
+        Some(match (sess.is_person, sess.identity) {
+            (true, Some(fp)) => crate::limits::PostKey::Account(Some(fp), String::new()),
+            (true, None) => crate::limits::PostKey::Account(None, sess.login.clone()),
+            (false, _) => crate::limits::PostKey::Session(sess.serial),
+        })
+    }
+
     /// Post an article or a reply, tell every reader their view of that
     /// category is stale, and tell the people it is addressed to that it
     /// is theirs (§10).
@@ -1930,9 +2082,13 @@ impl Core {
                 return Err(NewsError::AttachmentsFull);
             }
         }
-        let posted = store
-            .post(&post, policy.max_depth, policy.max_refs)
-            .map_err(store_failed)?;
+        let posted = {
+            let _serial = self.news_post_serial.lock().unwrap();
+            news_room(&**store, &post, policy)?;
+            store
+                .post(&post, policy.max_depth, policy.max_refs)
+                .map_err(store_failed)?
+        };
         self.news_fan_out(Event::NewsPosted {
             id: posted.id,
             category: post.category,
@@ -2318,7 +2474,9 @@ mod tests {
                 transport: Transport::default(),
                 has_inbox,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
+                can_spam: false,
                 is_person,
                 reads_on_delivery: false,
                 identity: None,

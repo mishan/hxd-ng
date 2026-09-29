@@ -2,7 +2,7 @@
 //! what these test is whose avatar it is, who hears about a change, and
 //! what survives a session.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::*;
 use crate::access::AccessBits;
@@ -54,6 +54,11 @@ enum Who<'a> {
 /// A visible session, with its owner's avatar restored as the frontends
 /// do before announcing it.
 fn join(core: &Core, who: Who) -> (Uid, Events) {
+    join_from(core, who, IpAddr::V4(Ipv4Addr::LOCALHOST), true)
+}
+
+/// [`join`], from `addr`, with the account's `set_avatar` as given.
+fn join_from(core: &Core, who: Who, addr: IpAddr, set_avatar: bool) -> (Uid, Events) {
     let (login, is_person, identity) = match who {
         Who::Account(login) => (login.to_string(), true, None),
         Who::Guest(identity) => ("guest".to_string(), false, identity),
@@ -65,12 +70,14 @@ fn join(core: &Core, who: Who) -> (Uid, Events) {
             admin: false,
             access: AccessBits::empty(),
             login,
-            addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            addr: Some(addr),
             can_detach: false,
             transport: Transport::default(),
             has_inbox: false,
             attach_news: false,
+            set_avatar,
             moderate: false,
+            can_spam: false,
             is_person,
             reads_on_delivery: false,
             identity,
@@ -195,8 +202,8 @@ fn changes_are_rationed_per_owner() {
     let (alice, _) = join(&core, Who::Account("alice"));
     let (alice_too, _) = join(&core, Who::Account("alice"));
     let (bob, _) = join(&core, Who::Account("bob"));
-    let (guest, _) = join(&core, Who::Guest(None));
-    let (other_guest, _) = join(&core, Who::Guest(None));
+    let (guest, _) = join_from(&core, Who::Guest(None), v4(1), true);
+    let (other_guest, _) = join_from(&core, Who::Guest(None), v4(2), true);
     core.set_avatar(alice, b"one").unwrap();
     assert_eq!(
         core.set_avatar(alice, b"two"),
@@ -208,14 +215,129 @@ fn changes_are_rationed_per_owner() {
         core.set_avatar(alice_too, b"two"),
         Err(MediaReject::RateLimited)
     );
+    assert_eq!(
+        core.avatar_change_admits(alice_too),
+        Err(MediaReject::RateLimited),
+        "asked before the bytes are read"
+    );
+    for _ in 0..3 {
+        assert_eq!(core.avatar_change_admits(bob), Ok(()), "and asking is free");
+    }
     core.set_avatar(bob, b"one").unwrap();
-    // Guests without an identity are each their own.
+    // Guests without an identity are each their own, one per address.
     core.set_avatar(guest, b"one").unwrap();
     core.set_avatar(other_guest, b"one").unwrap();
     assert_eq!(
         core.set_avatar(guest, b"two"),
         Err(MediaReject::RateLimited)
     );
+}
+
+fn v4(last: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))
+}
+
+#[test]
+fn a_guests_turn_is_its_address_and_survives_a_reconnect() {
+    let core = Core::new().with_avatars(
+        Arc::new(MemoryAvatars::default()),
+        Arc::new(FakeCodec),
+        AvatarPolicy::default(),
+    );
+    let (guest, _) = join_from(&core, Who::Guest(None), v4(1), true);
+    core.set_avatar(guest, b"one").unwrap();
+    // Reconnecting is a new session, not a new turn.
+    core.end_session(guest);
+    let (back, _) = join_from(&core, Who::Guest(None), v4(1), true);
+    assert_eq!(core.set_avatar(back, b"two"), Err(MediaReject::RateLimited));
+    // Nor is a freshly minted identity from the same address.
+    let (minted, _) = join_from(&core, Who::Guest(Some([6; 32])), v4(1), true);
+    assert_eq!(
+        core.set_avatar(minted, b"two"),
+        Err(MediaReject::RateLimited)
+    );
+    // An IPv6 guest is its /64, which is what one subscriber holds.
+    let net = |host: u16| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, host));
+    let (here, _) = join_from(&core, Who::Guest(None), net(1), true);
+    core.set_avatar(here, b"one").unwrap();
+    let (next_door, _) = join_from(&core, Who::Guest(None), net(2), true);
+    assert_eq!(
+        core.set_avatar(next_door, b"two"),
+        Err(MediaReject::RateLimited)
+    );
+    // Another address is another guest; an account is held by its
+    // login alone, whoever else shares its address.
+    let (elsewhere, _) = join_from(&core, Who::Guest(None), v4(2), true);
+    core.set_avatar(elsewhere, b"one").unwrap();
+    let (alice, _) = join_from(&core, Who::Account("alice"), v4(1), true);
+    core.set_avatar(alice, b"one").unwrap();
+}
+
+#[test]
+fn a_session_that_may_not_set_is_refused_before_anything_is_spent() {
+    let core = Core::new().with_avatars(
+        Arc::new(MemoryAvatars::default()),
+        Arc::new(FakeCodec),
+        AvatarPolicy::default(),
+    );
+    let (guest, mut rx) = join_from(&core, Who::Guest(None), v4(1), false);
+    let (_watcher, mut watcher_rx) = join(&core, Who::Account("bob"));
+    changes(&mut rx);
+    assert_eq!(
+        core.set_avatar(guest, b"one"),
+        Err(MediaReject::NotAuthorized)
+    );
+    assert!(user(&core, guest).avatar.is_none());
+    assert!(changes(&mut watcher_rx).is_empty(), "nothing announced");
+    // Clearing is never refused, and there is nothing to clear.
+    assert_eq!(core.clear_avatar(guest), Ok(false));
+    // The refusal spent no turn: a guest on the same address that may
+    // set one still can, inside the interval.
+    let (allowed, _) = join_from(&core, Who::Guest(None), v4(1), true);
+    core.set_avatar(allowed, b"one").unwrap();
+    // An account whose file says no is refused the same way.
+    let (kiosk, _) = join_from(&core, Who::Account("kiosk"), v4(3), false);
+    assert_eq!(
+        core.set_avatar(kiosk, b"one"),
+        Err(MediaReject::NotAuthorized)
+    );
+}
+
+#[test]
+fn an_identitys_avatar_ages_out_once_it_stops_coming_back() {
+    let core = core();
+    let day = Duration::from_secs(24 * 3600);
+    let (keyed, _) = join(&core, Who::Guest(Some([4; 32])));
+    core.set_avatar(keyed, b"keyed").unwrap();
+    let (alice, _) = join(&core, Who::Account("alice"));
+    core.set_avatar(alice, b"alice").unwrap();
+    let later = SystemTime::now() + 365 * day;
+    // Still on the roster, so still seen: nothing goes.
+    assert_eq!(core.prune_avatars(later), 0);
+    core.end_session(keyed);
+    core.end_session(alice);
+    // Seen by that prune a year on, so a prune the same day keeps it.
+    assert_eq!(core.prune_avatars(later), 0);
+    assert_eq!(core.prune_avatars(later + 100 * day), 1);
+    let (again, _) = join(&core, Who::Guest(Some([4; 32])));
+    assert!(user(&core, again).avatar.is_none(), "the identity's went");
+    let (alice, _) = join(&core, Who::Account("alice"));
+    assert!(user(&core, alice).avatar.is_some(), "the account's stays");
+
+    // Zero keeps an identity's for good.
+    let forever = Core::new().with_avatars(
+        Arc::new(MemoryAvatars::default()),
+        Arc::new(FakeCodec),
+        AvatarPolicy {
+            set_interval: Duration::ZERO,
+            identity_retention: Duration::ZERO,
+            ..Default::default()
+        },
+    );
+    let (keyed, _) = join(&forever, Who::Guest(Some([4; 32])));
+    forever.set_avatar(keyed, b"keyed").unwrap();
+    forever.end_session(keyed);
+    assert_eq!(forever.prune_avatars(later + 100 * day), 0);
 }
 
 /// Ends the session it is decoding for, as a kick or a logout would

@@ -110,7 +110,7 @@ Condensed; the spec is normative and this is the checklist.
 - **Mute is server-enforced.** A muted participant's RTP is dropped, not
   forwarded, regardless of what the client sends. Status (605) fans out
   on every join/leave/mute; a ~100 ms debounce of mute flaps is
-  RECOMMENDED.
+  RECOMMENDED, and hxd-ng has one (§13).
 - **Timeouts** (minimums; monotonic clocks): no answer after join, 10 s;
   ICE failure, 30 s; DTLS failure, 10 s; no RTP *or RTCP* from the client,
   30 s. Each tears the peer down and sends status to the room. The
@@ -396,7 +396,7 @@ of [hotline-ng.md](hotline-ng.md) §5. The login reply's `caps` list
 
 | `req` | params | ok | errors |
 |---|---|---|---|
-| `voice_join` | `cid` | `{ "sdp", "codec": "PCMU", "participants": [ {uid, muted} ] }` | `voice_disabled`, `access_denied`, `no_such_chat`, `not_a_member`, `voice_full` |
+| `voice_join` | `cid` | `{ "sdp", "codec": "PCMU", "participants": [ {uid, muted} ] }` | `voice_disabled`, `access_denied`, `no_such_chat`, `not_a_member`, `voice_full`, `rate_limited` (with `retry_after`, §13) |
 | `voice_leave` | `cid` | `{}` | `not_in_voice` |
 | `voice_answer` | `cid`, `sdp` | `{}` | `not_in_voice`, `bad_answer` |
 | `voice_ice` | `cid`, `candidate` (object, or `null` for end-of-candidates) | `{}` | `voice_disabled`, `not_in_voice` |
@@ -498,7 +498,8 @@ V5 is what remains: real clients, real microphones, one room.
 | Bandwidth: PCMU has no DTX, 64 kbps per stream each way, N−1 downstream per client | Low for Hotline-sized rooms, real at 16 | The per-room cap is the knob; the spec's bandwidth table goes in the operator docs |
 | Sequential cids are guessable, and the spec's room-membership rules say a guessed cid is a joinable private room | **High if membership isn't checked; Low once it is** | Membership check in V1 is the real defence; random cids (§11) are defence in depth and cheap |
 | ~~`hxproto` changes coordinated by hand across two trees~~ | Avoided | Nothing crossed. The participants encoder stayed server-side (§7), round-tripped against the shared parser. |
-| The mute-debounce timer has no natural home in a domain that "schedules nothing" | Low | Ship without it (it's a SHOULD); if PTT flapping is noisy in practice, the `hxd-voice` task owns the timer and calls `core.voice_flush_status(cid)` |
+| ~~The mute-debounce timer has no natural home in a domain that "schedules nothing"~~ | Answered | The domain records what each room is owed and when; a task in the binary sleeps until then and calls `Core::voice_flush_status` (§13) |
+| One client costing the room more than its share: join loops, renegotiation storms, a publisher ignoring `b=AS`, an endless trickle of candidates | Medium — answered | Per-session allowances, the debounce, an inbound policer and a candidate cap (§13) |
 
 ## 11. Open questions
 
@@ -610,3 +611,81 @@ only ever pointed at an address the operator said it can reach. The shape
 that remains unserveable — a wildcard bind with two advertised addresses
 of one family, which can only be told apart by guessing — is refused at
 startup rather than discovered in production.
+
+## 13. What one session may cost the room
+
+Every join and leave renegotiates the whole room, every mute flip is a
+status to everyone in it, every video start or subscription change
+renegotiates whoever it touches — all of it under the roster lock — and
+every packet a publisher sends is written once per listener. None of
+that was bounded per client, so one client could make the room, and the
+lock every other login and chat line needs, pay for as much of it as it
+cared to ask for. What bounds it now, and what it deliberately leaves
+alone:
+
+- **Joins are an allowance** (`[voice] joins` per `join_seconds`, five
+  in ten seconds by default): a burst, earned back steadily, per session
+  and charged before any of the join's work. Past it a join is refused —
+  an ordinary task error on the classic wire, saying how long to wait,
+  `rate_limited` with `retry_after` in whole seconds on the ng one — and
+  the user stays in whatever room it was in, since the refusal comes
+  before the teardown. A join that then finds the room full, or that
+  the media layer cannot seat, is refunded.
+- **Video starts and subscription changes are another**
+  (`[voice.video] changes` per `change_seconds`, ten in ten by
+  default), refused the same way. A start the media layer cannot seat
+  because its session is already gone is refunded; one refused because
+  the peer's offer has no room for another section is not, since the
+  offer stays that full for the session's life and every retry would
+  meet the same refusal. Only a subscription set that adds a
+  publication the room has now is charged, since that is what
+  renegotiates toward a new receive section. One re-declared unchanged is free, as it
+  renegotiates nobody; one that only narrows is the way out (below);
+  and one naming a stream nobody publishes yet costs nothing until its
+  publisher starts it, and that start is charged.
+- **The way out is never refused.** A leave, a video stop, a narrowed
+  subscription set (`[]` included), a mute and a pause need no
+  allowance: each undoes something that paid, or costs
+  the room at most one status per debounce window, and a user who
+  cannot hang up or turn a camera off is a worse failure than any a
+  client can cause with them.
+- **Mute and pause flips are debounced** (`status_debounce_ms`, 100 by
+  default). The media layer enforces each flip at once; only the
+  announcing waits. The window is fixed from the first flip rather than
+  restarted by each, so a burst reaches the room as one status carrying
+  the state it ended in and a client that never stops flapping still has
+  its room told where it stands once per window. A join or leave status
+  sent meanwhile carries the same state and settles what was owed. The
+  domain schedules nothing, so it only records what each room is owed
+  and when; `hxd::voice::debounce` sleeps until then, woken when a room
+  first starts owing one, and calls `Core::voice_flush_status`.
+- **Inbound RTP is policed** in `hxd-voice` (`police`), per stream: a
+  peer's audio against PCMU's 64 kbps, each publication against its
+  kind's `max_bitrate`, at `[voice] police_factor` times the ceiling
+  (1.5 by default: an encoder overshoots on keyframes and while probing,
+  and one that honors its ceiling should never be touched; a factor
+  between 0 and 1 is refused at startup, since it would drop media
+  inside the `b=AS` ceiling the server itself advertised). Over the
+  rate a packet is dropped rather than multiplied; receivers' own
+  keyframe requests, relayed at most once a second, repair the frame,
+  and the policer asks for none itself — requesting a keyframe from a
+  publisher just policed for sending too much is how the two talk each
+  other into a loop. A stream still arriving at twice the policed rate
+  after ten seconds is ended: the publication, for video, as a stalled
+  one is; the session, for audio. Drops and ends are counted
+  (`docs/metrics.md`).
+- **Trickled candidates are capped** at thirty-two distinct ones per
+  session before they reach str0m's ICE agent, which caps its pairs but
+  keeps every remote candidate and compares each new one against all of
+  them. Past the cap a candidate is ignored and logged at debug; the
+  session goes on.
+
+Answers need no allowance of their own: one is accepted only while an
+offer is outstanding, and offers are serialized per peer. A session
+whose account `can_spam` is held to neither allowance, as it is held to
+none of the flood limits. No address is exempt, loopback included: the
+allowances are per session, so sessions sharing an address never share
+one, and exempting a proxy or container gateway would exempt everyone
+behind it. The per-request
+bucket on the ng wire is a separate, coarser layer in front of all of
+this.

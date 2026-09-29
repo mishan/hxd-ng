@@ -30,12 +30,23 @@ host scrape: the run reads the server's own numbers before, during and
 after, and its check for sessions left behind compares the server's
 count with the one it started with. Without metrics the harness still
 runs and still checks everything it can see from the clients' side.
+Its `[limits]` should set `chat_lines`, `spam_points`, `ng_requests`
+and `news_posts` to 0: every harness client talks far faster than a
+person, from one address, and the flood limits would kick and ban them
+as mhxd's would, and the request limits slow them down.
 
 For numbers worth comparing, put the server and the harness on
 separate cores (`taskset`), raise `ulimit -n` for both, and record the
 storage the database is on: the rate public chat can be persisted at is
 the disk's fsync rate (`docs/metrics.md`, the `LogSerial` lock). The
 baseline script does all of that (§7).
+
+Every connection the harness opens comes from one address, and the
+server holds an address to a few connections and a slow reconnect rate
+(`[limits]`, the README). Loopback is exempt by default, so a server on
+the same host takes the whole load. A server on another host refuses
+nearly all of it as `too_many` or `too_fast`: raise `[limits]` there, or
+better, add the generator's address to `exempt`.
 
 ## 2. The scenario file
 
@@ -72,6 +83,24 @@ latency is measured from when each was *due*, so a server that stalls
 shows up as latency rather than as a generator that quietly sent less.
 Latencies are HDR histograms, reported as p50, p90, p99, p99.9 and max.
 
+Every login the harness makes, a storm's arrivals, the members a
+scenario joins and the churners' logins alike, is tried again when the
+server refuses it as busy: past `[server] logins_in_flight`, or past
+the share of it one address may have, which every client of a run on
+one machine shares. The ng wire says so as `rate_limited`, the classic
+wire in its task error's text. As a real client does, the harness waits
+a short and growing while before each new try, and gives up once
+`BUSY_PATIENCE` (`member.rs`) has passed, when the refusal stands as
+the login's error. A refusal the retry absorbs fails nothing and is
+never a violation, since the server is right to refuse, so the report
+counts them apart, in `busy_logins`: `refusals`, every try refused;
+`logins`, those refused at least once; `gave_up`, those still refused
+when patience ran out, which failed; and `longest_wait_ms`, the longest
+a refused login spent from its first try to its last. The summary gives
+them a line of their own, `logins refused as busy`. A count that climbs
+from one run to the next, or a login that gave up, is what a login gate
+losing places would look like.
+
 ### Login storm (`login_storm`)
 
 Arrivals at `rate` a second, rising by `ramp_step` every `ramp_every`
@@ -80,7 +109,10 @@ seconds, each on a wire picked by weight (`legacy`, `legacy_tls`,
 accounts` with `accounts = true`), agrees to the agreement and fetches
 the user list; it stays `linger` seconds and leaves. Each step is
 reported on its own, and the knee is the first step whose p99 is twice
-the first step's or whose failures pass one in a hundred.
+the first step's or whose failures pass one in a hundred. An arrival
+refused as busy is retried like any other login, and its latency, timed
+from when it was due, includes the retries: the server's login gate
+shows in a step as latency and in `busy_logins`, not as failed logins.
 `max_in_flight` caps what the generator attempts at once; an arrival
 past it is counted as shed, which is the generator's limit and not the
 server's.

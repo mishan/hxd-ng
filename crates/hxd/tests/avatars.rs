@@ -163,6 +163,15 @@ struct Legacy {
 
 impl Legacy {
     async fn login(addr: SocketAddr, login: &str) -> Self {
+        Self::login_with(addr, login, "pw").await
+    }
+
+    /// The bootstrap guest, which has no password.
+    async fn guest(addr: SocketAddr) -> Self {
+        Self::login_with(addr, "guest", "").await
+    }
+
+    async fn login_with(addr: SocketAddr, login: &str, password: &str) -> Self {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(b"TRTPHOTL\x00\x01\x00\x02").await.unwrap();
         let mut magic = [0; 8];
@@ -172,7 +181,7 @@ impl Legacy {
             (tag::ICON, 128u16.to_be_bytes().to_vec()),
             (tag::VERSION, 190u16.to_be_bytes().to_vec()),
             (tag::LOGIN, xor(login.as_bytes())),
-            (tag::PASSWORD, xor(b"pw")),
+            (tag::PASSWORD, xor(password.as_bytes())),
         ];
         stream
             .write_all(&pack_frame(LOGIN, 1, 0, &chunks))
@@ -283,6 +292,10 @@ struct Ng {
 
 impl Ng {
     async fn login(addr: SocketAddr, login: &str) -> (Self, Value) {
+        Self::login_with(addr, login, "pw").await
+    }
+
+    async fn login_with(addr: SocketAddr, login: &str, password: &str) -> (Self, Value) {
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
@@ -294,7 +307,7 @@ impl Ng {
             uid: 0,
         };
         let reply = client
-            .request("login", json!({ "login": login, "password": "pw" }))
+            .request("login", json!({ "login": login, "password": password }))
             .await;
         let ok = reply["ok"].clone();
         assert!(ok.is_object(), "{reply}");
@@ -674,4 +687,213 @@ async fn without_avatars_neither_wire_offers_them() {
         alice.request("avatar_clear", json!({})).await["error"]["code"],
         "unknown_method"
     );
+}
+
+/// Let the bootstrap guest set an avatar, as an operator would: the
+/// `[extra]` key, appended to the file first run wrote.
+fn let_guests_set_avatars(dir: &Path) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("accounts/guest.toml"))
+        .unwrap();
+    f.write_all(b"\n[extra]\nset_avatar = true\n").unwrap();
+}
+
+fn error_text(frame: &Frame) -> String {
+    String::from_utf8_lossy(&field(frame, tag::TASK_ERROR).unwrap_or_default()).into_owned()
+}
+
+#[tokio::test]
+async fn a_guest_sets_no_avatar_on_either_wire_until_its_file_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), Some(unthrottled())).await;
+    let (mut alice, _) = Ng::login(server.ng, "alice").await;
+    let mut bob = Legacy::login(server.legacy, "bob").await;
+    assert!(bob.icon_list().await.is_empty());
+
+    // The classic wire: answered as a set is, so a client re-sending its
+    // saved icon at login shows no error — and not applied: the icon
+    // stays unset and nobody is told anything changed.
+    let mut guest = Legacy::guest(server.legacy).await;
+    assert!(guest.icon_list().await.is_empty());
+    let quiet = guest
+        .call(ICON_SET, &[(tag::ICON_GIF, gif(1, 16, 16))])
+        .await;
+    assert_eq!(quiet.flag, 0, "{}", error_text(&quiet));
+    assert!(guest.icon_of(guest.uid).await.is_empty());
+    assert!(bob.icon_of(guest.uid).await.is_empty());
+    // Clearing is never refused.
+    let clear = guest.call(ICON_SET, &[(tag::ICON_GIF, vec![])]).await;
+    assert_eq!(clear.flag, 0);
+
+    // The ng wire: 403, and `avatar_clear` still answers.
+    let (mut ng_guest, ok) = Ng::login_with(server.ng, "guest", "").await;
+    assert!(
+        ok["caps"].as_array().unwrap().contains(&json!("avatars")),
+        "a guest still sees everyone else's"
+    );
+    let put = put_avatar(server.ng, &ng_guest.bearer, &png(32, 32)).await;
+    assert_eq!(put.status, 403);
+    assert_eq!(put.json()["error"]["code"], "access_denied");
+    assert_eq!(
+        ng_guest.request("avatar_clear", json!({})).await["ok"],
+        json!({})
+    );
+
+    // An account sets one as it always has, and it is the first change
+    // alice hears about: neither refused set was announced.
+    let set = put_avatar(server.ng, &alice.bearer, &png(32, 32)).await;
+    assert_eq!(set.status, 200);
+    let heard = alice.user_changed(alice.uid).await;
+    assert_eq!(heard["avatar"], set.json()["avatar"]);
+    assert!(
+        !alice
+            .events
+            .iter()
+            .any(|e| e["ev"] == "user_changed" && e["data"]["user"].get("avatar").is_some()),
+        "no other avatar change"
+    );
+    // And the first Icon Change bob hears is alice's, not the guest's.
+    let first = loop {
+        let frame = bob.recv().await;
+        if frame.ty == ICON_CHANGE {
+            break field(&frame, tag::UID).unwrap();
+        }
+    };
+    assert_eq!(first, (alice.uid as u16).to_be_bytes().to_vec());
+
+    // The operator's `[extra] set_avatar` lets guests, at their next login.
+    let_guests_set_avatars(dir.path());
+    let mut allowed = Legacy::guest(server.legacy).await;
+    let set = allowed
+        .call(ICON_SET, &[(tag::ICON_GIF, gif(1, 16, 16))])
+        .await;
+    assert_eq!(set.flag, 0, "{}", error_text(&set));
+    assert!(allowed.icon_of(allowed.uid).await.starts_with(b"GIF89a"));
+}
+
+#[tokio::test]
+async fn the_interval_outlasts_a_reconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), Some(AvatarPolicy::default())).await;
+    let_guests_set_avatars(dir.path());
+
+    // A guest's turn is its address's, so logging in again buys nothing.
+    let mut guest = Legacy::guest(server.legacy).await;
+    let set = guest
+        .call(ICON_SET, &[(tag::ICON_GIF, gif(1, 16, 16))])
+        .await;
+    assert_eq!(set.flag, 0, "{}", error_text(&set));
+    drop(guest);
+    let mut again = Legacy::guest(server.legacy).await;
+    let limited = again
+        .call(ICON_SET, &[(tag::ICON_GIF, gif(1, 24, 24))])
+        .await;
+    assert_eq!(limited.flag, 1);
+    assert_eq!(error_text(&limited), "Slow down");
+
+    // An account's is its login's, from whichever wire.
+    let (alice, _) = Ng::login(server.ng, "alice").await;
+    assert_eq!(
+        put_avatar(server.ng, &alice.bearer, &png(32, 32))
+            .await
+            .status,
+        200
+    );
+    drop(alice);
+    let mut alice = Legacy::login(server.legacy, "alice").await;
+    let limited = alice
+        .call(ICON_SET, &[(tag::ICON_GIF, gif(1, 16, 16))])
+        .await;
+    assert_eq!(limited.flag, 1);
+    assert_eq!(error_text(&limited), "Slow down");
+}
+
+#[tokio::test]
+async fn a_client_asking_for_the_icon_list_in_a_loop_is_slowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), Some(unthrottled())).await;
+    let mut bob = Legacy::login(server.legacy, "bob").await;
+    // The probe, and a few refreshes after it, are answered.
+    for _ in 0..4 {
+        assert!(bob.icon_list().await.is_empty());
+    }
+    let refused = bob.call(ICON_GETLIST, &[]).await;
+    assert_eq!(refused.flag, 1);
+    assert_eq!(error_text(&refused), "Slow down");
+    // Only the list: a single icon is still fetched.
+    assert!(bob.icon_of(bob.uid).await.is_empty());
+    // And a new session probes as GtkHx does at every login.
+    let mut carol = Legacy::login(server.legacy, "carol").await;
+    assert!(carol.icon_list().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_identitys_avatar_is_pruned_from_the_database_once_it_stops_coming_back() {
+    use hxd_core::avatar::{AvatarOwner, AvatarStore};
+    use hxd_core::roster::{AttachInfo, Transport};
+    use std::time::SystemTime;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("avatars.db");
+    let store = Arc::new(SqliteStore::open(&path, Default::default()).unwrap());
+    let core = Core::new().with_avatars(
+        store.clone(),
+        Arc::new(hxd_media::Codec::new(Default::default())),
+        unthrottled(),
+    );
+    let fp = [0x5a; 32];
+    let join = |login: &str, is_person: bool, identity: Option<[u8; 32]>| {
+        let (uid, _rx) = core
+            .attach(AttachInfo {
+                nick: login.into(),
+                icon: 1,
+                admin: false,
+                access: hxd_core::AccessBits::empty(),
+                login: login.into(),
+                addr: Some("192.0.2.9".parse().unwrap()),
+                can_detach: false,
+                transport: Transport::default(),
+                has_inbox: false,
+                attach_news: false,
+                set_avatar: true,
+                moderate: false,
+                can_spam: false,
+                is_person,
+                reads_on_delivery: false,
+                identity,
+                system: false,
+            })
+            .unwrap();
+        core.restore_avatar(uid);
+        core.announce(uid);
+        uid
+    };
+    let keyed = join("guest", false, Some(fp));
+    core.set_avatar(keyed, &png(40, 40)).unwrap();
+    let alice = join("alice", true, None);
+    core.set_avatar(alice, &png(20, 20)).unwrap();
+    core.end_session(keyed);
+    core.end_session(alice);
+
+    let day = Duration::from_secs(24 * 3600);
+    assert_eq!(core.prune_avatars(SystemTime::now()), 0, "seen today");
+    // Coming back is what keeps it: a login is a sighting.
+    let back = join("guest", false, Some(fp));
+    assert!(core.avatar_of(back).is_some());
+    core.end_session(back);
+    assert_eq!(
+        core.prune_avatars(SystemTime::now() + AvatarPolicy::default().identity_retention + day),
+        1
+    );
+
+    // Gone from the file, where the account's is not.
+    let reopened = SqliteStore::open(&path, Default::default()).unwrap();
+    assert_eq!(reopened.load(&AvatarOwner::Identity(fp)).unwrap(), None);
+    assert!(reopened
+        .load(&AvatarOwner::Account("alice".into()))
+        .unwrap()
+        .is_some());
+    drop(store);
 }

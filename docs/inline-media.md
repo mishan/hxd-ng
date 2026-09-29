@@ -112,10 +112,16 @@ The spec's ten steps, in its order, with what each one is here.
    the first chunk with code 4.
 2. **Quotas.** Per account: one upload per 10 s, 30 per hour, two
    concurrent upload sessions. Per address: 100 per hour. Downloads: 60
-   per minute per session. All keyed as the spec keys them, which means
-   every guest shares the `guest` account's bucket — deliberate; the
-   shared door is the one that needs the throttle most. Refused with
-   code 3, or 5 for the concurrent-session cap.
+   per minute per session. An account that is one person — a password
+   or a linked identity — is keyed by its login, as the spec keys it.
+   One that is nobody in particular, `guest` above all, is keyed by the
+   address it came from instead (an IPv6 one by its /64): keyed by the
+   shared login, one guest's uploads would spend every other guest's
+   allowance, which turns a throttle into a way to lock everyone else
+   out. The per-address hour holds beside it for every account, keyed
+   the same way (an IPv6 address by its /64), so every account's uploads
+   from one /64 share it, a password account's as much as a guest's.
+   Refused with code 3, or 5 for the concurrent-session cap.
 
    The interval is charged when an upload *starts*, so a chunked upload
    costs what a single-shot one costs rather than one per chunk. The

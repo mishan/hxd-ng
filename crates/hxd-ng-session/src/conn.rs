@@ -31,11 +31,11 @@ use tracing::{debug, info, warn};
 use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
     blocked_json, event_json, history_line_json, parse_streams, participants_json, reply_err,
-    reply_err_retry, reply_ok, reply_ok_with_users, stored_msg_json, user_json, video_err,
-    video_limits_json, voice_err, BlockParams, ChatParams, HistoryParams, InboxParams, LoginParams,
-    MsgParams, MsgReadParams, NickParams, ReqEnvelope, ResumeParams, VideoStartParams,
-    VideoStateParams, VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams,
-    VoiceMuteParams, VoiceRoomParams,
+    reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users, stored_msg_json, user_json,
+    video_limits_json, video_reply_err, voice_reply_err, BlockParams, ChatParams, HistoryParams,
+    InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams, ReqEnvelope, ResumeParams,
+    VideoStartParams, VideoStateParams, VideoStopParams, VideoSubscribeParams, VoiceAnswerParams,
+    VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -85,6 +85,34 @@ fn req_label(req: &str) -> &'static str {
         return "moderation";
     }
     "other"
+}
+
+/// What a request spends of its session's request limit
+/// (`hxd_core::RequestLimits`). A read costs the least; what writes, or
+/// tells others, costs more; what fans out to many, searches, or
+/// renegotiates media costs the most. Every request is priced here, so
+/// one added to the dispatcher is a read until it is given a price, and
+/// never free: only `logout` is, since ending the session is what a
+/// limit would want of a client that floods.
+///
+/// `voice_ice` is priced as a read. A client trickles one per candidate
+/// it gathers, one for each address a multi-homed device has and each
+/// kind of candidate, all as the call is joined, and a candidate refused
+/// is one the call silently goes without. Nothing else bounds how many a
+/// peer may send, so it is not free.
+fn request_weight(req: &str) -> u32 {
+    match req {
+        "logout" => 0,
+        "voice_ice" => 1,
+        "chat" | "msg" | "nick" | "block" | "unblock" | "msg_read" | "avatar_clear"
+        | "voice_answer" | "voice_mute" | "video_state" | "news_seen" | "news_subscribe"
+        | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
+        | "report_close" | "redact" | "revoke" | "kick" => 2,
+        "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
+        | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
+        | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge" => 4,
+        _ => 1,
+    }
 }
 
 /// How often a quiet connection is pinged, and how long it may stay
@@ -284,9 +312,23 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                         break Exit::ConnectionLost("malformed");
                     };
                     instrument::frame(WIRE, Dir::In, Kind::Name(req_label(&req.req)), text.len());
-                    // `sync` is the one request that needs the event
-                    // channel itself; see `handle_sync`.
-                    let flow = if req.req == "sync" {
+                    // Over the limit is a delay, not a failure: answered
+                    // with how long to wait, and costing nothing, so a
+                    // client that waits that long is served. The limit
+                    // is the session's (§9), so a resume does not refill
+                    // it.
+                    let over = ctx
+                        .core
+                        .spend_request(state.uid, request_weight(&req.req))
+                        .err();
+                    let flow = if let Some(wait) = over {
+                        instrument::rate_limited(WIRE, "requests");
+                        let secs = retry_secs(wait);
+                        let out = reply_err_retry(req.id, "rate_limited", "Slow down.", secs);
+                        finish(&mut ws_tx, out).await
+                    } else if req.req == "sync" {
+                        // `sync` is the one request that needs the event
+                        // channel itself; see `handle_sync`.
                         handle_sync(&ctx, &state, &req, &mut ws_tx, &mut events).await
                     } else {
                         dispatch(&ctx, &state, &req, &mut ws_tx).await
@@ -437,6 +479,32 @@ async fn handle_login(
     // layer refused never got a token or a certificate admission, so it
     // can't reach here — `new_accounts = deny` is decided there, on
     // every admitting path.
+    // A password is a guess until it verifies. An address that has
+    // guessed wrong as often as it may is refused before this one is
+    // checked, whichever wire the guesses came in on
+    // (`Core::login_attempt`). An identity socket's password is not read,
+    // and a guest's is empty: neither is a guess, and neither is held to
+    // the count.
+    let attempt = match identity {
+        Some(_) => None,
+        None => match ctx.core.login_attempt(peer.ip(), p.password.as_bytes()) {
+            Ok(attempt) => Some(attempt),
+            Err(wait) => {
+                info!("ng login refused: too many failed logins from this address");
+                let _ = send_frame(
+                    ws_tx,
+                    Message::Text(reply_err_retry(
+                        req.id,
+                        "rate_limited",
+                        "Too many failed logins. Try again later.",
+                        crate::http::retry_secs(wait),
+                    )),
+                )
+                .await;
+                return None;
+            }
+        },
+    };
     let auth = ctx.auth.clone();
     let identity_state = ctx.identity.clone();
     let (login, password) = match identity {
@@ -481,6 +549,17 @@ async fn handle_login(
         account
     })
     .await;
+    // Settled as the answer comes in: only a password that did not
+    // verify, that named no account, or whose check never answered
+    // stays counted.
+    if let Some(attempt) = attempt {
+        match &verdict {
+            Ok(Err(Refused::Auth(AuthError::NoSuchAccount | AuthError::BadProof))) | Err(_) => {
+                ctx.core.login_failed(attempt)
+            }
+            Ok(_) => ctx.core.login_refund(attempt),
+        }
+    }
     // The blocking task panicked. Nothing was attached, so there is
     // nothing to undo, but the client is owed an answer.
     let Ok(verdict) = verdict else {
@@ -536,6 +615,22 @@ async fn handle_login(
             return None;
         }
     };
+    // A ban on the person: the account's login, the identity it links or
+    // this socket proved, or the registrar that issued its handle
+    // (`docs/moderation.md` §3.5). Told the reason, and until when.
+    let fp = account
+        .identity
+        .fingerprint
+        .or_else(|| identity.map(|i| i.fingerprint.0));
+    let handle = identity.and_then(|i| i.handle.clone());
+    if let Some(hit) = ctx
+        .core
+        .person_banned(Some(&account.login), fp.as_ref(), handle.as_deref())
+    {
+        info!(login = %account.login, ban = hit.id, "ng login refused: banned");
+        let _ = send_frame(ws_tx, Message::Text(reply_err_banned(req.id, &hit))).await;
+        return None;
+    }
 
     let mut nick = match (&p.nick, account.access.has(bit::USE_ANY_NAME)) {
         (Some(n), true) if !n.is_empty() => n.clone(),
@@ -556,7 +651,9 @@ async fn handle_login(
         addr: Some(peer.ip()),
         can_detach: account.can_detach,
         attach_news: account.attach_news,
+        set_avatar: account.set_avatar,
         moderate: account.moderate,
+        can_spam: account.can_spam,
         // The plaintext listener is loopback-only and WSS is mandatory in
         // production (`docs/hotline-ng.md` §9), so ng sockets are
         // encrypted by construction — unless the client told us at
@@ -618,6 +715,14 @@ async fn handle_login(
         let _ = send_frame(ws_tx, Message::Text(reply_err(req.id, code, text))).await;
         return None;
     };
+    // Asked again now the session is on the roster: a ban placed since
+    // the check above found no session to end. Ended here, before it is
+    // announced or given a token.
+    if let Some(hit) = ctx.core.end_if_banned(uid) {
+        info!(login = %account.login, ban = hit.id, "ng login refused: banned while attaching");
+        let _ = send_frame(ws_tx, Message::Text(reply_err_banned(req.id, &hit))).await;
+        return None;
+    }
     // ng has no agreement dance: announce immediately (the snapshot below
     // then includes self), with the owner's avatar already on it.
     if ctx.core.avatar_policy().is_some() {
@@ -868,6 +973,16 @@ async fn handle_resume(
         return None;
     };
 
+    // A ban on the person placed while the session was away: the token
+    // is no way back past it (`docs/moderation.md` §3.5). An address ban
+    // was asked at the HTTP layer, of this connection's address. The
+    // session ends, rather than waiting out its grace detached.
+    if let Some(hit) = ctx.core.end_if_person_banned(uid) {
+        ctx.registry.remove(&p.session);
+        info!(uid, ban = hit.id, "ng resume refused: banned");
+        let _ = send_frame(ws_tx, Message::Text(reply_err_banned(req.id, &hit))).await;
+        return None;
+    }
     let (events, replay) = match ctx.core.resume(uid, p.last_seq) {
         Resume::Replayed(rx, replay) => (rx, Some(replay)),
         Resume::ResyncRequired(rx) => (rx, None),
@@ -1246,8 +1361,45 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
     }
 }
 
+/// mhxd's spam points (`hxd_core::FloodLimits`), charged for the
+/// requests that stand for a classic transaction it charges, at its
+/// price and under its type: `chat` for its Chat and `msg` for its
+/// Message, 2 each; `nick` for User Change, 20; and the news writes for
+/// the 1.5 transactions they are, `news_post` a threaded post, 10 each
+/// as the table's default prices every one of them. (Its 20 for a post
+/// is the 1.2 flat one's, which an ng post is not, and at that price an
+/// editor who files a few replies in as many seconds is banned for
+/// it.) Whatever else this wire asks for, it has no classic counterpart
+/// to be priced by, and is held to the request limit instead. As
+/// `(type, points)`.
+fn spam_charge(req: &str) -> Option<(u32, u32)> {
+    match req {
+        "chat" => Some((0x69, 2)),
+        "msg" => Some((0x6c, 2)),
+        "nick" => Some((0x130, 20)),
+        "news_post" => Some((0x19a, 10)),
+        "news_delete" => Some((0x19b, 10)),
+        "news_node_create" => Some((0x17e, 10)),
+        "news_node_delete" => Some((0x17c, 10)),
+        _ => None,
+    }
+}
+
 async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut WsTx) -> Flow {
     let send = |s: String| Message::Text(s);
+    if let Some((trans, points)) = spam_charge(&req.req) {
+        if let Err(flooded) = ctx.core.spend_spam(state.uid, points, trans) {
+            // The kick is made; its ban is a store write, so it is placed
+            // off the reactor, and before the reply, so it stands by the
+            // time the client can be back.
+            if let Some(ban) = flooded.ban {
+                off_reactor(&ctx.core, move |c| c.place_spam_ban(ban)).await;
+            }
+            // The kick that follows is the session's end; this says why.
+            let out = reply_err(req.id, "flooding", "You were kicked for flooding.");
+            return finish(ws_tx, out).await;
+        }
+    }
     let out = match req.req.as_str() {
         "ping" => reply_ok(req.id, json!({})),
 
@@ -1286,6 +1438,11 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     Some(Err(ChatError::NoSuchMedia)) => {
                         reply_err(req.id, "bad_request", "No such media.")
                     }
+                    // The kick that follows is the session's end; this
+                    // says why.
+                    Some(Err(ChatError::Flooding)) => {
+                        reply_err(req.id, "flooding", "You were kicked for flooding.")
+                    }
                     _ => reply_err(req.id, "server_error", "Server error."),
                 }
             }
@@ -1307,6 +1464,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     "You are not allowed to read chat history.",
                 )
             } else if !ctx.core.allow_history_request(state.uid).unwrap_or(false) {
+                instrument::rate_limited(WIRE, "history");
                 reply_err(req.id, "rate_limited", "Slow down.")
             } else {
                 match params_or_default::<HistoryParams>(&req.params) {
@@ -1445,6 +1603,14 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     Err(ChatError::MailboxFull) => {
                         reply_err(req.id, "mailbox_full", "That user's mailbox is full.")
                     }
+                    // The sender's quota, which only mail that would have
+                    // to wait meets: to an attached recipient it arrives.
+                    Err(ChatError::SendQuota) => reply_err(
+                        req.id,
+                        "quota_exceeded",
+                        "That user is not connected, and you have sent as much offline mail \
+                         today as this server allows.",
+                    ),
                     Err(ChatError::Blocked) => reply_err(
                         req.id,
                         "blocked",
@@ -1461,6 +1627,9 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     // have gone. Nothing was sent.
                     Err(ChatError::NoSuchMedia) => {
                         reply_err(req.id, "bad_request", "No such media.")
+                    }
+                    Err(ChatError::Flooding) => {
+                        reply_err(req.id, "flooding", "You were kicked for flooding.")
                     }
                     // One answer for "no such user", "no such account" and
                     // "that account takes no offline messages", so none of
@@ -1663,10 +1832,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                         "participants": participants_json(&join.participants),
                     }),
                 ),
-                Err(e) => {
-                    let (code, text) = voice_err(e);
-                    reply_err(req.id, code, text)
-                }
+                Err(e) => voice_reply_err(req.id, e),
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_join."),
         },
@@ -1674,10 +1840,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         "voice_leave" => match params_or_default::<VoiceRoomParams>(&req.params) {
             Ok(p) => match ctx.core.voice_leave(state.uid, p.cid) {
                 Ok(()) => reply_ok(req.id, json!({})),
-                Err(e) => {
-                    let (code, text) = voice_err(e);
-                    reply_err(req.id, code, text)
-                }
+                Err(e) => voice_reply_err(req.id, e),
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_leave."),
         },
@@ -1685,10 +1848,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         "voice_answer" => match serde_json::from_value::<VoiceAnswerParams>(req.params.clone()) {
             Ok(p) => match ctx.core.voice_answer(state.uid, p.cid, p.sdp) {
                 Ok(()) => reply_ok(req.id, json!({})),
-                Err(e) => {
-                    let (code, text) = voice_err(e);
-                    reply_err(req.id, code, text)
-                }
+                Err(e) => voice_reply_err(req.id, e),
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_answer."),
         },
@@ -1706,10 +1866,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 // drops it instead.
                 match ctx.core.voice_ice(state.uid, p.cid, candidate) {
                     Ok(()) => reply_ok(req.id, json!({})),
-                    Err(e) => {
-                        let (code, text) = voice_err(e);
-                        reply_err(req.id, code, text)
-                    }
+                    Err(e) => voice_reply_err(req.id, e),
                 }
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_ice."),
@@ -1718,10 +1875,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         "voice_mute" => match serde_json::from_value::<VoiceMuteParams>(req.params.clone()) {
             Ok(p) => match ctx.core.voice_mute(state.uid, p.cid, p.muted) {
                 Ok(()) => reply_ok(req.id, json!({})),
-                Err(e) => {
-                    let (code, text) = voice_err(e);
-                    reply_err(req.id, code, text)
-                }
+                Err(e) => voice_reply_err(req.id, e),
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_mute."),
         },
@@ -1759,10 +1913,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     // client must not wait for it to consider the start
                     // to have succeeded.
                     Ok(codec) => reply_ok(req.id, json!({ "codec": codec })),
-                    Err(e) => {
-                        let (code, text) = video_err(e);
-                        reply_err(req.id, code, text)
-                    }
+                    Err(e) => video_reply_err(req.id, e),
                 },
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed video_start."),
@@ -1783,10 +1934,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 let kind = p.kind.as_deref().and_then(VideoKind::from_name);
                 match ctx.core.video_stop(state.uid, p.cid, kind) {
                     Ok(()) => reply_ok(req.id, json!({})),
-                    Err(e) => {
-                        let (code, text) = video_err(e);
-                        reply_err(req.id, code, text)
-                    }
+                    Err(e) => video_reply_err(req.id, e),
                 }
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed video_stop."),
@@ -1797,10 +1945,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 None => reply_err(req.id, "bad_request", "Unknown video stream kind."),
                 Some(kind) => match ctx.core.video_state(state.uid, p.cid, kind, p.paused) {
                     Ok(()) => reply_ok(req.id, json!({})),
-                    Err(e) => {
-                        let (code, text) = video_err(e);
-                        reply_err(req.id, code, text)
-                    }
+                    Err(e) => video_reply_err(req.id, e),
                 },
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed video_state."),
@@ -1816,10 +1961,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     let streams = parse_streams(&p.streams);
                     match ctx.core.video_subscribe(state.uid, p.cid, &streams) {
                         Ok(()) => reply_ok(req.id, json!({})),
-                        Err(e) => {
-                            let (code, text) = video_err(e);
-                            reply_err(req.id, code, text)
-                        }
+                        Err(e) => video_reply_err(req.id, e),
                     }
                 }
                 Err(_) => reply_err(req.id, "bad_request", "Malformed video_subscribe."),
@@ -1877,6 +2019,12 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         _ => reply_err(req.id, "unknown_method", "Unknown request."),
     };
     finish(ws_tx, out).await
+}
+
+/// A wait as `retry_after`'s whole seconds, rounded up so that a client
+/// that waits that long finds the request paid for.
+pub(crate) fn retry_secs(wait: std::time::Duration) -> u64 {
+    wait.as_secs() + u64::from(wait.subsec_nanos() > 0)
 }
 
 /// What a nick may weigh, in *characters*. The legacy wire's field is 31

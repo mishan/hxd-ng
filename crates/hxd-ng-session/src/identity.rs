@@ -16,9 +16,10 @@
 //! Revocation is the operator's own list (`identity-registrar.md`),
 //! held by the core so that installing it can end the sessions it
 //! refuses; the registrar's published records, which need a registrar to
-//! fetch from, are not here yet. Nor is rate limiting, which should share
-//! the login-attempt limiter when that exists. Each is marked where it
-//! would go.
+//! fetch from, are not here yet, and are marked where they would go.
+//! Rate limiting is the HTTP layer's, in front of this: challenges per
+//! address, and the core's count of failed logins, which a password
+//! checked here shares with both wires' logins.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -187,6 +188,11 @@ pub enum AuthRefused {
     UnknownChallenge,
     /// `login`/`password` didn't verify (§5.4).
     LoginFailed,
+    /// `login`/`password` named the guest account, which links to no
+    /// one. The client is told `login_failed`, exactly as for a wrong
+    /// password, but the password was not wrong: it is not a guess, and
+    /// the failed-login count does not hear of it.
+    GuestLink,
     /// The device certificate lacks the manage bit (§8.2, §8.4).
     NoManage,
     /// This identity already links a different account here (§8.2).
@@ -195,6 +201,9 @@ pub enum AuthRefused {
     WouldOrphan,
     /// The account isn't linked, or is linked to someone else.
     NotLinked,
+    /// A ban on this identity, or on the registrar that issued its
+    /// handle (`docs/moderation.md` §3.5).
+    Banned,
     /// The auth backend failed; logged, not shown.
     Backend,
 }
@@ -209,11 +218,12 @@ impl AuthRefused {
             AuthRefused::Denied => "denied",
             AuthRefused::CardTooLarge => "card_too_large",
             AuthRefused::UnknownChallenge => "unknown_challenge",
-            AuthRefused::LoginFailed => "login_failed",
+            AuthRefused::LoginFailed | AuthRefused::GuestLink => "login_failed",
             AuthRefused::NoManage => "no_manage",
             AuthRefused::AlreadyLinked => "already_linked",
             AuthRefused::WouldOrphan => "would_orphan",
             AuthRefused::NotLinked => "not_linked",
+            AuthRefused::Banned => "banned",
             AuthRefused::Backend => "server_error",
         }
     }
@@ -222,7 +232,10 @@ impl AuthRefused {
     /// with the account's state", 500 for us.
     pub fn status(self) -> u16 {
         match self {
-            AuthRefused::Denied | AuthRefused::Revoked | AuthRefused::NoManage => 403,
+            AuthRefused::Denied
+            | AuthRefused::Revoked
+            | AuthRefused::NoManage
+            | AuthRefused::Banned => 403,
             AuthRefused::AlreadyLinked | AuthRefused::WouldOrphan | AuthRefused::NotLinked => 409,
             AuthRefused::Backend => 500,
             _ => 401,
@@ -618,6 +631,21 @@ impl IdentityState {
             }
         }
 
+        // A banned person is refused before anything below writes: an
+        // account created for a banned identity, or a link to one, is a
+        // way back in that the ban was meant to close. Re-admitting a
+        // device on file writes nothing, and the login on the socket it
+        // opens is refused with the ban's reason, so that is left to it.
+        if assoc == Assoc::Write {
+            if let Some(hit) =
+                self.core
+                    .person_banned(None, Some(&fingerprint.0), handle.as_deref())
+            {
+                info!(fingerprint = %fingerprint.short(), ban = hit.id, "identity auth refused: banned");
+                return Err(AuthRefused::Banned);
+            }
+        }
+
         // Step 6: policy.
         if !self.cfg.allow_list.is_empty() {
             let fp = fingerprint.to_string();
@@ -655,6 +683,16 @@ impl IdentityState {
             };
             if account.login == "guest" {
                 // Logging in as guest names no account to link.
+            } else if assoc == Assoc::Write
+                && self
+                    .core
+                    .person_banned(Some(&account.login), None, None)
+                    .is_some()
+            {
+                // A banned account gains no identity: the link would
+                // outlive the ban as a second way in. Its password
+                // verified, so saying why tells nobody anything new.
+                return Err(AuthRefused::Banned);
             } else if account.identity.fingerprint == Some(fingerprint.0) {
                 linked = Some(account);
             } else if assoc == Assoc::ReadOnly {
@@ -909,7 +947,8 @@ impl IdentityState {
         }
         let account = match self.auth.authenticate(login, Proof::Plain(password)) {
             Ok(a) if a.login != "guest" => a,
-            Ok(_) | Err(AuthError::NoSuchAccount | AuthError::BadProof) => {
+            Ok(_) => return Err(AuthRefused::GuestLink),
+            Err(AuthError::NoSuchAccount | AuthError::BadProof) => {
                 return Err(AuthRefused::LoginFailed)
             }
             Err(AuthError::Backend(e)) => {
@@ -917,6 +956,19 @@ impl IdentityState {
                 return Err(AuthRefused::Backend);
             }
         };
+        // Neither a banned identity nor a banned account is linked: the
+        // link would carry the one past the other's ban.
+        if self
+            .core
+            .person_banned(
+                Some(&account.login),
+                Some(&ident.fingerprint.0),
+                ident.handle.as_deref(),
+            )
+            .is_some()
+        {
+            return Err(AuthRefused::Banned);
+        }
         match self.link_exclusive(&account.login, &ident.fingerprint)? {
             LinkOutcome::Linked(a) => {
                 info!(login = %a.login, fingerprint = %ident.fingerprint.short(), "identity linked");
@@ -1495,7 +1547,9 @@ mod tests {
             has_password: password,
             has_inbox: password,
             attach_news: false,
+            set_avatar: password,
             moderate: false,
+            can_spam: false,
             identity: hxd_core::IdentityLink {
                 identity_login: true,
                 allow_self_link: true,
@@ -2073,6 +2127,18 @@ mod tests {
             .find_by_fingerprint(&id.fingerprint().0)
             .unwrap()
             .is_none());
+
+        // A wrong password and the guest account are both `login_failed`
+        // to the client, but only the first is a guess the failed-login
+        // count should hear of.
+        assert_eq!(
+            st.link(&ident, "alice", b"nope").unwrap_err(),
+            AuthRefused::LoginFailed
+        );
+        let guest = st.link(&ident, "guest", b"").unwrap_err();
+        assert_eq!(guest, AuthRefused::GuestLink);
+        assert_eq!(guest.code(), AuthRefused::LoginFailed.code());
+        assert_eq!(guest.status(), AuthRefused::LoginFailed.status());
 
         // Link after auth, then a password-less account can't be unlinked.
         assert_eq!(st.link(&ident, "alice", b"pw").unwrap().login, "alice");

@@ -315,7 +315,7 @@ Errors:
 | `revoked` | The socket's identity or device key was revoked on this server after it authenticated (identity-registrar.md §7.3). |
 | `banned` | The address or identity is banned. *hxd-ng* refuses a banned address before the upgrade — closing the TCP connection at accept, or answering the HTTP request 403 — and never sends this code. |
 | `server_full` | No uid is free. |
-| `rate_limited` | The server is taking logins as fast as it can. Retry after `retry_after` seconds. *hxd-ng:* past `[server] logins_in_flight` logins in progress. |
+| `rate_limited` | The server is taking logins as fast as it can, or this address has failed too many. Retry after `retry_after` seconds. *hxd-ng:* past `[server] logins_in_flight` logins in progress, or past `[limits] login_failures` wrong passwords from the address on any wire (§9). |
 | `server_error` | The server could not complete the login. |
 
 ### 6.2 Resume
@@ -512,7 +512,7 @@ family document. Each family of §4 adds its own.
 | `login` / `resume` / `sync` | §6 | §6 | §6 |
 | `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?` | `{}` | `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?` | `{ "queued": bool }` | `no_such_user`, `mailbox_full`, `blocked`, `server_error` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?` | `{ "queued": bool }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `server_error` |
 | `history` | `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `server_error` |
 | `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message id) | `{ "unread", "total" }` | `no_inbox`, `server_error` |
@@ -660,10 +660,62 @@ news body is different: it declares its own type (news.md §5).
 - **Rate limits.** This endpoint faces phones on the open internet. A
   server SHOULD limit requests per connection and login attempts per
   address, and answers a request over its limit `rate_limited`, which a
-  client MUST NOT treat as fatal. *hxd-ng* limits `history`,
-  `news_search`, media and news-attachment uploads, media downloads, and
-  enrollment; the general per-connection and login-attempt limits are not
-  yet built.
+  client MUST NOT treat as fatal. *hxd-ng* holds each session to a token
+  bucket (`[limits] ng_requests` in `ng_request_seconds`, a burst of 40
+  and then 20 a second by default) that every request after the
+  handshake spends its weight from. A write, or a request others hear
+  of, costs 2: `chat`, `msg`, `nick`, `block`, `unblock`, `msg_read`,
+  `avatar_clear`, `voice_answer`, `voice_mute`, `video_state`,
+  `news_seen`, `news_subscribe`, `news_unsubscribe`, `news_mute`,
+  `push_unregister`, `files_download`, `report_close`, `redact`,
+  `revoke` and `kick`. What fans out, searches, or joins, leaves or
+  renegotiates media costs 4: `news_post`, `news_delete`,
+  `news_node_create`, `news_node_rename`, `news_node_delete`,
+  `news_search`, `voice_join`, `voice_leave`, `video_start`,
+  `video_stop`, `video_subscribe`, `push_register`, `report` and
+  `purge`. Every other request, the reads and a trickled `voice_ice`
+  candidate among them, costs 1, and only `logout` is free. A request
+  the bucket cannot pay for costs nothing, and is answered
+  `rate_limited` with `retry_after`, the whole seconds until it could
+  be. The bucket is the session's rather than the connection's: it is
+  filled at login and kept across a detach, so a resume finds it as the
+  dropped connection left it rather than refilled. An account with
+  `[extra] can_spam` is held to none, as it is held to no flood budget.
+  Over and above that, one account may post so many news articles and
+  replies (`news_posts` in `news_post_seconds`, ten and then one each
+  half minute), past which `news_post` is answered the same way; and
+  `history`, `news_search`, media and news-attachment uploads (asked
+  before the body is read), media and news-image downloads, avatar
+  fetches and enrollment have limits of their own. Login attempts are
+  limited per address: past `[limits] login_failures` wrong passwords — here, on the classic wire, or at
+  `/identity/auth` and `/identity/link` — a password login is refused
+  with `retry_after` until the address earns one back, and a socket
+  that authenticated with an identity, or a guest login that sends no
+  password, is not held to it. Each password is counted as it is let
+  in and given back unless it turns out wrong (a password that
+  verifies, a login refused for something other than its password,
+  and a server that could not check it all give it back), so guesses
+  made at once on many connections are held to the same count.
+  `/identity/challenge` is limited per address, and answers 429 with
+  `Retry-After`, as every HTTP route over its limit does. The port
+  holds so many connections from one address and from everyone,
+  counted from accept, before a byte is read; past either a
+  connection is closed unanswered.
+- **Flooding.** A server MAY instead kick a session that sends faster
+  than anyone is allowed to, answering the request that crossed the line
+  `flooding` before the `kicked` event (§10). *hxd-ng* holds a session to
+  the budgets mhxd's `nospam` does, one session on either wire the same
+  (`[limits]`): so many lines of `chat` in a window, every line of a
+  multi-line `text` counted, and so many spam points, which a request
+  that stands for a classic transaction spends at the price mhxd
+  charges that one: `chat` and `msg` its Chat and Message, `nick` its
+  User Change, and the news writes their 1.5 transactions, `news_post`
+  a threaded post. Past the first the session is kicked and its room told;
+  past the second it is kicked and its address banned for `[server]
+  ban_time` (on an address `[limits] exempt` holds to nothing, its
+  account's login or identity instead, and a plain guest is only
+  kicked), and public chat told. An account with `[extra] can_spam` is
+  held to neither.
 - **Roster pollution** is bounded by the detach rules of §2: permission
   per account and off for guests, a per-address cap, and moderation that
   ends a detached session on the spot.
@@ -679,6 +731,7 @@ news body is different: it declares its own type (news.md §5).
 | `bad_request` | `params` malformed, a required param missing, or a combination this document forbids. |
 | `access_denied` | The session lacks the privilege this request needs. |
 | `rate_limited` | Over a limit (§9). Retry later; MAY carry `retry_after`. |
+| `flooding` | The session sent faster than the server allows anyone to, and has been kicked for it (§9). **Fatal**, unlike `rate_limited`: a `kicked` event follows and the session ends. Retrying is what got it kicked. |
 | `server_error` | The server failed. Not the client's fault; MAY be retried. |
 
 **Core** — from §6 and §7:
@@ -696,6 +749,7 @@ news body is different: it declares its own type (news.md §5).
 | `no_such_user` | `msg`, `block`, `unblock` | No such uid, no such account, or that account takes no offline mail — one answer for all three. |
 | `no_inbox` | `inbox`, `msg_read`, `block`, `unblock`, `blocks` | *Your* account has no inbox, or the server has none: the `inbox` family's "not available" code. |
 | `mailbox_full` | `msg` | The recipient's inbox is at its cap. |
+| `quota_exceeded` | `msg` | The recipient is not connected, and you have stored as much mail today as the server allows. To someone connected, the same message is delivered. *hxd-ng:* `[inbox] max_sent_per_day` and `max_sent_bytes_per_day`. |
 | `blocked` | `msg` | The recipient blocks you. |
 
 The files codes are §7.2's. Each family's document lists its own. A

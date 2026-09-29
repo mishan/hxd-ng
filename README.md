@@ -221,15 +221,18 @@ bind = "0.0.0.0:5500"
 name = "My Server"
 version = 185           # 0 mimics a pre-1.5 server
 login_timeout = 10
-ban_time = 1800         # seconds a kick-with-ban holds the address
+ban_time = 1800         # seconds a kick-with-ban holds the address; kept
+                        # in the [moderation] database, so a restart does
+                        # not lift it
 stamp_queued = true     # stamp a message that waited in the inbox with its
                         # send time (docs/private-messages.md §7)
 queue_budget_mb = 128   # what the server may hold for its clients, all
                         # together; past it, the furthest behind are dropped
                         # (docs/metrics.md, the budget)
 logins_in_flight = 32   # logins worked on at once, a quarter of them from
-                        # one address at most; past it a login is refused
-                        # as busy, and its user tries again
+                        # one address at most (not one [limits] exempts);
+                        # past it a login is refused as busy, and its user
+                        # tries again
 
 # Set User Flags bit 4 on unencrypted legacy sessions (docs/hotline-ng-auth.md §8).
 # Off until that bit is confirmed free against 1.8/1.9 clients.
@@ -239,6 +242,131 @@ logins_in_flight = 32   # logins worked on at once, a quarter of them from
 accounts = "accounts"
 agreement = "agreement.txt"
 ```
+
+### Limits
+
+What one address, and one session, is held to, on both wires together.
+Always on, at the defaults of mhxd's `nospam`. A connection past either
+connection limit is closed unanswered on the classic ports, as mhxd
+closes one, and refused with HTTP 429 on the ng port, `/trtp` included.
+
+```toml
+[limits]
+connections_per_addr = 5     # at once; 0 for no limit
+reconnect_seconds = 2        # past a burst of that many new connections
+                             # (5 when the line above is 0), one more
+                             # each this often; 0 for no limit
+exempt = ["127.0.0.0/8", "::1"]  # addresses and blocks held to none of
+                             # the per-address limits, and kept a few
+                             # places past ng_connections
+chat_lines = 20              # 0 for no limit, or the chat lines one user
+chat_seconds = 5             # may send in each window this long, or be kicked
+spam_points = 100            # 0 for no limit, or the spam points one user
+spam_seconds = 5             # may spend in each window this long, or be banned
+private_chats_per_user = 16  # private chats one session opened and still
+                             # open (per session, so a user with several
+                             # is bounded by private_chats); 0 = no limit
+private_chats = 4096         # private chats open on the server; 0 = no limit
+ng_requests = 40             # 0 for no limit, or the request weight one ng
+ng_request_seconds = 2       # session may spend at once, earned back over this
+news_posts = 10              # 0 for no limit, or the news posts one account
+news_post_seconds = 300      # may make at once, earned back over this
+login_failures = 10          # wrong passwords one address may give, on
+login_failure_seconds = 30   # any wire, then one more each this often;
+                             # 0 failures = no limit
+http_connections_per_addr = 16  # connections to the ng port, whatever
+                             # they carry; 0 for no limit
+ng_connections = 4096        # connections to the ng port from everyone
+challenges_per_minute = 30   # POST /identity/challenge, per address
+avatar_fetches_per_minute = 600  # GET /avatars/{id}, per address
+```
+
+The flood limits are mhxd's `chat_max` and `spam_max`, and hold for
+every session wherever it connects from, loopback included. Every line
+of a multi-line chat counts. A user past `chat_lines` is kicked and its
+room is told, in mhxd's words, "X was kicked for chat spamming". Every
+transaction a classic client sends spends spam points at the price
+mhxd's table gives it (a chat line or a private message 2, a user list
+20, anything it does not list 10; the extensions mhxd never had, and
+fetching icons, cost nothing), as does an ng request that stands for
+one of them (`chat`, `msg`, `nick`, and the news posts, deletes and
+creates); a user
+who reaches `spam_points` is kicked and its address banned for
+`[server] ban_time`, and public chat is told as mhxd tells it. An
+address in `exempt` is never banned for it, since everyone behind a
+shared proxy would go with the flooder: there the ban is on the
+account's login (or the identity a guest came with), and a plain guest
+is only kicked. Exempt a proxy that hides its clients' addresses for
+this too. An account
+with `[extra] can_spam = true` is held to neither, which by default is
+every account with the kick bit. A load test from one machine wants
+both at 0.
+
+The two private-chat limits are this server's, not mhxd's, which has
+none: a chat stays open, counted against whoever opened it, until its
+last member leaves, and a create past either is refused with a task
+error a period client shows like any other.
+
+The request limits are not mhxd's, and slow a client down rather than
+kick it. Every request an ng session sends spends its weight from
+`ng_requests`, earned back over `ng_request_seconds`: a read 1, a write
+2, and a post, a search or a call joined 4. One the session cannot pay
+for is answered `rate_limited` with how many seconds to wait. The
+allowance is the session's, so a client that drops its socket and
+resumes carries on with what it had left; only a fresh login starts
+full. One
+account's news posts are held to `news_posts`, earned back over
+`news_post_seconds`, the same way; a classic post counts toward it but
+is never refused by it, since mhxd would take it. `can_spam` exempts
+from these as well. A load test wants `ng_requests` and `news_posts` at
+0 too.
+
+An address that has given `login_failures` wrong passwords — on the
+classic wire, the ng wire's `login`, or `/identity/auth` and
+`/identity/link` — is refused before its next password is checked, the
+right one included, until it has earned one back. Each password counts
+from the moment it is let in and is given back unless it turns out
+wrong — a password that verifies, a login refused for something other
+than its password, and a server that could not check it all give it
+back — so guesses sent at once on many connections are held to the
+same count as guesses sent one after another. A login that checks no password is not
+held to it: a guest's, with none, and an identity that `[identity]
+trtp_login = trust` admits, or that logs in on the ng wire without
+one. A classic client is told so in the error text of the login it
+already expects to fail; an ng one gets `rate_limited` with
+`retry_after`, and an HTTP route 429 with `Retry-After`.
+
+The ng port holds each connection to `http_connections_per_addr` and
+`ng_connections` from accept, before a byte is read, and for the whole
+life of a WebSocket; past either it is closed unanswered. The count per
+address is its own rather than `connections_per_addr`, because one
+browser page opens several connections at once beside its socket. An
+ng session's socket counts toward `connections_per_addr` as well.
+`ng_connections` is what bounds the port's descriptors whoever holds
+them, and a crowd of addresses can fill it — one IPv6 /56, say, whose
+/64s each count as an address of their own. An address `exempt` lists
+still gets in when it is full, into a few places kept past it for the
+operator's own tools, such as a `/metrics` scrape; a trusted proxy is
+not given them, exempt or not.
+Behind a proxy in `[ng] trusted_proxies` the proxy's connections carry
+everyone, so they count toward `ng_connections` alone and the proxy is
+the place to limit connections per client; the request limits still
+apply to the address it forwards. Keep `ng_connections` below the
+process's descriptor limit, less what the classic port and the
+databases need. An idle keep-alive connection is closed after
+`[server] login_timeout`, as a request head that never arrives is.
+
+An IPv6 client counts as its /64. An ng client behind a reverse proxy
+listed in `[ng] trusted_proxies` counts as the address the proxy
+forwards. A classic client reaching the server through a TCP proxy that
+hides its address counts as the proxy, so every client of that proxy
+shares one allowance: exempt the proxy, or raise the limit. A proxy on
+the same host connects from loopback, which `exempt` holds to none of
+the per-address limits by default, so every client behind it is exempt
+too, down to the share of logins in flight one address may hold. For
+limits per client, list the proxy in `[ng] trusted_proxies` for the ng
+port, or take loopback out of `exempt` for a TCP proxy to the classic
+ports.
 
 ### Banner
 
@@ -626,8 +754,17 @@ max_queued = 200         # messages waiting, per account; a full one refuses
 deliver_at_flush = 25    # queued messages handed over per login
 retain_unread = 2592000  # seconds; 30 days, from when it was sent
 retain_read = 604800     # seconds; 7 days, from when it was read
+max_sent_per_day = 1000  # messages one account may store in a rolling day,
+                         # delivered or waiting; 0 = no quota
+max_sent_bytes_per_day = 8388608  # the same in body bytes
 sync = "normal"          # or "full": fsync every commit
 ```
+
+Retention keeps a delivered message as well as a waiting one, so the
+sender's quota, not `max_queued`, is what bounds how fast one account can
+grow the database. Past it, a message to someone connected still
+arrives, live and unstored, as a period server delivers it; one that
+would have to wait is refused, as a full mailbox refuses.
 
 `full` costs a disk sync per commit. Public chat lines arriving together
 share a commit, so a busy room pays one sync for many lines, but a line
@@ -678,6 +815,9 @@ max_depth = 32            # reply nesting
 max_node_depth = 16       # bundle nesting
 max_page = 200            # threads in one request
 retain_days = 0           # a thread's life after its last post; 0 = forever
+max_articles = 100000     # live articles the news may hold; 0 = no ceiling
+max_text_bytes = 1073741824  # bytes of their bodies and plain-text parts
+max_per_author = 10000    # live articles one account may hold, guests as one
 self_delete = true        # authors may delete their own; false = period behavior
 search = true             # false turns news_search off; the index is kept either way
 search_max_results = 500  # the deepest a search pages
@@ -746,14 +886,18 @@ the legacy wire, the `avatars` capability on the ng one, and one avatar
 crossing between them. An avatar belongs to the account (or to a guest's
 proven identity) and is kept in the shared database, so it is there at
 the next login. Uploads go through the inline-media pipeline, so this
-needs the `media` feature. See [docs/avatars.md](docs/avatars.md).
+needs the `media` feature, and are decoded one at a time on a budget
+apart from `[media]`'s. Setting one is the account's `[extra]
+set_avatar`, which defaults to a password or a linked identity, so the
+bootstrap guest has none. See [docs/avatars.md](docs/avatars.md).
 
 ```toml
 [avatars]                 # presence turns it on
 max_bytes = 262144        # the largest upload, on either wire
 max_dimension = 128       # what an avatar is fitted to
 legacy_max_bytes = 32768  # the GIF legacy clients are sent
-set_interval = 10         # seconds between one session's changes
+set_interval = 10         # seconds between one owner's changes
+identity_retain_days = 90 # an identity's avatar, once it stops logging in; 0 keeps it
 # db = "avatars.db"       # default: [inbox], [history] or [news]'s database
 ```
 
@@ -779,8 +923,8 @@ max_total_bytes = 268435456  # held across all live handles; oldest evicted
 history_access = "recipients" # or "readers": may a scrollback reader fetch?
 
 [media.rate]
-upload_interval = 10          # seconds between one account's uploads
-upload_per_hour = 30          # per account
+upload_interval = 10          # seconds between one account's uploads (a guest's: its address's)
+upload_per_hour = 30          # per account, or per guest address
 upload_per_hour_per_addr = 100
 download_per_minute = 60      # per session
 upload_sessions = 2           # chunked uploads in flight, per account
@@ -865,7 +1009,7 @@ it answers today.
 Always on: kick and ban never needed a database, and neither do reports
 — on a server with none they last until it stops. Where `[inbox]`,
 `[history]` or `[news]` names a database (in that order), the audit
-trail and the reports are kept there. Who moderates is `[extra] moderate`
+trail, the reports and the bans are kept there. Who moderates is `[extra] moderate`
 in the account file, which defaults to the kick bit (`disconnect_users`).
 The section is optional; these are its defaults. See
 [docs/moderation.md](docs/moderation.md).
@@ -873,10 +1017,11 @@ The section is optional; these are its defaults. See
 ```toml
 [moderation]
 evidence_days = 30    # how long a redacted line's words stay readable to moderators
-report_days = 90      # how long a closed report is kept
+report_days = 90      # how long a closed report, or an ended ban, is kept
 pin_days = 7          # how long a reported image may outlive its handle
 notify_legacy = true  # reports as private messages to moderators on the classic wire
 kick_purges = 0       # seconds of a kicked user's output a classic kick takes; 0 = none
+ban_v6_prefix = 64    # how wide a kick's ban is on an IPv6 address, in bits
 ```
 
 ### Voice and video
@@ -893,6 +1038,13 @@ advertise = ["203.0.113.5:5504"]  # what clients are told to send media to.
                                   # gives a client nothing else to go on.
                                   # List a v4 and a v6 to serve both.
 max_per_room = 16                 # the spec's VoiceMaxPerRoom
+joins = 5                         # joins one session may make in join_seconds;
+join_seconds = 10                 # 0 for no limit. Leaving is never limited
+status_debounce_ms = 100          # a burst of mute or pause flips is
+                                  # announced once, with its final state
+police_factor = 1.5               # inbound media past this multiple of its
+                                  # ceiling is dropped, not forwarded; 0 = off,
+                                  # and below 1 is refused
 
 [voice.video]
 max_cameras_per_room = 8          # VideoMaxCamerasPerRoom
@@ -906,6 +1058,10 @@ screen_max_width = 1920           # screen-share ceiling: more pixels, fewer
 screen_max_height = 1080          # frames — a desktop is mostly still
 screen_max_fps = 15
 screen_max_bitrate = 2500000
+changes = 10                      # video starts, and subscription changes
+change_seconds = 10               # that add a live stream, one session may
+                                  # make; a stop, a pause and any other
+                                  # subscription change never count
 ```
 
 ## Operating
@@ -1029,6 +1185,13 @@ hxd news-reindex
 It opens the database the server uses, which must already exist, and
 leaves the articles as they are. See [docs/news.md](docs/news.md) §6.4.
 
+News is kept until someone deletes it, as a period server keeps it, so
+the ceilings are what bound it: a post past `max_articles`,
+`max_text_bytes` or the author's `max_per_author` is refused, never made
+room for, and the log says so each time. Make room by deleting threads,
+by raising a ceiling, or with `retain_days`. See
+[docs/news.md](docs/news.md) §7.4.
+
 ### Moderation
 
 Moderators act from an ng client. The same acts, the reports and the
@@ -1043,7 +1206,20 @@ hxd history redact 4711 --reason "slur"      # blank a public line, keep its wor
 hxd purge bob --since 1h --reason "spam run" # redact bob's lines and delete his articles
 hxd purge bob --since 1h --reason x --dry-run
 hxd moderation log                           # the audit trail, newest first
+hxd ban add 203.0.113.0/24 --reason "botnet" --for 7d
+hxd ban add login:bob --reason "spam"        # bob's account, and the identity it links
+hxd ban list                                 # what stands; --all for every ban on record
+hxd ban lift 12
 ```
+
+A ban refuses an address or block before the handshake, and a login
+or an identity (`identity:FINGERPRINT`, whether it logs in with its key
+or as the account it links) at login, with its reason, on both wires.
+A registrar's every identity (`*@HOST`) is refused when a login proves
+one of its handles, which a password login does not. A kick-with-ban is
+one too, on the kicked address for `ban_time`, and disconnects only the
+one kicked, as mhxd's does. A running server applies
+`hxd ban` on SIGHUP, ending the sessions a new ban refuses.
 
 Images live in the running server's memory, not in the database, so
 revoking one — and a purge's images — is an ng moderator's to do; `hxd

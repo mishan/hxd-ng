@@ -4,10 +4,17 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures_util::{SinkExt, StreamExt};
+use hxd_core::inbox::{Mailbox, StoreError};
+use hxd_core::news::{
+    Article, ArticleId, ArticlePage, Listed, NewNode, NewPost, NewsError, NewsStore, NewsUsage,
+    Node, NodeId, Posted, Reference, SearchPage, SearchQuery, SubScope, Subscriber, Subscription,
+    ThreadPage, ThreadQuery,
+};
 use hxd_core::{AttachmentPolicy, Core, MarkdownMode, NewsPolicy, NotifyPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::{cap, Caps};
@@ -52,6 +59,16 @@ async fn start_server_with(
     news: Option<NewsPolicy>,
     legacy_news: LegacyNews,
 ) -> (SocketAddr, SocketAddr, Arc<Core>) {
+    start_server_wrapped(dir, news, legacy_news, |store| store as Arc<dyn NewsStore>).await
+}
+
+/// [`start_server_with`], with the news store as `wrap` hands it back.
+async fn start_server_wrapped(
+    dir: &Path,
+    news: Option<NewsPolicy>,
+    legacy_news: LegacyNews,
+    wrap: impl FnOnce(Arc<SqliteStore>) -> Arc<dyn NewsStore>,
+) -> (SocketAddr, SocketAddr, Arc<Core>) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     for (login, access) in [
@@ -87,7 +104,7 @@ async fn start_server_with(
                 SqliteStore::open(dir.join("server.sqlite"), Synchronous::Normal).unwrap(),
             );
             let mut core = Core::new()
-                .with_news(store, policy)
+                .with_news(wrap(store), policy)
                 .with_accounts(files.clone());
             if policy.attach.is_some() {
                 let blobs = hxd_store_sqlite::FileBlobStore::open(dir.join("news-blobs")).unwrap();
@@ -625,6 +642,43 @@ async fn stage(ng: SocketAddr, who: &Ng, image: &[u8], name: &str) -> HttpReply 
     .await
 }
 
+/// A request whose body is promised and never sent: the status and
+/// headers, which arrive only if the server answers without reading it.
+async fn unsent_body(
+    addr: SocketAddr,
+    path: &str,
+    extra: &[(&str, &str)],
+    promised: usize,
+) -> (u16, Vec<(String, String)>) {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {promised}\r\n");
+    for (k, v) in extra {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("the server waited for a body it was going to refuse")
+            .unwrap();
+        assert!(n > 0, "closed unanswered");
+        raw.extend_from_slice(&buf[..n]);
+    }
+    let head = String::from_utf8_lossy(&raw).to_string();
+    let mut lines = head.lines();
+    let status = lines.next().unwrap().split_whitespace().nth(1).unwrap();
+    let headers = lines
+        .filter_map(|l| {
+            l.split_once(':')
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+        })
+        .collect();
+    (status.parse().unwrap(), headers)
+}
+
 async fn fetch_blob(ng: SocketAddr, who: &Ng, path: &str) -> HttpReply {
     http(
         ng,
@@ -644,6 +698,48 @@ fn staged_id(reply: &HttpReply) -> String {
 fn refusal(reply: &HttpReply) -> (u16, String) {
     let code = reply.json()["error"]["code"].as_str().unwrap().to_owned();
     (reply.status, code)
+}
+
+#[tokio::test]
+async fn news_images_are_staged_and_fetched_within_their_allowances() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(
+        dir.path(),
+        Some(attaching(AttachmentPolicy {
+            per_hour: 1,
+            ..attach_policy()
+        })),
+    )
+    .await;
+    let (alice, _) = Ng::login(ng, "alice").await;
+    let handle = staged_id(&stage(ng, &alice, &png(8, 8), "one.png").await);
+
+    // The hour's one staging is spent, and the next is refused before its
+    // body is read: it promises one it never sends.
+    let (status, headers) = unsent_body(
+        ng,
+        "/news/blob",
+        &[
+            ("Authorization", &alice.bearer),
+            ("Content-Type", "image/png"),
+        ],
+        10_000,
+    )
+    .await;
+    assert_eq!(status, 429);
+    assert!(headers.iter().any(|(k, _)| k == "retry-after"));
+
+    // A fetch is an image fetched by a session, and draws on the
+    // allowance `/media` downloads do: with no `[media]`, its default,
+    // a minute's worth at once and then no more.
+    let per_minute = hxd_core::MediaConfig::default().download_per_minute;
+    for n in 0..per_minute {
+        let got = fetch_blob(ng, &alice, &handle).await;
+        assert_eq!(got.status, 200, "fetch {n}");
+    }
+    let refused = fetch_blob(ng, &alice, &handle).await;
+    assert_eq!(refusal(&refused), (429, "rate_limited".to_owned()));
+    assert!(refused.header("retry-after").is_some());
 }
 
 #[tokio::test]
@@ -1991,9 +2087,12 @@ impl Period {
         let mut magic = [0; 8];
         stream.read_exact(&mut magic).await.unwrap();
         let obfuscate = |s: &str| s.bytes().map(|b| !b).collect::<Vec<u8>>();
+        // Every account here has the password `pw` but the guest, which
+        // is a guest by having none.
+        let password = if login == "guest" { "" } else { "pw" };
         let mut chunks = vec![
             (tag::LOGIN, obfuscate(login)),
-            (tag::PASSWORD, obfuscate("pw")),
+            (tag::PASSWORD, obfuscate(password)),
             (tag::NAME, login.as_bytes().to_vec()),
             (tag::ICON, 128u16.to_be_bytes().to_vec()),
             (tag::VERSION, 150u16.to_be_bytes().to_vec()),
@@ -2639,6 +2738,7 @@ fn flat_general() -> LegacyNews {
             articles: 100,
             reply: FlatReply::NewestThread,
             masthead: None,
+            pushes: Default::default(),
         }),
         ..LegacyNews::default()
     }
@@ -2824,4 +2924,300 @@ async fn a_1_2_client_is_told_what_this_server_has() {
             "News is not available on this server."
         );
     }
+}
+
+/// The SQLite store, counting the reads a flat push makes — the category
+/// walk and the article — so a test can say how many a post costs.
+struct CountingNews {
+    inner: Arc<SqliteStore>,
+    reads: AtomicUsize,
+}
+
+impl NewsStore for CountingNews {
+    fn nodes(&self, parent: Option<NodeId>) -> Result<Vec<Node>, StoreError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.nodes(parent)
+    }
+
+    fn node(&self, id: NodeId) -> Result<Option<Node>, StoreError> {
+        self.inner.node(id)
+    }
+
+    fn create_node(&self, n: &NewNode, max_depth: u16) -> Result<Node, NewsError> {
+        self.inner.create_node(n, max_depth)
+    }
+
+    fn rename_node(&self, id: NodeId, name: &str) -> Result<Node, NewsError> {
+        self.inner.rename_node(id, name)
+    }
+
+    fn delete_node(&self, id: NodeId) -> Result<u64, NewsError> {
+        self.inner.delete_node(id)
+    }
+
+    fn post(&self, p: &NewPost, max_depth: u16, max_refs: usize) -> Result<Posted, NewsError> {
+        self.inner.post(p, max_depth, max_refs)
+    }
+
+    fn article(&self, id: ArticleId) -> Result<Option<Article>, StoreError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.article(id)
+    }
+
+    fn threads(&self, q: &ThreadQuery) -> Result<ThreadPage, NewsError> {
+        self.inner.threads(q)
+    }
+
+    fn thread(
+        &self,
+        root: ArticleId,
+        after: Option<ArticleId>,
+        snapshot: Option<ArticleId>,
+        limit: usize,
+    ) -> Result<ArticlePage, NewsError> {
+        self.inner.thread(root, after, snapshot, limit)
+    }
+
+    fn tombstone(
+        &self,
+        id: ArticleId,
+        by: &str,
+        at: SystemTime,
+    ) -> Result<Option<Article>, StoreError> {
+        self.inner.tombstone(id, by, at)
+    }
+
+    fn articles_by(&self, who: &Mailbox, since: SystemTime) -> Result<Vec<ArticleId>, StoreError> {
+        self.inner.articles_by(who, since)
+    }
+
+    fn refs_to(&self, id: ArticleId, limit: usize) -> Result<Vec<Reference>, StoreError> {
+        self.inner.refs_to(id, limit)
+    }
+
+    fn usage(&self) -> Result<NewsUsage, StoreError> {
+        self.inner.usage()
+    }
+
+    fn written_by(&self, who: Option<&Mailbox>) -> Result<u64, StoreError> {
+        self.inner.written_by(who)
+    }
+
+    fn prune(&self, max_age: Duration, now: SystemTime) -> Result<u64, StoreError> {
+        self.inner.prune(max_age, now)
+    }
+
+    fn search(&self, q: &SearchQuery) -> Result<SearchPage, StoreError> {
+        self.inner.search(q)
+    }
+
+    fn reindex(&self) -> Result<u64, StoreError> {
+        self.inner.reindex()
+    }
+
+    fn listing(&self, category: NodeId, limit: usize) -> Result<Vec<Listed>, NewsError> {
+        self.inner.listing(category, limit)
+    }
+
+    fn recent(&self, category: NodeId, limit: usize) -> Result<Vec<Article>, NewsError> {
+        self.inner.recent(category, limit)
+    }
+
+    fn subscribe(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        max_subs: usize,
+        at: SystemTime,
+    ) -> Result<usize, NewsError> {
+        self.inner.subscribe(owner, scope, max_subs, at)
+    }
+
+    fn unsubscribe(&self, owner: &Mailbox, scope: SubScope) -> Result<bool, StoreError> {
+        self.inner.unsubscribe(owner, scope)
+    }
+
+    fn mute(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        muted: bool,
+        max_subs: usize,
+        at: SystemTime,
+    ) -> Result<(), NewsError> {
+        self.inner.mute(owner, scope, muted, max_subs, at)
+    }
+
+    fn subscriptions(&self, owner: &Mailbox) -> Result<Vec<Subscription>, StoreError> {
+        self.inner.subscriptions(owner)
+    }
+
+    fn seen(
+        &self,
+        owner: &Mailbox,
+        scope: SubScope,
+        up_to: ArticleId,
+    ) -> Result<Option<usize>, StoreError> {
+        self.inner.seen(owner, scope, up_to)
+    }
+
+    fn subscribers(
+        &self,
+        root: ArticleId,
+        category: Option<NodeId>,
+        article: ArticleId,
+    ) -> Result<Vec<Subscriber>, StoreError> {
+        self.inner.subscribers(root, category, article)
+    }
+
+    fn unread_total(&self, owner: &Mailbox) -> Result<usize, StoreError> {
+        self.inner.unread_total(owner)
+    }
+
+    fn subs_claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError> {
+        self.inner.subs_claim(login, fingerprint)
+    }
+
+    fn subs_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError> {
+        self.inner.subs_rotate(from, to)
+    }
+
+    fn subs_purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
+        self.inner.subs_purge(of)
+    }
+}
+
+/// However many classic connections hear a post, the flat push reads the
+/// store for it once (§12.5): the first connection resolves the category
+/// and reads the article, and the rest are handed its entry.
+#[tokio::test]
+async fn a_post_reads_the_store_once_for_every_classic_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let counting = Arc::new(std::sync::OnceLock::<Arc<CountingNews>>::new());
+    let keep = counting.clone();
+    // No subscriptions, whose audience is worked out from a read of its
+    // own: every read counted is the flat push's.
+    let policy = NewsPolicy {
+        notify: None,
+        ..news_server()
+    };
+    let (legacy, ng, _) =
+        start_server_wrapped(dir.path(), Some(policy), flat_general(), move |inner| {
+            let store = Arc::new(CountingNews {
+                inner,
+                reads: AtomicUsize::new(0),
+            });
+            keep.set(store.clone()).ok().unwrap();
+            store as Arc<dyn NewsStore>
+        })
+        .await;
+    let reads = || counting.get().unwrap().reads.load(Ordering::SeqCst);
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let general = category(&mut admin, None, "General").await;
+    let mut readers = Vec::new();
+    for login in ["bob", "lurker", "admin", "boss", "bob", "lurker"] {
+        readers.push(Period::login(legacy, login).await);
+    }
+    // One period client in UTF-8 among the Mac Roman ones: the entry is
+    // shared, and each converts it for its own wire.
+    let mut utf8 = Period::login_as(legacy, "bob", true).await;
+
+    let before = reads();
+    let id = post(&mut alice, general, None, "Caf\u{e9}", "One read.").await;
+    for reader in &mut readers {
+        let entry = reader.entry(id).await;
+        assert!(
+            entry.contains("Subject: Caf\u{e9}\r\rOne read.\r"),
+            "{entry}"
+        );
+    }
+    let entry = field(&utf8.pushed(NEWSFILE_PUSH).await, tag::NEWS);
+    let entry = String::from_utf8(entry).unwrap();
+    assert!(
+        entry.contains("Subject: Caf\u{e9}\n\nOne read.\n"),
+        "{entry}"
+    );
+    assert_eq!(
+        reads() - before,
+        2,
+        "the flat category's walk and the article, once for everyone"
+    );
+}
+
+/// The news ceilings refuse a post on both wires, the author's before
+/// the server's, and a delete makes room again. The guests share one
+/// author's allowance, and the refusal says so to a guest who has
+/// posted nothing.
+#[tokio::test]
+async fn a_full_news_refuses_a_post_on_both_wires() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = NewsPolicy {
+        max_articles: 5,
+        max_per_author: 2,
+        ..news_server()
+    };
+    let (legacy, ng, _) = start_server_with(dir.path(), Some(policy), flat_general()).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let (mut bob, _) = Ng::login(ng, "bob").await;
+    let general = category(&mut admin, None, "General").await;
+    let first = post(&mut alice, general, None, "One", "first").await;
+    post(&mut alice, general, None, "Two", "second").await;
+    let third = json!({ "category": general, "subject": "Three", "body": "third" });
+    assert_eq!(
+        alice.refused("news_post", third.clone()).await,
+        "too_many_articles"
+    );
+    let mut alice_period = Period::login(legacy, "alice").await;
+    let flat_post = |body: &str| vec![(tag::BODY, body.as_bytes().to_vec())];
+    assert_eq!(
+        alice_period
+            .refused(NEWSFILE_POST, flat_post("third"))
+            .await,
+        "You have as many articles here as this server allows. Delete one first."
+    );
+
+    std::fs::write(
+        dir.path().join("accounts").join("guest.toml"),
+        "name = \"Guest\"\n[access]\nread_news = true\npost_news = true\n",
+    )
+    .unwrap();
+    let (mut guest, _) = Ng::login_with(ng, "guest", "").await;
+    post(&mut guest, general, None, "G1", "a guest's").await;
+    post(&mut guest, general, None, "G2", "another guest's").await;
+    let (mut next_guest, _) = Ng::login_with(ng, "guest", "").await;
+    let reply = next_guest
+        .request(
+            "news_post",
+            json!({ "category": general, "subject": "G3", "body": "mine?" }),
+        )
+        .await;
+    assert_eq!(reply["error"]["code"], "too_many_articles");
+    assert_eq!(
+        reply["error"]["text"],
+        "Guests have as many articles here as this server allows."
+    );
+    let mut guest_period = Period::login(legacy, "guest").await;
+    assert_eq!(
+        guest_period
+            .refused(NEWSFILE_POST, flat_post("mine?"))
+            .await,
+        "Guests have as many articles here as this server allows.",
+        "a guest who posted nothing is not told the articles are theirs"
+    );
+
+    post(&mut bob, general, None, "Bob's", "the last place").await;
+    assert_eq!(bob.refused("news_post", third).await, "news_full");
+    let mut bob_period = Period::login(legacy, "bob").await;
+    assert_eq!(
+        bob_period
+            .refused(NEWSFILE_POST, flat_post("one more"))
+            .await,
+        "This server's news is full."
+    );
+
+    // A tombstone holds nothing, so a delete is room.
+    admin.ok("news_delete", json!({ "id": first })).await;
+    bob_period.ok(NEWSFILE_POST, flat_post("one more")).await;
 }

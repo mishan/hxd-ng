@@ -39,22 +39,29 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, Limited, StreamBody};
-use hxd_core::{FileError, FileKind, IdentityTag, LinkAuthority, Transport};
+use hxd_core::{
+    AddrSet, ConnGate, ConnLimits, ConnPermit, FileError, FileKind, IdentityTag, LinkAuthority,
+    RateGate, Transport,
+};
 use hyper::body::{Frame as BodyFrame, Incoming};
 use hyper::header::{
     HeaderValue, ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
     ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
     AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
-    ETAG, ORIGIN, RANGE,
+    ETAG, ORIGIN, RANGE, RETRY_AFTER,
 };
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, info, warn};
 
@@ -89,23 +96,194 @@ const MAX_BODY: usize = 64 * 1024;
 /// thing keeping the answer proportionate to what it answers.
 const MAX_BUNDLE_BYTES: usize = 4 * 1024 + 16 * 1024 + 256;
 
+/// How many connections past `ng_connections` the addresses `[limits]`
+/// exempts may hold between them ([`Gates::admit`]).
+const EXEMPT_RESERVE: usize = 16;
+
+/// The port's own counts ([`crate::HttpLimits`]) and its request rates.
+/// One per listener, built by `serve`.
+pub(crate) struct Gates {
+    /// Connections each address holds to the port.
+    per_addr: ConnGate,
+    /// Connections everyone holds; `None` is no ceiling.
+    ceiling: Option<Arc<Semaphore>>,
+    /// Places past the ceiling kept for addresses `[limits]` exempts, so
+    /// a flood that fills the port does not also shut out the
+    /// operator's own tools — a metrics scrape, a health check.
+    reserve: Arc<Semaphore>,
+    /// The addresses the reserve is kept for.
+    exempt: AddrSet,
+    /// `POST /identity/challenge`, per address.
+    challenges: RateGate,
+    /// `GET /avatars/{id}`, per address.
+    avatar_fetches: RateGate,
+}
+
+impl Gates {
+    pub(crate) fn new(ctx: &NgCtx) -> Gates {
+        let l = ctx.cfg.http_limits;
+        let exempt = ctx.core.limits_exempt().clone();
+        Gates {
+            per_addr: ConnGate::new(ConnLimits {
+                per_addr: l.connections_per_addr,
+                // A rate would refuse the second of a page's parallel
+                // requests; the rates that matter are the requests'.
+                reconnect: Duration::ZERO,
+                exempt: exempt.clone(),
+            }),
+            ceiling: (l.connections != 0).then(|| Arc::new(Semaphore::new(l.connections))),
+            reserve: Arc::new(Semaphore::new(EXEMPT_RESERVE)),
+            challenges: RateGate::per_minute(l.challenges_per_minute, exempt.clone()),
+            avatar_fetches: RateGate::per_minute(l.avatar_fetches_per_minute, exempt.clone()),
+            exempt,
+        }
+    }
+
+    /// The connection's places in both counts, or `None` when either is
+    /// full. A trusted proxy's connection carries everyone behind it, so
+    /// it counts toward the ceiling alone.
+    ///
+    /// An exempt address that finds the ceiling full takes a place from
+    /// the reserve instead. It is a reserve rather than an exemption: the
+    /// ceiling is what keeps the process inside its descriptor limit, and
+    /// an exempt address can stand for many clients — Docker's gateway,
+    /// or a proxy the operator exempted without listing it as trusted —
+    /// so it may go past the ceiling by the reserve and no further. A
+    /// trusted proxy is not given the reserve even when exempt: its
+    /// connections are everyone's, and would fill it for the flood.
+    fn admit(&self, peer: SocketAddr, ctx: &NgCtx) -> Option<Places> {
+        let proxy = ctx.cfg.trusted_proxies.contains(peer.ip());
+        let total = match &self.ceiling {
+            Some(ceiling) => match ceiling.clone().try_acquire_owned().or_else(|e| {
+                if !proxy && self.exempt.contains(peer.ip()) {
+                    self.reserve.clone().try_acquire_owned()
+                } else {
+                    Err(e)
+                }
+            }) {
+                Ok(place) => Some(place),
+                Err(_) => {
+                    info!("refusing a connection: the ng port holds as many as it may");
+                    hxd_core::instrument::disconnect("http", "full");
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let addr = if proxy {
+            None
+        } else {
+            match self.per_addr.admit(peer.ip()) {
+                Ok(place) => Some(place),
+                Err(refused) => {
+                    info!(
+                        reason = refused.reason(),
+                        "refusing a connection past its address's limit on the ng port"
+                    );
+                    hxd_core::instrument::disconnect("http", refused.reason());
+                    return None;
+                }
+            }
+        };
+        Some(Places {
+            _total: total,
+            _addr: addr,
+        })
+    }
+}
+
+/// A connection's places in the port's counts, given back when it closes.
+struct Places {
+    _total: Option<OwnedSemaphorePermit>,
+    _addr: Option<ConnPermit>,
+}
+
+/// The socket and its places, together: an upgrade takes the socket to
+/// a task of its own and outlives the HTTP connection it came from, and
+/// the places have to go with it rather than being given back when that
+/// connection's task ends.
+struct Held {
+    stream: TcpStream,
+    _places: Places,
+}
+
+impl tokio::io::AsyncRead for Held {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Held {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
 /// Serve one accepted TCP connection: HTTP/1.1 until it upgrades.
-pub(crate) async fn serve_connection(stream: TcpStream, peer: SocketAddr, ctx: NgCtx) {
+pub(crate) async fn serve_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    ctx: NgCtx,
+    gates: Arc<Gates>,
+) {
     if ctx.core.is_banned(peer.ip()) {
         info!("refusing banned address");
         hxd_core::instrument::disconnect("ng", "banned");
         return;
     }
-    let io = TokioIo::new(stream);
+    // Before a byte is read, and closed unanswered past either count, as
+    // the classic wire closes a connection past its address's: answering
+    // would mean holding the connection open to do it, which is what a
+    // flood of them wants.
+    let Some(places) = gates.admit(peer, &ctx) else {
+        return;
+    };
+    let io = TokioIo::new(Held {
+        stream,
+        _places: places,
+    });
     let head_timeout = ctx.cfg.login_timeout;
     let svc = hyper::service::service_fn(move |req| {
         let ctx = ctx.clone();
-        async move { Ok::<_, std::convert::Infallible>(route(req, peer, ctx).await) }
+        let gates = gates.clone();
+        async move { Ok::<_, std::convert::Infallible>(route(req, peer, ctx, &gates).await) }
     });
     // hyper's default 30 s header timeout is silently inert without a
     // timer, so a half-open `GET /ng` would hold a task forever. On the
     // TCP listener the accept itself was under `login_timeout`; here the
-    // request head is, and the body timeout is in `read_body`.
+    // request head is, and the body timeout is in `read_body`. The same
+    // timeout bounds a keep-alive connection's idle wait for its next
+    // request: hyper starts it again as each response is written, so a
+    // connection that has said what it had to say is closed rather than
+    // held.
     let conn = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(head_timeout)
@@ -116,7 +294,7 @@ pub(crate) async fn serve_connection(stream: TcpStream, peer: SocketAddr, ctx: N
     }
 }
 
-async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp {
+async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx, gates: &Gates) -> Resp {
     let path = req.uri().path().to_owned();
 
     // Everything keyed on an address — bans, `max_detached_per_addr`,
@@ -172,7 +350,17 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
         let resp = match (req.method(), path.strip_prefix("/avatars/")) {
             (&Method::PUT, None) => boxed(crate::avatar::upload(req, &ctx).await),
             (&Method::GET, Some(id)) if !id.is_empty() && !id.contains('/') => {
-                boxed(crate::avatar::download(id, req, &ctx).await)
+                // Per address rather than per session: a client fetches
+                // a room's worth of pictures at once, more than the
+                // session's allowance of images, and they are cacheable
+                // for ever after.
+                match gates.avatar_fetches.take(client.ip()) {
+                    Ok(()) => boxed(crate::avatar::download(id, req, &ctx).await),
+                    Err(wait) => {
+                        hxd_core::instrument::throttled("fetch");
+                        slow_down(wait, "too many avatar fetches")
+                    }
+                }
             }
             _ => plain(StatusCode::NOT_FOUND, "not found"),
         };
@@ -227,9 +415,9 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx) -> Resp
             return boxed(crate::metrics::scrape(&req, peer, client, source, &ctx).await);
         }
         (&Method::GET, "/.well-known/hotline") => discovery(&ctx, host.as_deref()),
-        (&Method::POST, "/identity/challenge") => challenge(&ctx),
-        (&Method::POST, "/identity/auth") => auth(req, peer, &ctx).await,
-        (&Method::POST, "/identity/link") => link(req, peer, &ctx).await,
+        (&Method::POST, "/identity/challenge") => challenge(&ctx, client, gates),
+        (&Method::POST, "/identity/auth") => auth(req, peer, client, &ctx).await,
+        (&Method::POST, "/identity/link") => link(req, peer, client, &ctx).await,
         (&Method::POST, "/identity/unlink") => unlink(req, peer, &ctx).await,
         (&Method::PUT, "/identity/card") => put_card(req, peer, &ctx).await,
         (_, p) if p.starts_with("/identity/enroll") => {
@@ -554,6 +742,31 @@ async fn upgrade(
             return plain(StatusCode::BAD_REQUEST, "bad upgrade");
         }
     };
+    // A connection that carries a session — an ng one, or a tunnelled
+    // classic one — counts against its client's address like any other
+    // (`hxd_core::limits`); a transfer belongs to a session already
+    // counted, and is not. It is asked before the token is redeemed, for
+    // the same reason the request is validated first: the gate needs
+    // only the peer, and a client refused 429 keeps its single-use token
+    // to try again with, rather than running the challenge dance again —
+    // and a refused connection costs no verification. The place taken
+    // here is the connection's for its life; a tunnelled session is
+    // handed it rather than taking a second.
+    let place = match proto {
+        Proto::Json | Proto::Trtp => match ctx.core.admit_connection(peer.ip()) {
+            Ok(place) => Some(place),
+            Err(refused) => {
+                info!(%peer, reason = refused.reason(), "refusing a connection past its address's limit");
+                let wire = match proto {
+                    Proto::Trtp => "legacy",
+                    _ => "ng",
+                };
+                hxd_core::instrument::disconnect(wire, refused.reason());
+                return plain(StatusCode::TOO_MANY_REQUESTS, "too many connections");
+            }
+        },
+        Proto::Htxf => None,
+    };
     // The certificate header is believed by the *socket's* peer, which
     // is the proxy; the forwarded address is who the proxy is speaking
     // for and carries no trust of its own.
@@ -584,7 +797,10 @@ async fn upgrade(
             }
         };
         match proto {
-            Proto::Json => conn::run(ws, peer, ctx, identity).await,
+            Proto::Json => {
+                let _place = place;
+                conn::run(ws, peer, ctx, identity).await
+            }
             Proto::Htxf => {
                 let (Some(sink), Some(fp)) = (ctx.tunnel.as_ref(), htxf_identity) else {
                     return;
@@ -596,7 +812,7 @@ async fn upgrade(
                 }
             }
             Proto::Trtp => {
-                let Some(sink) = ctx.tunnel.as_ref() else {
+                let (Some(sink), Some(place)) = (ctx.tunnel.as_ref(), place) else {
                     return;
                 };
                 // The WebSocket hop is TLS; the hop behind the tunnel is
@@ -636,6 +852,7 @@ async fn upgrade(
                     peer,
                     transport,
                     link,
+                    place,
                 )
                 .await;
             }
@@ -1365,14 +1582,20 @@ async fn enroll_fetch(secret: &str, mb: &crate::enroll::Mailbox) -> Resp {
     }
 }
 
-fn challenge(ctx: &NgCtx) -> Resp {
+fn challenge(ctx: &NgCtx, client: SocketAddr, gates: &Gates) -> Resp {
     let Some(st) = ctx.identity.as_ref() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
-    // Rate limiting belongs here (§13); it should share whatever the
-    // login-attempt limiter becomes rather than grow its own. Until it
-    // exists, the challenge table has a ceiling of its own, and reaching
-    // it sheds rather than grows.
+    // Per address (§13), because the table below is everyone's: one
+    // address asking as fast as it could filled it, and then nobody
+    // could log in with an identity until the minute ran out. The
+    // table's own ceiling stays, for a crowd of addresses, and reaching
+    // it sheds rather than grows. A client asks once per login, so the
+    // allowance is far past what one needs.
+    if let Err(wait) = gates.challenges.take(client.ip()) {
+        hxd_core::instrument::throttled("challenge");
+        return slow_down(wait, "too many challenges from this address");
+    }
     let Some(ch) = st.issue_challenge() else {
         return plain(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1385,7 +1608,7 @@ fn challenge(ctx: &NgCtx) -> Resp {
     )
 }
 
-async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
+async fn auth(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx: &NgCtx) -> Resp {
     let Some(st) = ctx.identity.as_ref() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
@@ -1462,6 +1685,22 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
             },
         );
     }
+    // A password is a guess until it verifies, and an address that has
+    // guessed wrong as often as it may is refused before this one is
+    // checked — whichever wire the guesses came in on
+    // (`Core::login_attempt`). A proof is not a guess and is not held
+    // to it. The failure is spent now and given back below unless the
+    // password turns out wrong, so requests in flight at once cannot all
+    // pass while none has failed yet — and it is spent only here, once
+    // nothing but the check itself is left to refuse the request: a
+    // request refused above had its password looked at by no one.
+    let attempt = match password.as_deref() {
+        Some(pw) => match ctx.core.login_attempt(client.ip(), pw.as_bytes()) {
+            Ok(attempt) => Some(attempt),
+            Err(wait) => return slow_down(wait, "too many failed logins from this address"),
+        },
+        None => None,
+    };
     // The state does signature checks and, with credentials or a
     // create policy, file I/O: off the reactor.
     let st = st.clone();
@@ -1498,6 +1737,9 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
         result
     })
     .await;
+    if let Some(attempt) = attempt {
+        settle(ctx, attempt, &result);
+    }
     let Ok(result) = result else {
         return plain(StatusCode::INTERNAL_SERVER_ERROR, "auth task failed");
     };
@@ -1521,11 +1763,26 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     }
 }
 
+/// Settle a password's [`hxd_core::LoginAttempt`] by what the identity
+/// state made of it: only `LoginFailed` was a wrong guess. `GuestLink`
+/// and the refusals that come after the password verified give the
+/// failure back; a task that never answered keeps it.
+fn settle<T, E>(
+    ctx: &NgCtx,
+    attempt: hxd_core::LoginAttempt,
+    result: &Result<Result<T, AuthRefused>, E>,
+) {
+    match result {
+        Ok(Err(AuthRefused::LoginFailed)) | Err(_) => ctx.core.login_failed(attempt),
+        Ok(_) => ctx.core.login_refund(attempt),
+    }
+}
+
 /// `POST /identity/link` (§8.2). The socket that proved the identity is
 /// whichever presented the token or certificate; a running guest session
 /// of the same identity is told to reconnect rather than upgraded in
 /// place (the spec allows either).
-async fn link(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
+async fn link(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx: &NgCtx) -> Resp {
     let Some(st) = ctx.identity.as_ref() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
@@ -1550,11 +1807,18 @@ async fn link(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
             "login and password are required, as strings",
         );
     };
+    // The password is checked here as it is at `auth`, and held to the
+    // same count of failures.
+    let attempt = match ctx.core.login_attempt(client.ip(), password.as_bytes()) {
+        Ok(attempt) => attempt,
+        Err(wait) => return slow_down(wait, "too many failed logins from this address"),
+    };
     let st = st.clone();
     let result = crate::spawn_blocking("identity", move || {
         st.link(&ident, &login, password.as_bytes())
     })
     .await;
+    settle(ctx, attempt, &result);
     match result {
         Ok(Ok(account)) => json_resp(
             StatusCode::OK,
@@ -1729,11 +1993,14 @@ fn refused(e: AuthRefused) -> Resp {
             AuthRefused::Denied => "refused by server policy",
             AuthRefused::CardTooLarge => "the user card exceeds 16 KiB",
             AuthRefused::UnknownChallenge => "unknown or expired challenge",
-            AuthRefused::LoginFailed => "the account name or password is wrong",
+            AuthRefused::LoginFailed | AuthRefused::GuestLink => {
+                "the account name or password is wrong"
+            }
             AuthRefused::NoManage => "this device's certificate does not allow account management",
             AuthRefused::AlreadyLinked => "this identity is already linked to another account here",
             AuthRefused::WouldOrphan => "set a password on the account before unlinking; it has no other way in",
             AuthRefused::NotLinked => "this identity has no linked account here",
+            AuthRefused::Banned => "banned from this server",
             AuthRefused::Backend => "server error",
         } }),
     )
@@ -1745,6 +2012,25 @@ fn json_resp(status: StatusCode, v: Value) -> Resp {
         .header(CONTENT_TYPE, "application/json")
         .body(full(Bytes::from(v.to_string())))
         .unwrap()
+}
+
+/// 429, with how long to wait in `Retry-After` and in the body, for the
+/// routes that answer in this module's error shape.
+fn slow_down(wait: Duration, text: &str) -> Resp {
+    let secs = retry_secs(wait);
+    let mut resp = json_resp(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({ "error": "rate_limited", "text": text, "retry_after": secs }),
+    );
+    resp.headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from(secs));
+    resp
+}
+
+/// A wait in whole seconds, rounded up: a client told 0 would ask again
+/// at once and be refused again.
+pub(crate) fn retry_secs(wait: Duration) -> u64 {
+    wait.as_secs() + u64::from(wait.subsec_nanos() > 0)
 }
 
 fn plain(status: StatusCode, text: &str) -> Resp {

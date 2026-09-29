@@ -172,6 +172,14 @@ function baseConfig(ports, name) {
       // file lowers it back to 2 to assert the eviction on purpose.
       max_detached_per_addr: 64,
     },
+    // Off, for the same reason: loopback is exempt from the per-address
+    // limits but not from these, which are a session's and an account's
+    // (`[limits]`), and one account posting all of a file's news, or one
+    // client driven as fast as a script drives it, is not a flood.
+    limits: {
+      ng_requests: 0,
+      news_posts: 0,
+    },
   };
 }
 

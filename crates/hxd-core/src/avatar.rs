@@ -14,8 +14,9 @@
 //! in one order.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -134,9 +135,12 @@ pub struct AvatarImages {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AvatarPolicy {
     pub limits: AvatarLimits,
-    /// Time one session must leave between two changes: each is pushed to
+    /// Time one owner must leave between two changes: each is pushed to
     /// every session on the server.
     pub set_interval: Duration,
+    /// How long an identity's avatar is kept once the identity stops
+    /// logging in; zero keeps it for good. Accounts' are not aged.
+    pub identity_retention: Duration,
 }
 
 impl Default for AvatarPolicy {
@@ -148,6 +152,7 @@ impl Default for AvatarPolicy {
                 legacy_max_bytes: 32 * 1024,
             },
             set_interval: Duration::from_secs(10),
+            identity_retention: Duration::from_secs(90 * 24 * 3600),
         }
     }
 }
@@ -159,25 +164,38 @@ pub trait AvatarStore: Send + Sync + 'static {
     fn save(&self, owner: &AvatarOwner, avatar: Option<&Avatar>) -> Result<(), StoreError>;
     /// Any stored avatar with this id, whoever owns it.
     fn by_id(&self, id: &AvatarId) -> Result<Option<Avatar>, StoreError>;
+    /// Record that `owner` was on the server at `at`. Saving an avatar
+    /// counts as being seen; nothing happens for an owner with none.
+    fn seen(&self, owner: &AvatarOwner, at: SystemTime) -> Result<(), StoreError>;
+    /// Delete every identity's avatar last seen before `before`, and say
+    /// how many went. Accounts' are never aged out: an account is a file
+    /// an operator wrote, where an identity is a key anyone can mint, so
+    /// only the second kind can grow the table without anyone's say.
+    fn prune_identities(&self, before: SystemTime) -> Result<usize, StoreError>;
 }
 
 /// The store a server with no database keeps: an account's avatar
 /// survives from one session to the next until the process ends.
 #[derive(Default)]
 pub struct MemoryAvatars {
-    by_owner: Mutex<HashMap<AvatarOwner, Avatar>>,
+    by_owner: Mutex<HashMap<AvatarOwner, (Avatar, SystemTime)>>,
 }
 
 impl AvatarStore for MemoryAvatars {
     fn load(&self, owner: &AvatarOwner) -> Result<Option<Avatar>, StoreError> {
-        Ok(self.by_owner.lock().unwrap().get(owner).cloned())
+        Ok(self
+            .by_owner
+            .lock()
+            .unwrap()
+            .get(owner)
+            .map(|(a, _)| a.clone()))
     }
 
     fn save(&self, owner: &AvatarOwner, avatar: Option<&Avatar>) -> Result<(), StoreError> {
         let mut map = self.by_owner.lock().unwrap();
         match avatar {
             Some(a) => {
-                map.insert(owner.clone(), a.clone());
+                map.insert(owner.clone(), (a.clone(), SystemTime::now()));
             }
             None => {
                 map.remove(owner);
@@ -192,8 +210,22 @@ impl AvatarStore for MemoryAvatars {
             .lock()
             .unwrap()
             .values()
-            .find(|a| a.meta.id == *id)
-            .cloned())
+            .find(|(a, _)| a.meta.id == *id)
+            .map(|(a, _)| a.clone()))
+    }
+
+    fn seen(&self, owner: &AvatarOwner, at: SystemTime) -> Result<(), StoreError> {
+        if let Some((_, seen)) = self.by_owner.lock().unwrap().get_mut(owner) {
+            *seen = at;
+        }
+        Ok(())
+    }
+
+    fn prune_identities(&self, before: SystemTime) -> Result<usize, StoreError> {
+        let mut map = self.by_owner.lock().unwrap();
+        let was = map.len();
+        map.retain(|owner, (_, seen)| matches!(owner, AvatarOwner::Account(_)) || *seen >= before);
+        Ok(was - map.len())
     }
 }
 
@@ -227,7 +259,30 @@ struct Changer {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Turn {
     Owner(AvatarOwner),
+    /// A guest's address, as [`crate::limits::limit_key`] has it.
+    Address(IpAddr),
     Session(Uid, u64),
+}
+
+/// Every allowance a change by `sess` spends; it may go ahead only when
+/// all of them are free. An account is its owner, however many sessions
+/// and addresses it has. A guest is its address as well as its identity,
+/// if it proved one: a fresh key is free to make and a reconnect is a
+/// fresh session, so neither may be a fresh turn. Only a guest with no
+/// address to key on is its session.
+fn turns_of(uid: Uid, sess: &UserSession, owner: &Option<AvatarOwner>) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    if let Some(owner) = owner {
+        turns.push(Turn::Owner(owner.clone()));
+    }
+    if !sess.is_person {
+        match sess.addr {
+            Some(addr) => turns.push(Turn::Address(crate::limits::limit_key(addr))),
+            None if owner.is_none() => turns.push(Turn::Session(uid, sess.serial)),
+            None => {}
+        }
+    }
+    turns
 }
 
 /// The owner a session's avatar belongs to, or `None` for a guest with
@@ -288,6 +343,14 @@ impl Core {
                 return;
             }
         };
+        // A login is what keeps an identity's avatar from being aged out
+        // (`prune_avatars`); an account's is never aged, so its logins
+        // cost no write.
+        if avatar.is_some() && matches!(owner, AvatarOwner::Identity(_)) {
+            if let Err(e) = state.store.seen(&owner, SystemTime::now()) {
+                tracing::warn!(target: "avatar", uid, "seen: {e}");
+            }
+        }
         let mut r = self.roster.lock().unwrap();
         let Some(sess) = r.users.get_mut(&uid).filter(|s| s.serial == serial) else {
             return;
@@ -305,8 +368,18 @@ impl Core {
 
     /// Set a session's owner's avatar from uploaded bytes. The decode is
     /// the codec's: call this off the reactor.
+    ///
+    /// `NotAuthorized` for a session whose account may not (`[extra]
+    /// set_avatar`), before anything is spent: no turn and no decode.
     pub fn set_avatar(&self, uid: Uid, input: &[u8]) -> Result<AvatarRef, MediaReject> {
         let state = self.avatars.as_ref().ok_or(MediaReject::Unsupported)?;
+        let allowed = {
+            let r = self.roster.lock().unwrap();
+            r.users.get(&uid).ok_or(MediaReject::Generic)?.set_avatar
+        };
+        if !allowed {
+            return Err(MediaReject::NotAuthorized);
+        }
         if input.len() > state.policy.limits.max_bytes {
             return Err(MediaReject::TooLarge);
         }
@@ -319,6 +392,8 @@ impl Core {
     }
 
     /// Clear a session's owner's avatar. `Ok(false)` when there was none.
+    /// Not gated on `set_avatar`: a session may always take its picture
+    /// down, as one that lost the permission may still be wearing one.
     pub fn clear_avatar(&self, uid: Uid) -> Result<bool, MediaReject> {
         let state = self.avatars.as_ref().ok_or(MediaReject::Unsupported)?;
         let had = self
@@ -339,33 +414,107 @@ impl Core {
     /// Who is asking, and whether they may change an avatar now: one
     /// change per `interval` **per owner**, because a change is shown on
     /// every session of the owner and each is announced to everyone — an
-    /// account open five times must not get five turns to make twenty-five
-    /// announcements. A session-only guest is its own owner. The turn is
-    /// spent before the decode, so a refused upload costs one too.
+    /// account open on several sessions must not get a turn for each and
+    /// make every announcement several times over. A guest is held by its
+    /// address too ([`turns_of`]), so reconnecting does not buy a turn.
+    /// The turn is spent before the decode, so a refused upload costs one
+    /// too.
     fn avatar_turn(&self, uid: Uid, interval: Duration) -> Result<Changer, MediaReject> {
-        let who = {
-            let r = self.roster.lock().unwrap();
-            let sess = r.users.get(&uid).ok_or(MediaReject::Generic)?;
-            Changer {
-                uid,
-                serial: sess.serial,
-                owner: owner_of(sess),
-            }
-        };
-        let key = match &who.owner {
-            Some(owner) => Turn::Owner(owner.clone()),
-            None => Turn::Session(uid, who.serial),
-        };
+        let (who, keys) = self.avatar_changer(uid)?;
         let now = Instant::now();
         let mut turns = self.avatar_turns.lock().unwrap();
         // Everything older than the interval has no say; dropping it keeps
         // the map to the owners who changed something recently.
         turns.retain(|_, at| now.duration_since(*at) < interval);
-        if turns.contains_key(&key) {
+        if keys.iter().any(|k| turns.contains_key(k)) {
             return Err(MediaReject::RateLimited);
         }
-        turns.insert(key, now);
+        for key in keys {
+            turns.insert(key, now);
+        }
         Ok(who)
+    }
+
+    /// Would a change this session asks for now be allowed and have its
+    /// turn? What [`Core::set_avatar`] asks first, asked without spending
+    /// the turn, so a frontend can refuse an upload before it reads the
+    /// bytes.
+    pub fn avatar_change_admits(&self, uid: Uid) -> Result<(), MediaReject> {
+        let state = self.avatars.as_ref().ok_or(MediaReject::Unsupported)?;
+        let allowed = {
+            let r = self.roster.lock().unwrap();
+            r.users.get(&uid).ok_or(MediaReject::Generic)?.set_avatar
+        };
+        if !allowed {
+            return Err(MediaReject::NotAuthorized);
+        }
+        let (_, keys) = self.avatar_changer(uid)?;
+        let turns = self.avatar_turns.lock().unwrap();
+        let spent = keys.iter().any(|k| {
+            turns
+                .get(k)
+                .is_some_and(|at| at.elapsed() < state.policy.set_interval)
+        });
+        if spent {
+            return Err(MediaReject::RateLimited);
+        }
+        Ok(())
+    }
+
+    /// Who is asking, and the turns a change of theirs spends
+    /// ([`turns_of`]).
+    fn avatar_changer(&self, uid: Uid) -> Result<(Changer, Vec<Turn>), MediaReject> {
+        let (who, keys) = {
+            let r = self.roster.lock().unwrap();
+            let sess = r.users.get(&uid).ok_or(MediaReject::Generic)?;
+            let owner = owner_of(sess);
+            let keys = turns_of(uid, sess, &owner);
+            let who = Changer {
+                uid,
+                serial: sess.serial,
+                owner,
+            };
+            (who, keys)
+        };
+        Ok((who, keys))
+    }
+
+    /// Age out identities' avatars (`AvatarPolicy::identity_retention`),
+    /// and say how many went. An identity still on the roster is seen
+    /// now, so a session that outlasts the window does not lose its
+    /// picture at its next login. Store I/O: call it off the reactor.
+    pub fn prune_avatars(&self, now: SystemTime) -> usize {
+        let Some(state) = self.avatars.as_ref() else {
+            return 0;
+        };
+        if state.policy.identity_retention.is_zero() {
+            return 0;
+        }
+        let Some(before) = now.checked_sub(state.policy.identity_retention) else {
+            return 0;
+        };
+        // Copied out, then the store: never under the roster's lock.
+        let live: std::collections::HashSet<AvatarOwner> = {
+            let r = self.roster.lock().unwrap();
+            r.users
+                .values()
+                .filter(|s| s.avatar.is_some())
+                .filter_map(owner_of)
+                .filter(|o| matches!(o, AvatarOwner::Identity(_)))
+                .collect()
+        };
+        for owner in &live {
+            if let Err(e) = state.store.seen(owner, now) {
+                tracing::warn!(target: "avatar", "seen: {e}");
+            }
+        }
+        match state.store.prune_identities(before) {
+            Ok(gone) => gone,
+            Err(e) => {
+                tracing::warn!(target: "avatar", "prune: {e}");
+                0
+            }
+        }
     }
 
     /// Store the change, then show it on every live session of the owner.
@@ -468,6 +617,7 @@ pub mod conformance {
         owners_of_either_kind_never_meet(&*new_store());
         an_avatar_is_found_by_id_whoever_owns_it(&*new_store());
         an_avatar_without_a_legacy_rendition_stays_without_one(&*new_store());
+        identities_unseen_are_aged_out_and_accounts_never_are(&*new_store());
     }
 
     pub fn avatar(seed: u8, mime: MediaType) -> Avatar {
@@ -547,6 +697,57 @@ pub mod conformance {
         plain.legacy_gif = None;
         store.save(&owner, Some(&plain)).unwrap();
         assert_eq!(store.load(&owner).unwrap(), Some(plain));
+    }
+
+    fn identities_unseen_are_aged_out_and_accounts_never_are(store: &dyn AvatarStore) {
+        let day = Duration::from_secs(24 * 3600);
+        let now = SystemTime::now();
+        let account = AvatarOwner::Account("erin".into());
+        let regular = AvatarOwner::Identity([1; 32]);
+        let lapsed = AvatarOwner::Identity([2; 32]);
+        store
+            .save(&account, Some(&avatar(7, MediaType::Png)))
+            .unwrap();
+        store
+            .save(&regular, Some(&avatar(8, MediaType::Png)))
+            .unwrap();
+        store
+            .save(&lapsed, Some(&avatar(9, MediaType::Png)))
+            .unwrap();
+        // A save is a sighting: nothing just saved is older than a day.
+        assert_eq!(store.prune_identities(now - day).unwrap(), 0);
+
+        // Seeing an owner with no avatar is not an error, and keeps
+        // nothing it could later find.
+        store
+            .seen(&AvatarOwner::Identity([3; 32]), now + 30 * day)
+            .unwrap();
+        assert_eq!(store.load(&AvatarOwner::Identity([3; 32])).unwrap(), None);
+
+        // Weeks on, the identity that came back stays, the one that did
+        // not goes, and the account stays whatever its age.
+        store.seen(&regular, now + 30 * day).unwrap();
+        assert_eq!(store.prune_identities(now + 20 * day).unwrap(), 1);
+        assert_eq!(store.load(&lapsed).unwrap(), None);
+        assert_eq!(
+            store.by_id(&avatar(9, MediaType::Png).meta.id).unwrap(),
+            None,
+            "gone by id too"
+        );
+        assert_eq!(
+            store.load(&regular).unwrap(),
+            Some(avatar(8, MediaType::Png))
+        );
+        assert_eq!(
+            store.load(&account).unwrap(),
+            Some(avatar(7, MediaType::Png))
+        );
+        assert_eq!(store.prune_identities(now + 20 * day).unwrap(), 0);
+        assert_eq!(store.prune_identities(now + 365 * day).unwrap(), 1);
+        assert_eq!(
+            store.load(&account).unwrap(),
+            Some(avatar(7, MediaType::Png))
+        );
     }
 }
 

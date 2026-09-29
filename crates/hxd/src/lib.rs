@@ -41,6 +41,11 @@ pub mod tracker;
 pub struct Config {
     #[serde(default)]
     pub server: ServerSection,
+    /// What one address, and one session, is held to
+    /// (`hxd_core::limits`). Always on, at mhxd's `nospam` defaults, with
+    /// loopback exempt from the per-address ones.
+    #[serde(default)]
+    pub limits: LimitsSection,
     #[serde(default)]
     pub paths: PathsSection,
     /// The Hotline-ng WebSocket frontend. Absent = disabled.
@@ -114,9 +119,13 @@ pub struct AvatarsSection {
     /// recommendation, and what GtkHx accepts.
     #[serde(default = "default_avatar_legacy_max_bytes")]
     pub legacy_max_bytes: usize,
-    /// Seconds between one session's changes; each is pushed to everyone.
+    /// Seconds between one owner's changes; each is pushed to everyone.
     #[serde(default = "default_avatar_set_interval")]
     pub set_interval: u64,
+    /// Days an identity's avatar is kept after the identity was last on
+    /// the server; 0 keeps it for good. Accounts' are not aged.
+    #[serde(default = "default_avatar_identity_retain_days")]
+    pub identity_retain_days: u32,
     /// Where owners' avatars are kept. Defaults to the database `[inbox]`,
     /// `[history]` or `[news]` names; with none, avatars last until the
     /// server stops.
@@ -134,6 +143,9 @@ fn default_avatar_legacy_max_bytes() -> usize {
 }
 fn default_avatar_set_interval() -> u64 {
     10
+}
+fn default_avatar_identity_retain_days() -> u32 {
+    90
 }
 
 impl AvatarsSection {
@@ -161,6 +173,9 @@ impl AvatarsSection {
                 legacy_max_bytes: self.legacy_max_bytes,
             },
             set_interval: Duration::from_secs(self.set_interval),
+            identity_retention: Duration::from_secs(
+                u64::from(self.identity_retain_days) * 24 * 3600,
+            ),
         }
     }
 }
@@ -461,9 +476,22 @@ pub struct NewsSection {
     /// The largest page of threads one request may ask for.
     #[serde(default = "default_news_max_page")]
     pub max_page: usize,
-    /// Days a thread survives its last post. 0 keeps everything.
+    /// Days a thread survives its last post. 0 keeps everything, which
+    /// is what an operator coming from mhxd expects of news.
     #[serde(default)]
     pub retain_days: u32,
+    /// Live articles the store may hold; a post past it is refused. 0
+    /// for no ceiling.
+    #[serde(default = "default_news_max_articles")]
+    pub max_articles: u64,
+    /// Bytes of body and plain-text downgrade the live articles may
+    /// hold together; a post past it is refused. 0 for no ceiling.
+    #[serde(default = "default_news_max_text_bytes")]
+    pub max_text_bytes: u64,
+    /// Live articles one author may hold, every guest counted as one. 0
+    /// for no ceiling.
+    #[serde(default = "default_news_max_per_author")]
+    pub max_per_author: u64,
     /// May an author delete their own article? `false` is the period
     /// behavior, where only `delete_articles` can.
     #[serde(default = "default_true")]
@@ -627,6 +655,9 @@ impl NewsSection {
             max_page: self.max_page,
             self_delete: self.self_delete,
             retain_days: self.retain_days,
+            max_articles: self.max_articles,
+            max_text_bytes: self.max_text_bytes,
+            max_per_author: self.max_per_author,
             search: self.search,
             search_max_results: self.search_max_results,
             search_per_minute: self.search_per_minute,
@@ -667,6 +698,7 @@ impl NewsSection {
                     reply: hxd_session::FlatReply::from_name(&self.flat_reply)
                         .unwrap_or(hxd_session::FlatReply::NewestThread),
                     masthead: self.flat_masthead.clone(),
+                    pushes: Default::default(),
                 }),
         }
     }
@@ -832,6 +864,15 @@ fn default_news_max_node_depth() -> u16 {
 }
 fn default_news_max_page() -> usize {
     hxd_core::NewsPolicy::default().max_page
+}
+fn default_news_max_articles() -> u64 {
+    hxd_core::NewsPolicy::default().max_articles
+}
+fn default_news_max_text_bytes() -> u64 {
+    hxd_core::NewsPolicy::default().max_text_bytes
+}
+fn default_news_max_per_author() -> u64 {
+    hxd_core::NewsPolicy::default().max_per_author
 }
 
 /// Inline media (`docs/inline-media.md` §11).
@@ -1051,6 +1092,16 @@ pub struct InboxSection {
     /// is left waits for the next login rather than being dropped.
     #[serde(default = "default_deliver_at_flush")]
     pub deliver_at_flush: usize,
+    /// Messages one account may *store* in a rolling day, delivered or
+    /// waiting; 0 for no quota. Retention keeps a delivered message too,
+    /// so this rather than `max_queued` is what bounds how fast one
+    /// sender can fill the disk. Past it, a message to someone connected
+    /// still arrives, unstored; one that would have to wait is refused.
+    #[serde(default = "default_max_sent_per_day")]
+    pub max_sent_per_day: usize,
+    /// Body bytes, likewise; 0 for no quota.
+    #[serde(default = "default_max_sent_bytes_per_day")]
+    pub max_sent_bytes_per_day: u64,
     /// Seconds an *unread* message is kept, measured from when it was
     /// sent. Default 30 days.
     #[serde(default = "default_retain_unread")]
@@ -1064,6 +1115,24 @@ pub struct InboxSection {
     /// fsyncs every commit.
     #[serde(default)]
     pub sync: InboxSync,
+}
+
+impl InboxSection {
+    pub fn policy(&self) -> hxd_core::InboxPolicy {
+        hxd_core::InboxPolicy {
+            max_queued: self.max_queued,
+            deliver_at_flush: self.deliver_at_flush,
+            max_sent_per_day: self.max_sent_per_day,
+            max_sent_bytes_per_day: self.max_sent_bytes_per_day,
+        }
+    }
+}
+
+fn default_max_sent_per_day() -> usize {
+    hxd_core::InboxPolicy::default().max_sent_per_day
+}
+fn default_max_sent_bytes_per_day() -> u64 {
+    hxd_core::InboxPolicy::default().max_sent_bytes_per_day
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -1094,6 +1163,25 @@ pub struct VoiceSection {
         deserialize_with = "deserialize_max_per_room"
     )]
     pub max_per_room: usize,
+    /// Joins one session may make in `join_seconds`, earned back
+    /// steadily; 0 for no limit. A join renegotiates the whole room it
+    /// enters and the one it leaves. A leave is never limited.
+    #[serde(default = "default_voice_joins")]
+    pub joins: u32,
+    #[serde(default = "default_voice_join_seconds")]
+    pub join_seconds: u64,
+    /// How long a room's status waits after a mute (or pause) flip, so a
+    /// burst of them is announced once with the state it ended in; 0
+    /// announces each at once. The spec recommends about 100 ms.
+    #[serde(default = "default_status_debounce_ms")]
+    pub status_debounce_ms: u64,
+    /// Inbound RTP is dropped past this multiple of each stream's
+    /// ceiling — 64 kbps for PCMU audio, `max_bitrate` for a camera,
+    /// `screen_max_bitrate` for a screen — rather than forwarded to
+    /// everyone else in the room; 0 turns policing off. See
+    /// `hxd_voice::police` for why the default is 1.5.
+    #[serde(default = "default_police_factor")]
+    pub police_factor: f64,
     /// Video chat. Absent = disabled, which is the video spec's
     /// `EnableVideo` default.
     ///
@@ -1148,6 +1236,36 @@ where
 }
 
 impl VoiceSection {
+    /// The per-session signaling allowances this section describes,
+    /// with `[voice.video]`'s.
+    pub fn voice_limits(&self) -> Result<hxd_core::VoiceLimits, String> {
+        let (changes, change_seconds) = self.video.as_ref().map_or(
+            (default_video_changes(), default_video_change_seconds()),
+            |v| (v.changes, v.change_seconds),
+        );
+        if (self.joins != 0 && self.join_seconds == 0) || (changes != 0 && change_seconds == 0) {
+            return Err("[voice] a count needs its seconds: set both, or the count to 0".into());
+        }
+        // Below 1 the policer would drop an honest encoder's traffic
+        // under the very `b=AS` ceiling this server advertised to it, so
+        // it is refused rather than accepted as a stricter setting.
+        let f = self.police_factor;
+        if !f.is_finite() || f < 0.0 || (f > 0.0 && f < 1.0) {
+            return Err(format!(
+                "[voice] police_factor {f} must be 0 (off) or at least 1: \
+                 below 1 it drops media that stays within the ceiling \
+                 clients are told"
+            ));
+        }
+        Ok(hxd_core::VoiceLimits {
+            joins: self.joins,
+            joins_per: Duration::from_secs(self.join_seconds),
+            video_changes: changes,
+            video_changes_per: Duration::from_secs(change_seconds),
+            status_debounce: Duration::from_millis(self.status_debounce_ms),
+        })
+    }
+
     /// The per-kind ceilings this section describes.
     pub fn video_config(&self) -> hxd_core::VideoConfig {
         self.video.as_ref().map_or_else(
@@ -1191,6 +1309,15 @@ pub struct VideoSection {
     pub screen_max_fps: u16,
     #[serde(default = "default_screen_bitrate")]
     pub screen_max_bitrate: u32,
+    /// Video starts and subscription changes one session may make in
+    /// `change_seconds`; 0 for no limit. Only a subscription change that
+    /// adds a live publication counts. A stop, a pause or a narrowed
+    /// subscription set is never limited: turning video off has to work
+    /// every time.
+    #[serde(default = "default_video_changes")]
+    pub changes: u32,
+    #[serde(default = "default_video_change_seconds")]
+    pub change_seconds: u64,
 }
 
 impl VideoSection {
@@ -1216,6 +1343,27 @@ impl VideoSection {
 
 fn default_max_per_room() -> usize {
     hxd_core::DEFAULT_MAX_PER_ROOM
+}
+fn default_voice_joins() -> u32 {
+    hxd_core::VoiceLimits::DEFAULT.joins
+}
+fn default_voice_join_seconds() -> u64 {
+    hxd_core::VoiceLimits::DEFAULT.joins_per.as_secs()
+}
+fn default_status_debounce_ms() -> u64 {
+    hxd_core::VoiceLimits::DEFAULT.status_debounce.as_millis() as u64
+}
+/// `hxd_voice::police::DEFAULT_FACTOR`, written out because `hxd-voice`
+/// is an optional dependency and the config still parses without it; a
+/// test with the `voice` feature holds the two together.
+fn default_police_factor() -> f64 {
+    1.5
+}
+fn default_video_changes() -> u32 {
+    hxd_core::VoiceLimits::DEFAULT.video_changes
+}
+fn default_video_change_seconds() -> u64 {
+    hxd_core::VoiceLimits::DEFAULT.video_changes_per.as_secs()
 }
 fn default_max_cameras() -> u16 {
     hxd_core::VideoLimits::CAMERA.max_per_room
@@ -1501,6 +1649,242 @@ impl ServerSection {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSection {
+    /// Connections one address may hold at once; 0 for no limit.
+    #[serde(default = "default_connections_per_addr")]
+    pub connections_per_addr: usize,
+    /// Seconds one address waits for each new connection past a burst
+    /// of `connections_per_addr` (mhxd's `conn_max` when that is 0); 0
+    /// for no limit.
+    #[serde(default = "default_reconnect_seconds")]
+    pub reconnect_seconds: u64,
+    /// Addresses and CIDR blocks held to none of the per-address limits:
+    /// connections, failed logins, and the ng port's — and kept a few
+    /// places past `ng_connections`. The flood limits are a session's,
+    /// and hold everywhere.
+    #[serde(default = "default_limits_exempt")]
+    pub exempt: Vec<String>,
+    /// Chat lines one session may send in each `chat_seconds` window,
+    /// public and private rooms together and every line of a multi-line
+    /// send counted, before it is kicked; 0 for no limit. mhxd's
+    /// `chat_max` and `chat_time`.
+    #[serde(default = "default_chat_lines")]
+    pub chat_lines: u32,
+    #[serde(default = "default_chat_seconds")]
+    pub chat_seconds: u64,
+    /// Spam points one session may spend in each `spam_seconds` window,
+    /// every transaction costing what mhxd's table charges it, before it
+    /// is kicked and banned for `[server] ban_time`; 0 for no limit.
+    /// mhxd's `spam_max` and `spam_time`.
+    #[serde(default = "default_spam_points")]
+    pub spam_points: u32,
+    #[serde(default = "default_spam_seconds")]
+    pub spam_seconds: u64,
+    /// Private chats one session may have opened and still open; 0 for
+    /// no limit. mhxd has none.
+    #[serde(default = "default_private_chats_per_user")]
+    pub private_chats_per_user: usize,
+    /// Private chats open on the whole server; 0 for no limit.
+    #[serde(default = "default_private_chats")]
+    pub private_chats: usize,
+    /// Weight of requests one ng session may send at once, earned
+    /// back over `ng_request_seconds`, past which a request is answered
+    /// `rate_limited` with how long to wait; 0 for no limit. Not mhxd's:
+    /// the classic wire is held to the spam points instead.
+    #[serde(default = "default_ng_requests")]
+    pub ng_requests: u32,
+    #[serde(default = "default_ng_request_seconds")]
+    pub ng_request_seconds: u64,
+    /// News articles and replies one account may post at once, earned
+    /// back over `news_post_seconds`; 0 for no limit. Refuses ng posts
+    /// only: a classic post counts, and is held to mhxd's spam points.
+    #[serde(default = "default_news_posts")]
+    pub news_posts: u32,
+    #[serde(default = "default_news_post_seconds")]
+    pub news_post_seconds: u64,
+    /// Wrong passwords one address may give, on either wire, before a
+    /// password from it is refused until it earns one back, one every
+    /// `login_failure_seconds`; 0 for no limit. A login that sends no
+    /// password is not held to it.
+    #[serde(default = "default_login_failures")]
+    pub login_failures: u32,
+    #[serde(default = "default_login_failure_seconds")]
+    pub login_failure_seconds: u64,
+    /// Connections one address may hold to the ng port, whatever they
+    /// carry; 0 for no limit.
+    #[serde(default = "default_http_connections_per_addr")]
+    pub http_connections_per_addr: usize,
+    /// Connections everyone together may hold to the ng port; 0 for no
+    /// limit. Exempt addresses have a few places past it.
+    #[serde(default = "default_ng_connections")]
+    pub ng_connections: usize,
+    /// `POST /identity/challenge` one address may make a minute; 0 for
+    /// no limit.
+    #[serde(default = "default_challenges_per_minute")]
+    pub challenges_per_minute: u32,
+    /// `GET /avatars/{id}` one address may make a minute; 0 for no
+    /// limit.
+    #[serde(default = "default_avatar_fetches_per_minute")]
+    pub avatar_fetches_per_minute: u32,
+}
+
+fn default_private_chats_per_user() -> usize {
+    hxd_core::ChatLimits::DEFAULT.per_creator
+}
+fn default_private_chats() -> usize {
+    hxd_core::ChatLimits::DEFAULT.total
+}
+fn default_ng_requests() -> u32 {
+    hxd_core::RequestLimits::DEFAULT.requests
+}
+fn default_ng_request_seconds() -> u64 {
+    hxd_core::RequestLimits::DEFAULT.requests_per.as_secs()
+}
+fn default_news_posts() -> u32 {
+    hxd_core::RequestLimits::DEFAULT.news_posts
+}
+fn default_news_post_seconds() -> u64 {
+    hxd_core::RequestLimits::DEFAULT.news_posts_per.as_secs()
+}
+fn default_login_failures() -> u32 {
+    hxd_core::LoginLimits::RECOMMENDED.failures
+}
+fn default_login_failure_seconds() -> u64 {
+    hxd_core::LoginLimits::RECOMMENDED.every.as_secs()
+}
+fn default_http_connections_per_addr() -> usize {
+    hxd_ng_session::HttpLimits::RECOMMENDED.connections_per_addr
+}
+fn default_ng_connections() -> usize {
+    hxd_ng_session::HttpLimits::RECOMMENDED.connections
+}
+fn default_challenges_per_minute() -> u32 {
+    hxd_ng_session::HttpLimits::RECOMMENDED.challenges_per_minute
+}
+fn default_avatar_fetches_per_minute() -> u32 {
+    hxd_ng_session::HttpLimits::RECOMMENDED.avatar_fetches_per_minute
+}
+
+fn default_chat_lines() -> u32 {
+    hxd_core::FloodLimits::MHXD.chat_lines
+}
+fn default_chat_seconds() -> u64 {
+    hxd_core::FloodLimits::MHXD.chat_per.as_secs()
+}
+fn default_spam_points() -> u32 {
+    hxd_core::FloodLimits::MHXD.spam_points
+}
+fn default_spam_seconds() -> u64 {
+    hxd_core::FloodLimits::MHXD.spam_per.as_secs()
+}
+
+fn default_connections_per_addr() -> usize {
+    hxd_core::limits::CONNECTIONS_PER_ADDR
+}
+fn default_reconnect_seconds() -> u64 {
+    hxd_core::limits::RECONNECT_EVERY.as_secs()
+}
+fn default_limits_exempt() -> Vec<String> {
+    vec!["127.0.0.0/8".into(), "::1".into()]
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        LimitsSection {
+            connections_per_addr: default_connections_per_addr(),
+            reconnect_seconds: default_reconnect_seconds(),
+            exempt: default_limits_exempt(),
+            chat_lines: default_chat_lines(),
+            chat_seconds: default_chat_seconds(),
+            spam_points: default_spam_points(),
+            spam_seconds: default_spam_seconds(),
+            private_chats_per_user: default_private_chats_per_user(),
+            private_chats: default_private_chats(),
+            ng_requests: default_ng_requests(),
+            ng_request_seconds: default_ng_request_seconds(),
+            news_posts: default_news_posts(),
+            news_post_seconds: default_news_post_seconds(),
+            login_failures: default_login_failures(),
+            login_failure_seconds: default_login_failure_seconds(),
+            http_connections_per_addr: default_http_connections_per_addr(),
+            ng_connections: default_ng_connections(),
+            challenges_per_minute: default_challenges_per_minute(),
+            avatar_fetches_per_minute: default_avatar_fetches_per_minute(),
+        }
+    }
+}
+
+impl LimitsSection {
+    pub fn chat_limits(&self) -> hxd_core::ChatLimits {
+        hxd_core::ChatLimits {
+            per_creator: self.private_chats_per_user,
+            total: self.private_chats,
+        }
+    }
+
+    /// The flood limits, banning a session past its spam points for
+    /// `ban_time` seconds (`[server] ban_time`).
+    pub fn flood_limits(&self, ban_time: u64) -> Result<hxd_core::FloodLimits, String> {
+        if (self.chat_lines != 0 && self.chat_seconds == 0)
+            || (self.spam_points != 0 && self.spam_seconds == 0)
+        {
+            return Err("[limits] a count needs its seconds: set both, or the count to 0".into());
+        }
+        Ok(hxd_core::FloodLimits {
+            chat_lines: self.chat_lines,
+            chat_per: Duration::from_secs(self.chat_seconds),
+            spam_points: self.spam_points,
+            spam_per: Duration::from_secs(self.spam_seconds),
+            ban_for: Duration::from_secs(ban_time),
+        })
+    }
+
+    /// The ng request limit and the news-post limit.
+    pub fn request_limits(&self) -> Result<hxd_core::RequestLimits, String> {
+        if (self.ng_requests != 0 && self.ng_request_seconds == 0)
+            || (self.news_posts != 0 && self.news_post_seconds == 0)
+        {
+            return Err("[limits] a count needs its seconds: set both, or the count to 0".into());
+        }
+        Ok(hxd_core::RequestLimits {
+            requests: self.ng_requests,
+            requests_per: Duration::from_secs(self.ng_request_seconds),
+            news_posts: self.news_posts,
+            news_posts_per: Duration::from_secs(self.news_post_seconds),
+        })
+    }
+
+    pub fn login_limits(&self) -> Result<hxd_core::LoginLimits, String> {
+        if self.login_failures != 0 && self.login_failure_seconds == 0 {
+            return Err("[limits] login_failures needs login_failure_seconds: set both, or login_failures to 0".into());
+        }
+        Ok(hxd_core::LoginLimits {
+            failures: self.login_failures,
+            every: Duration::from_secs(self.login_failure_seconds),
+        })
+    }
+
+    pub fn http_limits(&self) -> hxd_ng_session::HttpLimits {
+        hxd_ng_session::HttpLimits {
+            connections_per_addr: self.http_connections_per_addr,
+            connections: self.ng_connections,
+            challenges_per_minute: self.challenges_per_minute,
+            avatar_fetches_per_minute: self.avatar_fetches_per_minute,
+        }
+    }
+
+    pub fn conn_limits(&self) -> Result<hxd_core::ConnLimits, String> {
+        Ok(hxd_core::ConnLimits {
+            per_addr: self.connections_per_addr,
+            reconnect: Duration::from_secs(self.reconnect_seconds),
+            exempt: hxd_core::AddrSet::parse(&self.exempt)
+                .map_err(|e| format!("[limits] exempt: {e}"))?,
+        })
+    }
+}
+
 impl Default for ServerSection {
     fn default() -> Self {
         ServerSection {
@@ -1610,9 +1994,24 @@ fn ng_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>) -> Vec
     caps
 }
 
+/// How many avatar decodes may run at once, apart from `[media]`'s
+/// `max_concurrent_decodes`.
+///
+/// Its own budget, because a shared one lets either kind of traffic
+/// starve the other: avatar changes are rationed per owner and per
+/// guest address, but a handful of accounts churning theirs could still
+/// hold every shared permit and answer chat's images with Busy. One is
+/// enough for the traffic: an avatar change is rare by construction —
+/// once per owner per `set_interval` — and the work is bounded by the
+/// same pixel and allocation caps as chat's, so a queue waits a decode
+/// or two. The server's decode concurrency is `[media]`'s plus this,
+/// still bounded, and a burst of avatar changes costs chat nothing.
+#[cfg(feature = "media")]
+const AVATAR_DECODES: usize = 1;
+
 /// Give the domain an image pipeline when `[media]` asks for one, and
-/// avatars when `[avatars]` does — the same pipeline, so the same decode
-/// budget.
+/// avatars when `[avatars]` does — the same pipeline and caps, with a
+/// decode budget of their own ([`AVATAR_DECODES`]).
 #[cfg(feature = "media")]
 fn with_media(
     core: Core,
@@ -1633,7 +2032,11 @@ fn with_media(
     let core = match config.avatars.as_ref() {
         Some(section) => core.with_avatars(
             avatars.unwrap_or_else(|| Arc::new(hxd_core::MemoryAvatars::default())),
-            Arc::new(codec.with_max_bytes(section.max_bytes)),
+            Arc::new(
+                codec
+                    .with_max_bytes(section.max_bytes)
+                    .with_own_permits(AVATAR_DECODES),
+            ),
             section.to_policy(),
         ),
         None => core,
@@ -1733,12 +2136,13 @@ impl TunnelSink for LegacyTunnel {
         peer: SocketAddr,
         transport: Transport,
         link: LinkAuthority,
+        place: hxd_core::ConnPermit,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let ctx = self.0.clone();
         Box::pin(async move {
             let span = tracing::info_span!("tunnel", %peer);
             tracing::Instrument::instrument(
-                hxd_session::run_session(stream, peer, ctx, transport, link),
+                hxd_session::run_session(stream, peer, ctx, transport, link, place),
                 span,
             )
             .await
@@ -2150,6 +2554,13 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     {
         return Err("[server] logins_in_flight must be at least 1, and not absurd".into());
     }
+    config.limits.conn_limits()?;
+    config.limits.flood_limits(config.server.ban_time)?;
+    if let Some(voice) = &config.voice {
+        voice.voice_limits()?;
+    }
+    config.limits.request_limits()?;
+    config.limits.login_limits()?;
     if config.server.queue_budget() == 0 {
         return Err(
             "[server] queue_budget_mb must be at least 1, and small enough to count in bytes"
@@ -2161,11 +2572,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     banner::check(config)?;
     metrics::check(config)?;
     if let Some(inbox) = &config.inbox {
-        hxd_core::InboxPolicy {
-            max_queued: inbox.max_queued,
-            deliver_at_flush: inbox.deliver_at_flush,
-        }
-        .check()?;
+        inbox.policy().check()?;
     }
     if let Some(history) = &config.history {
         if history.db.is_none() && config.inbox.is_none() {
@@ -2900,6 +3307,24 @@ pub async fn news_pruner(core: Arc<Core>) {
     }
 }
 
+/// Avatar retention: identities' avatars not seen within `[avatars]
+/// identity_retain_days` (`docs/avatars.md` §2). Hourly and on the
+/// blocking pool, like the others.
+pub async fn avatar_pruner(core: Arc<Core>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let core = core.clone();
+        let gone = crate::spawn_blocking("prune", move || core.prune_avatars(SystemTime::now()))
+            .await
+            .unwrap_or(0);
+        if gone > 0 {
+            tracing::debug!(gone, "identity avatars pruned");
+        }
+    }
+}
+
 /// Delete the device rows whose certificates have expired. Skipping it
 /// costs rows and never a wrong push: the gateway compares expiry
 /// itself, so a lapsed device stops being sent to the moment it lapses
@@ -2989,6 +3414,7 @@ pub fn build_ng_ctx(
             caps: ng_caps(config, voice, files),
             trusted_proxies: TrustedProxies::parse(&ng.trusted_proxies)?,
             forwarded_header: ForwardedHeader::parse(&ng.forwarded_header)?,
+            http_limits: config.limits.http_limits(),
         }),
         registry: Arc::new(Registry::new()),
         identity,
@@ -3022,12 +3448,25 @@ pub fn build_ctx(
     };
 
     let budget = config.server.queue_budget();
+    let conn_limits = config.limits.conn_limits()?;
+    let flood_limits = config.limits.flood_limits(config.server.ban_time)?;
+    let request_limits = config.limits.request_limits()?;
+    let login_limits = config.limits.login_limits()?;
     let core = match voice {
         Some(v) => {
             let core = Core::new()
+                .with_conn_limits(conn_limits)
+                .with_flood_limits(flood_limits)
+                .with_chat_limits(config.limits.chat_limits())
+                .with_request_limits(request_limits)
+                .with_login_limits(login_limits)
                 .with_queue_budget(budget)
                 .with_logins_in_flight(config.server.logins_in_flight)
-                .with_voice(v.media(), v.max_per_room());
+                .with_voice(v.media(), v.max_per_room())
+                .with_voice_limits(config.voice.as_ref().map_or(
+                    Ok(hxd_core::VoiceLimits::DEFAULT),
+                    VoiceSection::voice_limits,
+                )?);
             // `with_video` is a no-op without a media layer, so the
             // dependency holds even if this ordering ever changes.
             if video_enabled(config) {
@@ -3042,6 +3481,11 @@ pub fn build_ctx(
             }
         }
         None => Core::new()
+            .with_conn_limits(conn_limits)
+            .with_flood_limits(flood_limits)
+            .with_chat_limits(config.limits.chat_limits())
+            .with_request_limits(request_limits)
+            .with_login_limits(login_limits)
             .with_queue_budget(budget)
             .with_logins_in_flight(config.server.logins_in_flight),
     };
@@ -3063,10 +3507,10 @@ pub fn build_ctx(
         Some(store) => core.with_inbox(
             store,
             auth.clone(),
-            hxd_core::InboxPolicy {
-                max_queued: config.inbox.as_ref().map_or(200, |i| i.max_queued),
-                deliver_at_flush: config.inbox.as_ref().map_or(25, |i| i.deliver_at_flush),
-            },
+            config
+                .inbox
+                .as_ref()
+                .map_or_else(hxd_core::InboxPolicy::default, InboxSection::policy),
         ),
         None => core,
     };
@@ -4199,6 +4643,8 @@ sync = "full"
             screen_max_height: 1081,
             screen_max_fps: 16,
             screen_max_bitrate: 2_500_001,
+            changes: 13,
+            change_seconds: 14,
         }
     }
 
@@ -4268,6 +4714,79 @@ sync = "full"
             c.voice.as_ref().unwrap().video_config().camera.max_width,
             hxd_core::VideoLimits::CAMERA.max_width
         );
+    }
+
+    #[test]
+    fn the_voice_allowances_default_and_are_read_from_both_tables() {
+        let c = parse("[voice]\nadvertise = [\"198.51.100.9:5504\"]\n").unwrap();
+        let voice = c.voice.as_ref().unwrap();
+        assert_eq!(
+            voice.voice_limits().unwrap(),
+            hxd_core::VoiceLimits::DEFAULT
+        );
+        assert_eq!(voice.police_factor, 1.5);
+
+        let c = parse(
+            r#"
+            [voice]
+            advertise = ["198.51.100.9:5504"]
+            joins = 3
+            join_seconds = 30
+            status_debounce_ms = 0
+            police_factor = 2
+
+            [voice.video]
+            changes = 7
+            change_seconds = 21
+            "#,
+        )
+        .expect("every allowance set");
+        let voice = c.voice.as_ref().unwrap();
+        assert_eq!(voice.police_factor, 2.0, "an integer is a factor too");
+        assert_eq!(
+            voice.voice_limits().unwrap(),
+            hxd_core::VoiceLimits {
+                joins: 3,
+                joins_per: Duration::from_secs(30),
+                video_changes: 7,
+                video_changes_per: Duration::from_secs(21),
+                status_debounce: Duration::ZERO,
+            }
+        );
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn the_default_police_factor_is_the_policers_own() {
+        assert_eq!(default_police_factor(), hxd_voice::police::DEFAULT_FACTOR);
+    }
+
+    #[test]
+    fn a_police_factor_of_zero_or_at_least_one_is_accepted() {
+        for ok in ["0", "1", "1.0", "3"] {
+            let c = parse(&format!(
+                "[voice]\nadvertise = [\"198.51.100.9:5504\"]\npolice_factor = {ok}\n"
+            ))
+            .unwrap();
+            assert!(check_config(&c).is_ok(), "police_factor = {ok} was refused");
+        }
+    }
+
+    #[test]
+    fn a_voice_allowance_without_its_seconds_or_a_factor_under_one_is_refused() {
+        for bad in [
+            "joins = 3\njoin_seconds = 0\n",
+            "police_factor = -1\n",
+            "police_factor = 0.5\n",
+            "police_factor = nan\n",
+            "[voice.video]\nchanges = 3\nchange_seconds = 0\n",
+        ] {
+            let c = parse(&format!(
+                "[voice]\nadvertise = [\"198.51.100.9:5504\"]\n{bad}"
+            ))
+            .unwrap();
+            assert!(check_config(&c).is_err(), "{bad:?} was accepted");
+        }
     }
 
     #[test]

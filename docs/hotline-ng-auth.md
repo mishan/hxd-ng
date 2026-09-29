@@ -691,8 +691,12 @@ one profile and one switch.
   SHOULD be stored only as a hash, and MUST NOT be logged, as for session
   tokens (`hotline-ng.md` §9).
 - **Rate limits.** A server SHOULD limit the `challenge` and `auth`
-  endpoints per source address, as it limits login attempts. *Not
-  implemented in hxd-ng.*
+  endpoints per source address, as it limits login attempts. *hxd-ng:*
+  `challenge` per address (`[limits] challenges_per_minute`), answered
+  429 with `Retry-After`; `auth` through it, since each spends a
+  challenge; and the classic credentials of §5.4 and `/identity/link`
+  through the server's count of failed logins per address, which the
+  classic wire and the ng `login` share (`[limits] login_failures`).
 - **Bounded state.** Every table an unauthenticated caller can grow —
   outstanding challenges, unredeemed tokens, the key-on-file cache of
   §6.3 — MUST be bounded, whether or not rate limits exist (rationale §9).

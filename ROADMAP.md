@@ -383,7 +383,39 @@ fetch a derivative by, and the mhxd importer.
   metadata, HMAC nonces, acknowledgments and per-target tokens, and v3
   deregistration on graceful shutdown.
 - Rate limiting, flood protection, connection caps per IP, ban enforcement at
-  accept time.
+  accept time. Connection caps per address, a reconnect rate, and mhxd's
+  chat-line and spam-point flood limits are in, at its `nospam` defaults
+  (`[limits]`), with ng requests that stand for a classic transaction
+  (chat, messages, nick changes, the news writes) charged at its price.
+  So are failed logins, counted per address across both wires and
+  `/identity/auth`; on the ng port, connections per address and in all,
+  counted from accept, and per-address rates on `/identity/challenge`
+  and avatar fetches, with uploads refused before their bodies are read.
+  Every ng session is held to a weighted request limit, which a resume
+  does not refill, and every account to a news-post limit, both
+  answered `rate_limited` with `retry_after` (docs/hotline-ng.md §9).
+  Bans are durable: addresses, logins, identities and registrars, kept
+  in the database, placed by a kick-with-ban or `hxd ban`, and applied
+  on SIGHUP (docs/moderation.md §3.5). The ban list on the ng wire and
+  bans placed from the config are next.
+  What one account can store is bounded too: news holds a ceiling of
+  live articles and text and a share of it per author, refused rather
+  than evicted (docs/news.md §7.4); offline mail a per-sender daily
+  quota, which bounds storage and never a live message
+  (docs/private-messages.md §9); private chats a count per creator and
+  per server (`[limits]`). A post's 1.2 push reads the store once
+  however many classic clients hear it, and the report ration makes room
+  by forgetting its fullest buckets rather than everyone's.
+  Voice and video are bounded per session too (docs/voice.md §13): joins
+  and video changes are allowances, mute and pause flips are debounced,
+  inbound RTP is policed against each stream's ceiling, and trickled ICE
+  candidates are capped.
+  Avatars are an account's to set (`[extra] set_avatar`, not the
+  bootstrap guest's), rationed per owner and per guest address across
+  reconnects, decoded on a budget apart from chat's, and an identity's
+  ages out once it stops coming back; Get Icon List is rationed per
+  session; and a guest's media quotas are its address's rather than the
+  shared login's.
 - Fuzz the frame decoder (`cargo-fuzz` against the session layer's read
   path); a server's parser meets far more hostile input than a client's.
 

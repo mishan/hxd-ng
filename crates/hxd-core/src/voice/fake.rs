@@ -16,7 +16,7 @@ use std::sync::Mutex;
 
 use super::{IceCandidate, VoiceError, VoiceMedia};
 use crate::roster::Uid;
-use crate::video::{VideoKind, VideoStream};
+use crate::video::{PublishRefusal, VideoKind, VideoStream};
 
 /// One call the domain made into the media layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +88,7 @@ struct Inner {
     no_next_offer: bool,
     /// Make the next `publish` refuse, the way a real SFU does when the
     /// session is gone or its offer has no room left.
-    refuse_publish: bool,
+    refuse_publish: Option<PublishRefusal>,
     /// What a rejected answer is rejected with.
     answer_error: VoiceError,
 }
@@ -100,7 +100,7 @@ impl Default for Inner {
             generation: 0,
             reject_next_answer: false,
             no_next_offer: false,
-            refuse_publish: false,
+            refuse_publish: None,
             answer_error: VoiceError::BadAnswer,
         }
     }
@@ -147,9 +147,15 @@ impl RecordingMedia {
         self.inner.lock().unwrap().no_next_offer = true;
     }
 
-    /// Make the next [`VoiceMedia::publish`] refuse.
+    /// Make the next [`VoiceMedia::publish`] refuse, as a session that
+    /// is already gone would.
     pub fn refuse_next_publish(&self) {
-        self.inner.lock().unwrap().refuse_publish = true;
+        self.refuse_next_publish_with(PublishRefusal::Unavailable);
+    }
+
+    /// Make the next [`VoiceMedia::publish`] refuse for `why`.
+    pub fn refuse_next_publish_with(&self, why: PublishRefusal) {
+        self.inner.lock().unwrap().refuse_publish = Some(why);
     }
 }
 
@@ -220,14 +226,14 @@ impl VoiceMedia for RecordingMedia {
         "VP8"
     }
 
-    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> bool {
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> Result<(), PublishRefusal> {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push(MediaCall::Publish { uid, cid, kind });
         // The real SFU can refuse — its session may already have been
         // reaped, or its offer may have no room left for another section
         // — so the fake has to be able to as well, or the domain's
         // rollback path is only ever exercised in production.
-        !std::mem::take(&mut inner.refuse_publish)
+        inner.refuse_publish.take().map_or(Ok(()), Err)
     }
 
     fn unpublish(&self, uid: Uid, cid: u32, kind: VideoKind) {

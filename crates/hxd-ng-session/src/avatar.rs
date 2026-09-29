@@ -67,6 +67,15 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
     let Some(uid) = bearer_session(&req, ctx) else {
         return unauthorized();
     };
+    // The turn is asked about before the body is read, as `/media` asks
+    // (`crate::media::upload`), and spent by `set_avatar` after it.
+    if let Err(e) = ctx.core.avatar_change_admits(uid) {
+        if e == MediaReject::RateLimited {
+            hxd_core::instrument::throttled("upload");
+        }
+        crate::media::discard(req.into_body(), policy.limits.max_bytes);
+        return refused(e, &policy);
+    }
     let max = policy.limits.max_bytes;
     if req
         .headers()
@@ -88,17 +97,21 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
         Ok(Ok(avatar)) => json_resp(StatusCode::OK, json!({ "avatar": avatar_json(&avatar) })),
         Ok(Err(e)) => {
             debug!(target: "avatar", uid, code = e.code(), "upload refused");
-            let mut resp = reject(e);
-            // The allowance is the server's own interval, not media's.
-            if e == MediaReject::RateLimited {
-                let secs = policy.set_interval.as_secs().max(1).to_string();
-                resp.headers_mut()
-                    .insert(RETRY_AFTER, HeaderValue::from_str(&secs).unwrap());
-            }
-            resp
+            refused(e, &policy)
         }
         Err(_) => reject(MediaReject::Busy),
     }
+}
+
+fn refused(e: MediaReject, policy: &AvatarPolicy) -> Resp {
+    let mut resp = reject(e);
+    // The allowance is the server's own interval, not media's.
+    if e == MediaReject::RateLimited {
+        let secs = policy.set_interval.as_secs().max(1).to_string();
+        resp.headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_str(&secs).unwrap());
+    }
+    resp
 }
 
 /// `GET /avatars/{id}` — the canonical bytes, whole.

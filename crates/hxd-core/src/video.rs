@@ -204,6 +204,31 @@ pub enum VideoError {
     /// could not be seated, which is the same answer to a client either
     /// way — the room cannot take this right now.
     Full(VideoKind),
+    /// The session has spent its allowance of video changes
+    /// ([`crate::voice::VoiceLimits`]); `retry_after` is the whole
+    /// seconds until it has one again. A stop, a pause and a subscription
+    /// set that adds no live stream are never refused this way: turning
+    /// video off has to work every time.
+    RateLimited { retry_after: u64 },
+}
+
+/// Why the media layer could not seat a publication
+/// ([`crate::VoiceMedia::publish`]). The domain answers a client
+/// [`VideoError::Full`] either way; what differs is whether the start is
+/// charged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishRefusal {
+    /// The media layer has no session to seat it on — reaped, with the
+    /// failure that will tell the domain still in flight — or is out of
+    /// step with the domain. Nothing the client did, and a retry may
+    /// well find the session back, so the start is refunded.
+    Unavailable,
+    /// The peer's offer has no room left for another section. Sections
+    /// are never removed and mids never reassigned, so this holds for the
+    /// rest of the session, and every retry would be refused the same
+    /// way: the start is charged, so a client that keeps asking pays for
+    /// asking rather than looping on a refusal that costs it nothing.
+    OfferFull,
 }
 
 impl From<VoiceError> for VideoError {
@@ -215,6 +240,7 @@ impl From<VoiceError> for VideoError {
     fn from(e: VoiceError) -> VideoError {
         match e {
             VoiceError::Disabled => VideoError::Disabled,
+            VoiceError::RateLimited { retry_after } => VideoError::RateLimited { retry_after },
             _ => VideoError::NotInVoice,
         }
     }
@@ -298,6 +324,8 @@ impl RosterInner {
         if !self.voice.video_enabled {
             return;
         }
+        // Whatever pause flips were waiting are in the list about to go.
+        self.voice.settled(cid, true);
         let publications = self.video_publications(cid);
         let uids: Vec<Uid> = self
             .voice
@@ -441,18 +469,32 @@ impl Core {
         if r.video_slots_used(cid, kind) >= r.voice.video.limits(kind).max_per_room as usize {
             return Err(VideoError::Full(kind));
         }
+        // Charged once the start is one that may happen: the offers it
+        // sets off are what the allowance is for, and a start the media
+        // layer then refuses sets off none, so it is refunded below —
+        // unless the refusal is one every retry would meet too. A
+        // stop is free — every stop undoes a start that paid — and must
+        // be, since it is how a camera goes off.
+        if let Err(retry_after) = self.voice_spend(&mut r, uid, crate::voice::Spend::Video) {
+            return Err(VideoError::RateLimited { retry_after });
+        }
 
         if let Some(p) = r.voice.peer_mut(cid, uid) {
             p.video.publications.push((kind, false));
         }
-        if !media.publish(uid, cid, kind) {
-            // The media layer could not seat it — the session is gone, or
-            // its offer has no room left for another section. Give the
-            // slot back rather than announcing a publication that can
-            // never carry a frame and that only the publisher could ever
-            // clear.
+        if let Err(refusal) = media.publish(uid, cid, kind) {
+            // The media layer could not seat it. Give the slot back
+            // rather than announcing a publication that can never carry
+            // a frame and that only the publisher could ever clear.
             if let Some(p) = r.voice.peer_mut(cid, uid) {
                 p.video.publications.retain(|(k, _)| *k != kind);
+            }
+            // A session that is gone is refunded. An offer that is full
+            // is not: it stays full for the session's life, so a refund
+            // would make every retry free — a loop of lock time and SSRC
+            // allocations the allowance exists to bound.
+            if refusal == PublishRefusal::Unavailable {
+                self.voice_refund(&mut r, uid, crate::voice::Spend::Video);
             }
             return Err(VideoError::Full(kind));
         }
@@ -557,7 +599,10 @@ impl Core {
         // decoder cannot start mid-stream, so a resumed publication is
         // invisible until the next one.
         media.set_paused(uid, cid, kind, paused);
-        r.video_status(cid);
+        // Forwarding stops or starts now; the room is told once the
+        // debounce window closes, so a client mashing the camera button
+        // costs its room one status per window rather than one a press.
+        r.status_soon(cid, true);
         Ok(())
     }
 
@@ -612,14 +657,34 @@ impl Core {
                 break;
             }
         }
-        let changed = match r.voice.peer_mut(cid, uid) {
-            Some(p) if p.video.wanted != wanted => {
-                p.video.wanted = wanted;
-                true
-            }
-            _ => false,
-        };
+        let changed = r
+            .voice
+            .peer_mut(cid, uid)
+            .is_some_and(|p| p.video.wanted != wanted);
         if changed {
+            // Only a set that starts delivering something is charged: one
+            // that adds a publication the room has now, which is what
+            // costs a renegotiation toward a new receive section.
+            // Re-declaring the same set renegotiates nobody; narrowing it
+            // is the way out, and `[]` has to work every time, as a stop
+            // does; and a stream that is not published yet costs nothing
+            // until its publisher starts it, and that start is charged.
+            let live = r.video_publications(cid);
+            let adds = r.voice.peer_mut(cid, uid).is_some_and(|p| {
+                wanted.iter().any(|s| {
+                    !p.video.active.contains(s)
+                        && live.iter().any(|l| l.uid == s.uid && l.kind == s.kind)
+                })
+            });
+            if adds {
+                if let Err(retry_after) = self.voice_spend(&mut r, uid, crate::voice::Spend::Video)
+                {
+                    return Err(VideoError::RateLimited { retry_after });
+                }
+            }
+            if let Some(p) = r.voice.peer_mut(cid, uid) {
+                p.video.wanted = wanted;
+            }
             let dirty = r.video_resync(cid);
             r.voice_renegotiate_peers(cid, &dirty);
         }

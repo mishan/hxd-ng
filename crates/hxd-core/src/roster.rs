@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc::{self, error::TrySendError};
 
 use crate::access::{bit, AccessBits};
-use crate::chat::{Ban, PrivateChat};
+use crate::chat::PrivateChat;
 use crate::instrument::{self, TimedMutex};
 
 /// A user id, as seen on the wire (16-bit, never 0 for a real user).
@@ -314,6 +314,11 @@ pub enum Event {
         cid: u32,
         from: Uid,
         text: String,
+        /// Said in the action form (legacy: `\r *** text`) rather than
+        /// as a notice: mhxd's own chat-spamming notice is, and the
+        /// classic wire says it byte for byte. The ng wire does not
+        /// tell the two apart.
+        action: bool,
     },
     /// A chat (or, for cid 0, server) subject change.
     ChatSubject {
@@ -702,8 +707,21 @@ pub(crate) struct UserSession {
     /// sender of a stored message is recorded only when it is true.
     pub(crate) has_inbox: bool,
     pub(crate) attach_news: bool,
+    /// See [`AttachInfo::set_avatar`].
+    pub(crate) set_avatar: bool,
     /// See [`AttachInfo::moderate`].
     pub(crate) moderate: bool,
+    /// See [`AttachInfo::can_spam`].
+    pub(crate) can_spam: bool,
+    /// What this session has spent of its flood allowances.
+    pub(crate) flood: crate::limits::Flood,
+    /// And of its voice signaling allowances (`crate::voice`).
+    pub(crate) voice_flood: crate::voice::VoiceFlood,
+    /// What it has left of its ng request limit, or `None` when there is
+    /// no limit ([`Core::spend_request`]). The session's rather than a
+    /// connection's, as the flood allowances are, so a resume carries on
+    /// from where the dropped connection left it.
+    pub(crate) requests: Option<crate::RateBucket>,
     /// See [`AttachInfo::is_person`].
     pub(crate) is_person: bool,
     /// See [`AttachInfo::reads_on_delivery`].
@@ -747,9 +765,16 @@ pub struct AttachInfo {
     pub has_inbox: bool,
     /// May this session stage durable news attachments?
     pub attach_news: bool,
+    /// May this session set its owner's avatar? The account's `[extra]
+    /// set_avatar`, which defaults to a password or a linked identity.
+    pub set_avatar: bool,
     /// May this session moderate (`docs/moderation.md` §2)? The
     /// account's `[extra] moderate`, which defaults to the kick bit.
     pub moderate: bool,
+    /// Is this session held to no flood limit (`crate::limits`)? The
+    /// account's `[extra] can_spam`, mhxd's, which defaults to the kick
+    /// bit.
+    pub can_spam: bool,
     /// Is exactly one person behind this account? [`Account::is_person`]:
     /// what news records authorship against, independent of `has_inbox`.
     ///
@@ -810,7 +835,6 @@ pub(crate) struct RosterInner {
     last_serial: u64,
     pub(crate) public_subject: String,
     pub(crate) chats: HashMap<u32, PrivateChat>,
-    pub(crate) bans: Vec<Ban>,
     pub(crate) voice: crate::voice::VoiceState,
 }
 
@@ -979,6 +1003,16 @@ pub struct InboxPolicy {
     /// the legacy wire, where each private message opens a window; the
     /// remainder stays pending rather than being dropped.
     pub deliver_at_flush: usize,
+    /// Messages one sender may *store* in a rolling day, delivered or
+    /// waiting; 0 for no quota. `max_queued` bounds a mailbox's queue,
+    /// and retention keeps every row besides — a delivered one for a
+    /// week once read — so without this one account could fill the disk
+    /// at the rate the flood limit allows. Past it, mail that would have
+    /// to wait is refused; mail to someone attached still reaches them,
+    /// unstored (`docs/private-messages.md` §9).
+    pub max_sent_per_day: usize,
+    /// Body bytes, likewise; 0 for no quota.
+    pub max_sent_bytes_per_day: u64,
 }
 
 impl Default for InboxPolicy {
@@ -986,6 +1020,8 @@ impl Default for InboxPolicy {
         InboxPolicy {
             max_queued: 200,
             deliver_at_flush: 25,
+            max_sent_per_day: 1_000,
+            max_sent_bytes_per_day: 8 << 20,
         }
     }
 }
@@ -1019,6 +1055,30 @@ pub struct Core {
     pub(crate) queue_budget: Arc<crate::budget::QueueBudget>,
     /// Logins the server is working on at once ([`Core::admit_login`]).
     pub(crate) login_gate: LoginGate,
+    /// Connections each address holds ([`Core::admit_connection`]).
+    pub(crate) conn_gate: crate::limits::ConnGate,
+    /// Failed logins each address has made ([`Core::login_attempt`]).
+    pub(crate) login_failures: crate::limits::RateGate,
+    /// How fast one session may talk (`crate::limits`).
+    pub(crate) flood_limits: crate::limits::FloodLimits,
+    /// How many private chats may be open (`crate::limits`).
+    pub(crate) chat_limits: crate::limits::ChatLimits,
+    /// How fast one ng session may ask and one account post news
+    /// (`crate::limits`).
+    pub(crate) request_limits: crate::limits::RequestLimits,
+    /// What each account has left of its news posts. Its own lock, taken
+    /// with nothing else held.
+    pub(crate) post_rates: crate::limits::PostRates,
+    /// Every standing ban, for matching without the store
+    /// (`crate::ban`).
+    pub(crate) bans: std::sync::RwLock<crate::ban::BanMatcher>,
+    /// Ids for bans placed with no store to number them.
+    pub(crate) ban_ids: std::sync::atomic::AtomicU64,
+    /// Held by whatever changes the bans — a place, a lift, a reread —
+    /// across its store call and its matcher update, so none lands
+    /// between another's two halves. Taken before `bans`, never while
+    /// the roster lock is held.
+    pub(crate) ban_writes: Mutex<()>,
     /// The durable private-message inbox, or `None` — in which case
     /// private messaging behaves exactly as it did before the inbox
     /// existed, which is what a server that configures no database gets.
@@ -1085,6 +1145,10 @@ pub struct Core {
     pub(crate) news_codec: Option<Arc<dyn crate::media::MediaCodec>>,
     /// Serializes attachment filesystem and metadata transitions.
     pub(crate) news_blob_serial: Mutex<()>,
+    /// Holds a post's check against the news ceilings and its write
+    /// together, so two posts cannot both take the last place. Nothing
+    /// is taken under it but the news store's own lock.
+    pub(crate) news_post_serial: Mutex<()>,
     /// Makes persisted id order and live fan-out order the same fact.
     /// Nothing but public chat takes this lock; order is it first, then
     /// (briefly) `roster`.
@@ -1251,6 +1315,10 @@ impl Core {
     /// announced.
     pub fn admit_login(&self, addr: Option<IpAddr>) -> Option<LoginPermit> {
         let gate = &self.login_gate.0;
+        // An address exempt from `[limits]` has no share of its own to
+        // run out of: loopback, by default, where the tests, the load
+        // harness and an operator's tools log many in at once.
+        let addr = addr.filter(|ip| !self.conn_gate.exempt(*ip));
         let permit = (|| {
             let place = gate.places.clone().try_acquire_owned().ok()?;
             let Some(addr) = addr else {
@@ -1274,6 +1342,67 @@ impl Core {
             instrument::login_refused_busy();
         }
         permit
+    }
+
+    /// Hold connections from one address to `limits` rather than
+    /// [`crate::ConnLimits::default`].
+    pub fn with_conn_limits(mut self, limits: crate::ConnLimits) -> Self {
+        self.conn_gate = crate::limits::ConnGate::new(limits);
+        self
+    }
+
+    /// Hold sessions to `limits` rather than
+    /// [`crate::FloodLimits::default`].
+    pub fn with_flood_limits(mut self, limits: crate::FloodLimits) -> Self {
+        self.flood_limits = limits;
+        self
+    }
+
+    /// Hold private chats to `limits` rather than
+    /// [`crate::ChatLimits::default`].
+    pub fn with_chat_limits(mut self, limits: crate::ChatLimits) -> Self {
+        self.chat_limits = limits;
+        self
+    }
+
+    /// Hold ng sessions and news posts to `limits` rather than
+    /// [`crate::RequestLimits::default`].
+    pub fn with_request_limits(mut self, limits: crate::RequestLimits) -> Self {
+        self.request_limits = limits;
+        self
+    }
+
+    /// Spend `cost` of `uid`'s ng request limit
+    /// ([`crate::RequestLimits`]), or say how long until it could be; a
+    /// refusal spends nothing. The bucket is the session's, filled at
+    /// login and kept across a detach and resume, so a client cannot
+    /// buy a fresh one by dropping its socket. A session held to none
+    /// spends nothing: no limit is set, its account `can_spam` (held to
+    /// no request limit, as it is held to no flood limit), it is the
+    /// server account, or it has gone.
+    pub fn spend_request(&self, uid: Uid, cost: u32) -> Result<(), Duration> {
+        let mut r = self.roster.lock().unwrap();
+        let Some(sess) = r.users.get_mut(&uid) else {
+            return Ok(());
+        };
+        if sess.can_spam || sess.info.system {
+            return Ok(());
+        }
+        match sess.requests.as_mut() {
+            Some(bucket) => bucket.spend(cost, Instant::now()),
+            None => Ok(()),
+        }
+    }
+
+    /// A place for one connection from `addr`, held for as long as the
+    /// connection is open, or why there is none: the frontend closes the
+    /// connection unanswered (`crate::limits`). Asked once per
+    /// connection that can carry a session, with the client's address.
+    pub fn admit_connection(
+        &self,
+        addr: std::net::IpAddr,
+    ) -> Result<crate::ConnPermit, crate::ConnRefused> {
+        self.conn_gate.admit(addr)
     }
 
     /// The budget, for a frontend's queues to draw on too.
@@ -1386,7 +1515,16 @@ impl Core {
                 kicked: false,
                 has_inbox: info.has_inbox,
                 attach_news: info.attach_news,
+                set_avatar: info.set_avatar,
                 moderate: info.moderate,
+                can_spam: info.can_spam,
+                flood: Default::default(),
+                voice_flood: Default::default(),
+                requests: crate::RateBucket::new(
+                    self.request_limits.requests,
+                    self.request_limits.requests_per,
+                    Instant::now(),
+                ),
                 is_person: info.is_person,
                 reads_on_delivery: info.reads_on_delivery,
                 system: info.system,
@@ -1802,7 +1940,9 @@ pub(crate) fn test_attach(core: &Core, nick: &str, access: AccessBits) -> (Uid, 
             transport: Transport::default(),
             has_inbox: false,
             attach_news: false,
+            set_avatar: false,
             moderate: false,
+            can_spam: false,
             is_person: false,
             reads_on_delivery: false,
             identity: None,
@@ -1841,7 +1981,9 @@ mod tests {
                 transport: Transport::default(),
                 has_inbox: true,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
+                can_spam: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,
@@ -1920,7 +2062,9 @@ mod tests {
                 transport: Transport::default(),
                 has_inbox: false,
                 attach_news: false,
+                set_avatar: false,
                 moderate: false,
+                can_spam: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: None,
@@ -2216,6 +2360,20 @@ mod tests {
         assert!(core.admit_login(None).is_none(), "the gate is full");
         drop(a);
         assert!(core.admit_login(None).is_some(), "and a place came back");
+    }
+
+    #[test]
+    fn an_exempt_address_has_no_share_of_the_login_places_to_run_out_of() {
+        let core = Core::new().with_logins_in_flight(8);
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let held: Vec<_> = (0..8)
+            .map(|_| core.admit_login(Some(loopback)).expect("a place"))
+            .collect();
+        assert!(
+            core.admit_login(Some(loopback)).is_none(),
+            "the gate is full"
+        );
+        drop(held);
     }
 
     #[test]

@@ -110,32 +110,32 @@ gateway() {
         "0x$(echo "$hex" | cut -c3-4)" "0x$(echo "$hex" | cut -c1-2)"
 }
 
-# The addresses the ng port should believe X-Forwarded-For and
-# X-Hotline-Client-Cert from, with `gateway` standing for the container's
-# default gateway. Never by default: the gateway is where the host's
-# docker-proxy connects from on behalf of every client of a port
+# A list of addresses from the variable named $1 with value $2, written
+# as `$3 = [...]`, with `gateway` standing for the container's default
+# gateway. Never trusted or exempt by default: the gateway is where the
+# host's docker-proxy connects from on behalf of every client of a port
 # published on all addresses, and on the host network it is the router.
-trusted_proxies() {
+addresses() {
     out=
     old_ifs=$IFS
     IFS=,
-    for item in $1; do
+    for item in $2; do
         item=$(printf '%s' "$item" | tr -d '[:space:]')
         case $item in
             "" | none) continue ;;
             gateway)
                 item=$(gateway)
                 if [ -z "$item" ]; then
-                    echo "hxd-entrypoint: HXD_NG_TRUSTED_PROXIES: no default gateway to trust" >&2
+                    echo "hxd-entrypoint: $1: no default gateway" >&2
                     continue
                 fi
-                echo "hxd-entrypoint: trusting the gateway, $item, as a proxy" >&2
+                echo "hxd-entrypoint: $1: the gateway is $item" >&2
                 ;;
         esac
         out="${out:+$out,}$item"
     done
     IFS=$old_ifs
-    kvlist trusted_proxies "$out"
+    kvlist "$3" "$out"
 }
 
 # `key = [...]` of fingerprints from a variable, checked here so a typo is
@@ -172,6 +172,27 @@ generate() {
     num HXD_QUEUE_BUDGET_MB queue_budget_mb
     num HXD_LOGINS_IN_FLIGHT logins_in_flight
     echo
+    echo "[limits]"
+    num HXD_CONNECTIONS_PER_ADDR connections_per_addr
+    num HXD_RECONNECT_SECONDS reconnect_seconds
+    addresses HXD_LIMITS_EXEMPT "${HXD_LIMITS_EXEMPT-127.0.0.0/8,::1}" exempt
+    num HXD_CHAT_LINES chat_lines
+    num HXD_CHAT_SECONDS chat_seconds
+    num HXD_SPAM_POINTS spam_points
+    num HXD_SPAM_SECONDS spam_seconds
+    num HXD_PRIVATE_CHATS_PER_USER private_chats_per_user
+    num HXD_PRIVATE_CHATS private_chats
+    num HXD_NG_REQUESTS ng_requests
+    num HXD_NG_REQUEST_SECONDS ng_request_seconds
+    num HXD_NEWS_POSTS news_posts
+    num HXD_NEWS_POST_SECONDS news_post_seconds
+    num HXD_LOGIN_FAILURES login_failures
+    num HXD_LOGIN_FAILURE_SECONDS login_failure_seconds
+    num HXD_HTTP_CONNECTIONS_PER_ADDR http_connections_per_addr
+    num HXD_NG_CONNECTIONS ng_connections
+    num HXD_CHALLENGES_PER_MINUTE challenges_per_minute
+    num HXD_AVATAR_FETCHES_PER_MINUTE avatar_fetches_per_minute
+    echo
     echo "[paths]"
     echo "accounts = \"$DATA/accounts\""
     agreement=${HXD_AGREEMENT_FILE:-}
@@ -186,7 +207,7 @@ generate() {
         kv bind "${HXD_NG_BIND:-0.0.0.0:5700}"
         num HXD_NG_GRACE grace
         num HXD_NG_MAX_DETACHED_PER_ADDR max_detached_per_addr
-        trusted_proxies "${HXD_NG_TRUSTED_PROXIES-127.0.0.1,::1}"
+        addresses HXD_NG_TRUSTED_PROXIES "${HXD_NG_TRUSTED_PROXIES-127.0.0.1,::1}" trusted_proxies
         str HXD_NG_FORWARDED_HEADER forwarded_header
     fi
 
@@ -219,6 +240,8 @@ generate() {
         num HXD_INBOX_MAX_QUEUED max_queued
         num HXD_INBOX_RETAIN_UNREAD retain_unread
         num HXD_INBOX_RETAIN_READ retain_read
+        num HXD_INBOX_MAX_SENT_PER_DAY max_sent_per_day
+        num HXD_INBOX_MAX_SENT_BYTES_PER_DAY max_sent_bytes_per_day
         db=
     fi
     if on HXD_HISTORY on; then
@@ -235,6 +258,9 @@ generate() {
         [ -z "$db" ] || echo "db = $db"
         echo "blobs = \"$DATA/news-blobs\""
         num HXD_NEWS_RETAIN_DAYS retain_days
+        num HXD_NEWS_MAX_ARTICLES max_articles
+        num HXD_NEWS_MAX_TEXT_BYTES max_text_bytes
+        num HXD_NEWS_MAX_PER_AUTHOR max_per_author
         db=
     fi
     if on HXD_MEDIA on; then

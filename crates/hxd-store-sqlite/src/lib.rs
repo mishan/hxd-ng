@@ -23,6 +23,8 @@
 
 use hxd_core::instrument::TimedMutex;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hxd_core::history::{
@@ -30,7 +32,7 @@ use hxd_core::history::{
 };
 use hxd_core::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    Pushed, StoreError, StoredMessage,
+    Pushed, Sent, StoreError, StoredMessage,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
@@ -68,7 +70,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 12;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -386,6 +388,108 @@ CREATE TABLE avatar (
 CREATE INDEX avatar_id ON avatar (id);
 ";
 
+/// Bans (`docs/moderation.md` §7, `hxd_core::ban`): one row per ban,
+/// lifted rather than deleted, and at most one not yet lifted per
+/// target — a re-ban extends it. `target` is the kind's canonical bytes,
+/// an address as IPv6 with IPv4 mapped and `prefix_len` counted over
+/// that form; one column for every kind is what lets the unique index
+/// hold, where a nullable column per kind would count every NULL as
+/// distinct. The ban row is the state; the `moderation` row it names is
+/// the act that placed it.
+const SCHEMA_V10: &str = "
+CREATE TABLE ban (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind          INTEGER NOT NULL,
+  target        BLOB    NOT NULL,
+  prefix_len    INTEGER,
+  reason        TEXT    NOT NULL,
+  note          TEXT,
+  actor         TEXT    NOT NULL,
+  actor_fp      TEXT,
+  source        INTEGER NOT NULL,
+  created_at    INTEGER NOT NULL,
+  expires_at    INTEGER,
+  lifted_at     INTEGER,
+  lifted_by     TEXT,
+  moderation_id INTEGER,
+  CHECK (kind BETWEEN 1 AND 4),
+  CHECK ((kind = 1) = (prefix_len IS NOT NULL)),
+  CHECK (prefix_len IS NULL OR prefix_len BETWEEN 0 AND 128)
+);
+CREATE UNIQUE INDEX ban_standing
+  ON ban (kind, target, coalesce(prefix_len, -1))
+  WHERE lifted_at IS NULL;
+CREATE INDEX ban_expiry ON ban (expires_at)
+  WHERE lifted_at IS NULL AND expires_at IS NOT NULL;
+";
+
+/// Storage quotas. `news_usage` is what `[news] max_articles` and
+/// `max_text_bytes` are checked against (`docs/news.md` §7.4): the live
+/// articles and the UTF-8 bytes of their bodies and downgrades, kept by
+/// triggers so a post reads one row rather than summing the archive.
+/// Every write to `news_article` goes through them, the tombstone's
+/// clearing update included, so no code path can forget to. It starts
+/// from what is already there.
+///
+/// The two message indexes are the per-sender quota's
+/// (`docs/private-messages.md` §9): what one sender has stored in the
+/// last day, by the mailbox rule's two shapes of key, read as a range on
+/// `sent_at` rather than every row that sender has in retention.
+const SCHEMA_V11: &str = "
+CREATE TABLE news_usage (
+  id       INTEGER PRIMARY KEY CHECK (id = 1),
+  articles INTEGER NOT NULL,
+  bytes    INTEGER NOT NULL
+);
+INSERT INTO news_usage (id, articles, bytes)
+  SELECT 1, COUNT(*),
+         IFNULL(SUM(length(CAST(body AS BLOB)) + IFNULL(length(CAST(plain AS BLOB)), 0)), 0)
+    FROM news_article WHERE deleted_at IS NULL;
+CREATE TRIGGER news_usage_insert AFTER INSERT ON news_article
+  WHEN NEW.deleted_at IS NULL
+BEGIN
+  UPDATE news_usage
+     SET articles = articles + 1,
+         bytes = bytes + length(CAST(NEW.body AS BLOB))
+                       + IFNULL(length(CAST(NEW.plain AS BLOB)), 0)
+   WHERE id = 1;
+END;
+CREATE TRIGGER news_usage_delete AFTER DELETE ON news_article
+  WHEN OLD.deleted_at IS NULL
+BEGIN
+  UPDATE news_usage
+     SET articles = articles - 1,
+         bytes = bytes - length(CAST(OLD.body AS BLOB))
+                       - IFNULL(length(CAST(OLD.plain AS BLOB)), 0)
+   WHERE id = 1;
+END;
+CREATE TRIGGER news_usage_update AFTER UPDATE OF body, plain, deleted_at ON news_article
+BEGIN
+  UPDATE news_usage
+     SET articles = articles - (OLD.deleted_at IS NULL) + (NEW.deleted_at IS NULL),
+         bytes = bytes
+           - CASE WHEN OLD.deleted_at IS NULL THEN length(CAST(OLD.body AS BLOB))
+                   + IFNULL(length(CAST(OLD.plain AS BLOB)), 0) ELSE 0 END
+           + CASE WHEN NEW.deleted_at IS NULL THEN length(CAST(NEW.body AS BLOB))
+                   + IFNULL(length(CAST(NEW.plain AS BLOB)), 0) ELSE 0 END
+   WHERE id = 1;
+END;
+CREATE INDEX message_sent_fp ON message (sender_fp, sent_at)
+  WHERE sender_fp IS NOT NULL;
+CREATE INDEX message_sent_login ON message (sender, sent_at)
+  WHERE sender_fp IS NULL AND sender IS NOT NULL;
+";
+
+/// Avatar retention (`docs/avatars.md` §2): when each owner was last on
+/// the server, which is what ages out an identity's picture. A row that
+/// predates the column was last seen when it was set. The index leads
+/// with the owner's kind so the sweep reads identities' rows only.
+const SCHEMA_V12: &str = "
+ALTER TABLE avatar ADD COLUMN seen_at INTEGER NOT NULL DEFAULT 0;
+UPDATE avatar SET seen_at = set_at;
+CREATE INDEX avatar_identity_seen ON avatar (seen_at) WHERE owner LIKE 'i:%';
+";
+
 /// Moderation (`docs/moderation.md` §7, `docs/news.md` §11). Version 2
 /// reserved the audit trail, the reports and the block list; this is
 /// what filling them needed besides. An article is a target of both an
@@ -490,6 +594,14 @@ struct Checkpointer {
     /// thread.
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Rewinds done, for the tests: whether one ran is a fact the
+    /// checkpointer knows, where the log's size at any moment only
+    /// hints at it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    rewinds: Arc<AtomicU64>,
+    /// Rewinds tried and refused, and so backed off, for the same tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    refusals: Arc<AtomicU64>,
 }
 
 impl Drop for Checkpointer {
@@ -507,12 +619,16 @@ impl Checkpointer {
         // Only a rewind waits on anything, and it waits holding the write
         // lock: briefly, or not at all (`checkpoint`).
         conn.busy_timeout(REWIND_WAIT).map_err(StoreError::new)?;
+        let rewinds = Arc::new(AtomicU64::new(0));
+        let refusals = Arc::new(AtomicU64::new(0));
         let mut state = CheckpointState {
             db: path
                 .file_name()
                 .map_or_else(|| "db".into(), |n| n.to_string_lossy().into_owned()),
             rewind_pages,
             rewind_after: None,
+            rewinds: rewinds.clone(),
+            refusals: refusals.clone(),
         };
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
@@ -531,6 +647,8 @@ impl Checkpointer {
         Ok(Checkpointer {
             stop: Some(stop),
             thread: Some(thread),
+            rewinds,
+            refusals,
         })
     }
 }
@@ -542,6 +660,8 @@ struct CheckpointState {
     rewind_pages: i64,
     /// A rewind came back busy: not again before this.
     rewind_after: Option<std::time::Instant>,
+    rewinds: Arc<AtomicU64>,
+    refusals: Arc<AtomicU64>,
 }
 
 /// What one pass of the checkpointer did.
@@ -625,11 +745,13 @@ fn checkpoint(conn: &Connection, state: &mut CheckpointState) -> Pass {
     match wal("TRUNCATE") {
         Ok((false, ..)) => {
             state.rewind_after = None;
+            state.rewinds.fetch_add(1, Ordering::Relaxed);
             hxd_core::instrument::checkpoint(&state.db, "rewind", took, 0);
             Pass::Rewound
         }
         Ok((true, ..)) | Err(_) => {
             state.rewind_after = Some(std::time::Instant::now() + REWIND_BACKOFF);
+            state.refusals.fetch_add(1, Ordering::Relaxed);
             hxd_core::instrument::checkpoint_busy(&state.db);
             tracing::debug!("sqlite checkpoint: a reader kept the log from being rewound");
             Pass::RewindBusy
@@ -833,6 +955,22 @@ impl SqliteStore {
     pub fn in_memory() -> Result<Self, StoreError> {
         Self::open(":memory:", Synchronous::Normal)
     }
+
+    /// How many times the checkpointer has rewound the log.
+    #[cfg(test)]
+    fn rewinds(&self) -> u64 {
+        self._checkpointer
+            .as_ref()
+            .map_or(0, |c| c.rewinds.load(Ordering::Relaxed))
+    }
+
+    /// How many times a rewind the checkpointer tried came back busy.
+    #[cfg(test)]
+    fn rewind_refusals(&self) -> u64 {
+        self._checkpointer
+            .as_ref()
+            .map_or(0, |c| c.refusals.load(Ordering::Relaxed))
+    }
 }
 
 #[cfg(unix)]
@@ -944,6 +1082,15 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 9 {
         steps.push_str(SCHEMA_V9);
+    }
+    if version < 10 {
+        steps.push_str(SCHEMA_V10);
+    }
+    if version < 11 {
+        steps.push_str(SCHEMA_V11);
+    }
+    if version < 12 {
+        steps.push_str(SCHEMA_V12);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -1644,6 +1791,30 @@ impl MessageStore for SqliteStore {
         .map_err(StoreError::new)
     }
 
+    fn sent_since(&self, from: &Mailbox, since: SystemTime) -> Result<Sent, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // `message_sent_fp` or `message_sent_login`, by which shape of
+        // key the sender has: a range on `sent_at`, so what is read is
+        // the window's rows and not the sender's whole retention.
+        let sql = format!(
+            "SELECT COUNT(*), IFNULL(SUM(length(CAST(body AS BLOB))), 0) FROM message
+              WHERE {} AND {MAIL_ONLY} AND sent_at >= ?2",
+            mailbox_sql(from, "sender", 1)
+        );
+        let (messages, bytes): (i64, i64) = conn
+            .prepare_cached(&sql)
+            .and_then(|mut stmt| {
+                stmt.query_row(params![bind(from), unix(since)], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+            })
+            .map_err(StoreError::new)?;
+        Ok(Sent {
+            messages: messages.max(0) as usize,
+            bytes: bytes.max(0) as u64,
+        })
+    }
+
     fn is_blocked(&self, owner: &Mailbox, other: &Mailbox) -> Result<bool, StoreError> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
@@ -2023,23 +2194,46 @@ mod tests {
     /// The log is rewound while commits keep coming: a PASSIVE checkpoint
     /// alone never leaves it rewindable under a steady stream of them, and
     /// it grew for as long as the stream lasted.
+    ///
+    /// Asked of the checkpointer rather than of the log's size: a size
+    /// sampled at one moment says nothing of whether a rewind ran just
+    /// before it or is about to, and a slow machine, whose commits are
+    /// fewer and whose rewinds can be refused and backed off, moved every
+    /// moment the test could sample. The stream goes on until the log has
+    /// been rewound twice — so the second came while the stream continued
+    /// past the first — however long the machine takes to get there.
+    ///
+    /// Rewinds refused along the way are counted and reported, but not
+    /// held to a ratio with the ones that went through: what makes one
+    /// busy is the machine's load, the very thing this test was made to
+    /// stop depending on. What is asserted of them is what the design
+    /// promises whatever the load — each is followed by `REWIND_BACKOFF`
+    /// without another, so a checkpointer that stopped backing off, and
+    /// so held the write lock over and over, fails here.
     #[test]
     fn the_wal_is_rewound_while_writes_keep_coming() {
         use hxd_core::history::{ChatLog, NewLine};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.db");
-        let wal = dir.path().join("server.db-wal");
         let rewind = 256;
+        // Before the checkpointer starts, so no refusal predates it.
+        let started = std::time::Instant::now();
         let store =
             SqliteStore::open_inner(&path, Synchronous::Normal, false, Checkpoints::Own(rewind))
                 .unwrap();
         let text = "x".repeat(64);
-        let size = || std::fs::metadata(&wal).map_or(0, |m| m.len());
-        let began = std::time::Instant::now();
-        let mut early = None;
+        // Long enough for a refused rewind's backoff, and more, on the
+        // slowest runner; a healthy one is done in a few seconds.
+        let deadline = std::time::Instant::now() + 6 * REWIND_BACKOFF;
         // A commit a millisecond, about what a busy room makes, so every
         // checkpoint has some arriving while it runs.
-        while began.elapsed() < 9 * CHECKPOINT_EVERY / 2 {
+        while store.rewinds() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the log was rewound {} times while writes kept coming, and refused {} times",
+                store.rewinds(),
+                store.rewind_refusals()
+            );
             store
                 .append(&NewLine {
                     channel: 0,
@@ -2053,16 +2247,17 @@ mod tests {
                 })
                 .unwrap();
             std::thread::sleep(Duration::from_millis(1));
-            if early.is_none() && began.elapsed() >= 2 * CHECKPOINT_EVERY {
-                early = Some(size());
-            }
         }
-        let (early, late) = (early.unwrap(), size());
-        // Rewound, the log is reused from its start and its file stops
-        // growing; without the rewind it holds every page since the start.
+        let (rewinds, refusals) = (store.rewinds(), store.rewind_refusals());
+        let took = started.elapsed();
+        eprintln!("rewound {rewinds} times and refused {refusals} in {took:?}");
+        // The first refusal can come at once; each after it only once
+        // the backoff since the one before has run out.
+        let most = (took.as_secs_f64() / REWIND_BACKOFF.as_secs_f64()).floor() as u64 + 1;
         assert!(
-            late < early * 2,
-            "the log kept growing: {early} then {late} bytes"
+            refusals <= most,
+            "{refusals} rewinds refused in {took:?}, more than one per {REWIND_BACKOFF:?} \
+             ({rewinds} went through)"
         );
     }
 
@@ -2145,6 +2340,8 @@ mod tests {
             db: "server.db".into(),
             rewind_pages: 0,
             rewind_after: None,
+            rewinds: Default::default(),
+            refusals: Default::default(),
         };
         assert_eq!(checkpoint(&conn, &mut state), Pass::Collided);
         assert_eq!(state.rewind_after, None);
@@ -2812,6 +3009,46 @@ mod tests {
     }
 
     #[test]
+    fn version_ten_migrates_into_news_usage_counting_what_is_there() {
+        use hxd_core::news::{NewsStore, NewsUsage};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            // A live article with a downgrade, its body two characters
+            // and three bytes, and a tombstone, which holds nothing.
+            conn.execute_batch(
+                "INSERT INTO news_node (id, kind, name, guid, created_at)
+                   VALUES (1, 1, 'General', x'00', 1);
+                 INSERT INTO news_article
+                   (category, root, path, depth, nick, login, subject, body, plain, at)
+                   VALUES (1, 1, x'00000001', 0, 'Alice', 'alice', 's', char(104, 233),
+                           'plain', 1);
+                 INSERT INTO news_article
+                   (category, root, path, depth, nick, subject, body, at, deleted_at)
+                   VALUES (1, 2, x'00000002', 0, '', '', '', 2, 3);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 10).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        assert_eq!(
+            store.usage().unwrap(),
+            NewsUsage {
+                articles: 1,
+                bytes: 3 + 5,
+            }
+        );
+        assert_eq!(store.written_by(Some(&Mailbox::login("alice"))).unwrap(), 1);
+    }
+
+    #[test]
     fn version_seven_migrates_into_a_moderation_store() {
         use hxd_core::moderation::{ModerationStore, ReportFilter};
         let dir = tempfile::tempdir().unwrap();
@@ -2838,6 +3075,52 @@ mod tests {
             .unwrap()
             .is_empty());
         let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_eleven_migrates_its_avatars_as_last_seen_when_set() {
+        use hxd_core::avatar::{AvatarOwner, AvatarStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            for (owner, set_at) in [("i:01", 1_000), ("i:02", 5_000), ("a:alice", 1_000)] {
+                conn.execute(
+                    "INSERT INTO avatar (owner, id, mime, width, height, bytes, set_at)
+                     VALUES (?1, ?2, 'image/png', 8, 8, x'00', ?3)",
+                    params![owner, [owner.len() as u8; 32].as_slice(), set_at],
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 11).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        // Only the identity set before the cutoff goes; the account set
+        // just as long ago stays.
+        assert_eq!(store.prune_identities(from_unix(2_000)).unwrap(), 1);
+        assert!(store
+            .load(&AvatarOwner::Account("alice".into()))
+            .unwrap()
+            .is_some());
+        let conn = Connection::open(&path).unwrap();
+        let left: Vec<String> = conn
+            .prepare("SELECT owner FROM avatar ORDER BY owner")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, ["a:alice", "i:02"]);
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();

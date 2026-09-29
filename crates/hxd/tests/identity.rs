@@ -65,6 +65,7 @@ async fn start_server_forwarded(dir: &Path, proxies: &[&str]) -> (SocketAddr, So
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -83,6 +84,7 @@ async fn start_server_with_inbox(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) 
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -96,6 +98,7 @@ async fn start_server_without_mailbox(dir: &Path) -> (SocketAddr, SocketAddr, Ng
         &[],
         false,
         hxd_ng_session::ForwardedHeader::default(),
+        None,
         None,
         None,
         None,
@@ -118,6 +121,7 @@ async fn start_server_with_web_client(dir: &Path) -> (SocketAddr, SocketAddr, Ng
         Some("http://{ng}/app/"),
         None,
         None,
+        None,
     )
     .await
 }
@@ -136,6 +140,7 @@ async fn start_server_with_small_mailbox(
         false,
         hxd_ng_session::ForwardedHeader::default(),
         Some(cfg),
+        None,
         None,
         None,
         None,
@@ -160,6 +165,7 @@ async fn start_server_full(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -176,6 +182,7 @@ async fn start_server_inner(
     web_client: Option<&str>,
     devices: Option<Arc<hxd_core::push::MemoryDevices>>,
     banner: Option<Arc<hxd_session::Banner>>,
+    login_limits: Option<hxd_core::LoginLimits>,
 ) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -206,6 +213,19 @@ async fn start_server_inner(
     };
     let core = match &devices {
         Some(devices) => core.with_devices(devices.clone()),
+        None => core,
+    };
+    // Failed logins are counted by address, and loopback is exempt from
+    // that by default — so a case that counts them takes loopback off
+    // the list, and holds it to nothing else.
+    let core = match login_limits {
+        Some(l) => core
+            .with_conn_limits(hxd_core::ConnLimits {
+                per_addr: 0,
+                reconnect: Duration::ZERO,
+                exempt: hxd_core::AddrSet::default(),
+            })
+            .with_login_limits(l),
         None => core,
     };
     let core = Arc::new(core);
@@ -257,6 +277,7 @@ async fn start_server_inner(
             trusted_proxies: hxd_ng_session::TrustedProxies::parse(proxies).unwrap(),
             forwarded_header,
             web_client,
+            ..Default::default()
         }),
         registry: Arc::new(Registry::new()),
         identity: Some(Arc::new(identity)),
@@ -758,6 +779,50 @@ impl Tunnel {
     }
 }
 
+/// A classic login through `/trtp` as `p`: the session, or the text of
+/// the error reply that refused it.
+async fn tunnel_login(
+    ng: SocketAddr,
+    p: &Person,
+    login: &[u8],
+    password: &[u8],
+) -> Result<Tunnel, String> {
+    let token = authenticate(ng, p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut req = format!("ws://{ng}/trtp").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let mut t = Tunnel::new(ws);
+    t.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
+    t.read_exact(8).await;
+    let xor: Vec<u8> = password.iter().map(|b| b ^ 0xff).collect();
+    let xlogin: Vec<u8> = login.iter().map(|b| b ^ 0xff).collect();
+    t.send(
+        REQ_LOGIN,
+        &[
+            (tag::LOGIN, xlogin),
+            (tag::PASSWORD, xor),
+            (tag::NAME, b"n".to_vec()),
+            (tag::VERSION, 150u16.to_be_bytes().to_vec()),
+        ],
+    )
+    .await;
+    let reply = t.recv_type(HDR_TASK).await;
+    if reply.flag != 0 {
+        let text = reply
+            .chunks()
+            .find(|c| c.tag == tag::TASK_ERROR)
+            .map(|c| String::from_utf8_lossy(c.data).into_owned())
+            .unwrap_or_default();
+        return Err(text);
+    }
+    t.recv_type(HDR_SELFINFO).await;
+    Ok(t)
+}
+
 #[tokio::test]
 async fn trtp_tunnel_gives_a_legacy_client_an_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -1032,47 +1097,127 @@ async fn new_accounts_create_writes_an_account_file() {
     assert_eq!(authenticate(ng, &p).await["outcome"], "linked");
 }
 
+/// A banned person is refused before anything is written for them: no
+/// account is created for a banned identity or one whose registrar is
+/// banned, and a banned account gains no identity through the tunnel.
+#[tokio::test]
+async fn a_banned_person_is_neither_given_an_account_nor_linked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = IdentityConfig {
+        new_accounts: hxd_ng_session::NewAccounts::Create,
+        ..Default::default()
+    };
+    let reg = ServerKey::from_seed(&[0x33; 32]);
+    cfg.registrar_keys.insert("hl.example".into(), reg.public());
+    let (_legacy, ng, ctx) =
+        start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+    let attested = |seed: u8, handle: &str| {
+        let mut p = person(seed, handle);
+        let att = hl_identity::Attestation {
+            identity: p.id.public(),
+            registrar: "hl.example".into(),
+            registrar_key: reg.public(),
+            handle: handle.into(),
+            registered: now() - 86_400,
+            issued: now() - 5,
+            expires: now() + 86_400,
+            level: None,
+        };
+        p.card = Card::new(&p.id, handle, now())
+            .sign(&p.id, vec![att.signed_value(&reg)])
+            .unwrap();
+        p
+    };
+    let ban = |target| {
+        ctx.core
+            .place_ban(
+                hxd_core::Actor::Operator,
+                hxd_core::ban::NewBan {
+                    target,
+                    reason: "flood".into(),
+                    note: None,
+                    expires_at: None,
+                    source: hxd_core::ban::BanSource::Cli,
+                },
+            )
+            .unwrap()
+    };
+    let accounts = || {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("accounts"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = accounts();
+
+    let carol = attested(20, "carol");
+    ban(hxd_core::ban::BanTarget::Identity(carol.id.fingerprint().0));
+    let r = try_authenticate(ng, &carol, json!({})).await;
+    assert_eq!((r.status, &r.json()["error"]), (403, &json!("banned")));
+    let r = try_authenticate(ng, &carol, json!({ "login": "alice", "password": "pw" })).await;
+    assert_eq!(r.status, 403, "nor linked by the credentials it brings");
+
+    ban(hxd_core::ban::BanTarget::registrar("hl.example").unwrap());
+    let r = try_authenticate(ng, &attested(21, "dave"), json!({})).await;
+    assert_eq!((r.status, &r.json()["error"]), (403, &json!("banned")));
+    assert_eq!(accounts(), before, "no account was created");
+
+    // A banned account gains no identity: not by the credentials an
+    // identity no ban names brings to /identity/auth, nor by
+    // /identity/link once that identity holds a token.
+    ban(hxd_core::ban::BanTarget::login("alice").unwrap());
+    let alice_linked = || {
+        std::fs::read_to_string(dir.path().join("accounts/alice.toml"))
+            .unwrap()
+            .contains("fingerprint")
+    };
+    let frank = person(23, "Frank");
+    let r = try_authenticate(ng, &frank, json!({ "login": "alice", "password": "pw" })).await;
+    assert_eq!((r.status, &r.json()["error"]), (403, &json!("banned")));
+    assert!(!alice_linked());
+    let token = authenticate(ng, &frank).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let r = http(
+        ng,
+        "POST",
+        "/identity/link",
+        &[("Authorization", &format!("Bearer {token}"))],
+        json!({ "login": "alice", "password": "pw" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!((r.status, &r.json()["error"]), (403, &json!("banned")));
+    assert!(!alice_linked());
+
+    // Nor through the tunnel with its password: refused with the ban's
+    // reason.
+    let erin = person(22, "Erin");
+    assert_eq!(
+        tunnel_login(ng, &erin, b"alice", b"pw")
+            .await
+            .err()
+            .as_deref(),
+        Some("You are banned from this server: flood"),
+    );
+    let file = std::fs::read_to_string(dir.path().join("accounts/alice.toml")).unwrap();
+    assert!(!file.contains("fingerprint"), "{file}");
+    assert!(
+        ctx.core
+            .person_banned(None, Some(&erin.id.fingerprint().0), None)
+            .is_none(),
+        "the identity itself was never banned: only the link was refused"
+    );
+}
+
 #[tokio::test]
 async fn tunnelled_classic_login_links_under_verify_and_refuses_strangers() {
     let dir = tempfile::tempdir().unwrap();
     let (_legacy, ng, _ctx) = start_server(dir.path()).await;
-
-    async fn tunnel_login(
-        ng: SocketAddr,
-        p: &Person,
-        login: &[u8],
-        password: &[u8],
-    ) -> Option<Tunnel> {
-        let token = authenticate(ng, p).await["token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let mut req = format!("ws://{ng}/trtp").into_client_request().unwrap();
-        req.headers_mut()
-            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
-        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-        let mut t = Tunnel::new(ws);
-        t.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
-        t.read_exact(8).await;
-        let xor: Vec<u8> = password.iter().map(|b| b ^ 0xff).collect();
-        let xlogin: Vec<u8> = login.iter().map(|b| b ^ 0xff).collect();
-        t.send(
-            REQ_LOGIN,
-            &[
-                (tag::LOGIN, xlogin),
-                (tag::PASSWORD, xor),
-                (tag::NAME, b"n".to_vec()),
-                (tag::VERSION, 150u16.to_be_bytes().to_vec()),
-            ],
-        )
-        .await;
-        let reply = t.recv_type(HDR_TASK).await;
-        if reply.flag != 0 {
-            return None; // error reply
-        }
-        t.recv_type(HDR_SELFINFO).await;
-        Some(t)
-    }
 
     // A tunnelled classic login with the password links the account.
     let p = person(8, "Bob");
@@ -1090,7 +1235,7 @@ async fn tunnelled_classic_login_links_under_verify_and_refuses_strangers() {
     // is refused: verify mode never lets an identity borrow someone
     // else's account.
     let q = person(9, "Stranger");
-    assert!(tunnel_login(ng, &q, b"bob", b"s3cret").await.is_none());
+    assert!(tunnel_login(ng, &q, b"bob", b"s3cret").await.is_err());
 
     // The owner logging in as guest through the tunnel lands on the
     // linked account (admin bit shows on the roster).
@@ -1120,7 +1265,155 @@ async fn tunnelled_classic_login_links_under_verify_and_refuses_strangers() {
         .expect("a linked identity's guest login survives guests being off");
     drop(t);
     // An identity with no link still doesn't get in that way.
-    assert!(tunnel_login(ng, &q, b"", b"").await.is_none());
+    assert!(tunnel_login(ng, &q, b"", b"").await.is_err());
+}
+
+#[tokio::test]
+async fn a_tunnelled_login_refused_by_identity_policy_is_not_a_failed_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_inner(
+        dir.path(),
+        Default::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        None,
+        None,
+        None,
+        Some(hxd_core::LoginLimits {
+            failures: 2,
+            every: Duration::from_secs(600),
+        }),
+    )
+    .await;
+    let owner = person(8, "Bob");
+    let stranger = person(9, "Stranger");
+    drop(
+        tunnel_login(ng, &owner, b"bob", b"s3cret")
+            .await
+            .expect("the owner links the account"),
+    );
+
+    // The right password each time, refused because this identity may
+    // not have the account: one linked to someone else, and one that
+    // refuses self-linking. The client hears what a wrong password gets,
+    // but nothing was guessed, and as many again as the address may
+    // fail leave it free to log in.
+    for _ in 0..3 {
+        let refused = tunnel_login(ng, &stranger, b"bob", b"s3cret").await.err();
+        assert_eq!(refused.as_deref(), Some("Login failed."));
+        let refused = tunnel_login(ng, &stranger, b"locked", b"pw").await.err();
+        assert_eq!(refused.as_deref(), Some("Login failed."));
+    }
+    drop(
+        tunnel_login(ng, &owner, b"bob", b"s3cret")
+            .await
+            .expect("policy refusals did not lock the address out"),
+    );
+
+    // A wrong password through the same tunnel is a guess, and counts:
+    // past the limit even the right one is refused unchecked.
+    for _ in 0..2 {
+        let refused = tunnel_login(ng, &owner, b"bob", b"wrong").await.err();
+        assert_eq!(refused.as_deref(), Some("Login failed."));
+    }
+    let refused = tunnel_login(ng, &owner, b"bob", b"s3cret")
+        .await
+        .err()
+        .expect("locked out after wrong passwords");
+    assert!(refused.starts_with("Too many failed logins."), "{refused}");
+}
+
+#[tokio::test]
+async fn a_linked_identitys_guest_login_with_a_password_is_not_a_failed_login() {
+    // With guests off, a tunnelled login naming the guest account names
+    // no account, and the linked identity is what admits it. It checked
+    // a password against nothing and went on to succeed: a login that
+    // succeeds is not a failure, however many times it is made.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_inner(
+        dir.path(),
+        Default::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        None,
+        None,
+        None,
+        Some(hxd_core::LoginLimits {
+            failures: 2,
+            every: Duration::from_secs(600),
+        }),
+    )
+    .await;
+    let owner = person(14, "Bob");
+    drop(
+        tunnel_login(ng, &owner, b"bob", b"s3cret")
+            .await
+            .expect("the owner links the account"),
+    );
+    std::fs::remove_file(dir.path().join("accounts/guest.toml")).unwrap();
+    for _ in 0..3 {
+        drop(
+            tunnel_login(ng, &owner, b"guest", b"typed anyway")
+                .await
+                .expect("the linked identity admits a guest-named login"),
+        );
+    }
+    drop(
+        tunnel_login(ng, &owner, b"bob", b"s3cret")
+            .await
+            .expect("the guest-named logins did not lock the address out"),
+    );
+}
+
+#[tokio::test]
+async fn an_identity_trust_admits_is_not_held_to_the_failed_login_count() {
+    // `trtp_login = trust` admits a linked identity without reading the
+    // password it sent: no password is checked, so an address that has
+    // guessed wrong as often as it may does not refuse it (hotline-ng.md
+    // §9).
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_inner(
+        dir.path(),
+        Default::default(),
+        hxd_session::TrtpLogin::Trust,
+        &[],
+        false,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        None,
+        None,
+        None,
+        Some(hxd_core::LoginLimits {
+            failures: 1,
+            every: Duration::from_secs(600),
+        }),
+    )
+    .await;
+    let owner = person(12, "Bob");
+    let stranger = person(13, "Stranger");
+    drop(
+        tunnel_login(ng, &owner, b"bob", b"s3cret")
+            .await
+            .expect("the owner links the account"),
+    );
+    let refused = tunnel_login(ng, &stranger, b"alice", b"wrong").await.err();
+    assert_eq!(refused.as_deref(), Some("Login failed."));
+    let refused = tunnel_login(ng, &stranger, b"alice", b"pw")
+        .await
+        .err()
+        .expect("the address is locked out");
+    assert!(refused.starts_with("Too many failed logins."), "{refused}");
+    drop(
+        tunnel_login(ng, &owner, b"bob", b"anything")
+            .await
+            .expect("trust reads no password, so the lockout does not apply"),
+    );
 }
 
 #[tokio::test]
@@ -1511,6 +1804,133 @@ async fn a_token_survives_an_upgrade_the_server_refuses_to_parse() {
         ok["self"]["identity"]["fingerprint"],
         p.id.fingerprint().to_string()
     );
+}
+
+#[tokio::test]
+async fn a_token_survives_an_upgrade_refused_for_its_addresss_limit() {
+    // The address's connection count is asked before the token is
+    // redeemed, so a client refused 429 keeps the token to retry with
+    // rather than running the challenge dance again.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) =
+        start_server_with_proxies(dir.path(), IdentityConfig::default(), &["127.0.0.1"]).await;
+    // A forwarded address, since loopback is exempt from `[limits]`.
+    async fn from(ng: SocketAddr, query: &str) -> Result<Ws, u16> {
+        let mut req = format!("ws://{ng}/ng{query}")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("X-Forwarded-For", "203.0.113.50".parse().unwrap());
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+            Err(e) => panic!("ng: {e}"),
+        }
+    }
+    let mut held = Vec::new();
+    for _ in 0..hxd_core::limits::CONNECTIONS_PER_ADDR {
+        held.push(from(ng, "").await.expect("within the limit"));
+    }
+    let p = person(26, "Patient");
+    let token = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let query = format!("?token={token}");
+    assert_eq!(from(ng, &query).await.err(), Some(429));
+    // A place freed, and the next new connection earned: the same token
+    // is still good.
+    held.pop();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let ws = loop {
+        match from(ng, &query).await {
+            Ok(ws) => break ws,
+            Err(429) => {
+                assert!(tokio::time::Instant::now() < deadline, "never admitted");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(status) => panic!("refused {status}: the token was spent"),
+        }
+    };
+    let mut c = Ng::from_ws(ws).await;
+    let ok = c.request("login", json!({ "nick": "p" })).await;
+    assert_eq!(
+        ok["ok"]["self"]["identity"]["fingerprint"],
+        p.id.fingerprint().to_string(),
+        "{ok}"
+    );
+}
+
+#[tokio::test]
+async fn a_tunnel_refused_for_its_addresss_limit_keeps_its_token_and_counts_once() {
+    // `/trtp` carries a session, so it counts against its address like
+    // `/ng`, and is asked at the same point: before the token is spent,
+    // answered 429 rather than a socket that opens and closes. The place
+    // taken at the upgrade is the one the tunnelled session holds; asked
+    // for a second inside, a tunnel arriving at an address's last place
+    // would be refused after its upgrade succeeded.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) =
+        start_server_with_proxies(dir.path(), IdentityConfig::default(), &["127.0.0.1"]).await;
+    // A forwarded address, since loopback is exempt from `[limits]`.
+    async fn from(ng: SocketAddr, path: &str) -> Result<Ws, u16> {
+        let mut req = format!("ws://{ng}{path}").into_client_request().unwrap();
+        req.headers_mut()
+            .insert("X-Forwarded-For", "203.0.113.51".parse().unwrap());
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+            Err(e) => panic!("{path}: {e}"),
+        }
+    }
+    let mut held = Vec::new();
+    for _ in 0..hxd_core::limits::CONNECTIONS_PER_ADDR {
+        held.push(from(ng, "/ng").await.expect("within the limit"));
+    }
+    let p = person(27, "Tunnelling");
+    let token = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let path = format!("/trtp?token={token}");
+    assert_eq!(from(ng, &path).await.err(), Some(429));
+    // One place freed, and the next new connection earned: the tunnel
+    // takes the address's last place with the same token.
+    held.pop();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let ws = loop {
+        match from(ng, &path).await {
+            Ok(ws) => break ws,
+            Err(429) => {
+                assert!(tokio::time::Instant::now() < deadline, "never admitted");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(status) => panic!("refused {status}: the token was spent"),
+        }
+    };
+    // And the classic session inside it runs in that place rather than
+    // being refused for a second one.
+    let mut t = Tunnel::new(ws);
+    t.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
+    let hello = t.read_exact(8).await;
+    assert_eq!(&hello[..4], b"TRTP");
+    t.send(
+        REQ_LOGIN,
+        &[
+            (tag::NAME, b"Tunnelling".to_vec()),
+            (tag::VERSION, 150u16.to_be_bytes().to_vec()),
+        ],
+    )
+    .await;
+    t.recv_type(HDR_TASK).await;
+    t.recv_type(HDR_SELFINFO).await;
+    // Every place is held again, the tunnel's among them. The tunnel
+    // spent the address's last new connection, so a probe now would be
+    // refused as too fast whether or not the tunnel holds a place; one
+    // made after the address has earned another is refused only because
+    // every place is taken.
+    tokio::time::sleep(hxd_core::limits::RECONNECT_EVERY + Duration::from_millis(250)).await;
+    assert_eq!(from(ng, "/ng").await.err(), Some(429));
 }
 
 #[tokio::test]
@@ -2343,6 +2763,28 @@ async fn a_client_behind_a_proxy_does_not_choose_its_own_address() {
         let (ws, _) = tokio_tungstenite::connect_async(req).await.ok()?;
         Some(Ng::from_ws(ws).await)
     }
+    /// A `/ng` socket that must be admitted: one refused 429 for its
+    /// address's reconnect rate (`[limits]`) waits for the next
+    /// connection it earns, so this test does not depend on how many
+    /// the default burst allows.
+    async fn admitted(ng: SocketAddr, xff: &str) -> Ng {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+            req.headers_mut()
+                .insert("X-Forwarded-For", xff.parse().unwrap());
+            match tokio_tungstenite::connect_async(req).await {
+                Ok((ws, _)) => return Ng::from_ws(ws).await,
+                Err(tokio_tungstenite::tungstenite::Error::Http(r))
+                    if r.status().as_u16() == 429 =>
+                {
+                    assert!(tokio::time::Instant::now() < deadline, "never admitted");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("{xff}: refused: {e}"),
+            }
+        }
+    }
     async fn login(c: &mut Ng) -> Value {
         let ok = c
             .request(
@@ -2384,12 +2826,11 @@ async fn a_client_behind_a_proxy_does_not_choose_its_own_address() {
     drop(c);
 
     // The per-address detach cap counts the same address, however many
-    // different values the client writes ahead of it.
+    // different values the client writes ahead of it. Every connection
+    // here is one address's, so each is closed before the next opens.
     let mut parked = Vec::new();
     for i in 0..3 {
-        let mut c = as_addr(ng, &format!("203.0.113.{i}, 198.51.100.9, 10.0.0.7"))
-            .await
-            .expect("not banned");
+        let mut c = admitted(ng, &format!("203.0.113.{i}, 198.51.100.9, 10.0.0.7")).await;
         let ok = login(&mut c).await;
         parked.push((
             ok["session"].as_str().unwrap().to_owned(),
@@ -2401,9 +2842,7 @@ async fn a_client_behind_a_proxy_does_not_choose_its_own_address() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let (session, token) = parked[0].clone();
-    let mut c = as_addr(ng, "198.51.100.9, 10.0.0.7")
-        .await
-        .expect("not banned");
+    let mut c = admitted(ng, "198.51.100.9, 10.0.0.7").await;
     let reply = c
         .request(
             "resume",
@@ -2414,11 +2853,10 @@ async fn a_client_behind_a_proxy_does_not_choose_its_own_address() {
         reply.get("error").is_some(),
         "max_detached_per_addr = 2 must have ended the oldest: {reply}"
     );
+    drop(c);
     // The newest two are still there.
     let (session, token) = parked[2].clone();
-    let mut c = as_addr(ng, "198.51.100.9, 10.0.0.7")
-        .await
-        .expect("not banned");
+    let mut c = admitted(ng, "198.51.100.9, 10.0.0.7").await;
     let reply = c
         .request(
             "resume",
@@ -4282,6 +4720,7 @@ async fn a_web_client_the_server_names_off_its_own_origin_gets_no_qr_code() {
         Some("https://evil.test/app/"),
         None,
         None,
+        None,
     )
     .await;
     let hlid = hlid_binary();
@@ -4354,6 +4793,7 @@ async fn start_server_with_push(dir: &Path) -> (SocketAddr, Arc<hxd_core::push::
         Some(Default::default()),
         None,
         Some(devices.clone()),
+        None,
         None,
     )
     .await;
@@ -4743,6 +5183,7 @@ async fn start_server_with_banner(dir: &Path, image: &[u8]) -> (SocketAddr, NgCt
         None,
         None,
         Some(Arc::new(banner)),
+        None,
     )
     .await;
     (ng, ctx)

@@ -18,6 +18,10 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn ModerationStore>) {
     blocks_are_a_set(&*new_store());
     a_reports_image_is_held_while_it_is_open(&*new_store());
     a_close_keeps_its_outcome_through_the_scrub(&*new_store());
+    a_ban_round_trips_and_a_reban_extends_its_one_row(&*new_store());
+    a_lifted_ban_stays_on_record_and_a_new_one_is_a_new_row(&*new_store());
+    bans_list_standing_or_all_and_age_out(&*new_store());
+    an_expired_ban_is_closed_and_a_new_one_is_a_new_row(&*new_store());
 }
 
 fn t(secs: u64) -> SystemTime {
@@ -302,4 +306,162 @@ fn blocks_are_a_set(s: &dyn ModerationStore) {
 #[test]
 fn memory_moderation_passes() {
     run(&|| Box::<super::MemoryModeration>::default());
+}
+
+fn a_ban(target: crate::ban::BanTarget, created: u64, expires: Option<u64>) -> crate::ban::Ban {
+    crate::ban::Ban {
+        id: 0,
+        target,
+        reason: "spam".into(),
+        note: Some("seen before".into()),
+        actor: "carol".into(),
+        actor_fp: Some([3; 32]),
+        source: crate::ban::BanSource::Moderator,
+        created_at: t(created),
+        expires_at: expires.map(t),
+        lifted_at: None,
+        lifted_by: None,
+        act: Some(7),
+    }
+}
+
+fn a_ban_round_trips_and_a_reban_extends_its_one_row(store: &dyn ModerationStore) {
+    use crate::ban::{BanSource, BanTarget};
+    let block = BanTarget::parse("10.0.0.0/24", |_| None).unwrap();
+    let first = store.ban(&a_ban(block.clone(), 100, Some(200))).unwrap();
+    assert!(first.id > 0);
+    let listed = store.bans(None, None, 10).unwrap();
+    assert_eq!(
+        listed,
+        std::slice::from_ref(&first),
+        "every field round-trips"
+    );
+    let fp = BanTarget::Identity([9; 32]);
+    let other = store.ban(&a_ban(fp.clone(), 100, None)).unwrap();
+    assert_ne!(other.id, first.id);
+
+    // A shorter re-ban keeps the later expiry; a new reason and actor,
+    // and the act that created the row.
+    let again = store
+        .ban(&crate::ban::Ban {
+            reason: "again".into(),
+            actor: "dave".into(),
+            act: Some(8),
+            ..a_ban(block.clone(), 150, Some(180))
+        })
+        .unwrap();
+    assert_eq!(again.id, first.id, "one row per target");
+    assert_eq!(again.expires_at, Some(t(200)));
+    assert_eq!(
+        (again.reason.as_str(), again.actor.as_str()),
+        ("again", "dave")
+    );
+    assert_eq!(again.created_at, t(100), "when it was first placed");
+    assert_eq!(
+        again.act,
+        Some(7),
+        "the act that placed it, not one that extended it"
+    );
+    assert_eq!(store.bans(None, None, 10).unwrap()[1], again, "as stored");
+    // One until lifted outlasts both.
+    let forever = store.ban(&a_ban(block.clone(), 160, None)).unwrap();
+    assert_eq!((forever.id, forever.expires_at), (first.id, None));
+    assert_eq!(store.bans(None, None, 10).unwrap().len(), 2);
+
+    // The config's rows stay the config's.
+    let login = BanTarget::login("mallory").unwrap();
+    store
+        .ban(&crate::ban::Ban {
+            source: BanSource::Config,
+            ..a_ban(login.clone(), 100, None)
+        })
+        .unwrap();
+    let rebanned = store.ban(&a_ban(login, 120, None)).unwrap();
+    assert_eq!(rebanned.source, BanSource::Config);
+}
+
+fn a_lifted_ban_stays_on_record_and_a_new_one_is_a_new_row(store: &dyn ModerationStore) {
+    use crate::ban::BanTarget;
+    let login = BanTarget::login("mallory").unwrap();
+    let ban = store.ban(&a_ban(login.clone(), 100, None)).unwrap();
+    let lifted = store.lift_ban(ban.id, "carol", t(150)).unwrap().unwrap();
+    assert_eq!(
+        (lifted.lifted_at, lifted.lifted_by.as_deref()),
+        (Some(t(150)), Some("carol"))
+    );
+    assert!(!lifted.standing(t(151)));
+    assert_eq!(
+        store.lift_ban(ban.id, "carol", t(160)).unwrap(),
+        None,
+        "once"
+    );
+    let again = store.ban(&a_ban(login, 200, None)).unwrap();
+    assert_ne!(again.id, ban.id, "a new ban, with the old one on record");
+    assert_eq!(store.bans(None, None, 10).unwrap().len(), 2);
+}
+
+fn an_expired_ban_is_closed_and_a_new_one_is_a_new_row(store: &dyn ModerationStore) {
+    use crate::ban::BanTarget;
+    let block = BanTarget::parse("10.0.0.0/24", |_| None).unwrap();
+    let old = store.ban(&a_ban(block.clone(), 100, Some(150))).unwrap();
+    let new = store
+        .ban(&crate::ban::Ban {
+            reason: "again".into(),
+            actor: "dave".into(),
+            ..a_ban(block, 200, Some(300))
+        })
+        .unwrap();
+    assert_ne!(new.id, old.id, "not an extension of what ran out");
+    assert_eq!((new.created_at, new.expires_at), (t(200), Some(t(300))));
+    let all = store.bans(None, None, 10).unwrap();
+    assert_eq!(all.len(), 2);
+    let closed = all.iter().find(|b| b.id == old.id).unwrap();
+    assert_eq!(
+        closed,
+        &crate::ban::Ban {
+            lifted_at: Some(t(150)),
+            ..old
+        },
+        "its record as it was, closed at its expiry by nobody"
+    );
+    let standing: Vec<_> = store
+        .bans(Some(t(250)), None, 10)
+        .unwrap()
+        .iter()
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(standing, [new.id]);
+}
+
+fn bans_list_standing_or_all_and_age_out(store: &dyn ModerationStore) {
+    use crate::ban::BanTarget;
+    let ids: Vec<_> = (0..4u8)
+        .map(|n| {
+            let target = BanTarget::Identity([n; 32]);
+            let expires = if n == 1 { Some(150) } else { None };
+            store.ban(&a_ban(target, 100, expires)).unwrap().id
+        })
+        .collect();
+    store.lift_ban(ids[2], "carol", t(120)).unwrap();
+    let standing: Vec<_> = store
+        .bans(Some(t(200)), None, 10)
+        .unwrap()
+        .iter()
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(
+        standing,
+        [ids[3], ids[0]],
+        "newest first, expired and lifted out"
+    );
+    let page: Vec<_> = store
+        .bans(None, Some(ids[3]), 2)
+        .unwrap()
+        .iter()
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(page, [ids[2], ids[1]]);
+    // Lifted or expired before 160 goes; the rest stays.
+    assert_eq!(store.prune_bans(t(160)).unwrap(), 2);
+    assert_eq!(store.bans(None, None, 10).unwrap().len(), 2);
 }

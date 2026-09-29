@@ -1008,7 +1008,9 @@ fn losing_the_connection_ends_the_publication_even_though_the_session_lives() {
             transport: crate::Transport::default(),
             has_inbox: true,
             attach_news: false,
+            set_avatar: false,
             moderate: false,
+            can_spam: false,
             is_person: true,
             reads_on_delivery: false,
             identity: None,
@@ -1219,4 +1221,181 @@ fn the_default_ceilings_are_the_specs() {
     // b=AS counts kilobits.
     assert_eq!(c.camera.bandwidth_kbps(), 1500);
     assert_eq!(c.screen.bandwidth_kbps(), 2500);
+}
+
+// --- Allowances and the status debounce --------------------------------
+
+fn limited(video_changes: u32) -> (Core, Arc<RecordingMedia>) {
+    let media = Arc::new(RecordingMedia::new());
+    let core = Core::new()
+        .with_voice(media.clone(), DEFAULT_MAX_PER_ROOM)
+        .with_video(VideoConfig::default())
+        .with_voice_limits(crate::voice::VoiceLimits {
+            video_changes,
+            video_changes_per: std::time::Duration::from_secs(20),
+            ..Default::default()
+        });
+    (core, media)
+}
+
+#[test]
+fn video_changes_past_the_allowance_are_refused_but_stops_never_are() {
+    let (core, media) = limited(2);
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    joined(&core, &media, &mut [(a, &mut rx_a), (b, &mut rx_b)]);
+
+    core.video_start(a, 0, VideoKind::Camera).unwrap();
+    core.video_stop(a, 0, Some(VideoKind::Camera)).unwrap();
+    // Bob's standing subscription is to nothing published yet, so it is
+    // free; alice's start, which activates it, is what pays.
+    core.video_subscribe(b, 0, &[cam(a)]).unwrap();
+    media.take_calls();
+    // Alice has spent one of her two. Her second start passes and her
+    // third is refused.
+    core.video_start(a, 0, VideoKind::Camera).unwrap();
+    assert_eq!(
+        core.video_start(a, 0, VideoKind::Screen),
+        Err(VideoError::RateLimited { retry_after: 10 })
+    );
+    // Turning a camera off always works.
+    core.video_state(a, 0, VideoKind::Camera, true).unwrap();
+    core.video_stop(a, 0, None).unwrap();
+    assert!(core.video_publications(0).is_empty());
+}
+
+#[test]
+fn a_start_the_media_layer_refuses_costs_no_allowance() {
+    let (core, media) = limited(1);
+    let (a, mut rx_a) = quiet(&core, "alice");
+    in_voice(&core, &media, a, &mut rx_a);
+    media.refuse_next_publish();
+    assert_eq!(
+        core.video_start(a, 0, VideoKind::Camera),
+        Err(VideoError::Full(VideoKind::Camera))
+    );
+    // The refused start is refunded, so the one start she is allowed
+    // still works, and only the one after it is refused.
+    core.video_start(a, 0, VideoKind::Camera).unwrap();
+    assert!(matches!(
+        core.video_start(a, 0, VideoKind::Screen),
+        Err(VideoError::RateLimited { .. })
+    ));
+}
+
+#[test]
+fn a_start_refused_for_a_full_offer_is_charged() {
+    // A full offer stays full for the session's life, so every retry
+    // would be refused the same way. Refunding it would make the loop
+    // free; keeping the charge makes it cost what any other start does.
+    let (core, media) = limited(2);
+    let (a, mut rx_a) = quiet(&core, "alice");
+    in_voice(&core, &media, a, &mut rx_a);
+    for _ in 0..2 {
+        media.refuse_next_publish_with(PublishRefusal::OfferFull);
+        assert_eq!(
+            core.video_start(a, 0, VideoKind::Camera),
+            Err(VideoError::Full(VideoKind::Camera))
+        );
+    }
+    let calls = media.take_calls();
+    assert!(
+        matches!(
+            core.video_start(a, 0, VideoKind::Camera),
+            Err(VideoError::RateLimited { .. })
+        ),
+        "the refused starts spent the allowance"
+    );
+    assert!(
+        media.take_calls().is_empty(),
+        "and the one past it never reaches the media layer"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| matches!(c, MediaCall::Publish { .. }))
+            .count(),
+        2
+    );
+    assert!(core.video_publications(0).is_empty());
+}
+
+#[test]
+fn only_a_subscription_that_adds_a_live_stream_is_charged() {
+    let (core, media) = limited(2);
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    let (c, mut rx_c) = quiet(&core, "carol");
+    joined(
+        &core,
+        &media,
+        &mut [(a, &mut rx_a), (b, &mut rx_b), (c, &mut rx_c)],
+    );
+    core.video_start(c, 0, VideoKind::Camera).unwrap();
+    core.video_start(c, 0, VideoKind::Screen).unwrap();
+
+    // Re-declaring an unchanged set costs nothing, however often.
+    for _ in 0..5 {
+        core.video_subscribe(b, 0, &[]).unwrap();
+    }
+    // Each set that adds one of carol's publications spends one of bob's
+    // two; one that adds only alice's, which does not exist, spends
+    // nothing, and neither does one that narrows.
+    core.video_subscribe(b, 0, &[cam(c)]).unwrap();
+    core.video_subscribe(b, 0, &[cam(c), screen(c)]).unwrap();
+    core.video_subscribe(b, 0, &[cam(c), screen(c), cam(a)])
+        .unwrap();
+    core.video_subscribe(b, 0, &[cam(c)]).unwrap();
+    // Asking for the screen back is an addition, and he has none left.
+    // A refused change leaves the set as it was.
+    assert_eq!(
+        core.video_subscribe(b, 0, &[cam(c), screen(c)]),
+        Err(VideoError::RateLimited { retry_after: 10 })
+    );
+    {
+        let r = core.roster.lock().unwrap();
+        let peer = r.voice.rooms[&0].iter().find(|p| p.uid == b).unwrap();
+        assert_eq!(peer.video.wanted, vec![cam(c)]);
+    }
+    // And the way out works with the allowance spent: dropping all video
+    // is what a client on a failing link does, and it must not be told
+    // to wait.
+    core.video_subscribe(b, 0, &[]).unwrap();
+    let r = core.roster.lock().unwrap();
+    let peer = r.voice.rooms[&0].iter().find(|p| p.uid == b).unwrap();
+    assert!(peer.video.wanted.is_empty());
+    assert!(peer.video.active.is_empty());
+}
+
+#[test]
+fn a_burst_of_pause_flips_reaches_the_room_as_one_status() {
+    let media = Arc::new(RecordingMedia::new());
+    let core = Core::new()
+        .with_voice(media.clone(), DEFAULT_MAX_PER_ROOM)
+        .with_video(VideoConfig::default())
+        .with_voice_limits(crate::voice::VoiceLimits {
+            status_debounce: std::time::Duration::from_millis(100),
+            ..Default::default()
+        });
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    joined(&core, &media, &mut [(a, &mut rx_a), (b, &mut rx_b)]);
+    core.video_start(a, 0, VideoKind::Camera).unwrap();
+    drain(&mut rx_a);
+    drain(&mut rx_b);
+
+    for paused in [true, false, true] {
+        core.video_state(a, 0, VideoKind::Camera, paused).unwrap();
+    }
+    assert!(publications(&drain(&mut rx_b)).is_empty());
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    assert_eq!(core.voice_flush_status(later), None);
+    assert_eq!(
+        publications(&drain(&mut rx_b)),
+        vec![vec![VideoPublication {
+            uid: a,
+            kind: VideoKind::Camera,
+            paused: true
+        }]]
+    );
 }

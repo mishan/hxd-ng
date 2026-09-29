@@ -26,7 +26,8 @@ pub struct ModerationSection {
     /// audit trail. 0 keeps it forever.
     #[serde(default = "default_evidence_days")]
     pub evidence_days: u32,
-    /// Days a closed report is kept. 0 keeps it forever.
+    /// Days a closed report is kept, and a ban that has ended. 0 keeps
+    /// them forever.
     #[serde(default = "default_report_days")]
     pub report_days: u32,
     /// Days a reported image may outlive its handle's TTL.
@@ -38,6 +39,13 @@ pub struct ModerationSection {
     /// Seconds of a kicked user's output a legacy kick purges; 0 = none.
     #[serde(default)]
     pub kick_purges: u64,
+    /// How wide a kick's ban is on an IPv6 address, in bits.
+    #[serde(default = "default_ban_v6_prefix")]
+    pub ban_v6_prefix: u8,
+}
+
+fn default_ban_v6_prefix() -> u8 {
+    64
 }
 
 impl Default for ModerationSection {
@@ -48,6 +56,7 @@ impl Default for ModerationSection {
             pin_days: default_pin_days(),
             notify_legacy: true,
             kick_purges: 0,
+            ban_v6_prefix: default_ban_v6_prefix(),
         }
     }
 }
@@ -72,10 +81,14 @@ impl ModerationSection {
             pin_days: self.pin_days,
             notify_legacy: self.notify_legacy,
             kick_purges: Duration::from_secs(self.kick_purges),
+            ban_v6_prefix: self.ban_v6_prefix,
         }
     }
 
     pub fn check(&self) -> Result<(), String> {
+        if !(16..=128).contains(&self.ban_v6_prefix) {
+            return Err("[moderation] ban_v6_prefix is a prefix length from 16 to 128 bits".into());
+        }
         if self.pin_days == 0 {
             return Err(
                 "[moderation] pin_days must be at least 1: a reported image has to outlive \
@@ -110,47 +123,75 @@ pub(crate) fn db(config: &Config) -> Option<std::path::PathBuf> {
         .or_else(|| config.news.as_ref().and_then(|n| n.db.clone()))
 }
 
-/// Retention for the trail and the reports: hourly, on the blocking
-/// pool, like every other sweeper.
+/// Retention for the trail, the reports and the bans that have ended:
+/// hourly, on the blocking pool, like every other sweeper.
 pub async fn pruner(core: Arc<Core>) {
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let core = core.clone();
-        let (scrubbed, pruned) = crate::spawn_blocking("prune", move || core.prune_moderation())
-            .await
-            .unwrap_or((0, 0));
-        if scrubbed + pruned > 0 {
-            tracing::debug!(scrubbed, pruned, "moderation retention");
+        let (scrubbed, pruned, bans) =
+            crate::spawn_blocking("prune", move || core.prune_moderation())
+                .await
+                .unwrap_or((0, 0, 0));
+        if scrubbed + pruned + bans > 0 {
+            tracing::debug!(scrubbed, pruned, bans, "moderation retention");
         }
     }
 }
 
 /// A duration as an operator types one: `90s`, `30m`, `1h`, `7d`, bare
-/// seconds, or `all`.
+/// seconds, or `all`. `--since`'s: `all` reaches back past anything on
+/// record.
 pub fn parse_since(text: &str) -> Result<Duration, String> {
-    let text = text.trim();
-    if text == "all" {
+    if text.trim() == "all" {
         return Ok(Duration::from_secs(u64::MAX / 2));
     }
+    parse_span("--since", text)
+}
+
+/// The longest `--for` a ban takes: past it the answer is a ban until
+/// lifted, which is what leaving `--for` off (or `--for all`) says.
+const BAN_FOR_MAX: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+
+/// `hxd ban add --for`: how long, or `None` (`all`) for until lifted.
+pub fn parse_ban_for(text: &str) -> Result<Option<Duration>, String> {
+    if text.trim() == "all" {
+        return Ok(None);
+    }
+    let d = parse_span("--for", text)?;
+    if d > BAN_FOR_MAX {
+        return Err(format!(
+            "--for {:?} is longer than a ban runs; `--for all`, or no --for, bans until lifted",
+            text.trim()
+        ));
+    }
+    if d.is_zero() {
+        return Err(format!("--for {:?} would end before it began", text.trim()));
+    }
+    Ok(Some(d))
+}
+
+fn parse_span(flag: &str, text: &str) -> Result<Duration, String> {
+    let text = text.trim();
     let (digits, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
         Some(i) => text.split_at(i),
         None => (text, "s"),
     };
     let n: u64 = digits
         .parse()
-        .map_err(|_| format!("--since {text:?}: expected e.g. 90s, 30m, 1h, 7d or all"))?;
+        .map_err(|_| format!("{flag} {text:?}: expected e.g. 90s, 30m, 1h, 7d or all"))?;
     let scale = match unit {
         "s" => 1,
         "m" => 60,
         "h" => 3600,
         "d" => 24 * 3600,
-        _ => return Err(format!("--since {text:?}: the unit is s, m, h or d")),
+        _ => return Err(format!("{flag} {text:?}: the unit is s, m, h or d")),
     };
     n.checked_mul(scale)
         .map(Duration::from_secs)
-        .ok_or_else(|| format!("--since {text:?} is too long"))
+        .ok_or_else(|| format!("{flag} {text:?} is too long"))
 }
 
 fn refused(e: hxd_core::ModError) -> String {
@@ -169,6 +210,8 @@ fn refused(e: hxd_core::ModError) -> String {
         OwnReport => "that report is about you".into(),
         RateLimited => "rate limited".into(),
         NoSession => "no session".into(),
+        NoSuchBan => "no such ban standing".into(),
+        ConfigBan => "that ban is in the config file: remove it there and reload".into(),
         Store(e) => e.to_string(),
     }
 }
@@ -409,4 +452,111 @@ pub fn log(config: &Config, limit: usize) -> Result<String, String> {
         })
         .collect();
     Ok(lines.join("\n"))
+}
+
+/// How a ban reads in `hxd ban list`.
+fn ban_line(b: &hxd_core::ban::Ban) -> String {
+    let target = b
+        .target
+        .describe(|fp| hl_identity::Fingerprint(*fp).to_string());
+    let until = match (b.lifted_at, b.lifted_by.as_deref(), b.expires_at) {
+        (Some(at), Some(by), _) => format!("lifted {} by {by}", unix(at)),
+        // Closed by nobody: it ran out before its target was banned again.
+        (Some(at), None, _) => format!("expired {}", unix(at)),
+        (None, _, Some(at)) => format!("until {}", unix(at)),
+        (None, _, None) => "until lifted".into(),
+    };
+    format!(
+        "#{} {target}: {} ({}, {} by {}, {until})",
+        b.id,
+        b.reason,
+        b.source.name(),
+        unix(b.created_at),
+        b.actor
+    )
+}
+
+fn unix(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// `hxd ban add`: a ban on the operator's word, against the store
+/// directly. A running server applies it on SIGHUP.
+pub fn ban_add(
+    config: &Config,
+    target: &str,
+    reason: &str,
+    note: Option<String>,
+    for_: Option<Duration>,
+) -> Result<String, String> {
+    let target = hxd_core::ban::BanTarget::parse(target, |fp| crate::parse_fingerprint(fp).ok())?;
+    let core = operator_core(config, false)?;
+    let placed = core
+        .place_ban(
+            Actor::Operator,
+            hxd_core::ban::NewBan {
+                target,
+                reason: reason.to_owned(),
+                note,
+                expires_at: for_
+                    .map(|d| {
+                        std::time::SystemTime::now()
+                            .checked_add(d)
+                            .ok_or("--for runs past what the clock can say")
+                    })
+                    .transpose()?,
+                source: hxd_core::ban::BanSource::Cli,
+            },
+        )
+        .map_err(refused)?;
+    Ok(placed.iter().map(ban_line).collect::<Vec<_>>().join("\n"))
+}
+
+/// `hxd ban list`: the standing bans, or with `all` every one on record.
+pub fn ban_list(config: &Config, all: bool) -> Result<String, String> {
+    let core = operator_core(config, true)?;
+    let bans = core.list_bans(!all, None, usize::MAX).map_err(refused)?;
+    if bans.is_empty() {
+        return Ok(if all {
+            "nobody has been banned".into()
+        } else {
+            "nobody is banned".into()
+        });
+    }
+    Ok(bans.iter().map(ban_line).collect::<Vec<_>>().join("\n"))
+}
+
+/// `hxd ban lift`: lift a standing ban, and any placed with it (a login
+/// ban's twin on the identity its account links), one line each. A
+/// running server applies it on SIGHUP.
+pub fn ban_lift(config: &Config, id: u64) -> Result<String, String> {
+    let core = operator_core(config, false)?;
+    let lifted = core.lift_ban(Actor::Operator, id).map_err(refused)?;
+    Ok(lifted.iter().map(ban_line).collect::<Vec<_>>().join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ban_for_all_is_until_lifted_and_an_absurd_one_is_refused() {
+        assert_eq!(parse_ban_for("all"), Ok(None));
+        assert_eq!(
+            parse_ban_for("7d"),
+            Ok(Some(Duration::from_secs(7 * 24 * 3600)))
+        );
+        assert_eq!(parse_ban_for("90"), Ok(Some(Duration::from_secs(90))));
+        for absurd in ["36600000d", "18446744073709551615s", "0"] {
+            let e = parse_ban_for(absurd).unwrap_err();
+            assert!(e.starts_with("--for "), "{e}");
+        }
+        for bad in ["soon", "3w", "-1d"] {
+            let e = parse_ban_for(bad).unwrap_err();
+            assert!(e.starts_with("--for "), "names its flag: {e}");
+        }
+        assert!(parse_since("soon").unwrap_err().starts_with("--since "));
+        assert!(parse_since("all").is_ok());
+    }
 }

@@ -20,13 +20,15 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use hxd_core::video::{VideoConfig, VideoKind, VideoStream};
+use hxd_core::video::{PublishRefusal, VideoConfig, VideoKind, VideoStream};
 use hxd_core::Uid;
 use str0m::config::DtlsCert;
 use str0m::media::MediaKind;
+use str0m::net::Protocol;
 use str0m::rtp::Ssrc;
 use str0m::{Candidate, Rtc, RtcConfig};
 
+use crate::police::Policer;
 use crate::sdp::{
     self, candidate_bytes, section_bytes, Direction, OfferParams, OfferSection, SectionMedia,
     CAM_SEND_MID, MIC_MID, OFFER_BASE_BYTES, SCR_SEND_MID,
@@ -58,6 +60,18 @@ use crate::sdp::{
 /// own model has for this, and it keeps "a mid is never reassigned
 /// *within a session*" true.
 const MAX_OFFER_BYTES: usize = sdp::MAX_OFFER_BYTES;
+
+/// How many distinct remote candidates one session may trickle.
+///
+/// A real client gathers a host candidate per interface and address
+/// family, a server-reflexive one per STUN server that answers, and a
+/// relay per TURN server it is given: a handful on a phone, and a couple
+/// of dozen on a well-connected desktop with VPNs and containers
+/// attached. Thirty-two is past all of that and a quarter of the pairs
+/// the ICE agent keeps, and against an ICE-lite server that only ever
+/// answers checks, a client's first few candidates are the ones that
+/// matter anyway.
+pub(crate) const MAX_REMOTE_CANDIDATES: usize = 32;
 
 /// What a media section carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +196,9 @@ pub(crate) struct Publication {
     /// been written. A section the client has never been shown cannot
     /// have been declined by it.
     pub(crate) offered: bool,
+    /// What this publication's RTP may arrive at before it is dropped
+    /// rather than forwarded ([`crate::police`]).
+    pub(crate) police: Policer,
 }
 
 pub(crate) struct Peer {
@@ -203,6 +220,13 @@ pub(crate) struct Peer {
     /// listeners were already tracking.
     pub(crate) forward_ssrc: u32,
     pub(crate) muted: bool,
+    /// What this peer's audio may arrive at before it is dropped rather
+    /// than forwarded ([`crate::police`]).
+    pub(crate) audio_police: Policer,
+    /// The distinct remote candidates this peer has trickled, as address
+    /// and transport — what the ICE agent would keep. See
+    /// [`Peer::add_remote_candidate`].
+    remote_candidates: Vec<(SocketAddr, Protocol)>,
     /// This peer's video publications: at most one per kind.
     pub(crate) publications: Vec<Publication>,
     /// What this peer has been told to receive, as the domain computed
@@ -290,6 +314,8 @@ impl Peer {
             offer_bytes: OFFER_BASE_BYTES,
             forward_ssrc,
             muted: false,
+            audio_police: Policer::off(),
+            remote_candidates: Vec::new(),
             publications: Vec::new(),
             subscriptions: Vec::new(),
             mic_ssrc: None,
@@ -304,6 +330,34 @@ impl Peer {
             remote: None,
             next_timeout: None,
         }
+    }
+
+    /// Hand a trickled candidate to the ICE agent, unless this session
+    /// already holds [`MAX_REMOTE_CANDIDATES`] distinct ones. Returns
+    /// whether it was taken; a repeat of one already taken is taken
+    /// again, as the agent itself ignores it.
+    ///
+    /// The agent caps its candidate *pairs*, but every distinct remote
+    /// candidate it is given is kept, and each new one is compared
+    /// against all of them and against every pair — so an unbounded
+    /// trickle is unbounded memory and quadratic time, spent under the
+    /// SFU's lock. Past the cap a candidate is ignored rather than
+    /// refused: a client with that many has plenty for ICE to work with
+    /// already, and the session goes on.
+    pub(crate) fn add_remote_candidate(&mut self, c: Candidate) -> bool {
+        let key = (c.addr(), c.proto());
+        if !self.remote_candidates.contains(&key) {
+            if self.remote_candidates.len() >= MAX_REMOTE_CANDIDATES {
+                return false;
+            }
+            self.remote_candidates.push(key);
+        }
+        self.rtc.add_remote_candidate(c);
+        true
+    }
+
+    pub(crate) fn remote_candidate_count(&self) -> usize {
+        self.remote_candidates.len()
     }
 
     /// The section for a given participant, if this peer has ever had one.
@@ -439,17 +493,25 @@ impl Peer {
     }
 
     /// Add a send section for `kind`, so this peer's next offer has
-    /// somewhere to publish on. Returns `false` if the section list is
-    /// full or the publication already exists.
-    pub(crate) fn declare_video_send(&mut self, kind: VideoKind, forward_ssrc: u32) -> bool {
+    /// somewhere to publish on. Refused as [`PublishRefusal::OfferFull`]
+    /// if the offer has no room for the section, which it will not have
+    /// for the rest of the session, and as
+    /// [`PublishRefusal::Unavailable`] if the publication already exists
+    /// — the domain never asks for that, so it is being out of step with
+    /// it, not the client's doing.
+    pub(crate) fn declare_video_send(
+        &mut self,
+        kind: VideoKind,
+        forward_ssrc: u32,
+    ) -> Result<(), PublishRefusal> {
         if self.publication(kind).is_some() {
-            return false;
+            return Err(PublishRefusal::Unavailable);
         }
         let mid = send_mid(kind);
         if self.section_index(SectionKind::VideoSend(kind)).is_none()
             && !self.push_section(mid.to_string(), SectionKind::VideoSend(kind))
         {
-            return false;
+            return Err(PublishRefusal::OfferFull);
         }
         self.publications.push(Publication {
             kind,
@@ -459,8 +521,9 @@ impl Peer {
             last_media: None,
             last_keyframe: None,
             offered: false,
+            police: Policer::off(),
         });
-        true
+        Ok(())
     }
 
     /// Drop a publication. The **section stays** — mids are never

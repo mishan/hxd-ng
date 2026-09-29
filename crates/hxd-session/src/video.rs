@@ -23,6 +23,8 @@
 //! for later revisions of the extension — simulcast most likely — and
 //! `0x0220`–`0x023F` is video's field block. Neither may be squatted on.
 
+use std::borrow::Cow;
+
 use hxd_core::video::{
     VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,
 };
@@ -117,8 +119,8 @@ pub fn limits_chunks(config: &VideoConfig) -> Vec<(u16, Vec<u8>)> {
 
 /// Task-error text for a refused video operation. Human-readable and not
 /// meant for programmatic parsing, per the spec.
-pub fn err_text(e: VideoError) -> &'static str {
-    match e {
+pub fn err_text(e: VideoError) -> Cow<'static, str> {
+    Cow::Borrowed(match e {
         VideoError::Disabled => "Video is not available on this server.",
         VideoError::NotInVoice => "You are not in that voice chat.",
         VideoError::AlreadyPublishing => "You are already publishing that.",
@@ -134,7 +136,13 @@ pub fn err_text(e: VideoError) -> &'static str {
             "Someone else is already sharing. Ask them to stop first."
         }
         VideoError::Full(VideoKind::Camera) => "This room has as many cameras on as it allows.",
-    }
+        VideoError::RateLimited { retry_after } => {
+            return Cow::Owned(format!(
+                "You are changing video too often. {}",
+                crate::voice::try_again_in(retry_after)
+            ));
+        }
+    })
 }
 
 /// The `CHAT_ID` chunk every video transaction carries.

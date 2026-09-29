@@ -73,7 +73,9 @@ fn attach_boxed(core: &Core, nick: &str) -> (Uid, Events) {
             },
             has_inbox: true,
             attach_news: false,
+            set_avatar: false,
             moderate: false,
+            can_spam: false,
             is_person: true,
             reads_on_delivery: false,
             identity: None,
@@ -113,7 +115,9 @@ fn attach_with(
             },
             has_inbox: false,
             attach_news: false,
+            set_avatar: false,
             moderate: false,
+            can_spam: false,
             is_person: false,
             reads_on_delivery: false,
             identity: None,
@@ -122,6 +126,40 @@ fn attach_with(
         .unwrap();
     core.announce(uid);
     (uid, rx)
+}
+
+/// A session through the shared `guest` login, which is nobody in
+/// particular, allowed to send media as an operator may allow it.
+fn attach_guest(core: &Core, nick: &str, addr: IpAddr) -> Uid {
+    let (uid, _) = core
+        .attach(AttachInfo {
+            nick: nick.into(),
+            icon: 1,
+            admin: false,
+            access: AccessBits::empty()
+                .with(bit::READ_CHAT)
+                .with(bit::SEND_CHAT)
+                .with(bit::SEND_MEDIA),
+            login: "guest".into(),
+            addr: Some(addr),
+            can_detach: false,
+            transport: Transport {
+                inline_media: true,
+                ..Default::default()
+            },
+            has_inbox: false,
+            attach_news: false,
+            set_avatar: false,
+            moderate: false,
+            can_spam: false,
+            is_person: false,
+            reads_on_delivery: false,
+            identity: None,
+            system: false,
+        })
+        .unwrap();
+    core.announce(uid);
+    uid
 }
 
 fn upload(core: &Core, uid: Uid, bytes: &[u8]) -> Result<MediaRef, MediaReject> {
@@ -323,9 +361,7 @@ fn the_upload_quotas_hold() {
         "the interval between one account's uploads"
     );
 
-    // Per hour, per account. Every guest shares the `guest` account's
-    // bucket deliberately — the shared door is the one that needs the
-    // throttle most.
+    // Per hour, per account.
     let core = core_with(MediaConfig {
         upload_interval: Duration::ZERO,
         upload_per_hour: 2,
@@ -350,6 +386,24 @@ fn the_upload_quotas_hold() {
     let (bob, _rb) = attach(&core, "bob", here);
     upload(&core, alice, b"one").unwrap();
     assert_eq!(upload(&core, bob, b"two"), Err(MediaReject::RateLimited));
+}
+
+#[test]
+fn asking_whether_an_upload_would_be_admitted_spends_nothing() {
+    let core = core_with(MediaConfig {
+        upload_interval: Duration::ZERO,
+        upload_per_hour: 1,
+        ..Default::default()
+    });
+    let (alice, _ra) = attach(&core, "alice", Ipv4Addr::LOCALHOST);
+    for _ in 0..5 {
+        assert_eq!(core.media_upload_admits(alice), Ok(()));
+    }
+    upload(&core, alice, b"one").unwrap();
+    assert_eq!(
+        core.media_upload_admits(alice),
+        Err(MediaReject::RateLimited)
+    );
 }
 
 #[test]
@@ -702,4 +756,56 @@ fn a_quota_refused_by_the_address_does_not_spend_the_account() {
     // he can still upload from somewhere else.
     let (bob_elsewhere, _rb2) = attach(&core, "bob", Ipv4Addr::new(10, 0, 0, 8));
     upload(&core, bob_elsewhere, b"three").expect("the refusal cost bob's account nothing");
+}
+
+#[test]
+fn guests_are_held_by_their_address_and_not_by_the_login_they_share() {
+    let core = core_with(MediaConfig {
+        upload_interval: Duration::from_secs(60),
+        upload_sessions: 1,
+        ..Default::default()
+    });
+    let here = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+    let there = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8));
+    let first = attach_guest(&core, "first", here);
+    let beside = attach_guest(&core, "beside", here);
+    let elsewhere = attach_guest(&core, "elsewhere", there);
+    upload(&core, first, b"one").unwrap();
+    // One guest's upload spends its address's interval and nobody
+    // else's: `guest` is everyone, and a quota on it would be one guest
+    // turning all the others away.
+    assert_eq!(
+        upload(&core, beside, b"two"),
+        Err(MediaReject::RateLimited),
+        "the same address is the same guest"
+    );
+    upload(&core, elsewhere, b"two").expect("another address is another guest");
+
+    // An IPv6 guest is its /64, so walking the prefix is no way out.
+    let net = |host: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, host));
+    let v6 = attach_guest(&core, "v6", net(1));
+    upload(&core, v6, b"one").unwrap();
+    let next_door = attach_guest(&core, "next", net(2));
+    assert_eq!(
+        upload(&core, next_door, b"two"),
+        Err(MediaReject::RateLimited)
+    );
+
+    // Open chunked uploads are counted the same way.
+    let core = core_with(MediaConfig {
+        upload_interval: Duration::ZERO,
+        upload_sessions: 1,
+        ..Default::default()
+    });
+    let first = attach_guest(&core, "first", here);
+    let beside = attach_guest(&core, "beside", here);
+    let elsewhere = attach_guest(&core, "elsewhere", there);
+    core.media_upload_part(first, part(b"ab", None, 0, Some(2), false))
+        .unwrap();
+    assert_eq!(
+        core.media_upload_part(beside, part(b"ab", None, 0, Some(2), false)),
+        Err(MediaReject::Busy)
+    );
+    core.media_upload_part(elsewhere, part(b"ab", None, 0, Some(2), false))
+        .expect("another guest's upload slot is its own");
 }
