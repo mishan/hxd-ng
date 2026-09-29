@@ -157,7 +157,7 @@ function baseConfig(ports, name) {
     server: {
       bind: `127.0.0.1:${ports.legacy}`,
       name,
-      version: 185,
+      version: 254,
       login_timeout: 10,
     },
     paths: { accounts: 'accounts' },

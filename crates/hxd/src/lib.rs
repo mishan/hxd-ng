@@ -1581,7 +1581,8 @@ pub struct ServerSection {
     #[serde(default = "default_name")]
     pub name: String,
     /// Advertised server version; 0 mimics a pre-1.5 server (no agreement
-    /// flow, uid-only login reply).
+    /// flow, uid-only login reply). The default is hxd-ng's own number
+    /// ([`default_version`]).
     #[serde(default = "default_version")]
     pub version: u16,
     /// Seconds a connection may take to complete its login.
@@ -1631,8 +1632,12 @@ fn default_bind() -> String {
 fn default_name() -> String {
     "hxd-ng".into()
 }
+/// 254 (0xFE), the number hxd-ng and GtkHx share. It was 185, which
+/// the public client and server version registry also gives the
+/// official 1.8.5 client and server and Pitbull Pro, so a client could
+/// not tell this server from theirs.
 fn default_version() -> u16 {
-    185
+    254
 }
 fn default_login_timeout() -> u64 {
     10
@@ -4012,6 +4017,16 @@ hmac_secret = "new secret"
         )
         .unwrap();
         check_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn the_server_reports_its_own_version_unless_told_otherwise() {
+        assert_eq!(parse("").unwrap().server.version, 254);
+        assert_eq!(ServerSection::default().version, 254);
+        let old = parse("[server]\nversion = 185\n").unwrap();
+        assert_eq!(old.server.version, 185);
+        let pre_15 = parse("[server]\nversion = 0\n").unwrap();
+        assert_eq!(pre_15.server.version, 0);
     }
 
     #[test]

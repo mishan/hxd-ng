@@ -94,18 +94,34 @@ Where this server differs, on purpose:
   pipeline like any other image. mhxd stores whatever arrives.
   A refusal is a task error with readable text.
 - **Set Icon is not everyone's.** A session whose account may not set
-  an avatar (§2) is answered as a set is, with an empty reply, and the
-  icon is quietly not applied: nothing is decoded, stored or announced,
-  and no turn is spent. mhxd lets anyone. This is a stopgap for GtkHx
-  1.2 through 1.4.0 (every release so far), which send the saved icon
-  after every login without a task of their own, so a task error there
-  is a pop-up at every login for a guest on a server that keeps the
-  default. The fix came after 1.4.0, on GtkHx's development line, so no
-  release through 1.4.0 has it. Releases after 1.4.0 do not need the
-  stopgap: the login-time send carries its own task and a refusal of it
-  is only logged, while a set the user makes by hand would show its
-  refusal, as it should. The ng wire still answers `access_denied`,
-  since a modern client can handle a refusal.
+  an avatar (§2) is refused with a task error, "You are not allowed to
+  set an icon.", before anything is decoded, stored or announced, and
+  no turn is spent. mhxd lets anyone.
+  The one exception is a login that looks like GtkHx 1.2 through 1.4.0,
+  which send the saved icon after every login without a task of their
+  own, so a task error there is a pop-up at every login for a guest on
+  a server that keeps the default. That session is answered as a set
+  is, with an empty reply, and the icon is quietly not applied. GtkHx
+  after 1.4.0 sends the login-time icon under its own task and only
+  logs a refusal, while a set the user makes by hand shows its refusal,
+  as it should. The ng wire answers `access_denied`.
+
+  The identification is positive rather than a version threshold:
+  GtkHx 1.2 through 1.4.0 send client version 185 on every login, as
+  the official 1.8.5 client does, but also a `DATA_CAPABILITIES` field,
+  which no official client sends, of a shape all their own: large
+  files, text encoding, inline media and chat history, voice when built
+  with it, and video only beside voice. Both together earn the
+  exception; anything else, including version 185 without that field,
+  is refused.
+
+  GtkHx releases after 1.4.0 send version 254 (0xFE), which hxd-ng also
+  reports as its own. 185 was never GtkHx's alone: the
+  [public registry of client and server versions](https://github.com/fogWraith/Hotline/blob/main/Docs/client-server-versions.md)
+  also gives it to the official 1.8.5 client and server and to Pitbull
+  Pro. Those releases are answered with the refusal, so the exception
+  exists only for the 185-era releases, which will send 185 for as long
+  as they are run.
 - **Get Icon List is rationed.** A session has a few in a burst and
   one more every 15 seconds; past that it is a task error. A request of
   a few bytes can be answered with a megabyte, and GtkHx asks once, as

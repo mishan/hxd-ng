@@ -224,7 +224,7 @@ is optional unless noted.
 [server]
 bind = "0.0.0.0:5500"
 name = "My Server"
-version = 185           # 0 mimics a pre-1.5 server
+version = 254           # 0 mimics a pre-1.5 server
 login_timeout = 10
 ban_time = 1800         # seconds a kick-with-ban holds the person, and an
                         # address [limits] does not exempt; kept

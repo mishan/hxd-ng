@@ -207,7 +207,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             name: "hxd-ng".into(),
-            version: 185,
+            version: 254,
             agreement: None,
             login_timeout: Duration::from_secs(10),
             ban_time: Duration::from_secs(1800),
@@ -1197,6 +1197,43 @@ fn parse_login(f: &Frame) -> LoginRequest {
     req
 }
 
+/// What a classic client whose account may not set an icon is told.
+const SET_ICON_REFUSED: &str = "You are not allowed to set an icon.";
+
+/// Does this login look like GtkHx 1.2 through 1.4.0, whose re-send of
+/// the saved icon after login goes out without a task of its own? Those
+/// releases get the Set Icon stopgap (the `gif_icons::SET` arm).
+///
+/// The identification is positive, not a version threshold. GtkHx 1.2
+/// through 1.4.0 send no name of their own on a plaintext login, but
+/// they send version 185 on every path and a capability field whose
+/// shape nobody else's has: large files, text encoding, inline media and
+/// chat history always, voice when built with it, video only beside
+/// voice, and nothing else. Version 185 alone would also catch the
+/// official 1.8.5 client (mhxd names it "1.8.5 compatible"), but no
+/// official client sends `DATA_CAPABILITIES` at all, so it is the pair
+/// that identifies. A false positive costs what every client cost
+/// before: a refused set answered as done.
+///
+/// GtkHx releases after 1.4.0 send version 254, a number of hxd-ng's and
+/// GtkHx's own (185 is also the official 1.8.5 client's and server's,
+/// and Pitbull Pro's, in the public client and server version
+/// registry), and are answered with the real refusal, which they take
+/// quietly. So the gate stays at 185: it describes releases that exist
+/// and will not change, and nothing newer ever needs it.
+fn resends_icon_untasked(req: &LoginRequest) -> bool {
+    const ALWAYS: u64 = 1 << cap::LARGE_FILES
+        | 1 << cap::TEXT_ENCODING
+        | 1 << cap::INLINE_MEDIA
+        | 1 << cap::CHAT_HISTORY;
+    const OPTIONAL: u64 = 1 << cap::VOICE | 1 << cap::VIDEO;
+    let bits = req.caps.bits();
+    req.clientversion == 185
+        && bits & ALWAYS == ALWAYS
+        && bits & !(ALWAYS | OPTIONAL) == 0
+        && (!req.caps.has(cap::VIDEO) || req.caps.has(cap::VOICE))
+}
+
 /// Per-session protocol state after a successful login.
 struct Session {
     uid: Uid,
@@ -1233,6 +1270,10 @@ struct Session {
     /// Change. The extension has no capability bit; a client that never
     /// asked is not handed a transaction it may not know.
     gif_icons: bool,
+    /// The login looked like GtkHx 1.4.0 or older
+    /// ([`resends_icon_untasked`]), so a Set Icon this session may not
+    /// make is answered as done rather than refused.
+    quiet_icon_refusal: bool,
     /// Get Icon List's allowance ([`ICON_LISTS`]), refilled continuously.
     icon_list_tokens: f64,
     icon_list_refill: Instant,
@@ -2094,6 +2135,7 @@ async fn login_phase(
         media_stream: None,
         transfer_addr: None,
         gif_icons: false,
+        quiet_icon_refusal: resends_icon_untasked(&req),
         icon_list_tokens: ICON_LISTS,
         icon_list_refill: Instant::now(),
         banner_sent: false,
@@ -4244,23 +4286,27 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             .await;
             match outcome {
                 Some(Ok(())) => reply(tx, f.trans, vec![]),
-                // `[extra] set_avatar`: answered as the success a set
+                // `[extra] set_avatar`, for a login that looked like
+                // GtkHx 1.4.0 or older: answered as the success a set
                 // gets, and not applied — the core refused it before any
                 // decode or turn, so nothing is stored or announced. A
-                // deliberate stopgap for GtkHx 1.2 through 1.4.0 (every
-                // release so far), which re-send the saved icon after
-                // every login untasked, so a task error here is a toast
-                // at each one for every guest. The fix came after 1.4.0,
-                // on GtkHx's development line, so no release through
-                // 1.4.0 has it: releases after 1.4.0 send it under a task
-                // of its own and only log a refusal, and do not need
-                // this; a set their user makes by hand would show the
-                // refusal, as it should. The ng wire still answers
-                // `access_denied`, since a modern client can handle a
-                // refusal.
-                Some(Err(hxd_core::media::MediaReject::NotAuthorized)) => {
+                // deliberate stopgap for GtkHx 1.2 through 1.4.0, which
+                // re-send the saved icon after every login untasked, so
+                // a task error here is a toast at each one for every
+                // guest. GtkHx after 1.4.0 sends it under a task of its
+                // own and only logs a refusal. Every other client is
+                // refused, and the ng wire answers `access_denied`.
+                Some(Err(hxd_core::media::MediaReject::NotAuthorized))
+                    if sess.quiet_icon_refusal =>
+                {
                     debug!(uid, "set icon not allowed; answered as done, not applied");
                     reply(tx, f.trans, vec![])
+                }
+                // The core's text for this is "Media rejected", which is
+                // shared with every media refusal and says nothing about
+                // why; the icon has words of its own.
+                Some(Err(hxd_core::media::MediaReject::NotAuthorized)) => {
+                    reply_error(tx, f.trans, SET_ICON_REFUSED)
                 }
                 Some(Err(e)) => reply_error(tx, f.trans, e.text()),
                 None => reply_error(tx, f.trans, hxd_core::media::MediaReject::Busy.text()),
@@ -4341,6 +4387,32 @@ fn file_error_text(error: &hxd_core::FileError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_gtkhxs_login_shape_gets_the_quiet_icon_refusal() {
+        let login = |version: u16, caps: Option<u64>| LoginRequest {
+            clientversion: version,
+            caps: caps.map(Caps::from_bits).unwrap_or_default(),
+            ..LoginRequest::default()
+        };
+        // GtkHx 1.2 through 1.4.0: without voice, with it, and with
+        // video beside it.
+        for caps in [0x1b, 0x1f, 0x41f] {
+            assert!(resends_icon_untasked(&login(185, Some(caps))), "{caps:#x}");
+        }
+        // The official 1.8.5 client sends the same version and no
+        // capabilities; 1.5 and 1.9 send other versions.
+        assert!(!resends_icon_untasked(&login(185, None)));
+        assert!(!resends_icon_untasked(&login(151, None)));
+        assert!(!resends_icon_untasked(&login(190, None)));
+        // GtkHx after 1.4.0, which sends a version of its own.
+        assert!(!resends_icon_untasked(&login(254, Some(0x41f))));
+        // Some other client's capabilities at 185: a bit GtkHx never
+        // sends, one it always does missing, video without voice.
+        assert!(!resends_icon_untasked(&login(185, Some(0x3f))));
+        assert!(!resends_icon_untasked(&login(185, Some(0x17))));
+        assert!(!resends_icon_untasked(&login(185, Some(0x41b))));
+    }
 
     #[test]
     fn fetching_icons_is_free_and_setting_one_is_not() {
