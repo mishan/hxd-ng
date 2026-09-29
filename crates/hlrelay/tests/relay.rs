@@ -368,7 +368,7 @@ async fn via_proxy(
     client: &str,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-    tokio_tungstenite::tungstenite::Error,
+    Box<tokio_tungstenite::tungstenite::Error>,
 > {
     let mut req = format!("ws://{relay}/trtp").into_client_request().unwrap();
     req.headers_mut()
@@ -376,6 +376,7 @@ async fn via_proxy(
     tokio_tungstenite::connect_async(req)
         .await
         .map(|(ws, _)| ws)
+        .map_err(Box::new)
 }
 
 #[tokio::test]
