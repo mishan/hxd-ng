@@ -415,6 +415,18 @@ pub fn reply_err(id: u64, code: &str, text: &str) -> String {
     json!({ "reply": id, "error": { "code": code, "text": text } }).to_string()
 }
 
+/// A login refused by a ban: `banned`, with the ban's reason and when it
+/// runs out, if it does (`docs/moderation.md` §3.5).
+pub fn reply_err_banned(id: u64, hit: &hxd_core::ban::BanHit) -> String {
+    json!({ "reply": id, "error": {
+        "code": "banned",
+        "text": format!("You are banned: {}", hit.reason),
+        "reason": hit.reason,
+        "expires_at": hit.expires_at.map(unix),
+    } })
+    .to_string()
+}
+
 /// [`reply_err`] with the seconds to wait before asking again (§10).
 pub fn reply_err_retry(id: u64, code: &str, text: &str, retry_after: u64) -> String {
     json!({ "reply": id, "error": { "code": code, "text": text, "retry_after": retry_after } })

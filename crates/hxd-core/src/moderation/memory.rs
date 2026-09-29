@@ -18,6 +18,8 @@ struct Inner {
     /// moderator's "#17" names one report forever.
     last_report: ReportId,
     blocked: Vec<[u8; 32]>,
+    bans: Vec<crate::ban::Ban>,
+    last_ban: crate::ban::BanId,
 }
 
 /// A [`ModerationStore`] in memory.
@@ -161,5 +163,73 @@ impl ModerationStore for MemoryModeration {
             .reports
             .retain(|r| r.closed.as_ref().is_none_or(|c| c.at >= before));
         Ok(was - inner.reports.len())
+    }
+
+    fn ban(&self, ban: &crate::ban::Ban) -> Result<crate::ban::Ban, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(old) = inner
+            .bans
+            .iter_mut()
+            .find(|b| b.lifted_at.is_none() && b.target == ban.target)
+        {
+            if old.standing(ban.created_at) {
+                *old = super::extend_ban(old, ban);
+                return Ok(old.clone());
+            }
+            old.lifted_at = old.expires_at;
+        }
+        inner.last_ban += 1;
+        let ban = crate::ban::Ban {
+            id: inner.last_ban,
+            ..ban.clone()
+        };
+        inner.bans.push(ban.clone());
+        Ok(ban)
+    }
+
+    fn lift_ban(
+        &self,
+        id: crate::ban::BanId,
+        by: &str,
+        at: SystemTime,
+    ) -> Result<Option<crate::ban::Ban>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        Ok(inner
+            .bans
+            .iter_mut()
+            .find(|b| b.id == id && b.lifted_at.is_none())
+            .map(|b| {
+                b.lifted_at = Some(at);
+                b.lifted_by = Some(by.to_owned());
+                b.clone()
+            }))
+    }
+
+    fn bans(
+        &self,
+        standing_at: Option<SystemTime>,
+        before: Option<crate::ban::BanId>,
+        limit: usize,
+    ) -> Result<Vec<crate::ban::Ban>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .bans
+            .iter()
+            .rev()
+            .filter(|b| {
+                before.is_none_or(|id| b.id < id) && standing_at.is_none_or(|now| b.standing(now))
+            })
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    fn prune_bans(&self, before: SystemTime) -> Result<usize, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let was = inner.bans.len();
+        inner.bans.retain(|b| {
+            b.lifted_at.is_none_or(|at| at >= before) && b.expires_at.is_none_or(|at| at >= before)
+        });
+        Ok(was - inner.bans.len())
     }
 }

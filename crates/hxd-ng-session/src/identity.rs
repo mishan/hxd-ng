@@ -195,6 +195,9 @@ pub enum AuthRefused {
     WouldOrphan,
     /// The account isn't linked, or is linked to someone else.
     NotLinked,
+    /// A ban on this identity, or on the registrar that issued its
+    /// handle (`docs/moderation.md` §3.5).
+    Banned,
     /// The auth backend failed; logged, not shown.
     Backend,
 }
@@ -214,6 +217,7 @@ impl AuthRefused {
             AuthRefused::AlreadyLinked => "already_linked",
             AuthRefused::WouldOrphan => "would_orphan",
             AuthRefused::NotLinked => "not_linked",
+            AuthRefused::Banned => "banned",
             AuthRefused::Backend => "server_error",
         }
     }
@@ -222,7 +226,10 @@ impl AuthRefused {
     /// with the account's state", 500 for us.
     pub fn status(self) -> u16 {
         match self {
-            AuthRefused::Denied | AuthRefused::Revoked | AuthRefused::NoManage => 403,
+            AuthRefused::Denied
+            | AuthRefused::Revoked
+            | AuthRefused::NoManage
+            | AuthRefused::Banned => 403,
             AuthRefused::AlreadyLinked | AuthRefused::WouldOrphan | AuthRefused::NotLinked => 409,
             AuthRefused::Backend => 500,
             _ => 401,
@@ -618,6 +625,21 @@ impl IdentityState {
             }
         }
 
+        // A banned person is refused before anything below writes: an
+        // account created for a banned identity, or a link to one, is a
+        // way back in that the ban was meant to close. Re-admitting a
+        // device on file writes nothing, and the login on the socket it
+        // opens is refused with the ban's reason, so that is left to it.
+        if assoc == Assoc::Write {
+            if let Some(hit) =
+                self.core
+                    .person_banned(None, Some(&fingerprint.0), handle.as_deref())
+            {
+                info!(fingerprint = %fingerprint.short(), ban = hit.id, "identity auth refused: banned");
+                return Err(AuthRefused::Banned);
+            }
+        }
+
         // Step 6: policy.
         if !self.cfg.allow_list.is_empty() {
             let fp = fingerprint.to_string();
@@ -655,6 +677,16 @@ impl IdentityState {
             };
             if account.login == "guest" {
                 // Logging in as guest names no account to link.
+            } else if assoc == Assoc::Write
+                && self
+                    .core
+                    .person_banned(Some(&account.login), None, None)
+                    .is_some()
+            {
+                // A banned account gains no identity: the link would
+                // outlive the ban as a second way in. Its password
+                // verified, so saying why tells nobody anything new.
+                return Err(AuthRefused::Banned);
             } else if account.identity.fingerprint == Some(fingerprint.0) {
                 linked = Some(account);
             } else if assoc == Assoc::ReadOnly {
@@ -917,6 +949,19 @@ impl IdentityState {
                 return Err(AuthRefused::Backend);
             }
         };
+        // Neither a banned identity nor a banned account is linked: the
+        // link would carry the one past the other's ban.
+        if self
+            .core
+            .person_banned(
+                Some(&account.login),
+                Some(&ident.fingerprint.0),
+                ident.handle.as_deref(),
+            )
+            .is_some()
+        {
+            return Err(AuthRefused::Banned);
+        }
         match self.link_exclusive(&account.login, &ident.fingerprint)? {
             LinkOutcome::Linked(a) => {
                 info!(login = %a.login, fingerprint = %ident.fingerprint.short(), "identity linked");

@@ -31,9 +31,9 @@ use tracing::{debug, info, warn};
 use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
     blocked_json, event_json, history_line_json, parse_streams, participants_json, reply_err,
-    reply_err_retry, reply_ok, reply_ok_with_users, stored_msg_json, user_json, video_err,
-    video_limits_json, voice_err, BlockParams, ChatParams, HistoryParams, InboxParams, LoginParams,
-    MsgParams, MsgReadParams, NickParams, ReqEnvelope, ResumeParams, VideoStartParams,
+    reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users, stored_msg_json, user_json,
+    video_err, video_limits_json, voice_err, BlockParams, ChatParams, HistoryParams, InboxParams,
+    LoginParams, MsgParams, MsgReadParams, NickParams, ReqEnvelope, ResumeParams, VideoStartParams,
     VideoStateParams, VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams,
     VoiceMuteParams, VoiceRoomParams,
 };
@@ -536,6 +536,22 @@ async fn handle_login(
             return None;
         }
     };
+    // A ban on the person: the account's login, the identity it links or
+    // this socket proved, or the registrar that issued its handle
+    // (`docs/moderation.md` §3.5). Told the reason, and until when.
+    let fp = account
+        .identity
+        .fingerprint
+        .or_else(|| identity.map(|i| i.fingerprint.0));
+    let handle = identity.and_then(|i| i.handle.clone());
+    if let Some(hit) = ctx
+        .core
+        .person_banned(Some(&account.login), fp.as_ref(), handle.as_deref())
+    {
+        info!(login = %account.login, ban = hit.id, "ng login refused: banned");
+        let _ = send_frame(ws_tx, Message::Text(reply_err_banned(req.id, &hit))).await;
+        return None;
+    }
 
     let mut nick = match (&p.nick, account.access.has(bit::USE_ANY_NAME)) {
         (Some(n), true) if !n.is_empty() => n.clone(),
@@ -619,6 +635,14 @@ async fn handle_login(
         let _ = send_frame(ws_tx, Message::Text(reply_err(req.id, code, text))).await;
         return None;
     };
+    // Asked again now the session is on the roster: a ban placed since
+    // the check above found no session to end. Ended here, before it is
+    // announced or given a token.
+    if let Some(hit) = ctx.core.end_if_banned(uid) {
+        info!(login = %account.login, ban = hit.id, "ng login refused: banned while attaching");
+        let _ = send_frame(ws_tx, Message::Text(reply_err_banned(req.id, &hit))).await;
+        return None;
+    }
     // ng has no agreement dance: announce immediately (the snapshot below
     // then includes self), with the owner's avatar already on it.
     if ctx.core.avatar_policy().is_some() {
@@ -869,6 +893,16 @@ async fn handle_resume(
         return None;
     };
 
+    // A ban on the person placed while the session was away: the token
+    // is no way back past it (`docs/moderation.md` §3.5). An address ban
+    // was asked at the HTTP layer, of this connection's address. The
+    // session ends, rather than waiting out its grace detached.
+    if let Some(hit) = ctx.core.end_if_person_banned(uid) {
+        ctx.registry.remove(&p.session);
+        info!(uid, ban = hit.id, "ng resume refused: banned");
+        let _ = send_frame(ws_tx, Message::Text(reply_err_banned(req.id, &hit))).await;
+        return None;
+    }
     let (events, replay) = match ctx.core.resume(uid, p.last_seq) {
         Resume::Replayed(rx, replay) => (rx, Some(replay)),
         Resume::ResyncRequired(rx) => (rx, None),
@@ -1260,7 +1294,13 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         _ => None,
     };
     if let Some(trans) = charge {
-        if ctx.core.spend_spam(state.uid, 2, trans).is_err() {
+        if let Err(flooded) = ctx.core.spend_spam(state.uid, 2, trans) {
+            // The kick is made; its ban is a store write, so it is placed
+            // off the reactor, and before the reply, so it stands by the
+            // time the client can be back.
+            if let Some(ban) = flooded.ban {
+                off_reactor(&ctx.core, move |c| c.place_spam_ban(ban)).await;
+            }
             // The kick that follows is the session's end; this says why.
             let out = reply_err(req.id, "flooding", "You were kicked for flooding.");
             return finish(ws_tx, out).await;

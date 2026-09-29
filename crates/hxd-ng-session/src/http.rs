@@ -1763,6 +1763,7 @@ fn refused(e: AuthRefused) -> Resp {
             AuthRefused::AlreadyLinked => "this identity is already linked to another account here",
             AuthRefused::WouldOrphan => "set a password on the account before unlinking; it has no other way in",
             AuthRefused::NotLinked => "this identity has no linked account here",
+            AuthRefused::Banned => "banned from this server",
             AuthRefused::Backend => "server error",
         } }),
     )

@@ -75,7 +75,8 @@ pub struct ModerationPolicy {
     /// How long a redacted line's text stays readable to moderators in
     /// the audit trail before the sweeper scrubs it. 0 keeps it.
     pub evidence_days: u32,
-    /// How long a closed report is kept. 0 keeps it.
+    /// How long a closed report is kept, and a ban that has ended
+    /// (lifted or run out). 0 keeps them.
     pub report_days: u32,
     /// How long a reported image may outlive its handle's TTL.
     pub pin_days: u32,
@@ -86,6 +87,10 @@ pub struct ModerationPolicy {
     /// the default — is none, because a kick over that wire has meant
     /// one thing for twenty-five years (§6).
     pub kick_purges: Duration,
+    /// How wide a kick's ban is on an IPv6 address, in bits: the next
+    /// address in the same /64 is the same subscriber. An IPv4 one is
+    /// always its /32.
+    pub ban_v6_prefix: u8,
 }
 
 impl Default for ModerationPolicy {
@@ -96,6 +101,7 @@ impl Default for ModerationPolicy {
             pin_days: 7,
             notify_legacy: true,
             kick_purges: Duration::ZERO,
+            ban_v6_prefix: 64,
         }
     }
 }
@@ -113,6 +119,10 @@ pub enum ActKind {
     NewsDelete,
     /// A news category deleted, and every article in it.
     NodeDelete,
+    /// A ban placed or extended (`crate::ban`).
+    Ban,
+    /// A ban lifted.
+    Unban,
 }
 
 impl ActKind {
@@ -124,6 +134,8 @@ impl ActKind {
             ActKind::Close => 4,
             ActKind::NewsDelete => 5,
             ActKind::NodeDelete => 6,
+            ActKind::Ban => 7,
+            ActKind::Unban => 8,
         }
     }
 
@@ -135,6 +147,8 @@ impl ActKind {
             4 => ActKind::Close,
             5 => ActKind::NewsDelete,
             6 => ActKind::NodeDelete,
+            7 => ActKind::Ban,
+            8 => ActKind::Unban,
             _ => return None,
         })
     }
@@ -147,6 +161,8 @@ impl ActKind {
             ActKind::Close => "close",
             ActKind::NewsDelete => "news_delete",
             ActKind::NodeDelete => "news_node_delete",
+            ActKind::Ban => "ban",
+            ActKind::Unban => "unban",
         }
     }
 }
@@ -175,7 +191,7 @@ pub struct Act {
 }
 
 impl Act {
-    fn new(kind: ActKind, by: &Acting, reason: String) -> Self {
+    pub(crate) fn new(kind: ActKind, by: &Acting, reason: String) -> Self {
         Act {
             id: 0,
             kind,
@@ -469,6 +485,68 @@ pub trait ModerationStore: Send + Sync + 'static {
     fn scrub_evidence(&self, before: SystemTime) -> Result<usize, StoreError>;
     /// Delete reports closed before `before`. Returns how many went.
     fn prune_reports(&self, before: SystemTime) -> Result<usize, StoreError>;
+
+    /// Record a ban (`crate::ban`); `ban.id` is ignored. A target with a
+    /// ban standing at `ban.created_at` keeps its one row, extended: the
+    /// later expiry of the two (none is the latest), the new reason and
+    /// actor, and its source unless that was the config, whose rows the
+    /// config alone rules. Its act stays the one that created it
+    /// ([`extend_ban`]). One that has expired but was never lifted is
+    /// closed at its expiry (`lifted_at` set, `lifted_by` not), its
+    /// record left as it was, and the new ban is a new row.
+    /// Returns the row as it now stands.
+    fn ban(&self, ban: &crate::ban::Ban) -> Result<crate::ban::Ban, StoreError>;
+    /// Lift a ban not yet lifted. `None` when there is none by `id`.
+    fn lift_ban(
+        &self,
+        id: crate::ban::BanId,
+        by: &str,
+        at: SystemTime,
+    ) -> Result<Option<crate::ban::Ban>, StoreError>;
+    /// Bans, newest first, from before `before` (exclusive): with
+    /// `standing_at`, only those standing then.
+    fn bans(
+        &self,
+        standing_at: Option<SystemTime>,
+        before: Option<crate::ban::BanId>,
+        limit: usize,
+    ) -> Result<Vec<crate::ban::Ban>, StoreError>;
+    /// Delete bans lifted, or expired, before `before`. Returns how many
+    /// went.
+    fn prune_bans(&self, before: SystemTime) -> Result<usize, StoreError>;
+}
+
+/// [`ModerationStore::ban`]'s rule for a target already banned: the
+/// standing row, extended by `new`.
+///
+/// The row keeps the act that created it. Lifting a ban lifts every
+/// standing row its act placed (`Core::lift_ban`), so a row that took
+/// the act of whatever extended it would be lifted with a ban that
+/// merely touched it: a week's login ban of an account would, lifted,
+/// take with it the permanent ban an earlier act placed on the identity
+/// that account links. An act that only extended a row does not own it;
+/// lifting that act leaves the row standing as it now is.
+pub fn extend_ban(old: &crate::ban::Ban, new: &crate::ban::Ban) -> crate::ban::Ban {
+    use crate::ban::BanSource;
+    let expires_at = match (old.expires_at, new.expires_at) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        _ => None,
+    };
+    crate::ban::Ban {
+        id: old.id,
+        target: old.target.clone(),
+        created_at: old.created_at,
+        expires_at,
+        source: if old.source == BanSource::Config {
+            BanSource::Config
+        } else {
+            new.source
+        },
+        lifted_at: None,
+        lifted_by: None,
+        act: old.act,
+        ..new.clone()
+    }
 }
 
 /// Why a moderation request did not happen. Each is a distinct ng error
@@ -497,6 +575,10 @@ pub enum ModError {
     OwnReport,
     RateLimited,
     NoSession,
+    /// No ban by that id, or none still standing.
+    NoSuchBan,
+    /// A ban the config file places, which only the config lifts.
+    ConfigBan,
     Store(StoreError),
 }
 
@@ -625,6 +707,10 @@ impl Core {
             Ok(hashes) => self.media_block_hashes(hashes),
             Err(e) => warn!("moderation: the block list would not load: {e}"),
         }
+        match store.bans(Some(SystemTime::now()), None, usize::MAX) {
+            Ok(bans) => *self.bans.write().unwrap() = crate::ban::BanMatcher::load(bans),
+            Err(e) => warn!("moderation: the ban list would not load: {e}"),
+        }
         self.moderation = Some(store);
         self.moderation_policy = policy;
         self
@@ -680,6 +766,30 @@ impl Core {
                     return Err(ModError::AccessDenied);
                 }
                 Ok(Acting {
+                    name: sess.login.clone(),
+                    fingerprint: sess.identity,
+                    overrides: sess.access.has(bit::DELETE_USERS),
+                    uid: Some(uid),
+                    person: Some(Subject {
+                        login: sess.is_person.then(|| sess.login.clone()),
+                        fingerprint: sess.identity,
+                        nick: sess.info.nick.clone(),
+                    }),
+                })
+            }
+        }
+    }
+
+    /// Who a kick is by, for the ban it places: the kicker's session,
+    /// which a kick needs the kick bit for and not `moderate`, or the
+    /// operator.
+    pub(crate) fn acting_kicker(&self, by: Actor) -> Option<Acting> {
+        match by {
+            Actor::Operator => self.acting(Actor::Operator).ok(),
+            Actor::Session(uid) => {
+                let r = self.roster.lock().unwrap();
+                let sess = r.users.get(&uid)?;
+                Some(Acting {
                     name: sess.login.clone(),
                     fingerprint: sess.identity,
                     overrides: sess.access.has(bit::DELETE_USERS),
@@ -1704,11 +1814,14 @@ impl Core {
         Ok((page, more))
     }
 
-    /// The sweeper's work (§3.1, §4.4): evidence past its window is
-    /// scrubbed, closed reports past theirs deleted. Returns both counts.
-    pub fn prune_moderation(&self) -> (usize, usize) {
+    /// The sweeper's work (§3.1, §3.5, §4.4): evidence past its window
+    /// is scrubbed, and closed reports and ended bans past theirs
+    /// deleted. Returns the three counts. A standing ban is never
+    /// pruned: only one lifted, or run out, `report_days` ago, whose row
+    /// is a record and no longer refuses anyone.
+    pub fn prune_moderation(&self) -> (usize, usize, usize) {
         let Some(store) = self.moderation.as_ref() else {
-            return (0, 0);
+            return (0, 0, 0);
         };
         let now = SystemTime::now();
         let before = |d: u32| now.checked_sub(days(d)).unwrap_or(SystemTime::UNIX_EPOCH);
@@ -1733,7 +1846,17 @@ impl Core {
                     0
                 })
         };
-        (scrubbed, pruned)
+        let bans = if policy.report_days == 0 {
+            0
+        } else {
+            store
+                .prune_bans(before(policy.report_days))
+                .unwrap_or_else(|e| {
+                    warn!("ban retention: {e}");
+                    0
+                })
+        };
+        (scrubbed, pruned, bans)
     }
 }
 

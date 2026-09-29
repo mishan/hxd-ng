@@ -779,6 +779,21 @@ fn reply_error(tx: &Tx, trans: u32, msg: &str) {
     );
 }
 
+/// A task error is ASCII (`reply_error`), and a ban's reason is whatever
+/// a moderator typed: what cannot be said in ASCII is left out.
+fn banned_text(reason: &str) -> String {
+    let reason: String = reason
+        .chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control())
+        .take(200)
+        .collect();
+    if reason.trim().is_empty() {
+        "You are banned from this server.".into()
+    } else {
+        format!("You are banned from this server: {}", reason.trim())
+    }
+}
+
 /// A task error carrying extra fields beside its text — the shape the
 /// inline-media extension's optional error code needs
 /// (`docs/inline-media.md` §7.2).
@@ -1449,9 +1464,26 @@ fn names_guest(login: &str) -> bool {
     login.is_empty() || login.eq_ignore_ascii_case("guest")
 }
 
+/// Why [`reconcile_login`] admitted no one.
+#[derive(Debug)]
+enum Refused {
+    Auth(AuthError),
+    /// An identity socket named a banned account not linked to it.
+    Banned(hxd_core::ban::BanHit),
+}
+
+impl From<AuthError> for Refused {
+    fn from(e: AuthError) -> Self {
+        Refused::Auth(e)
+    }
+}
+
 /// The classic login, reconciled with the socket's transport identity
 /// when it has one (`docs/hotline-ng-identity.md` §8.3). Without an
 /// identity this is just `authenticate`.
+///
+/// A login on an identity socket that names a banned account not linked
+/// to it is [`Refused::Banned`], whatever the account's linking rules.
 fn reconcile_login(
     auth: &dyn AuthBackend,
     core: &Core,
@@ -1460,7 +1492,7 @@ fn reconcile_login(
     identity_fp: Option<[u8; 32]>,
     policy: TrtpLogin,
     link: LinkAuthority,
-) -> Result<Account, AuthError> {
+) -> Result<Account, Refused> {
     // Whatever this login resolves to, an account that links an identity
     // has its mail claimed onto the fingerprint before it is handed a
     // session. `claim` is idempotent and does nothing on a mailbox that
@@ -1508,7 +1540,7 @@ fn reconcile_login(
         // the link alone. Naming no account is a question about the
         // identity; only a linked account that may log in answers it.
         Err(AuthError::NoSuchAccount) if names_guest(login) && identity_admits => None,
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
     };
     if account.as_ref().is_none_or(|a| a.login == "guest") {
         // §8.1: naming no account on an identity socket associates by
@@ -1522,7 +1554,7 @@ fn reconcile_login(
             }
             Some(a) => {
                 info!(login = %a.login, "identity_login is off for the linked account");
-                Err(AuthError::BadProof)
+                Err(AuthError::BadProof.into())
             }
             // §8.1 `deny`, decided on this wire as it is on the JSON one:
             // nothing links this identity, so there is no guest to fall
@@ -1532,12 +1564,22 @@ fn reconcile_login(
             // from the upgrade.
             None if !link.unlinked_ok => {
                 info!("new_accounts = deny: an identity with no linked account");
-                Err(AuthError::BadProof)
+                Err(AuthError::BadProof.into())
             }
-            None => account.ok_or(AuthError::NoSuchAccount),
+            None => account.ok_or(AuthError::NoSuchAccount.into()),
         };
     }
     let account = account.expect("a named account was authenticated");
+    // A banned account gains no identity: the link would outlive the ban
+    // as a second way in. Refused here, with the ban's reason, and never
+    // handed back unlinked for the caller's ban check: a ban lifted or
+    // run out by then would land this identity on an account it has no
+    // business on unless it may link it.
+    if account.identity.fingerprint.is_none() {
+        if let Some(hit) = core.person_banned(Some(&account.login), None, None) {
+            return Err(Refused::Banned(hit));
+        }
+    }
     match account.identity.fingerprint {
         Some(f) if f == fp => {
             claim(&account);
@@ -1545,7 +1587,7 @@ fn reconcile_login(
         }
         Some(_) => {
             info!(login = %account.login, "tunnelled login names an account linked to another identity");
-            Err(AuthError::BadProof)
+            Err(AuthError::BadProof.into())
         }
         // Self-linking here writes an association exactly as
         // `/identity/link` does, so it needs the same `manage`
@@ -1571,7 +1613,7 @@ fn reconcile_login(
                 // unlinked self-linkable one — so this is neither.
                 LinkOutcome::Taken(_) | LinkOutcome::Refused(_) => {
                     info!(login = %account.login, "tunnelled login names an account this identity may not have");
-                    Err(AuthError::BadProof)
+                    Err(AuthError::BadProof.into())
                 }
             }
         }
@@ -1586,7 +1628,7 @@ fn reconcile_login(
         // to do with identities belongs.
         None => {
             info!(login = %account.login, "tunnelled login names an account that refuses self-linking");
-            Err(AuthError::BadProof)
+            Err(AuthError::BadProof.into())
         }
     }
 }
@@ -1641,6 +1683,20 @@ async fn login_phase(
     // this same canonical form.) The wire's cap of 31 applies in
     // characters, which is bytes for Mac Roman as it always was, so a
     // password cuts at the same place whichever encoding sent it.
+    // A banned identity, or one whose registrar is banned, is refused
+    // before the backend is asked: that may link it to the account the
+    // login names, and a link written for a banned person is a way back
+    // in once the ban on them ends or is evaded.
+    if let Some(t) = transport.identity.as_ref() {
+        if let Some(hit) = ctx
+            .core
+            .person_banned(None, Some(&t.fingerprint), t.handle.as_deref())
+        {
+            info!(ban = hit.id, "tunnelled login refused: banned");
+            reply_error(tx, f.trans, &banned_text(&hit.reason));
+            return None;
+        }
+    }
     let auth = ctx.auth.clone();
     let core = ctx.core.clone();
     let login_str = enc.decode_chars(&req.login, 31);
@@ -1663,19 +1719,42 @@ async fn login_phase(
 
     let account = match verdict {
         Ok(a) => a,
-        Err(e @ (AuthError::NoSuchAccount | AuthError::BadProof)) => {
+        Err(Refused::Auth(e @ (AuthError::NoSuchAccount | AuthError::BadProof))) => {
             info!(login = %String::from_utf8_lossy(&req.login), "login refused: {e}");
             // The reference server closes with an empty error reply; give
             // the human a reason too — clients render the text.
             reply_error(tx, f.trans, "Login failed.");
             return None;
         }
-        Err(AuthError::Backend(e)) => {
+        Err(Refused::Banned(hit)) => {
+            info!(login = %String::from_utf8_lossy(&req.login), ban = hit.id, "tunnelled login refused: banned");
+            reply_error(tx, f.trans, &banned_text(&hit.reason));
+            return None;
+        }
+        Err(Refused::Auth(AuthError::Backend(e))) => {
             warn!("auth backend failure: {e}");
             reply_error(tx, f.trans, "Server error.");
             return None;
         }
     };
+    // A ban on the person (`docs/moderation.md` §3.5): the reference
+    // server's refusal, with the ban's reason.
+    let fp = account
+        .identity
+        .fingerprint
+        .or_else(|| transport.identity.as_ref().map(|t| t.fingerprint));
+    let handle = transport
+        .identity
+        .as_ref()
+        .and_then(|t| t.handle.as_deref());
+    if let Some(hit) = ctx
+        .core
+        .person_banned(Some(&account.login), fp.as_ref(), handle)
+    {
+        info!(login = %account.login, ban = hit.id, "login refused: banned");
+        reply_error(tx, f.trans, &banned_text(&hit.reason));
+        return None;
+    }
 
     // Resolve the visible name: the account must grant use_any_name for
     // the client's own nick to stick; otherwise the account name rules.
@@ -1761,6 +1840,14 @@ async fn login_phase(
         );
         return None;
     };
+    // Asked again now the session is on the roster: a ban placed since
+    // the check above found no session to end. Ended here, before the
+    // login is answered or anyone told of the join.
+    if let Some(hit) = ctx.core.end_if_banned(uid) {
+        info!(login = %account.login, ban = hit.id, "login refused: banned while attaching");
+        reply_error(tx, f.trans, &banned_text(&hit.reason));
+        return None;
+    }
 
     // Login reply. A version-0 server sends only the uid (and a 1.0/1.2
     // client wouldn't know what to do with more).
@@ -2317,8 +2404,15 @@ async fn session_loop(
                     // mhxd charges every transaction after login before
                     // it looks at it, and one that spends the last of the
                     // budget is never answered: the kick that follows is
-                    // the reply. Nor is anything after it.
-                    if ctx.core.spend_spam(sess.uid, spam_points(f.ty), f.ty).is_err() {
+                    // the reply. Nor is anything after it. The kick is
+                    // already made; its ban is a store write, placed off
+                    // the reactor before this connection reads the kick
+                    // and closes, so it stands by the time the client
+                    // can reconnect.
+                    if let Err(flooded) = ctx.core.spend_spam(sess.uid, spam_points(f.ty), f.ty) {
+                        if let Some(ban) = flooded.ban {
+                            off_reactor(&ctx.core, move |c| c.place_spam_ban(ban)).await;
+                        }
                         continue;
                     }
                     dispatch(&f, tx, ctx, sess).await;
@@ -3417,7 +3511,16 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     debug!(target, "kick purge skipped: {e:?}");
                 }
             }
-            match ctx.core.kick(target, ban_for) {
+            let kick_ban = ban_for.map(|for_| hxd_core::KickBan {
+                by: hxd_core::Actor::Session(sess.uid),
+                for_,
+                reason: "banned by a moderator".into(),
+            });
+            // A ban is written to the store: off the reactor.
+            let kicked = off_reactor(&ctx.core, move |c| c.kick_by(target, kick_ban))
+                .await
+                .unwrap_or(Err(ChatError::ServerError));
+            match kicked {
                 Ok(nick) => {
                     reply(tx, f.trans, vec![]);
                     // The public-chat announcement, in the reference

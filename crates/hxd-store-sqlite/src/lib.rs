@@ -70,7 +70,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -386,6 +386,41 @@ CREATE TABLE avatar (
   set_at     INTEGER NOT NULL
 );
 CREATE INDEX avatar_id ON avatar (id);
+";
+
+/// Bans (`docs/moderation.md` §7, `hxd_core::ban`): one row per ban,
+/// lifted rather than deleted, and at most one not yet lifted per
+/// target — a re-ban extends it. `target` is the kind's canonical bytes,
+/// an address as IPv6 with IPv4 mapped and `prefix_len` counted over
+/// that form; one column for every kind is what lets the unique index
+/// hold, where a nullable column per kind would count every NULL as
+/// distinct. The ban row is the state; the `moderation` row it names is
+/// the act that placed it.
+const SCHEMA_V10: &str = "
+CREATE TABLE ban (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind          INTEGER NOT NULL,
+  target        BLOB    NOT NULL,
+  prefix_len    INTEGER,
+  reason        TEXT    NOT NULL,
+  note          TEXT,
+  actor         TEXT    NOT NULL,
+  actor_fp      TEXT,
+  source        INTEGER NOT NULL,
+  created_at    INTEGER NOT NULL,
+  expires_at    INTEGER,
+  lifted_at     INTEGER,
+  lifted_by     TEXT,
+  moderation_id INTEGER,
+  CHECK (kind BETWEEN 1 AND 4),
+  CHECK ((kind = 1) = (prefix_len IS NOT NULL)),
+  CHECK (prefix_len IS NULL OR prefix_len BETWEEN 0 AND 128)
+);
+CREATE UNIQUE INDEX ban_standing
+  ON ban (kind, target, coalesce(prefix_len, -1))
+  WHERE lifted_at IS NULL;
+CREATE INDEX ban_expiry ON ban (expires_at)
+  WHERE lifted_at IS NULL AND expires_at IS NOT NULL;
 ";
 
 /// Moderation (`docs/moderation.md` §7, `docs/news.md` §11). Version 2
@@ -980,6 +1015,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 9 {
         steps.push_str(SCHEMA_V9);
+    }
+    if version < 10 {
+        steps.push_str(SCHEMA_V10);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"

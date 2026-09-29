@@ -421,11 +421,22 @@ async fn kick_ban_and_untouchable_targets() {
         .await;
     let ack = admin.recv_type(HDR_TASK).await;
     assert_eq!((ack.trans, ack.flag), (t, 0));
-    let chat = admin.recv_type(HDR_CHAT).await;
-    let line = chunk(&chat, tag::BODY).unwrap();
-    assert_eq!(line, b"\r<victim has been banned by root>".to_vec());
-    let part = admin.recv_type(HDR_USER_PART).await;
-    assert_eq!(chunk_u32(&part, tag::UID), Some(victim.uid as u32));
+    // The two race: the part follows the victim's connection down, the
+    // line follows the ack.
+    let (mut line, mut part) = (None, None);
+    for _ in 0..12 {
+        let f = admin.recv().await;
+        match f.ty {
+            HDR_CHAT => line = chunk(&f, tag::BODY),
+            HDR_USER_PART => part = chunk_u32(&f, tag::UID),
+            _ => {}
+        }
+        if line.is_some() && part.is_some() {
+            break;
+        }
+    }
+    assert_eq!(line, Some(b"\r<victim has been banned by root>".to_vec()));
+    assert_eq!(part, Some(victim.uid as u32));
 
     // The victim's socket is dead.
     let end = timeout(Duration::from_secs(5), read_frame(&mut victim.stream)).await;

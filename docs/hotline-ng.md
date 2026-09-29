@@ -673,7 +673,9 @@ news body is different: it declares its own type (news.md §5).
   `msg` spend at the price mhxd charges its Chat and Message
   transactions. Past the first the session is kicked and its room told;
   past the second it is kicked and its address banned for `[server]
-  ban_time`, and public chat told. An account with `[extra] can_spam` is
+  ban_time` (on an address `[limits] exempt` holds to nothing, its
+  account's login or identity instead, and a plain guest is only
+  kicked), and public chat told. An account with `[extra] can_spam` is
   held to neither.
 - **Roster pollution** is bounded by the detach rules of §2: permission
   per account and off for guests, a per-address cap, and moderation that

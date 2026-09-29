@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc::{self, error::TrySendError};
 
 use crate::access::{bit, AccessBits};
-use crate::chat::{Ban, PrivateChat};
+use crate::chat::PrivateChat;
 use crate::instrument::{self, TimedMutex};
 
 /// A user id, as seen on the wire (16-bit, never 0 for a real user).
@@ -823,7 +823,6 @@ pub(crate) struct RosterInner {
     last_serial: u64,
     pub(crate) public_subject: String,
     pub(crate) chats: HashMap<u32, PrivateChat>,
-    pub(crate) bans: Vec<Ban>,
     pub(crate) voice: crate::voice::VoiceState,
 }
 
@@ -1036,6 +1035,16 @@ pub struct Core {
     pub(crate) conn_gate: crate::limits::ConnGate,
     /// How fast one session may talk (`crate::limits`).
     pub(crate) flood_limits: crate::limits::FloodLimits,
+    /// Every standing ban, for matching without the store
+    /// (`crate::ban`).
+    pub(crate) bans: std::sync::RwLock<crate::ban::BanMatcher>,
+    /// Ids for bans placed with no store to number them.
+    pub(crate) ban_ids: std::sync::atomic::AtomicU64,
+    /// Held by whatever changes the bans — a place, a lift, a reread —
+    /// across its store call and its matcher update, so none lands
+    /// between another's two halves. Taken before `bans`, never while
+    /// the roster lock is held.
+    pub(crate) ban_writes: Mutex<()>,
     /// The durable private-message inbox, or `None` — in which case
     /// private messaging behaves exactly as it did before the inbox
     /// existed, which is what a server that configures no database gets.

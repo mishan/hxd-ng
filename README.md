@@ -221,7 +221,9 @@ bind = "0.0.0.0:5500"
 name = "My Server"
 version = 185           # 0 mimics a pre-1.5 server
 login_timeout = 10
-ban_time = 1800         # seconds a kick-with-ban holds the address
+ban_time = 1800         # seconds a kick-with-ban holds the address; kept
+                        # in the [moderation] database, so a restart does
+                        # not lift it
 stamp_queued = true     # stamp a message that waited in the inbox with its
                         # send time (docs/private-messages.md §7)
 queue_budget_mb = 128   # what the server may hold for its clients, all
@@ -270,7 +272,12 @@ mhxd's table gives it (a chat line or a private message 2, a user list
 20, anything it does not list 10; the extensions mhxd never had, and
 fetching icons, cost nothing), as does an ng `chat` or `msg`; a user
 who reaches `spam_points` is kicked and its address banned for
-`[server] ban_time`, and public chat is told as mhxd tells it. An account
+`[server] ban_time`, and public chat is told as mhxd tells it. An
+address in `exempt` is never banned for it, since everyone behind a
+shared proxy would go with the flooder: there the ban is on the
+account's login (or the identity a guest came with), and a plain guest
+is only kicked. Exempt a proxy that hides its clients' addresses for
+this too. An account
 with `[extra] can_spam = true` is held to neither, which by default is
 every account with the kick bit. A load test from one machine wants
 both at 0.
@@ -911,7 +918,7 @@ it answers today.
 Always on: kick and ban never needed a database, and neither do reports
 — on a server with none they last until it stops. Where `[inbox]`,
 `[history]` or `[news]` names a database (in that order), the audit
-trail and the reports are kept there. Who moderates is `[extra] moderate`
+trail, the reports and the bans are kept there. Who moderates is `[extra] moderate`
 in the account file, which defaults to the kick bit (`disconnect_users`).
 The section is optional; these are its defaults. See
 [docs/moderation.md](docs/moderation.md).
@@ -919,10 +926,11 @@ The section is optional; these are its defaults. See
 ```toml
 [moderation]
 evidence_days = 30    # how long a redacted line's words stay readable to moderators
-report_days = 90      # how long a closed report is kept
+report_days = 90      # how long a closed report, or an ended ban, is kept
 pin_days = 7          # how long a reported image may outlive its handle
 notify_legacy = true  # reports as private messages to moderators on the classic wire
 kick_purges = 0       # seconds of a kicked user's output a classic kick takes; 0 = none
+ban_v6_prefix = 64    # how wide a kick's ban is on an IPv6 address, in bits
 ```
 
 ### Voice and video
@@ -1089,7 +1097,20 @@ hxd history redact 4711 --reason "slur"      # blank a public line, keep its wor
 hxd purge bob --since 1h --reason "spam run" # redact bob's lines and delete his articles
 hxd purge bob --since 1h --reason x --dry-run
 hxd moderation log                           # the audit trail, newest first
+hxd ban add 203.0.113.0/24 --reason "botnet" --for 7d
+hxd ban add login:bob --reason "spam"        # bob's account, and the identity it links
+hxd ban list                                 # what stands; --all for every ban on record
+hxd ban lift 12
 ```
+
+A ban refuses an address or block before the handshake, and a login
+or an identity (`identity:FINGERPRINT`, whether it logs in with its key
+or as the account it links) at login, with its reason, on both wires.
+A registrar's every identity (`*@HOST`) is refused when a login proves
+one of its handles, which a password login does not. A kick-with-ban is
+one too, on the kicked address for `ban_time`, and disconnects only the
+one kicked, as mhxd's does. A running server applies
+`hxd ban` on SIGHUP, ending the sessions a new ban refuses.
 
 Images live in the running server's memory, not in the database, so
 revoking one — and a purge's images — is an ng moderator's to do; `hxd

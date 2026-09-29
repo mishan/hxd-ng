@@ -1032,47 +1032,155 @@ async fn new_accounts_create_writes_an_account_file() {
     assert_eq!(authenticate(ng, &p).await["outcome"], "linked");
 }
 
+/// A classic login through the `/trtp` tunnel with `p`'s identity:
+/// the tunnel when it was admitted, `None` on an error reply.
+async fn tunnel_login(ng: SocketAddr, p: &Person, login: &[u8], password: &[u8]) -> Option<Tunnel> {
+    let token = authenticate(ng, p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut req = format!("ws://{ng}/trtp").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let mut t = Tunnel::new(ws);
+    t.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
+    t.read_exact(8).await;
+    let xor: Vec<u8> = password.iter().map(|b| b ^ 0xff).collect();
+    let xlogin: Vec<u8> = login.iter().map(|b| b ^ 0xff).collect();
+    t.send(
+        REQ_LOGIN,
+        &[
+            (tag::LOGIN, xlogin),
+            (tag::PASSWORD, xor),
+            (tag::NAME, b"n".to_vec()),
+            (tag::VERSION, 150u16.to_be_bytes().to_vec()),
+        ],
+    )
+    .await;
+    let reply = t.recv_type(HDR_TASK).await;
+    if reply.flag != 0 {
+        return None; // error reply
+    }
+    t.recv_type(HDR_SELFINFO).await;
+    Some(t)
+}
+
+/// A banned person is refused before anything is written for them: no
+/// account is created for a banned identity or one whose registrar is
+/// banned, and a banned account gains no identity through the tunnel.
+#[tokio::test]
+async fn a_banned_person_is_neither_given_an_account_nor_linked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = IdentityConfig {
+        new_accounts: hxd_ng_session::NewAccounts::Create,
+        ..Default::default()
+    };
+    let reg = ServerKey::from_seed(&[0x33; 32]);
+    cfg.registrar_keys.insert("hl.example".into(), reg.public());
+    let (_legacy, ng, ctx) =
+        start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+    let attested = |seed: u8, handle: &str| {
+        let mut p = person(seed, handle);
+        let att = hl_identity::Attestation {
+            identity: p.id.public(),
+            registrar: "hl.example".into(),
+            registrar_key: reg.public(),
+            handle: handle.into(),
+            registered: now() - 86_400,
+            issued: now() - 5,
+            expires: now() + 86_400,
+            level: None,
+        };
+        p.card = Card::new(&p.id, handle, now())
+            .sign(&p.id, vec![att.signed_value(&reg)])
+            .unwrap();
+        p
+    };
+    let ban = |target| {
+        ctx.core
+            .place_ban(
+                hxd_core::Actor::Operator,
+                hxd_core::ban::NewBan {
+                    target,
+                    reason: "flood".into(),
+                    note: None,
+                    expires_at: None,
+                    source: hxd_core::ban::BanSource::Cli,
+                },
+            )
+            .unwrap()
+    };
+    let accounts = || {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("accounts"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = accounts();
+
+    let carol = attested(20, "carol");
+    ban(hxd_core::ban::BanTarget::Identity(carol.id.fingerprint().0));
+    let r = try_authenticate(ng, &carol, json!({})).await;
+    assert_eq!((r.status, &r.json()["error"]), (403, &json!("banned")));
+    let r = try_authenticate(ng, &carol, json!({ "login": "alice", "password": "pw" })).await;
+    assert_eq!(r.status, 403, "nor linked by the credentials it brings");
+
+    ban(hxd_core::ban::BanTarget::registrar("hl.example").unwrap());
+    let r = try_authenticate(ng, &attested(21, "dave"), json!({})).await;
+    assert_eq!((r.status, &r.json()["error"]), (403, &json!("banned")));
+    assert_eq!(accounts(), before, "no account was created");
+
+    // A banned account gains no identity: not by the credentials an
+    // identity no ban names brings to /identity/auth, nor by
+    // /identity/link once that identity holds a token.
+    ban(hxd_core::ban::BanTarget::login("alice").unwrap());
+    let alice_linked = || {
+        std::fs::read_to_string(dir.path().join("accounts/alice.toml"))
+            .unwrap()
+            .contains("fingerprint")
+    };
+    let frank = person(23, "Frank");
+    let r = try_authenticate(ng, &frank, json!({ "login": "alice", "password": "pw" })).await;
+    assert_eq!((r.status, &r.json()["error"]), (403, &json!("banned")));
+    assert!(!alice_linked());
+    let token = authenticate(ng, &frank).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let r = http(
+        ng,
+        "POST",
+        "/identity/link",
+        &[("Authorization", &format!("Bearer {token}"))],
+        json!({ "login": "alice", "password": "pw" })
+            .to_string()
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!((r.status, &r.json()["error"]), (403, &json!("banned")));
+    assert!(!alice_linked());
+
+    // Nor through the tunnel with its password: refused with the ban's
+    // reason.
+    let erin = person(22, "Erin");
+    assert!(tunnel_login(ng, &erin, b"alice", b"pw").await.is_none());
+    let file = std::fs::read_to_string(dir.path().join("accounts/alice.toml")).unwrap();
+    assert!(!file.contains("fingerprint"), "{file}");
+    assert!(
+        ctx.core
+            .person_banned(None, Some(&erin.id.fingerprint().0), None)
+            .is_none(),
+        "the identity itself was never banned: only the link was refused"
+    );
+}
+
 #[tokio::test]
 async fn tunnelled_classic_login_links_under_verify_and_refuses_strangers() {
     let dir = tempfile::tempdir().unwrap();
     let (_legacy, ng, _ctx) = start_server(dir.path()).await;
-
-    async fn tunnel_login(
-        ng: SocketAddr,
-        p: &Person,
-        login: &[u8],
-        password: &[u8],
-    ) -> Option<Tunnel> {
-        let token = authenticate(ng, p).await["token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let mut req = format!("ws://{ng}/trtp").into_client_request().unwrap();
-        req.headers_mut()
-            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
-        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-        let mut t = Tunnel::new(ws);
-        t.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
-        t.read_exact(8).await;
-        let xor: Vec<u8> = password.iter().map(|b| b ^ 0xff).collect();
-        let xlogin: Vec<u8> = login.iter().map(|b| b ^ 0xff).collect();
-        t.send(
-            REQ_LOGIN,
-            &[
-                (tag::LOGIN, xlogin),
-                (tag::PASSWORD, xor),
-                (tag::NAME, b"n".to_vec()),
-                (tag::VERSION, 150u16.to_be_bytes().to_vec()),
-            ],
-        )
-        .await;
-        let reply = t.recv_type(HDR_TASK).await;
-        if reply.flag != 0 {
-            return None; // error reply
-        }
-        t.recv_type(HDR_SELFINFO).await;
-        Some(t)
-    }
 
     // A tunnelled classic login with the password links the account.
     let p = person(8, "Bob");
