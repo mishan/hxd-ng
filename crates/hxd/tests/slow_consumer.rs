@@ -19,6 +19,7 @@ use hxproto::messages::tag;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -107,15 +108,22 @@ fn body(f: &Frame) -> String {
 }
 
 /// The line numbers a classic reader hears, until `end` or the socket
-/// closes. Returns them and whether the server closed the socket.
-fn listen(mut s: TcpStream, end: usize) -> JoinHandle<(Vec<usize>, bool)> {
-    tokio::spawn(async move {
+/// closes. Returns them and whether the server closed the socket, and
+/// meanwhile publishes the last line it heard, for [`flood`] to keep
+/// pace with. The publisher goes when the reader does, however it ends.
+fn listen(
+    mut s: TcpStream,
+    end: usize,
+) -> (JoinHandle<(Vec<usize>, bool)>, watch::Receiver<usize>) {
+    let (last, heard_to) = watch::channel(0);
+    let task = tokio::spawn(async move {
         let mut heard = Vec::new();
         loop {
             match timeout(Duration::from_secs(30), read_frame(&mut s)).await {
                 Ok(Ok(f)) if f.ty == HDR_CHAT_PUSH => {
                     if let Some(n) = line_number(&body(&f)) {
                         heard.push(n);
+                        last.send_replace(n);
                         if n == end {
                             return (heard, false);
                         }
@@ -126,7 +134,8 @@ fn listen(mut s: TcpStream, end: usize) -> JoinHandle<(Vec<usize>, bool)> {
                 Err(_) => panic!("heard nothing for 30s, after {} lines", heard.len()),
             }
         }
-    })
+    });
+    (task, heard_to)
 }
 
 fn line_number(text: &str) -> Option<usize> {
@@ -134,35 +143,59 @@ fn line_number(text: &str) -> Option<usize> {
     rest.split(' ').next()?.parse().ok()
 }
 
-/// Send `n` lines as fast as the server takes them, then an `end` line.
-/// The talker hears its own lines too, so something drains its socket
-/// meanwhile: it must not become a slow consumer itself. The connection
-/// stays open afterwards: closed with its echoes unread, it would be
-/// reset, and the reset takes its last lines with it.
-async fn flood(talker: TcpStream, n: usize) -> tokio::net::tcp::OwnedWriteHalf {
-    flood_paced(talker, n, None).await
-}
+/// How far the talker may run ahead of what it and the reader have heard,
+/// in lines. Flooded as fast as the server took them, the room raced the
+/// reader as well as the stalled client, and a reader descheduled for a
+/// moment on a busy machine fell a whole connection's bound behind and was
+/// cut off with the client that never read; pausing on a clock only
+/// narrowed that race, and made the run as long as the scheduler's latency.
+/// So the talker waits on its hearers instead. The window is a small
+/// fraction of every bound a hearer could be held to: the classic writer's
+/// queue, the live channel, and in the budget case the half of the average
+/// that a queue which has kept up may always hold. Wide enough that the
+/// hearers, not the window, set the pace.
+const WINDOW: usize = 64;
 
-/// [`flood`], pausing a moment every `pace` lines: a room busy enough to
-/// bury a client that reads nothing, and slow enough that one that reads
-/// everything is never behind.
-async fn flood_paced(
+/// Send `n` lines, then an `end` line, never more than [`WINDOW`] ahead
+/// of the last line `heard` says the reader has, nor of the last of its
+/// own lines the talker has heard back. Nothing waits on the stalled
+/// client, so it is buried as fast as the others read.
+///
+/// The talker hears its own lines too, so something reads its socket
+/// meanwhile: it must not become a slow consumer itself. Nor may it run
+/// ahead of its own echoes. While the server is busy taking its lines, the
+/// echoes queue for it, and against a tight budget a talker far enough
+/// ahead of them is cut off as the one holding the most.
+///
+/// Should either hearer stop, its publisher goes with it, and the flood
+/// stops there too rather than waiting forever: the reader's shortfall is
+/// the failure, reported by its own timeout. The connection stays open
+/// afterwards: closed with its echoes unread, it would be reset, and the
+/// reset takes its last lines with it.
+async fn flood(
     talker: TcpStream,
     n: usize,
-    pace: Option<usize>,
+    mut heard: watch::Receiver<usize>,
 ) -> tokio::net::tcp::OwnedWriteHalf {
     let (mut rd, mut wr) = talker.into_split();
+    let (echo, mut echoed) = watch::channel(0);
     tokio::spawn(async move {
-        let mut sink = vec![0u8; 64 * 1024];
-        while matches!(rd.read(&mut sink).await, Ok(n) if n > 0) {}
+        while let Ok(f) = read_frame(&mut rd).await {
+            if f.ty == HDR_CHAT_PUSH {
+                if let Some(n) = line_number(&body(&f)) {
+                    echo.send_replace(n);
+                }
+            }
+        }
     });
     let pad = "x".repeat(LINE);
     for i in 1..=n + 1 {
         let text = format!("line {i} {pad}");
         let frame = pack_frame(HDR_CHAT, i as u32, 0, &[(tag::BODY, text.into_bytes())]);
         wr.write_all(&frame).await.unwrap();
-        if pace.is_some_and(|p| i % p == 0) {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        let caught_up = |&h: &usize| i < h + WINDOW;
+        if heard.wait_for(caught_up).await.is_err() || echoed.wait_for(caught_up).await.is_err() {
+            break;
         }
     }
     wr
@@ -194,9 +227,9 @@ async fn classic_case() {
     let n = 8000;
 
     let stalled = classic(server.legacy, "stalled").await;
-    let reader = listen(classic(server.legacy, "reader").await, n + 1);
+    let (reader, heard) = listen(classic(server.legacy, "reader").await, n + 1);
     let talker = classic(server.legacy, "talker").await;
-    let talking = tokio::spawn(flood(talker, n));
+    let talking = tokio::spawn(flood(talker, n, heard));
 
     let (heard, _) = timeout(Duration::from_secs(60), reader)
         .await
@@ -206,7 +239,7 @@ async fn classic_case() {
 
     // Only now does the stalled client read: what the kernel had buffered
     // for it, and then the end of the connection, well short of the room.
-    let (got, closed) = timeout(Duration::from_secs(60), listen(stalled, n + 1))
+    let (got, closed) = timeout(Duration::from_secs(60), listen(stalled, n + 1).0)
         .await
         .unwrap()
         .unwrap();
@@ -248,9 +281,9 @@ async fn ng_case() {
     };
     let (session, token) = (hello["session"].clone(), hello["token"].clone());
 
-    let reader = listen(classic(server.legacy, "reader").await, n + 1);
+    let (reader, heard) = listen(classic(server.legacy, "reader").await, n + 1);
     let talker = classic(server.legacy, "talker").await;
-    let talking = tokio::spawn(flood(talker, n));
+    let talking = tokio::spawn(flood(talker, n, heard));
     let (heard, _) = timeout(Duration::from_secs(30), reader)
         .await
         .unwrap()
@@ -387,9 +420,9 @@ async fn budget_case() {
         }
         stalled.push(ws);
     }
-    let reader = listen(classic(server.legacy, "reader").await, n + 1);
+    let (reader, heard) = listen(classic(server.legacy, "reader").await, n + 1);
     let talker = classic(server.legacy, "talker").await;
-    let talking = tokio::spawn(flood_paced(talker, n, Some(2)));
+    let talking = tokio::spawn(flood(talker, n, heard));
     let (heard, _) = timeout(Duration::from_secs(30), reader)
         .await
         .unwrap()
