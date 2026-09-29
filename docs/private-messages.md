@@ -622,6 +622,8 @@ max_queued = 200         # messages *waiting*, per account
 deliver_at_flush = 25
 retain_unread = 2592000  # seconds: 30 days, from when it was sent
 retain_read = 604800     # seconds: 7 days, from when it was read
+max_sent_per_day = 1000  # messages one sender may *store* in a rolling day
+max_sent_bytes_per_day = 8388608  # the same in body bytes; 0 = no quota
 sync = "normal"          # or "full"
 
 [server]
@@ -641,6 +643,37 @@ spec's vocabulary. It does not silently drop, and it does not evict the
 oldest to make room: a message a sender was told was delivered and which
 then quietly disappeared is the failure mode that destroys trust in a
 messaging system.
+
+**The sender's quota bounds what one account can store.** Store-always
+(§3) keeps every message, delivered or not, and retention keeps a read
+one for a week and an unread one for a month; `max_queued` counts only
+what is waiting. So without a second bound one account talking as fast
+as the flood limit allows — mhxd's spam points, fifty messages in five
+seconds — grows the database by whatever that is for a month. The quota
+is per sender over a rolling day, in messages and in bytes, and it
+counts every row the sender has stored in that day, delivered or not,
+read from the store (two indexes on `(sender, sent_at)`, schema version
+11), so a restart forgets nothing.
+
+It bounds storage and never conversation. Past it, a message to someone
+attached is still handed to them — live, with no row and no id, exactly
+as it would be on mhxd, which stores nothing at all — and only a message
+that would have to wait is refused: `SendQuota`, answered on the ng wire
+as `quota_exceeded` and on the legacy wire as a task error, the shape a
+full mailbox is refused in. A detached session is not attached for this:
+its outbox is no place for what the store was just refused. The check
+reads before it writes rather than reserving, so sends in flight at once
+can each pass it; a daily ceiling can afford that.
+
+A retry is not a new message, so the quota does not refuse one. A send
+whose `guid` is already stored for that sender and recipient (§5) stores
+nothing, and it is answered as the original was, even past the quota:
+the client whose last message within the quota was stored but lost its
+ack hears that it was, rather than `quota_exceeded` for a message the
+server has, and an attached recipient is not handed a second, live copy
+beside the stored one. The lookup is made only once the quota is spent,
+so an ordinary send pays nothing for it; a retry racing its own first
+send past the quota can still be refused.
 
 **Blocking exists because account addressing needs it.** Before
 `to_login`, a sender had to be on the roster to reach you — a bounded,

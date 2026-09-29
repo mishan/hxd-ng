@@ -185,6 +185,10 @@ fn history_store_failed(e: StoreError) -> ChatError {
 /// roster itself, not an entry here.)
 #[derive(Default)]
 pub(crate) struct PrivateChat {
+    /// Who opened it, while that session lasts: what
+    /// [`crate::ChatLimits::per_creator`] counts. Cleared when the
+    /// session ends, so a recycled uid inherits nothing.
+    pub(crate) creator: Option<Uid>,
     pub(crate) members: Vec<Uid>,
     pub(crate) invited: Vec<Uid>,
     pub(crate) subject: String,
@@ -394,6 +398,13 @@ pub enum ChatError {
     /// delivered and which then quietly disappeared is the failure mode
     /// that destroys trust in a messaging system.
     MailboxFull,
+    /// The recipient is not attached, and the sender has stored as much
+    /// mail today as `[inbox]` allows. Refused the way a full mailbox
+    /// is, and about the sender rather than the recipient.
+    SendQuota,
+    /// The creator has as many private chats open as `[limits]` allows,
+    /// or the server has.
+    TooManyChats,
     /// The recipient has blocked the sender. Named rather than hidden,
     /// matching fogWraith's `Blocked` (reason 3) so the two subsystems
     /// answer alike — see docs/private-messages.md §14 for the argument
@@ -943,8 +954,23 @@ impl Core {
             .get(&creator)
             .map(|s| s.info.clone())
             .ok_or(ChatError::NoSuchUser)?;
+        // Counted as they stand, under the lock that creates: a chat
+        // stays open, and counted against whoever opened it, until its
+        // last member leaves, whether or not that was the creator.
+        let limits = self.chat_limits;
+        if (limits.total > 0 && r.chats.len() >= limits.total)
+            || (limits.per_creator > 0
+                && r.chats
+                    .values()
+                    .filter(|c| c.creator == Some(creator))
+                    .count()
+                    >= limits.per_creator)
+        {
+            return Err(ChatError::TooManyChats);
+        }
         let cid = r.next_chat_id().ok_or(ChatError::ServerError)?;
         let mut chat = PrivateChat {
+            creator: Some(creator),
             members: vec![creator],
             ..Default::default()
         };
@@ -1103,6 +1129,11 @@ impl Core {
     }
 
     pub(crate) fn leave_all_chats(r: &mut RosterInner, uid: Uid) {
+        for chat in r.chats.values_mut() {
+            if chat.creator == Some(uid) {
+                chat.creator = None;
+            }
+        }
         let cids: Vec<u32> = r
             .chats
             .iter()
@@ -1238,6 +1269,31 @@ impl Core {
             text,
             guid,
             media,
+        )
+    }
+
+    /// Has `from` stored its day's allowance of mail, or would `adds`
+    /// more bytes take it past? A rolling day, read from the store, so a
+    /// restart forgets nothing.
+    fn send_quota_spent(
+        &self,
+        store: &dyn MessageStore,
+        from: &Mailbox,
+        adds: usize,
+        now: SystemTime,
+    ) -> Result<bool, ChatError> {
+        let p = self.inbox_policy;
+        if p.max_sent_per_day == 0 && p.max_sent_bytes_per_day == 0 {
+            return Ok(false);
+        }
+        let since = now
+            .checked_sub(Duration::from_secs(24 * 3600))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let sent = store.sent_since(from, since).map_err(store_failed)?;
+        Ok(
+            (p.max_sent_per_day > 0 && sent.messages >= p.max_sent_per_day)
+                || (p.max_sent_bytes_per_day > 0
+                    && sent.bytes.saturating_add(adds as u64) > p.max_sent_bytes_per_day),
         )
     }
 
@@ -1379,6 +1435,70 @@ impl Core {
             .map_err(store_failed)?
         {
             return Err(ChatError::Blocked);
+        }
+
+        // The sender's quota (`docs/private-messages.md` §9): what one
+        // account may *store* in a day, delivered or not, since retention
+        // keeps both. It bounds storage and never conversation. Past it,
+        // a message to someone attached still reaches them — live, with
+        // no row and no id, as it would on mhxd, which stores nothing at
+        // all — and only one that would have to wait is refused.
+        // Checked rather than reserved, so sends in flight at once can
+        // each pass it: a daily ceiling can afford that.
+        //
+        // A retry of a message already stored is not a new message and
+        // stores nothing, so it is not the quota's to refuse: it goes on
+        // to `push`, which recognizes it and answers it as the first
+        // send was answered. Otherwise the client whose last in-quota
+        // message lost its ack would hear `quota_exceeded` for a message
+        // we have, and an attached recipient would be handed it twice,
+        // the second time live with no id. Looked up only once the quota
+        // is spent, so the ordinary send costs nothing more; a retry
+        // racing its own first send past the quota can still miss it,
+        // which is the narrow case the store's own dedupe cannot reach
+        // from here.
+        let retry = |guid: &Option<MessageGuid>| -> Result<bool, ChatError> {
+            match guid {
+                Some(g) => Ok(store
+                    .find_guid(&to.mailbox, Some(&from_mailbox), g)
+                    .map_err(store_failed)?
+                    .is_some()),
+                None => Ok(false),
+            }
+        };
+        if self.send_quota_spent(&**store, &from_mailbox, text.len(), now)? && !retry(&guid)? {
+            let mut r = self.roster.lock().unwrap();
+            let attached = |uid: &Uid| {
+                r.users
+                    .get(uid)
+                    .is_some_and(|s| s.mailbox() == to.mailbox && is_live(s))
+            };
+            // Attached only: a detached session's outbox is not a place
+            // to leave what the store was just refused.
+            let Some(uid) = to
+                .uid
+                .filter(attached)
+                .or_else(|| attached_session_of(&r, &to.mailbox))
+            else {
+                return Err(ChatError::SendQuota);
+            };
+            if let Some(handle) = &image {
+                self.media_capture(handle, audience.clone());
+            }
+            r.send_to(
+                uid,
+                Event::Msg {
+                    from: sender.uid,
+                    from_nick: sender.nick,
+                    from_login: sender.reply_login,
+                    text,
+                    id: None,
+                    sent_at: now,
+                    queued: false,
+                    media,
+                },
+            );
+            return Ok(MsgOutcome::Delivered);
         }
 
         // The store decides both of the questions that used to be asked
@@ -3493,6 +3613,125 @@ mod inbox_tests {
     }
 
     #[test]
+    fn a_senders_quota_bounds_what_is_stored_and_never_a_live_message() {
+        let (core, store) = server_with(
+            InboxPolicy {
+                max_sent_per_day: 2,
+                max_sent_bytes_per_day: 20,
+                ..InboxPolicy::default()
+            },
+            &["alice", "bob", "dave"],
+        );
+        let (a, _ra) = attach(&core, "alice", true);
+        core.msg_login(a, "dave", "one".into(), None, None).unwrap();
+        // A delivered message counts: retention keeps it all the same.
+        let (m, _rm) = attach(&core, "dave", true);
+        core.msg_login(a, "dave", "two".into(), None, None).unwrap();
+        core.end_session(m);
+        assert_eq!(
+            core.msg_login(a, "dave", "three".into(), None, None),
+            Err(ChatError::SendQuota),
+            "nobody is there, and the day's storage is spent"
+        );
+        assert_eq!(store.all().len(), 2);
+
+        // Someone who is there hears it, with no row kept and no id.
+        let (m, mut rm) = attach(&core, "dave", true);
+        drain(&mut rm);
+        assert_eq!(
+            core.msg_login(a, "dave", "live".into(), None, None),
+            Ok(MsgOutcome::Delivered)
+        );
+        assert!(matches!(
+            &msgs(drain(&mut rm))[..],
+            [Event::Msg { id: None, text, .. }] if text == "live"
+        ));
+        assert_eq!(store.all().len(), 2, "nothing stored past the quota");
+        core.end_session(m);
+
+        // Another sender's day is their own, and bytes count as well as
+        // messages: this one fits the count and not the bytes.
+        let (b, _rb) = attach(&core, "bob", true);
+        core.msg_login(b, "dave", "x".repeat(20), None, None)
+            .unwrap();
+        assert_eq!(
+            core.msg_login(b, "dave", "y".into(), None, None),
+            Err(ChatError::SendQuota)
+        );
+    }
+
+    #[test]
+    fn a_retry_of_a_stored_message_is_answered_past_the_quota() {
+        let (core, store) = server_with(
+            InboxPolicy {
+                max_sent_per_day: 1,
+                ..InboxPolicy::default()
+            },
+            &["alice", "dave"],
+        );
+        let g = crate::inbox::MessageGuid::parse("00000002-0000-4000-8000-000000000000").unwrap();
+        let (a, _ra) = attach(&core, "alice", true);
+        // The last message the day allows, stored while nobody is there;
+        // its ack is what the client lost.
+        let first = core
+            .msg_login(a, "dave", "last one".into(), Some(g.clone()), None)
+            .unwrap();
+        let MsgOutcome::Queued(id) = first else {
+            panic!("queued, got {first:?}");
+        };
+        assert_eq!(
+            core.msg_login(a, "dave", "last one".into(), Some(g.clone()), None),
+            Ok(MsgOutcome::Queued(id)),
+            "the retry is the message we have, not one past the quota"
+        );
+
+        // The recipient attaches before the next retry: they are handed
+        // the stored row once, with its id, and never a live copy beside it.
+        let (m, mut rm) = attach(&core, "dave", true);
+        drain(&mut rm);
+        assert_eq!(
+            core.msg_login(a, "dave", "last one".into(), Some(g), None),
+            Ok(MsgOutcome::Delivered)
+        );
+        assert!(
+            matches!(
+                &msgs(drain(&mut rm))[..],
+                [Event::Msg { id: Some(got), .. }] if *got == id
+            ),
+            "one copy, the stored one"
+        );
+        assert_eq!(store.all().len(), 1);
+        core.end_session(m);
+    }
+
+    #[test]
+    fn private_chats_are_capped_per_creator_and_per_server_until_they_close() {
+        let core = Core::new().with_chat_limits(crate::ChatLimits {
+            per_creator: 2,
+            total: 3,
+        });
+        let anyone = crate::AccessBits::default();
+        let (a, _ra) = crate::roster::test_attach(&core, "alice", anyone);
+        let (b, _rb) = crate::roster::test_attach(&core, "bob", anyone);
+        let (first, _) = core.chat_create(a, b).unwrap();
+        core.chat_create(a, b).unwrap();
+        assert_eq!(core.chat_create(a, b).err(), Some(ChatError::TooManyChats));
+        let (bobs, _) = core.chat_create(b, a).unwrap();
+        assert_eq!(
+            core.chat_create(b, a).err(),
+            Some(ChatError::TooManyChats),
+            "the server's are spent"
+        );
+        // Still open with bob in it after alice walks out: still hers.
+        core.chat_join(first, b, "").unwrap();
+        core.chat_part(first, a);
+        core.chat_part(bobs, b);
+        assert_eq!(core.chat_create(a, b).err(), Some(ChatError::TooManyChats));
+        core.chat_part(first, b);
+        core.chat_create(a, b).unwrap();
+    }
+
+    #[test]
     fn a_full_mailbox_refuses_rather_than_dropping_the_oldest() {
         let (core, store) = server_with(
             InboxPolicy {
@@ -3949,6 +4188,13 @@ mod inbox_tests {
         }
         fn blocked(&self, owner: &Mailbox) -> Result<Vec<Mailbox>, StoreError> {
             self.inner.blocked(owner)
+        }
+        fn sent_since(
+            &self,
+            from: &Mailbox,
+            since: SystemTime,
+        ) -> Result<crate::inbox::Sent, StoreError> {
+            self.inner.sent_since(from, since)
         }
     }
 

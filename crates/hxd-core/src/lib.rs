@@ -49,12 +49,12 @@ pub use history::{
     MemoryLog, NewLine,
 };
 pub use inbox::{
-    Delivery, InboxCounts, MemoryStore, MessageId, MessageStore, NewMessage, Pushed, StoreError,
-    StoredMessage,
+    Delivery, InboxCounts, MemoryStore, MessageId, MessageStore, NewMessage, Pushed, Sent,
+    StoreError, StoredMessage,
 };
 pub use limits::{
-    AddrSet, ConnGate, ConnLimits, ConnPermit, ConnRefused, FloodLimits, LoginAttempt, LoginLimits,
-    RateBucket, RateGate, RequestLimits,
+    AddrSet, ChatLimits, ConnGate, ConnLimits, ConnPermit, ConnRefused, FloodLimits, LoginAttempt,
+    LoginLimits, RateBucket, RateGate, RequestLimits,
 };
 pub use media::{
     Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRecord,
@@ -67,9 +67,9 @@ pub use moderation::{
 pub use news::{
     Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, AttachmentPolicy, Author,
     AutoFollow, AutoSubscribe, BlobId, BlobStore, BodyRenderer, BodyType, Listed, MarkdownMode,
-    MemoryNews, NewsError, NewsPolicy, NewsStore, Node, NodeId, NodeKind, NodeTree, Notified,
-    NotifyPolicy, NotifyReason, PostRequest, Reference, Rendered, StagedAttachment, SubScope,
-    Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery,
+    MemoryNews, NewsError, NewsPolicy, NewsStore, NewsUsage, Node, NodeId, NodeKind, NodeTree,
+    Notified, NotifyPolicy, NotifyReason, PostRequest, Reference, Rendered, StagedAttachment,
+    SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery,
 };
 pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};

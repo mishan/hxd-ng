@@ -604,6 +604,28 @@ impl FloodLimits {
     };
 }
 
+/// How many private chats may be open (`[limits]`). A chat costs the
+/// server a row and a place in every member's lookups for as long as
+/// anyone is in it, and creating one costs a click, so both are capped:
+/// the chats one session created that are still open, and every chat
+/// on the server. A count of 0 is no limit, which is what a `Core`
+/// built by hand has; a server built from a config has
+/// [`ChatLimits::DEFAULT`] unless it says otherwise. mhxd has neither,
+/// and a period client meets them as the task error any refused create
+/// is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChatLimits {
+    pub per_creator: usize,
+    pub total: usize,
+}
+
+impl ChatLimits {
+    pub const DEFAULT: ChatLimits = ChatLimits {
+        per_creator: 16,
+        total: 4096,
+    };
+}
+
 /// How many lines mhxd counts in a chat send: every piece its
 /// `cr_strtok_r` loop cuts the text into at a CR or an LF, the empty
 /// ones included, so one more than the breaks it holds.

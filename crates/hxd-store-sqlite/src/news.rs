@@ -18,7 +18,7 @@ use hxd_core::inbox::{Mailbox, StoreError};
 use hxd_core::media::MediaType;
 use hxd_core::news::{
     Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, Author, BlobId, BodyType, Listed,
-    NewNode, NewPost, NewsError, NewsStore, Node, NodeId, NodeKind, Posted, Reference,
+    NewNode, NewPost, NewsError, NewsStore, NewsUsage, Node, NodeId, NodeKind, Posted, Reference,
     StagedAttachment, SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage,
     ThreadQuery,
 };
@@ -1252,6 +1252,45 @@ impl NewsStore for SqliteStore {
                 .map_err(|_| StoreError::new(format!("article id {id} is not an id")))
         })
         .collect()
+    }
+
+    fn usage(&self) -> Result<NewsUsage, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // One row the triggers of schema version 11 keep, so a post's
+        // check reads two integers rather than every body in the archive.
+        let (articles, bytes) = sql(conn
+            .prepare_cached("SELECT articles, bytes FROM news_usage WHERE id = 1")
+            .and_then(|mut stmt| {
+                stmt.query_row([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            }))?;
+        Ok(NewsUsage {
+            articles: articles.max(0) as u64,
+            bytes: bytes.max(0) as u64,
+        })
+    }
+
+    fn written_by(&self, who: Option<&Mailbox>) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // `news_article_author` again, led by the author's key, and for
+        // the guests by the two NULLs every guest row carries.
+        let n: i64 = match who {
+            Some(who) => {
+                let query = format!(
+                    "SELECT COUNT(*) FROM news_article WHERE {} AND deleted_at IS NULL",
+                    mailbox_sql(who, "login", 1)
+                );
+                sql(conn
+                    .prepare_cached(&query)
+                    .and_then(|mut stmt| stmt.query_row(params![bind(who)], |r| r.get(0))))?
+            }
+            None => sql(conn
+                .prepare_cached(
+                    "SELECT COUNT(*) FROM news_article
+                      WHERE login_fp IS NULL AND login IS NULL AND deleted_at IS NULL",
+                )
+                .and_then(|mut stmt| stmt.query_row([], |r| r.get(0))))?,
+        };
+        Ok(n.max(0) as u64)
     }
 
     fn refs_to(&self, id: ArticleId, limit: usize) -> Result<Vec<Reference>, StoreError> {

@@ -32,7 +32,7 @@ use hxd_core::history::{
 };
 use hxd_core::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    Pushed, StoreError, StoredMessage,
+    Pushed, Sent, StoreError, StoredMessage,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
@@ -70,7 +70,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -421,6 +421,63 @@ CREATE UNIQUE INDEX ban_standing
   WHERE lifted_at IS NULL;
 CREATE INDEX ban_expiry ON ban (expires_at)
   WHERE lifted_at IS NULL AND expires_at IS NOT NULL;
+";
+
+/// Storage quotas. `news_usage` is what `[news] max_articles` and
+/// `max_text_bytes` are checked against (`docs/news.md` §7.4): the live
+/// articles and the UTF-8 bytes of their bodies and downgrades, kept by
+/// triggers so a post reads one row rather than summing the archive.
+/// Every write to `news_article` goes through them, the tombstone's
+/// clearing update included, so no code path can forget to. It starts
+/// from what is already there.
+///
+/// The two message indexes are the per-sender quota's
+/// (`docs/private-messages.md` §9): what one sender has stored in the
+/// last day, by the mailbox rule's two shapes of key, read as a range on
+/// `sent_at` rather than every row that sender has in retention.
+const SCHEMA_V11: &str = "
+CREATE TABLE news_usage (
+  id       INTEGER PRIMARY KEY CHECK (id = 1),
+  articles INTEGER NOT NULL,
+  bytes    INTEGER NOT NULL
+);
+INSERT INTO news_usage (id, articles, bytes)
+  SELECT 1, COUNT(*),
+         IFNULL(SUM(length(CAST(body AS BLOB)) + IFNULL(length(CAST(plain AS BLOB)), 0)), 0)
+    FROM news_article WHERE deleted_at IS NULL;
+CREATE TRIGGER news_usage_insert AFTER INSERT ON news_article
+  WHEN NEW.deleted_at IS NULL
+BEGIN
+  UPDATE news_usage
+     SET articles = articles + 1,
+         bytes = bytes + length(CAST(NEW.body AS BLOB))
+                       + IFNULL(length(CAST(NEW.plain AS BLOB)), 0)
+   WHERE id = 1;
+END;
+CREATE TRIGGER news_usage_delete AFTER DELETE ON news_article
+  WHEN OLD.deleted_at IS NULL
+BEGIN
+  UPDATE news_usage
+     SET articles = articles - 1,
+         bytes = bytes - length(CAST(OLD.body AS BLOB))
+                       - IFNULL(length(CAST(OLD.plain AS BLOB)), 0)
+   WHERE id = 1;
+END;
+CREATE TRIGGER news_usage_update AFTER UPDATE OF body, plain, deleted_at ON news_article
+BEGIN
+  UPDATE news_usage
+     SET articles = articles - (OLD.deleted_at IS NULL) + (NEW.deleted_at IS NULL),
+         bytes = bytes
+           - CASE WHEN OLD.deleted_at IS NULL THEN length(CAST(OLD.body AS BLOB))
+                   + IFNULL(length(CAST(OLD.plain AS BLOB)), 0) ELSE 0 END
+           + CASE WHEN NEW.deleted_at IS NULL THEN length(CAST(NEW.body AS BLOB))
+                   + IFNULL(length(CAST(NEW.plain AS BLOB)), 0) ELSE 0 END
+   WHERE id = 1;
+END;
+CREATE INDEX message_sent_fp ON message (sender_fp, sent_at)
+  WHERE sender_fp IS NOT NULL;
+CREATE INDEX message_sent_login ON message (sender, sent_at)
+  WHERE sender_fp IS NULL AND sender IS NOT NULL;
 ";
 
 /// Moderation (`docs/moderation.md` §7, `docs/news.md` §11). Version 2
@@ -1018,6 +1075,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 10 {
         steps.push_str(SCHEMA_V10);
+    }
+    if version < 11 {
+        steps.push_str(SCHEMA_V11);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -1716,6 +1776,30 @@ impl MessageStore for SqliteStore {
         )
         .map(|_| ())
         .map_err(StoreError::new)
+    }
+
+    fn sent_since(&self, from: &Mailbox, since: SystemTime) -> Result<Sent, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // `message_sent_fp` or `message_sent_login`, by which shape of
+        // key the sender has: a range on `sent_at`, so what is read is
+        // the window's rows and not the sender's whole retention.
+        let sql = format!(
+            "SELECT COUNT(*), IFNULL(SUM(length(CAST(body AS BLOB))), 0) FROM message
+              WHERE {} AND {MAIL_ONLY} AND sent_at >= ?2",
+            mailbox_sql(from, "sender", 1)
+        );
+        let (messages, bytes): (i64, i64) = conn
+            .prepare_cached(&sql)
+            .and_then(|mut stmt| {
+                stmt.query_row(params![bind(from), unix(since)], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+            })
+            .map_err(StoreError::new)?;
+        Ok(Sent {
+            messages: messages.max(0) as usize,
+            bytes: bytes.max(0) as u64,
+        })
     }
 
     fn is_blocked(&self, owner: &Mailbox, other: &Mailbox) -> Result<bool, StoreError> {
@@ -2909,6 +2993,46 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_ten_migrates_into_news_usage_counting_what_is_there() {
+        use hxd_core::news::{NewsStore, NewsUsage};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            // A live article with a downgrade, its body two characters
+            // and three bytes, and a tombstone, which holds nothing.
+            conn.execute_batch(
+                "INSERT INTO news_node (id, kind, name, guid, created_at)
+                   VALUES (1, 1, 'General', x'00', 1);
+                 INSERT INTO news_article
+                   (category, root, path, depth, nick, login, subject, body, plain, at)
+                   VALUES (1, 1, x'00000001', 0, 'Alice', 'alice', 's', char(104, 233),
+                           'plain', 1);
+                 INSERT INTO news_article
+                   (category, root, path, depth, nick, subject, body, at, deleted_at)
+                   VALUES (1, 2, x'00000002', 0, '', '', '', 2, 3);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 10).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        assert_eq!(
+            store.usage().unwrap(),
+            NewsUsage {
+                articles: 1,
+                bytes: 3 + 5,
+            }
+        );
+        assert_eq!(store.written_by(Some(&Mailbox::login("alice"))).unwrap(), 1);
     }
 
     #[test]

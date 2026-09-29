@@ -2029,3 +2029,34 @@ fn a_restarted_server_refuses_whom_it_banned() {
     assert!(core.is_banned("2001:db8:1:2:ffff::1".parse().unwrap()));
     assert!(!core.is_banned("2001:db8:1:3::1".parse().unwrap()));
 }
+
+/// A ration table full of spent buckets makes room by forgetting the
+/// ones that give back least, never by handing everyone a fresh ration:
+/// a reporter who has spent every report stays out of them however many
+/// new keys arrive.
+#[test]
+fn a_full_ration_table_forgets_the_fullest_and_keeps_the_spent() {
+    let core = Core::new();
+    let spent = ReporterKey::Mailbox(None, "spammer".into());
+    for _ in 0..REPORTS_PER_HOUR {
+        assert!(core.report_rate_allows(std::slice::from_ref(&spent)));
+    }
+    assert!(!core.report_rate_allows(std::slice::from_ref(&spent)));
+    // Every other place taken by a bucket one report down: none has
+    // refilled, so the old answer was to clear the lot.
+    {
+        let mut rates = core.report_rate.lock().unwrap();
+        let now = std::time::Instant::now();
+        let almost = f64::from(REPORTS_PER_HOUR) - 1.0;
+        for n in 0..RATES_KEPT as u64 {
+            rates.insert(ReporterKey::Session(n as crate::Uid, n), (now, almost));
+        }
+    }
+    let newcomer = ReporterKey::Mailbox(None, "newcomer".into());
+    assert!(core.report_rate_allows(std::slice::from_ref(&newcomer)));
+    assert!(core.report_rate.lock().unwrap().len() <= RATES_KEPT);
+    assert!(
+        !core.report_rate_allows(std::slice::from_ref(&spent)),
+        "the spent ration survived the room being made"
+    );
+}

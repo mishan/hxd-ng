@@ -1045,6 +1045,9 @@ line of text about it.
 | Staged handle lifetime | 30 min | store, swept hourly |
 | Uploads per account | 20 / hour | domain |
 | Total blob bytes | 8 GiB | store; an upload over it is refused (507), never evicted |
+| Live articles | 100 000 | domain, at post; refused (`news_full`), never evicted |
+| Live article text | 1 GiB | domain, at post: bodies and plain downgrades, in UTF-8 bytes; refused (`news_full`) |
+| Live articles per author | 10 000 | domain, at post, the guests counted as one; refused (`too_many_articles`) |
 | Article body | 65 535 bytes | domain — §12.4 says why that number |
 | Plain downgrade | 65 535 bytes | renderer, truncated at a char boundary (§5.4) |
 | References per article | 32 | domain, at extraction |
@@ -1058,6 +1061,18 @@ The total cap is **refused, not evicted**, which is the opposite of the
 oldest chat image loses a moment, evicting the oldest news attachment
 silently guts the archive. A server at its cap needs an operator, not a
 heuristic.
+
+The article ceilings follow the same rule for the same reason. News is
+kept forever by default (§11), a post is up to 64 KiB with its downgrade
+beside it and its words indexed, and nothing else bounds how much of it
+there can be, so the total is capped — as a count and as bytes, since
+either alone lets the other run — and a post past it is refused and
+logged. A total alone lets one account spend it for everyone, so each
+author has a share of it too. Tombstones hold no text and count against
+nothing: deleting is how room is made. The store keeps the totals in a
+row its triggers maintain (schema version 11) rather than summing the
+archive per post, and a post's check and its write are serialized so
+two posts cannot both take the last place.
 
 **v1 accepts images and nothing else.** Not because the wire cannot
 carry more — the 1.5 article part carries a MIME type precisely so it
@@ -1172,7 +1187,10 @@ none — distinct from `access_denied`, which is about you),
 bundle, or nesting a category under a category), `wrong_category` (a
 reply whose parent lives elsewhere), `too_deep`, `no_such_media` (a
 staged handle that is not yours or has expired — one answer for both,
-as `chat` already does), `attachments_full`, `news_full` (the blob cap),
+as `chat` already does), `attachments_full`, `news_full` (the blob cap,
+or the article ceilings of §7.4 — about the server), `too_many_articles`
+(the author's share of them — about you, except for a guest, whose
+share is the one every guest spends together and whose message says so),
 `name_taken`, `not_empty` (deleting a bundle with children), and
 `bad_body_type` (`text/markdown` against a server in `markdown = "off"`).
 
@@ -1898,7 +1916,11 @@ it rather than being re-invented:
 
 Retention is `[news] retain_days` (default 0, forever) and runs off the
 hourly sweeper with the stage expiry and the orphan scan, never on the
-request path — the rule chat history already follows.
+request path — the rule chat history already follows. The default stays
+forever: an operator coming from mhxd expects news to be an archive, and
+a server that quietly deleted last year's threads would be a surprise
+worse than one that eventually says it is full. The ceilings of §7.4
+are what bound it instead.
 
 ## 12. The legacy 1.5 binding
 
@@ -2220,6 +2242,13 @@ grows the 1996 pane. The entry pushed is rendered exactly as the read
 format renders it, so a client that prepends the delta and a client that
 refetches the document see the same text.
 
+Every connection with `read_news` hears the post, and the entry is the
+same for all of them but for its encoding, so it is read and rendered
+once: the first connection to handle the post resolves the flat category
+and reads the article, the others wait for its answer, and each converts
+that one entry for its own wire. A busy room is one store read per post,
+not one per classic client.
+
 `hxproto`'s `ServerHdr` names it `NewsFilePost`, from the hx-libs change
 that opened W9 (§1).
 
@@ -2261,6 +2290,9 @@ max_depth = 32                  # reply nesting
 max_node_depth = 16             # bundle nesting
 max_page = 200
 retain_days = 0                 # 0 = forever
+max_articles = 100000           # live articles; a post past it is refused; 0 = none
+max_text_bytes = 1073741824     # their bodies and downgrades, in bytes; 0 = none
+max_per_author = 10000          # live articles per account, guests as one; 0 = none
 self_delete = true              # authors may delete their own; false = period behavior
 legacy_catlist_max = 2000       # articles in one 1.5 category reply
 

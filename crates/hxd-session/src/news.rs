@@ -13,6 +13,8 @@
 //! largest deviation is that flat and threaded news here are one store,
 //! so a post from any wire grows the 1.2 pane (§12.5).
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hxd_core::access::bit;
@@ -22,6 +24,7 @@ use hxd_core::{
     TextLen, ThreadQuery, Uid,
 };
 use hxproto::messages::{tag, ClientHdr};
+use tokio::sync::OnceCell;
 use tracing::warn;
 
 use crate::encoding::{floor_char_boundary, TextEncoding};
@@ -88,6 +91,64 @@ pub struct FlatNews {
     /// The line above the entries: `None` for the built-in one, `Some("")`
     /// for none at all.
     pub masthead: Option<String>,
+    /// The entries recent posts were pushed as, shared by every
+    /// connection this config serves. Not a setting: `default()` it.
+    pub pushes: FlatPushes,
+}
+
+/// How many recent posts' entries [`FlatPushes`] remembers. A post's
+/// push is handled by every connection within moments of the others,
+/// so this is room for a burst of posts, not a cache of the news.
+const FLAT_PUSHES_KEPT: usize = 16;
+
+/// A post's flat push, read and rendered once however many classic
+/// connections hear of it (§12.5). Every connection with `read_news`
+/// is handed the same `NewsPosted`, and each used to resolve the flat
+/// category and read the article for itself: a store read per
+/// connection per post, which a busy room turns into a read storm.
+/// The first connection to handle the post does the work, the rest wait
+/// for its answer, and each converts that one UTF-8 entry to its own
+/// encoding — which is all that ever differed between them.
+#[derive(Clone, Default)]
+pub struct FlatPushes(Arc<Mutex<VecDeque<(ArticleId, FlatEntry)>>>);
+
+/// One post's entry, once the first connection has rendered it: `None`
+/// when the post is not in the flat category.
+type FlatEntry = Arc<OnceCell<Option<Arc<str>>>>;
+
+impl std::fmt::Debug for FlatPushes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FlatPushes")
+    }
+}
+
+impl FlatPushes {
+    /// The entry for article `id`: `render`'s answer, from the first
+    /// connection to ask while the post is remembered. `Err` is an answer
+    /// about the connection that rendered — one whose session has gone,
+    /// or which may no longer read — and so is not remembered: the next
+    /// connection renders for itself.
+    pub(crate) async fn entry<F, Fut>(&self, id: ArticleId, render: F) -> Option<Arc<str>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Option<Arc<str>>, ()>>,
+    {
+        let cell = {
+            let mut kept = self.0.lock().unwrap();
+            match kept.iter().find(|(at, _)| *at == id) {
+                Some((_, cell)) => cell.clone(),
+                None => {
+                    let cell = Arc::new(OnceCell::new());
+                    kept.push_back((id, cell.clone()));
+                    if kept.len() > FLAT_PUSHES_KEPT {
+                        kept.pop_front();
+                    }
+                    cell
+                }
+            }
+        };
+        cell.get_or_try_init(render).await.ok().cloned().flatten()
+    }
 }
 
 /// Where a 1.2 post with no `Re:` goes.
@@ -248,6 +309,13 @@ pub(crate) fn error_text(e: &NewsError) -> &'static str {
         NewsError::BadBodyType => "This server does not take articles of that type.",
         NewsError::BadRequest(why) => why,
         NewsError::Protected => "That author's articles are protected.",
+        NewsError::NewsFull => "This server's news is full.",
+        NewsError::TooManyArticles { guests: false } => {
+            "You have as many articles here as this server allows. Delete one first."
+        }
+        NewsError::TooManyArticles { guests: true } => {
+            "Guests have as many articles here as this server allows."
+        }
         _ => "Server error.",
     }
 }
@@ -1118,22 +1186,31 @@ pub(crate) async fn flat_push(
     id: ArticleId,
     category: NodeId,
 ) -> Option<Vec<u8>> {
-    let names = cfg.flat.as_ref()?.category.clone();
-    off_reactor(core, move |core| {
-        // Asked of every post by every connection, so a missing category
-        // is not warned about here: reading the news says so once.
-        if find_category(core, who.uid, &names).ok()?? != category {
-            return None;
-        }
-        let article = core.news_article(who.uid, id).ok()?;
-        Some(fit(
-            who.enc,
-            who.enc.body(&render_entry(&article)),
-            CHUNK_MAX,
-        ))
-    })
-    .await
-    .flatten()
+    let flat = cfg.flat.as_ref()?;
+    let names = flat.category.clone();
+    let core = core.clone();
+    let entry = flat
+        .pushes
+        .entry(id, move || async move {
+            off_reactor(&core, move |core| {
+                // A missing category is not warned about here: reading
+                // the news says so once.
+                match find_category(core, who.uid, &names) {
+                    Ok(Some(flat)) if flat == category => {}
+                    Ok(_) => return Ok(None),
+                    Err(_) => return Err(()),
+                }
+                match core.news_article(who.uid, id) {
+                    Ok(article) => Ok(Some(Arc::from(render_entry(&article)))),
+                    Err(NewsError::NoSuchArticle) => Ok(None),
+                    Err(_) => Err(()),
+                }
+            })
+            .await
+            .unwrap_or(Err(()))
+        })
+        .await?;
+    Some(fit(who.enc, who.enc.body(&entry), CHUNK_MAX))
 }
 
 #[cfg(test)]
@@ -1174,12 +1251,50 @@ mod tests {
         }
     }
 
+    /// Every connection hears a post, and the first to handle it reads
+    /// and renders it for all of them: one render per post, whatever
+    /// the number of connections. A render that failed for its reader is
+    /// not an answer for the others; one that found no flat entry is.
+    #[tokio::test]
+    async fn a_posts_entry_is_rendered_once_for_every_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pushes = FlatPushes::default();
+        let renders = Arc::new(AtomicUsize::new(0));
+        let asks: Vec<_> = (0..50)
+            .map(|_| {
+                let (pushes, renders) = (pushes.clone(), renders.clone());
+                tokio::spawn(async move {
+                    pushes
+                        .entry(7, move || async move {
+                            renders.fetch_add(1, Ordering::SeqCst);
+                            tokio::task::yield_now().await;
+                            Ok(Some(Arc::from("the entry")))
+                        })
+                        .await
+                })
+            })
+            .collect();
+        for ask in asks {
+            assert_eq!(ask.await.unwrap().as_deref(), Some("the entry"));
+        }
+        assert_eq!(renders.load(Ordering::SeqCst), 1);
+
+        assert_eq!(pushes.entry(8, || async { Err(()) }).await, None);
+        let second = pushes.entry(8, || async { Ok(Some(Arc::from("second"))) });
+        assert_eq!(second.await.as_deref(), Some("second"));
+
+        assert_eq!(pushes.entry(9, || async { Ok(None) }).await, None);
+        let again = pushes.entry(9, || async { Ok(Some(Arc::from("never"))) });
+        assert_eq!(again.await, None, "not the flat category, for everyone");
+    }
+
     fn flat(articles: usize) -> FlatNews {
         FlatNews {
             category: vec!["General".into()],
             articles,
             reply: FlatReply::NewestThread,
             masthead: Some(String::new()),
+            pushes: FlatPushes::default(),
         }
     }
 

@@ -18,6 +18,6 @@ pub mod voice;
 pub use banner::Banner;
 pub use caps::{cap, Caps};
 pub use encoding::TextEncoding;
-pub use news::{FlatNews, FlatReply, LegacyNews};
+pub use news::{FlatNews, FlatPushes, FlatReply, LegacyNews};
 pub use session::{run_session, serve, serve_tls, ServerConfig, ServerCtx, TrtpLogin};
 pub use tls::LegacyTls;

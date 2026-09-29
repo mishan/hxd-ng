@@ -1296,3 +1296,68 @@ async fn an_account_with_no_inbox_of_its_own_hears_no_inbox() {
         );
     }
 }
+
+/// Past the day's quota a sender stores nothing more, on either wire. A
+/// message to someone connected still arrives, live and unstored, as it
+/// would on a period server that stores nothing at all; one that would
+/// have to wait is refused, in the words a full mailbox uses.
+#[tokio::test]
+async fn a_sender_past_the_days_quota_stores_nothing_more_and_still_talks() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_with(
+        dir.path(),
+        InboxPolicy {
+            max_sent_per_day: 2,
+            ..InboxPolicy::default()
+        },
+        &["bob", "alice", "carol"],
+    )
+    .await;
+    let (mut alice, _) = Ng::login(srv.ng, "alice").await;
+    for text in ["one", "two"] {
+        let ok = alice
+            .request_ok("msg", json!({ "to_login": "carol", "text": text }))
+            .await;
+        assert_eq!(ok["queued"], true);
+    }
+    let refused = alice
+        .request("msg", json!({ "to_login": "carol", "text": "three" }))
+        .await;
+    assert_eq!(refused["error"]["code"], "quota_exceeded", "{refused}");
+
+    // Someone who is there hears it anyway, and nothing is kept.
+    let (mut bob, hello) = Ng::login(srv.ng, "bob").await;
+    let bob_uid = hello["self"]["uid"].as_u64().unwrap() as u16;
+    let ok = alice
+        .request_ok("msg", json!({ "to_login": "bob", "text": "live" }))
+        .await;
+    assert_eq!(ok["queued"], false);
+    let m = bob.msg_event().await;
+    assert_eq!(m["text"], "live");
+    assert_eq!(bob.request_ok("inbox", json!({})).await["total"], 0);
+
+    // The classic wire: the same refusal to a session that has gone
+    // away, and the same live delivery to one that has not.
+    let mut period = Legacy::login(srv.legacy, "alice").await;
+    bob.close().await;
+    until(|| srv.core.is_detached(bob_uid), "bob detaches").await;
+    let reply = period.msg(bob_uid, "while you were out").await;
+    assert_ne!(reply.flag, 0, "refused on this wire too");
+    let text = reply
+        .chunks()
+        .find(|c| c.tag == tag::TASK_ERROR)
+        .map(|c| String::from_utf8_lossy(c.data).into_owned())
+        .unwrap();
+    assert_eq!(
+        text,
+        "That user is not connected, and you have sent as much offline mail today as this \
+         server allows."
+    );
+    let mut carol = Legacy::login(srv.legacy, "carol").await;
+    // What was stored before the quota ran out is hers, flushed at login.
+    assert!(carol.body().await.ends_with("one"));
+    assert!(carol.body().await.ends_with("two"));
+    let reply = period.msg(carol.uid, "hello, live").await;
+    assert_eq!(reply.flag, 0);
+    assert_eq!(carol.body().await, "hello, live");
+}

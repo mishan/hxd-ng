@@ -263,6 +263,10 @@ chat_lines = 20              # 0 for no limit, or the chat lines one user
 chat_seconds = 5             # may send in each window this long, or be kicked
 spam_points = 100            # 0 for no limit, or the spam points one user
 spam_seconds = 5             # may spend in each window this long, or be banned
+private_chats_per_user = 16  # private chats one session opened and still
+                             # open (per session, so a user with several
+                             # is bounded by private_chats); 0 = no limit
+private_chats = 4096         # private chats open on the server; 0 = no limit
 ng_requests = 40             # 0 for no limit, or the request weight one ng
 ng_request_seconds = 2       # session may spend at once, earned back over this
 news_posts = 10              # 0 for no limit, or the news posts one account
@@ -297,6 +301,11 @@ this too. An account
 with `[extra] can_spam = true` is held to neither, which by default is
 every account with the kick bit. A load test from one machine wants
 both at 0.
+
+The two private-chat limits are this server's, not mhxd's, which has
+none: a chat stays open, counted against whoever opened it, until its
+last member leaves, and a create past either is refused with a task
+error a period client shows like any other.
 
 The request limits are not mhxd's, and slow a client down rather than
 kick it. Every request an ng session sends spends its weight from
@@ -745,8 +754,17 @@ max_queued = 200         # messages waiting, per account; a full one refuses
 deliver_at_flush = 25    # queued messages handed over per login
 retain_unread = 2592000  # seconds; 30 days, from when it was sent
 retain_read = 604800     # seconds; 7 days, from when it was read
+max_sent_per_day = 1000  # messages one account may store in a rolling day,
+                         # delivered or waiting; 0 = no quota
+max_sent_bytes_per_day = 8388608  # the same in body bytes
 sync = "normal"          # or "full": fsync every commit
 ```
+
+Retention keeps a delivered message as well as a waiting one, so the
+sender's quota, not `max_queued`, is what bounds how fast one account can
+grow the database. Past it, a message to someone connected still
+arrives, live and unstored, as a period server delivers it; one that
+would have to wait is refused, as a full mailbox refuses.
 
 `full` costs a disk sync per commit. Public chat lines arriving together
 share a commit, so a busy room pays one sync for many lines, but a line
@@ -797,6 +815,9 @@ max_depth = 32            # reply nesting
 max_node_depth = 16       # bundle nesting
 max_page = 200            # threads in one request
 retain_days = 0           # a thread's life after its last post; 0 = forever
+max_articles = 100000     # live articles the news may hold; 0 = no ceiling
+max_text_bytes = 1073741824  # bytes of their bodies and plain-text parts
+max_per_author = 10000    # live articles one account may hold, guests as one
 self_delete = true        # authors may delete their own; false = period behavior
 search = true             # false turns news_search off; the index is kept either way
 search_max_results = 500  # the deepest a search pages
@@ -1148,6 +1169,13 @@ hxd news-reindex
 
 It opens the database the server uses, which must already exist, and
 leaves the articles as they are. See [docs/news.md](docs/news.md) §6.4.
+
+News is kept until someone deletes it, as a period server keeps it, so
+the ceilings are what bound it: a post past `max_articles`,
+`max_text_bytes` or the author's `max_per_author` is refused, never made
+room for, and the log says so each time. Make room by deleting threads,
+by raising a ceiling, or with `retain_days`. See
+[docs/news.md](docs/news.md) §7.4.
 
 ### Moderation
 

@@ -64,6 +64,14 @@ pub fn news_err(e: &NewsError) -> (&'static str, &'static str) {
             "That post has more attachments than this server allows.",
         ),
         NewsError::NewsFull => ("news_full", "This server's news storage is full."),
+        NewsError::TooManyArticles { guests: false } => (
+            "too_many_articles",
+            "You have as many articles here as this server allows. Delete one first.",
+        ),
+        NewsError::TooManyArticles { guests: true } => (
+            "too_many_articles",
+            "Guests have as many articles here as this server allows.",
+        ),
         NewsError::NoSession | NewsError::Store(_) => ("server_error", "Server error."),
     }
 }

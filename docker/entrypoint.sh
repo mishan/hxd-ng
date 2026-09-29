@@ -180,6 +180,8 @@ generate() {
     num HXD_CHAT_SECONDS chat_seconds
     num HXD_SPAM_POINTS spam_points
     num HXD_SPAM_SECONDS spam_seconds
+    num HXD_PRIVATE_CHATS_PER_USER private_chats_per_user
+    num HXD_PRIVATE_CHATS private_chats
     num HXD_NG_REQUESTS ng_requests
     num HXD_NG_REQUEST_SECONDS ng_request_seconds
     num HXD_NEWS_POSTS news_posts
@@ -238,6 +240,8 @@ generate() {
         num HXD_INBOX_MAX_QUEUED max_queued
         num HXD_INBOX_RETAIN_UNREAD retain_unread
         num HXD_INBOX_RETAIN_READ retain_read
+        num HXD_INBOX_MAX_SENT_PER_DAY max_sent_per_day
+        num HXD_INBOX_MAX_SENT_BYTES_PER_DAY max_sent_bytes_per_day
         db=
     fi
     if on HXD_HISTORY on; then
@@ -254,6 +258,9 @@ generate() {
         [ -z "$db" ] || echo "db = $db"
         echo "blobs = \"$DATA/news-blobs\""
         num HXD_NEWS_RETAIN_DAYS retain_days
+        num HXD_NEWS_MAX_ARTICLES max_articles
+        num HXD_NEWS_MAX_TEXT_BYTES max_text_bytes
+        num HXD_NEWS_MAX_PER_AUTHOR max_per_author
         db=
     fi
     if on HXD_MEDIA on; then

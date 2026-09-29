@@ -930,6 +930,11 @@ fn err_text(e: ChatError) -> &'static str {
         ChatError::AlreadyThere => "Already there.",
         ChatError::WrongPassword => "Wrong chat password.",
         ChatError::MailboxFull => "That user's mailbox is full.",
+        ChatError::SendQuota => {
+            "That user is not connected, and you have sent as much offline mail today as this \
+             server allows."
+        }
+        ChatError::TooManyChats => "Too many private chats are open. Leave one first.",
         ChatError::Blocked => "That user is not accepting messages from you.",
         ChatError::NoInbox => "This account has no message inbox.",
         // Not theirs, expired, or revoked — one answer for all three, so

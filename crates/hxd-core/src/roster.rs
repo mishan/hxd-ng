@@ -996,6 +996,16 @@ pub struct InboxPolicy {
     /// the legacy wire, where each private message opens a window; the
     /// remainder stays pending rather than being dropped.
     pub deliver_at_flush: usize,
+    /// Messages one sender may *store* in a rolling day, delivered or
+    /// waiting; 0 for no quota. `max_queued` bounds a mailbox's queue,
+    /// and retention keeps every row besides — a delivered one for a
+    /// week once read — so without this one account could fill the disk
+    /// at the rate the flood limit allows. Past it, mail that would have
+    /// to wait is refused; mail to someone attached still reaches them,
+    /// unstored (`docs/private-messages.md` §9).
+    pub max_sent_per_day: usize,
+    /// Body bytes, likewise; 0 for no quota.
+    pub max_sent_bytes_per_day: u64,
 }
 
 impl Default for InboxPolicy {
@@ -1003,6 +1013,8 @@ impl Default for InboxPolicy {
         InboxPolicy {
             max_queued: 200,
             deliver_at_flush: 25,
+            max_sent_per_day: 1_000,
+            max_sent_bytes_per_day: 8 << 20,
         }
     }
 }
@@ -1042,6 +1054,8 @@ pub struct Core {
     pub(crate) login_failures: crate::limits::RateGate,
     /// How fast one session may talk (`crate::limits`).
     pub(crate) flood_limits: crate::limits::FloodLimits,
+    /// How many private chats may be open (`crate::limits`).
+    pub(crate) chat_limits: crate::limits::ChatLimits,
     /// How fast one ng session may ask and one account post news
     /// (`crate::limits`).
     pub(crate) request_limits: crate::limits::RequestLimits,
@@ -1124,6 +1138,10 @@ pub struct Core {
     pub(crate) news_codec: Option<Arc<dyn crate::media::MediaCodec>>,
     /// Serializes attachment filesystem and metadata transitions.
     pub(crate) news_blob_serial: Mutex<()>,
+    /// Holds a post's check against the news ceilings and its write
+    /// together, so two posts cannot both take the last place. Nothing
+    /// is taken under it but the news store's own lock.
+    pub(crate) news_post_serial: Mutex<()>,
     /// Makes persisted id order and live fan-out order the same fact.
     /// Nothing but public chat takes this lock; order is it first, then
     /// (briefly) `roster`.
@@ -1330,6 +1348,13 @@ impl Core {
     /// [`crate::FloodLimits::default`].
     pub fn with_flood_limits(mut self, limits: crate::FloodLimits) -> Self {
         self.flood_limits = limits;
+        self
+    }
+
+    /// Hold private chats to `limits` rather than
+    /// [`crate::ChatLimits::default`].
+    pub fn with_chat_limits(mut self, limits: crate::ChatLimits) -> Self {
+        self.chat_limits = limits;
         self
     }
 

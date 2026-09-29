@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use super::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    Pushed, StoreError, StoredMessage,
+    Pushed, Sent, StoreError, StoredMessage,
 };
 
 struct Block {
@@ -508,6 +508,19 @@ impl MessageStore for MemoryStore {
             _ => {}
         }
         Ok(())
+    }
+
+    fn sent_since(&self, from: &Mailbox, since: SystemTime) -> Result<Sent, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .msgs
+            .iter()
+            .filter(|x| x.kind == MessageKind::Message && x.sent_at >= since)
+            .filter(|x| x.sender.as_ref().is_some_and(|s| is(s, from)))
+            .fold(Sent::default(), |sent, x| Sent {
+                messages: sent.messages + 1,
+                bytes: sent.bytes + x.body.len() as u64,
+            }))
     }
 
     fn is_blocked(&self, owner: &Mailbox, other: &Mailbox) -> Result<bool, StoreError> {

@@ -340,7 +340,10 @@ id) — for a person, the same person by the mailbox rule, which two
 guests never are. A guest pays from its session's ration and from its
 address's, which every guest there shares: a reconnect is a new
 session, and the address is what stays. Accounts are people, and
-people behind one address are not rationed together. Reports are retained `[moderation] report_days` (default 90) after
+people behind one address are not rationed together. The rations are
+kept in a bounded table; when it is full of spent ones it forgets the
+fullest first, never the lot, so a flood of new reporters cannot hand
+anyone a fresh ration. Reports are retained `[moderation] report_days` (default 90) after
 closing.
 
 ### 4.5 Who hears

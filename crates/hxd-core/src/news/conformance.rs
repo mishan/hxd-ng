@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     ArticleId, Author, AutoFollow, BodyType, CompiledQuery, NewNode, NewPost, NewsError, NewsStore,
-    NodeId, NodeKind, Posted, SearchOrder, SearchQuery, SubScope, TextLen, ThreadQuery,
+    NewsUsage, NodeId, NodeKind, Posted, SearchOrder, SearchQuery, SubScope, TextLen, ThreadQuery,
 };
 use crate::inbox::Mailbox;
 
@@ -34,6 +34,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     references_resolve_once_and_report_their_target_now(&*new_store());
     a_tombstone_keeps_its_place_and_loses_its_words(&*new_store());
     an_authors_articles_are_found_by_the_mailbox_rule(&*new_store());
+    usage_follows_the_live_articles_whichever_way_they_go(&*new_store());
     a_thread_of_nothing_but_tombstones_is_not_listed(&*new_store());
     deleting_a_category_takes_its_articles_and_a_bundle_must_be_empty(&*new_store());
     pruning_takes_whole_threads_by_their_last_post(&*new_store());
@@ -1392,6 +1393,80 @@ fn an_authors_articles_are_found_by_the_mailbox_rule(s: &dyn NewsStore) {
     assert!(by(&Mailbox::login("alice"), 0).is_empty());
     assert!(by(&Mailbox::login("guest"), 0).is_empty());
     let _ = anon;
+}
+
+/// What the news ceilings are checked against: the live articles and
+/// the UTF-8 bytes of their bodies and downgrades, and one author's
+/// share of them under the mailbox rule — kept right through a
+/// tombstone, a prune and a category delete.
+fn usage_follows_the_live_articles_whichever_way_they_go(s: &dyn NewsStore) {
+    assert_eq!(s.usage().unwrap(), NewsUsage::default());
+    let cat = category(s, "General");
+    // Bytes, not characters: the é is two of them.
+    let first = post(s, cat, None, "h\u{e9}llo", 100);
+    let marked = NewPost {
+        mime: BodyType::Markdown,
+        plain: Some("plain".into()),
+        ..new_post(cat, Some(first), "**md**", 101)
+    };
+    s.post(&marked, 32, 32).unwrap();
+    let bobs = post_by(s, bob_writing(), cat, None, "bob", 102);
+    let guest = Author {
+        nick: "Guest".into(),
+        login: None,
+        fingerprint: None,
+    };
+    post_by(s, guest, cat, None, "anon", 103);
+    let later = category(s, "Later");
+    post(s, later, None, "kept", 2000);
+
+    assert_eq!(
+        s.usage().unwrap(),
+        NewsUsage {
+            articles: 5,
+            bytes: 6 + 6 + 5 + 3 + 4 + 4,
+        }
+    );
+    assert_eq!(s.written_by(Some(&alice_mailbox())).unwrap(), 3);
+    assert_eq!(
+        s.written_by(Some(&Mailbox::identified("alicia", [7u8; 32])))
+            .unwrap(),
+        3,
+        "a rename is the same author"
+    );
+    assert_eq!(s.written_by(Some(&bob())).unwrap(), 1);
+    assert_eq!(s.written_by(None).unwrap(), 1, "the guests, together");
+    assert_eq!(
+        s.written_by(Some(&Mailbox::login("alice"))).unwrap(),
+        0,
+        "a bare login never claims an identified author's work"
+    );
+
+    s.tombstone(bobs, "mod", t(104)).unwrap();
+    assert_eq!(
+        s.usage().unwrap(),
+        NewsUsage {
+            articles: 4,
+            bytes: 6 + 6 + 5 + 4 + 4,
+        },
+        "a tombstone holds nothing"
+    );
+    assert_eq!(s.written_by(Some(&bob())).unwrap(), 0);
+
+    s.prune(Duration::from_secs(500), t(2100)).unwrap();
+    assert_eq!(
+        s.usage().unwrap(),
+        NewsUsage {
+            articles: 1,
+            bytes: 4,
+        },
+        "retention gives back what it takes"
+    );
+    assert_eq!(s.written_by(None).unwrap(), 0);
+
+    s.delete_node(later).unwrap();
+    assert_eq!(s.usage().unwrap(), NewsUsage::default());
+    assert_eq!(s.written_by(Some(&alice_mailbox())).unwrap(), 0);
 }
 
 fn a_thread_of_nothing_but_tombstones_is_not_listed(s: &dyn NewsStore) {

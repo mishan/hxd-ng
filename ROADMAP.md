@@ -398,6 +398,14 @@ fetch a derivative by, and the mhxd importer.
   in the database, placed by a kick-with-ban or `hxd ban`, and applied
   on SIGHUP (docs/moderation.md §3.5). The ban list on the ng wire and
   bans placed from the config are next.
+  What one account can store is bounded too: news holds a ceiling of
+  live articles and text and a share of it per author, refused rather
+  than evicted (docs/news.md §7.4); offline mail a per-sender daily
+  quota, which bounds storage and never a live message
+  (docs/private-messages.md §9); private chats a count per creator and
+  per server (`[limits]`). A post's 1.2 push reads the store once
+  however many classic clients hear it, and the report ration makes room
+  by forgetting its fullest buckets rather than everyone's.
 - Fuzz the frame decoder (`cargo-fuzz` against the session layer's read
   path); a server's parser meets far more hostile input than a client's.
 

@@ -261,7 +261,7 @@ Three layers, all `cargo test --workspace`:
   loopback ports: `login.rs` (legacy login/presence/agreement), `tls.rs`
   (the legacy wire over TLS beside a plaintext client, and HTXF on the
   TLS transfer port), `chat.rs` (chat/PM/moderation over the legacy
-  wire), `ng.rs` (the WebSocket
+  wire, and the private-chat caps), `ng.rs` (the WebSocket
   frontend, **including cross-frontend scenarios** — a scripted 1.5 client
   and a WS client on one server, chat and PMs crossing both wire eras,
   detach showing as the away color, resume replay), `identity.rs` (the
@@ -275,14 +275,17 @@ Three layers, all `cargo test --workspace`:
   restart), `banner.rs` (the banner push after the agreement, and a
   banner file fetched over HTXF once per login), `inbox.rs` (offline
   private messages across both wires: queue, flush at login, resync,
-  blocks, retention), `news.rs` (threaded news on
+  blocks, retention, the sender's daily quota refusing only
+  what would have to wait), `news.rs` (threaded news on
   the ng wire: the tree and its containment rules, threads in reading
   order and paged both ways, references and backlinks, tombstones, who
   hears that the news changed and who hears that it is theirs, following
   and muting — and on the legacy wire: a scripted 1.5 client walking
   the tree an ng client built, reading both parts of a markdown article,
   posting and keeping house, and a 1.2 client reading the flat category,
-  posting into it and hearing its push), `moderation.rs` (the acts and
+  posting into it and hearing its push, read from the store once
+  however many classic clients hear it; and the news ceilings refused
+  on both wires), `moderation.rs` (the acts and
   reports on both wires against one database: a redaction blanking a
   rendered line and paging as a tombstone on 700 and `history`, a
   revocation and its refused re-upload, a kick with a purge across the

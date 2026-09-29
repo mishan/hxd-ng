@@ -466,9 +466,22 @@ pub struct NewsSection {
     /// The largest page of threads one request may ask for.
     #[serde(default = "default_news_max_page")]
     pub max_page: usize,
-    /// Days a thread survives its last post. 0 keeps everything.
+    /// Days a thread survives its last post. 0 keeps everything, which
+    /// is what an operator coming from mhxd expects of news.
     #[serde(default)]
     pub retain_days: u32,
+    /// Live articles the store may hold; a post past it is refused. 0
+    /// for no ceiling.
+    #[serde(default = "default_news_max_articles")]
+    pub max_articles: u64,
+    /// Bytes of body and plain-text downgrade the live articles may
+    /// hold together; a post past it is refused. 0 for no ceiling.
+    #[serde(default = "default_news_max_text_bytes")]
+    pub max_text_bytes: u64,
+    /// Live articles one author may hold, every guest counted as one. 0
+    /// for no ceiling.
+    #[serde(default = "default_news_max_per_author")]
+    pub max_per_author: u64,
     /// May an author delete their own article? `false` is the period
     /// behavior, where only `delete_articles` can.
     #[serde(default = "default_true")]
@@ -632,6 +645,9 @@ impl NewsSection {
             max_page: self.max_page,
             self_delete: self.self_delete,
             retain_days: self.retain_days,
+            max_articles: self.max_articles,
+            max_text_bytes: self.max_text_bytes,
+            max_per_author: self.max_per_author,
             search: self.search,
             search_max_results: self.search_max_results,
             search_per_minute: self.search_per_minute,
@@ -672,6 +688,7 @@ impl NewsSection {
                     reply: hxd_session::FlatReply::from_name(&self.flat_reply)
                         .unwrap_or(hxd_session::FlatReply::NewestThread),
                     masthead: self.flat_masthead.clone(),
+                    pushes: Default::default(),
                 }),
         }
     }
@@ -837,6 +854,15 @@ fn default_news_max_node_depth() -> u16 {
 }
 fn default_news_max_page() -> usize {
     hxd_core::NewsPolicy::default().max_page
+}
+fn default_news_max_articles() -> u64 {
+    hxd_core::NewsPolicy::default().max_articles
+}
+fn default_news_max_text_bytes() -> u64 {
+    hxd_core::NewsPolicy::default().max_text_bytes
+}
+fn default_news_max_per_author() -> u64 {
+    hxd_core::NewsPolicy::default().max_per_author
 }
 
 /// Inline media (`docs/inline-media.md` §11).
@@ -1056,6 +1082,16 @@ pub struct InboxSection {
     /// is left waits for the next login rather than being dropped.
     #[serde(default = "default_deliver_at_flush")]
     pub deliver_at_flush: usize,
+    /// Messages one account may *store* in a rolling day, delivered or
+    /// waiting; 0 for no quota. Retention keeps a delivered message too,
+    /// so this rather than `max_queued` is what bounds how fast one
+    /// sender can fill the disk. Past it, a message to someone connected
+    /// still arrives, unstored; one that would have to wait is refused.
+    #[serde(default = "default_max_sent_per_day")]
+    pub max_sent_per_day: usize,
+    /// Body bytes, likewise; 0 for no quota.
+    #[serde(default = "default_max_sent_bytes_per_day")]
+    pub max_sent_bytes_per_day: u64,
     /// Seconds an *unread* message is kept, measured from when it was
     /// sent. Default 30 days.
     #[serde(default = "default_retain_unread")]
@@ -1069,6 +1105,24 @@ pub struct InboxSection {
     /// fsyncs every commit.
     #[serde(default)]
     pub sync: InboxSync,
+}
+
+impl InboxSection {
+    pub fn policy(&self) -> hxd_core::InboxPolicy {
+        hxd_core::InboxPolicy {
+            max_queued: self.max_queued,
+            deliver_at_flush: self.deliver_at_flush,
+            max_sent_per_day: self.max_sent_per_day,
+            max_sent_bytes_per_day: self.max_sent_bytes_per_day,
+        }
+    }
+}
+
+fn default_max_sent_per_day() -> usize {
+    hxd_core::InboxPolicy::default().max_sent_per_day
+}
+fn default_max_sent_bytes_per_day() -> u64 {
+    hxd_core::InboxPolicy::default().max_sent_bytes_per_day
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -1539,6 +1593,13 @@ pub struct LimitsSection {
     pub spam_points: u32,
     #[serde(default = "default_spam_seconds")]
     pub spam_seconds: u64,
+    /// Private chats one session may have opened and still open; 0 for
+    /// no limit. mhxd has none.
+    #[serde(default = "default_private_chats_per_user")]
+    pub private_chats_per_user: usize,
+    /// Private chats open on the whole server; 0 for no limit.
+    #[serde(default = "default_private_chats")]
+    pub private_chats: usize,
     /// Weight of requests one ng session may send at once, earned
     /// back over `ng_request_seconds`, past which a request is answered
     /// `rate_limited` with how long to wait; 0 for no limit. Not mhxd's:
@@ -1580,6 +1641,12 @@ pub struct LimitsSection {
     pub avatar_fetches_per_minute: u32,
 }
 
+fn default_private_chats_per_user() -> usize {
+    hxd_core::ChatLimits::DEFAULT.per_creator
+}
+fn default_private_chats() -> usize {
+    hxd_core::ChatLimits::DEFAULT.total
+}
 fn default_ng_requests() -> u32 {
     hxd_core::RequestLimits::DEFAULT.requests
 }
@@ -1644,6 +1711,8 @@ impl Default for LimitsSection {
             chat_seconds: default_chat_seconds(),
             spam_points: default_spam_points(),
             spam_seconds: default_spam_seconds(),
+            private_chats_per_user: default_private_chats_per_user(),
+            private_chats: default_private_chats(),
             ng_requests: default_ng_requests(),
             ng_request_seconds: default_ng_request_seconds(),
             news_posts: default_news_posts(),
@@ -1659,6 +1728,13 @@ impl Default for LimitsSection {
 }
 
 impl LimitsSection {
+    pub fn chat_limits(&self) -> hxd_core::ChatLimits {
+        hxd_core::ChatLimits {
+            per_creator: self.private_chats_per_user,
+            total: self.private_chats,
+        }
+    }
+
     /// The flood limits, banning a session past its spam points for
     /// `ban_time` seconds (`[server] ban_time`).
     pub fn flood_limits(&self, ban_time: u64) -> Result<hxd_core::FloodLimits, String> {
@@ -2385,11 +2461,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     banner::check(config)?;
     metrics::check(config)?;
     if let Some(inbox) = &config.inbox {
-        hxd_core::InboxPolicy {
-            max_queued: inbox.max_queued,
-            deliver_at_flush: inbox.deliver_at_flush,
-        }
-        .check()?;
+        inbox.policy().check()?;
     }
     if let Some(history) = &config.history {
         if history.db.is_none() && config.inbox.is_none() {
@@ -3256,6 +3328,7 @@ pub fn build_ctx(
             let core = Core::new()
                 .with_conn_limits(conn_limits)
                 .with_flood_limits(flood_limits)
+                .with_chat_limits(config.limits.chat_limits())
                 .with_request_limits(request_limits)
                 .with_login_limits(login_limits)
                 .with_queue_budget(budget)
@@ -3277,6 +3350,7 @@ pub fn build_ctx(
         None => Core::new()
             .with_conn_limits(conn_limits)
             .with_flood_limits(flood_limits)
+            .with_chat_limits(config.limits.chat_limits())
             .with_request_limits(request_limits)
             .with_login_limits(login_limits)
             .with_queue_budget(budget)
@@ -3300,10 +3374,10 @@ pub fn build_ctx(
         Some(store) => core.with_inbox(
             store,
             auth.clone(),
-            hxd_core::InboxPolicy {
-                max_queued: config.inbox.as_ref().map_or(200, |i| i.max_queued),
-                deliver_at_flush: config.inbox.as_ref().map_or(25, |i| i.deliver_at_flush),
-            },
+            config
+                .inbox
+                .as_ref()
+                .map_or_else(hxd_core::InboxPolicy::default, InboxSection::policy),
         ),
         None => core,
     };

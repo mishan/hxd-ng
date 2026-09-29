@@ -512,7 +512,7 @@ family document. Each family of §4 adds its own.
 | `login` / `resume` / `sync` | §6 | §6 | §6 |
 | `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?` | `{}` | `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?` | `{ "queued": bool }` | `no_such_user`, `mailbox_full`, `blocked`, `server_error` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?` | `{ "queued": bool }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `server_error` |
 | `history` | `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `server_error` |
 | `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message id) | `{ "unread", "total" }` | `no_inbox`, `server_error` |
@@ -749,6 +749,7 @@ news body is different: it declares its own type (news.md §5).
 | `no_such_user` | `msg`, `block`, `unblock` | No such uid, no such account, or that account takes no offline mail — one answer for all three. |
 | `no_inbox` | `inbox`, `msg_read`, `block`, `unblock`, `blocks` | *Your* account has no inbox, or the server has none: the `inbox` family's "not available" code. |
 | `mailbox_full` | `msg` | The recipient's inbox is at its cap. |
+| `quota_exceeded` | `msg` | The recipient is not connected, and you have stored as much mail today as the server allows. To someone connected, the same message is delivered. *hxd-ng:* `[inbox] max_sent_per_day` and `max_sent_bytes_per_day`. |
 | `blocked` | `msg` | The recipient blocks you. |
 
 The files codes are §7.2's. Each family's document lists its own. A

@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    Pushed,
+    Pushed, Sent,
 };
 
 /// Run every case against a freshly built store. `new_store` is called
@@ -60,6 +60,8 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn MessageStore>) {
     a_flush_can_stamp_read_in_the_same_step(&*new_store());
     a_guid_is_scoped_to_one_sender_and_one_recipient(&*new_store());
     a_receipt_is_stored_but_never_read_as_mail(&*new_store());
+    // The per-sender quota's measure.
+    sent_since_counts_a_senders_stored_mail_in_its_window(&*new_store());
 }
 
 fn at(secs: u64) -> SystemTime {
@@ -956,5 +958,56 @@ fn a_receipt_is_stored_but_never_read_as_mail(s: &dyn MessageStore) {
         s.purge(&claimed).unwrap(),
         2,
         "{case}: purge takes the receipt with the mail"
+    );
+}
+
+/// What the per-sender quota measures: one sender's mail since a time,
+/// delivered or still waiting, under the mailbox rule on the sender's
+/// side — bytes rather than characters, and never a receipt, another
+/// sender's mail, or a row from before the window.
+fn sent_since_counts_a_senders_stored_mail_in_its_window(s: &dyn MessageStore) {
+    let case = "sent_since_counts_a_senders_stored_mail_in_its_window";
+    let (dave, bob) = (Mailbox::login("dave"), Mailbox::login("bob"));
+    let alice = Mailbox::identified("alice", fp(1));
+    push(s, &msg(&dave, &alice, "before the window", at(100)));
+    // Two characters and three bytes, and delivered: a delivered row is
+    // still stored, and storage is what the quota is about.
+    let read = push(s, &msg(&dave, &alice, "h\u{e9}", at(200)));
+    s.mark_delivered(&[read], at(201), Delivery::Read).unwrap();
+    push(s, &msg(&bob, &alice, "four", at(300)));
+    push(s, &msg(&dave, &bob, "bob's", at(300)));
+    push(
+        s,
+        &NewMessage {
+            kind: MessageKind::ReadReceipt,
+            ..msg(&bob, &alice, "a receipt", at(300))
+        },
+    );
+    let sent = |who: &Mailbox| s.sent_since(who, at(150)).unwrap();
+    assert_eq!(
+        sent(&alice),
+        Sent {
+            messages: 2,
+            bytes: 3 + 4,
+        },
+        "{case}"
+    );
+    assert_eq!(
+        sent(&Mailbox::identified("alicia", fp(1))),
+        sent(&alice),
+        "{case}: a rename is the same sender"
+    );
+    assert_eq!(
+        sent(&Mailbox::login("alice")),
+        Sent::default(),
+        "{case}: a bare login never claims an identity's mail"
+    );
+    assert_eq!(
+        sent(&bob),
+        Sent {
+            messages: 1,
+            bytes: 5,
+        },
+        "{case}"
     );
 }

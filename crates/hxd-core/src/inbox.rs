@@ -269,6 +269,15 @@ pub enum Pushed {
     Full,
 }
 
+/// What one sender has stored lately, as [`MessageStore::sent_since`]
+/// counts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sent {
+    pub messages: usize,
+    /// UTF-8 bytes of their bodies.
+    pub bytes: u64,
+}
+
 /// What a flush stamps on the rows it hands out.
 ///
 /// The ng wire has `msg_read`, so a client says for itself when it has
@@ -469,6 +478,13 @@ pub trait MessageStore: Send + Sync + 'static {
 
     /// Who `owner` has blocked, oldest first.
     fn blocked(&self, owner: &Mailbox) -> Result<Vec<Mailbox>, StoreError>;
+
+    /// The mail `from` has stored since `since`, by the mailbox rule on
+    /// the sender's columns: every row, delivered and read or still
+    /// waiting, because a delivered row is kept for retention all the
+    /// same and it is storage this measures (§9). Receipts are not mail
+    /// and are not counted.
+    fn sent_since(&self, from: &Mailbox, since: SystemTime) -> Result<Sent, StoreError>;
 }
 
 #[cfg(test)]

@@ -345,6 +345,9 @@ impl Core {
             Err(crate::ChatError::NoSuchUser) => "error: no such account".into(),
             Err(crate::ChatError::Blocked) => "ok: sent".into(),
             Err(crate::ChatError::MailboxFull) => "error: that mailbox is full".into(),
+            Err(crate::ChatError::SendQuota) => {
+                "error: you have sent as much offline mail today as this server allows".into()
+            }
             Err(_) => "error: that did not work".into(),
         }
     }

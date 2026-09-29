@@ -1346,10 +1346,25 @@ impl Core {
             // Forget the buckets that have refilled: they hold nothing.
             rates.retain(|_, (at, tokens)| refill(*at, *tokens) < per_hour);
             if rates.len() + keys.len() > RATES_KEPT {
-                // Still full of spent buckets: bounded memory beats a
-                // perfect ration, as the system account's has it. The
-                // address rations are what a flood runs into first.
-                rates.clear();
+                // Still full of spent buckets. Bounded memory still beats
+                // a perfect ration, but forgetting one hands its owner a
+                // full ration back, so forget the ones that give back
+                // least — the fullest, and of those the longest idle —
+                // and never the ones this report is about to charge.
+                // Down to three quarters, so the sort is not paid again
+                // on the very next report. Clearing the table instead
+                // handed everyone a fresh ration at once, which a flood
+                // of new keys could time to reset its own.
+                let mut by_worth: Vec<(f64, Instant, ReporterKey)> = rates
+                    .iter()
+                    .filter(|(key, _)| !keys.contains(key))
+                    .map(|(key, (at, tokens))| (refill(*at, *tokens), *at, key.clone()))
+                    .collect();
+                by_worth.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                let excess = (rates.len() + keys.len()).saturating_sub(RATES_KEPT * 3 / 4);
+                for (_, _, key) in by_worth.into_iter().take(excess) {
+                    rates.remove(&key);
+                }
             }
         }
         let allowed = keys.iter().all(|key| {

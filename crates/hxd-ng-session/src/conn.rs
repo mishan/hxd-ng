@@ -1602,6 +1602,14 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     Err(ChatError::MailboxFull) => {
                         reply_err(req.id, "mailbox_full", "That user's mailbox is full.")
                     }
+                    // The sender's quota, which only mail that would have
+                    // to wait meets: to an attached recipient it arrives.
+                    Err(ChatError::SendQuota) => reply_err(
+                        req.id,
+                        "quota_exceeded",
+                        "That user is not connected, and you have sent as much offline mail \
+                         today as this server allows.",
+                    ),
                     Err(ChatError::Blocked) => reply_err(
                         req.id,
                         "blocked",
