@@ -255,6 +255,24 @@ A relay can offer the ng JSON path only by implementing the JSON protocol
 itself against TRTP downstream, which is a full client implementation;
 a relay that offers only the TRTP path is complete.
 
+A relay that does not authenticate looks, at first sight, like an open
+proxy, and is not one. It dials exactly two ports on exactly one
+server, both of which that server already offers to the whole
+internet: a browser that could open TCP would reach the same place with
+the same bytes. What it changes is who the server sees. Every relayed
+client arrives from the relay's address, so the server's own address
+bans and per-address limits stop working for them — hence the rule
+that the relay keep those itself, on the address it does see. The
+relay is the operator's own, which is also why it is not the place to
+fix the absence of TLS on the classic ports: the hop behind it is
+normally loopback, and a browser's socket to it is `wss`.
+
+Why a relay beside each server, rather than one shared relay any page
+can point at any host: a shared one dials wherever it is told, and is
+then a relay to internal addresses, arbitrary ports and every server
+that has banned someone. Per-server relays cost each operator one
+process, and cost nobody a service to run for everyone.
+
 ## 9. The HTTP routes
 
 **CORS is a wildcard on purpose.** Every route is authenticated by a

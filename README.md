@@ -126,6 +126,12 @@ maintainer:
 Voice and video need a client that speaks the extensions or the ng wire:
 GtkHx or hx-ng.
 
+A browser cannot open TCP, so it cannot reach a server that speaks only
+the classic wire. `hlrelay`, built from this workspace, runs beside such
+a server — hxd 0.x, mhxd, Janus, Mobius, anything — and carries
+WebSockets to its ports, so that a web client can (`docs/relay.md`).
+hxd-ng serves the same paths on its ng port and does not need one.
+
 ## Getting started
 
 ### Prerequisites
@@ -1264,6 +1270,7 @@ other than this server. The last column is what this server has built.
 | [hotline-ng-rationale.md](docs/hotline-ng-rationale.md) | The reasoning behind the ng protocol, its domain-layer changes and the order it was built in | yes |
 | [hotline-ng-auth.md](docs/hotline-ng-auth.md) | Transport authentication: the principal, the challenge and mTLS bindings, transport tokens, the TRTP tunnel, cleartext marking, tunnels and relays | yes |
 | [hotline-ng-auth-rationale.md](docs/hotline-ng-auth-rationale.md) | The reasoning behind transport authentication, and working Caddy and nginx configurations for the mTLS binding | yes |
+| [relay.md](docs/relay.md) | `hlrelay`: putting a classic server where a browser can reach it | without authentication or its own bans |
 | [hotline-ng-identity.md](docs/hotline-ng-identity.md) | Portable identity: the signed objects, the identity profile at authentication, cards, account association | yes, to the registrar stub |
 | [identity-enrollment.md](docs/identity-enrollment.md) | Certifying a device through a mailbox and a pairing code instead of a paste; renewal | server side |
 | [identity-registrar.md](docs/identity-registrar.md) | The registrar: handles, revocation, rotation, freeze, key backup, transparency; what a server does with it | the server-local revocation list |

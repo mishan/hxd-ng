@@ -8,6 +8,7 @@
 resolver = "2"
 members = [
     "crates/hl-identity",
+    "crates/hl-tunnel",
     "crates/hxd-core",
     "crates/hxd-files",
     "crates/hxd-media",
@@ -23,6 +24,7 @@ members = [
     "crates/hxd-load",
     "crates/hxd",
     "crates/hlid",
+    "crates/hlrelay",
 ]
 [workspace.package]
 edition = "2021"
@@ -39,6 +41,8 @@ hxhfs = { git = "https://github.com/mishan/hx-libs.git", rev = "e7705c1dc7b9b755
 
 # Internal.
 hl-identity = { path = "crates/hl-identity" }
+hl-tunnel = { path = "crates/hl-tunnel" }
+hlrelay = { path = "crates/hlrelay" }
 hxd-core = { path = "crates/hxd-core" }
 hxd-files = { path = "crates/hxd-files" }
 hxd-auth-file = { path = "crates/hxd-auth-file" }
