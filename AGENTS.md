@@ -270,6 +270,14 @@ Three layers, all `cargo test --workspace`:
   media on both wires: the capability echo and its limits, single-shot
   and chunked upload, sliced downloads, a capable and a classic client
   in one room, a photo crossing each way, and a revocation),
+  `file_management.rs` (New Folder, Delete, rename, Move and comments
+  on both wires against one local area: each kind of entry under its own
+  bit, Set Info changing only what differs from what was shown, drop
+  boxes and aliases out of reach, a drop box behind a wire name cut
+  short of saying so, a folder holding a drop box kept from an account
+  that cannot view one, an act refused before any lookup to an account
+  with none of its bits, folders nested too deep on either wire, a
+  read-only area refusing it all),
   `avatars.rs` (a picture set on either wire and shown on the other,
   GIF Icons' probe and Icon Change, an account's avatar surviving a
   restart, a guest refused on both wires until its file allows it, the

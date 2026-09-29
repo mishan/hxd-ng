@@ -169,7 +169,7 @@ over them.
 | `news` | Threaded news, subscriptions and `news_notify` | news.md §9, §10.9 | `news` |
 | `voice` | Voice rooms | voice.md §8 | — |
 | `video` | Camera and screen publications, layered on voice | capabilities-video.md, "Hotline-ng Binding" | `video` |
-| `files` | The read-only file area | §7.2 here | — |
+| `files` | The file area | §7.2 here | `files` |
 | `identity` | The server has the identity endpoints of hotline-ng-auth.md | hotline-ng-identity.md §6.1 | fields in `self`, on a socket that authenticated with one |
 | `push` | Push device registration | push-notifications.md §8; webpush-gateway.md §7 | `push` |
 | `avatars` | Users' pictures: `avatar` on the `user` object, `avatar_clear`, bytes over HTTP | avatars.md §4 | `avatars` |
@@ -444,10 +444,10 @@ delivers it (§6.4).
 
 ### 7.2 Files
 
-The `files` capability means this server exposes the read-only file area.
-Every path is slash-separated UTF-8 relative to its root; `""` names the
-root. Paths are values, not URLs, and `.` / `..`, empty components, leading
-slashes and trailing slashes are malformed.
+The `files` capability means this server exposes its file area. Every path
+is slash-separated UTF-8 relative to its root; `""` names the root. Paths
+are values, not URLs, and `.` / `..`, empty components, leading slashes and
+trailing slashes are malformed.
 
 - `files_list { path? }` returns `{ path, entries }`. Each entry is
   `{ name, kind, size, media_type?, modified? }`, where `kind` is `file` or
@@ -461,12 +461,56 @@ slashes and trailing slashes are malformed.
   `/files/<token>`; it is short-lived and bound to the session that asked.
   `""` is `bad_request`.
 
+- `files_mkdir { path }` makes an empty folder at `path`.
+- `files_delete { path }` deletes the entry at `path`, a folder with
+  everything in it.
+- `files_move { path, to }` moves the entry at `path` to `to`, which may
+  name another folder, another name, or both: it is rename and move in
+  one.
+- `files_comment { path, comment }` sets the comment `files_info` shows;
+  `""` clears it. *hxd-ng* keeps comments in Mac Roman, as a classic
+  client reads them, so a character Mac Roman lacks is stored as `?`, and
+  at most 200 of them.
+
+Each of these four returns `{}`. None replaces an entry: a path or a `to`
+that is taken is `already_exists`. `""` is `bad_request` for each, as is
+a `to` inside the entry being moved.
+
 `files_list` and `files_info` need the account's `[extra] file_list` and
 `file_getinfo`, as on the legacy wire. Both are on unless the account file
 turns them off, as mhxd has them, so an account that may not download can
-still browse. A drop box, any path naming "drop box" in any case, also
-lists only for `view_drop_boxes`. `files_download` needs the
-`download_files` access bit.
+still browse. `files_download` needs the `download_files` access bit. A
+drop box, any path naming "drop box" in any case, also lists, answers
+`files_info` and downloads only for `view_drop_boxes`, and the path is
+refused before anything is looked up, so a name a drop box does not hold
+is refused the same way as one it does. This wire has no upload method yet;
+a classic upload into a drop box by an account without `view_drop_boxes`
+is never refused for a name that is taken, nor offered a resume, but
+stored under a free name, so that it too learns nothing of what the drop
+box holds (`files-plan.md`), and an upload method here will do the same.
+
+The changes need the bit for the kind of entry they act on:
+`create_folders` for `files_mkdir`; `delete_files` or `delete_folders`
+for `files_delete`; for `files_move`, `rename_files` or `rename_folders`
+when the name changes and `move_files` or `move_folders` when the folder
+does, both when both do; and `comment_files` or `comment_folders` for
+`files_comment`. A path or a `to` naming a drop box needs
+`view_drop_boxes` besides, as on the legacy wire.
+
+The login reply's `files` block says what this session may change, so a
+client can leave out what it would only be refused:
+
+```jsonc
+"files": {
+  "writable": true,   // false: the area is read-only, and "may" is empty
+  "may": ["create_folders", "delete_files", "rename_files"]
+}
+```
+
+`may` names the access bits above that this session holds, by their
+names in access-bits.md §2: some of `create_folders`, `delete_files`,
+`delete_folders`, `rename_files`, `rename_folders`, `move_files`,
+`move_folders`, `comment_files` and `comment_folders`.
 
 These methods answer errors from this set:
 
@@ -474,12 +518,16 @@ These methods answer errors from this set:
 |---|---|
 | `bad_request` | malformed params, or a malformed path |
 | `not_available` | Files is not configured, or its source is unavailable |
-| `access_denied` | `files_list` without `file_list` (or, for a drop box, without `view_drop_boxes`), `files_info` without `file_getinfo`, or `files_download` without `download_files` |
+| `access_denied` | `files_list` without `file_list`, `files_info` without `file_getinfo`, `files_download` without `download_files`, a change without the bit it needs, any of these on a drop box without `view_drop_boxes`, or without it a `files_move` or `files_delete` of a folder holding a drop box anywhere inside |
+| `read_only` | a change to an area that cannot be changed |
+| `already_exists` | a change onto a path that is taken |
+| `cross_filesystem` | a `files_move` that would leave the filesystem its entry is on, or a `files_delete` of a folder with another filesystem mounted inside it |
 | `not_authorized` | the session ended while the request was handled |
 | `not_found` | no entry at that path |
-| `not_folder` | `files_list` on a file |
-| `not_file` | `files_download` on a folder |
+| `not_folder` | `files_list` on a file, a `files_mkdir` or a `to` whose parent is a file, or a folder replaced by a file while a change to it was checked |
+| `not_file` | `files_download` on a folder, or the other way round for a change |
 | `too_large` | the entry exceeds this server's size limit |
+| `too_deep` | a `files_mkdir` that would nest folders deeper than this server allows, a `files_move` of a folder that would leave it or anything inside it deeper than that, whichever way it moves, or a `files_delete` of a folder already nested deeper inside than it will walk; a refused delete removes nothing |
 | `busy` | this server's outstanding-download limits are reached; retry later |
 | `range_unsupported`, `range_invalid`, `origin_changed` | the source refused the request as the corresponding HTTP failure would |
 
@@ -667,8 +715,9 @@ news body is different: it declares its own type (news.md §5).
   of, costs 2: `chat`, `msg`, `nick`, `block`, `unblock`, `msg_read`,
   `avatar_clear`, `voice_answer`, `voice_mute`, `video_state`,
   `news_seen`, `news_subscribe`, `news_unsubscribe`, `news_mute`,
-  `push_unregister`, `files_download`, `report_close`, `redact`,
-  `revoke` and `kick`. What fans out, searches, or joins, leaves or
+  `push_unregister`, `files_download`, `files_mkdir`, `files_delete`,
+  `files_move`, `files_comment`, `report_close`, `redact`, `revoke` and
+  `kick`. What fans out, searches, or joins, leaves or
   renegotiates media costs 4: `news_post`, `news_delete`,
   `news_node_create`, `news_node_rename`, `news_node_delete`,
   `news_search`, `voice_join`, `voice_leave`, `video_start`,
@@ -709,8 +758,9 @@ news body is different: it declares its own type (news.md §5).
   multi-line `text` counted, and so many spam points, which a request
   that stands for a classic transaction spends at the price mhxd
   charges that one: `chat` and `msg` its Chat and Message, `nick` its
-  User Change, and the news writes their 1.5 transactions, `news_post`
-  a threaded post. Past the first the session is kicked and its room told;
+  User Change, the news writes their 1.5 transactions, `news_post`
+  a threaded post, and the file-area changes their Delete File, New
+  Folder, Set File Info and Move File. Past the first the session is kicked and its room told;
   past the second it is kicked and its address banned for `[server]
   ban_time` (on an address `[limits] exempt` holds to nothing, its
   account's login or identity instead, and a plain guest is only

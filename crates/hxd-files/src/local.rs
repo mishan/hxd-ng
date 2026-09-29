@@ -27,6 +27,10 @@ const UPLOAD_GENERATION_LEN: usize = 16;
 const PARTIAL_SUFFIXES: [&str; 4] = ["data", "rsrc", "fndrinfo", "generation"];
 /// The longest name Linux and macOS filesystems store, in bytes.
 const NAME_MAX: usize = 255;
+/// The deepest a folder may sit, in folders from the root of the area.
+/// New Folder and a move refuse to go past it, so a delete or move of any
+/// folder, which walks at most this far beneath it, reaches the bottom.
+const MAX_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LocalLimits {
@@ -70,6 +74,13 @@ struct Inner {
     active_uploads: Mutex<HashSet<String>>,
     publishing_paths: Mutex<HashSet<String>>,
     reserved_upload_bytes: Mutex<HashMap<String, u64>>,
+    /// Held by whatever changes the tree: a mutation, and an upload's
+    /// publication. A check that a name is free and the act that takes it
+    /// are one step under it, and so are a move and the sidecars that
+    /// follow the moved paths. Waited for before an I/O permit is taken,
+    /// never while holding one: a long delete must hold up other changes,
+    /// not every listing and download on the server.
+    tree: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -136,6 +147,7 @@ impl LocalFileSource {
                 active_uploads: Mutex::new(HashSet::new()),
                 publishing_paths: Mutex::new(HashSet::new()),
                 reserved_upload_bytes: Mutex::new(HashMap::new()),
+                tree: Arc::new(tokio::sync::Mutex::new(())),
             }),
         };
         source.sweep_partials()?;
@@ -146,9 +158,14 @@ impl LocalFileSource {
         self.inner.limits
     }
 
-    pub fn prepare_upload(
+    /// Checks an upload to `path` before its reference is issued, and
+    /// quotes the partial it would resume when one is asked for. A blind
+    /// upload ([`PartialKey::blind`]) is told neither whether the name is
+    /// taken nor of any partial: it will be published under a free name,
+    /// and it starts over.
+    pub(crate) fn prepare_upload(
         &self,
-        owner: &str,
+        key: &PartialKey,
         path: &FilePath,
         transfer_len: Option<u64>,
         large: bool,
@@ -161,10 +178,11 @@ impl LocalFileSource {
         }
         let (parent, name) = self.open_parent(path)?;
         match parent.symlink_metadata(&name) {
+            Ok(_) if key.blind => {}
             Ok(_) => {
                 // This account's partial for a path that now exists can
                 // never be published, so it gives its slot back.
-                self.discard_inactive_partial(&partial_base(owner, path));
+                self.discard_inactive_partial(&key.base);
                 return Err(FileError::AlreadyExists);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -178,13 +196,13 @@ impl LocalFileSource {
         }
         // Without a declared size only the partial count limits can apply
         // here; the bytes are reserved once the handshake states them.
-        self.make_room(owner, &partial_base(owner, path))?;
-        self.enforce_partial_quota(owner, path, transfer_len.unwrap_or(0))?;
-        if !resume_requested {
+        self.make_room(&key.owner, &key.base)?;
+        self.enforce_partial_quota(&key.owner, &key.base, transfer_len.unwrap_or(0))?;
+        if !resume_requested || key.blind {
             return Ok(None);
         }
-        let base = partial_base(owner, path);
-        let _quote_guard = self.lock_upload_base(&base)?;
+        let base = &key.base;
+        let _quote_guard = self.lock_upload_base(base)?;
         let data_offset = partial_len(&self.inner.partials, &format!("{base}.data"))?;
         let resource_offset = partial_len(&self.inner.partials, &format!("{base}.rsrc"))?;
         if data_offset == 0 && resource_offset == 0 {
@@ -193,9 +211,9 @@ impl LocalFileSource {
         if large && resource_offset != 0 {
             return Err(FileError::InvalidPath);
         }
-        let generation = self.read_upload_generation(&base)?;
+        let generation = self.read_upload_generation(base)?;
         let digest = if large {
-            Some(self.resume_digest(&base, data_offset)?)
+            Some(self.resume_digest(base, data_offset)?)
         } else {
             None
         };
@@ -347,11 +365,10 @@ impl LocalFileSource {
     fn enforce_partial_quota(
         &self,
         owner: &str,
-        path: &FilePath,
+        current_base: &str,
         incoming: u64,
     ) -> Result<(), FileError> {
         let owner_prefix = format!("{}-", owner_key(owner));
-        let current_base = partial_base(owner, path);
         let mut total = 0u64;
         let mut all_bases = HashSet::new();
         let mut owner_bases = HashSet::new();
@@ -371,7 +388,7 @@ impl LocalFileSource {
             if !metadata.is_file() {
                 continue;
             }
-            if !name.starts_with(&current_base) && !name.ends_with(".generation") {
+            if !name.starts_with(current_base) && !name.ends_with(".generation") {
                 total = total
                     .checked_add(metadata.len())
                     .ok_or(FileError::TooLarge)?;
@@ -383,10 +400,10 @@ impl LocalFileSource {
                 owner_bases.insert(name.trim_end_matches(".data").to_owned());
             }
         }
-        if !all_bases.contains(&current_base) && all_bases.len() >= self.inner.limits.max_partials {
+        if !all_bases.contains(current_base) && all_bases.len() >= self.inner.limits.max_partials {
             return Err(FileError::Busy);
         }
-        if !owner_bases.contains(&current_base)
+        if !owner_bases.contains(current_base)
             && owner_bases.len() >= self.inner.limits.max_partials_per_account
         {
             return Err(FileError::Busy);
@@ -419,13 +436,14 @@ impl LocalFileSource {
 
     pub(crate) fn begin_upload(
         &self,
-        owner: &str,
+        key: &PartialKey,
         path: &FilePath,
         fresh: bool,
         reserve: u64,
     ) -> Result<UploadFiles, FileError> {
         self.sweep_partials()?;
-        let base = partial_base(owner, path);
+        let owner = key.owner.as_str();
+        let base = key.base.clone();
         let active = self.lock_upload_base(&base)?;
         self.make_room(owner, &base)?;
         let guard = UploadGuard {
@@ -498,9 +516,13 @@ impl LocalFileSource {
         }
         let (parent, name) = self.open_parent(path)?;
         match parent.symlink_metadata(&name) {
+            Ok(_) if key.blind => {}
             Ok(_) => return Err(FileError::AlreadyExists),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(map_lookup_error(error)),
+        }
+        if key.blind && !fresh {
+            return Err(FileError::OriginChanged);
         }
         if fresh {
             self.replace_upload_generation(&base)?;
@@ -519,6 +541,7 @@ impl LocalFileSource {
             .map_err(|error| unavailable("open partial resource fork", error))?;
         Ok(UploadFiles {
             base,
+            blind: key.blind,
             data: data.into_std(),
             resource: resource.into_std(),
             _guard: guard,
@@ -555,12 +578,30 @@ impl LocalFileSource {
         Ok(())
     }
 
+    /// The tree lock, which [`Self::publish_upload`] must be handed.
+    pub(crate) async fn lock_tree(&self) -> TreeGuard {
+        self.inner.tree.clone().lock_owned().await
+    }
+
+    /// Publishes a finished upload at `path`, and answers the path it was
+    /// published at. That is `path`, refused when taken, except for a
+    /// blind upload ([`PartialKey::blind`]), which takes the first free
+    /// name [`numbered`] offers instead: refusing it would tell its
+    /// uploader what a drop box it may not view holds, and replacing what
+    /// is there would let it destroy what it cannot see.
     pub(crate) fn publish_upload(
         &self,
+        _tree: &TreeGuard,
         path: &FilePath,
         files: &UploadFiles,
         hfs: &hxhfs::HfsInfo,
-    ) -> Result<(), FileError> {
+    ) -> Result<FilePath, FileError> {
+        let path = if files.blind {
+            self.free_name(path)?
+        } else {
+            path.clone()
+        };
+        let path = &path;
         let publish_key = Self::metadata_key(path);
         {
             let mut publishing = self.inner.publishing_paths.lock().unwrap();
@@ -661,7 +702,40 @@ impl LocalFileSource {
                 .partials
                 .remove_file(format!("{}.{}", files.base, suffix));
         }
-        Ok(())
+        Ok(path.clone())
+    }
+
+    /// `path`, or the first of its [`numbered`] names that nothing in its
+    /// folder, and no publication under way, holds. Asked under the tree
+    /// lock, so the name is still free when it is taken.
+    fn free_name(&self, path: &FilePath) -> Result<FilePath, FileError> {
+        /// How far a blind upload counts before giving up as busy.
+        const MAX_NUMBER: u32 = 10_000;
+        let (parent, name) = self.open_parent(path)?;
+        let folder = path.parent().ok_or(FileError::InvalidPath)?;
+        let publishing = self.inner.publishing_paths.lock().unwrap().clone();
+        let free = |candidate: &FilePath, name: &str| -> Result<bool, FileError> {
+            if publishing.contains(&Self::metadata_key(candidate)) {
+                return Ok(false);
+            }
+            match parent.symlink_metadata(name) {
+                Ok(_) => Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(map_lookup_error(error)),
+            }
+        };
+        if free(path, &name)? {
+            return Ok(path.clone());
+        }
+        for number in 2..=MAX_NUMBER {
+            let name = numbered(&name, number);
+            let candidate = folder.join(&name)?;
+            Self::validate_path(&candidate)?;
+            if free(&candidate, &name)? {
+                return Ok(candidate);
+            }
+        }
+        Err(FileError::Busy)
     }
 
     /// The name check catches the plain spelling of the state directory
@@ -839,11 +913,12 @@ impl LocalFileSource {
         if kind == FileKind::File && metadata.len() > self.inner.limits.max_file_size {
             return Err(FileError::TooLarge);
         }
-        let hfs = if kind == FileKind::File {
-            self.hfs_info(path)
-        } else {
-            hxhfs::HfsInfo::default()
-        };
+        // A folder's sidecar holds only its comment: a folder's type and
+        // creator are what every Hotline server says they are.
+        let mut hfs = self.hfs_info(path);
+        if kind == FileKind::Folder {
+            hfs.type_creator = [0; 8];
+        }
         let type_code = (hfs.type_creator[..4] != [0; 4])
             .then(|| hfs.type_creator[..4].try_into().expect("four bytes"));
         let creator_code = (hfs.type_creator[4..] != [0; 4])
@@ -859,7 +934,10 @@ impl LocalFileSource {
             return Err(FileError::TooLarge);
         }
         let size = if kind == FileKind::Folder {
-            self.count_visible(path, false)?
+            // Capped as a listing's is: the folder is listed with it, and
+            // a folder too full to count must still be one that can be
+            // deleted.
+            self.count_visible(path, true)?
         } else {
             metadata.len()
         };
@@ -875,7 +953,9 @@ impl LocalFileSource {
                 .or_else(|| header_time(metadata.created().ok())),
             modified: hfs_header_time(hfs.modify_time)
                 .or_else(|| header_time(metadata.modified().ok())),
-            comment: (!hfs.comment.is_empty()).then(|| text::to_utf8(&hfs.comment)),
+            // Read with LF line endings, whichever wire wrote them: each
+            // wire renders a comment in its own (`TextEncoding::body`).
+            comment: (!hfs.comment.is_empty()).then(|| lf_lines(&text::to_utf8(&hfs.comment))),
         })
     }
 
@@ -926,10 +1006,17 @@ impl LocalFileSource {
     }
 }
 
+pub(crate) type TreeGuard = tokio::sync::OwnedMutexGuard<()>;
+
 struct PartialState {
     newest: SystemTime,
     has_data: bool,
     names: Vec<String>,
+}
+
+/// The filesystem an entry is on.
+fn device(metadata: &Metadata) -> Option<u64> {
+    identity(metadata).map(|(device, _)| device)
 }
 
 /// A directory's identity, which no spelling of its name can change.
@@ -960,16 +1047,20 @@ pub(crate) struct UploadFiles {
     pub data: std::fs::File,
     pub resource: std::fs::File,
     base: String,
+    /// A blind upload's partial ([`PartialKey::blind`]), which nothing
+    /// can resume.
+    blind: bool,
     _guard: UploadGuard,
 }
 
 impl Drop for UploadFiles {
     fn drop(&mut self) {
         // An upload that ends with nothing written leaves nothing to
-        // resume, so it gives its partial slot back now rather than at
-        // expiry. The base is still held here: the guards drop after this.
+        // resume, and a blind one nothing that can be resumed, so it gives
+        // its partial slot back now rather than at expiry. The base is
+        // still held here: the guards drop after this.
         let empty = |file: &std::fs::File| file.metadata().is_ok_and(|m| m.len() == 0);
-        if empty(&self.data) && empty(&self.resource) {
+        if self.blind || (empty(&self.data) && empty(&self.resource)) {
             for suffix in PARTIAL_SUFFIXES {
                 let _ = self
                     ._guard
@@ -1033,6 +1124,61 @@ fn partial_base(owner: &str, path: &FilePath) -> String {
         owner_key(owner),
         hex_digest(path.as_slash_path().as_bytes())
     )
+}
+
+/// Where an upload keeps its partial, and whose it is.
+///
+/// An upload's partial is named by the account and the path, so that the
+/// next upload of that path by that account finds it and can resume it.
+/// A blind upload, into a drop box by an account that may not view drop
+/// boxes, must find nothing there: a quote would tell it that the account
+/// (every guest shares one) has part of a file of that name, and how
+/// much. Its partial is named afresh each time, so it neither finds nor
+/// disturbs another's, and it is published under a free name rather than
+/// refused when its own is taken (see [`LocalFileSource::publish_upload`]).
+#[derive(Debug, Clone)]
+pub(crate) struct PartialKey {
+    owner: String,
+    base: String,
+    blind: bool,
+}
+
+impl PartialKey {
+    pub(crate) fn resumable(owner: &str, path: &FilePath) -> Self {
+        PartialKey {
+            owner: owner.to_owned(),
+            base: partial_base(owner, path),
+            blind: false,
+        }
+    }
+
+    pub(crate) fn blind(owner: &str) -> Result<Self, FileError> {
+        let mut nonce = [0; 16];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|error| FileError::Unavailable(format!("partial name: {error}")))?;
+        Ok(PartialKey {
+            owner: owner.to_owned(),
+            base: format!("{}-{}", owner_key(owner), hex_digest(nonce)),
+            blind: true,
+        })
+    }
+}
+
+/// `name` numbered for a blind upload whose name is taken: "name 2",
+/// then "name 3", the number before any extension so the type a client
+/// infers from it stays, and the stem cut to keep it a name a filesystem
+/// can store.
+fn numbered(name: &str, number: u32) -> String {
+    let suffix = format!(" {number}");
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 && name.len() - dot + suffix.len() < NAME_MAX => name.split_at(dot),
+        _ => (name, ""),
+    };
+    let mut cut = stem.len().min(NAME_MAX - suffix.len() - extension.len());
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{suffix}{extension}", &stem[..cut])
 }
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
@@ -1197,6 +1343,466 @@ impl LocalFileSource {
     }
 }
 
+/// File management: New Folder, Delete, rename and move, and comments.
+///
+/// Each checks and acts under the tree lock. Each also takes the kind its
+/// caller authorized, since a file and a folder answer to different access
+/// bits: an entry replaced by one of the other kind in between is refused
+/// rather than acted on under the wrong one.
+impl LocalFileSource {
+    /// Makes an empty folder at `path`. Never replaces an entry.
+    pub async fn make_folder(&self, path: &FilePath) -> Result<(), FileError> {
+        let path = path.clone();
+        self.mutate(move |source| source.make_folder_sync(&path))
+            .await
+    }
+
+    /// Deletes the entry at `path`, a folder with everything in it, as
+    /// mhxd does.
+    ///
+    /// `sees_drop_boxes` says whether the asker may view drop boxes. When
+    /// not, a folder holding one anywhere beneath it is refused with
+    /// [`FileError::HoldsDropBox`] before anything inside the drop box is
+    /// looked at: how deep its folders nest, or whether a filesystem is
+    /// mounted in it, would otherwise decide which refusal the asker got.
+    pub async fn delete(
+        &self,
+        path: &FilePath,
+        kind: FileKind,
+        sees_drop_boxes: bool,
+    ) -> Result<(), FileError> {
+        let path = path.clone();
+        self.mutate(move |source| source.delete_sync(&path, kind, sees_drop_boxes))
+            .await
+    }
+
+    /// Moves the entry at `from` to `to`, which may name another folder,
+    /// another name, or both, and its sidecars with it. Never replaces an
+    /// entry. A folder holding a drop box is refused to an asker who may
+    /// not view drop boxes, as [`delete`](Self::delete) refuses it.
+    pub async fn rename(
+        &self,
+        from: &FilePath,
+        to: &FilePath,
+        kind: FileKind,
+        sees_drop_boxes: bool,
+    ) -> Result<(), FileError> {
+        let (from, to) = (from.clone(), to.clone());
+        self.mutate(move |source| source.rename_sync(&from, &to, kind, sees_drop_boxes))
+            .await
+    }
+
+    /// Sets the comment Get Info shows; an empty one clears it. It is kept
+    /// in the CAP sidecar, as an upload's is, so it is Mac Roman there: a
+    /// character Mac Roman lacks becomes `?`, and it keeps the sidecar's
+    /// length.
+    pub async fn set_comment(
+        &self,
+        path: &FilePath,
+        kind: FileKind,
+        comment: &str,
+    ) -> Result<(), FileError> {
+        let path = path.clone();
+        let comment = comment.to_owned();
+        self.mutate(move |source| source.set_comment_sync(&path, kind, &comment))
+            .await
+    }
+
+    async fn mutate<R: Send + 'static>(
+        &self,
+        work: impl FnOnce(&LocalFileSource) -> Result<R, FileError> + Send + 'static,
+    ) -> Result<R, FileError> {
+        let tree = self.lock_tree().await;
+        let _permit = self.acquire_io_permit().await?;
+        let source = self.clone();
+        crate::spawn_blocking("files", move || {
+            let _tree = tree;
+            work(&source)
+        })
+        .await
+        .map_err(|error| FileError::Unavailable(format!("local file worker: {error}")))?
+    }
+
+    fn make_folder_sync(&self, path: &FilePath) -> Result<(), FileError> {
+        if path.components().len() > MAX_DEPTH {
+            return Err(FileError::TooDeep);
+        }
+        let (parent, name) = self.open_parent(path)?;
+        match parent.symlink_metadata(&name) {
+            Ok(_) => return Err(FileError::AlreadyExists),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(map_lookup_error(error)),
+        }
+        // A sidecar left at this path by an entry removed behind the
+        // server's back would otherwise be the new folder's comment.
+        self.remove_sidecars(path);
+        parent.create_dir(&name).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                FileError::AlreadyExists
+            } else {
+                unavailable("create folder", error)
+            }
+        })?;
+        synced(&parent, "folder created");
+        Ok(())
+    }
+
+    fn delete_sync(
+        &self,
+        path: &FilePath,
+        kind: FileKind,
+        sees_drop_boxes: bool,
+    ) -> Result<(), FileError> {
+        self.expect_kind(path, kind)?;
+        let (parent, name) = self.open_parent(path)?;
+        match kind {
+            FileKind::File => parent.remove_file(&name).map_err(map_lookup_error)?,
+            FileKind::Folder => {
+                let dir = self.descend(&parent, &name)?;
+                let device = device(
+                    &dir.dir_metadata()
+                        .map_err(|error| unavailable("stat folder to delete", error))?,
+                );
+                // Whatever would stop the delete partway is found before
+                // anything is removed, so a refused delete removes nothing.
+                self.check_beneath(&dir, MAX_DEPTH - 1, device, true, sees_drop_boxes)?;
+                self.empty_folder(&dir, Some(path), device, 0)?;
+                drop(dir);
+                parent
+                    .remove_dir(&name)
+                    .map_err(|error| unavailable("remove folder", error))?;
+            }
+        }
+        self.remove_sidecars(path);
+        synced(&parent, "entry deleted");
+        Ok(())
+    }
+
+    /// Walks the folders beneath `dir`, refusing what a delete or move of
+    /// it would otherwise meet only partway through: folders nested more
+    /// than `room` deep beneath it, the server's own state, and, when
+    /// `mounts` is set, another filesystem (one not `device`) mounted
+    /// inside it. Nothing is changed.
+    ///
+    /// Unless `sees_drop_boxes`, a drop box beneath `dir` is refused as
+    /// [`FileError::HoldsDropBox`] the moment its name is read, before it
+    /// is opened: nothing inside it, nor the drop box's own metadata, can
+    /// then decide the answer. What the walk may still have answered
+    /// before reaching it is about folders the asker can list.
+    fn check_beneath(
+        &self,
+        dir: &Dir,
+        room: usize,
+        device: Option<u64>,
+        mounts: bool,
+        sees_drop_boxes: bool,
+    ) -> Result<(), FileError> {
+        for entry in dir
+            .entries()
+            .map_err(|error| unavailable("list folder", error))?
+        {
+            let entry = entry.map_err(|error| unavailable("read folder", error))?;
+            let is_dir = entry
+                .file_type()
+                .map_err(|error| unavailable("read file type", error))?
+                .is_dir();
+            if !is_dir {
+                continue;
+            }
+            if !sees_drop_boxes && names_drop_box(&entry.file_name()) {
+                return Err(FileError::HoldsDropBox);
+            }
+            if room == 0 {
+                return Err(FileError::TooDeep);
+            }
+            let sub = dir
+                .open_dir_nofollow(entry.file_name())
+                .map_err(|error| unavailable("open folder", error))?;
+            let metadata = sub
+                .dir_metadata()
+                .map_err(|error| unavailable("stat folder", error))?;
+            if self.is_state_dir(&metadata) {
+                return Err(FileError::InvalidPath);
+            }
+            // A mount beneath the folder is someone else's tree, as a move
+            // that would leave the filesystem is refused.
+            if mounts && self::device(&metadata) != device {
+                return Err(FileError::CrossesFilesystems);
+            }
+            self.check_beneath(&sub, room - 1, device, mounts, sees_drop_boxes)?;
+        }
+        Ok(())
+    }
+
+    /// Removes everything in the folder `dir`, and the sidecars of each
+    /// entry a path can name (`path` is `None` beneath a name it cannot,
+    /// which has none). A symlink is removed, never followed.
+    fn empty_folder(
+        &self,
+        dir: &Dir,
+        path: Option<&FilePath>,
+        device: Option<u64>,
+        depth: usize,
+    ) -> Result<(), FileError> {
+        // `check_beneath` has refused all of these already; the tree can
+        // still change behind the server's back in between.
+        if depth >= MAX_DEPTH {
+            return Err(FileError::TooDeep);
+        }
+        // Named first and removed after: a directory is not read while it
+        // is being changed.
+        let mut names = Vec::new();
+        for entry in dir
+            .entries()
+            .map_err(|error| unavailable("list folder to delete", error))?
+        {
+            let entry = entry.map_err(|error| unavailable("read folder to delete", error))?;
+            let is_dir = entry
+                .file_type()
+                .map_err(|error| unavailable("read file type", error))?
+                .is_dir();
+            names.push((entry.file_name(), is_dir));
+        }
+        for (name, is_dir) in names {
+            let child = path.and_then(|path| path.join(name.to_str()?).ok());
+            if is_dir {
+                let sub = dir
+                    .open_dir_nofollow(&name)
+                    .map_err(|error| unavailable("open folder to delete", error))?;
+                let metadata = sub
+                    .dir_metadata()
+                    .map_err(|error| unavailable("stat folder to delete", error))?;
+                if self.is_state_dir(&metadata) {
+                    return Err(FileError::InvalidPath);
+                }
+                if self::device(&metadata) != device {
+                    return Err(FileError::CrossesFilesystems);
+                }
+                self.empty_folder(&sub, child.as_ref(), device, depth + 1)?;
+                drop(sub);
+                dir.remove_dir(&name)
+                    .map_err(|error| unavailable("remove folder", error))?;
+            } else {
+                dir.remove_file(&name)
+                    .map_err(|error| unavailable("remove file", error))?;
+            }
+            if let Some(child) = &child {
+                self.remove_sidecars(child);
+            }
+        }
+        Ok(())
+    }
+
+    fn rename_sync(
+        &self,
+        from: &FilePath,
+        to: &FilePath,
+        kind: FileKind,
+        sees_drop_boxes: bool,
+    ) -> Result<(), FileError> {
+        if from == to {
+            return Ok(());
+        }
+        // Into itself: rename(2) refuses it too, less legibly.
+        if from.is_root() || to.starts_with(from) {
+            return Err(FileError::InvalidPath);
+        }
+        let moving = self.expect_kind(from, kind)?;
+        let (from_parent, from_name) = self.open_parent(from)?;
+        let (to_parent, to_name) = self.open_parent(to)?;
+        match to_parent.symlink_metadata(&to_name) {
+            // A case-folding filesystem finds the entry itself under its
+            // new spelling when only the case changes. Only then: two hard
+            // links share an identity too, even ones whose names differ
+            // only in case on a filesystem that keeps both, and rename(2)
+            // between them does nothing and succeeds. What tells the two
+            // apart is whether the new spelling is a name of its own.
+            Ok(existing)
+                if from.parent() == to.parent()
+                    && from_name.to_lowercase() == to_name.to_lowercase()
+                    && identity(&existing).is_some()
+                    && identity(&existing) == identity(&moving)
+                    && !has_exact_name(&to_parent, &to_name)? => {}
+            Ok(_) => return Err(FileError::AlreadyExists),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(map_lookup_error(error)),
+        }
+        // A folder may not sit past `MAX_DEPTH`, nor anything inside it,
+        // at its destination, whichever way it moves: what cannot be
+        // walked cannot be deleted or moved again, and its sidecars could
+        // not follow it. A subtree nested deeper behind the server's back
+        // is refused even on a rename in place. The walk comes after every
+        // cheaper check, so a move refused anyway costs none.
+        if kind == FileKind::Folder {
+            let room = MAX_DEPTH
+                .checked_sub(to.components().len())
+                .ok_or(FileError::TooDeep)?;
+            let dir = self.descend(&from_parent, &from_name)?;
+            self.check_beneath(&dir, room, None, false, sees_drop_boxes)?;
+        }
+        from_parent
+            .rename(&from_name, &to_parent, &to_name)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => FileError::NotFound,
+                // mhxd copies across filesystems. Here that would be a
+                // whole tree's worth of I/O under one request, so a move
+                // stays on the filesystem it started on.
+                std::io::ErrorKind::CrossesDevices => FileError::CrossesFilesystems,
+                // Into itself by a spelling a case-folding filesystem
+                // resolves, which the check above cannot see.
+                std::io::ErrorKind::InvalidInput => FileError::InvalidPath,
+                _ => unavailable("move entry", error),
+            })?;
+        // The entry has moved: what follows cannot undo that, so it warns
+        // rather than fails.
+        self.move_sidecars(from, to);
+        if kind == FileKind::Folder {
+            match self.descend(&to_parent, &to_name) {
+                Ok(dir) => self.move_folder_sidecars(&dir, from, to, 0),
+                Err(error) => tracing::warn!(%error, "moved folder's sidecars were not moved"),
+            }
+        }
+        synced(&from_parent, "entry moved");
+        if from.parent() != to.parent() {
+            synced(&to_parent, "entry moved");
+        }
+        Ok(())
+    }
+
+    /// Moves the sidecars of everything in the folder `dir`, which was at
+    /// `from` and is now at `to`: they are named by path.
+    fn move_folder_sidecars(&self, dir: &Dir, from: &FilePath, to: &FilePath, depth: usize) {
+        if depth >= MAX_DEPTH {
+            tracing::warn!(%to, "moved folder is too deep for all its sidecars to follow");
+            return;
+        }
+        let Ok(entries) = dir.entries() else {
+            tracing::warn!(%to, "moved folder's sidecars were not moved");
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let (Ok(old), Ok(new)) = (from.join(&name), to.join(&name)) else {
+                continue;
+            };
+            self.move_sidecars(&old, &new);
+            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                if let Ok(sub) = dir.open_dir_nofollow(&name) {
+                    self.move_folder_sidecars(&sub, &old, &new, depth + 1);
+                }
+            }
+        }
+    }
+
+    fn move_sidecars(&self, from: &FilePath, to: &FilePath) {
+        let (old, new) = (Self::metadata_key(from), Self::metadata_key(to));
+        for suffix in ["fndrinfo", "rsrc"] {
+            let (old, new) = (format!("{old}.{suffix}"), format!("{new}.{suffix}"));
+            // Anything already at the new name is residue: the path was
+            // free a moment ago.
+            let _ = self.inner.metadata.remove_file(&new);
+            match self.inner.metadata.rename(&old, &self.inner.metadata, &new) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(%error, %to, "sidecar was not moved"),
+            }
+        }
+    }
+
+    fn remove_sidecars(&self, path: &FilePath) {
+        let key = Self::metadata_key(path);
+        for suffix in ["fndrinfo", "rsrc"] {
+            let _ = self.inner.metadata.remove_file(format!("{key}.{suffix}"));
+        }
+    }
+
+    fn set_comment_sync(
+        &self,
+        path: &FilePath,
+        kind: FileKind,
+        comment: &str,
+    ) -> Result<(), FileError> {
+        if path.is_root() {
+            return Err(FileError::InvalidPath);
+        }
+        self.expect_kind(path, kind)?;
+        let mut hfs = self.hfs_info(path);
+        hfs.comment = text::from_utf8(comment);
+        hfs.comment.truncate(hxhfs::hfs::MAX_COMMENT);
+        let key = Self::metadata_key(path);
+        let staged = format!("{key}.fndrinfo.new");
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        let mut file = self
+            .inner
+            .metadata
+            .open_with(&staged, &options)
+            .map_err(|error| unavailable("open Finder metadata", error))?;
+        file.write_all(&hxhfs::hfs::encode_cap_info(&hfs))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| unavailable("write Finder metadata", error))?;
+        self.inner
+            .metadata
+            .rename(&staged, &self.inner.metadata, format!("{key}.fndrinfo"))
+            .map_err(|error| unavailable("publish Finder metadata", error))?;
+        synced(&self.inner.metadata, "comment set");
+        Ok(())
+    }
+
+    /// The entry at `path`, if it is of the kind the caller authorized.
+    fn expect_kind(&self, path: &FilePath, kind: FileKind) -> Result<Metadata, FileError> {
+        if path.is_root() {
+            return Err(FileError::InvalidPath);
+        }
+        let metadata = self.stat(path)?;
+        match (kind, metadata.is_dir(), metadata.is_file()) {
+            (FileKind::Folder, true, _) | (FileKind::File, _, true) => Ok(metadata),
+            (FileKind::File, true, _) => Err(FileError::NotFile),
+            (FileKind::Folder, _, true) => Err(FileError::NotFolder),
+            _ => Err(FileError::NotFound),
+        }
+    }
+}
+
+/// `text` with its CRLF and CR line endings as LF.
+fn lf_lines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Whether `dir` holds an entry spelled exactly `name`, rather than one a
+/// case-folding lookup finds under it.
+/// Whether a folder of this name is a drop box, by the rule
+/// [`FilePath::is_drop_box`] applies to a path. A name that is not UTF-8
+/// is read lossily, so one spelling a drop box is still one.
+fn names_drop_box(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("drop box")
+}
+
+fn has_exact_name(dir: &Dir, name: &str) -> Result<bool, FileError> {
+    for entry in dir
+        .entries()
+        .map_err(|error| unavailable("list folder", error))?
+    {
+        let entry = entry.map_err(|error| unavailable("read folder entry", error))?;
+        if entry.file_name().to_str() == Some(name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Syncs `dir` after a change that has already happened, which a failed
+/// sync leaves less durable but does not undo.
+fn synced(dir: &Dir, what: &str) {
+    if let Err(error) = sync_dir(dir) {
+        tracing::warn!(%error, "{what} but its folder was not synced");
+    }
+}
+
 fn header_time(time: Option<cap_std::time::SystemTime>) -> Option<u32> {
     let seconds = time?.into_std().duration_since(UNIX_EPOCH).ok()?.as_secs();
     Some(
@@ -1328,6 +1934,17 @@ mod tests {
     use super::*;
     use std::fs;
 
+    impl LocalFileSource {
+        /// The tree lock, from a test that holds nothing else.
+        fn tree(&self) -> TreeGuard {
+            self.inner.tree.clone().try_lock_owned().unwrap()
+        }
+    }
+
+    fn key(owner: &str, path: &FilePath) -> PartialKey {
+        PartialKey::resumable(owner, path)
+    }
+
     #[tokio::test]
     async fn internal_state_and_symlinks_are_never_exposed() {
         let temp = tempfile::tempdir().unwrap();
@@ -1445,25 +2062,29 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
         let path = FilePath::parse("upload.bin").unwrap();
-        let mut partial = source.begin_upload("alice", &path, true, 128).unwrap();
+        let mut partial = source
+            .begin_upload(&key("alice", &path), &path, true, 128)
+            .unwrap();
         partial.data.write_all(b"abc").unwrap();
         partial.resource.write_all(b"rsrc").unwrap();
         drop(partial);
         assert!(source.list(&FilePath::root()).await.unwrap().is_empty());
 
         let quote = source
-            .prepare_upload("alice", &path, Some(128), false, true)
+            .prepare_upload(&key("alice", &path), &path, Some(128), false, true)
             .unwrap()
             .unwrap();
         assert_eq!(quote.data_offset, 3);
         assert_eq!(quote.resource_offset, 4);
         assert!(quote.digest.is_none());
         assert!(source
-            .prepare_upload("mallory", &path, Some(128), false, true)
+            .prepare_upload(&key("mallory", &path), &path, Some(128), false, true)
             .unwrap()
             .is_none());
 
-        let partial = source.begin_upload("alice", &path, false, 121).unwrap();
+        let partial = source
+            .begin_upload(&key("alice", &path), &path, false, 121)
+            .unwrap();
         source.recheck_resume(&partial, &quote).unwrap();
         let hfs = hxhfs::HfsInfo {
             type_creator: *b"BINA????",
@@ -1472,7 +2093,9 @@ mod tests {
             rsrclen: 4,
             comment: b"safe".to_vec(),
         };
-        source.publish_upload(&path, &partial, &hfs).unwrap();
+        source
+            .publish_upload(&source.tree(), &path, &partial, &hfs)
+            .unwrap();
         assert_eq!(fs::read(temp.path().join("upload.bin")).unwrap(), b"abc");
         let info = source.info(&path).await.unwrap();
         assert_eq!(info.resource_size, 4);
@@ -1483,7 +2106,7 @@ mod tests {
         resource.reader.read_to_end(&mut bytes).await.unwrap();
         assert_eq!(bytes, b"rsrc");
         assert!(matches!(
-            source.prepare_upload("alice", &path, Some(3), false, false),
+            source.prepare_upload(&key("alice", &path), &path, Some(3), false, false),
             Err(FileError::AlreadyExists)
         ));
     }
@@ -1495,8 +2118,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
         let path = FilePath::parse("shared.bin").unwrap();
-        let mut alice = source.begin_upload("alice", &path, true, 1).unwrap();
-        let mut bob = source.begin_upload("bob", &path, true, 1).unwrap();
+        let mut alice = source
+            .begin_upload(&key("alice", &path), &path, true, 1)
+            .unwrap();
+        let mut bob = source
+            .begin_upload(&key("bob", &path), &path, true, 1)
+            .unwrap();
         alice.data.write_all(b"a").unwrap();
         bob.data.write_all(b"b").unwrap();
         let hfs = hxhfs::HfsInfo {
@@ -1515,7 +2142,7 @@ mod tests {
             .unwrap()
             .insert(publish_key.clone());
         assert!(matches!(
-            source.publish_upload(&path, &bob, &hfs),
+            source.publish_upload(&source.tree(), &path, &bob, &hfs),
             Err(FileError::Busy)
         ));
         assert!(!temp.path().join("shared.bin").exists());
@@ -1526,8 +2153,101 @@ mod tests {
             .unwrap()
             .remove(&publish_key);
 
-        source.publish_upload(&path, &alice, &hfs).unwrap();
+        source
+            .publish_upload(&source.tree(), &path, &alice, &hfs)
+            .unwrap();
         assert_eq!(fs::read(temp.path().join("shared.bin")).unwrap(), b"a");
+    }
+
+    #[test]
+    fn a_blind_upload_learns_nothing_and_takes_a_free_name() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        fs::create_dir(temp.path().join("Drop Box")).unwrap();
+        fs::write(temp.path().join("Drop Box/report.txt"), b"theirs").unwrap();
+        fs::write(temp.path().join("Drop Box/report 2.txt"), b"also theirs").unwrap();
+        let path = FilePath::parse("Drop Box/report.txt").unwrap();
+        let fresh = FilePath::parse("Drop Box/fresh.txt").unwrap();
+        // The shared account's own partial of the name, which a resumable
+        // upload would be quoted.
+        let mut partial = source
+            .begin_upload(&key("guest", &fresh), &fresh, true, 8)
+            .unwrap();
+        partial.data.write_all(b"half").unwrap();
+        drop(partial);
+        let partials = || fs::read_dir(partials_dir(temp.path())).unwrap().count();
+        let held = partials();
+
+        // A taken name is not refused, and no partial is quoted.
+        let blind = PartialKey::blind("guest").unwrap();
+        assert!(source
+            .prepare_upload(&blind, &path, Some(8), false, true)
+            .unwrap()
+            .is_none());
+        assert!(source
+            .prepare_upload(&blind, &fresh, Some(8), false, true)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            source.begin_upload(&blind, &path, false, 8),
+            Err(FileError::OriginChanged)
+        ));
+
+        let hfs = with_comment(b"");
+        let mut upload = source.begin_upload(&blind, &path, true, 8).unwrap();
+        upload.data.write_all(b"mine").unwrap();
+        let published = source
+            .publish_upload(&source.tree(), &path, &upload, &hfs)
+            .unwrap();
+        drop(upload);
+        assert_eq!(published.as_slash_path(), "Drop Box/report 3.txt");
+        assert_eq!(
+            fs::read(temp.path().join("Drop Box/report.txt")).unwrap(),
+            b"theirs"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("Drop Box/report 2.txt")).unwrap(),
+            b"also theirs"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("Drop Box/report 3.txt")).unwrap(),
+            b"mine"
+        );
+        // The resumable partial is untouched, and the blind one is gone.
+        assert_eq!(
+            source
+                .prepare_upload(&key("guest", &fresh), &fresh, Some(8), false, true)
+                .unwrap()
+                .unwrap()
+                .data_offset,
+            4
+        );
+        assert_eq!(partials(), held);
+
+        // One that ends early leaves no partial behind either.
+        let blind = PartialKey::blind("guest").unwrap();
+        let mut upload = source.begin_upload(&blind, &path, true, 8).unwrap();
+        upload.data.write_all(b"cut").unwrap();
+        drop(upload);
+        assert_eq!(partials(), held);
+    }
+
+    #[test]
+    fn numbered_names_keep_their_extension_and_their_length() {
+        assert_eq!(numbered("report.txt", 2), "report 2.txt");
+        assert_eq!(numbered("README", 3), "README 3");
+        assert_eq!(numbered(".profile", 2), ".profile 2");
+        assert_eq!(numbered("a.tar.gz", 2), "a.tar 2.gz");
+        let long = format!("{}.txt", "x".repeat(NAME_MAX - 4));
+        let cut = numbered(&long, 12);
+        assert_eq!(cut.len(), NAME_MAX);
+        assert!(cut.ends_with("x 12.txt"));
+        let wide = "\u{e9}".repeat(NAME_MAX / 2);
+        assert!(numbered(&wide, 2).len() <= NAME_MAX);
+        let all_extension = format!("a.{}", "x".repeat(NAME_MAX - 2));
+        assert!(numbered(&all_extension, 2).len() <= NAME_MAX);
     }
 
     #[test]
@@ -1537,16 +2257,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
         let path = FilePath::parse("large.bin").unwrap();
-        let mut partial = source.begin_upload("alice", &path, true, 20).unwrap();
+        let mut partial = source
+            .begin_upload(&key("alice", &path), &path, true, 20)
+            .unwrap();
         partial.data.write_all(b"partial").unwrap();
         assert!(matches!(
-            source.begin_upload("alice", &path, false, 13),
+            source.begin_upload(&key("alice", &path), &path, false, 13),
             Err(FileError::Busy)
         ));
         drop(partial);
 
         let quote = source
-            .prepare_upload("alice", &path, Some(20), true, true)
+            .prepare_upload(&key("alice", &path), &path, Some(20), true, true)
             .unwrap()
             .unwrap();
         assert_eq!(quote.data_offset, 7);
@@ -1554,7 +2276,9 @@ mod tests {
             quote.digest,
             Some(hxfiles_xfer::resume_digest::encode(7, b"partial").unwrap())
         );
-        let partial = source.begin_upload("alice", &path, false, 13).unwrap();
+        let partial = source
+            .begin_upload(&key("alice", &path), &path, false, 13)
+            .unwrap();
         source.recheck_resume(&partial, &quote).unwrap();
     }
 
@@ -1565,21 +2289,27 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
         let path = FilePath::parse("classic.bin").unwrap();
-        let mut original = source.begin_upload("alice", &path, true, 5).unwrap();
+        let mut original = source
+            .begin_upload(&key("alice", &path), &path, true, 5)
+            .unwrap();
         original.data.write_all(b"abc").unwrap();
         original.resource.write_all(b"rs").unwrap();
         drop(original);
 
         let quote = source
-            .prepare_upload("alice", &path, Some(5), false, true)
+            .prepare_upload(&key("alice", &path), &path, Some(5), false, true)
             .unwrap()
             .unwrap();
-        let mut replacement = source.begin_upload("alice", &path, true, 5).unwrap();
+        let mut replacement = source
+            .begin_upload(&key("alice", &path), &path, true, 5)
+            .unwrap();
         replacement.data.write_all(b"xyz").unwrap();
         replacement.resource.write_all(b"RS").unwrap();
         drop(replacement);
 
-        let resume = source.begin_upload("alice", &path, false, 0).unwrap();
+        let resume = source
+            .begin_upload(&key("alice", &path), &path, false, 0)
+            .unwrap();
         assert!(matches!(
             source.recheck_resume(&resume, &quote),
             Err(FileError::OriginChanged)
@@ -1598,15 +2328,30 @@ mod tests {
         )
         .unwrap();
         let first = source
-            .begin_upload("alice", &FilePath::parse("a").unwrap(), true, 6)
+            .begin_upload(
+                &key("alice", &FilePath::parse("a").unwrap()),
+                &FilePath::parse("a").unwrap(),
+                true,
+                6,
+            )
             .unwrap();
         assert!(matches!(
-            source.begin_upload("alice", &FilePath::parse("b").unwrap(), true, 5),
+            source.begin_upload(
+                &key("alice", &FilePath::parse("b").unwrap()),
+                &FilePath::parse("b").unwrap(),
+                true,
+                5
+            ),
             Err(FileError::TooLarge)
         ));
         drop(first);
         source
-            .begin_upload("alice", &FilePath::parse("b").unwrap(), true, 5)
+            .begin_upload(
+                &key("alice", &FilePath::parse("b").unwrap()),
+                &FilePath::parse("b").unwrap(),
+                true,
+                5,
+            )
             .unwrap();
     }
 
@@ -1622,17 +2367,32 @@ mod tests {
         )
         .unwrap();
         let first = source
-            .begin_upload("alice", &FilePath::parse("a").unwrap(), true, 0)
+            .begin_upload(
+                &key("alice", &FilePath::parse("a").unwrap()),
+                &FilePath::parse("a").unwrap(),
+                true,
+                0,
+            )
             .unwrap();
         assert!(matches!(
-            source.begin_upload("bob", &FilePath::parse("b").unwrap(), true, 0),
+            source.begin_upload(
+                &key("bob", &FilePath::parse("b").unwrap()),
+                &FilePath::parse("b").unwrap(),
+                true,
+                0
+            ),
             Err(FileError::Busy)
         ));
         // Nothing was written, so the partial gives its slot back as the
         // upload ends rather than holding it until expiry.
         drop(first);
         source
-            .begin_upload("bob", &FilePath::parse("b").unwrap(), true, 0)
+            .begin_upload(
+                &key("bob", &FilePath::parse("b").unwrap()),
+                &FilePath::parse("b").unwrap(),
+                true,
+                0,
+            )
             .unwrap();
     }
 
@@ -1656,7 +2416,12 @@ mod tests {
         use std::io::Write;
 
         let mut partial = source
-            .begin_upload(owner, &FilePath::parse(path).unwrap(), true, 8)
+            .begin_upload(
+                &key(owner, &FilePath::parse(path).unwrap()),
+                &FilePath::parse(path).unwrap(),
+                true,
+                8,
+            )
             .unwrap();
         partial.data.write_all(b"abc").unwrap();
         partial.base.clone()
@@ -1683,7 +2448,12 @@ mod tests {
         );
 
         source
-            .begin_upload("bob", &FilePath::parse("new").unwrap(), true, 0)
+            .begin_upload(
+                &key("bob", &FilePath::parse("new").unwrap()),
+                &FilePath::parse("new").unwrap(),
+                true,
+                0,
+            )
             .unwrap();
     }
 
@@ -1706,7 +2476,7 @@ mod tests {
         touch_partial(temp.path(), &base, &["data"], UNIX_EPOCH);
         source.sweep_partials().unwrap();
         assert!(source
-            .prepare_upload("alice", &path, Some(8), false, true)
+            .prepare_upload(&key("alice", &path), &path, Some(8), false, true)
             .unwrap()
             .is_some());
 
@@ -1744,7 +2514,12 @@ mod tests {
         );
 
         source
-            .begin_upload("guest", &FilePath::parse("third").unwrap(), true, 8)
+            .begin_upload(
+                &key("guest", &FilePath::parse("third").unwrap()),
+                &FilePath::parse("third").unwrap(),
+                true,
+                8,
+            )
             .unwrap();
         let exists = |base: &str| {
             partials_dir(temp.path())
@@ -1764,7 +2539,7 @@ mod tests {
 
         assert!(matches!(
             source.prepare_upload(
-                "alice",
+                &key("alice", &FilePath::parse("taken.bin").unwrap()),
                 &FilePath::parse("taken.bin").unwrap(),
                 Some(8),
                 false,
@@ -1823,8 +2598,469 @@ mod tests {
         let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
         let long = FilePath::parse(&"x".repeat(NAME_MAX + 1)).unwrap();
         assert!(matches!(
-            source.prepare_upload("alice", &long, Some(1), false, false),
+            source.prepare_upload(&key("alice", &long), &long, Some(1), false, false),
             Err(FileError::InvalidPath)
         ));
+    }
+
+    fn with_comment(comment: &[u8]) -> hxhfs::HfsInfo {
+        hxhfs::HfsInfo {
+            type_creator: *b"TEXTttxt",
+            create_time: 0u32.to_be_bytes(),
+            modify_time: 0u32.to_be_bytes(),
+            rsrclen: 0,
+            comment: comment.to_vec(),
+        }
+    }
+
+    /// Uploads `bytes` to `path` with a resource fork and a comment, as a
+    /// classic client would leave it.
+    fn published(source: &LocalFileSource, path: &str, bytes: &[u8]) {
+        use std::io::Write;
+
+        let path = FilePath::parse(path).unwrap();
+        let mut partial = source
+            .begin_upload(&key("alice", &path), &path, true, 64)
+            .unwrap();
+        partial.data.write_all(bytes).unwrap();
+        partial.resource.write_all(b"rsrc").unwrap();
+        source
+            .publish_upload(&source.tree(), &path, &partial, &with_comment(b"kept"))
+            .unwrap();
+    }
+
+    fn metadata_names(root: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(root.join(STATE_DIR).join(METADATA_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn a_new_folder_never_replaces_an_entry_or_inherits_residue() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        let path = FilePath::parse("stuff").unwrap();
+        // A comment whose folder was removed behind the server's back.
+        let key = LocalFileSource::metadata_key(&path);
+        fs::write(
+            temp.path()
+                .join(STATE_DIR)
+                .join(METADATA_DIR)
+                .join(format!("{key}.fndrinfo")),
+            hxhfs::hfs::encode_cap_info(&with_comment(b"stale")),
+        )
+        .unwrap();
+
+        source.make_folder(&path).await.unwrap();
+        assert!(temp.path().join("stuff").is_dir());
+        assert_eq!(source.info(&path).await.unwrap().comment, None);
+        assert_eq!(
+            source.make_folder(&path).await,
+            Err(FileError::AlreadyExists)
+        );
+        assert_eq!(
+            source
+                .make_folder(&FilePath::parse("missing/stuff").unwrap())
+                .await,
+            Err(FileError::NotFound)
+        );
+        assert_eq!(
+            source
+                .make_folder(&FilePath::parse(".HXD-state").unwrap())
+                .await,
+            Err(FileError::InvalidPath)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_takes_the_sidecars_and_a_folder_takes_everything_in_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        published(&source, "loose.bin", b"abc");
+        fs::create_dir_all(temp.path().join("tree/inner")).unwrap();
+        published(&source, "tree/inner/deep.bin", b"abc");
+        fs::write(temp.path().join("outside"), b"not in the tree").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../../outside", temp.path().join("tree/inner/link")).unwrap();
+
+        let file = FilePath::parse("loose.bin").unwrap();
+        assert_eq!(
+            source.delete(&file, FileKind::Folder, true).await,
+            Err(FileError::NotFolder)
+        );
+        source.delete(&file, FileKind::File, true).await.unwrap();
+        assert!(!temp.path().join("loose.bin").exists());
+
+        let tree = FilePath::parse("tree").unwrap();
+        assert_eq!(
+            source.delete(&tree, FileKind::File, true).await,
+            Err(FileError::NotFile)
+        );
+        source.delete(&tree, FileKind::Folder, true).await.unwrap();
+        assert!(!temp.path().join("tree").exists());
+        // The symlink went, and what it pointed at did not.
+        assert_eq!(
+            fs::read(temp.path().join("outside")).unwrap(),
+            b"not in the tree"
+        );
+        assert!(metadata_names(temp.path()).is_empty());
+        assert_eq!(
+            source
+                .delete(&FilePath::root(), FileKind::Folder, true)
+                .await,
+            Err(FileError::InvalidPath)
+        );
+    }
+
+    #[tokio::test]
+    async fn folders_nest_no_deeper_than_a_delete_or_move_walks() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        let folder = FileKind::Folder;
+
+        // New Folder stops at the limit, and the deepest chain it makes
+        // is deleted whole from the top.
+        let mut path = FilePath::root();
+        for _ in 0..MAX_DEPTH {
+            path = path.join("d").unwrap();
+            source.make_folder(&path).await.unwrap();
+        }
+        assert_eq!(
+            source.make_folder(&path.join("d").unwrap()).await,
+            Err(FileError::TooDeep)
+        );
+        source
+            .delete(&FilePath::parse("d").unwrap(), folder, true)
+            .await
+            .unwrap();
+        assert!(!temp.path().join("d").exists());
+
+        // A tree nested deeper behind the server's back is refused before
+        // anything in it is removed, not partway down.
+        let mut deep = temp.path().join("deep");
+        fs::create_dir(&deep).unwrap();
+        for _ in 0..MAX_DEPTH {
+            fs::write(deep.join("file"), b"x").unwrap();
+            deep = deep.join("d");
+            fs::create_dir(&deep).unwrap();
+        }
+        assert_eq!(
+            source
+                .delete(&FilePath::parse("deep").unwrap(), folder, true)
+                .await,
+            Err(FileError::TooDeep)
+        );
+        let mut level = temp.path().join("deep");
+        for _ in 0..MAX_DEPTH {
+            assert!(level.join("file").is_file(), "{}", level.display());
+            level = level.join("d");
+        }
+        assert!(level.is_dir());
+
+        // Nor may that tree move at all, in place or upward, since its
+        // bottom would still be past the limit wherever it went; a move
+        // refused for a cheaper reason is refused for that one first.
+        let mv = |from: &str, to: &str| {
+            let (from, to) = (FilePath::parse(from).unwrap(), FilePath::parse(to).unwrap());
+            let source = source.clone();
+            async move { source.rename(&from, &to, folder, true).await }
+        };
+        assert_eq!(mv("deep", "deeper").await, Err(FileError::TooDeep));
+        fs::create_dir(temp.path().join("up")).unwrap();
+        fs::rename(temp.path().join("deep"), temp.path().join("up/deep")).unwrap();
+        assert_eq!(mv("up/deep", "deep").await, Err(FileError::TooDeep));
+        fs::create_dir(temp.path().join("taken")).unwrap();
+        assert_eq!(mv("up/deep", "taken").await, Err(FileError::AlreadyExists));
+        assert!(temp.path().join("up/deep/d").is_dir());
+        // One level up it fits, and moves.
+        mv("up/deep/d", "fits").await.unwrap();
+
+        // A move may not sink a folder, or a folder inside it, past the
+        // limit either.
+        let bottom = "c/".repeat(MAX_DEPTH - 1);
+        fs::create_dir_all(temp.path().join(&bottom)).unwrap();
+        fs::create_dir_all(temp.path().join("s/t")).unwrap();
+        let into = |name: &str| FilePath::parse(&format!("{bottom}{name}")).unwrap();
+        assert_eq!(
+            source
+                .rename(&FilePath::parse("s").unwrap(), &into("s"), folder, true)
+                .await,
+            Err(FileError::TooDeep)
+        );
+        assert!(temp.path().join("s/t").is_dir());
+        source
+            .rename(&FilePath::parse("s/t").unwrap(), &into("t"), folder, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            source
+                .rename(&FilePath::parse("s").unwrap(), &into("t/s"), folder, true)
+                .await,
+            Err(FileError::TooDeep)
+        );
+        assert!(temp.path().join("s").is_dir());
+    }
+
+    #[tokio::test]
+    async fn a_folder_holding_a_drop_box_says_nothing_of_it_to_a_non_viewer() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        let folder = FileKind::Folder;
+        let path = |p: &str| FilePath::parse(p).unwrap();
+
+        // One drop box holds a file, the other folders nested past what a
+        // delete or move walks: the refusal is the same for both, in place
+        // and moved, and for a delete.
+        fs::create_dir_all(temp.path().join("shallow/inner/My DROP BOX")).unwrap();
+        fs::write(temp.path().join("shallow/inner/My DROP BOX/secret"), b"x").unwrap();
+        let mut deep = temp.path().join("deep/Drop Box");
+        for _ in 0..MAX_DEPTH {
+            deep = deep.join("d");
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir(temp.path().join("to")).unwrap();
+        for from in ["shallow", "deep"] {
+            assert_eq!(
+                source.delete(&path(from), folder, false).await,
+                Err(FileError::HoldsDropBox),
+                "{from}"
+            );
+            for to in [format!("{from}2"), format!("to/{from}")] {
+                assert_eq!(
+                    source.rename(&path(from), &path(&to), folder, false).await,
+                    Err(FileError::HoldsDropBox),
+                    "{from} to {to}"
+                );
+            }
+        }
+        assert!(temp
+            .path()
+            .join("shallow/inner/My DROP BOX/secret")
+            .is_file());
+        assert!(deep.is_dir());
+
+        // A viewer walks into it as into any other folder.
+        assert_eq!(
+            source.delete(&path("deep"), folder, true).await,
+            Err(FileError::TooDeep)
+        );
+        source
+            .rename(&path("shallow"), &path("to/shallow"), folder, true)
+            .await
+            .unwrap();
+        assert!(temp
+            .path()
+            .join("to/shallow/inner/My DROP BOX/secret")
+            .is_file());
+        source
+            .delete(&path("to/shallow"), folder, true)
+            .await
+            .unwrap();
+        assert!(!temp.path().join("to/shallow").exists());
+
+        // And a folder holding none is the non-viewer's to move.
+        source
+            .rename(&path("to"), &path("moved"), folder, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_move_carries_every_sidecar_beneath_it_and_replaces_nothing() {
+        use tokio::io::AsyncReadExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        fs::create_dir_all(temp.path().join("from/inner")).unwrap();
+        fs::create_dir(temp.path().join("to")).unwrap();
+        published(&source, "from/inner/deep.bin", b"abc");
+        source
+            .set_comment(
+                &FilePath::parse("from").unwrap(),
+                FileKind::Folder,
+                "a folder",
+            )
+            .await
+            .unwrap();
+
+        let from = FilePath::parse("from").unwrap();
+        let to = FilePath::parse("to/renamed").unwrap();
+        source
+            .rename(&from, &to, FileKind::Folder, true)
+            .await
+            .unwrap();
+        let moved = FilePath::parse("to/renamed/inner/deep.bin").unwrap();
+        let info = source.info(&moved).await.unwrap();
+        assert_eq!(info.comment.as_deref(), Some("kept"));
+        assert_eq!(info.type_code, Some(*b"TEXT"));
+        let mut fork = source.open_resource(&moved, 0).await.unwrap();
+        let mut bytes = Vec::new();
+        fork.reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"rsrc");
+        assert_eq!(
+            source.info(&to).await.unwrap().comment.as_deref(),
+            Some("a folder")
+        );
+
+        // Nothing is replaced, nothing moves into itself, and a kind
+        // other than the one authorized is refused.
+        fs::write(temp.path().join("taken"), b"x").unwrap();
+        assert_eq!(
+            source
+                .rename(
+                    &moved,
+                    &FilePath::parse("taken").unwrap(),
+                    FileKind::File,
+                    true
+                )
+                .await,
+            Err(FileError::AlreadyExists)
+        );
+        assert_eq!(
+            source
+                .rename(
+                    &to,
+                    &FilePath::parse("to/renamed/inner/x").unwrap(),
+                    FileKind::Folder,
+                    true
+                )
+                .await,
+            Err(FileError::InvalidPath)
+        );
+        assert_eq!(
+            source
+                .rename(
+                    &moved,
+                    &FilePath::parse("elsewhere").unwrap(),
+                    FileKind::Folder,
+                    true
+                )
+                .await,
+            Err(FileError::NotFolder)
+        );
+        assert_eq!(fs::read(temp.path().join("taken")).unwrap(), b"x");
+    }
+
+    #[tokio::test]
+    async fn a_comment_is_set_cleared_and_kept_to_the_sidecars_length() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        published(&source, "file.txt", b"abc");
+        let path = FilePath::parse("file.txt").unwrap();
+
+        source
+            .set_comment(&path, FileKind::File, "caf\u{e9} \u{3042}")
+            .await
+            .unwrap();
+        let info = source.info(&path).await.unwrap();
+        assert_eq!(info.comment.as_deref(), Some("caf\u{e9} ?"));
+        // The rest of the Finder metadata stays as the upload left it.
+        assert_eq!(info.type_code, Some(*b"TEXT"));
+        assert_eq!(info.resource_size, 4);
+
+        source
+            .set_comment(&path, FileKind::File, &"x".repeat(300))
+            .await
+            .unwrap();
+        assert_eq!(
+            source.info(&path).await.unwrap().comment.map(|c| c.len()),
+            Some(hxhfs::hfs::MAX_COMMENT)
+        );
+        source.set_comment(&path, FileKind::File, "").await.unwrap();
+        assert_eq!(source.info(&path).await.unwrap().comment, None);
+        assert_eq!(
+            source.set_comment(&path, FileKind::Folder, "no").await,
+            Err(FileError::NotFolder)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_is_never_managed() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("target"), b"x").unwrap();
+        std::os::unix::fs::symlink("target", temp.path().join("alias")).unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        let alias = FilePath::parse("alias").unwrap();
+        assert_eq!(
+            source.delete(&alias, FileKind::File, true).await,
+            Err(FileError::NotFound)
+        );
+        assert_eq!(
+            source
+                .rename(
+                    &alias,
+                    &FilePath::parse("other").unwrap(),
+                    FileKind::File,
+                    true
+                )
+                .await,
+            Err(FileError::NotFound)
+        );
+        assert!(temp.path().join("alias").symlink_metadata().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_folder_too_full_to_count_can_still_be_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            fs::create_dir_all(temp.path().join("full")).unwrap();
+            fs::write(temp.path().join("full").join(name), b"x").unwrap();
+        }
+        let source = LocalFileSource::open(
+            temp.path(),
+            LocalLimits {
+                max_entries: 2,
+                ..LocalLimits::default()
+            },
+        )
+        .unwrap();
+        let full = FilePath::parse("full").unwrap();
+        // Counted as a listing counts it, not refused.
+        assert_eq!(source.info(&full).await.unwrap().size, 2);
+        source.delete(&full, FileKind::Folder, true).await.unwrap();
+        assert!(!temp.path().join("full").exists());
+    }
+
+    /// Linux, whose filesystems keep both spellings; on a case-folding one
+    /// the second link could not be made.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_case_only_rename_onto_a_hard_link_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a"), b"x").unwrap();
+        fs::hard_link(temp.path().join("a"), temp.path().join("A")).unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        assert_eq!(
+            source
+                .rename(
+                    &FilePath::parse("a").unwrap(),
+                    &FilePath::parse("A").unwrap(),
+                    FileKind::File,
+                    true
+                )
+                .await,
+            Err(FileError::AlreadyExists)
+        );
+        assert!(temp.path().join("a").exists());
+    }
+
+    #[tokio::test]
+    async fn a_comment_reads_back_with_lf_whichever_wire_wrote_it() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("file"), b"x").unwrap();
+        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        let path = FilePath::parse("file").unwrap();
+        source
+            .set_comment(&path, FileKind::File, "one\rtwo\r\nthree")
+            .await
+            .unwrap();
+        assert_eq!(
+            source.info(&path).await.unwrap().comment.as_deref(),
+            Some("one\ntwo\nthree")
+        );
     }
 }

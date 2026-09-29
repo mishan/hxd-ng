@@ -71,6 +71,11 @@ impl FilePath {
         self.0.is_empty()
     }
 
+    /// Whether `prefix` is this path or a folder above it.
+    pub fn starts_with(&self, prefix: &FilePath) -> bool {
+        self.0.starts_with(&prefix.0)
+    }
+
     pub fn as_slash_path(&self) -> String {
         self.0.join("/")
     }
@@ -157,6 +162,13 @@ pub enum FileError {
     RangeInvalid,
     OriginChanged,
     TooLarge,
+    /// A move would leave the filesystem its entry is on.
+    CrossesFilesystems,
+    /// Folders would nest, or already nest, deeper than the source allows.
+    TooDeep,
+    /// A folder to be moved or deleted holds a drop box, and the asker
+    /// may not view drop boxes.
+    HoldsDropBox,
     Busy,
     Unavailable(String),
 }
@@ -173,6 +185,9 @@ impl fmt::Display for FileError {
             FileError::RangeInvalid => f.write_str("resume offset is outside the file"),
             FileError::OriginChanged => f.write_str("origin object changed"),
             FileError::TooLarge => f.write_str("file exceeds the configured size limit"),
+            FileError::CrossesFilesystems => f.write_str("move crosses filesystems"),
+            FileError::TooDeep => f.write_str("folders nest too deeply"),
+            FileError::HoldsDropBox => f.write_str("folder holds a drop box"),
             FileError::Busy => f.write_str("file source is busy"),
             FileError::Unavailable(reason) => write!(f, "file source unavailable: {reason}"),
         }
@@ -242,6 +257,16 @@ mod tests {
             assert_eq!(FilePath::parse(bad), Err(FileError::InvalidPath));
         }
         assert!(FilePath::parse("").unwrap().is_root());
+    }
+
+    #[test]
+    fn a_path_starts_with_itself_and_its_folders_only() {
+        let path = FilePath::parse("a/bc/d").unwrap();
+        assert!(path.starts_with(&FilePath::root()));
+        assert!(path.starts_with(&FilePath::parse("a/bc").unwrap()));
+        assert!(path.starts_with(&path));
+        assert!(!path.starts_with(&FilePath::parse("a/b").unwrap()));
+        assert!(!FilePath::parse("a").unwrap().starts_with(&path));
     }
 
     #[test]

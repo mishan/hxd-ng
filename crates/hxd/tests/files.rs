@@ -349,6 +349,122 @@ async fn classic_uploads_follow_mhxd_for_access_shape_and_session() {
     assert!(!root.path().join("Uploads/orphan.bin").exists());
 }
 
+#[tokio::test]
+async fn a_drop_box_takes_uploads_without_telling_what_it_holds() {
+    let (server, root, _source) =
+        start_local_with("upload_files = true\nread_chat = true\nuse_any_name = true\n").await;
+    std::fs::create_dir_all(root.path().join("Drop Box/sub")).unwrap();
+    std::fs::write(root.path().join("Drop Box/report.txt"), b"theirs").unwrap();
+    let mut guest = Legacy::login(server.legacy, false).await;
+    let refusal = |frame: &Frame| {
+        assert_ne!(frame.flag & 1, 0, "refused");
+        field(frame, tag::TASK_ERROR).unwrap()
+    };
+    let put_in = |folder: &[&[u8]], name: &[u8]| {
+        vec![
+            (tag::FILE_NAME, name.to_vec()),
+            (tag::DIR, dir_path(folder)),
+            (tag::FILE_PREVIEW, vec![1]),
+        ]
+    };
+    let drop_box: &[&[u8]] = &[b"Drop Box"];
+
+    // A folder inside a drop box is not somewhere it can upload: it is
+    // not found, as a folder that is not there is not.
+    let inside = guest
+        .request(FILE_PUT, &put_in(&[b"Drop Box", b"sub"], b"x.txt"))
+        .await;
+    for absent in [&[b"Drop Box".as_slice(), b"absent"][..], &[b"Uploads"]] {
+        let answer = guest.request(FILE_PUT, &put_in(absent, b"x.txt")).await;
+        assert_eq!(refusal(&inside), refusal(&answer), "{absent:?}");
+    }
+    assert!(!root.path().join("Drop Box/sub/x.txt").exists());
+
+    // Into the drop box itself it may, and a name that is taken there is
+    // answered as a free one is, with no resume offered, and stored under
+    // a free name rather than refused or put in its place.
+    let taken = guest
+        .request(FILE_PUT, &put_in(drop_box, b"report.txt"))
+        .await;
+    let free = guest
+        .request(FILE_PUT, &put_in(drop_box, b"fresh.txt"))
+        .await;
+    let tags = |frame: &Frame| {
+        assert_eq!(frame.flag & 1, 0, "accepted");
+        frame.chunks().map(|chunk| chunk.tag).collect::<Vec<_>>()
+    };
+    assert_eq!(tags(&taken), tags(&free));
+    assert!(field(&taken, tag::RFLT).is_none());
+    let object = two_fork_object(b"mine");
+    upload(server.htxf, reference_of(&taken), object.len(), &object).await;
+    assert_eq!(
+        std::fs::read(root.path().join("Drop Box/report.txt")).unwrap(),
+        b"theirs"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("Drop Box/report 2.txt")).unwrap(),
+        b"mine"
+    );
+
+    // An upload cut short leaves nothing behind for the next guest, who
+    // shares the account, to be offered.
+    let half = guest
+        .request(FILE_PUT, &put_in(drop_box, b"half.txt"))
+        .await;
+    let object = two_fork_object(&vec![b'x'; 64 * 1024]);
+    let mut transfer = TcpStream::connect(server.htxf).await.unwrap();
+    transfer
+        .write_all(
+            &htxf::Preamble {
+                reference: reference_of(&half),
+                transfer_len: object.len() as u64,
+                type_code: 0,
+                flags: 0,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    transfer
+        .write_all(&object[..object.len() / 2])
+        .await
+        .unwrap();
+    drop(transfer);
+    let partials = root.path().join(".hxd-state/partials");
+    timeout(Duration::from_secs(5), async {
+        while std::fs::read_dir(&partials).unwrap().next().is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the cut-short upload's partial is discarded");
+    let mut other = Legacy::login(server.legacy, false).await;
+    let again = other
+        .request(FILE_PUT, &put_in(drop_box, b"half.txt"))
+        .await;
+    assert_eq!(tags(&again), tags(&free));
+    assert!(!root.path().join("Drop Box/half.txt").exists());
+
+    // An account that may view drop boxes uploads into a folder inside
+    // one, and is told, as anywhere, that a name is taken.
+    let mut viewer = Legacy::login_as(server.legacy, "viewer", "pw").await;
+    let into_sub = viewer
+        .request(FILE_PUT, &put_in(&[b"Drop Box", b"sub"], b"x.txt"))
+        .await;
+    let object = two_fork_object(b"seen");
+    upload(server.htxf, reference_of(&into_sub), object.len(), &object).await;
+    assert_eq!(
+        std::fs::read(root.path().join("Drop Box/sub/x.txt")).unwrap(),
+        b"seen"
+    );
+    let taken = viewer
+        .request(FILE_PUT, &put_in(drop_box, b"report.txt"))
+        .await;
+    refusal(&taken);
+}
+
 async fn run_service(service: Arc<FileService>, access: &str) -> Running {
     let temp = tempfile::tempdir().unwrap();
     let accounts = temp.path().join("accounts");
@@ -362,6 +478,14 @@ async fn run_service(service: Arc<FileService>, access: &str) -> Running {
     std::fs::write(
         accounts.join("browser.toml"),
         "name = \"Browser\"\npassword = \"pw\"\n[access]\nread_chat = true\n",
+    )
+    .unwrap();
+    // An account that may view drop boxes and upload only where an
+    // account without upload-anywhere may.
+    std::fs::write(
+        accounts.join("viewer.toml"),
+        "password = \"pw\"\n[access]\nupload_files = true\nview_drop_boxes = true\n\
+         read_chat = true\n",
     )
     .unwrap();
     // Accounts that may download, but not list, and not get info.
@@ -522,6 +646,16 @@ fn listed_names(listing: &Frame) -> Vec<Vec<u8>> {
         .filter(|chunk| chunk.tag == LIST_ENTRY)
         .map(|chunk| chunk.data[20..].to_vec())
         .collect()
+}
+
+/// A DIR field naming the folders `path` spells, below the root.
+fn dir_path(path: &[&[u8]]) -> Vec<u8> {
+    let mut out = (path.len() as u16).to_be_bytes().to_vec();
+    for name in path {
+        out.extend_from_slice(&[0, 0, name.len() as u8]);
+        out.extend_from_slice(name);
+    }
+    out
 }
 
 /// A DIR field naming one folder below the root.

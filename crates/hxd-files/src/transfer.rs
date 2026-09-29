@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, warn};
 
+use crate::local::PartialKey;
 use crate::{
     LocalFileSource, PreparedDownload, PreparedTransfer, PreparedUpload, TransferRegistry,
     UploadQuote,
@@ -45,6 +46,12 @@ pub struct UploadTransfer {
     pub transfer_len: Option<u64>,
     pub large: bool,
     pub resume_requested: bool,
+    /// The uploader may not see into the folder it uploads to: a drop box,
+    /// for an account without `view_drop_boxes`. Such an upload is never
+    /// offered a resume and is never refused for a name that is taken; it
+    /// is published under a free one instead, so that it learns nothing of
+    /// what the folder holds.
+    pub blind: bool,
     /// The uploader's text is UTF-8 (`CAPABILITY_TEXT_ENCODING`). The
     /// comment is stored as Mac Roman whichever wire it came from, since
     /// that is what the sidecar holds and what every reader decodes.
@@ -100,13 +107,13 @@ pub async fn prepare_upload(
     request: UploadTransfer,
 ) -> Result<(u32, Option<UploadQuote>), FileError> {
     let quote_source = source.clone();
-    let owner = request.owner.clone();
+    let key = partial_key(&request.owner, &request.path, request.blind)?;
     let path = request.path.clone();
     let transfer_len = request.transfer_len;
     let large = request.large;
     let resume_requested = request.resume_requested;
     let quote = crate::spawn_blocking("files", move || {
-        quote_source.prepare_upload(&owner, &path, transfer_len, large, resume_requested)
+        quote_source.prepare_upload(&key, &path, transfer_len, large, resume_requested)
     })
     .await
     .map_err(|error| FileError::Unavailable(format!("local file worker: {error}")))??;
@@ -132,9 +139,18 @@ pub async fn prepare_upload(
         transfer_len: request.transfer_len,
         large: request.large,
         quote: quote.clone(),
+        blind: request.blind,
         comment_utf8: request.comment_utf8,
     }))?;
     Ok((reference, quote))
+}
+
+fn partial_key(owner: &str, path: &FilePath, blind: bool) -> Result<PartialKey, FileError> {
+    if blind {
+        PartialKey::blind(owner)
+    } else {
+        Ok(PartialKey::resumable(owner, path))
+    }
 }
 
 /// Timeouts for the HTXF listener.
@@ -394,7 +410,7 @@ async fn serve_upload<S: HtxfStream>(
     // than for the whole upload: a client trickling bytes must not hold
     // capacity that listings and downloads share.
     let fresh = transfer.quote.is_none();
-    let owner = transfer.owner.clone();
+    let key = partial_key(&transfer.owner, &transfer.path, transfer.blind)?;
     let path = transfer.path.clone();
     // The claim resolves a length the request left out.
     let reserve = transfer
@@ -402,7 +418,7 @@ async fn serve_upload<S: HtxfStream>(
         .ok_or_else(|| FileError::Unavailable("upload length was not resolved".into()))?;
     let quote = transfer.quote.clone();
     let files = on_disk(&transfer.source, move |source| {
-        let files = source.begin_upload(&owner, &path, fresh, reserve)?;
+        let files = source.begin_upload(&key, &path, fresh, reserve)?;
         if let Some(quote) = quote {
             source.recheck_resume(&files, &quote)?;
         }
@@ -418,8 +434,11 @@ async fn serve_upload<S: HtxfStream>(
     // arriving.
     let result = result.and_then(|hfs| alive.check().map(|()| hfs));
     let path = transfer.path.clone();
+    let tree = transfer.source.lock_tree().await;
     on_disk(&transfer.source, move |source| match result {
-        Ok(hfs) => source.publish_upload(&path, &files, &hfs),
+        Ok(hfs) => source
+            .publish_upload(&tree, &path, &files, &hfs)
+            .map(|_| ()),
         // Dropped here, off the runtime: a partial left empty is removed as
         // it goes.
         Err(error) => {

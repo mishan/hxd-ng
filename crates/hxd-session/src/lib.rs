@@ -6,6 +6,7 @@
 pub mod banner;
 pub mod caps;
 pub mod encoding;
+mod file_manage;
 mod files;
 pub mod frame;
 pub mod media;

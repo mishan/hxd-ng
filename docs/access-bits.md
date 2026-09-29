@@ -86,27 +86,30 @@ when it is.
 
 ### Files and folders (0–8, 25, 28–31, 38, 39)
 
-Every one of these is **parsed**. Files and HTXF are an open front on the
-roadmap; when they land, these are the bits they will read.
+Each kind of entry answers to its own bit: a file's delete, rename, move
+and comment are never allowed by a folder's bit, nor the other way round,
+though mhxd lets either Delete or Move bit do both. A path naming a drop
+box also needs bit 30, for every one of them. The management bits act
+only on a local file area; a manifest area refuses them all as read-only.
 
-| Bit | `[access]` key | Meaning |
-|---:|---|---|
-| 0 | `delete_files` | Delete a file |
-| 1 | `upload_files` | Upload into an upload folder |
-| 2 | `download_files` | Download a file |
-| 3 | `rename_files` | Rename a file |
-| 4 | `move_files` | Move a file |
-| 5 | `create_folders` | Create a folder |
-| 6 | `delete_folders` | Delete a folder |
-| 7 | `rename_folders` | Rename a folder |
-| 8 | `move_folders` | Move a folder |
-| 25 | `upload_anywhere` | Upload outside the designated upload folders |
-| 28 | `comment_files` | Set a file's comment |
-| 29 | `comment_folders` | Set a folder's comment |
-| 30 | `view_drop_boxes` | See the contents of a drop box |
-| 31 | `make_aliases` | Create an alias |
-| 38 | `upload_folders` | Upload a whole folder |
-| 39 | `download_folders` | Download a whole folder |
+| Bit | `[access]` key | Meaning | Status |
+|---:|---|---|---|
+| 0 | `delete_files` | Delete a file | **Enforced**, both wires |
+| 1 | `upload_files` | Upload into an upload folder | **Enforced**, legacy wire — the ng protocol has no uploads yet |
+| 2 | `download_files` | Download a file | **Enforced**, both wires |
+| 3 | `rename_files` | Rename a file | **Enforced**, both wires |
+| 4 | `move_files` | Move a file | **Enforced**, both wires |
+| 5 | `create_folders` | Create a folder | **Enforced**, both wires |
+| 6 | `delete_folders` | Delete a folder | **Enforced**, both wires |
+| 7 | `rename_folders` | Rename a folder | **Enforced**, both wires |
+| 8 | `move_folders` | Move a folder | **Enforced**, both wires |
+| 25 | `upload_anywhere` | Upload outside the designated upload folders | **Enforced**, legacy wire |
+| 28 | `comment_files` | Set a file's comment | **Enforced**, both wires |
+| 29 | `comment_folders` | Set a folder's comment | **Enforced**, both wires |
+| 30 | `view_drop_boxes` | See the contents of a drop box, and change any path that names one (as on mhxd, a folder holding a drop box is not such a path) | **Enforced**, both wires |
+| 31 | `make_aliases` | Create an alias | Parsed — aliases are refused whoever asks, since the file area never follows a symlink |
+| 38 | `upload_folders` | Upload a whole folder | Parsed |
+| 39 | `download_folders` | Download a whole folder | Parsed |
 
 ### Chat (9, 10, 11)
 
@@ -282,4 +285,5 @@ is a startup error rather than a surprise later. It has no effect unless
 | `crates/hxd-auth-file/src/lib.rs` | `NAMED_BITS`, the `[access]`/`[extra]`/`[identity]` tables, the bit-56 fallback, the guest bootstrap |
 | `crates/hxd-session/src/session.rs` | Legacy-wire gates, and `SELFINFO`'s real bitmap |
 | `crates/hxd-ng-session/src/conn.rs` | ng gates, all answering `access_denied` |
+| `crates/hxd-session/src/file_manage.rs`, `crates/hxd-ng-session/src/files.rs` | The file-management bits, one per kind of entry, on each wire |
 | `crates/hxd-core/src/media.rs` | Bit 57, checked in the domain so both wires inherit it |
