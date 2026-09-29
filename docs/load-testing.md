@@ -37,6 +37,13 @@ storage the database is on: the rate public chat can be persisted at is
 the disk's fsync rate (`docs/metrics.md`, the `LogSerial` lock). The
 baseline script does all of that (§7).
 
+Every connection the harness opens comes from one address, and the
+server holds an address to a few connections and a slow reconnect rate
+(`[limits]`, the README). Loopback is exempt by default, so a server on
+the same host takes the whole load. A server on another host refuses
+nearly all of it as `too_many` or `too_fast`: raise `[limits]` there, or
+better, add the generator's address to `exempt`.
+
 ## 2. The scenario file
 
 TOML, every key optional; `crates/hxd-load/scenarios/` holds one of

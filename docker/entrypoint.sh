@@ -110,32 +110,32 @@ gateway() {
         "0x$(echo "$hex" | cut -c3-4)" "0x$(echo "$hex" | cut -c1-2)"
 }
 
-# The addresses the ng port should believe X-Forwarded-For and
-# X-Hotline-Client-Cert from, with `gateway` standing for the container's
-# default gateway. Never by default: the gateway is where the host's
-# docker-proxy connects from on behalf of every client of a port
+# A list of addresses from the variable named $1 with value $2, written
+# as `$3 = [...]`, with `gateway` standing for the container's default
+# gateway. Never trusted or exempt by default: the gateway is where the
+# host's docker-proxy connects from on behalf of every client of a port
 # published on all addresses, and on the host network it is the router.
-trusted_proxies() {
+addresses() {
     out=
     old_ifs=$IFS
     IFS=,
-    for item in $1; do
+    for item in $2; do
         item=$(printf '%s' "$item" | tr -d '[:space:]')
         case $item in
             "" | none) continue ;;
             gateway)
                 item=$(gateway)
                 if [ -z "$item" ]; then
-                    echo "hxd-entrypoint: HXD_NG_TRUSTED_PROXIES: no default gateway to trust" >&2
+                    echo "hxd-entrypoint: $1: no default gateway" >&2
                     continue
                 fi
-                echo "hxd-entrypoint: trusting the gateway, $item, as a proxy" >&2
+                echo "hxd-entrypoint: $1: the gateway is $item" >&2
                 ;;
         esac
         out="${out:+$out,}$item"
     done
     IFS=$old_ifs
-    kvlist trusted_proxies "$out"
+    kvlist "$3" "$out"
 }
 
 # `key = [...]` of fingerprints from a variable, checked here so a typo is
@@ -172,6 +172,11 @@ generate() {
     num HXD_QUEUE_BUDGET_MB queue_budget_mb
     num HXD_LOGINS_IN_FLIGHT logins_in_flight
     echo
+    echo "[limits]"
+    num HXD_CONNECTIONS_PER_ADDR connections_per_addr
+    num HXD_RECONNECT_SECONDS reconnect_seconds
+    addresses HXD_LIMITS_EXEMPT "${HXD_LIMITS_EXEMPT-127.0.0.0/8,::1}" exempt
+    echo
     echo "[paths]"
     echo "accounts = \"$DATA/accounts\""
     agreement=${HXD_AGREEMENT_FILE:-}
@@ -186,7 +191,7 @@ generate() {
         kv bind "${HXD_NG_BIND:-0.0.0.0:5700}"
         num HXD_NG_GRACE grace
         num HXD_NG_MAX_DETACHED_PER_ADDR max_detached_per_addr
-        trusted_proxies "${HXD_NG_TRUSTED_PROXIES-127.0.0.1,::1}"
+        addresses HXD_NG_TRUSTED_PROXIES "${HXD_NG_TRUSTED_PROXIES-127.0.0.1,::1}" trusted_proxies
         str HXD_NG_FORWARDED_HEADER forwarded_header
     fi
 

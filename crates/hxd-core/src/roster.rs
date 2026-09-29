@@ -1019,6 +1019,8 @@ pub struct Core {
     pub(crate) queue_budget: Arc<crate::budget::QueueBudget>,
     /// Logins the server is working on at once ([`Core::admit_login`]).
     pub(crate) login_gate: LoginGate,
+    /// Connections each address holds ([`Core::admit_connection`]).
+    pub(crate) conn_gate: crate::limits::ConnGate,
     /// The durable private-message inbox, or `None` — in which case
     /// private messaging behaves exactly as it did before the inbox
     /// existed, which is what a server that configures no database gets.
@@ -1251,6 +1253,10 @@ impl Core {
     /// announced.
     pub fn admit_login(&self, addr: Option<IpAddr>) -> Option<LoginPermit> {
         let gate = &self.login_gate.0;
+        // An address exempt from `[limits]` has no share of its own to
+        // run out of: loopback, by default, where the tests, the load
+        // harness and an operator's tools log many in at once.
+        let addr = addr.filter(|ip| !self.conn_gate.exempt(*ip));
         let permit = (|| {
             let place = gate.places.clone().try_acquire_owned().ok()?;
             let Some(addr) = addr else {
@@ -1274,6 +1280,24 @@ impl Core {
             instrument::login_refused_busy();
         }
         permit
+    }
+
+    /// Hold connections from one address to `limits` rather than
+    /// [`crate::ConnLimits::default`].
+    pub fn with_conn_limits(mut self, limits: crate::ConnLimits) -> Self {
+        self.conn_gate = crate::limits::ConnGate::new(limits);
+        self
+    }
+
+    /// A place for one connection from `addr`, held for as long as the
+    /// connection is open, or why there is none: the frontend closes the
+    /// connection unanswered (`crate::limits`). Asked once per
+    /// connection that can carry a session, with the client's address.
+    pub fn admit_connection(
+        &self,
+        addr: std::net::IpAddr,
+    ) -> Result<crate::ConnPermit, crate::ConnRefused> {
+        self.conn_gate.admit(addr)
     }
 
     /// The budget, for a frontend's queues to draw on too.
@@ -2216,6 +2240,20 @@ mod tests {
         assert!(core.admit_login(None).is_none(), "the gate is full");
         drop(a);
         assert!(core.admit_login(None).is_some(), "and a place came back");
+    }
+
+    #[test]
+    fn an_exempt_address_has_no_share_of_the_login_places_to_run_out_of() {
+        let core = Core::new().with_logins_in_flight(8);
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let held: Vec<_> = (0..8)
+            .map(|_| core.admit_login(Some(loopback)).expect("a place"))
+            .collect();
+        assert!(
+            core.admit_login(Some(loopback)).is_none(),
+            "the gate is full"
+        );
+        drop(held);
     }
 
     #[test]

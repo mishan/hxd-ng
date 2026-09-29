@@ -41,6 +41,10 @@ pub mod tracker;
 pub struct Config {
     #[serde(default)]
     pub server: ServerSection,
+    /// What one address is held to (`hxd_core::limits`). Always on, at
+    /// mhxd's `nospam` defaults, with loopback exempt.
+    #[serde(default)]
+    pub limits: LimitsSection,
     #[serde(default)]
     pub paths: PathsSection,
     /// The Hotline-ng WebSocket frontend. Absent = disabled.
@@ -1501,6 +1505,53 @@ impl ServerSection {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSection {
+    /// Connections one address may hold at once; 0 for no limit.
+    #[serde(default = "default_connections_per_addr")]
+    pub connections_per_addr: usize,
+    /// Seconds one address waits for each new connection past a burst
+    /// of `connections_per_addr` (mhxd's `conn_max` when that is 0); 0
+    /// for no limit.
+    #[serde(default = "default_reconnect_seconds")]
+    pub reconnect_seconds: u64,
+    /// Addresses and CIDR blocks held to none of these.
+    #[serde(default = "default_limits_exempt")]
+    pub exempt: Vec<String>,
+}
+
+fn default_connections_per_addr() -> usize {
+    hxd_core::limits::CONNECTIONS_PER_ADDR
+}
+fn default_reconnect_seconds() -> u64 {
+    hxd_core::limits::RECONNECT_EVERY.as_secs()
+}
+fn default_limits_exempt() -> Vec<String> {
+    vec!["127.0.0.0/8".into(), "::1".into()]
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        LimitsSection {
+            connections_per_addr: default_connections_per_addr(),
+            reconnect_seconds: default_reconnect_seconds(),
+            exempt: default_limits_exempt(),
+        }
+    }
+}
+
+impl LimitsSection {
+    pub fn conn_limits(&self) -> Result<hxd_core::ConnLimits, String> {
+        Ok(hxd_core::ConnLimits {
+            per_addr: self.connections_per_addr,
+            reconnect: Duration::from_secs(self.reconnect_seconds),
+            exempt: hxd_core::AddrSet::parse(&self.exempt)
+                .map_err(|e| format!("[limits] exempt: {e}"))?,
+        })
+    }
+}
+
 impl Default for ServerSection {
     fn default() -> Self {
         ServerSection {
@@ -1733,12 +1784,13 @@ impl TunnelSink for LegacyTunnel {
         peer: SocketAddr,
         transport: Transport,
         link: LinkAuthority,
+        place: hxd_core::ConnPermit,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let ctx = self.0.clone();
         Box::pin(async move {
             let span = tracing::info_span!("tunnel", %peer);
             tracing::Instrument::instrument(
-                hxd_session::run_session(stream, peer, ctx, transport, link),
+                hxd_session::run_session(stream, peer, ctx, transport, link, place),
                 span,
             )
             .await
@@ -2150,6 +2202,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     {
         return Err("[server] logins_in_flight must be at least 1, and not absurd".into());
     }
+    config.limits.conn_limits()?;
     if config.server.queue_budget() == 0 {
         return Err(
             "[server] queue_budget_mb must be at least 1, and small enough to count in bytes"
@@ -3022,9 +3075,11 @@ pub fn build_ctx(
     };
 
     let budget = config.server.queue_budget();
+    let conn_limits = config.limits.conn_limits()?;
     let core = match voice {
         Some(v) => {
             let core = Core::new()
+                .with_conn_limits(conn_limits)
                 .with_queue_budget(budget)
                 .with_logins_in_flight(config.server.logins_in_flight)
                 .with_voice(v.media(), v.max_per_room());
@@ -3042,6 +3097,7 @@ pub fn build_ctx(
             }
         }
         None => Core::new()
+            .with_conn_limits(conn_limits)
             .with_queue_budget(budget)
             .with_logins_in_flight(config.server.logins_in_flight),
     };

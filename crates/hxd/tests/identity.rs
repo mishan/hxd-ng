@@ -1514,6 +1514,133 @@ async fn a_token_survives_an_upgrade_the_server_refuses_to_parse() {
 }
 
 #[tokio::test]
+async fn a_token_survives_an_upgrade_refused_for_its_addresss_limit() {
+    // The address's connection count is asked before the token is
+    // redeemed, so a client refused 429 keeps the token to retry with
+    // rather than running the challenge dance again.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) =
+        start_server_with_proxies(dir.path(), IdentityConfig::default(), &["127.0.0.1"]).await;
+    // A forwarded address, since loopback is exempt from `[limits]`.
+    async fn from(ng: SocketAddr, query: &str) -> Result<Ws, u16> {
+        let mut req = format!("ws://{ng}/ng{query}")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("X-Forwarded-For", "203.0.113.50".parse().unwrap());
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+            Err(e) => panic!("ng: {e}"),
+        }
+    }
+    let mut held = Vec::new();
+    for _ in 0..hxd_core::limits::CONNECTIONS_PER_ADDR {
+        held.push(from(ng, "").await.expect("within the limit"));
+    }
+    let p = person(26, "Patient");
+    let token = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let query = format!("?token={token}");
+    assert_eq!(from(ng, &query).await.err(), Some(429));
+    // A place freed, and the next new connection earned: the same token
+    // is still good.
+    held.pop();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let ws = loop {
+        match from(ng, &query).await {
+            Ok(ws) => break ws,
+            Err(429) => {
+                assert!(tokio::time::Instant::now() < deadline, "never admitted");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(status) => panic!("refused {status}: the token was spent"),
+        }
+    };
+    let mut c = Ng::from_ws(ws).await;
+    let ok = c.request("login", json!({ "nick": "p" })).await;
+    assert_eq!(
+        ok["ok"]["self"]["identity"]["fingerprint"],
+        p.id.fingerprint().to_string(),
+        "{ok}"
+    );
+}
+
+#[tokio::test]
+async fn a_tunnel_refused_for_its_addresss_limit_keeps_its_token_and_counts_once() {
+    // `/trtp` carries a session, so it counts against its address like
+    // `/ng`, and is asked at the same point: before the token is spent,
+    // answered 429 rather than a socket that opens and closes. The place
+    // taken at the upgrade is the one the tunnelled session holds; asked
+    // for a second inside, a tunnel arriving at an address's last place
+    // would be refused after its upgrade succeeded.
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) =
+        start_server_with_proxies(dir.path(), IdentityConfig::default(), &["127.0.0.1"]).await;
+    // A forwarded address, since loopback is exempt from `[limits]`.
+    async fn from(ng: SocketAddr, path: &str) -> Result<Ws, u16> {
+        let mut req = format!("ws://{ng}{path}").into_client_request().unwrap();
+        req.headers_mut()
+            .insert("X-Forwarded-For", "203.0.113.51".parse().unwrap());
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => Err(r.status().as_u16()),
+            Err(e) => panic!("{path}: {e}"),
+        }
+    }
+    let mut held = Vec::new();
+    for _ in 0..hxd_core::limits::CONNECTIONS_PER_ADDR {
+        held.push(from(ng, "/ng").await.expect("within the limit"));
+    }
+    let p = person(27, "Tunnelling");
+    let token = authenticate(ng, &p).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let path = format!("/trtp?token={token}");
+    assert_eq!(from(ng, &path).await.err(), Some(429));
+    // One place freed, and the next new connection earned: the tunnel
+    // takes the address's last place with the same token.
+    held.pop();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let ws = loop {
+        match from(ng, &path).await {
+            Ok(ws) => break ws,
+            Err(429) => {
+                assert!(tokio::time::Instant::now() < deadline, "never admitted");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(status) => panic!("refused {status}: the token was spent"),
+        }
+    };
+    // And the classic session inside it runs in that place rather than
+    // being refused for a second one.
+    let mut t = Tunnel::new(ws);
+    t.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
+    let hello = t.read_exact(8).await;
+    assert_eq!(&hello[..4], b"TRTP");
+    t.send(
+        REQ_LOGIN,
+        &[
+            (tag::NAME, b"Tunnelling".to_vec()),
+            (tag::VERSION, 150u16.to_be_bytes().to_vec()),
+        ],
+    )
+    .await;
+    t.recv_type(HDR_TASK).await;
+    t.recv_type(HDR_SELFINFO).await;
+    // Every place is held again, the tunnel's among them. The tunnel
+    // spent the address's last new connection, so a probe now would be
+    // refused as too fast whether or not the tunnel holds a place; one
+    // made after the address has earned another is refused only because
+    // every place is taken.
+    tokio::time::sleep(hxd_core::limits::RECONNECT_EVERY + Duration::from_millis(250)).await;
+    assert_eq!(from(ng, "/ng").await.err(), Some(429));
+}
+
+#[tokio::test]
 async fn an_authorization_header_that_is_not_a_bearer_token_is_a_401() {
     // §6.1: a token that doesn't work is never a silent downgrade to an
     // unauthenticated request — and neither is a scheme we don't speak.
@@ -2343,6 +2470,28 @@ async fn a_client_behind_a_proxy_does_not_choose_its_own_address() {
         let (ws, _) = tokio_tungstenite::connect_async(req).await.ok()?;
         Some(Ng::from_ws(ws).await)
     }
+    /// A `/ng` socket that must be admitted: one refused 429 for its
+    /// address's reconnect rate (`[limits]`) waits for the next
+    /// connection it earns, so this test does not depend on how many
+    /// the default burst allows.
+    async fn admitted(ng: SocketAddr, xff: &str) -> Ng {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut req = format!("ws://{ng}/ng").into_client_request().unwrap();
+            req.headers_mut()
+                .insert("X-Forwarded-For", xff.parse().unwrap());
+            match tokio_tungstenite::connect_async(req).await {
+                Ok((ws, _)) => return Ng::from_ws(ws).await,
+                Err(tokio_tungstenite::tungstenite::Error::Http(r))
+                    if r.status().as_u16() == 429 =>
+                {
+                    assert!(tokio::time::Instant::now() < deadline, "never admitted");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("{xff}: refused: {e}"),
+            }
+        }
+    }
     async fn login(c: &mut Ng) -> Value {
         let ok = c
             .request(
@@ -2384,12 +2533,11 @@ async fn a_client_behind_a_proxy_does_not_choose_its_own_address() {
     drop(c);
 
     // The per-address detach cap counts the same address, however many
-    // different values the client writes ahead of it.
+    // different values the client writes ahead of it. Every connection
+    // here is one address's, so each is closed before the next opens.
     let mut parked = Vec::new();
     for i in 0..3 {
-        let mut c = as_addr(ng, &format!("203.0.113.{i}, 198.51.100.9, 10.0.0.7"))
-            .await
-            .expect("not banned");
+        let mut c = admitted(ng, &format!("203.0.113.{i}, 198.51.100.9, 10.0.0.7")).await;
         let ok = login(&mut c).await;
         parked.push((
             ok["session"].as_str().unwrap().to_owned(),
@@ -2401,9 +2549,7 @@ async fn a_client_behind_a_proxy_does_not_choose_its_own_address() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let (session, token) = parked[0].clone();
-    let mut c = as_addr(ng, "198.51.100.9, 10.0.0.7")
-        .await
-        .expect("not banned");
+    let mut c = admitted(ng, "198.51.100.9, 10.0.0.7").await;
     let reply = c
         .request(
             "resume",
@@ -2414,11 +2560,10 @@ async fn a_client_behind_a_proxy_does_not_choose_its_own_address() {
         reply.get("error").is_some(),
         "max_detached_per_addr = 2 must have ended the oldest: {reply}"
     );
+    drop(c);
     // The newest two are still there.
     let (session, token) = parked[2].clone();
-    let mut c = as_addr(ng, "198.51.100.9, 10.0.0.7")
-        .await
-        .expect("not banned");
+    let mut c = admitted(ng, "198.51.100.9, 10.0.0.7").await;
     let reply = c
         .request(
             "resume",

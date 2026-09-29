@@ -189,11 +189,23 @@ no domain operation may push a session anywhere near the cap in one
 go: a purge of thousands of lines sends nothing to a wire that cannot
 show redactions (`Transport::redactions`).
 
+**One address is held to so many connections, and so fast**
+(`hxd_core::limits`, `[limits]`, mhxd's `nospam` defaults): a
+`ConnPermit` from `Core::admit_connection` is held for the life of every
+connection that can carry a session, taken where the classic wire
+checks bans (plain, TLS and the `/trtp` tunnel alike; on the TLS port
+at accept, so the handshake is counted) and at the ng upgrade, before
+its token is redeemed, with the client's address as trusted proxies
+give it. An IPv6
+client is its /64; loopback is exempt by default. A new listener that
+carries sessions takes a permit too.
+
 **Past capacity a login is refused, not queued.** Every login costs
 everyone present a join and later a part, so a server admitting logins
 faster than it can tell the room about them falls further behind with
 each one. `Core::admit_login` bounds the logins in progress
-(`[server] logins_in_flight`, a quarter of it per address), from the
+(`[server] logins_in_flight`, a quarter of it per address, `[limits]`
+exempt addresses aside), from the
 login request to the join, so a client slow to send one holds no place;
 past it both wires refuse at once as busy (`rate_limited` with
 `retry_after` on ng). A 1.5 client that answers the agreement before
@@ -256,7 +268,9 @@ Three layers, all `cargo test --workspace`:
   rotations published under both keys, a card's commitment, invites from
   the file and the command, the operator's commands on the running
   store, and `hlid register`, `revoke` and `rotate` driven as a user
-  would), `slow_consumer.rs` (a room flooded while one client reads
+  would), `limits.rs` (so many connections from one address across both
+  wires, then a burst and a rate, a TLS handshake counted from accept,
+  and an exempt address held to neither), `slow_consumer.rs` (a room flooded while one client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the
   ng one resumes into a resync; and clients each inside their own

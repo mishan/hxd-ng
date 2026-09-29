@@ -554,6 +554,31 @@ async fn upgrade(
             return plain(StatusCode::BAD_REQUEST, "bad upgrade");
         }
     };
+    // A connection that carries a session — an ng one, or a tunnelled
+    // classic one — counts against its client's address like any other
+    // (`hxd_core::limits`); a transfer belongs to a session already
+    // counted, and is not. It is asked before the token is redeemed, for
+    // the same reason the request is validated first: the gate needs
+    // only the peer, and a client refused 429 keeps its single-use token
+    // to try again with, rather than running the challenge dance again —
+    // and a refused connection costs no verification. The place taken
+    // here is the connection's for its life; a tunnelled session is
+    // handed it rather than taking a second.
+    let place = match proto {
+        Proto::Json | Proto::Trtp => match ctx.core.admit_connection(peer.ip()) {
+            Ok(place) => Some(place),
+            Err(refused) => {
+                info!(%peer, reason = refused.reason(), "refusing a connection past its address's limit");
+                let wire = match proto {
+                    Proto::Trtp => "legacy",
+                    _ => "ng",
+                };
+                hxd_core::instrument::disconnect(wire, refused.reason());
+                return plain(StatusCode::TOO_MANY_REQUESTS, "too many connections");
+            }
+        },
+        Proto::Htxf => None,
+    };
     // The certificate header is believed by the *socket's* peer, which
     // is the proxy; the forwarded address is who the proxy is speaking
     // for and carries no trust of its own.
@@ -584,7 +609,10 @@ async fn upgrade(
             }
         };
         match proto {
-            Proto::Json => conn::run(ws, peer, ctx, identity).await,
+            Proto::Json => {
+                let _place = place;
+                conn::run(ws, peer, ctx, identity).await
+            }
             Proto::Htxf => {
                 let (Some(sink), Some(fp)) = (ctx.tunnel.as_ref(), htxf_identity) else {
                     return;
@@ -596,7 +624,7 @@ async fn upgrade(
                 }
             }
             Proto::Trtp => {
-                let Some(sink) = ctx.tunnel.as_ref() else {
+                let (Some(sink), Some(place)) = (ctx.tunnel.as_ref(), place) else {
                     return;
                 };
                 // The WebSocket hop is TLS; the hop behind the tunnel is
@@ -636,6 +664,7 @@ async fn upgrade(
                     peer,
                     transport,
                     link,
+                    place,
                 )
                 .await;
             }

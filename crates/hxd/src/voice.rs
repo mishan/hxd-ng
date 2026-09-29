@@ -140,6 +140,7 @@ mod tests {
                 bind: server_bind.into(),
                 ..ServerSection::default()
             },
+            limits: Default::default(),
             paths: Default::default(),
             ng: None,
             voice,

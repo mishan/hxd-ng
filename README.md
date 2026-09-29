@@ -228,8 +228,9 @@ queue_budget_mb = 128   # what the server may hold for its clients, all
                         # together; past it, the furthest behind are dropped
                         # (docs/metrics.md, the budget)
 logins_in_flight = 32   # logins worked on at once, a quarter of them from
-                        # one address at most; past it a login is refused
-                        # as busy, and its user tries again
+                        # one address at most (not one [limits] exempts);
+                        # past it a login is refused as busy, and its user
+                        # tries again
 
 # Set User Flags bit 4 on unencrypted legacy sessions (docs/hotline-ng-auth.md §8).
 # Off until that bit is confirmed free against 1.8/1.9 clients.
@@ -239,6 +240,33 @@ logins_in_flight = 32   # logins worked on at once, a quarter of them from
 accounts = "accounts"
 agreement = "agreement.txt"
 ```
+
+### Limits
+
+What one address is held to, on both wires together. Always on, at the
+defaults of mhxd's `nospam`. A connection past either limit is closed
+unanswered on the classic ports, as mhxd closes one, and refused with
+HTTP 429 on the ng port, `/trtp` included.
+
+```toml
+[limits]
+connections_per_addr = 5     # at once; 0 for no limit
+reconnect_seconds = 2        # past a burst of that many new connections
+                             # (5 when the line above is 0), one more
+                             # each this often; 0 for no limit
+exempt = ["127.0.0.0/8", "::1"]  # addresses and blocks held to neither
+```
+
+An IPv6 client counts as its /64. An ng client behind a reverse proxy
+listed in `[ng] trusted_proxies` counts as the address the proxy
+forwards. A classic client reaching the server through a TCP proxy that
+hides its address counts as the proxy, so every client of that proxy
+shares one allowance: exempt the proxy, or raise the limit. A proxy on
+the same host connects from loopback, which `exempt` holds to no limit
+by default, so every client behind it is exempt too, down to the share
+of logins in flight one address may hold. For limits per client, list
+the proxy in `[ng] trusted_proxies` for the ng port, or take loopback
+out of `exempt` for a TCP proxy to the classic ports.
 
 ### Banner
 

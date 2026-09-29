@@ -24,9 +24,9 @@ use hxd_core::instrument::{self, Dir, Kind};
 use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
-    Account, AttachInfo, AuthBackend, AuthError, ChatError, Core, Event, Events, FileEntry,
-    FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof, SessionStatus, Share, Transport,
-    Uid, UserInfo,
+    Account, AttachInfo, AuthBackend, AuthError, ChatError, ConnPermit, Core, Event, Events,
+    FileEntry, FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof, SessionStatus, Share,
+    Transport, Uid, UserInfo,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::text;
@@ -208,7 +208,7 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) {
                 ctx,
                 Transport::default(),
                 LinkAuthority::default(),
-                true,
+                Direct::Admit,
             )
             .instrument(span)
             .await;
@@ -239,9 +239,22 @@ pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::Le
             instrument::disconnect(WIRE, "banned");
             continue;
         }
+        // The handshake slot is taken first: it is shared by every
+        // address, so a connection closed for want of one must not also
+        // spend its address's reconnect allowance, or a client arriving
+        // while others hold every slot is refused `too_fast` once they
+        // are free.
         let Ok(permit) = handshakes.clone().try_acquire_owned() else {
             debug!(%peer, "TLS handshakes at capacity; closing");
             continue;
+        };
+        // Nor does one past its limit cost a handshake, and the place
+        // taken here is the connection's for its whole life, handshake
+        // included: counted only after the handshake, one address could
+        // hold every handshake slot at once.
+        let place = match admit(&ctx, peer) {
+            Some(place) => place,
+            None => continue,
         };
         let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
@@ -265,9 +278,16 @@ pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::Le
                 encrypted: true,
                 ..Transport::default()
             };
-            run_connection(stream, peer, ctx, transport, LinkAuthority::default(), true)
-                .instrument(span)
-                .await;
+            run_connection(
+                stream,
+                peer,
+                ctx,
+                transport,
+                LinkAuthority::default(),
+                Direct::Admitted(place),
+            )
+            .instrument(span)
+            .await;
         });
     }
 }
@@ -1207,27 +1227,66 @@ impl Session {
 /// the caller knows about the link — encrypted or not, and the transport
 /// identity if the caller authenticated one — and is carried to the
 /// roster untouched. The protocol inside doesn't know which it got.
+///
+/// `place` is the connection's place in its address's count
+/// ([`Core::admit_connection`]), taken by the caller before it accepted
+/// the stream — the ng frontend asks at the upgrade, so a refused client
+/// hears a 429 and keeps its token — and held here for the session's
+/// life.
 pub async fn run_session<S>(
     stream: S,
     peer: SocketAddr,
     ctx: ServerCtx,
     transport: Transport,
     link: LinkAuthority,
+    place: ConnPermit,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    run_connection(stream, peer, ctx, transport, link, false).await
+    run_connection(stream, peer, ctx, transport, link, Direct::Tunnelled(place)).await
 }
 
-/// [`run_session`], told whether `peer` is the client's own TCP address.
-/// Only then can a file transfer be required to come from it.
+/// Whether a connection's `peer` is the client's own TCP address — only
+/// then can a file transfer be required to come from it — and whether
+/// its place in its address's count has been taken yet.
+enum Direct {
+    /// A direct connection; take its place.
+    Admit,
+    /// A direct connection whose place was taken at accept (the TLS
+    /// port, so the handshake counts too).
+    Admitted(ConnPermit),
+    /// A tunnelled one, from the address the tunnel carries, whose place
+    /// the tunnel took before accepting it.
+    Tunnelled(ConnPermit),
+}
+
+/// A place for one connection from `peer`, held for the life of the
+/// connection, or `None` and the refusal counted: closed unanswered past
+/// it, as mhxd closes a connection past `conn_max` (`hxd_core::limits`).
+fn admit(ctx: &ServerCtx, peer: SocketAddr) -> Option<ConnPermit> {
+    match ctx.core.admit_connection(peer.ip()) {
+        Ok(place) => Some(place),
+        Err(refused) => {
+            info!(
+                %peer,
+                reason = refused.reason(),
+                "refusing a connection past its address's limit"
+            );
+            instrument::disconnect(WIRE, refused.reason());
+            None
+        }
+    }
+}
+
+/// [`run_session`], told whether `peer` is the client's own TCP address
+/// and whether its place is already taken ([`Direct`]).
 async fn run_connection<S>(
     stream: S,
     peer: SocketAddr,
     ctx: ServerCtx,
     transport: Transport,
     link: LinkAuthority,
-    direct: bool,
+    direct: Direct,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1236,6 +1295,15 @@ async fn run_connection<S>(
         instrument::disconnect(WIRE, "banned");
         return;
     }
+    // One place per connection, however it came to be taken.
+    let (_place, direct) = match direct {
+        Direct::Admitted(place) => (place, true),
+        Direct::Tunnelled(place) => (place, false),
+        Direct::Admit => match admit(&ctx, peer) {
+            Some(place) => (place, true),
+            None => return,
+        },
+    };
     let (mut rd, wr): (ReadHalf<S>, WriteHalf<S>) = tokio::io::split(stream);
 
     // --- Magic exchange -------------------------------------------------

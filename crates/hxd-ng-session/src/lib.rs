@@ -58,6 +58,9 @@ pub trait TunnelSink: Send + Sync {
         // login change about account association (§8.2) — separate from
         // `transport`, which is descriptive; this authorizes.
         link: LinkAuthority,
+        // The connection's place in its address's count, taken at the
+        // upgrade and held for as long as the session runs.
+        place: hxd_core::ConnPermit,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
     /// Serve one file transfer a tunnelled session was issued, arriving
@@ -156,39 +159,15 @@ impl ForwardedHeader {
 /// an exact `IpAddr` comparison would silently never match — the mTLS
 /// binding would look configured and be off.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TrustedProxies(Vec<(IpAddr, u32)>);
+pub struct TrustedProxies(hxd_core::AddrSet);
 
 impl TrustedProxies {
     /// Parse `"192.0.2.7"`, `"10.0.0.0/8"`, `"2001:db8::/32"`. The error
     /// names the offending entry; it reaches the operator at startup.
     pub fn parse<S: AsRef<str>>(entries: &[S]) -> Result<Self, String> {
-        let mut out = Vec::new();
-        for e in entries {
-            let e = e.as_ref().trim();
-            let (addr, prefix) = match e.split_once('/') {
-                Some((a, p)) => (a, Some(p)),
-                None => (e, None),
-            };
-            let addr: IpAddr = addr
-                .parse()
-                .map_err(|_| format!("trusted_proxies: {e:?} is not an IP address"))?;
-            let addr = addr.to_canonical();
-            let full = if addr.is_ipv4() { 32 } else { 128 };
-            let bits = match prefix {
-                None => full,
-                Some(p) => {
-                    let bits: u32 = p
-                        .parse()
-                        .map_err(|_| format!("trusted_proxies: {e:?} has a bad prefix length"))?;
-                    if bits > full {
-                        return Err(format!("trusted_proxies: {e:?} prefix exceeds {full} bits"));
-                    }
-                    bits
-                }
-            };
-            out.push((addr, bits));
-        }
-        Ok(TrustedProxies(out))
+        hxd_core::AddrSet::parse(entries)
+            .map(TrustedProxies)
+            .map_err(|e| format!("trusted_proxies: {e}"))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -196,33 +175,8 @@ impl TrustedProxies {
     }
 
     pub fn contains(&self, peer: IpAddr) -> bool {
-        let peer = peer.to_canonical();
-        self.0
-            .iter()
-            .any(|(net, bits)| prefix_eq(peer, *net, *bits))
+        self.0.contains(peer)
     }
-}
-
-fn prefix_eq(a: IpAddr, b: IpAddr, bits: u32) -> bool {
-    fn octets(ip: IpAddr) -> Vec<u8> {
-        match ip {
-            IpAddr::V4(v) => v.octets().to_vec(),
-            IpAddr::V6(v) => v.octets().to_vec(),
-        }
-    }
-    if a.is_ipv4() != b.is_ipv4() {
-        return false;
-    }
-    let (a, b) = (octets(a), octets(b));
-    let (whole, rest) = ((bits / 8) as usize, bits % 8);
-    if a[..whole] != b[..whole] {
-        return false;
-    }
-    if rest == 0 {
-        return true;
-    }
-    let mask = 0xffu8 << (8 - rest);
-    a[whole] & mask == b[whole] & mask
 }
 
 impl Default for NgConfig {

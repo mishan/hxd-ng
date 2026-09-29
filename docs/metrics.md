@@ -162,7 +162,8 @@ shows.
 
 The reasons: `eof`, `io_error` and `malformed` from the socket,
 `closed` for a WebSocket close, `banned` for an address refused at
-the door, `handshake` and `login` for a connection that never got a
+the door, `too_many` and `too_fast` for one past `[limits]` (the
+connections it holds, or how fast it opens them), `handshake` and `login` for a connection that never got a
 session, `kicked`, `logout`, `replaced`,
 `send_failed`, `pong_deadline`, and `slow_consumer` for a client that
 stopped taking what was sent to it: a classic writer's queue past its

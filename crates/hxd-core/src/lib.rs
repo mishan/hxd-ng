@@ -16,6 +16,7 @@ pub mod files;
 pub mod history;
 pub mod inbox;
 pub mod instrument;
+pub mod limits;
 pub mod media;
 pub mod moderation;
 pub mod news;
@@ -50,6 +51,7 @@ pub use inbox::{
     Delivery, InboxCounts, MemoryStore, MessageId, MessageStore, NewMessage, Pushed, StoreError,
     StoredMessage,
 };
+pub use limits::{AddrSet, ConnLimits, ConnPermit, ConnRefused};
 pub use media::{
     Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRecord,
     MediaRef, MediaReject, MediaType, Principal, UploadOutcome, UploadPart,
