@@ -44,6 +44,31 @@ plain HTTP to everyone, for a client that is not a browser page.
 when it opens and when it closes, with the client's address and the
 bytes carried each way; behind a trusted proxy, with the address the
 proxy forwarded and the proxy's own.
+SIGTERM or Ctrl-C stops it, closing the sockets it carries.
+
+### In Docker
+
+hxd-ng's image carries `hlrelay` too, and runs it instead of the server
+with `HXD_MODE=relay`, its flags taken from `HXD_RELAY_*` variables
+([docker.md](docker.md#relay-mode) lists them):
+
+```sh
+docker run -d --name hlrelay --restart unless-stopped \
+  -p 127.0.0.1:5700:5700 \
+  --add-host host.docker.internal:host-gateway \
+  -e HXD_MODE=relay \
+  -e HXD_RELAY_UPSTREAM=host.docker.internal:5500 \
+  -e HXD_RELAY_NAME="My Server" \
+  -e HXD_RELAY_TRUSTED_PROXIES=gateway \
+  ghcr.io/mishan/hxd-ng:latest
+```
+
+In a container it listens on `0.0.0.0:5700` by default, since nothing
+outside can reach its loopback, and `-p` decides who reaches it. So the
+startup warning about a loopback relay with no trusted proxy (below)
+never appears there, though a proxy on the host is the usual case: it
+reaches the relay from Docker's gateway, which is what `gateway` in
+`HXD_RELAY_TRUSTED_PROXIES` stands for.
 
 ## Limits and proxies
 

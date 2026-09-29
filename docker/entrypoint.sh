@@ -5,6 +5,10 @@
 # container is the whole of reconfiguring it. docs/docker.md lists the
 # variables.
 #
+# With HXD_MODE=relay it runs hlrelay instead, in front of a classic
+# server elsewhere, with flags from HXD_RELAY_* variables; any flags
+# given to the container follow them.
+#
 #   hxd-entrypoint                          serve
 #   hxd-entrypoint registrar invites --add 5
 #   hxd-entrypoint news-reindex             any hxd subcommand, same config
@@ -500,6 +504,88 @@ admin() {
     } >"$accounts/$login.toml"
     echo "hxd-entrypoint: wrote account $login" >&2
 }
+
+# hlrelay's flags from HXD_RELAY_* variables, then the container's own,
+# so one given on the command line adds to the variables or, for a flag
+# given once, is the one hlrelay reads last. There is no config file and
+# no state: the relay is told everything at each start.
+relay() {
+    case ${1:-} in
+        -h | --help) exec hlrelay --help ;;
+        inbox | news-reindex | push | identity | registrar)
+            die "$1 is an hxd subcommand, and HXD_MODE=relay runs hlrelay" ;;
+    esac
+    [ -n "${HXD_RELAY_UPSTREAM:-}" ] ||
+        die "HXD_MODE=relay needs HXD_RELAY_UPSTREAM, the classic server's HOST:PORT"
+    given=$#
+    set -- "$@" --upstream "$HXD_RELAY_UPSTREAM"
+    if on HXD_RELAY_TRANSFERS on; then
+        [ -z "${HXD_RELAY_TRANSFER:-}" ] ||
+            set -- "$@" --transfer "$HXD_RELAY_TRANSFER"
+    else
+        [ -z "${HXD_RELAY_TRANSFER:-}" ] ||
+            die "HXD_RELAY_TRANSFER and HXD_RELAY_TRANSFERS=off contradict each other"
+        set -- "$@" --no-transfers
+    fi
+    # hlrelay listens on loopback by default, for a proxy on its host;
+    # in a container nothing else can reach that.
+    old_ifs=$IFS
+    IFS=$(printf ', \t')
+    for addr in ${HXD_RELAY_LISTEN:-0.0.0.0:5700}; do
+        # A doubled or trailing comma splits into an empty entry, which
+        # is skipped, as addresses() and kvlist() skip one.
+        case $addr in
+            "") continue ;;
+        esac
+        set -- "$@" --listen "$addr"
+    done
+    IFS=$old_ifs
+    [ -z "${HXD_RELAY_NAME:-}" ] || set -- "$@" --name "$HXD_RELAY_NAME"
+    for var in MAX_CONNECTIONS MAX_PENDING MAX_PER_ADDRESS; do
+        eval "v=\${HXD_RELAY_$var:-}"
+        case $v in
+            "") continue ;;
+            *[!0-9]*) die "HXD_RELAY_$var must be a whole number, got \"$v\"" ;;
+        esac
+        set -- "$@" "--$(echo "$var" | tr 'A-Z_' 'a-z-')" "$v"
+    done
+    # `gateway` as in HXD_NG_TRUSTED_PROXIES, and never by default.
+    IFS=$(printf ', \t')
+    for item in ${HXD_RELAY_TRUSTED_PROXIES:-}; do
+        case $item in
+            "" | none) continue ;;
+            gateway)
+                item=$(gateway)
+                if [ -z "$item" ]; then
+                    echo "hxd-entrypoint: HXD_RELAY_TRUSTED_PROXIES: no default gateway" >&2
+                    continue
+                fi
+                echo "hxd-entrypoint: HXD_RELAY_TRUSTED_PROXIES: the gateway is $item" >&2
+                ;;
+        esac
+        set -- "$@" --trusted-proxy "$item"
+    done
+    IFS=$old_ifs
+    [ -z "${HXD_RELAY_FORWARDED_HEADER:-}" ] ||
+        set -- "$@" --forwarded-header "$HXD_RELAY_FORWARDED_HEADER"
+    # The container's own arguments, moved from the front to the end.
+    while [ "$given" -gt 0 ]; do
+        set -- "$@" "$1"
+        shift
+        given=$((given - 1))
+    done
+    exec hlrelay "$@"
+}
+
+case ${HXD_MODE:-server} in
+    server)
+        for var in $(env | sed -n 's/^\(HXD_RELAY_[A-Z_]*\)=.*/\1/p'); do
+            echo "hxd-entrypoint: $var ignored: HXD_MODE is not relay" >&2
+        done
+        ;;
+    relay) relay "$@" ;;
+    *) die "HXD_MODE must be server or relay, got \"$HXD_MODE\"" ;;
+esac
 
 if [ -f "$HXD_CONFIG" ]; then
     # The file is the operator's, and it may keep its accounts anywhere.

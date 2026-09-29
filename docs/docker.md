@@ -1,12 +1,16 @@
 # Running hxd-ng in Docker
 
-The image in the repository's `Dockerfile` is for operators: `hxd` and
-`hlid` on Debian slim, running as an unprivileged user (uid 10001), with
-every piece of state in one volume and the configuration taken from
-environment variables. It is meant to sit behind a TLS-terminating
-reverse proxy — nginx, Caddy, or whatever already fronts the host —
-because the ng port speaks plaintext HTTP and WebSocket
-([hotline-ng.md](hotline-ng.md)).
+The image in the repository's `Dockerfile` is for operators: `hxd`,
+`hlid` and `hlrelay` on Debian slim, running as an unprivileged user
+(uid 10001), with every piece of state in one volume and the
+configuration taken from environment variables. It is meant to sit
+behind a TLS-terminating reverse proxy — nginx, Caddy, or whatever
+already fronts the host — because the ng port speaks plaintext HTTP and
+WebSocket ([hotline-ng.md](hotline-ng.md)).
+
+It runs the server unless told otherwise. `HXD_MODE=relay` runs
+`hlrelay` instead, in front of a classic server that is not hxd-ng
+([relay mode](#relay-mode)).
 
 ## Quick start
 
@@ -418,8 +422,106 @@ Anything that is not a subcommand runs as given, so
 SIGTERM, which hxd handles; there is no need for `--init`.
 
 The image's health check opens a connection to the legacy port from
-inside the container. A mounted config that moves that port needs
-`--health-cmd` to match, or `--no-healthcheck`.
+inside the container (a relay's, to its own port). A mounted config that
+moves that port needs `--health-cmd` to match, or `--no-healthcheck`.
+
+## Relay mode
+
+With `HXD_MODE=relay` the image runs `hlrelay` ([relay.md](relay.md))
+rather than the server: a WebSocket front for a classic Hotline server
+that has none — hxd 0.x, mhxd, Janus, Mobius — so that a web client can
+reach it. hxd-ng does not need one; its ng port serves the same paths.
+
+A relay has no config file and no state. At each start the entry point
+turns the variables below into `hlrelay`'s flags, and writes nothing.
+Flags given after the image name follow them, so a flag given there once
+wins over its variable, and a repeatable one adds to the list:
+`docker run ... ghcr.io/mishan/hxd-ng:latest --max-pending 64`. None of
+the server's variables apply, and the `HXD_RELAY_*` variables are
+reported and ignored when the image runs the server.
+
+| Variable | Default | |
+|---|---|---|
+| `HXD_MODE` | `server` | `relay` runs `hlrelay`; `server`, or leaving it unset, runs `hxd` as above. |
+| `HXD_RELAY_UPSTREAM` | required | The classic server's `HOST:PORT` (`--upstream`). Resolved at each connection, so a container name works. |
+| `HXD_RELAY_TRANSFER` | the upstream's port plus one | Its transfer port, when it is not the next one (`--transfer`). |
+| `HXD_RELAY_TRANSFERS` | `on` | `off` serves no `/htxf` (`--no-transfers`), for a server with no files and no banner. Setting `HXD_RELAY_TRANSFER` as well is refused. |
+| `HXD_RELAY_LISTEN` | `0.0.0.0:5700` | Where it listens inside the container, comma- or space-separated (`--listen`, once for each). |
+| `HXD_RELAY_NAME` | `hlrelay` | The server's name in discovery (`--name`). Set it: a relay cannot ask the server its name. |
+| `HXD_RELAY_MAX_CONNECTIONS` | 512 | Sockets relayed at once, control and transfer together (`--max-connections`). |
+| `HXD_RELAY_MAX_PENDING` | 128 | Connections accepted and not yet upgraded (`--max-pending`). |
+| `HXD_RELAY_MAX_PER_ADDRESS` | 16 | Connections one client address holds at once; 0 for no limit (`--max-per-address`). |
+| `HXD_RELAY_TRUSTED_PROXIES` | none | Proxies whose forwarded header is believed, comma- or space-separated addresses and CIDR blocks (`--trusted-proxy`, once for each). `gateway` is the container's default gateway, as in `HXD_NG_TRUSTED_PROXIES` ([the proxy](#the-proxy)); `none` believes nobody. |
+| `HXD_RELAY_FORWARDED_HEADER` | `x-forwarded-for` | Or `forwarded`, or `none` (`--forwarded-header`). |
+| `RUST_LOG` | `info` | The log level. |
+
+**The listen address.** `hlrelay` on its own listens on
+`127.0.0.1:5700`, for a proxy on the same host; inside a container
+nothing else can reach loopback, so the image listens on `0.0.0.0:5700`
+and `-p` chooses what the host publishes. Publish it on loopback, as the
+server's ng port is, when a proxy on the host fronts it — which a
+browser needs, since the relay speaks plain HTTP. One consequence: the
+warning `hlrelay` gives at startup when it listens only on loopback with
+no trusted proxy never appears in the container, though the case it
+warns about is the usual one here. A proxy on the host reaches the
+relay through Docker from the gateway, and unless
+`HXD_RELAY_TRUSTED_PROXIES` names it every client behind the proxy
+shares one address's limit. Trusting `gateway` is safe only while 5700
+is published on loopback alone, for the reasons [the proxy](#the-proxy)
+gives.
+
+**Reaching the server.** Inside the container `127.0.0.1` is the
+container. A classic server on the host is `host.docker.internal` with
+`--add-host host.docker.internal:host-gateway`, and must listen on an
+address the container can reach, not loopback alone; a server in
+another container is its name on a network the two share. Every relayed
+client then arrives at the server from one address — the gateway, or
+the relay container's own — which the server should exempt from its
+per-address limits ([relay.md](relay.md#what-it-changes-for-the-server)).
+Keep the relay on the server's host: the hop between them is plain TCP.
+
+```sh
+docker run -d --name hlrelay --restart unless-stopped \
+  -p 127.0.0.1:5700:5700 \
+  --add-host host.docker.internal:host-gateway \
+  -e HXD_MODE=relay \
+  -e HXD_RELAY_UPSTREAM=host.docker.internal:5500 \
+  -e HXD_RELAY_NAME="My Hotline Server" \
+  -e HXD_RELAY_TRUSTED_PROXIES=gateway \
+  ghcr.io/mishan/hxd-ng:latest
+```
+
+The same with Compose:
+
+```yaml
+services:
+  hlrelay:
+    image: ghcr.io/mishan/hxd-ng:latest
+    container_name: hlrelay
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5700:5700"   # only the proxy on this host reaches it
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      HXD_MODE: relay
+      HXD_RELAY_UPSTREAM: "host.docker.internal:5500"
+      HXD_RELAY_NAME: "My Hotline Server"
+      HXD_RELAY_TRUSTED_PROXIES: "gateway"
+```
+
+The proxy in front is the server's: `docker/nginx.conf` works as it
+is, its line about `X-Hotline-Client-Cert` doing nothing, since a relay
+never reads that header. Clients look for a relay on the classic port plus 200
+([relay.md](relay.md#where-clients-find-it)), so a server on 5500 wants
+the proxy on 5700.
+
+The image declares a volume for the server's state. A relay mounts
+none, so Docker gives it an anonymous one it never writes to;
+`docker rm -v` removes it with the container. The health check asks the
+port of the first `HXD_RELAY_LISTEN` address on 127.0.0.1, so a first
+address other than a wildcard address or 127.0.0.1 needs `--health-cmd`.
+`docker stop` ends the relay cleanly, closing the sockets it carries.
 
 ## Building
 
@@ -437,7 +539,9 @@ serve is a startup error rather than a silently ignored promise.
 `RUST_VERSION` and `DEBIAN_RELEASE` pick the toolchain image and the base.
 
 CI builds the image on every pull request and starts it once, checking
-that the legacy port and the ng discovery endpoint answer; a merge to
+that the legacy port and the ng discovery endpoint answer, then again in
+relay mode in front of the first, checking that the relay answers
+discovery and carries `/trtp` to the classic port; a merge to
 `main` does the same and then publishes it
 (`.github/workflows/docker.yml`). The published image is linux/amd64
 only: building the Rust workspace for arm64 under emulation would take

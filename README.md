@@ -167,6 +167,8 @@ To run it as a service instead, the `Dockerfile` builds an image
 configured from environment variables, meant to sit behind nginx or
 another TLS-terminating proxy; each merge to main publishes it as
 `ghcr.io/mishan/hxd-ng`. [docs/docker.md](docs/docker.md) has the rest.
+The same image runs `hlrelay` in front of a classic server, with
+`HXD_MODE=relay` (`docs/docker.md`, "Relay mode").
 
 ### Say hello
 
