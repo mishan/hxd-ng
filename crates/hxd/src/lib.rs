@@ -1153,6 +1153,25 @@ pub struct VoiceSection {
         deserialize_with = "deserialize_max_per_room"
     )]
     pub max_per_room: usize,
+    /// Joins one session may make in `join_seconds`, earned back
+    /// steadily; 0 for no limit. A join renegotiates the whole room it
+    /// enters and the one it leaves. A leave is never limited.
+    #[serde(default = "default_voice_joins")]
+    pub joins: u32,
+    #[serde(default = "default_voice_join_seconds")]
+    pub join_seconds: u64,
+    /// How long a room's status waits after a mute (or pause) flip, so a
+    /// burst of them is announced once with the state it ended in; 0
+    /// announces each at once. The spec recommends about 100 ms.
+    #[serde(default = "default_status_debounce_ms")]
+    pub status_debounce_ms: u64,
+    /// Inbound RTP is dropped past this multiple of each stream's
+    /// ceiling — 64 kbps for PCMU audio, `max_bitrate` for a camera,
+    /// `screen_max_bitrate` for a screen — rather than forwarded to
+    /// everyone else in the room; 0 turns policing off. See
+    /// `hxd_voice::police` for why the default is 1.5.
+    #[serde(default = "default_police_factor")]
+    pub police_factor: f64,
     /// Video chat. Absent = disabled, which is the video spec's
     /// `EnableVideo` default.
     ///
@@ -1207,6 +1226,36 @@ where
 }
 
 impl VoiceSection {
+    /// The per-session signaling allowances this section describes,
+    /// with `[voice.video]`'s.
+    pub fn voice_limits(&self) -> Result<hxd_core::VoiceLimits, String> {
+        let (changes, change_seconds) = self.video.as_ref().map_or(
+            (default_video_changes(), default_video_change_seconds()),
+            |v| (v.changes, v.change_seconds),
+        );
+        if (self.joins != 0 && self.join_seconds == 0) || (changes != 0 && change_seconds == 0) {
+            return Err("[voice] a count needs its seconds: set both, or the count to 0".into());
+        }
+        // Below 1 the policer would drop an honest encoder's traffic
+        // under the very `b=AS` ceiling this server advertised to it, so
+        // it is refused rather than accepted as a stricter setting.
+        let f = self.police_factor;
+        if !f.is_finite() || f < 0.0 || (f > 0.0 && f < 1.0) {
+            return Err(format!(
+                "[voice] police_factor {f} must be 0 (off) or at least 1: \
+                 below 1 it drops media that stays within the ceiling \
+                 clients are told"
+            ));
+        }
+        Ok(hxd_core::VoiceLimits {
+            joins: self.joins,
+            joins_per: Duration::from_secs(self.join_seconds),
+            video_changes: changes,
+            video_changes_per: Duration::from_secs(change_seconds),
+            status_debounce: Duration::from_millis(self.status_debounce_ms),
+        })
+    }
+
     /// The per-kind ceilings this section describes.
     pub fn video_config(&self) -> hxd_core::VideoConfig {
         self.video.as_ref().map_or_else(
@@ -1250,6 +1299,15 @@ pub struct VideoSection {
     pub screen_max_fps: u16,
     #[serde(default = "default_screen_bitrate")]
     pub screen_max_bitrate: u32,
+    /// Video starts and subscription changes one session may make in
+    /// `change_seconds`; 0 for no limit. Only a subscription change that
+    /// adds a live publication counts. A stop, a pause or a narrowed
+    /// subscription set is never limited: turning video off has to work
+    /// every time.
+    #[serde(default = "default_video_changes")]
+    pub changes: u32,
+    #[serde(default = "default_video_change_seconds")]
+    pub change_seconds: u64,
 }
 
 impl VideoSection {
@@ -1275,6 +1333,27 @@ impl VideoSection {
 
 fn default_max_per_room() -> usize {
     hxd_core::DEFAULT_MAX_PER_ROOM
+}
+fn default_voice_joins() -> u32 {
+    hxd_core::VoiceLimits::DEFAULT.joins
+}
+fn default_voice_join_seconds() -> u64 {
+    hxd_core::VoiceLimits::DEFAULT.joins_per.as_secs()
+}
+fn default_status_debounce_ms() -> u64 {
+    hxd_core::VoiceLimits::DEFAULT.status_debounce.as_millis() as u64
+}
+/// `hxd_voice::police::DEFAULT_FACTOR`, written out because `hxd-voice`
+/// is an optional dependency and the config still parses without it; a
+/// test with the `voice` feature holds the two together.
+fn default_police_factor() -> f64 {
+    1.5
+}
+fn default_video_changes() -> u32 {
+    hxd_core::VoiceLimits::DEFAULT.video_changes
+}
+fn default_video_change_seconds() -> u64 {
+    hxd_core::VoiceLimits::DEFAULT.video_changes_per.as_secs()
 }
 fn default_max_cameras() -> u16 {
     hxd_core::VideoLimits::CAMERA.max_per_room
@@ -2448,6 +2527,9 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     }
     config.limits.conn_limits()?;
     config.limits.flood_limits(config.server.ban_time)?;
+    if let Some(voice) = &config.voice {
+        voice.voice_limits()?;
+    }
     config.limits.request_limits()?;
     config.limits.login_limits()?;
     if config.server.queue_budget() == 0 {
@@ -3333,7 +3415,11 @@ pub fn build_ctx(
                 .with_login_limits(login_limits)
                 .with_queue_budget(budget)
                 .with_logins_in_flight(config.server.logins_in_flight)
-                .with_voice(v.media(), v.max_per_room());
+                .with_voice(v.media(), v.max_per_room())
+                .with_voice_limits(config.voice.as_ref().map_or(
+                    Ok(hxd_core::VoiceLimits::DEFAULT),
+                    VoiceSection::voice_limits,
+                )?);
             // `with_video` is a no-op without a media layer, so the
             // dependency holds even if this ordering ever changes.
             if video_enabled(config) {
@@ -4510,6 +4596,8 @@ sync = "full"
             screen_max_height: 1081,
             screen_max_fps: 16,
             screen_max_bitrate: 2_500_001,
+            changes: 13,
+            change_seconds: 14,
         }
     }
 
@@ -4579,6 +4667,79 @@ sync = "full"
             c.voice.as_ref().unwrap().video_config().camera.max_width,
             hxd_core::VideoLimits::CAMERA.max_width
         );
+    }
+
+    #[test]
+    fn the_voice_allowances_default_and_are_read_from_both_tables() {
+        let c = parse("[voice]\nadvertise = [\"198.51.100.9:5504\"]\n").unwrap();
+        let voice = c.voice.as_ref().unwrap();
+        assert_eq!(
+            voice.voice_limits().unwrap(),
+            hxd_core::VoiceLimits::DEFAULT
+        );
+        assert_eq!(voice.police_factor, 1.5);
+
+        let c = parse(
+            r#"
+            [voice]
+            advertise = ["198.51.100.9:5504"]
+            joins = 3
+            join_seconds = 30
+            status_debounce_ms = 0
+            police_factor = 2
+
+            [voice.video]
+            changes = 7
+            change_seconds = 21
+            "#,
+        )
+        .expect("every allowance set");
+        let voice = c.voice.as_ref().unwrap();
+        assert_eq!(voice.police_factor, 2.0, "an integer is a factor too");
+        assert_eq!(
+            voice.voice_limits().unwrap(),
+            hxd_core::VoiceLimits {
+                joins: 3,
+                joins_per: Duration::from_secs(30),
+                video_changes: 7,
+                video_changes_per: Duration::from_secs(21),
+                status_debounce: Duration::ZERO,
+            }
+        );
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn the_default_police_factor_is_the_policers_own() {
+        assert_eq!(default_police_factor(), hxd_voice::police::DEFAULT_FACTOR);
+    }
+
+    #[test]
+    fn a_police_factor_of_zero_or_at_least_one_is_accepted() {
+        for ok in ["0", "1", "1.0", "3"] {
+            let c = parse(&format!(
+                "[voice]\nadvertise = [\"198.51.100.9:5504\"]\npolice_factor = {ok}\n"
+            ))
+            .unwrap();
+            assert!(check_config(&c).is_ok(), "police_factor = {ok} was refused");
+        }
+    }
+
+    #[test]
+    fn a_voice_allowance_without_its_seconds_or_a_factor_under_one_is_refused() {
+        for bad in [
+            "joins = 3\njoin_seconds = 0\n",
+            "police_factor = -1\n",
+            "police_factor = 0.5\n",
+            "police_factor = nan\n",
+            "[voice.video]\nchanges = 3\nchange_seconds = 0\n",
+        ] {
+            let c = parse(&format!(
+                "[voice]\nadvertise = [\"198.51.100.9:5504\"]\n{bad}"
+            ))
+            .unwrap();
+            assert!(check_config(&c).is_err(), "{bad:?} was accepted");
+        }
     }
 
     #[test]

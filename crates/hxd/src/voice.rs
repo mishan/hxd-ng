@@ -167,6 +167,10 @@ mod tests {
             bind: bind.map(str::to_string),
             advertise: advertise.iter().map(|s| s.to_string()).collect(),
             max_per_room: 16,
+            joins: 5,
+            join_seconds: 10,
+            status_debounce_ms: 100,
+            police_factor: 1.5,
             video: None,
         }
     }
@@ -325,6 +329,9 @@ mod imp {
             Box::new(std::time::Instant::now),
         )
         .map_err(|e| e.to_string())?;
+        if let Some(v) = &config.voice {
+            sfu.set_police_factor(v.police_factor);
+        }
         // Bind here, not in `serve`. Everything downstream — the
         // capability bit on both wires, `Core::with_voice`, the room
         // state — is a promise that a join will work, and a port that
@@ -418,3 +425,25 @@ mod imp {
 }
 
 pub use imp::{build, Voice};
+
+/// Send each room the statuses its debounce was holding back, as their
+/// windows close (`Core::voice_flush_status`).
+///
+/// The domain schedules nothing, so the timer is here: the task sleeps
+/// until the next status is due, or until the domain says a room has
+/// started owing one, and costs nothing on a server whose rooms are
+/// quiet. Run for as long as the server has voice.
+pub async fn debounce(core: Arc<Core>) {
+    let wake = core.voice_status_wake();
+    loop {
+        match core.voice_flush_status(std::time::Instant::now()) {
+            Some(due) => {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(due.into()) => {}
+                    _ = wake.notified() => {}
+                }
+            }
+            None => wake.notified().await,
+        }
+    }
+}

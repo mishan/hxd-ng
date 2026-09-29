@@ -14,6 +14,8 @@
 //! id 0**, not the push counter the rest of this frontend uses; see
 //! [`crate::session`]'s writer.
 
+use std::borrow::Cow;
+
 use hxd_core::voice::{IceCandidate, VoiceError, VoiceParticipant};
 use hxproto::messages::tag;
 use hxproto::voice::ice as wire_ice;
@@ -148,14 +150,32 @@ pub fn parse_ice(data: &[u8]) -> Option<IceCandidate> {
 /// Task-error text for a refused voice operation. The privilege refusal
 /// is worded exactly as the spec writes it; the rest follow this
 /// frontend's convention of saying something a human can act on.
-pub fn err_text(e: VoiceError) -> &'static str {
-    match e {
+pub fn err_text(e: VoiceError) -> Cow<'static, str> {
+    Cow::Borrowed(match e {
         VoiceError::Disabled => "Voice chat is not available on this server.",
         VoiceError::NoSuchChat => "That chat does not exist.",
         VoiceError::NotAMember => "You are not in that chat.",
         VoiceError::RoomFull => "That voice chat is full.",
         VoiceError::NotInVoice => "You are not in that voice chat.",
         VoiceError::BadAnswer => "Your client's voice session was rejected.",
+        // A classic client has no field for the wait, so the sentence
+        // carries it: the one number a user needs to act on.
+        VoiceError::RateLimited { retry_after } => {
+            return Cow::Owned(format!(
+                "You are joining voice chat too often. {}",
+                try_again_in(retry_after)
+            ));
+        }
+    })
+}
+
+/// "Try again in N seconds.", for a refusal that knows its wait. Shared
+/// with video's refusals.
+pub(crate) fn try_again_in(secs: u64) -> String {
+    if secs == 1 {
+        "Try again in a second.".to_owned()
+    } else {
+        format!("Try again in {secs} seconds.")
     }
 }
 
@@ -168,6 +188,18 @@ pub fn chat_id(cid: u32) -> (u16, Vec<u8>) {
 mod tests {
     use super::*;
     use hxproto::voice::parse_voice_participants;
+
+    #[test]
+    fn a_rate_limited_refusal_says_how_long_to_wait() {
+        assert_eq!(
+            err_text(VoiceError::RateLimited { retry_after: 10 }),
+            "You are joining voice chat too often. Try again in 10 seconds."
+        );
+        assert_eq!(
+            crate::video::err_text(hxd_core::video::VideoError::RateLimited { retry_after: 1 }),
+            "You are changing video too often. Try again in a second."
+        );
+    }
 
     #[test]
     fn the_participants_blob_round_trips_through_the_clients_parser() {

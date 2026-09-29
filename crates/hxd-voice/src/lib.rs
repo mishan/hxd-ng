@@ -38,6 +38,7 @@
 //! as the spec's own rejoin case does.
 
 pub mod peer;
+pub mod police;
 pub mod sdp;
 
 use std::collections::HashMap;
@@ -45,7 +46,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use hxd_core::video::{VideoConfig, VideoKind, VideoStream};
+use hxd_core::video::{PublishRefusal, VideoConfig, VideoKind, VideoStream};
 use hxd_core::voice::{IceCandidate, MediaEvent, VoiceError, VoiceMedia};
 use hxd_core::Uid;
 use str0m::config::DtlsCert;
@@ -56,6 +57,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info, warn};
 
 use crate::peer::Peer;
+use crate::police::{Policer, Verdict, PCMU_BITRATE, RTP_HEADER_BYTES};
 use crate::sdp::{host_candidates, MIC_MID, PCMU_PT, VP8_PT};
 
 /// The spec's timeouts, as minimums. All measured against the monotonic
@@ -193,6 +195,9 @@ struct Inner {
     /// The configured per-kind ceilings, reflected in `b=AS` on every
     /// video section. Configuration, not negotiation.
     video: VideoConfig,
+    /// The headroom inbound RTP is policed at over each stream's ceiling
+    /// ([`police`]); zero turns policing off.
+    police_factor: f64,
 }
 
 /// Which of a peer's streams a packet belongs to. Audio is the peer
@@ -202,6 +207,16 @@ struct Inner {
 enum Stream {
     Audio,
     Video(VideoKind),
+}
+
+impl Stream {
+    /// The label a metric carries for it.
+    fn label(self) -> &'static str {
+        match self {
+            Stream::Audio => "audio",
+            Stream::Video(k) => k.name(),
+        }
+    }
 }
 
 /// One packet on its way from one peer to the others.
@@ -264,6 +279,7 @@ impl Sfu {
                 next_session_id: 1,
                 video,
                 cert,
+                police_factor: police::DEFAULT_FACTOR,
             }),
             clock,
         });
@@ -272,6 +288,19 @@ impl Sfu {
 
     fn now(&self) -> Instant {
         (self.clock)()
+    }
+
+    /// Police inbound RTP at `factor` times each stream's ceiling rather
+    /// than [`police::DEFAULT_FACTOR`]; zero turns policing off. Applies
+    /// to sessions and publications begun after the call.
+    ///
+    /// A factor that is not zero should be at least 1: below it the
+    /// policer drops media an encoder sends within the `b=AS` ceiling the
+    /// server advertised. This takes the factor as given; `hxd` refuses
+    /// one between 0 and 1 at startup (`[voice] police_factor`), and a
+    /// negative or non-finite one turns policing off here.
+    pub fn set_police_factor(&self, factor: f64) {
+        self.inner.lock().unwrap().police_factor = factor;
     }
 
     /// Feed one received datagram. `to` is the local address it arrived
@@ -378,6 +407,17 @@ impl Sfu {
     /// How many participants are in voice right now (metrics, tests).
     pub fn peer_count(&self) -> usize {
         self.inner.lock().unwrap().peers.len()
+    }
+
+    /// How many distinct remote candidates `uid`'s session has handed
+    /// its ICE agent (tests).
+    pub fn remote_candidate_count(&self, uid: Uid) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .peers
+            .get(&uid)
+            .map_or(0, Peer::remote_candidate_count)
     }
 }
 
@@ -498,6 +538,10 @@ impl Inner {
         let uids: Vec<Uid> = self.peers.keys().copied().collect();
         let mut broken = Vec::new();
         let mut keyframes: Vec<(Uid, VideoKind)> = Vec::new();
+        // Streams the policer ended, and what it dropped, tallied here
+        // and recorded once per pass rather than once per packet.
+        let mut overrun: Vec<(Uid, Stream)> = Vec::new();
+        let mut policed: [u64; 3] = [0; 3];
         for uid in uids {
             let Some(peer) = self.peers.get_mut(&uid) else {
                 continue;
@@ -580,6 +624,29 @@ impl Inner {
                                 // sends uninvited.
                                 continue;
                             };
+                            // Policed only now, once the packet is one
+                            // that would be forwarded: what is muted,
+                            // paused or unattributable costs its inbound
+                            // bytes and is multiplied by nobody.
+                            let bytes = p.payload.len() + RTP_HEADER_BYTES;
+                            let police = match stream {
+                                Stream::Audio => Some(&mut peer.audio_police),
+                                Stream::Video(kind) => {
+                                    peer.publication_mut(kind).map(|p| &mut p.police)
+                                }
+                            };
+                            let verdict = police.map_or(Verdict::Pass, |p| p.admit(bytes, now));
+                            if verdict != Verdict::Pass {
+                                policed[match stream {
+                                    Stream::Audio => 0,
+                                    Stream::Video(VideoKind::Camera) => 1,
+                                    Stream::Video(VideoKind::Screen) => 2,
+                                }] += 1;
+                                if verdict == Verdict::End && !overrun.contains(&(uid, stream)) {
+                                    overrun.push((uid, stream));
+                                }
+                                continue;
+                            }
                             forwards.push(Forward {
                                 from: uid,
                                 cid: peer.cid,
@@ -613,10 +680,48 @@ impl Inner {
         for uid in broken {
             self.fail(uid);
         }
+        for (i, stream) in ["audio", "camera", "screen"].into_iter().enumerate() {
+            if policed[i] > 0 {
+                hxd_core::instrument::voice_policed(stream, policed[i]);
+            }
+        }
+        for (uid, stream) in overrun {
+            self.overrun(uid, stream, &mut forwards);
+        }
         for (uid, kind) in keyframes {
             self.request_keyframe(uid, kind, now);
         }
         forwards
+    }
+
+    /// End a stream that has stayed far over its rate: the publication,
+    /// for video, exactly as a stalled one is ended and with the call
+    /// left alone; the whole session, for audio, which is the call. What
+    /// it had queued this pass goes with it.
+    fn overrun(&mut self, uid: Uid, stream: Stream, forwards: &mut Vec<Forward>) {
+        let Some(peer) = self.peers.get_mut(&uid) else {
+            return;
+        };
+        let cid = peer.cid;
+        forwards.retain(|f| !(f.from == uid && (stream == Stream::Audio || f.stream == stream)));
+        hxd_core::instrument::voice_policed_end(stream.label());
+        match stream {
+            Stream::Audio => {
+                warn!(uid, cid, "voice session ended: audio far over its rate");
+                self.fail(uid);
+            }
+            Stream::Video(kind) => {
+                warn!(
+                    uid,
+                    cid,
+                    ?kind,
+                    "video publication ended: far over its rate"
+                );
+                if peer.undeclare_video_send(kind) {
+                    self.emit(MediaEvent::VideoFailed { uid, cid, kind });
+                }
+            }
+        }
     }
 
     /// Ask a publisher for a keyframe, no more than once a second per
@@ -745,6 +850,7 @@ impl VoiceMedia for Sfu {
         let extra = inner.extra_locals.clone();
         let cert = inner.cert.clone();
         let mut peer = Peer::new(cid, now, &candidates, &extra, cert, session_id, 0);
+        peer.audio_police = Policer::new(PCMU_BITRATE, inner.police_factor);
         // str0m's own SSRC allocator: random, and one less dependency
         // than reaching for a CSPRNG here.
         peer.forward_ssrc = *peer.rtc.direct_api().new_ssrc();
@@ -905,7 +1011,15 @@ impl VoiceMedia for Sfu {
             return;
         };
         match Candidate::from_sdp_string(&candidate.candidate) {
-            Ok(c) => peer.rtc.add_remote_candidate(c),
+            Ok(c) => {
+                if !peer.add_remote_candidate(c) {
+                    debug!(
+                        uid,
+                        cid, "ignoring ICE candidate: the session holds as many as it takes"
+                    );
+                    hxd_core::instrument::voice_ice_ignored();
+                }
+            }
             Err(e) => debug!(uid, cid, "ignoring unparseable ICE candidate: {e}"),
         }
     }
@@ -934,14 +1048,14 @@ impl VoiceMedia for Sfu {
         "VP8"
     }
 
-    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> bool {
+    fn publish(&self, uid: Uid, cid: u32, kind: VideoKind) -> Result<(), PublishRefusal> {
         let mut inner = self.inner.lock().unwrap();
         // The forwarding SSRC is allocated up front, exactly as audio's
         // is: the offer for a publication has to be complete before the
         // publisher's answer arrives, or every subscriber who joined
         // first would need renegotiating again the moment it did.
         //
-        // The `bool` matters. This can fail — the session may have been
+        // The refusal matters. This can fail — the session may have been
         // reaped with a `Failed` already in flight, or its offer may have
         // no room left for another section — and the domain has by this
         // point claimed a room slot and is about to announce the
@@ -951,24 +1065,28 @@ impl VoiceMedia for Sfu {
         // occupied by a publication that could never produce a pixel.
         // `answer` reports its failures through `VideoFailed` for exactly
         // this reason; this had no channel at all.
+        let limits = inner.video;
+        let factor = inner.police_factor;
         let Some(peer) = inner.peers.get_mut(&uid) else {
-            return false;
+            return Err(PublishRefusal::Unavailable);
         };
         if peer.cid != cid {
-            return false;
+            return Err(PublishRefusal::Unavailable);
         }
         let ssrc = *peer.rtc.direct_api().new_ssrc();
-        if !peer.declare_video_send(kind, ssrc) {
-            warn!(
-                uid,
-                cid,
-                ?kind,
-                "video publication refused: no room in the offer"
-            );
-            return false;
+        let police = Policer::new(limits.limits(kind).max_bitrate, factor);
+        if let Err(refusal) = peer.declare_video_send(kind, ssrc) {
+            // Debug, not warn: a full offer stays full, and a client
+            // retrying its start would otherwise write a warning per
+            // attempt. Its allowance is what bounds the attempts.
+            debug!(uid, cid, ?kind, ?refusal, "video publication refused");
+            return Err(refusal);
+        }
+        if let Some(p) = peer.publication_mut(kind) {
+            p.police = police;
         }
         info!(uid, cid, ?kind, "video publication started");
-        true
+        Ok(())
     }
 
     fn unpublish(&self, uid: Uid, cid: u32, kind: VideoKind) {

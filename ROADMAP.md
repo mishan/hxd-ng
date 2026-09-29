@@ -406,6 +406,10 @@ fetch a derivative by, and the mhxd importer.
   per server (`[limits]`). A post's 1.2 push reads the store once
   however many classic clients hear it, and the report ration makes room
   by forgetting its fullest buckets rather than everyone's.
+  Voice and video are bounded per session too (docs/voice.md §13): joins
+  and video changes are allowances, mute and pause flips are debounced,
+  inbound RTP is policed against each stream's ceiling, and trickled ICE
+  candidates are capped.
 - Fuzz the frame decoder (`cargo-fuzz` against the session layer's read
   path); a server's parser meets far more hostile input than a client's.
 

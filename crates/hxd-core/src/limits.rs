@@ -321,7 +321,7 @@ pub struct RateGate {
 /// grow before it is next walked.
 #[derive(Default)]
 struct RateTable {
-    map: HashMap<IpAddr, Bucket>,
+    map: HashMap<IpAddr, AddrBucket>,
     prune_at: usize,
     /// How many times the table has been walked, for the tests.
     #[cfg(test)]
@@ -330,7 +330,7 @@ struct RateTable {
 
 /// What one address has left of a [`RateGate`]'s burst, as of `at`.
 #[derive(Debug)]
-struct Bucket {
+struct AddrBucket {
     tokens: f64,
     at: Instant,
 }
@@ -396,9 +396,9 @@ impl RateGate {
         b.tokens = (b.tokens + 1.0).min(burst);
     }
 
-    fn bucket<'a>(&self, by: &'a mut RateTable, ip: IpAddr, now: Instant) -> &'a mut Bucket {
+    fn bucket<'a>(&self, by: &'a mut RateTable, ip: IpAddr, now: Instant) -> &'a mut AddrBucket {
         let (burst, every) = (self.burst, self.every);
-        let earned = |b: &Bucket| {
+        let earned = |b: &AddrBucket| {
             (b.tokens + now.duration_since(b.at).as_secs_f64() / every.as_secs_f64()).min(burst)
         };
         let key = limit_key(ip);
@@ -439,7 +439,7 @@ impl RateGate {
             }
             by.prune_at = by.map.len().saturating_mul(2).min(RATE_CAP);
         }
-        let b = by.map.entry(key).or_insert(Bucket {
+        let b = by.map.entry(key).or_insert(AddrBucket {
             tokens: burst,
             at: now,
         });
@@ -655,6 +655,51 @@ impl Window {
         if self.start.is_none_or(|s| now.duration_since(s) >= per) {
             self.start = Some(now);
             self.spent = 0;
+        }
+    }
+}
+
+/// A token bucket: `count` per `per`, refilled continuously.
+#[derive(Debug)]
+pub(crate) struct Bucket {
+    tokens: f64,
+    at: Instant,
+}
+
+impl Bucket {
+    /// Spend one of `count` per `per` from `slot`, filling it on first
+    /// use: `Err` with how long until one is earned back when there are
+    /// none left. A count or a period of 0 is no limit.
+    pub(crate) fn take(
+        slot: &mut Option<Bucket>,
+        count: u32,
+        per: Duration,
+        now: Instant,
+    ) -> Result<(), Duration> {
+        if count == 0 || per.is_zero() {
+            return Ok(());
+        }
+        let full = f64::from(count);
+        let b = slot.get_or_insert(Bucket {
+            tokens: full,
+            at: now,
+        });
+        let every = per.as_secs_f64() / full;
+        let earned = now.saturating_duration_since(b.at).as_secs_f64() / every;
+        b.tokens = (b.tokens + earned).min(full);
+        b.at = now;
+        if b.tokens < 1.0 {
+            return Err(Duration::from_secs_f64((1.0 - b.tokens) * every));
+        }
+        b.tokens -= 1.0;
+        Ok(())
+    }
+
+    /// Give back one [`Bucket::take`] just spent from `slot`, for an
+    /// operation that turned out not to happen. Never past `count`.
+    pub(crate) fn refund(slot: &mut Option<Bucket>, count: u32) {
+        if let Some(b) = slot {
+            b.tokens = (b.tokens + 1.0).min(f64::from(count));
         }
     }
 }

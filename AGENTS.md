@@ -299,7 +299,12 @@ Three layers, all `cargo test --workspace`:
   rotations published under both keys, a card's commitment, invites from
   the file and the command, the operator's commands on the running
   store, and `hlid register`, `revoke` and `rotate` driven as a user
-  would), `limits.rs` (so many connections from one address across both
+  would), `voice.rs` (voice signaling on both wires against a
+  recording media layer: the capability and privilege gates, the chunk
+  and JSON shapes, one room shared by a classic and an ng client, joins
+  past a session's allowance refused on each wire while leaves never
+  are, and a burst of mute flips announced once with its final state),
+  `limits.rs` (so many connections from one address across both
   wires, then a burst and a rate, a TLS handshake counted from accept,
   and an exempt address held to neither; a classic user's multi-line
   flood kicked once with the room told in mhxd's bytes, and a user past

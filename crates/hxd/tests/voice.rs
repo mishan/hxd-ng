@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use hxd_core::voice::fake::RecordingMedia;
-use hxd_core::Core;
+use hxd_core::{Core, VoiceLimits};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::caps::{cap, Caps};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
@@ -51,6 +51,24 @@ async fn start_server(dir: &Path, voice: bool) -> (SocketAddr, Arc<RecordingMedi
 
 /// A server on both wires, sharing one core — which is the whole point.
 async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<RecordingMedia>) {
+    start_with(dir, voice, None).await
+}
+
+/// The same, holding sessions to `limits` — which no address is exempt
+/// from, loopback included — with the debounce's timer running as the
+/// binary runs it.
+async fn start_limited(
+    dir: &Path,
+    limits: VoiceLimits,
+) -> (SocketAddr, SocketAddr, Arc<RecordingMedia>) {
+    start_with(dir, true, Some(limits)).await
+}
+
+async fn start_with(
+    dir: &Path,
+    voice: bool,
+    limits: Option<VoiceLimits>,
+) -> (SocketAddr, SocketAddr, Arc<RecordingMedia>) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     std::fs::write(
@@ -73,8 +91,16 @@ async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<Rec
     } else {
         Core::new()
     };
+    let core = match limits {
+        Some(limits) => core.with_voice_limits(limits),
+        None => core,
+    };
+    let core = Arc::new(core);
+    if limits.is_some() {
+        tokio::spawn(hxd::voice::debounce(core.clone()));
+    }
     let ctx = ServerCtx {
-        core: Arc::new(core),
+        core,
         auth: Arc::new(hxd_auth_file::FileAuth::new(accounts)),
         cfg: Arc::new(ServerConfig {
             name: "voice test".into(),
@@ -189,6 +215,54 @@ impl Ng {
             }
             self.pending.push(v);
         }
+    }
+
+    /// A request that must be refused: the whole `error` object.
+    async fn refused(&mut self, method: &str, params: Value) -> Value {
+        self.id += 1;
+        let id = self.id;
+        self.ws
+            .send(Message::Text(
+                json!({ "id": id, "req": method, "params": params }).to_string(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let v = self.recv().await;
+            if v["reply"] == json!(id) {
+                return v
+                    .get("error")
+                    .unwrap_or_else(|| panic!("{method} was not refused: {v}"))
+                    .clone();
+            }
+            self.pending.push(v);
+        }
+    }
+
+    /// Every event of this kind that arrives within `window`, buffering
+    /// anything else.
+    async fn events_within(&mut self, ev: &str, window: Duration) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        let mut i = 0;
+        while i < self.pending.len() {
+            if self.pending[i]["ev"] == json!(ev) {
+                out.push(self.pending.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + window;
+        while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, self.ws.next()).await {
+            if let Message::Text(t) = msg {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["ev"] == json!(ev) {
+                    out.push(v);
+                } else {
+                    self.pending.push(v);
+                }
+            }
+        }
+        out
     }
 
     async fn ok(&mut self, method: &str, params: Value) -> Value {
@@ -948,3 +1022,145 @@ async fn a_legacy_client_and_an_ng_client_share_one_voice_room() {
     old.recv_type(HDR_TASK).await;
     new.status_for(&[(new.uid, true)]).await;
 }
+
+// --- Allowances and the status debounce ---------------------------------
+
+#[tokio::test]
+async fn a_burst_of_mute_flips_is_announced_once_with_the_state_it_ended_in() {
+    // Push-to-talk on a flaky key: five flips in a few milliseconds. Each
+    // is enforced at once and acked at once; the room, on either wire,
+    // hears about it once, when the window closes.
+    //
+    // The window is fixed from the first flip, so "once" holds only while
+    // the whole burst lands inside it. It is set far wider than the
+    // spec's 100 ms for that reason: five loopback round trips take
+    // milliseconds, and a runner slow enough to spend seconds on them
+    // fails the elapsed check below, which says so, rather than the
+    // count, which would not.
+    let window = Duration::from_secs(2);
+    let td = tempfile::tempdir().unwrap();
+    let (addr, ng, media) = start_limited(
+        td.path(),
+        VoiceLimits {
+            status_debounce: window,
+            ..VoiceLimits::default()
+        },
+    )
+    .await;
+    let mut a = Client::login(addr, "talker", true).await;
+    let mut b = Ng::login(ng, "talker").await;
+    a.join_voice(0).await;
+    b.join_voice(0).await;
+    a.status_for(&[(a.uid, false), (b.uid, false)]).await;
+    b.status_for(&[(a.uid, false), (b.uid, false)]).await;
+    a.pending.clear();
+    b.pending.clear();
+    media.take_calls();
+
+    let burst = std::time::Instant::now();
+    for (i, muted) in [1u16, 0, 1, 0, 1].into_iter().enumerate() {
+        let t = a
+            .send(
+                REQ_VOICE_MUTE,
+                &[chat_id(0), (tag::VOICE_MUTED, muted.to_be_bytes().to_vec())],
+            )
+            .await;
+        let reply = a.recv_type(HDR_TASK).await;
+        assert_eq!((reply.trans, reply.flag), (t, 0), "flip {i} acked");
+    }
+    let took = burst.elapsed();
+    assert!(
+        took < window,
+        "the burst took {took:?}, longer than the {window:?} window it must fit in"
+    );
+    assert_eq!(
+        media
+            .take_calls()
+            .iter()
+            .filter(|c| matches!(c, hxd_core::voice::fake::MediaCall::SetMuted { .. }))
+            .count(),
+        5,
+        "every flip is enforced as it arrives"
+    );
+
+    // Long enough past the window for a second status, had the burst
+    // been split across two, to have arrived.
+    let heard = b
+        .events_within("voice_status", window + Duration::from_millis(500))
+        .await;
+    assert_eq!(heard.len(), 1, "one status for the burst: {heard:?}");
+    assert_eq!(
+        ng_participants(&heard[0]),
+        vec![(a.uid, true), (b.uid, false)]
+    );
+    let status = a.recv_type(NOTIFY_VOICE_STATUS).await;
+    assert_eq!(participants(&status), vec![(a.uid, true), (b.uid, false)]);
+    a.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn joins_past_the_allowance_are_refused_on_both_wires_and_leaves_never_are() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, ng, _media) = start_limited(
+        td.path(),
+        VoiceLimits {
+            joins: 2,
+            joins_per: Duration::from_secs(60),
+            ..VoiceLimits::default()
+        },
+    )
+    .await;
+
+    // The ng wire: `rate_limited`, with how long to wait.
+    let mut n = Ng::login(ng, "talker").await;
+    for _ in 0..2 {
+        n.ok("voice_join", json!({ "cid": 0 })).await;
+        n.ok("voice_leave", json!({ "cid": 0 })).await;
+    }
+    let err = n.refused("voice_join", json!({ "cid": 0 })).await;
+    assert_eq!(err["code"], json!("rate_limited"));
+    // A join is earned back every thirty seconds, and the wait is rounded
+    // up to whole seconds from when it is asked, so a slow runner that
+    // took a second or two over the round trips above sees a little less.
+    let wait = err["retry_after"]
+        .as_u64()
+        .expect("retry_after is a number");
+    assert!(
+        (WAIT_FLOOR..=30).contains(&wait),
+        "a join every thirty seconds, got {wait}"
+    );
+
+    // The classic wire: an ordinary task error, which every client can
+    // show. The allowance is the session's, so this one starts full.
+    let mut c = Client::login(addr, "talker", true).await;
+    for _ in 0..2 {
+        c.send(REQ_VOICE_JOIN, &[chat_id(0)]).await;
+        assert_eq!(c.recv_type(HDR_TASK).await.flag, 0);
+        let t = c.send(REQ_VOICE_LEAVE, &[chat_id(0)]).await;
+        let reply = c.recv_type(HDR_TASK).await;
+        assert_eq!(
+            (reply.trans, reply.flag),
+            (t, 0),
+            "a leave is never refused"
+        );
+    }
+    let t = c.send(REQ_VOICE_JOIN, &[chat_id(0)]).await;
+    let reply = c.recv_type(HDR_TASK).await;
+    assert_eq!((reply.trans, reply.flag), (t, 1));
+    // With the wait in words, since the wire has nowhere else for it.
+    let text = task_error(&reply);
+    let wait: u64 = text
+        .strip_suffix(" seconds.")
+        .and_then(|t| t.rsplit_once("too often. Try again in "))
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or_else(|| panic!("no wait in {text:?}"));
+    assert!(
+        (WAIT_FLOOR..=30).contains(&wait),
+        "a join every thirty seconds, got {wait} in {text:?}"
+    );
+}
+
+/// The least a thirty-second wait may have come down to by the time a
+/// test reads it: the allowance is spent a few round trips before the
+/// refusal, and a loaded runner can take seconds over them.
+const WAIT_FLOOR: u64 = 25;

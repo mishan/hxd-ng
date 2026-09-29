@@ -457,6 +457,40 @@ pub fn voice_call(op: &'static str, took: Timer) {
     let _ = (op, took);
 }
 
+/// A voice operation refused because the session had spent its
+/// allowance (`crate::voice::VoiceLimits`): `join` or `video`.
+pub fn voice_refused(what: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_voice_refused_total", "what" => what).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = what;
+}
+
+/// Inbound RTP the SFU dropped for arriving faster than its stream may:
+/// `packets` of `stream` (`audio`, `camera`, `screen`).
+pub fn voice_policed(stream: &'static str, packets: u64) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_voice_policed_packets_total", "stream" => stream).increment(packets);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (stream, packets);
+}
+
+/// A stream the SFU ended for staying far over its rate: the session,
+/// for `audio`, or the publication, for `camera` or `screen`.
+pub fn voice_policed_end(stream: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_voice_policed_ends_total", "stream" => stream).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = stream;
+}
+
+/// A client's trickled ICE candidate the SFU ignored because the session
+/// already holds as many as it takes.
+pub fn voice_ice_ignored() {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_voice_ice_ignored_total").increment(1);
+}
+
 /// A file transfer in progress, `download` or `upload`, until the guard
 /// drops.
 pub fn transfer_open(dir: &'static str) -> Open {

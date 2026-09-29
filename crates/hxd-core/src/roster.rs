@@ -713,6 +713,8 @@ pub(crate) struct UserSession {
     pub(crate) can_spam: bool,
     /// What this session has spent of its flood allowances.
     pub(crate) flood: crate::limits::Flood,
+    /// And of its voice signaling allowances (`crate::voice`).
+    pub(crate) voice_flood: crate::voice::VoiceFlood,
     /// What it has left of its ng request limit, or `None` when there is
     /// no limit ([`Core::spend_request`]). The session's rather than a
     /// connection's, as the flood allowances are, so a resume carries on
@@ -1511,6 +1513,7 @@ impl Core {
                 moderate: info.moderate,
                 can_spam: info.can_spam,
                 flood: Default::default(),
+                voice_flood: Default::default(),
                 requests: crate::RateBucket::new(
                     self.request_limits.requests,
                     self.request_limits.requests_per,

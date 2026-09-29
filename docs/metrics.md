@@ -132,6 +132,10 @@ that is tried waits a tenth of a second at most for a reader.
 | `hxd_outbox_broken_total` | | detached buffers that overflowed |
 | `hxd_outbox_lagged_total` | `bound` | attached sessions whose client fell behind and was cut off: `count` for a whole channel (8192 events), `own` for its 16 MiB, `server` for more than the queues hold on average once the server's budget was spent |
 | `hxd_voice_media_seconds` | `op` | each call into the SFU, all made under the roster lock |
+| `hxd_voice_refused_total` | `what` | voice operations refused because the session had spent its allowance: `join`, or `video` for a start or a subscription change that adds a live stream (docs/voice.md §13) |
+| `hxd_voice_policed_packets_total` | `stream` | inbound RTP the SFU dropped for arriving faster than its stream may: `audio`, `camera`, `screen` |
+| `hxd_voice_policed_ends_total` | `stream` | streams ended for staying far over their rate: the session for `audio`, the publication for `camera` or `screen` |
+| `hxd_voice_ice_ignored_total` | | trickled ICE candidates ignored because the session already held as many as it takes |
 
 A fan-out runs under the roster lock, and so does its recording: once
 per event, whatever its reach, so the cost inside the hold is a

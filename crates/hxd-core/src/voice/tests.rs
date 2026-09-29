@@ -911,3 +911,219 @@ fn a_user_who_is_not_on_the_roster_cannot_join() {
     let (core, _media) = voiced(DEFAULT_MAX_PER_ROOM);
     assert_eq!(core.voice_join(4242, 0), Err(VoiceError::NotAMember));
 }
+
+// --- Allowances and the status debounce --------------------------------
+
+fn limited(limits: VoiceLimits) -> (Core, Arc<RecordingMedia>) {
+    let media = Arc::new(RecordingMedia::new());
+    let core = Core::new()
+        .with_voice(media.clone(), DEFAULT_MAX_PER_ROOM)
+        .with_voice_limits(limits);
+    (core, media)
+}
+
+#[test]
+fn a_burst_of_mute_flips_reaches_the_room_as_one_status_with_the_final_state() {
+    // A window far wider than the test takes to reach its first flush,
+    // even on a loaded runner: the flush at `due` below is explicit, so
+    // nothing waits on it, and a narrow one closes before `now` is read.
+    let window = std::time::Duration::from_secs(10);
+    let (core, media) = limited(VoiceLimits {
+        status_debounce: window,
+        ..VoiceLimits::default()
+    });
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    core.voice_join(a, 0).unwrap();
+    core.voice_join(b, 0).unwrap();
+    drain(&mut rx_a);
+    drain(&mut rx_b);
+    media.take_calls();
+    // Nothing is owed yet, so there is nothing to flush.
+    assert_eq!(core.voice_flush_status(std::time::Instant::now()), None);
+
+    let wake = core.voice_status_wake();
+    for muted in [true, false, true, false, true] {
+        core.voice_mute(a, 0, muted).unwrap();
+    }
+    // Enforcement is not debounced: the media layer heard every flip.
+    assert_eq!(
+        media
+            .take_calls()
+            .iter()
+            .filter(|c| matches!(c, MediaCall::SetMuted { .. }))
+            .count(),
+        5
+    );
+    // The announcing is. Nobody has heard anything yet, and whatever
+    // flushes has been woken.
+    assert!(statuses(&drain(&mut rx_a)).is_empty());
+    assert!(statuses(&drain(&mut rx_b)).is_empty());
+    assert!(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+                    .await
+                    .is_ok()
+            }),
+        "the first flip wakes the flusher"
+    );
+
+    // Before the window closes, flushing sends nothing and says when.
+    let now = std::time::Instant::now();
+    let due = core.voice_flush_status(now).expect("a status is owed");
+    assert!(due > now && due <= now + window);
+    assert!(statuses(&drain(&mut rx_b)).is_empty());
+
+    // Once it has, the room hears one status carrying the final state.
+    assert_eq!(core.voice_flush_status(due), None);
+    let want = vec![
+        VoiceParticipant {
+            uid: a,
+            muted: true,
+        },
+        VoiceParticipant {
+            uid: b,
+            muted: false,
+        },
+    ];
+    assert_eq!(statuses(&drain(&mut rx_a)), vec![want.clone()]);
+    assert_eq!(statuses(&drain(&mut rx_b)), vec![want]);
+    // And nothing is owed after it.
+    assert_eq!(
+        core.voice_flush_status(due + std::time::Duration::from_secs(1)),
+        None
+    );
+    assert!(drain(&mut rx_b).is_empty());
+}
+
+#[test]
+fn a_status_sent_for_a_join_settles_what_the_debounce_was_holding() {
+    let (core, _media) = limited(VoiceLimits {
+        status_debounce: std::time::Duration::from_millis(100),
+        ..VoiceLimits::default()
+    });
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    core.voice_join(a, 0).unwrap();
+    core.voice_mute(a, 0, true).unwrap();
+    core.voice_join(b, 0).unwrap();
+    drain(&mut rx_b);
+    // The join's own status already said alice is muted, so the flush
+    // owes the room nothing.
+    let last = statuses(&drain(&mut rx_a)).pop().unwrap();
+    assert!(last.contains(&VoiceParticipant {
+        uid: a,
+        muted: true
+    }));
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    assert_eq!(core.voice_flush_status(later), None);
+    assert!(drain(&mut rx_a).is_empty());
+}
+
+#[test]
+fn joins_past_the_allowance_are_refused_with_how_long_to_wait() {
+    let (core, media) = limited(VoiceLimits {
+        joins: 3,
+        joins_per: std::time::Duration::from_secs(30),
+        ..VoiceLimits::default()
+    });
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, _rx_b) = quiet(&core, "bob");
+    for _ in 0..3 {
+        core.voice_join(a, 0).unwrap();
+        core.voice_leave(a, 0).unwrap();
+    }
+    drain(&mut rx_a);
+    media.take_calls();
+    // A join every ten seconds is earned back, so the wait is ten.
+    assert_eq!(
+        core.voice_join(a, 0),
+        Err(VoiceError::RateLimited { retry_after: 10 })
+    );
+    // Refused before any of its work: nothing reached the media layer
+    // and nobody was told anything.
+    assert!(media.take_calls().is_empty());
+    assert!(drain(&mut rx_a).is_empty());
+    // The allowance is the session's, not the room's.
+    core.voice_join(b, 0).unwrap();
+    // And a leave is never refused: it needs no allowance.
+    core.voice_leave(b, 0).unwrap();
+}
+
+#[test]
+fn a_join_that_finds_no_room_costs_no_allowance() {
+    let media = Arc::new(RecordingMedia::new());
+    let core = Core::new()
+        .with_voice(media.clone(), 1)
+        .with_voice_limits(VoiceLimits {
+            joins: 1,
+            joins_per: std::time::Duration::from_secs(60),
+            ..VoiceLimits::default()
+        });
+    let (a, _rx_a) = quiet(&core, "alice");
+    let (b, _rx_b) = quiet(&core, "bob");
+    core.voice_join(a, 0).unwrap();
+    // A full room, however often it is tried, and a media layer with no
+    // session to offer: neither is a join, so neither is charged.
+    for _ in 0..3 {
+        assert_eq!(core.voice_join(b, 0), Err(VoiceError::RoomFull));
+    }
+    core.voice_leave(a, 0).unwrap();
+    media.no_next_offer();
+    assert_eq!(core.voice_join(b, 0), Err(VoiceError::RoomFull));
+    // So bob still has the one join he was allowed, and then none.
+    core.voice_join(b, 0).unwrap();
+    core.voice_leave(b, 0).unwrap();
+    assert!(matches!(
+        core.voice_join(b, 0),
+        Err(VoiceError::RateLimited { .. })
+    ));
+}
+
+#[test]
+fn a_can_spam_session_is_held_to_no_allowance() {
+    let media = Arc::new(RecordingMedia::new());
+    let core = Core::new()
+        .with_voice(media.clone(), DEFAULT_MAX_PER_ROOM)
+        .with_voice_limits(VoiceLimits {
+            joins: 1,
+            joins_per: std::time::Duration::from_secs(60),
+            ..VoiceLimits::default()
+        });
+    let (a, _rx) = quiet(&core, "alice");
+    // `can_spam` is what an operator's own tools log in with.
+    core.roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&a)
+        .unwrap()
+        .can_spam = true;
+    for _ in 0..5 {
+        core.voice_join(a, 0).unwrap();
+    }
+}
+
+#[test]
+fn no_address_is_exempt_not_even_loopback() {
+    // The allowances are per session, so a shared address costs nobody
+    // one; `[limits] exempt` (loopback by default) is for the
+    // connection limits and is not consulted here.
+    let (core, _media) = limited(VoiceLimits {
+        joins: 1,
+        joins_per: std::time::Duration::from_secs(60),
+        ..VoiceLimits::default()
+    });
+    let (a, _rx) = quiet(&core, "alice");
+    core.roster.lock().unwrap().users.get_mut(&a).unwrap().addr =
+        Some("127.0.0.1".parse().unwrap());
+    core.voice_join(a, 0).unwrap();
+    assert!(matches!(
+        core.voice_join(a, 0),
+        Err(VoiceError::RateLimited { .. })
+    ));
+}

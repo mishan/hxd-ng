@@ -3786,7 +3786,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         ),
                     ],
                 ),
-                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &voice::err_text(e)),
             }
         }
 
@@ -3797,7 +3797,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             match ctx.core.voice_leave(sess.uid, voice_cid(f)) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &voice::err_text(e)),
             }
         }
 
@@ -3825,12 +3825,12 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             let Ok(sdp) = sdp else {
                 debug!(uid = sess.uid, cid, "voice answer is not valid UTF-8");
-                reply_error(tx, f.trans, voice::err_text(VoiceError::BadAnswer));
+                reply_error(tx, f.trans, &voice::err_text(VoiceError::BadAnswer));
                 return;
             };
             match ctx.core.voice_answer(sess.uid, cid, sdp) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &voice::err_text(e)),
             }
         }
 
@@ -3877,7 +3877,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             match ctx.core.voice_mute(sess.uid, cid, muted) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, voice::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &voice::err_text(e)),
             }
         }
 
@@ -3932,7 +3932,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         (tag::VIDEO_CODEC, codec.as_bytes().to_vec()),
                     ],
                 ),
-                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &video::err_text(e)),
             }
         }
 
@@ -3957,7 +3957,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             };
             match ctx.core.video_stop(sess.uid, voice_cid(f), kind) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &video::err_text(e)),
             }
         }
 
@@ -3976,7 +3976,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .is_some_and(|c| c.as_uint() != 0);
             match ctx.core.video_state(sess.uid, voice_cid(f), kind, paused) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &video::err_text(e)),
             }
         }
 
@@ -3998,7 +3998,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .unwrap_or_default();
             match ctx.core.video_subscribe(sess.uid, voice_cid(f), &streams) {
                 Ok(()) => reply(tx, f.trans, vec![]),
-                Err(e) => reply_error(tx, f.trans, video::err_text(e)),
+                Err(e) => reply_error(tx, f.trans, &video::err_text(e)),
             }
         }
 

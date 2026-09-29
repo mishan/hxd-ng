@@ -32,10 +32,10 @@ use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
     blocked_json, event_json, history_line_json, parse_streams, participants_json, reply_err,
     reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users, stored_msg_json, user_json,
-    video_err, video_limits_json, voice_err, BlockParams, ChatParams, HistoryParams, InboxParams,
-    LoginParams, MsgParams, MsgReadParams, NickParams, ReqEnvelope, ResumeParams, VideoStartParams,
-    VideoStateParams, VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams,
-    VoiceMuteParams, VoiceRoomParams,
+    video_limits_json, video_reply_err, voice_reply_err, BlockParams, ChatParams, HistoryParams,
+    InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams, ReqEnvelope, ResumeParams,
+    VideoStartParams, VideoStateParams, VideoStopParams, VideoSubscribeParams, VoiceAnswerParams,
+    VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -1831,10 +1831,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                         "participants": participants_json(&join.participants),
                     }),
                 ),
-                Err(e) => {
-                    let (code, text) = voice_err(e);
-                    reply_err(req.id, code, text)
-                }
+                Err(e) => voice_reply_err(req.id, e),
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_join."),
         },
@@ -1842,10 +1839,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         "voice_leave" => match params_or_default::<VoiceRoomParams>(&req.params) {
             Ok(p) => match ctx.core.voice_leave(state.uid, p.cid) {
                 Ok(()) => reply_ok(req.id, json!({})),
-                Err(e) => {
-                    let (code, text) = voice_err(e);
-                    reply_err(req.id, code, text)
-                }
+                Err(e) => voice_reply_err(req.id, e),
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_leave."),
         },
@@ -1853,10 +1847,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         "voice_answer" => match serde_json::from_value::<VoiceAnswerParams>(req.params.clone()) {
             Ok(p) => match ctx.core.voice_answer(state.uid, p.cid, p.sdp) {
                 Ok(()) => reply_ok(req.id, json!({})),
-                Err(e) => {
-                    let (code, text) = voice_err(e);
-                    reply_err(req.id, code, text)
-                }
+                Err(e) => voice_reply_err(req.id, e),
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_answer."),
         },
@@ -1874,10 +1865,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 // drops it instead.
                 match ctx.core.voice_ice(state.uid, p.cid, candidate) {
                     Ok(()) => reply_ok(req.id, json!({})),
-                    Err(e) => {
-                        let (code, text) = voice_err(e);
-                        reply_err(req.id, code, text)
-                    }
+                    Err(e) => voice_reply_err(req.id, e),
                 }
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_ice."),
@@ -1886,10 +1874,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         "voice_mute" => match serde_json::from_value::<VoiceMuteParams>(req.params.clone()) {
             Ok(p) => match ctx.core.voice_mute(state.uid, p.cid, p.muted) {
                 Ok(()) => reply_ok(req.id, json!({})),
-                Err(e) => {
-                    let (code, text) = voice_err(e);
-                    reply_err(req.id, code, text)
-                }
+                Err(e) => voice_reply_err(req.id, e),
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed voice_mute."),
         },
@@ -1927,10 +1912,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     // client must not wait for it to consider the start
                     // to have succeeded.
                     Ok(codec) => reply_ok(req.id, json!({ "codec": codec })),
-                    Err(e) => {
-                        let (code, text) = video_err(e);
-                        reply_err(req.id, code, text)
-                    }
+                    Err(e) => video_reply_err(req.id, e),
                 },
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed video_start."),
@@ -1951,10 +1933,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 let kind = p.kind.as_deref().and_then(VideoKind::from_name);
                 match ctx.core.video_stop(state.uid, p.cid, kind) {
                     Ok(()) => reply_ok(req.id, json!({})),
-                    Err(e) => {
-                        let (code, text) = video_err(e);
-                        reply_err(req.id, code, text)
-                    }
+                    Err(e) => video_reply_err(req.id, e),
                 }
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed video_stop."),
@@ -1965,10 +1944,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 None => reply_err(req.id, "bad_request", "Unknown video stream kind."),
                 Some(kind) => match ctx.core.video_state(state.uid, p.cid, kind, p.paused) {
                     Ok(()) => reply_ok(req.id, json!({})),
-                    Err(e) => {
-                        let (code, text) = video_err(e);
-                        reply_err(req.id, code, text)
-                    }
+                    Err(e) => video_reply_err(req.id, e),
                 },
             },
             Err(_) => reply_err(req.id, "bad_request", "Malformed video_state."),
@@ -1984,10 +1960,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     let streams = parse_streams(&p.streams);
                     match ctx.core.video_subscribe(state.uid, p.cid, &streams) {
                         Ok(()) => reply_ok(req.id, json!({})),
-                        Err(e) => {
-                            let (code, text) = video_err(e);
-                            reply_err(req.id, code, text)
-                        }
+                        Err(e) => video_reply_err(req.id, e),
                     }
                 }
                 Err(_) => reply_err(req.id, "bad_request", "Malformed video_subscribe."),

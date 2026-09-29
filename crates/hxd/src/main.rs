@@ -966,6 +966,8 @@ async fn main() {
                     tracing::error!("voice media socket: {e}");
                 }
             });
+            // The mute and pause debounce's timer.
+            tokio::spawn(hxd::voice::debounce(ctx.core.clone()));
         }
 
         // Inbox retention, when there is an inbox. Not the ng frontend's

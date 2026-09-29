@@ -358,6 +358,17 @@ pub fn video_err(e: VideoError) -> (&'static str, &'static str) {
             "video_full",
             "This room has as many cameras on as it allows.",
         ),
+        VideoError::RateLimited { .. } => ("rate_limited", "You are changing video too often."),
+    }
+}
+
+/// The error reply for a refused video operation, with `retry_after`
+/// when the refusal was the session's allowance.
+pub fn video_reply_err(id: u64, e: VideoError) -> String {
+    let (code, text) = video_err(e);
+    match e {
+        VideoError::RateLimited { retry_after } => reply_err_retry(id, code, text, retry_after),
+        _ => reply_err(id, code, text),
     }
 }
 
@@ -374,6 +385,17 @@ pub fn voice_err(e: VoiceError) -> (&'static str, &'static str) {
         VoiceError::RoomFull => ("voice_full", "That voice chat is full."),
         VoiceError::NotInVoice => ("not_in_voice", "You are not in that voice chat."),
         VoiceError::BadAnswer => ("bad_answer", "Your client's voice session was rejected."),
+        VoiceError::RateLimited { .. } => ("rate_limited", "You are joining voice chat too often."),
+    }
+}
+
+/// The error reply for a refused voice operation, with `retry_after`
+/// when the refusal was the session's allowance.
+pub fn voice_reply_err(id: u64, e: VoiceError) -> String {
+    let (code, text) = voice_err(e);
+    match e {
+        VoiceError::RateLimited { retry_after } => reply_err_retry(id, code, text, retry_after),
+        _ => reply_err(id, code, text),
     }
 }
 

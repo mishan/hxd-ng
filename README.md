@@ -1034,6 +1034,13 @@ advertise = ["203.0.113.5:5504"]  # what clients are told to send media to.
                                   # gives a client nothing else to go on.
                                   # List a v4 and a v6 to serve both.
 max_per_room = 16                 # the spec's VoiceMaxPerRoom
+joins = 5                         # joins one session may make in join_seconds;
+join_seconds = 10                 # 0 for no limit. Leaving is never limited
+status_debounce_ms = 100          # a burst of mute or pause flips is
+                                  # announced once, with its final state
+police_factor = 1.5               # inbound media past this multiple of its
+                                  # ceiling is dropped, not forwarded; 0 = off,
+                                  # and below 1 is refused
 
 [voice.video]
 max_cameras_per_room = 8          # VideoMaxCamerasPerRoom
@@ -1047,6 +1054,10 @@ screen_max_width = 1920           # screen-share ceiling: more pixels, fewer
 screen_max_height = 1080          # frames — a desktop is mostly still
 screen_max_fps = 15
 screen_max_bitrate = 2500000
+changes = 10                      # video starts, and subscription changes
+change_seconds = 10               # that add a live stream, one session may
+                                  # make; a stop, a pause and any other
+                                  # subscription change never count
 ```
 
 ## Operating

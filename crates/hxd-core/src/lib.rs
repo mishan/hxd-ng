@@ -80,8 +80,10 @@ pub use roster::{
     LIVE_QUEUE_CAP, LOGINS_IN_FLIGHT, OUTBOX_BUFFER_CAP,
 };
 pub use system::SystemPolicy;
-pub use video::{VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream};
+pub use video::{
+    PublishRefusal, VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,
+};
 pub use voice::{
-    IceCandidate, MediaEvent, VoiceError, VoiceJoin, VoiceMedia, VoiceParticipant,
+    IceCandidate, MediaEvent, VoiceError, VoiceJoin, VoiceLimits, VoiceMedia, VoiceParticipant,
     DEFAULT_MAX_PER_ROOM,
 };
