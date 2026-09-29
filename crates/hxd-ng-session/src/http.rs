@@ -786,13 +786,7 @@ fn client_addr(req: &Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Socket
         ForwardedHeader::XForwardedFor => "x-forwarded-for",
         ForwardedHeader::Forwarded => "forwarded",
     };
-    let mut elements = Vec::new();
-    for value in req.headers().get_all(name) {
-        let Ok(text) = value.to_str() else {
-            return peer;
-        };
-        elements.extend(text.split(','));
-    }
+    let elements = forwarded_elements(req.headers(), name);
     match forwarded_client(
         &elements,
         ctx.cfg.forwarded_header,
@@ -801,6 +795,21 @@ fn client_addr(req: &Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Socket
         Some(ip) => SocketAddr::new(ip, 0),
         None => peer,
     }
+}
+
+/// Every element of the `name` header, across all its lines in order.
+/// The values are split as bytes and each element decoded on its own:
+/// one that is not text reads as empty, which ends the walk if the walk
+/// gets that far. One to the left of the client, which an appending
+/// proxy passes through from whatever the client sent, is never reached,
+/// so junk there cannot move the answer to the proxy's own address.
+fn forwarded_elements<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Vec<&'a str> {
+    headers
+        .get_all(name)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|b| *b == b','))
+        .map(|e| std::str::from_utf8(e).unwrap_or(""))
+        .collect()
 }
 
 /// The rightmost element of a forwarded chain that isn't a trusted
@@ -1871,6 +1880,31 @@ mod tests {
             None
         );
         assert_eq!(forwarded_client(&[""], xff, &trusted), None);
+
+        // Bytes that are not text, sent by the client and passed on by an
+        // appending proxy, sit left of the client and change nothing,
+        // whether in the same line or an earlier one. Reached by the
+        // walk, they end it.
+        let mut headers = hyper::HeaderMap::new();
+        let raw = |b: &[u8]| hyper::header::HeaderValue::from_bytes(b).unwrap();
+        headers.append("x-forwarded-for", raw(b"\xff\xfe, 198.51.100.4"));
+        let elements = forwarded_elements(&headers, "x-forwarded-for");
+        assert_eq!(
+            forwarded_client(&elements, xff, &trusted),
+            ip("198.51.100.4")
+        );
+        headers.clear();
+        headers.append("x-forwarded-for", raw(b"203.0.113.9 \xff"));
+        headers.append("x-forwarded-for", raw(b"198.51.100.4, 10.0.0.7"));
+        let elements = forwarded_elements(&headers, "x-forwarded-for");
+        assert_eq!(
+            forwarded_client(&elements, xff, &trusted),
+            ip("198.51.100.4")
+        );
+        headers.clear();
+        headers.append("x-forwarded-for", raw(b"198.51.100.4, \xff"));
+        let elements = forwarded_elements(&headers, "x-forwarded-for");
+        assert_eq!(forwarded_client(&elements, xff, &trusted), None);
 
         // RFC 7239 form, same walk.
         let fwd = ForwardedHeader::Forwarded;
