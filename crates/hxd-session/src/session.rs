@@ -1464,17 +1464,29 @@ fn names_guest(login: &str) -> bool {
     login.is_empty() || login.eq_ignore_ascii_case("guest")
 }
 
-/// Why [`reconcile_login`] admitted no one.
+/// Why [`reconcile_login`] refused. The client hears "Login failed." for
+/// the first two — which one it was is nothing a guesser should learn —
+/// but only the first is a guess, and only a guess counts against the
+/// address (`Core::login_attempt`).
 #[derive(Debug)]
-enum Refused {
+enum LoginRefused {
+    /// The backend's answer: a wrong password, an unknown login, or the
+    /// backend itself failing.
     Auth(AuthError),
+    /// The credentials were not what was wrong: the socket's identity
+    /// may not have the account they named, or may not log in here at
+    /// all (§8.1, §8.3).
+    Policy,
+    /// The address has given as many wrong passwords as it may for now,
+    /// and this one was not checked. Carries how long until it may try.
+    Throttled(Duration),
     /// An identity socket named a banned account not linked to it.
     Banned(hxd_core::ban::BanHit),
 }
 
-impl From<AuthError> for Refused {
+impl From<AuthError> for LoginRefused {
     fn from(e: AuthError) -> Self {
-        Refused::Auth(e)
+        LoginRefused::Auth(e)
     }
 }
 
@@ -1483,16 +1495,18 @@ impl From<AuthError> for Refused {
 /// identity this is just `authenticate`.
 ///
 /// A login on an identity socket that names a banned account not linked
-/// to it is [`Refused::Banned`], whatever the account's linking rules.
+/// to it is [`LoginRefused::Banned`], whatever the account's linking rules.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_login(
     auth: &dyn AuthBackend,
     core: &Core,
+    addr: IpAddr,
     login: &str,
     password: &[u8],
     identity_fp: Option<[u8; 32]>,
     policy: TrtpLogin,
     link: LinkAuthority,
-) -> Result<Account, Refused> {
+) -> Result<Account, LoginRefused> {
     // Whatever this login resolves to, an account that links an identity
     // has its mail claimed onto the fingerprint before it is handed a
     // session. `claim` is idempotent and does nothing on a mailbox that
@@ -1509,6 +1523,39 @@ fn reconcile_login(
             }
         }
     };
+    // A password is a guess until it verifies. An address that has
+    // guessed wrong as often as it may, on either wire, is refused before
+    // this one is checked — a right one included, or the guessing would
+    // go on. Asked where the password is going to be checked, rather
+    // than before the login is looked at: a login that sends none, and
+    // an identity `trtp_login = trust` admits without reading the one it
+    // sent, make no guess and are not held to it. `held` is an attempt
+    // already taken for this password; `no_account_admits` says that
+    // naming no account is not a refusal here, so it is no guess either.
+    let authenticate = |login: &str,
+                        held: Option<hxd_core::LoginAttempt>,
+                        no_account_admits: bool|
+     -> Result<Account, LoginRefused> {
+        let attempt = match held {
+            Some(attempt) => attempt,
+            None => core
+                .login_attempt(addr, password)
+                .map_err(LoginRefused::Throttled)?,
+        };
+        let verdict = auth.authenticate(login, Proof::Plain(password));
+        match &verdict {
+            // The login goes on to succeed on the identity alone: a
+            // login that succeeds is not a failure.
+            Err(AuthError::NoSuchAccount) if no_account_admits => core.login_refund(attempt),
+            Err(AuthError::NoSuchAccount | AuthError::BadProof) => core.login_failed(attempt),
+            // Verified, or the backend could not say: no guess failed.
+            // What is refused after this — an identity that may not
+            // have the account — is refused for something other than
+            // the password.
+            _ => core.login_refund(attempt),
+        }
+        Ok(verdict?)
+    };
     let Some(fp) = identity_fp else {
         // No transport identity — and the claim still belongs here. The
         // obligation is the *account's*, not the socket's: someone who
@@ -1516,15 +1563,36 @@ fn reconcile_login(
         // their password has a fingerprint-keyed mailbox, and the rows
         // those two windows leave on the bare login would sit there
         // unread forever if the only claim were on the identity paths.
-        let account = auth.authenticate(login, Proof::Plain(password))?;
+        let account = authenticate(login, None, false)?;
         claim(&account);
         return Ok(account);
+    };
+    // Under any policy but `trust` the password is checked whatever the
+    // identity links, so a locked-out address is refused here, before
+    // the accounts directory is scanned for the link. Under `trust` the
+    // scan is what says whether the password is read at all, so the
+    // attempt waits for it.
+    let held = match policy {
+        TrtpLogin::Trust => None,
+        TrtpLogin::Verify => Some(
+            core.login_attempt(addr, password)
+                .map_err(LoginRefused::Throttled)?,
+        ),
     };
     // Unfiltered: "no account links this identity" and "one does but the
     // operator turned identity login off" are different answers, and
     // §8.1 gives them different outcomes. Collapsing them here turned the
     // second into a silent guest session, where the ng path denies it.
-    let linked = auth.find_by_fingerprint(&fp)?;
+    let linked = match auth.find_by_fingerprint(&fp) {
+        Ok(linked) => linked,
+        Err(e) => {
+            // No password was checked.
+            if let Some(attempt) = held {
+                core.login_refund(attempt);
+            }
+            return Err(e.into());
+        }
+    };
     let identity_admits = linked.as_ref().is_some_and(|a| a.identity.identity_login);
     if policy == TrtpLogin::Trust && identity_admits {
         let a = linked.expect("identity_admits implies a linked account");
@@ -1532,15 +1600,19 @@ fn reconcile_login(
         claim(&a);
         return Ok(a);
     }
-    let account = match auth.authenticate(login, Proof::Plain(password)) {
+    let account = match authenticate(login, held, names_guest(login) && identity_admits) {
         Ok(a) => Some(a),
         // Deleting `guest.toml` is the documented way to turn guests
         // off, and it used to refuse a linked identity's guest login on
         // this wire while the JSON wire admitted the same identity on
         // the link alone. Naming no account is a question about the
         // identity; only a linked account that may log in answers it.
-        Err(AuthError::NoSuchAccount) if names_guest(login) && identity_admits => None,
-        Err(e) => return Err(e.into()),
+        Err(LoginRefused::Auth(AuthError::NoSuchAccount))
+            if names_guest(login) && identity_admits =>
+        {
+            None
+        }
+        Err(e) => return Err(e),
     };
     if account.as_ref().is_none_or(|a| a.login == "guest") {
         // §8.1: naming no account on an identity socket associates by
@@ -1554,7 +1626,7 @@ fn reconcile_login(
             }
             Some(a) => {
                 info!(login = %a.login, "identity_login is off for the linked account");
-                Err(AuthError::BadProof.into())
+                Err(LoginRefused::Policy)
             }
             // §8.1 `deny`, decided on this wire as it is on the JSON one:
             // nothing links this identity, so there is no guest to fall
@@ -1564,9 +1636,9 @@ fn reconcile_login(
             // from the upgrade.
             None if !link.unlinked_ok => {
                 info!("new_accounts = deny: an identity with no linked account");
-                Err(AuthError::BadProof.into())
+                Err(LoginRefused::Policy)
             }
-            None => account.ok_or(AuthError::NoSuchAccount.into()),
+            None => account.ok_or(LoginRefused::Auth(AuthError::NoSuchAccount)),
         };
     }
     let account = account.expect("a named account was authenticated");
@@ -1577,7 +1649,7 @@ fn reconcile_login(
     // business on unless it may link it.
     if account.identity.fingerprint.is_none() {
         if let Some(hit) = core.person_banned(Some(&account.login), None, None) {
-            return Err(Refused::Banned(hit));
+            return Err(LoginRefused::Banned(hit));
         }
     }
     match account.identity.fingerprint {
@@ -1587,7 +1659,7 @@ fn reconcile_login(
         }
         Some(_) => {
             info!(login = %account.login, "tunnelled login names an account linked to another identity");
-            Err(AuthError::BadProof.into())
+            Err(LoginRefused::Policy)
         }
         // Self-linking here writes an association exactly as
         // `/identity/link` does, so it needs the same `manage`
@@ -1613,7 +1685,7 @@ fn reconcile_login(
                 // unlinked self-linkable one — so this is neither.
                 LinkOutcome::Taken(_) | LinkOutcome::Refused(_) => {
                     info!(login = %account.login, "tunnelled login names an account this identity may not have");
-                    Err(AuthError::BadProof.into())
+                    Err(LoginRefused::Policy)
                 }
             }
         }
@@ -1628,7 +1700,7 @@ fn reconcile_login(
         // to do with identities belongs.
         None => {
             info!(login = %account.login, "tunnelled login names an account that refuses self-linking");
-            Err(AuthError::BadProof.into())
+            Err(LoginRefused::Policy)
         }
     }
 }
@@ -1667,7 +1739,6 @@ async fn login_phase(
         reply_error(tx, f.trans, "The server is busy. Try again in a moment.");
         return None;
     };
-
     // The encoding comes from the same frame as the credentials, so it is
     // settled before anything in that frame is read as text. Bit 1 needs
     // nothing wired to be honored, but it is still only honored when the
@@ -1703,10 +1774,12 @@ async fn login_phase(
     let password = enc.decode_chars(&req.password, 31).into_bytes();
     let identity_fp = transport.identity.as_ref().map(|t| t.fingerprint);
     let policy = ctx.cfg.trtp_login;
+    let addr = peer.ip();
     let verdict = tokio::task::spawn_blocking(instrument::blocking("login", move || {
         reconcile_login(
             &*auth,
             &core,
+            addr,
             &login_str,
             &password,
             identity_fp,
@@ -1719,21 +1792,44 @@ async fn login_phase(
 
     let account = match verdict {
         Ok(a) => a,
-        Err(Refused::Auth(e @ (AuthError::NoSuchAccount | AuthError::BadProof))) => {
+        Err(LoginRefused::Auth(e @ (AuthError::NoSuchAccount | AuthError::BadProof))) => {
             info!(login = %String::from_utf8_lossy(&req.login), "login refused: {e}");
             // The reference server closes with an empty error reply; give
             // the human a reason too — clients render the text.
             reply_error(tx, f.trans, "Login failed.");
             return None;
         }
-        Err(Refused::Banned(hit)) => {
+        // Refused by the identity's policy rather than its password: the
+        // same reply, so the two stay indistinguishable, but no guess was
+        // made and none is counted. A tunnel whose identity may not have
+        // the account would otherwise lock its own address out of the
+        // plain port too, by retrying a password that was right.
+        Err(LoginRefused::Policy) => {
+            info!(login = %String::from_utf8_lossy(&req.login), "login refused by identity policy");
+            reply_error(tx, f.trans, "Login failed.");
+            return None;
+        }
+        Err(LoginRefused::Banned(hit)) => {
             info!(login = %String::from_utf8_lossy(&req.login), ban = hit.id, "tunnelled login refused: banned");
             reply_error(tx, f.trans, &banned_text(&hit.reason));
             return None;
         }
-        Err(Refused::Auth(AuthError::Backend(e))) => {
+        Err(LoginRefused::Auth(AuthError::Backend(e))) => {
             warn!("auth backend failure: {e}");
             reply_error(tx, f.trans, "Server error.");
+            return None;
+        }
+        // The refusal is the error reply every failed login already gets,
+        // with a reason the client shows, and nothing a 1.2 client has
+        // not seen before.
+        Err(LoginRefused::Throttled(wait)) => {
+            info!("login refused: too many failed logins from this address");
+            let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+            reply_error(
+                tx,
+                f.trans,
+                &format!("Too many failed logins. Try again in {secs} seconds."),
+            );
             return None;
         }
     };

@@ -1033,6 +1033,8 @@ pub struct Core {
     pub(crate) login_gate: LoginGate,
     /// Connections each address holds ([`Core::admit_connection`]).
     pub(crate) conn_gate: crate::limits::ConnGate,
+    /// Failed logins each address has made ([`Core::login_attempt`]).
+    pub(crate) login_failures: crate::limits::RateGate,
     /// How fast one session may talk (`crate::limits`).
     pub(crate) flood_limits: crate::limits::FloodLimits,
     /// Every standing ban, for matching without the store

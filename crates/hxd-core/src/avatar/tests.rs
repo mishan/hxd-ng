@@ -209,6 +209,14 @@ fn changes_are_rationed_per_owner() {
         core.set_avatar(alice_too, b"two"),
         Err(MediaReject::RateLimited)
     );
+    assert_eq!(
+        core.avatar_change_admits(alice_too),
+        Err(MediaReject::RateLimited),
+        "asked before the bytes are read"
+    );
+    for _ in 0..3 {
+        assert_eq!(core.avatar_change_admits(bob), Ok(()), "and asking is free");
+    }
     core.set_avatar(bob, b"one").unwrap();
     // Guests without an identity are each their own.
     core.set_avatar(guest, b"one").unwrap();

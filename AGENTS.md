@@ -207,7 +207,12 @@ gives its transaction, it is kicked and banned
 (`Core::spend_spam`, called by each frontend before it acts on a
 request; a new frontend or an ng request with a classic counterpart
 calls it too). A session already kicked is refused, never kicked
-again. An account that `can_spam` is held to neither.
+again. An account that `can_spam` is held to neither. A wrong password
+counts against its address whichever wire or route it came in on
+(`Core::login_attempt` before, `Core::login_failed` after); a new path
+that checks a password does both. Every connection to the ng port
+holds places in that port's own counts (`HttpLimits`) from accept, in
+the socket itself so an upgrade carries them.
 
 **Past capacity a login is refused, not queued.** Every login costs
 everyone present a join and later a part, so a server admitting logins
@@ -284,7 +289,15 @@ Three layers, all `cargo test --workspace`:
   wires, then a burst and a rate, a TLS handshake counted from accept,
   and an exempt address held to neither; a classic user's multi-line
   flood kicked once with the room told in mhxd's bytes, and a user past
-  its spam points on each wire banned, the ng one refused `flooding`), `slow_consumer.rs` (a room flooded while one client reads
+  its spam points on each wire banned, the ng one refused `flooding`), `http_limits.rs`
+  (the ng port's own counts: plain HTTP and a WebSocket past an
+  address's connections closed unanswered, the ceiling on everyone's
+  and the reserve an exempt address is kept past it, an idle
+  keep-alive closed; challenges and avatar fetches past their rate
+  answered 429; failed logins on every wire locking the address out of
+  all of them until it earns one back, guesses made at once held to
+  the same count, a request refused before its password is checked
+  not counted, and a login with no password not held to it), `slow_consumer.rs` (a room flooded while one client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the
   ng one resumes into a resync; and clients each inside their own

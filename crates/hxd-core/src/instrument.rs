@@ -328,6 +328,17 @@ pub fn login_refused_busy() {
     metrics::counter!("hxd_logins_refused_busy_total").increment(1);
 }
 
+/// Something refused for coming too fast or too often from one address,
+/// before any work was done on it: `login` (an address past its failed
+/// logins), `challenge` (`/identity/challenge`), `fetch` (an avatar or a
+/// news image), `upload` (an upload refused before its body was read).
+pub fn rate_limited(what: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_rate_limited_total", "what" => what).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = what;
+}
+
 /// A detached session's buffer overflowed; its resume will be a resync.
 pub fn outbox_broken() {
     #[cfg(feature = "metrics")]

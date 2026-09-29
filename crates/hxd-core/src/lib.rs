@@ -52,7 +52,10 @@ pub use inbox::{
     Delivery, InboxCounts, MemoryStore, MessageId, MessageStore, NewMessage, Pushed, StoreError,
     StoredMessage,
 };
-pub use limits::{AddrSet, ConnLimits, ConnPermit, ConnRefused, FloodLimits};
+pub use limits::{
+    AddrSet, ConnGate, ConnLimits, ConnPermit, ConnRefused, FloodLimits, LoginAttempt, LoginLimits,
+    RateGate,
+};
 pub use media::{
     Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRecord,
     MediaRef, MediaReject, MediaType, Principal, UploadOutcome, UploadPart,

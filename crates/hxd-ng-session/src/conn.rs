@@ -437,6 +437,32 @@ async fn handle_login(
     // layer refused never got a token or a certificate admission, so it
     // can't reach here — `new_accounts = deny` is decided there, on
     // every admitting path.
+    // A password is a guess until it verifies. An address that has
+    // guessed wrong as often as it may is refused before this one is
+    // checked, whichever wire the guesses came in on
+    // (`Core::login_attempt`). An identity socket's password is not read,
+    // and a guest's is empty: neither is a guess, and neither is held to
+    // the count.
+    let attempt = match identity {
+        Some(_) => None,
+        None => match ctx.core.login_attempt(peer.ip(), p.password.as_bytes()) {
+            Ok(attempt) => Some(attempt),
+            Err(wait) => {
+                info!("ng login refused: too many failed logins from this address");
+                let _ = send_frame(
+                    ws_tx,
+                    Message::Text(reply_err_retry(
+                        req.id,
+                        "rate_limited",
+                        "Too many failed logins. Try again later.",
+                        crate::http::retry_secs(wait),
+                    )),
+                )
+                .await;
+                return None;
+            }
+        },
+    };
     let auth = ctx.auth.clone();
     let identity_state = ctx.identity.clone();
     let (login, password) = match identity {
@@ -481,6 +507,17 @@ async fn handle_login(
         account
     })
     .await;
+    // Settled as the answer comes in: only a password that did not
+    // verify, that named no account, or whose check never answered
+    // stays counted.
+    if let Some(attempt) = attempt {
+        match &verdict {
+            Ok(Err(Refused::Auth(AuthError::NoSuchAccount | AuthError::BadProof))) | Err(_) => {
+                ctx.core.login_failed(attempt)
+            }
+            Ok(_) => ctx.core.login_refund(attempt),
+        }
+    }
     // The blocking task panicked. Nothing was attached, so there is
     // nothing to undo, but the client is owed an answer.
     let Ok(verdict) = verdict else {

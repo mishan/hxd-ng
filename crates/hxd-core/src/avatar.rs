@@ -343,6 +343,33 @@ impl Core {
     /// announcements. A session-only guest is its own owner. The turn is
     /// spent before the decode, so a refused upload costs one too.
     fn avatar_turn(&self, uid: Uid, interval: Duration) -> Result<Changer, MediaReject> {
+        let (who, key) = self.avatar_changer(uid)?;
+        let now = Instant::now();
+        let mut turns = self.avatar_turns.lock().unwrap();
+        // Everything older than the interval has no say; dropping it keeps
+        // the map to the owners who changed something recently.
+        turns.retain(|_, at| now.duration_since(*at) < interval);
+        if turns.contains_key(&key) {
+            return Err(MediaReject::RateLimited);
+        }
+        turns.insert(key, now);
+        Ok(who)
+    }
+
+    /// Would a change this session asks for now have its turn? What
+    /// [`Core::set_avatar`] asks first, asked without spending the turn,
+    /// so a frontend can refuse an upload before it reads the bytes.
+    pub fn avatar_change_admits(&self, uid: Uid) -> Result<(), MediaReject> {
+        let state = self.avatars.as_ref().ok_or(MediaReject::Unsupported)?;
+        let (_, key) = self.avatar_changer(uid)?;
+        let turns = self.avatar_turns.lock().unwrap();
+        match turns.get(&key) {
+            Some(at) if at.elapsed() < state.policy.set_interval => Err(MediaReject::RateLimited),
+            _ => Ok(()),
+        }
+    }
+
+    fn avatar_changer(&self, uid: Uid) -> Result<(Changer, Turn), MediaReject> {
         let who = {
             let r = self.roster.lock().unwrap();
             let sess = r.users.get(&uid).ok_or(MediaReject::Generic)?;
@@ -356,16 +383,7 @@ impl Core {
             Some(owner) => Turn::Owner(owner.clone()),
             None => Turn::Session(uid, who.serial),
         };
-        let now = Instant::now();
-        let mut turns = self.avatar_turns.lock().unwrap();
-        // Everything older than the interval has no say; dropping it keeps
-        // the map to the owners who changed something recently.
-        turns.retain(|_, at| now.duration_since(*at) < interval);
-        if turns.contains_key(&key) {
-            return Err(MediaReject::RateLimited);
-        }
-        turns.insert(key, now);
-        Ok(who)
+        Ok((who, key))
     }
 
     /// Store the change, then show it on every live session of the owner.

@@ -114,6 +114,59 @@ pub struct NgConfig {
     /// write (§6.3). Only this one is read, because a header the proxy
     /// doesn't write is one the client gets to choose.
     pub forwarded_header: ForwardedHeader,
+    /// What the HTTP layer holds addresses, and everyone, to.
+    pub http_limits: HttpLimits,
+}
+
+/// What the ng port holds one address to, and everyone together
+/// (`[limits]`), before and beside the limits on the sessions it
+/// carries (`hxd_core::limits`). 0 is no limit, in each.
+///
+/// Every connection to the port holds a place in both counts from
+/// accept until it closes, whatever it turns out to carry — a WebSocket
+/// included, for its whole life — so they bound the descriptors the
+/// port can take. An ng session's socket also holds a place in the
+/// address's shared count, the one the classic wire's connections
+/// count against; the count here is separate and larger, because one
+/// browser page opens several connections at once beside its socket
+/// and would be refused by the classic wire's allowance of five.
+///
+/// **Behind a trusted proxy** (`[ng] trusted_proxies`) the connection
+/// at accept is the proxy's, and it carries requests for everyone
+/// behind it, so the per-address count does not apply to it: the
+/// proxy is the place to limit connections per client. The request
+/// limits still apply, to the forwarded address, as every other
+/// per-address rule on this port does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpLimits {
+    /// Connections one address may hold to the port at once.
+    pub connections_per_addr: usize,
+    /// Connections everyone together may hold to the port at once.
+    /// Past it a new one is closed unanswered; it is what stands
+    /// between a crowd of addresses and the process's descriptors,
+    /// which the classic port and the databases share. Addresses
+    /// `[limits]` exempts have a few places kept past it, so a flood
+    /// does not shut out the operator's own tools.
+    pub connections: usize,
+    /// `POST /identity/challenge` one address may make a minute.
+    pub challenges_per_minute: u32,
+    /// `GET /avatars/{id}` one address may make a minute.
+    pub avatar_fetches_per_minute: u32,
+}
+
+impl HttpLimits {
+    pub const RECOMMENDED: HttpLimits = HttpLimits {
+        connections_per_addr: 16,
+        connections: 4096,
+        challenges_per_minute: 30,
+        avatar_fetches_per_minute: 600,
+    };
+}
+
+impl Default for HttpLimits {
+    fn default() -> Self {
+        HttpLimits::RECOMMENDED
+    }
 }
 
 /// The header a trusted proxy uses to say who it is speaking for.
@@ -191,6 +244,7 @@ impl Default for NgConfig {
             caps: Vec::new(),
             trusted_proxies: TrustedProxies::default(),
             forwarded_header: ForwardedHeader::default(),
+            http_limits: HttpLimits::default(),
         }
     }
 }
@@ -233,12 +287,14 @@ pub struct NgCtx {
 }
 
 /// Accept loop: one connection task per socket. Each is HTTP until it
-/// upgrades (`http.rs`). Never returns: an accept error — descriptors
-/// exhausted, most often, which anyone able to hold enough idle
-/// connections open can cause — is waited out. Returned, it ended this
-/// task, and the ng port stopped answering while the rest of the server
-/// ran on without it.
+/// upgrades (`http.rs`), and holds its places in [`HttpLimits`]' counts
+/// until it closes. Never returns: an accept error — descriptors
+/// exhausted, most often, which the counts make hard for anyone but a
+/// crowd to cause, and the classic port or the databases might anyway —
+/// is waited out. Returned, it ended this task, and the ng port stopped
+/// answering while the rest of the server ran on without it.
 pub async fn serve(listener: TcpListener, ctx: NgCtx) {
+    let gates = Arc::new(http::Gates::new(&ctx));
     let mut backoff = Duration::from_millis(10);
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -255,9 +311,10 @@ pub async fn serve(listener: TcpListener, ctx: NgCtx) {
         };
         let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
+        let gates = gates.clone();
         tokio::spawn(async move {
             let span = tracing::info_span!("ng", %peer);
-            http::serve_connection(stream, peer, ctx)
+            http::serve_connection(stream, peer, ctx, gates)
                 .instrument(span)
                 .await;
         });

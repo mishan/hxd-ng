@@ -20,17 +20,28 @@
 //! banned for `[server] ban_time` with public chat told, both in mhxd's
 //! words. An account that `can_spam` is held to neither.
 //!
+//! **Requests.** Some requests are cheap to make and dear to answer, or
+//! are a guess at something: a password, a challenge that fills a table.
+//! Those are held to a rate per address ([`RateGate`]) — a burst, then
+//! one more as each comes due — and one past it is told how long to
+//! wait. Failed logins are one of them, and are counted wherever a
+//! password is checked, whichever wire it arrived on
+//! ([`Core::login_attempt`], [`LoginLimits`]).
+//!
 //! **Addresses.** An IPv4 address is itself; an IPv6 one is its /64,
 //! which is what one subscriber is given, so a client cannot step past
 //! the cap by walking its own prefix. An IPv4 address mapped into IPv6
-//! is the IPv4 address. Addresses in `exempt` are held to neither
-//! connection limit: loopback by default, so the tests, the load harness and an operator's
-//! own tools are not refused by their own server.
+//! is the IPv4 address. Addresses in `exempt` are held to none of the
+//! limits an address is, though a session from one is still held to its
+//! own: loopback by default, so the tests, the load harness and an
+//! operator's own tools are not refused by their own server.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::roster::Core;
 
 /// A set of addresses and CIDR blocks: `"192.0.2.7"`, `"10.0.0.0/8"`,
 /// `"2001:db8::/32"`.
@@ -170,9 +181,11 @@ impl ConnRefused {
 }
 
 /// The connections each address holds, and what it has spent of its
-/// burst.
+/// burst. The core keeps one for every connection that can carry a
+/// session ([`Core::admit_connection`]); a frontend may keep another for
+/// connections of its own that do not.
 #[derive(Default)]
-pub(crate) struct ConnGate(Arc<GateInner>);
+pub struct ConnGate(Arc<GateInner>);
 
 #[derive(Default)]
 pub(crate) struct GateInner {
@@ -216,7 +229,7 @@ impl Drop for ConnPermit {
 }
 
 impl ConnGate {
-    pub(crate) fn new(limits: ConnLimits) -> ConnGate {
+    pub fn new(limits: ConnLimits) -> ConnGate {
         ConnGate(Arc::new(GateInner {
             limits,
             by_addr: Mutex::default(),
@@ -225,11 +238,16 @@ impl ConnGate {
 
     /// Is `ip` held to no per-address limit (`exempt`)? The flood
     /// limits hold for it all the same.
-    pub(crate) fn exempt(&self, ip: IpAddr) -> bool {
+    pub fn exempt(&self, ip: IpAddr) -> bool {
         self.0.limits.exempt.contains(ip)
     }
 
-    pub(crate) fn admit(&self, ip: IpAddr) -> Result<ConnPermit, ConnRefused> {
+    /// The limits this gate holds addresses to.
+    pub fn limits(&self) -> &ConnLimits {
+        &self.0.limits
+    }
+
+    pub fn admit(&self, ip: IpAddr) -> Result<ConnPermit, ConnRefused> {
         let gate = &self.0;
         let l = &gate.limits;
         if (l.per_addr == 0 && l.reconnect.is_zero()) || l.exempt.contains(ip) {
@@ -270,6 +288,259 @@ impl ConnGate {
         Ok(ConnPermit {
             gate: Some((gate.clone(), key)),
         })
+    }
+}
+
+/// A rate one address is held to: a burst of `burst`, then one more
+/// every `every`. Past it the caller is told how long until the next.
+/// A `burst` of 0, or a zero `every`, is no limit; `exempt` addresses are
+/// never limited. What the gate counts is the caller's: a request, or a
+/// failed login ([`RateGate::spend`] after the fact, with
+/// [`RateGate::check`] before it).
+pub struct RateGate {
+    burst: f64,
+    every: Duration,
+    exempt: AddrSet,
+    by_addr: Mutex<RateTable>,
+}
+
+/// The addresses a [`RateGate`] remembers, and how large the table may
+/// grow before it is next walked.
+#[derive(Default)]
+struct RateTable {
+    map: HashMap<IpAddr, Bucket>,
+    prune_at: usize,
+    /// How many times the table has been walked, for the tests.
+    #[cfg(test)]
+    walks: usize,
+}
+
+/// What one address has left of a [`RateGate`]'s burst, as of `at`.
+#[derive(Debug)]
+struct Bucket {
+    tokens: f64,
+    at: Instant,
+}
+
+impl Default for RateGate {
+    /// No limit.
+    fn default() -> Self {
+        RateGate::new(0, Duration::ZERO, AddrSet::default())
+    }
+}
+
+/// How many addresses a gate remembers before it first forgets the ones
+/// that have earned their whole burst back.
+const RATE_KEPT: usize = 4096;
+
+/// The most addresses a gate remembers at all. Addresses spread over
+/// more networks than this (an IPv6 client has a /64 per network it
+/// cares to route) cost a bounded table, not a growing one.
+const RATE_CAP: usize = 1 << 16;
+
+impl RateGate {
+    pub fn new(burst: u32, every: Duration, exempt: AddrSet) -> RateGate {
+        RateGate {
+            burst: f64::from(burst),
+            every,
+            exempt,
+            by_addr: Mutex::default(),
+        }
+    }
+
+    /// `per_minute` a minute, all of them at once if need be: the burst
+    /// is the minute's worth.
+    pub fn per_minute(per_minute: u32, exempt: AddrSet) -> RateGate {
+        let every = if per_minute == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(60) / per_minute
+        };
+        RateGate::new(per_minute, every, exempt)
+    }
+
+    fn off(&self, ip: IpAddr) -> bool {
+        self.burst < 1.0 || self.every.is_zero() || self.exempt.contains(ip)
+    }
+
+    /// Admit one more from `ip` and spend it, or say how long until one
+    /// would be admitted.
+    pub fn take(&self, ip: IpAddr) -> Result<(), Duration> {
+        self.at(ip, Instant::now(), true)
+    }
+
+    /// Give back one [`take`](Self::take) spent: what it admitted turned
+    /// out not to be what the gate counts. The bucket does not go above
+    /// its burst.
+    pub fn refund(&self, ip: IpAddr) {
+        if self.off(ip) {
+            return;
+        }
+        let now = Instant::now();
+        let mut by = self.by_addr.lock().unwrap();
+        let burst = self.burst;
+        let b = self.bucket(&mut by, ip, now);
+        b.tokens = (b.tokens + 1.0).min(burst);
+    }
+
+    fn bucket<'a>(&self, by: &'a mut RateTable, ip: IpAddr, now: Instant) -> &'a mut Bucket {
+        let (burst, every) = (self.burst, self.every);
+        let earned = |b: &Bucket| {
+            (b.tokens + now.duration_since(b.at).as_secs_f64() / every.as_secs_f64()).min(burst)
+        };
+        let key = limit_key(ip);
+        // An address that has earned its whole burst back is one a fresh
+        // bucket describes, so the table holds only addresses that spent
+        // something a moment ago. The walk is over the whole table, under
+        // the lock every login takes, so it waits until the table has
+        // doubled since the last one — as `ConnGate`'s does — and a table
+        // of addresses still paying off their spending is not walked
+        // again at every call.
+        if !by.map.contains_key(&key) && by.map.len() >= by.prune_at.max(RATE_KEPT) {
+            #[cfg(test)]
+            {
+                by.walks += 1;
+            }
+            by.map.retain(|_, b| earned(b) < burst);
+            // Still near the cap, the fullest are forgotten until a
+            // quarter of it is free, so the next walk is that many new
+            // addresses away. Forgetting an address gives it its whole
+            // burst back, which is why it is the fullest that go: each
+            // was the nearest to a fresh bucket already, and an address
+            // that spent a moment ago is among the emptiest and stays. To
+            // have one of its own addresses forgotten, and gain at most a
+            // burst by it, an attacker must first bring a quarter of the
+            // cap's worth of new networks, each of which was a fresh
+            // burst of its own anyway. The other way to hold the
+            // cap, refusing whatever address is new, would let anyone
+            // with enough networks to fill the table lock out every
+            // address that had not yet been seen.
+            let keep = RATE_CAP / 4 * 3;
+            if by.map.len() > keep {
+                let mut fill: Vec<(f64, IpAddr)> =
+                    by.map.iter().map(|(k, b)| (earned(b), *k)).collect();
+                fill.select_nth_unstable_by(keep, |a, b| a.0.total_cmp(&b.0));
+                for (_, k) in &fill[keep..] {
+                    by.map.remove(k);
+                }
+            }
+            by.prune_at = by.map.len().saturating_mul(2).min(RATE_CAP);
+        }
+        let b = by.map.entry(key).or_insert(Bucket {
+            tokens: burst,
+            at: now,
+        });
+        b.tokens = earned(b);
+        b.at = now;
+        b
+    }
+
+    fn at(&self, ip: IpAddr, now: Instant, spend: bool) -> Result<(), Duration> {
+        if self.off(ip) {
+            return Ok(());
+        }
+        let every = self.every;
+        let mut by = self.by_addr.lock().unwrap();
+        let b = self.bucket(&mut by, ip, now);
+        if b.tokens < 1.0 {
+            return Err(every.mul_f64(1.0 - b.tokens));
+        }
+        if spend {
+            b.tokens -= 1.0;
+        }
+        Ok(())
+    }
+}
+
+/// How many failed logins one address may make (`[limits]`): a burst of
+/// `failures`, then one more every `every`. Past it the address is
+/// refused before its password is checked, until it has earned one back —
+/// a right password included, or guessing would go on. 0 is no limit,
+/// which is what a `Core` built by hand has; a server built from a config
+/// has [`LoginLimits::RECOMMENDED`] unless it says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LoginLimits {
+    pub failures: u32,
+    pub every: Duration,
+}
+
+impl LoginLimits {
+    /// Ten wrong passwords at once, then one every thirty seconds: a
+    /// person who mistypes is never refused, a guesser gets a hundred and
+    /// twenty an hour.
+    pub const RECOMMENDED: LoginLimits = LoginLimits {
+        failures: 10,
+        every: Duration::from_secs(30),
+    };
+}
+
+/// A password about to be checked, holding the failure it will count
+/// as if it is wrong ([`Core::login_attempt`]). Settle it with
+/// [`Core::login_failed`] or [`Core::login_refund`] once the answer is
+/// in; one dropped unsettled counts as a failure.
+#[derive(Debug)]
+#[must_use = "settle it with Core::login_failed or Core::login_refund"]
+pub struct LoginAttempt {
+    /// The address whose failure was spent; `None` when nothing was.
+    held: Option<IpAddr>,
+}
+
+impl Core {
+    /// Hold failed logins to `limits` rather than
+    /// [`LoginLimits::default`]. Addresses exempt from `[limits]` are
+    /// held to none.
+    pub fn with_login_limits(mut self, limits: LoginLimits) -> Self {
+        self.login_failures = RateGate::new(limits.failures, limits.every, AddrSet::default());
+        self
+    }
+
+    /// May `addr` try `password` now? `Err` says how long until it may:
+    /// it has failed as often as it may for now, and the frontend refuses
+    /// the login without checking it. Asked before every password is
+    /// checked, on every wire.
+    ///
+    /// The failure is spent here, before the password is checked, and
+    /// given back when the attempt is settled as anything but a wrong
+    /// guess ([`Core::login_refund`]). Checking first and spending once
+    /// the answer is in would let every connection an address holds pass
+    /// the check while the first of their passwords was still being
+    /// verified, and a guesser would get as many tries at once as it
+    /// could open connections. An empty password is not a guess — it is
+    /// how a guest logs in, and it is one value, which trying again
+    /// cannot change — so it is neither held to the count nor counted.
+    pub fn login_attempt(&self, addr: IpAddr, password: &[u8]) -> Result<LoginAttempt, Duration> {
+        if password.is_empty() || self.conn_gate.exempt(addr) {
+            return Ok(LoginAttempt { held: None });
+        }
+        match self.login_failures.take(addr) {
+            Ok(()) => Ok(LoginAttempt { held: Some(addr) }),
+            Err(wait) => {
+                crate::instrument::rate_limited("login");
+                Err(wait)
+            }
+        }
+    }
+
+    /// The password `attempt` was for did not verify, or named no
+    /// account: the failure it spent stays spent. Dropping an attempt
+    /// unsettled says the same.
+    pub fn login_failed(&self, attempt: LoginAttempt) {
+        drop(attempt);
+    }
+
+    /// The attempt was not a wrong guess — the password verified, or the
+    /// login was refused for something other than it, or the server
+    /// could not tell — and the failure it spent is given back.
+    pub fn login_refund(&self, attempt: LoginAttempt) {
+        if let Some(addr) = attempt.held {
+            self.login_failures.refund(addr);
+        }
+    }
+
+    /// The addresses `[limits]` holds to none of its limits, for a
+    /// frontend's own gates to exempt as well.
+    pub fn limits_exempt(&self) -> &AddrSet {
+        &self.conn_gate.limits().exempt
     }
 }
 
@@ -521,6 +792,153 @@ mod tests {
             assert!(f.chat(100, &none, t));
             assert!(f.spam(100, &none, t).1);
         }
+    }
+
+    #[test]
+    fn a_rate_admits_its_burst_then_says_how_long_to_wait() {
+        let g = RateGate::new(3, Duration::from_secs(10), AddrSet::default());
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let t = Instant::now();
+        for _ in 0..3 {
+            assert!(g.at(ip, t, true).is_ok());
+        }
+        let wait = g.at(ip, t, true).unwrap_err();
+        assert!(
+            wait > Duration::from_secs(9) && wait <= Duration::from_secs(10),
+            "{wait:?}"
+        );
+        assert!(
+            g.at("192.0.2.2".parse().unwrap(), t, true).is_ok(),
+            "another address"
+        );
+        let later = t + Duration::from_secs(10);
+        assert!(g.at(ip, later, true).is_ok(), "one earned");
+        assert!(g.at(ip, later, true).is_err());
+        // An IPv6 client is its /64 here too.
+        let v6 = RateGate::new(1, Duration::from_secs(60), AddrSet::default());
+        assert!(v6.take("2001:db8::1".parse().unwrap()).is_ok());
+        assert!(v6.take("2001:db8::2".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_refund_gives_back_what_a_take_spent_and_no_more() {
+        let g = RateGate::new(2, Duration::from_secs(60), AddrSet::default());
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        // Refunded before anything was spent, the burst stays the burst.
+        g.refund(ip);
+        g.refund(ip);
+        assert!(g.take(ip).is_ok());
+        assert!(g.take(ip).is_ok());
+        assert!(g.take(ip).is_err(), "none left");
+        g.refund(ip);
+        assert!(g.take(ip).is_ok(), "one given back");
+        assert!(g.take(ip).is_err());
+    }
+
+    #[test]
+    fn a_rate_table_is_walked_seldom_and_held_to_its_cap() {
+        // Nothing earns its whole burst back in the test's lifetime, so no
+        // walk can forget an address for being full again.
+        let g = RateGate::new(1, Duration::from_secs(3600), AddrSet::default());
+        let addr = |i: u32| IpAddr::from((0x0a00_0000 + i).to_be_bytes());
+        let spread = RATE_CAP as u32 * 2;
+        for i in 0..spread {
+            assert!(g.take(addr(i)).is_ok());
+            assert!(g.by_addr.lock().unwrap().map.len() <= RATE_CAP);
+        }
+        // Doubling up to the cap, then a quarter of it between walks.
+        let walks = g.by_addr.lock().unwrap().walks;
+        assert!(walks <= 16, "walked {walks} times");
+        for i in spread - 64..spread {
+            assert!(
+                g.take(addr(i)).is_err(),
+                "an address that spent lately is not the one forgotten"
+            );
+        }
+        assert!(g.take(addr(0)).is_ok(), "the fullest were forgotten");
+        assert!(
+            g.take("203.0.113.1".parse().unwrap()).is_ok(),
+            "a new address is admitted with the table full"
+        );
+    }
+
+    #[test]
+    fn a_rate_of_zero_and_an_exempt_address_are_not_limited() {
+        let off = RateGate::per_minute(0, AddrSet::default());
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..100 {
+            assert!(off.take(ip).is_ok());
+        }
+        let g = RateGate::per_minute(1, AddrSet::parse(&["127.0.0.0/8"]).unwrap());
+        for _ in 0..100 {
+            assert!(g.take("127.0.0.1".parse().unwrap()).is_ok());
+        }
+        assert!(g.take(ip).is_ok());
+        assert!(g.take(ip).is_err());
+    }
+
+    #[test]
+    fn failed_logins_lock_an_address_out_until_it_earns_one_back() {
+        let core = Core::new()
+            .with_conn_limits(ConnLimits {
+                exempt: AddrSet::default(),
+                ..ConnLimits::default()
+            })
+            .with_login_limits(LoginLimits {
+                failures: 2,
+                every: Duration::from_millis(200),
+            });
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let pw = b"wrong".as_slice();
+        core.login_failed(core.login_attempt(ip, pw).unwrap());
+        core.login_failed(core.login_attempt(ip, pw).expect("one mistake"));
+        assert!(core.login_attempt(ip, pw).is_err(), "locked out");
+        core.login_refund(
+            core.login_attempt("192.0.2.2".parse().unwrap(), pw)
+                .unwrap(),
+        );
+        // An empty password is a guest's, and is neither refused nor
+        // counted.
+        for _ in 0..5 {
+            core.login_failed(core.login_attempt(ip, b"").expect("no password"));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        core.login_refund(core.login_attempt(ip, pw).expect("one earned back"));
+        core.login_refund(
+            core.login_attempt(ip, pw)
+                .expect("a right password costs nothing"),
+        );
+        // A core built by hand is not limited.
+        let open = Core::new();
+        for _ in 0..50 {
+            open.login_failed(open.login_attempt(ip, pw).unwrap());
+        }
+        assert!(open.login_attempt(ip, pw).is_ok());
+    }
+
+    #[test]
+    fn attempts_in_flight_at_once_are_held_to_the_limit() {
+        // Every attempt spends its failure as it is let in, so attempts
+        // waiting on their answers at once cannot all pass a check none
+        // of them has yet failed.
+        let core = Core::new()
+            .with_conn_limits(ConnLimits {
+                exempt: AddrSet::default(),
+                ..ConnLimits::default()
+            })
+            .with_login_limits(LoginLimits {
+                failures: 3,
+                every: Duration::from_secs(60),
+            });
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let held: Vec<_> = (0..20)
+            .filter_map(|_| core.login_attempt(ip, b"guess").ok())
+            .collect();
+        assert_eq!(held.len(), 3);
+        for a in held {
+            core.login_failed(a);
+        }
+        assert!(core.login_attempt(ip, b"guess").is_err());
     }
 
     #[test]

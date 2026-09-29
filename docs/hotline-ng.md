@@ -315,7 +315,7 @@ Errors:
 | `revoked` | The socket's identity or device key was revoked on this server after it authenticated (identity-registrar.md §7.3). |
 | `banned` | The address or identity is banned. *hxd-ng* refuses a banned address before the upgrade — closing the TCP connection at accept, or answering the HTTP request 403 — and never sends this code. |
 | `server_full` | No uid is free. |
-| `rate_limited` | The server is taking logins as fast as it can. Retry after `retry_after` seconds. *hxd-ng:* past `[server] logins_in_flight` logins in progress. |
+| `rate_limited` | The server is taking logins as fast as it can, or this address has failed too many. Retry after `retry_after` seconds. *hxd-ng:* past `[server] logins_in_flight` logins in progress, or past `[limits] login_failures` wrong passwords from the address on any wire (§9). |
 | `server_error` | The server could not complete the login. |
 
 ### 6.2 Resume
@@ -661,9 +661,24 @@ news body is different: it declares its own type (news.md §5).
   server SHOULD limit requests per connection and login attempts per
   address, and answers a request over its limit `rate_limited`, which a
   client MUST NOT treat as fatal. *hxd-ng* limits `history`,
-  `news_search`, media and news-attachment uploads, media downloads, and
-  enrollment; the general per-connection and login-attempt limits are not
-  yet built.
+  `news_search`, media and news-attachment uploads (asked before the
+  body is read), media and news-image downloads, avatar fetches and
+  enrollment. Login attempts are limited per address: past `[limits]
+  login_failures` wrong passwords — here, on the classic wire, or at
+  `/identity/auth` and `/identity/link` — a password login is refused
+  with `retry_after` until the address earns one back, and a socket
+  that authenticated with an identity, or a guest login that sends no
+  password, is not held to it. Each password is counted as it is let
+  in and given back unless it turns out wrong (a password that
+  verifies, a login refused for something other than its password,
+  and a server that could not check it all give it back), so guesses
+  made at once on many connections are held to the same count.
+  `/identity/challenge` is limited per address, and answers 429 with
+  `Retry-After`, as every HTTP route over its limit does. The port
+  holds so many connections from one address and from everyone,
+  counted from accept, before a byte is read; past either a
+  connection is closed unanswered. The general per-connection request
+  limit is not yet built.
 - **Flooding.** A server MAY instead kick a session that sends faster
   than anyone is allowed to, answering the request that crossed the line
   `flooding` before the `kicked` event (§10). *hxd-ng* holds a session to

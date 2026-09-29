@@ -149,6 +149,7 @@ constant rather than one per recipient.
 | `hxd_login_seconds` | `wire`, `auth` | first byte to a session on the roster; `auth` is `guest`, `password`, `identity` or `resume` |
 | `hxd_flood_kicks_total` | `what` | sessions kicked for talking faster than `[limits]` allows: `chat` past `chat_lines`, `spam` past `spam_points` |
 | `hxd_logins_refused_busy_total` | | logins refused because the server was already working on `[server] logins_in_flight` of them |
+| `hxd_rate_limited_total` | `what` | refused for coming too often from one address or session, before any work was done on it: `login` (past `[limits] login_failures`), `challenge` (`/identity/challenge`), `fetch` (an avatar or a news or media image), `upload` (an upload refused before its body was read) |
 | `hxd_disconnects_total` | `wire`, `reason` | why a connection ended |
 | `hxd_transfers_open` | `dir` | file transfers in progress |
 
@@ -164,13 +165,17 @@ shows.
 The reasons: `eof`, `io_error` and `malformed` from the socket,
 `closed` for a WebSocket close, `banned` for an address refused at
 the door, `too_many` and `too_fast` for one past `[limits]` (the
-connections it holds, or how fast it opens them), `handshake` and `login` for a connection that never got a
+connections it holds, or how fast it opens them), `full` for a
+connection past `[limits] ng_connections`, `handshake` and `login` for a connection that never got a
 session, `kicked`, `logout`, `replaced`,
 `send_failed`, `pong_deadline`, and `slow_consumer` for a client that
 stopped taking what was sent to it: a classic writer's queue past its
 bound or a write that made no progress for a minute, either wire's
 session a whole channel behind, or either wire's queue among the
-furthest behind once the server's budget is spent (below).
+furthest behind once the server's budget is spent (below). A connection to the ng
+port refused by `[limits]` before a byte of it is read, past
+`http_connections_per_addr` (`too_many`) or `ng_connections` (`full`),
+is counted as `wire="http"`: it was never a session on either wire.
 
 ### Read at scrape time
 

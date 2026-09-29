@@ -16,9 +16,10 @@
 //! Revocation is the operator's own list (`identity-registrar.md`),
 //! held by the core so that installing it can end the sessions it
 //! refuses; the registrar's published records, which need a registrar to
-//! fetch from, are not here yet. Nor is rate limiting, which should share
-//! the login-attempt limiter when that exists. Each is marked where it
-//! would go.
+//! fetch from, are not here yet, and are marked where they would go.
+//! Rate limiting is the HTTP layer's, in front of this: challenges per
+//! address, and the core's count of failed logins, which a password
+//! checked here shares with both wires' logins.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -187,6 +188,11 @@ pub enum AuthRefused {
     UnknownChallenge,
     /// `login`/`password` didn't verify (§5.4).
     LoginFailed,
+    /// `login`/`password` named the guest account, which links to no
+    /// one. The client is told `login_failed`, exactly as for a wrong
+    /// password, but the password was not wrong: it is not a guess, and
+    /// the failed-login count does not hear of it.
+    GuestLink,
     /// The device certificate lacks the manage bit (§8.2, §8.4).
     NoManage,
     /// This identity already links a different account here (§8.2).
@@ -212,7 +218,7 @@ impl AuthRefused {
             AuthRefused::Denied => "denied",
             AuthRefused::CardTooLarge => "card_too_large",
             AuthRefused::UnknownChallenge => "unknown_challenge",
-            AuthRefused::LoginFailed => "login_failed",
+            AuthRefused::LoginFailed | AuthRefused::GuestLink => "login_failed",
             AuthRefused::NoManage => "no_manage",
             AuthRefused::AlreadyLinked => "already_linked",
             AuthRefused::WouldOrphan => "would_orphan",
@@ -941,7 +947,8 @@ impl IdentityState {
         }
         let account = match self.auth.authenticate(login, Proof::Plain(password)) {
             Ok(a) if a.login != "guest" => a,
-            Ok(_) | Err(AuthError::NoSuchAccount | AuthError::BadProof) => {
+            Ok(_) => return Err(AuthRefused::GuestLink),
+            Err(AuthError::NoSuchAccount | AuthError::BadProof) => {
                 return Err(AuthRefused::LoginFailed)
             }
             Err(AuthError::Backend(e)) => {
@@ -2119,6 +2126,18 @@ mod tests {
             .find_by_fingerprint(&id.fingerprint().0)
             .unwrap()
             .is_none());
+
+        // A wrong password and the guest account are both `login_failed`
+        // to the client, but only the first is a guess the failed-login
+        // count should hear of.
+        assert_eq!(
+            st.link(&ident, "alice", b"nope").unwrap_err(),
+            AuthRefused::LoginFailed
+        );
+        let guest = st.link(&ident, "guest", b"").unwrap_err();
+        assert_eq!(guest, AuthRefused::GuestLink);
+        assert_eq!(guest.code(), AuthRefused::LoginFailed.code());
+        assert_eq!(guest.status(), AuthRefused::LoginFailed.status());
 
         // Link after auth, then a password-less account can't be unlinked.
         assert_eq!(st.link(&ident, "alice", b"pw").unwrap().login, "alice");

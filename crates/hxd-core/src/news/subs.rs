@@ -131,6 +131,15 @@ pub(super) fn spend(budgets: &mut Budgets, key: BudgetKey, per_hour: u32) -> boo
     true
 }
 
+/// Whether [`spend`] would take one from `key`'s bucket, taking nothing.
+pub(super) fn would_spend(budgets: &Budgets, key: &BudgetKey, per_hour: u32) -> bool {
+    let per_hour = f64::from(per_hour);
+    budgets
+        .get(key)
+        .is_none_or(|(at, tokens)| *tokens + at.elapsed().as_secs_f64() * per_hour / 3600.0 >= 1.0)
+        && per_hour >= 1.0
+}
+
 /// The opening of a body as one line, cut at a word near the limit. What a
 /// lock screen shows, if the gateway's content policy shows anything.
 fn excerpt(body: &str) -> String {

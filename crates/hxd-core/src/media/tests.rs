@@ -355,6 +355,24 @@ fn the_upload_quotas_hold() {
 }
 
 #[test]
+fn asking_whether_an_upload_would_be_admitted_spends_nothing() {
+    let core = core_with(MediaConfig {
+        upload_interval: Duration::ZERO,
+        upload_per_hour: 1,
+        ..Default::default()
+    });
+    let (alice, _ra) = attach(&core, "alice", Ipv4Addr::LOCALHOST);
+    for _ in 0..5 {
+        assert_eq!(core.media_upload_admits(alice), Ok(()));
+    }
+    upload(&core, alice, b"one").unwrap();
+    assert_eq!(
+        core.media_upload_admits(alice),
+        Err(MediaReject::RateLimited)
+    );
+}
+
+#[test]
 fn an_assembled_upload_cannot_exceed_the_cap() {
     let core = core_with(MediaConfig {
         max_bytes: 8,

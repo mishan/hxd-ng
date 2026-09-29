@@ -625,6 +625,43 @@ async fn stage(ng: SocketAddr, who: &Ng, image: &[u8], name: &str) -> HttpReply 
     .await
 }
 
+/// A request whose body is promised and never sent: the status and
+/// headers, which arrive only if the server answers without reading it.
+async fn unsent_body(
+    addr: SocketAddr,
+    path: &str,
+    extra: &[(&str, &str)],
+    promised: usize,
+) -> (u16, Vec<(String, String)>) {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {promised}\r\n");
+    for (k, v) in extra {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("the server waited for a body it was going to refuse")
+            .unwrap();
+        assert!(n > 0, "closed unanswered");
+        raw.extend_from_slice(&buf[..n]);
+    }
+    let head = String::from_utf8_lossy(&raw).to_string();
+    let mut lines = head.lines();
+    let status = lines.next().unwrap().split_whitespace().nth(1).unwrap();
+    let headers = lines
+        .filter_map(|l| {
+            l.split_once(':')
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+        })
+        .collect();
+    (status.parse().unwrap(), headers)
+}
+
 async fn fetch_blob(ng: SocketAddr, who: &Ng, path: &str) -> HttpReply {
     http(
         ng,
@@ -644,6 +681,48 @@ fn staged_id(reply: &HttpReply) -> String {
 fn refusal(reply: &HttpReply) -> (u16, String) {
     let code = reply.json()["error"]["code"].as_str().unwrap().to_owned();
     (reply.status, code)
+}
+
+#[tokio::test]
+async fn news_images_are_staged_and_fetched_within_their_allowances() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng) = start_server(
+        dir.path(),
+        Some(attaching(AttachmentPolicy {
+            per_hour: 1,
+            ..attach_policy()
+        })),
+    )
+    .await;
+    let (alice, _) = Ng::login(ng, "alice").await;
+    let handle = staged_id(&stage(ng, &alice, &png(8, 8), "one.png").await);
+
+    // The hour's one staging is spent, and the next is refused before its
+    // body is read: it promises one it never sends.
+    let (status, headers) = unsent_body(
+        ng,
+        "/news/blob",
+        &[
+            ("Authorization", &alice.bearer),
+            ("Content-Type", "image/png"),
+        ],
+        10_000,
+    )
+    .await;
+    assert_eq!(status, 429);
+    assert!(headers.iter().any(|(k, _)| k == "retry-after"));
+
+    // A fetch is an image fetched by a session, and draws on the
+    // allowance `/media` downloads do: with no `[media]`, its default,
+    // a minute's worth at once and then no more.
+    let per_minute = hxd_core::MediaConfig::default().download_per_minute;
+    for n in 0..per_minute {
+        let got = fetch_blob(ng, &alice, &handle).await;
+        assert_eq!(got.status, 200, "fetch {n}");
+    }
+    let refused = fetch_blob(ng, &alice, &handle).await;
+    assert_eq!(refusal(&refused), (429, "rate_limited".to_owned()));
+    assert!(refused.header("retry-after").is_some());
 }
 
 #[tokio::test]

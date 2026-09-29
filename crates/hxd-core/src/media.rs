@@ -628,26 +628,40 @@ impl Core {
         part: UploadPart<'_>,
     ) -> Result<UploadOutcome, MediaReject> {
         let store = self.media.as_ref().ok_or(MediaReject::NotAuthorized)?;
-        let who = {
-            let r = self.roster.lock().unwrap();
-            let sess = r.users.get(&uid).ok_or(MediaReject::NotAuthorized)?;
-            // The spec has operators grant this explicitly; an account
-            // file that says nothing says no, and the bootstrap guest
-            // says nothing.
-            if !sess.access.has(bit::SEND_MEDIA) {
-                return Err(MediaReject::NotAuthorized);
-            }
-            Uploader {
-                login: sess.login.clone(),
-                mailbox: (sess.is_person || sess.identity.is_some()).then(|| sess.mailbox()),
-                addr: sess.addr,
-                principal: Principal::Session {
-                    uid,
-                    serial: sess.serial,
-                },
-            }
-        };
+        let who = self.uploader(uid)?;
         store.accept_part(&who, part)
+    }
+
+    /// Would an upload this session starts now be admitted? What
+    /// [`Core::media_upload_part`] asks when an upload starts, asked
+    /// without spending anything — so a frontend that is handed the
+    /// whole image in one body can refuse it before reading a byte of
+    /// it, rather than after.
+    pub fn media_upload_admits(&self, uid: Uid) -> Result<(), MediaReject> {
+        let store = self.media.as_ref().ok_or(MediaReject::NotAuthorized)?;
+        let who = self.uploader(uid)?;
+        let mut inner = store.inner.lock().unwrap();
+        store.ask_rate(&mut inner, &who, Instant::now())
+    }
+
+    fn uploader(&self, uid: Uid) -> Result<Uploader, MediaReject> {
+        let r = self.roster.lock().unwrap();
+        let sess = r.users.get(&uid).ok_or(MediaReject::NotAuthorized)?;
+        // The spec has operators grant this explicitly; an account file
+        // that says nothing says no, and the bootstrap guest says
+        // nothing.
+        if !sess.access.has(bit::SEND_MEDIA) {
+            return Err(MediaReject::NotAuthorized);
+        }
+        Ok(Uploader {
+            login: sess.login.clone(),
+            mailbox: (sess.is_person || sess.identity.is_some()).then(|| sess.mailbox()),
+            addr: sess.addr,
+            principal: Principal::Session {
+                uid,
+                serial: sess.serial,
+            },
+        })
     }
 
     /// The bytes, for a session that may have them.
@@ -1206,6 +1220,25 @@ impl MediaStore {
         who: &Uploader,
         now: Instant,
     ) -> Result<(), MediaReject> {
+        self.ask_rate(inner, who, now)?;
+        // Nothing can refuse it now, so both buckets pay.
+        let account = inner.per_account.entry(who.login.clone()).or_default();
+        account.hour.charge(now);
+        account.last_upload = Some(now);
+        if let Some(addr) = who.addr {
+            inner.per_addr.entry(addr).or_default().charge(now);
+        }
+        Ok(())
+    }
+
+    /// Whether [`Self::check_rate`] would admit an upload, charging
+    /// nothing.
+    fn ask_rate(
+        &self,
+        inner: &mut StoreInner,
+        who: &Uploader,
+        now: Instant,
+    ) -> Result<(), MediaReject> {
         let hour = Duration::from_secs(3600);
         // Both buckets are *asked* before either is charged. Charging as
         // we go would let a refusal from the second one still spend the
@@ -1233,13 +1266,6 @@ impl MediaStore {
             if !per_addr.would_admit(now, hour, self.cfg.upload_per_hour_per_addr) {
                 return Err(MediaReject::RateLimited);
             }
-        }
-        // Nothing can refuse it now, so both buckets pay.
-        let account = inner.per_account.entry(who.login.clone()).or_default();
-        account.hour.charge(now);
-        account.last_upload = Some(now);
-        if let Some(addr) = who.addr {
-            inner.per_addr.entry(addr).or_default().charge(now);
         }
         Ok(())
     }

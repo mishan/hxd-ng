@@ -1517,8 +1517,10 @@ pub struct LimitsSection {
     /// for no limit.
     #[serde(default = "default_reconnect_seconds")]
     pub reconnect_seconds: u64,
-    /// Addresses and CIDR blocks held to neither connection limit. The
-    /// flood limits are a session's, and hold everywhere.
+    /// Addresses and CIDR blocks held to none of the per-address limits:
+    /// connections, failed logins, and the ng port's — and kept a few
+    /// places past `ng_connections`. The flood limits are a session's,
+    /// and hold everywhere.
     #[serde(default = "default_limits_exempt")]
     pub exempt: Vec<String>,
     /// Chat lines one session may send in each `chat_seconds` window,
@@ -1537,6 +1539,49 @@ pub struct LimitsSection {
     pub spam_points: u32,
     #[serde(default = "default_spam_seconds")]
     pub spam_seconds: u64,
+    /// Wrong passwords one address may give, on either wire, before a
+    /// password from it is refused until it earns one back, one every
+    /// `login_failure_seconds`; 0 for no limit. A login that sends no
+    /// password is not held to it.
+    #[serde(default = "default_login_failures")]
+    pub login_failures: u32,
+    #[serde(default = "default_login_failure_seconds")]
+    pub login_failure_seconds: u64,
+    /// Connections one address may hold to the ng port, whatever they
+    /// carry; 0 for no limit.
+    #[serde(default = "default_http_connections_per_addr")]
+    pub http_connections_per_addr: usize,
+    /// Connections everyone together may hold to the ng port; 0 for no
+    /// limit. Exempt addresses have a few places past it.
+    #[serde(default = "default_ng_connections")]
+    pub ng_connections: usize,
+    /// `POST /identity/challenge` one address may make a minute; 0 for
+    /// no limit.
+    #[serde(default = "default_challenges_per_minute")]
+    pub challenges_per_minute: u32,
+    /// `GET /avatars/{id}` one address may make a minute; 0 for no
+    /// limit.
+    #[serde(default = "default_avatar_fetches_per_minute")]
+    pub avatar_fetches_per_minute: u32,
+}
+
+fn default_login_failures() -> u32 {
+    hxd_core::LoginLimits::RECOMMENDED.failures
+}
+fn default_login_failure_seconds() -> u64 {
+    hxd_core::LoginLimits::RECOMMENDED.every.as_secs()
+}
+fn default_http_connections_per_addr() -> usize {
+    hxd_ng_session::HttpLimits::RECOMMENDED.connections_per_addr
+}
+fn default_ng_connections() -> usize {
+    hxd_ng_session::HttpLimits::RECOMMENDED.connections
+}
+fn default_challenges_per_minute() -> u32 {
+    hxd_ng_session::HttpLimits::RECOMMENDED.challenges_per_minute
+}
+fn default_avatar_fetches_per_minute() -> u32 {
+    hxd_ng_session::HttpLimits::RECOMMENDED.avatar_fetches_per_minute
 }
 
 fn default_chat_lines() -> u32 {
@@ -1572,6 +1617,12 @@ impl Default for LimitsSection {
             chat_seconds: default_chat_seconds(),
             spam_points: default_spam_points(),
             spam_seconds: default_spam_seconds(),
+            login_failures: default_login_failures(),
+            login_failure_seconds: default_login_failure_seconds(),
+            http_connections_per_addr: default_http_connections_per_addr(),
+            ng_connections: default_ng_connections(),
+            challenges_per_minute: default_challenges_per_minute(),
+            avatar_fetches_per_minute: default_avatar_fetches_per_minute(),
         }
     }
 }
@@ -1592,6 +1643,25 @@ impl LimitsSection {
             spam_per: Duration::from_secs(self.spam_seconds),
             ban_for: Duration::from_secs(ban_time),
         })
+    }
+
+    pub fn login_limits(&self) -> Result<hxd_core::LoginLimits, String> {
+        if self.login_failures != 0 && self.login_failure_seconds == 0 {
+            return Err("[limits] login_failures needs login_failure_seconds: set both, or login_failures to 0".into());
+        }
+        Ok(hxd_core::LoginLimits {
+            failures: self.login_failures,
+            every: Duration::from_secs(self.login_failure_seconds),
+        })
+    }
+
+    pub fn http_limits(&self) -> hxd_ng_session::HttpLimits {
+        hxd_ng_session::HttpLimits {
+            connections_per_addr: self.http_connections_per_addr,
+            connections: self.ng_connections,
+            challenges_per_minute: self.challenges_per_minute,
+            avatar_fetches_per_minute: self.avatar_fetches_per_minute,
+        }
     }
 
     pub fn conn_limits(&self) -> Result<hxd_core::ConnLimits, String> {
@@ -2256,6 +2326,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     }
     config.limits.conn_limits()?;
     config.limits.flood_limits(config.server.ban_time)?;
+    config.limits.login_limits()?;
     if config.server.queue_budget() == 0 {
         return Err(
             "[server] queue_budget_mb must be at least 1, and small enough to count in bytes"
@@ -3095,6 +3166,7 @@ pub fn build_ng_ctx(
             caps: ng_caps(config, voice, files),
             trusted_proxies: TrustedProxies::parse(&ng.trusted_proxies)?,
             forwarded_header: ForwardedHeader::parse(&ng.forwarded_header)?,
+            http_limits: config.limits.http_limits(),
         }),
         registry: Arc::new(Registry::new()),
         identity,
@@ -3130,11 +3202,13 @@ pub fn build_ctx(
     let budget = config.server.queue_budget();
     let conn_limits = config.limits.conn_limits()?;
     let flood_limits = config.limits.flood_limits(config.server.ban_time)?;
+    let login_limits = config.limits.login_limits()?;
     let core = match voice {
         Some(v) => {
             let core = Core::new()
                 .with_conn_limits(conn_limits)
                 .with_flood_limits(flood_limits)
+                .with_login_limits(login_limits)
                 .with_queue_budget(budget)
                 .with_logins_in_flight(config.server.logins_in_flight)
                 .with_voice(v.media(), v.max_per_room());
@@ -3154,6 +3228,7 @@ pub fn build_ctx(
         None => Core::new()
             .with_conn_limits(conn_limits)
             .with_flood_limits(flood_limits)
+            .with_login_limits(login_limits)
             .with_queue_budget(budget)
             .with_logins_in_flight(config.server.logins_in_flight),
     };

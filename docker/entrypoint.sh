@@ -180,6 +180,12 @@ generate() {
     num HXD_CHAT_SECONDS chat_seconds
     num HXD_SPAM_POINTS spam_points
     num HXD_SPAM_SECONDS spam_seconds
+    num HXD_LOGIN_FAILURES login_failures
+    num HXD_LOGIN_FAILURE_SECONDS login_failure_seconds
+    num HXD_HTTP_CONNECTIONS_PER_ADDR http_connections_per_addr
+    num HXD_NG_CONNECTIONS ng_connections
+    num HXD_CHALLENGES_PER_MINUTE challenges_per_minute
+    num HXD_AVATAR_FETCHES_PER_MINUTE avatar_fetches_per_minute
     echo
     echo "[paths]"
     echo "accounts = \"$DATA/accounts\""

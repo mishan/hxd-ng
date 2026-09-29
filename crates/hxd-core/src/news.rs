@@ -1537,6 +1537,27 @@ impl Core {
         }
     }
 
+    /// Would an image this session stages now be admitted? The questions
+    /// [`Core::news_stage_attachment`] asks before it decodes anything,
+    /// asked without spending the allowance, so a frontend can refuse an
+    /// upload before it reads the bytes.
+    pub fn news_attach_admits(&self, uid: Uid) -> Result<(), NewsError> {
+        use crate::media::MediaReject;
+
+        self.news_store()?;
+        let asker = self.news_reader(uid)?;
+        let policy = self.news_policy.attach.ok_or(NewsError::Disabled)?;
+        if !asker.access.has(bit::POST_NEWS) || !asker.attach_news {
+            return Err(NewsError::AccessDenied);
+        }
+        let owner = Self::attachment_owner(&asker).ok_or(NewsError::NoMailbox)?;
+        let rate = self.news_attach_rate.lock().unwrap();
+        if !subs::would_spend(&rate, &subs::budget_key(&owner), policy.per_hour) {
+            return Err(NewsError::Media(MediaReject::RateLimited));
+        }
+        Ok(())
+    }
+
     /// Validate, canonicalize, persist and stage one news image (§7.3).
     /// Frontends call this off their reactor thread.
     pub fn news_stage_attachment(

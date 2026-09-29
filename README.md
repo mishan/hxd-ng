@@ -256,11 +256,21 @@ connections_per_addr = 5     # at once; 0 for no limit
 reconnect_seconds = 2        # past a burst of that many new connections
                              # (5 when the line above is 0), one more
                              # each this often; 0 for no limit
-exempt = ["127.0.0.0/8", "::1"]  # held to neither connection limit
+exempt = ["127.0.0.0/8", "::1"]  # addresses and blocks held to none of
+                             # the per-address limits, and kept a few
+                             # places past ng_connections
 chat_lines = 20              # 0 for no limit, or the chat lines one user
 chat_seconds = 5             # may send in each window this long, or be kicked
 spam_points = 100            # 0 for no limit, or the spam points one user
 spam_seconds = 5             # may spend in each window this long, or be banned
+login_failures = 10          # wrong passwords one address may give, on
+login_failure_seconds = 30   # any wire, then one more each this often;
+                             # 0 failures = no limit
+http_connections_per_addr = 16  # connections to the ng port, whatever
+                             # they carry; 0 for no limit
+ng_connections = 4096        # connections to the ng port from everyone
+challenges_per_minute = 30   # POST /identity/challenge, per address
+avatar_fetches_per_minute = 600  # GET /avatars/{id}, per address
 ```
 
 The flood limits are mhxd's `chat_max` and `spam_max`, and hold for
@@ -282,16 +292,52 @@ with `[extra] can_spam = true` is held to neither, which by default is
 every account with the kick bit. A load test from one machine wants
 both at 0.
 
+An address that has given `login_failures` wrong passwords — on the
+classic wire, the ng wire's `login`, or `/identity/auth` and
+`/identity/link` — is refused before its next password is checked, the
+right one included, until it has earned one back. Each password counts
+from the moment it is let in and is given back unless it turns out
+wrong — a password that verifies, a login refused for something other
+than its password, and a server that could not check it all give it
+back — so guesses sent at once on many connections are held to the
+same count as guesses sent one after another. A login that checks no password is not
+held to it: a guest's, with none, and an identity that `[identity]
+trtp_login = trust` admits, or that logs in on the ng wire without
+one. A classic client is told so in the error text of the login it
+already expects to fail; an ng one gets `rate_limited` with
+`retry_after`, and an HTTP route 429 with `Retry-After`.
+
+The ng port holds each connection to `http_connections_per_addr` and
+`ng_connections` from accept, before a byte is read, and for the whole
+life of a WebSocket; past either it is closed unanswered. The count per
+address is its own rather than `connections_per_addr`, because one
+browser page opens several connections at once beside its socket. An
+ng session's socket counts toward `connections_per_addr` as well.
+`ng_connections` is what bounds the port's descriptors whoever holds
+them, and a crowd of addresses can fill it — one IPv6 /56, say, whose
+/64s each count as an address of their own. An address `exempt` lists
+still gets in when it is full, into a few places kept past it for the
+operator's own tools, such as a `/metrics` scrape; a trusted proxy is
+not given them, exempt or not.
+Behind a proxy in `[ng] trusted_proxies` the proxy's connections carry
+everyone, so they count toward `ng_connections` alone and the proxy is
+the place to limit connections per client; the request limits still
+apply to the address it forwards. Keep `ng_connections` below the
+process's descriptor limit, less what the classic port and the
+databases need. An idle keep-alive connection is closed after
+`[server] login_timeout`, as a request head that never arrives is.
+
 An IPv6 client counts as its /64. An ng client behind a reverse proxy
 listed in `[ng] trusted_proxies` counts as the address the proxy
 forwards. A classic client reaching the server through a TCP proxy that
 hides its address counts as the proxy, so every client of that proxy
 shares one allowance: exempt the proxy, or raise the limit. A proxy on
-the same host connects from loopback, which `exempt` holds to neither
-connection limit by default, so every client behind it is exempt too,
-down to the share of logins in flight one address may hold. For limits
-per client, list the proxy in `[ng] trusted_proxies` for the ng port,
-or take loopback out of `exempt` for a TCP proxy to the classic ports.
+the same host connects from loopback, which `exempt` holds to none of
+the per-address limits by default, so every client behind it is exempt
+too, down to the share of logins in flight one address may hold. For
+limits per client, list the proxy in `[ng] trusted_proxies` for the ng
+port, or take loopback out of `exempt` for a TCP proxy to the classic
+ports.
 
 ### Banner
 

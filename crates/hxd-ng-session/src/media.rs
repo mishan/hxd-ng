@@ -97,6 +97,17 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
     let Some(uid) = bearer_session(&req, ctx) else {
         return unauthorized();
     };
+    // Refused before a byte of the body is read, when the pipeline
+    // would refuse it anyway: reading it first held a quarter of a
+    // megabyte and a decode's place for an answer that was known before
+    // it started.
+    if let Err(e) = ctx.core.media_upload_admits(uid) {
+        if e == MediaReject::RateLimited {
+            hxd_core::instrument::rate_limited("upload");
+        }
+        discard(req.into_body(), cfg.max_bytes);
+        return reject(e);
+    }
     // Refuse an oversized body before reading it, when the client was
     // honest enough to say how big it is. `Limited` below is what holds
     // for one that was not.
@@ -180,10 +191,7 @@ pub async fn download(id: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
         .media_config()
         .map(|c| c.download_per_minute)
         .unwrap_or(0);
-    if !ctx
-        .registry
-        .allow_download(&session_of(&req).unwrap_or_default(), per_minute)
-    {
+    if !allow_download(&req, ctx, per_minute) {
         // Through `reject`, not a bare string: this module promises one
         // parseable error shape for every failure it produces, and a
         // `fetch` caller that has to special-case one status is exactly
@@ -211,6 +219,38 @@ pub async fn download(id: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp {
         .header(CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'")
         .body(Full::new(Bytes::from(fetched.bytes.as_ref().clone())))
         .unwrap()
+}
+
+/// Read a refused upload's body and throw it away, beside the answer
+/// rather than before it, keeping none of it.
+///
+/// Not reading it at all would be simpler and worse: the connection is
+/// closed with the body still arriving, the peer's kernel answers the
+/// rest with a reset, and a browser that has not read the refusal yet
+/// loses it to the reset and reports a network error instead of a 429.
+/// So the answer goes out at once and the body is drained after it, up
+/// to the route's cap and for as long as an upload may take.
+pub(crate) fn discard(body: Incoming, max: usize) {
+    tokio::spawn(async move {
+        let mut body = Limited::new(body, max);
+        let _ = tokio::time::timeout(UPLOAD_WINDOW, async {
+            while let Some(Ok(_)) = body.frame().await {}
+        })
+        .await;
+    });
+}
+
+/// Take one image from the session's allowance (`[media]
+/// download_per_minute`), which `GET /media/{id}` and `GET
+/// /news/blob/{id}` share: both are an image fetched by a session.
+pub(crate) fn allow_download(req: &Request<Incoming>, ctx: &NgCtx, per_minute: u32) -> bool {
+    let allowed = ctx
+        .registry
+        .allow_download(&session_of(req).unwrap_or_default(), per_minute);
+    if !allowed {
+        hxd_core::instrument::rate_limited("fetch");
+    }
+    allowed
 }
 
 /// `Bearer <session>.<token>` → the uid it belongs to.
