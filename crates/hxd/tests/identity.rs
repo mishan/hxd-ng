@@ -222,6 +222,7 @@ async fn start_server_inner(
         Some(l) => core
             .with_conn_limits(hxd_core::ConnLimits {
                 per_addr: 0,
+                per_v6_48: 0,
                 reconnect: Duration::ZERO,
                 per_account: 0,
                 exempt: hxd_core::AddrSet::default(),

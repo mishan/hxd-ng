@@ -755,19 +755,22 @@ news body is different: it declares its own type (news.md §5).
   made at once on many connections are held to the same count.
   `/identity/challenge` is limited per address, and answers 429 with
   `Retry-After`, as every HTTP route over its limit does. The port
-  holds so many connections from one address and from everyone,
-  counted from accept, before a byte is read; past either a
-  connection is closed unanswered. The per-address counts hold a
-  socket until it logs in: one that logs in, or resumes, as an account
-  with a password or a linked identity counts against that account
-  from then on (`[limits] connections_per_account`), because a mobile
-  carrier puts many unrelated people behind one address, and one past
-  the account's cap is answered `too_many_connections`. A guest's
-  socket goes on counting against its address. The rate at which an
-  address may connect is not given back at login: each login costs its
-  address a new connection and its account one of its own, and one
-  past the account's rate is answered `rate_limited`, so neither goes
-  faster than the slower of the two.
+  holds so many connections from one address, from one IPv6 /48 (its
+  /64s together, each of which is an address), and from everyone,
+  counted from accept, before a byte is read; past any of them a
+  connection is closed unanswered. A socket that carries a session is
+  held to the server's shared counts per address and per /48 as well,
+  and is refused 429 past either. The per-address and per-/48 counts
+  hold a socket until it logs in: one that logs in, or resumes, as an
+  account with a password or a linked identity counts against that
+  account from then on (`[limits] connections_per_account`), because a
+  mobile carrier puts many unrelated people behind one address, and
+  one past the account's cap is answered `too_many_connections`. A
+  guest's socket goes on counting against its address and its /48.
+  The rate at which an address may connect is not given back at
+  login: each login costs its address a new connection and its account
+  one of its own, and one past the account's rate is answered
+  `rate_limited`, so neither goes faster than the slower of the two.
 - **Flooding.** A server MAY instead kick a session that sends faster
   than anyone is allowed to, answering the request that crossed the line
   `flooding` before the `kicked` event (§10). *hxd-ng* holds a session to

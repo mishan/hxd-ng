@@ -252,7 +252,7 @@ agreement = "agreement.txt"
 
 What one address, one account, and one session, is held to, on both
 wires together. Always on, at the defaults of mhxd's `nospam`. A
-connection past either connection limit is closed unanswered on the
+connection past any connection limit is closed unanswered on the
 classic ports, as mhxd closes one, and refused with HTTP 429 on the ng
 port, `/trtp` included.
 
@@ -262,6 +262,8 @@ connections_per_addr = 5     # at once, until they log in; 0 for no limit
 reconnect_seconds = 2        # past a burst of that many new connections
                              # (5 when the line above is 0), one more
                              # each this often; 0 for no limit
+connections_per_v6_48 = 20   # at once from all the /64s of one IPv6 /48
+                             # together, until they log in; 0 for no limit
 connections_per_account = 10 # at once, once logged in as an account with
                              # a password or an identity; 0 for no limit
 exempt = ["127.0.0.0/8", "::1"]  # addresses and blocks held to none of
@@ -286,6 +288,8 @@ login_failures_per_addr = 50 # and for every login together, earned back
                              # at the same rate; 0 = no limit
 http_connections_per_addr = 16  # connections to the ng port, whatever
                              # they carry; 0 for no limit
+http_connections_per_v6_48 = 64  # the same, from one IPv6 /48's /64s
+                             # together; 0 for no limit
 ng_connections = 4096        # connections to the ng port from everyone
 challenges_per_minute = 30   # POST /identity/challenge, per address
 avatar_fetches_per_minute = 600  # GET /avatars/{id}, per address
@@ -338,11 +342,12 @@ connections nobody has vouched for and a poor one on people: a
 connection that logs in as an account with a password or a linked
 identity stops counting against its address and counts against its
 account instead, held to `connections_per_account` from wherever it
-comes, exempt addresses included. The address gets back its place, and
-the ng port the socket's place in `http_connections_per_addr` too, but
-not the new connection it spent: each login costs its address one from
-the address's burst and its account one from a burst of its own,
-`connections_per_account` earned back at `reconnect_seconds` as an
+comes, exempt addresses included. The address gets back its place (and
+its IPv6 /48 the place it held there), and the ng port the socket's
+places in `http_connections_per_addr` and `http_connections_per_v6_48`
+too, but not the new connection it spent: each login costs its address
+one from the address's burst and its account one from a burst of its
+own, `connections_per_account` earned back at `reconnect_seconds` as an
 address's is, so neither logs in faster than the slower of the two
 rates, however many accounts an address logs in as or addresses an
 account logs in from. A
@@ -392,11 +397,13 @@ life of a WebSocket; past either it is closed unanswered. The count per
 address is its own rather than `connections_per_addr`, because one
 browser page opens several connections at once beside its socket. An
 ng session's socket counts toward `connections_per_addr` as well, until
-it logs in as a person, when it leaves both per-address counts for its
-account's; it keeps its place in `ng_connections`.
+it logs in as a person, when it leaves the per-address and per-/48
+counts on both sides for its account's; it keeps its place in
+`ng_connections`.
 `ng_connections` is what bounds the port's descriptors whoever holds
-them, and a crowd of addresses can fill it — one IPv6 /56, say, whose
-/64s each count as an address of their own. An address `exempt` lists
+them, and a crowd of addresses can fill it; `http_connections_per_v6_48`
+is there so that one IPv6 delegation is not such a crowd by itself (see
+below). An address `exempt` lists
 still gets in when it is full, into a few places kept past it for the
 operator's own tools, such as a `/metrics` scrape; a trusted proxy is
 not given them, exempt or not.
@@ -408,7 +415,22 @@ process's descriptor limit, less what the classic port and the
 databases need. An idle keep-alive connection is closed after
 `[server] login_timeout`, as a request head that never arrives is.
 
-An IPv6 client counts as its /64. An ng client behind a reverse proxy
+An IPv6 client counts as its /64, which is what one subscriber is
+given, and its /48 is counted as well: a subscriber is as often given
+a /56 or a /48, hundreds or tens of thousands of /64s, and each would
+otherwise be an address with a whole allowance of its own. A
+connection must fit under both `connections_per_addr` and
+`connections_per_v6_48` (on the ng port, under
+`http_connections_per_addr` and `http_connections_per_v6_48` as well),
+and one past the /48's is refused exactly as one past its address's
+is. The defaults are four addresses' worth, so a site with a few
+machines on a few /64s gets in and one client walking its /48 is held
+to a few machines' share rather than filling `ng_connections`. IPv4
+has no wider count: one client seldom holds many IPv4 addresses, and
+its neighbors in a /24 are as likely strangers behind a carrier's NAT
+as the same person. An address in `exempt` is not counted toward its
+/48, and a connection that logs in as a person leaves its /48's count
+when it leaves its address's. An ng client behind a reverse proxy
 listed in `[ng] trusted_proxies` counts as the address the proxy
 forwards. A classic client reaching the server through a TCP proxy that
 hides its address counts as the proxy, so every client of that proxy

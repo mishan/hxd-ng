@@ -103,7 +103,7 @@ const EXEMPT_RESERVE: usize = 16;
 /// The port's own counts ([`crate::HttpLimits`]) and its request rates.
 /// One per listener, built by `serve`.
 pub(crate) struct Gates {
-    /// Connections each address holds to the port.
+    /// Connections each address, and each IPv6 /48, holds to the port.
     per_addr: ConnGate,
     /// Connections everyone holds; `None` is no ceiling.
     ceiling: Option<Arc<Semaphore>>,
@@ -121,11 +121,15 @@ pub(crate) struct Gates {
 
 impl Gates {
     pub(crate) fn new(ctx: &NgCtx) -> Gates {
-        let l = ctx.cfg.http_limits;
-        let exempt = ctx.core.limits_exempt().clone();
+        Gates::with(ctx.cfg.http_limits, ctx.core.limits_exempt().clone())
+    }
+
+    /// The gates for `l`, exempting `exempt`.
+    fn with(l: crate::HttpLimits, exempt: AddrSet) -> Gates {
         Gates {
             per_addr: ConnGate::new(ConnLimits {
                 per_addr: l.connections_per_addr,
+                per_v6_48: l.connections_per_v6_48,
                 // A rate would refuse the second of a page's parallel
                 // requests; the rates that matter are the requests'.
                 reconnect: Duration::ZERO,
@@ -157,39 +161,47 @@ impl Gates {
     /// connections are everyone's, and would fill it for the flood.
     fn admit(&self, peer: SocketAddr, ctx: &NgCtx) -> Option<Places> {
         let proxy = ctx.cfg.trusted_proxies.contains(peer.ip());
+        match self.places(peer.ip(), proxy) {
+            Ok(places) => Some(places),
+            Err("full") => {
+                info!("refusing a connection: the ng port holds as many as it may");
+                hxd_core::instrument::disconnect("http", "full");
+                None
+            }
+            Err(reason) => {
+                info!(
+                    reason,
+                    "refusing a connection past its address's limit on the ng port"
+                );
+                hxd_core::instrument::disconnect("http", reason);
+                None
+            }
+        }
+    }
+
+    /// [`Gates::admit`]'s places for a connection from `ip`, which is a
+    /// trusted proxy's when `proxy` is, or the reason it is refused:
+    /// `full` past the ceiling, or the per-address count's own.
+    fn places(&self, ip: IpAddr, proxy: bool) -> Result<Places, &'static str> {
         let total = match &self.ceiling {
             Some(ceiling) => match ceiling.clone().try_acquire_owned().or_else(|e| {
-                if !proxy && self.exempt.contains(peer.ip()) {
+                if !proxy && self.exempt.contains(ip) {
                     self.reserve.clone().try_acquire_owned()
                 } else {
                     Err(e)
                 }
             }) {
                 Ok(place) => Some(place),
-                Err(_) => {
-                    info!("refusing a connection: the ng port holds as many as it may");
-                    hxd_core::instrument::disconnect("http", "full");
-                    return None;
-                }
+                Err(_) => return Err("full"),
             },
             None => None,
         };
         let addr = if proxy {
             None
         } else {
-            match self.per_addr.admit(peer.ip()) {
-                Ok(place) => Some(place),
-                Err(refused) => {
-                    info!(
-                        reason = refused.reason(),
-                        "refusing a connection past its address's limit on the ng port"
-                    );
-                    hxd_core::instrument::disconnect("http", refused.reason());
-                    return None;
-                }
-            }
+            Some(self.per_addr.admit(ip).map_err(|r| r.reason())?)
         };
-        Some(Places {
+        Ok(Places {
             _total: total,
             addr: SharedPlace::new(addr),
         })
@@ -2099,6 +2111,40 @@ impl From<&TransportIdentity> for IdentityTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ports_48_count_is_held_beside_each_64s() {
+        let gates = Gates::with(
+            crate::HttpLimits {
+                connections_per_addr: 16,
+                connections_per_v6_48: 2,
+                ..crate::HttpLimits::RECOMMENDED
+            },
+            AddrSet::default(),
+        );
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let a = gates.places(ip("2001:db8:1:1::1"), false).unwrap();
+        let _b = gates.places(ip("2001:db8:1:2::1"), false).unwrap();
+        // Each /64 is far inside its own count; their /48 is full.
+        assert_eq!(
+            gates.places(ip("2001:db8:1:3::1"), false).err(),
+            Some("too_many_48")
+        );
+        assert!(
+            gates.places(ip("2001:db8:2:1::1"), false).is_ok(),
+            "another /48"
+        );
+        assert!(gates.places(ip("192.0.2.1"), false).is_ok(), "IPv4");
+        assert!(
+            gates.places(ip("2001:db8:1:3::1"), true).is_ok(),
+            "a trusted proxy's connection is counted by no address"
+        );
+        drop(a);
+        assert!(
+            gates.places(ip("2001:db8:1:3::1"), false).is_ok(),
+            "a place came back to the /48"
+        );
+    }
 
     #[test]
     fn download_names_are_safe_and_preserve_utf8() {

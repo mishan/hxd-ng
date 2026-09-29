@@ -69,7 +69,17 @@
 //! **Addresses.** An IPv4 address is itself; an IPv6 one is its /64,
 //! which is what one subscriber is given, so a client cannot step past
 //! the cap by walking its own prefix. An IPv4 address mapped into IPv6
-//! is the IPv4 address. Addresses in `exempt` are held to none of the
+//! is the IPv4 address. A subscriber is as often given a /56 or a /48,
+//! though, which is hundreds or tens of thousands of /64s, each an
+//! address of its own; so the connections a /48 holds are counted
+//! again, to a wider cap ([`ConnLimits::per_v6_48`]), and a connection
+//! must fit under both. IPv4 has no wider count: its addresses are dear
+//! enough that one client does not hold many, and the neighbors in a
+//! /24 are as likely a carrier's NAT pool or a campus of strangers as
+//! one person. The /48's count is an address's like the /64's, so a
+//! connection that logs in as a person gives both back when its place
+//! moves to its account (**Accounts**, above). Addresses in `exempt`
+//! are held to none of the
 //! limits an address is, though a session from one is still held to its
 //! own: loopback by default, so the tests, the load harness and an
 //! operator's own tools are not refused by their own server.
@@ -168,6 +178,20 @@ pub fn limit_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// The IPv6 /48 an address is in, whose connections are counted
+/// together as well as by /64; `None` for IPv4, which has no wider count
+/// (`crate::limits`).
+fn v6_48(ip: IpAddr) -> Option<IpAddr> {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let mut o = v6.octets();
+            o[6..].fill(0);
+            Some(IpAddr::from(o))
+        }
+        IpAddr::V4(_) => None,
+    }
+}
+
 /// How connections from one address are limited (`[limits]`).
 #[derive(Debug, Clone)]
 pub struct ConnLimits {
@@ -177,6 +201,12 @@ pub struct ConnLimits {
     /// flat one connection per interval, and refuse an ng client's quick
     /// drop and resume.
     pub per_addr: usize,
+    /// Connections the /64s of one IPv6 /48 may hold at once between
+    /// them, beside each one's `per_addr`; 0 is no limit. An exempt
+    /// address's connections are not counted toward it, and like
+    /// `per_addr` it counts a connection only until it logs in as a
+    /// person ([`ConnGate::admit_account`]).
+    pub per_v6_48: usize,
     /// How often one address earns another new connection once it has
     /// spent its burst; zero is no rate limit.
     pub reconnect: Duration,
@@ -196,6 +226,7 @@ impl Default for ConnLimits {
     fn default() -> Self {
         ConnLimits {
             per_addr: CONNECTIONS_PER_ADDR,
+            per_v6_48: CONNECTIONS_PER_V6_48,
             reconnect: RECONNECT_EVERY,
             per_account: CONNECTIONS_PER_ACCOUNT,
             exempt: AddrSet::parse(&["127.0.0.0/8", "::1"]).expect("loopback parses"),
@@ -205,6 +236,11 @@ impl Default for ConnLimits {
 
 /// mhxd's `conn_max`.
 pub const CONNECTIONS_PER_ADDR: usize = 5;
+/// Four addresses' worth, not mhxd's, which counted an IPv6 address as
+/// itself: a site with a few machines on a few /64s of its delegation
+/// is not held to one machine's share, and one client walking its /48
+/// is held to a few machines' rather than to tens of thousands.
+pub const CONNECTIONS_PER_V6_48: usize = 4 * CONNECTIONS_PER_ADDR;
 /// mhxd's `reconn_time`.
 pub const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 /// Connections one account may hold. Twice what mhxd let one address
@@ -221,6 +257,8 @@ pub enum ConnRefused {
     TooMany,
     /// The address has been connecting faster than it may.
     TooFast,
+    /// The address's IPv6 /48 already holds as many as it may.
+    TooManyIn48,
 }
 
 impl ConnRefused {
@@ -229,6 +267,7 @@ impl ConnRefused {
         match self {
             ConnRefused::TooMany => "too_many",
             ConnRefused::TooFast => "too_fast",
+            ConnRefused::TooManyIn48 => "too_many_48",
         }
     }
 }
@@ -271,13 +310,18 @@ pub(crate) struct GateInner {
 }
 
 /// The addresses and accounts the gate remembers, and how large each
-/// table may grow before it is next pruned.
+/// table may grow before it is next pruned; and the connections each
+/// IPv6 /48 holds.
 #[derive(Default)]
 struct Table {
     map: HashMap<IpAddr, AddrState>,
     prune_at: usize,
     accounts: HashMap<Box<str>, AddrState>,
     accounts_prune_at: usize,
+    /// A /48 is here only while it holds a connection: it has no burst
+    /// to remember, so it is forgotten as its last place is given back
+    /// and never needs a walk of its own.
+    by_48: HashMap<IpAddr, usize>,
 }
 
 /// The fewest addresses the table is let grow to before a prune.
@@ -290,9 +334,9 @@ struct AddrState {
     at: Instant,
 }
 
-/// One connection's place in its address's count, or once it has
-/// logged in as a person in its account's; dropping it gives the place
-/// back.
+/// One connection's place in its address's count, and in its /48's
+/// when that is counted, or once it has logged in as a person in its
+/// account's alone; dropping it gives back whichever it holds.
 pub struct ConnPermit {
     gate: Option<(Arc<GateInner>, Place)>,
     /// A place the same connection holds in another gate's count, given
@@ -302,7 +346,9 @@ pub struct ConnPermit {
 
 /// Whose count a [`ConnPermit`] holds a place in.
 enum Place {
-    Addr(IpAddr),
+    /// An address as [`limit_key`] has it, and its IPv6 /48 when that is
+    /// counted.
+    Addr(IpAddr, Option<IpAddr>),
     Account(Box<str>),
 }
 
@@ -310,13 +356,36 @@ impl Drop for ConnPermit {
     fn drop(&mut self) {
         if let Some((gate, place)) = self.gate.take() {
             let mut by = gate.by_addr.lock().unwrap();
-            let s = match &place {
-                Place::Addr(key) => by.map.get_mut(key),
-                Place::Account(login) => by.accounts.get_mut(login),
-            };
-            if let Some(s) = s {
-                s.live = s.live.saturating_sub(1);
+            match &place {
+                Place::Addr(key, wide) => {
+                    by.release_addr(*key, *wide);
+                }
+                Place::Account(login) => {
+                    if let Some(s) = by.accounts.get_mut(login) {
+                        s.live = s.live.saturating_sub(1);
+                    }
+                }
             }
+        }
+    }
+}
+
+impl Table {
+    /// Give back a place in `key`'s count, and in `wide`'s, the /48 it
+    /// is in, when that is counted: the two are taken together
+    /// ([`ConnGate::admit`]) and always given back together, whether the
+    /// connection drops or moves to its account's count.
+    fn release_addr(&mut self, key: IpAddr, wide: Option<IpAddr>) {
+        if let Some(wide) = wide {
+            if let Some(n) = self.by_48.get_mut(&wide) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.by_48.remove(&wide);
+                }
+            }
+        }
+        if let Some(s) = self.map.get_mut(&key) {
+            s.live = s.live.saturating_sub(1);
         }
     }
 }
@@ -386,10 +455,11 @@ impl ConnGate {
     pub fn admit(&self, ip: IpAddr) -> Result<ConnPermit, ConnRefused> {
         let gate = &self.0;
         let l = &gate.limits;
-        if (l.per_addr == 0 && l.reconnect.is_zero()) || l.exempt.contains(ip) {
+        if (l.per_addr == 0 && l.per_v6_48 == 0 && l.reconnect.is_zero()) || l.exempt.contains(ip) {
             return Ok(ConnPermit::free());
         }
         let key = limit_key(ip);
+        let wide = if l.per_v6_48 == 0 { None } else { v6_48(ip) };
         let now = Instant::now();
         let burst = burst(l.per_addr);
         let mut by = gate.by_addr.lock().unwrap();
@@ -404,7 +474,8 @@ impl ConnGate {
                 .retain(|_, s| s.live > 0 || refill(s, now, l.reconnect, burst) < burst);
             by.prune_at = by.map.len().saturating_mul(2);
         }
-        let s = by.map.entry(key).or_insert(AddrState {
+        let Table { map, by_48, .. } = &mut *by;
+        let s = map.entry(key).or_insert(AddrState {
             live: 0,
             tokens: burst,
             at: now,
@@ -414,6 +485,13 @@ impl ConnGate {
         if l.per_addr != 0 && s.live >= l.per_addr {
             return Err(ConnRefused::TooMany);
         }
+        // Asked before the burst is spent: a connection the /48 refuses
+        // costs its address nothing, as one its own count refuses does.
+        if let Some(wide) = wide {
+            if by_48.get(&wide).copied().unwrap_or(0) >= l.per_v6_48 {
+                return Err(ConnRefused::TooManyIn48);
+            }
+        }
         if !l.reconnect.is_zero() {
             if s.tokens < 1.0 {
                 return Err(ConnRefused::TooFast);
@@ -421,8 +499,11 @@ impl ConnGate {
             s.tokens -= 1.0;
         }
         s.live += 1;
+        if let Some(wide) = wide {
+            *by_48.entry(wide).or_insert(0) += 1;
+        }
         Ok(ConnPermit {
-            gate: Some((gate.clone(), Place::Addr(key))),
+            gate: Some((gate.clone(), Place::Addr(key, wide))),
             carried: None,
         })
     }
@@ -433,16 +514,17 @@ impl ConnGate {
     /// a connection that has not yet noticed it is gone holds one more
     /// than the account has sessions, for a moment.
     ///
-    /// The address is given back its place, but not the new connection
-    /// it spent of its burst: the login spends one of the account's too,
-    /// or is refused [`AccountRefused::TooFast`] when the account has
-    /// none left. Each login so costs both, and neither an address
-    /// logging in as many accounts nor an account logging in from many
-    /// addresses goes faster than the slower of its two rates. A place
-    /// given back to an address exempt from its limits, or to a gate
-    /// that holds addresses to none, is nothing given back; the account
-    /// is held to its rate all the same. A permit already in an
-    /// account's count stays where it is.
+    /// The address is given back its place, and its IPv6 /48 the place
+    /// it held there, but not the new connection the address spent of
+    /// its burst: the login spends one of the account's too, or is
+    /// refused [`AccountRefused::TooFast`] when the account has none
+    /// left. Each login so costs both, and neither an address logging in
+    /// as many accounts nor an account logging in from many addresses
+    /// goes faster than the slower of its two rates. A place given back
+    /// to an address exempt from its limits, or to a gate that holds
+    /// addresses to none, is nothing given back; the account is held to
+    /// its rate all the same. A permit already in an account's count
+    /// stays where it is.
     pub fn admit_account(
         &self,
         place: &mut ConnPermit,
@@ -491,10 +573,11 @@ impl ConnGate {
             a.tokens -= 1.0;
         }
         a.live += 1;
-        if let Some((_, Place::Addr(addr))) = &place.gate {
-            if let Some(s) = by.map.get_mut(addr) {
-                s.live = s.live.saturating_sub(1);
-            }
+        if let Some((_, Place::Addr(addr, wide))) = &place.gate {
+            // The /48's place goes with the address's: it counts the
+            // connections its addresses hold, and this one is no longer
+            // an address's.
+            by.release_addr(*addr, *wide);
         }
         drop(guard);
         // The address's place was given back above, under the lock; the
@@ -1204,16 +1287,35 @@ mod tests {
     use super::*;
 
     fn gate(per_addr: usize, reconnect: Duration) -> ConnGate {
-        gate_for(per_addr, reconnect, 0)
+        gate_with(per_addr, 0, reconnect, 0)
     }
 
     fn gate_for(per_addr: usize, reconnect: Duration, per_account: usize) -> ConnGate {
+        gate_with(per_addr, 0, reconnect, per_account)
+    }
+
+    fn gate_48(per_addr: usize, per_v6_48: usize, reconnect: Duration) -> ConnGate {
+        gate_with(per_addr, per_v6_48, reconnect, 0)
+    }
+
+    fn gate_with(
+        per_addr: usize,
+        per_v6_48: usize,
+        reconnect: Duration,
+        per_account: usize,
+    ) -> ConnGate {
         ConnGate::new(ConnLimits {
             per_addr,
+            per_v6_48,
             reconnect,
             per_account,
-            exempt: AddrSet::parse(&["127.0.0.0/8"]).unwrap(),
+            exempt: AddrSet::parse(&["127.0.0.0/8", "2001:db8:1:ff::/64"]).unwrap(),
         })
+    }
+
+    /// The `n`th /64 of 2001:db8:`site`::/48, host `host`.
+    fn in_48(site: u16, n: u16, host: u16) -> IpAddr {
+        IpAddr::from([0x2001, 0xdb8, site, n, 0, 0, 0, host])
     }
 
     #[test]
@@ -1302,6 +1404,133 @@ mod tests {
         for _ in 0..10 {
             std::mem::forget(g.admit("127.0.0.1".parse().unwrap()).unwrap());
         }
+    }
+
+    #[test]
+    fn the_64s_of_one_48_share_a_wider_cap() {
+        let g = gate_48(2, 5, Duration::ZERO);
+        // Each /64 well inside its own share, and the /48 full all the
+        // same.
+        let held: Vec<_> = (0..5)
+            .map(|n| g.admit(in_48(1, n, 1)).expect("inside both counts"))
+            .collect();
+        assert_eq!(
+            g.admit(in_48(1, 100, 1)).err(),
+            Some(ConnRefused::TooManyIn48),
+            "a /64 the gate has never seen, in a full /48"
+        );
+        assert_eq!(
+            g.admit(in_48(1, 0, 2)).err(),
+            Some(ConnRefused::TooManyIn48),
+            "a /64 with room of its own"
+        );
+        // Another /48 is counted apart, and IPv4 has no wider count.
+        let _other: Vec<_> = (0..5)
+            .map(|n| g.admit(in_48(2, n, 1)).expect("another /48"))
+            .collect();
+        let _v4: Vec<_> = (0..20u8)
+            .map(|i| g.admit(IpAddr::from([198, 51, 100, i])).expect("IPv4"))
+            .collect();
+        // The /64's own count still comes first.
+        let _again = g.admit(in_48(3, 0, 1)).unwrap();
+        let _twice = g.admit(in_48(3, 0, 2)).unwrap();
+        assert_eq!(g.admit(in_48(3, 0, 3)).err(), Some(ConnRefused::TooMany));
+        drop(held);
+        assert!(
+            g.admit(in_48(1, 100, 1)).is_ok(),
+            "the /48's places came back with the /64s'"
+        );
+    }
+
+    #[test]
+    fn a_place_gives_back_both_its_counts() {
+        let g = gate_48(1, 2, Duration::ZERO);
+        let a = g.admit(in_48(1, 1, 1)).unwrap();
+        let _b = g.admit(in_48(1, 2, 1)).unwrap();
+        assert_eq!(
+            g.admit(in_48(1, 3, 1)).err(),
+            Some(ConnRefused::TooManyIn48)
+        );
+        drop(a);
+        // The /64 and the /48 each have a place again.
+        let _c = g.admit(in_48(1, 1, 2)).expect("both counts released");
+        assert_eq!(
+            g.admit(in_48(1, 1, 3)).err(),
+            Some(ConnRefused::TooMany),
+            "and the /64 holds its one again"
+        );
+    }
+
+    #[test]
+    fn a_refusal_by_the_48_spends_nothing_of_the_burst() {
+        let g = gate_48(0, 1, Duration::from_secs(60));
+        let a = g.admit(in_48(1, 1, 1)).unwrap();
+        for _ in 0..10 {
+            assert_eq!(
+                g.admit(in_48(1, 2, 1)).err(),
+                Some(ConnRefused::TooManyIn48)
+            );
+        }
+        drop(a);
+        // A burst of mhxd's five, less none for the refusals.
+        for _ in 0..CONNECTIONS_PER_ADDR {
+            drop(g.admit(in_48(1, 2, 1)).expect("the burst is whole"));
+        }
+        assert_eq!(g.admit(in_48(1, 2, 1)).err(), Some(ConnRefused::TooFast));
+    }
+
+    #[test]
+    fn exempt_addresses_are_not_counted_toward_their_48() {
+        let g = gate_48(1, 1, Duration::ZERO);
+        // The exempt /64 is inside 2001:db8:1::/48.
+        let _tools: Vec<_> = (0..10)
+            .map(|i| g.admit(in_48(1, 0xff, i)).expect("exempt"))
+            .collect();
+        let _a = g.admit(in_48(1, 1, 1)).expect("the /48 is still empty");
+        assert_eq!(
+            g.admit(in_48(1, 2, 1)).err(),
+            Some(ConnRefused::TooManyIn48)
+        );
+        assert!(
+            g.admit(in_48(1, 0xff, 99)).is_ok(),
+            "and a full /48 does not refuse its exempt /64"
+        );
+    }
+
+    #[test]
+    fn the_48s_are_forgotten_as_they_empty_and_the_64s_still_pruned() {
+        let g = gate_48(2, 4, Duration::ZERO);
+        let busy = in_48(1, 1, 1);
+        let _held = g.admit(busy).unwrap();
+        let lens = || {
+            let by = g.0.by_addr.lock().unwrap();
+            (by.map.len(), by.by_48.len())
+        };
+        // Enough /64s to reach the floor, spread over many /48s.
+        for i in 0..PRUNE_FLOOR as u32 - 1 {
+            drop(
+                g.admit(in_48(2 + (i >> 8) as u16, (i & 0xff) as u16, 1))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(lens(), (PRUNE_FLOOR, 1), "only the busy /48 is held");
+        drop(g.admit(in_48(0x7fff, 0, 1)).unwrap());
+        assert_eq!(lens(), (2, 1), "the busy /64 and the newest are left");
+        let _second = g.admit(in_48(1, 2, 1)).unwrap();
+        let _third = g.admit(in_48(1, 3, 1)).unwrap();
+        let _fourth = g.admit(busy).unwrap();
+        assert_eq!(
+            g.admit(in_48(1, 4, 1)).err(),
+            Some(ConnRefused::TooManyIn48),
+            "the busy /48 kept its count through the prune"
+        );
+    }
+
+    #[test]
+    fn with_no_wider_cap_a_48_is_not_counted() {
+        let g = gate(1, Duration::ZERO);
+        let _held: Vec<_> = (0..50).map(|n| g.admit(in_48(1, n, 1)).unwrap()).collect();
+        assert!(g.0.by_addr.lock().unwrap().by_48.is_empty());
     }
 
     #[test]
@@ -1546,6 +1775,47 @@ mod tests {
             Err(AccountRefused::Full)
         );
         g.admit_account(&mut local, "bob", 0).unwrap();
+    }
+
+    #[test]
+    fn a_login_gives_the_48_back_its_place_with_the_address() {
+        let g = gate_with(1, 2, Duration::ZERO, 0);
+        let mut a = g.admit(in_48(1, 1, 1)).unwrap();
+        let _b = g.admit(in_48(1, 2, 1)).unwrap();
+        assert_eq!(
+            g.admit(in_48(1, 3, 1)).err(),
+            Some(ConnRefused::TooManyIn48)
+        );
+        g.admit_account(&mut a, "alice", 0).unwrap();
+        // Both counts have the place back: the /64 and the /48 alike.
+        let _c = g.admit(in_48(1, 1, 2)).expect("the /64 and the /48");
+        assert_eq!(
+            g.admit(in_48(1, 3, 1)).err(),
+            Some(ConnRefused::TooManyIn48),
+            "and the /48 is full again with the new one"
+        );
+        // The account's place holds no /48, so dropping it gives none
+        // back twice.
+        drop(a);
+        assert_eq!(
+            g.admit(in_48(1, 3, 1)).err(),
+            Some(ConnRefused::TooManyIn48)
+        );
+        assert_eq!(g.0.by_addr.lock().unwrap().by_48.values().sum::<usize>(), 2);
+        // The ng port's place, carried, gives back its /48 as it goes.
+        let core_gate = gate_for(0, Duration::ZERO, 0);
+        let port = gate_48(0, 1, Duration::ZERO);
+        let shared = SharedPlace::new(Some(port.admit(in_48(2, 1, 1)).unwrap()));
+        let mut place = core_gate.admit(in_48(2, 1, 1)).unwrap();
+        place.carry(shared.clone());
+        assert_eq!(
+            port.admit(in_48(2, 2, 1)).err(),
+            Some(ConnRefused::TooManyIn48)
+        );
+        core_gate.admit_account(&mut place, "bob", 0).unwrap();
+        let _d = port
+            .admit(in_48(2, 2, 1))
+            .expect("the port's /48 place went with the login");
     }
 
     #[test]

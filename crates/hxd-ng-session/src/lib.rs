@@ -142,10 +142,18 @@ pub struct NgConfig {
 /// proxy is the place to limit connections per client. The request
 /// limits still apply, to the forwarded address, as every other
 /// per-address rule on this port does.
+///
+/// An IPv6 address is its /64 here as everywhere (`hxd_core::limits`),
+/// and the /64s of one /48 are held to a wider count between them, so
+/// that one subscriber's delegation cannot fill `connections` by
+/// itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpLimits {
     /// Connections one address may hold to the port at once.
     pub connections_per_addr: usize,
+    /// Connections the /64s of one IPv6 /48 may hold to the port at
+    /// once between them.
+    pub connections_per_v6_48: usize,
     /// Connections everyone together may hold to the port at once.
     /// Past it a new one is closed unanswered; it is what stands
     /// between a crowd of addresses and the process's descriptors,
@@ -162,6 +170,10 @@ pub struct HttpLimits {
 impl HttpLimits {
     pub const RECOMMENDED: HttpLimits = HttpLimits {
         connections_per_addr: 16,
+        // Four addresses' worth, as the shared count's is: a site's few
+        // machines get in, and it takes many /48s rather than one to
+        // fill `connections`.
+        connections_per_v6_48: 64,
         connections: 4096,
         challenges_per_minute: 30,
         avatar_fetches_per_minute: 600,

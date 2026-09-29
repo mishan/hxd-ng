@@ -171,7 +171,9 @@ The reasons: `eof`, `io_error` and `malformed` from the socket,
 `closed` for a WebSocket close, `banned` for an address refused at
 the door, `too_many` and `too_fast` for one past `[limits]` (the
 connections its address holds, or how fast it opens them; a login past
-its account's is `login`, and counted as `hxd_throttled_total{what="account"}`), `full` for a
+its account's is `login`, and counted as `hxd_throttled_total{what="account"}`), `too_many_48` for
+one whose IPv6 /48 holds as many as `connections_per_v6_48` (or, on
+the ng port, `http_connections_per_v6_48`) lets it, `full` for a
 connection past `[limits] ng_connections`, `handshake` and `login` for a connection that never got a
 session, `kicked`, `logout`, `replaced`,
 `send_failed`, `pong_deadline`, and `slow_consumer` for a client that
@@ -180,7 +182,8 @@ bound or a write that made no progress for a minute, either wire's
 session a whole channel behind, or either wire's queue among the
 furthest behind once the server's budget is spent (below). A connection to the ng
 port refused by `[limits]` before a byte of it is read, past
-`http_connections_per_addr` (`too_many`) or `ng_connections` (`full`),
+`http_connections_per_addr` (`too_many`), `http_connections_per_v6_48`
+(`too_many_48`) or `ng_connections` (`full`),
 is counted as `wire="http"`: it was never a session on either wire.
 
 ### Read at scrape time

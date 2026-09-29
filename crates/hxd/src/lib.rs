@@ -1658,6 +1658,11 @@ pub struct LimitsSection {
     /// there instead, and a guest's goes on counting here.
     #[serde(default = "default_connections_per_addr")]
     pub connections_per_addr: usize,
+    /// Connections the /64s of one IPv6 /48 may hold at once between
+    /// them, each still held to `connections_per_addr`; 0 for no limit.
+    /// IPv4 has no wider count.
+    #[serde(default = "default_connections_per_v6_48")]
+    pub connections_per_v6_48: usize,
     /// Seconds one address waits for each new connection past a burst
     /// of `connections_per_addr` (mhxd's `conn_max` when that is 0); 0
     /// for no limit. One account is held to the same rate past a burst
@@ -1733,6 +1738,10 @@ pub struct LimitsSection {
     /// carry; 0 for no limit.
     #[serde(default = "default_http_connections_per_addr")]
     pub http_connections_per_addr: usize,
+    /// Connections the /64s of one IPv6 /48 may hold to the ng port
+    /// between them; 0 for no limit.
+    #[serde(default = "default_http_connections_per_v6_48")]
+    pub http_connections_per_v6_48: usize,
     /// Connections everyone together may hold to the ng port; 0 for no
     /// limit. Exempt addresses have a few places past it.
     #[serde(default = "default_ng_connections")]
@@ -1777,6 +1786,9 @@ fn default_login_failure_seconds() -> u64 {
 fn default_http_connections_per_addr() -> usize {
     hxd_ng_session::HttpLimits::RECOMMENDED.connections_per_addr
 }
+fn default_http_connections_per_v6_48() -> usize {
+    hxd_ng_session::HttpLimits::RECOMMENDED.connections_per_v6_48
+}
 fn default_ng_connections() -> usize {
     hxd_ng_session::HttpLimits::RECOMMENDED.connections
 }
@@ -1803,6 +1815,9 @@ fn default_spam_seconds() -> u64 {
 fn default_connections_per_addr() -> usize {
     hxd_core::limits::CONNECTIONS_PER_ADDR
 }
+fn default_connections_per_v6_48() -> usize {
+    hxd_core::limits::CONNECTIONS_PER_V6_48
+}
 fn default_reconnect_seconds() -> u64 {
     hxd_core::limits::RECONNECT_EVERY.as_secs()
 }
@@ -1817,6 +1832,7 @@ impl Default for LimitsSection {
     fn default() -> Self {
         LimitsSection {
             connections_per_addr: default_connections_per_addr(),
+            connections_per_v6_48: default_connections_per_v6_48(),
             reconnect_seconds: default_reconnect_seconds(),
             connections_per_account: default_connections_per_account(),
             exempt: default_limits_exempt(),
@@ -1834,6 +1850,7 @@ impl Default for LimitsSection {
             login_failures_per_addr: default_login_failures_per_addr(),
             login_failure_seconds: default_login_failure_seconds(),
             http_connections_per_addr: default_http_connections_per_addr(),
+            http_connections_per_v6_48: default_http_connections_per_v6_48(),
             ng_connections: default_ng_connections(),
             challenges_per_minute: default_challenges_per_minute(),
             avatar_fetches_per_minute: default_avatar_fetches_per_minute(),
@@ -1895,24 +1912,51 @@ impl LimitsSection {
         })
     }
 
-    pub fn http_limits(&self) -> hxd_ng_session::HttpLimits {
-        hxd_ng_session::HttpLimits {
+    pub fn http_limits(&self) -> Result<hxd_ng_session::HttpLimits, String> {
+        wider_than_one(
+            "http_connections_per_v6_48",
+            self.http_connections_per_v6_48,
+            "http_connections_per_addr",
+            self.http_connections_per_addr,
+        )?;
+        Ok(hxd_ng_session::HttpLimits {
             connections_per_addr: self.http_connections_per_addr,
+            connections_per_v6_48: self.http_connections_per_v6_48,
             connections: self.ng_connections,
             challenges_per_minute: self.challenges_per_minute,
             avatar_fetches_per_minute: self.avatar_fetches_per_minute,
-        }
+        })
     }
 
     pub fn conn_limits(&self) -> Result<hxd_core::ConnLimits, String> {
+        wider_than_one(
+            "connections_per_v6_48",
+            self.connections_per_v6_48,
+            "connections_per_addr",
+            self.connections_per_addr,
+        )?;
         Ok(hxd_core::ConnLimits {
             per_addr: self.connections_per_addr,
+            per_v6_48: self.connections_per_v6_48,
             reconnect: Duration::from_secs(self.reconnect_seconds),
             per_account: self.connections_per_account,
             exempt: hxd_core::AddrSet::parse(&self.exempt)
                 .map_err(|e| format!("[limits] exempt: {e}"))?,
         })
     }
+}
+
+/// A /48's count below one /64's would refuse a single client short of
+/// its own share, which is a typo rather than a policy: the /48 is the
+/// wider of the two. Either at 0 is no limit, and anything goes with it.
+fn wider_than_one(wide: &str, n: usize, one: &str, per: usize) -> Result<(), String> {
+    if n != 0 && per != 0 && n < per {
+        return Err(format!(
+            "[limits] {wide} ({n}) is below {one} ({per}): a /48 holds many addresses, \
+             so set it at least as high, or to 0 for no limit"
+        ));
+    }
+    Ok(())
 }
 
 impl Default for ServerSection {
@@ -2585,6 +2629,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
         return Err("[server] logins_in_flight must be at least 1, and not absurd".into());
     }
     config.limits.conn_limits()?;
+    config.limits.http_limits()?;
     config.limits.flood_limits(config.server.ban_time)?;
     if let Some(voice) = &config.voice {
         voice.voice_limits()?;
@@ -3444,7 +3489,7 @@ pub fn build_ng_ctx(
             caps: ng_caps(config, voice, files),
             trusted_proxies: TrustedProxies::parse(&ng.trusted_proxies)?,
             forwarded_header: ForwardedHeader::parse(&ng.forwarded_header)?,
-            http_limits: config.limits.http_limits(),
+            http_limits: config.limits.http_limits()?,
         }),
         registry: Arc::new(Registry::new()),
         identity,
@@ -3867,6 +3912,35 @@ hmac_secret = "new secret"
         for bad in ["0", &(usize::MAX >> 10).to_string()] {
             let cfg = parse(&format!("[server]\nqueue_budget_mb = {bad}\n")).unwrap();
             assert!(check_config(&cfg).unwrap_err().contains("queue_budget_mb"));
+        }
+    }
+
+    #[test]
+    fn a_48s_connection_cap_is_no_narrower_than_one_address() {
+        let default = parse("").unwrap();
+        check_config(&default).unwrap();
+        let l = &default.limits;
+        assert!(l.connections_per_v6_48 > l.connections_per_addr);
+        assert!(l.http_connections_per_v6_48 > l.http_connections_per_addr);
+        for ok in [
+            "connections_per_v6_48 = 0",
+            "connections_per_v6_48 = 5",
+            "connections_per_addr = 0\nconnections_per_v6_48 = 1",
+            "http_connections_per_v6_48 = 0",
+            "http_connections_per_addr = 0\nhttp_connections_per_v6_48 = 1",
+        ] {
+            let cfg = parse(&format!("[limits]\n{ok}\n")).unwrap();
+            check_config(&cfg).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+        for (bad, key) in [
+            ("connections_per_v6_48 = 4", "connections_per_v6_48"),
+            (
+                "http_connections_per_v6_48 = 15",
+                "http_connections_per_v6_48",
+            ),
+        ] {
+            let cfg = parse(&format!("[limits]\n{bad}\n")).unwrap();
+            assert!(check_config(&cfg).unwrap_err().contains(key), "{bad:?}");
         }
     }
 
