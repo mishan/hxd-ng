@@ -1187,7 +1187,10 @@ the snippet **counted in UTF-16 code units** — what a JSON client's
 strings index by, in JavaScript and Swift's `NSString` and Java alike —
 so a client slices the match straight out of the string it received.
 A server with `search = false` answers `news_search` `not_available`,
-and too many searches answer `rate_limited`.
+and too many searches answer `rate_limited`. So does a `news_post`
+past what one account may post (`[limits] news_posts`), with
+`retry_after`; a legacy post counts toward it and is never refused by
+it, the legacy wire keeping to mhxd's rules.
 
 Search pages by offset (§6.3). Every other paged request follows the
 `history` request where its ordering permits:

@@ -54,7 +54,7 @@ pub use inbox::{
 };
 pub use limits::{
     AddrSet, ConnGate, ConnLimits, ConnPermit, ConnRefused, FloodLimits, LoginAttempt, LoginLimits,
-    RateGate,
+    RateBucket, RateGate, RequestLimits,
 };
 pub use media::{
     Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRecord,

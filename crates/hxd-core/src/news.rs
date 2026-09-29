@@ -1894,6 +1894,57 @@ impl Core {
         store.recent(category, limit).map_err(store_failed)
     }
 
+    /// Take one of the posts `uid`'s account may make
+    /// ([`crate::RequestLimits::news_posts`]), or say how long until one
+    /// is there: asked by a frontend that refuses a post with that wait,
+    /// before it posts. Taken rather than looked at, so two sessions of
+    /// one account posting at once are not both let through on the one
+    /// that was left; a post then refused for what it says gives it back
+    /// ([`Self::news_post_refund`]). A session whose account
+    /// `can_spam`, and the server account, are held to none, as they are
+    /// held to no flood budget.
+    pub fn news_post_reserve(&self, uid: Uid) -> Result<(), Duration> {
+        match self.post_key(uid) {
+            Some(key) => {
+                self.post_rates
+                    .reserve(key, &self.request_limits, std::time::Instant::now())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Give back what [`Self::news_post_reserve`] took, for a post that
+    /// did not land.
+    pub fn news_post_refund(&self, uid: Uid) {
+        if let Some(key) = self.post_key(uid) {
+            self.post_rates.refund(&key, std::time::Instant::now());
+        }
+    }
+
+    /// Count a post of `uid`'s that landed against what its account may
+    /// post, from a wire held to its reference server's rules, which has
+    /// no such limit and is never refused by it.
+    pub fn news_post_counted(&self, uid: Uid) {
+        if let Some(key) = self.post_key(uid) {
+            self.post_rates
+                .count(key, &self.request_limits, std::time::Instant::now());
+        }
+    }
+
+    /// Whose posts `uid`'s count as, or `None` when they count as nobody's.
+    fn post_key(&self, uid: Uid) -> Option<crate::limits::PostKey> {
+        let r = self.roster.lock().unwrap();
+        let sess = r.users.get(&uid)?;
+        if sess.can_spam || sess.info.system {
+            return None;
+        }
+        Some(match (sess.is_person, sess.identity) {
+            (true, Some(fp)) => crate::limits::PostKey::Account(Some(fp), String::new()),
+            (true, None) => crate::limits::PostKey::Account(None, sess.login.clone()),
+            (false, _) => crate::limits::PostKey::Session(sess.serial),
+        })
+    }
+
     /// Post an article or a reply, tell every reader their view of that
     /// category is stale, and tell the people it is addressed to that it
     /// is theirs (§10).

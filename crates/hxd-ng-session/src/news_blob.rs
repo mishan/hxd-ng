@@ -27,7 +27,7 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
     // (`crate::media::upload`); spent by the staging after it.
     if let Err(e) = ctx.core.news_attach_admits(uid) {
         if e == NewsError::Media(MediaReject::RateLimited) {
-            hxd_core::instrument::rate_limited("upload");
+            hxd_core::instrument::throttled("upload");
         }
         crate::media::discard(req.into_body(), policy.max_bytes);
         return refused(&e);

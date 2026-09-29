@@ -660,11 +660,34 @@ news body is different: it declares its own type (news.md §5).
 - **Rate limits.** This endpoint faces phones on the open internet. A
   server SHOULD limit requests per connection and login attempts per
   address, and answers a request over its limit `rate_limited`, which a
-  client MUST NOT treat as fatal. *hxd-ng* limits `history`,
-  `news_search`, media and news-attachment uploads (asked before the
-  body is read), media and news-image downloads, avatar fetches and
-  enrollment. Login attempts are limited per address: past `[limits]
-  login_failures` wrong passwords — here, on the classic wire, or at
+  client MUST NOT treat as fatal. *hxd-ng* holds each session to a token
+  bucket (`[limits] ng_requests` in `ng_request_seconds`, a burst of 40
+  and then 20 a second by default) that every request after the
+  handshake spends its weight from. A write, or a request others hear
+  of, costs 2: `chat`, `msg`, `nick`, `block`, `unblock`, `msg_read`,
+  `avatar_clear`, `voice_answer`, `voice_mute`, `video_state`,
+  `news_seen`, `news_subscribe`, `news_unsubscribe`, `news_mute`,
+  `push_unregister`, `files_download`, `report_close`, `redact`,
+  `revoke` and `kick`. What fans out, searches, or joins, leaves or
+  renegotiates media costs 4: `news_post`, `news_delete`,
+  `news_node_create`, `news_node_rename`, `news_node_delete`,
+  `news_search`, `voice_join`, `voice_leave`, `video_start`,
+  `video_stop`, `video_subscribe`, `push_register`, `report` and
+  `purge`. Every other request, the reads and a trickled `voice_ice`
+  candidate among them, costs 1, and only `logout` is free. A request
+  the bucket cannot pay for costs nothing, and is answered
+  `rate_limited` with `retry_after`, the whole seconds until it could
+  be. The bucket is the session's rather than the connection's: it is
+  filled at login and kept across a detach, so a resume finds it as the
+  dropped connection left it rather than refilled. An account with
+  `[extra] can_spam` is held to none, as it is held to no flood budget.
+  Over and above that, one account may post so many news articles and
+  replies (`news_posts` in `news_post_seconds`, ten and then one each
+  half minute), past which `news_post` is answered the same way; and
+  `history`, `news_search`, media and news-attachment uploads (asked
+  before the body is read), media and news-image downloads, avatar
+  fetches and enrollment have limits of their own. Login attempts are
+  limited per address: past `[limits] login_failures` wrong passwords — here, on the classic wire, or at
   `/identity/auth` and `/identity/link` — a password login is refused
   with `retry_after` until the address earns one back, and a socket
   that authenticated with an identity, or a guest login that sends no
@@ -677,16 +700,17 @@ news body is different: it declares its own type (news.md §5).
   `Retry-After`, as every HTTP route over its limit does. The port
   holds so many connections from one address and from everyone,
   counted from accept, before a byte is read; past either a
-  connection is closed unanswered. The general per-connection request
-  limit is not yet built.
+  connection is closed unanswered.
 - **Flooding.** A server MAY instead kick a session that sends faster
   than anyone is allowed to, answering the request that crossed the line
   `flooding` before the `kicked` event (§10). *hxd-ng* holds a session to
   the budgets mhxd's `nospam` does, one session on either wire the same
   (`[limits]`): so many lines of `chat` in a window, every line of a
-  multi-line `text` counted, and so many spam points, which `chat` and
-  `msg` spend at the price mhxd charges its Chat and Message
-  transactions. Past the first the session is kicked and its room told;
+  multi-line `text` counted, and so many spam points, which a request
+  that stands for a classic transaction spends at the price mhxd
+  charges that one: `chat` and `msg` its Chat and Message, `nick` its
+  User Change, and the news writes their 1.5 transactions, `news_post`
+  a threaded post. Past the first the session is kicked and its room told;
   past the second it is kicked and its address banned for `[server]
   ban_time` (on an address `[limits] exempt` holds to nothing, its
   account's login or identity instead, and a plain guest is only

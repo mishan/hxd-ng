@@ -103,7 +103,7 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
     // it started.
     if let Err(e) = ctx.core.media_upload_admits(uid) {
         if e == MediaReject::RateLimited {
-            hxd_core::instrument::rate_limited("upload");
+            hxd_core::instrument::throttled("upload");
         }
         discard(req.into_body(), cfg.max_bytes);
         return reject(e);
@@ -248,7 +248,7 @@ pub(crate) fn allow_download(req: &Request<Incoming>, ctx: &NgCtx, per_minute: u
         .registry
         .allow_download(&session_of(req).unwrap_or_default(), per_minute);
     if !allowed {
-        hxd_core::instrument::rate_limited("fetch");
+        hxd_core::instrument::throttled("fetch");
     }
     allowed
 }

@@ -2564,6 +2564,81 @@ mod tests {
         assert!(core.is_banned("192.0.2.7".parse().unwrap()), "its address");
     }
 
+    /// The ng request limit is a session's, kept across a detach and
+    /// resume and filled again only by a fresh login, and a `can_spam`
+    /// account is held to none, as it is held to no flood budget; the
+    /// news-post limit is an account's, across its sessions, and a
+    /// guest's is its session's.
+    #[test]
+    fn request_and_post_limits_are_held_by_whom_they_say() {
+        let core = Core::new().with_request_limits(crate::RequestLimits {
+            requests: 4,
+            requests_per: Duration::from_secs(60),
+            news_posts: 1,
+            news_posts_per: Duration::from_secs(60),
+        });
+        let who = |login: &str, can_spam: bool, is_person: bool| crate::AttachInfo {
+            nick: login.into(),
+            icon: 1,
+            admin: false,
+            access: chatter(),
+            login: login.into(),
+            addr: None,
+            can_detach: is_person,
+            transport: Default::default(),
+            has_inbox: false,
+            attach_news: false,
+            moderate: false,
+            can_spam,
+            is_person,
+            reads_on_delivery: false,
+            identity: None,
+            system: false,
+        };
+        let (alice, _rx1) = core.attach(who("alice", false, true)).unwrap();
+        let (alice_again, _rx2) = core.attach(who("alice", false, true)).unwrap();
+        let (admin, _rx3) = core.attach(who("admin", true, true)).unwrap();
+        let (guest, _rx4) = core.attach(who("guest", false, false)).unwrap();
+        let (guest_too, _rx5) = core.attach(who("guest", false, false)).unwrap();
+
+        for _ in 0..2 {
+            core.spend_request(alice, 2).unwrap();
+        }
+        assert!(core.spend_request(alice, 1).is_err(), "spent");
+        assert!(core.connection_lost(alice, 8), "detached");
+        assert!(!matches!(core.resume(alice, 0), crate::Resume::Gone));
+        assert!(
+            core.spend_request(alice, 1).is_err(),
+            "a resume is no fresh bucket"
+        );
+        core.spend_request(alice_again, 4)
+            .expect("another login's is its own");
+        for _ in 0..10 {
+            core.spend_request(admin, 4).expect("can_spam");
+        }
+        let unlimited = Core::new();
+        let (bob, _rx6) = unlimited.attach(who("bob", false, true)).unwrap();
+        for _ in 0..10 {
+            unlimited.spend_request(bob, 4).expect("no limit set");
+        }
+
+        core.news_post_reserve(alice).unwrap();
+        assert!(
+            core.news_post_reserve(alice_again).is_err(),
+            "one account, two sessions"
+        );
+        core.news_post_refund(alice);
+        core.news_post_reserve(alice_again)
+            .expect("a post that did not land is given back");
+        for _ in 0..3 {
+            core.news_post_counted(admin);
+        }
+        assert_eq!(core.news_post_reserve(admin), Ok(()), "can_spam");
+        core.news_post_counted(guest);
+        assert_eq!(core.news_post_reserve(guest_too), Ok(()), "another guest");
+        assert!(core.news_post_reserve(guest).is_err());
+    }
+
     /// Behind an address `[limits] exempt` — loopback here, a shared
     /// proxy in production — a spam kick bans the person, never the
     /// address everyone behind it shares, and a guest with nothing of

@@ -357,7 +357,7 @@ async fn route(mut req: Request<Incoming>, peer: SocketAddr, ctx: NgCtx, gates: 
                 match gates.avatar_fetches.take(client.ip()) {
                     Ok(()) => boxed(crate::avatar::download(id, req, &ctx).await),
                     Err(wait) => {
-                        hxd_core::instrument::rate_limited("fetch");
+                        hxd_core::instrument::throttled("fetch");
                         slow_down(wait, "too many avatar fetches")
                     }
                 }
@@ -1593,7 +1593,7 @@ fn challenge(ctx: &NgCtx, client: SocketAddr, gates: &Gates) -> Resp {
     // it sheds rather than grows. A client asks once per login, so the
     // allowance is far past what one needs.
     if let Err(wait) = gates.challenges.take(client.ip()) {
-        hxd_core::instrument::rate_limited("challenge");
+        hxd_core::instrument::throttled("challenge");
         return slow_down(wait, "too many challenges from this address");
     }
     let Some(ch) = st.issue_challenge() else {

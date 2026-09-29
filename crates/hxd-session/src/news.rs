@@ -212,6 +212,17 @@ fn answer(
         ),
         _ => return Err("Not implemented."),
     };
+    // A post that landed counts against what the account may post on the
+    // ng wire (`hxd_core::RequestLimits::news_posts`), and is never
+    // refused for it: mhxd has no such limit, and this wire keeps to its
+    // rules, the 20 spam points a 1.2 post costs and the 10 a 1.5 one
+    // does.
+    let posted = [ClientHdr::NewsPost, ClientHdr::PostThread]
+        .iter()
+        .any(|h| h.as_u32() == ty);
+    if posted && result.is_ok() {
+        core.news_post_counted(who.uid);
+    }
     result.map_err(|e| error_text(&e))
 }
 

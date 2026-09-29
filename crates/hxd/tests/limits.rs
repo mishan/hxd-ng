@@ -1,6 +1,8 @@
 //! What one address is held to (`[limits]`, `hxd_core::limits`): so many
 //! connections at once, and new ones no faster than a burst and then a
-//! rate, on the classic wire and the ng one alike, counted together.
+//! rate, on the classic wire and the ng one alike, counted together. And
+//! what one session is: mhxd's flood budgets, and on the ng wire its
+//! request limit and its account's news posts.
 //!
 //! Each case builds a real server from a config file that takes loopback
 //! off the exempt list, which is what makes the test's own address one
@@ -514,4 +516,247 @@ async fn an_ng_user_past_its_spam_points_is_refused_flooding_and_banned() {
         notice["text"],
         "sender has been banned by sender: spam_max exceeded: 10 >= 10, last transaction: 0x6c"
     );
+}
+
+// --- Requests ----------------------------------------------------------
+
+const HDR_USER_CHANGE: u32 = 0x130;
+
+/// A request's reply, sent and awaited.
+async fn ask(ws: &mut Ws, id: u64, req: &str, params: Value) -> Value {
+    let msg = json!({ "id": id, "req": req, "params": params });
+    ws.send(Message::Text(msg.to_string())).await.unwrap();
+    timeout(Duration::from_secs(5), next_reply(ws, id))
+        .await
+        .unwrap_or_else(|_| panic!("no reply to {req}"))
+}
+
+/// A nick change on the ng wire costs what mhxd charges a User Change,
+/// 20 points, so a guest renaming itself at socket speed is banned
+/// rather than telling everyone present each time.
+#[tokio::test]
+async fn an_ng_nick_flood_spends_spam_points_and_is_banned() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(
+        td.path(),
+        "connections_per_addr = 0\nreconnect_seconds = 0\n\
+         spam_points = 100\nspam_seconds = 60\n[server]\nban_time = 60",
+    )
+    .await;
+    let (mut watcher, _) = ng_guest(server.ng, "watcher").await;
+    let (mut renamer, _) = ng_guest(server.ng, "renamer").await;
+    for id in 2..=5 {
+        let ok = ask(
+            &mut renamer,
+            id,
+            "nick",
+            json!({ "nick": format!("n{id}") }),
+        )
+        .await;
+        assert!(ok.get("ok").is_some(), "{ok}");
+    }
+    let refused = ask(&mut renamer, 6, "nick", json!({ "nick": "n6" })).await;
+    assert_eq!(refused["error"]["code"], "flooding", "{refused}");
+    event(&mut renamer, "kicked", |_| true).await;
+    let notice = event(&mut watcher, "notice", |d| {
+        d["text"].as_str().is_some_and(|t| t.contains("spam_max"))
+    })
+    .await;
+    assert_eq!(
+        notice["text"],
+        "n5 has been banned by n5: spam_max exceeded: 100 >= 100, last transaction: 0x130"
+    );
+}
+
+/// A nick or icon change that changes nothing tells nobody, on either
+/// wire: the watcher's next `user_changed` for each is the real change
+/// that followed it.
+#[tokio::test]
+async fn a_nick_that_changes_nothing_is_not_told() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "connections_per_addr = 0\nreconnect_seconds = 0").await;
+    let (mut watcher, _) = ng_guest(server.ng, "watcher").await;
+
+    let (mut same, _) = ng_guest(server.ng, "same").await;
+    let uid = joined_uid(&mut watcher, "same").await;
+    let ok = ask(&mut same, 2, "nick", json!({ "nick": "same" })).await;
+    assert!(ok.get("ok").is_some(), "{ok}");
+    ask(&mut same, 3, "nick", json!({ "nick": "renamed" })).await;
+    let changed = event(&mut watcher, "user_changed", |d| d["user"]["uid"] == uid).await;
+    assert_eq!(changed["user"]["nick"], "renamed", "the no-op was told");
+
+    let mut classic_same = classic_guest(server.legacy, "old").await;
+    let uid = joined_uid(&mut watcher, "old").await;
+    let change = |trans, nick: &str| {
+        pack_frame(
+            HDR_USER_CHANGE,
+            trans,
+            0,
+            &[
+                (tag::NAME, nick.as_bytes().to_vec()),
+                (tag::ICON, 1u16.to_be_bytes().to_vec()),
+            ],
+        )
+    };
+    classic_same.write_all(&change(2, "old")).await.unwrap();
+    classic_same.write_all(&change(3, "new")).await.unwrap();
+    let changed = event(&mut watcher, "user_changed", |d| d["user"]["uid"] == uid).await;
+    assert_eq!(changed["user"]["nick"], "new", "the classic no-op was told");
+}
+
+/// One account's news posts are held to `news_posts`, and the one past
+/// it is answered `rate_limited` with how long to wait. A post refused
+/// for what it says costs none of them.
+#[tokio::test]
+async fn an_account_past_its_news_posts_is_told_how_long_to_wait() {
+    let td = tempfile::tempdir().unwrap();
+    let accounts = td.path().join("accounts");
+    std::fs::create_dir_all(&accounts).unwrap();
+    std::fs::write(
+        accounts.join("writer.toml"),
+        "name = \"writer\"\npassword = \"pw\"\n[access]\nread_news = true\n\
+         post_news = true\ncreate_categories = true\n",
+    )
+    .unwrap();
+    let d = td.path().display();
+    let server = start(
+        td.path(),
+        &format!(
+            "connections_per_addr = 0\nreconnect_seconds = 0\nspam_points = 0\n\
+             news_posts = 2\nnews_post_seconds = 600\n[news]\ndb = \"{d}/news.db\""
+        ),
+    )
+    .await;
+    let mut ws = ng(server.ng).await.expect("admitted");
+    let login = ask(
+        &mut ws,
+        1,
+        "login",
+        json!({ "login": "writer", "password": "pw" }),
+    )
+    .await;
+    assert!(login.get("ok").is_some(), "{login}");
+    let made = ask(
+        &mut ws,
+        2,
+        "news_node_create",
+        json!({ "kind": "category", "name": "General" }),
+    )
+    .await;
+    let category = made["ok"]["node"]["id"].as_u64().expect("a category");
+    let post =
+        |n: u64| json!({ "category": category, "subject": format!("post {n}"), "body": "hi" });
+    let untitled = json!({ "category": category, "subject": "", "body": "hi" });
+    let bad = ask(&mut ws, 3, "news_post", untitled).await;
+    assert_eq!(bad["error"]["code"], "bad_request", "{bad}");
+    for id in 4..=5 {
+        let ok = ask(&mut ws, id, "news_post", post(id)).await;
+        assert!(
+            ok.get("ok").is_some(),
+            "the refused one was given back: {ok}"
+        );
+    }
+    let refused = ask(&mut ws, 6, "news_post", post(6)).await;
+    assert_eq!(refused["error"]["code"], "rate_limited", "{refused}");
+    // One post each 300 s, less what a slow runner took to get here:
+    // not the whole bucket's 600, and not a wait that has run out.
+    let wait = refused["error"]["retry_after"].as_u64().unwrap();
+    assert!(
+        (290..=300).contains(&wait),
+        "one post each 300 s: {refused}"
+    );
+    // A delay, not a kick: the connection goes on.
+    let ok = ask(&mut ws, 7, "ping", json!({})).await;
+    assert!(ok.get("ok").is_some(), "{ok}");
+}
+
+/// Past its request limit an ng session is answered `rate_limited`
+/// with how long to wait, and after that wait it is served again.
+#[tokio::test]
+async fn the_request_limit_answers_rate_limited_then_recovers() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(
+        td.path(),
+        "connections_per_addr = 0\nreconnect_seconds = 0\n\
+         ng_requests = 4\nng_request_seconds = 12",
+    )
+    .await;
+    let (mut ws, _) = ng_guest(server.ng, "asker").await;
+    // Sent together, and a token earned back only every three seconds,
+    // so the fifth finds the bucket empty however slowly the first four
+    // are served.
+    let mut burst = Vec::new();
+    for id in 2..=6 {
+        burst.push(json!({ "id": id, "req": "ping" }).to_string());
+    }
+    for text in burst {
+        ws.send(Message::Text(text)).await.unwrap();
+    }
+    for id in 2..=5 {
+        let ok = next_reply(&mut ws, id).await;
+        assert!(ok.get("ok").is_some(), "{ok}");
+    }
+    let refused = next_reply(&mut ws, 6).await;
+    assert_eq!(refused["error"]["code"], "rate_limited", "{refused}");
+    let wait = refused["error"]["retry_after"].as_u64().unwrap();
+    assert!((1..=3).contains(&wait), "{refused}");
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    let ok = ask(&mut ws, 7, "ping", json!({})).await;
+    assert!(ok.get("ok").is_some(), "served again after the wait: {ok}");
+}
+
+/// The request limit is the session's, not the connection's: a client
+/// that spends it, drops its socket and resumes finds it as it left it,
+/// rather than a full one bought by reconnecting.
+#[tokio::test]
+async fn the_request_limit_survives_a_resume() {
+    let td = tempfile::tempdir().unwrap();
+    let accounts = td.path().join("accounts");
+    std::fs::create_dir_all(&accounts).unwrap();
+    std::fs::write(
+        accounts.join("asker.toml"),
+        "name = \"asker\"\npassword = \"pw\"\n[access]\nsend_chat = true\n",
+    )
+    .unwrap();
+    let server = start(
+        td.path(),
+        "connections_per_addr = 0\nreconnect_seconds = 0\n\
+         ng_requests = 4\nng_request_seconds = 60",
+    )
+    .await;
+    let mut ws = ng(server.ng).await.expect("admitted");
+    let login = ask(
+        &mut ws,
+        1,
+        "login",
+        json!({ "login": "asker", "password": "pw" }),
+    )
+    .await;
+    let hello = login["ok"].clone();
+    assert!(hello["detach"].is_object(), "it may detach: {login}");
+    let (session, token) = (hello["session"].clone(), hello["token"].clone());
+    for id in 2..=5 {
+        let ok = ask(&mut ws, id, "ping", json!({})).await;
+        assert!(ok.get("ok").is_some(), "{ok}");
+    }
+    let refused = ask(&mut ws, 6, "ping", json!({})).await;
+    assert_eq!(refused["error"]["code"], "rate_limited", "{refused}");
+    drop(ws);
+
+    let mut ws = ng(server.ng).await.expect("admitted");
+    let resumed = ask(
+        &mut ws,
+        1,
+        "resume",
+        json!({ "session": session, "token": token, "last_seq": 0 }),
+    )
+    .await;
+    assert!(resumed.get("ok").is_some(), "{resumed}");
+    let refused = ask(&mut ws, 2, "ping", json!({})).await;
+    assert_eq!(
+        refused["error"]["code"], "rate_limited",
+        "a resume starts no fresh bucket: {refused}"
+    );
+    let wait = refused["error"]["retry_after"].as_u64().unwrap();
+    assert!((1..=15).contains(&wait), "{refused}");
 }

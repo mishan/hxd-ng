@@ -87,6 +87,34 @@ fn req_label(req: &str) -> &'static str {
     "other"
 }
 
+/// What a request spends of its session's request limit
+/// (`hxd_core::RequestLimits`). A read costs the least; what writes, or
+/// tells others, costs more; what fans out to many, searches, or
+/// renegotiates media costs the most. Every request is priced here, so
+/// one added to the dispatcher is a read until it is given a price, and
+/// never free: only `logout` is, since ending the session is what a
+/// limit would want of a client that floods.
+///
+/// `voice_ice` is priced as a read. A client trickles one per candidate
+/// it gathers, one for each address a multi-homed device has and each
+/// kind of candidate, all as the call is joined, and a candidate refused
+/// is one the call silently goes without. Nothing else bounds how many a
+/// peer may send, so it is not free.
+fn request_weight(req: &str) -> u32 {
+    match req {
+        "logout" => 0,
+        "voice_ice" => 1,
+        "chat" | "msg" | "nick" | "block" | "unblock" | "msg_read" | "avatar_clear"
+        | "voice_answer" | "voice_mute" | "video_state" | "news_seen" | "news_subscribe"
+        | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
+        | "report_close" | "redact" | "revoke" | "kick" => 2,
+        "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
+        | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
+        | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge" => 4,
+        _ => 1,
+    }
+}
+
 /// How often a quiet connection is pinged, and how long it may stay
 /// silent before the ping is treated as unanswered. The deadline is
 /// three periods so that one lost ping, or one tick delayed behind a
@@ -284,9 +312,23 @@ pub(crate) async fn run(ws: Ws, peer: SocketAddr, ctx: NgCtx, identity: Option<T
                         break Exit::ConnectionLost("malformed");
                     };
                     instrument::frame(WIRE, Dir::In, Kind::Name(req_label(&req.req)), text.len());
-                    // `sync` is the one request that needs the event
-                    // channel itself; see `handle_sync`.
-                    let flow = if req.req == "sync" {
+                    // Over the limit is a delay, not a failure: answered
+                    // with how long to wait, and costing nothing, so a
+                    // client that waits that long is served. The limit
+                    // is the session's (§9), so a resume does not refill
+                    // it.
+                    let over = ctx
+                        .core
+                        .spend_request(state.uid, request_weight(&req.req))
+                        .err();
+                    let flow = if let Some(wait) = over {
+                        instrument::rate_limited(WIRE, "requests");
+                        let secs = retry_secs(wait);
+                        let out = reply_err_retry(req.id, "rate_limited", "Slow down.", secs);
+                        finish(&mut ws_tx, out).await
+                    } else if req.req == "sync" {
+                        // `sync` is the one request that needs the event
+                        // channel itself; see `handle_sync`.
                         handle_sync(&ctx, &state, &req, &mut ws_tx, &mut events).await
                     } else {
                         dispatch(&ctx, &state, &req, &mut ws_tx).await
@@ -1318,20 +1360,34 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
     }
 }
 
+/// mhxd's spam points (`hxd_core::FloodLimits`), charged for the
+/// requests that stand for a classic transaction it charges, at its
+/// price and under its type: `chat` for its Chat and `msg` for its
+/// Message, 2 each; `nick` for User Change, 20; and the news writes for
+/// the 1.5 transactions they are, `news_post` a threaded post, 10 each
+/// as the table's default prices every one of them. (Its 20 for a post
+/// is the 1.2 flat one's, which an ng post is not, and at that price an
+/// editor who files a few replies in as many seconds is banned for
+/// it.) Whatever else this wire asks for, it has no classic counterpart
+/// to be priced by, and is held to the request limit instead. As
+/// `(type, points)`.
+fn spam_charge(req: &str) -> Option<(u32, u32)> {
+    match req {
+        "chat" => Some((0x69, 2)),
+        "msg" => Some((0x6c, 2)),
+        "nick" => Some((0x130, 20)),
+        "news_post" => Some((0x19a, 10)),
+        "news_delete" => Some((0x19b, 10)),
+        "news_node_create" => Some((0x17e, 10)),
+        "news_node_delete" => Some((0x17c, 10)),
+        _ => None,
+    }
+}
+
 async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut WsTx) -> Flow {
     let send = |s: String| Message::Text(s);
-    // mhxd's spam points (`hxd_core::FloodLimits`), charged for the
-    // requests that stand for a classic transaction it charges, at its
-    // price: `chat` for its Chat and `msg` for its Message, 2 each, under
-    // those types. Whatever else this wire asks for, it has no classic
-    // counterpart to be priced by.
-    let charge = match req.req.as_str() {
-        "chat" => Some(0x69),
-        "msg" => Some(0x6c),
-        _ => None,
-    };
-    if let Some(trans) = charge {
-        if let Err(flooded) = ctx.core.spend_spam(state.uid, 2, trans) {
+    if let Some((trans, points)) = spam_charge(&req.req) {
+        if let Err(flooded) = ctx.core.spend_spam(state.uid, points, trans) {
             // The kick is made; its ban is a store write, so it is placed
             // off the reactor, and before the reply, so it stands by the
             // time the client can be back.
@@ -1407,6 +1463,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                     "You are not allowed to read chat history.",
                 )
             } else if !ctx.core.allow_history_request(state.uid).unwrap_or(false) {
+                instrument::rate_limited(WIRE, "history");
                 reply_err(req.id, "rate_limited", "Slow down.")
             } else {
                 match params_or_default::<HistoryParams>(&req.params) {
@@ -1980,6 +2037,12 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
         _ => reply_err(req.id, "unknown_method", "Unknown request."),
     };
     finish(ws_tx, out).await
+}
+
+/// A wait as `retry_after`'s whole seconds, rounded up so that a client
+/// that waits that long finds the request paid for.
+pub(crate) fn retry_secs(wait: std::time::Duration) -> u64 {
+    wait.as_secs() + u64::from(wait.subsec_nanos() > 0)
 }
 
 /// What a nick may weigh, in *characters*. The legacy wire's field is 31

@@ -263,6 +263,10 @@ chat_lines = 20              # 0 for no limit, or the chat lines one user
 chat_seconds = 5             # may send in each window this long, or be kicked
 spam_points = 100            # 0 for no limit, or the spam points one user
 spam_seconds = 5             # may spend in each window this long, or be banned
+ng_requests = 40             # 0 for no limit, or the request weight one ng
+ng_request_seconds = 2       # session may spend at once, earned back over this
+news_posts = 10              # 0 for no limit, or the news posts one account
+news_post_seconds = 300      # may make at once, earned back over this
 login_failures = 10          # wrong passwords one address may give, on
 login_failure_seconds = 30   # any wire, then one more each this often;
                              # 0 failures = no limit
@@ -280,7 +284,9 @@ room is told, in mhxd's words, "X was kicked for chat spamming". Every
 transaction a classic client sends spends spam points at the price
 mhxd's table gives it (a chat line or a private message 2, a user list
 20, anything it does not list 10; the extensions mhxd never had, and
-fetching icons, cost nothing), as does an ng `chat` or `msg`; a user
+fetching icons, cost nothing), as does an ng request that stands for
+one of them (`chat`, `msg`, `nick`, and the news posts, deletes and
+creates); a user
 who reaches `spam_points` is kicked and its address banned for
 `[server] ban_time`, and public chat is told as mhxd tells it. An
 address in `exempt` is never banned for it, since everyone behind a
@@ -291,6 +297,20 @@ this too. An account
 with `[extra] can_spam = true` is held to neither, which by default is
 every account with the kick bit. A load test from one machine wants
 both at 0.
+
+The request limits are not mhxd's, and slow a client down rather than
+kick it. Every request an ng session sends spends its weight from
+`ng_requests`, earned back over `ng_request_seconds`: a read 1, a write
+2, and a post, a search or a call joined 4. One the session cannot pay
+for is answered `rate_limited` with how many seconds to wait. The
+allowance is the session's, so a client that drops its socket and
+resumes carries on with what it had left; only a fresh login starts
+full. One
+account's news posts are held to `news_posts`, earned back over
+`news_post_seconds`, the same way; a classic post counts toward it but
+is never refused by it, since mhxd would take it. `can_spam` exempts
+from these as well. A load test wants `ng_requests` and `news_posts` at
+0 too.
 
 An address that has given `login_failures` wrong passwords — on the
 classic wire, the ng wire's `login`, or `/identity/auth` and

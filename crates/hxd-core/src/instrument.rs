@@ -321,6 +321,16 @@ pub fn flood_kick(what: &'static str) {
     let _ = what;
 }
 
+/// A request answered `rate_limited` on `wire`: `requests` past its
+/// session's request limit, `news_post` past its account's news
+/// posts, `history` and `news_search` past their own.
+pub fn rate_limited(wire: &'static str, reason: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_rate_limited_total", "wire" => wire, "reason" => reason).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (wire, reason);
+}
+
 /// A login refused because the server was already working on as many as
 /// it takes (`Core::admit_login`).
 pub fn login_refused_busy() {
@@ -332,9 +342,9 @@ pub fn login_refused_busy() {
 /// before any work was done on it: `login` (an address past its failed
 /// logins), `challenge` (`/identity/challenge`), `fetch` (an avatar or a
 /// news image), `upload` (an upload refused before its body was read).
-pub fn rate_limited(what: &'static str) {
+pub fn throttled(what: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_rate_limited_total", "what" => what).increment(1);
+    metrics::counter!("hxd_throttled_total", "what" => what).increment(1);
     #[cfg(not(feature = "metrics"))]
     let _ = what;
 }

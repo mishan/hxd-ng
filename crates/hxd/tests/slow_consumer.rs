@@ -43,12 +43,12 @@ async fn start(dir: &Path) -> Server {
 }
 
 /// With `server` lines for the config's `[server]` section. The talker
-/// floods on purpose, so the flood limits are off.
+/// floods on purpose, so the flood and request limits are off.
 async fn start_with(dir: &Path, server: &str) -> Server {
     let d = dir.display();
     let text = format!(
         "[server]\n{server}\n[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n\
-         [limits]\nchat_lines = 0\nspam_points = 0\n"
+         [limits]\nchat_lines = 0\nspam_points = 0\nng_requests = 0\n"
     );
     let path = dir.join("hxd-ng.toml");
     std::fs::write(&path, &text).unwrap();

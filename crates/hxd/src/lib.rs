@@ -1539,6 +1539,21 @@ pub struct LimitsSection {
     pub spam_points: u32,
     #[serde(default = "default_spam_seconds")]
     pub spam_seconds: u64,
+    /// Weight of requests one ng session may send at once, earned
+    /// back over `ng_request_seconds`, past which a request is answered
+    /// `rate_limited` with how long to wait; 0 for no limit. Not mhxd's:
+    /// the classic wire is held to the spam points instead.
+    #[serde(default = "default_ng_requests")]
+    pub ng_requests: u32,
+    #[serde(default = "default_ng_request_seconds")]
+    pub ng_request_seconds: u64,
+    /// News articles and replies one account may post at once, earned
+    /// back over `news_post_seconds`; 0 for no limit. Refuses ng posts
+    /// only: a classic post counts, and is held to mhxd's spam points.
+    #[serde(default = "default_news_posts")]
+    pub news_posts: u32,
+    #[serde(default = "default_news_post_seconds")]
+    pub news_post_seconds: u64,
     /// Wrong passwords one address may give, on either wire, before a
     /// password from it is refused until it earns one back, one every
     /// `login_failure_seconds`; 0 for no limit. A login that sends no
@@ -1565,6 +1580,18 @@ pub struct LimitsSection {
     pub avatar_fetches_per_minute: u32,
 }
 
+fn default_ng_requests() -> u32 {
+    hxd_core::RequestLimits::DEFAULT.requests
+}
+fn default_ng_request_seconds() -> u64 {
+    hxd_core::RequestLimits::DEFAULT.requests_per.as_secs()
+}
+fn default_news_posts() -> u32 {
+    hxd_core::RequestLimits::DEFAULT.news_posts
+}
+fn default_news_post_seconds() -> u64 {
+    hxd_core::RequestLimits::DEFAULT.news_posts_per.as_secs()
+}
 fn default_login_failures() -> u32 {
     hxd_core::LoginLimits::RECOMMENDED.failures
 }
@@ -1617,6 +1644,10 @@ impl Default for LimitsSection {
             chat_seconds: default_chat_seconds(),
             spam_points: default_spam_points(),
             spam_seconds: default_spam_seconds(),
+            ng_requests: default_ng_requests(),
+            ng_request_seconds: default_ng_request_seconds(),
+            news_posts: default_news_posts(),
+            news_post_seconds: default_news_post_seconds(),
             login_failures: default_login_failures(),
             login_failure_seconds: default_login_failure_seconds(),
             http_connections_per_addr: default_http_connections_per_addr(),
@@ -1642,6 +1673,21 @@ impl LimitsSection {
             spam_points: self.spam_points,
             spam_per: Duration::from_secs(self.spam_seconds),
             ban_for: Duration::from_secs(ban_time),
+        })
+    }
+
+    /// The ng request limit and the news-post limit.
+    pub fn request_limits(&self) -> Result<hxd_core::RequestLimits, String> {
+        if (self.ng_requests != 0 && self.ng_request_seconds == 0)
+            || (self.news_posts != 0 && self.news_post_seconds == 0)
+        {
+            return Err("[limits] a count needs its seconds: set both, or the count to 0".into());
+        }
+        Ok(hxd_core::RequestLimits {
+            requests: self.ng_requests,
+            requests_per: Duration::from_secs(self.ng_request_seconds),
+            news_posts: self.news_posts,
+            news_posts_per: Duration::from_secs(self.news_post_seconds),
         })
     }
 
@@ -2326,6 +2372,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     }
     config.limits.conn_limits()?;
     config.limits.flood_limits(config.server.ban_time)?;
+    config.limits.request_limits()?;
     config.limits.login_limits()?;
     if config.server.queue_budget() == 0 {
         return Err(
@@ -3202,12 +3249,14 @@ pub fn build_ctx(
     let budget = config.server.queue_budget();
     let conn_limits = config.limits.conn_limits()?;
     let flood_limits = config.limits.flood_limits(config.server.ban_time)?;
+    let request_limits = config.limits.request_limits()?;
     let login_limits = config.limits.login_limits()?;
     let core = match voice {
         Some(v) => {
             let core = Core::new()
                 .with_conn_limits(conn_limits)
                 .with_flood_limits(flood_limits)
+                .with_request_limits(request_limits)
                 .with_login_limits(login_limits)
                 .with_queue_budget(budget)
                 .with_logins_in_flight(config.server.logins_in_flight)
@@ -3228,6 +3277,7 @@ pub fn build_ctx(
         None => Core::new()
             .with_conn_limits(conn_limits)
             .with_flood_limits(flood_limits)
+            .with_request_limits(request_limits)
             .with_login_limits(login_limits)
             .with_queue_budget(budget)
             .with_logins_in_flight(config.server.logins_in_flight),

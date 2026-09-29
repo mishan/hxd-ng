@@ -207,12 +207,23 @@ gives its transaction, it is kicked and banned
 (`Core::spend_spam`, called by each frontend before it acts on a
 request; a new frontend or an ng request with a classic counterpart
 calls it too). A session already kicked is refused, never kicked
-again. An account that `can_spam` is held to neither. A wrong password
-counts against its address whichever wire or route it came in on
-(`Core::login_attempt` before, `Core::login_failed` after); a new path
-that checks a password does both. Every connection to the ng port
-holds places in that port's own counts (`HttpLimits`) from accept, in
-the socket itself so an upgrade carries them.
+again. An account that `can_spam` is held to neither. Most ng requests
+have no classic counterpart to be priced by, so an ng session is also
+held to a token bucket (`ng_requests`, `Core::spend_request`, kept
+with the session so a resume does not refill it), each request
+spending the weight `request_weight` in `conn.rs` gives it; a request
+added to the dispatcher gets a weight there, and one the bucket cannot
+pay for is answered `rate_limited` with `retry_after`, a delay and
+never a kick. One account's news posts are held to `news_posts`
+(`Core::news_post_reserve`, taken before an ng post and given back if
+it is refused; `Core::news_post_counted`, after a classic one), which
+the classic wire's posts count toward and are never refused by: that
+wire keeps mhxd's rules. `can_spam` exempts from both, as from the
+budgets. A wrong password counts against its address whichever wire or
+route it came in on (`Core::login_attempt` before, `Core::login_failed`
+after); a new path that checks a password does both. Every connection to
+the ng port holds places in that port's own counts (`HttpLimits`) from
+accept, in the socket itself so an upgrade carries them.
 
 **Past capacity a login is refused, not queued.** Every login costs
 everyone present a join and later a part, so a server admitting logins
@@ -289,7 +300,12 @@ Three layers, all `cargo test --workspace`:
   wires, then a burst and a rate, a TLS handshake counted from accept,
   and an exempt address held to neither; a classic user's multi-line
   flood kicked once with the room told in mhxd's bytes, and a user past
-  its spam points on each wire banned, the ng one refused `flooding`), `http_limits.rs`
+  its spam points on each wire banned, the ng one refused `flooding`;
+  an ng nick flood banned at User Change's price, a nick that changes
+  nothing told to nobody on either wire, an account past its news posts
+  told how long to wait, and the request limit answering `rate_limited`
+  and then serving again, and still refusing after a resume),
+  `http_limits.rs`
   (the ng port's own counts: plain HTTP and a WebSocket past an
   address's connections closed unanswered, the ceiling on everyone's
   and the reserve an exempt address is kept past it, an idle

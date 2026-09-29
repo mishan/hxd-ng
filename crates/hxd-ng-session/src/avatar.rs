@@ -71,7 +71,7 @@ pub async fn upload(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
     // (`crate::media::upload`), and spent by `set_avatar` after it.
     if let Err(e) = ctx.core.avatar_change_admits(uid) {
         if e == MediaReject::RateLimited {
-            hxd_core::instrument::rate_limited("upload");
+            hxd_core::instrument::throttled("upload");
         }
         crate::media::discard(req.into_body(), policy.limits.max_bytes);
         return refused(e, &policy);

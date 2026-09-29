@@ -385,14 +385,19 @@ fetch a derivative by, and the mhxd importer.
 - Rate limiting, flood protection, connection caps per IP, ban enforcement at
   accept time. Connection caps per address, a reconnect rate, and mhxd's
   chat-line and spam-point flood limits are in, at its `nospam` defaults
-  (`[limits]`). So are failed logins, counted per address across both
-  wires and `/identity/auth`; on the ng port, connections per address
-  and in all, counted from accept, and per-address rates on
-  `/identity/challenge` and avatar fetches, with uploads refused before
-  their bodies are read. Bans are durable: addresses, logins, identities and
-  registrars, kept in the database, placed by a kick-with-ban or `hxd
-  ban`, and applied on SIGHUP (docs/moderation.md §3.5). The ban list
-  on the ng wire and bans placed from the config are next.
+  (`[limits]`), with ng requests that stand for a classic transaction
+  (chat, messages, nick changes, the news writes) charged at its price.
+  So are failed logins, counted per address across both wires and
+  `/identity/auth`; on the ng port, connections per address and in all,
+  counted from accept, and per-address rates on `/identity/challenge`
+  and avatar fetches, with uploads refused before their bodies are read.
+  Every ng session is held to a weighted request limit, which a resume
+  does not refill, and every account to a news-post limit, both
+  answered `rate_limited` with `retry_after` (docs/hotline-ng.md §9).
+  Bans are durable: addresses, logins, identities and registrars, kept
+  in the database, placed by a kick-with-ban or `hxd ban`, and applied
+  on SIGHUP (docs/moderation.md §3.5). The ban list on the ng wire and
+  bans placed from the config are next.
 - Fuzz the frame decoder (`cargo-fuzz` against the session layer's read
   path); a server's parser meets far more hostile input than a client's.
 

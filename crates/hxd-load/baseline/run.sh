@@ -43,6 +43,8 @@ max_detached_per_addr = 1024
 [limits]
 chat_lines = 0
 spam_points = 0
+ng_requests = 0
+news_posts = 0
 [inbox]
 db = "$D/server.db"
 sync = "$SYNC"

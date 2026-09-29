@@ -19,9 +19,10 @@ struct Server {
 
 async fn start(dir: &Path, ng: &str) -> Server {
     let d = dir.display();
-    // Its clients talk as fast as a load test does, so no flood limit.
+    // Its clients talk as fast as a load test does, so no flood limit
+    // and no request limit.
     let text = format!(
-        "[limits]\nchat_lines = 0\nspam_points = 0\n\
+        "[limits]\nchat_lines = 0\nspam_points = 0\nng_requests = 0\nnews_posts = 0\n\
          [paths]\naccounts = \"{d}/accounts\"\n\
          [ng]\nbind = \"127.0.0.1:0\"\n{ng}\n"
     );

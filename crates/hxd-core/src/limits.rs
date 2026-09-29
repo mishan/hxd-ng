@@ -20,7 +20,20 @@
 //! banned for `[server] ban_time` with public chat told, both in mhxd's
 //! words. An account that `can_spam` is held to neither.
 //!
-//! **Requests.** Some requests are cheap to make and dear to answer, or
+//! **Requests.** Neither budget sees most of what an ng client can ask
+//! for, and mhxd has no counterpart to price it by. One ng session is
+//! held to a token bucket instead ([`RequestLimits`]): each request
+//! spends its weight, a read the least and what writes, fans out or
+//! renegotiates media more, and one the bucket cannot pay for is
+//! answered `rate_limited` with how long to wait, which is a delay and
+//! not a kick. The bucket is the session's, like the budgets, so a
+//! client that drops its socket and resumes finds it as it left it.
+//! One account's news posts are held to a slower bucket of their own,
+//! which the classic wire's posts draw on and are never refused by. An
+//! account that `can_spam` is held to neither of these either, as it is
+//! held to neither budget.
+//!
+//! Some requests are cheap to make and dear to answer, or
 //! are a guess at something: a password, a challenge that fills a table.
 //! Those are held to a rate per address ([`RateGate`]) — a burst, then
 //! one more as each comes due — and one past it is told how long to
@@ -515,7 +528,7 @@ impl Core {
         match self.login_failures.take(addr) {
             Ok(()) => Ok(LoginAttempt { held: Some(addr) }),
             Err(wait) => {
-                crate::instrument::rate_limited("login");
+                crate::instrument::throttled("login");
                 Err(wait)
             }
         }
@@ -651,6 +664,175 @@ impl Flood {
         self.spam.roll(limits.spam_per, now);
         self.spam.spent = self.spam.spent.saturating_add(points);
         (self.spam.spent, self.spam.spent < limits.spam_points)
+    }
+}
+
+/// How fast one ng session may ask, and one account post news
+/// (`[limits]`), neither of which mhxd limits. `requests` is the weight
+/// one session may spend at once, across every connection it resumes
+/// on, earned back evenly over `requests_per`; `news_posts` the articles
+/// and replies one account may post at once, earned back over
+/// `news_posts_per`. A count of 0 is no
+/// limit, which is what a `Core` built by hand has
+/// ([`RequestLimits::default`]); a server built from a config has
+/// [`RequestLimits::DEFAULT`] unless it says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RequestLimits {
+    pub requests: u32,
+    pub requests_per: Duration,
+    pub news_posts: u32,
+    pub news_posts_per: Duration,
+}
+
+impl RequestLimits {
+    /// A burst of 40 and then 20 a second, in weight: joining a call
+    /// with the camera on, and answering the renegotiations that brings,
+    /// spends less than the burst even from a device trickling an ICE
+    /// candidate for each of a dozen addresses, opening the news spends
+    /// a few, and a person does not sustain twenty reads a second.
+    /// Ten posts at once and then one each half minute: a thread's
+    /// back-and-forth is slower than that, and a flood of a hundred
+    /// takes most of an hour.
+    pub const DEFAULT: RequestLimits = RequestLimits {
+        requests: 40,
+        requests_per: Duration::from_secs(2),
+        news_posts: 10,
+        news_posts_per: Duration::from_secs(300),
+    };
+}
+
+/// A token bucket: `count` tokens when full, earned back evenly over
+/// `per`, so a burst of the whole count and then a steady rate.
+#[derive(Debug, Clone)]
+pub struct RateBucket {
+    count: u32,
+    per: Duration,
+    tokens: f64,
+    at: Instant,
+}
+
+impl RateBucket {
+    /// A full bucket, or `None` for no limit (a count or a period of 0).
+    pub fn new(count: u32, per: Duration, now: Instant) -> Option<RateBucket> {
+        (count != 0 && !per.is_zero()).then_some(RateBucket {
+            count,
+            per,
+            tokens: f64::from(count),
+            at: now,
+        })
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let earned = now.saturating_duration_since(self.at).as_secs_f64() * f64::from(self.count)
+            / self.per.as_secs_f64();
+        self.tokens = (self.tokens + earned).min(f64::from(self.count));
+        self.at = self.at.max(now);
+    }
+
+    /// Spend `cost`, or say how long until it could be: nothing is spent
+    /// by a refusal. A cost past the whole bucket costs the whole
+    /// bucket, so that no request is refused forever.
+    pub fn spend(&mut self, cost: u32, now: Instant) -> Result<(), Duration> {
+        if let Some(wait) = self.wait(cost, now) {
+            return Err(wait);
+        }
+        self.tokens -= f64::from(cost.min(self.count));
+        Ok(())
+    }
+
+    /// How long until `cost` could be spent, or `None` when it could be
+    /// now; spending nothing.
+    pub fn wait(&mut self, cost: u32, now: Instant) -> Option<Duration> {
+        self.refill(now);
+        let cost = f64::from(cost.min(self.count));
+        (self.tokens < cost).then(|| {
+            Duration::from_secs_f64(
+                (cost - self.tokens) * self.per.as_secs_f64() / f64::from(self.count),
+            )
+        })
+    }
+
+    /// Spend `cost` whether it is there or not, down to empty: for what
+    /// is counted but never refused.
+    pub fn charge(&mut self, cost: u32, now: Instant) {
+        self.refill(now);
+        self.tokens = (self.tokens - f64::from(cost)).max(0.0);
+    }
+
+    /// Give back `cost` spent on something that did not happen, up to
+    /// full.
+    pub fn refund(&mut self, cost: u32, now: Instant) {
+        self.refill(now);
+        self.tokens = (self.tokens + f64::from(cost)).min(f64::from(self.count));
+    }
+
+    fn full(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= f64::from(self.count)
+    }
+}
+
+/// Whose news posts a bucket counts: an account's, by the mailbox rule,
+/// or one session's when it is not one person — a guest, whose login
+/// every other guest shares and whose posts must not stop theirs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum PostKey {
+    Account(Option<[u8; 32]>, String),
+    Session(u64),
+}
+
+/// Every account's news-post bucket ([`RequestLimits::news_posts`]).
+#[derive(Debug, Default)]
+pub(crate) struct PostRates(Mutex<HashMap<PostKey, RateBucket>>);
+
+impl PostRates {
+    /// Take one post from `key`'s bucket, or say how long until one is
+    /// there; a refusal takes nothing. Taken before the post is made, so
+    /// two sessions of one account posting at once cannot both be let
+    /// through on the one post that was left, and given back by
+    /// [`Self::refund`] when the post is then refused for what it says.
+    pub(crate) fn reserve(
+        &self,
+        key: PostKey,
+        limits: &RequestLimits,
+        now: Instant,
+    ) -> Result<(), Duration> {
+        let Some(fresh) = RateBucket::new(limits.news_posts, limits.news_posts_per, now) else {
+            return Ok(());
+        };
+        self.with(key, fresh, now, |b| b.spend(1, now))
+    }
+
+    /// Give back a post [`Self::reserve`] took for one that did not land.
+    pub(crate) fn refund(&self, key: &PostKey, now: Instant) {
+        if let Some(b) = self.0.lock().unwrap().get_mut(key) {
+            b.refund(1, now);
+        }
+    }
+
+    /// Count one post of `key`'s, whether or not there was one left: a
+    /// post that has landed has been made.
+    pub(crate) fn count(&self, key: PostKey, limits: &RequestLimits, now: Instant) {
+        let Some(fresh) = RateBucket::new(limits.news_posts, limits.news_posts_per, now) else {
+            return;
+        };
+        self.with(key, fresh, now, |b| b.charge(1, now));
+    }
+
+    fn with<T>(
+        &self,
+        key: PostKey,
+        fresh: RateBucket,
+        now: Instant,
+        f: impl FnOnce(&mut RateBucket) -> T,
+    ) -> T {
+        let mut by = self.0.lock().unwrap();
+        // An account whose bucket has filled again is forgotten, so the
+        // table holds only those that posted a moment ago.
+        if by.len() > 4096 {
+            by.retain(|_, b| !b.full(now));
+        }
+        f(by.entry(key).or_insert(fresh))
     }
 }
 
@@ -950,5 +1132,82 @@ mod tests {
         assert!(!s.contains("11.0.0.1".parse().unwrap()));
         assert!(AddrSet::parse(&["10.0.0.0/33"]).is_err());
         assert!(AddrSet::parse(&["nope"]).is_err());
+    }
+
+    #[test]
+    fn a_bucket_spends_its_burst_then_its_rate_and_says_how_long() {
+        let t = Instant::now();
+        let mut b = RateBucket::new(4, Duration::from_secs(2), t).unwrap();
+        b.spend(2, t).unwrap();
+        b.spend(2, t).unwrap();
+        let wait = b.spend(1, t).unwrap_err();
+        assert_eq!(
+            wait,
+            Duration::from_millis(500),
+            "one token every half second"
+        );
+        // A refusal spends nothing: half a second later the one is there.
+        let t = t + Duration::from_millis(500);
+        b.spend(1, t).unwrap();
+        // A weight past the bucket costs the bucket rather than never
+        // being allowed.
+        let t = t + Duration::from_secs(10);
+        b.spend(9, t).unwrap();
+        assert!(b.spend(1, t).is_err());
+        assert!(RateBucket::new(0, Duration::from_secs(1), t).is_none());
+        assert!(RateBucket::new(5, Duration::ZERO, t).is_none());
+    }
+
+    #[test]
+    fn a_charge_is_never_refused_but_empties_the_bucket() {
+        let t = Instant::now();
+        let mut b = RateBucket::new(2, Duration::from_secs(10), t).unwrap();
+        for _ in 0..5 {
+            b.charge(1, t);
+        }
+        assert_eq!(
+            b.spend(1, t),
+            Err(Duration::from_secs(5)),
+            "empty, not in debt"
+        );
+    }
+
+    #[test]
+    fn posts_are_counted_by_account_and_a_guest_by_its_session() {
+        let limits = RequestLimits {
+            news_posts: 2,
+            news_posts_per: Duration::from_secs(60),
+            ..RequestLimits::default()
+        };
+        let rates = PostRates::default();
+        let t = Instant::now();
+        let alice = || PostKey::Account(None, "alice".into());
+        rates.reserve(alice(), &limits, t).unwrap();
+        // A post refused for what it says is given back.
+        rates.refund(&alice(), t);
+        rates.reserve(alice(), &limits, t).unwrap();
+        rates.reserve(alice(), &limits, t).unwrap();
+        assert_eq!(
+            rates.reserve(alice(), &limits, t),
+            Err(Duration::from_secs(30)),
+            "taken when asked, so a second asker finds it gone"
+        );
+        // Counted past the limit, as a post on the other wire is.
+        rates.count(alice(), &limits, t);
+        assert_eq!(
+            rates.reserve(alice(), &limits, t),
+            Err(Duration::from_secs(30)),
+            "empty, not in debt"
+        );
+        rates.count(PostKey::Session(7), &limits, t);
+        rates.count(PostKey::Session(8), &limits, t);
+        rates.count(PostKey::Session(8), &limits, t);
+        rates.reserve(PostKey::Session(7), &limits, t).unwrap();
+        assert!(rates.reserve(PostKey::Session(8), &limits, t).is_err());
+        assert_eq!(
+            rates.reserve(alice(), &RequestLimits::default(), t),
+            Ok(()),
+            "no limit"
+        );
     }
 }

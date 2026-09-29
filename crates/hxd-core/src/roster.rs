@@ -713,6 +713,11 @@ pub(crate) struct UserSession {
     pub(crate) can_spam: bool,
     /// What this session has spent of its flood allowances.
     pub(crate) flood: crate::limits::Flood,
+    /// What it has left of its ng request limit, or `None` when there is
+    /// no limit ([`Core::spend_request`]). The session's rather than a
+    /// connection's, as the flood allowances are, so a resume carries on
+    /// from where the dropped connection left it.
+    pub(crate) requests: Option<crate::RateBucket>,
     /// See [`AttachInfo::is_person`].
     pub(crate) is_person: bool,
     /// See [`AttachInfo::reads_on_delivery`].
@@ -1037,6 +1042,12 @@ pub struct Core {
     pub(crate) login_failures: crate::limits::RateGate,
     /// How fast one session may talk (`crate::limits`).
     pub(crate) flood_limits: crate::limits::FloodLimits,
+    /// How fast one ng session may ask and one account post news
+    /// (`crate::limits`).
+    pub(crate) request_limits: crate::limits::RequestLimits,
+    /// What each account has left of its news posts. Its own lock, taken
+    /// with nothing else held.
+    pub(crate) post_rates: crate::limits::PostRates,
     /// Every standing ban, for matching without the store
     /// (`crate::ban`).
     pub(crate) bans: std::sync::RwLock<crate::ban::BanMatcher>,
@@ -1322,6 +1333,35 @@ impl Core {
         self
     }
 
+    /// Hold ng sessions and news posts to `limits` rather than
+    /// [`crate::RequestLimits::default`].
+    pub fn with_request_limits(mut self, limits: crate::RequestLimits) -> Self {
+        self.request_limits = limits;
+        self
+    }
+
+    /// Spend `cost` of `uid`'s ng request limit
+    /// ([`crate::RequestLimits`]), or say how long until it could be; a
+    /// refusal spends nothing. The bucket is the session's, filled at
+    /// login and kept across a detach and resume, so a client cannot
+    /// buy a fresh one by dropping its socket. A session held to none
+    /// spends nothing: no limit is set, its account `can_spam` (held to
+    /// no request limit, as it is held to no flood limit), it is the
+    /// server account, or it has gone.
+    pub fn spend_request(&self, uid: Uid, cost: u32) -> Result<(), Duration> {
+        let mut r = self.roster.lock().unwrap();
+        let Some(sess) = r.users.get_mut(&uid) else {
+            return Ok(());
+        };
+        if sess.can_spam || sess.info.system {
+            return Ok(());
+        }
+        match sess.requests.as_mut() {
+            Some(bucket) => bucket.spend(cost, Instant::now()),
+            None => Ok(()),
+        }
+    }
+
     /// A place for one connection from `addr`, held for as long as the
     /// connection is open, or why there is none: the frontend closes the
     /// connection unanswered (`crate::limits`). Asked once per
@@ -1446,6 +1486,11 @@ impl Core {
                 moderate: info.moderate,
                 can_spam: info.can_spam,
                 flood: Default::default(),
+                requests: crate::RateBucket::new(
+                    self.request_limits.requests,
+                    self.request_limits.requests_per,
+                    Instant::now(),
+                ),
                 is_person: info.is_person,
                 reads_on_delivery: info.reads_on_delivery,
                 system: info.system,
