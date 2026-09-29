@@ -40,7 +40,7 @@ use hxproto::messages::ClientHdr;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
-use crate::member::{Got, Member, Wire};
+use crate::member::{retry_busy, Got, Member, Wire};
 use crate::{ledger, Ctx};
 
 /// Sessions the moderator may kick, by uid, each with the flag it sets
@@ -333,17 +333,18 @@ async fn login(
     targets: &Targets,
 ) -> Option<(ng::Client, Arc<AtomicBool>)> {
     let took = std::time::Instant::now();
-    let mut c = match ng::Client::connect(addr).await {
+    let attempt = || async {
+        let mut c = ng::Client::connect(addr).await?;
+        c.login(params.clone()).await?;
+        Ok(c)
+    };
+    let c = match retry_busy(ctx, attempt).await {
         Ok(c) => c,
         Err(e) => {
             ctx.stats.error("churn.login", &e.to_string());
             return None;
         }
     };
-    if let Err(e) = c.login(params.clone()).await {
-        ctx.stats.error("churn.login", &e.to_string());
-        return None;
-    }
     ctx.stats.record("churn.login", took.elapsed());
     let flag = Arc::new(AtomicBool::new(false));
     if let Some(uid) = c.uid {
@@ -400,8 +401,8 @@ async fn legacy_churner(
                 }
                 // Logged in, a while, then gone: cleanly, or not.
                 _ => {
-                    let mut c = legacy::Client::connect(addr).await?;
-                    c.login(&Login::guest(&nick)).await?;
+                    let login = Login::guest(&nick);
+                    let c = retry_busy(&ctx, || legacy::Client::login_at(addr, &login)).await?;
                     let flag = Arc::new(AtomicBool::new(false));
                     if let Some(uid) = c.uid {
                         targets.lock().unwrap().insert(uid as u64, flag.clone());

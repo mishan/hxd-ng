@@ -23,6 +23,8 @@
 
 use hxd_core::instrument::TimedMutex;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hxd_core::history::{
@@ -490,6 +492,14 @@ struct Checkpointer {
     /// thread.
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Rewinds done, for the tests: whether one ran is a fact the
+    /// checkpointer knows, where the log's size at any moment only
+    /// hints at it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    rewinds: Arc<AtomicU64>,
+    /// Rewinds tried and refused, and so backed off, for the same tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    refusals: Arc<AtomicU64>,
 }
 
 impl Drop for Checkpointer {
@@ -507,12 +517,16 @@ impl Checkpointer {
         // Only a rewind waits on anything, and it waits holding the write
         // lock: briefly, or not at all (`checkpoint`).
         conn.busy_timeout(REWIND_WAIT).map_err(StoreError::new)?;
+        let rewinds = Arc::new(AtomicU64::new(0));
+        let refusals = Arc::new(AtomicU64::new(0));
         let mut state = CheckpointState {
             db: path
                 .file_name()
                 .map_or_else(|| "db".into(), |n| n.to_string_lossy().into_owned()),
             rewind_pages,
             rewind_after: None,
+            rewinds: rewinds.clone(),
+            refusals: refusals.clone(),
         };
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
@@ -531,6 +545,8 @@ impl Checkpointer {
         Ok(Checkpointer {
             stop: Some(stop),
             thread: Some(thread),
+            rewinds,
+            refusals,
         })
     }
 }
@@ -542,6 +558,8 @@ struct CheckpointState {
     rewind_pages: i64,
     /// A rewind came back busy: not again before this.
     rewind_after: Option<std::time::Instant>,
+    rewinds: Arc<AtomicU64>,
+    refusals: Arc<AtomicU64>,
 }
 
 /// What one pass of the checkpointer did.
@@ -625,11 +643,13 @@ fn checkpoint(conn: &Connection, state: &mut CheckpointState) -> Pass {
     match wal("TRUNCATE") {
         Ok((false, ..)) => {
             state.rewind_after = None;
+            state.rewinds.fetch_add(1, Ordering::Relaxed);
             hxd_core::instrument::checkpoint(&state.db, "rewind", took, 0);
             Pass::Rewound
         }
         Ok((true, ..)) | Err(_) => {
             state.rewind_after = Some(std::time::Instant::now() + REWIND_BACKOFF);
+            state.refusals.fetch_add(1, Ordering::Relaxed);
             hxd_core::instrument::checkpoint_busy(&state.db);
             tracing::debug!("sqlite checkpoint: a reader kept the log from being rewound");
             Pass::RewindBusy
@@ -832,6 +852,22 @@ impl SqliteStore {
     /// SQLite implementation's exact semantics without a file.
     pub fn in_memory() -> Result<Self, StoreError> {
         Self::open(":memory:", Synchronous::Normal)
+    }
+
+    /// How many times the checkpointer has rewound the log.
+    #[cfg(test)]
+    fn rewinds(&self) -> u64 {
+        self._checkpointer
+            .as_ref()
+            .map_or(0, |c| c.rewinds.load(Ordering::Relaxed))
+    }
+
+    /// How many times a rewind the checkpointer tried came back busy.
+    #[cfg(test)]
+    fn rewind_refusals(&self) -> u64 {
+        self._checkpointer
+            .as_ref()
+            .map_or(0, |c| c.refusals.load(Ordering::Relaxed))
     }
 }
 
@@ -2023,23 +2059,46 @@ mod tests {
     /// The log is rewound while commits keep coming: a PASSIVE checkpoint
     /// alone never leaves it rewindable under a steady stream of them, and
     /// it grew for as long as the stream lasted.
+    ///
+    /// Asked of the checkpointer rather than of the log's size: a size
+    /// sampled at one moment says nothing of whether a rewind ran just
+    /// before it or is about to, and a slow machine, whose commits are
+    /// fewer and whose rewinds can be refused and backed off, moved every
+    /// moment the test could sample. The stream goes on until the log has
+    /// been rewound twice — so the second came while the stream continued
+    /// past the first — however long the machine takes to get there.
+    ///
+    /// Rewinds refused along the way are counted and reported, but not
+    /// held to a ratio with the ones that went through: what makes one
+    /// busy is the machine's load, the very thing this test was made to
+    /// stop depending on. What is asserted of them is what the design
+    /// promises whatever the load — each is followed by `REWIND_BACKOFF`
+    /// without another, so a checkpointer that stopped backing off, and
+    /// so held the write lock over and over, fails here.
     #[test]
     fn the_wal_is_rewound_while_writes_keep_coming() {
         use hxd_core::history::{ChatLog, NewLine};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.db");
-        let wal = dir.path().join("server.db-wal");
         let rewind = 256;
+        // Before the checkpointer starts, so no refusal predates it.
+        let started = std::time::Instant::now();
         let store =
             SqliteStore::open_inner(&path, Synchronous::Normal, false, Checkpoints::Own(rewind))
                 .unwrap();
         let text = "x".repeat(64);
-        let size = || std::fs::metadata(&wal).map_or(0, |m| m.len());
-        let began = std::time::Instant::now();
-        let mut early = None;
+        // Long enough for a refused rewind's backoff, and more, on the
+        // slowest runner; a healthy one is done in a few seconds.
+        let deadline = std::time::Instant::now() + 6 * REWIND_BACKOFF;
         // A commit a millisecond, about what a busy room makes, so every
         // checkpoint has some arriving while it runs.
-        while began.elapsed() < 9 * CHECKPOINT_EVERY / 2 {
+        while store.rewinds() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the log was rewound {} times while writes kept coming, and refused {} times",
+                store.rewinds(),
+                store.rewind_refusals()
+            );
             store
                 .append(&NewLine {
                     channel: 0,
@@ -2053,16 +2112,17 @@ mod tests {
                 })
                 .unwrap();
             std::thread::sleep(Duration::from_millis(1));
-            if early.is_none() && began.elapsed() >= 2 * CHECKPOINT_EVERY {
-                early = Some(size());
-            }
         }
-        let (early, late) = (early.unwrap(), size());
-        // Rewound, the log is reused from its start and its file stops
-        // growing; without the rewind it holds every page since the start.
+        let (rewinds, refusals) = (store.rewinds(), store.rewind_refusals());
+        let took = started.elapsed();
+        eprintln!("rewound {rewinds} times and refused {refusals} in {took:?}");
+        // The first refusal can come at once; each after it only once
+        // the backoff since the one before has run out.
+        let most = (took.as_secs_f64() / REWIND_BACKOFF.as_secs_f64()).floor() as u64 + 1;
         assert!(
-            late < early * 2,
-            "the log kept growing: {early} then {late} bytes"
+            refusals <= most,
+            "{refusals} rewinds refused in {took:?}, more than one per {REWIND_BACKOFF:?} \
+             ({rewinds} went through)"
         );
     }
 
@@ -2145,6 +2205,8 @@ mod tests {
             db: "server.db".into(),
             rewind_pages: 0,
             rewind_after: None,
+            rewinds: Default::default(),
+            refusals: Default::default(),
         };
         assert_eq!(checkpoint(&conn, &mut state), Pass::Collided);
         assert_eq!(state.rewind_after, None);

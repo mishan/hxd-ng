@@ -6,6 +6,9 @@
 //! The rate steps up every `ramp_every` seconds, and each step is
 //! reported on its own. The knee is the first step whose p99 is more
 //! than twice the first step's, or whose errors pass one in a hundred.
+//! A login the server refuses as busy tries again, as a client would
+//! (`member::retry_busy`), so the server's login gate shows as latency
+//! and in the report's `busy_logins` rather than as failed logins.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
