@@ -70,7 +70,7 @@ pub fn news_err(e: &NewsError) -> (&'static str, &'static str) {
         ),
         NewsError::TooManyArticles { guests: true } => (
             "too_many_articles",
-            "Guests have as many articles here as this server allows.",
+            "Guests from your address have as many articles here as this server allows.",
         ),
         NewsError::NoSession | NewsError::Store(_) => ("server_error", "Server error."),
     }

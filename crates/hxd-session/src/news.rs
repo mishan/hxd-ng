@@ -314,7 +314,7 @@ pub(crate) fn error_text(e: &NewsError) -> &'static str {
             "You have as many articles here as this server allows. Delete one first."
         }
         NewsError::TooManyArticles { guests: true } => {
-            "Guests have as many articles here as this server allows."
+            "Guests from your address have as many articles here as this server allows."
         }
         _ => "Server error.",
     }

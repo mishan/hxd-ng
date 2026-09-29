@@ -450,6 +450,13 @@ pub struct NewsSection {
     /// Filesystem root for durable content-addressed attachment bytes.
     #[serde(default = "default_news_blobs")]
     pub blobs: PathBuf,
+    /// The secret a guest's address is kept under beside its articles
+    /// (`docs/news.md` §7.4): 32 bytes in hex, created owner-only on
+    /// first start. Absent, `news-guest.key` in the database's directory.
+    /// Kept out of the database on purpose, so a copy of it is not a
+    /// list of where guests posted from; lost or replaced, it leaves the
+    /// guests' articles already kept counted under no address.
+    pub guest_secret: Option<PathBuf>,
     /// The legacy `NEWSDATA` ceiling. ↓ freely, ↑ never: 65 535 is what
     /// the 1.5 wire can carry in one chunk (§12.4).
     #[serde(default = "default_news_max_body")]
@@ -488,8 +495,8 @@ pub struct NewsSection {
     /// hold together; a post past it is refused. 0 for no ceiling.
     #[serde(default = "default_news_max_text_bytes")]
     pub max_text_bytes: u64,
-    /// Live articles one author may hold, every guest counted as one. 0
-    /// for no ceiling.
+    /// Live articles one author may hold, the guests from one address
+    /// counted as one. 0 for no ceiling.
     #[serde(default = "default_news_max_per_author")]
     pub max_per_author: u64,
     /// May an author delete their own article? `false` is the period
@@ -645,6 +652,25 @@ fn default_news_stale_after() -> u64 {
 }
 
 impl NewsSection {
+    /// Where the guests' secret lives: `guest_secret`, or
+    /// `news-guest.key` in the directory of the database the news is
+    /// kept in, which is where an operator backing the data up will find
+    /// it, and apart from the database file itself.
+    pub fn guest_secret_path(&self, config: &Config) -> PathBuf {
+        if let Some(path) = &self.guest_secret {
+            return path.clone();
+        }
+        let db = self
+            .db
+            .clone()
+            .or_else(|| config.inbox.as_ref().map(|i| i.db.clone()))
+            .or_else(|| config.history.as_ref().and_then(|h| h.db.clone()));
+        db.as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new(""))
+            .join("news-guest.key")
+    }
+
     pub fn to_policy(&self) -> hxd_core::NewsPolicy {
         hxd_core::NewsPolicy {
             max_body: self.max_body,
@@ -2302,6 +2328,31 @@ pub(crate) fn load_key(path: &Path, what: &str) -> Result<ServerKey, String> {
 
 /// Read a key [`load_key`] wrote, failing if there is none.
 pub(crate) fn read_key(path: &Path) -> Result<ServerKey, String> {
+    read_seed(path).map(|seed| ServerKey::from_seed(&seed))
+}
+
+/// The 32-byte secret kept in hex at `path`, made from the OS CSPRNG and
+/// written there owner-only the first time it is asked for, as
+/// [`load_key`] makes a key.
+pub(crate) fn load_secret(path: &Path, what: &str) -> Result<[u8; 32], String> {
+    use rand_core::RngCore;
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut secret = [0u8; 32];
+            rand_core::OsRng
+                .try_fill_bytes(&mut secret)
+                .map_err(|e| format!("{what}: the OS CSPRNG: {e}"))?;
+            let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+            write_private(path, &hex).map_err(|e| format!("{}: {e}", path.display()))?;
+            tracing::info!("generated the {what} at {}", path.display());
+            Ok(secret)
+        }
+        _ => read_seed(path),
+    }
+}
+
+/// 32 bytes in hex, as [`load_key`] and [`load_secret`] write them.
+fn read_seed(path: &Path) -> Result<[u8; 32], String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let hex = text.trim();
     let bytes = (0..hex.len())
@@ -2309,10 +2360,9 @@ pub(crate) fn read_key(path: &Path) -> Result<ServerKey, String> {
         .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("zz"), 16))
         .collect::<Result<Vec<u8>, _>>()
         .map_err(|_| format!("{}: not a hex seed", path.display()))?;
-    let seed: [u8; 32] = bytes
+    bytes
         .try_into()
-        .map_err(|_| format!("{}: seed must be 32 bytes", path.display()))?;
-    Ok(ServerKey::from_seed(&seed))
+        .map_err(|_| format!("{}: seed must be 32 bytes", path.display()))
 }
 
 /// A public key as configuration and discovery spell it: base64url, 32
@@ -3612,6 +3662,10 @@ pub fn build_ctx(
         // account nobody may be logged into (§10.5).
         (Some(store), Some(news)) => core
             .with_news(store, news.to_policy())
+            .with_news_guest_keyer(hxd_core::news::GuestKeyer::new(load_secret(
+                &news.guest_secret_path(config),
+                "news guest secret",
+            )?))
             .with_accounts(auth.clone()),
         (None, None) => core,
         _ => return Err("[news] store was not opened".into()),
@@ -3685,6 +3739,60 @@ pub(crate) fn spawn_blocking<R: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The secret a guest's news share is kept under is made the first
+    /// time, owner-only, and read back unchanged after: the same address
+    /// is the same key across a restart, so a guest's articles stay its
+    /// address's.
+    #[test]
+    fn the_news_guest_secret_is_made_once_owner_only_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("news-guest.key");
+        let first = load_secret(&path, "news guest secret").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "owner-only from its first byte");
+        }
+        let again = load_secret(&path, "news guest secret").unwrap();
+        assert_eq!(first, again, "read back, not made again");
+        let addr: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        assert_eq!(
+            hxd_core::news::GuestKeyer::new(first).key(addr),
+            hxd_core::news::GuestKeyer::new(again).key(addr),
+            "the same address, the same key, after a restart"
+        );
+        assert_ne!(first, [0; 32]);
+        std::fs::write(&path, "not hex\n").unwrap();
+        assert!(load_secret(&path, "news guest secret").is_err());
+    }
+
+    /// Unnamed, the secret lives beside the database the news is kept
+    /// in, and a server built from the config makes it there.
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn the_news_guest_secret_defaults_to_beside_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let text =
+            format!("[paths]\naccounts = \"{d}/accounts\"\n[inbox]\ndb = \"{d}/hx.db\"\n[news]\n");
+        let config: Config = toml::from_str(&text).unwrap();
+        let news = config.news.as_ref().unwrap();
+        let path = dir.path().join("news-guest.key");
+        assert_eq!(news.guest_secret_path(&config), path);
+        assert!(!path.exists());
+        build_ctx(&config, None, None, None, None).unwrap();
+        assert!(path.exists(), "made at start");
+        let named: Config = toml::from_str(&format!(
+            "[news]\ndb = \"{d}/news.db\"\nguest_secret = \"{d}/elsewhere.key\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            named.news.as_ref().unwrap().guest_secret_path(&named),
+            dir.path().join("elsewhere.key")
+        );
+    }
 
     /// `hxd identity revoke` against a file an operator wrote by hand.
     #[test]

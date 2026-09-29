@@ -13,10 +13,10 @@ use hxd_core::inbox::{Mailbox, StoreError};
 use hxd_core::news::{
     Article, ArticleId, ArticlePage, Listed, NewNode, NewPost, NewsError, NewsStore, NewsUsage,
     Node, NodeId, Posted, Reference, SearchPage, SearchQuery, SubScope, Subscriber, Subscription,
-    ThreadPage, ThreadQuery,
+    ThreadPage, ThreadQuery, Writer,
 };
-use hxd_core::{AttachmentPolicy, Core, MarkdownMode, NewsPolicy, NotifyPolicy};
-use hxd_ng_session::{NgConfig, NgCtx, Registry};
+use hxd_core::{AttachmentPolicy, Core, MarkdownMode, NewsPolicy, NotifyPolicy, RequestLimits};
+use hxd_ng_session::{NgConfig, NgCtx, Registry, TrustedProxies};
 use hxd_session::caps::{cap, Caps};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{FlatNews, FlatReply, LegacyNews, ServerConfig, ServerCtx};
@@ -27,6 +27,7 @@ use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 const EVERY_NEWS_BIT: &str = "read_news = true\npost_news = true\ndelete_articles = true\n\
@@ -68,6 +69,21 @@ async fn start_server_wrapped(
     news: Option<NewsPolicy>,
     legacy_news: LegacyNews,
     wrap: impl FnOnce(Arc<SqliteStore>) -> Arc<dyn NewsStore>,
+) -> (SocketAddr, SocketAddr, Arc<Core>) {
+    start_server_limited(dir, news, legacy_news, wrap, RequestLimits::default()).await
+}
+
+/// [`start_server_wrapped`], holding sessions to `limits` — a hand-built
+/// `Core` has none. The ng port believes loopback as a proxy, so a test
+/// can present a client from any address with `X-Forwarded-For`
+/// ([`Ng::login_from`]); without the header a client is loopback, as
+/// ever.
+async fn start_server_limited(
+    dir: &Path,
+    news: Option<NewsPolicy>,
+    legacy_news: LegacyNews,
+    wrap: impl FnOnce(Arc<SqliteStore>) -> Arc<dyn NewsStore>,
+    limits: RequestLimits,
 ) -> (SocketAddr, SocketAddr, Arc<Core>) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -122,7 +138,7 @@ async fn start_server_wrapped(
         }
         None => Core::new(),
     };
-    let core = Arc::new(core);
+    let core = Arc::new(core.with_request_limits(limits));
     let auth: Arc<dyn hxd_core::AuthBackend> = files;
     let legacy_ctx = ServerCtx {
         core: core.clone(),
@@ -154,6 +170,7 @@ async fn start_server_wrapped(
             grace: Duration::from_secs(60),
             max_detached_per_addr: 8,
             caps: Vec::new(),
+            trusted_proxies: TrustedProxies::parse(&["127.0.0.1"]).unwrap(),
             ..Default::default()
         }),
         registry: Arc::new(Registry::new()),
@@ -196,9 +213,27 @@ impl Ng {
     }
 
     async fn login_with(addr: SocketAddr, login: &str, password: &str) -> (Self, Value) {
-        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
-            .await
-            .unwrap();
+        Self::login_via(addr, login, password, None).await
+    }
+
+    /// A login from `from`, as the proxy the test server believes names
+    /// it in `X-Forwarded-For`.
+    async fn login_from(addr: SocketAddr, login: &str, password: &str, from: &str) -> Self {
+        Self::login_via(addr, login, password, Some(from)).await.0
+    }
+
+    async fn login_via(
+        addr: SocketAddr,
+        login: &str,
+        password: &str,
+        from: Option<&str>,
+    ) -> (Self, Value) {
+        let mut req = format!("ws://{addr}").into_client_request().unwrap();
+        if let Some(from) = from {
+            req.headers_mut()
+                .insert("X-Forwarded-For", from.parse().unwrap());
+        }
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
         let mut client = Self {
             ws,
             next: 1,
@@ -2999,7 +3034,7 @@ impl NewsStore for CountingNews {
         self.inner.usage()
     }
 
-    fn written_by(&self, who: Option<&Mailbox>) -> Result<u64, StoreError> {
+    fn written_by(&self, who: &Writer) -> Result<u64, StoreError> {
         self.inner.written_by(who)
     }
 
@@ -3146,9 +3181,10 @@ async fn a_post_reads_the_store_once_for_every_classic_reader() {
 }
 
 /// The news ceilings refuse a post on both wires, the author's before
-/// the server's, and a delete makes room again. The guests share one
-/// author's allowance, and the refusal says so to a guest who has
-/// posted nothing.
+/// the server's, and a delete makes room again. The guests from one
+/// address share one author's allowance — here every guest is loopback,
+/// on either wire — and the refusal says so to a guest who has posted
+/// nothing.
 #[tokio::test]
 async fn a_full_news_refuses_a_post_on_both_wires() {
     let dir = tempfile::tempdir().unwrap();
@@ -3196,14 +3232,14 @@ async fn a_full_news_refuses_a_post_on_both_wires() {
     assert_eq!(reply["error"]["code"], "too_many_articles");
     assert_eq!(
         reply["error"]["text"],
-        "Guests have as many articles here as this server allows."
+        "Guests from your address have as many articles here as this server allows."
     );
     let mut guest_period = Period::login(legacy, "guest").await;
     assert_eq!(
         guest_period
             .refused(NEWSFILE_POST, flat_post("mine?"))
             .await,
-        "Guests have as many articles here as this server allows.",
+        "Guests from your address have as many articles here as this server allows.",
         "a guest who posted nothing is not told the articles are theirs"
     );
 
@@ -3220,4 +3256,126 @@ async fn a_full_news_refuses_a_post_on_both_wires() {
     // A tombstone holds nothing, so a delete is room.
     admin.ok("news_delete", json!({ "id": first })).await;
     bob_period.ok(NEWSFILE_POST, flat_post("one more")).await;
+}
+
+/// Allow guests to read and post news, in the accounts directory a test
+/// server was started on.
+fn guests_post(dir: &Path) {
+    std::fs::write(
+        dir.join("accounts").join("guest.toml"),
+        "name = \"Guest\"\n[access]\nread_news = true\npost_news = true\n",
+    )
+    .unwrap();
+}
+
+/// A guest's share of the articles is its address's, IPv6 by the /64:
+/// guests from one address share one, whichever of them posted, and a
+/// guest from anywhere else has its own — so one guest cannot fill the
+/// news for every guest, and logging in again is not a fresh share. A
+/// classic guest is counted by its address too.
+#[tokio::test]
+async fn guests_share_the_articles_of_their_address_and_no_one_elses() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = NewsPolicy {
+        max_per_author: 2,
+        ..news_server()
+    };
+    let (legacy, ng, _) = start_server_with(dir.path(), Some(policy), flat_general()).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let general = category(&mut admin, None, "General").await;
+    guests_post(dir.path());
+    let full = "Guests from your address have as many articles here as this server allows.";
+    let one_more = json!({ "category": general, "subject": "More", "body": "one more" });
+
+    let mut here = Ng::login_from(ng, "guest", "", "203.0.113.7").await;
+    let h1 = post(&mut here, general, None, "H1", "from here").await;
+    post(&mut here, general, None, "H2", "from here again").await;
+    let reply = here.request("news_post", one_more.clone()).await;
+    assert_eq!(reply["error"]["code"], "too_many_articles", "{reply}");
+    assert_eq!(reply["error"]["text"], full);
+    let mut here_again = Ng::login_from(ng, "guest", "", "203.0.113.7").await;
+    assert_eq!(
+        here_again.refused("news_post", one_more.clone()).await,
+        "too_many_articles",
+        "a second guest from that address shares its share"
+    );
+
+    let mut there = Ng::login_from(ng, "guest", "", "198.51.100.9").await;
+    post(&mut there, general, None, "T1", "from there").await;
+    post(&mut there, general, None, "T2", "from there too").await;
+    assert_eq!(
+        there.refused("news_post", one_more.clone()).await,
+        "too_many_articles"
+    );
+
+    let mut six = Ng::login_from(ng, "guest", "", "2001:db8:1:2::a").await;
+    post(&mut six, general, None, "S1", "a /64").await;
+    let mut neighbor = Ng::login_from(ng, "guest", "", "2001:db8:1:2:ffff::b").await;
+    post(&mut neighbor, general, None, "S2", "the same /64").await;
+    assert_eq!(
+        six.refused("news_post", one_more.clone()).await,
+        "too_many_articles",
+        "an IPv6 guest's share is its /64's"
+    );
+    let mut next_door = Ng::login_from(ng, "guest", "", "2001:db8:1:3::a").await;
+    post(&mut next_door, general, None, "S3", "the next /64").await;
+
+    // A classic guest is loopback here, which nobody above spent from.
+    let mut period = Period::login(legacy, "guest").await;
+    let flat_post = |body: &str| vec![(tag::BODY, body.as_bytes().to_vec())];
+    period.ok(NEWSFILE_POST, flat_post("from home")).await;
+    period.ok(NEWSFILE_POST, flat_post("and again")).await;
+    assert_eq!(
+        period.refused(NEWSFILE_POST, flat_post("once more")).await,
+        full
+    );
+
+    // Deleting one of an address's articles is room for that address.
+    admin.ok("news_delete", json!({ "id": h1 })).await;
+    post(&mut here_again, general, None, "H3", "room again").await;
+}
+
+/// A guest's news-post rate is its address's too: logging in again does
+/// not refill it, another address has its own, and a person's is theirs
+/// whoever else is posting.
+#[tokio::test]
+async fn a_guest_logging_in_again_finds_its_address_post_rate_spent() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = RequestLimits {
+        news_posts: 2,
+        news_posts_per: Duration::from_secs(600),
+        ..RequestLimits::default()
+    };
+    let (_, ng, _) = start_server_limited(
+        dir.path(),
+        Some(news_server()),
+        flat_general(),
+        |store| store as Arc<dyn NewsStore>,
+        limits,
+    )
+    .await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let general = category(&mut admin, None, "General").await;
+    guests_post(dir.path());
+    let one_more = json!({ "category": general, "subject": "More", "body": "one more" });
+
+    let mut first = Ng::login_from(ng, "guest", "", "203.0.113.20").await;
+    post(&mut first, general, None, "A", "first").await;
+    post(&mut first, general, None, "B", "second").await;
+    let refused = first.request("news_post", one_more.clone()).await;
+    assert_eq!(refused["error"]["code"], "rate_limited", "{refused}");
+    first.ok("logout", json!({})).await;
+
+    let mut again = Ng::login_from(ng, "guest", "", "203.0.113.20").await;
+    let refused = again.request("news_post", one_more.clone()).await;
+    assert_eq!(
+        refused["error"]["code"], "rate_limited",
+        "a fresh login is not a fresh bucket: {refused}"
+    );
+    assert!(refused["error"]["retry_after"].as_u64().unwrap() > 0);
+
+    let mut elsewhere = Ng::login_from(ng, "guest", "", "198.51.100.20").await;
+    post(&mut elsewhere, general, None, "C", "another address").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    post(&mut alice, general, None, "D", "a person").await;
 }

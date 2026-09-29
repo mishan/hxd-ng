@@ -475,6 +475,7 @@ CREATE TABLE news_article (
   at         INTEGER NOT NULL,
   deleted_at INTEGER,
   deleted_by TEXT,
+  guest_key  TEXT,                         -- a keyed hash of a guest's address, never the address (§7.4); version 13
   -- What news_fts reads by name (§6.1): computed on read, stored nowhere.
   author      TEXT GENERATED ALWAYS AS (nick || ' ' || IFNULL(login, '')) VIRTUAL,
   search_body TEXT GENERATED ALWAYS AS
@@ -485,6 +486,8 @@ CREATE INDEX news_article_roots  ON news_article (category, id) WHERE parent IS 
 CREATE INDEX news_article_root   ON news_article (root, id);
 CREATE INDEX news_article_author ON news_article (login_fp, login, id);
 CREATE INDEX news_article_at     ON news_article (at);
+CREATE INDEX news_article_guest  ON news_article (guest_key)
+  WHERE login IS NULL AND login_fp IS NULL AND deleted_at IS NULL;
 
 CREATE TABLE news_ref (
   src  INTEGER NOT NULL REFERENCES news_article(id),
@@ -1047,7 +1050,7 @@ line of text about it.
 | Total blob bytes | 8 GiB | store; an upload over it is refused (507), never evicted |
 | Live articles | 100 000 | domain, at post; refused (`news_full`), never evicted |
 | Live article text | 1 GiB | domain, at post: bodies and plain downgrades, in UTF-8 bytes; refused (`news_full`) |
-| Live articles per author | 10 000 | domain, at post, the guests counted as one; refused (`too_many_articles`) |
+| Live articles per author | 10 000 | domain, at post, the guests from one address counted as one; refused (`too_many_articles`) |
 | Article body | 65 535 bytes | domain — §12.4 says why that number |
 | Plain downgrade | 65 535 bytes | renderer, truncated at a char boundary (§5.4) |
 | References per article | 32 | domain, at extraction |
@@ -1073,6 +1076,38 @@ nothing: deleting is how room is made. The store keeps the totals in a
 row its triggers maintain (schema version 11) rather than summing the
 archive per post, and a post's check and its write are serialized so
 two posts cannot both take the last place.
+
+A guest is nobody in particular — the `guest` login is everyone's — so
+its share is its address's: the address a guest's post came from, keyed
+as the rest of `[limits]` keys one (IPv4 whole, IPv6 its /64, the rule
+guest media quotas follow). The guests behind one address share one
+allowance, and a guest anywhere else has its own. Counting every guest
+together let one of them fill the news for all of them. The same key
+holds a guest's news-post rate (`[limits] news_posts`), which keyed by
+session was refilled by logging in again.
+
+What the store keeps for this is not the address. It is the address as
+`[limits]` has it, hashed with HMAC-SHA-256 under a secret of the
+server's own and cut to 128 bits, in hex: equal addresses give equal
+keys, so the guests of one address still share one allowance, but the
+database alone does not say where anyone posted from. The secret is 32
+bytes from the OS's CSPRNG, made on first start in a file of its own
+(`[news] guest_secret`, by default `news-guest.key` beside the
+database), owner-only, and never in the database: IPv4 has few enough
+addresses that a hash anyone holding the database could recompute would
+be undone by trying them all. The key is on a guest's live article and
+nowhere else, never shown to a reader, and cleared by a tombstone with
+the author's login; the database zeroes what an update or a delete
+leaves in a page (`secure_delete = FAST`), so a cleared key is not left
+readable in the file's free space. A secret that is lost or replaced
+leaves the keys already kept matching no new post: those articles are
+counted against no address, and every address starts again from
+nothing. The in-memory rate (`news_posts`) is keyed by the address
+itself, and is never written down. Guest articles from before the key
+was kept (schema version 13) have none, and are a pool of their own that no address is charged
+for: which guest wrote them cannot be recovered, and charging them to
+every address would bring back the shared allowance the key exists to
+end. They count toward the totals as ever.
 
 **v1 accepts images and nothing else.** Not because the wire cannot
 carry more — the 1.5 article part carries a MIME type precisely so it
@@ -1190,7 +1225,8 @@ staged handle that is not yours or has expired — one answer for both,
 as `chat` already does), `attachments_full`, `news_full` (the blob cap,
 or the article ceilings of §7.4 — about the server), `too_many_articles`
 (the author's share of them — about you, except for a guest, whose
-share is the one every guest spends together and whose message says so),
+share is the one every guest from its address spends together and whose
+message says so),
 `name_taken`, `not_empty` (deleting a bundle with children), and
 `bad_body_type` (`text/markdown` against a server in `markdown = "off"`).
 
@@ -1206,7 +1242,8 @@ strings index by, in JavaScript and Swift's `NSString` and Java alike —
 so a client slices the match straight out of the string it received.
 A server with `search = false` answers `news_search` `not_available`,
 and too many searches answer `rate_limited`. So does a `news_post`
-past what one account may post (`[limits] news_posts`), with
+past what one account — or the guests from one address — may post
+(`[limits] news_posts`), with
 `retry_after`; a legacy post counts toward it and is never refused by
 it, the legacy wire keeping to mhxd's rules.
 
@@ -2292,7 +2329,8 @@ max_page = 200
 retain_days = 0                 # 0 = forever
 max_articles = 100000           # live articles; a post past it is refused; 0 = none
 max_text_bytes = 1073741824     # their bodies and downgrades, in bytes; 0 = none
-max_per_author = 10000          # live articles per account, guests as one; 0 = none
+max_per_author = 10000          # live articles per account, a guest's address as one; 0 = none
+# guest_secret = "news-guest.key"  # what a guest's address is hashed under (§7.4); beside the db
 self_delete = true              # authors may delete their own; false = period behavior
 legacy_catlist_max = 2000       # articles in one 1.5 category reply
 

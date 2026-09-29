@@ -70,7 +70,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -488,6 +488,29 @@ const SCHEMA_V12: &str = "
 ALTER TABLE avatar ADD COLUMN seen_at INTEGER NOT NULL DEFAULT 0;
 UPDATE avatar SET seen_at = set_at;
 CREATE INDEX avatar_identity_seen ON avatar (seen_at) WHERE owner LIKE 'i:%';
+";
+
+/// A guest's share of the news (`docs/news.md` §7.4): which address a
+/// guest's article came from, as `max_per_author` counts the guests by.
+/// Not the address: the address as `hxd_core::limits::limit_key` has it
+/// (IPv4 whole, IPv6 its /64) under HMAC-SHA-256 with the server's
+/// secret, cut to 128 bits and kept as hex (`hxd_core::news::GuestKeyer`).
+/// Equal addresses give equal keys, so the count is unchanged, and the
+/// secret is kept in a file of its own beside the database, never in
+/// it: IPv4 is small enough that a hash this file alone could recompute
+/// would be read back by trying every address. Live guest rows only; a
+/// tombstone clears it with the author's login. A lost or replaced
+/// secret leaves the keys already here matching no new post.
+///
+/// Rows from before it are left NULL, which is its own pool: an old
+/// guest article cannot be told apart from another, and charging them
+/// to every address would be the shared allowance this column exists to
+/// end. They still count toward `max_articles` and `max_text_bytes`.
+/// The index is the count's, over the live guest rows alone.
+const SCHEMA_V13: &str = "
+ALTER TABLE news_article ADD COLUMN guest_key TEXT;
+CREATE INDEX news_article_guest ON news_article (guest_key)
+  WHERE login IS NULL AND login_fp IS NULL AND deleted_at IS NULL;
 ";
 
 /// Moderation (`docs/moderation.md` §7, `docs/news.md` §11). Version 2
@@ -910,6 +933,19 @@ impl SqliteStore {
             .map_err(StoreError::new)?;
         conn.pragma_update(None, "synchronous", sync.pragma())
             .map_err(StoreError::new)?;
+        // What a delete or an update leaves behind in a page is zeroed
+        // rather than left readable in the file's free space: a
+        // tombstone's cleared body and author and a guest's address key
+        // (`docs/news.md` §7.4), a deleted private message. `FAST` zeroes
+        // what is left inside a page being written anyway, at no cost in
+        // I/O, which is where an update like a tombstone leaves the old
+        // row; `ON` would also write zeroes over every page freed whole,
+        // which is a write per page that no row still needs, and a purge
+        // frees many. Any connection may write news, so every one that
+        // can write has it. A page as it was before stays in the WAL
+        // until the log, rewound by the checkpointer, is written over it.
+        conn.pragma_update(None, "secure_delete", "FAST")
+            .map_err(StoreError::new)?;
         migrate(&conn)?;
         // The checkpoints move off this connection (`Checkpointer`), and
         // off every connection but one checkpointer's on the file.
@@ -1091,6 +1127,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 12 {
         steps.push_str(SCHEMA_V12);
+    }
+    if version < 13 {
+        steps.push_str(SCHEMA_V13);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -2514,6 +2553,7 @@ mod tests {
                     follow: None,
                     attachments: Vec::new(),
                     attachment_owner: None,
+                    guest: None,
                     attachment_cutoff: UNIX_EPOCH,
                 },
                 32,
@@ -2611,6 +2651,7 @@ mod tests {
             follow: None,
             attachments: vec![staged.attachment.id],
             attachment_owner: Some(bob.clone()),
+            guest: None,
             attachment_cutoff: UNIX_EPOCH,
         };
         assert!(matches!(
@@ -3010,7 +3051,7 @@ mod tests {
 
     #[test]
     fn version_ten_migrates_into_news_usage_counting_what_is_there() {
-        use hxd_core::news::{NewsStore, NewsUsage};
+        use hxd_core::news::{NewsStore, NewsUsage, Writer};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("messages.db");
         {
@@ -3045,7 +3086,138 @@ mod tests {
                 bytes: 3 + 5,
             }
         );
-        assert_eq!(store.written_by(Some(&Mailbox::login("alice"))).unwrap(), 1);
+        assert_eq!(
+            store
+                .written_by(&Writer::Account(Mailbox::login("alice")))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn every_connection_that_writes_zeroes_what_it_deletes_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let beside = SqliteStore::open_beside(&path, Synchronous::Normal, &store).unwrap();
+        for s in [&store, &beside] {
+            let mode: i64 = s
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode, 2, "FAST");
+        }
+    }
+
+    #[test]
+    fn version_twelve_migrates_its_guest_articles_into_a_pool_of_their_own() {
+        use hxd_core::news::{Author, BodyType, GuestKeyer, NewPost, NewsStore, NewsUsage, Writer};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            // Two guests' articles and an account's, from before a guest's
+            // address was kept.
+            conn.execute_batch(
+                "INSERT INTO news_node (id, kind, name, guid, created_at)
+                   VALUES (1, 1, 'General', x'00', 1);
+                 INSERT INTO news_article
+                   (category, root, path, depth, nick, subject, body, at)
+                   VALUES (1, 1, x'00000001', 0, 'Guest', 's', 'one', 1);
+                 INSERT INTO news_article
+                   (category, root, path, depth, nick, subject, body, at)
+                   VALUES (1, 2, x'00000002', 0, 'Guest', 's', 'two', 2);
+                 INSERT INTO news_article
+                   (category, root, path, depth, nick, login, subject, body, at)
+                   VALUES (1, 3, x'00000003', 0, 'Alice', 'alice', 's', 'three', 3);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 12).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let here = GuestKeyer::new([3; 32]).key("192.0.2.7".parse().unwrap());
+        assert_eq!(
+            store.written_by(&Writer::Guest(None)).unwrap(),
+            2,
+            "whoever wrote them, together"
+        );
+        assert_eq!(
+            store.written_by(&Writer::Guest(Some(here))).unwrap(),
+            0,
+            "an address is charged for none of them"
+        );
+        assert_eq!(
+            store.usage().unwrap(),
+            NewsUsage {
+                articles: 3,
+                bytes: 3 + 3 + 5,
+            },
+            "and the ceilings still hold them"
+        );
+        store
+            .post(
+                &NewPost {
+                    category: 1,
+                    parent: None,
+                    author: Author {
+                        nick: "Guest".into(),
+                        login: None,
+                        fingerprint: None,
+                    },
+                    guest: Some(here),
+                    subject: "s".into(),
+                    body: "four".into(),
+                    mime: BodyType::Plain,
+                    plain: None,
+                    refs: Vec::new(),
+                    at: from_unix(4),
+                    follow: None,
+                    attachments: Vec::new(),
+                    attachment_owner: None,
+                    attachment_cutoff: from_unix(0),
+                },
+                32,
+                32,
+            )
+            .unwrap();
+        assert_eq!(store.written_by(&Writer::Guest(Some(here))).unwrap(), 1);
+        assert_eq!(store.written_by(&Writer::Guest(None)).unwrap(), 2);
+        let conn = Connection::open(&path).unwrap();
+        let kept: Vec<Option<String>> = conn
+            .prepare("SELECT guest_key FROM news_article ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(kept, [None, None, None, Some(here.to_hex())]);
+        assert!(
+            !kept[3].as_ref().unwrap().contains("192.0.2"),
+            "the key, never the address"
+        );
+        // The count reads the guests' own index, not every article.
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM news_article
+                  WHERE login_fp IS NULL AND login IS NULL AND guest_key IS ?1
+                    AND deleted_at IS NULL",
+                params![here.to_hex()],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("news_article_guest"), "{plan}");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

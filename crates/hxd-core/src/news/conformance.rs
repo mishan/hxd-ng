@@ -14,8 +14,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    ArticleId, Author, AutoFollow, BodyType, CompiledQuery, NewNode, NewPost, NewsError, NewsStore,
-    NewsUsage, NodeId, NodeKind, Posted, SearchOrder, SearchQuery, SubScope, TextLen, ThreadQuery,
+    ArticleId, Author, AutoFollow, BodyType, CompiledQuery, GuestKey, GuestKeyer, NewNode, NewPost,
+    NewsError, NewsStore, NewsUsage, NodeId, NodeKind, Posted, SearchOrder, SearchQuery, SubScope,
+    TextLen, ThreadQuery, Writer,
 };
 use crate::inbox::Mailbox;
 
@@ -35,6 +36,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     a_tombstone_keeps_its_place_and_loses_its_words(&*new_store());
     an_authors_articles_are_found_by_the_mailbox_rule(&*new_store());
     usage_follows_the_live_articles_whichever_way_they_go(&*new_store());
+    guests_are_counted_by_the_address_they_wrote_from(&*new_store());
     a_thread_of_nothing_but_tombstones_is_not_listed(&*new_store());
     deleting_a_category_takes_its_articles_and_a_bundle_must_be_empty(&*new_store());
     pruning_takes_whole_threads_by_their_last_post(&*new_store());
@@ -102,6 +104,7 @@ fn corpus(s: &dyn NewsStore) -> Corpus {
                 follow: None,
                 attachments: Vec::new(),
                 attachment_owner: None,
+                guest: None,
                 attachment_cutoff: t(0),
             },
             32,
@@ -878,6 +881,7 @@ fn new_post(category: NodeId, parent: Option<ArticleId>, body: &str, at: u64) ->
         follow: None,
         attachments: Vec::new(),
         attachment_owner: None,
+        guest: None,
         attachment_cutoff: t(0),
     }
 }
@@ -1427,17 +1431,22 @@ fn usage_follows_the_live_articles_whichever_way_they_go(s: &dyn NewsStore) {
             bytes: 6 + 6 + 5 + 3 + 4 + 4,
         }
     );
-    assert_eq!(s.written_by(Some(&alice_mailbox())).unwrap(), 3);
+    assert_eq!(s.written_by(&Writer::Account(alice_mailbox())).unwrap(), 3);
     assert_eq!(
-        s.written_by(Some(&Mailbox::identified("alicia", [7u8; 32])))
+        s.written_by(&Writer::Account(Mailbox::identified("alicia", [7u8; 32])))
             .unwrap(),
         3,
         "a rename is the same author"
     );
-    assert_eq!(s.written_by(Some(&bob())).unwrap(), 1);
-    assert_eq!(s.written_by(None).unwrap(), 1, "the guests, together");
+    assert_eq!(s.written_by(&Writer::Account(bob())).unwrap(), 1);
     assert_eq!(
-        s.written_by(Some(&Mailbox::login("alice"))).unwrap(),
+        s.written_by(&Writer::Guest(None)).unwrap(),
+        1,
+        "the guests with no address, together"
+    );
+    assert_eq!(
+        s.written_by(&Writer::Account(Mailbox::login("alice")))
+            .unwrap(),
         0,
         "a bare login never claims an identified author's work"
     );
@@ -1451,7 +1460,7 @@ fn usage_follows_the_live_articles_whichever_way_they_go(s: &dyn NewsStore) {
         },
         "a tombstone holds nothing"
     );
-    assert_eq!(s.written_by(Some(&bob())).unwrap(), 0);
+    assert_eq!(s.written_by(&Writer::Account(bob())).unwrap(), 0);
 
     s.prune(Duration::from_secs(500), t(2100)).unwrap();
     assert_eq!(
@@ -1462,11 +1471,68 @@ fn usage_follows_the_live_articles_whichever_way_they_go(s: &dyn NewsStore) {
         },
         "retention gives back what it takes"
     );
-    assert_eq!(s.written_by(None).unwrap(), 0);
+    assert_eq!(s.written_by(&Writer::Guest(None)).unwrap(), 0);
 
     s.delete_node(later).unwrap();
     assert_eq!(s.usage().unwrap(), NewsUsage::default());
-    assert_eq!(s.written_by(Some(&alice_mailbox())).unwrap(), 0);
+    assert_eq!(s.written_by(&Writer::Account(alice_mailbox())).unwrap(), 0);
+}
+
+/// A guest's share of the ceilings is its address's, by the key the
+/// post carried: guests from one address share one, another address has
+/// its own, the guests with none are a pool of their own, and an
+/// account's article is never a guest's whatever key it came with. A
+/// tombstone gives the place back.
+fn guests_are_counted_by_the_address_they_wrote_from(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let keyer = GuestKeyer::new([1; super::GUEST_SECRET_LEN]);
+    let key = |addr: &str| keyer.key(addr.parse().unwrap());
+    let here = key("192.0.2.7");
+    let there = key("2001:db8:1:2::");
+    let guest = |key: Option<GuestKey>, body: &str, at: u64| NewPost {
+        author: Author {
+            nick: "Guest".into(),
+            login: None,
+            fingerprint: None,
+        },
+        guest: key,
+        ..new_post(cat, None, body, at)
+    };
+    let first = s.post(&guest(Some(here), "one", 1), 32, 32).unwrap().id;
+    s.post(&guest(Some(here), "two", 2), 32, 32).unwrap();
+    s.post(&guest(Some(there), "three", 3), 32, 32).unwrap();
+    s.post(&guest(None, "four", 4), 32, 32).unwrap();
+    // An account's post handed a key anyway: its share is its login's.
+    let alices = NewPost {
+        guest: Some(here),
+        ..new_post(cat, None, "five", 5)
+    };
+    s.post(&alices, 32, 32).unwrap();
+
+    assert_eq!(s.written_by(&Writer::Guest(Some(here))).unwrap(), 2);
+    assert_eq!(s.written_by(&Writer::Guest(Some(there))).unwrap(), 1);
+    assert_eq!(
+        s.written_by(&Writer::Guest(Some(key("192.0.2.8"))))
+            .unwrap(),
+        0,
+        "a neighbor is not charged"
+    );
+    assert_eq!(
+        s.written_by(&Writer::Guest(None)).unwrap(),
+        1,
+        "no address is a pool of its own, not everyone's"
+    );
+    assert_eq!(s.written_by(&Writer::Account(alice_mailbox())).unwrap(), 1);
+    // The key is never part of what is read back.
+    let a = s.article(first).unwrap().unwrap();
+    assert_eq!(a.author.login, None);
+
+    s.tombstone(first, "mod", t(6)).unwrap();
+    assert_eq!(
+        s.written_by(&Writer::Guest(Some(here))).unwrap(),
+        1,
+        "a tombstone holds no place"
+    );
 }
 
 fn a_thread_of_nothing_but_tombstones_is_not_listed(s: &dyn NewsStore) {

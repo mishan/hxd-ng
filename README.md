@@ -331,8 +331,10 @@ allowance is the session's, so a client that drops its socket and
 resumes carries on with what it had left; only a fresh login starts
 full. One
 account's news posts are held to `news_posts`, earned back over
-`news_post_seconds`, the same way; a classic post counts toward it but
-is never refused by it, since mhxd would take it. `can_spam` exempts
+`news_post_seconds`, the same way, and a guest's by its address (an
+IPv6 one's /64), so logging in again does not refill them; a classic
+post counts toward it but is never refused by it, since mhxd would take
+it. `can_spam` exempts
 from these as well. A load test wants `ng_requests` and `news_posts` at
 0 too.
 
@@ -901,7 +903,7 @@ max_page = 200            # threads in one request
 retain_days = 0           # a thread's life after its last post; 0 = forever
 max_articles = 100000     # live articles the news may hold; 0 = no ceiling
 max_text_bytes = 1073741824  # bytes of their bodies and plain-text parts
-max_per_author = 10000    # live articles one account may hold, guests as one
+max_per_author = 10000    # live articles one account may hold, a guest's address as one
 self_delete = true        # authors may delete their own; false = period behavior
 search = true             # false turns news_search off; the index is kept either way
 search_max_results = 500  # the deepest a search pages
@@ -916,6 +918,8 @@ flat_default_subject = "(no subject)"
                           # at most 4096 bytes
 
 blobs = "news-blobs"      # durable content-addressed attachment bytes
+# guest_secret = "news-guest.key"  # the key a guest's address is hashed under;
+                          # made on first start, mode 0600, beside the db
 [news.attach]              # absent = attachments off
 max_bytes = 2097152        # one uploaded image
 max_count = 8              # images on one article
@@ -1272,7 +1276,16 @@ leaves the articles as they are. See [docs/news.md](docs/news.md) §6.4.
 News is kept until someone deletes it, as a period server keeps it, so
 the ceilings are what bound it: a post past `max_articles`,
 `max_text_bytes` or the author's `max_per_author` is refused, never made
-room for, and the log says so each time. Make room by deleting threads,
+room for, and the log says so each time. A guest's share is its
+address's (an IPv6 one's /64), so one guest cannot fill every guest's.
+What an article keeps of the address is not the address but a keyed
+hash of it, HMAC-SHA-256 under a secret the server makes on first start
+in `news-guest.key` beside the database (`[news] guest_secret` to put it
+elsewhere), owner-only: equal addresses still match, and the database
+alone does not say where a guest posted from. Keep the secret with the
+data, and out of anything that copies the database alone; lose it and
+the guests' articles already kept are counted against no address. A
+tombstone clears the key, and the database zeroes what it leaves behind. Make room by deleting threads,
 by raising a ceiling, or with `retain_days`. See
 [docs/news.md](docs/news.md) §7.4.
 

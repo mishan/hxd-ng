@@ -1219,11 +1219,14 @@ impl RateBucket {
 }
 
 /// Whose news posts a bucket counts: an account's, by the mailbox rule,
-/// or one session's when it is not one person — a guest, whose login
-/// every other guest shares and whose posts must not stop theirs.
+/// or when it is not one person — a guest, whose login every other guest
+/// shares and whose posts must not stop theirs — its address, as
+/// [`limit_key`] has it, so logging in again is not a fresh bucket. One
+/// session's only for a guest with no address to key it by.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum PostKey {
     Account(Option<[u8; 32]>, String),
+    Guest(IpAddr),
     Session(u64),
 }
 
@@ -2030,7 +2033,7 @@ mod tests {
     }
 
     #[test]
-    fn posts_are_counted_by_account_and_a_guest_by_its_session() {
+    fn posts_are_counted_by_account_and_a_guest_by_its_address() {
         let limits = RequestLimits {
             news_posts: 2,
             news_posts_per: Duration::from_secs(60),
@@ -2056,11 +2059,13 @@ mod tests {
             Err(Duration::from_secs(30)),
             "empty, not in debt"
         );
-        rates.count(PostKey::Session(7), &limits, t);
-        rates.count(PostKey::Session(8), &limits, t);
-        rates.count(PostKey::Session(8), &limits, t);
-        rates.reserve(PostKey::Session(7), &limits, t).unwrap();
-        assert!(rates.reserve(PostKey::Session(8), &limits, t).is_err());
+        let here = || PostKey::Guest("192.0.2.7".parse().unwrap());
+        let there = || PostKey::Guest("192.0.2.8".parse().unwrap());
+        rates.count(here(), &limits, t);
+        rates.count(there(), &limits, t);
+        rates.count(there(), &limits, t);
+        rates.reserve(here(), &limits, t).unwrap();
+        assert!(rates.reserve(there(), &limits, t).is_err());
         assert_eq!(
             rates.reserve(alice(), &RequestLimits::default(), t),
             Ok(()),

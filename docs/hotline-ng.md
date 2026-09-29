@@ -735,7 +735,9 @@ news body is different: it declares its own type (news.md §5).
   `[extra] can_spam` is held to none, as it is held to no flood budget.
   Over and above that, one account may post so many news articles and
   replies (`news_posts` in `news_post_seconds`, ten and then one each
-  half minute), past which `news_post` is answered the same way; and
+  half minute) — a guest, the guests from its address, IPv6 by the /64,
+  so a fresh login is not a fresh allowance — past which `news_post` is
+  answered the same way; and
   `history`, `news_search`, media and news-attachment uploads (asked
   before the body is read), media and news-image downloads, avatar
   fetches and enrollment have limits of their own. Login attempts are

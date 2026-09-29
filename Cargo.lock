@@ -1319,6 +1319,7 @@ name = "hxd-core"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
+ "hmac",
  "metrics",
  "sha2",
  "tokio",

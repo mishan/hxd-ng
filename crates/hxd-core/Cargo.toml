@@ -24,6 +24,8 @@ getrandom = "0.2"
 # Canonical media hashes, which is what a moderator's re-upload block is
 # keyed on. Same version the identity crates use.
 sha2 = "0.10"
+# The keyed hash a guest's news share is kept under (`news::GuestKeyer`).
+hmac = { workspace = true }
 metrics = { version = "0.24", optional = true }
 
 [dev-dependencies]

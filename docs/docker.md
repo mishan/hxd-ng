@@ -55,7 +55,7 @@ layout under `/srv/hxd-ng`:
 
 | On the host | In the container | What | Mounted |
 |---|---|---|---|
-| `/srv/hxd-ng/data` | `/var/lib/hxd-ng` | All state: accounts, the SQLite store, news blobs, the identity, VAPID and self-signed TLS keys. | Always, or the named volume instead. |
+| `/srv/hxd-ng/data` | `/var/lib/hxd-ng` | All state: accounts, the SQLite store, news blobs, the identity, VAPID and self-signed TLS keys, and the secret guests' news is counted under. | Always, or the named volume instead. |
 | `/srv/hxd-ng/etc` | `/etc/hxd-ng` | A config file of the operator's own. | Only for [a mounted config](#configuration). |
 | `/srv/hxd-ng/tls` | `/etc/hxd-ng/tls`, read-only | A certificate and key from a CA. | Only for [TLS certificates](#tls-certificates). |
 | `/srv/hxd-ng/files` | `/srv/files` | The file area, with `HXD_FILES_ROOT=/srv/files`. | Only for files. |
@@ -283,7 +283,7 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_NEWS_RETAIN_DAYS` | 0 | A thread's life after its last post; 0 is forever. |
 | `HXD_NEWS_MAX_ARTICLES` | 100000 | Articles the news may hold; past it a post is refused. 0 for no ceiling. |
 | `HXD_NEWS_MAX_TEXT_BYTES` | 1073741824 | Bytes of article text it may hold, likewise. |
-| `HXD_NEWS_MAX_PER_AUTHOR` | 10000 | Articles one account may hold, the guests counted together. |
+| `HXD_NEWS_MAX_PER_AUTHOR` | 10000 | Articles one account may hold, the guests from one address counted together. |
 | `HXD_MEDIA` | `on` | Images in chat ([inline-media.md](inline-media.md)). Sending one needs the `send_media` bit: the account `HXD_ADMIN_LOGIN` writes has it, and any other account only if its file grants it. |
 | `HXD_AVATARS` | `on` | Users' pictures on both wires ([avatars.md](avatars.md)), kept in the database. |
 | `HXD_PUSH_CONTACT` | | Turns on Web Push; a `mailto:` or `https:` contact for push services ([webpush-gateway.md](webpush-gateway.md)). The VAPID key is generated into the volume, and losing it silently breaks every subscription — back it up. |

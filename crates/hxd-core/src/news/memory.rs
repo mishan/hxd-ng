@@ -11,9 +11,10 @@ use std::time::{Duration, SystemTime};
 
 use super::query::{words, Field, Term};
 use super::{
-    Article, ArticleId, ArticlePage, Author, BodyType, Hit, Listed, NewNode, NewPost, NewsError,
-    NewsStore, NewsUsage, Node, NodeId, NodeKind, Posted, Reference, SearchPage, SearchQuery,
-    SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery,
+    Article, ArticleId, ArticlePage, Author, BodyType, GuestKey, Hit, Listed, NewNode, NewPost,
+    NewsError, NewsStore, NewsUsage, Node, NodeId, NodeKind, Posted, Reference, SearchPage,
+    SearchQuery, SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery,
+    Writer,
 };
 use crate::inbox::{Mailbox, StoreError};
 
@@ -125,6 +126,8 @@ struct ArticleRow {
     path: Vec<u8>,
     depth: u16,
     author: Author,
+    /// [`NewPost::guest`], for a guest's article and nobody else's.
+    guest: Option<GuestKey>,
     subject: String,
     body: String,
     mime: BodyType,
@@ -566,6 +569,9 @@ impl NewsStore for MemoryNews {
             path,
             depth,
             author: p.author.clone(),
+            guest: p
+                .guest
+                .filter(|_| p.author.login.is_none() && p.author.fingerprint.is_none()),
             subject: p.subject.clone(),
             body: p.body.clone(),
             mime: p.mime,
@@ -711,6 +717,7 @@ impl NewsStore for MemoryNews {
             login: None,
             fingerprint: None,
         };
+        row.guest = None;
         let category = row.category;
         let cat = inner
             .node_mut(category)
@@ -741,15 +748,17 @@ impl NewsStore for MemoryNews {
             }))
     }
 
-    fn written_by(&self, who: Option<&Mailbox>) -> Result<u64, StoreError> {
+    fn written_by(&self, who: &Writer) -> Result<u64, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
             .articles
             .iter()
             .filter(|a| !a.deleted)
             .filter(|a| match who {
-                Some(who) => a.author.is(who),
-                None => a.author.login.is_none(),
+                Writer::Account(who) => a.author.is(who),
+                Writer::Guest(addr) => {
+                    a.author.login.is_none() && a.author.fingerprint.is_none() && a.guest == *addr
+                }
             })
             .count() as u64)
     }
