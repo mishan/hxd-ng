@@ -594,7 +594,9 @@ impl Peer {
         // the NACK to the publisher would. That only works if the offer
         // *names* the repair SSRC in `a=ssrc-group:FID`, which is what
         // `Section::rtx_ssrc` is carried into the offer for — declaring it
-        // here and not there is what made the whole mechanism inert.
+        // here and not there is what made the whole mechanism inert — and
+        // if the forwarded packets are written nackable, which is what
+        // puts them in the cache at all (see `forward_all` in lib.rs).
         self.rtc
             .direct_api()
             .declare_stream_tx(ssrc, Some(rtx), mid.as_str().into(), None);
