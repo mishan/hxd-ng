@@ -236,7 +236,7 @@ VP8 has no static payload type, so this specification fixes the dynamic values t
 | 96 | `VP8/90000` | All video sections, both kinds |
 | 97 | `rtx/90000`, `a=fmtp:97 apt=96` | OPTIONAL retransmission stream |
 
-A client's answer MUST use the same payload type numbers the offer used for each media section. A client that does not implement RTX MUST still answer the section; it simply never sends or receives retransmissions.
+A client's answer MUST NOT renumber: any payload type it keeps uses the number the offer gave it. A client that does not implement RTX answers the section without PT 97; RTX is then not negotiated for that section, and lost packets reach it, if at all, as retransmitted originals (see [Keyframes and RTCP Feedback](#keyframes-and-rtcp-feedback)).
 
 **Both stream kinds use payload type 96.** Camera and screen video are the same codec at the same payload type, distinguished by `mid` and SSRC and by nothing else. This has a direct consequence for [Send SSRC Declaration](#send-ssrc-declaration).
 
@@ -590,7 +590,7 @@ The request is sent to the publisher as RTCP Picture Loss Indication ([RFC 4585]
 
 Publishers MUST honour PLI and FIR by producing a keyframe promptly.
 
-**Retransmission.** A receiver's NACK MUST NOT be discarded unanswered. The server either answers it from a retransmission cache of its own, sending the lost packet again — as an RTX packet (PT 97, `apt=96`) on a section where RTX was negotiated, otherwise as the original packet — or forwards it toward the publisher, whose own retransmission then reaches the loss. A server MAY do both, answering what its cache holds and forwarding the rest. RTX counts as negotiated only when the receiver's answer keeps PT 97: offering it is not enough, and a hand-rolled client may well drop it. Video loss is far more visible than audio loss; a stream with no loss recovery at all degrades badly on ordinary domestic connections.
+**Retransmission.** A receiver's NACK MUST NOT be discarded unanswered. The server either answers it from a retransmission cache of its own, sending the lost packet again — as an RTX packet (PT 97, `apt=96`) on a section where RTX was negotiated, otherwise as the original packet — or forwards it toward the publisher, whose own retransmission then reaches the loss. The publisher's retransmission arrives in whatever form the publisher's section negotiated, usually RTX; the server MUST deliver it to the receiver in the form the receiver's section negotiated: as RTX where RTX was negotiated, otherwise unwrapped to the original packet (original sequence number restored, the RTX header removed). A server MAY do both, answering what its cache holds and forwarding the rest. RTX counts as negotiated only when the receiver's answer keeps PT 97: offering it is not enough, and a hand-rolled client may well drop it. Video loss is far more visible than audio loss; a stream with no loss recovery at all degrades badly on ordinary domestic connections.
 
 The SFU forwards RTP payloads, sequence numbers and timestamps unchanged, and rewrites the SSRC as the voice extension does: each forwarded copy carries the SSRC declared for that section in the receiving peer's most recent offer. Feedback travels the other way. A receiver's PLI, FIR and NACK name the SSRC that receiver sees, and the server MUST translate them to the publisher's own SSRC before acting on them or passing them on.
 
