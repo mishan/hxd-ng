@@ -78,7 +78,8 @@ fn a_first_joiner_gets_an_offer_an_empty_list_and_its_own_status() {
         statuses(&evs),
         vec![vec![VoiceParticipant {
             uid: a,
-            muted: false
+            muted: false,
+            ..Default::default()
         }]]
     );
 }
@@ -469,7 +470,8 @@ fn mute_is_recorded_enforced_and_announced_once() {
         statuses(&drain(&mut rx_a)),
         vec![vec![VoiceParticipant {
             uid: a,
-            muted: true
+            muted: true,
+            ..Default::default()
         }]]
     );
 
@@ -484,7 +486,8 @@ fn mute_is_recorded_enforced_and_announced_once() {
         statuses(&drain(&mut rx_a)),
         vec![vec![VoiceParticipant {
             uid: a,
-            muted: false
+            muted: false,
+            ..Default::default()
         }]]
     );
     // Mute never renegotiates: no tracks changed.
@@ -986,10 +989,12 @@ fn a_burst_of_mute_flips_reaches_the_room_as_one_status_with_the_final_state() {
         VoiceParticipant {
             uid: a,
             muted: true,
+            ..Default::default()
         },
         VoiceParticipant {
             uid: b,
             muted: false,
+            ..Default::default()
         },
     ];
     assert_eq!(statuses(&drain(&mut rx_a)), vec![want.clone()]);
@@ -1019,7 +1024,8 @@ fn a_status_sent_for_a_join_settles_what_the_debounce_was_holding() {
     let last = statuses(&drain(&mut rx_a)).pop().unwrap();
     assert!(last.contains(&VoiceParticipant {
         uid: a,
-        muted: true
+        muted: true,
+        ..Default::default()
     }));
     let later = std::time::Instant::now() + std::time::Duration::from_secs(1);
     assert_eq!(core.voice_flush_status(later), None);

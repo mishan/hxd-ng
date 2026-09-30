@@ -66,6 +66,11 @@ const FIELD_VIDEO_CODEC: u16 = 0x0223;
 const FIELD_VIDEO_LIMITS: u16 = 0x0224;
 const FIELD_VIDEO_SUBSCRIPTIONS: u16 = 0x0225;
 
+/// The participant flags bits: voice's mute, and the two publication
+/// bits the video extension added so a voice-only client can see them.
+const FLAG_MUTED: u16 = 0x0001;
+const FLAG_CAMERA: u16 = 0x0002;
+
 const KIND_CAMERA: u16 = 1;
 const KIND_SCREEN: u16 = 2;
 
@@ -425,6 +430,18 @@ impl Client {
         panic!("no voice status matching {want:?}");
     }
 
+    /// Wait for a voice room status whose entries carry exactly these
+    /// flags words.
+    async fn voice_flags_for(&mut self, want: &[(u16, u16)]) -> Frame {
+        for _ in 0..24 {
+            let f = self.recv_type(NOTIFY_VOICE_STATUS).await;
+            if flags(&f) == want {
+                return f;
+            }
+        }
+        panic!("no voice status with flags {want:?}");
+    }
+
     /// Everything buffered, drained — a quiet assertion has to look at
     /// all of it, not at whichever frame happened to be next.
     fn buffered(&self) -> Vec<u32> {
@@ -505,6 +522,19 @@ fn participants(f: &Frame) -> Vec<(u16, bool)> {
             let uid = u16::from_be_bytes([e[0], e[1]]);
             let flags = u16::from_be_bytes([e[2], e[3]]);
             (uid, flags & 1 != 0)
+        })
+        .collect()
+}
+
+/// The same blob with each entry's whole flags word.
+fn flags(f: &Frame) -> Vec<(u16, u16)> {
+    let blob = chunk(f, tag::VOICE_PARTICIPANTS).expect("participants blob");
+    blob.chunks_exact(6)
+        .map(|e| {
+            (
+                u16::from_be_bytes([e[0], e[1]]),
+                u16::from_be_bytes([e[2], e[3]]),
+            )
         })
         .collect()
 }
@@ -1088,6 +1118,40 @@ async fn a_voice_only_client_never_sees_a_video_transaction() {
     // have passed the assertion above and failed this one.
     a.voice_status_for(&[(a.uid, false), (legacy.uid, true)])
         .await;
+}
+
+#[tokio::test]
+async fn a_voice_only_client_sees_who_publishes_in_the_participant_flags() {
+    // What a client without video can know: bit 1 of a participant's
+    // flags is a camera, bit 2 a screen, and bit 0 is still the mute and
+    // only the mute. It reads them from the join reply when it arrives
+    // mid-share, and from the room status when the share ends — and it
+    // still sees nothing from 607–611.
+    let td = tempfile::tempdir().unwrap();
+    let addr = start_server(td.path()).await.legacy;
+    let mut a = Client::video_login(addr, "sharer").await;
+    a.join_voice(0).await;
+    a.settle(0).await;
+    a.start(0, KIND_CAMERA).await;
+    a.status_for(&[(a.uid, KIND_CAMERA, false)]).await;
+
+    let mut legacy = Client::login(addr, "watcher", Caps::empty().with(cap::VOICE)).await;
+    let reply = legacy.ok(REQ_VOICE_JOIN, &[chat_id(0)]).await;
+    assert_eq!(flags(&reply), vec![(a.uid, FLAG_CAMERA)]);
+    let sdp = String::from_utf8(chunk(&reply, tag::VOICE_SDP).unwrap()).unwrap();
+    legacy.answer(0, &format!("answer to {sdp}")).await;
+
+    // A muted watcher and a camera beside it: each bit is its own.
+    legacy.sync(0).await;
+    a.voice_flags_for(&[(a.uid, FLAG_CAMERA), (legacy.uid, FLAG_MUTED)])
+        .await;
+
+    a.settle(0).await;
+    a.ok(REQ_VIDEO_STOP, &[chat_id(0)]).await;
+    legacy
+        .voice_flags_for(&[(a.uid, 0), (legacy.uid, FLAG_MUTED)])
+        .await;
+    legacy.expect_no_video(0).await;
 }
 
 // --- The ng wire --------------------------------------------------------

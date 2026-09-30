@@ -26,9 +26,18 @@ const CODEC_PCMU: u16 = 0;
 
 /// Flags bit 0 of a participant entry.
 const FLAG_MUTED: u16 = 0x0001;
+/// Flags bit 1: the participant holds a camera publication, paused or
+/// not. Set for every recipient, video-capable or not — this bit is how
+/// a voice-only client learns a camera is on in its room.
+const FLAG_CAMERA: u16 = 0x0002;
+/// Flags bit 2: the same for a screen share.
+const FLAG_SCREEN: u16 = 0x0004;
 
 /// The `DATA_VOICE_PARTICIPANTS` (`0x01F9`) payload: a packed array of
-/// six-byte entries, `uid | flags | codec id`, all big-endian.
+/// six-byte entries, `uid | flags | codec id`, all big-endian. The same
+/// bytes go in the join reply and in every room status, so a client
+/// joining mid-share sees the publication bits at once. Bits 3-15 are
+/// reserved and always sent as zero.
 ///
 /// `hxproto::voice::parse_voice_participants` is the client-side
 /// half of this and the round-trip test in this module runs against it,
@@ -40,7 +49,17 @@ pub fn participants_payload(ps: &[VoiceParticipant]) -> Vec<u8> {
     let mut v = Vec::with_capacity(ps.len() * 6);
     for p in ps {
         v.extend_from_slice(&p.uid.to_be_bytes());
-        v.extend_from_slice(&(if p.muted { FLAG_MUTED } else { 0 }).to_be_bytes());
+        let mut flags = 0;
+        if p.muted {
+            flags |= FLAG_MUTED;
+        }
+        if p.camera {
+            flags |= FLAG_CAMERA;
+        }
+        if p.screen {
+            flags |= FLAG_SCREEN;
+        }
+        v.extend_from_slice(&flags.to_be_bytes());
         v.extend_from_slice(&CODEC_PCMU.to_be_bytes());
     }
     v
@@ -207,10 +226,12 @@ mod tests {
             VoiceParticipant {
                 uid: 1,
                 muted: false,
+                ..Default::default()
             },
             VoiceParticipant {
                 uid: 65535,
                 muted: true,
+                ..Default::default()
             },
         ];
         let blob = participants_payload(&ps);
@@ -227,6 +248,33 @@ mod tests {
         // Byte for byte, so a change to either side has to be deliberate.
         assert_eq!(blob, vec![0, 1, 0, 0, 0, 0, 0xff, 0xff, 0, 1, 0, 0]);
         assert!(participants_payload(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_publication_bits_leave_the_mute_bit_alone() {
+        let ps = vec![
+            VoiceParticipant {
+                uid: 2,
+                muted: true,
+                camera: true,
+                screen: false,
+            },
+            VoiceParticipant {
+                uid: 3,
+                muted: false,
+                camera: true,
+                screen: true,
+            },
+        ];
+        let blob = participants_payload(&ps);
+        assert_eq!(blob, vec![0, 2, 0, 3, 0, 0, 0, 3, 0, 6, 0, 0]);
+
+        // The clients' parser reads mute from bit 0 alone, so a camera
+        // does not make anyone look muted.
+        let decoded: Vec<_> = parse_voice_participants(&blob).collect();
+        assert!(decoded[0].is_muted());
+        assert!(!decoded[1].is_muted());
+        assert_eq!(decoded[1].flags, FLAG_CAMERA | FLAG_SCREEN);
     }
 
     #[test]

@@ -275,7 +275,7 @@ impl PeerVideo {
             .map(|(_, paused)| *paused)
     }
 
-    fn publishes(&self, kind: VideoKind) -> bool {
+    pub(crate) fn publishes(&self, kind: VideoKind) -> bool {
         self.publication(kind).is_some()
     }
 }
@@ -504,6 +504,10 @@ impl Core {
         let mut targets = vec![uid];
         targets.extend(r.video_resync(cid).into_iter().filter(|u| *u != uid));
         r.voice_renegotiate_peers(cid, &targets);
+        // The voice status too: its participant entries carry the
+        // publication bits, which is how a participant without video
+        // learns that a camera is on.
+        r.voice_status(cid);
         r.video_status(cid);
         Ok(media.video_codec())
     }
@@ -550,6 +554,7 @@ impl Core {
         let mut targets = vec![uid];
         targets.extend(r.video_resync(cid).into_iter().filter(|u| *u != uid));
         r.voice_renegotiate_peers(cid, &targets);
+        r.voice_status(cid);
         r.video_status(cid);
         Ok(())
     }
