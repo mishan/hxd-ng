@@ -126,7 +126,7 @@ Condensed; the spec is normative and this is the checklist.
 |---|---|---|
 | `hxd-core` (`voice.rs`) | Voice rooms: who is in voice in which cid, muted flags, the one-room rule, the per-room cap, membership checks, the per-peer offer/answer serialisation state, and cleanup hooked into `end_session` / `connection_lost` / chat part / kick. Emits `Event::Voice*` through the existing outbox. Defines the `VoiceMedia` trait. | SDP syntax, ICE, DTLS, RTP, sockets, wire encodings |
 | `hxd-voice` | The SFU: one UDP socket, one str0m `Rtc` per participant, hand-written SDP offers, answer parsing, ICE-lite candidates, DTLS-SRTP, RTP forwarding with mute enforcement, the media timeouts. Implements `VoiceMedia`. | Hotline, chat rooms, access bits, either wire |
-| `hxd-session` | `DATA_CAPABILITIES` parse/echo; transactions 600–606 and fields `0x01F5`–`0x01F9` mapped to `Core` calls and `Event::Voice*`. | Media |
+| `hxd-session` | `DATA_CAPABILITIES` parse/echo; transactions 600–606 and fields `0x01F5`–`0x01F9` mapped to `Core` calls and `Event::Voice*`; `0x01FB` (Voice Transport) on a join, where anything but `0` (DTLS-SRTP) is refused before `Core` sees it — the plain RTP transport is not implemented. | Media |
 | `hxd-ng-session` | `caps: ["voice"]`; the `voice_*` requests and events (§8). | Media |
 | `hxd` | `[voice]` config, the `voice` Cargo feature, wiring the SFU into `Core`, the UDP listener task. | — |
 
