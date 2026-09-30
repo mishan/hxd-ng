@@ -1187,6 +1187,82 @@ fn a_joiner_learns_the_rooms_video_state_without_asking() {
     );
 }
 
+/// Each voice status's `(uid, camera, screen)`, in the order they came.
+fn publication_bits(evs: &[Event]) -> Vec<Vec<(Uid, bool, bool)>> {
+    evs.iter()
+        .filter_map(|e| match e {
+            Event::VoiceStatus { participants, .. } => Some(
+                participants
+                    .iter()
+                    .map(|p| (p.uid, p.camera, p.screen))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_voice_status_says_who_publishes_and_pausing_does_not_touch_it() {
+    // The voice status is the one a participant without video can read,
+    // so it carries whether each participant holds a camera or a screen.
+    // Starting and stopping change that; pausing does not, and sends no
+    // voice status at all.
+    let (core, media) = videoed();
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, mut rx_b) = quiet(&core, "bob");
+    joined(&core, &media, &mut [(a, &mut rx_a), (b, &mut rx_b)]);
+    drain(&mut rx_b);
+
+    core.video_start(a, 0, VideoKind::Camera).unwrap();
+    assert_eq!(
+        publication_bits(&drain(&mut rx_b)),
+        vec![vec![(a, true, false), (b, false, false)]]
+    );
+    answer_offers(&core, a, &mut rx_a);
+
+    core.video_start(a, 0, VideoKind::Screen).unwrap();
+    assert_eq!(
+        publication_bits(&drain(&mut rx_b)),
+        vec![vec![(a, true, true), (b, false, false)]]
+    );
+    answer_offers(&core, a, &mut rx_a);
+
+    core.video_state(a, 0, VideoKind::Camera, true).unwrap();
+    core.voice_flush_status(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    assert!(
+        publication_bits(&drain(&mut rx_b)).is_empty(),
+        "a paused camera still holds its publication"
+    );
+
+    core.video_stop(a, 0, None).unwrap();
+    assert_eq!(
+        publication_bits(&drain(&mut rx_b)),
+        vec![vec![(a, false, false), (b, false, false)]]
+    );
+}
+
+#[test]
+fn a_joiner_mid_share_sees_the_publication_in_its_join_reply() {
+    // The join reply carries the room's participants in the same shape
+    // as a voice status, so it carries the bits too: a voice-only joiner
+    // must not wait for the next status to learn a camera is on.
+    let (core, media) = videoed();
+    let (a, mut rx_a) = quiet(&core, "alice");
+    let (b, _rx_b) = quiet(&core, "bob");
+    in_voice(&core, &media, a, &mut rx_a);
+    core.video_start(a, 0, VideoKind::Screen).unwrap();
+
+    let join = core.voice_join(b, 0).unwrap();
+    assert_eq!(
+        join.participants
+            .iter()
+            .map(|p| (p.uid, p.camera, p.screen))
+            .collect::<Vec<_>>(),
+        vec![(a, false, true)]
+    );
+}
+
 // --- Wire vocabulary ---------------------------------------------------
 
 #[test]

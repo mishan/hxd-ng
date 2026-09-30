@@ -132,10 +132,18 @@ impl Spend {
 }
 
 /// One voice participant, as a room status reports them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `camera` and `screen` say whether the participant holds a publication
+/// of that kind, paused or not. They ride in the voice status rather than
+/// only in the video one so that a participant who never negotiated
+/// video still learns a camera is on in the room it is sitting in;
+/// pausing changes neither, and is told by the video status alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VoiceParticipant {
     pub uid: Uid,
     pub muted: bool,
+    pub camera: bool,
+    pub screen: bool,
 }
 
 /// An ICE candidate crossing the signalling channel, in either direction.
@@ -516,6 +524,8 @@ impl VoiceState {
                     .map(|p| VoiceParticipant {
                         uid: p.uid,
                         muted: p.muted,
+                        camera: p.video.publishes(VideoKind::Camera),
+                        screen: p.video.publishes(VideoKind::Screen),
                     })
                     .collect()
             })
@@ -670,7 +680,7 @@ impl RosterInner {
     }
 
     /// Announce the room's participant list to everyone in it.
-    fn voice_status(&mut self, cid: u32) {
+    pub(crate) fn voice_status(&mut self, cid: u32) {
         let participants = self.voice.participants(cid);
         for p in participants.clone() {
             self.send_to(
@@ -929,9 +939,11 @@ impl Core {
         r.voice_status(cid);
         // Video state arrives as its own notification rather than as
         // extra fields on the join reply, so voice's reply shape is
-        // untouched and a voice-only client sees exactly what it always
-        // saw. A joiner with no publications still needs this: it is how
-        // it learns what everyone else is already showing.
+        // untouched: a voice-only client learns who publishes from the
+        // participant entries' publication bits, and a video-capable one
+        // learns the rest from this. A joiner with no publications still
+        // needs it: it is how it learns what everyone else is already
+        // showing.
         r.video_status(cid);
 
         Ok(VoiceJoin {
@@ -1127,6 +1139,7 @@ impl Core {
                 let mut targets = vec![uid];
                 targets.extend(r.video_resync(cid).into_iter().filter(|u| *u != uid));
                 r.voice_renegotiate_peers(cid, &targets);
+                r.voice_status(cid);
                 r.video_status(cid);
             }
         }

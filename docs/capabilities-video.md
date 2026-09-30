@@ -10,8 +10,9 @@
 > side by side.
 >
 > Drafted against [Capabilities-Voice.md](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Voice.md)
-> at `75d4485` and the capability/privilege allocations in
-> `Capabilities.md` at the same commit.
+> at `4e8baa6` — which lists this extension's publication bits in its
+> participant entry and specifies microphone device changes — and the
+> capability/privilege allocations in `Capabilities.md` at `75d4485`.
 
 > **Conformance language:** The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://datatracker.ietf.org/doc/html/rfc2119).
 
@@ -32,6 +33,7 @@ This extension is **layered on** the voice extension, not parallel to it. It def
 - [Compatibility and Negotiation](#compatibility-and-negotiation)
   - [Capability Bit](#capability-bit)
   - [Degrading to Voice](#degrading-to-voice)
+  - [Publication Bits](#publication-bits)
   - [Server Configuration](#server-configuration)
 - [Codec Negotiation](#codec-negotiation)
   - [Supported Codecs](#supported-codecs)
@@ -114,7 +116,7 @@ The server maintains, per room, a bounded number of publication **slots** per ki
 
 A **subscription** is the receive-side counterpart: one participant's declared interest in one publication. Publishing announces a stream's existence to the room; it does not deliver it to anybody. A peer receives a publication only while it holds a subscription to it, and every participant begins with none.
 
-The asymmetry is deliberate. A publication is a room-wide fact, bounded by slots and visible to everyone through [Video Status (611)](#video-status-611). A subscription is a private arrangement between one participant and the server: it is not announced, not bounded, and the publisher is never told who is watching. What it bounds instead is the receiver's own bandwidth, which is the resource that actually runs out first — a phone on a cellular connection in a room of eight cameras.
+The asymmetry is deliberate. A publication is a room-wide fact, bounded by slots and visible to everyone: in detail through [Video Status (611)](#video-status-611), and as a bare fact through the [publication bits](#publication-bits) of the voice participant list. A subscription is a private arrangement between one participant and the server: it is not announced, not bounded, and the publisher is never told who is watching. What it bounds instead is the receiver's own bandwidth, which is the resource that actually runs out first — a phone on a cellular connection in a room of eight cameras.
 
 ---
 
@@ -154,6 +156,25 @@ Three corollaries:
 - The set of media sections in an offer, and therefore the mapping from `sdpMLineIndex` to `mid`, differs between peers in the same room and changes as each peer's subscriptions change. It already differed under the voice extension — each peer's offer omits its own receive section — but video widens the gap considerably. Clients MUST key on `mid`, never on section position.
 - A room's video slot accounting is global to the room, not per subscriber. A screen share occupies the room's screen slot whether one participant is watching it or none.
 - Starting a publication does not renegotiate the room. It renegotiates the publisher, to add the publisher's own send section, and notifies everyone else. Peers renegotiate individually, if and when they subscribe.
+
+### Publication Bits
+
+A voice-only participant receives nothing from this extension's transactions, but it is still in the frame: it should be able to tell that a camera or a screen share is live in the room it is sitting in. The voice extension's participant entry (`DATA_VOICE_PARTICIPANTS`, `0x01F9`) therefore carries two publication bits in its flags word, alongside the mute bit. The voice extension lists them with the same rules; this section is where they are defined:
+
+| Bit | Mask | Meaning |
+|---|---|---|
+| 0 | `0x0001` | Muted (defined by the voice extension) |
+| 1 | `0x0002` | The participant has a camera publication |
+| 2 | `0x0004` | The participant has a screen publication |
+| 3–15 | — | Reserved |
+
+- Servers MUST send reserved bits as zero. Clients MUST ignore reserved bits, and MUST read mute from bit 0 alone.
+- Bits 1 and 2 are set in **every** `DATA_VOICE_PARTICIPANTS` the server sends — the Join Voice Room (600) reply and every Voice Room Status (605) — whatever the receiving client negotiated. A client that joins mid-share learns of it from its join reply, without waiting for the next status. A server that does not implement this extension leaves them zero.
+- A bit reflects whether the publication exists, not whether it is paused. A paused camera still holds its publication and its slot; pause state is carried by Video Status (611) alone.
+- The server sends Voice Room Status (605) to the room whenever a publication starts or stops, including when a publisher leaves voice, is kicked, disconnects, or has a failed publication reaped. Pausing and resuming change no bit and send no 605.
+- These notifications MAY go through the same debounce as the voice extension's mute notifications. A coalesced 605 MUST carry the room's state at the moment it is sent, so a debounce may delay a change but never lose one.
+
+Video-capable clients get the same fact, with detail, from Video Status (611), and SHOULD prefer it. The bits exist for the participant who has no 611 to read.
 
 ### Server Configuration
 
@@ -346,7 +367,7 @@ Sixteen bytes in this revision. A parser MUST accept a longer field and ignore t
 
 **Server Reply (error):** standard error reply with `DATA_ERROR_TEXT` (field 100), human-readable and not intended for programmatic parsing. Conditions include: the client is not in voice in that room; a publication of that kind already exists for this client; no slot is free for that kind (`VideoMaxCamerasPerRoom` / `VideoMaxScreensPerRoom`); video is disabled; the user lacks `accessVideoChat`, or `accessScreenShare` for a screen publication.
 
-The server also sends **Video Status (611)** to every video-capable participant in the room.
+The server also sends **Video Status (611)** to every video-capable participant in the room, and **Voice Room Status (605)** to every participant, with the publisher's [publication bit](#publication-bits) now set.
 
 ### Video Stop (608)
 
@@ -359,7 +380,7 @@ The server also sends **Video Status (611)** to every video-capable participant 
 
 **Server Reply:** empty success reply.
 
-The publication's media section becomes `a=inactive` in the next offer to each peer, its slot is released, and Video Status (611) is sent to the room. Stopping a publication that does not exist is not an error; the operation is idempotent, because disconnect races make it so.
+The publication's media section becomes `a=inactive` in the next offer to each peer, its slot is released, and Video Status (611) and Voice Room Status (605) are sent to the room, the latter with the publisher's [publication bit](#publication-bits) cleared. Stopping a publication that does not exist is not an error; the operation is idempotent, because disconnect races make it so.
 
 ### Video State (609)
 
@@ -373,7 +394,7 @@ The publication's media section becomes `a=inactive` in the next offer to each p
 
 **Server Reply:** empty success reply.
 
-No renegotiation occurs. The server sends Video Status (611) to the room, and SHOULD coalesce rapid toggles with a debounce window of approximately 100 ms, as the voice extension recommends for mute.
+No renegotiation occurs. The server sends Video Status (611) to the room — but no Voice Room Status (605), since pausing changes no [publication bit](#publication-bits) — and SHOULD coalesce rapid toggles with a debounce window of approximately 100 ms, as the voice extension recommends for mute.
 
 On resume, the server MUST request a keyframe from the publisher before or as it resumes forwarding; see [Keyframes and RTCP Feedback](#keyframes-and-rtcp-feedback).
 
@@ -582,7 +603,7 @@ Servers and clients MAY additionally negotiate `goog-remb` or `transport-cc` for
 
 The voice extension's timeout table governs the peer connection as a whole and is unchanged. Video adds one rule:
 
-**A failed video publication MUST NOT tear down the voice session.** If a publisher's video RTP stops arriving while its audio continues, the server SHOULD stop the publication — releasing its slot and sending Video Status (611) — and leave audio untouched. The reverse is also true: a client whose camera fails locally sends Video Stop and remains in the call. Losing video is a degradation; losing the call is a failure.
+**A failed video publication MUST NOT tear down the voice session.** If a publisher's video RTP stops arriving while its audio continues, the server SHOULD stop the publication — releasing its slot and sending Video Status (611) and Voice Room Status (605) — and leave audio untouched. The reverse is also true: a client whose camera fails locally sends Video Stop and remains in the call. Losing video is a degradation; losing the call is a failure.
 
 The media-timeout in the voice extension's table applies to the peer connection: a peer sending neither audio nor video RTP nor RTCP for the timeout is gone, and is torn down as before.
 
@@ -662,6 +683,8 @@ The download column is the one a client controls, and it controls it entirely: s
 - **Keyframes:** send RTCP PLI when a decoder has no keyframe. Do not spin: one request per second per stream is ample.
 - **Failure:** a video failure is not a call failure. Drop the publication, keep the call, and tell the user what happened.
 - **No camera, no problem:** a client with no camera participates fully, receiving video and publishing none.
+- **Device changes:** switching cameras, or changing what a screen share captures, is not a new publication. The client keeps the publication and its SSRC, swaps the source beneath the encoder (in WebRTC, `RTCRtpSender.replaceTrack`, not removing the track and adding another), and sends no transaction. It MUST NOT use Video Stop (608) and Video Start (607) for this: stopping releases the slot, which another participant may take, and announces a stop and a start to the room. It cannot declare a new SSRC instead, because only the server makes offers, and inbound video is attributed by the SSRC the last answer declared. RTP sequence numbers and timestamps MUST continue across the change, as the voice extension requires for audio: the server forwards them unchanged. The publisher SHOULD begin the new source with a keyframe, since a change of resolution cannot be decoded from the old stream's reference frames.
+- **Voice-only clients:** a client that negotiated voice but not video SHOULD still show who is publishing, from the [publication bits](#publication-bits) of the voice participant list.
 
 ---
 
@@ -670,6 +693,7 @@ The download column is the one a client controls, and it controls it entirely: s
 - **Per-client offers:** build each peer's offer from the room's current state and that peer's negotiated capabilities. Never send video sections to a client that has not confirmed `CAPABILITY_VIDEO`, and never forward video RTP to one.
 - **Slot enforcement:** enforce `VideoMaxCamerasPerRoom` and `VideoMaxScreensPerRoom` at Video Start, and release slots on stop, leave, kick and disconnect.
 - **Pause enforcement:** discard a paused publication's inbound RTP rather than forwarding it, exactly as for a muted audio stream.
+- **Publication bits:** set bits 1 and 2 of each voice participant entry from that participant's publications, in the join reply and in every room status, and send a room status when a publication starts or stops. See [Publication Bits](#publication-bits).
 - **Subscribe enforcement:** deliver a publication only to peers subscribed to it. Retain subscriptions naming publications that do not exist yet, and activate them if they appear. Never tell a publisher who is subscribed to it.
 - **Keyframes:** request one whenever a receiver newly begins consuming a publication, and rate-limit to roughly one per second per publication.
 - **No transcoding:** forward RTP unmodified; never decode or re-encode. The server never sees pixels.
@@ -689,7 +713,8 @@ Screen sharing raises risks that voice does not, and a specification that ignore
 - **The indicator is not optional.** While sharing, a client MUST display a persistent, visible indication of what is being shared. Screen shares that the user has forgotten about are the extension's characteristic failure mode.
 - **Consent to a room, not to a server.** An implicit leave (joining voice in another room) ends every publication; it MUST NOT carry a screen share into the new room. A user who wants to share in room B says so in room B.
 - **No silent starts.** A server MUST NOT be able to start a client's camera or screen share. There is no server-initiated publication in this specification, and none should be added.
-- **Others are in the frame.** Servers SHOULD make the room's publication state visible to every participant, video-capable or not, so that a voice-only participant can at least know a camera is on. Clients SHOULD show who is publishing regardless of whether they render the video.
+- **A new source is a new choice.** Changing what a screen share captures takes the same consent as starting one, and the sharing indicator MUST update to show the new source.
+- **Others are in the frame.** Servers SHOULD make the room's publication state visible to every participant, video-capable or not: through Video Status (611) to video-capable participants, and through the [publication bits](#publication-bits) of Voice Room Status (605) and the Join Voice Room (600) reply to all of them, so that a voice-only participant can at least know a camera is on. Clients SHOULD show who is publishing regardless of whether they render the video.
 - **Kick ends everything.** A participant removed from a chat loses voice and every publication in that room immediately, per the voice extension's existing rule.
 
 ---
@@ -724,6 +749,8 @@ The login reply's `caps` list gains `"video"` when the SFU supports video, along
 `video_subscribe` carries the complete desired set on this wire too, and the same defaults apply: a session receives no video until it asks, and `"streams": []` turns it all off in one request. For a mobile client this is the whole point of the binding — the ng protocol exists for clients on cellular connections, and this is the message that keeps a video room affordable on one.
 
 `video_status` carries the complete publication list on every emission, exactly as transaction 611 does. A client replaces its whole view of the room's video state on each one.
+
+The [publication bits](#publication-bits) have no counterpart here: `voice_status` keeps its `{ uid, muted }` entries, because a session on this wire in a room where video exists has `"video"` in its `caps` and receives `video_status` whatever it renders. `voice_status` is still emitted when a publication starts or stops, as 605 is, carrying an unchanged list.
 
 **Limits** are reported in the login reply rather than as a repeated field:
 
