@@ -24,6 +24,14 @@ use hxproto::voice::ice as wire_ice;
 /// spec defines, and the only one a room can be using.
 const CODEC_PCMU: u16 = 0;
 
+/// `DATA_VOICE_TRANSPORT`: the media transport a Join Voice Room (600)
+/// asks for — `0` DTLS-SRTP, the default when absent, `1` plain RTP.
+/// Not in `hxproto` yet; one tag does not earn a coordinated pin advance.
+pub const TAG_VOICE_TRANSPORT: u16 = 0x01fb;
+
+/// The only transport this server offers: DTLS-SRTP.
+pub const TRANSPORT_DTLS_SRTP: u32 = 0;
+
 /// Flags bit 0 of a participant entry.
 const FLAG_MUTED: u16 = 0x0001;
 /// Flags bit 1: the participant holds a camera publication, paused or

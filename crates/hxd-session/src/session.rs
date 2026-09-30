@@ -3938,6 +3938,24 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "You are not allowed to join voice chat.");
                 return;
             }
+            // A transport we don't offer is refused before the domain
+            // sees the join, so no room state changes, and never
+            // substituted: a client asking for plain RTP has no DTLS
+            // stack to fall back to. This server offers DTLS-SRTP only,
+            // so any other value — plain RTP or one not yet defined —
+            // gets the same answer.
+            let transport = f
+                .chunks()
+                .find(|c| c.tag == voice::TAG_VOICE_TRANSPORT)
+                .map_or(voice::TRANSPORT_DTLS_SRTP, |c| c.as_uint());
+            if transport != voice::TRANSPORT_DTLS_SRTP {
+                reply_error(
+                    tx,
+                    f.trans,
+                    "This server does not offer that voice transport. It needs DTLS-SRTP.",
+                );
+                return;
+            }
             let cid = voice_cid(f);
             match ctx.core.voice_join(sess.uid, cid) {
                 Ok(join) => reply(

@@ -1164,3 +1164,45 @@ async fn joins_past_the_allowance_are_refused_on_both_wires_and_leaves_never_are
 /// test reads it: the allowance is spent a few round trips before the
 /// refusal, and a loaded runner can take seconds over them.
 const WAIT_FLOOR: u64 = 25;
+
+#[tokio::test]
+async fn a_transport_this_server_does_not_offer_is_refused_and_changes_nothing() {
+    // Voice Transport (0x01FB) on Join Voice Room: 0 is DTLS-SRTP, the
+    // only transport here, and 1 is plain RTP. Anything but 0 is refused
+    // before the room is touched — never answered with a DTLS offer the
+    // client has no stack for, and never at the cost of the room it is
+    // already in.
+    const VOICE_TRANSPORT: u16 = 0x01fb;
+    let transport = |v: u16| (VOICE_TRANSPORT, v.to_be_bytes().to_vec());
+    let td = tempfile::tempdir().unwrap();
+    let (addr, _media) = start_server(td.path(), true).await;
+    let mut a = Client::login(addr, "talker", true).await;
+    let mut b = Client::login(addr, "talker", true).await;
+
+    // Asking for DTLS-SRTP by name is the same as not asking.
+    let t = a.send(REQ_VOICE_JOIN, &[chat_id(0), transport(0)]).await;
+    let reply = a.recv_type(HDR_TASK).await;
+    assert_eq!(reply.trans, t);
+    assert_eq!(reply.flag, 0, "join refused: {}", task_error(&reply));
+    let sdp = String::from_utf8(chunk(&reply, tag::VOICE_SDP).unwrap()).unwrap();
+    a.answer_voice(0, &format!("answer to {sdp}")).await;
+    a.status_for(&[(a.uid, false)]).await;
+
+    // Plain RTP, and a value no revision defines.
+    for v in [1, 7] {
+        let t = a.send(REQ_VOICE_JOIN, &[chat_id(0), transport(v)]).await;
+        let reply = a.recv_type(HDR_TASK).await;
+        assert_eq!(reply.trans, t);
+        assert_eq!(reply.flag, 1, "transport {v} must be refused");
+        assert!(
+            task_error(&reply).contains("voice transport"),
+            "and say why: {}",
+            task_error(&reply)
+        );
+        assert!(chunk(&reply, tag::VOICE_SDP).is_none(), "with no offer");
+    }
+
+    // A is still in the room it was in: the next joiner sees it there.
+    let reply = b.join_voice(0).await;
+    assert_eq!(participants(&reply), vec![(a.uid, false)]);
+}
