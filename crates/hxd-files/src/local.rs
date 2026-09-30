@@ -382,9 +382,15 @@ impl LocalFileSource {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let metadata = entry
-                .metadata()
-                .map_err(|error| unavailable("stat partial quota entry", error))?;
+            // A partial removed between the listing and this stat, by a
+            // sweep or a finishing upload, is simply not counted, as in
+            // `partial_bases`; failing the whole request for it would
+            // refuse an upload over someone else's cleanup.
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(unavailable("stat partial quota entry", error)),
+            };
             if !metadata.is_file() {
                 continue;
             }
