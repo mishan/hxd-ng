@@ -774,9 +774,18 @@ impl Inner {
                 // Payload type, sequence number, timestamp and marker
                 // pass through untouched; only the SSRC is ours, and it
                 // is the one this peer's SDP declared.
+                //
+                // Nackable, or str0m caches nothing and answers no NACK:
+                // the flag defaults off. str0m clears it again itself on
+                // a stream with no RTX negotiated (audio, or a receiver
+                // that dropped PT 97), since it only resends over RTX.
+                // That leaves such a receiver's NACKs unanswered, short
+                // of the spec's rule: str0m 0.23 can neither resend the
+                // original packet nor hand us the NACK to forward.
                 stream.write_rtp(
                     RtpWrite::new(f.pt.into(), f.seq_no, f.time, now, Arc::clone(&f.payload))
-                        .marker(f.marker),
+                        .marker(f.marker)
+                        .nackable(true),
                 );
             }
         }

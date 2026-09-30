@@ -499,10 +499,28 @@ fn pump_filtered(
     step: Duration,
     allow: impl Fn(&[u8]) -> bool,
 ) {
+    pump_lossy(sfu, clients, clock, steps, step, allow, |_, _| false);
+}
+
+/// The general case: `allow` filters what reaches the server, and `lose`
+/// drops what the server sends before it reaches a client — the other
+/// hop, which is where a receiver's loss happens and a NACK starts.
+fn pump_lossy(
+    sfu: &Sfu,
+    clients: &mut [&mut Client],
+    clock: &Clock,
+    steps: usize,
+    step: Duration,
+    allow: impl Fn(&[u8]) -> bool,
+    mut lose: impl FnMut(SocketAddr, &[u8]) -> bool,
+) {
     for _ in 0..steps {
         let now = clock.now();
         let (out, _deadline) = sfu.poll(now);
         for d in out {
+            if lose(d.to, &d.data) {
+                continue;
+            }
             if let Some(c) = clients.iter_mut().find(|c| c.addr == d.to) {
                 let input = Input::Receive(
                     now,
@@ -1806,6 +1824,62 @@ fn resubscribing_gets_a_fresh_ssrc_on_the_same_mid() {
     a.publish_frame(VideoKind::Camera, b"back", clock.now());
     pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
     assert_eq!(b.heard_on("cam-user-1"), [b"back".to_vec()]);
+}
+
+/// An RTP packet rather than RTCP, by RFC 5761's rule for a muxed port:
+/// SRTP's first byte, and a second byte outside RTCP's packet types.
+fn is_rtp(d: &[u8]) -> bool {
+    d.len() > 1 && (128..=191).contains(&d[0]) && !(192..=223).contains(&d[1])
+}
+
+#[test]
+fn a_receivers_nack_is_answered_from_the_servers_cache() {
+    // The spec's retransmission rule: a receiver's NACK is never left
+    // unanswered. One packet is lost on the server-to-receiver hop; the
+    // receiver's stack notices the gap when the next one arrives and
+    // NACKs it; the server resends it from its own cache, over the
+    // repair stream the offer declared, without asking the publisher.
+    let clock = Clock::new();
+    let sfu = new_sfu(&clock);
+    let mut a = Client::new(1, 6250, clock.now());
+    let mut b = Client::new(2, 6251, clock.now());
+    camera_published(&sfu, &clock, &mut [&mut a, &mut b]);
+    let step = Duration::from_millis(5);
+
+    b.heard.clear();
+    a.publish_frame(VideoKind::Camera, b"one", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 6);
+
+    // The next RTP packet bound for B is lost on the way.
+    a.publish_frame(VideoKind::Camera, b"two", clock.now());
+    let b_addr = b.addr;
+    let mut lost = 0;
+    pump_lossy(
+        &sfu,
+        &mut [&mut a, &mut b],
+        &clock,
+        6,
+        step,
+        |_| true,
+        |to, d| {
+            let drop = to == b_addr && lost == 0 && is_rtp(d);
+            lost += usize::from(drop);
+            drop
+        },
+    );
+    assert_eq!(lost, 1, "the test lost exactly one packet");
+    assert_eq!(b.heard_on("cam-user-1"), [b"one".to_vec()]);
+
+    // The one after it shows the receiver the gap, and the repair follows.
+    a.publish_frame(VideoKind::Camera, b"three", clock.now());
+    pump(&sfu, &mut [&mut a, &mut b], &clock, 60);
+    let mut heard = b.heard_on("cam-user-1").to_vec();
+    heard.sort();
+    assert_eq!(
+        heard,
+        [b"one".to_vec(), b"three".to_vec(), b"two".to_vec()],
+        "the lost packet arrives after all, resent by the server"
+    );
 }
 
 #[test]
