@@ -236,7 +236,7 @@ VP8 has no static payload type, so this specification fixes the dynamic values t
 | 96 | `VP8/90000` | All video sections, both kinds |
 | 97 | `rtx/90000`, `a=fmtp:97 apt=96` | OPTIONAL retransmission stream |
 
-A client's answer MUST use the same payload type numbers the offer used for each media section. A client that does not implement RTX MUST still answer the section; it simply never sends or receives retransmissions.
+A client's answer MUST NOT renumber: any payload type it keeps uses the number the offer gave it. A client that does not implement RTX answers the section without PT 97; RTX is then not negotiated for that section, and lost packets reach it, if at all, as retransmitted originals (see [Keyframes and RTCP Feedback](#keyframes-and-rtcp-feedback)).
 
 **Both stream kinds use payload type 96.** Camera and screen video are the same codec at the same payload type, distinguished by `mid` and SSRC and by nothing else. This has a direct consequence for [Send SSRC Declaration](#send-ssrc-declaration).
 
