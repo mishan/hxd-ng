@@ -34,6 +34,7 @@ This extension is **layered on** the voice extension, not parallel to it. It def
   - [Capability Bit](#capability-bit)
   - [Degrading to Voice](#degrading-to-voice)
   - [Publication Bits](#publication-bits)
+  - [Plain RTP Transport](#plain-rtp-transport)
   - [Server Configuration](#server-configuration)
 - [Codec Negotiation](#codec-negotiation)
   - [Supported Codecs](#supported-codecs)
@@ -175,6 +176,10 @@ A voice-only participant receives nothing from this extension's transactions, bu
 - These notifications MAY go through the same debounce as the voice extension's mute notifications. A coalesced 605 MUST carry the room's state at the moment it is sent, so a debounce may delay a change but never lose one.
 
 Video-capable clients get the same fact, with detail, from Video Status (611), and SHOULD prefer it. The bits exist for the participant who has no 611 to read.
+
+### Plain RTP Transport
+
+The voice extension's [plain RTP transport](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Voice.md#plain-rtp-transport) has no peer connection, and so nothing to add a video section to. A server MUST refuse Video Start (607) and Video Subscribe (610) from a participant on the plain RTP transport. Such a participant is otherwise an ordinary voice-only peer: it receives no video, and still sees who is publishing through the [publication bits](#publication-bits).
 
 ### Server Configuration
 
@@ -365,7 +370,7 @@ Sixteen bytes in this revision. A parser MUST accept a longer field and ignore t
 
 **The reply carries no SDP offer.** This differs from Join Voice Room (600) deliberately. A renegotiation may already be outstanding toward this peer, and the voice extension forbids a second offer before the first is answered; the server therefore replies immediately with success and sends the offer as a Voice SDP Offer (602) when serialisation allows. The client MUST NOT wait for an offer before considering the request to have succeeded, and MUST NOT begin capturing until the resulting negotiation completes.
 
-**Server Reply (error):** standard error reply with `DATA_ERROR_TEXT` (field 100), human-readable and not intended for programmatic parsing. Conditions include: the client is not in voice in that room; a publication of that kind already exists for this client; no slot is free for that kind (`VideoMaxCamerasPerRoom` / `VideoMaxScreensPerRoom`); video is disabled; the user lacks `accessVideoChat`, or `accessScreenShare` for a screen publication.
+**Server Reply (error):** standard error reply with `DATA_ERROR_TEXT` (field 100), human-readable and not intended for programmatic parsing. Conditions include: the client is not in voice in that room; the client is on the voice extension's [plain RTP transport](#plain-rtp-transport); a publication of that kind already exists for this client; no slot is free for that kind (`VideoMaxCamerasPerRoom` / `VideoMaxScreensPerRoom`); video is disabled; the user lacks `accessVideoChat`, or `accessScreenShare` for a screen publication.
 
 The server also sends **Video Status (611)** to every video-capable participant in the room, and **Voice Room Status (605)** to every participant, with the publisher's [publication bit](#publication-bits) now set.
 
@@ -409,7 +414,7 @@ Declares the complete set of streams this client wishes to receive in a room. **
 | Chat ID | 114 | UInt32 | Yes | |
 | Video Subscriptions | `0x0225` | Binary | No | Complete desired set; omit or send empty to receive nothing |
 
-**Server Reply:** empty success reply.
+**Server Reply:** empty success reply. A participant on the [plain RTP transport](#plain-rtp-transport) is refused with a standard error reply, as for Video Start.
 
 The server diffs the requested set against the client's current subscriptions and, if they differ, sends **one** consolidated Voice SDP Offer (602) reflecting every change — subject to the usual serialisation rule, so the offer may arrive after an outstanding one is answered rather than immediately. As with Video Start, the reply does not carry the offer.
 
@@ -585,9 +590,9 @@ The request is sent to the publisher as RTCP Picture Loss Indication ([RFC 4585]
 
 Publishers MUST honour PLI and FIR by producing a keyframe promptly.
 
-**Retransmission.** A server MAY offer an RTX stream (PT 97, `apt=96`) and maintain a per-receiver retransmission cache. A server that does not offer RTX MUST still forward receivers' NACKs toward the publisher rather than discarding them, so that the publisher's own retransmissions can reach the loss. Video loss is far more visible than audio loss; a stream with no loss recovery at all degrades badly on ordinary domestic connections.
+**Retransmission.** A receiver's NACK MUST NOT be discarded unanswered. The server either answers it from a retransmission cache of its own, sending the lost packet again — as an RTX packet (PT 97, `apt=96`) on a section where RTX was negotiated, otherwise as the original packet — or forwards it toward the publisher, whose own retransmission then reaches the loss. A server MAY do both, answering what its cache holds and forwarding the rest. RTX counts as negotiated only when the receiver's answer keeps PT 97: offering it is not enough, and a hand-rolled client may well drop it. Video loss is far more visible than audio loss; a stream with no loss recovery at all degrades badly on ordinary domestic connections.
 
-The SFU forwards RTP without rewriting SSRCs, sequence numbers or timestamps, as in the voice extension.
+The SFU forwards RTP payloads, sequence numbers and timestamps unchanged, and rewrites the SSRC as the voice extension does: each forwarded copy carries the SSRC declared for that section in the receiving peer's most recent offer. Feedback travels the other way. A receiver's PLI, FIR and NACK name the SSRC that receiver sees, and the server MUST translate them to the publisher's own SSRC before acting on them or passing them on.
 
 ### Bitrate
 
@@ -696,7 +701,7 @@ The download column is the one a client controls, and it controls it entirely: s
 - **Publication bits:** set bits 1 and 2 of each voice participant entry from that participant's publications, in the join reply and in every room status, and send a room status when a publication starts or stops. See [Publication Bits](#publication-bits).
 - **Subscribe enforcement:** deliver a publication only to peers subscribed to it. Retain subscriptions naming publications that do not exist yet, and activate them if they appear. Never tell a publisher who is subscribed to it.
 - **Keyframes:** request one whenever a receiver newly begins consuming a publication, and rate-limit to roughly one per second per publication.
-- **No transcoding:** forward RTP unmodified; never decode or re-encode. The server never sees pixels.
+- **No transcoding:** never decode or re-encode. Payloads, sequence numbers and timestamps are forwarded unchanged; only the SSRC is rewritten, to the one each receiver's offer declared. The server never sees pixels.
 - **Codec enforcement:** offer only VP8 at PT 96. Reject an answer whose video sections lack PT 96, or whose send sections lack `a=ssrc`.
 - **Renegotiation:** obey the voice extension's per-peer serialisation rule; consolidate accumulated changes into one follow-up offer.
 - **Cleanup:** ending a participant's voice session ends its publications. A publication whose media has stopped may be reaped without disturbing the call.
