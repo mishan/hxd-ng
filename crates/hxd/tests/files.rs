@@ -390,7 +390,12 @@ async fn a_drop_box_takes_uploads_without_telling_what_it_holds() {
         .request(FILE_PUT, &put_in(drop_box, b"fresh.txt"))
         .await;
     let tags = |frame: &Frame| {
-        assert_eq!(frame.flag & 1, 0, "accepted");
+        assert_eq!(
+            frame.flag & 1,
+            0,
+            "accepted, not refused with {:?}",
+            field(frame, tag::TASK_ERROR).map(|text| String::from_utf8_lossy(&text).into_owned())
+        );
         frame.chunks().map(|chunk| chunk.tag).collect::<Vec<_>>()
     };
     assert_eq!(tags(&taken), tags(&free));
