@@ -1365,49 +1365,6 @@ fn media_now(
     })
 }
 
-/// Whether a history reader may fetch the image on a line it was just
-/// served, and — under `history_access = "readers"` — the act of
-/// granting it.
-///
-/// The default is the spec's: gaining read access does not grant
-/// retroactive download rights, so a line carries its metadata and a
-/// download resolves only for the principals captured when it was
-/// relayed. `readers` is the operator's other answer, for public chat
-/// only, on the argument that a public line's audience is everyone
-/// holding read-chat (§5.4).
-fn media_for_reader(ctx: &NgCtx, uid: hxd_core::Uid, line: &hxd_core::LogLine) -> bool {
-    let Some(meta) = line.media.as_ref() else {
-        return false;
-    };
-    // A redacted line's image went with it. `history_line_json` already
-    // withholds the handle here and stamps `removed`, but this function
-    // *grants* under the `readers` policy, and a grant nobody was shown
-    // the handle for is still a grant that never expires.
-    if line.flags.contains(hxd_core::LineFlags::DELETED) {
-        return false;
-    }
-    let Ok(handle) = <hxd_core::media::Handle>::try_from(meta.id.as_slice()) else {
-        return false;
-    };
-    // Gone is gone, whatever the policy says.
-    if ctx.core.media_meta(&handle).and_then(|m| m.id).is_none() {
-        return false;
-    }
-    let readers = ctx
-        .core
-        .media_config()
-        .is_some_and(|c| c.history_access == hxd_core::HistoryAccess::Readers);
-    if readers {
-        if let Some(who) = ctx.core.principal_of(uid) {
-            ctx.core.media_grant(&handle, who);
-        }
-        return true;
-    }
-    // Otherwise the handle is only worth naming to someone the relay
-    // captured — anyone else would fetch it and be told no.
-    ctx.core.media_fetch(uid, &handle).is_some()
-}
-
 /// Is this `msg` addressed to the system account, by uid or by login?
 fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
     match (p.to, p.to_login.as_deref()) {
@@ -1544,7 +1501,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                                     .lines
                                     .iter()
                                     .map(|line| {
-                                        let fetchable = media_for_reader(ctx, uid, line);
+                                        let fetchable = ctx.core.history_media_fetchable(uid, line);
                                         history_line_json(line, fetchable)
                                     })
                                     .collect();

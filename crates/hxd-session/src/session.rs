@@ -906,6 +906,35 @@ fn hl_decode(data: &[u8]) -> Vec<u8> {
 /// The `CHAT_ID` of a voice transaction. Absent means the public chat,
 /// which is also what `0` means — every voice transaction carries the
 /// field, and a client that omits it is asking about the lobby.
+/// A history entry's media sub-fields (Capabilities-Chat-History,
+/// chat-history.md §8): the MIME type, dimensions and size of the image a
+/// line carried, always, and its handle (`0x0010`, the `DATA_CHAT_MEDIA_ID`
+/// bytes) only while the reader can still fetch it. A dimension that is
+/// not known is omitted rather than sent as zero.
+fn history_media_subfields(
+    meta: &hxd_core::history::MediaMeta,
+    fetchable: bool,
+) -> Vec<(u16, Vec<u8>)> {
+    const MEDIA_HANDLE: u16 = 0x0010;
+    const MEDIA_MIME: u16 = 0x0011;
+    const MEDIA_WIDTH: u16 = 0x0012;
+    const MEDIA_HEIGHT: u16 = 0x0013;
+    const MEDIA_BYTES: u16 = 0x0014;
+    let mut out = Vec::with_capacity(5);
+    if fetchable {
+        out.push((MEDIA_HANDLE, meta.id.clone()));
+    }
+    out.push((MEDIA_MIME, meta.mime.as_bytes().to_vec()));
+    if meta.width != 0 {
+        out.push((MEDIA_WIDTH, meta.width.to_be_bytes().to_vec()));
+    }
+    if meta.height != 0 {
+        out.push((MEDIA_HEIGHT, meta.height.to_be_bytes().to_vec()));
+    }
+    out.push((MEDIA_BYTES, meta.bytes.to_be_bytes().to_vec()));
+    out
+}
+
 fn voice_cid(f: &Frame) -> u32 {
     f.chunks()
         .find(|c| c.tag == tag::CHAT_ID)
@@ -3448,6 +3477,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             match off_reactor(&ctx.core, move |c| c.history(uid, query)).await {
                 Some(Ok(page)) => {
                     let mut entries = Vec::with_capacity(page.lines.len());
+                    let media_reader = sess.has_cap(cap::INLINE_MEDIA);
                     for line in page.lines {
                         let deleted = line.flags.contains(hxd_core::LineFlags::DELETED);
                         let nick = if deleted {
@@ -3455,11 +3485,27 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         } else {
                             sess.enc.encode(&line.from_nick)
                         };
+                        // A line that was only an image reads as "[image]"
+                        // to a reader that cannot show one, rather than as
+                        // a gap where one was (Capabilities-Chat-History).
                         let body = if deleted {
                             Vec::new()
+                        } else if line.text.is_empty() && line.media.is_some() && !media_reader {
+                            b"[image]".to_vec()
                         } else {
                             sess.enc.encode(&line.text)
                         };
+                        let media = match &line.media {
+                            Some(meta) if media_reader && !deleted => {
+                                let fetchable = ctx.core.history_media_fetchable(sess.uid, &line);
+                                history_media_subfields(meta, fetchable)
+                            }
+                            _ => Vec::new(),
+                        };
+                        let subfields: Vec<_> = media
+                            .iter()
+                            .map(|(ty, data)| hxproto::build::HistorySubfield { ty: *ty, data })
+                            .collect();
                         let timestamp = line
                             .at
                             .duration_since(SystemTime::UNIX_EPOCH)
@@ -3471,7 +3517,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             line.icon,
                             &nick,
                             &body,
-                            &[],
+                            &subfields,
                         ) else {
                             warn!(id = line.id, "chat history entry exceeds the wire chunk");
                             reply_error(tx, f.trans, "Server error.");

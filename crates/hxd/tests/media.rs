@@ -306,6 +306,15 @@ struct Legacy {
 
 impl Legacy {
     async fn login(addr: SocketAddr, login: &str, offer_media: bool) -> (Self, Frame) {
+        let caps = if offer_media {
+            Some(Caps::empty().with(cap::INLINE_MEDIA))
+        } else {
+            None
+        };
+        Self::login_with(addr, login, caps).await
+    }
+
+    async fn login_with(addr: SocketAddr, login: &str, caps: Option<Caps>) -> (Self, Frame) {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(b"TRTPHOTL\x00\x01\x00\x02").await.unwrap();
         let mut magic = [0; 8];
@@ -317,11 +326,8 @@ impl Legacy {
             (tag::LOGIN, xor(login.as_bytes())),
             (tag::PASSWORD, xor(b"pw")),
         ];
-        if offer_media {
-            chunks.push((
-                tag::CAPABILITIES,
-                Caps::empty().with(cap::INLINE_MEDIA).to_wire(),
-            ));
+        if let Some(caps) = caps {
+            chunks.push((tag::CAPABILITIES, caps.to_wire()));
         }
         let mut client = Self { stream, trans: 1 };
         client
@@ -1390,6 +1396,103 @@ async fn a_revocation_stops_the_next_download_and_tells_the_room() {
     let again = ng_upload(server.ng, &web.bearer, &png(16, 16)).await;
     assert_eq!(again.status, 400);
     assert_eq!(again.json()["error"]["code"], "media_rejected");
+}
+
+/// One 700 entry's message and sub-fields. `hxproto` skips sub-fields, so
+/// the walk is here: header, nick, message, then `type | len | data`.
+fn history_entry_with_subfields(data: &[u8]) -> (Vec<u8>, Vec<(u16, Vec<u8>)>) {
+    let be16 = |at: usize| u16::from_be_bytes([data[at], data[at + 1]]) as usize;
+    let nick_len = be16(20);
+    let msg_at = 22 + nick_len;
+    let msg_len = be16(msg_at);
+    let message = data[msg_at + 2..msg_at + 2 + msg_len].to_vec();
+    let mut at = msg_at + 2 + msg_len;
+    let mut subfields = Vec::new();
+    while at + 4 <= data.len() {
+        let ty = be16(at) as u16;
+        let len = be16(at + 2);
+        subfields.push((ty, data[at + 4..at + 4 + len].to_vec()));
+        at += 4 + len;
+    }
+    assert_eq!(at, data.len(), "the sub-fields fill the entry exactly");
+    (message, subfields)
+}
+
+#[tokio::test]
+async fn a_history_reader_sees_an_image_line_as_its_wire_allows() {
+    // Capabilities-Chat-History: a line that carried an image pages with
+    // its metadata as sub-fields 0x0011-0x0014 for a reader that
+    // negotiated inline media, the handle (0x0010) too while it can be
+    // fetched, and "[image]" in place of an empty body for any other.
+    const REQ_HISTORY: u32 = 700;
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_with_history(dir.path(), media_config()).await;
+    let both = Caps::empty()
+        .with(cap::INLINE_MEDIA)
+        .with(cap::CHAT_HISTORY);
+
+    let (mut alice, _) = Legacy::login_with(server.legacy, "alice", Some(both)).await;
+    let reply = alice.upload(&png(24, 16)).await;
+    assert_eq!(reply.flag, 0, "upload refused");
+    let handle = field(&reply, tag::CHAT_MEDIA_ID).unwrap();
+    alice
+        .send(
+            REQ_CHAT,
+            &[
+                (tag::BODY, Vec::new()),
+                (tag::CHAT_MEDIA_ID, handle.clone()),
+                (tag::CHAT_MEDIA_TYPE, b"image/png".to_vec()),
+            ],
+        )
+        .await;
+    alice.recv_type(HDR_CHAT).await;
+
+    let page = |reply: Frame| {
+        let entries: Vec<_> = reply
+            .chunks()
+            .filter(|chunk| chunk.tag == tag::HISTORY_ENTRY)
+            .map(|chunk| history_entry_with_subfields(chunk.data))
+            .collect();
+        assert_eq!(entries.len(), 1, "one line in the log");
+        entries.into_iter().next().unwrap()
+    };
+    let channel = [(tag::CHANNEL_ID, 0u32.to_be_bytes().to_vec())];
+
+    // Alice was shown the image when it was relayed, so the handle is hers.
+    let (message, subfields) = page(alice.call(REQ_HISTORY, &channel).await);
+    assert!(message.is_empty(), "the body stays the sender's: empty");
+    assert_eq!(
+        subfields,
+        vec![
+            (0x0010, handle.clone()),
+            (0x0011, b"image/png".to_vec()),
+            (0x0012, 24u32.to_be_bytes().to_vec()),
+            (0x0013, 16u32.to_be_bytes().to_vec()),
+            (
+                0x0014,
+                be32(&reply, tag::CHAT_MEDIA_BYTES)
+                    .unwrap()
+                    .to_be_bytes()
+                    .to_vec()
+            ),
+        ]
+    );
+
+    // A later reader with inline media gets the metadata, but not a
+    // handle it would only be refused: retroactive download rights are
+    // not granted by default.
+    let (mut bob, _) = Legacy::login_with(server.legacy, "bob", Some(both)).await;
+    let (_, subfields) = page(bob.call(REQ_HISTORY, &channel).await);
+    let types: Vec<u16> = subfields.iter().map(|(ty, _)| *ty).collect();
+    assert_eq!(types, vec![0x0011, 0x0012, 0x0013, 0x0014]);
+
+    // A reader without inline media gets no sub-fields, and a placeholder
+    // where the line would otherwise be blank.
+    let history_only = Caps::empty().with(cap::CHAT_HISTORY);
+    let (mut classic, _) = Legacy::login_with(server.legacy, "nomedia", Some(history_only)).await;
+    let (message, subfields) = page(classic.call(REQ_HISTORY, &channel).await);
+    assert_eq!(message, b"[image]".to_vec());
+    assert!(subfields.is_empty());
 }
 
 #[tokio::test]

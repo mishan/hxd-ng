@@ -83,8 +83,8 @@ Two things it leaves open that this design has to answer:
    inline-media document says sub-fields `0x0010`–`0x0014` "are
    allocated to this extension" in a section of the history document
    that does not exist (its link is to `Capabilities-Chat-Cistory.md`).
-   §8 allocates them provisionally, and §11 lists it as the first thing
-   to raise upstream.
+   §8 allocated them provisionally; Capabilities-Chat-History now
+   allocates the same numbers, so they are final.
 2. **What a message id is.** Only "monotonically increasing uint64,
    opaque". §4 makes it a SQLite `AUTOINCREMENT` rowid, which is
    monotonic even across deletes, and nothing on either wire is allowed
@@ -476,8 +476,8 @@ lookup, not a heuristic — which is what §3.2's ordering lock is for.
 A line sent with an inline image (inline-media.md) is stored with the
 canonical metadata the relay carried — handle, MIME type, width, height,
 byte size — and its history entry carries them as mini-TLV sub-fields.
-The allocation is **provisional**, chosen to match the range the
-inline-media document claims:
+Capabilities-Chat-History allocates them (`0x0001`–`0x000F` are kept
+for core history fields, `0x0010`–`0x001F` for inline media):
 
 | Sub-type | Content | Size |
 |---|---|---|
@@ -487,15 +487,23 @@ inline-media document claims:
 | `0x0013` | Height, u32 BE | 4 |
 | `0x0014` | Canonical byte size, u32 BE | 4 |
 
-`0x0011`–`0x0014` are sent for every line that had media — a client can
-say "[image, PNG, 800×600]" forever. `0x0010` is sent only while the
-handle is still live, and whether a history reader may then *download*
-it is inline-media.md §5.4's question. On the ng wire the same five
-values are the line's `media` object, with `id` absent once the handle
-has expired.
+They go only to a reader that negotiated inline media (capability bit
+3). `0x0011`–`0x0014` are sent for every line that had media — a client
+can say "[image, PNG, 800×600]" forever — with a dimension that is not
+known omitted. `0x0010` is sent only while the reader can fetch it: the
+handle is still live, and inline-media.md §5.4's policy lets this reader
+download it. A redacted line carries none of them. A reader without
+inline media gets no sub-fields, and `[image]` in place of a body that
+would otherwise be empty, so a captionless photo is not a blank line.
+On the ng wire the same five values are the line's `media` object, with
+`id` absent when it cannot be fetched.
 
-GtkHx today skips all sub-fields, so nothing changes for it until it
-chooses to render the placeholder.
+`0x0010` carries the `DATA_CHAT_MEDIA_ID` bytes as they are: this
+server's handles are 16 random bytes, not text, whatever the history
+document's "UTF-8" says (raised upstream).
+
+GtkHx today skips all sub-fields, so it shows what the sender typed;
+it gets `[image]` only if it does not negotiate inline media.
 
 ## 9. Configuration
 
@@ -548,10 +556,10 @@ follow-up.
 
 ## 11. Open questions, and what to raise upstream
 
-- **Sub-field allocation.** The inline-media document references a
-  table the history document does not have. Ask fogWraith to add the
-  allocation of §8 (or tell us the real one) before H2 emits a byte of
-  it; until then the types are marked provisional in the code.
+- **Sub-field allocation.** Settled: Capabilities-Chat-History now
+  allocates §8's numbers. Still to raise: it calls `0x0010` a "UTF-8"
+  handle where Capabilities-Inline-Media defines `DATA_CHAT_MEDIA_ID`
+  as binary.
 - **Reader download rights** for public-chat media in history — the
   spec's "no retroactive widening" rule against the obvious wish to see
   the picture in scrollback. inline-media.md §5.4 has the knob and the
