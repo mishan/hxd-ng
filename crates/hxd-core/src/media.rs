@@ -766,6 +766,48 @@ impl Core {
         }
     }
 
+    /// Whether a history reader may fetch the image on a line it was
+    /// just served, and, under `history_access = "readers"`, the act of
+    /// granting it. Both wires ask this before naming a line's handle to
+    /// a history reader (§5.4, chat-history.md §8).
+    ///
+    /// The default is the spec's: gaining read access does not grant
+    /// retroactive download rights, so a line carries its metadata and a
+    /// download resolves only for the principals captured when it was
+    /// relayed. `readers` is the operator's other answer, for public chat
+    /// only, on the argument that a public line's audience is everyone
+    /// holding read-chat.
+    pub fn history_media_fetchable(&self, uid: Uid, line: &crate::history::LogLine) -> bool {
+        let Some(meta) = line.media.as_ref() else {
+            return false;
+        };
+        // A redacted line's image went with it. This *grants* under the
+        // `readers` policy, and a grant nobody was shown the handle for
+        // is still a grant that never expires.
+        if line.flags.contains(crate::history::LineFlags::DELETED) {
+            return false;
+        }
+        let Ok(handle) = Handle::try_from(meta.id.as_slice()) else {
+            return false;
+        };
+        // Gone is gone, whatever the policy says.
+        if self.media_meta(&handle).and_then(|m| m.id).is_none() {
+            return false;
+        }
+        let readers = self
+            .media_config()
+            .is_some_and(|c| c.history_access == HistoryAccess::Readers);
+        if readers {
+            if let Some(who) = self.principal_of(uid) {
+                self.media_grant(&handle, who);
+            }
+            return true;
+        }
+        // Otherwise the handle is only worth naming to someone the relay
+        // captured: anyone else would fetch it and be told no.
+        self.media_fetch(uid, &handle).is_some()
+    }
+
     /// Hold a handle past its TTL while a report on it is open.
     ///
     /// A pin already in force is kept rather than extended: the cap is

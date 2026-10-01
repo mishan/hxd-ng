@@ -356,17 +356,14 @@ everyone who could have been in the room. The argument against is the
 spec's, and it is the reference implementation's job to ship the
 spec's answer and raise the question upstream (§14).
 
-**On the ng wire both settings work as described**: a history line
-carries the metadata always and the handle only when the reader can
-actually fetch it, so a client never renders a fetch button that would
-answer 404. **On the legacy wire a history entry carries no media at
-all**, because 700's entries have no allocated sub-fields for it — that
-allocation is chat-history.md §11's open upstream question, and
-inventing numbers for it here would put two implementations on
-different ones. A GtkHx reading history therefore sees scrollback text
-where a capable ng client sees the image; live lines are unaffected,
-which is where nearly all of the images are. (A period client has no
-history at all; 700 is an extension.)
+**Both settings work on both wires**: a history line carries the
+metadata always and the handle only when the reader can actually fetch
+it, so a client never renders a fetch button that would answer 404. On
+the ng wire that is the line's `media` object; on the legacy wire it is
+the 700 entry's sub-fields `0x0010`–`0x0014` (chat-history.md §8), sent
+to a reader that negotiated bit 3. A legacy reader without the bit gets
+`[image]` where an image-only line's body would be empty. (A period
+client has no history at all; 700 is an extension.)
 
 ## 6. Rate limits and the numbers
 
@@ -692,9 +689,9 @@ as what each one is tested by.
 5. **M5 — the two stores.** Done for the inbox (schema v2's `message`
    columns, the flush and the `inbox` listing resolving each handle) and
    for the log's own record (`attach_media` on relay, the ng `history`
-   entry carrying metadata and the `history_access` knob). **Not** the
-   legacy 700 entry, which has no allocated sub-field to carry it —
-   §5.4 and chat-history.md §11.
+   entry carrying metadata and the `history_access` knob), and the
+   legacy 700 entry's sub-fields once Capabilities-Chat-History
+   allocated them (chat-history.md §8).
 6. **M6 — moderation.** The media half is here: `media_revoke` drops the
    bytes at once and keeps the metadata, the canonical hash goes on a
    block list that refuses the same file's re-upload, `media_pin` and
@@ -738,8 +735,9 @@ its queued mail. A 1.5 client sees nothing new at all.
   `Get Chat History`, since the "no retroactive widening" rule was
   written for rooms and access changes, not for a log the spec itself
   introduced afterwards.
-- **Sub-field allocation** in the history document (chat-history.md
-  §11) — the same upstream conversation.
+- **Sub-field allocation** in the history document: allocated upstream
+  with §8's numbers. Left to raise: `0x0010` is described as UTF-8, not
+  as `DATA_CHAT_MEDIA_ID`'s binary (chat-history.md §11).
 - **Format follows source** (§3.3) is a departure from a
   recommendation; worth saying upstream so the recommendation can say
   "or the source format".
