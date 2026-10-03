@@ -409,6 +409,23 @@ async fn the_classic_editor_changes_only_what_it_can_say() {
     let text = std::fs::read_to_string(server.file("dora")).unwrap();
     assert!(text.contains("read_chat_history = false"), "{text}");
 
+    // History granted by number is the file's too.
+    write(
+        server.accounts.path(),
+        "fay",
+        "password = \"pw\"\n[access]\nraw_bits = [56]\n",
+    );
+    let opened = admin.call(ACCOUNT_READ, &[read("fay")]).await.unwrap();
+    let mut fields = user("fay", None, "Fay", AccessBits::empty());
+    fields.retain(|(t, _)| *t != tag::ACCESS);
+    fields.push((tag::ACCESS, opened.bytes(tag::ACCESS).unwrap()));
+    admin.call(ACCOUNT_MODIFY, &fields).await.unwrap();
+    let opened = admin.call(ACCOUNT_READ, &[read("fay")]).await.unwrap();
+    assert_eq!(
+        opened.bytes(tag::ACCESS).unwrap(),
+        access(&[bit::CHAT_HISTORY]).to_wire()
+    );
+
     // Taking read-chat away takes the history that followed it.
     admin
         .call(
@@ -736,6 +753,31 @@ async fn the_command_line_keeps_accounts_and_a_reload_reaches_their_sessions() {
     .unwrap();
     let shown = hxd::accounts::set_access(&config, "gus", &["read_chat=off".into()]).unwrap();
     assert!(!shown.contains("read_chat"), "{shown}");
+    // History set apart from read-chat stays apart unless named.
+    std::fs::write(
+        td.path().join("accounts/hal.toml"),
+        "password = \"pw\"\n[access]\nread_chat = false\nread_chat_history = false\n",
+    )
+    .unwrap();
+    let shown = hxd::accounts::set_access(&config, "hal", &["read_chat=on".into()]).unwrap();
+    assert!(
+        shown.contains("read_chat") && !shown.contains("read_chat_history"),
+        "{shown}"
+    );
+
+    // An account with an identity is purged by its fingerprint, which
+    // nothing can say once its file is gone.
+    let fp = "6htgz65xb7yfs53dmhdanfmk7fgn995n1571rjnz8a36a1fks5z0";
+    std::fs::write(
+        td.path().join("accounts/ida.toml"),
+        format!("password = \"pw\"\n[identity]\nfingerprint = \"{fp}\"\n"),
+    )
+    .unwrap();
+    let said = hxd::accounts::remove(&config, "ida").unwrap();
+    assert!(
+        said.contains(&format!("hxd inbox purge ida --fingerprint {fp}")),
+        "{said}"
+    );
 
     hxd::accounts::remove(&config, "frank").unwrap();
     assert_eq!(core.reload_accounts(), (0, 1));

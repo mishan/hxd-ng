@@ -531,6 +531,9 @@ impl Event {
                 subject, from_nick, ..
             } => subject.len() + from_nick.len(),
             Event::Joined(u) | Event::Changed(u) | Event::AvatarChanged(u) => u.nick.len(),
+            Event::AccountChanged(a) => {
+                std::mem::size_of::<crate::Account>() + a.login.len() + a.name.len()
+            }
             Event::ChatPurged { ids } => ids.len() * std::mem::size_of::<crate::history::LineId>(),
             Event::NewsPurged { articles } => {
                 articles.len()
@@ -1113,6 +1116,14 @@ pub struct Core {
     pub(crate) directory: Option<Arc<dyn crate::account::AccountDirectory>>,
     /// Account administration (`crate::admin`), or `None`, which refuses it.
     pub(crate) admin: Option<Arc<dyn crate::account::AccountAdmin>>,
+    /// Held by an account write, delete or reload from its file I/O
+    /// through telling the account's sessions, so no two land out of
+    /// order. Never with the roster lock held.
+    pub(crate) account_writes: Mutex<()>,
+    /// Bumped by each of those as it begins, so a login that read it
+    /// before authenticating can tell an edit landed before its session
+    /// was on the roster to be told (`Core::account_settled`).
+    pub(crate) account_epoch: std::sync::atomic::AtomicU64,
     pub(crate) inbox_policy: InboxPolicy,
     /// Where push notifications go, or `None` — which is the no-op, and
     /// the default. See [`crate::notify`].

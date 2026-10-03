@@ -798,11 +798,25 @@ fn write_access(table: &mut dyn toml_edit::TableLike, access: AccessBits, histor
             None => {}
         }
     }
-    let unnamed: Vec<i64> = access::names_of(access)
+    let raw_history = || {
+        table
+            .get("raw_bits")
+            .and_then(|item| item.as_array())
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|v| v.as_integer() == Some(bit::CHAT_HISTORY.into()))
+            })
+    };
+    let mut unnamed: Vec<i64> = access::names_of(access)
         .1
         .into_iter()
         .map(i64::from)
         .collect();
+    // History granted by number is as much the file's to keep as by name.
+    if history_unsaid && raw_history() {
+        unnamed.push(bit::CHAT_HISTORY.into());
+        unnamed.sort_unstable();
+    }
     let same = table
         .get("raw_bits")
         .and_then(|item| item.as_array())

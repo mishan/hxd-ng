@@ -7,7 +7,7 @@
 //! be given anything.
 
 use hxd_auth_file::FileAuth;
-use hxd_core::access::{self, bit, AccessBits};
+use hxd_core::access::{self, AccessBits};
 use hxd_core::account::FIELD_MAX_CHARS;
 use hxd_core::{Account, AccountAdmin, AccountEdit, AdminError};
 
@@ -200,10 +200,6 @@ pub fn set_access(config: &Config, login: &str, changes: &[String]) -> Result<St
         .read_account(login)
         .map_err(|e| refused(login, e))?
         .access;
-    // History that follows read-chat goes on following it unless this
-    // command says otherwise.
-    let follows = access.has(bit::CHAT_HISTORY) == access.has(bit::READ_CHAT)
-        && !changes.iter().any(|c| c.starts_with("read_chat_history="));
     for change in changes {
         let (key, on) = change
             .split_once('=')
@@ -220,16 +216,12 @@ pub fn set_access(config: &Config, login: &str, changes: &[String]) -> Result<St
             access.without(b)
         };
     }
-    if follows {
-        access = if access.has(bit::READ_CHAT) {
-            access.with(bit::CHAT_HISTORY)
-        } else {
-            access.without(bit::CHAT_HISTORY)
-        };
-    }
     let edit = AccountEdit {
         login: login.to_owned(),
         access: Some(access),
+        // History stays as the file has it — following read-chat, or set
+        // apart from it — unless this command names it.
+        history_unsaid: !changes.iter().any(|c| c.starts_with("read_chat_history=")),
         ..Default::default()
     };
     let account = auth
@@ -240,10 +232,22 @@ pub fn set_access(config: &Config, login: &str, changes: &[String]) -> Result<St
 
 /// `hxd account rm <login>`.
 pub fn remove(config: &Config, login: &str) -> Result<String, String> {
-    backend(config)
-        .delete_account(login, &|_| Ok(()))
+    let auth = backend(config);
+    // Read first: once the file is gone, nothing says which identity's
+    // mail, subscriptions and devices were the account's.
+    let account = auth.read_account(login).map_err(|e| refused(login, e))?;
+    auth.delete_account(login, &|_| Ok(()))
         .map_err(|e| refused(login, e))?;
+    let purge = match account.identity.fingerprint {
+        Some(fp) => format!(
+            "hxd inbox purge {} --fingerprint {}",
+            account.login,
+            hl_identity::Fingerprint(fp)
+        ),
+        None => format!("hxd inbox purge {}", account.login),
+    };
     Ok(format!(
-        "deleted {login}; `hxd inbox purge {login}` takes its mail and subscriptions too"
+        "deleted {}; `{purge}` takes its mail and subscriptions too",
+        account.login
     ))
 }

@@ -69,11 +69,23 @@ and — for an account that may not choose its own name — its nick. The
 roster changes first, so the domain's own checks see the new access at
 once; each frontend then hears `Event::AccountChanged` and updates its
 copy. A classic client is sent fresh self-info (354), as at login; an ng
-client is sent `account_changed` (§5.4).
+client is sent `account_changed` (§5.4). Either frontend handles what it
+was sent before the next request, so a request that follows a change is
+judged by the account as it now is.
+
+Account writes are taken one at a time, from the file through telling
+the sessions, so two edits cannot reach the sessions in the opposite
+order from the file. A login that read its account before an edit began
+and joined the roster after the edit told it is caught too: each write
+counts itself, a login notes the count before authenticating, and if it
+moved by the time the session is on the roster the account is read
+again and applied — or, if it is gone, the login is refused.
 
 Deleting an account disconnects every session logged in as it but the
 deleter's own (mhxd's `kick_transients`, on by default there). Its mail
-is left for `hxd inbox purge`.
+is left for `hxd inbox purge` — with `--fingerprint` for an account that
+linked an identity, which `hxd account rm` prints, since nothing can say
+it once the file is gone.
 
 An edit made outside the server — `hxd account`, or a hand edit — is
 applied the same way on SIGHUP (`Core::reload_accounts`): every session
@@ -191,8 +203,9 @@ goes on the command line, where `ps` shows it to everyone on the host.
 `add` takes its access from `--access`, from the account `--like` names
 (the guest account is the usual template), or none; an account with no
 password and no linked identity is an open door, so `--no-password` has
-to be said. `access` moves history with `read_chat` when the account's
-follows it, unless the same command names `read_chat_history`.
+to be said. `access` leaves history as the file has it — following
+`read_chat`, or set apart from it — unless the same command names
+`read_chat_history`.
 
 The command line and the server do not hold one lock between them, so
 an edit made while the server links an identity to the same account can

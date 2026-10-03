@@ -1884,6 +1884,7 @@ async fn login_phase(
             return None;
         }
     }
+    let epoch = ctx.core.account_epoch();
     let auth = ctx.auth.clone();
     let core = ctx.core.clone();
     let login_str = enc.decode_chars(&req.login, 31);
@@ -2079,6 +2080,13 @@ async fn login_phase(
     if let Some(hit) = ctx.core.end_if_banned(uid) {
         info!(login = %account.login, ban = hit.id, "login refused: banned while attaching");
         reply_error(tx, f.trans, &banned_text(&hit.reason));
+        return None;
+    }
+    // Likewise an account edited or deleted since it was read.
+    if off_reactor(&ctx.core, move |c| c.account_settled(uid, epoch)).await == Some(false) {
+        info!(login = %account.login, "login refused: account deleted while attaching");
+        ctx.core.end_session(uid);
+        reply_error(tx, f.trans, "Login failed.");
         return None;
     }
 
@@ -2644,6 +2652,27 @@ async fn session_loop(
 ) -> Option<&'static str> {
     loop {
         tokio::select! {
+            // Events first: one the session was handed before a request
+            // arrived is in force for it. An administrator's change to
+            // what this account may do is the one that matters — the
+            // request is judged by the account as it now is.
+            biased;
+            maybe = events.recv() => match maybe {
+                Some(se) => {
+                    if !deliver_event(tx, ctx, sess, se.event).await {
+                        info!(uid = sess.uid, "kicked");
+                        return Some("kicked");
+                    }
+                }
+                // The domain closed the stream: this client fell a whole
+                // channel behind (`LIVE_QUEUE_CAP`), or the session was
+                // ended elsewhere.
+                None if events.lagged() => {
+                    info!(uid = sess.uid, "not keeping up; disconnecting");
+                    return Some("slow_consumer");
+                }
+                None => return Some("replaced"),
+            },
             maybe = frames.recv() => match maybe {
                 Some(f) => {
                     trace_in(&f);
@@ -2664,22 +2693,6 @@ async fn session_loop(
                     dispatch(&f, tx, ctx, sess).await;
                 }
                 None => return None, // Reader exited: EOF, error, or bad frame.
-            },
-            maybe = events.recv() => match maybe {
-                Some(se) => {
-                    if !deliver_event(tx, ctx, sess, se.event).await {
-                        info!(uid = sess.uid, "kicked");
-                        return Some("kicked");
-                    }
-                }
-                // The domain closed the stream: this client fell a whole
-                // channel behind (`LIVE_QUEUE_CAP`), or the session was
-                // ended elsewhere.
-                None if events.lagged() => {
-                    info!(uid = sess.uid, "not keeping up; disconnecting");
-                    return Some("slow_consumer");
-                }
-                None => return Some("replaced"),
             },
             _ = tx.backlog.lagged.notified() => {
                 info!(uid = sess.uid, "not keeping up; disconnecting");

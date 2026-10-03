@@ -95,6 +95,7 @@ impl Core {
         };
         let admin = self.admin_backend(uid, need)?;
         let login = self.login_of(uid)?;
+        let _writing = self.begin_account_write();
         let account = admin.write_account(edit, &|existing, after| {
             let actor = actor(admin, &login, need)?;
             match (mode, existing) {
@@ -119,6 +120,7 @@ impl Core {
     pub fn account_delete(&self, uid: Uid, login: &str) -> Result<(), AdminError> {
         let admin = self.admin_backend(uid, bit::DELETE_USERS)?;
         let actor_login = self.login_of(uid)?;
+        let _writing = self.begin_account_write();
         admin.delete_account(login, &|account| {
             if beyond(&actor(admin, &actor_login, bit::DELETE_USERS)?, account) {
                 return Err(AdminError::Outranked);
@@ -139,6 +141,55 @@ impl Core {
         Ok(admin)
     }
 
+    /// Hold account writes, and say one has begun.
+    fn begin_account_write(&self) -> std::sync::MutexGuard<'_, ()> {
+        let guard = self
+            .account_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.account_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        guard
+    }
+
+    /// How many account writes have begun: read by a login before it
+    /// authenticates, for [`Core::account_settled`].
+    pub fn account_epoch(&self) -> u64 {
+        self.account_epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A login's last word on its account, once its session `uid` is on
+    /// the roster: an account write that began since `epoch` may have
+    /// told the account's sessions before this one was among them, so the
+    /// account is read again and applied. `false` when it is gone, and
+    /// the caller ends the session. Store I/O, so off the reactor.
+    pub fn account_settled(&self, uid: Uid, epoch: u64) -> bool {
+        let Some(admin) = self.admin.as_deref() else {
+            return true;
+        };
+        if self.account_epoch() == epoch {
+            return true;
+        }
+        let Ok(login) = self.login_of(uid) else {
+            return true;
+        };
+        let _writing = self
+            .account_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match admin.read_account(&login) {
+            Ok(account) => {
+                self.apply_account(&account);
+                true
+            }
+            Err(AdminError::NoSuchAccount) => false,
+            Err(e) => {
+                tracing::warn!(login, "account recheck skipped: {e}");
+                true
+            }
+        }
+    }
+
     fn login_of(&self, uid: Uid) -> Result<String, AdminError> {
         let r = self.roster.lock().unwrap();
         r.users
@@ -156,6 +207,7 @@ impl Core {
         let Some(admin) = self.admin.as_deref() else {
             return (0, 0);
         };
+        let _writing = self.begin_account_write();
         let mut logins: Vec<String> = {
             let r = self.roster.lock().unwrap();
             r.users
@@ -236,5 +288,140 @@ impl Core {
             }
         }
         uids.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::account::{IdentityLink, WriteCheck};
+    use crate::roster::test_attach;
+    use crate::AccessBits;
+
+    /// Accounts in a map, for what this module decides apart from files.
+    #[derive(Default)]
+    struct Accounts(Mutex<HashMap<String, Account>>);
+
+    fn account(login: &str, access: AccessBits) -> Account {
+        Account {
+            login: login.into(),
+            name: login.into(),
+            access,
+            can_detach: false,
+            set_subject: false,
+            file_list: true,
+            file_getinfo: true,
+            has_password: true,
+            has_inbox: false,
+            attach_news: false,
+            set_avatar: false,
+            moderate: false,
+            can_spam: false,
+            identity: IdentityLink::default(),
+        }
+    }
+
+    impl AccountAdmin for Accounts {
+        fn read_account(&self, login: &str) -> Result<Account, AdminError> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(login)
+                .cloned()
+                .ok_or(AdminError::NoSuchAccount)
+        }
+        fn list_accounts(&self) -> Result<Vec<Account>, AdminError> {
+            Ok(self.0.lock().unwrap().values().cloned().collect())
+        }
+        fn write_account(
+            &self,
+            edit: &AccountEdit,
+            check: WriteCheck<'_>,
+        ) -> Result<Account, AdminError> {
+            // Unlocked for the check, which reads accounts too.
+            let existing = self.read_account(&edit.login).ok();
+            let mut after = existing
+                .clone()
+                .unwrap_or_else(|| account(&edit.login, AccessBits::empty()));
+            if let Some(access) = edit.access {
+                after.access = access;
+            }
+            check(existing.as_ref(), &after)?;
+            self.0
+                .lock()
+                .unwrap()
+                .insert(edit.login.clone(), after.clone());
+            Ok(after)
+        }
+        fn delete_account(
+            &self,
+            login: &str,
+            check: &dyn Fn(&Account) -> Result<(), AdminError>,
+        ) -> Result<(), AdminError> {
+            check(&self.read_account(login)?)?;
+            self.0.lock().unwrap().remove(login);
+            Ok(())
+        }
+    }
+
+    const USERS: [u8; 4] = [
+        bit::READ_USERS,
+        bit::CREATE_USERS,
+        bit::MODIFY_USERS,
+        bit::DELETE_USERS,
+    ];
+
+    /// A core with `root`, who may do anything to accounts, logged in, and
+    /// `bob`, who may chat, not yet.
+    fn server() -> (Core, Arc<Accounts>, Uid) {
+        let accounts = Arc::new(Accounts::default());
+        let chat = AccessBits::empty().with(bit::SEND_CHAT);
+        let root = USERS.iter().fold(chat, |a, b| a.with(*b));
+        for a in [account("root", root), account("bob", chat)] {
+            accounts.0.lock().unwrap().insert(a.login.clone(), a);
+        }
+        let core = Core::new().with_admin(accounts.clone());
+        let (uid, _) = test_attach(&core, "root", root);
+        (core, accounts, uid)
+    }
+
+    #[test]
+    fn a_login_attached_after_its_account_changed_is_brought_up_to_date() {
+        let (core, _, root) = server();
+        // Bob's login reads the account, then root curbs it before bob's
+        // session is on the roster to be told.
+        let epoch = core.account_epoch();
+        let edit = AccountEdit {
+            login: "bob".into(),
+            access: Some(AccessBits::empty()),
+            ..Default::default()
+        };
+        core.account_write(root, &edit, WriteMode::Modify).unwrap();
+        let (bob, _) = test_attach(&core, "bob", AccessBits::empty().with(bit::SEND_CHAT));
+        assert!(core.account_settled(bob, epoch));
+        assert_eq!(core.access_of(bob), Some(AccessBits::empty()));
+    }
+
+    #[test]
+    fn a_login_attached_after_its_account_was_deleted_is_refused() {
+        let (core, _, root) = server();
+        let epoch = core.account_epoch();
+        core.account_delete(root, "bob").unwrap();
+        let (bob, _) = test_attach(&core, "bob", AccessBits::empty().with(bit::SEND_CHAT));
+        assert!(!core.account_settled(bob, epoch));
+    }
+
+    #[test]
+    fn a_login_nothing_changed_under_is_not_read_again() {
+        let (core, accounts, _) = server();
+        let epoch = core.account_epoch();
+        let (bob, _) = test_attach(&core, "bob", AccessBits::empty().with(bit::SEND_CHAT));
+        // Gone from the store, unbeknownst to anyone who would bump the
+        // epoch: a settled login does not look.
+        accounts.0.lock().unwrap().remove("bob");
+        assert!(core.account_settled(bob, epoch));
     }
 }

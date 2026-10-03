@@ -543,6 +543,7 @@ async fn handle_login(
             }
         },
     };
+    let epoch = ctx.core.account_epoch();
     let auth = ctx.auth.clone();
     let identity_state = ctx.identity.clone();
     let (login, password) = match identity {
@@ -774,6 +775,17 @@ async fn handle_login(
     if let Some(hit) = ctx.core.end_if_banned(uid) {
         info!(login = %account.login, ban = hit.id, "ng login refused: banned while attaching");
         let _ = send_frame(ws_tx, Message::Text(reply_err_banned(req.id, &hit))).await;
+        return None;
+    }
+    // Likewise an account edited or deleted since it was read.
+    if off_reactor(&ctx.core, move |c| c.account_settled(uid, epoch)).await == Some(false) {
+        info!(login = %account.login, "ng login refused: account deleted while attaching");
+        ctx.core.end_session(uid);
+        let _ = send_frame(
+            ws_tx,
+            Message::Text(reply_err(req.id, "login_failed", "Login failed.")),
+        )
+        .await;
         return None;
     }
     // ng has no agreement dance: announce immediately (the snapshot below
