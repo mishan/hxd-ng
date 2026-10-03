@@ -676,6 +676,10 @@ pub fn event_json(se: &SeqEvent) -> String {
             json!({ "from": { "uid": from, "nick": from_nick }, "text": text }),
         ),
         Event::Kicked => ("kicked", json!({})),
+        Event::AccountChanged(account) => (
+            "account_changed",
+            crate::accounts::access_json(account.access),
+        ),
         // A client blanks the line in place (moderation.md §5); history
         // already answers it as the tombstone.
         Event::ChatRedacted { id } => ("chat_redacted", json!({ "id": id })),

@@ -2299,7 +2299,7 @@ impl Core {
 /// [`Core::kick`], without its ban, under a roster lock the caller
 /// already holds: a ban is written to the store, and that is not done
 /// under the roster's lock.
-fn kick_in(r: &mut RosterInner, target: Uid) -> Result<String, ChatError> {
+pub(crate) fn kick_in(r: &mut RosterInner, target: Uid) -> Result<String, ChatError> {
     let sess = r.users.get(&target).ok_or(ChatError::NoSuchUser)?;
     // The server cannot be kicked off its own roster
     // (`docs/system-account.md` §2). Refused the same way a kick of

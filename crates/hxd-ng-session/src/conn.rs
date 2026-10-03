@@ -76,7 +76,7 @@ fn req_label(req: &str) -> &'static str {
     if let Some(k) = KNOWN.iter().find(|k| **k == req) {
         return k;
     }
-    for family in ["news_", "push_", "files_"] {
+    for family in ["news_", "push_", "files_", "account_"] {
         if req.starts_with(family) {
             return family.trim_end_matches('_');
         }
@@ -108,10 +108,12 @@ fn request_weight(req: &str) -> u32 {
         | "voice_answer" | "voice_mute" | "video_state" | "news_seen" | "news_subscribe"
         | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
         | "files_mkdir" | "files_delete" | "files_move" | "files_comment" | "report_close"
-        | "redact" | "revoke" | "kick" => 2,
+        | "redact" | "revoke" | "kick" | "account_get" | "account_create" | "account_update"
+        | "account_delete" => 2,
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
-        | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge" => 4,
+        | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
+        | "account_list" => 4,
         _ => 1,
     }
 }
@@ -139,6 +141,17 @@ pub(crate) struct SessState {
     /// roster does not carry.
     pub(crate) file_list: bool,
     pub(crate) file_getinfo: bool,
+}
+
+impl SessState {
+    /// Keep up with an administrator's change to the account.
+    fn note(&mut self, event: &hxd_core::Event) {
+        if let hxd_core::Event::AccountChanged(account) = event {
+            self.access = account.access;
+            self.file_list = account.file_list;
+            self.file_getinfo = account.file_getinfo;
+        }
+    }
 }
 
 /// Why the connection loop ended, deciding the session's fate.
@@ -190,7 +203,7 @@ pub(crate) async fn run(
         },
     };
 
-    let (state, mut events) = match first.req.as_str() {
+    let (mut state, mut events) = match first.req.as_str() {
         "login" => match handle_login(
             &ctx,
             peer,
@@ -285,11 +298,13 @@ pub(crate) async fn run(
                     // storm cost, every join and part being an event to
                     // everyone present. A kick is the batch's last word.
                     let mut kicked = matches!(se.event, hxd_core::Event::Kicked);
+                    state.note(&se.event);
                     let mut batch = vec![event_json(&se)];
                     let mut bytes = batch[0].len();
                     while !kicked && bytes < WRITE_BATCH {
                         let Ok(se) = events.try_recv() else { break };
                         kicked = matches!(se.event, hxd_core::Event::Kicked);
+                        state.note(&se.event);
                         let text = event_json(&se);
                         bytes += text.len();
                         batch.push(text);
@@ -348,7 +363,7 @@ pub(crate) async fn run(
                     } else if req.req == "sync" {
                         // `sync` is the one request that needs the event
                         // channel itself; see `handle_sync`.
-                        handle_sync(&ctx, &state, &req, &mut ws_tx, &mut events).await
+                        handle_sync(&ctx, &mut state, &req, &mut ws_tx, &mut events).await
                     } else {
                         dispatch(&ctx, &state, &req, &mut ws_tx).await
                     };
@@ -528,6 +543,7 @@ async fn handle_login(
             }
         },
     };
+    let epoch = ctx.core.account_epoch();
     let auth = ctx.auth.clone();
     let identity_state = ctx.identity.clone();
     let (login, password) = match identity {
@@ -761,6 +777,17 @@ async fn handle_login(
         let _ = send_frame(ws_tx, Message::Text(reply_err_banned(req.id, &hit))).await;
         return None;
     }
+    // Likewise an account edited or deleted since it was read.
+    if off_reactor(&ctx.core, move |c| c.account_settled(uid, epoch)).await == Some(false) {
+        info!(login = %account.login, "ng login refused: account deleted while attaching");
+        ctx.core.end_session(uid);
+        let _ = send_frame(
+            ws_tx,
+            Message::Text(reply_err(req.id, "login_failed", "Login failed.")),
+        )
+        .await;
+        return None;
+    }
     // ng has no agreement dance: announce immediately (the snapshot below
     // then includes self), with the owner's avatar already on it.
     if ctx.core.avatar_policy().is_some() {
@@ -864,6 +891,10 @@ async fn handle_login(
     if ctx.core.avatar_policy().is_some() && !caps.iter().any(|c| c == "avatars") {
         caps.push("avatars".into());
     }
+    // And `accounts`, whenever accounts can be administered here.
+    if ctx.core.accounts_enabled() && !caps.iter().any(|c| c == "accounts") {
+        caps.push("accounts".into());
+    }
     // And `banner`, whenever there is one to show.
     if ctx.banner.is_some() && !caps.iter().any(|c| c == "banner") {
         caps.push("banner".into());
@@ -945,6 +976,10 @@ async fn handle_login(
         .flatten();
     if let Some(news) = news {
         ok["news"] = news;
+    }
+    // What this session may do, for a client deciding what to offer.
+    if ctx.core.accounts_enabled() {
+        ok["accounts"] = crate::accounts::access_json(account.access);
     }
     // Open reports, for a moderator's badge (docs/moderation.md §4.5).
     let moderation = off_reactor(&ctx.core, move |c| crate::moderation::login_json(c, uid))
@@ -1296,7 +1331,7 @@ async fn end_kicked(ctx: &NgCtx, state: &SessState, ws_tx: &mut WsTx) {
 /// whatever is stamped after the snapshot gets a later seq by construction.
 async fn handle_sync(
     ctx: &NgCtx,
-    state: &SessState,
+    state: &mut SessState,
     req: &ReqEnvelope,
     ws_tx: &mut WsTx,
     events: &mut Events,
@@ -1312,6 +1347,7 @@ async fn handle_sync(
             Ok(se) => {
                 seq = seq.max(se.seq);
                 kicked |= matches!(se.event, hxd_core::Event::Kicked);
+                state.note(&se.event);
                 if !send_frame(ws_tx, Message::Text(event_json(&se))).await {
                     return Flow::Dead;
                 }
@@ -1330,17 +1366,20 @@ async fn handle_sync(
         end_kicked(ctx, state, ws_tx).await;
         return Flow::LoggedOut;
     }
-    let out = reply_ok_with_users(
-        req.id,
-        json!({
-            "server": {
-                "name": ctx.cfg.server_name,
-                "subject": ctx.core.public_subject(),
-            },
-            "seq": seq,
-        }),
-        &ctx.core.snapshot(),
-    );
+    let mut ok = json!({
+        "server": {
+            "name": ctx.cfg.server_name,
+            "subject": ctx.core.public_subject(),
+        },
+        "seq": seq,
+    });
+    // An `account_changed` the gap swallowed is said again here, from
+    // the roster, which the gap did not touch.
+    state.access = ctx.core.access_of(state.uid).unwrap_or(state.access);
+    if ctx.core.accounts_enabled() {
+        ok["accounts"] = crate::accounts::access_json(state.access);
+    }
+    let out = reply_ok_with_users(req.id, ok, &ctx.core.snapshot());
     if !send_frame(ws_tx, Message::Text(out)).await {
         return Flow::Dead;
     }
@@ -1384,9 +1423,10 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
 /// is the 1.2 flat one's, which an ng post is not, and at that price an
 /// editor who files a few replies in as many seconds is banned for
 /// it.) The file-area changes are its Delete File, New Folder, Set File
-/// Info and Move File, 7 each. Whatever else this wire asks for, it has
-/// no classic counterpart to be priced by, and is held to the request
-/// limit instead. As `(type, points)`.
+/// Info and Move File, 7 each, and the account requests its New, Delete,
+/// Open and Set User, 20 each but Open's 10. Whatever else this wire asks
+/// for, it has no classic counterpart to be priced by, and is held to the
+/// request limit instead. As `(type, points)`.
 fn spam_charge(req: &str) -> Option<(u32, u32)> {
     match req {
         "chat" => Some((0x69, 2)),
@@ -1400,6 +1440,10 @@ fn spam_charge(req: &str) -> Option<(u32, u32)> {
         "files_mkdir" => Some((0xcd, 7)),
         "files_comment" => Some((0xcf, 7)),
         "files_move" => Some((0xd0, 7)),
+        "account_create" => Some((0x15e, 20)),
+        "account_delete" => Some((0x15f, 20)),
+        "account_get" => Some((0x160, 10)),
+        "account_update" => Some((0x161, 20)),
         _ => None,
     }
 }
@@ -1997,6 +2041,7 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
 
         // Reports and the acts (docs/moderation.md §5).
         r if crate::moderation::handles(r) => crate::moderation::handle(ctx, state, req).await,
+        r if crate::accounts::handles(r) => crate::accounts::handle(ctx, state, req).await,
 
         // --- Files (docs/files-plan.md) -------------------------------
         r if r.starts_with("files_") => crate::files::handle(ctx, state, req).await,

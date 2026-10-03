@@ -281,6 +281,99 @@ pub trait AuthBackend: Send + Sync + 'static {
     fn reserved_by(&self, name: &str) -> Result<Option<String>, AuthError>;
 }
 
+/// The longest login, name or password an account takes, in
+/// characters: the classic wire cuts each there, so a longer one could
+/// never be typed on it.
+pub const FIELD_MAX_CHARS: usize = 31;
+
+/// An administrator's change to one account. `None` keeps what the
+/// account has; a new account takes its login as its name, no password
+/// and no access.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountEdit {
+    pub login: String,
+    pub name: Option<String>,
+    /// `Some("")` clears the password.
+    pub password: Option<String>,
+    pub access: Option<AccessBits>,
+    /// Bit 56 (chat history) is not this edit's to say, because the
+    /// editor it came from cannot show it: the account keeps whatever it
+    /// had, which for a new one is to follow read-chat.
+    pub history_unsaid: bool,
+}
+
+/// Why an account was not read, written or deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminError {
+    /// The asking session lacks the access bit the act needs.
+    NotAllowed,
+    /// The account may, or would be allowed to, do something the asking
+    /// session's account may not.
+    Outranked,
+    NoSuchAccount,
+    /// A create named a login an account already has.
+    Exists,
+    /// Not a login this backend can store, or one reserved for the
+    /// server.
+    InvalidLogin,
+    /// This server has no account administration.
+    Unsupported,
+    /// The backend itself failed. For the log, not the client.
+    Backend(String),
+}
+
+impl std::fmt::Display for AdminError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AdminError::NotAllowed => "You are not allowed to do that.",
+            AdminError::Outranked => {
+                "That account may do, or would be allowed to do, something you may not."
+            }
+            AdminError::NoSuchAccount => "There is no such account.",
+            AdminError::Exists => "That account already exists.",
+            AdminError::InvalidLogin => {
+                "A login is up to 31 letters, digits and _ - . @, not starting with a dot."
+            }
+            AdminError::Unsupported => "This server does not administer accounts.",
+            AdminError::Backend(e) => return write!(f, "account store: {e}"),
+        })
+    }
+}
+
+/// What a write asks before it lands: the account as it is (`None` when
+/// there is none) and as the edit would leave it. Run by the backend with
+/// its writes held, so nothing changes the account between the two.
+pub type WriteCheck<'a> = &'a dyn Fn(Option<&Account>, &Account) -> Result<(), AdminError>;
+
+/// Account administration: reading and writing accounts on an
+/// administrator's behalf. Separate from [`AuthBackend`], which answers
+/// for a login and never changes who may do what.
+pub trait AccountAdmin: Send + Sync + 'static {
+    /// The account `login` names, exactly: an empty login is no account,
+    /// not the guest one.
+    fn read_account(&self, login: &str) -> Result<Account, AdminError>;
+
+    /// Every account, by login.
+    fn list_accounts(&self) -> Result<Vec<Account>, AdminError>;
+
+    /// Apply `edit`, making the account if there is none, once `check`
+    /// has passed; refusing is `check`'s. Answers the account as it now
+    /// reads. Whatever the backend keeps beside what an edit names —
+    /// identity links, server-local policy — is left as it was.
+    fn write_account(
+        &self,
+        edit: &AccountEdit,
+        check: WriteCheck<'_>,
+    ) -> Result<Account, AdminError>;
+
+    /// Delete the account `login` names, once `check` has passed on it.
+    fn delete_account(
+        &self,
+        login: &str,
+        check: &dyn Fn(&Account) -> Result<(), AdminError>,
+    ) -> Result<(), AdminError>;
+}
+
 /// A read-only look at accounts nobody is logged into.
 ///
 /// Authentication answers "is this person who they say they are"; this

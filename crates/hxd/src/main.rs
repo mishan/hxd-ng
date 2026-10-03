@@ -62,7 +62,8 @@ fn init_tracing() {
 /// do it. `systemctl reload` sends exactly this. It also re-reads
 /// `[tls]`'s certificate and key from the paths the server started with,
 /// so a renewal reaches the next handshake without dropping a session,
-/// and `[banner]`'s file, which the next client to agree is shown.
+/// `[banner]`'s file, which the next client to agree is shown, and the
+/// account files of everyone logged in.
 #[cfg(unix)]
 async fn reload_on_hangup(
     core: std::sync::Arc<hxd_core::Core>,
@@ -91,6 +92,14 @@ async fn reload_on_hangup(
         // new ban now refuses.
         core.reload_bans();
         tracing::info!("SIGHUP: bans reloaded");
+        // What `hxd account` or a hand edit changed meanwhile.
+        let accounts = core.clone();
+        match tokio::task::spawn_blocking(move || accounts.reload_accounts()).await {
+            Ok((told, ended)) => {
+                tracing::info!("SIGHUP: accounts reloaded; {told} sessions told, {ended} ended")
+            }
+            Err(e) => tracing::error!("SIGHUP: account reload failed: {e}"),
+        }
         if let Some(reg) = registrar.as_deref() {
             match hxd::registrar::reload(reg, &path) {
                 Ok((reserved, invites)) => tracing::info!(
@@ -230,6 +239,28 @@ enum Command {
     BanLift {
         id: u64,
     },
+    AccountList,
+    AccountShow {
+        login: String,
+    },
+    AccountAdd {
+        login: String,
+        name: Option<String>,
+        like: Option<String>,
+        access: Option<String>,
+        password: hxd::accounts::Password,
+    },
+    AccountPasswd {
+        login: String,
+        password: hxd::accounts::Password,
+    },
+    AccountAccess {
+        login: String,
+        changes: Vec<String>,
+    },
+    AccountRm {
+        login: String,
+    },
 }
 
 const USAGE: &str = "usage:\n  \
@@ -251,7 +282,14 @@ hxd [--config …] reports close <id> --outcome dismissed|duplicate [--note N] [
 hxd [--config …] moderation log [--limit N]\n  \
 hxd [--config …] ban add <target> --reason R [--for 1d] [--note N]\n  \
 hxd [--config …] ban list [--all]\n  \
-hxd [--config …] ban lift <id>\n\n\
+hxd [--config …] ban lift <id>\n  \
+hxd [--config …] account list\n  \
+hxd [--config …] account show <login>\n  \
+hxd [--config …] account add <login> [--name N] [--access KEY,… | --like LOGIN]\n    \
+(--password-stdin | --password-file F | --no-password)\n  \
+hxd [--config …] account passwd <login> (--password-stdin | --password-file F)\n  \
+hxd [--config …] account access <login> KEY=on|off…\n  \
+hxd [--config …] account rm <login>\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
 `push rekey` replaces the server's VAPID key and drops every registered\n\
@@ -293,7 +331,14 @@ an address or block (`192.0.2.7`, `10.0.0.0/8`, `2001:db8::/48`),\n\
 `identity:FINGERPRINT`, or `*@HOST` for every identity a registrar\n\
 issued. `ban list` is what stands (--all for the record), `ban lift`\n\
 ends one and every row the same act placed. A running server applies\n\
-either on SIGHUP, ending the sessions a new ban refuses.";
+either on SIGHUP, ending the sessions a new ban refuses.\n\n\
+`account` edits the accounts directory, keeping each file's comments.\n\
+`add` takes its access from --access (the [access] keys of\n\
+docs/access-bits.md), or from the account --like names; a password\n\
+never goes on the command line. `rm` leaves the account's mail for\n\
+`inbox purge`. A running server applies an edit to whoever is logged\n\
+in as the account on SIGHUP, ending the sessions of one removed; a\n\
+new login sees it at once.";
 
 fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut config = PathBuf::from("hxd-ng.toml");
@@ -314,6 +359,11 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut of = None;
     let mut limit = None;
     let mut ban_for = None;
+    let mut name = None;
+    let mut like = None;
+    let mut access = None;
+    let mut password = hxd::accounts::Password::None;
+    let mut no_password = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -367,6 +417,22 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                         .ok_or_else(|| "--for needs a duration".to_string())?,
                 )?);
             }
+            "--name" => {
+                name = Some(args.next().ok_or("--name needs a value")?);
+            }
+            "--like" => {
+                like = Some(args.next().ok_or("--like needs a login")?);
+            }
+            "--access" => {
+                access = Some(args.next().ok_or("--access needs KEY,KEY…")?);
+            }
+            "--password-stdin" => password = hxd::accounts::Password::Stdin,
+            "--password-file" => {
+                password = hxd::accounts::Password::File(PathBuf::from(
+                    args.next().ok_or("--password-file needs a path")?,
+                ));
+            }
+            "--no-password" => no_password = true,
             "--no-block" => no_block = true,
             "--all" => all = true,
             "--outcome" => {
@@ -459,10 +525,23 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     if (fingerprint.is_some() || dry_run)
         && matches!(
             words.first(),
-            Some(&"history" | &"media" | &"reports" | &"moderation" | &"ban")
+            Some(&"history" | &"media" | &"reports" | &"moderation" | &"ban" | &"account")
         )
     {
         return Err("--fingerprint and --dry-run belong to `inbox purge` and `purge`".to_string());
+    }
+    let adding = matches!(words[..], ["account", "add", _]);
+    if (name.is_some() || like.is_some() || access.is_some() || no_password) && !adding {
+        return Err("--name, --like, --access and --no-password belong to `account add`".into());
+    }
+    if !matches!(password, hxd::accounts::Password::None)
+        && !adding
+        && !matches!(words[..], ["account", "passwd", _])
+    {
+        return Err(
+            "--password-stdin and --password-file belong to `account add` and `account passwd`"
+                .into(),
+        );
     }
     if (identity.is_some() || keep_age) && !matches!(words[..], ["registrar", "recover", _]) {
         return Err("--identity and --keep-age belong to `registrar recover`".to_string());
@@ -572,6 +651,45 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
         ["ban", "list"] => Command::BanList { all },
         ["ban", "lift", id] => Command::BanLift {
             id: id.parse().map_err(|_| format!("{id:?} is not a ban id"))?,
+        },
+        ["account", "list"] => Command::AccountList,
+        ["account", "show", login] => Command::AccountShow {
+            login: login.to_string(),
+        },
+        ["account", "add", login] => {
+            if like.is_some() && access.is_some() {
+                return Err("`account add` takes --access or --like, not both".into());
+            }
+            if matches!(password, hxd::accounts::Password::None) != no_password {
+                return Err("`account add` needs --password-stdin, --password-file or \
+                     --no-password, and only one"
+                    .into());
+            }
+            Command::AccountAdd {
+                login: login.to_string(),
+                name,
+                like,
+                access,
+                password,
+            }
+        }
+        ["account", "passwd", login] => {
+            if matches!(password, hxd::accounts::Password::None) {
+                return Err("`account passwd` needs --password-stdin or --password-file".into());
+            }
+            Command::AccountPasswd {
+                login: login.to_string(),
+                password,
+            }
+        }
+        ["account", "access", login, ref changes @ ..] if !changes.is_empty() => {
+            Command::AccountAccess {
+                login: login.to_string(),
+                changes: changes.iter().map(|c| c.to_string()).collect(),
+            }
+        }
+        ["account", "rm", login] => Command::AccountRm {
+            login: login.to_string(),
         },
         ["inbox", "purge", login] => Command::InboxPurge {
             login: login.to_string(),
@@ -752,6 +870,46 @@ async fn main() {
             }
             Command::BanLift { id } => {
                 println!("{}", hxd::moderation::ban_lift(&config, *id)?);
+                return Ok(());
+            }
+            Command::AccountList => {
+                println!("{}", hxd::accounts::list(&config)?);
+                return Ok(());
+            }
+            Command::AccountShow { login } => {
+                println!("{}", hxd::accounts::show(&config, login)?);
+                return Ok(());
+            }
+            Command::AccountAdd {
+                login,
+                name,
+                like,
+                access,
+                password,
+            } => {
+                println!(
+                    "{}",
+                    hxd::accounts::add(
+                        &config,
+                        login,
+                        name.clone(),
+                        like.as_deref(),
+                        access.as_deref(),
+                        password,
+                    )?
+                );
+                return Ok(());
+            }
+            Command::AccountPasswd { login, password } => {
+                println!("{}", hxd::accounts::passwd(&config, login, password)?);
+                return Ok(());
+            }
+            Command::AccountAccess { login, changes } => {
+                println!("{}", hxd::accounts::set_access(&config, login, changes)?);
+                return Ok(());
+            }
+            Command::AccountRm { login } => {
+                println!("{}", hxd::accounts::remove(&config, login)?);
                 return Ok(());
             }
             _ => {}

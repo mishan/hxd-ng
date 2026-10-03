@@ -21,6 +21,7 @@ use hxd_ng_session::{
 use hxd_session::{cap, Caps, ServerConfig, ServerCtx, TrtpLogin};
 use serde::Deserialize;
 
+pub mod accounts;
 pub mod banner;
 pub mod files;
 pub mod metrics;
@@ -3633,6 +3634,7 @@ pub fn build_ctx(
     // Say at startup what an operator would otherwise learn from a user:
     // an account file that does not parse, or one nothing can log in to.
     auth.audit();
+    let core = core.with_admin(auth.clone());
     let stores = open_runtime_stores(config)?;
     let core = match stores.inbox {
         // The same FileAuth answers both "is this person who they say

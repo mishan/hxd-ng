@@ -389,6 +389,11 @@ pub enum Event {
     },
     /// The recipient has been kicked; its transport should close.
     Kicked,
+    /// An administrator changed the account this session is logged in
+    /// as (`Core::account_write`): the account as it now reads, for a
+    /// frontend that keeps its own copy of what the session may do. The
+    /// roster's copy has already changed.
+    AccountChanged(Box<crate::Account>),
     /// A public line was redacted (`docs/moderation.md` §3.1). Delivered
     /// to every session that reads public chat; a client that rendered
     /// the line blanks it in place, and one that has not never sees it
@@ -526,6 +531,9 @@ impl Event {
                 subject, from_nick, ..
             } => subject.len() + from_nick.len(),
             Event::Joined(u) | Event::Changed(u) | Event::AvatarChanged(u) => u.nick.len(),
+            Event::AccountChanged(a) => {
+                std::mem::size_of::<crate::Account>() + a.login.len() + a.name.len()
+            }
             Event::ChatPurged { ids } => ids.len() * std::mem::size_of::<crate::history::LineId>(),
             Event::NewsPurged { articles } => {
                 articles.len()
@@ -553,6 +561,7 @@ impl Event {
             Event::Msg { .. } => "msg",
             Event::Broadcast { .. } => "broadcast",
             Event::Kicked => "kicked",
+            Event::AccountChanged(..) => "account_changed",
             Event::ChatRedacted { .. } => "chat_redacted",
             Event::ChatPurged { .. } => "chat_purged",
             Event::Report(..) => "report",
@@ -1105,6 +1114,16 @@ pub struct Core {
     /// The markdown parser behind `[news] markdown = "render"`, or `None`.
     pub(crate) body_renderer: Option<Arc<dyn crate::news::BodyRenderer>>,
     pub(crate) directory: Option<Arc<dyn crate::account::AccountDirectory>>,
+    /// Account administration (`crate::admin`), or `None`, which refuses it.
+    pub(crate) admin: Option<Arc<dyn crate::account::AccountAdmin>>,
+    /// Held by an account write, delete or reload from its file I/O
+    /// through telling the account's sessions, so no two land out of
+    /// order. Never with the roster lock held.
+    pub(crate) account_writes: Mutex<()>,
+    /// Bumped by each of those as it begins, so a login that read it
+    /// before authenticating can tell an edit landed before its session
+    /// was on the roster to be told (`Core::account_settled`).
+    pub(crate) account_epoch: std::sync::atomic::AtomicU64,
     pub(crate) inbox_policy: InboxPolicy,
     /// Where push notifications go, or `None` — which is the no-op, and
     /// the default. See [`crate::notify`].
@@ -1506,6 +1525,13 @@ impl Core {
     /// news is a question about the account (`docs/news.md` §10.5).
     pub fn with_accounts(mut self, directory: Arc<dyn crate::account::AccountDirectory>) -> Self {
         self.directory = Some(directory);
+        self
+    }
+
+    /// Let sessions holding the user-editing bits read and change
+    /// accounts (`crate::admin`).
+    pub fn with_admin(mut self, admin: Arc<dyn crate::account::AccountAdmin>) -> Self {
+        self.admin = Some(admin);
         self
     }
 

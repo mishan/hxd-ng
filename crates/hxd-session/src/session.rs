@@ -38,6 +38,7 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
+use crate::accounts;
 use crate::banner::Banner;
 use crate::caps::{cap, Caps};
 use crate::encoding::TextEncoding;
@@ -550,6 +551,7 @@ fn type_label(ty: u32) -> Kind<'static> {
     let known = HANDLED.iter().any(|h| h.as_u32() == ty)
         || news::handles(ty)
         || file_manage::handles(ty)
+        || accounts::handles(ty)
         || ty == media::trans::UPLOAD_MEDIA
         || ty == media::trans::DOWNLOAD_MEDIA
         || matches!(ty, gif_icons::GET_LIST | gif_icons::GET | gif_icons::SET);
@@ -1882,6 +1884,7 @@ async fn login_phase(
             return None;
         }
     }
+    let epoch = ctx.core.account_epoch();
     let auth = ctx.auth.clone();
     let core = ctx.core.clone();
     let login_str = enc.decode_chars(&req.login, 31);
@@ -2079,6 +2082,13 @@ async fn login_phase(
         reply_error(tx, f.trans, &banned_text(&hit.reason));
         return None;
     }
+    // Likewise an account edited or deleted since it was read.
+    if off_reactor(&ctx.core, move |c| c.account_settled(uid, epoch)).await == Some(false) {
+        info!(login = %account.login, "login refused: account deleted while attaching");
+        ctx.core.end_session(uid);
+        reply_error(tx, f.trans, "Login failed.");
+        return None;
+    }
 
     // Login reply. A version-0 server sends only the uid (and a 1.0/1.2
     // client wouldn't know what to do with more).
@@ -2196,23 +2206,9 @@ pub(crate) async fn off_reactor<T: Send + 'static>(
         .ok()
 }
 
-/// The "loginupdate" moment: hand the client its self-info and make it
-/// visible (which broadcasts the join to everyone else).
-/// `permit` is the login's place ([`hxd_core::Core::admit_login`]), when
-/// this is the login finishing at once: given back as soon as the room
-/// has been told, before the inbox is flushed, which is store work the
-/// room does not wait on. A 1.5 client that answers the agreement first
-/// comes here from the session loop with none: its login's place went
-/// with `login_phase`, so its join is outside the bound.
-async fn complete_login(
-    tx: &Tx,
-    ctx: &ServerCtx,
-    sess: &mut Session,
-    permit: Option<hxd_core::LoginPermit>,
-) {
-    if sess.announced {
-        return;
-    }
+/// Tell the client what its account may do, as at login and again when
+/// an administrator changes it.
+fn push_self_info(tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     if ctx.cfg.version != 0 {
         if let Some(me) = ctx.core.user(sess.uid) {
             // Real access bits — not the reference server's all-ones fake.
@@ -2231,6 +2227,26 @@ async fn complete_login(
             );
         }
     }
+}
+
+/// The "loginupdate" moment: hand the client its self-info and make it
+/// visible (which broadcasts the join to everyone else).
+/// `permit` is the login's place ([`hxd_core::Core::admit_login`]), when
+/// this is the login finishing at once: given back as soon as the room
+/// has been told, before the inbox is flushed, which is store work the
+/// room does not wait on. A 1.5 client that answers the agreement first
+/// comes here from the session loop with none: its login's place went
+/// with `login_phase`, so its join is outside the bound.
+async fn complete_login(
+    tx: &Tx,
+    ctx: &ServerCtx,
+    sess: &mut Session,
+    permit: Option<hxd_core::LoginPermit>,
+) {
+    if sess.announced {
+        return;
+    }
+    push_self_info(tx, ctx, sess);
     // The owner's avatar, before anyone is told the session exists. A
     // store read, so off the reactor — and only on a server with avatars,
     // so one without has nothing between the login and the join.
@@ -2273,7 +2289,7 @@ fn system_msg(tx: &Tx, ctx: &ServerCtx, sess: &Session, text: &str) {
 
 /// Encode one domain event onto the wire. Returns `false` when the session
 /// must end (kicked).
-async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
+async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) -> bool {
     match ev {
         Event::Changed(u) => {
             push(
@@ -2619,6 +2635,10 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
         | Event::NewsNodeDeleted { .. }
         | Event::NewsNotify(_) => {}
         Event::Kicked => return false,
+        Event::AccountChanged(account) => {
+            sess.account = *account;
+            push_self_info(tx, ctx, sess);
+        }
     }
     true
 }
@@ -2632,6 +2652,27 @@ async fn session_loop(
 ) -> Option<&'static str> {
     loop {
         tokio::select! {
+            // Events first: one the session was handed before a request
+            // arrived is in force for it. An administrator's change to
+            // what this account may do is the one that matters — the
+            // request is judged by the account as it now is.
+            biased;
+            maybe = events.recv() => match maybe {
+                Some(se) => {
+                    if !deliver_event(tx, ctx, sess, se.event).await {
+                        info!(uid = sess.uid, "kicked");
+                        return Some("kicked");
+                    }
+                }
+                // The domain closed the stream: this client fell a whole
+                // channel behind (`LIVE_QUEUE_CAP`), or the session was
+                // ended elsewhere.
+                None if events.lagged() => {
+                    info!(uid = sess.uid, "not keeping up; disconnecting");
+                    return Some("slow_consumer");
+                }
+                None => return Some("replaced"),
+            },
             maybe = frames.recv() => match maybe {
                 Some(f) => {
                     trace_in(&f);
@@ -2652,22 +2693,6 @@ async fn session_loop(
                     dispatch(&f, tx, ctx, sess).await;
                 }
                 None => return None, // Reader exited: EOF, error, or bad frame.
-            },
-            maybe = events.recv() => match maybe {
-                Some(se) => {
-                    if !deliver_event(tx, ctx, sess, se.event).await {
-                        info!(uid = sess.uid, "kicked");
-                        return Some("kicked");
-                    }
-                }
-                // The domain closed the stream: this client fell a whole
-                // channel behind (`LIVE_QUEUE_CAP`), or the session was
-                // ended elsewhere.
-                None if events.lagged() => {
-                    info!(uid = sess.uid, "not keeping up; disconnecting");
-                    return Some("slow_consumer");
-                }
-                None => return Some("replaced"),
             },
             _ = tx.backlog.lagged.notified() => {
                 info!(uid = sess.uid, "not keeping up; disconnecting");
@@ -4248,6 +4273,21 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 Err(file_manage::Refusal::File(error)) => {
                     reply_error(tx, f.trans, file_error_text(&error))
                 }
+            }
+        }
+
+        t if accounts::handles(t) => {
+            let fields: Vec<_> = f.chunks().map(|c| (c.tag, c.data.to_vec())).collect();
+            let (uid, enc) = (sess.uid, sess.enc);
+            // The account store is file I/O.
+            let done = off_reactor(&ctx.core, move |c| {
+                accounts::transaction(c, uid, enc, t, &fields)
+            })
+            .await;
+            match done {
+                Some(Ok(chunks)) => reply(tx, f.trans, chunks),
+                Some(Err(msg)) => reply_error(tx, f.trans, &msg),
+                None => reply_error(tx, f.trans, "The server could not reach its accounts."),
             }
         }
 

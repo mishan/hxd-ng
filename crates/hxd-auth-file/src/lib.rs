@@ -35,67 +35,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use hxd_core::access::{bit, AccessBits};
+use hxd_core::access::{self, bit, AccessBits, NAMES};
 use hxd_core::inbox::Mailbox;
 use hxd_core::{
-    Account, AccountDirectory, AuthBackend, AuthError, IdentityLink, LinkOutcome, Proof,
-    UnlinkOutcome,
+    Account, AccountAdmin, AccountDirectory, AccountEdit, AdminError, AuthBackend, AuthError,
+    IdentityLink, LinkOutcome, Proof, UnlinkOutcome, WriteCheck,
 };
 use serde::Deserialize;
-
-/// Named access keys, mapped to protocol bit numbers. Names mirror
-/// `hxd_core::access::bit` (and therefore mhxd's field names).
-const NAMED_BITS: &[(&str, u8)] = &[
-    ("delete_files", bit::DELETE_FILES),
-    ("upload_files", bit::UPLOAD_FILES),
-    ("download_files", bit::DOWNLOAD_FILES),
-    ("rename_files", bit::RENAME_FILES),
-    ("move_files", bit::MOVE_FILES),
-    ("create_folders", bit::CREATE_FOLDERS),
-    ("delete_folders", bit::DELETE_FOLDERS),
-    ("rename_folders", bit::RENAME_FOLDERS),
-    ("move_folders", bit::MOVE_FOLDERS),
-    ("read_chat", bit::READ_CHAT),
-    ("send_chat", bit::SEND_CHAT),
-    ("create_pchats", bit::CREATE_PCHATS),
-    ("create_users", bit::CREATE_USERS),
-    ("delete_users", bit::DELETE_USERS),
-    ("read_users", bit::READ_USERS),
-    ("modify_users", bit::MODIFY_USERS),
-    ("read_news", bit::READ_NEWS),
-    ("post_news", bit::POST_NEWS),
-    ("disconnect_users", bit::DISCONNECT_USERS),
-    ("cant_be_disconnected", bit::CANT_BE_DISCONNECTED),
-    ("get_user_info", bit::GET_USER_INFO),
-    ("upload_anywhere", bit::UPLOAD_ANYWHERE),
-    ("use_any_name", bit::USE_ANY_NAME),
-    ("dont_show_agreement", bit::DONT_SHOW_AGREEMENT),
-    ("comment_files", bit::COMMENT_FILES),
-    ("comment_folders", bit::COMMENT_FOLDERS),
-    ("view_drop_boxes", bit::VIEW_DROP_BOXES),
-    ("make_aliases", bit::MAKE_ALIASES),
-    ("can_broadcast", bit::CAN_BROADCAST),
-    ("delete_articles", bit::DELETE_ARTICLES),
-    ("create_categories", bit::CREATE_CATEGORIES),
-    ("delete_categories", bit::DELETE_CATEGORIES),
-    ("create_news_bundles", bit::CREATE_NEWS_BUNDLES),
-    ("delete_news_bundles", bit::DELETE_NEWS_BUNDLES),
-    ("upload_folders", bit::UPLOAD_FOLDERS),
-    ("download_folders", bit::DOWNLOAD_FOLDERS),
-    ("send_msgs", bit::SEND_MSGS),
-    ("voice_chat", bit::VOICE_CHAT),
-    ("read_chat_history", bit::CHAT_HISTORY),
-    // Off unless an account file says otherwise, which the inline-media
-    // spec asks for by name: an image is the one thing a user can put on
-    // everyone else's screen without their asking, so an operator grants
-    // it rather than inheriting it. Bootstrap's guest does not get it.
-    ("send_media", bit::SEND_MEDIA),
-    ("video_chat", bit::VIDEO_CHAT),
-    // Off for guests by default, per the video spec: a screen share can
-    // leak documents, credentials and other people's messages in a way a
-    // camera generally cannot. Bootstrap's guest account grants neither.
-    ("screen_share", bit::SCREEN_SHARE),
-];
 
 /// The bit an account file's access key names, if any. Exposed so the
 /// binary can validate `[identity.default_access]` against the same
@@ -106,7 +52,7 @@ pub fn named_bit(key: &str) -> Option<u8> {
     if key == "chat_history" {
         return Some(bit::CHAT_HISTORY);
     }
-    NAMED_BITS.iter().find(|(n, _)| *n == key).map(|(_, b)| *b)
+    access::named(key)
 }
 
 #[derive(Debug, Deserialize)]
@@ -649,28 +595,11 @@ impl AuthBackend for FileAuth {
         };
         let mut doc = toml_edit::DocumentMut::new();
         doc["name"] = toml_edit::value(name);
+        // The template is usually the guest account, which is where an
+        // operator puts a `raw_bits` entry for a bit this build has no
+        // name for yet; `write_access` keeps those.
         let mut acc = toml_edit::Table::new();
-        for (key, b) in NAMED_BITS {
-            if access.has(*b) {
-                acc[key] = toml_edit::value(true);
-            }
-        }
-        // Whatever is set and has no name goes to `raw_bits`, the same
-        // escape hatch a hand-written file uses. Writing only the named
-        // ones silently dropped every reserved or future allocation —
-        // and the template these accounts are created from is usually
-        // the guest account, which is exactly where an operator puts a
-        // `raw_bits` entry for a bit this build has no name for yet.
-        let unnamed: Vec<u8> = (0..64)
-            .filter(|b| access.has(*b) && !NAMED_BITS.iter().any(|(_, n)| n == b))
-            .collect();
-        if !unnamed.is_empty() {
-            let mut arr = toml_edit::Array::new();
-            for b in unnamed {
-                arr.push(i64::from(b));
-            }
-            acc["raw_bits"] = toml_edit::value(arr);
-        }
+        write_access(&mut acc, access, false);
         doc["access"] = toml_edit::Item::Table(acc);
         let mut id = toml_edit::Table::new();
         id["fingerprint"] = toml_edit::value(hl_identity::Fingerprint(*fingerprint).to_string());
@@ -721,6 +650,188 @@ impl AuthBackend for FileAuth {
             Ok(_) | Err(AuthError::NoSuchAccount) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+impl AccountAdmin for FileAuth {
+    fn read_account(&self, login: &str) -> Result<Account, AdminError> {
+        let login = admin_login(login)?;
+        self.load(&login)
+            .map(|file| file.into_account(login))
+            .map_err(admin_error)
+    }
+
+    fn list_accounts(&self) -> Result<Vec<Account>, AdminError> {
+        let entries = self.entries().map_err(admin_error)?;
+        Ok(entries
+            .into_iter()
+            .filter(|(login, _)| !self.is_reserved(login))
+            // A file that does not read is named at startup by `audit`;
+            // it does not hide the rest.
+            .filter_map(|(login, _)| self.read_account(&login).ok())
+            .collect())
+    }
+
+    fn write_account(
+        &self,
+        edit: &AccountEdit,
+        check: WriteCheck<'_>,
+    ) -> Result<Account, AdminError> {
+        let login = admin_login(&edit.login)?;
+        if self.is_reserved(&login) {
+            return Err(AdminError::InvalidLogin);
+        }
+        let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
+        let path = self.dir.join(format!("{login}.toml"));
+        let failed =
+            |e: &dyn std::fmt::Display| AdminError::Backend(format!("{}: {e}", path.display()));
+        let read = |text: &str| -> Result<Account, AdminError> {
+            let file: AccountFile = toml::from_str(text).map_err(|e| failed(&e))?;
+            Ok(file.into_account(login.clone()))
+        };
+        let old = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(failed(&e)),
+        };
+        let existing = old.as_deref().map(read).transpose()?;
+        let mut doc: toml_edit::DocumentMut = match &old {
+            Some(text) => text.parse().map_err(|e| failed(&e))?,
+            None => toml_edit::DocumentMut::new(),
+        };
+        if let Some(name) = &edit.name {
+            doc["name"] = toml_edit::value(name.as_str());
+        }
+        match edit.password.as_deref() {
+            Some("") => {
+                doc.remove("password");
+            }
+            Some(password) => doc["password"] = toml_edit::value(password),
+            None => {}
+        }
+        if old.is_none() || edit.access.is_some() {
+            let table = doc["access"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+            let table = table
+                .as_table_like_mut()
+                .ok_or_else(|| failed(&"access is not a table"))?;
+            write_access(table, edit.access.unwrap_or_default(), edit.history_unsaid);
+        }
+        let text = doc.to_string();
+        // Also what makes sure no file is left behind that the next login
+        // cannot read.
+        let after = read(&text)?;
+        check(existing.as_ref(), &after)?;
+        if old.is_none() {
+            write_new(&path, &text).map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => AdminError::Exists,
+                _ => failed(&e),
+            })?;
+        } else {
+            write_atomic(&path, &text).map_err(|e| failed(&e))?;
+        }
+        Ok(after)
+    }
+
+    fn delete_account(
+        &self,
+        login: &str,
+        check: &dyn Fn(&Account) -> Result<(), AdminError>,
+    ) -> Result<(), AdminError> {
+        let login = admin_login(login)?;
+        let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
+        check(&self.read_account(&login)?)?;
+        let path = self.dir.join(format!("{login}.toml"));
+        std::fs::remove_file(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => AdminError::NoSuchAccount,
+            _ => AdminError::Backend(format!("{}: {e}", path.display())),
+        })
+    }
+}
+
+/// An administrator's login, canonical, or why it names no file.
+fn admin_login(login: &str) -> Result<String, AdminError> {
+    let login = login.to_ascii_lowercase();
+    if valid_login(&login) {
+        Ok(login)
+    } else {
+        Err(AdminError::InvalidLogin)
+    }
+}
+
+fn admin_error(e: AuthError) -> AdminError {
+    match e {
+        AuthError::NoSuchAccount => AdminError::NoSuchAccount,
+        e => AdminError::Backend(e.to_string()),
+    }
+}
+
+/// Make an `[access]` table say `access`, changing no more of it than
+/// that takes: a key whose bit already reads right is left as written,
+/// comment and all, a set bit with no key gets one, and `raw_bits`
+/// becomes the set bits that have no name. Read-chat-history with no key
+/// follows read-chat, so it is written only where it parts from it; with
+/// `history_unsaid` it is not touched at all.
+fn write_access(table: &mut dyn toml_edit::TableLike, access: AccessBits, history_unsaid: bool) {
+    if !history_unsaid {
+        if let Some(old) = table.remove("chat_history") {
+            if !table.contains_key("read_chat_history") {
+                table.insert("read_chat_history", old);
+            }
+        }
+    }
+    for (key, b) in NAMES {
+        let history = *b == bit::CHAT_HISTORY;
+        if history && history_unsaid {
+            continue;
+        }
+        let on = access.has(*b);
+        match table.get_mut(key).and_then(|item| item.as_value_mut()) {
+            Some(v) if v.as_bool() == Some(on) => {}
+            Some(v) => {
+                let decor = v.decor().clone();
+                *v = on.into();
+                *v.decor_mut() = decor;
+            }
+            None if (on && !history) || (history && on != access.has(bit::READ_CHAT)) => {
+                table.insert(key, toml_edit::value(on));
+            }
+            None => {}
+        }
+    }
+    let raw_history = || {
+        table
+            .get("raw_bits")
+            .and_then(|item| item.as_array())
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|v| v.as_integer() == Some(bit::CHAT_HISTORY.into()))
+            })
+    };
+    let mut unnamed: Vec<i64> = access::names_of(access)
+        .1
+        .into_iter()
+        .map(i64::from)
+        .collect();
+    // History granted by number is as much the file's to keep as by name.
+    if history_unsaid && raw_history() {
+        unnamed.push(bit::CHAT_HISTORY.into());
+        unnamed.sort_unstable();
+    }
+    let same = table
+        .get("raw_bits")
+        .and_then(|item| item.as_array())
+        .is_some_and(|a| {
+            a.iter()
+                .map(|v| v.as_integer())
+                .eq(unnamed.iter().map(|b| Some(*b)))
+        });
+    if unnamed.is_empty() {
+        table.remove("raw_bits");
+    } else if !same {
+        table.insert(
+            "raw_bits",
+            toml_edit::value(unnamed.into_iter().collect::<toml_edit::Array>()),
+        );
     }
 }
 
@@ -873,26 +984,14 @@ fn private_opts(_opts: &mut std::fs::OpenOptions) {}
 /// without that, a crash can leave the rename durable and the contents
 /// not, which is a zero-length account file.
 fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let tmp = path.with_extension("toml.tmp");
-    let mode = std::fs::metadata(path).ok().map(file_mode);
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        private_opts(&mut opts);
-        let mut f = opts.open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-    }
     // Keep whatever the operator set on the original.
-    if let Some(mode) = mode {
-        set_file_mode(&tmp, mode)?;
+    let mode = std::fs::metadata(path).ok().map(file_mode);
+    let tmp = write_tmp(path, text, mode)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
-    // The rename itself is only durable once the directory is synced.
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
-    }
+    sync_dir(path);
     Ok(())
 }
 
@@ -918,14 +1017,51 @@ fn set_file_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write a file that must not exist yet. Written and synced under a
+/// name of its own and then linked into place, which fails if the name
+/// is taken: created in place, it would be an empty account file for a
+/// moment — no password and no access, which `""` logs in to — or for
+/// good after a crash.
 fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = write_tmp(path, text, None)?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    linked?;
+    sync_dir(path);
+    Ok(())
+}
+
+/// `text` in a temp file beside `path`, synced, with `mode` if given.
+/// One per process: `hxd account` writes beside a running server.
+fn write_tmp(path: &Path, text: &str, mode: Option<u32>) -> std::io::Result<PathBuf> {
     use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    private_opts(&mut opts);
-    let mut f = opts.open(path)?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    let written = (|| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        private_opts(&mut opts);
+        let mut f = opts.open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        if let Some(mode) = mode {
+            set_file_mode(&tmp, mode)?;
+        }
+        Ok(())
+    })();
+    match written {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// A rename or a link is only durable once its directory is synced.
+fn sync_dir(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
 }
 
 impl AccountDirectory for FileAuth {
@@ -1625,7 +1761,7 @@ mod tests {
         // The guest account is the usual template, and `raw_bits` is
         // where an operator puts an allocation this build predates —
         // the messaging extension's access bit 58, for one. Emitting
-        // only `NAMED_BITS` dropped them on the floor.
+        // only `NAMES` dropped them on the floor.
         let (td, auth) = backend();
         let access = AccessBits::empty().with(bit::SEND_CHAT).with(58).with(61);
         let (a, created) = auth
