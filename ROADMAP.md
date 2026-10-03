@@ -232,8 +232,8 @@ no-version client).
 - Private chats: create, invite, decline, join/leave, per-chat member lists.
 - Private messages, broadcast, user info.
 - Access bitmap enforcement on every op (the mhxd bitmap is the reference).
-- Admin over the wire: create/modify/delete accounts (the 1.5 user editor),
-  kick, ban list.
+- Admin over the wire: create/modify/delete accounts (implemented on both
+  wires and as `hxd account`, `docs/account-admin.md`), kick, ban list.
 - HOPE negotiation + ciphers (ChaCha20-Poly1305, Blowfish OFB-64) and zlib
   compression, server side, via `hxcrypto`. Port the rekey-marker behavior
   byte for byte — it's wire-format-critical on this side too.

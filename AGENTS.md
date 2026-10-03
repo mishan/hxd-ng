@@ -51,12 +51,12 @@ been exercised on newer toolchains; CI runs stable.
 
 | Crate | Role |
 |---|---|
-| `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation and bans, the news tree, avatars, access bits, auth traits, and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
-| `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), the server banner (`banner.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
+| `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation and bans, the news tree, avatars, access bits, auth traits and account administration (`admin`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
+| `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs, and the registrar's requests, records and signed lists (with the one record verifier they all share) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
 | `hl-tunnel` | `WsByteStream`: a WebSocket whose binary frames carry a classic byte stream, as `AsyncRead + AsyncWrite`, with the keep-alive ping and the silence deadline. What the ng port's `/trtp` and `/htxf` and `hlrelay` all run the classic protocol over. |
-| `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy + `[identity]` link), first-run guest bootstrap. Identity links are written back with `toml_edit` so hand-edited files keep their comments; fingerprint lookups scan the directory. |
+| `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy + `[identity]` link), first-run guest bootstrap, and the account editing behind `hxd_core::admin`. Identity links and edits are written back with `toml_edit` so hand-edited files keep their comments; fingerprint lookups scan the directory. |
 | `hxd-media` | The inline-media pipeline (`docs/inline-media.md`): magic-byte sniff, hand-written JPEG/PNG/GIF container walkers that refuse polyglots, a bounded decode and a re-encode that strips every byte of metadata by construction, and the fitting that makes an avatar and its legacy GIF (`docs/avatars.md`). Behind `hxd-core`'s `MediaCodec` trait and the `media` Cargo feature, and knows nothing about Hotline. |
 | `hxd-markdown` | Markdown news bodies (`docs/news.md` §5): pulldown-cmark, built without its HTML writer, folded into the plain-text downgrade that search and legacy clients read, and the references a body makes. Text in, text out — nothing here ever produces markup. Behind `hxd-core`'s `BodyRenderer` trait and the `markdown` Cargo feature. |
 | `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
@@ -67,7 +67,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-testclient` | Scripted clients for the server's own tests: the classic wire over TCP or TLS, framed with the pinned `hxproto` rather than the server's framer and read through a buffer so a timeout cannot cut a frame, and the ng wire with every event's seq checked as it arrives. Both keep what arrives while they wait for something else. Shared by `hxd-load` and the e2e suites. |
 | `hxd-load` | The load harness (`docs/load-testing.md`): scenarios from TOML — the login storm, public chat, the slow consumer, churn — open-loop, timed from when each thing was due, with the server's invariants checked under load and a JSON report. `hxd-load accounts` writes the accounts churn logs in to. Its `tests/` run each scenario small against a real server. |
 | `hlrelay` | A relay (`docs/hotline-ng-auth.md` §10.2, `docs/relay.md`): discovery, `/trtp` and `/htxf` in front of a classic server that has never heard of Hotline-ng, each socket copied to a TCP connection of its own. Knows nothing about the bytes it carries and does not authenticate. |
-| `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing, and behind the `metrics` feature the recorder `GET /metrics` renders (`metrics.rs`, `docs/metrics.md`). Its `tests/` hold the e2e suites. |
+| `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing, the operator's commands (`hxd account` in `accounts.rs`, `hxd ban` and the rest of moderation in `moderation.rs`), and behind the `metrics` feature the recorder `GET /metrics` renders (`metrics.rs`, `docs/metrics.md`). Its `tests/` hold the e2e suites. |
 
 `tools/ng-client.mjs` is an interactive ng test client (Node 22+, or
 `npm install` in tools/ for the `ws` fallback) — `/drop` exercises
@@ -274,7 +274,13 @@ Three layers, all `cargo test --workspace`:
   bit numbering pinned against mhxd's constants, account parsing, frame
   round-trips).
 - **E2E** suites in `crates/hxd/tests/` drive *real* servers on ephemeral
-  loopback ports: `login.rs` (legacy login/presence/agreement), `tls.rs`
+  loopback ports: `login.rs` (legacy login/presence/agreement),
+  `accounts.rs` (the 1.5 user editor and the ng `accounts` family: each
+  act under its bit, an administrator outranked by an account it would
+  touch, an edit keeping the file's comments, a change reaching the
+  account's sessions on both wires, `[extra]` policy no edit may give
+  away, the classic editor leaving bit 56 as it was, and `hxd account`
+  applied by a reload), `tls.rs`
   (the legacy wire over TLS beside a plaintext client, and HTXF on the
   TLS transfer port), `chat.rs` (chat/PM/moderation over the legacy
   wire, and the private-chat caps), `ng.rs` (the WebSocket

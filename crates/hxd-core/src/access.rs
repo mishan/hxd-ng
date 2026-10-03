@@ -48,6 +48,16 @@ impl AccessBits {
         n < 64 && self.0 & (1u64 << (63 - n)) != 0
     }
 
+    /// A copy with protocol bit `n` clear. Bits ≥ 64 are ignored.
+    #[must_use]
+    pub const fn without(self, n: u8) -> Self {
+        if n < 64 {
+            AccessBits(self.0 & !(1u64 << (63 - n)))
+        } else {
+            self
+        }
+    }
+
     /// A copy with protocol bit `n` set. Bits ≥ 64 are ignored.
     #[must_use]
     pub const fn with(self, n: u8) -> Self {
@@ -126,6 +136,81 @@ pub mod bit {
     /// other people's messages in a way a camera generally cannot.
     /// Neither bit implies the other.
     pub const SCREEN_SHARE: u8 = 60;
+}
+
+/// Every bit's name: the `[access]` key an account file grants it by,
+/// and the name the ng wire lists it under. Names mirror [`bit`] (and
+/// therefore mhxd's field names). A bit missing here has no name, and
+/// goes by its number.
+pub const NAMES: &[(&str, u8)] = &[
+    ("delete_files", bit::DELETE_FILES),
+    ("upload_files", bit::UPLOAD_FILES),
+    ("download_files", bit::DOWNLOAD_FILES),
+    ("rename_files", bit::RENAME_FILES),
+    ("move_files", bit::MOVE_FILES),
+    ("create_folders", bit::CREATE_FOLDERS),
+    ("delete_folders", bit::DELETE_FOLDERS),
+    ("rename_folders", bit::RENAME_FOLDERS),
+    ("move_folders", bit::MOVE_FOLDERS),
+    ("read_chat", bit::READ_CHAT),
+    ("send_chat", bit::SEND_CHAT),
+    ("create_pchats", bit::CREATE_PCHATS),
+    ("create_users", bit::CREATE_USERS),
+    ("delete_users", bit::DELETE_USERS),
+    ("read_users", bit::READ_USERS),
+    ("modify_users", bit::MODIFY_USERS),
+    ("read_news", bit::READ_NEWS),
+    ("post_news", bit::POST_NEWS),
+    ("disconnect_users", bit::DISCONNECT_USERS),
+    ("cant_be_disconnected", bit::CANT_BE_DISCONNECTED),
+    ("get_user_info", bit::GET_USER_INFO),
+    ("upload_anywhere", bit::UPLOAD_ANYWHERE),
+    ("use_any_name", bit::USE_ANY_NAME),
+    ("dont_show_agreement", bit::DONT_SHOW_AGREEMENT),
+    ("comment_files", bit::COMMENT_FILES),
+    ("comment_folders", bit::COMMENT_FOLDERS),
+    ("view_drop_boxes", bit::VIEW_DROP_BOXES),
+    ("make_aliases", bit::MAKE_ALIASES),
+    ("can_broadcast", bit::CAN_BROADCAST),
+    ("delete_articles", bit::DELETE_ARTICLES),
+    ("create_categories", bit::CREATE_CATEGORIES),
+    ("delete_categories", bit::DELETE_CATEGORIES),
+    ("create_news_bundles", bit::CREATE_NEWS_BUNDLES),
+    ("delete_news_bundles", bit::DELETE_NEWS_BUNDLES),
+    ("upload_folders", bit::UPLOAD_FOLDERS),
+    ("download_folders", bit::DOWNLOAD_FOLDERS),
+    ("send_msgs", bit::SEND_MSGS),
+    ("voice_chat", bit::VOICE_CHAT),
+    ("read_chat_history", bit::CHAT_HISTORY),
+    // Off unless an account file says otherwise, which the inline-media
+    // spec asks for by name: an image is the one thing a user can put on
+    // everyone else's screen without their asking, so an operator grants
+    // it rather than inheriting it. Bootstrap's guest does not get it.
+    ("send_media", bit::SEND_MEDIA),
+    ("video_chat", bit::VIDEO_CHAT),
+    // Off for guests by default, per the video spec: a screen share can
+    // leak documents, credentials and other people's messages in a way a
+    // camera generally cannot. Bootstrap's guest account grants neither.
+    ("screen_share", bit::SCREEN_SHARE),
+];
+
+/// The bit `name` names.
+pub fn named(name: &str) -> Option<u8> {
+    NAMES.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
+}
+
+/// What `access` holds: the names of its named bits, and the numbers of
+/// the rest.
+pub fn names_of(access: AccessBits) -> (Vec<&'static str>, Vec<u8>) {
+    let names = NAMES
+        .iter()
+        .filter(|(_, b)| access.has(*b))
+        .map(|(n, _)| *n)
+        .collect();
+    let raw = (0..64)
+        .filter(|b| access.has(*b) && !NAMES.iter().any(|(_, n)| n == b))
+        .collect();
+    (names, raw)
 }
 
 #[cfg(test)]

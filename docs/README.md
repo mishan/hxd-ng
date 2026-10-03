@@ -39,6 +39,7 @@ to another project.
 | Document | Built | Population | Kind |
 |---|---|---|---|
 | [access-bits.md](access-bits.md) — every access bit, `[extra]` policy, `[identity]` flags | yes | all | design |
+| [account-admin.md](account-admin.md) — the user editor, the ng `accounts` family, `hxd account` | yes, less renames and the 1.8 batch editor | all | design; §5 is the ng spec |
 | [private-messages.md](private-messages.md) — the offline inbox | yes | all (period receives) | design |
 | [chat-history.md](chat-history.md) — server-held scrollback, fogWraith's Get Chat History | yes | extended, ng | design, implements a fogWraith spec |
 | [inline-media.md](inline-media.md) — images in chat, fogWraith's Inline Media | yes | extended, ng (period sees the caption) | design, implements a fogWraith spec |

@@ -38,6 +38,7 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 use tracing::{debug, info, warn, Instrument};
 
+use crate::accounts;
 use crate::banner::Banner;
 use crate::caps::{cap, Caps};
 use crate::encoding::TextEncoding;
@@ -550,6 +551,7 @@ fn type_label(ty: u32) -> Kind<'static> {
     let known = HANDLED.iter().any(|h| h.as_u32() == ty)
         || news::handles(ty)
         || file_manage::handles(ty)
+        || accounts::handles(ty)
         || ty == media::trans::UPLOAD_MEDIA
         || ty == media::trans::DOWNLOAD_MEDIA
         || matches!(ty, gif_icons::GET_LIST | gif_icons::GET | gif_icons::SET);
@@ -2196,23 +2198,9 @@ pub(crate) async fn off_reactor<T: Send + 'static>(
         .ok()
 }
 
-/// The "loginupdate" moment: hand the client its self-info and make it
-/// visible (which broadcasts the join to everyone else).
-/// `permit` is the login's place ([`hxd_core::Core::admit_login`]), when
-/// this is the login finishing at once: given back as soon as the room
-/// has been told, before the inbox is flushed, which is store work the
-/// room does not wait on. A 1.5 client that answers the agreement first
-/// comes here from the session loop with none: its login's place went
-/// with `login_phase`, so its join is outside the bound.
-async fn complete_login(
-    tx: &Tx,
-    ctx: &ServerCtx,
-    sess: &mut Session,
-    permit: Option<hxd_core::LoginPermit>,
-) {
-    if sess.announced {
-        return;
-    }
+/// Tell the client what its account may do, as at login and again when
+/// an administrator changes it.
+fn push_self_info(tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     if ctx.cfg.version != 0 {
         if let Some(me) = ctx.core.user(sess.uid) {
             // Real access bits — not the reference server's all-ones fake.
@@ -2231,6 +2219,26 @@ async fn complete_login(
             );
         }
     }
+}
+
+/// The "loginupdate" moment: hand the client its self-info and make it
+/// visible (which broadcasts the join to everyone else).
+/// `permit` is the login's place ([`hxd_core::Core::admit_login`]), when
+/// this is the login finishing at once: given back as soon as the room
+/// has been told, before the inbox is flushed, which is store work the
+/// room does not wait on. A 1.5 client that answers the agreement first
+/// comes here from the session loop with none: its login's place went
+/// with `login_phase`, so its join is outside the bound.
+async fn complete_login(
+    tx: &Tx,
+    ctx: &ServerCtx,
+    sess: &mut Session,
+    permit: Option<hxd_core::LoginPermit>,
+) {
+    if sess.announced {
+        return;
+    }
+    push_self_info(tx, ctx, sess);
     // The owner's avatar, before anyone is told the session exists. A
     // store read, so off the reactor — and only on a server with avatars,
     // so one without has nothing between the login and the join.
@@ -2273,7 +2281,7 @@ fn system_msg(tx: &Tx, ctx: &ServerCtx, sess: &Session, text: &str) {
 
 /// Encode one domain event onto the wire. Returns `false` when the session
 /// must end (kicked).
-async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> bool {
+async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) -> bool {
     match ev {
         Event::Changed(u) => {
             push(
@@ -2619,6 +2627,10 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &Session, ev: Event) -> b
         | Event::NewsNodeDeleted { .. }
         | Event::NewsNotify(_) => {}
         Event::Kicked => return false,
+        Event::AccountChanged(account) => {
+            sess.account = *account;
+            push_self_info(tx, ctx, sess);
+        }
     }
     true
 }
@@ -4248,6 +4260,21 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 Err(file_manage::Refusal::File(error)) => {
                     reply_error(tx, f.trans, file_error_text(&error))
                 }
+            }
+        }
+
+        t if accounts::handles(t) => {
+            let fields: Vec<_> = f.chunks().map(|c| (c.tag, c.data.to_vec())).collect();
+            let (uid, enc) = (sess.uid, sess.enc);
+            // The account store is file I/O.
+            let done = off_reactor(&ctx.core, move |c| {
+                accounts::transaction(c, uid, enc, t, &fields)
+            })
+            .await;
+            match done {
+                Some(Ok(chunks)) => reply(tx, f.trans, chunks),
+                Some(Err(msg)) => reply_error(tx, f.trans, &msg),
+                None => reply_error(tx, f.trans, "The server could not reach its accounts."),
             }
         }
 

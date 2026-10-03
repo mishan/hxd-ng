@@ -121,8 +121,12 @@ only on a local file area; a manifest area refuses them all as read-only.
 
 ### User administration (14–17)
 
-All **parsed**. There is no account administration over either wire; a
-server's accounts are files an operator edits.
+**Enforced**, both wires — the user editor's transactions and the ng
+`accounts` family — each act under its bit; an administrator may write
+or delete only an account that may do nothing their own may not, the
+`[extra]` policy below included, and grant nothing they lack. `hxd
+account` is the operator's, held to neither.
+[account-admin.md](account-admin.md) is the whole of it.
 
 | Bit | `[access]` key | Meaning |
 |---:|---|---|

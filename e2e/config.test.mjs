@@ -46,7 +46,9 @@ describe('config', () => {
     // over-promise here is a client calling a request that cannot work.
     await withServer({}, async (_server, crew) => {
       const probe = await crew.connect({ nick: 'Probe' });
-      assert.deepEqual(probe.conn.caps, []);
+      // `accounts` needs no section: every server administers its
+      // accounts directory.
+      assert.deepEqual(probe.conn.caps, ['accounts']);
       assert.equal(probe.conn.media, null);
     });
   });

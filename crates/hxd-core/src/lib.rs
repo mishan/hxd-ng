@@ -9,6 +9,7 @@
 
 pub mod access;
 pub mod account;
+pub mod admin;
 pub mod avatar;
 pub mod ban;
 pub mod budget;
@@ -31,8 +32,8 @@ pub mod voice;
 
 pub use access::AccessBits;
 pub use account::{
-    Account, AccountDirectory, AuthBackend, AuthError, IdentityLink, LinkAuthority, LinkOutcome,
-    Proof, UnlinkOutcome,
+    Account, AccountAdmin, AccountDirectory, AccountEdit, AdminError, AuthBackend, AuthError,
+    IdentityLink, LinkAuthority, LinkOutcome, Proof, UnlinkOutcome, WriteCheck,
 };
 pub use avatar::{
     Avatar, AvatarId, AvatarImages, AvatarLimits, AvatarOwner, AvatarPolicy, AvatarRef,

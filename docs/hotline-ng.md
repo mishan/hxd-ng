@@ -174,6 +174,7 @@ over them.
 | `push` | Push device registration | push-notifications.md §8; webpush-gateway.md §7 | `push` |
 | `avatars` | Users' pictures: `avatar` on the `user` object, `avatar_clear`, bytes over HTTP | avatars.md §4 | `avatars` |
 | `banner` | The server banner: where its image is, where a click goes, and `GET /banner` | banner.md §3 | `banner` |
+| `accounts` | Account administration: `account_list`, `account_get`, `account_create`, `account_update`, `account_delete`, and `account_changed` | account-admin.md §5 | `accounts` |
 
 - `video` MUST NOT appear without `voice`.
 - A login reply block is present exactly when its capability is, except
@@ -367,7 +368,10 @@ time after the handshake.
 ```
 
 `users` is the complete roster and `seq` is the seq the client continues
-from: the next event it receives has a greater one.
+from: the next event it receives has a greater one. With the `accounts`
+capability it also carries that family's block, as the login reply does
+(account-admin.md §5.1), since an `account_changed` may have been lost
+in the gap.
 
 - **The server MUST NOT send an event with a seq at or below `sync`'s
   `seq` after the `sync` reply** (rationale §5). A server that cannot keep
