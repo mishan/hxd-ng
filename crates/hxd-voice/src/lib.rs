@@ -90,8 +90,8 @@ mod timeouts {
 /// than decorative: eight receivers whose renegotiations complete
 /// together will each want a keyframe within a few milliseconds, and
 /// eight keyframes is a bitrate spike at precisely the wrong moment. One
-/// request coalesces the burst into the one keyframe that satisfies all
-/// of them.
+/// request, and one more a second later for whatever asked in between,
+/// coalesces the burst.
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long the pump waits when no peer has anything to do.
@@ -542,6 +542,22 @@ impl Inner {
         // and recorded once per pass rather than once per packet.
         let mut overrun: Vec<(Uid, Stream)> = Vec::new();
         let mut policed: [u64; 3] = [0; 3];
+        // Before the peers are polled, since str0m only turns a request
+        // into RTCP on its next timeout: this is what a `deadline` wake
+        // for an owed one is for.
+        let owed: Vec<(Uid, VideoKind)> = self
+            .peers
+            .iter()
+            .flat_map(|(&uid, p)| {
+                p.publications
+                    .iter()
+                    .filter(|p| p.keyframe_owed)
+                    .map(move |p| (uid, p.kind))
+            })
+            .collect();
+        for (uid, kind) in owed {
+            self.request_keyframe(uid, kind, now);
+        }
         for uid in uids {
             let Some(peer) = self.peers.get_mut(&uid) else {
                 continue;
@@ -792,9 +808,19 @@ impl Inner {
     }
 
     fn deadline(&self, now: Instant) -> Instant {
+        let owed = self
+            .peers
+            .values()
+            .flat_map(|p| &p.publications)
+            .filter(|p| p.keyframe_owed)
+            .filter_map(|p| p.last_keyframe)
+            .map(|t| t + KEYFRAME_INTERVAL)
+            // One the pump could not send when due must not spin it.
+            .filter(|&t| t > now);
         self.peers
             .values()
             .filter_map(|p| p.next_timeout)
+            .chain(owed)
             .min()
             .unwrap_or(now + IDLE_TICK)
             .max(now)

@@ -584,9 +584,11 @@ Video introduces a requirement audio does not have: a decoder cannot start mid-s
 - resume after a pause (Video State 609);
 - a receiver's own RTCP PLI or FIR arriving for that stream.
 
+A trigger that cannot be acted on yet — the publisher's answer has not declared the publication's SSRC, or the rate limit below holds it back — is held, and the request sent as soon as it can be; one held request stands for all of them. Dropping it instead loses the request that matters most, the one made when a receiver can at last decode, which tends to land within a second of an earlier one. Nor does the stream's own first keyframe stand in for it: it can reach the server before the receiver is being forwarded to.
+
 The request is sent to the publisher as RTCP Picture Loss Indication ([RFC 4585](https://datatracker.ietf.org/doc/html/rfc4585)) or Full Intra Request ([RFC 5104](https://datatracker.ietf.org/doc/html/rfc5104)); the `a=rtcp-fb` lines in the offer are what make them legal.
 
-**Servers MUST rate-limit keyframe requests per publication.** A room of eight receivers whose renegotiations complete together will otherwise ask one publisher for eight keyframes in a few milliseconds, and the publisher will send eight — a bitrate spike precisely when the network is busiest. A single request per publication per interval, with **one second RECOMMENDED**, coalesces the burst into the one keyframe that satisfies all of them.
+**Servers MUST rate-limit keyframe requests per publication.** A room of eight receivers whose renegotiations complete together will otherwise ask one publisher for eight keyframes in a few milliseconds, and the publisher will send eight — a bitrate spike precisely when the network is busiest. A single request per publication per interval, with **one second RECOMMENDED**, coalesces the burst into one keyframe now and, for whoever asked after it, at most one more an interval later.
 
 Publishers MUST honour PLI and FIR by producing a keyframe promptly.
 
