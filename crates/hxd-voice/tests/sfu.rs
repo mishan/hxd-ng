@@ -1405,8 +1405,8 @@ fn a_voice_only_peers_offer_never_grows_a_video_section() {
 ///
 /// The publication's *receive* SSRC is bound by the time this returns,
 /// which is the part that matters for the keyframe tests below: a
-/// request for a publication nothing has been bound to has nowhere to go
-/// and is silently not sent, so a test that skipped the publisher's own
+/// request for a publication nothing has been bound to waits for the
+/// publisher's answer, so a test that skipped the publisher's own
 /// renegotiation would be asserting on the wrong absence.
 fn camera_published(sfu: &Sfu, clock: &Clock, clients: &mut [&mut Client]) {
     for c in clients.iter_mut() {
@@ -1429,6 +1429,10 @@ fn camera_published(sfu: &Sfu, clock: &Clock, clients: &mut [&mut Client]) {
         renegotiate(sfu, c, 0);
     }
     pump(sfu, clients, clock, 40);
+    // Each subscriber's answer asks again within the second its
+    // subscription's request opened, so the limiter holds that one for
+    // the second's end; a test counting from here must not see it.
+    pump_slowly(sfu, clients, clock, 6);
 }
 
 // --- Keyframes -----------------------------------------------------------
@@ -1470,6 +1474,56 @@ fn a_new_subscription_asks_the_publisher_for_a_keyframe() {
         1,
         "the subscriber's arrival is what asks"
     );
+}
+
+#[test]
+fn a_subscription_racing_the_publishers_answer_gets_a_keyframe_once_both_are_in() {
+    // A subscriber can decode once its own answer is in and the
+    // publisher's stream is bound, in whichever order those land. Asked
+    // before the stream is bound, a request has nowhere to go; asked
+    // within a second of the request the publisher's answer released, the
+    // limiter holds it. Either way it must still be sent once it can be,
+    // or a receiver that never sends a PLI of its own never decodes
+    // anything — and only once, or it is the burst the limiter exists to
+    // prevent.
+    for (i, publisher_first) in [false, true].into_iter().enumerate() {
+        let clock = Clock::new();
+        let sfu = new_sfu(&clock);
+        let port = 6164 + 2 * i as u16;
+        let mut a = Client::new(1, port, clock.now());
+        let mut b = Client::new(2, port + 1, clock.now());
+        join(&sfu, &mut a, 0);
+        join(&sfu, &mut b, 0);
+        renegotiate(&sfu, &mut a, 0);
+        pump(&sfu, &mut [&mut a, &mut b], &clock, 60);
+
+        assert!(sfu.publish(1, 0, VideoKind::Camera).is_ok());
+        sfu.set_subscriptions(2, 0, &[cam(1)]);
+        let b_offer = offer_of(&sfu, 2, 0);
+        if publisher_first {
+            renegotiate(&sfu, &mut a, 0);
+            pump(&sfu, &mut [&mut a, &mut b], &clock, 10);
+        }
+        let b_answer = b.answer(&b_offer, false);
+        sfu.answer(2, 0, &b_answer).unwrap();
+        if !publisher_first {
+            pump(&sfu, &mut [&mut a, &mut b], &clock, 10);
+            assert_eq!(
+                a.keyframes_on(CAM_SEND_MID),
+                0,
+                "nothing bound to ask on yet"
+            );
+            renegotiate(&sfu, &mut a, 0);
+        }
+
+        let before = a.keyframes_on(CAM_SEND_MID);
+        pump_slowly(&sfu, &mut [&mut a, &mut b], &clock, 6);
+        assert_eq!(
+            a.keyframes_on(CAM_SEND_MID),
+            before + 1,
+            "publisher answered first: {publisher_first}"
+        );
+    }
 }
 
 #[test]
@@ -1527,12 +1581,13 @@ fn a_receivers_keyframe_request_is_relayed_to_the_publisher() {
 }
 
 #[test]
-fn a_burst_of_requests_from_a_room_costs_the_publisher_one_keyframe() {
+fn a_burst_of_requests_from_a_room_costs_the_publisher_one_keyframe_and_one_trailing() {
     // The rate limit is not an optimisation. Three receivers whose
     // renegotiations complete together each want a keyframe within a few
     // milliseconds of each other, and three keyframes is a bitrate spike
-    // at precisely the moment the network is busiest — for one keyframe's
-    // worth of benefit, because the first satisfies all three.
+    // at precisely the moment the network is busiest. The first is sent;
+    // the rest are held, and cost one more between them once the
+    // interval is up, for whoever asked after the first went.
     let clock = Clock::new();
     let sfu = new_sfu(&clock);
     let mut a = Client::new(1, 6190, clock.now());
@@ -1563,6 +1618,13 @@ fn a_burst_of_requests_from_a_room_costs_the_publisher_one_keyframe() {
         a.keyframes_on(CAM_SEND_MID),
         1,
         "three askers, one keyframe"
+    );
+
+    pump_slowly(&sfu, &mut [&mut a, &mut b, &mut c, &mut d], &clock, 6);
+    assert_eq!(
+        a.keyframes_on(CAM_SEND_MID),
+        2,
+        "the two held requests cost one more between them"
     );
 }
 

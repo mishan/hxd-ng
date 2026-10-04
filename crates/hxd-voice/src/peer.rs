@@ -182,6 +182,13 @@ pub(crate) struct Publication {
     /// keyframes in a few milliseconds and get eight, a bitrate spike
     /// precisely when the network is busiest.
     pub(crate) last_keyframe: Option<Instant>,
+    /// A keyframe was asked for and not yet requested, because nothing
+    /// was bound to send it on or the limiter held it back. The pump sends
+    /// it once it can. Dropping it instead lost the request that mattered:
+    /// the one made when a receiver could at last decode, which tends to
+    /// land within a second of an earlier one, and the stream's own first
+    /// keyframe can pass before the receiver is being forwarded to.
+    pub(crate) keyframe_owed: bool,
     /// Whether an offer carrying this publication's send section has
     /// actually been built yet.
     ///
@@ -520,6 +527,7 @@ impl Peer {
             recv_ssrc: None,
             last_media: None,
             last_keyframe: None,
+            keyframe_owed: false,
             offered: false,
             police: Policer::off(),
         });
@@ -669,20 +677,19 @@ impl Peer {
     }
 
     /// Ask this peer for a keyframe on `kind`, no more often than
-    /// `interval`. Returns whether a request was actually sent, which is
-    /// what the caller logs.
+    /// `interval`; one that cannot go yet is owed instead. Returns whether
+    /// a request was actually sent, which is what the caller logs.
     pub(crate) fn request_keyframe(
         &mut self,
         kind: VideoKind,
         now: Instant,
         interval: std::time::Duration,
     ) -> bool {
-        let Some(p) = self.publication(kind) else {
+        let Some(p) = self.publication_mut(kind) else {
             return false;
         };
+        p.keyframe_owed = true;
         let Some(ssrc) = p.recv_ssrc else {
-            // Nothing has been bound yet; the first keyframe will arrive
-            // with the stream itself.
             return false;
         };
         if p.last_keyframe
@@ -699,6 +706,7 @@ impl Peer {
         if sent {
             if let Some(p) = self.publication_mut(kind) {
                 p.last_keyframe = Some(now);
+                p.keyframe_owed = false;
             }
         }
         sent
