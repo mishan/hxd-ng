@@ -23,7 +23,7 @@ use crate::wire::{chunks, field, fields, find, tx, Field, Hello, Reason};
 /// the login reply, then its whole Link Servers. Pings do not extend it.
 const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 /// A Ping after this long without sending anything else.
-const PING_AFTER: Duration = Duration::from_secs(60);
+pub(crate) const PING_AFTER: Duration = Duration::from_secs(60);
 /// A link is dead after three ping intervals without hearing from it.
 const DEAD_AFTER: Duration = Duration::from_secs(180);
 /// The most servers one link may put behind it. The extension leaves the
@@ -37,6 +37,8 @@ pub(crate) struct End {
     pub(crate) label: &'static str,
     pub(crate) peer_reason: Option<Reason>,
     pub(crate) established: bool,
+    /// How long it was established for, zero if never.
+    pub(crate) lasted: Duration,
 }
 
 /// What interrupted establishment.
@@ -53,12 +55,15 @@ pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
         generation,
         last_sent: Instant::now(),
         next_trans: 1,
-        established: false,
+        established: None,
     };
     // A reload between the login and here found no link to close: the
     // entry this link was authorized under must still be the one in force.
     let end = if hub.authorizes(&entry) {
         link.session(&mut io, &mut closed).await
+    } else if hub.entry(&entry.name).is_some() {
+        // Changed, not removed: as a reload would have closed it.
+        link.close(&io, Reason::ProtocolError, "changed")
     } else {
         link.close(&io, Reason::Unlinked, "unlinked")
     };
@@ -73,7 +78,8 @@ struct Link<'a> {
     generation: u64,
     last_sent: Instant,
     next_trans: u32,
-    established: bool,
+    /// When the link was established, once it is.
+    established: Option<Instant>,
 }
 
 impl Link<'_> {
@@ -81,7 +87,8 @@ impl Link<'_> {
         End {
             label,
             peer_reason,
-            established: self.established,
+            established: self.established.is_some(),
+            lasted: self.established.map_or(Duration::ZERO, |at| at.elapsed()),
         }
     }
 
@@ -163,6 +170,10 @@ impl Link<'_> {
         if peer.version == 0 {
             return self.close(io, Reason::VersionUnsupported, "version");
         }
+        if let Err(why) = peer.server.admissible() {
+            warn!(peer = %self.entry.name, "Hello's server group refused: {why}");
+            return self.close(io, Reason::ProtocolError, "protocol_error");
+        }
         if peer.server.id != ServerId::of_key(&self.entry.key) {
             warn!(peer = %self.entry.name, "Hello names a server other than the key it proved");
             return self.close(io, Reason::ProtocolError, "protocol_error");
@@ -182,7 +193,7 @@ impl Link<'_> {
         }
         // Nor anyone to export: an empty snapshot is valid.
         self.notify(io, tx::SNAPSHOT, &[]);
-        self.established = true;
+        self.established = Some(Instant::now());
         info!(peer = %self.entry.name, server = ?peer.server.id, tag = %peer.server.tag, "link up");
 
         let mut tick = interval(Duration::from_secs(5));
@@ -259,9 +270,10 @@ impl Link<'_> {
     /// establishment every refusal ends it; afterwards only a loop does,
     /// and the rest are ignored, as the extension says.
     fn take_server(&mut self, io: &LinkIo, g: ServerGroup, establishing: bool) -> Option<End> {
-        if g.extra_len() > crate::server::MAX_EXTRA {
-            // Relaying Fields: a group over the bound is dropped whole.
-            warn!(peer = %self.entry.name, server = ?g.id, "server group over the field bound dropped");
+        if let Err(why) = g.admissible() {
+            // Relaying Fields: a group the bounds or the fields that never
+            // cross refuse is dropped whole.
+            warn!(peer = %self.entry.name, server = ?g.id, "server group dropped: {why}");
             return None;
         }
         if self.hub.servers_behind(&self.entry.name, self.generation) >= MAX_SERVERS
@@ -334,6 +346,10 @@ fn is_reply(f: &Frame) -> bool {
 }
 
 fn refuse(io: &LinkIo, f: &Frame, reason: Reason) {
+    // A notification has no task to answer.
+    if f.trans == 0 {
+        return;
+    }
     io.out.reply(
         f.trans,
         true,

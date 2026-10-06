@@ -95,6 +95,14 @@ pub fn check(config: &Config) -> Result<(), String> {
         if !names.insert(peer.name.as_str()) {
             return Err(format!("[[link.peer]] {}: named twice", peer.name));
         }
+        // The classic wire reads a login as at most 31 characters, so a
+        // longer one could never match.
+        if peer.account.is_empty() || peer.account.chars().count() > 31 {
+            return Err(format!(
+                "[[link.peer]] {}: account must be 1-31 characters",
+                peer.name
+            ));
+        }
         if peer.accept && !accepted.insert(peer.account.as_str()) {
             return Err(format!(
                 "[[link.peer]] {}: another accepting entry expects the login {:?}",

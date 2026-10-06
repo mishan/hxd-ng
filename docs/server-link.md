@@ -512,8 +512,7 @@ and `DATA_LINK_KEY_PROOF` (`0x0641`):
   an ordinary account of the same name, which is then an ordinary account
   like any other; the link does not use it. A password-mode login (L8) goes through
   `reconcile_login` as today.
-- A confirmed link session releases its `LoginPermit` at once, sends no
-  agreement, never reaches `attach` or `announce`, and replies with the
+- A confirmed link session takes no `LoginPermit`, sends no agreement, never reaches `attach` or `announce`, and replies with the
   acceptor's key and proof in key mode. A request on it that the link
   does not define is refused with an error, and a notification it does
   not define is dropped.
@@ -705,9 +704,10 @@ learned over the link goes.
   `server_key` too, and so refuses while the key is shared.
 - **The server ID** is derived from the key, from the first link on.
   `hxd link reset-id` works on a stopped server, like every operator
-  command: the restart closes its links with `Shutdown` and its next Hello
-  names the new ID, which is all the extension asks of an ID change, and
-  never `Unlinked`, which would stop its peers' dialers. It says what it
+  command: the restart drops its links, which peers take as an
+  interruption, as they would a `Shutdown`, and its next Hello names the
+  new ID, which is all the extension asks of an ID change. It never closes
+  them with `Unlinked`, which would stop its peers' dialers. It says what it
   costs: bans this server placed under its old ID can no longer be
   lifted, so an operator lifts the ones they want lifted first.
 - **The epoch** is random at each start.

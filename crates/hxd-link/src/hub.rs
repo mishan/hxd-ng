@@ -131,7 +131,7 @@ impl Hub {
         }
     }
 
-    fn spawn_dialer(&self, peer: String) {
+    pub(crate) fn spawn_dialer(&self, peer: String) {
         if self.0.state.lock().unwrap().dialing.insert(peer.clone()) {
             tokio::spawn(crate::dial::dial_loop(self.clone(), peer));
         }
@@ -196,8 +196,18 @@ impl Hub {
             }
         }
         drop(state);
+        // Only an entry that is new or changed: a dialer that stopped on
+        // Unlinked, Replaced or VersionUnsupported waits for its operator
+        // to act on it, and a SIGHUP sent for something else (a renewed
+        // certificate) is not that.
         for entry in peers.into_iter().filter(|e| e.dial.is_some()) {
-            self.spawn_dialer(entry.name);
+            if old
+                .iter()
+                .find(|p| p.name == entry.name)
+                .is_none_or(|was| !same_terms(was, &entry))
+            {
+                self.spawn_dialer(entry.name);
+            }
         }
     }
 
@@ -293,6 +303,13 @@ impl Hub {
         if group.id == self.server_id() {
             return Err(Reason::Loop);
         }
+        // An update about the peer itself (a new tag or name) replaces
+        // what its Hello said rather than adding a second server.
+        let own = own
+            || state.links[peer]
+                .peer
+                .as_ref()
+                .is_some_and(|p| p.id == group.id);
         if !own && group.hops.saturating_add(1) > MAX_HOPS {
             return Err(Reason::HopLimit);
         }
@@ -481,6 +498,19 @@ mod tests {
             h.accept_server("a", second, group(2, "two", 0), true),
             Ok(())
         );
+    }
+
+    #[test]
+    fn an_update_about_the_peer_replaces_what_its_hello_said() {
+        let h = hub();
+        let (a, _ra) = h.register("a");
+        h.accept_server("a", a, group(2, "two", 0), true).unwrap();
+        h.accept_server("a", a, group(2, "renamed", 0), false)
+            .unwrap();
+        let status = h.status();
+        assert_eq!(status[0].servers, 0);
+        // Its old tag is free again for another server behind it.
+        assert_eq!(h.accept_server("a", a, group(3, "two", 1), false), Ok(()));
     }
 
     impl ServerGroup {

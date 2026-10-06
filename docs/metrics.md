@@ -179,7 +179,7 @@ session, `kicked`, `logout`, `replaced`,
 `send_failed`, `pong_deadline`, the ends of a server link accepted on the
 TLS port (`docs/server-link.md`: `closed_here`, `closed_by_peer`,
 `establish_timeout`, `protocol_error`, `refused`, `version`,
-`too_many_servers`, `unlinked`, `dead`), and `slow_consumer` for a client that
+`too_many_servers`, `unlinked`, `changed`, `dead`), and `slow_consumer` for a client that
 stopped taking what was sent to it: a classic writer's queue past its
 bound or a write that made no progress for a minute, either wire's
 session a whole channel behind, or either wire's queue among the

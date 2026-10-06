@@ -58,6 +58,17 @@ pub fn same_tag(a: &str, b: &str) -> bool {
 /// headers included (Relaying Fields). A group over it is dropped whole.
 pub const MAX_EXTRA: usize = 1024;
 
+/// The longest server name accepted, in bytes: the extension's bound on a
+/// user name, for want of one of its own.
+pub const MAX_NAME: usize = 255;
+
+/// Fields that carry what a link must never carry (Relaying Fields,
+/// "Fields that never cross"): a login, password material, access
+/// privileges, a messaging Login, and HOPE's login fields.
+fn never_crosses(id: u16) -> bool {
+    matches!(id, 105 | 106 | 110 | 0x0600 | 0x0e00..=0x0eff)
+}
+
 /// One server, as a group of fields opened by `DATA_LINK_SERVER_ID`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerGroup {
@@ -80,8 +91,19 @@ pub enum ServerGroupError {
 }
 
 impl ServerGroup {
-    pub fn extra_len(&self) -> usize {
-        self.extra.iter().map(|f| 4 + f.data.len()).sum()
+    /// Whether a received group may be kept and passed on: within the
+    /// bounds, and carrying nothing that never crosses a link.
+    pub fn admissible(&self) -> Result<(), &'static str> {
+        if self.name.len() > MAX_NAME {
+            return Err("server name too long");
+        }
+        if self.extra.iter().any(|f| never_crosses(f.id)) {
+            return Err("a field that never crosses a link");
+        }
+        if self.extra.iter().map(|f| 4 + f.data.len()).sum::<usize>() > MAX_EXTRA {
+            return Err("over the field bound");
+        }
+        Ok(())
     }
 
     pub fn to_fields(&self) -> Vec<Field> {
@@ -200,6 +222,26 @@ mod tests {
         fields.push(Field::u16(field::MORE, 1));
         let parsed = ServerGroup::parse_all(&fields).unwrap();
         assert_eq!(parsed, vec![a, b]);
+    }
+
+    #[test]
+    fn a_group_over_its_bounds_or_carrying_what_never_crosses_is_not_admissible() {
+        let with = |name: &str, extra: Vec<Field>| ServerGroup {
+            name: name.into(),
+            extra,
+            ..group(1, "a")
+        };
+        assert!(with("ok", vec![Field::new(0x0700, vec![0; 1020])])
+            .admissible()
+            .is_ok());
+        for g in [
+            with(&"n".repeat(MAX_NAME + 1), vec![]),
+            with("ok", vec![Field::new(0x0700, vec![0; 1021])]),
+            with("ok", vec![Field::new(105, b"login".to_vec())]),
+            with("ok", vec![Field::new(0x0e05, vec![1])]),
+        ] {
+            assert!(g.admissible().is_err(), "{g:?}");
+        }
     }
 
     #[test]

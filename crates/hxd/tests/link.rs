@@ -140,8 +140,10 @@ async fn two_servers_link_by_their_keys() {
 
 #[tokio::test]
 async fn a_link_with_a_key_either_side_did_not_configure_never_comes_up() {
-    // `a` holds a stranger's key for `b`, then `b` a stranger's for `a`:
-    // the acceptor refuses the login, then the dialer refuses the reply.
+    // `a` holds a stranger's key for `b`, then `b` a stranger's for `a`.
+    // The acceptor refuses both: the first proof is not by the key it
+    // holds, and the second names a key that is not its own. The dialer's
+    // own check of a reply is the unit tests' (`hxd-link`'s `dial.rs`).
     for (a_holds, b_holds) in [(3, 1), (2, 3)] {
         let (a, b, _dirs) = pair(a_holds, b_holds).await;
         // Long past the moment a good pair links (the test above).

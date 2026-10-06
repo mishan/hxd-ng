@@ -45,23 +45,30 @@ enum Next {
 }
 
 pub(crate) async fn dial_loop(hub: Hub, peer: String) {
-    dial(&hub, &peer).await;
+    let unconfigured = dial(&hub, &peer).await;
     hub.dialer_stopped(&peer);
+    // A reload that put the entry back while this loop was finding it gone
+    // started no dialer, since this one still counted.
+    if unconfigured && hub.entry(&peer).is_some_and(|e| e.dial.is_some()) {
+        hub.spawn_dialer(peer);
+    }
 }
 
-async fn dial(hub: &Hub, peer: &str) {
+/// Dial until the link ends for good. True when it ends because the
+/// entry is gone, false when the peer said not to come back.
+async fn dial(hub: &Hub, peer: &str) -> bool {
     let mut wait = FIRST_RETRY;
     loop {
         // Re-read each time: SIGHUP may have changed or removed the entry.
         let Some(entry) = hub.entry(peer).filter(|e| e.dial.is_some()) else {
             info!(%peer, "no longer configured; not dialing");
-            return;
+            return true;
         };
         let next = dial_once(hub, &entry).await;
         wait = match next {
             Next::Stop => {
                 warn!(peer = %entry.name, "not redialing without an operator");
-                return;
+                return false;
             }
             Next::Again => FIRST_RETRY,
             Next::Backoff => (wait * 2).min(SLOWEST),
@@ -162,44 +169,14 @@ async fn dial_once(hub: &Hub, entry: &PeerEntry) -> Next {
         Ok(Ok(f)) => f,
         _ => return Next::Backoff,
     };
-    if reply.flag != 0 {
-        let text = reply
-            .chunks()
-            .find(|c| c.tag == tag::TASK_ERROR)
-            .map(|c| String::from_utf8_lossy(c.data).into_owned())
-            .unwrap_or_default();
-        warn!(peer = %entry.name, "link login refused: {text}");
-        return Next::Slow;
-    }
-    let confirmed = reply
-        .chunks()
-        .find(|c| c.tag == tag::CAPABILITIES)
-        .map(|c| Caps::from_wire(c.data))
-        .is_some_and(|c| c.has(cap::SERVER_LINK) && c.has(cap::TEXT_ENCODING));
-    if !confirmed {
-        warn!(peer = %entry.name, "peer did not confirm bits 1 and 11: a configuration error on one side");
-        return Next::Slow;
-    }
-    let key = reply
-        .chunks()
-        .find(|c| c.tag == field::SERVER_KEY)
-        .map(|c| c.data.to_vec());
-    let their_proof: Option<[u8; 64]> = reply
-        .chunks()
-        .find(|c| c.tag == field::KEY_PROOF)
-        .and_then(|c| c.data.try_into().ok());
-    let proven = key.as_deref() == Some(entry.key.as_slice())
-        && their_proof.is_some_and(|p| {
-            verify_proof(
-                &peer_key,
-                Role::Acceptor,
-                &exporter,
-                &hub.key().public(),
-                &p,
-            )
-        });
-    if !proven {
-        warn!(peer = %entry.name, "peer's key did not check: possible impersonation");
+    if let Err(why) = check_reply(
+        reply.flag,
+        &crate::wire::fields(&reply),
+        &peer_key,
+        &exporter,
+        &hub.key().public(),
+    ) {
+        warn!(peer = %entry.name, "{why}");
         return Next::Slow;
     }
 
@@ -210,11 +187,43 @@ async fn dial_once(hub: &Hub, entry: &PeerEntry) -> Next {
         Some(Reason::Unlinked | Reason::VersionUnsupported | Reason::Replaced) => Next::Stop,
         Some(Reason::Suspended) => Next::Slow,
         Some(Reason::Loop | Reason::TagConflict | Reason::HopLimit) => Next::Backoff,
-        // A link that failed before it was established, on either side,
-        // would fail the same way again at once.
-        _ if !end.established => Next::Backoff,
+        // A link that failed before it was established, on either side, or
+        // soon after, would fail the same way again at once.
+        _ if !end.established || end.lasted < crate::link::PING_AFTER => Next::Backoff,
         _ => Next::Again,
     }
+}
+
+/// The acceptor's login reply, checked: not a refusal, bits 1 and 11
+/// confirmed, and the key the operator configured for the peer proven over
+/// this TLS session in the acceptor's role, to this server's key. Anything
+/// else is answered at the slowest pace, since an operator has to look.
+fn check_reply(
+    flag: u32,
+    reply: &[crate::wire::Field],
+    peer_key: &ed25519_dalek::VerifyingKey,
+    exporter: &[u8; EXPORTER_LEN],
+    own: &[u8; 32],
+) -> Result<(), String> {
+    let get = |id| crate::wire::find(reply, id);
+    if flag != 0 {
+        let text = get(tag::TASK_ERROR)
+            .map(|f| String::from_utf8_lossy(&f.data).into_owned())
+            .unwrap_or_default();
+        return Err(format!("link login refused: {text}"));
+    }
+    let caps = get(tag::CAPABILITIES).map(|f| Caps::from_wire(&f.data));
+    if !caps.is_some_and(|c| c.has(cap::SERVER_LINK) && c.has(cap::TEXT_ENCODING)) {
+        return Err("peer did not confirm bits 1 and 11: a configuration error on one side".into());
+    }
+    let key = get(field::SERVER_KEY).and_then(|f| f.fixed::<32>());
+    let proof = get(field::KEY_PROOF).and_then(|f| f.fixed::<64>());
+    let proven = key == Some(peer_key.to_bytes())
+        && proof.is_some_and(|p| verify_proof(peer_key, Role::Acceptor, exporter, own, &p));
+    if !proven {
+        return Err("peer's key did not check: possible impersonation".into());
+    }
+    Ok(())
 }
 
 /// Trust any certificate: in key mode the proof authenticates the peer,
@@ -276,5 +285,86 @@ impl ServerCertVerifier for AnyCertificate {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::Field;
+    use crate::LinkKey;
+
+    #[test]
+    fn a_reply_is_accepted_only_with_the_configured_key_proven_to_this_server() {
+        let (us, them, stranger) = (
+            LinkKey::from_seed(&[1; 32]),
+            LinkKey::from_seed(&[2; 32]),
+            LinkKey::from_seed(&[3; 32]),
+        );
+        let configured = check_public(&them.public()).unwrap();
+        let exporter = [7; EXPORTER_LEN];
+        let caps = Caps::empty()
+            .with(cap::TEXT_ENCODING)
+            .with(cap::SERVER_LINK);
+        let reply = |key: &LinkKey, proof: [u8; 64], caps: Caps| {
+            vec![
+                Field::new(tag::CAPABILITIES, caps.to_wire()),
+                Field::new(field::SERVER_KEY, key.public()),
+                Field::new(field::KEY_PROOF, proof),
+            ]
+        };
+        let good = them.prove(Role::Acceptor, &exporter, &us.public());
+        let check = |flag, fields: &[Field]| {
+            check_reply(flag, fields, &configured, &exporter, &us.public()).is_ok()
+        };
+
+        assert!(check(0, &reply(&them, good, caps)));
+        for (why, flag, fields) in [
+            ("refused", 1, reply(&them, good, caps)),
+            (
+                "bit 11 unconfirmed",
+                0,
+                reply(&them, good, Caps::empty().with(cap::TEXT_ENCODING)),
+            ),
+            (
+                "another key",
+                0,
+                reply(
+                    &stranger,
+                    stranger.prove(Role::Acceptor, &exporter, &us.public()),
+                    caps,
+                ),
+            ),
+            (
+                "the dialer's role",
+                0,
+                reply(
+                    &them,
+                    them.prove(Role::Dialer, &exporter, &us.public()),
+                    caps,
+                ),
+            ),
+            (
+                "another session",
+                0,
+                reply(
+                    &them,
+                    them.prove(Role::Acceptor, &[8; EXPORTER_LEN], &us.public()),
+                    caps,
+                ),
+            ),
+            (
+                "proven to someone else",
+                0,
+                reply(
+                    &them,
+                    them.prove(Role::Acceptor, &exporter, &stranger.public()),
+                    caps,
+                ),
+            ),
+            ("no proof", 0, reply(&them, good, caps)[..2].to_vec()),
+        ] {
+            assert!(!check(flag, &fields), "{why}");
+        }
     }
 }
