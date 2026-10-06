@@ -282,7 +282,9 @@ export async function startFailing({ config = {}, guest = true } = {}) {
       proc.kill();
       resolve('running');
     }, 15_000);
-    proc.on('exit', (c) => {
+    // 'close', not 'exit': 'exit' can come before the pipes are read, and
+    // the refusal with them.
+    proc.on('close', (c) => {
       clearTimeout(timer);
       resolve(c);
     });
