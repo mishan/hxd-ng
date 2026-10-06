@@ -726,6 +726,191 @@ async fn a_peer_shut_down_is_held_for_the_grace_period_and_then_let_go() {
     assert!(matches!(late, Ok(Ok(_))), "{late:?}");
 }
 
+/// Three servers in a chain, `aa` and `cc` each dialing `bb`, every link
+/// with every feature and transit, so `bb` relays between them.
+async fn chain() -> (Server, Server, Server, [tempfile::TempDir; 3]) {
+    chain_offering(r#"["chat", "msgs", "info", "transit"]"#).await
+}
+
+/// [`chain`], `cc`'s link to `bb` offering only `cc_offers`.
+async fn chain_offering(cc_offers: &str) -> (Server, Server, Server, [tempfile::TempDir; 3]) {
+    const TRANSIT: &str = r#"["chat", "msgs", "info", "transit"]"#;
+    let dirs = [
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    ];
+    let b_tls = bind().await;
+    let b_addr = b_tls.local_addr().unwrap();
+    let accept = |name: &str, seed: u8| {
+        format!(
+            "[[link.peer]]\nname = \"{name}\"\naccept = true\nprotection = \"key\"\n\
+             key = \"{}\"\naccount = \"link-{name}\"\nfeatures = {TRANSIT}\n",
+            public(seed)
+        )
+    };
+    let dial = |name: &str| {
+        format!(
+            "[[link.peer]]\nname = \"bb\"\ndial = \"{b_addr}\"\nprotection = \"key\"\n\
+             key = \"{}\"\naccount = \"link-{name}\"\nfeatures = {TRANSIT}\n",
+            public(2)
+        )
+    };
+    let peers = accept("aa", 1) + &accept("cc", 3);
+    let b = start(dirs[1].path(), 2, "bb", "", &peers, b_tls).await;
+    let a = start(dirs[0].path(), 1, "aa", "", &dial("aa"), bind().await).await;
+    let c_peer = dial("cc").replace(
+        &format!("features = {TRANSIT}"),
+        &format!("features = {cc_offers}"),
+    );
+    let c = start(dirs[2].path(), 3, "cc", "", &c_peer, bind().await).await;
+    assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
+    assert!(comes_up(&c.hub, 2, Duration::from_secs(10)).await);
+    (a, b, c, dirs)
+}
+
+#[tokio::test]
+async fn a_server_in_the_middle_relays_users_chat_and_messages_between_its_links() {
+    let (a, _b, c, _dirs) = chain().await;
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let mut cat = legacy::Client::login_at(c.legacy, &Login::guest("cat"))
+        .await
+        .unwrap();
+    // Each sees the other, two links away, as from the far end's server.
+    let cat_here = row(&mut ann, "cat").await.uid;
+    let ann_there = row(&mut cat, "ann").await.uid;
+    let (_watcher, hello) = ng::Client::guest(a.ng, "watcher").await.unwrap();
+    let users = hello["users"].as_array().unwrap();
+    let seen = users.iter().find(|u| u["nick"] == "cat").unwrap();
+    assert_eq!(seen["remote"]["tag"], "cc");
+
+    // A line crosses both links, formatted where it is heard.
+    cat.chat(b"hi from cc").await.unwrap();
+    assert_eq!(
+        heard(&mut ann, cat_here).await,
+        b"\r          cat:  hi from cc"
+    );
+
+    // A message crosses both, and the answer comes back.
+    let sent = ann
+        .call(
+            ClientHdr::Msg.as_u32(),
+            &[
+                (tag::UID, cat_here.to_be_bytes().to_vec()),
+                (tag::BODY, b"hi cat".to_vec()),
+            ],
+        )
+        .await;
+    assert!(sent.is_ok(), "{sent:?}");
+    let got = cat
+        .rx
+        .recv_where(|f| f.ty == push::MSG && f.uint(tag::UID) == Some(ann_there.into()))
+        .await
+        .unwrap();
+    assert_eq!(got.bytes(tag::BODY).unwrap(), b"hi cat");
+
+    // User info names the far server.
+    let info = ann
+        .call(
+            ClientHdr::UserGetInfo.as_u32(),
+            &[(tag::UID, cat_here.to_be_bytes().to_vec())],
+        )
+        .await
+        .unwrap();
+    let text = String::from_utf8(info.bytes(tag::BODY).unwrap()).unwrap();
+    assert!(text.starts_with("  server: cc server\r"), "{text:?}");
+    assert!(text.contains("name: cat\r"), "{text:?}");
+
+    // And when cat leaves cc, ann hears it two links away.
+    drop(cat);
+    let part = ann
+        .rx
+        .recv_where(|f| f.ty == push::USER_PART && f.uint(tag::UID) == Some(cat_here.into()))
+        .await;
+    assert!(part.is_ok(), "{part:?}");
+}
+
+#[tokio::test]
+async fn a_kick_two_links_away_is_carried_out_by_the_users_home() {
+    let (a, _b, c, _dirs) = chain().await;
+    let mut admin = legacy::Client::login_at(a.legacy, &Login::account("ann", "admin", "pw"))
+        .await
+        .unwrap();
+    let mut cat = legacy::Client::login_at(c.legacy, &Login::guest("cat"))
+        .await
+        .unwrap();
+    let cat_here = row(&mut admin, "cat").await.uid;
+    let kicked = admin
+        .call(
+            ClientHdr::UserKick.as_u32(),
+            &[(tag::UID, cat_here.to_be_bytes().to_vec())],
+        )
+        .await;
+    assert!(kicked.is_ok(), "{kicked:?}");
+    let told = cat.rx.recv_where(|f| f.ty == 0x163).await.unwrap();
+    let text = String::from_utf8(told.bytes(tag::BODY).unwrap()).unwrap();
+    assert!(text.contains("aa server (aa)"), "{text:?}");
+}
+
+#[tokio::test]
+async fn a_ban_two_links_away_is_placed_and_enforced_by_the_users_home() {
+    let (a, _b, c, dirs) = chain().await;
+    std::fs::write(
+        dirs[2].path().join("accounts/cat.toml"),
+        "name = \"cat\"\npassword = \"pw\"\n[access]\nread_chat = true\n",
+    )
+    .unwrap();
+    let mut admin = legacy::Client::login_at(a.legacy, &Login::account("ann", "admin", "pw"))
+        .await
+        .unwrap();
+    let mut cat = legacy::Client::login_at(c.legacy, &Login::account("cat", "cat", "pw"))
+        .await
+        .unwrap();
+    let cat_here = row(&mut admin, "cat").await.uid;
+    let banned = admin
+        .call(
+            ClientHdr::UserKick.as_u32(),
+            &[
+                (tag::UID, cat_here.to_be_bytes().to_vec()),
+                (tag::BAN, vec![0, 1]),
+            ],
+        )
+        .await;
+    assert!(banned.is_ok(), "{banned:?}");
+    let told = cat.rx.recv_where(|f| f.ty == 0x163).await.unwrap();
+    let text = String::from_utf8(told.bytes(tag::BODY).unwrap()).unwrap();
+    assert!(
+        text.contains("banned from the network by aa server (aa)"),
+        "{text:?}"
+    );
+    let again = legacy::Client::login_at(c.legacy, &Login::account("cat", "cat", "pw")).await;
+    assert!(again.is_err(), "refused at home");
+}
+
+#[tokio::test]
+async fn a_link_without_transit_is_not_joined_to_the_others() {
+    let (a, b, c, _dirs) = chain_offering(r#"["chat", "msgs", "info"]"#).await;
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let mut bea = legacy::Client::login_at(b.legacy, &Login::guest("bea"))
+        .await
+        .unwrap();
+    let _cat = legacy::Client::login_at(c.legacy, &Login::guest("cat"))
+        .await
+        .unwrap();
+    // bb shows cat, but does not pass cat on to aa.
+    row(&mut bea, "cat").await;
+    row(&mut ann, "bea").await;
+    let rows = ann.user_list().await.unwrap();
+    assert!(
+        rows.iter().all(|r| r.nick != b"cat"),
+        "cat crossed a link without transit"
+    );
+}
+
 #[tokio::test]
 async fn no_act_on_another_user_reaches_a_ghost() {
     let (a, b, _dirs) = linked("").await;

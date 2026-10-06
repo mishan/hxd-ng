@@ -4,8 +4,8 @@ Status: partial, 2026-10. Built: L0 (the uid quarantine, Colored
 Nicknames), L1 (links by key mode, Hello, server lists, pings, close,
 reload), L2 (users crossing one link both ways, ghosts on both wires), L3
 (public chat both ways), L4 (private messages and user info), L5
-(moderation both ways) and L6 (interruption and its grace period). The
-rest is design. It implements fogWraith's
+(moderation both ways), L6 (interruption and its grace period) and L7
+(relaying between this server's links). The rest is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -342,7 +342,8 @@ the hub feeds it from one task of its own:
   `ChatCommit` a line at a time (`Core::ghost_chat`), as a local sender
   does; local lines share its commits. Past the channel's bound a line is
   not shown here, and is logged: the extension's volume bound, held
-  across every link. Until relaying (L7) there is nowhere to relay it.
+  across every link. It is relayed onward whether it is shown here or
+  not (§7.4.1).
 - **The batch re-check.** `Staged` has no session for a ghost's line, and
   the re-check looks the ghost up in `ghosts` instead: a line is dropped
   when its ghost is still present but hidden, and goes out under the
@@ -650,7 +651,7 @@ The hub holds, per link:
 Hello first in each direction and nothing before it, closing with
 `ProtocolError` a peer that sends none within 30 seconds; the Hello
 checks (the server ID derived from the proven key on a key-mode link, then
-Loop and TagConflict); this server's Link Servers (empty until it relays);
+Loop and TagConflict); this server's Link Servers (§7.4.1);
 and its snapshot only after the peer's first complete Link Servers is
 accepted. Between snapshot parts nothing but Ping, Close and replies is
 sent, so feed events that arrive meanwhile are held, within a bound whose
@@ -682,18 +683,41 @@ only server or user state that cannot be parsed closes the link.
 whole; fields that never cross are refused at every hop; the bounds are
 checked on receipt and a group over them is dropped whole.
 
-### 7.4.1 Transit on one link
+### 7.4.1 Relaying
 
-`transit` may be offered to one peer, ahead of L7. Over that link the
-peer may then relay this server's users to the rest of its network and
-show this server the users and servers behind it (§7.4). On the wire
-this server owes the link nothing more: transit obliges a server to relay
-between *its own* transit links, and with one there is nothing to relay,
-so its Link Servers stays empty. A second peer offering transit is
-refused at config load until L7 builds that relaying.
+Between two links that both negotiated transit, the hub passes on what
+one learns to the other (`Relay`, numbered under the hub's lock as the
+export feed is, into a channel of each link's own):
 
-What it does owe, moderation now across a whole network rather than one
-operator's server, is §7.5's.
+- **Servers.** A link's Link Servers names the servers behind the other
+  transit links, the peers included, one hop farther (`Hub::relay_open`,
+  just before it is sent); a server accepted later goes on as a Server
+  Update, and one forgotten, or a link ended past its grace, as a Server
+  Gone for it and everything behind it, standing for its users.
+- **Users.** A ghost goes on as a user group under this server's uid for
+  it, every field as it came but the ID and the flags (this server's
+  rules: away, refusing messages or chat, refusing messages over a link
+  that cannot carry them, never an admin); a change as an update, a
+  departure as a User Gone with the reason it came with. A link's
+  snapshot holds the other transit links' ghosts beside the local users.
+- **Order.** What was passed on before a link's snapshot was taken is
+  in it, servers aside: those go out ahead of the snapshot, as a server is
+  announced before its users, and what came after waits for it.
+- **Chat.** A line arriving over a link with public chat and transit
+  goes on to the others with both, its speaker under this server's uid,
+  whatever this server shows of it (an excluded or rate-limited speaker
+  included).
+- **Requests.** A 905, 906, 907 or 908 naming a ghost goes on to the link
+  it came from (`Hub::forward`), its IDs translated and every other field
+  as it came, the requester included, and the reply goes back as it was
+  given; a hop that does not answer in `PEER_WAIT` is `Unreachable`. A
+  909 for another server's ban is routed by that server's ID, never back
+  over the link it came in on. A ghost is only addressable over a link it
+  was shown on, so both links must have transit.
+
+A link held through an interruption (§7.6) is still relayed as it was:
+nothing about it goes on until the grace runs out. What this server's
+moderation owes now reaches across the whole network (§7.5).
 
 ### 7.5 Moderation, both sides
 
@@ -738,7 +762,7 @@ feature: it is part of every link.
   refuses end as a local moderator's ban ends them.
 - **Unban (909)**: honored only from the requester that made the ban, and
   only for this server's own bans (`DATA_LINK_SERVER_ID`); another
-  server's is `Unreachable` until relaying (L7).
+  server's goes on toward that server (§7.4.1).
 
 **As requester:** a ban another server placed at this server's asking is
 recorded with its handle, the home server and what was known at the
@@ -822,7 +846,7 @@ protection = "key"          # "key" or "tls"
 key = "ed25519:b64..."      # the peer's public key, base64url, prefix optional (Janus writes it); checked for canonical form and small order at load
 account = "link-hx"         # the account the peer issued this server, or this server's for the peer
 # password = "..."          # tls mode only: what the peer issued
-features = ["chat", "msgs", "info", "transit"]   # transit: one peer until L7
+features = ["chat", "msgs", "info", "transit"]
 ghosts = 1000               # this link's bound
 ```
 
@@ -885,7 +909,7 @@ use: dead code fails `-D warnings`.
 | L4 | Private messages and user info: the router, answered on a task (classic) or in place (ng) | `link.rs` |
 | L5 | Kick, ban and unban on both sides; the requester's ban records; purge of a ghost's lines | `link.rs` |
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
-| L7 | Relaying between this server's own links: announcing other servers, users relayed on. Transit on a single link, which needs none of it, came ahead of it | `link.rs` |
+| L7 | Relaying between this server's own links: servers, users, chat and requests passed on between transit links | `link.rs` |
 | L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge | `link.rs`, `limits.rs`, `metrics.rs` |
 | L9 | User keys, after the end-to-end document | later |
 

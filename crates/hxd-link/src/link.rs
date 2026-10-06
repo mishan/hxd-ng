@@ -16,9 +16,9 @@ use tokio::sync::oneshot;
 use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use hxd_core::server_link::{GoneReason, PeerEvent, MAX_LINK_TEXT};
+use hxd_core::server_link::{GoneReason, PeerEvent, PeerRefusal, MAX_LINK_TEXT, PEER_WAIT};
 
-use crate::hub::{reason_of, Hub, PeerEntry, Reply, Request, Subscribed};
+use crate::hub::{reason_of, Hub, PeerEntry, Relay, Relayed, Reply, Request, Subscribed};
 use crate::server::MAX_EXTRA;
 use crate::server::{ServerGroup, ServerId};
 use crate::users::{of_local, UserGroup};
@@ -118,6 +118,15 @@ struct Link<'a> {
 /// Requests one link waits on at once; past it a request is not sent,
 /// and its asker hears that the server did not answer.
 const MAX_PENDING: usize = 256;
+
+/// The next thing other links pass on, or never when this link takes
+/// none.
+async fn next_relay(relays: &mut Option<tokio::sync::mpsc::Receiver<Relayed>>) -> Option<Relayed> {
+    match relays {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
 
 /// Text as a link carries it: lines end in CR, whatever the client that
 /// sent it used (Text on a Link).
@@ -240,12 +249,14 @@ impl Link<'_> {
             self.generation,
             peer.server.id,
             peer.epoch,
+            self.features,
         );
-        self.hub
-            .set_features(&self.entry.name, self.generation, self.features);
 
-        // Nothing to relay yet, so this server's list is empty.
-        self.notify(io, tx::SERVERS, &[]);
+        // The servers behind this server's other transit links, and from
+        // here what those links pass on, for this link to send in order.
+        let (servers, mut relays) = self.hub.relay_open(&self.entry.name, self.generation);
+        let groups: Vec<Vec<Field>> = servers.iter().map(ServerGroup::to_fields).collect();
+        self.send_parts(io, tx::SERVERS, groups);
         if let Err(end) = self.receive_servers(io, closed).await {
             return end;
         }
@@ -255,13 +266,34 @@ impl Link<'_> {
             users,
             mut exports,
             mut requests,
+            relayed,
+            relayed_up_to,
         }) = self.hub.subscribe(&self.entry.name, self.generation)
         else {
             return self.end("replaced", None);
         };
+        // What was passed on before the snapshot: servers go first, as a
+        // server is announced before its users; users and lines it holds
+        // already; what came after waits for it.
+        let mut after = Vec::new();
+        if let Some(rx) = relays.as_mut() {
+            while let Ok((n, what)) = rx.try_recv() {
+                match what {
+                    Relay::Server(_) | Relay::ServerGone(_) if n <= relayed_up_to => {
+                        self.pass_on(io, what)
+                    }
+                    _ if n <= relayed_up_to => {}
+                    _ => after.push(what),
+                }
+            }
+        }
         let own = self.hub.server_id();
-        let groups: Vec<Vec<Field>> = users.iter().map(|u| of_local(u, own)).collect();
+        let mut groups: Vec<Vec<Field>> = users.iter().map(|u| of_local(u, own)).collect();
+        groups.extend(relayed);
         self.send_snapshot(io, groups);
+        for what in after {
+            self.pass_on(io, what);
+        }
         self.established = Some(Instant::now());
         info!(peer = %self.entry.name, server = ?peer.server.id, tag = %peer.server.tag, "link up");
         // Lifts asked while the ban's home server was out of reach go now,
@@ -289,6 +321,11 @@ impl Link<'_> {
                     None => return self.close(io, Reason::Shutdown, "slow_consumer"),
                 },
                 Some(request) = requests.recv() => self.send_request(io, request),
+                passed = next_relay(&mut relays) => match passed {
+                    Some((_, what)) => self.pass_on(io, what),
+                    // The hub dropped this link's relays: it fell behind.
+                    None => return self.close(io, Reason::Shutdown, "slow_consumer"),
+                },
                 f = io.frames.recv() => {
                     let Some(f) = f else { return self.end("eof", None) };
                     last_heard = Instant::now();
@@ -391,29 +428,46 @@ impl Link<'_> {
                 // its users with it.
                 if known {
                     self.hub
-                        .forget_server(&self.entry.name, self.generation, id);
+                        .forget_server(&self.entry.name, self.generation, id, None);
                 }
                 None
             }
         }
     }
 
+    /// What another link passes on, as this peer must hear it.
+    fn pass_on(&mut self, io: &LinkIo, what: Relay) {
+        match what {
+            Relay::Server(group) => self.notify(io, tx::SERVER_UPDATE, &group.to_fields()),
+            Relay::ServerGone(fields) => self.notify(io, tx::SERVER_GONE, &fields),
+            Relay::User(group) => self.notify(io, tx::USER_UPDATE, &group),
+            Relay::UserGone(fields) => self.notify(io, tx::USER_GONE, &fields),
+            Relay::Chat(fields) => self.notify(io, tx::CHAT, &fields),
+        }
+    }
+
     /// This server's users, as the snapshot it owes the peer: in parts
     /// marked `DATA_LINK_MORE` but the last, one part if there is nobody.
     fn send_snapshot(&mut self, io: &LinkIo, groups: Vec<Vec<Field>>) {
+        self.send_parts(io, tx::SNAPSHOT, groups);
+    }
+
+    /// Groups in as many parts as they need, each but the last marked
+    /// `DATA_LINK_MORE`, one part if there are none.
+    fn send_parts(&mut self, io: &LinkIo, ty: u32, groups: Vec<Vec<Field>>) {
         let mut part: Vec<Field> = Vec::new();
         let mut size = 0;
         for g in groups {
             let len: usize = g.iter().map(|f| 4 + f.data.len()).sum();
             if size + len > SNAPSHOT_PART && !part.is_empty() {
                 part.push(Field::u16(field::MORE, 1));
-                self.notify(io, tx::SNAPSHOT, &std::mem::take(&mut part));
+                self.notify(io, ty, &std::mem::take(&mut part));
                 size = 0;
             }
             size += len;
             part.extend(g);
         }
-        self.notify(io, tx::SNAPSHOT, &part);
+        self.notify(io, ty, &part);
     }
 
     /// One change to a local user, as the peer must hear it.
@@ -495,7 +549,7 @@ impl Link<'_> {
         let style = u16::from(find(&fs, field::CHAT_OPTIONS).and_then(Field::uint) == Some(1));
         if let Err(why) = self
             .hub
-            .chat(&self.entry.name, self.generation, id, text, style)
+            .chat(&self.entry.name, self.generation, id, text, style, &fs)
         {
             warn!(peer = %self.entry.name, "chat line dropped: {why}");
         }
@@ -514,9 +568,33 @@ impl Link<'_> {
         self.pending.insert(trans, request.reply);
     }
 
-    /// Link Private Message (905) for a local user, from one of the
-    /// peer's.
-    fn private_message(&self, f: &Frame) -> Result<(), Reason> {
+    /// A request about `target`, forwarded to the link its ghost came from
+    /// and answered with that link's reply when it comes (the extension's
+    /// Routing); `None` when `target` is no ghost, for this server to
+    /// answer.
+    fn forward_request(
+        &self,
+        io: &LinkIo,
+        f: &Frame,
+        target: u16,
+        feature: u32,
+        sender: Option<u16>,
+    ) -> Option<Result<(), Reason>> {
+        let sent = self.hub.forward(
+            &self.entry.name,
+            self.generation,
+            target,
+            f,
+            feature,
+            sender,
+        )?;
+        Some(sent.map(|reply| pass_reply(io, f.trans, reply)))
+    }
+
+    /// Link Private Message (905) from one of the peer's users: delivered
+    /// to a local user, or forwarded toward a ghost's home (true: answered
+    /// when its reply comes).
+    fn private_message(&self, io: &LinkIo, f: &Frame) -> Result<bool, Reason> {
         if self.features & feature::PRIVATE_MESSAGES == 0 {
             return Err(Reason::FeatureNotNegotiated);
         }
@@ -552,17 +630,25 @@ impl Link<'_> {
         else {
             return Err(Reason::RefusedFields);
         };
+        if let Some(sent) = self.forward_request(io, f, to, feature::PRIVATE_MESSAGES, Some(from)) {
+            return sent.map(|()| true);
+        }
         let from = self
             .hub
             .ghost_uid(&self.entry.name, self.generation, from)
             .ok_or(Reason::UnknownUser)?;
         // Quoting and an automatic response's flag are not kept: this
         // server's own messages carry neither yet.
-        self.hub.core().ghost_msg(from, to, text).map_err(reason_of)
+        self.hub
+            .core()
+            .ghost_msg(from, to, text)
+            .map(|()| false)
+            .map_err(reason_of)
     }
 
-    /// Link User Info (906) about a local user.
-    fn user_info(&self, f: &Frame) -> Result<String, Reason> {
+    /// Link User Info (906): about a local user, or forwarded toward a
+    /// ghost's home (`None`: answered when its reply comes).
+    fn user_info(&self, io: &LinkIo, f: &Frame) -> Result<Option<String>, Reason> {
         if self.features & feature::USER_INFO == 0 {
             return Err(Reason::FeatureNotNegotiated);
         }
@@ -577,7 +663,14 @@ impl Link<'_> {
             .and_then(Field::fixed)
             .map(u16::from_be_bytes)
             .ok_or(Reason::RefusedFields)?;
-        self.hub.core().info_text_for_peer(uid).map_err(reason_of)
+        if let Some(sent) = self.forward_request(io, f, uid, feature::USER_INFO, None) {
+            return sent.map(|()| None);
+        }
+        self.hub
+            .core()
+            .info_text_for_peer(uid)
+            .map(Some)
+            .map_err(reason_of)
     }
 
     /// Link Kick, Ban or Unban (907-909), carried out here as this
@@ -636,6 +729,15 @@ impl Link<'_> {
             };
             out.reply(trans, result_failed, chunks(&reply));
         };
+        // A ghost's: on toward its home, the requester as it came.
+        if let Some(uid) = target.filter(|_| matches!(f.ty, tx::KICK | tx::BAN)) {
+            if let Some(sent) = self.forward_request(io, f, uid, 0, None) {
+                if let Err(why) = sent {
+                    refuse(io, f, why);
+                }
+                return;
+            }
+        }
         match f.ty {
             tx::KICK => {
                 info!(peer = %self.entry.name, by = %by.tag, uid = ?target, "network kick");
@@ -674,10 +776,24 @@ impl Link<'_> {
                 let ours = find(&fs, field::SERVER_ID)
                     .and_then(Field::fixed)
                     .is_some_and(|id| ServerId(id) == self.hub.server_id());
-                // Nothing is relayed yet, so another server's ban is out
-                // of reach (L7).
-                if !ours {
+                // Another server's ban: on toward it, never back, and only
+                // from a link with transit.
+                if !ours && self.features & feature::TRANSIT == 0 {
                     return answer(Err(Reason::Unreachable));
+                }
+                if !ours {
+                    let home = find(&fs, field::SERVER_ID)
+                        .and_then(Field::fixed)
+                        .map(ServerId);
+                    let sent = home.ok_or(PeerRefusal::Unreachable).and_then(|home| {
+                        self.hub
+                            .request_for(home, tx::UNBAN, fs.clone(), Some(&self.entry.name))
+                    });
+                    match sent {
+                        Ok(reply) => pass_reply(io, f.trans, reply),
+                        Err(_) => answer(Err(Reason::Unreachable)),
+                    }
+                    return;
                 }
                 let Some(handle) = handle else {
                     return answer(Err(Reason::UnknownBan));
@@ -736,10 +852,11 @@ impl Link<'_> {
             },
             tx::SERVER_GONE => {
                 // The peer itself goes only with the link.
-                let id = find(&fields(&f), field::SERVER_ID).and_then(Field::fixed);
+                let fs = fields(&f);
+                let id = find(&fs, field::SERVER_ID).and_then(Field::fixed);
                 if let Some(id) = id.map(ServerId).filter(|id| Some(*id) != self.peer_id) {
                     self.hub
-                        .forget_server(&self.entry.name, self.generation, id);
+                        .forget_server(&self.entry.name, self.generation, id, Some(fs));
                 }
             }
             tx::SNAPSHOT => self.snapshot_part(&f),
@@ -764,18 +881,24 @@ impl Link<'_> {
                 }
             },
             tx::USER_GONE => {
-                if let Some(id) = find(&fields(&f), field::USER_ID).and_then(Field::fixed) {
+                let fs = fields(&f);
+                if let Some(id) = find(&fs, field::USER_ID).and_then(Field::fixed) {
+                    // Passed on as it came, its reason (a ban's above all)
+                    // and every other field with it.
+                    let id = u16::from_be_bytes(id);
                     self.hub
-                        .user_gone(&self.entry.name, self.generation, u16::from_be_bytes(id));
+                        .user_gone(&self.entry.name, self.generation, id, fs);
                 }
             }
             tx::CHAT => self.chat(&f),
-            tx::PRIVATE_MESSAGE => match self.private_message(&f) {
-                Ok(()) => answer(io, &f, vec![Field::u16(field::REASON, Reason::Ok as u16)]),
+            tx::PRIVATE_MESSAGE => match self.private_message(io, &f) {
+                Ok(true) => {}
+                Ok(false) => answer(io, &f, vec![Field::u16(field::REASON, Reason::Ok as u16)]),
                 Err(reason) => refuse(io, &f, reason),
             },
-            tx::USER_INFO => match self.user_info(&f) {
-                Ok(text) => answer(io, &f, vec![Field::new(field::DATA, text.into_bytes())]),
+            tx::USER_INFO => match self.user_info(io, &f) {
+                Ok(None) => {}
+                Ok(Some(text)) => answer(io, &f, vec![Field::new(field::DATA, text.into_bytes())]),
                 Err(reason) => refuse(io, &f, reason),
             },
             tx::KICK | tx::BAN | tx::UNBAN => self.moderation(io, &f),
@@ -794,6 +917,24 @@ impl Link<'_> {
 /// The reply flag sits in the type word's second byte.
 fn is_reply(f: &Frame) -> bool {
     (f.ty >> 16) & 0xff == 1
+}
+
+/// Answer task `trans` with what the next hop answered, as it answered it,
+/// when it does; a hop that does not answer in time is `Unreachable`.
+fn pass_reply(io: &LinkIo, trans: u32, reply: tokio::sync::oneshot::Receiver<Reply>) {
+    let out = io.out.clone();
+    tokio::spawn(async move {
+        let (error, fields) = match tokio::time::timeout(PEER_WAIT, reply).await {
+            Ok(Ok(answered)) => answered,
+            _ => (
+                true,
+                vec![Field::u16(field::REASON, Reason::Unreachable as u16)],
+            ),
+        };
+        if trans != 0 {
+            out.reply(trans, error, chunks(&fields));
+        }
+    });
 }
 
 fn answer(io: &LinkIo, f: &Frame, reply: Vec<Field>) {

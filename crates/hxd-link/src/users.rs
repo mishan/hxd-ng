@@ -48,7 +48,11 @@ pub fn of_local(user: &LocalUser, home: ServerId) -> Vec<Field> {
         Field::new(field::SERVER_ID, home.0),
         Field::new(field::USER_NAME, user.nick.as_bytes()),
         Field::u16(field::USER_ICON, user.icon),
-        Field::u16(field::USER_FLAGS, if user.away { flag::AWAY } else { 0 }),
+        // Private chat never crosses a link.
+        Field::u16(
+            field::USER_FLAGS,
+            flag::REFUSES_CHAT | if user.away { flag::AWAY } else { 0 },
+        ),
     ];
     if let Some(c) = user.color {
         f.push(Field::u32(field::COLOR, c));
@@ -176,7 +180,7 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!((parsed[0].id, parsed[0].name.as_str()), (3, "ann"));
-        assert_eq!(parsed[0].flags, flag::AWAY);
+        assert_eq!(parsed[0].flags, flag::AWAY | flag::REFUSES_CHAT);
         assert_eq!(parsed[0].exclude, [ServerId([9; 8])]);
         assert_eq!(
             parsed[0].fields.len(),
