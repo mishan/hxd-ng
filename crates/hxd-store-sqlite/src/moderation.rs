@@ -3,6 +3,7 @@
 //! columns version 8 added for news and for naming a report, and nothing
 //! clever. The decisions are the trait's; this is them in SQL.
 
+use hxd_core::server_link::NetworkBan;
 use std::time::SystemTime;
 
 use hxd_core::ban::{Ban, BanId, BanSource, BanTarget};
@@ -559,7 +560,79 @@ impl ModerationStore for SqliteStore {
             "DELETE FROM link_ban WHERE ban_id NOT IN (SELECT id FROM ban)",
             [],
         ))?;
+        sql(conn.execute(
+            "DELETE FROM network_ban WHERE lifted_at < ?1 OR expires_at < ?1",
+            params![unix(before)],
+        ))?;
         Ok(pruned)
+    }
+
+    fn record_network_ban(&self, ban: &NetworkBan) -> Result<NetworkBan, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT INTO network_ban (requester, home, home_tag, handle, nick, reason, actor,
+                created_at, expires_at, lift_asked, lifted_at)
+             VALUES (?11, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                &ban.home[..],
+                ban.home_tag,
+                &ban.handle[..],
+                ban.nick,
+                ban.reason,
+                ban.actor,
+                unix(ban.created_at),
+                ban.expires_at.map(unix),
+                ban.lift_asked.map(unix),
+                ban.lifted_at.map(unix),
+                &ban.requester[..],
+            ],
+        ))?;
+        Ok(NetworkBan {
+            id: id_of(conn.last_insert_rowid(), "network ban id")?,
+            ..ban.clone()
+        })
+    }
+
+    fn network_bans(&self) -> Result<Vec<NetworkBan>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare_cached(&format!(
+            "SELECT {NETWORK_BAN_COLUMNS} FROM network_ban ORDER BY id DESC"
+        )))?;
+        let rows = sql(stmt.query_map([], network_ban_of))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(sql(r)??);
+        }
+        Ok(out)
+    }
+
+    fn ask_network_unban(&self, id: u64, at: SystemTime) -> Result<Option<NetworkBan>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = sql(conn.execute(
+            "UPDATE network_ban SET lift_asked = ?1
+              WHERE id = ?2 AND lifted_at IS NULL AND (expires_at IS NULL OR expires_at > ?1)",
+            params![unix(at), clamp(id)],
+        ))?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        sql(conn
+            .query_row(
+                &format!("SELECT {NETWORK_BAN_COLUMNS} FROM network_ban WHERE id = ?1"),
+                params![clamp(id)],
+                network_ban_of,
+            )
+            .optional())?
+        .transpose()
+    }
+
+    fn network_unbanned(&self, id: u64, at: SystemTime) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "UPDATE network_ban SET lifted_at = ?1 WHERE id = ?2 AND lifted_at IS NULL",
+            params![unix(at), clamp(id)],
+        ))?;
+        Ok(())
     }
 
     fn note_link_ban(
@@ -587,6 +660,42 @@ impl ModerationStore for SqliteStore {
             .optional())?;
         id.map(|id| id_of(id, "ban id")).transpose()
     }
+}
+
+const NETWORK_BAN_COLUMNS: &str = "id, home, home_tag, handle, nick, reason, actor, created_at, \
+                                   expires_at, lift_asked, lifted_at, requester";
+
+fn network_ban_of(r: &Row<'_>) -> rusqlite::Result<Result<NetworkBan, StoreError>> {
+    let id: i64 = r.get(0)?;
+    let home: Vec<u8> = r.get(1)?;
+    let handle: Vec<u8> = r.get(3)?;
+    let (home_tag, nick, reason, actor) = (r.get(2)?, r.get(4)?, r.get(5)?, r.get(6)?);
+    let created_at: i64 = r.get(7)?;
+    let (expires_at, lift_asked, lifted_at): (Option<i64>, Option<i64>, Option<i64>) =
+        (r.get(8)?, r.get(9)?, r.get(10)?);
+    let requester: Vec<u8> = r.get(11)?;
+    Ok((|| {
+        Ok(NetworkBan {
+            id: id_of(id, "network ban id")?,
+            requester: requester
+                .try_into()
+                .map_err(|_| StoreError::new("a stored server id is not 8 bytes"))?,
+            home: home
+                .try_into()
+                .map_err(|_| StoreError::new("a stored server id is not 8 bytes"))?,
+            home_tag,
+            handle: handle
+                .try_into()
+                .map_err(|_| StoreError::new("a stored ban handle is not 16 bytes"))?,
+            nick,
+            reason,
+            actor,
+            created_at: from_unix(created_at),
+            expires_at: expires_at.map(from_unix),
+            lift_asked: lift_asked.map(from_unix),
+            lifted_at: lifted_at.map(from_unix),
+        })
+    })())
 }
 
 const BAN_COLUMNS: &str = "id, kind, target, prefix_len, reason, note, actor, actor_fp, source, \

@@ -4117,7 +4117,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     reason: "banned by a moderator".into(),
                 });
             let banning = ghost_ban.is_some();
-            if let Some(kick) = ctx.core.ghost_kick(target, ghost_ban) {
+            if let Some(kick) = ctx.core.ghost_kick(sess.uid, target, ghost_ban) {
                 let (tx, trans) = (tx.clone(), f.trans);
                 tokio::spawn(async move {
                     match peer_answer(kick.answer).await {

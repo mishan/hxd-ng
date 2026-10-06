@@ -124,7 +124,13 @@ pub trait PeerRouter: Send + Sync {
     /// Ask a ghost's home server to kick it from this one, or with `ban`
     /// to ban it from the network for a time (`None`, until lifted) and a
     /// reason. Answers whether the home server did it.
-    fn kick(&self, of: Uid, ban: Option<GhostBan>) -> oneshot::Receiver<Result<(), PeerRefusal>>;
+    /// `by` is the moderator's login, for this server's record of a ban.
+    fn kick(
+        &self,
+        of: Uid,
+        ban: Option<GhostBan>,
+        by: String,
+    ) -> oneshot::Receiver<Result<(), PeerRefusal>>;
 }
 
 /// A ban asked of a ghost's home server.
@@ -132,6 +138,36 @@ pub trait PeerRouter: Send + Sync {
 pub struct GhostBan {
     pub for_: Option<Duration>,
     pub reason: String,
+}
+
+/// A ban this server asked a linked server to place on one of its users:
+/// what this server's operator lists, and lifts by asking that server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkBan {
+    /// Its number here; 0 until the store records it.
+    pub id: u64,
+    /// This server's ID when it asked: only under it can it be lifted.
+    pub requester: [u8; 8],
+    pub home: [u8; 8],
+    pub home_tag: String,
+    /// What the home server gave this server to lift it by.
+    pub handle: [u8; 16],
+    pub nick: String,
+    pub reason: String,
+    pub actor: String,
+    pub created_at: SystemTime,
+    pub expires_at: Option<SystemTime>,
+    /// When this server's operator asked for it lifted.
+    pub lift_asked: Option<SystemTime>,
+    /// When its home server lifted it, or answered that it had no such
+    /// ban (lifted there by its own operator, or run out).
+    pub lifted_at: Option<SystemTime>,
+}
+
+impl NetworkBan {
+    pub fn standing(&self, now: SystemTime) -> bool {
+        self.lifted_at.is_none() && self.expires_at.is_none_or(|e| e > now)
+    }
 }
 
 /// A moderator's kick of a ghost, carried out here at once and asked of
@@ -433,10 +469,17 @@ impl Core {
     /// for as long as it is shown whatever its home server answers; and
     /// asked of that server, whose answer comes in [`GhostKick::answer`].
     /// `None` when `uid` is no ghost shown here.
-    pub fn ghost_kick(&self, uid: Uid, ban: Option<GhostBan>) -> Option<GhostKick> {
+    pub fn ghost_kick(&self, by: Uid, uid: Uid, ban: Option<GhostBan>) -> Option<GhostKick> {
         let nick = self.ghost_hide(uid)?;
+        let moderator = self
+            .roster
+            .lock()
+            .unwrap()
+            .users
+            .get(&by)
+            .map(|s| s.login.clone());
         let answer = match self.peer_router.get() {
-            Some(router) => router.kick(uid, ban),
+            Some(router) => router.kick(uid, ban, moderator.unwrap_or_default()),
             None => answered(Err(PeerRefusal::Unreachable)),
         };
         Some(GhostKick { nick, answer })
@@ -745,6 +788,56 @@ impl Core {
         }
     }
 
+    /// Keep a ban this server asked for, so its operator can list and
+    /// lift it. A store write: off the reactor. Logged when it cannot be
+    /// kept, as the ban stands at its home server either way.
+    pub fn record_network_ban(&self, ban: NetworkBan) {
+        let Some(store) = self.moderation.as_ref() else {
+            return;
+        };
+        if let Err(e) = store.record_network_ban(&ban) {
+            tracing::warn!(nick = %ban.nick, home = %ban.home_tag, "network ban not recorded: {e}");
+        }
+    }
+
+    /// The bans this server asked of others, newest first.
+    pub fn network_bans(&self) -> Result<Vec<NetworkBan>, crate::moderation::ModError> {
+        let store = self
+            .moderation
+            .as_ref()
+            .ok_or(crate::moderation::ModError::Disabled)?;
+        Ok(store.network_bans()?)
+    }
+
+    /// Ask for ban `id` lifted: sent to its home server by the running
+    /// server, on its next reload ([`Core::network_unbans_asked`]).
+    pub fn ask_network_unban(&self, id: u64) -> Result<NetworkBan, crate::moderation::ModError> {
+        use crate::moderation::ModError;
+        let store = self.moderation.as_ref().ok_or(ModError::Disabled)?;
+        store
+            .ask_network_unban(id, SystemTime::now())?
+            .ok_or(ModError::NoSuchBan)
+    }
+
+    /// The bans asked for lifted and not yet lifted, still standing.
+    pub fn network_unbans_asked(&self) -> Vec<NetworkBan> {
+        let now = SystemTime::now();
+        self.network_bans()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|b| b.lift_asked.is_some() && b.standing(now))
+            .collect()
+    }
+
+    /// Ban `id` is lifted at its home server.
+    pub fn network_unbanned(&self, id: u64) {
+        if let Some(store) = self.moderation.as_ref() {
+            if let Err(e) = store.network_unbanned(id, SystemTime::now()) {
+                tracing::warn!(id, "network unban not recorded: {e}");
+            }
+        }
+    }
+
     pub fn ghost_count(&self) -> usize {
         self.roster.lock().unwrap().ghosts.len()
     }
@@ -981,10 +1074,10 @@ mod tests {
         let (_me, mut rx) = test_attach(&core, "me", chatter());
         let g = core.ghost_attach(ghost("bob", true)).unwrap();
         assert_eq!(
-            core.ghost_kick(g, None).map(|k| k.nick).as_deref(),
+            core.ghost_kick(0, g, None).map(|k| k.nick).as_deref(),
             Some("bob")
         );
-        assert!(core.ghost_kick(g, None).is_none(), "hidden already");
+        assert!(core.ghost_kick(0, g, None).is_none(), "hidden already");
         core.ghost_update(g, ghost("robert", true));
         assert!(core.roster_rows().iter().all(|u| u.uid != g));
         assert!(core.ghost_line(g, "hi".into(), 0).is_none());

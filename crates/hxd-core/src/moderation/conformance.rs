@@ -22,6 +22,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn ModerationStore>) {
     a_lifted_ban_stays_on_record_and_a_new_one_is_a_new_row(&*new_store());
     bans_list_standing_or_all_and_age_out(&*new_store());
     a_link_ban_answers_only_its_requester_and_goes_with_its_ban(&*new_store());
+    a_network_ban_is_kept_asked_lifted_and_aged_out(&*new_store());
     an_expired_ban_is_closed_and_a_new_one_is_a_new_row(&*new_store());
 }
 
@@ -483,4 +484,62 @@ fn a_link_ban_answers_only_its_requester_and_goes_with_its_ban(store: &dyn Moder
     assert_eq!(store.link_ban([1; 8], [8; 16]).unwrap(), None);
     store.prune_bans(t(160)).unwrap();
     assert_eq!(store.link_ban([1; 8], [9; 16]).unwrap(), None);
+}
+
+fn a_network_ban_is_kept_asked_lifted_and_aged_out(store: &dyn ModerationStore) {
+    use crate::server_link::NetworkBan;
+    let ban = |nick: &str| NetworkBan {
+        id: 0,
+        requester: [2; 8],
+        home: [3; 8],
+        home_tag: "hch".into(),
+        handle: [9; 16],
+        nick: nick.into(),
+        reason: "spam".into(),
+        actor: "alice".into(),
+        created_at: t(100),
+        expires_at: None,
+        lift_asked: None,
+        lifted_at: None,
+    };
+    let eve = store.record_network_ban(&ban("eve")).unwrap();
+    let bob = store.record_network_ban(&ban("bob")).unwrap();
+    assert_ne!(eve.id, bob.id);
+    let listed: Vec<_> = store
+        .network_bans()
+        .unwrap()
+        .into_iter()
+        .map(|b| b.nick)
+        .collect();
+    assert_eq!(listed, ["bob", "eve"], "newest first");
+    let asked = store.ask_network_unban(eve.id, t(110)).unwrap().unwrap();
+    assert_eq!(
+        (asked.lift_asked, asked.handle, asked.requester),
+        (Some(t(110)), [9; 16], [2; 8])
+    );
+    let gone = store
+        .record_network_ban(&NetworkBan {
+            expires_at: Some(t(105)),
+            ..ban("ran out")
+        })
+        .unwrap();
+    assert!(
+        store.ask_network_unban(gone.id, t(110)).unwrap().is_none(),
+        "ran out already"
+    );
+    store.network_unbanned(eve.id, t(120)).unwrap();
+    assert!(
+        store.ask_network_unban(eve.id, t(130)).unwrap().is_none(),
+        "lifted already"
+    );
+    store.prune_bans(t(160)).unwrap();
+    let left: Vec<_> = store
+        .network_bans()
+        .unwrap()
+        .into_iter()
+        .map(|b| b.nick)
+        .collect();
+    assert_eq!(left, ["bob"]);
+    let carol = store.record_network_ban(&ban("carol")).unwrap();
+    assert!(carol.id > bob.id, "an id is never given out again");
 }

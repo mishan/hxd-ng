@@ -122,6 +122,9 @@ async fn reload_on_hangup(
                 Ok(n) => tracing::info!("SIGHUP: {n} link peers configured"),
                 Err(e) => tracing::error!("SIGHUP: [link] {e}; the link peers are unchanged"),
             }
+            // What `hxd ban lift` asked of other servers meanwhile.
+            let sending = hub.clone();
+            let _ = tokio::task::spawn_blocking(move || sending.send_unbans()).await;
         }
         if let Some(banner) = banner.as_ref().filter(|b| b.image_len().is_some()) {
             // A file read, so on the blocking pool rather than this task.
@@ -246,6 +249,10 @@ enum Command {
     BanLift {
         id: u64,
     },
+    /// `hxd ban lift n<id>`: one this server asked of a linked server.
+    BanLiftNetwork {
+        id: u64,
+    },
     AccountList,
     AccountShow {
         login: String,
@@ -338,7 +345,9 @@ an address or block (`192.0.2.7`, `10.0.0.0/8`, `2001:db8::/48`),\n\
 `identity:FINGERPRINT`, or `*@HOST` for every identity a registrar\n\
 issued. `ban list` is what stands (--all for the record), `ban lift`\n\
 ends one and every row the same act placed. A running server applies\n\
-either on SIGHUP, ending the sessions a new ban refuses.\n\n\
+either on SIGHUP, ending the sessions a new ban refuses. Bans this\n\
+server asked linked servers for are listed as `n#ID`; `ban lift nID`\n\
+asks the user's home server to lift one, sent on SIGHUP.\n\n\
 `account` edits the accounts directory, keeping each file's comments.\n\
 `add` takes its access from --access (the [access] keys of\n\
 docs/access-bits.md), or from the account --like names; a password\n\
@@ -656,8 +665,14 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             for_: ban_for.flatten(),
         },
         ["ban", "list"] => Command::BanList { all },
-        ["ban", "lift", id] => Command::BanLift {
-            id: id.parse().map_err(|_| format!("{id:?} is not a ban id"))?,
+        // `n#3` as `ban list` prints it, or `n3`.
+        ["ban", "lift", id] => match id.strip_prefix('n').map(|n| n.trim_start_matches('#')) {
+            Some(n) => Command::BanLiftNetwork {
+                id: n.parse().map_err(|_| format!("{id:?} is not a ban id"))?,
+            },
+            None => Command::BanLift {
+                id: id.parse().map_err(|_| format!("{id:?} is not a ban id"))?,
+            },
         },
         ["account", "list"] => Command::AccountList,
         ["account", "show", login] => Command::AccountShow {
@@ -877,6 +892,10 @@ async fn main() {
             }
             Command::BanLift { id } => {
                 println!("{}", hxd::moderation::ban_lift(&config, *id)?);
+                return Ok(());
+            }
+            Command::BanLiftNetwork { id } => {
+                println!("{}", hxd::moderation::ban_lift_network(&config, *id)?);
                 return Ok(());
             }
             Command::AccountList => {

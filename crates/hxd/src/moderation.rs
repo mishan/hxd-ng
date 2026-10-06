@@ -513,18 +513,64 @@ pub fn ban_add(
     Ok(placed.iter().map(ban_line).collect::<Vec<_>>().join("\n"))
 }
 
-/// `hxd ban list`: the standing bans, or with `all` every one on record.
+/// How a ban this server asked of a linked server reads in `hxd ban
+/// list`: numbered `n#`, as `hxd ban lift` takes it.
+fn network_ban_line(b: &hxd_core::server_link::NetworkBan) -> String {
+    let until = match (b.lifted_at, b.lift_asked, b.expires_at) {
+        (Some(at), _, _) => format!("lifted {}", unix(at)),
+        (None, Some(at), _) => format!("lift asked {}, not yet answered", unix(at)),
+        (None, None, Some(at)) => format!("until {}", unix(at)),
+        (None, None, None) => "until lifted".into(),
+    };
+    format!(
+        "n#{} {} on {}: {} (asked of {}, {} by {}, {until})",
+        b.id,
+        b.nick,
+        b.home_tag,
+        b.reason,
+        b.home_tag,
+        unix(b.created_at),
+        b.actor
+    )
+}
+
+/// `hxd ban list`: the standing bans, or with `all` every one on record,
+/// and then the bans this server asked linked servers for.
 pub fn ban_list(config: &Config, all: bool) -> Result<String, String> {
     let core = operator_core(config, true)?;
     let bans = core.list_bans(!all, None, usize::MAX).map_err(refused)?;
-    if bans.is_empty() {
+    let now = std::time::SystemTime::now();
+    let network: Vec<_> = core
+        .network_bans()
+        .map_err(refused)?
+        .into_iter()
+        .filter(|b| all || b.standing(now))
+        .collect();
+    if bans.is_empty() && network.is_empty() {
         return Ok(if all {
             "nobody has been banned".into()
         } else {
             "nobody is banned".into()
         });
     }
-    Ok(bans.iter().map(ban_line).collect::<Vec<_>>().join("\n"))
+    Ok(bans
+        .iter()
+        .map(ban_line)
+        .chain(network.iter().map(network_ban_line))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// `hxd ban lift n<id>`: ask for a ban this server asked of a linked
+/// server lifted. A running server sends the request on SIGHUP, and its
+/// log says what came of it.
+pub fn ban_lift_network(config: &Config, id: u64) -> Result<String, String> {
+    let core = operator_core(config, false)?;
+    let ban = core.ask_network_unban(id).map_err(refused)?;
+    Ok(format!(
+        "{}\nasked; a running server sends it on SIGHUP",
+        network_ban_line(&ban)
+    ))
 }
 
 /// `hxd ban lift`: lift a standing ban, and any placed with it (a login

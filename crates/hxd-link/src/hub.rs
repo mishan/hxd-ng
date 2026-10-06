@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use hxd_core::roster::Uid;
 use hxd_core::server_link::{
-    GhostBan, GhostInfo, GhostLine, LocalUser, PeerEvent, PeerRefusal, PeerRouter, RemoteRef,
-    Requester, PEER_WAIT,
+    GhostBan, GhostInfo, GhostLine, LocalUser, NetworkBan, PeerEvent, PeerRefusal, PeerRouter,
+    RemoteRef, Requester, PEER_WAIT,
 };
 use hxd_core::Core;
 use hxd_session::peer::{LinkGrant, LinkIo, LinkLogin, PeerAcceptor};
@@ -548,6 +548,21 @@ impl Hub {
             })
     }
 
+    /// Where ghost `uid` is from: its home server's ID and tag, and its
+    /// own name.
+    fn ghost_home(&self, uid: Uid) -> Option<(ServerId, String, String)> {
+        let state = self.0.state.lock().unwrap();
+        state.links.values().find_map(|live| {
+            let slot = live.ghosts.values().find(|s| s.uid == uid)?;
+            let home = live
+                .peer
+                .iter()
+                .chain(live.servers.values())
+                .find(|s| s.id == slot.group.home)?;
+            Some((home.id, home.tag.clone(), slot.group.name.clone()))
+        })
+    }
+
     /// The ghost the peer calls `id` on this link.
     pub(crate) fn ghost_uid(&self, peer: &str, generation: u64, id: u16) -> Option<Uid> {
         let state = self.0.state.lock().unwrap();
@@ -583,16 +598,74 @@ impl Hub {
         if feature != 0 && live.features & feature == 0 {
             return Err(PeerRefusal::FeatureNotNegotiated);
         }
-        let (reply, answer) = oneshot::channel();
-        let request = Request {
-            ty,
-            fields: build(id),
-            reply,
-        };
-        match live.requests.as_ref().map(|r| r.try_send(request)) {
-            Some(Ok(())) => Ok(answer),
-            Some(Err(mpsc::error::TrySendError::Full(_))) => Err(PeerRefusal::RateLimited),
-            _ => Err(PeerRefusal::Unreachable),
+        enqueue(live, ty, build(id))
+    }
+
+    /// Send a request for server `home` over the link it lies behind.
+    fn request_for(
+        &self,
+        home: ServerId,
+        ty: u32,
+        fields: Vec<Field>,
+    ) -> Result<oneshot::Receiver<Reply>, PeerRefusal> {
+        let state = self.0.state.lock().unwrap();
+        let live = state
+            .links
+            .values()
+            .find(|l| {
+                l.peer
+                    .iter()
+                    .chain(l.servers.values())
+                    .any(|s| s.id == home)
+            })
+            .ok_or(PeerRefusal::Unreachable)?;
+        enqueue(live, ty, fields)
+    }
+
+    /// The bans this server's operator asked lifted, sent to their home
+    /// servers: on a reload, after `hxd ban lift`. One the home server
+    /// lifts, or no longer knows, is marked lifted; one it cannot be
+    /// asked about now waits for the next reload. Called off the reactor:
+    /// the bans are read from the store.
+    pub fn send_unbans(&self) {
+        let me = self.server_id();
+        for ban in self.0.core.network_unbans_asked() {
+            // Asked under a key this server no longer has: its home server
+            // would answer any other requester `UnknownBan`, which reads as
+            // lifted while the ban stands.
+            if ban.requester != me.0 {
+                warn!(id = ban.id, home = %ban.home_tag, "network ban asked under another server key; its home server's operator must lift it");
+                continue;
+            }
+            let home = ServerId(ban.home);
+            let fields = vec![
+                Field::new(field::BAN_ID, ban.handle),
+                Field::new(field::SERVER_ID, ban.home),
+                Field::new(field::REQUESTER, me.0),
+            ];
+            let answer = match self.request_for(home, tx::UNBAN, fields) {
+                Ok(answer) => answer,
+                Err(why) => {
+                    warn!(id = ban.id, home = %ban.home_tag, ?why, "network unban not sent; again at the next reload");
+                    continue;
+                }
+            };
+            let core = self.0.core.clone();
+            tokio::spawn(async move {
+                let result = match tokio::time::timeout(PEER_WAIT, answer).await {
+                    Ok(Ok((error, fields))) => refusal(error, &fields),
+                    _ => Some(PeerRefusal::Unreachable),
+                };
+                match result {
+                    None | Some(PeerRefusal::UnknownBan) => {
+                        tracing::info!(id = ban.id, home = %ban.home_tag, "network ban lifted");
+                        tokio::task::spawn_blocking(move || core.network_unbanned(ban.id));
+                    }
+                    Some(why) => {
+                        warn!(id = ban.id, home = %ban.home_tag, ?why, "network unban refused; again at the next reload")
+                    }
+                }
+            });
         }
     }
 
@@ -874,6 +947,21 @@ impl PeerAcceptor for Hub {
     }
 }
 
+/// Hand a request to a link's session loop.
+fn enqueue(
+    live: &Live,
+    ty: u32,
+    fields: Vec<Field>,
+) -> Result<oneshot::Receiver<Reply>, PeerRefusal> {
+    let (reply, answer) = oneshot::channel();
+    let request = Request { ty, fields, reply };
+    match live.requests.as_ref().map(|r| r.try_send(request)) {
+        Some(Ok(())) => Ok(answer),
+        Some(Err(mpsc::error::TrySendError::Full(_))) => Err(PeerRefusal::RateLimited),
+        _ => Err(PeerRefusal::Unreachable),
+    }
+}
+
 /// What a link hands its session loop when it is established.
 pub(crate) struct Subscribed {
     /// The feed's number at the snapshot: events up to it are in `users`.
@@ -942,6 +1030,7 @@ fn refusal(error: bool, fields: &[Field]) -> Option<PeerRefusal> {
         Some(Some(Reason::RateLimited)) => PeerRefusal::RateLimited,
         Some(Some(Reason::FeatureNotNegotiated)) => PeerRefusal::FeatureNotNegotiated,
         Some(Some(Reason::Unreachable)) => PeerRefusal::Unreachable,
+        Some(Some(Reason::UnknownBan)) => PeerRefusal::UnknownBan,
         _ => PeerRefusal::Refused,
     })
 }
@@ -978,8 +1067,38 @@ impl PeerRouter for Router {
         )
     }
 
-    fn kick(&self, of: Uid, ban: Option<GhostBan>) -> oneshot::Receiver<Result<(), PeerRefusal>> {
-        let me = self.0.upgrade().map(|inner| Hub(inner).server_id());
+    fn kick(
+        &self,
+        of: Uid,
+        ban: Option<GhostBan>,
+        by: String,
+    ) -> oneshot::Receiver<Result<(), PeerRefusal>> {
+        let hub = self.0.upgrade().map(Hub);
+        let me = hub.as_ref().map(Hub::server_id);
+        // What this server keeps of a ban once placed, taken now: the
+        // ghost may be gone by the time the answer comes.
+        let record = ban.as_ref().and_then(|ban| {
+            let hub = hub.as_ref()?;
+            let (home, home_tag, nick) = hub.ghost_home(of)?;
+            let now = std::time::SystemTime::now();
+            Some((
+                hub.0.core.clone(),
+                NetworkBan {
+                    id: 0,
+                    requester: hub.server_id().0,
+                    home: home.0,
+                    home_tag,
+                    handle: [0; 16],
+                    nick,
+                    reason: ban.reason.clone(),
+                    actor: by,
+                    created_at: now,
+                    expires_at: ban.for_.and_then(|d| now.checked_add(d)),
+                    lift_asked: None,
+                    lifted_at: None,
+                },
+            ))
+        });
         let ty = if ban.is_some() { tx::BAN } else { tx::KICK };
         self.send(
             of,
@@ -1001,7 +1120,15 @@ impl PeerRouter for Router {
                 }
                 f
             },
-            |_| Ok(()),
+            move |fields| {
+                let handle = find(&fields, field::BAN_ID).and_then(Field::fixed::<16>);
+                if let (Some((core, ban)), Some(handle)) = (record, handle) {
+                    tokio::task::spawn_blocking(move || {
+                        core.record_network_ban(NetworkBan { handle, ..ban })
+                    });
+                }
+                Ok(())
+            },
         )
     }
 

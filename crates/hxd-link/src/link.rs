@@ -242,6 +242,10 @@ impl Link<'_> {
         self.send_snapshot(io, groups);
         self.established = Some(Instant::now());
         info!(peer = %self.entry.name, server = ?peer.server.id, tag = %peer.server.tag, "link up");
+        // Lifts asked while the ban's home server was out of reach go now,
+        // not at the next reload. A store read, so off the reactor.
+        let hub = self.hub.clone();
+        tokio::task::spawn_blocking(move || hub.send_unbans());
 
         let mut tick = interval(Duration::from_secs(5));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);

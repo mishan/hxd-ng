@@ -70,7 +70,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -522,6 +522,27 @@ CREATE TABLE link_ban (
   requester BLOB    NOT NULL,
   ban_id    INTEGER NOT NULL,
   CHECK (length(handle) = 16 AND length(requester) = 8)
+);
+";
+
+/// The bans this server asked linked servers for (`docs/server-link.md`
+/// §7.5), which its operator lists and lifts: a ban of another server's
+/// user is that server's row, and this is only the record of asking.
+const SCHEMA_V15: &str = "
+CREATE TABLE network_ban (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  requester   BLOB    NOT NULL,
+  home        BLOB    NOT NULL,
+  home_tag    TEXT    NOT NULL,
+  handle      BLOB    NOT NULL,
+  nick        TEXT    NOT NULL,
+  reason      TEXT    NOT NULL,
+  actor       TEXT    NOT NULL,
+  created_at  INTEGER NOT NULL,
+  expires_at  INTEGER,
+  lift_asked  INTEGER,
+  lifted_at   INTEGER,
+  CHECK (length(requester) = 8 AND length(home) = 8 AND length(handle) = 16)
 );
 ";
 
@@ -1145,6 +1166,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 14 {
         steps.push_str(SCHEMA_V14);
+    }
+    if version < 15 {
+        steps.push_str(SCHEMA_V15);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"

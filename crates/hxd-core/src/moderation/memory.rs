@@ -21,6 +21,8 @@ struct Inner {
     bans: Vec<crate::ban::Ban>,
     last_ban: crate::ban::BanId,
     link_bans: std::collections::HashMap<[u8; 16], ([u8; 8], crate::ban::BanId)>,
+    network_bans: Vec<crate::server_link::NetworkBan>,
+    last_network_ban: u64,
     /// Bans still to write before every later one fails, for the tests
     /// of a store that fails partway.
     #[cfg(test)]
@@ -254,6 +256,9 @@ impl ModerationStore for MemoryModeration {
             bans, link_bans, ..
         } = &mut *inner;
         link_bans.retain(|_, (_, id)| bans.iter().any(|b| b.id == *id));
+        inner.network_bans.retain(|b| {
+            b.lifted_at.is_none_or(|at| at >= before) && b.expires_at.is_none_or(|at| at >= before)
+        });
         Ok(was - inner.bans.len())
     }
 
@@ -265,6 +270,47 @@ impl ModerationStore for MemoryModeration {
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
         inner.link_bans.insert(handle, (requester, id));
+        Ok(())
+    }
+
+    fn record_network_ban(
+        &self,
+        ban: &crate::server_link::NetworkBan,
+    ) -> Result<crate::server_link::NetworkBan, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.last_network_ban += 1;
+        let id = inner.last_network_ban;
+        let row = crate::server_link::NetworkBan { id, ..ban.clone() };
+        inner.network_bans.push(row.clone());
+        Ok(row)
+    }
+
+    fn network_bans(&self) -> Result<Vec<crate::server_link::NetworkBan>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.network_bans.iter().rev().cloned().collect())
+    }
+
+    fn ask_network_unban(
+        &self,
+        id: u64,
+        at: SystemTime,
+    ) -> Result<Option<crate::server_link::NetworkBan>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        Ok(inner
+            .network_bans
+            .iter_mut()
+            .find(|b| b.id == id && b.standing(at))
+            .map(|b| {
+                b.lift_asked = Some(at);
+                b.clone()
+            }))
+    }
+
+    fn network_unbanned(&self, id: u64, at: SystemTime) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(b) = inner.network_bans.iter_mut().find(|b| b.id == id) {
+            b.lifted_at.get_or_insert(at);
+        }
         Ok(())
     }
 
