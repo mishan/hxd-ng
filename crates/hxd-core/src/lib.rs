@@ -26,6 +26,7 @@ pub mod notify;
 pub mod push;
 pub mod revoked;
 pub mod roster;
+pub mod server_link;
 pub mod system;
 pub mod video;
 pub mod voice;

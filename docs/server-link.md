@@ -1,8 +1,9 @@
 # Server linking: hxd-ng on a linked network
 
 Status: partial, 2026-10. Built: L0 (the uid quarantine, Colored
-Nicknames) and L1 (links by key mode, Hello, server lists, pings, close,
-reload; no users cross yet). The rest is design. It implements fogWraith's
+Nicknames), L1 (links by key mode, Hello, server lists, pings, close,
+reload) and L2 (users crossing one link both ways, ghosts on both wires).
+Chat does not cross yet. The rest is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -157,10 +158,9 @@ from, and each frontend renders them.
 
   ```rust
   pub struct RemoteRef {
-      pub home: ServerId,
       pub home_tag: String,
       pub home_name: String,
-      pub color: u32,          // the color this server shows that home server in (the extension's Color)
+      pub tagged: bool,         // [link] show_tags when the ghost was shown
       pub refuses_msgs: bool,
   }
   ```
@@ -187,18 +187,17 @@ the cut never takes the tag. In chat lines, the name is cut to fit
 **The ng frontend** sends `nick` as the own name and `remote: {server,
 tag, color}`, and the client decides how to show it (§5).
 
-When `show_tags` changes on reload, the core re-announces every ghost with
-`Changed` so classic lists pick up the new names. `ServerConfig` is an
-immutable `Arc`, so the frontends read the setting from a live value.
+`show_tags` is read when a ghost is shown and kept in its `RemoteRef`, so
+changing it takes a restart, like the rest of `[link]` outside the peers.
 
 ### 3.5 Colored Nicknames
 
 The extension identifies an untagged ghost by its home server's color,
 through Colored Nicknames (`DATA_COLOR`, `0x0500`), which hxd-ng
 implements (L0) for the clients that send a color. A ghost shows its home
-server's color (`RemoteRef.color`, §3.4), never its own, so the classic
-frontend's `nick_color` must prefer the former for a ghost (L2). Its own
-color still crosses the link, in its group.
+server's color, never its own: the hub puts the home server's color in
+the ghost's `UserInfo.color`, so every frontend shows it the way it shows
+a local user's. Its own color still crosses the link, in its group.
 
 Color tells a ghost apart only so far: since L0 any local user may pick
 any color, the one a linked server's users show included. A name never
@@ -213,10 +212,12 @@ A snapshot arriving, or a netsplit past the grace period, is one `Joined`
 or `Parted` per ghost to every local session in one go. AGENTS.md forbids
 any domain operation that pushes a session near its cap in one go.
 
-- **A server-wide ghost cap**, `[link] max_ghosts` (default 2000), well
-  below `LIVE_QUEUE_CAP`, across all links, beside the per-link bound the
-  extension recommends. Ghosts past it are not represented, and traffic
-  naming them is dropped and logged.
+- **A server-wide ghost cap**, `[link] max_ghosts` (default 2000; the
+  config check holds it to half of `LIVE_QUEUE_CAP`), across all links,
+  beside the per-link bound the extension recommends, `ghosts` on each
+  peer (default 1000), which also bounds a snapshot held while its parts
+  arrive. Ghosts past either are not represented, and traffic naming them
+  is dropped and logged.
 - A detached ng session buffers at most `OUTBOX_BUFFER_CAP` events, which
   a netsplit can exceed. It breaks and resumes into `resync_required`,
   which is what that answer exists for. A roster-reset event that replaced
@@ -232,14 +233,18 @@ snapshot and then updates:
 
 ```rust
 impl Core {
-    pub fn peer_subscribe(&self, cap: usize) -> (Vec<LocalUser>, PeerFeed);
+    pub fn peer_feed(&self, cap: usize) -> mpsc::Receiver<(u64, PeerEvent)>;
+    pub fn peer_snapshot(&self) -> (u64, Vec<LocalUser>);
 }
 ```
 
-taken under one roster lock, so the snapshot and the feed's first event
+The feed numbers each event under the roster lock, and a snapshot is
+taken under it with the number it stands at, so a link that sends one
+skips every event numbered up to it: the snapshot and the updates after it
 neither miss nor repeat anything. The core `try_send`s `PeerEvent`s to the
 feed from inside the roster lock, at the call sites that broadcast local
-presence: `announce`, `update`, `set_status`, `apply_account`,
+presence: `announce`, `update_with_color`, `set_status`, `apply_account`
+(when the name changes: the admin bit never crosses),
 `RosterInner::end_session` (which every way of leaving goes through), and
 the broadcast step of `chat_commit_batch`, which checks there that the
 sender is exported (`chat_public` does not check `visible`, so a line
@@ -253,13 +258,13 @@ user is always `Shown` before their first `Chat`.
 pub enum PeerEvent {
     Shown(LocalUser),
     Changed(LocalUser),
-    Gone(Uid, GoneReason),     // Disconnected, NotExported, Banned
-    Chat { from: Uid, serial: u64, text: String, style: u16 },
+    Gone(Uid, GoneReason),     // Disconnected; NotExported and Banned with L5
+    // Chat { from, serial, text, style } with L3
 }
 ```
 
-`LocalUser` carries only what may cross: uid, serial, own name, icon,
-away, exclusions (§7.5) and, later, the user key fingerprint. Never the
+`LocalUser` carries only what may cross: uid, own name, icon, away and
+color; later, the serial, exclusions (§7.5) and the user key fingerprint. Never the
 login, address or access bits; the type has no field for them, so a later
 change cannot leak them. Refuses-messages has no source in the domain and
 is always false for local users. A session's departure reason is recorded on
@@ -295,7 +300,7 @@ link is closed.
 
 ```rust
 impl Core {
-    pub fn ghost_attach(&self, g: GhostInfo) -> Result<Uid, GhostRefused>;
+    pub fn ghost_attach(&self, g: GhostInfo) -> Option<Uid>;   // None: no uid free
     pub fn ghost_update(&self, uid: Uid, g: GhostInfo) -> bool;
     pub fn ghost_part(&self, uid: Uid);
     pub fn ghosts_part_peer(&self, peer: PeerId, home: Option<ServerId>);
@@ -378,7 +383,8 @@ and then its last line; the alternative is losing it.
 
 ## 5. The ng wire
 
-A ghost's `user` object gains `remote: {server, tag, color}`. It has no
+A ghost's `user` object gains `remote: {server, tag, tagged}`, beside its
+`color`, which is its home server's. It has no
 `identity` (until user keys), no `avatar`, and `admin: false`. Its
 `transport` describes the user's own connection, which this server cannot
 know, so `hotline-ng.md` gains a third value, `unknown`, for ghosts.
@@ -759,10 +765,10 @@ ghosts = 1000               # this link's bound
     user list bytes, and leaves; the tracker count does not include
     ghosts.
   - **Every classic transaction and ng request that names a uid fails for
-    a ghost**, except the translated ones. One table-driven test, with the
-    list of uid-naming requests built from the dispatchers' source so a
-    new one is covered without anyone remembering to add it (the classic
-    frontend already has a test that reads its own dispatcher).
+    a ghost** exactly as for a uid nobody holds, except the translated
+    ones. One table-driven test over the classic list `NAMES_A_USER`,
+    which a unit test checks against the dispatcher's source, so a new
+    uid-reading arm fails until it is listed.
   - Chat crosses both ways, formatted by the receiver, in order; a
     media-only line does not cross; a user's last line before leaving is
     heard; public chat keeps flowing while ghost lines stream in.

@@ -9,10 +9,14 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
-use hxd_testclient::legacy::{self, Login};
+use hxd_testclient::legacy::{self, push, Login, UserRow};
+use hxd_testclient::ng;
+use hxproto::messages::{tag, ClientHdr};
+use serde_json::json;
 
 struct Server {
     legacy: SocketAddr,
+    ng: SocketAddr,
     hub: hxd_link::Hub,
     config: std::path::PathBuf,
 }
@@ -21,17 +25,29 @@ fn public(seed: u8) -> String {
     B64.encode(hxd_link::LinkKey::from_seed(&[seed; 32]).public())
 }
 
-/// A server whose link key is `seed` repeated, with `peers` as its
-/// `[[link.peer]]` entries. Its TLS listener is `tls`, bound by the
-/// caller so a peer's config can name it first.
+/// A server whose link key is `seed` repeated, with `link` as more keys
+/// of its `[link]` section and `peers` as its `[[link.peer]]` entries. Its
+/// TLS listener is `tls`, bound by the caller so a peer's config can name
+/// it first.
 async fn start(
     dir: &Path,
     seed: u8,
     tag: &str,
+    link: &str,
     peers: &str,
     tls: tokio::net::TcpListener,
 ) -> Server {
     let d = dir.display();
+    let accounts = dir.join("accounts");
+    hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
+    // Every act on another user, so that a refusal for a ghost is the
+    // ghost's and never a missing privilege's.
+    std::fs::write(
+        accounts.join("admin.toml"),
+        "name = \"Admin\"\npassword = \"pw\"\n[access]\nread_chat = true\nsend_chat = true\n\
+         send_msgs = true\nget_user_info = true\ndisconnect_users = true\ncreate_pchats = true\n",
+    )
+    .unwrap();
     let seed_hex: String = [seed; 32].iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.join("link.key"), seed_hex).unwrap();
     let issued = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -39,34 +55,42 @@ async fn start(
     std::fs::write(dir.join("key.pem"), issued.signing_key.serialize_pem()).unwrap();
     let text = format!(
         "[server]\nname = \"{tag} server\"\n[paths]\naccounts = \"{d}/accounts\"\n\
+         [ng]\nbind = \"127.0.0.1:0\"\n\
+         [limits]\nspam_points = 0\nchat_lines = 0\nng_requests = 0\n\
          [tls]\ncert = \"{d}/cert.pem\"\nkey = \"{d}/key.pem\"\n\
-         [link]\ntag = \"{tag}\"\nkey = \"{d}/link.key\"\n{peers}\n"
+         [link]\ntag = \"{tag}\"\nkey = \"{d}/link.key\"\n{link}\n{peers}\n"
     );
     let path = dir.join("hxd-ng.toml");
     std::fs::write(&path, &text).unwrap();
     let config = hxd::Config::load(&path).unwrap();
     hxd::check_config(&config).unwrap();
     let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
-    let hub = hxd::link::build(&config, ctx.core.queue_budget().clone())
+    let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
+        .unwrap()
+        .unwrap();
+    let hub = hxd::link::build(&config, ctx.core.clone())
         .unwrap()
         .unwrap();
     let certs = Arc::new(
         hxd_session::LegacyTls::load(&dir.join("cert.pem"), &dir.join("key.pem")).unwrap(),
     );
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ngl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server = Server {
         legacy: legacy.local_addr().unwrap(),
+        ng: ngl.local_addr().unwrap(),
         hub: hub.clone(),
         config: path,
     };
     tokio::spawn(hxd_session::serve(legacy, ctx.clone()));
+    tokio::spawn(hxd_ng_session::serve(ngl, ng_ctx));
     tokio::spawn(hxd_session::serve_tls_with_peers(
         tls,
         ctx,
         certs,
         Some(Arc::new(hub.clone()) as Arc<dyn hxd_session::PeerAcceptor>),
     ));
-    hub.spawn_dialers();
+    hub.start();
     server
 }
 
@@ -91,8 +115,22 @@ async fn comes_up(hub: &hxd_link::Hub, seed: u8, within: Duration) -> bool {
     true
 }
 
-/// Two servers, `a` accepting `b`, with the key each holds for the other.
-async fn pair(a_holds: u8, b_holds: u8) -> (Server, Server, [tempfile::TempDir; 2]) {
+/// Wait for the link to `seed` to go down.
+async fn goes_down(hub: &hxd_link::Hub, seed: u8) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while up(hub, seed) {
+        assert!(tokio::time::Instant::now() < deadline, "{:?}", hub.status());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Two servers, `a` (tag `aa`) accepting `b` (tag `bb`), with the key
+/// each holds for the other and more `[link]` keys for `a`.
+async fn pair_with(
+    a_holds: u8,
+    b_holds: u8,
+    a_link: &str,
+) -> (Server, Server, [tempfile::TempDir; 2]) {
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a_tls = bind().await;
     let a_addr = a_tls.local_addr().unwrap();
@@ -100,6 +138,7 @@ async fn pair(a_holds: u8, b_holds: u8) -> (Server, Server, [tempfile::TempDir; 
         da.path(),
         1,
         "aa",
+        a_link,
         &format!(
             "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
              key = \"{}\"\naccount = \"link-bb\"\n",
@@ -112,6 +151,7 @@ async fn pair(a_holds: u8, b_holds: u8) -> (Server, Server, [tempfile::TempDir; 
         db.path(),
         2,
         "bb",
+        "",
         &format!(
             "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
              key = \"{}\"\naccount = \"link-bb\"\n",
@@ -121,6 +161,34 @@ async fn pair(a_holds: u8, b_holds: u8) -> (Server, Server, [tempfile::TempDir; 
     )
     .await;
     (a, b, [da, db])
+}
+
+async fn pair(a_holds: u8, b_holds: u8) -> (Server, Server, [tempfile::TempDir; 2]) {
+    pair_with(a_holds, b_holds, "").await
+}
+
+/// Two servers linked, waited for.
+async fn linked(a_link: &str) -> (Server, Server, [tempfile::TempDir; 2]) {
+    let servers = pair_with(2, 1, a_link).await;
+    assert!(comes_up(&servers.0.hub, 2, Duration::from_secs(10)).await);
+    assert!(comes_up(&servers.1.hub, 1, Duration::from_secs(10)).await);
+    servers
+}
+
+/// The row named `nick` in `c`'s user list, once it appears.
+async fn row(c: &mut legacy::Client, nick: &str) -> UserRow {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows = c.user_list().await.unwrap();
+        if let Some(r) = rows.into_iter().find(|r| r.nick == nick.as_bytes()) {
+            return r;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{nick} never listed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
@@ -152,15 +220,6 @@ async fn a_link_with_a_key_either_side_did_not_configure_never_comes_up() {
             "{a_holds} {b_holds}"
         );
         assert!(!up(&a.hub, 2), "{a_holds} {b_holds}");
-    }
-}
-
-/// Wait for the link to `seed` to go down.
-async fn goes_down(hub: &hxd_link::Hub, seed: u8) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while up(hub, seed) {
-        assert!(tokio::time::Instant::now() < deadline, "{:?}", hub.status());
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -211,9 +270,9 @@ async fn a_key_proof_without_bit_11_is_refused() {
     let mut c = legacy::Client::connect(a.legacy).await.unwrap();
     let reply = c
         .call(
-            hxproto::messages::ClientHdr::Login.as_u32(),
+            ClientHdr::Login.as_u32(),
             &[
-                (hxproto::messages::tag::NAME, b"guest".to_vec()),
+                (tag::NAME, b"guest".to_vec()),
                 (0x0640, vec![9; 32]),
                 (0x0641, vec![9; 64]),
             ],
@@ -222,5 +281,134 @@ async fn a_key_proof_without_bit_11_is_refused() {
     match reply {
         Err(hxd_testclient::Error::Refused { text, .. }) => assert_eq!(text, "Login failed."),
         other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+#[tokio::test]
+async fn users_cross_the_link_both_ways_on_both_wires_and_leave() {
+    let (a, b, _dirs) = linked("").await;
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let mut bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+
+    // Each sees the other as a user, greyed out for what a ghost cannot
+    // be sent (private chat always; private messages, which this link
+    // does not carry yet), and never as an admin.
+    let ghost = row(&mut ann, "bob").await;
+    assert_eq!(ghost.color, 4 | 8);
+    assert_eq!(row(&mut bob, "ann").await.color, 4 | 8);
+
+    // An ng client is told where the ghost is from.
+    let (_watcher, hello) = ng::Client::guest(a.ng, "watcher").await.unwrap();
+    let users = hello["users"].as_array().unwrap();
+    let seen = users.iter().find(|u| u["nick"] == "bob").unwrap();
+    assert_eq!(
+        seen["remote"],
+        json!({ "server": "bb server", "tag": "bb", "tagged": false })
+    );
+    assert_eq!(seen["transport"], "unknown");
+    assert_eq!(a.hub.status()[0].ghosts, 1);
+
+    // When Bob leaves his server, he leaves Ann's list.
+    drop(bob);
+    let part = ann
+        .rx
+        .recv_where(|f| f.ty == push::USER_PART && f.uint(tag::UID) == Some(ghost.uid.into()))
+        .await;
+    assert!(part.is_ok(), "{part:?}");
+}
+
+#[tokio::test]
+async fn show_tags_puts_the_home_servers_tag_in_every_ghosts_name() {
+    let (a, b, _dirs) = linked("show_tags = true").await;
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let _bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    row(&mut ann, "bob@bb").await;
+}
+
+#[tokio::test]
+async fn no_act_on_another_user_reaches_a_ghost() {
+    let (a, b, _dirs) = linked("").await;
+    let mut admin = legacy::Client::login_at(a.legacy, &Login::account("admin", "admin", "pw"))
+        .await
+        .unwrap();
+    let carol = legacy::Client::login_at(a.legacy, &Login::guest("carol"))
+        .await
+        .unwrap();
+    let _bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    let ghost = row(&mut admin, "bob").await.uid;
+    // Nobody's uid: a ghost must be refused exactly as a user who is not
+    // there would be.
+    let nobody: u16 = 0x7ff0;
+
+    // A private chat of the admin's, with a local user in it, for the
+    // invitation.
+    let made = admin
+        .call(
+            ClientHdr::ChatCreate.as_u32(),
+            &[(tag::UID, carol.uid.unwrap().to_be_bytes().to_vec())],
+        )
+        .await
+        .unwrap();
+    let chat = (tag::CHAT_ID, made.bytes(tag::CHAT_ID).unwrap());
+
+    for ty in hxd_session::NAMES_A_USER {
+        let request = |to: u16| {
+            let uid = (tag::UID, to.to_be_bytes().to_vec());
+            match ty {
+                ClientHdr::Msg => vec![uid, (tag::BODY, b"hello".to_vec())],
+                ClientHdr::UserGetInfo | ClientHdr::UserKick | ClientHdr::ChatCreate => vec![uid],
+                ClientHdr::ChatInvite => vec![chat.clone(), uid],
+                other => panic!("{other:?} names a user and has no case here"),
+            }
+        };
+        let answer = admin.call(ty.as_u32(), &request(ghost)).await;
+        let absent = admin.call(ty.as_u32(), &request(nobody)).await;
+        assert!(
+            matches!(&answer, Err(hxd_testclient::Error::Refused { .. })),
+            "{ty:?}: {answer:?}"
+        );
+        assert_eq!(
+            format!("{answer:?}"),
+            format!("{absent:?}"),
+            "{ty:?}: a ghost refused unlike a user who is not there"
+        );
+    }
+
+    // The same on the ng wire, from an account that may do each.
+    let (mut ngc, _) = ng::Client::account(a.ng, "admin", "pw", "ngc")
+        .await
+        .unwrap();
+    for (method, params) in [
+        ("msg", json!({ "text": "hello" })),
+        ("block", json!({})),
+        ("kick", json!({})),
+    ] {
+        let key = if method == "msg" { "to" } else { "uid" };
+        let to = |uid: u16| {
+            let mut p = params.clone();
+            p[key] = json!(uid);
+            p
+        };
+        let answer = ngc.request(method, to(ghost)).await;
+        let absent = ngc.request(method, to(nobody)).await;
+        assert!(
+            matches!(&answer, Err(hxd_testclient::Error::Refused { code, .. }) if code != "access_denied"),
+            "{method}: {answer:?}"
+        );
+        assert_eq!(
+            format!("{answer:?}"),
+            format!("{absent:?}"),
+            "{method}: a ghost refused unlike a user who is not there"
+        );
     }
 }

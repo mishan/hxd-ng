@@ -277,14 +277,19 @@ impl Core {
             s.is_person = account.is_person();
             let mut shown = s.info.admin != admin;
             s.info.admin = admin;
+            let renamed = name.as_ref().is_some_and(|n| s.info.nick != *n);
             if let Some(name) = &name {
-                shown |= s.info.nick != *name;
                 s.info.nick = name.clone();
             }
+            shown |= renamed;
             let shown = (shown && s.visible).then(|| s.info.clone());
             r.send_to(uid, Event::AccountChanged(Box::new(account.clone())));
             if let Some(info) = shown {
                 r.broadcast_where(&Event::Changed(info), None, |_| true);
+                // The admin bit never crosses a link; only the name does.
+                if renamed {
+                    r.export_changed(uid);
+                }
             }
         }
         uids.len()

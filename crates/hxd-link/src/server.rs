@@ -69,6 +69,18 @@ fn never_crosses(id: u16) -> bool {
     matches!(id, 105 | 106 | 110 | 0x0600 | 0x0e00..=0x0eff)
 }
 
+/// Whether a group's fields outside the baseline may be kept and passed
+/// on: none of them one that never crosses, and all within the bound.
+pub fn admissible_extra(extra: &[Field]) -> Result<(), &'static str> {
+    if extra.iter().any(|f| never_crosses(f.id)) {
+        return Err("a field that never crosses a link");
+    }
+    if extra.iter().map(|f| 4 + f.data.len()).sum::<usize>() > MAX_EXTRA {
+        return Err("over the field bound");
+    }
+    Ok(())
+}
+
 /// One server, as a group of fields opened by `DATA_LINK_SERVER_ID`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerGroup {
@@ -97,13 +109,7 @@ impl ServerGroup {
         if self.name.len() > MAX_NAME {
             return Err("server name too long");
         }
-        if self.extra.iter().any(|f| never_crosses(f.id)) {
-            return Err("a field that never crosses a link");
-        }
-        if self.extra.iter().map(|f| 4 + f.data.len()).sum::<usize>() > MAX_EXTRA {
-            return Err("over the field bound");
-        }
-        Ok(())
+        admissible_extra(&self.extra)
     }
 
     pub fn to_fields(&self) -> Vec<Field> {
