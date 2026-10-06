@@ -185,6 +185,7 @@ async fn a_key_changed_on_reload_closes_the_link() {
     std::fs::write(&a.config, text.replace(&public(2), &public(3))).unwrap();
     assert_eq!(hxd::link::reload(&a.hub, &a.config), Ok(1));
     goes_down(&a.hub, 2).await;
+    goes_down(&b.hub, 1).await;
     // The dialer tries again, and is refused under the new key.
     assert!(!comes_up(&b.hub, 1, Duration::from_secs(2)).await);
 }
