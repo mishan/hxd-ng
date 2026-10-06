@@ -15,12 +15,12 @@ use tokio::sync::oneshot;
 use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use hxd_core::server_link::{GoneReason, PeerEvent};
+use hxd_core::server_link::{GoneReason, PeerEvent, MAX_LINK_TEXT};
 
 use crate::hub::{Hub, PeerEntry};
 use crate::server::{ServerGroup, ServerId};
 use crate::users::{of_local, UserGroup};
-use crate::wire::{chunks, field, fields, find, tx, Field, Hello, Reason};
+use crate::wire::{chunks, feature, field, fields, find, tx, Field, Hello, Reason};
 
 /// The most a snapshot part this server sends carries, well below the
 /// frame limit either end reads with.
@@ -64,6 +64,7 @@ pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
         next_trans: 1,
         established: None,
         snapshot: None,
+        features: 0,
     };
     // A reload between the login and here found no link to close: the
     // entry this link was authorized under must still be the one in force.
@@ -91,6 +92,14 @@ struct Link<'a> {
     /// The peer's snapshot while its parts arrive: nothing else about its
     /// users may come between them.
     snapshot: Option<Vec<UserGroup>>,
+    /// The features both sides offered, once Hello has been heard.
+    features: u32,
+}
+
+/// Text as a link carries it: lines end in CR, whatever the client that
+/// sent it used (Text on a Link).
+fn link_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
 impl Link<'_> {
@@ -197,8 +206,9 @@ impl Link<'_> {
             return self.close(io, reason, "refused");
         }
 
+        self.features = features & peer.features;
         self.hub
-            .set_features(&self.entry.name, self.generation, features & peer.features);
+            .set_features(&self.entry.name, self.generation, self.features);
 
         // Nothing to relay yet, so this server's list is empty.
         self.notify(io, tx::SERVERS, &[]);
@@ -358,6 +368,68 @@ impl Link<'_> {
                     Field::u16(field::REASON, Reason::Disconnected as u16),
                 ],
             ),
+            PeerEvent::Chat {
+                from,
+                text,
+                style,
+                line,
+            } if self.features & feature::PUBLIC_CHAT != 0 => {
+                let mut line_id = own.0.to_vec();
+                line_id.extend(self.hub.epoch());
+                line_id.extend(line.to_be_bytes());
+                let mut f = vec![
+                    Field::u16(field::USER_ID, from),
+                    Field::new(field::DATA, link_line_endings(&text).into_bytes()),
+                    Field::new(field::LINE_ID, line_id),
+                ];
+                if style == 1 {
+                    f.push(Field::u16(field::CHAT_OPTIONS, 1));
+                }
+                self.notify(io, tx::CHAT, &f);
+            }
+            PeerEvent::Chat { .. } => {}
+        }
+    }
+
+    /// A ghost's line (Link Chat). Over a link that did not negotiate
+    /// public chat, or over a bound, it is dropped, never cut.
+    fn chat(&mut self, f: &Frame) {
+        if self.features & feature::PUBLIC_CHAT == 0 {
+            return warn!(peer = %self.entry.name, "chat over a link without it dropped");
+        }
+        let fs = fields(f);
+        let id = find(&fs, field::USER_ID)
+            .and_then(Field::fixed)
+            .map(u16::from_be_bytes);
+        let text = find(&fs, field::DATA).and_then(|d| String::from_utf8(d.data.clone()).ok());
+        let (Some(id), Some(text)) = (id, text) else {
+            return warn!(peer = %self.entry.name, "unreadable chat line dropped");
+        };
+        if text.len() > MAX_LINK_TEXT {
+            return warn!(peer = %self.entry.name, "chat line over the link's bound dropped");
+        }
+        let extra: Vec<Field> = fs
+            .iter()
+            .filter(|f| {
+                ![
+                    field::USER_ID,
+                    field::DATA,
+                    field::CHAT_OPTIONS,
+                    field::LINE_ID,
+                ]
+                .contains(&f.id)
+            })
+            .cloned()
+            .collect();
+        if let Err(why) = crate::server::admissible_extra(&extra) {
+            return warn!(peer = %self.entry.name, "chat line dropped: {why}");
+        }
+        let style = u16::from(find(&fs, field::CHAT_OPTIONS).and_then(Field::uint) == Some(1));
+        if let Err(why) = self
+            .hub
+            .chat(&self.entry.name, self.generation, id, text, style)
+        {
+            warn!(peer = %self.entry.name, "chat line dropped: {why}");
         }
     }
 
@@ -431,8 +503,7 @@ impl Link<'_> {
                         .user_gone(&self.entry.name, self.generation, u16::from_be_bytes(id));
                 }
             }
-            // Chat arrives in L3.
-            tx::CHAT => {}
+            tx::CHAT => self.chat(&f),
             tx::PRIVATE_MESSAGE | tx::USER_INFO => refuse(io, &f, Reason::FeatureNotNegotiated),
             // This server carries out no moderation for a peer yet (L5):
             // refused, never pretended.
@@ -464,4 +535,16 @@ fn refuse(io: &LinkIo, f: &Frame, reason: Reason) {
         true,
         vec![(field::REASON, (reason as u16).to_be_bytes().to_vec())],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_link_carries_cr_line_endings() {
+        for (sent, carried) in [("a\nb", "a\rb"), ("a\r\nb", "a\rb"), ("a\rb", "a\rb")] {
+            assert_eq!(link_line_endings(sent), carried);
+        }
+    }
 }

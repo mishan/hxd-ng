@@ -918,6 +918,22 @@ fn shown_nick(enc: TextEncoding, u: &UserInfo) -> Vec<u8> {
     }
 }
 
+/// A name as public chat's 13-column name field shows it: a tagged
+/// ghost's cut short so the field never cuts its `@tag`.
+fn chat_nick(enc: TextEncoding, u: &UserInfo) -> Vec<u8> {
+    match u.remote.as_ref().filter(|r| r.tagged) {
+        Some(r) => {
+            let tag = enc.encode_capped(&format!("@{}", r.home_tag), 31);
+            let keep = 13usize.saturating_sub(r.home_tag.chars().count() + 1);
+            let name: String = u.nick.chars().take(keep).collect();
+            let mut name = enc.encode_capped(&name, 31 - tag.len());
+            name.extend(tag);
+            name
+        }
+        None => wire_nick(enc, &u.nick),
+    }
+}
+
 /// A chat subject, cut to the wire's 255 bytes after conversion. Inbound
 /// the cap is 255 characters, which UTF-8 can carry in up to four times
 /// the bytes, and a subject can come from an ng client with no cap of
@@ -2549,12 +2565,13 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         } => {
             // Format at the edge, in the connection's encoding, so the
             // 13-column name alignment stays correct for its renderer.
-            let line = format_chat(
-                sess.enc,
-                &wire_nick(sess.enc, &from.nick),
-                &sess.enc.encode(&text),
-                style,
-            );
+            // An emote has no name column to fit.
+            let nick = if style == 1 {
+                shown_nick(sess.enc, &from)
+            } else {
+                chat_nick(sess.enc, &from)
+            };
+            let line = format_chat(sess.enc, &nick, &sess.enc.encode(&text), style);
             let mut chunks = vec![(tag::BODY, line)];
             if cid != 0 {
                 chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
@@ -4733,6 +4750,32 @@ fn file_error_text(error: &hxd_core::FileError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tagged_ghosts_name_keeps_its_tag_in_chat_on_either_encoding() {
+        let ghost = |nick: &str| UserInfo {
+            uid: 9,
+            transport: Default::default(),
+            nick: nick.into(),
+            icon: 0,
+            admin: false,
+            system: false,
+            status: SessionStatus::Active,
+            avatar: None,
+            color: None,
+            remote: Some(hxd_core::server_link::RemoteRef {
+                home_tag: "bb".into(),
+                home_name: "B".into(),
+                tagged: true,
+                refuses_msgs: true,
+            }),
+        };
+        let long = "\u{3042}".repeat(12);
+        for enc in [TextEncoding::MacRoman, TextEncoding::Utf8] {
+            assert!(chat_nick(enc, &ghost(&long)).ends_with(b"@bb"), "{enc:?}");
+            assert_eq!(chat_nick(enc, &ghost("roberta-long")), b"roberta-lo@bb");
+        }
+    }
 
     #[test]
     fn only_gtkhxs_login_shape_gets_the_quiet_icon_refusal() {

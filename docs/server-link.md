@@ -2,8 +2,8 @@
 
 Status: partial, 2026-10. Built: L0 (the uid quarantine, Colored
 Nicknames), L1 (links by key mode, Hello, server lists, pings, close,
-reload) and L2 (users crossing one link both ways, ghosts on both wires).
-Chat does not cross yet. The rest is design. It implements fogWraith's
+reload), L2 (users crossing one link both ways, ghosts on both wires) and
+L3 (public chat both ways). The rest is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -259,7 +259,7 @@ pub enum PeerEvent {
     Shown(LocalUser),
     Changed(LocalUser),
     Gone(Uid, GoneReason),     // Disconnected; NotExported and Banned with L5
-    // Chat { from, serial, text, style } with L3
+    Chat { from: Uid, text: String, style: u16, line: u32 },
 }
 ```
 
@@ -271,11 +271,13 @@ is always false for local users. A session's departure reason is recorded on
 the `UserSession` when it is kicked or banned, and
 `RosterInner::end_session` reads it, so a ban reaches peers as `Banned`
 even though the frontend that ends the session later knows nothing about
-the ban. A `Chat` from a session already gone (the
-commit re-check and the broadcast take the lock separately) is dropped by
-the hub by its serial. The hub mints each 904's line ID (server ID, epoch,
-a per-epoch count); the history's own `LineId` is a database row and does
-not cross.
+the ban. A `Chat` is exported only if its sender is still on the roster
+when the line is broadcast (the commit re-check and the broadcast take the
+lock separately), and a uid is quarantined once freed, so a line never
+reaches the feed after its sender's `Gone`. The feed counts the lines it
+carries, and each link builds a 904's line ID from this server's ID, its
+epoch and that count; the history's own `LineId` is a database row and
+does not cross.
 
 **What is exported:**
 
@@ -324,44 +326,45 @@ buffer, as any direct message.
 
 ### 4.3 Ghost chat
 
-`ghost_chat` must keep a link's lines in order, never run a commit on the
-reactor, and never stall the link's reader. Today's `ChatCommit` hands
-the lead to a submitter waiting on its own slot, so it needs three
-changes:
+A ghost's line must keep its link's order, never run a commit on the
+reactor, and never stall the link's reader. `ChatCommit` is unchanged;
+the hub feeds it from one task of its own:
 
-- **`Staged` gains an origin**, `Session { uid, serial }` or `Ghost { uid,
-  serial }`. The batch re-check looks a session up in `users` as today,
-  and a ghost up in `ghosts`: a line is dropped when its ghost is still
-  present but hidden, excluded or purged, and passes when its ghost has
-  gone, rendered from the `UserInfo` staged with it. That keeps "a purge
-  between two batches misses nothing" true for ghosts, without losing the
-  last line of a ghost whose departure the hub handled first.
-- **`enqueue` places a line without a waiter.** A leader returns once its
-  own batch is done; if the head of the queue is then an enqueued line,
-  it hands the lead to a fresh committer started with `spawn_blocking`,
-  as `enqueue` does when it finds no commit under way. No submitter is
-  held past its own batch, and the hub never runs `append_all` on the
-  reactor.
-- **Bounded.** Today the queue is bounded by the threads blocked in it;
-  enqueued lines are not, so lines waiting are capped per link and
-  server-wide. Past the cap a line is dropped here and logged, after the
-  hub relayed it: the extension's per-link volume bound.
-- **Order.** The hub enqueues a link's lines in the order they arrive, and
-  queue order is commit order, so they are logged and heard in that order.
+- **Staged on arrival.** The link resolves the ghost and asks
+  `Core::ghost_line` for a `GhostLine`, under the roster lock: `None` for
+  a ghost excluded here or past local users' chat limit, and otherwise
+  the line with the ghost's `UserInfo` as it is now. Staging it then is
+  what keeps the last line of a ghost whose 903 follows at once.
+- **One committer.** Every link's lines go, in the order they arrived,
+  into one bounded channel, and one `spawn_blocking` task submits them to
+  `ChatCommit` a line at a time (`Core::ghost_chat`), as a local sender
+  does; local lines share its commits. Past the channel's bound a line is
+  not shown here, and is logged: the extension's volume bound, held
+  across every link. Until transit (L7) there is nowhere to relay it.
+- **The batch re-check.** `Staged` has no session for a ghost's line, and
+  the re-check looks the ghost up in `ghosts` instead: a line is dropped
+  when its ghost is still present but hidden, and goes out under the
+  ghost's current name, or under the one it was staged with when the
+  ghost has gone since.
+
+One task holds every link's lines to one commit each, which a busy
+network could outrun; batching them is the change if it does.
 
 Where the line is shown:
 
 - not for a ghost that is excluded or hidden here (the hub has relayed it
   regardless, as the extension requires);
 - the per-ghost rate limit decides display only, for the same reason;
-- history records it with the ghost's own name, icon and home server, and
-  no login. Each server's history is the chat it saw.
+- history records it with the ghost's name as shown (`name@tag` when
+  tagged) and icon, and no login or fingerprint. Each server's history is the chat it saw. The home server
+  and the line ID join it with the next schema version, as purge needs
+  (§6.3).
 
 **Two consequences, stated.** A batch that fails to commit drops its ghost
-lines locally without a trace, as it drops local ones; they have already
-been relayed. And `ghost_part` takes effect at once while a line enqueued
-just before it commits a moment later, so a client can see a ghost leave
-and then its last line; the alternative is losing it.
+lines locally without a trace, as it drops local ones. And `ghost_part`
+takes effect at once while a line staged just before it commits a moment
+later, so a client can see a ghost leave and then its last line; the
+alternative is losing it.
 
 ### 4.4 Text on a link
 
@@ -376,7 +379,8 @@ and then its last line; the alternative is losing it.
   bytes only from a classic client in Mac Roman, where one byte can become
   three in UTF-8. When `[link]` is configured, such a line is cut to 8192
   bytes of UTF-8 at ingest, before it is shown anywhere, so every copy on
-  the network is the same, as the extension requires. A local name longer than 255 bytes is
+  the network is the same, as the extension requires. (A UTF-8 classic
+  client's invalid bytes, each a replacement character, can do it too.) A local name longer than 255 bytes is
   not exported; hxd-ng's nick cap is far below that.
 - **Receiving:** the hub drops, never truncates, a transaction or group
   over the extension's maximums or the Relaying Fields bounds.
@@ -795,7 +799,7 @@ use: dead code fails `-D warnings`.
 | L0 | Prerequisites with no link: uid quarantine, Colored Nicknames on the classic wire | unit, `nick_colors.rs` |
 | L1 | `hxd-link`: capability bit 11, key mode, accept and dial, the handoff, `Replaced`, continuous authorization, Hello and its checks, Ping, Close, empty Link Servers; receiving the peer's Servers, Server Updates and Gones | `link.rs` |
 | L2 | Users over one link, including users homed behind the peer: snapshot, update, gone; `ghosts`, `roster_rows`, `RemoteRef`; ghosts on both wires; bounded fan-out; **the fail-closed table test** | `link.rs` |
-| L3 | Public chat both ways: `Staged` origins, `ChatCommit::enqueue`, text rules, ghost lines in the log (the next schema version) | `link.rs` |
+| L3 | Public chat both ways: ghost lines staged on arrival and committed by one task, text rules, ghost lines in the log | `link.rs` |
 | L4 | Private messages and user info: `resolve`, the router, answering out of band on both wires | `link.rs` |
 | L5 | Kick, ban, unban and purge on both sides (the next schema version) | `link.rs`, `bans.rs` |
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
