@@ -84,9 +84,6 @@ pub const NAMES_A_USER: &[ClientHdr] = &[
     ClientHdr::ChatInvite,
 ];
 
-/// Why a ban on a user of another server is not placed.
-const GHOST_BAN: &str = "this server cannot ban users of other servers yet.";
-
 /// fogWraith's GIF Icons extension (`docs/avatars.md` §3): client
 /// opcodes hxproto routes no enum for.
 mod gif_icons {
@@ -4110,15 +4107,34 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     _ => {}
                 }
             }
-            // A user of another server: hidden here, which is all this
-            // server can do to one, and told so if a ban was asked for.
-            if let Some(nick) = ctx.core.ghost_hide(target) {
-                if ban {
-                    let text = format!("{nick} is hidden here, but not banned: {GHOST_BAN}");
-                    reply_error(tx, f.trans, &text);
-                } else {
-                    reply(tx, f.trans, vec![]);
-                }
+            // A user of another server: hidden here at once, and the kick
+            // or ban asked of their server, whose answer the reply waits
+            // for, on a task of its own.
+            // A ban time of zero is a kick, here as for a local user.
+            let ghost_ban =
+                (ban && !ctx.cfg.ban_time.is_zero()).then(|| hxd_core::server_link::GhostBan {
+                    for_: Some(ctx.cfg.ban_time),
+                    reason: "banned by a moderator".into(),
+                });
+            let banning = ghost_ban.is_some();
+            if let Some(kick) = ctx.core.ghost_kick(target, ghost_ban) {
+                let (tx, trans) = (tx.clone(), f.trans);
+                tokio::spawn(async move {
+                    match peer_answer(kick.answer).await {
+                        Ok(()) => reply(&tx, trans, vec![]),
+                        Err(why) => {
+                            // A kick reaches no further than here when its server
+                            // did not take it; a ban was then not placed.
+                            let done = if banning {
+                                "hidden here, but not banned"
+                            } else {
+                                "hidden here only"
+                            };
+                            let text = format!("{} is {done}: {}", kick.nick, why.text());
+                            reply_error(&tx, trans, &text);
+                        }
+                    }
+                });
                 return;
             }
             if ctx

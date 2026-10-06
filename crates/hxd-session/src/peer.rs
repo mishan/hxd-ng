@@ -83,6 +83,7 @@ pub(crate) struct LinkPort {
 
 /// The writing half of a link session, over the connection's own writer,
 /// with its bound: a link that stops reading is dropped like any client.
+#[derive(Clone)]
 pub struct LinkOut(pub(crate) Tx);
 
 impl LinkOut {

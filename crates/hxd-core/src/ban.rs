@@ -542,6 +542,18 @@ impl crate::Core {
         ban: NewBan,
         also: Vec<BanTarget>,
     ) -> Result<Vec<Ban>, crate::moderation::ModError> {
+        self.place_bans_act(acting, ban, also)
+            .map(|(_, placed)| placed)
+    }
+
+    /// [`Core::place_bans_as`], with the act it recorded: the rows it
+    /// created carry it, and a row it only extended keeps its own.
+    pub(crate) fn place_bans_act(
+        &self,
+        acting: &crate::moderation::Acting,
+        ban: NewBan,
+        also: Vec<BanTarget>,
+    ) -> Result<(Option<crate::moderation::ActId>, Vec<Ban>), crate::moderation::ModError> {
         use crate::moderation::{Act, ActKind, ModError};
         if ban.reason.trim().is_empty() {
             return Err(ModError::BadRequest("a ban needs a reason"));
@@ -671,7 +683,7 @@ impl crate::Core {
                 self.end_refused(&row.target, acting.uid);
             }
         }
-        Ok(placed)
+        Ok((act_id, placed))
     }
 
     /// Lift a ban as `by`, and with it every standing ban placed in the
@@ -688,8 +700,16 @@ impl crate::Core {
         by: crate::moderation::Actor,
         id: BanId,
     ) -> Result<Vec<Ban>, crate::moderation::ModError> {
-        use crate::moderation::{Act, ActKind, ModError};
         let acting = self.acting(by)?;
+        self.lift_ban_as(&acting, id)
+    }
+
+    pub(crate) fn lift_ban_as(
+        &self,
+        acting: &crate::moderation::Acting,
+        id: BanId,
+    ) -> Result<Vec<Ban>, crate::moderation::ModError> {
+        use crate::moderation::{Act, ActKind, ModError};
         let store = self.moderation.as_ref().ok_or(ModError::Disabled)?;
         let _writing = self.ban_writes.lock().unwrap();
         let Some(ban) = store
@@ -725,7 +745,7 @@ impl crate::Core {
             }
         }
         let ids: Vec<String> = lifted.iter().map(|b| format!("#{}", b.id)).collect();
-        let mut act = Act::new(ActKind::Unban, &acting, format!("ban {}", ids.join(", ")));
+        let mut act = Act::new(ActKind::Unban, acting, format!("ban {}", ids.join(", ")));
         act.evidence = Some(
             lifted
                 .iter()

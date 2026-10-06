@@ -2240,8 +2240,8 @@ impl Core {
     /// are refused at their next connection.
     pub fn kick_by(&self, target: Uid, ban: Option<KickBan>) -> Result<Kicked, ChatError> {
         let (nick, targets, serial) = {
-            let r = self.roster.lock().unwrap();
-            let sess = r.users.get(&target).ok_or(ChatError::NoSuchUser)?;
+            let mut r = self.roster.lock().unwrap();
+            let sess = r.users.get_mut(&target).ok_or(ChatError::NoSuchUser)?;
             // The server cannot be kicked off its own roster
             // (`docs/system-account.md` §2). Refused the same way a kick
             // of somebody who is not there is refused, because from the
@@ -2253,6 +2253,9 @@ impl Core {
                 Some(_) => self.kick_ban_targets(sess),
                 None => Vec::new(),
             };
+            // So its leaving crosses links as a ban; the session ends
+            // either way, so an unplaced ban leaves nothing stale.
+            sess.banned |= !targets.is_empty();
             (sess.info.nick.clone(), targets, sess.serial)
         };
         let banned = ban.is_some_and(|ban| self.place_kick_ban(target, targets, ban));

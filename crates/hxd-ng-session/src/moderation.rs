@@ -483,10 +483,28 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     "You are not allowed to disconnect users.",
                 );
             }
-            // A user of another server: hidden here, which is all this
-            // server can do to one; a ban asked for is not placed.
-            if core.ghost_hide(p.uid).is_some() {
-                return reply_ok(id, json!({ "hidden_here": true, "banned": false }));
+            // A user of another server: hidden here at once, and the kick
+            // or ban asked of their server, whose answer is awaited in
+            // place, as ng replies keep their requests' order.
+            // A ban of no time is a kick, as a classic ban time of zero is.
+            let ghost_ban = p
+                .ban
+                .filter(|s| *s != 0)
+                .map(|s| hxd_core::server_link::GhostBan {
+                    for_: Some(Duration::from_secs(s).min(MAX_BAN)),
+                    reason: p.reason.clone().unwrap_or_default(),
+                });
+            let banning = ghost_ban.is_some();
+            if let Some(kick) = core.ghost_kick(p.uid, ghost_ban) {
+                let wait = hxd_core::server_link::PEER_WAIT;
+                let done = matches!(
+                    tokio::time::timeout(wait, kick.answer).await,
+                    Ok(Ok(Ok(())))
+                );
+                return reply_ok(
+                    id,
+                    json!({ "hidden_here": true, "network": done, "banned": banning && done }),
+                );
             }
             if core.user(p.uid).is_none() {
                 return refused(ModError::NoSuchUser);

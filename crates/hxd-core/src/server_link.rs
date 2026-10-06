@@ -73,6 +73,8 @@ pub enum PeerRefusal {
     RateLimited,
     FeatureNotNegotiated,
     Unreachable,
+    /// No ban by that handle was made by that server.
+    UnknownBan,
     /// The ghost's server refused it, for a reason this server has no
     /// better word for.
     Refused,
@@ -91,7 +93,9 @@ impl PeerRefusal {
     /// What a client is told, on either wire.
     pub fn text(self) -> &'static str {
         match self {
-            PeerRefusal::UnknownUser => "That user is not connected.",
+            // Told apart from a local "not connected": over a link it can
+            // also mean the far server does not know the sender.
+            PeerRefusal::UnknownUser => "That user's server does not know them, or you.",
             PeerRefusal::RefusesMessages => "That user does not accept private messages.",
             PeerRefusal::Excluded => "That user cannot be reached from here.",
             PeerRefusal::RateLimited => {
@@ -102,6 +106,7 @@ impl PeerRefusal {
             }
             PeerRefusal::Unreachable => "That user's server did not answer.",
             PeerRefusal::Refused => "That user's server refused it.",
+            PeerRefusal::UnknownBan => "No such ban.",
             PeerRefusal::NotExported => {
                 "Users on other servers cannot see you, so you cannot message them."
             }
@@ -116,6 +121,48 @@ impl PeerRefusal {
 pub trait PeerRouter: Send + Sync {
     fn msg(&self, from: Uid, to: Uid, text: String) -> oneshot::Receiver<Result<(), PeerRefusal>>;
     fn user_info(&self, of: Uid) -> oneshot::Receiver<Result<String, PeerRefusal>>;
+    /// Ask a ghost's home server to kick it from this one, or with `ban`
+    /// to ban it from the network for a time (`None`, until lifted) and a
+    /// reason. Answers whether the home server did it.
+    fn kick(&self, of: Uid, ban: Option<GhostBan>) -> oneshot::Receiver<Result<(), PeerRefusal>>;
+}
+
+/// A ban asked of a ghost's home server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhostBan {
+    pub for_: Option<Duration>,
+    pub reason: String,
+}
+
+/// A moderator's kick of a ghost, carried out here at once and asked of
+/// its home server.
+pub struct GhostKick {
+    pub nick: String,
+    pub answer: oneshot::Receiver<Result<(), PeerRefusal>>,
+}
+
+/// The linked server a moderation request is made for, as the link that
+/// carried it knows that server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requester {
+    pub id: [u8; 8],
+    pub tag: String,
+    pub name: String,
+}
+
+impl Requester {
+    /// Acts for it as this server's operator would, as the extension
+    /// has a home server act on a network moderator's request, under a
+    /// name its operator can read in the audit trail and the bans.
+    fn acting(&self) -> crate::moderation::Acting {
+        crate::moderation::Acting {
+            name: format!("link {} ({})", self.tag, self.name),
+            fingerprint: None,
+            overrides: true,
+            uid: None,
+            person: None,
+        }
+    }
 }
 
 /// An answer already known.
@@ -160,6 +207,8 @@ pub struct LocalUser {
     pub icon: u16,
     pub away: bool,
     pub color: Option<u32>,
+    /// Linked servers that kicked this user, which must not show it.
+    pub exclude: Vec<[u8; 8]>,
 }
 
 impl LocalUser {
@@ -170,6 +219,7 @@ impl LocalUser {
             icon: sess.info.icon,
             away: sess.info.status != SessionStatus::Active,
             color: sess.info.color,
+            exclude: sess.excluded_at.clone(),
         }
     }
 }
@@ -178,6 +228,7 @@ impl LocalUser {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoneReason {
     Disconnected,
+    Banned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,7 +320,12 @@ impl RosterInner {
     /// asked of the session itself.
     pub(crate) fn export_gone(&mut self, sess: &UserSession) {
         if exported(sess) {
-            self.export(PeerEvent::Gone(sess.info.uid, GoneReason::Disconnected));
+            let why = if sess.banned {
+                GoneReason::Banned
+            } else {
+                GoneReason::Disconnected
+            };
+            self.export(PeerEvent::Gone(sess.info.uid, why));
         }
     }
 
@@ -372,11 +428,21 @@ impl Core {
         }
     }
 
-    /// A moderator's kick of a ghost, which this server can carry out
-    /// only here: hidden from this server's users until it leaves, as the
-    /// extension has a requesting server do. Its nick, or `None` when
-    /// `uid` is no ghost shown here.
-    pub fn ghost_hide(&self, uid: Uid) -> Option<String> {
+    /// A moderator's kick of ghost `uid`, or with `ban` its ban: hidden
+    /// here at once, as the extension has a requesting server do, and
+    /// for as long as it is shown whatever its home server answers; and
+    /// asked of that server, whose answer comes in [`GhostKick::answer`].
+    /// `None` when `uid` is no ghost shown here.
+    pub fn ghost_kick(&self, uid: Uid, ban: Option<GhostBan>) -> Option<GhostKick> {
+        let nick = self.ghost_hide(uid)?;
+        let answer = match self.peer_router.get() {
+            Some(router) => router.kick(uid, ban),
+            None => answered(Err(PeerRefusal::Unreachable)),
+        };
+        Some(GhostKick { nick, answer })
+    }
+
+    fn ghost_hide(&self, uid: Uid) -> Option<String> {
         let mut r = self.roster.lock().unwrap();
         let g = r.ghosts.get_mut(&uid).filter(|g| g.visible)?;
         g.visible = false;
@@ -513,6 +579,160 @@ impl Core {
             (secs % 3600) / 60,
             secs % 60,
         ))
+    }
+
+    /// A linked server's kick of local user `uid`: it is not shown there
+    /// for the rest of its session, and stays here and everywhere else.
+    pub fn peer_kick(&self, uid: Uid, by: &Requester) -> Result<(), PeerRefusal> {
+        let mut r = self.roster.lock().unwrap();
+        let sess = r
+            .users
+            .get_mut(&uid)
+            .filter(|s| exported(s))
+            .ok_or(PeerRefusal::UnknownUser)?;
+        if !sess.excluded_at.contains(&by.id) {
+            sess.excluded_at.push(by.id);
+        }
+        // So its users vanishing is not a mystery.
+        let text = format!(
+            "{} ({}) has removed you: its users no longer see you.",
+            by.name, by.tag
+        );
+        r.send_to(
+            uid,
+            Event::Broadcast {
+                from: 0,
+                from_nick: String::new(),
+                text,
+            },
+        );
+        r.export_changed(uid);
+        Ok(())
+    }
+
+    /// A linked server's ban of local user `uid`, placed as this server's
+    /// operator would place it and ending the session; for `None`, until
+    /// lifted. The handle the requester may lift it by. A store write:
+    /// call it off the reactor.
+    pub fn peer_ban(
+        &self,
+        uid: Uid,
+        by: &Requester,
+        for_: Option<Duration>,
+        reason: &str,
+    ) -> Result<[u8; 16], PeerRefusal> {
+        let (targets, serial) = {
+            let mut r = self.roster.lock().unwrap();
+            let sess = r
+                .users
+                .get_mut(&uid)
+                .filter(|s| exported(s))
+                .ok_or(PeerRefusal::UnknownUser)?;
+            // Before the ban, which may end the session itself.
+            sess.banned = true;
+            let serial = sess.serial;
+            let targets = self.kick_ban_targets(sess);
+            // Told first, while there is a session to tell: the ban may end
+            // it, and `Kicked` says nothing.
+            let text = format!(
+                "You have been banned from the network by {} ({}).",
+                by.name, by.tag
+            );
+            r.send_to(
+                uid,
+                Event::Broadcast {
+                    from: 0,
+                    from_nick: String::new(),
+                    text,
+                },
+            );
+            (targets, serial)
+        };
+        // The person, where there is one, so their every session ends and
+        // nobody else's; the address only for a shared login such as
+        // guest, as the extension asks a home server to judge.
+        let targets = match targets.first() {
+            Some(
+                person @ (crate::ban::BanTarget::Login(_) | crate::ban::BanTarget::Identity(_)),
+            ) => {
+                vec![person.clone()]
+            }
+            _ => targets,
+        };
+        let unmark = |core: &Core| {
+            let mut r = core.roster.lock().unwrap();
+            if let Some(sess) = r.users.get_mut(&uid).filter(|s| s.serial == serial) {
+                sess.banned = false;
+            }
+        };
+        let mut handle = [0u8; 16];
+        if getrandom::getrandom(&mut handle).is_err() {
+            unmark(self);
+            return Err(PeerRefusal::Unreachable);
+        }
+        let reason = match reason.trim() {
+            "" => format!("banned from the network by {}", by.tag),
+            why => format!("banned from the network by {}: {why}", by.tag),
+        };
+        // A guest on an address nobody may ban: thrown off, but nothing
+        // holds them, so the requester is told no ban was placed.
+        let Some((first, rest)) = targets.split_first() else {
+            unmark(self);
+            let mut r = self.roster.lock().unwrap();
+            if r.users.get(&uid).is_some_and(|s| s.serial == serial) {
+                let _ = crate::chat::kick_in(&mut r, uid);
+            }
+            return Err(PeerRefusal::UnknownUser);
+        };
+        {
+            let ban = crate::ban::NewBan {
+                target: first.clone(),
+                reason,
+                note: Some(format!("asked for by {} ({})", by.name, by.tag)),
+                expires_at: for_.and_then(|d| SystemTime::now().checked_add(d)),
+                // As a moderator's ban: every session it refuses ends.
+                source: crate::ban::BanSource::Moderator,
+            };
+            let (act, placed) = match self.place_bans_act(&by.acting(), ban, rest.to_vec()) {
+                Ok(placed) => placed,
+                Err(e) => {
+                    tracing::warn!(target = uid, "network ban not placed: {e:?}");
+                    unmark(self);
+                    return Err(PeerRefusal::Unreachable);
+                }
+            };
+            // Only a row this ban created: one it extended is another act's,
+            // which the requester has no business lifting, so the handle
+            // then names nothing and its unban answers `UnknownBan`.
+            let own = placed.iter().find(|row| act.is_some() && row.act == act);
+            if let (Some(store), Some(row)) = (self.moderation.as_ref(), own) {
+                // The ban stands either way; only lifting it from there is
+                // lost.
+                if let Err(e) = store.note_link_ban(row.id, by.id, handle) {
+                    tracing::warn!(target = uid, "network ban's handle not kept: {e}");
+                }
+            }
+        }
+        let mut r = self.roster.lock().unwrap();
+        // Ended already, by the ban, or gone; and its uid, if given out
+        // again, somebody else's.
+        if r.users.get(&uid).is_some_and(|s| s.serial == serial) {
+            let _ = crate::chat::kick_in(&mut r, uid);
+        }
+        Ok(handle)
+    }
+
+    /// A linked server lifting the ban it placed under `handle`.
+    pub fn peer_unban(&self, handle: [u8; 16], by: &Requester) -> Result<(), PeerRefusal> {
+        let store = self.moderation.as_ref().ok_or(PeerRefusal::UnknownBan)?;
+        let id = store
+            .link_ban(by.id, handle)
+            .ok()
+            .flatten()
+            .ok_or(PeerRefusal::UnknownBan)?;
+        self.lift_ban_as(&by.acting(), id)
+            .map(|_| ())
+            .map_err(|_| PeerRefusal::UnknownBan)
     }
 
     pub fn ghost_count(&self) -> usize {
@@ -750,13 +970,169 @@ mod tests {
         let core = Core::new();
         let (_me, mut rx) = test_attach(&core, "me", chatter());
         let g = core.ghost_attach(ghost("bob", true)).unwrap();
-        assert_eq!(core.ghost_hide(g).as_deref(), Some("bob"));
-        assert!(core.ghost_hide(g).is_none(), "hidden already");
+        assert_eq!(
+            core.ghost_kick(g, None).map(|k| k.nick).as_deref(),
+            Some("bob")
+        );
+        assert!(core.ghost_kick(g, None).is_none(), "hidden already");
         core.ghost_update(g, ghost("robert", true));
         assert!(core.roster_rows().iter().all(|u| u.uid != g));
         assert!(core.ghost_line(g, "hi".into(), 0).is_none());
         let kinds: Vec<&str> = drain(&mut rx).iter().map(Event::kind).collect();
         assert_eq!(kinds, ["joined", "parted"]);
+    }
+
+    fn hub_server() -> Requester {
+        Requester {
+            id: [4; 8],
+            tag: "hch".into(),
+            name: "Hub".into(),
+        }
+    }
+
+    #[test]
+    fn a_network_kick_hides_the_user_at_its_requester_only() {
+        let core = Core::new();
+        let mut feed = core.peer_feed(16);
+        let (ann, mut rx) = test_attach(&core, "ann", chatter());
+        assert_eq!(core.peer_kick(ann, &hub_server()), Ok(()));
+        assert!(drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, Event::Broadcast { text, .. } if text.contains("Hub (hch)"))));
+        let mut changed = vec![];
+        while let Ok((_, e)) = feed.try_recv() {
+            if let PeerEvent::Changed(u) = e {
+                changed.push(u.exclude);
+            }
+        }
+        assert_eq!(changed, [vec![[4; 8]]]);
+        assert!(core.user(ann).is_some(), "still here");
+        assert_eq!(
+            core.peer_kick(0x7ff0, &hub_server()),
+            Err(PeerRefusal::UnknownUser)
+        );
+    }
+
+    #[test]
+    fn a_network_ban_is_placed_as_the_operator_would_and_lifted_only_by_its_requester() {
+        use crate::moderation::{MemoryModeration, ModerationPolicy};
+        let core = Core::new().with_moderation(
+            Arc::new(MemoryModeration::default()),
+            ModerationPolicy::default(),
+        );
+        let mut feed = core.peer_feed(16);
+        let (ann, mut rx) = core
+            .attach(crate::roster::AttachInfo {
+                nick: "ann".into(),
+                icon: 1,
+                admin: false,
+                access: chatter(),
+                login: "ann".into(),
+                addr: None,
+                can_detach: false,
+                transport: Default::default(),
+                has_inbox: false,
+                attach_news: false,
+                set_avatar: false,
+                moderate: false,
+                can_spam: false,
+                is_person: true,
+                reads_on_delivery: false,
+                identity: None,
+                system: false,
+            })
+            .unwrap();
+        core.announce(ann);
+        let handle = core.peer_ban(ann, &hub_server(), None, "spam").unwrap();
+        // Told who banned them before the ban ends the session.
+        let kinds: Vec<&str> = drain(&mut rx).iter().map(Event::kind).collect();
+        let told = kinds.iter().position(|k| *k == "broadcast").unwrap();
+        assert!(
+            told < kinds.iter().position(|k| *k == "kicked").unwrap(),
+            "{kinds:?}"
+        );
+        let bans = core.list_bans(true, None, 10).unwrap();
+        assert_eq!(bans.len(), 1);
+        assert_eq!(bans[0].actor, "link hch (Hub)");
+        assert!(bans[0].reason.contains("hch"), "{}", bans[0].reason);
+        // The frontend ends the kicked session; its leaving is a ban.
+        core.end_session(ann);
+        let mut gone = None;
+        while let Ok((_, e)) = feed.try_recv() {
+            if let PeerEvent::Gone(uid, why) = e {
+                gone = Some((uid, why));
+            }
+        }
+        assert_eq!(gone, Some((ann, GoneReason::Banned)));
+
+        let other = Requester {
+            id: [5; 8],
+            ..hub_server()
+        };
+        assert_eq!(
+            core.peer_unban(handle, &other),
+            Err(PeerRefusal::UnknownBan)
+        );
+        assert_eq!(core.peer_unban(handle, &hub_server()), Ok(()));
+        assert!(core.list_bans(true, None, 10).unwrap().is_empty());
+        assert_eq!(
+            core.peer_unban(handle, &hub_server()),
+            Err(PeerRefusal::UnknownBan),
+            "lifted already"
+        );
+    }
+
+    #[test]
+    fn a_network_ban_cannot_lift_a_ban_it_only_extended() {
+        use crate::moderation::{Actor, MemoryModeration, ModerationPolicy};
+        let core = Core::new().with_moderation(
+            Arc::new(MemoryModeration::default()),
+            ModerationPolicy::default(),
+        );
+        let (ann, _rx) = core
+            .attach(crate::roster::AttachInfo {
+                nick: "ann".into(),
+                icon: 1,
+                admin: false,
+                access: chatter(),
+                login: "ann".into(),
+                addr: None,
+                can_detach: false,
+                transport: Default::default(),
+                has_inbox: false,
+                attach_news: false,
+                set_avatar: false,
+                moderate: false,
+                can_spam: false,
+                is_person: true,
+                reads_on_delivery: false,
+                identity: None,
+                system: false,
+            })
+            .unwrap();
+        core.announce(ann);
+        // The operator's ban first, standing when the network's arrives.
+        core.place_ban(
+            Actor::Operator,
+            crate::ban::NewBan {
+                target: crate::ban::BanTarget::Login("ann".into()),
+                reason: "ours".into(),
+                note: None,
+                expires_at: None,
+                source: crate::ban::BanSource::Cli,
+            },
+        )
+        .unwrap();
+        let handle = core.peer_ban(ann, &hub_server(), None, "theirs").unwrap();
+        assert_eq!(
+            core.peer_unban(handle, &hub_server()),
+            Err(PeerRefusal::UnknownBan)
+        );
+        assert_eq!(
+            core.list_bans(true, None, 10).unwrap().len(),
+            1,
+            "ours stands"
+        );
     }
 
     #[test]

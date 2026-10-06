@@ -525,15 +525,21 @@ async fn a_link_without_messages_refuses_them_and_names_the_server_for_info() {
 }
 
 #[tokio::test]
-async fn a_moderator_hides_a_ghost_here_and_is_told_a_ban_cannot_reach_it() {
-    let (a, b, _dirs) = linked("").await;
+async fn a_kick_hides_a_ghost_at_its_kicker_and_a_ban_is_placed_by_its_home_server() {
+    let (a, b, dirs) = linked("").await;
+    // An account of eve's own, as a ban is placed on a person's account.
+    std::fs::write(
+        dirs[1].path().join("accounts/eve.toml"),
+        "name = \"eve\"\npassword = \"pw\"\n[access]\nread_chat = true\n",
+    )
+    .unwrap();
     let mut admin = legacy::Client::login_at(a.legacy, &Login::account("ann", "admin", "pw"))
         .await
         .unwrap();
-    let _bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+    let mut bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
         .await
         .unwrap();
-    let _eve = legacy::Client::login_at(b.legacy, &Login::guest("eve"))
+    let mut eve = legacy::Client::login_at(b.legacy, &Login::account("eve", "eve", "pw"))
         .await
         .unwrap();
     let kick = |uid: u16, ban: bool| {
@@ -544,39 +550,45 @@ async fn a_moderator_hides_a_ghost_here_and_is_told_a_ban_cannot_reach_it() {
         chunks
     };
 
-    let bob = row(&mut admin, "bob").await.uid;
+    // A kick: gone from the kicker's server, told why, and still on its
+    // own.
+    let bob_here = row(&mut admin, "bob").await.uid;
     let kicked = admin
-        .call(ClientHdr::UserKick.as_u32(), &kick(bob, false))
+        .call(ClientHdr::UserKick.as_u32(), &kick(bob_here, false))
         .await;
     assert!(kicked.is_ok(), "{kicked:?}");
-    let part = admin
-        .rx
-        .recv_where(|f| f.ty == push::USER_PART && f.uint(tag::UID) == Some(bob.into()))
-        .await;
-    assert!(part.is_ok(), "{part:?}");
     assert!(admin
         .user_list()
         .await
         .unwrap()
         .iter()
-        .all(|r| r.uid != bob));
+        .all(|r| r.uid != bob_here));
+    let told = bob.rx.recv_where(|f| f.ty == 0x163).await.unwrap();
+    let text = String::from_utf8(told.bytes(tag::BODY).unwrap()).unwrap();
+    assert!(text.contains("aa server (aa)"), "{text:?}");
+    assert!(bob.user_list().await.is_ok(), "still connected at home");
 
-    let eve = row(&mut admin, "eve").await.uid;
+    // A ban: placed by the home server as its own operator would, so the
+    // user is thrown off there and refused there.
+    let eve_here = row(&mut admin, "eve").await.uid;
     let banned = admin
-        .call(ClientHdr::UserKick.as_u32(), &kick(eve, true))
+        .call(ClientHdr::UserKick.as_u32(), &kick(eve_here, true))
         .await;
+    assert!(banned.is_ok(), "{banned:?}");
+    let told = eve.rx.recv_where(|f| f.ty == 0x163).await.unwrap();
+    let text = String::from_utf8(told.bytes(tag::BODY).unwrap()).unwrap();
     assert!(
-        matches!(&banned, Err(hxd_testclient::Error::Refused { text, .. }) if text.contains("not banned")),
-        "{banned:?}"
+        text.contains("banned from the network by aa server (aa)"),
+        "{text:?}"
     );
-    assert!(admin
-        .user_list()
-        .await
-        .unwrap()
-        .iter()
-        .all(|r| r.uid != eve));
+    let again = legacy::Client::login_at(b.legacy, &Login::account("eve", "eve", "pw")).await;
+    assert!(
+        matches!(&again, Err(hxd_testclient::Error::Refused { text, .. }) if text.contains("aa")),
+        "{:?}",
+        again.map(|_| ())
+    );
 
-    // On the ng wire, the reply says what was done.
+    // On the ng wire, the reply says what was done where.
     let _carol = legacy::Client::login_at(b.legacy, &Login::guest("carol"))
         .await
         .unwrap();
@@ -585,7 +597,10 @@ async fn a_moderator_hides_a_ghost_here_and_is_told_a_ban_cannot_reach_it() {
         .await
         .unwrap();
     let hidden = ngc.request("kick", json!({ "uid": carol })).await.unwrap();
-    assert_eq!(hidden, json!({ "hidden_here": true, "banned": false }));
+    assert_eq!(
+        hidden,
+        json!({ "hidden_here": true, "network": true, "banned": false })
+    );
 }
 
 #[tokio::test]

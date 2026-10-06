@@ -3,8 +3,8 @@
 Status: partial, 2026-10. Built: L0 (the uid quarantine, Colored
 Nicknames), L1 (links by key mode, Hello, server lists, pings, close,
 reload), L2 (users crossing one link both ways, ghosts on both wires), L3
-(public chat both ways) and L4 (private messages and user info). The rest
-is design. It implements fogWraith's
+(public chat both ways), L4 (private messages and user info) and L5's
+kicks and bans both ways. The rest is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -474,18 +474,16 @@ whole list: everything else is already refused by §3.1.
 
 ### 6.3 Kicks, bans and purge
 
-Built so far: a kick of a ghost, on either wire, hides it on this server
-until it leaves (`Core::ghost_hide`), and nothing crosses. What follows is
-L5.
-
-- The frontend calls `core.hide_ghost(uid)` before spawning the router
-  call, so the ghost disappears here at once, with `Parted` to local
-  sessions, as the extension requires.
-- **If a kick or ban fails** (`Unreachable`, `UnknownUser`,
-  `InvalidRequester`, or no reply), `hidden_here` keeps the ghost hidden
-  for the session, and the moderator is told it was applied here only
-  (kick) or not applied (ban). A ban is announced in chat only when it
-  succeeded.
+- `Core::ghost_kick` hides the ghost here at once, with `Parted` to local
+  sessions, as the extension requires, and asks its home server through
+  the router: 907, or 908 for a kick with a ban (the classic `[server]`
+  ban time, or the ng `ban`).
+- The ghost stays hidden for as long as it is shown, whatever the home
+  server answers: its exclusion arrives when the kick took, and nothing
+  does when it did not. **If a kick or ban fails** (`Unreachable`,
+  `UnknownUser`, `InvalidRequester`, or no reply), the classic moderator
+  gets a task error saying it was applied here only; the ng reply says
+  `network: false` (`moderation.md`). Nothing is announced in chat.
 - **Purge.** Today's purge (ng `kick` with `purge`, and the classic 110
   path through `kick_purges`) is by person, through `resolve_person` to a
   mailbox, which a ghost does not have. For a ghost it purges this
@@ -687,47 +685,56 @@ between *its own* transit links, and with one there is nothing to relay,
 so its Link Servers stays empty. A second peer offering transit is
 refused at config load until L7 builds that relaying.
 
-What it does owe, and cannot yet give, is moderation (L5), now across a
-whole network rather than one operator's server. Until then a kick of a
-ghost hides it here for as long as it is shown, the extension's rule for
-a server whose ban did not reach the user, and a kick asking for a ban
-says that none was placed. Network moderators cannot yet act on this
-server's users.
+What it does owe, moderation now across a whole network rather than one
+operator's server, is §7.5's.
 
 ### 7.5 Moderation, both sides
 
+Every request first passes the requester check: `DATA_LINK_REQUESTER`
+must be the peer or a server learned over the link (`Hub::requester`),
+or it is refused `InvalidRequester` and logged. Moderation needs no
+feature: it is part of every link.
+
 **As home server:**
 
-- **Kick (907)**: `peer_exclude` adds the requester to the session's
-  exclusions (`UserSession.exclusions: Vec<ServerId>`, exported in
-  `LocalUser`), emits `Changed` so the user's group is re-exported, and
-  tells the user with a server message naming the requesting server.
-- **Ban (908)**: `peer_ban` places a ban against the identifiers
-  `kick_ban_targets` chooses for a local ban, with a new
-  `Actor::Peer(PeerRequester)` so the audit trail and `hxd ban list` show
-  the requesting server's tag and name, and a ban source of its own so
-  every matching session ends (a kick's source ends only the one).
-  **Protection does not apply**: the ban path that ends sessions today
-  spares accounts that cannot be disconnected, and the extension says
-  explicitly that a user's privileges at home, including that one, do not
-  shield them from a moderator elsewhere. The user is told which server
-  banned them by a message sent before `Kicked`, which carries no text,
-  and their departure crosses as 903 with `Banned`. A `PeerBanId` is 16
-  random bytes mapped to the moderation act and the requester, since one
-  act writes several ban rows and an unban lifts them all; a local lift
-  leaves the mapping pointing at nothing, and a later 909 answers
-  `UnknownBan`, as the extension expects. When there is nothing to ban by (a guest on an
-  exempt address), it answers `UnknownUser`, and the requester keeps the
-  ghost hidden as for a failed ban.
-- **Unban (909)**: honored only from the requester that made the ban.
+- **Kick (907)**: `Core::peer_kick` adds the requester to the session's
+  exclusions (`UserSession.excluded_at`, exported in `LocalUser` as
+  `DATA_LINK_EXCLUDE`), emits `Changed` so the user's group is
+  re-exported, and tells the user with a server message naming the
+  requesting server.
+- **Ban (908)**: `Core::peer_ban`, off the reactor, places a ban acting
+  as `link <tag> (<name>)` with the operator's standing, so the audit
+  trail and `hxd ban list` name the requesting server, and as a
+  moderator's ban, so every session it refuses ends. It bans what the
+  extension asks a home server to judge by: the person (account or
+  identity) where there is one, so their every session ends and nobody
+  else behind their address does, and the address only for a shared
+  login such as `guest`. The user is told which server banned them by a
+  server message sent before the ban, which ends the session with a
+  `Kicked` that carries no text, and their departure crosses as 903 with
+  `Banned`. `DATA_LINK_DURATION` is required, and a reason over 8192
+  bytes or not UTF-8 is refused `RefusedFields`. The handle returned is
+  16 random bytes, kept against a row this ban created and the requester
+  (`link_ban`, schema version 14): a target already banned is extended
+  rather than banned again, and that row is another act's, so then the
+  handle names nothing. An unban lifts the act's every row, and a local
+  lift leaves the handle naming nothing, so a later 909 answers
+  `UnknownBan`, as the extension expects. A failure reply is marked an
+  error as well as carrying its reason. When there is nothing
+  to ban by (a guest on an exempt address), the session is ended and the
+  answer is `UnknownUser`, and the requester keeps the ghost hidden as
+  for a failed ban. Protection from disconnection is not consulted for
+  the user banned, as the extension says; other sessions the ban
+  refuses end as a local moderator's ban ends them.
+- **Unban (909)**: honored only from the requester that made the ban, and
+  only for this server's own bans (`DATA_LINK_SERVER_ID`); another
+  server's is `Unreachable` until relaying (L7).
 
-**As requester:** a ban placed on another server's user is recorded with
-its ban ID, the home server and what was known at the time, and listed by
-`hxd ban list` beside local bans. `hxd ban lift` is an offline command,
-like every operator command, so it records a lift request in the
-database; the running server sends the 909 on the next SIGHUP and logs the
-answer. Both kinds persist in the next schema version, kept apart so
-lifting one never touches the other.
+**As requester, still to build:** a ban placed on another server's user
+recorded with its handle, the home server and what was known at the
+time, listed by `hxd ban list` beside local bans, and lifted by a 909;
+and purge of a ghost's lines (§6.3). Until then a network ban this
+server asked for is lifted by the home server's operator.
 
 ### 7.6 Interruption
 
@@ -838,7 +845,7 @@ use: dead code fails `-D warnings`.
 | L2 | Users over one link, including users homed behind the peer: snapshot, update, gone; `ghosts`, `roster_rows`, `RemoteRef`; ghosts on both wires; bounded fan-out; **the fail-closed table test** | `link.rs` |
 | L3 | Public chat both ways: ghost lines staged on arrival and committed by one task, text rules, ghost lines in the log | `link.rs` |
 | L4 | Private messages and user info: the router, answered on a task (classic) or in place (ng) | `link.rs` |
-| L5 | Kick, ban, unban and purge on both sides (the next schema version) | `link.rs`, `bans.rs` |
+| L5 | Kick, ban and unban on both sides; then the requester's ban records and purge | `link.rs` |
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
 | L7 | Relaying between this server's own links: announcing other servers, users relayed on. Transit on a single link, which needs none of it, came ahead of it | `link.rs` |
 | L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge | `link.rs`, `limits.rs`, `metrics.rs` |

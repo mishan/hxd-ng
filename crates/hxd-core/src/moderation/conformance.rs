@@ -21,6 +21,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn ModerationStore>) {
     a_ban_round_trips_and_a_reban_extends_its_one_row(&*new_store());
     a_lifted_ban_stays_on_record_and_a_new_one_is_a_new_row(&*new_store());
     bans_list_standing_or_all_and_age_out(&*new_store());
+    a_link_ban_answers_only_its_requester_and_goes_with_its_ban(&*new_store());
     an_expired_ban_is_closed_and_a_new_one_is_a_new_row(&*new_store());
 }
 
@@ -464,4 +465,22 @@ fn bans_list_standing_or_all_and_age_out(store: &dyn ModerationStore) {
     // Lifted or expired before 160 goes; the rest stays.
     assert_eq!(store.prune_bans(t(160)).unwrap(), 2);
     assert_eq!(store.bans(None, None, 10).unwrap().len(), 2);
+}
+
+fn a_link_ban_answers_only_its_requester_and_goes_with_its_ban(store: &dyn ModerationStore) {
+    use crate::ban::BanTarget;
+    let id = store
+        .ban(&a_ban(BanTarget::Identity([7; 32]), 100, Some(150)))
+        .unwrap()
+        .id;
+    store.note_link_ban(id, [1; 8], [9; 16]).unwrap();
+    assert_eq!(store.link_ban([1; 8], [9; 16]).unwrap(), Some(id));
+    assert_eq!(
+        store.link_ban([2; 8], [9; 16]).unwrap(),
+        None,
+        "another server's"
+    );
+    assert_eq!(store.link_ban([1; 8], [8; 16]).unwrap(), None);
+    store.prune_bans(t(160)).unwrap();
+    assert_eq!(store.link_ban([1; 8], [9; 16]).unwrap(), None);
 }

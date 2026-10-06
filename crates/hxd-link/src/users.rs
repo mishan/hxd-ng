@@ -53,6 +53,11 @@ pub fn of_local(user: &LocalUser, home: ServerId) -> Vec<Field> {
     if let Some(c) = user.color {
         f.push(Field::u32(field::COLOR, c));
     }
+    f.extend(
+        user.exclude
+            .iter()
+            .map(|id| Field::new(field::EXCLUDE, *id)),
+    );
     f
 }
 
@@ -154,6 +159,7 @@ mod tests {
             icon: 128,
             away: true,
             color: Some(0xff8000),
+            exclude: vec![],
         }
     }
 

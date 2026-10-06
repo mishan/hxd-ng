@@ -551,10 +551,41 @@ impl ModerationStore for SqliteStore {
 
     fn prune_bans(&self, before: SystemTime) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
-        sql(conn.execute(
+        let pruned = sql(conn.execute(
             "DELETE FROM ban WHERE lifted_at < ?1 OR expires_at < ?1",
             params![unix(before)],
-        ))
+        ))?;
+        sql(conn.execute(
+            "DELETE FROM link_ban WHERE ban_id NOT IN (SELECT id FROM ban)",
+            [],
+        ))?;
+        Ok(pruned)
+    }
+
+    fn note_link_ban(
+        &self,
+        id: BanId,
+        requester: [u8; 8],
+        handle: [u8; 16],
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT INTO link_ban (handle, requester, ban_id) VALUES (?1, ?2, ?3)",
+            params![&handle[..], &requester[..], clamp(id)],
+        ))?;
+        Ok(())
+    }
+
+    fn link_ban(&self, requester: [u8; 8], handle: [u8; 16]) -> Result<Option<BanId>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let id: Option<i64> = sql(conn
+            .query_row(
+                "SELECT ban_id FROM link_ban WHERE handle = ?1 AND requester = ?2",
+                params![&handle[..], &requester[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        id.map(|id| id_of(id, "ban id")).transpose()
     }
 }
 
