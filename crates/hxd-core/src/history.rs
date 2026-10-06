@@ -69,6 +69,9 @@ pub struct MediaMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewLine {
     pub channel: u32,
+    /// The key of the linked server's user who said it, which a purge of
+    /// that ghost finds it by (`docs/server-link.md` §6.3).
+    pub ghost: Option<[u8; 16]>,
     pub from_nick: String,
     pub from_login: Option<String>,
     pub from_fingerprint: Option<[u8; 32]>,
@@ -159,6 +162,15 @@ pub trait ChatLog: Send + Sync + 'static {
         now: SystemTime,
     ) -> Result<usize, StoreError>;
     fn attach_media(&self, id: LineId, media: &MediaMeta) -> Result<(), StoreError>;
+    /// [`ChatLog::lines_by`] for a linked server's user, by the key its
+    /// lines were logged with ([`NewLine::ghost`]): a ghost has no login to
+    /// purge by, and its name may be anyone's.
+    fn lines_by_ghost(
+        &self,
+        channel: u32,
+        ghost: [u8; 16],
+        since: SystemTime,
+    ) -> Result<Vec<LogLine>, StoreError>;
 }
 
 #[derive(Default)]
@@ -170,6 +182,7 @@ pub struct MemoryLog {
 struct MemoryInner {
     next_id: LineId,
     lines: Vec<LogLine>,
+    ghosts: std::collections::HashMap<LineId, [u8; 16]>,
 }
 
 impl ChatLog for MemoryLog {
@@ -192,6 +205,9 @@ impl ChatLog for MemoryLog {
             at: line.at,
             media: None,
         });
+        if let Some(key) = line.ghost {
+            inner.ghosts.insert(id, key);
+        }
         Ok(id)
     }
 
@@ -222,6 +238,26 @@ impl ChatLog for MemoryLog {
     fn line(&self, id: LineId) -> Result<Option<LogLine>, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.lines.iter().find(|line| line.id == id).cloned())
+    }
+
+    fn lines_by_ghost(
+        &self,
+        channel: u32,
+        ghost: [u8; 16],
+        since: SystemTime,
+    ) -> Result<Vec<LogLine>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .lines
+            .iter()
+            .filter(|l| {
+                l.channel == channel
+                    && l.at >= since
+                    && !l.flags.contains(LineFlags::DELETED)
+                    && inner.ghosts.get(&l.id) == Some(&ghost)
+            })
+            .cloned()
+            .collect())
     }
 
     fn lines_by(
@@ -275,6 +311,8 @@ impl ChatLog for MemoryLog {
             let excess = inner.lines.len() - max_lines;
             inner.lines.drain(..excess);
         }
+        let MemoryInner { lines, ghosts, .. } = &mut *inner;
+        ghosts.retain(|id, _| lines.iter().any(|line| line.id == *id));
         Ok(before - inner.lines.len())
     }
 
@@ -296,6 +334,7 @@ pub mod conformance {
     fn line(n: u64) -> NewLine {
         NewLine {
             channel: 0,
+            ghost: None,
             from_nick: format!("user-{n}"),
             from_login: Some(format!("login-{n}")),
             from_fingerprint: Some([n as u8; 32]),
@@ -320,6 +359,34 @@ pub mod conformance {
         a_line_is_found_by_id_tombstone_or_not(new_log());
         a_senders_lines_are_found_by_the_mailbox_rule(new_log());
         lines_appended_together_keep_their_order(new_log());
+        a_ghosts_lines_are_found_by_its_key(new_log());
+    }
+
+    /// A linked server's user's lines, by the key this server gave it, and
+    /// never another's, whatever the name.
+    fn a_ghosts_lines_are_found_by_its_key(log: Box<dyn ChatLog>) {
+        for (n, ghost) in [
+            (1, Some([7; 16])),
+            (2, Some([8; 16])),
+            (3, Some([7; 16])),
+            (4, None),
+        ] {
+            log.append(&NewLine { ghost, ..line(n) }).unwrap();
+        }
+        let since = SystemTime::UNIX_EPOCH;
+        let ids = |key| -> Vec<LineId> {
+            log.lines_by_ghost(0, key, since)
+                .unwrap()
+                .iter()
+                .map(|l| l.id)
+                .collect()
+        };
+        assert_eq!(ids([7; 16]), [1, 3]);
+        assert_eq!(ids([8; 16]), [2]);
+        assert!(log.tombstone(3, "carol", SystemTime::now()).unwrap());
+        assert_eq!(ids([7; 16]), [1], "a tombstone is purged already");
+        let later = SystemTime::UNIX_EPOCH + Duration::from_secs(102);
+        assert!(log.lines_by_ghost(0, [7; 16], later).unwrap().is_empty());
     }
 
     /// Several lines at once are logged as a line at a time would log

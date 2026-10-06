@@ -54,6 +54,9 @@ pub(crate) struct Ghost {
     pub(crate) visible: bool,
     /// Hidden by a moderator here, for as long as the ghost is shown.
     hidden_here: bool,
+    /// What its lines are logged under, for a purge to name it by: a
+    /// ghost has no login, and its name may be anyone's.
+    pub(crate) key: [u8; 16],
     /// Held to local users' chat limit, for what is shown here only.
     flood: crate::limits::Flood,
 }
@@ -168,6 +171,14 @@ impl NetworkBan {
     pub fn standing(&self, now: SystemTime) -> bool {
         self.lifted_at.is_none() && self.expires_at.is_none_or(|e| e > now)
     }
+}
+
+/// A ghost as a purge names it: the key its lines were logged under, and
+/// how the audit trail calls it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhostRef {
+    pub key: [u8; 16],
+    pub label: String,
 }
 
 /// A moderator's kick of a ghost, carried out here at once and asked of
@@ -414,6 +425,8 @@ impl Core {
     /// Show a ghost, telling the room if it is visible. `None` when there
     /// is no uid to give it.
     pub fn ghost_attach(&self, g: GhostInfo) -> Option<Uid> {
+        let mut key = [0u8; 16];
+        getrandom::getrandom(&mut key).ok()?;
         let mut r = self.roster.lock().unwrap();
         let uid = r.next_uid()?;
         let info = RosterInner::ghost_row(&g, uid);
@@ -426,6 +439,7 @@ impl Core {
                 info,
                 visible: g.visible,
                 hidden_here: false,
+                key,
                 flood: Default::default(),
             },
         );
@@ -485,13 +499,17 @@ impl Core {
         Some(GhostKick { nick, answer })
     }
 
+    /// Hide ghost `uid` here; one hidden already, kicked again, stays so
+    /// and is asked of its home server again.
     fn ghost_hide(&self, uid: Uid) -> Option<String> {
         let mut r = self.roster.lock().unwrap();
-        let g = r.ghosts.get_mut(&uid).filter(|g| g.visible)?;
-        g.visible = false;
+        let g = r.ghosts.get_mut(&uid)?;
+        let was = std::mem::replace(&mut g.visible, false);
         g.hidden_here = true;
         let nick = g.info.nick.clone();
-        r.broadcast(&Event::Parted(uid), None);
+        if was {
+            r.broadcast(&Event::Parted(uid), None);
+        }
         Some(nick)
     }
 
@@ -512,6 +530,7 @@ impl Core {
         }
         Some(GhostLine(crate::chat::Staged::ghost(
             g.info.clone(),
+            g.key,
             text,
             style,
         )))
@@ -838,6 +857,19 @@ impl Core {
         }
     }
 
+    /// What a purge of ghost `uid` needs, shown here or hidden: taken
+    /// before it is kicked, as its home server's answer may take it away.
+    pub fn ghost_ref(&self, uid: Uid) -> Option<GhostRef> {
+        let r = self.roster.lock().unwrap();
+        r.ghosts.get(&uid).map(|g| GhostRef {
+            key: g.key,
+            label: match &g.info.remote {
+                Some(remote) => format!("{}@{}", g.info.nick, remote.home_tag),
+                None => g.info.nick.clone(),
+            },
+        })
+    }
+
     pub fn ghost_count(&self) -> usize {
         self.roster.lock().unwrap().ghosts.len()
     }
@@ -1077,7 +1109,7 @@ mod tests {
             core.ghost_kick(0, g, None).map(|k| k.nick).as_deref(),
             Some("bob")
         );
-        assert!(core.ghost_kick(0, g, None).is_none(), "hidden already");
+        assert!(core.ghost_kick(0, g, None).is_some(), "kicked again");
         core.ghost_update(g, ghost("robert", true));
         assert!(core.roster_rows().iter().all(|u| u.uid != g));
         assert!(core.ghost_line(g, "hi".into(), 0).is_none());
@@ -1235,6 +1267,49 @@ mod tests {
             core.list_bans(true, None, 10).unwrap().len(),
             1,
             "ours stands"
+        );
+    }
+
+    #[test]
+    fn a_purge_of_a_ghost_takes_its_lines_and_spares_a_namesake() {
+        use crate::moderation::{Actor, MemoryModeration, ModerationPolicy};
+        let core = Core::new()
+            .with_history(
+                Arc::new(crate::history::MemoryLog::default()),
+                Default::default(),
+            )
+            .with_moderation(
+                Arc::new(MemoryModeration::default()),
+                ModerationPolicy::default(),
+            );
+        let (bob, _rx) = test_attach(&core, "bob", chatter());
+        let g = core.ghost_attach(ghost("bob", true)).unwrap();
+        core.chat_public(bob, "mine".into(), 0, None).unwrap();
+        for text in ["spam", "more spam"] {
+            core.ghost_chat(core.ghost_line(g, text.into(), 0).unwrap());
+        }
+        // Another ghost of the same name, from the same server.
+        let twin = core.ghost_attach(ghost("bob", true)).unwrap();
+        core.ghost_chat(core.ghost_line(twin, "hi".into(), 0).unwrap());
+        let target = core.ghost_ref(g).unwrap();
+        // Kicked, so hidden, before the purge, as the frontends do.
+        core.ghost_kick(0, g, None).unwrap();
+        let purged = core
+            .purge_ghost(Actor::Operator, &target, Duration::from_secs(3600), "spam")
+            .unwrap();
+        assert_eq!(purged.lines, [2, 3]);
+        let log = core.history.as_ref().unwrap();
+        let text = |id| log.line(id).unwrap().unwrap().text;
+        assert_eq!(text(1), "mine", "the local bob's line stands");
+        assert_eq!(text(4), "hi", "and the other bob's");
+        assert!(text(2).is_empty() && text(3).is_empty(), "tombstoned");
+        let act = &core.moderation_log(Actor::Operator, None, 1).unwrap().0[0];
+        assert!(
+            act.evidence
+                .as_deref()
+                .unwrap()
+                .starts_with("linked user bob@hl2"),
+            "{act:?}"
         );
     }
 

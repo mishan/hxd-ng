@@ -495,7 +495,22 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     reason: p.reason.clone().unwrap_or_default(),
                 });
             let banning = ghost_ban.is_some();
+            // Taken before the kick, as their server's answer may take the
+            // ghost away before the purge looks for its lines.
+            let ghost = core.ghost_ref(p.uid);
             if let Some(kick) = core.ghost_kick(uid, p.uid, ghost_ban) {
+                // Hidden first, so lines of its still on their way are not
+                // shown, then its lines here purged.
+                if let (Some(secs), Some(ghost)) = (p.purge, ghost) {
+                    let why = p.reason.clone().unwrap_or_default();
+                    let within = Duration::from_secs(secs);
+                    match off_reactor(core, move |c| c.purge_ghost(by, &ghost, within, &why)).await
+                    {
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => return refused(e),
+                        None => return reply_err(id, "server_error", "Server error."),
+                    }
+                }
                 let wait = hxd_core::server_link::PEER_WAIT;
                 let done = matches!(
                     tokio::time::timeout(wait, kick.answer).await,
