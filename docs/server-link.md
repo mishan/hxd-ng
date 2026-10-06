@@ -717,7 +717,10 @@ feature: it is part of every link.
   16 random bytes, kept against a row this ban created and the requester
   (`link_ban`, schema version 14): a target already banned is extended
   rather than banned again, and that row is another act's, so then the
-  handle names nothing. An unban lifts the act's every row, and a local
+  reply carries no handle and the requester keeps nothing to lift. A
+  store that will not answer an unban answers `Unreachable`, which the
+  requester asks again, never `UnknownBan`, which it takes for lifted.
+  An unban lifts the act's every row, and a local
   lift leaves the handle naming nothing, so a later 909 answers
   `UnknownBan`, as the extension expects. A failure reply is marked an
   error as well as carrying its reason. When there is nothing

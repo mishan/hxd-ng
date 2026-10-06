@@ -612,15 +612,16 @@ impl Core {
 
     /// A linked server's ban of local user `uid`, placed as this server's
     /// operator would place it and ending the session; for `None`, until
-    /// lifted. The handle the requester may lift it by. A store write:
-    /// call it off the reactor.
+    /// lifted. The handle the requester may lift it by, when there is one
+    /// to give: none when the ban only extended another act's. A store
+    /// write: call it off the reactor.
     pub fn peer_ban(
         &self,
         uid: Uid,
         by: &Requester,
         for_: Option<Duration>,
         reason: &str,
-    ) -> Result<[u8; 16], PeerRefusal> {
+    ) -> Result<Option<[u8; 16]>, PeerRefusal> {
         let (targets, serial) = {
             let mut r = self.roster.lock().unwrap();
             let sess = r
@@ -674,6 +675,7 @@ impl Core {
             "" => format!("banned from the network by {}", by.tag),
             why => format!("banned from the network by {}: {why}", by.tag),
         };
+        let kept;
         // A guest on an address nobody may ban: thrown off, but nothing
         // holds them, so the requester is told no ban was placed.
         let Some((first, rest)) = targets.split_first() else {
@@ -705,13 +707,18 @@ impl Core {
             // which the requester has no business lifting, so the handle
             // then names nothing and its unban answers `UnknownBan`.
             let own = placed.iter().find(|row| act.is_some() && row.act == act);
-            if let (Some(store), Some(row)) = (self.moderation.as_ref(), own) {
+            kept = match (self.moderation.as_ref(), own) {
                 // The ban stands either way; only lifting it from there is
                 // lost.
-                if let Err(e) = store.note_link_ban(row.id, by.id, handle) {
-                    tracing::warn!(target = uid, "network ban's handle not kept: {e}");
-                }
-            }
+                (Some(store), Some(row)) => match store.note_link_ban(row.id, by.id, handle) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(target = uid, "network ban's handle not kept: {e}");
+                        false
+                    }
+                },
+                _ => false,
+            };
         }
         let mut r = self.roster.lock().unwrap();
         // Ended already, by the ban, or gone; and its uid, if given out
@@ -719,20 +726,23 @@ impl Core {
         if r.users.get(&uid).is_some_and(|s| s.serial == serial) {
             let _ = crate::chat::kick_in(&mut r, uid);
         }
-        Ok(handle)
+        Ok(kept.then_some(handle))
     }
 
     /// A linked server lifting the ban it placed under `handle`.
     pub fn peer_unban(&self, handle: [u8; 16], by: &Requester) -> Result<(), PeerRefusal> {
         let store = self.moderation.as_ref().ok_or(PeerRefusal::UnknownBan)?;
+        // A store that would not answer is not "no such ban": the
+        // requester would take it for lifted and stop asking.
         let id = store
             .link_ban(by.id, handle)
-            .ok()
-            .flatten()
+            .map_err(|_| PeerRefusal::Unreachable)?
             .ok_or(PeerRefusal::UnknownBan)?;
-        self.lift_ban_as(&by.acting(), id)
-            .map(|_| ())
-            .map_err(|_| PeerRefusal::UnknownBan)
+        match self.lift_ban_as(&by.acting(), id) {
+            Ok(_) => Ok(()),
+            Err(crate::moderation::ModError::NoSuchBan) => Err(PeerRefusal::UnknownBan),
+            Err(_) => Err(PeerRefusal::Unreachable),
+        }
     }
 
     pub fn ghost_count(&self) -> usize {
@@ -1043,7 +1053,10 @@ mod tests {
             })
             .unwrap();
         core.announce(ann);
-        let handle = core.peer_ban(ann, &hub_server(), None, "spam").unwrap();
+        let handle = core
+            .peer_ban(ann, &hub_server(), None, "spam")
+            .unwrap()
+            .expect("a ban of its own to lift");
         // Told who banned them before the ban ends the session.
         let kinds: Vec<&str> = drain(&mut rx).iter().map(Event::kind).collect();
         let told = kinds.iter().position(|k| *k == "broadcast").unwrap();
@@ -1124,10 +1137,7 @@ mod tests {
         )
         .unwrap();
         let handle = core.peer_ban(ann, &hub_server(), None, "theirs").unwrap();
-        assert_eq!(
-            core.peer_unban(handle, &hub_server()),
-            Err(PeerRefusal::UnknownBan)
-        );
+        assert_eq!(handle, None, "nothing of its own to lift");
         assert_eq!(
             core.list_bans(true, None, 10).unwrap().len(),
             1,

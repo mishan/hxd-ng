@@ -629,9 +629,16 @@ impl Link<'_> {
                 info!(peer = %self.entry.name, by = %by.tag, uid, ?for_, "network ban");
                 tokio::task::spawn_blocking(move || {
                     let banned = core.peer_ban(uid, &by, for_, &reason);
+                    // No handle when there is nothing of this ban's own to
+                    // lift: the requester then keeps no record to lift by.
                     answer(
                         banned
-                            .map(|handle| vec![Field::new(field::BAN_ID, handle)])
+                            .map(|handle| {
+                                handle
+                                    .map(|h| Field::new(field::BAN_ID, h))
+                                    .into_iter()
+                                    .collect()
+                            })
                             .map_err(reason_of),
                     );
                 });
