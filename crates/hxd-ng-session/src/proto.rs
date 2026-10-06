@@ -538,6 +538,9 @@ impl serde::Serialize for UserOut<'_> {
         if let Some(avatar) = &u.avatar {
             m.serialize_entry("avatar", &crate::avatar::avatar_json(avatar))?;
         }
+        if let Some(color) = u.color {
+            m.serialize_entry("color", &color)?;
+        }
         if let Some(id) = &u.transport.identity {
             m.serialize_entry(
                 "identity",
@@ -884,6 +887,7 @@ mod tests {
                 width: 64,
                 height: 32,
             }),
+            color: full.then_some(0x00ff_8000),
         }
     }
 
@@ -900,6 +904,7 @@ mod tests {
             if full {
                 want["system"] = json!(true);
                 want["avatar"] = crate::avatar::avatar_json(u.avatar.as_ref().unwrap());
+                want["color"] = json!(0x00ff_8000);
                 want["identity"] = json!({
                     "fingerprint": hl_identity::Fingerprint([1; 32]).to_string(),
                     "handle": "ann@example.org",

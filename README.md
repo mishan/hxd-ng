@@ -54,6 +54,7 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 | **Chat history** — scrollback the server kept | — | yes | yes |
 | **Any script** — names, chat and messages in UTF-8 | Mac Roman, `?` for the rest | yes | yes |
 | **Images in chat**, re-encoded and metadata-stripped by the server | sees the caption | yes | yes |
+| **Nick colors** — a color for your name, for the session (Colored Nicknames) | — | yes | sees them |
 | **Voice chat** — one room, one UDP port, no transcoding | — | yes | yes |
 | **Video** — camera and screen share on the voice connection, opt-in per stream | — | when GtkHx adds it | yes |
 | **The file area** — browse, Get Info, download; upload into upload folders and drop boxes; new folder, delete, rename, move, comments | yes | yes, plus files over 4 GiB and verified resume | browse, download, and everything but uploads |
