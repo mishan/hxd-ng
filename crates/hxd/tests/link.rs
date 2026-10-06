@@ -525,6 +525,70 @@ async fn a_link_without_messages_refuses_them_and_names_the_server_for_info() {
 }
 
 #[tokio::test]
+async fn a_moderator_hides_a_ghost_here_and_is_told_a_ban_cannot_reach_it() {
+    let (a, b, _dirs) = linked("").await;
+    let mut admin = legacy::Client::login_at(a.legacy, &Login::account("ann", "admin", "pw"))
+        .await
+        .unwrap();
+    let _bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    let _eve = legacy::Client::login_at(b.legacy, &Login::guest("eve"))
+        .await
+        .unwrap();
+    let kick = |uid: u16, ban: bool| {
+        let mut chunks = vec![(tag::UID, uid.to_be_bytes().to_vec())];
+        if ban {
+            chunks.push((tag::BAN, vec![0, 1]));
+        }
+        chunks
+    };
+
+    let bob = row(&mut admin, "bob").await.uid;
+    let kicked = admin
+        .call(ClientHdr::UserKick.as_u32(), &kick(bob, false))
+        .await;
+    assert!(kicked.is_ok(), "{kicked:?}");
+    let part = admin
+        .rx
+        .recv_where(|f| f.ty == push::USER_PART && f.uint(tag::UID) == Some(bob.into()))
+        .await;
+    assert!(part.is_ok(), "{part:?}");
+    assert!(admin
+        .user_list()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.uid != bob));
+
+    let eve = row(&mut admin, "eve").await.uid;
+    let banned = admin
+        .call(ClientHdr::UserKick.as_u32(), &kick(eve, true))
+        .await;
+    assert!(
+        matches!(&banned, Err(hxd_testclient::Error::Refused { text, .. }) if text.contains("not banned")),
+        "{banned:?}"
+    );
+    assert!(admin
+        .user_list()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| r.uid != eve));
+
+    // On the ng wire, the reply says what was done.
+    let _carol = legacy::Client::login_at(b.legacy, &Login::guest("carol"))
+        .await
+        .unwrap();
+    let carol = row(&mut admin, "carol").await.uid;
+    let (mut ngc, _) = ng::Client::account(a.ng, "admin", "pw", "ngc")
+        .await
+        .unwrap();
+    let hidden = ngc.request("kick", json!({ "uid": carol })).await.unwrap();
+    assert_eq!(hidden, json!({ "hidden_here": true, "banned": false }));
+}
+
+#[tokio::test]
 async fn no_act_on_another_user_reaches_a_ghost() {
     let (a, b, _dirs) = linked("").await;
     let mut admin = legacy::Client::login_at(a.legacy, &Login::account("admin", "admin", "pw"))
@@ -553,8 +617,12 @@ async fn no_act_on_another_user_reaches_a_ghost() {
     let chat = (tag::CHAT_ID, made.bytes(tag::CHAT_ID).unwrap());
 
     for ty in hxd_session::NAMES_A_USER {
-        // Carried to the ghost's server, as its own test shows.
-        if matches!(ty, ClientHdr::Msg | ClientHdr::UserGetInfo) {
+        // Carried to the ghost's server, or a kick carried out here, as
+        // their own tests show.
+        if matches!(
+            ty,
+            ClientHdr::Msg | ClientHdr::UserGetInfo | ClientHdr::UserKick
+        ) {
             continue;
         }
         let request = |to: u16| {
@@ -583,7 +651,7 @@ async fn no_act_on_another_user_reaches_a_ghost() {
     let (mut ngc, _) = ng::Client::account(a.ng, "admin", "pw", "ngc")
         .await
         .unwrap();
-    for method in ["block", "kick"] {
+    for method in ["block"] {
         let to = |uid: u16| json!({ "uid": uid });
         let answer = ngc.request(method, to(ghost)).await;
         let absent = ngc.request(method, to(nobody)).await;

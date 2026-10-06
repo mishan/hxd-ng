@@ -1055,6 +1055,28 @@ mod tests {
     }
 
     #[test]
+    fn users_of_a_server_behind_the_peer_follow_that_servers_changes() {
+        let h = hub_with_peer("a");
+        let (link, _) = h.register("a");
+        h.accept_server("a", link, group(2, "two", 0), true)
+            .unwrap();
+        h.accept_server("a", link, group(3, "three", 1), false)
+            .unwrap();
+        h.apply_user("a", link, user(9, 3)).unwrap();
+        let ghost = h.ghost_uid("a", link, 9).unwrap();
+        let tag = |h: &Hub| {
+            let row = h.0.core.roster_rows().into_iter().find(|u| u.uid == ghost);
+            row.and_then(|u| u.remote).map(|r| r.home_tag)
+        };
+        assert_eq!(tag(&h).as_deref(), Some("three"));
+        h.accept_server("a", link, group(3, "drei", 1), false)
+            .unwrap();
+        assert_eq!(tag(&h).as_deref(), Some("drei"), "a 913 reaches it");
+        h.forget_server("a", link, ServerId([3; 8]));
+        assert_eq!(h.0.core.ghost_count(), 0, "a 914 takes it away");
+    }
+
+    #[test]
     fn a_replaced_link_takes_its_ghosts_with_it() {
         let h = hub_with_peer("a");
         let (first, _) = h.register("a");

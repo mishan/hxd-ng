@@ -84,6 +84,9 @@ pub const NAMES_A_USER: &[ClientHdr] = &[
     ClientHdr::ChatInvite,
 ];
 
+/// Why a ban on a user of another server is not placed.
+const GHOST_BAN: &str = "this server cannot ban users of other servers yet.";
+
 /// fogWraith's GIF Icons extension (`docs/avatars.md` §3): client
 /// opcodes hxproto routes no enum for.
 mod gif_icons {
@@ -4106,6 +4109,17 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     tag::BAN => ban = c.as_uint() != 0,
                     _ => {}
                 }
+            }
+            // A user of another server: hidden here, which is all this
+            // server can do to one, and told so if a ban was asked for.
+            if let Some(nick) = ctx.core.ghost_hide(target) {
+                if ban {
+                    let text = format!("{nick} is hidden here, but not banned: {GHOST_BAN}");
+                    reply_error(tx, f.trans, &text);
+                } else {
+                    reply(tx, f.trans, vec![]);
+                }
+                return;
             }
             if ctx
                 .core

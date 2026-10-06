@@ -483,6 +483,11 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     "You are not allowed to disconnect users.",
                 );
             }
+            // A user of another server: hidden here, which is all this
+            // server can do to one; a ban asked for is not placed.
+            if core.ghost_hide(p.uid).is_some() {
+                return reply_ok(id, json!({ "hidden_here": true, "banned": false }));
+            }
             if core.user(p.uid).is_none() {
                 return refused(ModError::NoSuchUser);
             }

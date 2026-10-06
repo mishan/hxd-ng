@@ -68,6 +68,7 @@ pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
         snapshot: None,
         features: 0,
         pending: HashMap::new(),
+        peer_id: None,
     };
     // A reload between the login and here found no link to close: the
     // entry this link was authorized under must still be the one in force.
@@ -99,6 +100,8 @@ struct Link<'a> {
     features: u32,
     /// Requests sent to the peer, by task, awaiting its reply.
     pending: HashMap<u32, oneshot::Sender<Reply>>,
+    /// The peer's own server ID, once its Hello was accepted.
+    peer_id: Option<ServerId>,
 }
 
 /// Requests one link waits on at once; past it a request is not sent,
@@ -216,6 +219,7 @@ impl Link<'_> {
         }
 
         self.features = features & peer.features;
+        self.peer_id = Some(peer.server.id);
         self.hub
             .set_features(&self.entry.name, self.generation, self.features);
 
@@ -326,14 +330,26 @@ impl Link<'_> {
             warn!(peer = %self.entry.name, server = ?g.id, "server group dropped: {why}");
             return None;
         }
-        if self.hub.servers_behind(&self.entry.name, self.generation) >= MAX_SERVERS
-            && !self
-                .hub
-                .knows_behind(&self.entry.name, self.generation, g.id)
-        {
-            warn!(peer = %self.entry.name, "more servers than a link may put behind it");
-            return Some(self.close(io, Reason::ProtocolError, "too_many_servers"));
+        let own = self.peer_id == Some(g.id);
+        let known = self
+            .hub
+            .knows_behind(&self.entry.name, self.generation, g.id);
+        // Without transit the peer shows only itself (Link Servers), and
+        // a server it names besides is not joined to this one.
+        if !own && self.features & feature::TRANSIT == 0 {
+            warn!(peer = %self.entry.name, server = ?g.id, "server behind a link without transit ignored");
+            return None;
         }
+        // Past the bound a server is not represented, nor are its users;
+        // closing would only bring the same list back at the next login.
+        if !own
+            && !known
+            && self.hub.servers_behind(&self.entry.name, self.generation) >= MAX_SERVERS
+        {
+            warn!(peer = %self.entry.name, server = ?g.id, "more servers than a link may put behind it; ignored");
+            return None;
+        }
+        let id = g.id;
         match self
             .hub
             .accept_server(&self.entry.name, self.generation, g, false)
@@ -345,6 +361,12 @@ impl Link<'_> {
             }
             Err(reason) => {
                 warn!(peer = %self.entry.name, ?reason, "server update ignored");
+                // A server it can no longer accept is gone from here, and
+                // its users with it.
+                if known {
+                    self.hub
+                        .forget_server(&self.entry.name, self.generation, id);
+                }
                 None
             }
         }
@@ -567,9 +589,11 @@ impl Link<'_> {
                 }
             },
             tx::SERVER_GONE => {
-                if let Some(id) = find(&fields(&f), field::SERVER_ID).and_then(Field::fixed) {
+                // The peer itself goes only with the link.
+                let id = find(&fields(&f), field::SERVER_ID).and_then(Field::fixed);
+                if let Some(id) = id.map(ServerId).filter(|id| Some(*id) != self.peer_id) {
                     self.hub
-                        .forget_server(&self.entry.name, self.generation, ServerId(id));
+                        .forget_server(&self.entry.name, self.generation, id);
                 }
             }
             tx::SNAPSHOT => self.snapshot_part(&f),

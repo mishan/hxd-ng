@@ -50,7 +50,10 @@ pub struct GhostInfo {
 
 pub(crate) struct Ghost {
     pub(crate) info: UserInfo,
+    /// Shown here: as the link says, and not hidden by a moderator here.
     pub(crate) visible: bool,
+    /// Hidden by a moderator here, for as long as the ghost is shown.
+    hidden_here: bool,
     /// Held to local users' chat limit, for what is shown here only.
     flood: crate::limits::Flood,
 }
@@ -330,6 +333,7 @@ impl Core {
             Ghost {
                 info,
                 visible: g.visible,
+                hidden_here: false,
                 flood: Default::default(),
             },
         );
@@ -344,7 +348,7 @@ impl Core {
             return false;
         };
         let info = RosterInner::ghost_row(&g, uid);
-        let (was, now) = (ghost.visible, g.visible);
+        let (was, now) = (ghost.visible, g.visible && !ghost.hidden_here);
         let changed = ghost.info != info;
         ghost.info = info.clone();
         ghost.visible = now;
@@ -366,6 +370,20 @@ impl Core {
         if ghost.visible {
             r.broadcast(&Event::Parted(uid), None);
         }
+    }
+
+    /// A moderator's kick of a ghost, which this server can carry out
+    /// only here: hidden from this server's users until it leaves, as the
+    /// extension has a requesting server do. Its nick, or `None` when
+    /// `uid` is no ghost shown here.
+    pub fn ghost_hide(&self, uid: Uid) -> Option<String> {
+        let mut r = self.roster.lock().unwrap();
+        let g = r.ghosts.get_mut(&uid).filter(|g| g.visible)?;
+        g.visible = false;
+        g.hidden_here = true;
+        let nick = g.info.nick.clone();
+        r.broadcast(&Event::Parted(uid), None);
+        Some(nick)
     }
 
     /// A line a ghost said, staged to be logged and shown by
@@ -725,6 +743,20 @@ mod tests {
         );
         let text = core.info_text_for_peer(me).unwrap();
         assert!(text.starts_with("    name: me\r"), "{text:?}");
+    }
+
+    #[test]
+    fn a_ghost_hidden_here_stays_hidden_whatever_its_link_says() {
+        let core = Core::new();
+        let (_me, mut rx) = test_attach(&core, "me", chatter());
+        let g = core.ghost_attach(ghost("bob", true)).unwrap();
+        assert_eq!(core.ghost_hide(g).as_deref(), Some("bob"));
+        assert!(core.ghost_hide(g).is_none(), "hidden already");
+        core.ghost_update(g, ghost("robert", true));
+        assert!(core.roster_rows().iter().all(|u| u.uid != g));
+        assert!(core.ghost_line(g, "hi".into(), 0).is_none());
+        let kinds: Vec<&str> = drain(&mut rx).iter().map(Event::kind).collect();
+        assert_eq!(kinds, ["joined", "parted"]);
     }
 
     #[test]

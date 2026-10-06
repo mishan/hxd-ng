@@ -474,6 +474,10 @@ whole list: everything else is already refused by §3.1.
 
 ### 6.3 Kicks, bans and purge
 
+Built so far: a kick of a ghost, on either wire, hides it on this server
+until it leaves (`Core::ghost_hide`), and nothing crosses. What follows is
+L5.
+
 - The frontend calls `core.hide_ghost(uid)` before spawning the router
   call, so the ghost disappears here at once, with `Parted` to local
   sessions, as the extension requires.
@@ -649,15 +653,18 @@ overflow closes the link, and sent after the last part. After that: a Ping
 after 60 seconds without sending, and the link counted dead after three
 intervals without receiving.
 
-**Receiving topology is not optional, even on one link.** A Janus that is
-already part of a network sends a non-empty Link Servers, Server Updates
-and Server Gones, and users homed behind it, from the first minute. The
-hub checks every server group it receives (Loop, TagConflict, hop limit)
-and accepts ghosts homed behind the link from L1. Relaying onward, and
-announcing other servers, is what waits for L7, and until then this
-server does not offer `LINK_FEATURE_TRANSIT`. A ghost not represented
-because of a cap (§3.6) stays unrepresented: its later updates and
-departure are ignored, and anything naming it is dropped.
+**Topology arrives only over transit.** Over a link with
+`LINK_FEATURE_TRANSIT` the peer's Link Servers, Server Updates and Server
+Gones name the servers behind it, and users homed on them; the hub checks
+every server group (Loop, TagConflict, hop limit) and accepts ghosts homed
+behind the link. Over a link without it the peer shows only itself, and a
+server it names besides is ignored, so that leaving transit off declines
+the peer's network as the extension means it to. Past the bound on
+servers behind a link, a server is ignored rather than the link closed,
+and a server a later update makes unacceptable is forgotten with its
+users. A ghost not represented because of a cap (§3.6) stays
+unrepresented: its later updates and departure are ignored, and anything
+naming it is dropped.
 
 **Checks.** Every incoming transaction is checked before the core sees it,
 as the extension's conformance list requires: a user group must be homed
@@ -674,12 +681,18 @@ checked on receipt and a group over them is dropped whole.
 
 `transit` may be offered to one peer, ahead of L7. Over that link the
 peer may then relay this server's users to the rest of its network and
-show this server the users and servers behind it, which hxd-ng already
-takes (users homed behind a link, its 912 and 913). This server owes
-the link nothing more: transit obliges a server to relay between *its
-own* transit links, and with one there is nothing to relay, so its Link
-Servers stays empty. A second peer offering transit is refused at
-config load until L7 builds that relaying.
+show this server the users and servers behind it (§7.4). On the wire
+this server owes the link nothing more: transit obliges a server to relay
+between *its own* transit links, and with one there is nothing to relay,
+so its Link Servers stays empty. A second peer offering transit is
+refused at config load until L7 builds that relaying.
+
+What it does owe, and cannot yet give, is moderation (L5), now across a
+whole network rather than one operator's server. Until then a kick of a
+ghost hides it here for as long as it is shown, the extension's rule for
+a server whose ban did not reach the user, and a kick asking for a ban
+says that none was placed. Network moderators cannot yet act on this
+server's users.
 
 ### 7.5 Moderation, both sides
 
