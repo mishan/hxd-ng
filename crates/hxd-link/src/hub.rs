@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use hxd_core::server_link::{GhostInfo, LocalUser, PeerEvent, RemoteRef};
+use hxd_core::server_link::{GhostInfo, GhostLine, LocalUser, PeerEvent, RemoteRef};
 use hxd_core::Core;
 use hxd_session::peer::{LinkGrant, LinkIo, LinkLogin, PeerAcceptor};
 use hxd_session::{cap, Caps};
@@ -37,7 +37,7 @@ pub const MAX_HOPS: u16 = 8;
 
 /// The link features this build implements. Each side offers what its
 /// operator enabled for a peer, and only this much of it.
-pub const SUPPORTED: u32 = 0;
+pub const SUPPORTED: u32 = feature::PUBLIC_CHAT;
 
 /// One peer this server links with, from `[[link.peer]]`.
 #[derive(Debug, Clone)]
@@ -89,7 +89,16 @@ struct Inner {
     config: Mutex<HubConfig>,
     core: Arc<Core>,
     state: Mutex<State>,
+    /// Ghosts' chat lines, in the order their links received them, on
+    /// their way to the one task that logs them: a commit blocks, and a
+    /// link's reader must not.
+    chat: mpsc::Sender<GhostLine>,
+    chat_rx: Mutex<Option<mpsc::Receiver<GhostLine>>>,
 }
+
+/// Ghosts' lines waiting to be logged, across every link. Past it a line
+/// is not shown here, and is logged as dropped.
+const CHAT_CAP: usize = 1024;
 
 #[derive(Default)]
 struct State {
@@ -129,12 +138,15 @@ impl Hub {
     pub fn new(seed: &[u8; 32], config: HubConfig, core: Arc<Core>) -> Hub {
         let mut epoch = [0u8; 8];
         getrandom::getrandom(&mut epoch).expect("the OS CSPRNG");
+        let (chat, chat_rx) = mpsc::channel(CHAT_CAP);
         Hub(Arc::new(Inner {
             key: LinkKey::from_seed(seed),
             epoch,
             config: Mutex::new(config),
             core,
             state: Mutex::default(),
+            chat,
+            chat_rx: Mutex::new(Some(chat_rx)),
         }))
     }
 
@@ -166,6 +178,14 @@ impl Hub {
         // no feed was installed would never hear what changed after.
         let rx = self.0.core.peer_feed(FEED_CAP);
         tokio::spawn(feed(self.clone(), rx));
+        if let Some(mut lines) = self.0.chat_rx.lock().unwrap().take() {
+            let core = self.0.core.clone();
+            tokio::task::spawn_blocking(move || {
+                while let Some(line) = lines.blocking_recv() {
+                    core.ghost_chat(line);
+                }
+            });
+        }
         self.spawn_dialers();
     }
 
@@ -577,6 +597,39 @@ impl Hub {
             },
             visible: !g.exclude.contains(&self.server_id()),
         })
+    }
+
+    /// A chat line from one of the peer's users, shown here unless the
+    /// core declines to.
+    pub(crate) fn chat(
+        &self,
+        peer: &str,
+        generation: u64,
+        id: u16,
+        text: String,
+        style: u16,
+    ) -> Result<(), &'static str> {
+        let uid = {
+            let state = self.0.state.lock().unwrap();
+            state
+                .links
+                .get(peer)
+                .filter(|l| l.generation == generation)
+                .and_then(|l| l.ghosts.get(&id))
+                .map(|slot| slot.uid)
+                .ok_or("no such user on this link")?
+        };
+        let Some(line) = self.0.core.ghost_line(uid, text, style) else {
+            return Ok(());
+        };
+        self.0.chat.try_send(line).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => "too many lines waiting to be logged",
+            mpsc::error::TrySendError::Closed(_) => "the task logging lines has ended",
+        })
+    }
+
+    pub(crate) fn epoch(&self) -> [u8; 8] {
+        self.0.epoch
     }
 
     pub(crate) fn user_gone(&self, peer: &str, generation: u64, id: u16) {

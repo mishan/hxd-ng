@@ -141,7 +141,7 @@ async fn pair_with(
         a_link,
         &format!(
             "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
-             key = \"ed25519:{}\"\naccount = \"link-bb\"\n",
+             key = \"ed25519:{}\"\naccount = \"link-bb\"\nfeatures = [\"chat\"]\n",
             public(a_holds)
         ),
         a_tls,
@@ -154,7 +154,7 @@ async fn pair_with(
         "",
         &format!(
             "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
-             key = \"{}\"\naccount = \"link-bb\"\n",
+             key = \"{}\"\naccount = \"link-bb\"\nfeatures = [\"chat\"]\n",
             public(b_holds)
         ),
         bind().await,
@@ -327,10 +327,69 @@ async fn show_tags_puts_the_home_servers_tag_in_every_ghosts_name() {
     let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
         .await
         .unwrap();
-    let _bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+    let mut bob = legacy::Client::login_at(b.legacy, &Login::guest("roberta-long"))
         .await
         .unwrap();
-    row(&mut ann, "bob@bb").await;
+    let ghost = row(&mut ann, "roberta-long@bb").await.uid;
+    // In chat too, where the name is cut so the 13 columns keep the tag.
+    row(&mut bob, "ann").await;
+    bob.chat(b"hi").await.unwrap();
+    let line = heard(&mut ann, ghost).await;
+    assert_eq!(line, b"\rroberta-lo@bb:  hi");
+}
+
+/// The next public chat line `c` hears from `uid`.
+async fn heard(c: &mut legacy::Client, uid: u16) -> Vec<u8> {
+    c.rx.recv_where(|f| f.ty == push::CHAT && f.uint(tag::UID) == Some(uid.into()))
+        .await
+        .unwrap()
+        .bytes(tag::BODY)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn public_chat_crosses_the_link_both_ways_on_both_wires() {
+    let (a, b, _dirs) = linked("").await;
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let mut bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    let (mut ngc, _) = ng::Client::guest(b.ng, "ngc").await.unwrap();
+    let ann_there = row(&mut bob, "ann").await.uid;
+    let ngc_here = row(&mut ann, "ngc").await.uid;
+
+    // Formatted where it is heard, as a local line is, on both wires.
+    ann.chat(b"hello from aa").await.unwrap();
+    assert_eq!(
+        heard(&mut bob, ann_there).await,
+        b"\r          ann:  hello from aa"
+    );
+    let event = ngc
+        .event_where("chat", |d| d["from"]["uid"] == ann_there)
+        .await
+        .unwrap();
+    assert_eq!(event.data["text"], "hello from aa");
+
+    // An ng client's lines cross line by line, and an emote as one.
+    ngc.request("chat", json!({ "text": "two\nlines", "style": "action" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        heard(&mut ann, ngc_here).await,
+        b"\r *** ngc two\r *** ngc lines"
+    );
+
+    // Lines keep their order across the link.
+    for n in 0..20 {
+        bob.chat(format!("line {n}").as_bytes()).await.unwrap();
+    }
+    let bob_here = row(&mut ann, "bob").await.uid;
+    for n in 0..20 {
+        let want = format!("\r          bob:  line {n}");
+        assert_eq!(heard(&mut ann, bob_here).await, want.as_bytes());
+    }
 }
 
 #[tokio::test]

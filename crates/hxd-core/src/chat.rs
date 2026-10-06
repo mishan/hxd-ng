@@ -261,11 +261,28 @@ pub(crate) struct Staged {
     info: UserInfo,
     login: Option<String>,
     fingerprint: Option<[u8; 32]>,
-    principal: crate::media::Principal,
+    /// The sending session; `None` for a linked server's user, a ghost,
+    /// which has no session and attaches no media.
+    principal: Option<crate::media::Principal>,
     text: String,
     style: u16,
     media: Option<(crate::media::Handle, crate::media::MediaRef)>,
     at: SystemTime,
+}
+
+impl Staged {
+    pub(crate) fn ghost(info: UserInfo, text: String, style: u16) -> Staged {
+        Staged {
+            info,
+            login: None,
+            fingerprint: None,
+            principal: None,
+            text,
+            style,
+            media: None,
+            at: SystemTime::now(),
+        }
+    }
 }
 
 /// The most public lines one commit takes.
@@ -464,11 +481,15 @@ impl Core {
         media: Option<crate::media::Handle>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
         self.chat_flood_check(from, 0, &text)?;
+        let mut text = text;
         let (info, login, fingerprint, principal) = {
             let r = self.roster.lock().unwrap();
             let Some(sess) = r.users.get(&from) else {
                 return Err(ChatError::NoSuchUser);
             };
+            if r.linked() {
+                crate::server_link::cut_to_link_bound(&mut text);
+            }
             (
                 sess.info.clone(),
                 (sess.login != "guest").then(|| sess.login.clone()),
@@ -496,13 +517,19 @@ impl Core {
                 info,
                 login,
                 fingerprint,
-                principal,
+                principal: Some(principal),
                 text,
                 style,
                 media,
                 at: SystemTime::now(),
             },
         )
+    }
+
+    /// A line a ghost said, logged and shown as a local one is. Blocking,
+    /// like [`Core::chat_public`]: the caller runs it off the reactor.
+    pub fn ghost_chat(&self, line: crate::server_link::GhostLine) {
+        let _ = self.chat_commit.submit(self, line.0);
     }
 
     /// Log a batch of public lines in one commit and relay them in order,
@@ -525,7 +552,16 @@ impl Core {
         {
             let r = self.roster.lock().unwrap();
             for (s, result) in batch.iter_mut().zip(results.iter_mut()) {
-                let crate::media::Principal::Session { uid, serial } = s.principal else {
+                let Some(crate::media::Principal::Session { uid, serial }) = s.principal else {
+                    // A ghost hidden since is not shown; one gone since
+                    // still is, as it was, so its last line is not lost.
+                    if s.principal.is_none() {
+                        match r.ghosts.get(&s.info.uid) {
+                            Some(g) if !g.visible => *result = Some(Err(ChatError::NoSuchUser)),
+                            Some(g) => s.info = g.info.clone(),
+                            None => {}
+                        }
+                    }
                     continue;
                 };
                 match r.users.get(&uid) {
@@ -549,9 +585,15 @@ impl Core {
                     .iter()
                     .map(|&i| {
                         let s = &batch[i];
+                        // A tagged ghost is logged as it is shown, so a
+                        // replay does not pass it off as a local user.
+                        let from_nick = match s.info.remote.as_ref().filter(|r| r.tagged) {
+                            Some(r) => format!("{}@{}", s.info.nick, r.home_tag),
+                            None => s.info.nick.clone(),
+                        };
                         NewLine {
                             channel: 0,
-                            from_nick: s.info.nick.clone(),
+                            from_nick,
                             from_login: s.login.clone(),
                             from_fingerprint: s.fingerprint,
                             icon: s.info.icon,
@@ -610,6 +652,14 @@ impl Core {
             // what keeps the lines in order.
             let mut r = self.roster.lock().unwrap();
             r.broadcast_where(&ev, None, reads_public_chat);
+            if let Event::Chat {
+                from, text, style, ..
+            } = &ev
+            {
+                if s.principal.is_some() && !text.is_empty() {
+                    r.export_chat(from.uid, text, *style);
+                }
+            }
             // The authorization set, fixed at relay time: the sender, and
             // every session this line just went to whose wire can carry
             // the reference. Captured under the roster's lock and stored
@@ -617,7 +667,7 @@ impl Core {
             // are ever taken in.
             if let Some((handle, _)) = &s.media {
                 let audience = r.media_audience(None, reads_public_chat);
-                self.media_capture(handle, audience.into_iter().chain([s.principal]));
+                self.media_capture(handle, audience.into_iter().chain(s.principal));
             }
             drop(r);
             results[i] = Some(Ok(id));

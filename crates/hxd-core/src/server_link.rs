@@ -50,6 +50,30 @@ pub struct GhostInfo {
 pub(crate) struct Ghost {
     pub(crate) info: UserInfo,
     pub(crate) visible: bool,
+    /// Held to local users' chat limit, for what is shown here only.
+    flood: crate::limits::Flood,
+}
+
+/// A ghost's chat line, staged when it arrives so that the ghost leaving
+/// before it is logged does not lose it ([`Core::ghost_chat`]).
+pub struct GhostLine(pub(crate) crate::chat::Staged);
+
+/// The most a chat line or private message may carry over a link, in
+/// bytes of UTF-8 (the extension's Text on a Link).
+pub const MAX_LINK_TEXT: usize = 8192;
+
+/// Cut a local line to what a link can carry, at a character boundary,
+/// before it is shown anywhere, so every copy of it is the same. Only a
+/// classic client's line can be this long once converted: Mac Roman, or
+/// UTF-8 whose invalid bytes became replacement characters.
+pub(crate) fn cut_to_link_bound(text: &mut String) {
+    if text.len() > MAX_LINK_TEXT {
+        let mut end = MAX_LINK_TEXT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
 }
 
 /// A local user as it may cross a link: nothing else about a session does.
@@ -86,6 +110,15 @@ pub enum PeerEvent {
     Shown(LocalUser),
     Changed(LocalUser),
     Gone(Uid, GoneReason),
+    /// A public chat line, with text: `line` counts the lines this server
+    /// has originated since it started, for the line's network-wide ID.
+    Chat {
+        from: Uid,
+        /// Shared, as each link's channel holds a copy of the event.
+        text: std::sync::Arc<str>,
+        style: u16,
+        line: u32,
+    },
 }
 
 /// The export feed's end in the roster.
@@ -93,6 +126,10 @@ pub enum PeerEvent {
 pub(crate) struct Feed {
     tx: Option<mpsc::Sender<(u64, PeerEvent)>>,
     seq: u64,
+    lines: u32,
+    /// A feed was ever installed, so a link is configured: kept while a
+    /// feed that fell behind is replaced.
+    linked: bool,
 }
 
 /// Whether a session is one a link may show elsewhere: announced, and not
@@ -136,6 +173,23 @@ impl RosterInner {
         }
     }
 
+    pub(crate) fn linked(&self) -> bool {
+        self.feed.linked
+    }
+
+    pub(crate) fn export_chat(&mut self, uid: Uid, text: &str, style: u16) {
+        if self.users.get(&uid).is_some_and(exported) {
+            self.feed.lines = self.feed.lines.wrapping_add(1);
+            let line = self.feed.lines;
+            self.export(PeerEvent::Chat {
+                from: uid,
+                text: text.into(),
+                style,
+                line,
+            });
+        }
+    }
+
     /// Before the session leaves the roster: whether it was exported is
     /// asked of the session itself.
     pub(crate) fn export_gone(&mut self, sess: &UserSession) {
@@ -169,7 +223,10 @@ impl Core {
     /// events the hub has not yet taken.
     pub fn peer_feed(&self, cap: usize) -> mpsc::Receiver<(u64, PeerEvent)> {
         let (tx, rx) = mpsc::channel(cap);
-        self.roster.lock().unwrap().feed.tx = Some(tx);
+        let mut r = self.roster.lock().unwrap();
+        r.feed.tx = Some(tx);
+        r.feed.linked = true;
+        drop(r);
         rx
     }
 
@@ -201,6 +258,7 @@ impl Core {
             Ghost {
                 info,
                 visible: g.visible,
+                flood: Default::default(),
             },
         );
         Some(uid)
@@ -238,6 +296,28 @@ impl Core {
         }
     }
 
+    /// A line a ghost said, staged to be logged and shown by
+    /// [`Core::ghost_chat`]; `None` when it is not shown here: no such
+    /// ghost, one excluded here, or one past local users' chat limit. The
+    /// hub relays a line whatever this answers.
+    pub fn ghost_line(&self, uid: Uid, text: String, style: u16) -> Option<GhostLine> {
+        let limits = self.flood_limits;
+        let mut r = self.roster.lock().unwrap();
+        let g = r.ghosts.get_mut(&uid).filter(|g| g.visible)?;
+        if !g.flood.chat(
+            crate::limits::chat_lines(&text),
+            &limits,
+            std::time::Instant::now(),
+        ) {
+            return None;
+        }
+        Some(GhostLine(crate::chat::Staged::ghost(
+            g.info.clone(),
+            text,
+            style,
+        )))
+    }
+
     pub fn ghost_count(&self) -> usize {
         self.roster.lock().unwrap().ghosts.len()
     }
@@ -269,6 +349,12 @@ mod tests {
     use super::*;
     use crate::access::AccessBits;
     use crate::roster::{drain, test_attach};
+
+    fn chatter() -> AccessBits {
+        AccessBits::empty()
+            .with(crate::access::bit::READ_CHAT)
+            .with(crate::access::bit::SEND_CHAT)
+    }
 
     fn ghost(nick: &str, visible: bool) -> GhostInfo {
         GhostInfo {
@@ -345,6 +431,69 @@ mod tests {
         assert!(events
             .iter()
             .any(|(n, e)| *n <= seq && matches!(e, PeerEvent::Shown(u) if u.uid == b)));
+    }
+
+    #[test]
+    fn local_lines_with_text_are_exported_numbered() {
+        let core = Core::new();
+        let mut feed = core.peer_feed(16);
+        let (a, _ra) = test_attach(&core, "a", chatter());
+        core.chat_public(a, "one".into(), 0, None).unwrap();
+        core.chat_public(a, String::new(), 0, None).unwrap();
+        core.chat_public(a, "two".into(), 1, None).unwrap();
+        let mut lines = vec![];
+        while let Ok((_, e)) = feed.try_recv() {
+            if let PeerEvent::Chat {
+                text, style, line, ..
+            } = e
+            {
+                lines.push((text, style, line));
+            }
+        }
+        assert_eq!(lines, [("one".into(), 0, 1), ("two".into(), 1, 2)]);
+    }
+
+    #[test]
+    fn a_ghosts_line_is_heard_unless_hidden_or_flooding_and_outlives_it() {
+        let core = Core::new().with_flood_limits(crate::FloodLimits::MHXD);
+        let (_me, mut rx) = test_attach(&core, "me", chatter());
+        let g = core.ghost_attach(ghost("bob", true)).unwrap();
+        let line = core.ghost_line(g, "bye".into(), 0).unwrap();
+        core.ghost_part(g);
+        core.ghost_chat(line);
+        let heard = drain(&mut rx);
+        assert!(
+            matches!(&heard[..], [Event::Joined(_), Event::Parted(_), Event::Chat { from, text, .. }] if from.uid == g && text == "bye"),
+            "{heard:?}"
+        );
+
+        let hidden = core.ghost_attach(ghost("eve", false)).unwrap();
+        assert!(core.ghost_line(hidden, "hi".into(), 0).is_none());
+        let shown = core.ghost_attach(ghost("bob", true)).unwrap();
+        let line = core.ghost_line(shown, "hi".into(), 0).unwrap();
+        core.ghost_update(shown, ghost("bob", false));
+        core.ghost_chat(line);
+        assert!(!drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, Event::Chat { .. })));
+
+        let loud = core.ghost_attach(ghost("loud", true)).unwrap();
+        let limit = core.flood_limits.chat_lines as usize;
+        let shown = (0..limit + 5)
+            .filter(|_| core.ghost_line(loud, "x".into(), 0).is_some())
+            .count();
+        assert_eq!(shown, limit);
+        assert!(
+            core.roster_rows().iter().any(|u| u.uid == loud),
+            "a ghost is never kicked here"
+        );
+    }
+
+    #[test]
+    fn a_long_line_is_cut_at_a_character_boundary() {
+        let mut text = "a".repeat(MAX_LINK_TEXT - 1) + "\u{e9}b";
+        cut_to_link_bound(&mut text);
+        assert_eq!(text, "a".repeat(MAX_LINK_TEXT - 1));
     }
 
     #[test]
