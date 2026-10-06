@@ -1269,6 +1269,7 @@ dependencies = [
  "hxd-auth-file",
  "hxd-core",
  "hxd-files",
+ "hxd-link",
  "hxd-markdown",
  "hxd-media",
  "hxd-ng-session",
@@ -1348,6 +1349,23 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "hxd-link"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hl-identity",
+ "hxd-core",
+ "hxd-session",
+ "hxproto",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]

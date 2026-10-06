@@ -15,6 +15,7 @@ members = [
     "crates/hxd-markdown",
     "crates/hxd-auth-file",
     "crates/hxd-session",
+    "crates/hxd-link",
     "crates/hxd-voice",
     "crates/hxd-ng-session",
     "crates/hxd-push-webpush",
@@ -47,6 +48,7 @@ hxd-core = { path = "crates/hxd-core" }
 hxd-files = { path = "crates/hxd-files" }
 hxd-auth-file = { path = "crates/hxd-auth-file" }
 hxd-session = { path = "crates/hxd-session" }
+hxd-link = { path = "crates/hxd-link" }
 hxd-ng-session = { path = "crates/hxd-ng-session" }
 hxd-media = { path = "crates/hxd-media" }
 hxd-markdown = { path = "crates/hxd-markdown" }

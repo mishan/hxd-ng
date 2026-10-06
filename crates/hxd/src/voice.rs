@@ -159,6 +159,7 @@ mod tests {
             banner: None,
             avatars: None,
             metrics: None,
+            link: None,
         }
     }
 

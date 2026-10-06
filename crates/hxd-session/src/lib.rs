@@ -12,6 +12,7 @@ mod files;
 pub mod frame;
 pub mod media;
 pub mod news;
+pub mod peer;
 pub mod session;
 pub mod tls;
 pub mod video;
@@ -21,5 +22,8 @@ pub use banner::Banner;
 pub use caps::{cap, Caps};
 pub use encoding::TextEncoding;
 pub use news::{FlatNews, FlatPushes, FlatReply, LegacyNews};
-pub use session::{run_session, serve, serve_tls, ServerConfig, ServerCtx, TrtpLogin};
+pub use peer::{LinkGrant, LinkIo, LinkLogin, LinkOut, PeerAcceptor};
+pub use session::{
+    run_session, serve, serve_tls, serve_tls_with_peers, ServerConfig, ServerCtx, TrtpLogin,
+};
 pub use tls::LegacyTls;

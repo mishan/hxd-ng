@@ -1,6 +1,8 @@
 # Server linking: hxd-ng on a linked network
 
-Status: design, 2026-10. Nothing here is built. It implements fogWraith's
+Status: partial, 2026-10. Built: L0 (the uid quarantine, Colored
+Nicknames) and L1 (links by key mode, Hello, server lists, pings, close,
+reload; no users cross yet). The rest is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -54,9 +56,9 @@ module) and keeps "link" for the crate name and the extension's own terms.
 | `hxd-link` (new crate) | The link wire: the 900-block, the hub that owns the server and ID tables, one I/O task per link, the dialer, the key proof, relaying. Depends on `hxd-core` and on `hxd-session`'s framing. Knows nothing about classic clients or the ng wire. |
 | `hxd-session`, `hxd-ng-session` | Show ghosts to their clients, refuse what cannot be done to a ghost, and on the classic ports, hand a session that logs in with bit 11 to `hxd-link`. |
 
-Behind a `link` Cargo feature, off by default until it has run against
-Janus for a while, with a `[link]` config section that is a startup error
-in a build without it (the `metrics` pattern).
+The `[link]` config section is the switch; there is no Cargo feature,
+since `hxd-link` adds nothing to the build that TLS and identity have not
+already brought.
 
 ## 3. Ghosts in the domain
 
@@ -483,16 +485,18 @@ whole list: everything else is already refused by §3.1.
 
 ### 7.1 Accepting
 
-A Login (107) that sets bit 11, on the classic port or the TLS port, goes
-to `hxd-link`, decided **before** `reconcile_login`. Today only the text
+A Login (107) that sets bit 11 on the TLS port goes to `hxd-link`;
+anywhere else it is refused. It is decided **before** `reconcile_login`. Today only the text
 encoding is settled that early (the capabilities are intersected after
 the credentials), so the link branch reads the requested bits from the
 login itself, and `parse_login` learns `DATA_LINK_SERVER_KEY` (`0x0640`)
 and `DATA_LINK_KEY_PROOF` (`0x0641`):
 
-- `caps.rs` gains `LINK = 11`. `legacy_caps()` offers it only when `[link]`
-  is configured. Only bits 1 and 11 are echoed to a link.
-- Bit 11 is confirmed only alongside bit 1, only for the account of an
+- `caps.rs` gains `SERVER_LINK = 11`. `legacy_caps()` never offers it: a
+  link login is taken before capabilities are intersected, and only bits 1
+  and 11 are echoed to it. It is decided before the login permit too, so a
+  link is never refused as busy: it never joins the room.
+- Bit 11 is confirmed only alongside bit 1, only for the login named by an
   accepting peer entry, and only on a connection accepted on the TLS port
   with an exporter value (§7.3). `transport.encrypted` is not the test: it
   is also true for the `/trtp` tunnel. Anything else is refused, never
@@ -501,14 +505,19 @@ and `DATA_LINK_KEY_PROOF` (`0x0641`):
 - **A key-mode login never reaches `reconcile_login`.** The proof is
   verified instead; the password is not checked and the attempt is not
   counted toward lockout. A valid proof on a login without bit 11 is
-  refused. A password-mode login goes through `reconcile_login` as today.
-  Either way, an `account_settled`-style check at confirmation catches an
-  account deleted during the login.
+  refused, as is a login that sets bit 11 without bit 1. **A key-mode link
+  needs no account**: its peer entry, the login it names and the key, is
+  the authorization, and no account is made for it, so there is none to
+  delete or disable under a live link. Nothing stops an operator creating
+  an ordinary account of the same name, which is then an ordinary account
+  like any other; the link does not use it. A password-mode login (L8) goes through
+  `reconcile_login` as today.
 - A confirmed link session releases its `LoginPermit` at once, sends no
   agreement, never reaches `attach` or `announce`, and replies with the
-  acceptor's key and proof in key mode. Every non-link transaction on it
-  is refused with an error.
-- **Limits.** The connection took its address's place, and spent its
+  acceptor's key and proof in key mode. A request on it that the link
+  does not define is refused with an error, and a notification it does
+  not define is dropped.
+- **Limits** (L8). The connection took its address's place, and spent its
   reconnect token, at accept, before anything showed it was a link. The
   extension's way out is what hxd-ng does: once a link has authenticated
   from an address, that address is trusted for a bounded time (renewed
@@ -523,14 +532,16 @@ and `DATA_LINK_KEY_PROOF` (`0x0641`):
   moves its permit to the account's count; link logins deliberately do
   not, because `connections_per_account` and the account's reconnect rate
   would refuse a newest-wins redial (below).
-- **The handoff** is two calls on a `PeerAcceptor` trait object in
-  `ServerCtx`, so `hxd-session` does not depend on `hxd-link` and never
-  holds the server key:
+- **The handoff** is two calls on a `PeerAcceptor` trait object passed to
+  the TLS accept loop (`serve_tls_with_peers`), the only listener links
+  are accepted on, so `hxd-session` does not depend on `hxd-link` and
+  never holds the server key:
   - `authorize(login, exporter, addr) -> Result<Grant, Refusal>`, before
     `reconcile_login`: `hxd-link` checks the entry, verifies the proof and
     builds the login reply, with the acceptor's key and proof, which
     `hxd-session` sends with the login's task ID;
-  - `accept(grant, frames, sender, permit)`, awaited inside
+  - `accept(grant, io)`, with the frames, the writer and the place in
+    `LinkIo`, awaited inside
     `run_connection`, so its teardown (aborting the reader, flushing the
     writer) still runs when the link ends. `Outbound` gains
     `Request { ty, trans, chunks }`, a frame with a caller-chosen task ID
@@ -543,14 +554,11 @@ and `DATA_LINK_KEY_PROOF` (`0x0641`):
   link closes the old one with `Replaced` and is treated as a reconnection
   for reconciliation, which is what lets Janus redial over a half-open
   link.
-- **Authorization is continuous.** A link session gets no `AccountChanged`
-  (it is not on the roster), so the core gains an account-change notifier,
-  called from `account_write` and `account_delete`, that the hub listens
-  to. `reload_accounts` re-reads only the logins of sessions on the
-  roster, which a link is not, so the hub also re-checks its link accounts
-  on every SIGHUP, when it re-reads `[[link.peer]]`. An account deleted,
-  or its entry removed, closes its link with `Unlinked`; a changed key,
-  with `ProtocolError`.
+- **Authorization is continuous.** SIGHUP re-reads `[[link.peer]]`: an
+  entry removed closes its link with `Unlinked`, a changed key with
+  `ProtocolError`. A password-mode link (L8) will also need an
+  account-change notifier, since a link session is not on the roster and
+  gets no `AccountChanged`.
 
 ### 7.2 Dialing
 
@@ -587,16 +595,15 @@ HOPE AEAD joins when `hxhope` lands in hx-libs.
 
 ### 7.4 The hub and its links
 
-**The hub** is one task that owns everything shared between links: the
-server table, each link's ID tables, the core subscription, and the
-"server before its users" ordering that relaying needs. **Each link** is an
-I/O task with a bounded writer queue of its own, drawing on the server's
-`QueueBudget`. The hub never waits on a socket: a link whose queue is full
-is dropped (once lagged it can send nothing, not even a Close), which the
-peer sees as an interruption, and it reconnects to a fresh snapshot; no
-other link notices. A `PeerId` is stable per peer entry across
-reconnections, which is what lets the grace period find what a link
-left behind.
+**The hub** owns everything shared between links: the server table, each
+link's ID tables, the core subscription, and the "server before its users"
+ordering that relaying needs. **Each link** is an I/O task with a bounded
+writer queue of its own, drawing on the server's `QueueBudget`. The hub
+never waits on a socket: a link whose queue is full is dropped (once
+lagged it can send nothing, not even a Close), which the peer sees as an
+interruption, and it reconnects to a fresh snapshot; no other link
+notices. A `PeerId` is stable per peer entry across reconnections, which
+is what lets the grace period find what a link left behind.
 
 The hub holds, per link:
 
@@ -697,11 +704,12 @@ learned over the link goes.
   configuration documents: `hxd link reset-id` would then rotate the ng
   `server_key` too, and so refuses while the key is shared.
 - **The server ID** is derived from the key, from the first link on.
-  `hxd link reset-id` works on a stopped server only: a restart with a new
-  ID needs nothing more than the restart, as the extension says, while a
-  running server would have to close every link with `Unlinked` first. It
-  says what it costs: bans this server placed under its old ID can no
-  longer be lifted.
+  `hxd link reset-id` works on a stopped server, like every operator
+  command: the restart closes its links with `Shutdown` and its next Hello
+  names the new ID, which is all the extension asks of an ID change, and
+  never `Unlinked`, which would stop its peers' dialers. It says what it
+  costs: bans this server placed under its old ID can no longer be
+  lifted, so an operator lifts the ones they want lifted first.
 - **The epoch** is random at each start.
 - **Suspensions** persist across restarts, in a state file beside the key,
   as do trusted addresses (§7.1).
@@ -726,9 +734,9 @@ features = ["chat", "msgs", "info"]   # "transit" from L7
 ghosts = 1000               # this link's bound
 ```
 
-- A key-mode accepting entry's account is created by `hxd account` with a
-  password that matches nothing. A tls-mode accepting entry's password is
-  generated with at least 128 bits of entropy and shown once.
+- A key-mode entry needs no account (§7.1). A tls-mode accepting entry's
+  account (L8) has a password generated with at least 128 bits of entropy
+  and shown once.
 - SIGHUP re-reads `[[link.peer]]`: an entry removed closes its link with
   `Unlinked`, a changed key with `ProtocolError`, as the extension
   specifies; a new entry starts dialing.
@@ -779,14 +787,14 @@ use: dead code fails `-D warnings`.
 | Stage | What | Covered by |
 |---|---|---|
 | L0 | Prerequisites with no link: uid quarantine, Colored Nicknames on the classic wire | unit, `nick_colors.rs` |
-| L1 | `hxd-link`: key mode, accept and dial, the handoff, trusted addresses, `Replaced`, continuous authorization, Hello and its checks, Ping, Close, empty Link Servers; receiving the peer's Servers, Server Updates and Gones | `link.rs` |
+| L1 | `hxd-link`: capability bit 11, key mode, accept and dial, the handoff, `Replaced`, continuous authorization, Hello and its checks, Ping, Close, empty Link Servers; receiving the peer's Servers, Server Updates and Gones | `link.rs` |
 | L2 | Users over one link, including users homed behind the peer: snapshot, update, gone; `ghosts`, `roster_rows`, `RemoteRef`; ghosts on both wires; bounded fan-out; **the fail-closed table test** | `link.rs` |
 | L3 | Public chat both ways: `Staged` origins, `ChatCommit::enqueue`, text rules, ghost lines in the log (the next schema version) | `link.rs` |
 | L4 | Private messages and user info: `resolve`, the router, answering out of band on both wires | `link.rs` |
 | L5 | Kick, ban, unban and purge on both sides (the next schema version) | `link.rs`, `bans.rs` |
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
 | L7 | Relaying: announcing other servers, transit, users relayed on | `link.rs` |
-| L8 | Verified TLS, `hxd link` commands, metrics and the ghost gauge | `link.rs`, `metrics.rs` |
+| L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge | `link.rs`, `limits.rs`, `metrics.rs` |
 | L9 | User keys, after the end-to-end document | later |
 
 L1 to L3 make a test link with Janus. **L5 is the minimum for a real

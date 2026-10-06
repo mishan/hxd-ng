@@ -176,7 +176,10 @@ one whose IPv6 /48 holds as many as `connections_per_v6_48` (or, on
 the ng port, `http_connections_per_v6_48`) lets it, `full` for a
 connection past `[limits] ng_connections`, `handshake` and `login` for a connection that never got a
 session, `kicked`, `logout`, `replaced`,
-`send_failed`, `pong_deadline`, and `slow_consumer` for a client that
+`send_failed`, `pong_deadline`, the ends of a server link accepted on the
+TLS port (`docs/server-link.md`: `closed_here`, `closed_by_peer`,
+`establish_timeout`, `protocol_error`, `refused`, `version`,
+`too_many_servers`, `unlinked`, `dead`), and `slow_consumer` for a client that
 stopped taking what was sent to it: a classic writer's queue past its
 bound or a write that made no progress for a minute, either wire's
 session a whole channel behind, or either wire's queue among the
