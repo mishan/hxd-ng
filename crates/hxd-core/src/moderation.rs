@@ -514,6 +514,20 @@ pub trait ModerationStore: Send + Sync + 'static {
     /// Delete bans lifted, or expired, before `before`. Returns how many
     /// went.
     fn prune_bans(&self, before: SystemTime) -> Result<usize, StoreError>;
+    /// Remember that ban `id` was placed for linked server `requester`,
+    /// which was given `handle` to name it by (server-link.md §7.5).
+    fn note_link_ban(
+        &self,
+        id: crate::ban::BanId,
+        requester: [u8; 8],
+        handle: [u8; 16],
+    ) -> Result<(), StoreError>;
+    /// The ban `requester` was given `handle` for, while it is recorded.
+    fn link_ban(
+        &self,
+        requester: [u8; 8],
+        handle: [u8; 16],
+    ) -> Result<Option<crate::ban::BanId>, StoreError>;
 }
 
 /// [`ModerationStore::ban`]'s rule for a target already banned: the

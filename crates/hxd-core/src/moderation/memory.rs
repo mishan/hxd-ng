@@ -20,6 +20,7 @@ struct Inner {
     blocked: Vec<[u8; 32]>,
     bans: Vec<crate::ban::Ban>,
     last_ban: crate::ban::BanId,
+    link_bans: std::collections::HashMap<[u8; 16], ([u8; 8], crate::ban::BanId)>,
     /// Bans still to write before every later one fails, for the tests
     /// of a store that fails partway.
     #[cfg(test)]
@@ -249,6 +250,34 @@ impl ModerationStore for MemoryModeration {
         inner.bans.retain(|b| {
             b.lifted_at.is_none_or(|at| at >= before) && b.expires_at.is_none_or(|at| at >= before)
         });
+        let Inner {
+            bans, link_bans, ..
+        } = &mut *inner;
+        link_bans.retain(|_, (_, id)| bans.iter().any(|b| b.id == *id));
         Ok(was - inner.bans.len())
+    }
+
+    fn note_link_ban(
+        &self,
+        id: crate::ban::BanId,
+        requester: [u8; 8],
+        handle: [u8; 16],
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.link_bans.insert(handle, (requester, id));
+        Ok(())
+    }
+
+    fn link_ban(
+        &self,
+        requester: [u8; 8],
+        handle: [u8; 16],
+    ) -> Result<Option<crate::ban::BanId>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .link_bans
+            .get(&handle)
+            .filter(|(by, _)| *by == requester)
+            .map(|(_, id)| *id))
     }
 }

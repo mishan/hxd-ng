@@ -396,14 +396,20 @@ impl Link<'_> {
             PeerEvent::Shown(u) | PeerEvent::Changed(u) => {
                 self.notify(io, tx::USER_UPDATE, &of_local(&u, own));
             }
-            PeerEvent::Gone(uid, GoneReason::Disconnected) => self.notify(
-                io,
-                tx::USER_GONE,
-                &[
-                    Field::u16(field::USER_ID, uid),
-                    Field::u16(field::REASON, Reason::Disconnected as u16),
-                ],
-            ),
+            PeerEvent::Gone(uid, why) => {
+                let reason = match why {
+                    GoneReason::Disconnected => Reason::Disconnected,
+                    GoneReason::Banned => Reason::Banned,
+                };
+                self.notify(
+                    io,
+                    tx::USER_GONE,
+                    &[
+                        Field::u16(field::USER_ID, uid),
+                        Field::u16(field::REASON, reason as u16),
+                    ],
+                )
+            }
             PeerEvent::Chat {
                 from,
                 text,
@@ -548,6 +554,120 @@ impl Link<'_> {
         self.hub.core().info_text_for_peer(uid).map_err(reason_of)
     }
 
+    /// Link Kick, Ban or Unban (907-909), carried out here as this
+    /// server's operator would: moderation is part of every link, and
+    /// asks only that the requester lie behind it. A ban is a store write,
+    /// so it is answered from a blocking task.
+    fn moderation(&self, io: &LinkIo, f: &Frame) {
+        let fs = fields(f);
+        let baseline: &[u16] = match f.ty {
+            tx::KICK => &[field::TARGET_ID, field::REQUESTER, field::DATA],
+            tx::BAN => &[
+                field::TARGET_ID,
+                field::REQUESTER,
+                field::DURATION,
+                field::DATA,
+            ],
+            _ => &[field::BAN_ID, field::SERVER_ID, field::REQUESTER],
+        };
+        let extra: Vec<Field> = fs
+            .iter()
+            .filter(|f| !baseline.contains(&f.id))
+            .cloned()
+            .collect();
+        if crate::server::admissible_extra(&extra).is_err() {
+            return refuse(io, f, Reason::RefusedFields);
+        }
+        let requester = find(&fs, field::REQUESTER)
+            .and_then(Field::fixed)
+            .map(ServerId)
+            .and_then(|id| self.hub.requester(&self.entry.name, self.generation, id));
+        let Some(by) = requester else {
+            warn!(peer = %self.entry.name, ty = f.ty, "moderation for a server not behind the link refused");
+            return refuse(io, f, Reason::InvalidRequester);
+        };
+        let target = find(&fs, field::TARGET_ID)
+            .and_then(Field::fixed)
+            .map(u16::from_be_bytes);
+        let reason = match find(&fs, field::DATA).map(|d| String::from_utf8(d.data.clone())) {
+            None => String::new(),
+            Some(Ok(text)) if text.len() <= MAX_LINK_TEXT => text,
+            Some(_) => return refuse(io, f, Reason::RefusedFields),
+        };
+        let core = self.hub.core_arc();
+        let (out, trans) = (io.out.clone(), f.trans);
+        let answer = move |result: Result<Vec<Field>, Reason>| {
+            if trans == 0 {
+                return;
+            }
+            let result_failed = result.is_err();
+            let reply = match result {
+                Ok(mut fields) => {
+                    fields.push(Field::u16(field::REASON, Reason::Ok as u16));
+                    fields
+                }
+                Err(reason) => vec![Field::u16(field::REASON, reason as u16)],
+            };
+            out.reply(trans, result_failed, chunks(&reply));
+        };
+        match f.ty {
+            tx::KICK => {
+                info!(peer = %self.entry.name, by = %by.tag, uid = ?target, "network kick");
+                let Some(uid) = target else {
+                    return answer(Err(Reason::UnknownUser));
+                };
+                answer(core.peer_kick(uid, &by).map(|()| vec![]).map_err(reason_of))
+            }
+            tx::BAN => {
+                let Some(uid) = target else {
+                    return answer(Err(Reason::UnknownUser));
+                };
+                let Some(secs) = find(&fs, field::DURATION).and_then(Field::uint) else {
+                    return answer(Err(Reason::RefusedFields));
+                };
+                let for_ = (secs != 0).then(|| Duration::from_secs(secs.into()));
+                info!(peer = %self.entry.name, by = %by.tag, uid, ?for_, "network ban");
+                tokio::task::spawn_blocking(move || {
+                    let banned = core.peer_ban(uid, &by, for_, &reason);
+                    // No handle when there is nothing of this ban's own to
+                    // lift: the requester then keeps no record to lift by.
+                    answer(
+                        banned
+                            .map(|handle| {
+                                handle
+                                    .map(|h| Field::new(field::BAN_ID, h))
+                                    .into_iter()
+                                    .collect()
+                            })
+                            .map_err(reason_of),
+                    );
+                });
+            }
+            _ => {
+                let handle = find(&fs, field::BAN_ID).and_then(Field::fixed::<16>);
+                let ours = find(&fs, field::SERVER_ID)
+                    .and_then(Field::fixed)
+                    .is_some_and(|id| ServerId(id) == self.hub.server_id());
+                // Nothing is relayed yet, so another server's ban is out
+                // of reach (L7).
+                if !ours {
+                    return answer(Err(Reason::Unreachable));
+                }
+                let Some(handle) = handle else {
+                    return answer(Err(Reason::UnknownBan));
+                };
+                info!(peer = %self.entry.name, by = %by.tag, "network unban");
+                tokio::task::spawn_blocking(move || {
+                    answer(
+                        core.peer_unban(handle, &by)
+                            .map(|()| vec![])
+                            .map_err(reason_of),
+                    );
+                });
+            }
+        }
+    }
+
     /// One part of the peer's snapshot. Nothing is shown until the last
     /// part, so the snapshot is applied as one.
     fn snapshot_part(&mut self, f: &Frame) {
@@ -632,9 +752,7 @@ impl Link<'_> {
                 Ok(text) => answer(io, &f, vec![Field::new(field::DATA, text.into_bytes())]),
                 Err(reason) => refuse(io, &f, reason),
             },
-            // This server carries out no moderation for a peer yet (L5):
-            // refused, never pretended.
-            tx::KICK | tx::BAN | tx::UNBAN => refuse(io, &f, Reason::FeatureNotNegotiated),
+            tx::KICK | tx::BAN | tx::UNBAN => self.moderation(io, &f),
             // Link Session Restrictions: a request the link does not
             // define is refused with an error, never silently processed.
             other if f.trans != 0 => {

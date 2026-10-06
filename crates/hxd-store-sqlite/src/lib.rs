@@ -70,7 +70,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -511,6 +511,18 @@ const SCHEMA_V13: &str = "
 ALTER TABLE news_article ADD COLUMN guest_key TEXT;
 CREATE INDEX news_article_guest ON news_article (guest_key)
   WHERE login IS NULL AND login_fp IS NULL AND deleted_at IS NULL;
+";
+
+/// The bans placed for linked servers (`docs/server-link.md` §7.5): the
+/// handle each requesting server was given, so it can lift its own ban
+/// and no other. Rows go with their ban when it is pruned.
+const SCHEMA_V14: &str = "
+CREATE TABLE link_ban (
+  handle    BLOB    PRIMARY KEY,
+  requester BLOB    NOT NULL,
+  ban_id    INTEGER NOT NULL,
+  CHECK (length(handle) = 16 AND length(requester) = 8)
+);
 ";
 
 /// Moderation (`docs/moderation.md` §7, `docs/news.md` §11). Version 2
@@ -1130,6 +1142,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 13 {
         steps.push_str(SCHEMA_V13);
+    }
+    if version < 14 {
+        steps.push_str(SCHEMA_V14);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"

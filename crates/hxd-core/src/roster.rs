@@ -722,6 +722,11 @@ pub(crate) struct UserSession {
     /// than park it, and `resume` refuse it, so a kick is never undone
     /// by the socket dying at the wrong moment.
     pub(crate) kicked: bool,
+    /// Linked servers that kicked this session, by server ID: it is not
+    /// shown at any of them for as long as it lasts (server-link.md §7.5).
+    pub(crate) excluded_at: Vec<[u8; 8]>,
+    /// Banned, so its leaving crosses links as a ban, not a departure.
+    pub(crate) banned: bool,
     /// Account policy: may private messages be stored for this account
     /// and delivered later? (The `[extra] inbox` flag; guests default to
     /// no.) It doubles as "is this session a repliable identity" — the
@@ -1714,6 +1719,8 @@ impl Core {
                 connected_at: Instant::now(),
                 can_detach: info.can_detach,
                 kicked: false,
+                excluded_at: Vec::new(),
+                banned: false,
                 has_inbox: info.has_inbox,
                 attach_news: info.attach_news,
                 set_avatar: info.set_avatar,

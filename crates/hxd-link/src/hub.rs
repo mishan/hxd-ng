@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use hxd_core::roster::Uid;
 use hxd_core::server_link::{
-    GhostInfo, GhostLine, LocalUser, PeerEvent, PeerRefusal, PeerRouter, RemoteRef, PEER_WAIT,
+    GhostBan, GhostInfo, GhostLine, LocalUser, PeerEvent, PeerRefusal, PeerRouter, RemoteRef,
+    Requester, PEER_WAIT,
 };
 use hxd_core::Core;
 use hxd_session::peer::{LinkGrant, LinkIo, LinkLogin, PeerAcceptor};
@@ -527,6 +528,26 @@ impl Hub {
         })
     }
 
+    /// The server `id` as the link knows it, when it lies behind the link:
+    /// the peer, or a server learned over it. A moderation request names
+    /// no other (the extension's requester check).
+    pub(crate) fn requester(&self, peer: &str, generation: u64, id: ServerId) -> Option<Requester> {
+        let state = self.0.state.lock().unwrap();
+        let live = state
+            .links
+            .get(peer)
+            .filter(|l| l.generation == generation)?;
+        live.peer
+            .iter()
+            .chain(live.servers.values())
+            .find(|s| s.id == id)
+            .map(|s| Requester {
+                id: s.id.0,
+                tag: s.tag.clone(),
+                name: s.name.clone(),
+            })
+    }
+
     /// The ghost the peer calls `id` on this link.
     pub(crate) fn ghost_uid(&self, peer: &str, generation: u64, id: u16) -> Option<Uid> {
         let state = self.0.state.lock().unwrap();
@@ -558,7 +579,8 @@ impl Hub {
                     .map(|(id, _)| (l, *id))
             })
             .ok_or(PeerRefusal::UnknownUser)?;
-        if live.features & feature == 0 {
+        // Zero is moderation, which every link carries.
+        if feature != 0 && live.features & feature == 0 {
             return Err(PeerRefusal::FeatureNotNegotiated);
         }
         let (reply, answer) = oneshot::channel();
@@ -696,6 +718,10 @@ impl Hub {
 
     pub(crate) fn core(&self) -> &Core {
         &self.0.core
+    }
+
+    pub(crate) fn core_arc(&self) -> Arc<Core> {
+        self.0.core.clone()
     }
 
     pub(crate) fn epoch(&self) -> [u8; 8] {
@@ -930,6 +956,7 @@ pub(crate) fn reason_of(why: PeerRefusal) -> Reason {
         PeerRefusal::FeatureNotNegotiated => Reason::FeatureNotNegotiated,
         PeerRefusal::Unreachable => Reason::Unreachable,
         PeerRefusal::Refused | PeerRefusal::CannotCross => Reason::RefusedFields,
+        PeerRefusal::UnknownBan => Reason::UnknownBan,
     }
 }
 
@@ -946,6 +973,33 @@ impl PeerRouter for Router {
                     Field::u16(field::TARGET_ID, id),
                     Field::new(field::DATA, text.into_bytes()),
                 ]
+            },
+            |_| Ok(()),
+        )
+    }
+
+    fn kick(&self, of: Uid, ban: Option<GhostBan>) -> oneshot::Receiver<Result<(), PeerRefusal>> {
+        let me = self.0.upgrade().map(|inner| Hub(inner).server_id());
+        let ty = if ban.is_some() { tx::BAN } else { tx::KICK };
+        self.send(
+            of,
+            0,
+            ty,
+            |id| {
+                let mut f = vec![Field::u16(field::TARGET_ID, id)];
+                if let Some(me) = me {
+                    f.push(Field::new(field::REQUESTER, me.0));
+                }
+                if let Some(ban) = ban {
+                    let secs = ban
+                        .for_
+                        .map_or(0, |d| d.as_secs().clamp(1, u32::MAX.into()));
+                    f.push(Field::u32(field::DURATION, secs as u32));
+                    if !ban.reason.is_empty() {
+                        f.push(Field::new(field::DATA, ban.reason.into_bytes()));
+                    }
+                }
+                f
             },
             |_| Ok(()),
         )
@@ -1077,6 +1131,25 @@ mod tests {
     }
 
     #[test]
+    fn only_a_server_behind_the_link_may_ask_for_moderation() {
+        let h = hub_with_peer("a");
+        let (link, _) = h.register("a");
+        h.accept_server("a", link, group(2, "two", 0), true)
+            .unwrap();
+        h.accept_server("a", link, group(3, "three", 1), false)
+            .unwrap();
+        let asks = |id: u8| h.requester("a", link, ServerId([id; 8])).map(|r| r.tag);
+        assert_eq!(asks(2).as_deref(), Some("two"), "the peer");
+        assert_eq!(asks(3).as_deref(), Some("three"), "behind it");
+        assert_eq!(asks(4), None, "anyone else");
+        assert_eq!(asks(1), None, "this server itself");
+        assert!(
+            h.requester("a", link + 1, ServerId([2; 8])).is_none(),
+            "a replaced link"
+        );
+    }
+
+    #[test]
     fn a_replaced_link_takes_its_ghosts_with_it() {
         let h = hub_with_peer("a");
         let (first, _) = h.register("a");
@@ -1141,6 +1214,7 @@ mod tests {
             icon: 1,
             away: false,
             color: None,
+            exclude: vec![],
         };
         UserGroup::parse(&crate::users::of_local(&local, ServerId([home; 8]))).unwrap()
     }
