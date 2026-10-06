@@ -259,6 +259,10 @@ pub struct UserInfo {
     /// The picture shown in place of the icon by a client that can show
     /// one (`docs/avatars.md`). The icon is still what the rest see.
     pub avatar: Option<crate::avatar::AvatarRef>,
+    /// The session's nick color, `0x00RRGGBB` (fogWraith's Colored
+    /// Nicknames). Set by the client for this session only, and gone
+    /// when it logs out.
+    pub color: Option<u32>,
 }
 
 /// The fuller view one session may request of another (the user-info op).
@@ -1678,6 +1682,7 @@ impl Core {
                     admin: info.admin,
                     status: SessionStatus::Active,
                     avatar: None,
+                    color: None,
                 },
                 access: info.access,
                 login: info.login,
@@ -1732,6 +1737,18 @@ impl Core {
     /// everyone, echo included) only if something actually changed and the
     /// session is visible. Returns whether anything changed.
     pub fn update(&self, uid: Uid, nick: Option<String>, icon: Option<u16>) -> bool {
+        self.update_with_color(uid, nick, icon, None)
+    }
+
+    /// [`Self::update`], and the nick color too: `Some(None)` clears it.
+    /// One change, so one `Changed`, whatever it touches.
+    pub fn update_with_color(
+        &self,
+        uid: Uid,
+        nick: Option<String>,
+        icon: Option<u16>,
+        color: Option<Option<u32>>,
+    ) -> bool {
         let mut r = self.roster.lock().unwrap();
         let Some(sess) = r.users.get_mut(&uid) else {
             return false;
@@ -1746,6 +1763,12 @@ impl Core {
         if let Some(i) = icon {
             if sess.info.icon != i {
                 sess.info.icon = i;
+                changed = true;
+            }
+        }
+        if let Some(c) = color {
+            if sess.info.color != c {
+                sess.info.color = c;
                 changed = true;
             }
         }

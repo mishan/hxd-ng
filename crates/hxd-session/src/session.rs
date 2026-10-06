@@ -28,7 +28,7 @@ use hxd_core::{
     Event, Events, FileEntry, FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof,
     SessionStatus, Share, Transport, Uid, UserInfo,
 };
-use hxproto::messages::{tag, ClientHdr, ServerHdr};
+use hxproto::messages::{tag, ClientHdr, ServerHdr, NICK_COLOR_NONE};
 use hxproto::text;
 use hxproto::HL_DATA_HDR_LEN;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -870,16 +870,33 @@ fn wire_color(u: &UserInfo, mark_cleartext: bool) -> u16 {
         })
 }
 
+/// A user's nick color as the wire carries it, `NO_NICK_COLOR` included,
+/// so a client is told when a color is cleared, not only when it is set.
+fn nick_color(u: &UserInfo) -> [u8; 4] {
+    u.color.unwrap_or(NICK_COLOR_NONE).to_be_bytes()
+}
+
 /// The `HTLS_DATA_USER_LIST` payload: uid, icon, color, nlen (all u16 BE),
 /// then the name bytes. `struct hl_userlist_hdr` minus the chunk header.
-fn userlist_payload(u: &UserInfo, mark_cleartext: bool, enc: TextEncoding) -> Vec<u8> {
+/// For a client that sends nick colors, a 4-byte nick color follows the
+/// name, as Janus sends it: a client that never sent one still knows the
+/// name's length and never reads past it.
+fn userlist_payload(
+    u: &UserInfo,
+    mark_cleartext: bool,
+    enc: TextEncoding,
+    nick_colors: bool,
+) -> Vec<u8> {
     let nick = wire_nick(enc, &u.nick);
-    let mut v = Vec::with_capacity(8 + nick.len());
+    let mut v = Vec::with_capacity(12 + nick.len());
     v.extend_from_slice(&u.uid.to_be_bytes());
     v.extend_from_slice(&u.icon.to_be_bytes());
     v.extend_from_slice(&wire_color(u, mark_cleartext).to_be_bytes());
     v.extend_from_slice(&(nick.len() as u16).to_be_bytes());
     v.extend_from_slice(&nick);
+    if nick_colors {
+        v.extend_from_slice(&nick_color(u));
+    }
     v
 }
 
@@ -887,8 +904,9 @@ fn user_change_chunks(
     u: &UserInfo,
     mark_cleartext: bool,
     enc: TextEncoding,
+    nick_colors: bool,
 ) -> Vec<(u16, Vec<u8>)> {
-    vec![
+    let mut chunks = vec![
         (tag::UID, u.uid.to_be_bytes().to_vec()),
         (tag::ICON, u.icon.to_be_bytes().to_vec()),
         (
@@ -896,7 +914,11 @@ fn user_change_chunks(
             wire_color(u, mark_cleartext).to_be_bytes().to_vec(),
         ),
         (tag::NAME, wire_nick(enc, &u.nick)),
-    ]
+    ];
+    if nick_colors {
+        chunks.push((tag::COLOR, nick_color(u).to_vec()));
+    }
+    chunks
 }
 
 /// The legacy XOR-0xff de-obfuscation of LOGIN/PASSWORD chunk payloads
@@ -1297,6 +1319,12 @@ struct Session {
     /// tunnelled session's peer is whoever terminated its WebSocket, so it
     /// binds nothing.
     transfer_addr: Option<IpAddr>,
+    /// This session has sent a nick color, so it is sent everyone's
+    /// (fogWraith's Colored Nicknames, which has no capability bit either).
+    nick_colors: bool,
+    /// This session has been sent the user list, so a client opting in to
+    /// nick colors afterwards needs telling the ones it was not sent.
+    listed: bool,
     /// This session has used the GIF Icons extension, so it is sent Icon
     /// Change. The extension has no capability bit; a client that never
     /// asked is not handed a transaction it may not know.
@@ -2173,6 +2201,8 @@ async fn login_phase(
         media_refill: Instant::now(),
         media_stream: None,
         transfer_addr: None,
+        nick_colors: false,
+        listed: false,
         gif_icons: false,
         quiet_icon_refusal: resends_icon_untasked(&req),
         icon_list_tokens: ICON_LISTS,
@@ -2221,9 +2251,17 @@ fn push_self_info(tx: &Tx, ctx: &ServerCtx, sess: &Session) {
                     (tag::ACCESS, sess.account.access.to_wire().to_vec()),
                     (
                         tag::USER_LIST,
-                        userlist_payload(&me, ctx.cfg.mark_cleartext, sess.enc),
+                        userlist_payload(&me, ctx.cfg.mark_cleartext, sess.enc, sess.nick_colors),
                     ),
-                ],
+                ]
+                .into_iter()
+                // GtkHx reads its own color from a field of its own here,
+                // as the spec lists it, rather than from the row.
+                .chain(
+                    sess.nick_colors
+                        .then(|| (tag::COLOR, nick_color(&me).to_vec())),
+                )
+                .collect(),
             );
         }
     }
@@ -2295,14 +2333,14 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             push(
                 tx,
                 hdr::USER_CHANGE,
-                user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc),
+                user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc, sess.nick_colors),
             );
         }
         Event::Joined(u) => {
             push(
                 tx,
                 hdr::USER_CHANGE,
-                user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc),
+                user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc, sess.nick_colors),
             );
             // A user list row cannot carry a picture, and a GIF-icon client
             // fetches one only on Icon Change: someone who joins already
@@ -2439,7 +2477,13 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                             .to_vec(),
                     ),
                     (tag::NAME, wire_nick(sess.enc, &user.nick)),
-                ],
+                ]
+                .into_iter()
+                .chain(
+                    sess.nick_colors
+                        .then(|| (tag::COLOR, nick_color(&user).to_vec())),
+                )
+                .collect(),
             );
         }
         Event::ChatUserParted { cid, uid } => {
@@ -2714,7 +2758,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .map(|u| {
                     (
                         tag::USER_LIST,
-                        userlist_payload(u, ctx.cfg.mark_cleartext, sess.enc),
+                        userlist_payload(u, ctx.cfg.mark_cleartext, sess.enc, sess.nick_colors),
                     )
                 })
                 .collect();
@@ -2723,6 +2767,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 wire_subject(sess.enc, &ctx.core.public_subject()),
             ));
             reply(tx, f.trans, chunks);
+            sess.listed = true;
             // Optional compatibility replay, only for clients that did
             // not negotiate history and only after their first user list.
             if !sess.history_replayed
@@ -2756,17 +2801,40 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
 
         t if t == ClientHdr::UserChange.as_u32() => {
-            let (mut nick, mut icon) = (None, None);
+            let (mut nick, mut icon, mut color) = (None, None, None);
             for c in f.chunks() {
                 match c.tag {
                     tag::NAME if sess.can(bit::USE_ANY_NAME) => {
                         nick = Some(sess.enc.decode_chars(c.data, 31));
                     }
                     tag::ICON => icon = Some(c.as_uint() as u16),
+                    tag::COLOR if c.data.len() == 4 => {
+                        let v = c.as_uint();
+                        // The high byte is reserved; nothing but "no color"
+                        // may set it.
+                        color = Some((v != NICK_COLOR_NONE).then_some(v & 0x00ff_ffff));
+                    }
                     _ => {}
                 }
             }
-            ctx.core.update(sess.uid, nick, icon);
+            if color.is_some() && !sess.nick_colors {
+                sess.nick_colors = true;
+                // A client that already has the user list was sent it
+                // without colors, so it is told everyone's that are set.
+                // One that asks for it next (GtkHx does) finds them in the
+                // rows, and would show a 301 for a user it has not listed
+                // yet as that user joining.
+                if sess.listed {
+                    for u in ctx.core.snapshot().iter().filter(|u| u.color.is_some()) {
+                        push(
+                            tx,
+                            hdr::USER_CHANGE,
+                            user_change_chunks(u, ctx.cfg.mark_cleartext, sess.enc, true),
+                        );
+                    }
+                }
+            }
+            ctx.core.update_with_color(sess.uid, nick, icon, color);
             if !sess.announced {
                 complete_login(tx, ctx, sess, None).await;
             }
@@ -3674,7 +3742,12 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         .map(|u| {
                             (
                                 tag::USER_LIST,
-                                userlist_payload(u, ctx.cfg.mark_cleartext, sess.enc),
+                                userlist_payload(
+                                    u,
+                                    ctx.cfg.mark_cleartext,
+                                    sess.enc,
+                                    sess.nick_colors,
+                                ),
                             )
                         })
                         .collect();

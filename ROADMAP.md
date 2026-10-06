@@ -470,6 +470,9 @@ In rough order of value-for-effort:
    2026-09**: the acts, reports and trail on both wires and the CLI,
    `/report` through the system account, and a durable block list; the
    vouching hooks wait on vouching.
+   Colored nicknames are **implemented 2026-10**, per session, on the
+   classic wire as Janus sends them and GtkHx reads them, and read-only on
+   the ng wire.
 4. **Voice** — an SFU, a genuinely large subsystem (this is where Janus has
    two known server-side bugs, both written up in the "Open" section of
    gtkhx's `docs/voice.md` — read them as a spec of what not to do).
