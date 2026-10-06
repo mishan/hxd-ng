@@ -40,7 +40,8 @@ pub const MAX_HOPS: u16 = 8;
 
 /// The link features this build implements. Each side offers what its
 /// operator enabled for a peer, and only this much of it.
-pub const SUPPORTED: u32 = feature::PUBLIC_CHAT | feature::PRIVATE_MESSAGES | feature::USER_INFO;
+pub const SUPPORTED: u32 =
+    feature::PUBLIC_CHAT | feature::PRIVATE_MESSAGES | feature::USER_INFO | feature::TRANSIT;
 
 /// One peer this server links with, from `[[link.peer]]`.
 #[derive(Debug, Clone)]

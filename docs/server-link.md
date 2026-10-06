@@ -341,7 +341,7 @@ the hub feeds it from one task of its own:
   `ChatCommit` a line at a time (`Core::ghost_chat`), as a local sender
   does; local lines share its commits. Past the channel's bound a line is
   not shown here, and is logged: the extension's volume bound, held
-  across every link. Until transit (L7) there is nowhere to relay it.
+  across every link. Until relaying (L7) there is nowhere to relay it.
 - **The batch re-check.** `Staged` has no session for a ghost's line, and
   the re-check looks the ghost up in `ghosts` instead: a line is dropped
   when its ghost is still present but hidden, and goes out under the
@@ -670,6 +670,17 @@ only server or user state that cannot be parsed closes the link.
 whole; fields that never cross are refused at every hop; the bounds are
 checked on receipt and a group over them is dropped whole.
 
+### 7.4.1 Transit on one link
+
+`transit` may be offered to one peer, ahead of L7. Over that link the
+peer may then relay this server's users to the rest of its network and
+show this server the users and servers behind it, which hxd-ng already
+takes (users homed behind a link, its 912 and 913). This server owes
+the link nothing more: transit obliges a server to relay between *its
+own* transit links, and with one there is nothing to relay, so its Link
+Servers stays empty. A second peer offering transit is refused at
+config load until L7 builds that relaying.
+
 ### 7.5 Moderation, both sides
 
 **As home server:**
@@ -753,7 +764,7 @@ protection = "key"          # "key" or "tls"
 key = "ed25519:b64..."      # the peer's public key, base64url, prefix optional (Janus writes it); checked for canonical form and small order at load
 account = "link-hx"         # the account the peer issued this server, or this server's for the peer
 # password = "..."          # tls mode only: what the peer issued
-features = ["chat", "msgs", "info"]   # "transit" from L7
+features = ["chat", "msgs", "info", "transit"]   # transit: one peer until L7
 ghosts = 1000               # this link's bound
 ```
 
@@ -816,7 +827,7 @@ use: dead code fails `-D warnings`.
 | L4 | Private messages and user info: the router, answered on a task (classic) or in place (ng) | `link.rs` |
 | L5 | Kick, ban, unban and purge on both sides (the next schema version) | `link.rs`, `bans.rs` |
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
-| L7 | Relaying: announcing other servers, transit, users relayed on | `link.rs` |
+| L7 | Relaying between this server's own links: announcing other servers, users relayed on. Transit on a single link, which needs none of it, came ahead of it | `link.rs` |
 | L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge | `link.rs`, `limits.rs`, `metrics.rs` |
 | L9 | User keys, after the end-to-end document | later |
 
