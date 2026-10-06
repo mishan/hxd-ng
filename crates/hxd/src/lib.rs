@@ -4178,6 +4178,7 @@ sync = "full"
         let id = history
             .append(&NewLine {
                 channel: 0,
+                ghost: None,
                 from_nick: "n".into(),
                 from_login: None,
                 from_fingerprint: None,

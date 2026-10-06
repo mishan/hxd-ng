@@ -264,6 +264,8 @@ pub(crate) struct Staged {
     /// The sending session; `None` for a linked server's user, a ghost,
     /// which has no session and attaches no media.
     principal: Option<crate::media::Principal>,
+    /// A ghost's key, which its logged lines are marked with.
+    ghost: Option<[u8; 16]>,
     text: String,
     style: u16,
     media: Option<(crate::media::Handle, crate::media::MediaRef)>,
@@ -271,12 +273,13 @@ pub(crate) struct Staged {
 }
 
 impl Staged {
-    pub(crate) fn ghost(info: UserInfo, text: String, style: u16) -> Staged {
+    pub(crate) fn ghost(info: UserInfo, key: [u8; 16], text: String, style: u16) -> Staged {
         Staged {
             info,
             login: None,
             fingerprint: None,
             principal: None,
+            ghost: Some(key),
             text,
             style,
             media: None,
@@ -518,6 +521,7 @@ impl Core {
                 login,
                 fingerprint,
                 principal: Some(principal),
+                ghost: None,
                 text,
                 style,
                 media,
@@ -593,6 +597,7 @@ impl Core {
                         };
                         NewLine {
                             channel: 0,
+                            ghost: s.ghost,
                             from_nick,
                             from_login: s.login.clone(),
                             from_fingerprint: s.fingerprint,
@@ -2399,6 +2404,14 @@ mod tests {
     }
 
     impl crate::history::ChatLog for SlowLog {
+        fn lines_by_ghost(
+            &self,
+            channel: u32,
+            ghost: [u8; 16],
+            since: SystemTime,
+        ) -> Result<Vec<crate::history::LogLine>, StoreError> {
+            self.inner.lines_by_ghost(channel, ghost, since)
+        }
         fn append(&self, line: &NewLine) -> Result<crate::history::LineId, StoreError> {
             self.append_all(std::slice::from_ref(line))
                 .map(|ids| ids[0])
@@ -2511,6 +2524,14 @@ mod tests {
     }
 
     impl crate::history::ChatLog for GatedLog {
+        fn lines_by_ghost(
+            &self,
+            channel: u32,
+            ghost: [u8; 16],
+            since: SystemTime,
+        ) -> Result<Vec<crate::history::LogLine>, StoreError> {
+            self.inner.lines_by_ghost(channel, ghost, since)
+        }
         fn append(&self, line: &NewLine) -> Result<crate::history::LineId, StoreError> {
             self.append_all(std::slice::from_ref(line))
                 .map(|ids| ids[0])

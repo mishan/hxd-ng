@@ -70,7 +70,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -525,6 +525,14 @@ CREATE TABLE link_ban (
 );
 ";
 
+/// Public chat lines said by linked servers' users carry the key this
+/// server gave each ghost (`docs/server-link.md` §6.3): a purge's only way
+/// to name one, as a ghost has no login and its name may be anyone's.
+const SCHEMA_V16: &str = "
+ALTER TABLE chat_line ADD COLUMN ghost BLOB;
+CREATE INDEX chat_line_ghost ON chat_line (ghost) WHERE ghost IS NOT NULL;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -567,8 +575,8 @@ CREATE INDEX report_closed_at ON report (closed_at) WHERE closed_at IS NOT NULL;
 fn insert_line(conn: &Connection, line: &NewLine) -> Result<LineId, StoreError> {
     conn.prepare_cached(
         "INSERT INTO chat_line
-           (channel, nick, login, login_fp, icon, flags, body, at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+           (channel, nick, login, login_fp, icon, flags, body, at, ghost)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .and_then(|mut stmt| {
         stmt.execute(params![
@@ -580,6 +588,7 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<LineId, StoreError> 
             i64::from(line.flags.bits()),
             line.text,
             unix(line.at),
+            line.ghost.as_ref().map(|k| &k[..]),
         ])
     })
     .map_err(StoreError::new)?;
@@ -1169,6 +1178,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 15 {
         steps.push_str(SCHEMA_V15);
+    }
+    if version < 16 {
+        steps.push_str(SCHEMA_V16);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -2117,6 +2129,29 @@ impl ChatLog for SqliteStore {
             .transpose()
     }
 
+    fn lines_by_ghost(
+        &self,
+        channel: u32,
+        ghost: [u8; 16],
+        since: SystemTime,
+    ) -> Result<Vec<LogLine>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {HISTORY_COLUMNS} FROM chat_line
+              WHERE channel = ?1 AND at >= ?2 AND deleted_at IS NULL
+                AND ghost = ?3
+              ORDER BY id ASC"
+        );
+        let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
+        let rows = stmt
+            .query_map(
+                params![i64::from(channel), unix(since), &ghost[..]],
+                history_row,
+            )
+            .map_err(StoreError::new)?;
+        collect_history(rows)
+    }
+
     fn lines_by(
         &self,
         channel: u32,
@@ -2249,6 +2284,7 @@ mod tests {
             store
                 .append(&NewLine {
                     channel: 0,
+                    ghost: None,
                     from_nick: "n".into(),
                     from_login: None,
                     from_fingerprint: None,
@@ -2315,6 +2351,7 @@ mod tests {
             store
                 .append(&NewLine {
                     channel: 0,
+                    ghost: None,
                     from_nick: "n".into(),
                     from_login: None,
                     from_fingerprint: None,
@@ -2353,6 +2390,7 @@ mod tests {
                 .unwrap();
         let line = || NewLine {
             channel: 0,
+            ghost: None,
             from_nick: "n".into(),
             from_login: None,
             from_fingerprint: None,
@@ -2481,6 +2519,7 @@ mod tests {
         held.wait();
         let line = NewLine {
             channel: 0,
+            ghost: None,
             from_nick: "n".into(),
             from_login: None,
             from_fingerprint: None,

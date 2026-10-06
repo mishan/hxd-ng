@@ -4107,9 +4107,21 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     _ => {}
                 }
             }
-            // A user of another server: hidden here at once, and the kick
-            // or ban asked of their server, whose answer the reply waits
-            // for, on a task of its own.
+            if ctx
+                .core
+                .access_of(target)
+                .is_some_and(|a| a.has(bit::CANT_BE_DISCONNECTED))
+            {
+                reply_error(tx, f.trans, "That user cannot be disconnected.");
+                return;
+            }
+            let ban_for = ban.then_some(ctx.cfg.ban_time);
+            // A user of another server: hidden here at once, then purged
+            // here if `kick_purges` asks, by the key taken before the kick,
+            // as their server's answer may take them away; the kick or ban
+            // is asked of their server, whose answer the reply waits for,
+            // on a task of its own.
+            let ghost = ctx.core.ghost_ref(target);
             // A ban time of zero is a kick, here as for a local user.
             let ghost_ban =
                 (ban && !ctx.cfg.ban_time.is_zero()).then(|| hxd_core::server_link::GhostBan {
@@ -4118,6 +4130,22 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 });
             let banning = ghost_ban.is_some();
             if let Some(kick) = ctx.core.ghost_kick(sess.uid, target, ghost_ban) {
+                let window = ctx.core.moderation_policy().kick_purges;
+                if let Some(ghost) = ghost.filter(|_| !window.is_zero()) {
+                    if ctx.core.is_moderator(sess.uid) {
+                        let by = hxd_core::Actor::Session(sess.uid);
+                        let why = if ban { "banned" } else { "kicked" };
+                        let core = ctx.core.clone();
+                        let purged =
+                            tokio::task::spawn_blocking(instrument::blocking("purge", move || {
+                                core.purge_ghost(by, &ghost, window, why)
+                            }))
+                            .await;
+                        if let Ok(Err(e)) = purged {
+                            debug!(target, "kick purge skipped: {e:?}");
+                        }
+                    }
+                }
                 let (tx, trans) = (tx.clone(), f.trans);
                 tokio::spawn(async move {
                     match peer_answer(kick.answer).await {
@@ -4137,15 +4165,6 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 });
                 return;
             }
-            if ctx
-                .core
-                .access_of(target)
-                .is_some_and(|a| a.has(bit::CANT_BE_DISCONNECTED))
-            {
-                reply_error(tx, f.trans, "That user cannot be disconnected.");
-                return;
-            }
-            let ban_for = ban.then_some(ctx.cfg.ban_time);
             // `[moderation] kick_purges` makes a kick take the target's
             // recent output with it, as the ng `kick { purge }` does —
             // and only for a kicker who may purge, since that is the

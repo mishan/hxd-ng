@@ -1173,6 +1173,44 @@ impl Core {
         Ok(purged)
     }
 
+    /// A linked server's user's lines here, by the key their ghost was
+    /// given (`docs/server-link.md` §6.3): this server's history only, and
+    /// nothing crosses. A ghost has no images or articles here to take.
+    pub fn purge_ghost(
+        &self,
+        by: Actor,
+        ghost: &crate::server_link::GhostRef,
+        within: Duration,
+        why: &str,
+    ) -> Result<Purged, ModError> {
+        let acting = self.acting(by)?;
+        let why = reason(why, MAX_ACT_REASON)?;
+        let store = self.moderation_store()?.clone();
+        let since = SystemTime::now()
+            .checked_sub(within)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let lines = match self.history.as_ref() {
+            Some(log) => log.lines_by_ghost(0, ghost.key, since)?,
+            None => Vec::new(),
+        };
+        // A ghost has no login or key here to file the act under: the
+        // evidence says who it was, whatever was found.
+        let mut act = Act::new(ActKind::Purge, &acting, why);
+        let evidence = std::iter::once(format!("linked user {}", ghost.label))
+            .chain(lines.iter().map(line_evidence));
+        act.evidence = Some(evidence.collect::<Vec<_>>().join("\n"));
+        store.record(&act)?;
+        let ids: Vec<LineId> = lines.iter().map(|l| l.id).collect();
+        self.tombstone_lines(&acting, &ids)?;
+        let targets: HashSet<ReportTarget> = ids.iter().map(|id| ReportTarget::Line(*id)).collect();
+        self.close_reports_on_any(&acting, &targets);
+        Ok(Purged {
+            lines: ids,
+            media: Vec::new(),
+            articles: Vec::new(),
+        })
+    }
+
     /// Tombstone lines and tell every reader, in log order with the
     /// sends: under the log's own lock, so a redaction can never reach a
     /// client ahead of the line it blanks.

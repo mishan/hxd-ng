@@ -55,7 +55,7 @@ async fn start(
     std::fs::write(dir.join("key.pem"), issued.signing_key.serialize_pem()).unwrap();
     let text = format!(
         "[server]\nname = \"{tag} server\"\n[paths]\naccounts = \"{d}/accounts\"\n\
-         [inbox]\ndb = \"{d}/hx.db\"\n\
+         [inbox]\ndb = \"{d}/hx.db\"\n[history]\n\
          [ng]\nbind = \"127.0.0.1:0\"\n\
          [limits]\nspam_points = 0\nchat_lines = 0\nng_requests = 0\n\
          [tls]\ncert = \"{d}/cert.pem\"\nkey = \"{d}/key.pem\"\n\
@@ -644,6 +644,62 @@ async fn a_kick_hides_a_ghost_at_its_kicker_and_a_ban_is_placed_by_its_home_serv
         hidden,
         json!({ "hidden_here": true, "network": true, "banned": false })
     );
+}
+
+#[tokio::test]
+async fn a_kick_with_purge_takes_a_ghosts_lines_here_and_spares_a_namesake() {
+    let (a, b, _dirs) = linked("").await;
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let mut bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    let mut local_bob = legacy::Client::login_at(a.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    row(&mut bob, "ann").await;
+    // The other bob, beside the local one.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let ghost = loop {
+        let rows = ann.user_list().await.unwrap();
+        if let Some(r) = rows
+            .iter()
+            .find(|r| r.nick == b"bob" && Some(r.uid) != local_bob.uid)
+        {
+            break r.uid;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the other bob never listed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    bob.chat(b"spam").await.unwrap();
+    heard(&mut ann, ghost).await;
+    local_bob.chat(b"mine").await.unwrap();
+    heard(&mut ann, local_bob.uid.unwrap()).await;
+
+    let (mut ngc, _) = ng::Client::account(a.ng, "admin", "pw", "ngc")
+        .await
+        .unwrap();
+    let kicked = ngc
+        .request(
+            "kick",
+            json!({ "uid": ghost, "purge": 3600, "reason": "spam" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(kicked["hidden_here"], true);
+    let page = ngc.request("history", json!({})).await.unwrap();
+    let lines = page["lines"].as_array().unwrap();
+    let text = |want: &str| lines.iter().any(|l| l["text"] == want);
+    assert!(!text("spam"), "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l["deleted"] == true),
+        "a tombstone in its place"
+    );
+    assert!(text("mine"), "the local bob's line stands");
 }
 
 #[tokio::test]

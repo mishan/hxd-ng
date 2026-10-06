@@ -484,15 +484,21 @@ whole list: everything else is already refused by §3.1.
   `UnknownUser`, `InvalidRequester`, or no reply), the classic moderator
   gets a task error saying it was applied here only; the ng reply says
   `network: false` (`moderation.md`). Nothing is announced in chat.
-- **Purge.** Today's purge (ng `kick` with `purge`, and the classic 110
-  path through `kick_purges`) is by person, through `resolve_person` to a
-  mailbox, which a ghost does not have. For a ghost it purges this
-  server's history by the ghost's home server, serial and this server's
-  epoch, which the log records (§3.4), never by name (names may be
-  shared), and it never crosses a link. That needs a `ChatLog` method that
-  selects lines by ghost, in both stores and the conformance suite, and a
-  purge subject with no mailbox (`purge_sender` refuses one today). Lines
-  from that ghost still queued are dropped by the commit re-check (§4.3).
+- **Purge.** A ghost is given a random 16-byte key when it is shown,
+  and its public lines are logged with it (`chat_line.ghost`, schema
+  version 16, both stores and the conformance suite), in the line's own
+  insert. `Core::purge_ghost` takes its lines in the window by that key
+  (`ChatLog::lines_by_ghost`), never by name, so a local user or another
+  ghost of the same name is spared, and records the act with the ghost
+  named (`linked user nick@tag`) in its evidence; a ghost has no images
+  or articles here to take, and nothing crosses a link. The ng `kick`
+  with `purge`, and the classic kick under `[moderation] kick_purges`,
+  take the ghost's key, kick it, so it is hidden and lines of its still
+  queued are dropped by the commit re-check (§4.3), then purge by the key,
+  which outlasts the ghost should its home server's answer take it away.
+  A ghost hidden here already can be kicked again, and purged. A ghost
+  that has left can no longer be named by uid, so its lines are purged
+  while it is here or redacted one by one.
 
 ### 6.4 User info
 
@@ -745,8 +751,7 @@ since replaced is not sent, as its home server would answer any other
 requester `UnknownBan`: its operator lifts it. `OK`, or
 `UnknownBan` because the home server's operator lifted it already or it
 ran out, marks it lifted; anything else, or a home server out of reach,
-leaves it to be sent again. Purge of a ghost's lines (§6.3) is still
-to build.
+leaves it to be sent again.
 
 ### 7.6 Interruption
 
@@ -857,7 +862,7 @@ use: dead code fails `-D warnings`.
 | L2 | Users over one link, including users homed behind the peer: snapshot, update, gone; `ghosts`, `roster_rows`, `RemoteRef`; ghosts on both wires; bounded fan-out; **the fail-closed table test** | `link.rs` |
 | L3 | Public chat both ways: ghost lines staged on arrival and committed by one task, text rules, ghost lines in the log | `link.rs` |
 | L4 | Private messages and user info: the router, answered on a task (classic) or in place (ng) | `link.rs` |
-| L5 | Kick, ban and unban on both sides; then the requester's ban records and purge | `link.rs` |
+| L5 | Kick, ban and unban on both sides; the requester's ban records; purge of a ghost's lines | `link.rs` |
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
 | L7 | Relaying between this server's own links: announcing other servers, users relayed on. Transit on a single link, which needs none of it, came ahead of it | `link.rs` |
 | L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge | `link.rs`, `limits.rs`, `metrics.rs` |
