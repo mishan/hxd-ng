@@ -1,0 +1,808 @@
+# Server linking: hxd-ng on a linked network
+
+Status: design, 2026-10. Nothing here is built. It implements fogWraith's
+[Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
+("the extension" below), through its fifth revision (server keys), against
+Janus 2.0.19 as the first peer.
+
+The extension joins independently run servers into one community: every
+server's users appear in every other server's user list as *ghosts*, with
+one public chat and private messages between them. A linking server dials
+its peer's classic port, logs in with capability bit 11, and speaks the
+900-block of transactions over that session. Classic clients need nothing
+new: a ghost is a user with a uid.
+
+This document is how hxd-ng does that without breaking what it already
+promises: a wire-free UTF-8 domain, user-scoped presence with gapless
+outboxes, bounded queues everywhere, and fail-closed handling of anything
+it does not understand. The extension is the spec; where this document
+and the extension disagree about the wire, the extension wins and this
+document is wrong.
+
+**Naming.** The code already uses "link" for associating an identity with
+an account (`LinkAuthority`, `LinkOutcome`, the `link` parameter of
+`run_connection`). Code for this document says *peer* and *ghost*
+(`PeerId`, `PeerFeed`, `PeerRouter`, the `ghosts` map, the `server_link`
+module) and keeps "link" for the crate name and the extension's own terms.
+
+---
+
+## 1. What is at stake
+
+- **Classic clients see ghosts as users.** User list rows, joins and parts,
+  chat lines and private messages from ghosts must look exactly like their
+  local counterparts, in mhxd's bytes, on 1.2, 1.5 and 1.9 clients.
+- **A ghost is not a connection.** Every handler that writes to a user,
+  starts a transfer, inspects an account or keys a store on a uid must
+  never be reached with a ghost's uid. The extension calls this the
+  property most likely to regress as a server grows, and hxd-ng has grown
+  a lot of uid-keyed features: private chat, voice and video, inline media
+  handles, the inbox, blocking, reports, purge, news notifications,
+  avatars.
+- **Nothing private crosses.** No login, address, access bit or password
+  material leaves this server over a link, and nothing arriving over one
+  can grant privilege here.
+- **A peer that will not drain costs a bounded amount**, and nothing
+  arriving over a link may push a local session near its queue cap in one
+  go, or stall a local session while it waits on the network.
+
+## 2. Shape
+
+| Where | What |
+|---|---|
+| `hxd-core` | Ghosts and the peer-facing domain API (`server_link` module): attach and update ghosts, deliver their chat and messages, the export feed, exclusions, bans placed for peers. Wire-free, and it never builds display strings. |
+| `hxd-link` (new crate) | The link wire: the 900-block, the hub that owns the server and ID tables, one I/O task per link, the dialer, the key proof, relaying. Depends on `hxd-core` and on `hxd-session`'s framing. Knows nothing about classic clients or the ng wire. |
+| `hxd-session`, `hxd-ng-session` | Show ghosts to their clients, refuse what cannot be done to a ghost, and on the classic ports, hand a session that logs in with bit 11 to `hxd-link`. |
+
+Behind a `link` Cargo feature, off by default until it has run against
+Janus for a while, with a `[link]` config section that is a startup error
+in a build without it (the `metrics` pattern).
+
+## 3. Ghosts in the domain
+
+### 3.1 A map of their own
+
+The precedent for a user with no connection is the system session: an
+`attach` whose `Events` receiver is dropped. Building ghosts that way
+would make every `users.get(&uid)` in the core a place where a ghost might
+be found and acted on, which is the regression the extension warns about.
+
+**Ghosts live in `RosterInner.ghosts: HashMap<Uid, Ghost>`, not in
+`users`.** Every existing lookup stays local-only (`user()`,
+`user_details()`, `snapshot()`, `access_of()`, `resolve_person()`) and
+finds nothing for a ghost's uid, so every existing feature fails for a
+ghost as it would for a user who has left: broadcasts, the inbox and its
+flush, voice, media audiences, private chats, reports, blocking, purge,
+avatars and GIF icons all go through `users`. A feature added later is
+safe by default: it cannot see ghosts.
+
+What does see them opts in, through lookups of its own:
+
+- `roster_rows()`, new: local users and visible ghosts, sorted by uid.
+  Used only by the classic user list (300) and the ng roster at login,
+  resume and sync.
+- `resolve(uid) -> Target { Local, Ghost(GhostRef), Refused(PeerRefusal), None }`,
+  new: for the three translated acts (§6), which are its only callers. A
+  ghost that is excluded or hidden here resolves to `Refused(Excluded)`.
+- The uid allocator, which checks both maps and the quarantine (§3.3).
+
+Counts stay local: the tracker counts with `snapshot()` (local-only), and
+`census()` and metrics count `users`, as the extension asks of tracker
+listings and the info port. A ghost gauge is separate (L8).
+
+**Joins and parts for ghosts are the core's**: attaching a visible ghost
+broadcasts `Event::Joined` to visible local sessions, consuming a seq in
+each outbox like any other event; parting, hiding or excluding one
+broadcasts `Event::Parted`. Nothing about seq accounting changes.
+
+### 3.2 The ghost record
+
+```rust
+pub(crate) struct Ghost {
+    serial: u64,              // from last_serial, never reused
+    peer: PeerId,             // the link it was learned over
+    peer_uid: u16,            // the id that link uses for it
+    home: ServerId,           // its home server
+    own_name: String,         // as relayed, never a display name
+    icon: u16,
+    away: bool,
+    refuses_msgs: bool,       // its own flag, or set because its path lacks private messages
+    excluded_here: bool,      // this server's ID is in its exclusion list
+    hidden_here: bool,        // kicked from here, or a failed kick or ban (§6.3)
+    group: Vec<Field>,        // the user group exactly as received, every field, in order
+}
+```
+
+`group` is what Relaying Fields needs: a relay re-sends a user group whole
+and in order, rewriting only the user ID and flags, so the exclusion list,
+the user's own `DATA_COLOR` and fields outside the baseline go on as they
+came. The parsed fields beside it are what this server uses.
+
+`hidden_here` is local and survives later user updates, since the next
+complete group from the peer does not mention it. It clears only when the
+ghost goes, or when it is re-used after a new epoch of its home server.
+Only the adjacent peer's epoch is visible (Hello carries it; server
+groups do not), so in practice it clears on re-use only for a ghost homed
+on the peer itself: a relay restarting does not end the home server's
+session, and a ghost homed further away stays hidden, which is the
+conservative direction. **Re-use keeps the uid and mints a new serial.**
+
+### 3.3 Uid quarantine
+
+The extension requires that a uid not be reused for five minutes after it
+stopped being exported, so a request in transit cannot reach whoever holds
+it next. `next_uid()` continues upward from the last uid allocated and
+wraps, skipping only uids in use, so on a busy server a wrap can reach a
+uid freed a moment ago.
+
+The allocator keeps freed uids, local and ghost alike (a ghost's uid is
+the id this server exports it under when it relays), in a `VecDeque` of
+(uid, freed at) with a `HashSet` beside it, so a check costs O(1) under the
+roster lock, and skips any uid freed less than five minutes ago. If no
+uid is free otherwise, it takes the least recently freed one rather than
+refuse a login as "Server full". It applies whether or not links are
+configured: one rule is simpler than two, and nothing a client sees
+changes.
+
+### 3.4 Display
+
+The domain has no away, refuses-messages or refuses-chat flags; the
+classic frontend derives away from `status != Active`. **The core never
+builds a display name**: it carries a ghost's own name and where it is
+from, and each frontend renders them.
+
+- `UserInfo` gains `remote: Option<RemoteRef>`:
+
+  ```rust
+  pub struct RemoteRef {
+      pub home: ServerId,
+      pub home_tag: String,
+      pub home_name: String,
+      pub color: u32,          // the color this server shows that home server in (the extension's Color)
+      pub refuses_msgs: bool,
+  }
+  ```
+
+- A ghost's `UserInfo.nick` is its own name; away maps to `status: Idle`;
+  `admin` is always false.
+- `Event::Msg` gains `from_remote: Option<RemoteRef>`, since it carries a
+  sender's name as a string rather than a `UserInfo`.
+- The chat log stores, for a ghost line, its own name, its home server's
+  ID and tag at the time, the ghost's serial and this server's epoch (the
+  next schema version), so a replay renders it the way a live line would,
+  a later change of `show_tags` applies to history too, and a purge can
+  name the ghost exactly (§6.3). Rendering takes the tag, name and color
+  from a server table the hub keeps in the core (`peer_servers`), and
+  falls back to the stored tag for a server no longer reachable.
+
+**The classic frontend** renders `name@tag` when `[link] show_tags` is on:
+the name is cut to leave room for the tag within the 31-byte nick cap, so
+the cut never takes the tag. In chat lines, the name is cut to fit
+`@tag` inside `name_column`'s 13 columns, so the tag survives there too.
+`wire_color` adds 4 (refuses private messages) from `refuses_msgs` and 8
+(refuses private chat) on every ghost, and never 16 (cleartext).
+
+**The ng frontend** sends `nick` as the own name and `remote: {server,
+tag, color}`, and the client decides how to show it (§5).
+
+When `show_tags` changes on reload, the core re-announces every ghost with
+`Changed` so classic lists pick up the new names. `ServerConfig` is an
+immutable `Arc`, so the frontends read the setting from a live value.
+
+### 3.5 Colored Nicknames
+
+The extension identifies an untagged ghost by its home server's color,
+through Colored Nicknames (`DATA_COLOR`, `0x0500`). hxd-ng does not
+implement Colored Nicknames today. It is a small, separate change (L0):
+`DATA_COLOR` on user list rows and 301 for clients that sent one. Until it
+lands, `show_tags` defaults to on, since a classic client would otherwise
+have no way to tell a ghost from a local user but the user info prefix.
+
+### 3.6 Bounded fan-out
+
+A snapshot arriving, or a netsplit past the grace period, is one `Joined`
+or `Parted` per ghost to every local session in one go. AGENTS.md forbids
+any domain operation that pushes a session near its cap in one go.
+
+- **A server-wide ghost cap**, `[link] max_ghosts` (default 2000), well
+  below `LIVE_QUEUE_CAP`, across all links, beside the per-link bound the
+  extension recommends. Ghosts past it are not represented, and traffic
+  naming them is dropped and logged.
+- A detached ng session buffers at most `OUTBOX_BUFFER_CAP` events, which
+  a netsplit can exceed. It breaks and resumes into `resync_required`,
+  which is what that answer exists for. A roster-reset event that replaced
+  the burst with one frame is possible later and not needed first.
+
+## 4. The peer-facing API
+
+### 4.1 Subscribing and the feed
+
+`hxd-link` needs every local user it may export, and then every change, at
+one consistent position, because the extension has it send a complete
+snapshot and then updates:
+
+```rust
+impl Core {
+    pub fn peer_subscribe(&self, cap: usize) -> (Vec<LocalUser>, PeerFeed);
+}
+```
+
+taken under one roster lock, so the snapshot and the feed's first event
+neither miss nor repeat anything. The core `try_send`s `PeerEvent`s to the
+feed from inside the roster lock, at the call sites that broadcast local
+presence: `announce`, `update`, `set_status`, `apply_account`,
+`RosterInner::end_session` (which every way of leaving goes through), and
+the broadcast step of `chat_commit_batch`, which checks there that the
+sender is exported (`chat_public` does not check `visible`, so a line
+could otherwise reach the feed ahead of its sender's `Shown`). They sit at
+the call sites, not
+inside `broadcast_where`, which also carries ghosts' own `Joined` events.
+All of them run under the roster lock, so the feed is totally ordered: a
+user is always `Shown` before their first `Chat`.
+
+```rust
+pub enum PeerEvent {
+    Shown(LocalUser),
+    Changed(LocalUser),
+    Gone(Uid, GoneReason),     // Disconnected, NotExported, Banned
+    Chat { from: Uid, serial: u64, text: String, style: u16 },
+}
+```
+
+`LocalUser` carries only what may cross: uid, serial, own name, icon,
+away, exclusions (§7.5) and, later, the user key fingerprint. Never the
+login, address or access bits; the type has no field for them, so a later
+change cannot leak them. Refuses-messages has no source in the domain and
+is always false for local users. A session's departure reason is recorded on
+the `UserSession` when it is kicked or banned, and
+`RosterInner::end_session` reads it, so a ban reaches peers as `Banned`
+even though the frontend that ends the session later knows nothing about
+the ban. A `Chat` from a session already gone (the
+commit re-check and the broadcast take the lock separately) is dropped by
+the hub by its serial. The hub mints each 904's line ID (server ID, epoch,
+a per-epoch count); the history's own `LineId` is a database row and does
+not cross.
+
+**What is exported:**
+
+- visible, announced local sessions;
+- not the system session. It is in the classic user list, so this is a
+  deviation from the extension's "every session an ordinary client would
+  see", and deliberate: a private message to it runs commands, and no
+  other server's user has any business sending one;
+- chat lines from exported senders, with text (a media-only line is not
+  exported; a line with media exports its text), and never a ghost's
+  line, which the hub relayed itself.
+
+**There is one feed, into the hub** (§7.4), not one per link: the core
+pushes each event once. The hub is in process and never waits on a
+socket, so a full feed means the hub itself has stalled; the feed is then
+marked broken and the hub closes every link with `Shutdown` and
+resubscribes, and each reconnection sends a fresh snapshot. A slow *peer*
+never reaches the feed: it fills its own writer queue (§7.4), and only its
+link is closed.
+
+### 4.2 Calls from the hub
+
+```rust
+impl Core {
+    pub fn ghost_attach(&self, g: GhostInfo) -> Result<Uid, GhostRefused>;
+    pub fn ghost_update(&self, uid: Uid, g: GhostInfo) -> bool;
+    pub fn ghost_part(&self, uid: Uid);
+    pub fn ghosts_part_peer(&self, peer: PeerId, home: Option<ServerId>);
+    pub fn ghost_chat(&self, uid: Uid, text: String, style: u16) -> Result<(), ChatError>;
+    pub fn ghost_msg(&self, from: Uid, to: Uid, text: String) -> Result<(), PeerRefusal>;
+    pub fn info_text_for_peer(&self, uid: Uid) -> Result<String, PeerRefusal>;
+    pub fn peer_exclude(&self, uid: Uid, requester: ServerId) -> Result<(), PeerRefusal>;
+    pub fn peer_ban(&self, uid: Uid, by: PeerRequester, for_: Option<Duration>, reason: String) -> Result<PeerBanId, PeerRefusal>;
+    pub fn peer_unban(&self, id: PeerBanId, by: ServerId) -> Result<(), PeerRefusal>;
+}
+```
+
+All but the bans are synchronous and quick. The bans write to the store,
+so the hub spawns them off the reactor and carries on; it never awaits
+them in its own loop, which would back the feed up.
+
+`ghost_msg` refuses with `Excluded` when either party is excluded or
+hidden at the other's server, and with `RateLimited` past a per-ghost and
+per-link budget. A recipient that is detached gets the message in its
+buffer, as any direct message.
+
+### 4.3 Ghost chat
+
+`ghost_chat` must keep a link's lines in order, never run a commit on the
+reactor, and never stall the link's reader. Today's `ChatCommit` hands
+the lead to a submitter waiting on its own slot, so it needs three
+changes:
+
+- **`Staged` gains an origin**, `Session { uid, serial }` or `Ghost { uid,
+  serial }`. The batch re-check looks a session up in `users` as today,
+  and a ghost up in `ghosts`: a line is dropped when its ghost is still
+  present but hidden, excluded or purged, and passes when its ghost has
+  gone, rendered from the `UserInfo` staged with it. That keeps "a purge
+  between two batches misses nothing" true for ghosts, without losing the
+  last line of a ghost whose departure the hub handled first.
+- **`enqueue` places a line without a waiter.** A leader returns once its
+  own batch is done; if the head of the queue is then an enqueued line,
+  it hands the lead to a fresh committer started with `spawn_blocking`,
+  as `enqueue` does when it finds no commit under way. No submitter is
+  held past its own batch, and the hub never runs `append_all` on the
+  reactor.
+- **Bounded.** Today the queue is bounded by the threads blocked in it;
+  enqueued lines are not, so lines waiting are capped per link and
+  server-wide. Past the cap a line is dropped here and logged, after the
+  hub relayed it: the extension's per-link volume bound.
+- **Order.** The hub enqueues a link's lines in the order they arrive, and
+  queue order is commit order, so they are logged and heard in that order.
+
+Where the line is shown:
+
+- not for a ghost that is excluded or hidden here (the hub has relayed it
+  regardless, as the extension requires);
+- the per-ghost rate limit decides display only, for the same reason;
+- history records it with the ghost's own name, icon and home server, and
+  no login. Each server's history is the chat it saw.
+
+**Two consequences, stated.** A batch that fails to commit drops its ghost
+lines locally without a trace, as it drops local ones; they have already
+been relayed. And `ghost_part` takes effect at once while a line enqueued
+just before it commits a moment later, so a client can see a ghost leave
+and then its last line; the alternative is losing it.
+
+### 4.4 Text on a link
+
+- **Line endings are CR on a link.** The domain stores whatever a client
+  sent (CR from classic clients, LF from ng ones), and each frontend
+  normalizes on the way out. The hub does the same: it converts LF and
+  CR LF to CR when it builds a 904 or 905, and passes what arrives on to
+  the core as it came. The classic encoder's `body()` is for clients and
+  is not reused: for UTF-8 it emits LF.
+- **Byte maximums.** Chat lines and private messages are already cut at
+  4096 bytes on both wires, so a local line exceeds the extension's 8192
+  bytes only from a classic client in Mac Roman, where one byte can become
+  three in UTF-8. When `[link]` is configured, such a line is cut to 8192
+  bytes of UTF-8 at ingest, before it is shown anywhere, so every copy on
+  the network is the same, as the extension requires. A local name longer than 255 bytes is
+  not exported; hxd-ng's nick cap is far below that.
+- **Receiving:** the hub drops, never truncates, a transaction or group
+  over the extension's maximums or the Relaying Fields bounds.
+
+## 5. The ng wire
+
+A ghost's `user` object gains `remote: {server, tag, color}`. It has no
+`identity` (until user keys), no `avatar`, and `admin: false`. Its
+`transport` describes the user's own connection, which this server cannot
+know, so `hotline-ng.md` gains a third value, `unknown`, for ghosts.
+Clients already must not treat anything but `encrypted` as protected.
+`msg` events gain `from.remote` for a ghost sender, and chat events and
+`history` entries carry the ghost's `remote` in `from`. These are wire changes: they land in
+`hotline-ng.md` with the server, and the e2e pin on hx-ng advances when
+the client handles them.
+
+There is no ng request for another user's info today, so user info for a
+ghost is classic-only; the `remote` object names the home server, which is
+what the extension's prefix line is for.
+
+## 6. Acts on a ghost
+
+### 6.1 Resolve, then answer out of band
+
+The extension translates three acts, each after the local privilege check
+it would get with a local target:
+
+| Act | Classic | ng | Over the link |
+|---|---|---|---|
+| Private message | 108 | `msg` with `to` | Link Private Message (905) |
+| User info | 303 | none (§5) | Link User Info (906) |
+| Kick, kick with ban | 110 | `kick` | Link Kick (907), Link Ban (908) |
+
+The core's `msg` and `kick_by` are synchronous and called off the reactor,
+so the core cannot await a peer inside them. Nor can the frontends await
+it inline: both session loops await their dispatch, and a session waiting
+up to ten seconds per hop gets no events meanwhile and can be dropped as a
+slow consumer. So:
+
+1. the frontend calls `core.resolve(uid)`;
+2. `Local`: exactly as today;
+3. `Refused(r)` or `None`: fail as today, with `r`'s reason;
+4. `Ghost(g)`: check the local privilege, then **spawn** the router call
+   and return to the loop. The answer is sent when it comes: a classic
+   reply echoes the request's task ID, so its order among other frames
+   does not matter, and an ng reply carries the request's `id`, delivered
+   through a channel into the ng loop, which owns its socket. A spawned
+   classic task holds a weak sender, so it never keeps a closed
+   connection's writer open; a reply for an ng connection that has since
+   been replaced is dropped.
+
+```rust
+#[async_trait]
+pub trait PeerRouter: Send + Sync {
+    async fn msg(&self, from: Uid, to: GhostRef, text: String) -> Result<(), PeerRefusal>;
+    async fn user_info(&self, of: GhostRef) -> Result<String, PeerRefusal>;
+    async fn kick(&self, by: Uid, of: GhostRef, ban: Option<Duration>, reason: String) -> Result<KickOutcome, PeerRefusal>;
+}
+```
+
+That puts ghost handling in two frontends for three acts, which is the
+whole list: everything else is already refused by §3.1.
+
+### 6.2 Private messages
+
+- Refused locally, without anything crossing, when the sender is not
+  exported over that link (the system session, a session not yet
+  announced), when the message carries media, when it is over 8192 bytes
+  (§4.4), when the ghost is excluded or hidden here, or when the
+  sender is excluded at the ghost's home server (the extension's SHOULD).
+- Delivered to a local user as `Event::Msg` from the ghost's uid, own name
+  and `from_remote`, with no login, on the direct (non-durable) path: a
+  ghost has no mailbox, so nothing is queued or blocked.
+- `Event::Msg` has no quote or automatic-response flag, and the classic
+  108 handler reads neither (214, 113). hxd-ng sends neither over a link
+  and ignores both on receipt, until it supports them locally.
+
+### 6.3 Kicks, bans and purge
+
+- The frontend calls `core.hide_ghost(uid)` before spawning the router
+  call, so the ghost disappears here at once, with `Parted` to local
+  sessions, as the extension requires.
+- **If a kick or ban fails** (`Unreachable`, `UnknownUser`,
+  `InvalidRequester`, or no reply), `hidden_here` keeps the ghost hidden
+  for the session, and the moderator is told it was applied here only
+  (kick) or not applied (ban). A ban is announced in chat only when it
+  succeeded.
+- **Purge.** Today's purge (ng `kick` with `purge`, and the classic 110
+  path through `kick_purges`) is by person, through `resolve_person` to a
+  mailbox, which a ghost does not have. For a ghost it purges this
+  server's history by the ghost's home server, serial and this server's
+  epoch, which the log records (§3.4), never by name (names may be
+  shared), and it never crosses a link. That needs a `ChatLog` method that
+  selects lines by ghost, in both stores and the conformance suite, and a
+  purge subject with no mailbox (`purge_sender` refuses one today). Lines
+  from that ghost still queued are dropped by the commit re-check (§4.3).
+
+### 6.4 User info
+
+- **As requester**, the classic 303 reply for a ghost is a first line
+  naming the home server, then the text the router returns, or that line
+  and nothing else when the request fails or times out, as the extension
+  requires.
+- **As home server**, `info_text_for_peer` builds what an ordinary,
+  unprivileged client may see: the name, the icon number and how long the
+  user has been connected. Never the login or address. hxd-ng's own 303 is
+  all-or-nothing today and includes both, so this is a new, smaller text,
+  not a reuse.
+
+## 7. The link wire (`hxd-link`)
+
+### 7.1 Accepting
+
+A Login (107) that sets bit 11, on the classic port or the TLS port, goes
+to `hxd-link`, decided **before** `reconcile_login`. Today only the text
+encoding is settled that early (the capabilities are intersected after
+the credentials), so the link branch reads the requested bits from the
+login itself, and `parse_login` learns `DATA_LINK_SERVER_KEY` (`0x0640`)
+and `DATA_LINK_KEY_PROOF` (`0x0641`):
+
+- `caps.rs` gains `LINK = 11`. `legacy_caps()` offers it only when `[link]`
+  is configured. Only bits 1 and 11 are echoed to a link.
+- Bit 11 is confirmed only alongside bit 1, only for the account of an
+  accepting peer entry, and only on a connection accepted on the TLS port
+  with an exporter value (§7.3). `transport.encrypted` is not the test: it
+  is also true for the `/trtp` tunnel. Anything else is refused, never
+  downgraded to an ordinary login; bit 11 not confirmed is reported to the
+  dialer's operator as a configuration error, as the extension says.
+- **A key-mode login never reaches `reconcile_login`.** The proof is
+  verified instead; the password is not checked and the attempt is not
+  counted toward lockout. A valid proof on a login without bit 11 is
+  refused. A password-mode login goes through `reconcile_login` as today.
+  Either way, an `account_settled`-style check at confirmation catches an
+  account deleted during the login.
+- A confirmed link session releases its `LoginPermit` at once, sends no
+  agreement, never reaches `attach` or `announce`, and replies with the
+  acceptor's key and proof in key mode. Every non-link transaction on it
+  is refused with an error.
+- **Limits.** The connection took its address's place, and spent its
+  reconnect token, at accept, before anything showed it was a link. The
+  extension's way out is what hxd-ng does: once a link has authenticated
+  from an address, that address is trusted for a bounded time (renewed
+  while the link stays up). Trust waives only the connection count, the
+  reconnect rate and the per-address login share, **never the
+  login-failure lockout** (which `exempt` also waives today): everyone
+  behind the peer's NAT shares the address. Never bans an operator set,
+  either. Today's exempt set is a static `AddrSet` copied into each
+  `RateGate` and the ng port's limits, so the trusted set is a shared
+  structure of its own that those consult.
+- **The permit stays the address's.** AGENTS.md says a new login path
+  moves its permit to the account's count; link logins deliberately do
+  not, because `connections_per_account` and the account's reconnect rate
+  would refuse a newest-wins redial (below).
+- **The handoff** is two calls on a `PeerAcceptor` trait object in
+  `ServerCtx`, so `hxd-session` does not depend on `hxd-link` and never
+  holds the server key:
+  - `authorize(login, exporter, addr) -> Result<Grant, Refusal>`, before
+    `reconcile_login`: `hxd-link` checks the entry, verifies the proof and
+    builds the login reply, with the acceptor's key and proof, which
+    `hxd-session` sends with the login's task ID;
+  - `accept(grant, frames, sender, permit)`, awaited inside
+    `run_connection`, so its teardown (aborting the reader, flushing the
+    writer) still runs when the link ends. `Outbound` gains
+    `Request { ty, trans, chunks }`, a frame with a caller-chosen task ID
+    and the reply flag clear, since the pending-request map needs known
+    IDs; `Reply { error: true }` already carries a non-zero error code.
+  - The reader's frame limit (`MAX_FRAME_DATA`, 256 KiB) applies to links
+    too: this server splits its own snapshot parts well below it, and the
+    limit is one to confirm with Janus.
+- **Newest wins.** A link login for an account that already has a live
+  link closes the old one with `Replaced` and is treated as a reconnection
+  for reconciliation, which is what lets Janus redial over a half-open
+  link.
+- **Authorization is continuous.** A link session gets no `AccountChanged`
+  (it is not on the roster), so the core gains an account-change notifier,
+  called from `account_write` and `account_delete`, that the hub listens
+  to. `reload_accounts` re-reads only the logins of sessions on the
+  roster, which a link is not, so the hub also re-checks its link accounts
+  on every SIGHUP, when it re-reads `[[link.peer]]`. An account deleted,
+  or its entry removed, closes its link with `Unlinked`; a changed key,
+  with `ProtocolError`.
+
+### 7.2 Dialing
+
+`hxd-link` dials each dialing peer entry itself: TCP, TLS (§7.3), the TRTP
+handshake, then a Login (107) with bits 1 and 11 and either the key proof
+or the password. It reuses `hxd-session`'s frame reader and packer. There
+is no outbound TRTP client in the server today, and the test client's is
+test-shaped and not reused.
+
+Reconnection follows the extension: a prompt first attempt, backoff with
+jitter to a ceiling of a few minutes, the slow pace for `Suspended` and
+failed key checks, ordinary backoff for `Loop`, `TagConflict` and
+`HopLimit`, and no automatic reconnect after `Unlinked`,
+`VersionUnsupported` or `Replaced`.
+
+### 7.3 Protection
+
+hxd-ng has no HOPE yet (a HOPE login is refused today), so the first two
+protections are:
+
+- **Server keys over TLS**, the extension's key mode. The proof needs the
+  exporter value of the accepted TLS connection, which `run_connection`
+  loses when it splits the stream; `serve_tls` computes it after the
+  handshake, while it still holds the `tokio_rustls` stream, and passes it
+  in beside the transport. The dialer takes it from its own connection.
+  Both refuse key mode unless TLS 1.3 was negotiated
+  (`with_safe_default_protocol_versions` also allows 1.2).
+- **Verified TLS**, for peers with a real certificate: the dialer verifies
+  against the system roots or a pinned fingerprint, and logs in with the
+  password the peer issued.
+
+A link over plain TCP, or over the ng port's `/trtp` tunnel, is refused.
+HOPE AEAD joins when `hxhope` lands in hx-libs.
+
+### 7.4 The hub and its links
+
+**The hub** is one task that owns everything shared between links: the
+server table, each link's ID tables, the core subscription, and the
+"server before its users" ordering that relaying needs. **Each link** is an
+I/O task with a bounded writer queue of its own, drawing on the server's
+`QueueBudget`. The hub never waits on a socket: a link whose queue is full
+is dropped (once lagged it can send nothing, not even a Close), which the
+peer sees as an interruption, and it reconnects to a fresh snapshot; no
+other link notices. A `PeerId` is stable per peer entry across
+reconnections, which is what lets the grace period find what a link
+left behind.
+
+The hub holds, per link:
+
+- **ID tables**: peer id to ghost uid for what the peer exported, and
+  exported uid for what this server exports (a local uid, or a relayed
+  ghost's uid: for hxd-ng the id it exports under is the uid itself);
+- **a pending-request map** keyed by task id for requests this server sent
+  (905 to 910), with the ten-second timeout the extension recommends,
+  answering the original request with `Unreachable` when it fires;
+- the negotiated features, the peer's epoch and server group.
+
+**Establishment** follows the extension's order on every link from L1:
+Hello first in each direction and nothing before it, closing with
+`ProtocolError` a peer that sends none within 30 seconds; the Hello
+checks (the server ID derived from the proven key on a key-mode link, then
+Loop and TagConflict); this server's Link Servers (empty until it relays);
+and its snapshot only after the peer's first complete Link Servers is
+accepted. Between snapshot parts nothing but Ping, Close and replies is
+sent, so feed events that arrive meanwhile are held, within a bound whose
+overflow closes the link, and sent after the last part. After that: a Ping
+after 60 seconds without sending, and the link counted dead after three
+intervals without receiving.
+
+**Receiving topology is not optional, even on one link.** A Janus that is
+already part of a network sends a non-empty Link Servers, Server Updates
+and Server Gones, and users homed behind it, from the first minute. The
+hub checks every server group it receives (Loop, TagConflict, hop limit)
+and accepts ghosts homed behind the link from L1. Relaying onward, and
+announcing other servers, is what waits for L7, and until then this
+server does not offer `LINK_FEATURE_TRANSIT`. A ghost not represented
+because of a cap (§3.6) stays unrepresented: its later updates and
+departure are ignored, and anything naming it is dropped.
+
+**Checks.** Every incoming transaction is checked before the core sees it,
+as the extension's conformance list requires: a user group must be homed
+behind its link, a sender must be a current ghost from that link, a target
+must be a user exported over it, a moderation requester must lie behind
+it. A failed check is logged and dropped, or answered with its reason;
+only server or user state that cannot be parsed closes the link.
+
+**Relaying Fields**: groups are kept whole (`Ghost.group`) and re-sent
+whole; fields that never cross are refused at every hop; the bounds are
+checked on receipt and a group over them is dropped whole.
+
+### 7.5 Moderation, both sides
+
+**As home server:**
+
+- **Kick (907)**: `peer_exclude` adds the requester to the session's
+  exclusions (`UserSession.exclusions: Vec<ServerId>`, exported in
+  `LocalUser`), emits `Changed` so the user's group is re-exported, and
+  tells the user with a server message naming the requesting server.
+- **Ban (908)**: `peer_ban` places a ban against the identifiers
+  `kick_ban_targets` chooses for a local ban, with a new
+  `Actor::Peer(PeerRequester)` so the audit trail and `hxd ban list` show
+  the requesting server's tag and name, and a ban source of its own so
+  every matching session ends (a kick's source ends only the one).
+  **Protection does not apply**: the ban path that ends sessions today
+  spares accounts that cannot be disconnected, and the extension says
+  explicitly that a user's privileges at home, including that one, do not
+  shield them from a moderator elsewhere. The user is told which server
+  banned them by a message sent before `Kicked`, which carries no text,
+  and their departure crosses as 903 with `Banned`. A `PeerBanId` is 16
+  random bytes mapped to the moderation act and the requester, since one
+  act writes several ban rows and an unban lifts them all; a local lift
+  leaves the mapping pointing at nothing, and a later 909 answers
+  `UnknownBan`, as the extension expects. When there is nothing to ban by (a guest on an
+  exempt address), it answers `UnknownUser`, and the requester keeps the
+  ghost hidden as for a failed ban.
+- **Unban (909)**: honored only from the requester that made the ban.
+
+**As requester:** a ban placed on another server's user is recorded with
+its ban ID, the home server and what was known at the time, and listed by
+`hxd ban list` beside local bans. `hxd ban lift` is an offline command,
+like every operator command, so it records a lift request in the
+database; the running server sends the 909 on the next SIGHUP and logs the
+answer. Both kinds persist in the next schema version, kept apart so
+lifting one never touches the other.
+
+### 7.6 Interruption
+
+A link that drops, or closes with `Shutdown`, keeps its ghosts for the
+grace period (`[link] grace`, default 60 seconds) without telling local
+clients or other links; requests through it meanwhile answer
+`Unreachable`. On reconnection it reconciles by epoch, including the
+peer's own server from its Hello: a Hello naming a different server ID
+means the old one is gone. A different epoch re-uses a ghost for a user
+with the same home server, name and icon; past the grace, everything
+learned over the link goes.
+
+## 8. Server identity and configuration
+
+- **The server key** is `[link] key`, its own file, generated on first run
+  by `load_key` and kept out of the accounts directory, so copying the
+  accounts to set up another server does not copy the server ID. An
+  operator MAY point it at the identity key (`key = "identity"`), so peers
+  can check the fingerprint against discovery, at a cost the
+  configuration documents: `hxd link reset-id` would then rotate the ng
+  `server_key` too, and so refuses while the key is shared.
+- **The server ID** is derived from the key, from the first link on.
+  `hxd link reset-id` works on a stopped server only: a restart with a new
+  ID needs nothing more than the restart, as the extension says, while a
+  running server would have to close every link with `Unlinked` first. It
+  says what it costs: bans this server placed under its old ID can no
+  longer be lifted.
+- **The epoch** is random at each start.
+- **Suspensions** persist across restarts, in a state file beside the key,
+  as do trusted addresses (§7.1).
+
+```toml
+[link]
+tag = "hx"                  # 1-8 printable ASCII, unique in the network
+color = 0x3a7bd5            # suggested color for this server's users elsewhere
+show_tags = true            # on until Colored Nicknames lands (§3.5)
+grace = "60s"
+max_ghosts = 2000           # across all links (§3.6)
+# key = "link-server.key"
+
+[[link.peer]]
+name = "janus-home"
+dial = "janus.example:5600" # or accept = true
+protection = "key"          # "key" or "tls"
+key = "b64...32 bytes"      # the peer's public key; checked for canonical form and small order at load
+account = "link-hx"         # the account the peer issued this server, or this server's for the peer
+# password = "..."          # tls mode only: what the peer issued
+features = ["chat", "msgs", "info"]   # "transit" from L7
+ghosts = 1000               # this link's bound
+```
+
+- A key-mode accepting entry's account is created by `hxd account` with a
+  password that matches nothing. A tls-mode accepting entry's password is
+  generated with at least 128 bits of entropy and shown once.
+- SIGHUP re-reads `[[link.peer]]`: an entry removed closes its link with
+  `Unlinked`, a changed key with `ProtocolError`, as the extension
+  specifies; a new entry starts dialing.
+- Operator commands are offline processes, as every `hxd` command is:
+  `hxd link suspend <name>` and `resume` write the state file, which the
+  server applies on SIGHUP; `hxd link status` reads a status file the
+  server rewrites as links change; `hxd link reset-id` as above.
+
+## 9. Testing
+
+- **Unit**, in `hxd-link`: each transaction's parse and build against the
+  extension's tables; the ID tables; the checks of §7.4; the key proof
+  against fixed exporter values in both roles; text conversion and the
+  byte maximums. In `hxd-core`: `ChatCommit` with enqueued ghost lines
+  interleaved with waiting submitters, never left without a leader.
+- **E2E**, a new `crates/hxd/tests/link.rs`: two (three for relaying)
+  in-process servers linked in key mode over loopback TLS, each with a
+  scripted classic client and an ng client.
+  - A user on one server appears on the other on both wires, with mhxd's
+    user list bytes, and leaves; the tracker count does not include
+    ghosts.
+  - **Every classic transaction and ng request that names a uid fails for
+    a ghost**, except the translated ones. One table-driven test, with the
+    list of uid-naming requests built from the dispatchers' source so a
+    new one is covered without anyone remembering to add it (the classic
+    frontend already has a test that reads its own dispatcher).
+  - Chat crosses both ways, formatted by the receiver, in order; a
+    media-only line does not cross; a user's last line before leaving is
+    heard; public chat keeps flowing while ghost lines stream in.
+  - A private message crosses and is answered, while the sender's session
+    keeps receiving events; a ghost that refuses them is greyed out on a
+    classic client.
+  - Kick, ban, unban and their persistence; a failed ban keeps the ghost
+    hidden and is not announced; purge of a ghost spares a local user
+    with the same name.
+  - A dropped link inside the grace period shows nothing; past it, a
+    netsplit; a Janus-style redial over a half-open link is `Replaced`.
+  - A slow peer is closed and resynchronized, and costs the other link and
+    local users nothing.
+- **Interop** with Janus 2.0.19, by hand with fogWraith first, then
+  scripted if Janus can run in CI.
+
+## 10. Staging
+
+Each stage is a branch with its tests. Nothing lands before its first
+use: dead code fails `-D warnings`.
+
+| Stage | What | Covered by |
+|---|---|---|
+| L0 | Prerequisites with no link: uid quarantine, Colored Nicknames on the classic wire, capability bit 11 defined | unit, `login.rs` |
+| L1 | `hxd-link`: key mode, accept and dial, the handoff, trusted addresses, `Replaced`, continuous authorization, Hello and its checks, Ping, Close, empty Link Servers; receiving the peer's Servers, Server Updates and Gones | `link.rs` |
+| L2 | Users over one link, including users homed behind the peer: snapshot, update, gone; `ghosts`, `roster_rows`, `RemoteRef`; ghosts on both wires; bounded fan-out; **the fail-closed table test** | `link.rs` |
+| L3 | Public chat both ways: `Staged` origins, `ChatCommit::enqueue`, text rules, ghost lines in the log (the next schema version) | `link.rs` |
+| L4 | Private messages and user info: `resolve`, the router, answering out of band on both wires | `link.rs` |
+| L5 | Kick, ban, unban and purge on both sides (the next schema version) | `link.rs`, `bans.rs` |
+| L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
+| L7 | Relaying: announcing other servers, transit, users relayed on | `link.rs` |
+| L8 | Verified TLS, `hxd link` commands, metrics and the ghost gauge | `link.rs`, `metrics.rs` |
+| L9 | User keys, after the end-to-end document | later |
+
+L1 to L3 make a test link with Janus. **L5 is the minimum for a real
+network**: the extension makes moderation part of every link, always
+honored, and a server that cannot carry out a ban on its own user should
+not link with anyone.
+
+**Janus dependency.** Key mode needs Janus 2.0.19, still in development.
+If it is late, a test link with Janus needs verified TLS, which L8 would
+have to move ahead of L1.
+
+## 11. Open questions
+
+- **Blocking a ghost.** The inbox's blocking keys on mailboxes, which a
+  ghost does not have, and the extension refuses acts it does not
+  translate. A local mute of a ghost may be worth having; a block that
+  follows a person needs user keys.
+- **Detached sessions.** A detached ng session stays on the roster as away
+  and stays exported the same way, so a resume inside its grace is
+  invisible to the network.
+- **The tunnel.** A peer that can reach hxd-ng only over WebSockets could
+  link over `/trtp` if the ng port terminated TLS in process. Left out
+  until someone needs it.
+- **Load.** A login storm on one server is a storm of joins on every linked
+  server. The bounds above handle a burst, but `hxd-load` should grow a
+  two-server scenario before linking is on by default.
