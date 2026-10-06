@@ -70,6 +70,19 @@ mod hdr {
     pub const ICON_CHANGE: u32 = 0x0000_0748;
 }
 
+/// The transactions that name another user by uid, which must each fail
+/// for a ghost (`docs/server-link.md` §6). A test reads `dispatch` for
+/// every arm that takes a uid and requires it here, and the link e2e
+/// suite sends each of these to a ghost: a new one cannot quietly start
+/// acting on another server's user.
+pub const NAMES_A_USER: &[ClientHdr] = &[
+    ClientHdr::Msg,
+    ClientHdr::UserGetInfo,
+    ClientHdr::UserKick,
+    ClientHdr::ChatCreate,
+    ClientHdr::ChatInvite,
+];
+
 /// fogWraith's GIF Icons extension (`docs/avatars.md` §3): client
 /// opcodes hxproto routes no enum for.
 mod gif_icons {
@@ -890,6 +903,21 @@ fn wire_nick(enc: TextEncoding, nick: &str) -> Vec<u8> {
     enc.encode_capped(nick, 31)
 }
 
+/// The name a user is shown under: its own, or for a ghost of a server
+/// whose operator tags them, its own then `@tag`. The name is cut to leave
+/// the tag room, never the tag, which is what says where the user is from.
+fn shown_nick(enc: TextEncoding, u: &UserInfo) -> Vec<u8> {
+    match u.remote.as_ref().filter(|r| r.tagged) {
+        Some(r) => {
+            let tag = enc.encode_capped(&format!("@{}", r.home_tag), 31);
+            let mut name = enc.encode_capped(&u.nick, 31 - tag.len());
+            name.extend(tag);
+            name
+        }
+        None => wire_nick(enc, &u.nick),
+    }
+}
+
 /// A chat subject, cut to the wire's 255 bytes after conversion. Inbound
 /// the cap is 255 characters, which UTF-8 can carry in up to four times
 /// the bytes, and a subject can come from an ng client with no cap of
@@ -910,6 +938,17 @@ fn wire_subject(enc: TextEncoding, subject: &str) -> Vec<u8> {
 /// `ServerConfig::mark_cleartext` (default off) until it has been seen
 /// against every 1.x client we care about.
 fn wire_color(u: &UserInfo, mark_cleartext: bool) -> u16 {
+    // A ghost greys out what it cannot be sent: private chat always, a
+    // private message when it refuses one or its path cannot carry one.
+    // Its connection is another server's, so it is never marked cleartext.
+    if let Some(r) = &u.remote {
+        return (if u.status == SessionStatus::Active {
+            0
+        } else {
+            1
+        }) | (if r.refuses_msgs { 4 } else { 0 })
+            | 8;
+    }
     (if u.admin { 2 } else { 0 })
         | (if u.status == SessionStatus::Active {
             0
@@ -940,7 +979,7 @@ fn userlist_payload(
     enc: TextEncoding,
     nick_colors: bool,
 ) -> Vec<u8> {
-    let nick = wire_nick(enc, &u.nick);
+    let nick = shown_nick(enc, u);
     let mut v = Vec::with_capacity(12 + nick.len());
     v.extend_from_slice(&u.uid.to_be_bytes());
     v.extend_from_slice(&u.icon.to_be_bytes());
@@ -966,7 +1005,7 @@ fn user_change_chunks(
             tag::COLOUR,
             wire_color(u, mark_cleartext).to_be_bytes().to_vec(),
         ),
-        (tag::NAME, wire_nick(enc, &u.nick)),
+        (tag::NAME, shown_nick(enc, u)),
     ];
     if nick_colors {
         chunks.push((tag::COLOR, nick_color(u).to_vec()));
@@ -2883,7 +2922,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         t if t == ClientHdr::UserGetList.as_u32() => {
             let mut chunks: Vec<(u16, Vec<u8>)> = ctx
                 .core
-                .snapshot()
+                .roster_rows()
                 .iter()
                 .map(|u| {
                     (
@@ -2955,7 +2994,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 // rows, and would show a 301 for a user it has not listed
                 // yet as that user joining.
                 if sess.listed {
-                    for u in ctx.core.snapshot().iter().filter(|u| u.color.is_some()) {
+                    for u in ctx.core.roster_rows().iter().filter(|u| u.color.is_some()) {
                         push(
                             tx,
                             hdr::USER_CHANGE,
@@ -4811,6 +4850,47 @@ mod tests {
         ));
         assert!(matches!(type_label(gif_icons::GET), Kind::Type(_)));
         assert!(matches!(type_label(0x7ff), Kind::Name("other")));
+    }
+
+    /// Every arm of `dispatch` that reads a uid from the request is in
+    /// `NAMES_A_USER`, whose transactions the link e2e suite sends to a
+    /// ghost; an extension's arm, which has no `ClientHdr` to list, must
+    /// look the uid up among the sessions, which hold no ghost.
+    #[test]
+    fn every_transaction_that_names_a_user_is_tested_against_a_ghost() {
+        let src = include_str!("session.rs");
+        let start = src.find("async fn dispatch(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let mut arms: Vec<(String, String)> = vec![];
+        for line in body.lines() {
+            let header = line
+                .strip_prefix("        ")
+                .filter(|l| !l.starts_with([' ', '}', '/']) && l.contains(" => "));
+            match (header, arms.last_mut()) {
+                (Some(h), _) => arms.push((h.into(), String::new())),
+                (None, Some((_, arm))) => arm.push_str(line),
+                (None, None) => {}
+            }
+        }
+        let mut seen = 0;
+        let reads_uid = |a: &str| a.contains("== tag::UID") || a.contains("tag::UID =>");
+        for (header, arm) in arms.iter().filter(|(_, a)| reads_uid(a)) {
+            match header.split_once("ClientHdr::") {
+                Some((_, rest)) => {
+                    let name = &rest[..rest.find('.').unwrap()];
+                    seen += 1;
+                    assert!(
+                        NAMES_A_USER.iter().any(|t| format!("{t:?}") == name),
+                        "{name} reads a uid but is not in NAMES_A_USER"
+                    );
+                }
+                None => assert!(
+                    arm.contains("user_details("),
+                    "{header} reads a uid without looking it up among the sessions"
+                ),
+            }
+        }
+        assert_eq!(seen, NAMES_A_USER.len());
     }
 
     /// A peer that takes nothing for `WRITE_STALL` stalls the write.

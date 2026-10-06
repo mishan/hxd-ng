@@ -522,7 +522,11 @@ impl serde::Serialize for UserOut<'_> {
         m.serialize_entry("status", status_str(u.status))?;
         // `docs/hotline-ng-auth.md` §7.2, §8: what other users may
         // know about this session's link.
-        let transport = if u.transport.encrypted {
+        // A ghost's connection is another server's, which this one
+        // cannot vouch for either way.
+        let transport = if u.remote.is_some() {
+            "unknown"
+        } else if u.transport.encrypted {
             "encrypted"
         } else {
             "cleartext"
@@ -540,6 +544,12 @@ impl serde::Serialize for UserOut<'_> {
         }
         if let Some(color) = u.color {
             m.serialize_entry("color", &color)?;
+        }
+        if let Some(r) = &u.remote {
+            m.serialize_entry(
+                "remote",
+                &json!({ "server": r.home_name, "tag": r.home_tag, "tagged": r.tagged }),
+            )?;
         }
         if let Some(id) = &u.transport.identity {
             m.serialize_entry(
@@ -888,6 +898,7 @@ mod tests {
                 height: 32,
             }),
             color: full.then_some(0x00ff_8000),
+            remote: None,
         }
     }
 

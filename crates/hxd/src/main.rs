@@ -1200,9 +1200,9 @@ async fn main() {
         }
         // The audit trail's evidence window and closed reports' retention.
         tokio::spawn(hxd::moderation::pruner(ctx.core.clone()));
-        let hub = hxd::link::build(&config, ctx.core.queue_budget().clone())?;
+        let hub = hxd::link::build(&config, ctx.core.clone())?;
         if let Some(hub) = &hub {
-            hub.spawn_dialers();
+            hub.start();
         }
         #[cfg(unix)]
         tokio::spawn(reload_on_hangup(

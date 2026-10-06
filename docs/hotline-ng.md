@@ -643,7 +643,7 @@ counts in §3's sequence.
   "uid": 3, "nick": "Alice", "icon": 128,
   "admin": false,
   "status": "active",              // §2
-  "transport": "encrypted",        // encrypted | cleartext
+  "transport": "encrypted",        // encrypted | cleartext | unknown
   "identity": {                    // absent unless the session proved one
     "fingerprint": "6htgz65…",     // 52 characters, Crockford base32
     "handle": "alice@hl.example"   // null when no attestation was accepted
@@ -661,10 +661,11 @@ counts in §3's sequence.
 | `nick`, `icon` | As shown to every other user, classic clients included. |
 | `admin` | The user may disconnect other users: the classic wire's admin color. |
 | `status` | §2. |
-| `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. |
+| `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. `"unknown"` for a user of a linked server, whose connection is that server's (server-link.md §5); clients treat it as they would `cleartext`. |
+| `remote` | Present only for a user of a linked server (server-link.md): `{server, tag, tagged}`, the home server's name and tag and whether this server puts the tag in its users' names. A client MAY show the tag itself when `tagged` is false. Such a user's `color` is its home server's. |
 | `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1). It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. |
 | `avatar` | Present only when the user has one, on a server with the `avatars` capability (avatars.md §4.2). Clients SHOULD show it in place of the icon when they can, and fall back to `icon`. |
-| `color` | Present only when the user set a nick color for this session: `0x00RRGGBB` as a number (fogWraith's Colored Nicknames). Classic clients that send nick colors see it too. It is the user's choice of how their name looks, so a client MAY ignore it, for contrast or accessibility. This wire does not set one yet. |
+| `color` | For a user of a linked server, its home server's color. Otherwise present only when the user set a nick color for this session: `0x00RRGGBB` as a number (fogWraith's Colored Nicknames). Classic clients that send nick colors see it too. It is the user's choice of how their name looks, so a client MAY ignore it, for contrast or accessibility. This wire does not set one yet. |
 | `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
 
 ## 8. Text and limits

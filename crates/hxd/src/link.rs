@@ -23,6 +23,15 @@ pub struct LinkSection {
     /// copy the server's identity, or the two are refused as a loop.
     #[serde(default = "default_key")]
     pub key: PathBuf,
+    /// Put the home server's tag in every ghost's name, for operators
+    /// whose users mostly run clients that show no colors.
+    #[serde(default)]
+    pub show_tags: bool,
+    /// The most other servers' users shown here, across every link: well
+    /// below a session's queue cap, since a netsplit is one event per user
+    /// to every local session at once.
+    #[serde(default = "default_max_ghosts")]
+    pub max_ghosts: usize,
     #[serde(default)]
     pub peer: Vec<PeerSection>,
 }
@@ -46,14 +55,28 @@ pub struct PeerSection {
     pub account: String,
     #[serde(default)]
     pub features: Vec<String>,
+    /// The most of this peer's side of the network shown here.
+    #[serde(default = "default_ghosts")]
+    pub ghosts: usize,
 }
 
 fn default_key() -> PathBuf {
     "link-server.key".into()
 }
 
+fn default_max_ghosts() -> usize {
+    2000
+}
+
+fn default_ghosts() -> usize {
+    1000
+}
+
 fn peer_key(peer: &PeerSection) -> Result<[u8; 32], String> {
-    let key = crate::decode_key(&peer.key)
+    // Janus writes a key `ed25519:` and base64url, and an operator pastes
+    // it as given.
+    let b64 = peer.key.trim();
+    let key = crate::decode_key(b64.strip_prefix("ed25519:").unwrap_or(b64))
         .map_err(|e| format!("[[link.peer]] {}: key: {e}", peer.name))?;
     hxd_link::check_public(&key)
         .map_err(|e| format!("[[link.peer]] {}: key refused: {e:?}", peer.name))?;
@@ -89,6 +112,13 @@ pub fn check(config: &Config) -> Result<(), String> {
         );
     }
     hxd_link::server::check_tag(&section.tag).map_err(|e| format!("[link] tag: {e:?}"))?;
+    // A netsplit is one event per ghost to every local session at once.
+    if section.max_ghosts > hxd_core::roster::LIVE_QUEUE_CAP / 2 {
+        return Err(format!(
+            "[link] max_ghosts must be at most {}, half a session's queue",
+            hxd_core::roster::LIVE_QUEUE_CAP / 2
+        ));
+    }
     let mut names = std::collections::HashSet::new();
     let mut accepted = std::collections::HashSet::new();
     for peer in &section.peer {
@@ -138,15 +168,13 @@ fn entries(section: &LinkSection) -> Result<Vec<hxd_link::PeerEntry>, String> {
                 key: peer_key(p)?,
                 account: p.account.clone(),
                 features: features(p)?,
+                ghosts: p.ghosts,
             })
         })
         .collect()
 }
 
-pub fn build(
-    config: &Config,
-    budget: Arc<hxd_core::QueueBudget>,
-) -> Result<Option<hxd_link::Hub>, String> {
+pub fn build(config: &Config, core: Arc<hxd_core::Core>) -> Result<Option<hxd_link::Hub>, String> {
     let Some(section) = config.link.as_ref() else {
         return Ok(None);
     };
@@ -158,13 +186,15 @@ pub fn build(
             tag: section.tag.clone(),
             name: config.server.name.clone(),
             color: section.color,
+            show_tags: section.show_tags,
+            max_ghosts: section.max_ghosts,
             peers,
         },
-        budget,
+        core,
     );
     tracing::info!(
         server = ?hub.server_id(),
-        key = %B64.encode(hub.public()),
+        key = %format!("ed25519:{}", B64.encode(hub.public())),
         fingerprint = %hub.fingerprint(),
         "linking as {}",
         section.tag

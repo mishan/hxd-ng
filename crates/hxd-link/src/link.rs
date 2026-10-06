@@ -2,10 +2,10 @@
 //! Lifecycle): Hello each way, this server's Link Servers and the peer's,
 //! then the snapshots, then pings and whatever the peer sends.
 //!
-//! Users and chat do not cross yet (stages L2 and L3 of
-//! `docs/server-link.md`): this server exports nobody and offers no
-//! features, so its server list and snapshot are empty, and what the peer
-//! sends about its users is read and set aside.
+//! Users cross both ways (stage L2 of `docs/server-link.md`): this
+//! server's own, from the core's export feed, and the peer's, shown here as
+//! ghosts. Chat does not yet (L3), and this server relays nothing, so its
+//! server list is empty.
 
 use std::time::Duration;
 
@@ -15,9 +15,16 @@ use tokio::sync::oneshot;
 use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use hxd_core::server_link::{GoneReason, PeerEvent};
+
 use crate::hub::{Hub, PeerEntry};
 use crate::server::{ServerGroup, ServerId};
+use crate::users::{of_local, UserGroup};
 use crate::wire::{chunks, field, fields, find, tx, Field, Hello, Reason};
+
+/// The most a snapshot part this server sends carries, well below the
+/// frame limit either end reads with.
+const SNAPSHOT_PART: usize = 32 * 1024;
 
 /// How long a peer has for each step of establishment: its Hello after
 /// the login reply, then its whole Link Servers. Pings do not extend it.
@@ -56,6 +63,7 @@ pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
         last_sent: Instant::now(),
         next_trans: 1,
         established: None,
+        snapshot: None,
     };
     // A reload between the login and here found no link to close: the
     // entry this link was authorized under must still be the one in force.
@@ -80,6 +88,9 @@ struct Link<'a> {
     next_trans: u32,
     /// When the link was established, once it is.
     established: Option<Instant>,
+    /// The peer's snapshot while its parts arrive: nothing else about its
+    /// users may come between them.
+    snapshot: Option<Vec<UserGroup>>,
 }
 
 impl Link<'_> {
@@ -186,13 +197,22 @@ impl Link<'_> {
             return self.close(io, reason, "refused");
         }
 
+        self.hub
+            .set_features(&self.entry.name, self.generation, features & peer.features);
+
         // Nothing to relay yet, so this server's list is empty.
         self.notify(io, tx::SERVERS, &[]);
         if let Err(end) = self.receive_servers(io, closed).await {
             return end;
         }
-        // Nor anyone to export: an empty snapshot is valid.
-        self.notify(io, tx::SNAPSHOT, &[]);
+        let Some((since, users, mut exports)) =
+            self.hub.subscribe(&self.entry.name, self.generation)
+        else {
+            return self.end("replaced", None);
+        };
+        let own = self.hub.server_id();
+        let groups: Vec<Vec<Field>> = users.iter().map(|u| of_local(u, own)).collect();
+        self.send_snapshot(io, groups);
         self.established = Some(Instant::now());
         info!(peer = %self.entry.name, server = ?peer.server.id, tag = %peer.server.tag, "link up");
 
@@ -209,6 +229,12 @@ impl Link<'_> {
                 // Named as a client that stops reading is, so the writer
                 // is stopped at once rather than flushed for a while.
                 () = io.out.lagged() => return self.end("slow_consumer", None),
+                export = exports.recv() => match export {
+                    Some((n, event)) if n > since => self.export(io, own, event),
+                    Some(_) => {}
+                    // The hub dropped this link's channel: it fell behind.
+                    None => return self.close(io, Reason::Shutdown, "slow_consumer"),
+                },
                 f = io.frames.recv() => {
                     let Some(f) = f else { return self.end("eof", None) };
                     last_heard = Instant::now();
@@ -300,6 +326,62 @@ impl Link<'_> {
         }
     }
 
+    /// This server's users, as the snapshot it owes the peer: in parts
+    /// marked `DATA_LINK_MORE` but the last, one part if there is nobody.
+    fn send_snapshot(&mut self, io: &LinkIo, groups: Vec<Vec<Field>>) {
+        let mut part: Vec<Field> = Vec::new();
+        let mut size = 0;
+        for g in groups {
+            let len: usize = g.iter().map(|f| 4 + f.data.len()).sum();
+            if size + len > SNAPSHOT_PART && !part.is_empty() {
+                part.push(Field::u16(field::MORE, 1));
+                self.notify(io, tx::SNAPSHOT, &std::mem::take(&mut part));
+                size = 0;
+            }
+            size += len;
+            part.extend(g);
+        }
+        self.notify(io, tx::SNAPSHOT, &part);
+    }
+
+    /// One change to a local user, as the peer must hear it.
+    fn export(&mut self, io: &LinkIo, own: ServerId, event: PeerEvent) {
+        match event {
+            PeerEvent::Shown(u) | PeerEvent::Changed(u) => {
+                self.notify(io, tx::USER_UPDATE, &of_local(&u, own));
+            }
+            PeerEvent::Gone(uid, GoneReason::Disconnected) => self.notify(
+                io,
+                tx::USER_GONE,
+                &[
+                    Field::u16(field::USER_ID, uid),
+                    Field::u16(field::REASON, Reason::Disconnected as u16),
+                ],
+            ),
+        }
+    }
+
+    /// One part of the peer's snapshot. Nothing is shown until the last
+    /// part, so the snapshot is applied as one.
+    fn snapshot_part(&mut self, f: &Frame) {
+        let fs = fields(f);
+        let pending = self.snapshot.get_or_insert_with(Vec::new);
+        for g in UserGroup::parse_all(&fs) {
+            match g {
+                // Held to the link's ghost bound, so a peer that never
+                // sends its last part costs no more than it could show.
+                Ok(_) if pending.len() >= self.entry.ghosts => {}
+                Ok(g) => pending.push(g),
+                Err(e) => warn!(peer = %self.entry.name, "user in snapshot dropped: {e:?}"),
+            }
+        }
+        if find(&fs, field::MORE).and_then(Field::uint) != Some(1) {
+            let groups = self.snapshot.take().unwrap_or_default();
+            self.hub
+                .apply_snapshot(&self.entry.name, self.generation, groups);
+        }
+    }
+
     /// One transaction once the link is established. `Some` ends the link.
     fn handle(&mut self, io: &LinkIo, f: Frame) -> Option<End> {
         if is_reply(&f) {
@@ -322,12 +404,39 @@ impl Link<'_> {
                         .forget_server(&self.entry.name, self.generation, ServerId(id));
                 }
             }
-            // Users and chat arrive in later stages.
-            tx::SNAPSHOT | tx::USER_UPDATE | tx::USER_GONE | tx::CHAT => {}
+            tx::SNAPSHOT => self.snapshot_part(&f),
+            tx::USER_UPDATE | tx::USER_GONE if self.snapshot.is_some() => {
+                warn!(peer = %self.entry.name, "user transaction between snapshot parts dropped");
+            }
+            tx::USER_UPDATE => match UserGroup::parse(&fields(&f)) {
+                Ok(g) => {
+                    if let Err(why) = self.hub.apply_user(&self.entry.name, self.generation, g) {
+                        warn!(peer = %self.entry.name, "user update dropped: {why}");
+                    }
+                }
+                // Over a bound, or carrying what never crosses: dropped
+                // whole, as Relaying Fields says.
+                Err(e @ crate::users::UserGroupError::Inadmissible(_)) => {
+                    warn!(peer = %self.entry.name, "user update dropped: {e:?}")
+                }
+                // State this server can no longer trust.
+                Err(e) => {
+                    warn!(peer = %self.entry.name, "unreadable user update: {e:?}");
+                    return Some(self.close(io, Reason::ProtocolError, "protocol_error"));
+                }
+            },
+            tx::USER_GONE => {
+                if let Some(id) = find(&fields(&f), field::USER_ID).and_then(Field::fixed) {
+                    self.hub
+                        .user_gone(&self.entry.name, self.generation, u16::from_be_bytes(id));
+                }
+            }
+            // Chat arrives in L3.
+            tx::CHAT => {}
             tx::PRIVATE_MESSAGE | tx::USER_INFO => refuse(io, &f, Reason::FeatureNotNegotiated),
-            // Nobody is exported, so no user a peer can name is here.
-            tx::KICK | tx::BAN => refuse(io, &f, Reason::UnknownUser),
-            tx::UNBAN => refuse(io, &f, Reason::UnknownBan),
+            // This server carries out no moderation for a peer yet (L5):
+            // refused, never pretended.
+            tx::KICK | tx::BAN | tx::UNBAN => refuse(io, &f, Reason::FeatureNotNegotiated),
             // Link Session Restrictions: a request the link does not
             // define is refused with an error, never silently processed.
             other if f.trans != 0 => {

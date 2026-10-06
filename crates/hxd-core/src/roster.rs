@@ -263,6 +263,9 @@ pub struct UserInfo {
     /// Nicknames). Set by the client for this session only, and gone
     /// when it logs out.
     pub color: Option<u32>,
+    /// Where a ghost is from (`docs/server-link.md` §3.4); `None` for
+    /// this server's own users.
+    pub remote: Option<crate::server_link::RemoteRef>,
 }
 
 /// The fuller view one session may request of another (the user-info op).
@@ -534,7 +537,12 @@ impl Event {
             Event::NewsPosted {
                 subject, from_nick, ..
             } => subject.len() + from_nick.len(),
-            Event::Joined(u) | Event::Changed(u) | Event::AvatarChanged(u) => u.nick.len(),
+            Event::Joined(u) | Event::Changed(u) | Event::AvatarChanged(u) => {
+                u.nick.len()
+                    + u.remote
+                        .as_ref()
+                        .map_or(0, |r| r.home_tag.len() + r.home_name.len())
+            }
             Event::AccountChanged(a) => {
                 std::mem::size_of::<crate::Account>() + a.login.len() + a.name.len()
             }
@@ -850,13 +858,13 @@ const UID_QUARANTINE: Duration = Duration::from_secs(5 * 60);
 /// Freed uids, oldest first, with a set beside the queue so a check under
 /// the roster lock costs O(1).
 #[derive(Default)]
-struct UidQuarantine {
+pub(crate) struct UidQuarantine {
     order: VecDeque<(Uid, Instant)>,
     held: HashSet<Uid>,
 }
 
 impl UidQuarantine {
-    fn hold(&mut self, uid: Uid, now: Instant) {
+    pub(crate) fn hold(&mut self, uid: Uid, now: Instant) {
         if self.held.insert(uid) {
             self.order.push_back((uid, now));
         }
@@ -887,7 +895,11 @@ impl UidQuarantine {
 pub(crate) struct RosterInner {
     pub(crate) users: HashMap<Uid, UserSession>,
     last_uid: Uid,
-    freed_uids: UidQuarantine,
+    pub(crate) freed_uids: UidQuarantine,
+    /// Other servers' users shown here, apart from the sessions so that
+    /// nothing that acts on a session finds one (`crate::server_link`).
+    pub(crate) ghosts: HashMap<Uid, crate::server_link::Ghost>,
+    pub(crate) feed: crate::server_link::Feed,
     last_serial: u64,
     pub(crate) public_subject: String,
     pub(crate) chats: HashMap<u32, PrivateChat>,
@@ -895,7 +907,7 @@ pub(crate) struct RosterInner {
 }
 
 impl RosterInner {
-    fn next_uid(&mut self) -> Option<Uid> {
+    pub(crate) fn next_uid(&mut self) -> Option<Uid> {
         self.next_uid_at(Instant::now())
     }
 
@@ -904,7 +916,9 @@ impl RosterInner {
         // ones — stable ids for the lifetime of a session, no reuse while
         // alive or for UID_QUARANTINE after.
         self.freed_uids.release_expired(now);
-        if self.users.len() + self.freed_uids.held.len() >= usize::from(u16::MAX) {
+        if self.users.len() + self.ghosts.len() + self.freed_uids.held.len()
+            >= usize::from(u16::MAX)
+        {
             // A uid is never both in use and held, so this is every uid:
             // skip a scan that cannot succeed, under the roster lock.
             return self.freed_uids.take_oldest();
@@ -914,7 +928,11 @@ impl RosterInner {
             if self.last_uid == 0 {
                 continue;
             }
-            if !self.users.contains_key(&self.last_uid) && !self.freed_uids.holds(self.last_uid) {
+            let uid = self.last_uid;
+            if !self.users.contains_key(&uid)
+                && !self.ghosts.contains_key(&uid)
+                && !self.freed_uids.holds(uid)
+            {
                 return Some(self.last_uid);
             }
         }
@@ -981,7 +999,7 @@ impl RosterInner {
         tally.record();
     }
 
-    fn broadcast(&mut self, ev: &Event, skip: Option<Uid>) {
+    pub(crate) fn broadcast(&mut self, ev: &Event, skip: Option<Uid>) {
         self.broadcast_where(ev, skip, |_| true);
     }
 
@@ -1032,6 +1050,7 @@ impl RosterInner {
         let Some(sess) = self.users.remove(&uid) else {
             return;
         };
+        self.export_gone(&sess);
         self.freed_uids.hold(uid, Instant::now());
         if sess.visible {
             self.broadcast(&Event::Parted(uid), Some(uid));
@@ -1050,6 +1069,7 @@ impl RosterInner {
         if sess.visible {
             let ev = Event::Changed(sess.info.clone());
             self.broadcast(&ev, None);
+            self.export_changed(uid);
         }
     }
 }
@@ -1683,6 +1703,7 @@ impl Core {
                     status: SessionStatus::Active,
                     avatar: None,
                     color: None,
+                    remote: None,
                 },
                 access: info.access,
                 login: info.login,
@@ -1731,6 +1752,7 @@ impl Core {
         sess.visible = true;
         let ev = Event::Joined(sess.info.clone());
         r.broadcast(&ev, Some(uid));
+        r.export_shown(uid);
     }
 
     /// Update a session's nick and/or icon. Broadcasts a change event (to
@@ -1775,6 +1797,7 @@ impl Core {
         if changed && sess.visible {
             let ev = Event::Changed(sess.info.clone());
             r.broadcast(&ev, None);
+            r.export_changed(uid);
         }
         changed
     }

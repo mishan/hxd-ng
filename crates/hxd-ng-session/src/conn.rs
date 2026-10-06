@@ -825,7 +825,7 @@ async fn handle_login(
     // the domain's own records and made JSON only at the end: a login
     // storm holding a JSON tree of every user for each login waiting on
     // the blocking pool below held gigabytes.
-    let users = ctx.core.snapshot();
+    let users = ctx.core.roster_rows();
     let detach = if account.can_detach {
         json!({ "grace": ctx.cfg.grace.as_secs() })
     } else {
@@ -1379,7 +1379,7 @@ async fn handle_sync(
     if ctx.core.accounts_enabled() {
         ok["accounts"] = crate::accounts::access_json(state.access);
     }
-    let out = reply_ok_with_users(req.id, ok, &ctx.core.snapshot());
+    let out = reply_ok_with_users(req.id, ok, &ctx.core.roster_rows());
     if !send_frame(ws_tx, Message::Text(out)).await {
         return Flow::Dead;
     }

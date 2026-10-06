@@ -12,6 +12,7 @@ pub mod hub;
 pub mod key;
 mod link;
 pub mod server;
+pub mod users;
 pub mod wire;
 
 pub use hub::{Hub, HubConfig, LinkStatus, PeerEntry};

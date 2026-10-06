@@ -1,22 +1,36 @@
 //! The hub: what every link shares (`docs/server-link.md` §7.4). The
 //! server table that loop and tag checks consult, which link is live for
-//! each peer, and this server's key and identity.
+//! each peer, each link's ghosts, and this server's key and identity.
 //!
-//! It is a lock rather than a task of its own: nothing holds it across an
-//! await, and every link consults it in passing.
+//! Its state is a lock that nothing holds across an await, and that is
+//! taken before the roster's whenever both are, never after. One task
+//! takes the core's export feed and hands each event to every link.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use hxd_core::server_link::{GhostInfo, LocalUser, PeerEvent, RemoteRef};
+use hxd_core::Core;
 use hxd_session::peer::{LinkGrant, LinkIo, LinkLogin, PeerAcceptor};
 use hxd_session::{cap, Caps};
-use tokio::sync::oneshot;
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot};
+use tracing::warn;
 
 use crate::key::{check_public, verify_proof, LinkKey, Role};
 use crate::server::{same_tag, ServerGroup, ServerId};
-use crate::wire::{field, Hello, Reason, VERSION};
+use crate::users::{flag, UserGroup};
+use crate::wire::{feature, field, Hello, Reason, VERSION};
+
+/// Events the core may hold for the hub before the feed counts as fallen
+/// behind, and events one link may hold before it does.
+const FEED_CAP: usize = 16384;
+const EXPORT_CAP: usize = 4096;
+
+/// An export event, numbered in the roster's order.
+pub(crate) type Export = (u64, PeerEvent);
 
 /// Links between this server and the farthest one it will accept.
 pub const MAX_HOPS: u16 = 8;
@@ -38,6 +52,9 @@ pub struct PeerEntry {
     /// or the one this server expects from it.
     pub account: String,
     pub features: u32,
+    /// The most ghosts this link may show here, counting every user
+    /// behind it.
+    pub ghosts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +62,12 @@ pub struct HubConfig {
     pub tag: String,
     pub name: String,
     pub color: Option<u32>,
+    /// Put the home server's tag in every ghost's name.
+    pub show_tags: bool,
+    /// The most ghosts shown here across every link, well below a
+    /// session's queue cap: a netsplit is one event per ghost to every
+    /// local session at once.
+    pub max_ghosts: usize,
     pub peers: Vec<PeerEntry>,
 }
 
@@ -54,6 +77,7 @@ pub struct LinkStatus {
     pub peer: String,
     pub server: ServerId,
     pub servers: usize,
+    pub ghosts: usize,
 }
 
 #[derive(Clone)]
@@ -63,7 +87,7 @@ struct Inner {
     key: LinkKey,
     epoch: [u8; 8],
     config: Mutex<HubConfig>,
-    budget: Arc<hxd_core::QueueBudget>,
+    core: Arc<Core>,
     state: Mutex<State>,
 }
 
@@ -82,6 +106,18 @@ struct Live {
     peer: Option<ServerGroup>,
     /// Servers learned over this link, the peer excluded.
     servers: HashMap<ServerId, ServerGroup>,
+    features: u32,
+    /// Where the export feed reaches this link, once it is established.
+    exports: Option<mpsc::Sender<Export>>,
+    /// The peer's users shown here, by the ID the peer gives them.
+    ghosts: HashMap<u16, Slot>,
+}
+
+struct Slot {
+    uid: hxd_core::roster::Uid,
+    /// The group as the peer last sent it, to show the ghost again when
+    /// its home server changes and, later, to relay it whole.
+    group: UserGroup,
 }
 
 /// A link login the hub confirmed.
@@ -90,14 +126,14 @@ struct Granted {
 }
 
 impl Hub {
-    pub fn new(seed: &[u8; 32], config: HubConfig, budget: Arc<hxd_core::QueueBudget>) -> Hub {
+    pub fn new(seed: &[u8; 32], config: HubConfig, core: Arc<Core>) -> Hub {
         let mut epoch = [0u8; 8];
         getrandom::getrandom(&mut epoch).expect("the OS CSPRNG");
         Hub(Arc::new(Inner {
             key: LinkKey::from_seed(seed),
             epoch,
             config: Mutex::new(config),
-            budget,
+            core,
             state: Mutex::default(),
         }))
     }
@@ -119,12 +155,21 @@ impl Hub {
     }
 
     pub(crate) fn budget(&self) -> &Arc<hxd_core::QueueBudget> {
-        &self.0.budget
+        self.0.core.queue_budget()
     }
 
-    /// Dial every peer this server dials, each on a task of its own that
-    /// reconnects for as long as its entry stays configured.
-    pub fn spawn_dialers(&self) {
+    /// Start linking: the task that hands the core's export feed to every
+    /// link, and a dialer for every peer this server dials, each on a
+    /// task of its own that reconnects while its entry stays configured.
+    pub fn start(&self) {
+        // Installed before anything can link: a link that subscribed while
+        // no feed was installed would never hear what changed after.
+        let rx = self.0.core.peer_feed(FEED_CAP);
+        tokio::spawn(feed(self.clone(), rx));
+        self.spawn_dialers();
+    }
+
+    fn spawn_dialers(&self) {
         let entries: Vec<PeerEntry> = self.0.config.lock().unwrap().peers.clone();
         for entry in entries.into_iter().filter(|e| e.dial.is_some()) {
             self.spawn_dialer(entry.name);
@@ -222,6 +267,7 @@ impl Hub {
                     peer: name.clone(),
                     server: live.peer.as_ref()?.id,
                     servers: live.servers.len(),
+                    ghosts: live.ghosts.len(),
                 })
             })
             .collect();
@@ -261,22 +307,45 @@ impl Hub {
                 close: Some(tx),
                 peer: None,
                 servers: HashMap::new(),
+                features: 0,
+                exports: None,
+                ghosts: HashMap::new(),
             },
         );
-        if let Some(close) = old.and_then(|mut old| old.close.take()) {
-            let _ = close.send(Reason::Replaced);
+        drop(state);
+        if let Some(mut old) = old {
+            if let Some(close) = old.close.take() {
+                let _ = close.send(Reason::Replaced);
+            }
+            // Its late frames can no longer touch the new link, and its
+            // own ending finds a newer generation; its ghosts go now.
+            self.part(old.ghosts.into_values());
         }
         (generation, rx)
     }
 
+    /// Ghosts leave, after the hub's lock is released: each is a broadcast
+    /// to every local session, and the feed waits on that lock.
+    fn part(&self, slots: impl IntoIterator<Item = Slot>) {
+        for slot in slots {
+            self.0.core.ghost_part(slot.uid);
+        }
+    }
+
+    /// The link has ended: everyone shown over it leaves.
     pub(crate) fn unregister(&self, peer: &str, generation: u64) {
         let mut state = self.0.state.lock().unwrap();
-        if state
+        if !state
             .links
             .get(peer)
             .is_some_and(|l| l.generation == generation)
         {
-            state.links.remove(peer);
+            return;
+        }
+        let gone = state.links.remove(peer);
+        drop(state);
+        if let Some(live) = gone {
+            self.part(live.ghosts.into_values());
         }
     }
 
@@ -290,7 +359,10 @@ impl Hub {
         group: ServerGroup,
         own: bool,
     ) -> Result<(), Reason> {
-        let own_tag = self.0.config.lock().unwrap().tag.clone();
+        let (own_tag, show_tags) = {
+            let config = self.0.config.lock().unwrap();
+            (config.tag.clone(), config.show_tags)
+        };
         let mut state = self.0.state.lock().unwrap();
         // A replaced link is told so before anything about the group.
         if !state
@@ -332,14 +404,29 @@ impl Hub {
             .get_mut(peer)
             .filter(|l| l.generation == generation)
             .ok_or(Reason::Replaced)?;
+        let id = group.id;
         if own {
             live.peer = Some(group);
         } else {
-            live.servers.insert(group.id, group);
+            live.servers.insert(id, group);
+        }
+        // A server's new tag, name or color reaches the ghosts already
+        // shown from it, not only those shown after.
+        let refreshed: Vec<(hxd_core::roster::Uid, GhostInfo)> = live
+            .ghosts
+            .values()
+            .filter(|slot| slot.group.home == id)
+            .filter_map(|slot| Some((slot.uid, self.ghost_info(live, &slot.group, show_tags)?)))
+            .collect();
+        drop(state);
+        for (uid, info) in refreshed {
+            self.0.core.ghost_update(uid, info);
         }
         Ok(())
     }
 
+    /// A server is no longer reachable over the link: it goes, and every
+    /// user homed there with it.
     pub(crate) fn forget_server(&self, peer: &str, generation: u64, id: ServerId) {
         let mut state = self.0.state.lock().unwrap();
         if let Some(live) = state
@@ -348,14 +435,224 @@ impl Hub {
             .filter(|l| l.generation == generation)
         {
             live.servers.remove(&id);
+            let homed: Vec<u16> = live
+                .ghosts
+                .iter()
+                .filter(|(_, slot)| slot.group.home == id)
+                .map(|(peer_id, _)| *peer_id)
+                .collect();
+            let gone: Vec<Slot> = homed
+                .iter()
+                .filter_map(|peer_id| live.ghosts.remove(peer_id))
+                .collect();
+            drop(state);
+            self.part(gone);
+        }
+    }
+
+    pub(crate) fn set_features(&self, peer: &str, generation: u64, features: u32) {
+        let mut state = self.0.state.lock().unwrap();
+        if let Some(live) = state
+            .links
+            .get_mut(peer)
+            .filter(|l| l.generation == generation)
+        {
+            live.features = features;
+        }
+    }
+
+    /// The link is established: from here every export reaches it. The
+    /// snapshot is taken under the same lock the feed task hands events
+    /// out under, so nothing numbered after it can have been handed out
+    /// before; events numbered up to it are the link's to skip.
+    pub(crate) fn subscribe(
+        &self,
+        peer: &str,
+        generation: u64,
+    ) -> Option<(u64, Vec<LocalUser>, mpsc::Receiver<Export>)> {
+        let mut state = self.0.state.lock().unwrap();
+        let live = state
+            .links
+            .get_mut(peer)
+            .filter(|l| l.generation == generation)?;
+        let (seq, users) = self.0.core.peer_snapshot();
+        let (tx, rx) = mpsc::channel(EXPORT_CAP);
+        live.exports = Some(tx);
+        Some((seq, users, rx))
+    }
+
+    /// Hand one export to every established link. A link too far behind
+    /// to take it is closed and starts over from a snapshot.
+    fn fan_out(&self, export: Export) {
+        let mut state = self.0.state.lock().unwrap();
+        for live in state.links.values_mut() {
+            let Some(tx) = &live.exports else { continue };
+            if tx.try_send(export.clone()).is_err() {
+                live.exports = None;
+                if let Some(close) = live.close.take() {
+                    let _ = close.send(Reason::Shutdown);
+                }
+            }
+        }
+    }
+
+    /// Every link, closed: the feed fell behind, so every link may have
+    /// missed something, and each starts over from a snapshot.
+    fn close_all(&self, reason: Reason) {
+        let mut state = self.0.state.lock().unwrap();
+        for live in state.links.values_mut() {
+            if let Some(close) = live.close.take() {
+                let _ = close.send(reason);
+            }
+        }
+    }
+
+    /// One user of the peer's, new or changed. A user homed anywhere but
+    /// behind this link is refused: a peer presents only its own side of
+    /// the network.
+    pub(crate) fn apply_user(
+        &self,
+        peer: &str,
+        generation: u64,
+        g: UserGroup,
+    ) -> Result<(), &'static str> {
+        let (show_tags, max_ghosts, limit) = {
+            let config = self.0.config.lock().unwrap();
+            let limit = config
+                .peers
+                .iter()
+                .find(|p| p.name == peer)
+                .map_or(0, |p| p.ghosts);
+            (config.show_tags, config.max_ghosts, limit)
+        };
+        let mut state = self.0.state.lock().unwrap();
+        let live = state
+            .links
+            .get_mut(peer)
+            .filter(|l| l.generation == generation)
+            .ok_or("link replaced")?;
+        let info = self
+            .ghost_info(live, &g, show_tags)
+            .ok_or("not homed behind this link")?;
+        // Attached and counted under the hub's lock, so two links cannot
+        // both take the last place under the caps.
+        if let Some(slot) = live.ghosts.get_mut(&g.id) {
+            slot.group = g;
+            self.0.core.ghost_update(slot.uid, info);
+            return Ok(());
+        }
+        if live.ghosts.len() >= limit || self.0.core.ghost_count() >= max_ghosts {
+            return Err("ghost bound reached");
+        }
+        let uid = self
+            .0
+            .core
+            .ghost_attach(info)
+            .ok_or("no uid to give a ghost")?;
+        live.ghosts.insert(g.id, Slot { uid, group: g });
+        Ok(())
+    }
+
+    /// How a user of the peer's is shown here, or `None` if it is homed
+    /// anywhere but behind this link.
+    fn ghost_info(&self, live: &Live, g: &UserGroup, show_tags: bool) -> Option<GhostInfo> {
+        let home = live
+            .peer
+            .iter()
+            .chain(live.servers.values())
+            .find(|s| s.id == g.home)?;
+        Some(GhostInfo {
+            // Cut to a local name's length for display only; the group
+            // keeps the name whole for relaying.
+            nick: g.name.chars().take(31).collect(),
+            icon: g.icon,
+            away: g.flags & flag::AWAY != 0,
+            color: home.color.unwrap_or_else(|| derived_color(&home.tag)),
+            remote: RemoteRef {
+                home_tag: home.tag.clone(),
+                home_name: home.name.clone(),
+                tagged: show_tags,
+                refuses_msgs: g.flags & flag::REFUSES_MESSAGES != 0
+                    || live.features & feature::PRIVATE_MESSAGES == 0,
+            },
+            visible: !g.exclude.contains(&self.server_id()),
+        })
+    }
+
+    pub(crate) fn user_gone(&self, peer: &str, generation: u64, id: u16) {
+        let mut state = self.0.state.lock().unwrap();
+        if let Some(live) = state
+            .links
+            .get_mut(peer)
+            .filter(|l| l.generation == generation)
+        {
+            let gone = live.ghosts.remove(&id);
+            drop(state);
+            self.part(gone);
+        }
+    }
+
+    /// A whole snapshot: everyone in it shown, everyone shown before and
+    /// not in it gone.
+    pub(crate) fn apply_snapshot(&self, peer: &str, generation: u64, groups: Vec<UserGroup>) {
+        let ids: std::collections::HashSet<u16> = groups.iter().map(|g| g.id).collect();
+        let stale: Vec<u16> = {
+            let state = self.0.state.lock().unwrap();
+            state
+                .links
+                .get(peer)
+                .filter(|l| l.generation == generation)
+                .map(|l| {
+                    l.ghosts
+                        .keys()
+                        .filter(|id| !ids.contains(id))
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for id in stale {
+            self.user_gone(peer, generation, id);
+        }
+        for g in groups {
+            if let Err(why) = self.apply_user(peer, generation, g) {
+                warn!(%peer, "user in snapshot not shown: {why}");
+            }
         }
     }
 }
 
-/// Whether two entries for a peer authorize the same link: the same key,
-/// the same login, and the same address to dial.
+/// The color a server's users are shown in when it suggests none: one of
+/// its own, from its tag, the same wherever it is shown.
+fn derived_color(tag: &str) -> u32 {
+    let d = Sha256::digest(tag.to_ascii_lowercase().as_bytes());
+    u32::from_be_bytes([0, d[0], d[1], d[2]])
+}
+
+/// Hand the core's export feed to every link, for as long as the process
+/// runs. A feed the core closed fell behind: every link starts over.
+async fn feed(hub: Hub, mut rx: mpsc::Receiver<Export>) {
+    loop {
+        while let Some(export) = rx.recv().await {
+            hub.fan_out(export);
+        }
+        warn!("the link export feed fell behind; every link starts over");
+        // A new feed before the links close, so none can subscribe while
+        // there is none to hear what changed after its snapshot.
+        rx = hub.0.core.peer_feed(FEED_CAP);
+        hub.close_all(Reason::Shutdown);
+    }
+}
+
+/// Whether two entries for a peer describe the same link: the same key,
+/// login and address, and the same features and ghost bound, which are
+/// settled when a link starts.
 fn same_terms(a: &PeerEntry, b: &PeerEntry) -> bool {
-    a.key == b.key && a.account == b.account && a.dial == b.dial
+    a.key == b.key
+        && a.account == b.account
+        && a.dial == b.dial
+        && a.features == b.features
+        && a.ghosts == b.ghosts
 }
 
 impl PeerAcceptor for Hub {
@@ -439,9 +736,11 @@ mod tests {
                 tag: "hx".into(),
                 name: "here".into(),
                 color: None,
+                show_tags: false,
+                max_ghosts: 100,
                 peers: vec![],
             },
-            hxd_core::QueueBudget::new(1 << 20),
+            Arc::new(Core::new()),
         )
     }
 
@@ -487,6 +786,24 @@ mod tests {
     }
 
     #[test]
+    fn a_replaced_link_takes_its_ghosts_with_it() {
+        let h = hub_with_peer("a");
+        let (first, _) = h.register("a");
+        h.accept_server("a", first, group(2, "two", 0), true)
+            .unwrap();
+        h.apply_user("a", first, user(9, 2)).unwrap();
+        assert_eq!(h.0.core.ghost_count(), 1);
+        let (second, _) = h.register("a");
+        assert_eq!(h.0.core.ghost_count(), 0);
+        // The replaced link ending, late, leaves the new one's alone.
+        h.accept_server("a", second, group(2, "two", 0), true)
+            .unwrap();
+        h.apply_user("a", second, user(9, 2)).unwrap();
+        h.unregister("a", first);
+        assert_eq!(h.0.core.ghost_count(), 1);
+    }
+
+    #[test]
     fn a_new_link_for_a_peer_replaces_the_old_one() {
         let h = hub();
         let (first, mut closed) = h.register("a");
@@ -511,6 +828,30 @@ mod tests {
         assert_eq!(status[0].servers, 0);
         // Its old tag is free again for another server behind it.
         assert_eq!(h.accept_server("a", a, group(3, "two", 1), false), Ok(()));
+    }
+
+    fn hub_with_peer(name: &str) -> Hub {
+        let h = hub();
+        h.0.config.lock().unwrap().peers.push(PeerEntry {
+            name: name.into(),
+            dial: None,
+            key: [0; 32],
+            account: "link".into(),
+            features: 0,
+            ghosts: 10,
+        });
+        h
+    }
+
+    fn user(id: u16, home: u8) -> UserGroup {
+        let local = LocalUser {
+            uid: id,
+            nick: "bob".into(),
+            icon: 1,
+            away: false,
+            color: None,
+        };
+        UserGroup::parse(&crate::users::of_local(&local, ServerId([home; 8]))).unwrap()
     }
 
     impl ServerGroup {
