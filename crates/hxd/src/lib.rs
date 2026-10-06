@@ -4898,6 +4898,28 @@ sync = "full"
         toml::from_str(toml_text).map_err(|e| e.to_string())
     }
 
+    #[test]
+    fn transit_is_offered_to_one_peer_at_most() {
+        use base64::Engine;
+        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(hxd_link::LinkKey::from_seed(&[1; 32]).public());
+        let peer = |name: &str| {
+            format!(
+                "[[link.peer]]\nname = \"{name}\"\naccept = true\nprotection = \"key\"\n\
+                 key = \"{key}\"\naccount = \"link-{name}\"\nfeatures = [\"transit\"]\n"
+            )
+        };
+        let config = |peers: &[&str]| {
+            let peers: String = peers.iter().map(|p| peer(p)).collect();
+            parse(&format!(
+                "[tls]\ncert = \"c.pem\"\nkey = \"k.pem\"\n[link]\ntag = \"hx\"\n{peers}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(link::check(&config(&["one"])), Ok(()));
+        assert!(link::check(&config(&["one", "two"])).is_err());
+    }
+
     /// A `[voice.video]` section with every field distinct, so a limit
     /// copied into the wrong slot shows up as a mismatched number rather
     /// than an equal one.

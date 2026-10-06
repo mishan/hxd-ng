@@ -341,7 +341,7 @@ the hub feeds it from one task of its own:
   `ChatCommit` a line at a time (`Core::ghost_chat`), as a local sender
   does; local lines share its commits. Past the channel's bound a line is
   not shown here, and is logged: the extension's volume bound, held
-  across every link. Until transit (L7) there is nowhere to relay it.
+  across every link. Until relaying (L7) there is nowhere to relay it.
 - **The batch re-check.** `Staged` has no session for a ghost's line, and
   the re-check looks the ghost up in `ghosts` instead: a line is dropped
   when its ghost is still present but hidden, and goes out under the
@@ -473,6 +473,10 @@ whole list: everything else is already refused by §3.1.
 - On ng, a refusal is `not_delivered` with the reason as text.
 
 ### 6.3 Kicks, bans and purge
+
+Built so far: a kick of a ghost, on either wire, hides it on this server
+until it leaves (`Core::ghost_hide`), and nothing crosses. What follows is
+L5.
 
 - The frontend calls `core.hide_ghost(uid)` before spawning the router
   call, so the ghost disappears here at once, with `Parted` to local
@@ -649,15 +653,18 @@ overflow closes the link, and sent after the last part. After that: a Ping
 after 60 seconds without sending, and the link counted dead after three
 intervals without receiving.
 
-**Receiving topology is not optional, even on one link.** A Janus that is
-already part of a network sends a non-empty Link Servers, Server Updates
-and Server Gones, and users homed behind it, from the first minute. The
-hub checks every server group it receives (Loop, TagConflict, hop limit)
-and accepts ghosts homed behind the link from L1. Relaying onward, and
-announcing other servers, is what waits for L7, and until then this
-server does not offer `LINK_FEATURE_TRANSIT`. A ghost not represented
-because of a cap (§3.6) stays unrepresented: its later updates and
-departure are ignored, and anything naming it is dropped.
+**Topology arrives only over transit.** Over a link with
+`LINK_FEATURE_TRANSIT` the peer's Link Servers, Server Updates and Server
+Gones name the servers behind it, and users homed on them; the hub checks
+every server group (Loop, TagConflict, hop limit) and accepts ghosts homed
+behind the link. Over a link without it the peer shows only itself, and a
+server it names besides is ignored, so that leaving transit off declines
+the peer's network as the extension means it to. Past the bound on
+servers behind a link, a server is ignored rather than the link closed,
+and a server a later update makes unacceptable is forgotten with its
+users. A ghost not represented because of a cap (§3.6) stays
+unrepresented: its later updates and departure are ignored, and anything
+naming it is dropped.
 
 **Checks.** Every incoming transaction is checked before the core sees it,
 as the extension's conformance list requires: a user group must be homed
@@ -669,6 +676,23 @@ only server or user state that cannot be parsed closes the link.
 **Relaying Fields**: groups are kept whole (`Ghost.group`) and re-sent
 whole; fields that never cross are refused at every hop; the bounds are
 checked on receipt and a group over them is dropped whole.
+
+### 7.4.1 Transit on one link
+
+`transit` may be offered to one peer, ahead of L7. Over that link the
+peer may then relay this server's users to the rest of its network and
+show this server the users and servers behind it (§7.4). On the wire
+this server owes the link nothing more: transit obliges a server to relay
+between *its own* transit links, and with one there is nothing to relay,
+so its Link Servers stays empty. A second peer offering transit is
+refused at config load until L7 builds that relaying.
+
+What it does owe, and cannot yet give, is moderation (L5), now across a
+whole network rather than one operator's server. Until then a kick of a
+ghost hides it here for as long as it is shown, the extension's rule for
+a server whose ban did not reach the user, and a kick asking for a ban
+says that none was placed. Network moderators cannot yet act on this
+server's users.
 
 ### 7.5 Moderation, both sides
 
@@ -753,7 +777,7 @@ protection = "key"          # "key" or "tls"
 key = "ed25519:b64..."      # the peer's public key, base64url, prefix optional (Janus writes it); checked for canonical form and small order at load
 account = "link-hx"         # the account the peer issued this server, or this server's for the peer
 # password = "..."          # tls mode only: what the peer issued
-features = ["chat", "msgs", "info"]   # "transit" from L7
+features = ["chat", "msgs", "info", "transit"]   # transit: one peer until L7
 ghosts = 1000               # this link's bound
 ```
 
@@ -816,7 +840,7 @@ use: dead code fails `-D warnings`.
 | L4 | Private messages and user info: the router, answered on a task (classic) or in place (ng) | `link.rs` |
 | L5 | Kick, ban, unban and purge on both sides (the next schema version) | `link.rs`, `bans.rs` |
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
-| L7 | Relaying: announcing other servers, transit, users relayed on | `link.rs` |
+| L7 | Relaying between this server's own links: announcing other servers, users relayed on. Transit on a single link, which needs none of it, came ahead of it | `link.rs` |
 | L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge | `link.rs`, `limits.rs`, `metrics.rs` |
 | L9 | User keys, after the end-to-end document | later |
 

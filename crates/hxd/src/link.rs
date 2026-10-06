@@ -119,6 +119,19 @@ pub fn check(config: &Config) -> Result<(), String> {
             hxd_core::roster::LIVE_QUEUE_CAP / 2
         ));
     }
+    // Transit on one link only joins this server to the network behind
+    // it; on two, the server would owe each what it learns from the
+    // other, and relaying between its own links is not built yet.
+    let transit = section
+        .peer
+        .iter()
+        .filter(|p| p.features.iter().any(|f| f == "transit"))
+        .count();
+    if transit > 1 {
+        return Err("[[link.peer]]: transit may be offered to one peer only, \
+                    until this server relays between its links"
+            .into());
+    }
     let mut names = std::collections::HashSet::new();
     let mut accepted = std::collections::HashSet::new();
     for peer in &section.peer {
