@@ -172,3 +172,105 @@ async fn an_ng_client_sees_a_classic_users_color() {
         .unwrap();
     assert_eq!(changed.data["user"]["color"], 0x00ff_8000);
 }
+
+#[tokio::test]
+async fn a_color_is_masked_to_rgb_and_one_of_the_wrong_size_ignored() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path()).await;
+    let (mut watcher, _) = ng::Client::guest(server.ng, "watcher").await.unwrap();
+    let mut ann = legacy::Client::login_at(server.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let mut bob = legacy::Client::login_at(server.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    let (ann_uid, bob_uid) = (ann.uid.unwrap(), bob.uid.unwrap());
+
+    // The reserved high byte never reaches anyone.
+    set_color(&mut ann, 0xab00_8000).await;
+    assert_eq!(change_color(&mut ann, ann_uid).await, 0x0000_8000);
+    let changed = watcher
+        .event_where("user_changed", |d| d["user"]["uid"] == ann_uid)
+        .await
+        .unwrap();
+    assert_eq!(changed.data["user"]["color"], 0x0000_8000);
+
+    // Two bytes are no color: Bob is not opted in, and Ann hears of no
+    // change to him (past his join, which she has already been sent).
+    ann.call(ClientHdr::UserGetList.as_u32(), &[])
+        .await
+        .unwrap();
+    ann.rx.take_backlog();
+    bob.tx
+        .send(
+            ClientHdr::UserChange.as_u32(),
+            &[(tag::COLOR, vec![0x12, 0x34])],
+        )
+        .await
+        .unwrap();
+    let list = bob
+        .call(ClientHdr::UserGetList.as_u32(), &[])
+        .await
+        .unwrap();
+    assert!(trailer(&row(&list, ann_uid)).is_empty());
+    ann.call(ClientHdr::UserGetList.as_u32(), &[])
+        .await
+        .unwrap();
+    assert!(!ann
+        .rx
+        .take_backlog()
+        .iter()
+        .any(|f| f.ty == push::USER_CHANGE && f.uint(tag::UID) == Some(bob_uid.into())));
+}
+
+#[tokio::test]
+async fn self_info_and_private_chat_joins_carry_colors_to_a_client_that_sends_them() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path()).await;
+    let mut bob = legacy::Client::login_at(server.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+
+    // A 1.5 client that logs in without a name finishes with a User
+    // Change; one carrying a color is answered with self-info that has
+    // the color in a field of its own, where GtkHx reads it.
+    let mut ann = legacy::Client::connect(server.legacy).await.unwrap();
+    ann.call(
+        ClientHdr::Login.as_u32(),
+        &[(tag::VERSION, 150u16.to_be_bytes().to_vec())],
+    )
+    .await
+    .unwrap();
+    ann.tx
+        .send(
+            ClientHdr::UserChange.as_u32(),
+            &[
+                (tag::NAME, b"ann".to_vec()),
+                (tag::COLOR, 0x00ff_8000u32.to_be_bytes().to_vec()),
+            ],
+        )
+        .await
+        .unwrap();
+    let selfinfo = ann.rx.recv_type(push::SELFINFO).await.unwrap();
+    assert_eq!(selfinfo.uint(tag::COLOR), Some(0x00ff_8000));
+
+    // Bob, who has no color, joins Ann's private chat: Ann is told so
+    // with "none" for his color.
+    let created = ann
+        .call(
+            ClientHdr::ChatCreate.as_u32(),
+            &[(tag::UID, bob.uid.unwrap().to_be_bytes().to_vec())],
+        )
+        .await
+        .unwrap();
+    let cid = created.bytes(tag::CHAT_ID).unwrap();
+    bob.call(ClientHdr::ChatJoin.as_u32(), &[(tag::CHAT_ID, cid)])
+        .await
+        .unwrap();
+    let joined = ann
+        .rx
+        .recv_where(|f| f.ty == 0x75 && f.uint(tag::UID) == Some(bob.uid.unwrap().into()))
+        .await
+        .unwrap();
+    assert_eq!(joined.uint(tag::COLOR), Some(NO_COLOR));
+}

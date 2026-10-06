@@ -192,11 +192,13 @@ immutable `Arc`, so the frontends read the setting from a live value.
 ### 3.5 Colored Nicknames
 
 The extension identifies an untagged ghost by its home server's color,
-through Colored Nicknames (`DATA_COLOR`, `0x0500`). hxd-ng does not
-implement Colored Nicknames today. It is a small, separate change (L0):
-`DATA_COLOR` on user list rows and 301 for clients that sent one. Until it
-lands, `show_tags` defaults to on, since a classic client would otherwise
-have no way to tell a ghost from a local user but the user info prefix.
+through Colored Nicknames (`DATA_COLOR`, `0x0500`), which hxd-ng
+implements (L0) for the clients that send a color: a ghost's color reaches
+them through the same rows and changes as a local user's. A classic client
+without colors, which a 1.2 or 1.5 client is, tells an untagged ghost from
+a local user only by the user info prefix, so `show_tags` is there for the
+operators whose users mostly run those, and off by default, as the
+extension has it.
 
 ### 3.6 Bounded fan-out
 
@@ -703,7 +705,7 @@ learned over the link goes.
 [link]
 tag = "hx"                  # 1-8 printable ASCII, unique in the network
 color = 0x3a7bd5            # suggested color for this server's users elsewhere
-show_tags = true            # on until Colored Nicknames lands (§3.5)
+show_tags = false           # on to tag every ghost, for clients without colors (§3.5)
 grace = "60s"
 max_ghosts = 2000           # across all links (§3.6)
 # key = "link-server.key"

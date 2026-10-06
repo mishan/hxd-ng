@@ -879,8 +879,8 @@ fn nick_color(u: &UserInfo) -> [u8; 4] {
 /// The `HTLS_DATA_USER_LIST` payload: uid, icon, color, nlen (all u16 BE),
 /// then the name bytes. `struct hl_userlist_hdr` minus the chunk header.
 /// For a client that sends nick colors, a 4-byte nick color follows the
-/// name, as Janus sends it: a client that does not knows the name's
-/// length and never reads past it.
+/// name, as Janus sends it: a client that never sent one still knows the
+/// name's length and never reads past it.
 fn userlist_payload(
     u: &UserInfo,
     mark_cleartext: bool,
