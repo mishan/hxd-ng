@@ -55,6 +55,7 @@ async fn start(
     std::fs::write(dir.join("key.pem"), issued.signing_key.serialize_pem()).unwrap();
     let text = format!(
         "[server]\nname = \"{tag} server\"\n[paths]\naccounts = \"{d}/accounts\"\n\
+         [inbox]\ndb = \"{d}/hx.db\"\n\
          [ng]\nbind = \"127.0.0.1:0\"\n\
          [limits]\nspam_points = 0\nchat_lines = 0\nng_requests = 0\n\
          [tls]\ncert = \"{d}/cert.pem\"\nkey = \"{d}/key.pem\"\n\
@@ -587,6 +588,48 @@ async fn a_kick_hides_a_ghost_at_its_kicker_and_a_ban_is_placed_by_its_home_serv
         "{:?}",
         again.map(|_| ())
     );
+
+    // The ban is the kicker's server's to list, and to lift, by asking
+    // the user's home server, which lets them back in.
+    let config = hxd::Config::load(&a.config).unwrap();
+    // Kept once the answer has come, a moment after the reply.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !hxd::moderation::ban_list(&config, false)
+        .unwrap()
+        .contains("n#1 eve on bb")
+    {
+        assert!(tokio::time::Instant::now() < deadline, "never recorded");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    hxd::moderation::ban_lift_network(&config, 1).unwrap();
+    let hub = a.hub.clone();
+    tokio::task::spawn_blocking(move || hub.send_unbans())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let back = legacy::Client::login_at(b.legacy, &Login::account("eve", "eve", "pw")).await;
+        if back.is_ok() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}",
+            back.map(|_| ())
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // And the record is marked lifted once the answer is kept.
+    while hxd::moderation::ban_list(&config, false)
+        .unwrap()
+        .contains("n#1")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never marked lifted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // On the ng wire, the reply says what was done where.
     let _carol = legacy::Client::login_at(b.legacy, &Login::guest("carol"))

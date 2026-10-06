@@ -495,7 +495,7 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     reason: p.reason.clone().unwrap_or_default(),
                 });
             let banning = ghost_ban.is_some();
-            if let Some(kick) = core.ghost_kick(p.uid, ghost_ban) {
+            if let Some(kick) = core.ghost_kick(uid, p.uid, ghost_ban) {
                 let wait = hxd_core::server_link::PEER_WAIT;
                 let done = matches!(
                     tokio::time::timeout(wait, kick.answer).await,

@@ -528,6 +528,23 @@ pub trait ModerationStore: Send + Sync + 'static {
         requester: [u8; 8],
         handle: [u8; 16],
     ) -> Result<Option<crate::ban::BanId>, StoreError>;
+    /// Keep a ban this server asked a linked server for; returns it with
+    /// its id. Pruned with the bans, by when it ran out or was lifted.
+    fn record_network_ban(
+        &self,
+        ban: &crate::server_link::NetworkBan,
+    ) -> Result<crate::server_link::NetworkBan, StoreError>;
+    /// Every one kept, newest first.
+    fn network_bans(&self) -> Result<Vec<crate::server_link::NetworkBan>, StoreError>;
+    /// Mark one not yet lifted as asked for lifting; `None` when there is
+    /// none such.
+    fn ask_network_unban(
+        &self,
+        id: u64,
+        at: SystemTime,
+    ) -> Result<Option<crate::server_link::NetworkBan>, StoreError>;
+    /// Mark one lifted at its home server.
+    fn network_unbanned(&self, id: u64, at: SystemTime) -> Result<(), StoreError>;
 }
 
 /// [`ModerationStore::ban`]'s rule for a target already banned: the

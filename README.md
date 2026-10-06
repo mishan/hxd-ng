@@ -1346,6 +1346,7 @@ hxd ban add 203.0.113.0/24 --reason "botnet" --for 7d
 hxd ban add login:bob --reason "spam"        # bob's account, and the identity it links
 hxd ban list                                 # what stands; --all for every ban on record
 hxd ban lift 12
+hxd ban lift n3                              # one asked of a linked server; sent on SIGHUP
 ```
 
 A ban refuses an address or block before the handshake, and a login

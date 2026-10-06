@@ -733,11 +733,20 @@ feature: it is part of every link.
   only for this server's own bans (`DATA_LINK_SERVER_ID`); another
   server's is `Unreachable` until relaying (L7).
 
-**As requester, still to build:** a ban placed on another server's user
+**As requester:** a ban another server placed at this server's asking is
 recorded with its handle, the home server and what was known at the
-time, listed by `hxd ban list` beside local bans, and lifted by a 909;
-and purge of a ghost's lines (§6.3). Until then a network ban this
-server asked for is lifted by the home server's operator.
+time (`network_ban`, schema version 15), and listed by `hxd ban list`
+after the local bans as `n#ID`. `hxd ban lift nID` is an offline
+command, like every operator command, so it marks the ban asked for
+lifting; the running server sends the 909 to the ban's home server on
+the next SIGHUP, and whenever a link comes up (`Hub::send_unbans`), and
+logs the answer. A ban asked for under a server key this server has
+since replaced is not sent, as its home server would answer any other
+requester `UnknownBan`: its operator lifts it. `OK`, or
+`UnknownBan` because the home server's operator lifted it already or it
+ran out, marks it lifted; anything else, or a home server out of reach,
+leaves it to be sent again. Purge of a ghost's lines (§6.3) is still
+to build.
 
 ### 7.6 Interruption
 
