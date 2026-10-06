@@ -4,6 +4,7 @@
 //! password is checked. This crate never holds a server key and knows
 //! nothing of the link wire; it frames bytes and hands them over.
 
+use hxd_core::server_link::{PeerRefusal, PEER_WAIT};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -183,5 +184,16 @@ impl DialedLink {
         {
             self.backlog.stop.notify_one();
         }
+    }
+}
+
+/// The answer to an act on a user of another server, or `Unreachable`
+/// once [`PEER_WAIT`] has passed without one.
+pub async fn peer_answer<T>(
+    answer: tokio::sync::oneshot::Receiver<Result<T, PeerRefusal>>,
+) -> Result<T, PeerRefusal> {
+    match tokio::time::timeout(PEER_WAIT, answer).await {
+        Ok(Ok(result)) => result,
+        _ => Err(PeerRefusal::Unreachable),
     }
 }

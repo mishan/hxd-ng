@@ -130,6 +130,7 @@ async fn pair_with(
     a_holds: u8,
     b_holds: u8,
     a_link: &str,
+    a_offers: &str,
 ) -> (Server, Server, [tempfile::TempDir; 2]) {
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a_tls = bind().await;
@@ -141,7 +142,7 @@ async fn pair_with(
         a_link,
         &format!(
             "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
-             key = \"ed25519:{}\"\naccount = \"link-bb\"\nfeatures = [\"chat\"]\n",
+             key = \"ed25519:{}\"\naccount = \"link-bb\"\nfeatures = {a_offers}\n",
             public(a_holds)
         ),
         a_tls,
@@ -154,7 +155,7 @@ async fn pair_with(
         "",
         &format!(
             "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
-             key = \"{}\"\naccount = \"link-bb\"\nfeatures = [\"chat\"]\n",
+             key = \"{}\"\naccount = \"link-bb\"\nfeatures = {EVERY_FEATURE}\n",
             public(b_holds)
         ),
         bind().await,
@@ -163,13 +164,22 @@ async fn pair_with(
     (a, b, [da, db])
 }
 
+/// Every link feature this server implements, as `[[link.peer]]` names
+/// them.
+const EVERY_FEATURE: &str = r#"["chat", "msgs", "info"]"#;
+
 async fn pair(a_holds: u8, b_holds: u8) -> (Server, Server, [tempfile::TempDir; 2]) {
-    pair_with(a_holds, b_holds, "").await
+    pair_with(a_holds, b_holds, "", EVERY_FEATURE).await
 }
 
 /// Two servers linked, waited for.
 async fn linked(a_link: &str) -> (Server, Server, [tempfile::TempDir; 2]) {
-    let servers = pair_with(2, 1, a_link).await;
+    linked_offering(a_link, EVERY_FEATURE).await
+}
+
+/// Two servers linked, `a` offering only `a_offers`.
+async fn linked_offering(a_link: &str, a_offers: &str) -> (Server, Server, [tempfile::TempDir; 2]) {
+    let servers = pair_with(2, 1, a_link, a_offers).await;
     assert!(comes_up(&servers.0.hub, 2, Duration::from_secs(10)).await);
     assert!(comes_up(&servers.1.hub, 1, Duration::from_secs(10)).await);
     servers
@@ -294,12 +304,11 @@ async fn users_cross_the_link_both_ways_on_both_wires_and_leave() {
         .await
         .unwrap();
 
-    // Each sees the other as a user, greyed out for what a ghost cannot
-    // be sent (private chat always; private messages, which this link
-    // does not carry yet), and never as an admin.
+    // Each sees the other as a user, greyed out for private chat, which
+    // never crosses, and never as an admin.
     let ghost = row(&mut ann, "bob").await;
-    assert_eq!(ghost.color, 4 | 8);
-    assert_eq!(row(&mut bob, "ann").await.color, 4 | 8);
+    assert_eq!(ghost.color, 8);
+    assert_eq!(row(&mut bob, "ann").await.color, 8);
 
     // An ng client is told where the ghost is from.
     let (_watcher, hello) = ng::Client::guest(a.ng, "watcher").await.unwrap();
@@ -393,6 +402,129 @@ async fn public_chat_crosses_the_link_both_ways_on_both_wires() {
 }
 
 #[tokio::test]
+async fn private_messages_and_user_info_cross_the_link() {
+    let (a, b, _dirs) = linked("").await;
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let mut bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    let (mut ngc, _) = ng::Client::guest(b.ng, "ngc").await.unwrap();
+    let (bob_here, ann_there) = (
+        row(&mut ann, "bob").await.uid,
+        row(&mut bob, "ann").await.uid,
+    );
+    let ngc_here = row(&mut ann, "ngc").await.uid;
+
+    // Ann's message reaches Bob as from her ghost there, and his answer
+    // comes back the same way.
+    let sent = ann
+        .call(
+            ClientHdr::Msg.as_u32(),
+            &[
+                (tag::UID, bob_here.to_be_bytes().to_vec()),
+                (tag::BODY, b"hi bob".to_vec()),
+            ],
+        )
+        .await;
+    assert!(sent.is_ok(), "{sent:?}");
+    let got = bob
+        .rx
+        .recv_where(|f| f.ty == push::MSG && f.uint(tag::UID) == Some(ann_there.into()))
+        .await
+        .unwrap();
+    assert_eq!(got.bytes(tag::BODY).unwrap(), b"hi bob");
+    bob.call(
+        ClientHdr::Msg.as_u32(),
+        &[
+            (tag::UID, ann_there.to_be_bytes().to_vec()),
+            (tag::BODY, b"hi ann".to_vec()),
+        ],
+    )
+    .await
+    .unwrap();
+    let got = ann
+        .rx
+        .recv_where(|f| f.ty == push::MSG && f.uint(tag::UID) == Some(bob_here.into()))
+        .await
+        .unwrap();
+    assert_eq!(got.bytes(tag::BODY).unwrap(), b"hi ann");
+
+    // An ng client's message too, its LF carried as a line break.
+    let sent = ngc
+        .request("msg", json!({ "to": ann_there, "text": "two\nlines" }))
+        .await
+        .unwrap();
+    assert_eq!(sent["queued"], false);
+    let got = ann
+        .rx
+        .recv_where(|f| f.ty == push::MSG && f.uint(tag::UID) == Some(ngc_here.into()))
+        .await
+        .unwrap();
+    assert_eq!(got.bytes(tag::BODY).unwrap(), b"two\rlines");
+
+    // User info names the ghost's server, then what that server shows
+    // anyone: never a login or an address.
+    let info = ann
+        .call(
+            ClientHdr::UserGetInfo.as_u32(),
+            &[(tag::UID, bob_here.to_be_bytes().to_vec())],
+        )
+        .await
+        .unwrap();
+    let text = String::from_utf8(info.bytes(tag::BODY).unwrap()).unwrap();
+    assert!(text.starts_with("  server: bb server\r"), "{text:?}");
+    assert!(text.contains("name: bob\r"), "{text:?}");
+    assert!(
+        !text.contains("login") && !text.contains("address"),
+        "{text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_link_without_messages_refuses_them_and_names_the_server_for_info() {
+    let (a, b, _dirs) = linked_offering("", r#"["chat"]"#).await;
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let _bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    let ghost = row(&mut ann, "bob").await;
+    assert_eq!(ghost.color, 4 | 8, "greyed out for messages too");
+    let sent = ann
+        .call(
+            ClientHdr::Msg.as_u32(),
+            &[
+                (tag::UID, ghost.uid.to_be_bytes().to_vec()),
+                (tag::BODY, b"hi".to_vec()),
+            ],
+        )
+        .await;
+    assert!(
+        matches!(&sent, Err(hxd_testclient::Error::Refused { text, .. }) if text.contains("private messages")),
+        "{sent:?}"
+    );
+    let (mut ngc, _) = ng::Client::guest(a.ng, "ngc").await.unwrap();
+    let sent = ngc
+        .request("msg", json!({ "to": ghost.uid, "text": "hi" }))
+        .await;
+    assert!(
+        matches!(&sent, Err(hxd_testclient::Error::Refused { code, .. }) if code == "not_delivered"),
+        "{sent:?}"
+    );
+    let info = ann
+        .call(
+            ClientHdr::UserGetInfo.as_u32(),
+            &[(tag::UID, ghost.uid.to_be_bytes().to_vec())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.bytes(tag::BODY).unwrap(), b"  server: bb server\r");
+}
+
+#[tokio::test]
 async fn no_act_on_another_user_reaches_a_ghost() {
     let (a, b, _dirs) = linked("").await;
     let mut admin = legacy::Client::login_at(a.legacy, &Login::account("admin", "admin", "pw"))
@@ -421,6 +553,10 @@ async fn no_act_on_another_user_reaches_a_ghost() {
     let chat = (tag::CHAT_ID, made.bytes(tag::CHAT_ID).unwrap());
 
     for ty in hxd_session::NAMES_A_USER {
+        // Carried to the ghost's server, as its own test shows.
+        if matches!(ty, ClientHdr::Msg | ClientHdr::UserGetInfo) {
+            continue;
+        }
         let request = |to: u16| {
             let uid = (tag::UID, to.to_be_bytes().to_vec());
             match ty {
@@ -447,17 +583,8 @@ async fn no_act_on_another_user_reaches_a_ghost() {
     let (mut ngc, _) = ng::Client::account(a.ng, "admin", "pw", "ngc")
         .await
         .unwrap();
-    for (method, params) in [
-        ("msg", json!({ "text": "hello" })),
-        ("block", json!({})),
-        ("kick", json!({})),
-    ] {
-        let key = if method == "msg" { "to" } else { "uid" };
-        let to = |uid: u16| {
-            let mut p = params.clone();
-            p[key] = json!(uid);
-            p
-        };
+    for method in ["block", "kick"] {
+        let to = |uid: u16| json!({ "uid": uid });
         let answer = ngc.request(method, to(ghost)).await;
         let absent = ngc.request(method, to(nobody)).await;
         assert!(

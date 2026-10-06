@@ -365,7 +365,7 @@ pub(crate) async fn run(
                         // channel itself; see `handle_sync`.
                         handle_sync(&ctx, &mut state, &req, &mut ws_tx, &mut events).await
                     } else {
-                        dispatch(&ctx, &state, &req, &mut ws_tx).await
+                        dispatch(&ctx, &state, &req, &mut ws_tx, &lag).await
                     };
                     match flow {
                         Flow::Continue => {}
@@ -1448,7 +1448,13 @@ fn spam_charge(req: &str) -> Option<(u32, u32)> {
     }
 }
 
-async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut WsTx) -> Flow {
+async fn dispatch(
+    ctx: &NgCtx,
+    state: &SessState,
+    req: &ReqEnvelope,
+    ws_tx: &mut WsTx,
+    lag: &hxd_core::Lag,
+) -> Flow {
     let send = |s: String| Message::Text(s);
     if let Some((trans, points)) = spam_charge(&req.req) {
         if let Err(flooded) = ctx.core.spend_spam(state.uid, points, trans) {
@@ -1627,6 +1633,26 @@ async fn dispatch(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope, ws_tx: &mut
                 let from = state.uid;
                 let outcome = match (p.to, p.to_login.clone()) {
                     (Some(uid), None) => {
+                        // A user of another server, answered here and now:
+                        // replies keep their requests' order (§5), and the
+                        // wait is bounded by `PEER_WAIT`.
+                        if let Some(answer) = ctx.core.peer_msg(from, uid, &text, media.is_some()) {
+                            let wait = hxd_core::server_link::PEER_WAIT;
+                            let answer = tokio::select! {
+                                answer = tokio::time::timeout(wait, answer) => answer,
+                                // Cut off meanwhile: the wait is no excuse.
+                                () = lag.wait() => return Flow::Lagged,
+                            };
+                            let out = match answer {
+                                Ok(Ok(Ok(()))) => reply_ok(req.id, json!({ "queued": false })),
+                                Ok(Ok(Err(why))) => reply_err(req.id, "not_delivered", why.text()),
+                                _ => {
+                                    let why = hxd_core::server_link::PeerRefusal::Unreachable;
+                                    reply_err(req.id, "not_delivered", why.text())
+                                }
+                            };
+                            return finish(ws_tx, out).await;
+                        }
                         off_reactor(&ctx.core, move |c| c.msg(from, uid, text, guid, media)).await
                     }
                     (None, Some(login)) => {

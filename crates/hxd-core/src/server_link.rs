@@ -12,9 +12,10 @@
 //! link would pass on, numbered in the order the roster made it, so a link
 //! that takes a snapshot can skip what the snapshot already holds.
 
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::roster::{Event, RosterInner, SessionStatus, Uid, UserInfo, UserSession};
 use crate::Core;
@@ -57,6 +58,77 @@ pub(crate) struct Ghost {
 /// A ghost's chat line, staged when it arrives so that the ghost leaving
 /// before it is logged does not lose it ([`Core::ghost_chat`]).
 pub struct GhostLine(pub(crate) crate::chat::Staged);
+
+/// Why an act on a ghost, or a ghost's act here, was refused: the
+/// extension's reply reasons, and what this server refuses before
+/// anything crosses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRefusal {
+    UnknownUser,
+    RefusesMessages,
+    Excluded,
+    RateLimited,
+    FeatureNotNegotiated,
+    Unreachable,
+    /// The ghost's server refused it, for a reason this server has no
+    /// better word for.
+    Refused,
+    /// Refused here: the sender has no ghost over that link to send as.
+    NotExported,
+    /// Refused here: what a link cannot carry, an image or a text over
+    /// [`MAX_LINK_TEXT`].
+    CannotCross,
+}
+
+/// How long an act on a ghost waits for its answer before the client is
+/// told the ghost's server did not answer (the extension's per-hop wait).
+pub const PEER_WAIT: Duration = Duration::from_secs(10);
+
+impl PeerRefusal {
+    /// What a client is told, on either wire.
+    pub fn text(self) -> &'static str {
+        match self {
+            PeerRefusal::UnknownUser => "That user is not connected.",
+            PeerRefusal::RefusesMessages => "That user does not accept private messages.",
+            PeerRefusal::Excluded => "That user cannot be reached from here.",
+            PeerRefusal::RateLimited => {
+                "Too much at once for that user's server; try again shortly."
+            }
+            PeerRefusal::FeatureNotNegotiated => {
+                "That user's server does not take this from this one."
+            }
+            PeerRefusal::Unreachable => "That user's server did not answer.",
+            PeerRefusal::Refused => "That user's server refused it.",
+            PeerRefusal::NotExported => {
+                "Users on other servers cannot see you, so you cannot message them."
+            }
+            PeerRefusal::CannotCross => "That cannot be sent to a user on another server.",
+        }
+    }
+}
+
+/// The acts that cross a link to a ghost's home server, answered when the
+/// answer comes: the frontends await it on a task of their own, never in
+/// their session loops.
+pub trait PeerRouter: Send + Sync {
+    fn msg(&self, from: Uid, to: Uid, text: String) -> oneshot::Receiver<Result<(), PeerRefusal>>;
+    fn user_info(&self, of: Uid) -> oneshot::Receiver<Result<String, PeerRefusal>>;
+}
+
+/// An answer already known.
+fn answered<T>(result: Result<T, PeerRefusal>) -> oneshot::Receiver<Result<T, PeerRefusal>> {
+    let (tx, rx) = oneshot::channel();
+    let _ = tx.send(result);
+    rx
+}
+
+/// A user info request for a ghost, on its way.
+pub struct PeerInfo {
+    pub nick: String,
+    /// The home server's name, which the reply names whatever comes back.
+    pub home: String,
+    pub answer: oneshot::Receiver<Result<String, PeerRefusal>>,
+}
 
 /// The most a chat line or private message may carry over a link, in
 /// bytes of UTF-8 (the extension's Text on a Link).
@@ -318,6 +390,113 @@ impl Core {
         )))
     }
 
+    /// Where acts on ghosts go. Set once, by the hub when it starts.
+    pub fn set_peer_router(&self, router: Arc<dyn PeerRouter>) {
+        let _ = self.peer_router.set(router);
+    }
+
+    /// A private message to `to`: `None` when `to` is not a ghost shown
+    /// here, so the message is a local one; otherwise its answer, refused
+    /// at once for what could never be delivered.
+    pub fn peer_msg(
+        &self,
+        from: Uid,
+        to: Uid,
+        text: &str,
+        media: bool,
+    ) -> Option<oneshot::Receiver<Result<(), PeerRefusal>>> {
+        let r = self.roster.lock().unwrap();
+        let g = r.ghosts.get(&to).filter(|g| g.visible)?;
+        let refused = if g.info.remote.as_ref().is_some_and(|r| r.refuses_msgs) {
+            Some(PeerRefusal::RefusesMessages)
+        } else if !r.users.get(&from).is_some_and(exported) {
+            Some(PeerRefusal::NotExported)
+        } else if media || text.len() > MAX_LINK_TEXT {
+            Some(PeerRefusal::CannotCross)
+        } else {
+            None
+        };
+        drop(r);
+        Some(match (refused, self.peer_router.get()) {
+            (Some(why), _) => answered(Err(why)),
+            (None, Some(router)) => router.msg(from, to, text.to_owned()),
+            (None, None) => answered(Err(PeerRefusal::Unreachable)),
+        })
+    }
+
+    /// User info for `uid`: `None` when it is not a ghost shown here.
+    pub fn peer_user_info(&self, uid: Uid) -> Option<PeerInfo> {
+        let r = self.roster.lock().unwrap();
+        let g = r.ghosts.get(&uid).filter(|g| g.visible)?;
+        let nick = g.info.nick.clone();
+        let home = g
+            .info
+            .remote
+            .as_ref()
+            .map_or_else(String::new, |r| r.home_name.clone());
+        drop(r);
+        let answer = match self.peer_router.get() {
+            Some(router) => router.user_info(uid),
+            None => answered(Err(PeerRefusal::Unreachable)),
+        };
+        Some(PeerInfo { nick, home, answer })
+    }
+
+    /// A private message from ghost `from` to `to`, a local user a link
+    /// showed the ghost's server. Delivered live, as from the ghost: a
+    /// ghost has no mailbox, so nothing waits and nothing is blocked.
+    pub fn ghost_msg(&self, from: Uid, to: Uid, text: String) -> Result<(), PeerRefusal> {
+        let limits = self.flood_limits;
+        let mut r = self.roster.lock().unwrap();
+        if !r.users.get(&to).is_some_and(exported) {
+            return Err(PeerRefusal::UnknownUser);
+        }
+        let g = r.ghosts.get_mut(&from).ok_or(PeerRefusal::UnknownUser)?;
+        if !g.visible {
+            return Err(PeerRefusal::Excluded);
+        }
+        // A message spends a line of the ghost's chat allowance: local
+        // users' limit, which is all the extension asks.
+        if !g.flood.chat(1, &limits, Instant::now()) {
+            return Err(PeerRefusal::RateLimited);
+        }
+        let from_nick = g.info.nick.clone();
+        r.send_to(
+            to,
+            Event::Msg {
+                from,
+                from_nick,
+                from_login: None,
+                text,
+                id: None,
+                sent_at: SystemTime::now(),
+                queued: false,
+                media: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// What a linked server's clients may read about a local user: what
+    /// an unprivileged client here may, never a login or an address.
+    pub fn info_text_for_peer(&self, uid: Uid) -> Result<String, PeerRefusal> {
+        let r = self.roster.lock().unwrap();
+        let sess = r
+            .users
+            .get(&uid)
+            .filter(|s| exported(s))
+            .ok_or(PeerRefusal::UnknownUser)?;
+        let secs = sess.connected_at.elapsed().as_secs();
+        Ok(format!(
+            "    name: {}\r    icon: {}\r  online: {}h {}m {}s\r",
+            sess.info.nick,
+            sess.info.icon,
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60,
+        ))
+    }
+
     pub fn ghost_count(&self) -> usize {
         self.roster.lock().unwrap().ghosts.len()
     }
@@ -494,6 +673,58 @@ mod tests {
         let mut text = "a".repeat(MAX_LINK_TEXT - 1) + "\u{e9}b";
         cut_to_link_bound(&mut text);
         assert_eq!(text, "a".repeat(MAX_LINK_TEXT - 1));
+    }
+
+    #[test]
+    fn what_cannot_reach_a_ghost_is_refused_before_anything_crosses() {
+        let core = Core::new();
+        let (me, _rx) = test_attach(&core, "me", chatter());
+        let g = core.ghost_attach(ghost("bob", true)).unwrap();
+        let refused = |text: &str, media| {
+            core.peer_msg(me, g, text, media)
+                .unwrap()
+                .try_recv()
+                .unwrap()
+        };
+        // `ghost` refuses messages, as a link without them does.
+        assert_eq!(refused("hi", false), Err(PeerRefusal::RefusesMessages));
+        let mut open = ghost("bob", true);
+        open.remote.refuses_msgs = false;
+        core.ghost_update(g, open);
+        assert_eq!(refused("hi", true), Err(PeerRefusal::CannotCross));
+        let long = "x".repeat(MAX_LINK_TEXT + 1);
+        assert_eq!(refused(&long, false), Err(PeerRefusal::CannotCross));
+        assert_eq!(
+            refused("hi", false),
+            Err(PeerRefusal::Unreachable),
+            "no router"
+        );
+        // A ghost hidden here is nobody: the message is a local one.
+        let hidden = core.ghost_attach(ghost("eve", false)).unwrap();
+        assert!(core.peer_msg(me, hidden, "hi", false).is_none());
+    }
+
+    #[test]
+    fn a_ghosts_message_reaches_an_exported_user_only() {
+        let core = Core::new().with_flood_limits(crate::FloodLimits::MHXD);
+        let (me, mut rx) = test_attach(&core, "me", chatter());
+        let g = core.ghost_attach(ghost("bob", true)).unwrap();
+        drain(&mut rx);
+        assert_eq!(core.ghost_msg(g, me, "hi".into()), Ok(()));
+        assert!(matches!(
+            &drain(&mut rx)[..],
+            [Event::Msg { from, from_login: None, text, .. }] if *from == g && text == "hi"
+        ));
+        assert_eq!(
+            core.ghost_msg(g, 0x7ff0, "hi".into()),
+            Err(PeerRefusal::UnknownUser)
+        );
+        assert_eq!(
+            core.ghost_msg(0x7ff1, me, "hi".into()),
+            Err(PeerRefusal::UnknownUser)
+        );
+        let text = core.info_text_for_peer(me).unwrap();
+        assert!(text.starts_with("    name: me\r"), "{text:?}");
     }
 
     #[test]

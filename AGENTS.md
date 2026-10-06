@@ -364,7 +364,9 @@ Three layers, all `cargo test --workspace`:
   unlinked with its dialer stopped, a key changed on reload closing the
   link, bit 11 on the plain port or a key proof without it refused, users
   crossing both ways on both wires and leaving, public chat crossing
-  both ways in order and formatted where it is heard, `show_tags`, and every
+  both ways in order and formatted where it is heard, private messages
+  and user info crossing on both wires and refused where the link does
+  not carry them, `show_tags`, and every
   transaction in `NAMES_A_USER`, and ng's `msg`, `block` and `kick`,
   refused for a ghost as for a uid nobody holds),
   `relay.rs` (a classic server behind `hlrelay`: a client that reaches

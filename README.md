@@ -1161,7 +1161,8 @@ Early, and absent by default. `[link]` joins this server to others under
 fogWraith's Server Linking Extension, by server keys: each side proves its
 key over the TLS session, so no password is shared and `[link]` needs
 `[tls]`. Users cross both ways, shown on each server as users of the
-other, and public chat crosses where both sides enable it. See
+other, and public chat, private messages and user info cross where both
+sides enable them. See
 [docs/server-link.md](docs/server-link.md).
 
 ```toml
@@ -1180,7 +1181,7 @@ dial = "janus.example:5600"        # or `accept = true` for a peer that dials yo
 protection = "key"
 key = "ed25519:base64url key"      # the peer's, as its log shows it (prefix optional)
 account = "link-hx"                # the login the peer expects (no account here)
-features = ["chat"]                # what this link carries, if the peer agrees
+features = ["chat", "msgs", "info"]  # what this link carries, if the peer agrees
 # ghosts = 1000                    # this link's users shown
 ```
 
