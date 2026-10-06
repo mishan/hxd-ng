@@ -703,6 +703,30 @@ async fn a_kick_with_purge_takes_a_ghosts_lines_here_and_spares_a_namesake() {
 }
 
 #[tokio::test]
+async fn a_peer_shut_down_is_held_for_the_grace_period_and_then_let_go() {
+    let (a, b, _dirs) = linked("grace = 2").await;
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let _bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    let bob = row(&mut ann, "bob").await.uid;
+    let is_part =
+        move |f: &legacy::Frame| f.ty == push::USER_PART && f.uint(tag::UID) == Some(bob.into());
+
+    // A stopping server closes for a Shutdown, and dials nobody after.
+    b.hub.shutdown().await;
+    goes_down(&a.hub, 2).await;
+    let early = tokio::time::timeout(Duration::from_secs(1), ann.rx.recv_where(is_part)).await;
+    assert!(early.is_err(), "held through the grace: {early:?}");
+    assert_eq!(row(&mut ann, "bob").await.uid, bob);
+    // Not back within it: an honest netsplit.
+    let late = tokio::time::timeout(Duration::from_secs(5), ann.rx.recv_where(is_part)).await;
+    assert!(matches!(late, Ok(Ok(_))), "{late:?}");
+}
+
+#[tokio::test]
 async fn no_act_on_another_user_reaches_a_ghost() {
     let (a, b, _dirs) = linked("").await;
     let mut admin = legacy::Client::login_at(a.legacy, &Login::account("admin", "admin", "pw"))

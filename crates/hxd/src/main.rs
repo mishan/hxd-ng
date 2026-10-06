@@ -1259,6 +1259,7 @@ async fn main() {
             tokio::spawn(hxd_ng_session::serve(ng_listener, ng_ctx));
         }
 
+        let link_hub = hub.clone();
         if let (Some((listener, _)), Some(tls)) = (tls_listener, tls.as_ref()) {
             tokio::spawn(hxd_session::serve_tls_with_peers(
                 listener,
@@ -1281,6 +1282,11 @@ async fn main() {
         };
         if let Some(tracker) = tracker {
             tracker.shutdown().await;
+        }
+        // Peers told this server is stopping and coming back, so they keep
+        // its users through the restart (their grace period).
+        if let Some(hub) = link_hub {
+            hub.shutdown().await;
         }
         outcome
     }
