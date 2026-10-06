@@ -26,7 +26,7 @@
 //! Chat rooms, messaging and moderation live in [`crate::chat`], as further
 //! `impl Core` blocks over the same state.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -837,10 +837,53 @@ pub enum Resume {
     Gone,
 }
 
+/// How long a freed uid stays out of circulation. A request naming a uid
+/// can still be on its way when that user leaves — across several linked
+/// servers, in fogWraith's Server Linking Extension ("User IDs on a
+/// Link") — and must not land on whoever is given the uid next.
+const UID_QUARANTINE: Duration = Duration::from_secs(5 * 60);
+
+/// Freed uids, oldest first, with a set beside the queue so a check under
+/// the roster lock costs O(1).
+#[derive(Default)]
+struct UidQuarantine {
+    order: VecDeque<(Uid, Instant)>,
+    held: HashSet<Uid>,
+}
+
+impl UidQuarantine {
+    fn hold(&mut self, uid: Uid, now: Instant) {
+        if self.held.insert(uid) {
+            self.order.push_back((uid, now));
+        }
+    }
+
+    fn release_expired(&mut self, now: Instant) {
+        while let Some(&(uid, at)) = self.order.front() {
+            if now.duration_since(at) < UID_QUARANTINE {
+                break;
+            }
+            self.order.pop_front();
+            self.held.remove(&uid);
+        }
+    }
+
+    fn holds(&self, uid: Uid) -> bool {
+        self.held.contains(&uid)
+    }
+
+    fn take_oldest(&mut self) -> Option<Uid> {
+        let (uid, _) = self.order.pop_front()?;
+        self.held.remove(&uid);
+        Some(uid)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct RosterInner {
     pub(crate) users: HashMap<Uid, UserSession>,
     last_uid: Uid,
+    freed_uids: UidQuarantine,
     last_serial: u64,
     pub(crate) public_subject: String,
     pub(crate) chats: HashMap<u32, PrivateChat>,
@@ -849,18 +892,31 @@ pub(crate) struct RosterInner {
 
 impl RosterInner {
     fn next_uid(&mut self) -> Option<Uid> {
-        // Sequential with wrap, skipping 0 and in-use ids — stable ids for
-        // the lifetime of a session, no reuse while alive.
+        self.next_uid_at(Instant::now())
+    }
+
+    fn next_uid_at(&mut self, now: Instant) -> Option<Uid> {
+        // Sequential with wrap, skipping 0, in-use ids and recently freed
+        // ones — stable ids for the lifetime of a session, no reuse while
+        // alive or for UID_QUARANTINE after.
+        self.freed_uids.release_expired(now);
+        if self.users.len() + self.freed_uids.held.len() >= usize::from(u16::MAX) {
+            // A uid is never both in use and held, so this is every uid:
+            // skip a scan that cannot succeed, under the roster lock.
+            return self.freed_uids.take_oldest();
+        }
         for _ in 0..=u16::MAX {
             self.last_uid = self.last_uid.wrapping_add(1);
             if self.last_uid == 0 {
                 continue;
             }
-            if !self.users.contains_key(&self.last_uid) {
+            if !self.users.contains_key(&self.last_uid) && !self.freed_uids.holds(self.last_uid) {
                 return Some(self.last_uid);
             }
         }
-        None
+        // Every free uid was freed within the quarantine. Reusing the one
+        // freed longest ago beats answering a login "server full".
+        self.freed_uids.take_oldest()
     }
 
     /// Allocate a private chat's id: nonzero, unused, and from the OS
@@ -972,6 +1028,7 @@ impl RosterInner {
         let Some(sess) = self.users.remove(&uid) else {
             return;
         };
+        self.freed_uids.hold(uid, Instant::now());
         if sess.visible {
             self.broadcast(&Event::Parted(uid), Some(uid));
         }
@@ -2080,6 +2137,40 @@ pub(crate) fn drain(rx: &mut Events) -> Vec<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_freed_uid_is_handed_out_again_once_its_quarantine_ends() {
+        let t0 = Instant::now();
+        let mut r = RosterInner::default();
+        r.freed_uids.hold(1, t0);
+        assert_eq!(
+            r.next_uid_at(t0 + UID_QUARANTINE - Duration::from_nanos(1)),
+            Some(2)
+        );
+        r.last_uid = 0;
+        assert_eq!(r.next_uid_at(t0 + UID_QUARANTINE), Some(1));
+    }
+
+    #[test]
+    fn a_fully_quarantined_uid_space_reuses_the_oldest() {
+        let t0 = Instant::now();
+        let mut r = RosterInner::default();
+        for uid in (1..=u16::MAX).rev() {
+            r.freed_uids.hold(uid, t0);
+        }
+        assert_eq!(r.next_uid_at(t0), Some(u16::MAX));
+        assert!(!r.freed_uids.holds(u16::MAX));
+    }
+
+    #[test]
+    fn an_ended_session_does_not_hand_its_uid_to_the_next_login() {
+        let core = Core::new();
+        let (gone, _rx) = test_attach(&core, "gone", AccessBits::empty());
+        core.end_session(gone);
+        core.roster.lock().unwrap().last_uid = gone - 1;
+        let (next, _rx) = test_attach(&core, "next", AccessBits::empty());
+        assert_ne!(next, gone);
+    }
 
     fn ng_attach(core: &Core, nick: &str, addr: &str) -> (Uid, Events) {
         let (uid, rx) = core
