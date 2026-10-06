@@ -70,6 +70,7 @@ async fn reload_on_hangup(
     registrar: Option<std::sync::Arc<hxd_registrar::Registrar>>,
     tls: Option<std::sync::Arc<hxd_session::LegacyTls>>,
     banner: Option<std::sync::Arc<hxd_session::Banner>>,
+    hub: Option<hxd_link::Hub>,
     path: PathBuf,
 ) {
     let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -114,6 +115,12 @@ async fn reload_on_hangup(
                 Err(e) => {
                     tracing::error!("SIGHUP: [tls] {e}; the certificate in use is unchanged")
                 }
+            }
+        }
+        if let Some(hub) = hub.as_ref() {
+            match hxd::link::reload(hub, &path) {
+                Ok(n) => tracing::info!("SIGHUP: {n} link peers configured"),
+                Err(e) => tracing::error!("SIGHUP: [link] {e}; the link peers are unchanged"),
             }
         }
         if let Some(banner) = banner.as_ref().filter(|b| b.image_len().is_some()) {
@@ -1193,12 +1200,17 @@ async fn main() {
         }
         // The audit trail's evidence window and closed reports' retention.
         tokio::spawn(hxd::moderation::pruner(ctx.core.clone()));
+        let hub = hxd::link::build(&config, ctx.core.queue_budget().clone())?;
+        if let Some(hub) = &hub {
+            hub.spawn_dialers();
+        }
         #[cfg(unix)]
         tokio::spawn(reload_on_hangup(
             ctx.core.clone(),
             ng_ctx.as_ref().and_then(|n| n.registrar.clone()),
             tls.as_ref().map(|t| t.tls.clone()),
             banner,
+            hub.clone(),
             config_path.clone(),
         ));
 
@@ -1229,10 +1241,13 @@ async fn main() {
         }
 
         if let (Some((listener, _)), Some(tls)) = (tls_listener, tls.as_ref()) {
-            tokio::spawn(hxd_session::serve_tls(
+            tokio::spawn(hxd_session::serve_tls_with_peers(
                 listener,
                 ctx.clone(),
                 tls.tls.clone(),
+                hub.map(|h| {
+                    std::sync::Arc::new(h) as std::sync::Arc<dyn hxd_session::PeerAcceptor>
+                }),
             ));
         }
         let outcome = tokio::select! {

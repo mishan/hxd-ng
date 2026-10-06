@@ -24,6 +24,7 @@ use serde::Deserialize;
 pub mod accounts;
 pub mod banner;
 pub mod files;
+pub mod link;
 pub mod metrics;
 pub mod moderation;
 pub mod push;
@@ -104,6 +105,8 @@ pub struct Config {
     /// `GET /metrics` on the ng port (`docs/metrics.md`). Absent = no
     /// route. Needs the `metrics` feature and `[ng]`.
     pub metrics: Option<metrics::MetricsSection>,
+    /// Server linking (`docs/server-link.md`).
+    pub link: Option<link::LinkSection>,
 }
 
 /// `[avatars]`: a user's picture, on both wires.
@@ -2706,6 +2709,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     tls::check(config)?;
     banner::check(config)?;
     metrics::check(config)?;
+    link::check(config)?;
     if let Some(inbox) = &config.inbox {
         inbox.policy().check()?;
     }

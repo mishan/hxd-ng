@@ -1155,6 +1155,32 @@ change_seconds = 10               # that add a live stream, one session may
                                   # subscription change never count
 ```
 
+### Server linking
+
+Early, and absent by default. `[link]` joins this server to others under
+fogWraith's Server Linking Extension, by server keys: each side proves its
+key over the TLS session, so no password is shared and `[link]` needs
+`[tls]`. Links come up, check each other and stay up; users and chat do
+not cross yet. See [docs/server-link.md](docs/server-link.md).
+
+```toml
+[link]
+tag = "hx"                         # 1-8 printable ASCII, unique in the network
+# color = 0x3a7bd5                 # suggested for this server's users elsewhere
+# key = "link-server.key"          # generated on first start; the log shows
+                                   # its public key to give your peers
+
+[[link.peer]]
+name = "janus-home"
+dial = "janus.example:5600"        # or `accept = true` for a peer that dials you
+protection = "key"
+key = "base64url public key"       # the peer's, as its log or discovery shows it
+account = "link-hx"                # the login the peer expects (no account here)
+```
+
+SIGHUP re-reads `[[link.peer]]`: a removed peer is unlinked, and a new one
+dialed.
+
 ## Operating
 
 ### Accounts and identity

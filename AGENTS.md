@@ -55,6 +55,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs, and the registrar's requests, records and signed lists (with the one record verifier they all share) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
+| `hxd-link` | The link wire of fogWraith's Server Linking Extension (`docs/server-link.md`): the 900-block as ordered field lists (so a relay can pass a group on whole), server groups and Hello, the key proof over the TLS 1.3 exporter, the hub (server table, loop and tag checks, newest-wins), one session loop per link, and the dialer. Knows nothing about classic clients or the ng wire; `hxd-session` hands it a bit-11 login on the TLS port through `PeerAcceptor`. |
 | `hl-tunnel` | `WsByteStream`: a WebSocket whose binary frames carry a classic byte stream, as `AsyncRead + AsyncWrite`, with the keep-alive ping and the silence deadline. What the ng port's `/trtp` and `/htxf` and `hlrelay` all run the classic protocol over. |
 | `hxd-auth-file` | Flat-TOML accounts (one file per account, `[access]` named bits + `[extra]` server-local policy + `[identity]` link), first-run guest bootstrap, and the account editing behind `hxd_core::admin`. Identity links and edits are written back with `toml_edit` so hand-edited files keep their comments; fingerprint lookups scan the directory. |
 | `hxd-media` | The inline-media pipeline (`docs/inline-media.md`): magic-byte sniff, hand-written JPEG/PNG/GIF container walkers that refuse polyglots, a bounded decode and a re-encode that strips every byte of metadata by construction, and the fitting that makes an avatar and its legacy GIF (`docs/avatars.md`). Behind `hxd-core`'s `MediaCodec` trait and the `media` Cargo feature, and knows nothing about Hotline. |
@@ -358,6 +359,10 @@ Three layers, all `cargo test --workspace`:
   all of them until it earns one back, guesses made at once held to
   the same count, a request refused before its password is checked
   not counted, and a login with no password not held to it),
+  `link.rs` (two servers linked by key mode over loopback TLS, a key
+  either side did not configure refused, a peer removed on reload
+  unlinked with its dialer stopped, a key changed on reload closing the
+  link, and bit 11 on the plain port or a key proof without it refused),
   `relay.rs` (a classic server behind `hlrelay`: a client that reaches
   it only over WebSockets logs in, chats with one on the TCP port, and
   downloads over `/htxf`), `slow_consumer.rs` (a room flooded while one

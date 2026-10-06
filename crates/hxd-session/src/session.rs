@@ -270,6 +270,7 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) {
                 Transport::default(),
                 LinkAuthority::default(),
                 Direct::Admit,
+                None,
             )
             .instrument(span)
             .await;
@@ -290,6 +291,19 @@ const MAX_TLS_HANDSHAKES: usize = 256;
 /// carries no identity — a client certificate is not asked for. Never
 /// returns.
 pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::LegacyTls>) {
+    serve_tls_with_peers(listener, ctx, tls, None).await
+}
+
+/// [`serve_tls`], accepting server links as well (`docs/server-link.md`
+/// §7.1). Only this port does: a key-mode link proves its key over the
+/// TLS session's exporter value, which only a session terminated here
+/// has.
+pub async fn serve_tls_with_peers(
+    listener: TcpListener,
+    ctx: ServerCtx,
+    tls: Arc<crate::LegacyTls>,
+    peers: Option<Arc<dyn crate::peer::PeerAcceptor>>,
+) {
     let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_TLS_HANDSHAKES));
     let mut backoff = Duration::from_millis(10);
     loop {
@@ -320,6 +334,7 @@ pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::Le
         let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
         let acceptor = tls.acceptor();
+        let peers = peers.clone();
         tokio::spawn(async move {
             let span = tracing::info_span!("session", %peer, tls = true);
             let handshake = timeout(ctx.cfg.login_timeout, acceptor.accept(stream)).await;
@@ -339,6 +354,10 @@ pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::Le
                 encrypted: true,
                 ..Transport::default()
             };
+            let link_port = peers.map(|acceptor| crate::peer::LinkPort {
+                acceptor,
+                exporter: link_exporter(stream.get_ref().1),
+            });
             run_connection(
                 stream,
                 peer,
@@ -346,6 +365,7 @@ pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::Le
                 transport,
                 LinkAuthority::default(),
                 Direct::Admitted(place),
+                link_port,
             )
             .instrument(span)
             .await;
@@ -353,8 +373,25 @@ pub async fn serve_tls(listener: TcpListener, ctx: ServerCtx, tls: Arc<crate::Le
     }
 }
 
+/// The session's exporter value for a key-mode link, on TLS 1.3 only:
+/// TLS 1.2 without extended master secret is open to triple-handshake
+/// attacks, which would let a proof made for one session serve another.
+fn link_exporter(
+    conn: &tokio_rustls::rustls::ServerConnection,
+) -> Option<[u8; crate::peer::EXPORTER_LEN]> {
+    if conn.protocol_version() != Some(tokio_rustls::rustls::ProtocolVersion::TLSv1_3) {
+        return None;
+    }
+    conn.export_keying_material(
+        [0u8; crate::peer::EXPORTER_LEN],
+        crate::peer::EXPORTER_LABEL,
+        Some(&[]),
+    )
+    .ok()
+}
+
 /// One outbound frame, typed by who stamps the transaction id.
-enum Outbound {
+pub(crate) enum Outbound {
     /// Reply to a client request: `trans` echoes the request.
     Reply {
         trans: u32,
@@ -378,6 +415,14 @@ enum Outbound {
         ty: u32,
         chunks: Vec<(u16, Vec<u8>)>,
     },
+    /// A request this side originates with a task id of its choosing, the
+    /// reply flag clear: only a server link sends one, and matches the
+    /// reply to it by that id.
+    Request {
+        ty: u32,
+        trans: u32,
+        chunks: Vec<(u16, Vec<u8>)>,
+    },
 }
 
 impl Outbound {
@@ -389,7 +434,8 @@ impl Outbound {
         let chunks = match self {
             Outbound::Reply { chunks, .. }
             | Outbound::Push { chunks, .. }
-            | Outbound::Notify { chunks, .. } => chunks,
+            | Outbound::Notify { chunks, .. }
+            | Outbound::Request { chunks, .. } => chunks,
         };
         hxproto::HL_HDR_LEN + chunks.iter().map(|(_, d)| 4 + d.len()).sum::<usize>()
     }
@@ -415,31 +461,31 @@ const WRITE_STALL: Duration = Duration::from_secs(60);
 
 /// How long a finished session's writer gets to send what is still
 /// queued — the last replies and pushes — before it is stopped.
-const WRITER_FLUSH: Duration = Duration::from_secs(5);
+pub(crate) const WRITER_FLUSH: Duration = Duration::from_secs(5);
 
 /// The sending side of a connection: the writer's queue, and what the
 /// queue shares with the writer and the session.
 #[derive(Clone)]
-struct Tx {
-    out: UnboundedSender<Outbound>,
-    backlog: Arc<Backlog>,
+pub(crate) struct Tx {
+    pub(crate) out: UnboundedSender<Outbound>,
+    pub(crate) backlog: Arc<Backlog>,
 }
 
-struct Backlog {
+pub(crate) struct Backlog {
     /// Bytes queued and not yet written, drawn on the server's budget
     /// (`hxd_core::budget`).
     share: Share,
     /// The client stopped keeping up: the queue passed its bound, or a
     /// write stalled. Nothing more is queued once it is set.
-    lagging: AtomicBool,
+    pub(crate) lagging: AtomicBool,
     /// Wakes the session loop when `lagging` is set.
-    lagged: Notify,
+    pub(crate) lagged: Notify,
     /// Tells the writer to stop, whatever it is in the middle of.
-    stop: Notify,
+    pub(crate) stop: Notify,
 }
 
 impl Backlog {
-    fn new(share: Share) -> Backlog {
+    pub(crate) fn new(share: Share) -> Backlog {
         Backlog {
             share,
             lagging: AtomicBool::new(false),
@@ -458,7 +504,7 @@ impl Backlog {
 /// Queue a frame for the writer. Every frame goes through here, so the
 /// bound and the write-queue gauges count what the writer later takes
 /// off the queue.
-fn enqueue(tx: &Tx, out: Outbound) {
+pub(crate) fn enqueue(tx: &Tx, out: Outbound) {
     let b = &tx.backlog;
     if b.lagging.load(Ordering::Acquire) {
         return; // The session is ending; its client is not reading.
@@ -562,7 +608,7 @@ fn type_label(ty: u32) -> Kind<'static> {
     }
 }
 
-async fn writer_task<W: AsyncWrite + Unpin>(
+pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
     mut wr: W,
     mut rx: UnboundedReceiver<Outbound>,
     backlog: Arc<Backlog>,
@@ -708,6 +754,10 @@ fn pack_out(out: Outbound, push_trans: &mut u32) -> (Kind<'static>, Vec<u8>) {
             trace_out(ty, 0, 0, &chunks);
             (Kind::Type(ty), pack_frame(ty, 0, 0, &chunks))
         }
+        Outbound::Request { ty, trans, chunks } => {
+            trace_out(ty, trans, 0, &chunks);
+            (Kind::Type(ty), pack_frame(ty, trans, 0, &chunks))
+        }
     }
 }
 
@@ -715,7 +765,10 @@ fn pack_out(out: Outbound, push_trans: &mut u32) -> (Kind<'static>, Vec<u8>) {
 /// a flooding client). Exits on EOF, error, or a malformed frame.
 /// Returns why it stopped, which is why the connection did when it was
 /// the reader that ended it.
-async fn reader_task<R: AsyncRead + Unpin>(mut rd: R, frames: Sender<Frame>) -> &'static str {
+pub(crate) async fn reader_task<R: AsyncRead + Unpin>(
+    mut rd: R,
+    frames: Sender<Frame>,
+) -> &'static str {
     loop {
         match read_frame(&mut rd).await {
             Ok(f) => {
@@ -1223,6 +1276,9 @@ struct LoginRequest {
     caps: Caps,
     /// A 1-byte all-zero LOGIN chunk: the HOPE session-key probe.
     hope_probe: bool,
+    /// A key-mode link login's key and proof (`docs/server-link.md` §7.1).
+    server_key: Option<[u8; 32]>,
+    link_proof: Option<[u8; 64]>,
 }
 
 fn parse_login(f: &Frame) -> LoginRequest {
@@ -1233,6 +1289,8 @@ fn parse_login(f: &Frame) -> LoginRequest {
             tag::ICON => req.icon = c.as_uint() as u16,
             tag::VERSION => req.clientversion = c.as_uint() as u16,
             tag::CAPABILITIES => req.caps = Caps::from_wire(c.data),
+            crate::peer::field::SERVER_KEY => req.server_key = c.data.try_into().ok(),
+            crate::peer::field::KEY_PROOF => req.link_proof = c.data.try_into().ok(),
             tag::LOGIN => {
                 if c.data.len() == 1 && c.data[0] == 0 {
                     req.hope_probe = true;
@@ -1445,7 +1503,16 @@ pub async fn run_session<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    run_connection(stream, peer, ctx, transport, link, Direct::Tunnelled(place)).await
+    run_connection(
+        stream,
+        peer,
+        ctx,
+        transport,
+        link,
+        Direct::Tunnelled(place),
+        None,
+    )
+    .await
 }
 
 /// Whether a connection's `peer` is the client's own TCP address — only
@@ -1489,6 +1556,7 @@ async fn run_connection<S>(
     transport: Transport,
     link: LinkAuthority,
     direct: Direct,
+    link_port: Option<crate::peer::LinkPort>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1547,8 +1615,27 @@ async fn run_connection<S>(
 
     // --- Login, then the session loop -----------------------------------
     let identified = transport.identity.is_some();
-    let outcome = login_phase(&mut frames, &tx, &ctx, peer, transport, link, &mut place).await;
-    let ended = if let Some((mut sess, mut events)) = outcome {
+    let outcome = login_phase(
+        &mut frames,
+        &tx,
+        &ctx,
+        peer,
+        transport,
+        link,
+        &mut place,
+        link_port.as_ref(),
+    )
+    .await;
+    let ended = if let Some(LoginOutcome::Link(grant, acceptor)) = outcome {
+        info!("server link logged in");
+        let io = crate::peer::LinkIo {
+            frames,
+            out: crate::peer::LinkOut(tx.clone()),
+            place: Some(place),
+            peer,
+        };
+        Some(acceptor.accept(grant, io).await)
+    } else if let Some(LoginOutcome::Session(mut sess, mut events)) = outcome {
         let auth = if identified {
             "identity"
         } else if names_guest(&sess.account.login) {
@@ -1588,6 +1675,12 @@ async fn run_connection<S>(
         backlog.stop.notify_one();
         let _ = writer.await;
     }
+}
+
+/// What a login became.
+enum LoginOutcome {
+    Session(Box<Session>, Events),
+    Link(crate::peer::LinkGrant, Arc<dyn crate::peer::PeerAcceptor>),
 }
 
 /// The refusal a login is given when its account already holds as many
@@ -1849,6 +1942,7 @@ fn reconcile_login(
 /// Wait for the LOGIN transaction and run the login flow. `None` = close.
 /// `place` is the connection's place in its address's count, moved to
 /// its account's if the login is a person's.
+#[allow(clippy::too_many_arguments)]
 async fn login_phase(
     frames: &mut Receiver<Frame>,
     tx: &Tx,
@@ -1857,7 +1951,8 @@ async fn login_phase(
     transport: Transport,
     link: LinkAuthority,
     place: &mut ConnPermit,
-) -> Option<(Session, Events)> {
+    link_port: Option<&crate::peer::LinkPort>,
+) -> Option<LoginOutcome> {
     let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
         Ok(Some(f)) => f,
         _ => return None, // timeout or reader gone
@@ -1877,18 +1972,53 @@ async fn login_phase(
         reply_error(tx, f.trans, "Secure login (HOPE) is not supported yet.");
         return None;
     }
-    // Past the logins the server takes at once, refused at once with a
-    // reason the client shows, rather than queued behind the others.
-    let Some(mut permit) = ctx.core.admit_login(Some(peer.ip())) else {
-        reply_error(tx, f.trans, "The server is busy. Try again in a moment.");
-        return None;
-    };
     // The encoding comes from the same frame as the credentials, so it is
     // settled before anything in that frame is read as text. Bit 1 needs
     // nothing wired to be honored, but it is still only honored when the
     // server lists it: the echo below is what tells the client which
     // encoding it got, and the two must agree.
     let enc = TextEncoding::negotiated(req.caps.intersect(ctx.cfg.caps));
+    // A server link: decided before any password is checked, so a link's
+    // login is never counted as a failed one, and never downgraded to an
+    // ordinary login (docs/server-link.md §7.1); and before the login
+    // permit, since a link never joins the room and is never busy for it.
+    if req.caps.has(cap::SERVER_LINK) {
+        let Some(port) = link_port else {
+            reply_error(tx, f.trans, "This port does not accept server links.");
+            return None;
+        };
+        let login = crate::peer::LinkLogin {
+            login: enc.decode_chars(&req.login, 31),
+            server_key: req.server_key,
+            proof: req.link_proof,
+            exporter: port.exporter,
+            text_encoding: req.caps.has(cap::TEXT_ENCODING),
+            addr: peer.ip(),
+        };
+        return match port.acceptor.authorize(login) {
+            Ok(mut grant) => {
+                reply(tx, f.trans, std::mem::take(&mut grant.reply));
+                Some(LoginOutcome::Link(grant, port.acceptor.clone()))
+            }
+            Err(why) => {
+                info!("server link login refused: {why}");
+                reply_error(tx, f.trans, why);
+                None
+            }
+        };
+    }
+    // A key proof belongs to a link login alone: one that comes without
+    // bit 11 is refused rather than read as an ordinary login.
+    if req.server_key.is_some() || req.link_proof.is_some() {
+        reply_error(tx, f.trans, "Login failed.");
+        return None;
+    }
+    // Past the logins the server takes at once, refused at once with a
+    // reason the client shows, rather than queued behind the others.
+    let Some(mut permit) = ctx.core.admit_login(Some(peer.ip())) else {
+        reply_error(tx, f.trans, "The server is busy. Try again in a moment.");
+        return None;
+    };
 
     // Authenticate on the blocking pool — backends do file I/O. Login and
     // password are canonicalized to UTF-8 from the connection's encoding
@@ -2216,7 +2346,7 @@ async fn login_phase(
     if req.clientversion < 150 || got_name {
         complete_login(tx, ctx, &mut sess, Some(permit)).await;
     }
-    Some((sess, events))
+    Some(LoginOutcome::Session(Box::new(sess), events))
 }
 
 /// Run a domain call that touches the message store off the reactor.

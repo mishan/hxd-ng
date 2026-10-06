@@ -115,6 +115,10 @@ pub mod cap {
     /// the same login reply, because video has no meaning without the
     /// voice room that carries it.
     pub const VIDEO: u8 = 10;
+    /// The session is a server link, not a user (`docs/server-link.md`
+    /// §7.1). Never offered in `legacy_caps()`: a link login is taken by
+    /// the link path before capabilities are intersected.
+    pub const SERVER_LINK: u8 = 11;
 }
 
 #[cfg(test)]
