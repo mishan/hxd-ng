@@ -1177,7 +1177,7 @@ tag = "hx"                         # 1-8 printable ASCII, unique in the network
 name = "janus-home"
 dial = "janus.example:5600"        # or `accept = true` for a peer that dials you
 protection = "key"
-key = "base64url public key"       # the peer's, as its log or discovery shows it
+key = "ed25519:base64url key"      # the peer's, as its log shows it (prefix optional)
 account = "link-hx"                # the login the peer expects (no account here)
 # ghosts = 1000                    # this link's users shown
 ```

@@ -141,7 +141,7 @@ async fn pair_with(
         a_link,
         &format!(
             "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
-             key = \"{}\"\naccount = \"link-bb\"\n",
+             key = \"ed25519:{}\"\naccount = \"link-bb\"\n",
             public(a_holds)
         ),
         a_tls,

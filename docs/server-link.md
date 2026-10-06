@@ -733,7 +733,7 @@ max_ghosts = 2000           # across all links (§3.6)
 name = "janus-home"
 dial = "janus.example:5600" # or accept = true
 protection = "key"          # "key" or "tls"
-key = "b64...32 bytes"      # the peer's public key; checked for canonical form and small order at load
+key = "ed25519:b64..."      # the peer's public key, base64url, prefix optional (Janus writes it); checked for canonical form and small order at load
 account = "link-hx"         # the account the peer issued this server, or this server's for the peer
 # password = "..."          # tls mode only: what the peer issued
 features = ["chat", "msgs", "info"]   # "transit" from L7

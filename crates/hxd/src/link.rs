@@ -73,7 +73,10 @@ fn default_ghosts() -> usize {
 }
 
 fn peer_key(peer: &PeerSection) -> Result<[u8; 32], String> {
-    let key = crate::decode_key(&peer.key)
+    // Janus writes a key `ed25519:` and base64url, and an operator pastes
+    // it as given.
+    let b64 = peer.key.trim();
+    let key = crate::decode_key(b64.strip_prefix("ed25519:").unwrap_or(b64))
         .map_err(|e| format!("[[link.peer]] {}: key: {e}", peer.name))?;
     hxd_link::check_public(&key)
         .map_err(|e| format!("[[link.peer]] {}: key refused: {e:?}", peer.name))?;
@@ -191,7 +194,7 @@ pub fn build(config: &Config, core: Arc<hxd_core::Core>) -> Result<Option<hxd_li
     );
     tracing::info!(
         server = ?hub.server_id(),
-        key = %B64.encode(hub.public()),
+        key = %format!("ed25519:{}", B64.encode(hub.public())),
         fingerprint = %hub.fingerprint(),
         "linking as {}",
         section.tag
