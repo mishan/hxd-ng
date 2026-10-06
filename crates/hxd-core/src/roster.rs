@@ -1261,6 +1261,9 @@ pub struct Core {
     pub(crate) log_serial: TimedMutex<LogSerial>,
     /// Public lines waiting to be committed together (`crate::chat`).
     pub(crate) chat_commit: crate::chat::ChatCommit,
+    /// Where acts on a ghost go (`crate::server_link`), once a link hub
+    /// has started.
+    pub(crate) peer_router: std::sync::OnceLock<Arc<dyn crate::server_link::PeerRouter>>,
     /// Keys the operator has refused by hand (`crate::revoked`). Read
     /// under the roster lock by `attach`, and written with nothing held,
     /// so the order is roster first, then this.

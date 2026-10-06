@@ -14,6 +14,7 @@
 //! what 1.2 and 1.5 clients expect. Deviations are deliberate and
 //! commented.
 
+use crate::peer::peer_answer;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -3994,6 +3995,18 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "Empty message or no recipient.");
                 return;
             }
+            // A user of another server: answered when that server answers,
+            // on a task of its own, since a reply carries its task ID.
+            if let Some(answer) = ctx.core.peer_msg(sess.uid, to, &body, media.is_some()) {
+                let (tx, trans) = (tx.clone(), f.trans);
+                tokio::spawn(async move {
+                    match peer_answer(answer).await {
+                        Ok(()) => reply(&tx, trans, vec![]),
+                        Err(why) => reply_error(&tx, trans, why.text()),
+                    }
+                });
+                return;
+            }
             // No guid: the legacy wire has no way to carry one, so every
             // send from it is its own message and a retry is a resend.
             let from = sess.uid;
@@ -4035,6 +4048,26 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // options.self_info default); other users need the bit.
             if target != sess.uid && !sess.can(bit::GET_USER_INFO) {
                 reply_error(tx, f.trans, "You are not allowed to get user information.");
+                return;
+            }
+            // A user of another server: a line naming its server, then
+            // what that server tells, or the line alone if it does not.
+            if let Some(info) = ctx.core.peer_user_info(target) {
+                let (tx, trans, enc) = (tx.clone(), f.trans, sess.enc);
+                tokio::spawn(async move {
+                    let mut text = format!("  server: {}\r", info.home);
+                    if let Ok(more) = peer_answer(info.answer).await {
+                        text.push_str(&more);
+                    }
+                    reply(
+                        &tx,
+                        trans,
+                        vec![
+                            (tag::BODY, enc.body(&text)),
+                            (tag::NAME, wire_nick(enc, &info.nick)),
+                        ],
+                    );
+                });
                 return;
             }
             let Some(d) = ctx.core.user_details(target) else {

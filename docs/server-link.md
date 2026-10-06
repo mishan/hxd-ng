@@ -2,8 +2,9 @@
 
 Status: partial, 2026-10. Built: L0 (the uid quarantine, Colored
 Nicknames), L1 (links by key mode, Hello, server lists, pings, close,
-reload), L2 (users crossing one link both ways, ghosts on both wires) and
-L3 (public chat both ways). The rest is design. It implements fogWraith's
+reload), L2 (users crossing one link both ways, ghosts on both wires), L3
+(public chat both ways) and L4 (private messages and user info). The rest
+is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -404,7 +405,7 @@ what the extension's prefix line is for.
 
 ## 6. Acts on a ghost
 
-### 6.1 Resolve, then answer out of band
+### 6.1 Resolve, then answer when the answer comes
 
 The extension translates three acts, each after the local privilege check
 it would get with a local target:
@@ -416,48 +417,60 @@ it would get with a local target:
 | Kick, kick with ban | 110 | `kick` | Link Kick (907), Link Ban (908) |
 
 The core's `msg` and `kick_by` are synchronous and called off the reactor,
-so the core cannot await a peer inside them. Nor can the frontends await
-it inline: both session loops await their dispatch, and a session waiting
-up to ten seconds per hop gets no events meanwhile and can be dropped as a
-slow consumer. So:
-
-1. the frontend calls `core.resolve(uid)`;
-2. `Local`: exactly as today;
-3. `Refused(r)` or `None`: fail as today, with `r`'s reason;
-4. `Ghost(g)`: check the local privilege, then **spawn** the router call
-   and return to the loop. The answer is sent when it comes: a classic
-   reply echoes the request's task ID, so its order among other frames
-   does not matter, and an ng reply carries the request's `id`, delivered
-   through a channel into the ng loop, which owns its socket. A spawned
-   classic task holds a weak sender, so it never keeps a closed
-   connection's writer open; a reply for an ng connection that has since
-   been replaced is dropped.
+so the core cannot await a peer inside them. So the frontend asks the core
+first (`Core::peer_msg`, `Core::peer_user_info`): `None` for a uid that is
+not a ghost shown here, which goes on exactly as today; otherwise a
+receiver for the answer, already answered when nothing can cross (§6.2)
+and otherwise filled by the `PeerRouter` the hub gives the core when it
+starts:
 
 ```rust
-#[async_trait]
 pub trait PeerRouter: Send + Sync {
-    async fn msg(&self, from: Uid, to: GhostRef, text: String) -> Result<(), PeerRefusal>;
-    async fn user_info(&self, of: GhostRef) -> Result<String, PeerRefusal>;
-    async fn kick(&self, by: Uid, of: GhostRef, ban: Option<Duration>, reason: String) -> Result<KickOutcome, PeerRefusal>;
+    fn msg(&self, from: Uid, to: Uid, text: String) -> oneshot::Receiver<Result<(), PeerRefusal>>;
+    fn user_info(&self, of: Uid) -> oneshot::Receiver<Result<String, PeerRefusal>>;
 }
 ```
+
+The hub sends the request over the ghost's link and the link matches the
+reply by its task. An answer that has not come in `PEER_WAIT` (ten
+seconds, the extension's per hop) is `Unreachable`, and the hub gives the
+request up then, so the link forgets a request a peer never answers. A
+reply marked an error is a refusal whether or not it carries a reason.
+
+- **Classic:** awaited on a task of its own, and the reply sent when it
+  comes. A reply echoes the request's task ID, so its place among other
+  frames does not matter, and the session loop goes on meanwhile. The
+  task holds the connection's sender for at most `PEER_WAIT`.
+- **ng:** awaited in place. The ng wire promises replies in the order of
+  their requests (`hotline-ng.md` §5), so the session stops for the
+  wait: no events are sent and no frames read, though the domain cutting
+  it off for lag still ends it at once. Its events wait in its live
+  channel, where under a tight queue budget a session holding more than
+  others is the one dropped. A reply queue that held later replies behind
+  a pending one would lift this, and is the change if it matters.
 
 That puts ghost handling in two frontends for three acts, which is the
 whole list: everything else is already refused by §3.1.
 
 ### 6.2 Private messages
 
-- Refused locally, without anything crossing, when the sender is not
-  exported over that link (the system session, a session not yet
-  announced), when the message carries media, when it is over 8192 bytes
-  (§4.4), when the ghost is excluded or hidden here, or when the
-  sender is excluded at the ghost's home server (the extension's SHOULD).
-- Delivered to a local user as `Event::Msg` from the ghost's uid, own name
-  and `from_remote`, with no login, on the direct (non-durable) path: a
-  ghost has no mailbox, so nothing is queued or blocked.
+- Refused locally, without anything crossing, when the ghost refuses
+  them or its link did not negotiate them, when the sender is not
+  exported (the system session, a session not yet announced), and when
+  the message carries media or is over 8192 bytes (§4.4). Receiving, a
+  905 may carry 17,408 bytes beside its baseline, room for a message and
+  its quote in another form, as the extension bounds it. A ghost hidden
+  here is no user at all, as for every other act. The sender excluded at
+  the ghost's home server joins this with exclusion (L5).
+- Delivered to a local user as `Event::Msg` from the ghost's uid and own
+  name, with no login, on the direct (non-durable) path: a ghost has no
+  mailbox, so nothing is queued or blocked. A message spends a line of
+  the ghost's chat allowance, local users' limit, and past it is refused
+  `RateLimited`.
 - `Event::Msg` has no quote or automatic-response flag, and the classic
   108 handler reads neither (214, 113). hxd-ng sends neither over a link
   and ignores both on receipt, until it supports them locally.
+- On ng, a refusal is `not_delivered` with the reason as text.
 
 ### 6.3 Kicks, bans and purge
 
@@ -482,9 +495,9 @@ whole list: everything else is already refused by §3.1.
 ### 6.4 User info
 
 - **As requester**, the classic 303 reply for a ghost is a first line
-  naming the home server, then the text the router returns, or that line
-  and nothing else when the request fails or times out, as the extension
-  requires.
+  naming the home server (`  server: <name>`), then the text the router
+  returns, or that line and nothing else when the request fails or times
+  out, as the extension requires.
 - **As home server**, `info_text_for_peer` builds what an ordinary,
   unprivileged client may see: the name, the icon number and how long the
   user has been connected. Never the login or address. hxd-ng's own 303 is
@@ -776,9 +789,9 @@ ghosts = 1000               # this link's bound
   - Chat crosses both ways, formatted by the receiver, in order; a
     media-only line does not cross; a user's last line before leaving is
     heard; public chat keeps flowing while ghost lines stream in.
-  - A private message crosses and is answered, while the sender's session
-    keeps receiving events; a ghost that refuses them is greyed out on a
-    classic client.
+  - A private message crosses and is answered on both wires; a ghost
+    whose link does not carry them is greyed out on a classic client and
+    refused on both.
   - Kick, ban, unban and their persistence; a failed ban keeps the ghost
     hidden and is not announced; purge of a ghost spares a local user
     with the same name.
@@ -800,7 +813,7 @@ use: dead code fails `-D warnings`.
 | L1 | `hxd-link`: capability bit 11, key mode, accept and dial, the handoff, `Replaced`, continuous authorization, Hello and its checks, Ping, Close, empty Link Servers; receiving the peer's Servers, Server Updates and Gones | `link.rs` |
 | L2 | Users over one link, including users homed behind the peer: snapshot, update, gone; `ghosts`, `roster_rows`, `RemoteRef`; ghosts on both wires; bounded fan-out; **the fail-closed table test** | `link.rs` |
 | L3 | Public chat both ways: ghost lines staged on arrival and committed by one task, text rules, ghost lines in the log | `link.rs` |
-| L4 | Private messages and user info: `resolve`, the router, answering out of band on both wires | `link.rs` |
+| L4 | Private messages and user info: the router, answered on a task (classic) or in place (ng) | `link.rs` |
 | L5 | Kick, ban, unban and purge on both sides (the next schema version) | `link.rs`, `bans.rs` |
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
 | L7 | Relaying: announcing other servers, transit, users relayed on | `link.rs` |

@@ -11,7 +11,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use hxd_core::server_link::{GhostInfo, GhostLine, LocalUser, PeerEvent, RemoteRef};
+use hxd_core::roster::Uid;
+use hxd_core::server_link::{
+    GhostInfo, GhostLine, LocalUser, PeerEvent, PeerRefusal, PeerRouter, RemoteRef, PEER_WAIT,
+};
 use hxd_core::Core;
 use hxd_session::peer::{LinkGrant, LinkIo, LinkLogin, PeerAcceptor};
 use hxd_session::{cap, Caps};
@@ -22,7 +25,7 @@ use tracing::warn;
 use crate::key::{check_public, verify_proof, LinkKey, Role};
 use crate::server::{same_tag, ServerGroup, ServerId};
 use crate::users::{flag, UserGroup};
-use crate::wire::{feature, field, Hello, Reason, VERSION};
+use crate::wire::{feature, field, find, tx, Field, Hello, Reason, VERSION};
 
 /// Events the core may hold for the hub before the feed counts as fallen
 /// behind, and events one link may hold before it does.
@@ -37,7 +40,7 @@ pub const MAX_HOPS: u16 = 8;
 
 /// The link features this build implements. Each side offers what its
 /// operator enabled for a peer, and only this much of it.
-pub const SUPPORTED: u32 = feature::PUBLIC_CHAT;
+pub const SUPPORTED: u32 = feature::PUBLIC_CHAT | feature::PRIVATE_MESSAGES | feature::USER_INFO;
 
 /// One peer this server links with, from `[[link.peer]]`.
 #[derive(Debug, Clone)]
@@ -118,6 +121,8 @@ struct Live {
     features: u32,
     /// Where the export feed reaches this link, once it is established.
     exports: Option<mpsc::Sender<Export>>,
+    /// Requests this server sends the peer, once the link is established.
+    requests: Option<mpsc::Sender<Request>>,
     /// The peer's users shown here, by the ID the peer gives them.
     ghosts: HashMap<u16, Slot>,
 }
@@ -128,6 +133,19 @@ struct Slot {
     /// its home server changes and, later, to relay it whole.
     group: UserGroup,
 }
+
+/// A request for the peer (905, 906), and where its reply's fields go.
+pub(crate) struct Request {
+    pub(crate) ty: u32,
+    pub(crate) fields: Vec<Field>,
+    pub(crate) reply: oneshot::Sender<Reply>,
+}
+
+/// A reply's fields, and whether it was marked an error.
+pub(crate) type Reply = (bool, Vec<Field>);
+
+/// Requests one link may have waiting to be sent.
+const REQUEST_CAP: usize = 64;
 
 /// A link login the hub confirmed.
 struct Granted {
@@ -178,6 +196,9 @@ impl Hub {
         // no feed was installed would never hear what changed after.
         let rx = self.0.core.peer_feed(FEED_CAP);
         tokio::spawn(feed(self.clone(), rx));
+        self.0
+            .core
+            .set_peer_router(Arc::new(Router(Arc::downgrade(&self.0))));
         if let Some(mut lines) = self.0.chat_rx.lock().unwrap().take() {
             let core = self.0.core.clone();
             tokio::task::spawn_blocking(move || {
@@ -330,6 +351,7 @@ impl Hub {
                 features: 0,
                 exports: None,
                 ghosts: HashMap::new(),
+                requests: None,
             },
         );
         drop(state);
@@ -485,20 +507,70 @@ impl Hub {
     /// snapshot is taken under the same lock the feed task hands events
     /// out under, so nothing numbered after it can have been handed out
     /// before; events numbered up to it are the link's to skip.
-    pub(crate) fn subscribe(
-        &self,
-        peer: &str,
-        generation: u64,
-    ) -> Option<(u64, Vec<LocalUser>, mpsc::Receiver<Export>)> {
+    pub(crate) fn subscribe(&self, peer: &str, generation: u64) -> Option<Subscribed> {
         let mut state = self.0.state.lock().unwrap();
         let live = state
             .links
             .get_mut(peer)
             .filter(|l| l.generation == generation)?;
-        let (seq, users) = self.0.core.peer_snapshot();
-        let (tx, rx) = mpsc::channel(EXPORT_CAP);
+        let (since, users) = self.0.core.peer_snapshot();
+        let (tx, exports) = mpsc::channel(EXPORT_CAP);
         live.exports = Some(tx);
-        Some((seq, users, rx))
+        let (tx, requests) = mpsc::channel(REQUEST_CAP);
+        live.requests = Some(tx);
+        Some(Subscribed {
+            since,
+            users,
+            exports,
+            requests,
+        })
+    }
+
+    /// The ghost the peer calls `id` on this link.
+    pub(crate) fn ghost_uid(&self, peer: &str, generation: u64, id: u16) -> Option<Uid> {
+        let state = self.0.state.lock().unwrap();
+        state
+            .links
+            .get(peer)
+            .filter(|l| l.generation == generation)
+            .and_then(|l| l.ghosts.get(&id))
+            .map(|slot| slot.uid)
+    }
+
+    /// Send the peer that shows ghost `uid` a request built from the ID
+    /// the peer gave it, over a link that negotiated `feature`.
+    fn request(
+        &self,
+        uid: Uid,
+        feature: u32,
+        ty: u32,
+        build: impl FnOnce(u16) -> Vec<Field>,
+    ) -> Result<oneshot::Receiver<Reply>, PeerRefusal> {
+        let state = self.0.state.lock().unwrap();
+        let (live, id) = state
+            .links
+            .values()
+            .find_map(|l| {
+                l.ghosts
+                    .iter()
+                    .find(|(_, slot)| slot.uid == uid)
+                    .map(|(id, _)| (l, *id))
+            })
+            .ok_or(PeerRefusal::UnknownUser)?;
+        if live.features & feature == 0 {
+            return Err(PeerRefusal::FeatureNotNegotiated);
+        }
+        let (reply, answer) = oneshot::channel();
+        let request = Request {
+            ty,
+            fields: build(id),
+            reply,
+        };
+        match live.requests.as_ref().map(|r| r.try_send(request)) {
+            Some(Ok(())) => Ok(answer),
+            Some(Err(mpsc::error::TrySendError::Full(_))) => Err(PeerRefusal::RateLimited),
+            _ => Err(PeerRefusal::Unreachable),
+        }
     }
 
     /// Hand one export to every established link. A link too far behind
@@ -609,16 +681,9 @@ impl Hub {
         text: String,
         style: u16,
     ) -> Result<(), &'static str> {
-        let uid = {
-            let state = self.0.state.lock().unwrap();
-            state
-                .links
-                .get(peer)
-                .filter(|l| l.generation == generation)
-                .and_then(|l| l.ghosts.get(&id))
-                .map(|slot| slot.uid)
-                .ok_or("no such user on this link")?
-        };
+        let uid = self
+            .ghost_uid(peer, generation, id)
+            .ok_or("no such user on this link")?;
         let Some(line) = self.0.core.ghost_line(uid, text, style) else {
             return Ok(());
         };
@@ -626,6 +691,10 @@ impl Hub {
             mpsc::error::TrySendError::Full(_) => "too many lines waiting to be logged",
             mpsc::error::TrySendError::Closed(_) => "the task logging lines has ended",
         })
+    }
+
+    pub(crate) fn core(&self) -> &Core {
+        &self.0.core
     }
 
     pub(crate) fn epoch(&self) -> [u8; 8] {
@@ -778,6 +847,124 @@ impl PeerAcceptor for Hub {
     }
 }
 
+/// What a link hands its session loop when it is established.
+pub(crate) struct Subscribed {
+    /// The feed's number at the snapshot: events up to it are in `users`.
+    pub(crate) since: u64,
+    pub(crate) users: Vec<LocalUser>,
+    pub(crate) exports: mpsc::Receiver<Export>,
+    pub(crate) requests: mpsc::Receiver<Request>,
+}
+
+/// The hub as the core's [`PeerRouter`]: weak, so the core holding it
+/// does not keep the hub alive.
+struct Router(std::sync::Weak<Inner>);
+
+impl Router {
+    /// Send a request and hand its reply's fields to `answer`, once they
+    /// come; a link that ends first answers `Unreachable`.
+    fn send<T: Send + 'static>(
+        &self,
+        uid: Uid,
+        feature: u32,
+        ty: u32,
+        build: impl FnOnce(u16) -> Vec<Field>,
+        answer: impl FnOnce(Vec<Field>) -> Result<T, PeerRefusal> + Send + 'static,
+    ) -> oneshot::Receiver<Result<T, PeerRefusal>> {
+        let (tx, rx) = oneshot::channel();
+        let sent = match self.0.upgrade() {
+            Some(inner) => Hub(inner).request(uid, feature, ty, build),
+            None => Err(PeerRefusal::Unreachable),
+        };
+        match sent {
+            Err(why) => {
+                let _ = tx.send(Err(why));
+            }
+            Ok(reply) => {
+                tokio::spawn(async move {
+                    // Given up on after the extension's per-hop wait, so
+                    // the link forgets a request a peer never answers.
+                    let result = match tokio::time::timeout(PEER_WAIT, reply).await {
+                        Ok(Ok((error, fields))) => match refusal(error, &fields) {
+                            Some(why) => Err(why),
+                            None => answer(fields),
+                        },
+                        _ => Err(PeerRefusal::Unreachable),
+                    };
+                    let _ = tx.send(result);
+                });
+            }
+        }
+        rx
+    }
+}
+
+/// A reply's refusal, as the core names it: a reason other than `Ok`,
+/// or a reply marked an error, which need not carry one.
+fn refusal(error: bool, fields: &[Field]) -> Option<PeerRefusal> {
+    let reason = find(fields, field::REASON)
+        .and_then(Field::uint)
+        .and_then(|v| u16::try_from(v).ok())
+        .map(Reason::from_wire);
+    Some(match reason {
+        None if !error => return None,
+        Some(Some(Reason::Ok)) if !error => return None,
+        Some(Some(Reason::UnknownUser)) => PeerRefusal::UnknownUser,
+        Some(Some(Reason::RefusesMessages)) => PeerRefusal::RefusesMessages,
+        Some(Some(Reason::Excluded)) => PeerRefusal::Excluded,
+        Some(Some(Reason::RateLimited)) => PeerRefusal::RateLimited,
+        Some(Some(Reason::FeatureNotNegotiated)) => PeerRefusal::FeatureNotNegotiated,
+        Some(Some(Reason::Unreachable)) => PeerRefusal::Unreachable,
+        _ => PeerRefusal::Refused,
+    })
+}
+
+/// The reason a refusal is answered with on the wire.
+pub(crate) fn reason_of(why: PeerRefusal) -> Reason {
+    match why {
+        PeerRefusal::UnknownUser | PeerRefusal::NotExported => Reason::UnknownUser,
+        PeerRefusal::RefusesMessages => Reason::RefusesMessages,
+        PeerRefusal::Excluded => Reason::Excluded,
+        PeerRefusal::RateLimited => Reason::RateLimited,
+        PeerRefusal::FeatureNotNegotiated => Reason::FeatureNotNegotiated,
+        PeerRefusal::Unreachable => Reason::Unreachable,
+        PeerRefusal::Refused | PeerRefusal::CannotCross => Reason::RefusedFields,
+    }
+}
+
+impl PeerRouter for Router {
+    fn msg(&self, from: Uid, to: Uid, text: String) -> oneshot::Receiver<Result<(), PeerRefusal>> {
+        let text = crate::link::link_line_endings(&text);
+        self.send(
+            to,
+            feature::PRIVATE_MESSAGES,
+            tx::PRIVATE_MESSAGE,
+            |id| {
+                vec![
+                    Field::u16(field::USER_ID, from),
+                    Field::u16(field::TARGET_ID, id),
+                    Field::new(field::DATA, text.into_bytes()),
+                ]
+            },
+            |_| Ok(()),
+        )
+    }
+
+    fn user_info(&self, of: Uid) -> oneshot::Receiver<Result<String, PeerRefusal>> {
+        self.send(
+            of,
+            feature::USER_INFO,
+            tx::USER_INFO,
+            |id| vec![Field::u16(field::TARGET_ID, id)],
+            |fields| {
+                find(&fields, field::DATA)
+                    .and_then(|d| String::from_utf8(d.data.clone()).ok())
+                    .ok_or(PeerRefusal::Refused)
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,6 +1023,34 @@ mod tests {
         }
         // An update to a server already known over the same link is fine.
         assert_eq!(h.accept_server("a", a, group(3, "three", 2), false), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_the_peer_never_answers_is_given_up_and_forgotten() {
+        let h = hub_with_peer("a");
+        let (generation, _) = h.register("a");
+        h.accept_server("a", generation, group(2, "two", 0), true)
+            .unwrap();
+        h.set_features("a", generation, feature::PRIVATE_MESSAGES);
+        h.apply_user("a", generation, user(9, 2)).unwrap();
+        let mut link = h.subscribe("a", generation).unwrap();
+        let ghost = h.ghost_uid("a", generation, 9).unwrap();
+        let answer = Router(Arc::downgrade(&h.0)).msg(1, ghost, "hi".into());
+        let sent = link.requests.recv().await.unwrap();
+        tokio::time::sleep(PEER_WAIT + std::time::Duration::from_secs(1)).await;
+        assert_eq!(answer.await.unwrap(), Err(PeerRefusal::Unreachable));
+        assert!(sent.reply.is_closed(), "the link may forget it");
+    }
+
+    #[test]
+    fn a_reply_marked_an_error_is_a_refusal_whatever_it_carries() {
+        let ok = [Field::u16(field::REASON, Reason::Ok as u16)];
+        assert_eq!(refusal(false, &ok), None);
+        assert_eq!(refusal(false, &[]), None);
+        assert_eq!(refusal(true, &[]), Some(PeerRefusal::Refused));
+        assert_eq!(refusal(true, &ok), Some(PeerRefusal::Refused));
+        let busy = [Field::u16(field::REASON, Reason::RateLimited as u16)];
+        assert_eq!(refusal(true, &busy), Some(PeerRefusal::RateLimited));
     }
 
     #[test]

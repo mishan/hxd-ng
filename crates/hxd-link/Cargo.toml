@@ -24,3 +24,7 @@ tracing = { workspace = true }
 # The dialer's TLS client, in key mode verifying nothing about the
 # certificate: the key proof authenticates the peer.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+[dev-dependencies]
+# A test runs the per-hop wait on a paused clock.
+tokio = { workspace = true, features = ["test-util"] }

@@ -72,10 +72,15 @@ fn never_crosses(id: u16) -> bool {
 /// Whether a group's fields outside the baseline may be kept and passed
 /// on: none of them one that never crosses, and all within the bound.
 pub fn admissible_extra(extra: &[Field]) -> Result<(), &'static str> {
+    admissible_extra_within(extra, MAX_EXTRA)
+}
+
+/// [`admissible_extra`] for a transaction whose own bound is `bound`.
+pub fn admissible_extra_within(extra: &[Field], bound: usize) -> Result<(), &'static str> {
     if extra.iter().any(|f| never_crosses(f.id)) {
         return Err("a field that never crosses a link");
     }
-    if extra.iter().map(|f| 4 + f.data.len()).sum::<usize>() > MAX_EXTRA {
+    if extra.iter().map(|f| 4 + f.data.len()).sum::<usize>() > bound {
         return Err("over the field bound");
     }
     Ok(())

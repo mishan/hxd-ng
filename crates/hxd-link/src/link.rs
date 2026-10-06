@@ -7,6 +7,7 @@
 //! ghosts. Chat does not yet (L3), and this server relays nothing, so its
 //! server list is empty.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use hxd_session::frame::Frame;
@@ -17,7 +18,8 @@ use tracing::{debug, info, warn};
 
 use hxd_core::server_link::{GoneReason, PeerEvent, MAX_LINK_TEXT};
 
-use crate::hub::{Hub, PeerEntry};
+use crate::hub::{reason_of, Hub, PeerEntry, Reply, Request, Subscribed};
+use crate::server::MAX_EXTRA;
 use crate::server::{ServerGroup, ServerId};
 use crate::users::{of_local, UserGroup};
 use crate::wire::{chunks, feature, field, fields, find, tx, Field, Hello, Reason};
@@ -65,6 +67,7 @@ pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
         established: None,
         snapshot: None,
         features: 0,
+        pending: HashMap::new(),
     };
     // A reload between the login and here found no link to close: the
     // entry this link was authorized under must still be the one in force.
@@ -94,11 +97,17 @@ struct Link<'a> {
     snapshot: Option<Vec<UserGroup>>,
     /// The features both sides offered, once Hello has been heard.
     features: u32,
+    /// Requests sent to the peer, by task, awaiting its reply.
+    pending: HashMap<u32, oneshot::Sender<Reply>>,
 }
+
+/// Requests one link waits on at once; past it a request is not sent,
+/// and its asker hears that the server did not answer.
+const MAX_PENDING: usize = 256;
 
 /// Text as a link carries it: lines end in CR, whatever the client that
 /// sent it used (Text on a Link).
-fn link_line_endings(text: &str) -> String {
+pub(crate) fn link_line_endings(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
@@ -215,8 +224,12 @@ impl Link<'_> {
         if let Err(end) = self.receive_servers(io, closed).await {
             return end;
         }
-        let Some((since, users, mut exports)) =
-            self.hub.subscribe(&self.entry.name, self.generation)
+        let Some(Subscribed {
+            since,
+            users,
+            mut exports,
+            mut requests,
+        }) = self.hub.subscribe(&self.entry.name, self.generation)
         else {
             return self.end("replaced", None);
         };
@@ -245,6 +258,7 @@ impl Link<'_> {
                     // The hub dropped this link's channel: it fell behind.
                     None => return self.close(io, Reason::Shutdown, "slow_consumer"),
                 },
+                Some(request) = requests.recv() => self.send_request(io, request),
                 f = io.frames.recv() => {
                     let Some(f) = f else { return self.end("eof", None) };
                     last_heard = Instant::now();
@@ -433,6 +447,85 @@ impl Link<'_> {
         }
     }
 
+    fn send_request(&mut self, io: &LinkIo, request: Request) {
+        // An asker that stopped waiting is no longer owed anything.
+        self.pending.retain(|_, asker| !asker.is_closed());
+        if self.pending.len() >= MAX_PENDING {
+            return warn!(peer = %self.entry.name, "too many requests waiting; one not sent");
+        }
+        let trans = self.next_trans;
+        self.next_trans = self.next_trans.wrapping_add(1).max(1);
+        io.out.request(request.ty, trans, chunks(&request.fields));
+        self.last_sent = Instant::now();
+        self.pending.insert(trans, request.reply);
+    }
+
+    /// Link Private Message (905) for a local user, from one of the
+    /// peer's.
+    fn private_message(&self, f: &Frame) -> Result<(), Reason> {
+        if self.features & feature::PRIVATE_MESSAGES == 0 {
+            return Err(Reason::FeatureNotNegotiated);
+        }
+        let fs = fields(f);
+        let baseline = [
+            field::USER_ID,
+            field::TARGET_ID,
+            field::DATA,
+            field::QUOTING,
+            field::OPTIONS,
+        ];
+        let extra: Vec<Field> = fs
+            .iter()
+            .filter(|f| !baseline.contains(&f.id))
+            .cloned()
+            .collect();
+        // Room beside the baseline for a message and its quote in another
+        // form, as the extension bounds 905.
+        crate::server::admissible_extra_within(&extra, 2 * MAX_LINK_TEXT + MAX_EXTRA)
+            .map_err(|_| Reason::RefusedFields)?;
+        if find(&fs, field::QUOTING).is_some_and(|q| q.data.len() > MAX_LINK_TEXT) {
+            return Err(Reason::RefusedFields);
+        }
+        let id = |which| {
+            find(&fs, which)
+                .and_then(Field::fixed)
+                .map(u16::from_be_bytes)
+        };
+        let text = find(&fs, field::DATA)
+            .and_then(|d| String::from_utf8(d.data.clone()).ok())
+            .filter(|t| t.len() <= MAX_LINK_TEXT);
+        let (Some(from), Some(to), Some(text)) = (id(field::USER_ID), id(field::TARGET_ID), text)
+        else {
+            return Err(Reason::RefusedFields);
+        };
+        let from = self
+            .hub
+            .ghost_uid(&self.entry.name, self.generation, from)
+            .ok_or(Reason::UnknownUser)?;
+        // Quoting and an automatic response's flag are not kept: this
+        // server's own messages carry neither yet.
+        self.hub.core().ghost_msg(from, to, text).map_err(reason_of)
+    }
+
+    /// Link User Info (906) about a local user.
+    fn user_info(&self, f: &Frame) -> Result<String, Reason> {
+        if self.features & feature::USER_INFO == 0 {
+            return Err(Reason::FeatureNotNegotiated);
+        }
+        let fs = fields(f);
+        let extra: Vec<Field> = fs
+            .iter()
+            .filter(|f| f.id != field::TARGET_ID)
+            .cloned()
+            .collect();
+        crate::server::admissible_extra(&extra).map_err(|_| Reason::RefusedFields)?;
+        let uid = find(&fs, field::TARGET_ID)
+            .and_then(Field::fixed)
+            .map(u16::from_be_bytes)
+            .ok_or(Reason::RefusedFields)?;
+        self.hub.core().info_text_for_peer(uid).map_err(reason_of)
+    }
+
     /// One part of the peer's snapshot. Nothing is shown until the last
     /// part, so the snapshot is applied as one.
     fn snapshot_part(&mut self, f: &Frame) {
@@ -457,7 +550,10 @@ impl Link<'_> {
     /// One transaction once the link is established. `Some` ends the link.
     fn handle(&mut self, io: &LinkIo, f: Frame) -> Option<End> {
         if is_reply(&f) {
-            // Only pings are sent so far, and their replies say nothing.
+            // A ping's reply says nothing, and is in nobody's way.
+            if let Some(asker) = self.pending.remove(&f.trans) {
+                let _ = asker.send((f.flag != 0, fields(&f)));
+            }
             return None;
         }
         match f.ty {
@@ -504,7 +600,14 @@ impl Link<'_> {
                 }
             }
             tx::CHAT => self.chat(&f),
-            tx::PRIVATE_MESSAGE | tx::USER_INFO => refuse(io, &f, Reason::FeatureNotNegotiated),
+            tx::PRIVATE_MESSAGE => match self.private_message(&f) {
+                Ok(()) => answer(io, &f, vec![Field::u16(field::REASON, Reason::Ok as u16)]),
+                Err(reason) => refuse(io, &f, reason),
+            },
+            tx::USER_INFO => match self.user_info(&f) {
+                Ok(text) => answer(io, &f, vec![Field::new(field::DATA, text.into_bytes())]),
+                Err(reason) => refuse(io, &f, reason),
+            },
             // This server carries out no moderation for a peer yet (L5):
             // refused, never pretended.
             tx::KICK | tx::BAN | tx::UNBAN => refuse(io, &f, Reason::FeatureNotNegotiated),
@@ -523,6 +626,12 @@ impl Link<'_> {
 /// The reply flag sits in the type word's second byte.
 fn is_reply(f: &Frame) -> bool {
     (f.ty >> 16) & 0xff == 1
+}
+
+fn answer(io: &LinkIo, f: &Frame, reply: Vec<Field>) {
+    if f.trans != 0 {
+        io.out.reply(f.trans, false, chunks(&reply));
+    }
 }
 
 fn refuse(io: &LinkIo, f: &Frame, reason: Reason) {
