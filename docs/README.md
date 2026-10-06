@@ -46,6 +46,7 @@ to another project.
 | [moderation.md](moderation.md) — reports, redaction, revocation, purge | yes, less vouching | all (period reports and is moderated) | design; §5 is the ng spec |
 | [news.md](news.md) — threaded news, references, follows, search, markdown, the legacy bindings | yes, less the image part and the importer | all | design; §9–§10 are the ng spec |
 | [system-account.md](system-account.md) — the reserved server account: commands and notifications on the classic wire | yes, less `/vouch` and queued mail | all | design |
+| [server-link.md](server-link.md) — joining fogWraith's linked network: ghosts, the link wire, key mode | no | all (ghosts are users to every client) | design, implements a fogWraith spec |
 | [voice.md](voice.md) — the SFU, one room across both signalling wires | yes | extended, ng | design, implements a fogWraith spec |
 | [capabilities-video.md](capabilities-video.md) — video publications and subscriptions | yes | ng; extended when GtkHx renders | spec, contributed to fogWraith's set |
 | [files-plan.md](files-plan.md) — the file area: browsing, downloads, the local area and uploads | yes, less folders and file management | all (ng browses and downloads) | design |
