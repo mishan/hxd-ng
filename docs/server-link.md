@@ -193,12 +193,17 @@ immutable `Arc`, so the frontends read the setting from a live value.
 
 The extension identifies an untagged ghost by its home server's color,
 through Colored Nicknames (`DATA_COLOR`, `0x0500`), which hxd-ng
-implements (L0) for the clients that send a color: a ghost's color reaches
-them through the same rows and changes as a local user's. A classic client
-without colors, which a 1.2 or 1.5 client is, tells an untagged ghost from
-a local user only by the user info prefix, so `show_tags` is there for the
-operators whose users mostly run those, and off by default, as the
-extension has it.
+implements (L0) for the clients that send a color. A ghost shows its home
+server's color (`RemoteRef.color`, §3.4), never its own, so the classic
+frontend's `nick_color` must prefer the former for a ghost (L2). Its own
+color still crosses the link, in its group.
+
+Color tells a ghost apart only so far: since L0 any local user may pick
+any color, the one a linked server's users show included. A name never
+proved where someone was from on Hotline, and a color does not either;
+the user info prefix does, and the tag option, `show_tags`, puts the home
+server in every ghost's name for operators who want that shown in every
+client. It is off by default, as the extension has it.
 
 ### 3.6 Bounded fan-out
 
@@ -773,7 +778,7 @@ use: dead code fails `-D warnings`.
 
 | Stage | What | Covered by |
 |---|---|---|
-| L0 | Prerequisites with no link: uid quarantine, Colored Nicknames on the classic wire, capability bit 11 defined | unit, `login.rs` |
+| L0 | Prerequisites with no link: uid quarantine, Colored Nicknames on the classic wire | unit, `nick_colors.rs` |
 | L1 | `hxd-link`: key mode, accept and dial, the handoff, trusted addresses, `Replaced`, continuous authorization, Hello and its checks, Ping, Close, empty Link Servers; receiving the peer's Servers, Server Updates and Gones | `link.rs` |
 | L2 | Users over one link, including users homed behind the peer: snapshot, update, gone; `ghosts`, `roster_rows`, `RemoteRef`; ghosts on both wires; bounded fan-out; **the fail-closed table test** | `link.rs` |
 | L3 | Public chat both ways: `Staged` origins, `ChatCommit::enqueue`, text rules, ghost lines in the log (the next schema version) | `link.rs` |
