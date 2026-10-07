@@ -231,12 +231,12 @@ fn listen(
             tokio::select! {
                 _ = stop.wait_for(|s| *s) => break,
                 got = rx.next() => match got {
-                    Ok(Got::Parted) => {
+                    Ok(Got::Parted(_)) => {
                         if let Some(h) = &heard {
                             h.parts.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    Ok(Got::Joined(nick)) if nicks.contains(&nick) => {
+                    Ok(Got::Joined { nick, .. }) if nicks.contains(&nick) => {
                         if let Some(h) = &heard {
                             h.joins.fetch_add(1, Ordering::Relaxed);
                         }

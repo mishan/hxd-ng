@@ -276,7 +276,7 @@ async fn watch_joins(
             changed = done.changed(), if logged_in.is_none() => if changed.is_err() { break },
             _ = tokio::time::sleep_until(wait) => {}
             got = rx.next() => match got {
-                Ok(Got::Joined(nick)) => {
+                Ok(Got::Joined { nick, .. }) => {
                     let due = arrivals.0.lock().unwrap().get(&nick).map(|a| a.0);
                     if let Some(due) = due.filter(|_| heard.insert(nick)) {
                         stats::sample(&mut latency, ctx.t0.elapsed().saturating_sub(due));

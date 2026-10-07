@@ -13,7 +13,7 @@
 # the run starts (listen 127.0.0.1:15601, upstream a's 15600) and the
 # run waits for the link; c always dials a directly. Every server takes
 # [interruption] grace as its [link] grace.
-# Environment as for run.sh, less ACCOUNTS and AFTER.
+# Environment as for run.sh, less AFTER; ACCOUNTS writes a's.
 set -u
 NAME=$1 SCEN=$2 SYNC=${3:-normal}
 BIN=${BIN:-target/release} OUT=${OUT:-out} WORK=${WORK:-work}
@@ -124,6 +124,11 @@ if ! up "$want"; then
     echo "the servers never came up${want:+ linked}" >&2
     tail -n 5 "$D"/*/hxd.log >&2
     exit 2
+fi
+
+if [ -n "${ACCOUNTS:-}" ]; then
+    "$BIN/hxd-load" accounts "$D/a/accounts" --prefix churn --count "$ACCOUNTS" \
+        --password pw --admin mod > /dev/null
 fi
 
 cpu() { awk '{ print $14 + $15 }' "/proc/$1/stat"; }

@@ -141,6 +141,11 @@ impl Member {
 
     /// The nicks on this client's user list.
     pub async fn nicks(&mut self) -> Result<BTreeSet<String>, Error> {
+        Ok(self.nick_list().await?.into_iter().collect())
+    }
+
+    /// The same, one per user: two users under one nick are two entries.
+    pub async fn nick_list(&mut self) -> Result<Vec<String>, Error> {
         Ok(match &mut self.conn {
             Conn::Legacy(c) => c
                 .user_list()
@@ -250,10 +255,13 @@ pub enum Got {
     Chat(String),
     /// An ng request refused.
     Refused(Value),
-    /// A user joined, or on the classic wire possibly changed: its nick.
-    Joined(String),
+    /// A user joined, or on the classic wire possibly changed.
+    Joined {
+        nick: String,
+        uid: Option<u64>,
+    },
     /// A user left.
-    Parted,
+    Parted(Option<u64>),
     /// The server ended this session.
     Kicked,
     Other,
@@ -271,11 +279,12 @@ impl Rx {
                             .into_owned(),
                     ),
                     legacy::push::DISCONNECT_MSG => Got::Kicked,
-                    legacy::push::USER_PART => Got::Parted,
-                    legacy::push::USER_CHANGE => Got::Joined(
-                        String::from_utf8_lossy(&f.bytes(tag::NAME).unwrap_or_default())
+                    legacy::push::USER_PART => Got::Parted(f.uint(tag::UID).map(u64::from)),
+                    legacy::push::USER_CHANGE => Got::Joined {
+                        nick: String::from_utf8_lossy(&f.bytes(tag::NAME).unwrap_or_default())
                             .into_owned(),
-                    ),
+                        uid: f.uint(tag::UID).map(u64::from),
+                    },
                     _ => Got::Other,
                 })
             }
@@ -286,13 +295,16 @@ impl Rx {
                     Got::Chat(e.data["text"].as_str().unwrap_or_default().to_owned())
                 }
                 ng::Incoming::Event(e) if e.ev == "kicked" => Got::Kicked,
-                ng::Incoming::Event(e) if e.ev == "user_parted" => Got::Parted,
-                ng::Incoming::Event(e) if e.ev == "user_joined" => Got::Joined(
-                    e.data["user"]["nick"]
+                ng::Incoming::Event(e) if e.ev == "user_parted" => {
+                    Got::Parted(e.data["uid"].as_u64())
+                }
+                ng::Incoming::Event(e) if e.ev == "user_joined" => Got::Joined {
+                    nick: e.data["user"]["nick"]
                         .as_str()
                         .unwrap_or_default()
                         .to_owned(),
-                ),
+                    uid: e.data["user"]["uid"].as_u64(),
+                },
                 ng::Incoming::Event(_) => Got::Other,
             }),
         }
