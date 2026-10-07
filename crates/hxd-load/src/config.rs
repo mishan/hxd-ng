@@ -169,6 +169,17 @@ impl Scenario {
                 ));
             }
         }
+        // Leaves of a star hear only the hub's users and their own, so a
+        // room on more than two servers talks on the hub. Its room is on
+        // every server but a slow peer's stalled one.
+        let room_on = match self.run.scenario {
+            Kind::Chat | Kind::Moderation => self.target.linked.len() + 1,
+            Kind::SlowPeer => self.target.linked.len(),
+            _ => 0,
+        };
+        if room_on > 2 && !self.chat.talkers_at_target {
+            return Err("[chat] on more than two linked servers needs talkers_at_target".into());
+        }
         if self.run.scenario == Kind::Chat || self.run.scenario == Kind::SlowConsumer {
             if self.chat.talkers_legacy + self.chat.talkers_ng == 0 {
                 return Err("[chat] needs at least one talker".into());
@@ -434,7 +445,8 @@ pub struct Target {
     pub admin: Option<Account>,
     /// Servers linked to this one (`docs/server-link.md`). A chat room
     /// is spread over all of them, each client on the next server in
-    /// turn; a login storm arrives here and is watched from them.
+    /// turn, or with `[chat] talkers_at_target` its readers only; a login
+    /// storm arrives here and is watched from them.
     pub linked: Vec<Server>,
     /// A proxy the run starts and the linked servers dial through, for a
     /// scenario that cuts their links.
@@ -743,6 +755,11 @@ pub struct Chat {
     pub rate: f64,
     /// Bytes of padding after each line's tag.
     pub line_bytes: usize,
+    /// With linked servers, every talker on `[target]` and only the
+    /// readers spread: a server linked without transit hears only its
+    /// peer's own users, so a hub's leaves hear each other through it no
+    /// other way, and what is loaded is the hub's fan-out to its links.
+    pub talkers_at_target: bool,
 }
 
 impl Default for Chat {
@@ -754,6 +771,7 @@ impl Default for Chat {
             talkers_ng: 1,
             rate: 10.0,
             line_bytes: 32,
+            talkers_at_target: false,
         }
     }
 }
@@ -885,6 +903,13 @@ mod tests {
             (
                 format!("{target}{linked}[run]\nscenario = \"slow_consumer\"\n"),
                 "is for chat",
+            ),
+            (
+                format!(
+                    "{target}{linked}{}[chat]\nreaders_legacy = 0\ntalkers_legacy = 0\n",
+                    linked.replace("\"b\"", "\"c\"")
+                ),
+                "talkers_at_target",
             ),
         ] {
             let err = Scenario::parse(&bad).unwrap_err();

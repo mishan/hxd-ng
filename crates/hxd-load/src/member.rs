@@ -349,9 +349,23 @@ impl Rx {
 /// run's `members`, with nobody missing and nobody extra. `either` are
 /// this run's clients that may or may not still be listed — stalled ones
 /// the server may rightly have disconnected — and are not looked for.
-pub async fn roster_agrees(ctx: &Ctx, members: &mut [Member], either: &[String]) {
-    let expect: BTreeSet<String> = members.iter().map(|m| m.nick.clone()).collect();
-    for m in members.iter_mut() {
+///
+/// `on` is the server each member is on, by `Ctx::servers`, or empty for
+/// one server or two: the servers of a run are a star on `[target]`
+/// without transit, so a member elsewhere sees only its own server's
+/// members and `[target]`'s, which sees everyone.
+pub async fn roster_agrees(ctx: &Ctx, members: &mut [Member], on: &[usize], either: &[String]) {
+    let nicks: Vec<String> = members.iter().map(|m| m.nick.clone()).collect();
+    let sees = |me: usize, them: usize| {
+        on.is_empty() || on[me] == 0 || on[them] == 0 || on[me] == on[them]
+    };
+    for (k, m) in members.iter_mut().enumerate() {
+        let expect: BTreeSet<String> = nicks
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| sees(k, *j))
+            .map(|(_, n)| n.clone())
+            .collect();
         match m.nicks().await {
             Ok(nicks) => {
                 let ours: BTreeSet<String> = nicks

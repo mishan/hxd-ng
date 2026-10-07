@@ -6,7 +6,8 @@
 //! so a reader missing a line is a violation, not bad timing.
 //!
 //! With linked servers the room is spread over them, client `i` on server
-//! `i` modulo their number, and a line heard on another server than its
+//! `i` modulo their number (but every talker on `[target]` with
+//! `talkers_at_target`), and a line heard on another server than its
 //! sender's is timed again apart, as `chat.delivery.cross`.
 
 use std::sync::Arc;
@@ -34,7 +35,8 @@ pub async fn gather(ctx: &Ctx) -> Result<Room, String> {
     gather_on(ctx, &all).await
 }
 
-/// The room on `servers` alone, client `i` on the `i`th of them in turn.
+/// The room on `servers` alone, client `i` on the `i`th of them in turn,
+/// or with `talkers_at_target`, every talker on the first.
 pub async fn gather_on(ctx: &Ctx, servers: &[usize]) -> Result<Room, String> {
     let c = &ctx.scenario.chat;
     let plan = [
@@ -43,12 +45,17 @@ pub async fn gather_on(ctx: &Ctx, servers: &[usize]) -> Result<Room, String> {
         (Wire::Legacy, c.readers_legacy),
         (Wire::Ng, c.readers_ng),
     ];
+    let talkers = c.talkers_legacy + c.talkers_ng;
     let mut members = Vec::new();
     let mut on = Vec::new();
     let mut i = 0;
     for (wire, n) in plan {
         for _ in 0..n {
-            let server = servers[i % servers.len()];
+            let server = if i < talkers && c.talkers_at_target {
+                servers[0]
+            } else {
+                servers[i % servers.len()]
+            };
             let m = Member::join_on(ctx, server, wire, i, None)
                 .await
                 .map_err(|e| format!("{} {i} could not join: {e}", wire.name()))?;
@@ -59,15 +66,16 @@ pub async fn gather_on(ctx: &Ctx, servers: &[usize]) -> Result<Room, String> {
     }
     Ok(Room {
         members,
-        talkers: c.talkers_legacy + c.talkers_ng,
+        talkers,
         on,
     })
 }
 
 pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let room = gather(ctx).await?;
+    let on = room.on.clone();
     let (mut members, sent) = speak(ctx, room).await;
-    member::roster_agrees(ctx, &mut members, &[]).await;
+    member::roster_agrees(ctx, &mut members, &on, &[]).await;
     leave(ctx, members).await;
     Ok(json!({ "lines_sent": sent }))
 }

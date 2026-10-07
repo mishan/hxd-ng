@@ -38,6 +38,7 @@ pub async fn run(
         .expect("checked by the scenario");
     let rest: Vec<usize> = (0..ctx.servers.len()).filter(|&k| k != stalled).collect();
     let room = chat::gather_on(ctx, &rest).await?;
+    let on = room.on.clone();
     let on_target: BTreeSet<String> = room
         .members
         .iter()
@@ -94,7 +95,7 @@ pub async fn run(
             });
     }
 
-    member::roster_agrees(ctx, &mut members, &[]).await;
+    member::roster_agrees(ctx, &mut members, &on, &[]).await;
     chat::leave(ctx, members).await;
     Ok(json!({
         "lines_sent": sent,
