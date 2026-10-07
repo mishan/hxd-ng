@@ -1,0 +1,38 @@
+# L-6 across a slow link: b dials a through the run's proxy, which adds
+# latency_ms each way, and enough requesters wait on the peer at once to
+# pass what a link lets wait (about its cap divided by the round trip,
+# a second): past it the server refuses, and the step reports how many.
+# Raise [requests] peer_latency_ms past half the server's wait for the
+# peer to see its answers outlast that wait.
+#
+#   baseline/link-run.sh link-requests-slow scenarios/link-requests-slow.toml
+
+[target]
+legacy = "127.0.0.1:15500"
+ng = "127.0.0.1:15700"
+metrics = true            # needs `--features metrics` and a [metrics] section
+log = "@LOG@"
+
+[target.proxy]
+listen = "127.0.0.1:15601"
+upstream = "127.0.0.1:15600"
+latency_ms = 250
+
+[[target.linked]]
+name = "b"
+legacy = "127.0.0.1:16500"
+ng = "127.0.0.1:16700"
+metrics = true
+log = "@LOG_B@"
+
+[run]
+scenario = "requests"
+settle = 10
+
+[requests]
+ghosts = [800]
+requesters_legacy = 150
+requesters_ng = 150
+rate = 550
+step = 10
+info_share = 0.5

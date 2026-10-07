@@ -9,12 +9,16 @@
 //! leaves its connects to time out; restored, it carries connections
 //! again.
 //!
+//! With a latency, every byte it carries arrives that much later, each
+//! way, in order: a peer across a slow network, rather than a slow peer.
+//!
 //! Stalled, it stops reading what the peer sends the dialer, while what
 //! the dialer sends still goes through: the peer hears from the dialer
 //! as ever, and its writes back up as they would behind a dialer that
 //! stopped reading, until the peer gives up on it or the stall ends.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket};
@@ -28,6 +32,8 @@ struct State {
     /// after it was accepted, even one restored before its task looked.
     cuts: u64,
     stalled: bool,
+    /// Added to every byte it carries, each way, from when it is read.
+    latency: Duration,
 }
 
 pub struct Proxy {
@@ -36,12 +42,18 @@ pub struct Proxy {
 }
 
 impl Proxy {
-    pub async fn start(listen: SocketAddr, upstream: SocketAddr) -> Result<Proxy, String> {
+    /// A proxy from `listen` to `upstream`, `latency` added each way.
+    pub async fn start(
+        listen: SocketAddr,
+        upstream: SocketAddr,
+        latency: Duration,
+    ) -> Result<Proxy, String> {
         let listener = TcpListener::bind(listen)
             .await
             .map_err(|e| format!("proxy {listen}: {e}"))?;
         let (state, rx) = watch::channel(State {
             open: true,
+            latency,
             ..State::default()
         });
         let task = tokio::spawn(serve(listener, upstream, rx));
@@ -66,6 +78,11 @@ impl Proxy {
     pub fn unstall(&self) {
         self.state.send_modify(|s| s.stalled = false);
     }
+
+    /// From now on, every byte read is carried `latency` later.
+    pub fn set_latency(&self, latency: Duration) {
+        self.state.send_modify(|s| s.latency = latency);
+    }
 }
 
 impl Drop for Proxy {
@@ -88,7 +105,7 @@ async fn serve(listener: TcpListener, upstream: SocketAddr, state: watch::Receiv
             continue;
         }
         let mut cut = state.clone();
-        let stall = state.clone();
+        let (up_state, down_state) = (state.clone(), state.clone());
         tokio::spawn(async move {
             let Ok(server) = connect(upstream).await else {
                 return;
@@ -99,8 +116,8 @@ async fn serve(listener: TcpListener, upstream: SocketAddr, state: watch::Receiv
             // is still read before the socket goes; a reset or a failed
             // write ends both directions, even one stalled, so the dialer
             // learns its peer gave up as it would behind a stopped server.
-            let up = pipe(client_rd, server_wr, None);
-            let down = pipe(server_rd, client_wr, Some(stall));
+            let up = pipe(client_rd, server_wr, up_state, false);
+            let down = pipe(server_rd, client_wr, down_state, true);
             tokio::pin!(up, down);
             let (mut up_open, mut down_open) = (true, true);
             while up_open || down_open {
@@ -135,24 +152,54 @@ async fn connect(upstream: SocketAddr) -> std::io::Result<tokio::net::TcpStream>
     socket.connect(upstream).await
 }
 
-/// Copy one direction, reading nothing while `stall` says so: `Ok` once
-/// its reader closed and its writer was closed in turn, `Err` on a
-/// reset or a failed write.
+/// Copy one direction, writing each read the proxy's latency after it was
+/// read, and, if `stalls`, reading nothing while the proxy is stalled:
+/// `Ok` once its reader closed and its writer was closed in turn, `Err`
+/// on a reset or a failed write.
 async fn pipe(
     mut from: impl AsyncRead + Unpin,
     mut to: impl AsyncWrite + Unpin,
-    mut stall: Option<watch::Receiver<State>>,
+    mut state: watch::Receiver<State>,
+    stalls: bool,
 ) -> Result<(), ()> {
-    let mut buf = vec![0; 16 * 1024];
-    loop {
-        if let Some(s) = stall.as_mut() {
-            s.wait_for(|s| !s.stalled).await.map_err(|_| ())?;
+    // Bounded, so a writer held up holds the reader up too, as a slow
+    // network's window would.
+    // A read's error goes down the queue behind what was read before it,
+    // so a peer's last words before a reset still arrive, as the kernel
+    // hands over queued data before it reports the reset.
+    type Read = Result<Vec<u8>, ()>;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(tokio::time::Instant, Read)>(256);
+    let reading = async move {
+        let mut buf = vec![0; 16 * 1024];
+        loop {
+            if stalls {
+                state.wait_for(|s| !s.stalled).await.map_err(|_| ())?;
+            }
+            let read = match from.read(&mut buf).await {
+                Ok(0) => return Ok(()),
+                Ok(n) => Ok(buf[..n].to_vec()),
+                Err(_) => Err(()),
+            };
+            let at = tokio::time::Instant::now() + state.borrow().latency;
+            let failed = read.is_err();
+            tx.send((at, read)).await.map_err(|_| ())?;
+            if failed {
+                return Ok(());
+            }
         }
-        match from.read(&mut buf).await.map_err(|_| ())? {
-            0 => return to.shutdown().await.map_err(|_| ()),
-            n => to.write_all(&buf[..n]).await.map_err(|_| ())?,
+    };
+    let writing = async move {
+        while let Some((at, read)) = rx.recv().await {
+            // Never the timer's tick for nothing: at no latency a read is
+            // passed on at once.
+            if at > tokio::time::Instant::now() {
+                tokio::time::sleep_until(at).await;
+            }
+            to.write_all(&read?).await.map_err(|_| ())?;
         }
-    }
+        to.shutdown().await.map_err(|_| ())
+    };
+    tokio::try_join!(reading, writing).map(|_| ())
 }
 
 #[cfg(test)]
@@ -190,7 +237,9 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
-        let proxy = Proxy::start(listen, echo().await).await.unwrap();
+        let proxy = Proxy::start(listen, echo().await, Duration::ZERO)
+            .await
+            .unwrap();
         let mut carried = TcpStream::connect(listen).await.unwrap();
         carried.write_all(b"ping").await.unwrap();
         let mut got = [0; 4];
@@ -218,7 +267,9 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
-        let proxy = Proxy::start(listen, upstream).await.unwrap();
+        let proxy = Proxy::start(listen, upstream, Duration::ZERO)
+            .await
+            .unwrap();
         proxy.stall();
         let mut s = TcpStream::connect(listen).await.unwrap();
         let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -242,13 +293,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_peers_last_words_before_a_reset_still_arrive() {
+        let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = peer.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = peer.accept().await.unwrap();
+            // Input left unread makes the close a reset.
+            let mut one = [0; 1];
+            s.read_exact(&mut one).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            s.write_all(b"bye").await.unwrap();
+        });
+        let listen = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let _proxy = Proxy::start(listen, upstream, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut s = TcpStream::connect(listen).await.unwrap();
+        s.write_all(b"xx").await.unwrap();
+        let mut got = Vec::new();
+        let _ = s.read_to_end(&mut got).await;
+        assert_eq!(got, b"bye");
+    }
+
+    #[tokio::test]
+    async fn a_latency_delays_every_byte_each_way() {
+        let listen = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let latency = Duration::from_millis(150);
+        let _proxy = Proxy::start(listen, echo().await, latency).await.unwrap();
+        let mut s = TcpStream::connect(listen).await.unwrap();
+        for _ in 0..2 {
+            let sent = tokio::time::Instant::now();
+            s.write_all(b"ping").await.unwrap();
+            let mut got = [0; 4];
+            s.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"ping");
+            let took = sent.elapsed();
+            assert!(took >= latency * 2 && took < latency * 4, "{took:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_stall_holds_back_what_the_peer_sends_until_it_ends() {
         let listen = TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap()
             .local_addr()
             .unwrap();
-        let proxy = Proxy::start(listen, echo().await).await.unwrap();
+        let proxy = Proxy::start(listen, echo().await, Duration::ZERO)
+            .await
+            .unwrap();
         let mut s = TcpStream::connect(listen).await.unwrap();
         proxy.stall();
         s.write_all(b"ping").await.unwrap();

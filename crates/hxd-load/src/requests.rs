@@ -76,7 +76,7 @@ struct Done {
     info: Histogram<u64>,
 }
 
-pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
+pub async fn run(ctx: &Arc<Ctx>, proxy: Option<&crate::proxy::Proxy>) -> Result<Value, String> {
     let r = &ctx.scenario.requests;
     let (stop_tx, stop) = watch::channel(false);
     let heard: Heard = Arc::default();
@@ -108,6 +108,10 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let mut seqs = vec![0u64; requesters.len()];
     let mut steps = Vec::new();
     for &ghosts in &r.ghosts {
+        // The ghosts cross at full speed, the requests slowed after.
+        if let (Some(p), Some(_)) = (proxy, r.peer_latency_ms) {
+            p.set_latency(Duration::ZERO);
+        }
         while nicks.len() < ghosts {
             let i = nicks.len();
             let wire = if i % 2 == 0 { Wire::Legacy } else { Wire::Ng };
@@ -128,6 +132,9 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
             break;
         };
         ctx.checks.held("link.ghosts_shown");
+        if let (Some(p), Some(ms)) = (proxy, r.peer_latency_ms) {
+            p.set_latency(Duration::from_millis(ms));
+        }
 
         let (back, done) = step(ctx, requesters, &uids, &mut seqs).await;
         requesters = back;

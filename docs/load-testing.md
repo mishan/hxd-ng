@@ -274,8 +274,9 @@ the finding.
   scenarios aim at: the core's one export feed (`FEED_CAP`; full, every
   link starts over), each link's share of it (`EXPORT_CAP`; full, that
   link does), what other transit links pass on through one
-  (`RELAY_CAP`; full, that link does), ghosts' lines waiting to be logged (`CHAT_CAP`; full, a
-  line is not shown), requests waiting for a peer (`REQUEST_CAP`,
+  (`RELAY_CAP`; full, that link does), ghosts' lines waiting to be
+  logged (`CHAT_CAP`; full, a line is not shown), requests waiting for
+  a peer (`REQUEST_CAP`,
   `MAX_PENDING`; past them, refused), and the ghost bounds (`[link]
   max_ghosts`, each peer's `ghosts`). `docs/metrics.md` has a series
   for each.
@@ -315,21 +316,25 @@ BIN=target/release crates/hxd-load/baseline/link-run.sh link-chat \
     crates/hxd-load/scenarios/link-chat.toml
 ```
 
-**`linkproxy`** (`proxy.rs`), a TCP proxy a run starts at `[target.proxy]
-listen` and carries on to `upstream`, which the linked servers dial
-instead of their peer. It copies bytes and never decrypts. Built: the
-cut, which closes every connection it carries, and accepts and at once
-closes every new one until restored, so each side sees its link drop and
-the dialer a TLS handshake fail; and the stall, which stops reading what
-the peer sends the dialer while the dialer's own traffic still flows,
-so the peer hears from it as ever while its writes back up, as behind a
-server that stopped reading. Its receive buffer toward the peer is kept
-small, as such a server's would be, not loopback's megabytes. Planned:
-latency and jitter, a bandwidth cap, a partition where connects time
-out, and the connection left half open. With `[target.proxy]` in the
-scenario, `link-run.sh` has `b` dial the proxy (`c`, if there is one,
-dials `a` directly), and every server takes `[interruption] grace` as
-its `[link] grace`.
+**`linkproxy`** (`proxy.rs`), a TCP proxy a run starts at
+`[target.proxy] listen` and carries on to `upstream`, which the linked
+servers dial instead of their peer. It copies bytes and never decrypts.
+Built: the cut, which closes every connection it carries, and accepts
+and at once closes every new one until restored, so each side sees its
+link drop and the dialer a TLS handshake fail; and the stall, which
+stops reading what the peer sends the dialer while the dialer's own
+traffic still flows, so the peer hears from it as ever while its writes
+back up, as behind a server that stopped reading. Its receive buffer
+toward the peer is kept small, as such a server's would be, not
+loopback's megabytes. And a latency, `[target.proxy] latency_ms` added
+to every byte each way, in order, which a scenario may change mid-run
+(L-6's `peer_latency_ms`, applied once the links are up, since a link
+cannot be set up across a round trip near its own timeouts). Planned:
+jitter, a bandwidth cap, a partition where connects time out, and the
+connection left half open. With `[target.proxy]` in the scenario,
+`link-run.sh` has `b` dial the proxy (`c`, if there is one, dials `a`
+directly), and every server takes `[interruption] grace` as its `[link]
+grace`.
 
 ### 8.3 Scenarios
 
@@ -340,7 +345,7 @@ its `[link] grace`.
 | L-3 | Interruption (built) | `[interruption] population_*` idle on A, `watchers_*` on B; the proxy cuts the link for each of `cuts` seconds in turn, swept across `grace`; `link.reconnect` times each link back, and the report each cut's parts and joins as the watchers heard them | time back up, snapshot time against N, the burst each local session takes | a local session dropped as `slow_consumer` by a netsplit's burst; only detached sessions should resync. Its numbers are what `grace` is tuned by |
 | L-4 | Slow peer (built) | A-B through the proxy and A-C directly, the `[chat]` room on A and C; `[slow_peer] stalled`'s link stalled from `stall_after` to the end of the talking; `chat.delivery.before` and `.after` the stall | C's and A's local latency, which should not move; A's memory, inside `QueueBudget` | A closing B as `slow_consumer` within a bound; anything that slows C or A's own users fails it |
 | L-5 | Churn across a link (built) | the churn scenario on A; once its time is up the kicks stop, then every churner says it is held, and B's list is compared with A's user for user; uid watchers on both | B's roster against A's once quiet | ghosts left on B, a uid reused inside its quarantine |
-| L-6 | Requests (built) | requesters on A sending private messages (both wires) and user info (classic) to B's users, open-loop, at each count in `[requests] ghosts`; each step reported apart | round trip against the ghosts shown (the scan) | requests refused once more are waiting than a link holds: each requester waits on its answer, so that takes more requesters than the link's queue for the peer (or, behind it, more than it lets wait on the peer at once) and enough of them waiting together, which a peer slow to answer makes likelier: the per-hop wait under the proxy's latency, still to build |
+| L-6 | Requests (built) | requesters on A sending private messages (both wires) and user info (classic) to B's users, open-loop, at each count in `[requests] ghosts`; each step reported apart | round trip against the ghosts shown (the scan) | requests refused once more wait on the peer than a link lets wait: each requester waits on its answer, so that takes more requesters than that cap and a round trip long enough to keep them waiting together (about the cap divided by the round trip, a second); and answers outlasting the server's wait for the peer, which the sender hears as refused while the message is still delivered (`link.msgs_delivered`, `scenarios/link-requests-slow.toml` with `peer_latency_ms`) |
 | L-7 | Moderation under load | kicks and bans across the link during L-1 | a ban stored and its ghost gone | a slow store write holding up the hub or the feed |
 | L-8 | Many links | a hub with K leaves, K doubling, under L-1 | per-event cost against K | the feed, past K times the rate |
 
@@ -388,5 +393,5 @@ both also run small in `tests/scenarios.rs` against two servers in
 process (without `metrics`, so there the clients' checks hold and the
 link checks are the baseline's); the proxy's cut and L-3, run small in
 process too; the stall and L-4 likewise, on three; and L-5 and L-6.
-Next: the proxy's latency (L-6's refusals, the per-hop wait), L-7 and
-L-8, and a link pass in the baseline's sweep.
+The proxy's latency and L-6 across it too. Next: L-7 and L-8, and a
+link pass in the baseline's sweep.

@@ -383,6 +383,7 @@ async fn a_cut_inside_the_grace_shows_nothing_and_one_past_it_recovers() {
     s.target.proxy = Some(hxd_load::config::ProxyAt {
         listen,
         upstream: a_addr,
+        latency_ms: 0,
     });
     let i = &mut s.interruption;
     (i.population_legacy, i.population_ng) = (4, 4);
@@ -452,6 +453,7 @@ async fn a_stalled_peer_is_dropped_and_costs_the_room_nothing() {
     s.target.proxy = Some(hxd_load::config::ProxyAt {
         listen,
         upstream: a_addr,
+        latency_ms: 0,
     });
     (s.chat.readers_legacy, s.chat.readers_ng) = (2, 2);
     (s.chat.talkers_legacy, s.chat.talkers_ng) = (2, 2);
@@ -605,4 +607,53 @@ async fn requests_to_ghosts_are_answered_and_every_message_accepted_is_heard_onc
         "{}",
         report.summary()
     );
+}
+
+/// L-6 through the run's proxy, slowed once the ghosts are shown: every
+/// answer from `b` takes the round trip the proxy adds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_across_a_slowed_link_take_its_round_trip() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a_tls.local_addr().unwrap();
+    let listen = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let features = r#"features = ["chat", "msgs", "info"]"#;
+    let a_peer = format!(
+        "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\n{features}\n",
+        link_key(2)
+    );
+    let b_peer = format!(
+        "[[link.peer]]\nname = \"aa\"\ndial = \"{listen}\"\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\n{features}\n",
+        link_key(1)
+    );
+    let a = start_unlinked(da.path(), 1, "aa", &a_peer, a_tls).await;
+    let b_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b = start_unlinked(db.path(), 2, "bb", &b_peer, b_tls).await;
+    let mut s = scenario(&a, Kind::Requests, 1.0);
+    s.target.linked = vec![hxd_load::config::Server {
+        name: "b".into(),
+        legacy: Some(b.legacy),
+        ng: Some(b.ng),
+        ..Default::default()
+    }];
+    s.target.proxy = Some(hxd_load::config::ProxyAt {
+        listen,
+        upstream: a_addr,
+        latency_ms: 0,
+    });
+    s.requests.ghosts = vec![4];
+    (s.requests.requesters_legacy, s.requests.requesters_ng) = (1, 1);
+    s.requests.rate = 10.0;
+    s.requests.step = 1.0;
+    s.requests.peer_latency_ms = Some(150);
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    let msg = &report.ops["request.msg"];
+    assert!(msg.count > 0 && msg.p50_ms >= 300.0, "{}", report.summary());
 }
