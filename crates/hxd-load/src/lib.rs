@@ -23,6 +23,8 @@
 //!   the room talks on the others.
 //! - **L-6** [`requests`]: private messages and user info to ghosts, as
 //!   there are more of them.
+//! - **L-7** [`moderation`]: kicks and bans of ghosts while the room
+//!   talks.
 
 pub mod accounts;
 pub mod chat;
@@ -32,6 +34,7 @@ pub mod config;
 pub mod interruption;
 pub mod ledger;
 pub mod member;
+pub mod moderation;
 pub mod proxy;
 pub mod report;
 pub mod requests;
@@ -159,6 +162,7 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
             slow_peer::run(&ctx, proxy, &before).await?
         }
         Kind::Requests => requests::run(&ctx, proxy.as_ref()).await?,
+        Kind::Moderation => moderation::run(&ctx).await?,
     };
 
     // Everyone this run brought has left; every roster should say so.

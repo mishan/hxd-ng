@@ -32,6 +32,8 @@ pub mod push {
     pub const USER_PART: u32 = 0x12e;
     pub const SELFINFO: u32 = 0x162;
     pub const DISCONNECT_MSG: u32 = 0x6f;
+    /// A message from the server itself.
+    pub const BROADCAST: u32 = 0x163;
 }
 
 /// The largest frame this client accepts: the server's own cap, with

@@ -1,0 +1,41 @@
+# L-7: the room on a and b, and a moderator on a kicking or banning b's
+# users, one a second, while it talks. Each act must be answered and
+# carried out on b (a kicked user told and kept, a banned one ended), a
+# kicked ghost gone from a's list at once, and the room must not notice
+# the bans b writes to its store meanwhile.
+#
+#   ACCOUNTS=50 baseline/link-run.sh link-moderation scenarios/link-moderation.toml
+
+[target]
+legacy = "127.0.0.1:15500"
+ng = "127.0.0.1:15700"
+metrics = true            # needs `--features metrics` and a [metrics] section
+log = "@LOG@"
+accounts = { prefix = "churn", count = 50, password = "pw" }
+admin = { login = "mod", password = "pw" }
+
+[[target.linked]]
+name = "b"
+legacy = "127.0.0.1:16500"
+ng = "127.0.0.1:16700"
+metrics = true
+log = "@LOG_B@"
+
+[run]
+scenario = "moderation"
+duration = 60
+settle = 10
+
+[chat]
+readers_legacy = 50
+readers_ng = 50
+talkers_legacy = 5
+talkers_ng = 5
+rate = 200
+line_bytes = 64
+
+[moderation]
+victims = 50
+acts_after = 20            # long enough a calm to hold the acts to
+every = 1
+ban_share = 0.5

@@ -5,7 +5,7 @@ consumer and churn scenarios, and the invariant checks; the
 `hxd-testclient` crate it drives both wires with; and the baseline, a
 script that runs them all the same way every time (§7). The other
 scenarios, and a CI smoke run, are next. Server links (§8): the metrics,
-several servers in a run, the proxy's cut and stall, and L-1 to L-6 are
+several servers in a run, the proxy's cut and stall, and L-1 to L-7 are
 built; the rest is planned.
 
 The point of loading this server is to find what only breaks under
@@ -346,7 +346,7 @@ grace`.
 | L-4 | Slow peer (built) | A-B through the proxy and A-C directly, the `[chat]` room on A and C; `[slow_peer] stalled`'s link stalled from `stall_after` to the end of the talking; `chat.delivery.before` and `.after` the stall | C's and A's local latency, which should not move; A's memory, inside `QueueBudget` | A closing B as `slow_consumer` within a bound; anything that slows C or A's own users fails it |
 | L-5 | Churn across a link (built) | the churn scenario on A; once its time is up the kicks stop, then every churner says it is held, and B's list is compared with A's user for user; uid watchers on both | B's roster against A's once quiet | ghosts left on B, a uid reused inside its quarantine |
 | L-6 | Requests (built) | requesters on A sending private messages (both wires) and user info (classic) to B's users, open-loop, at each count in `[requests] ghosts`; each step reported apart | round trip against the ghosts shown (the scan) | requests refused once more wait on the peer than a link lets wait: each requester waits on its answer, so that takes more requesters than that cap and a round trip long enough to keep them waiting together (about the cap divided by the round trip, a second); and answers outlasting the server's wait for the peer, which the sender hears as refused while the message is still delivered (`link.msgs_delivered`, `scenarios/link-requests-slow.toml` with `peer_latency_ms`) |
-| L-7 | Moderation under load | kicks and bans across the link during L-1 | a ban stored and its ghost gone | a slow store write holding up the hub or the feed |
+| L-7 | Moderation under load (built) | the room on A and B, and a moderator on A kicking or banning B's users, accounts there as on A, one every `every` seconds from `acts_after`; `chat.delivery.before` and `.after` the first act | each act answered (`moderation.kick`, `.ban`) and carried out on B (`moderation.carried`) | a slow store write holding up the hub or the feed |
 | L-8 | Many links | a hub with K leaves, K doubling, under L-1 | per-event cost against K | the feed, past K times the rate |
 
 Each is swept one variable at a time from a fixed point, repeated, and
@@ -377,7 +377,9 @@ gap; a ghost's line past `chat_lines` does not, which is one more reason
 | `link.recovered` | After each cut within `recover`: every link up again (with metrics; without, once the grace is past) and every watcher's server listing the whole population. In L-4, with metrics, every link up again within `recover` of the stall's end. |
 | `link.grace_held` | A cut shorter than `grace` showed no watcher anyone leaving. |
 | `link.stayed_connected` | Nobody in an interruption, watcher or population, lost their connection over it. |
-| `link.contained` | In L-4, the room's p99 from the stall on stays within `contained` times its p99 before (and a few milliseconds). |
+| `link.contained` | In L-4 and L-7, the room's p99 from the stall, or the first act, on stays within `contained` times its p99 before (and a few milliseconds). |
+| `link.acts_carried` | In L-7, every act answered, and within `settle` carried out on the victim's server: a kicked user told and still there, a banned one ended. |
+| `link.kick_hides` | In L-7, a kicked ghost is gone from the moderator's list as soon as the kick is answered, and no victim acted on, kicked or banned, is listed there again by the end. |
 | `link.peer_dropped` | In L-4, with metrics, `[target]` gave up on the stalled link, as a slow consumer or a lagged queue, within `drop_within` of the stall. |
 | `link.bounded` | In L-4, with metrics, `[target]`'s classic writers, the link's among them, never held more than `max_queued_bytes`. |
 
@@ -393,5 +395,5 @@ both also run small in `tests/scenarios.rs` against two servers in
 process (without `metrics`, so there the clients' checks hold and the
 link checks are the baseline's); the proxy's cut and L-3, run small in
 process too; the stall and L-4 likewise, on three; and L-5 and L-6.
-The proxy's latency and L-6 across it too. Next: L-7 and L-8, and a
+The proxy's latency and L-6 across it too, and L-7. Next: L-8, and a
 link pass in the baseline's sweep.

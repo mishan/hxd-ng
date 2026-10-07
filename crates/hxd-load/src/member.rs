@@ -274,6 +274,9 @@ pub enum Got {
     Parted(Option<u64>),
     /// A private message's text.
     Msg(String),
+    /// A message from the server itself (classic 0x163), such as the
+    /// one telling a user another server kicked it.
+    Told(String),
     /// The server ended this session.
     Kicked,
     Other,
@@ -292,6 +295,10 @@ impl Rx {
                     ),
                     legacy::push::DISCONNECT_MSG => Got::Kicked,
                     legacy::push::USER_PART => Got::Parted(f.uint(tag::UID).map(u64::from)),
+                    legacy::push::BROADCAST => Got::Told(
+                        String::from_utf8_lossy(&f.bytes(tag::BODY).unwrap_or_default())
+                            .into_owned(),
+                    ),
                     legacy::push::MSG => Got::Msg(
                         String::from_utf8_lossy(&f.bytes(tag::BODY).unwrap_or_default())
                             .into_owned(),

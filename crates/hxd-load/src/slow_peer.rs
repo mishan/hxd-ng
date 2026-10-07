@@ -25,10 +25,6 @@ use crate::proxy::Proxy;
 use crate::target::{self, Scrape};
 use crate::Ctx;
 
-/// What `link.contained` allows past the factor: at a millisecond or two
-/// of p99, the factor alone would be scheduling noise.
-const CONTAINED_FLOOR_MS: f64 = 10.0;
-
 pub async fn run(
     ctx: &Arc<Ctx>,
     proxy: &Proxy,
@@ -71,24 +67,7 @@ pub async fn run(
     )
     .await;
 
-    let ops = ctx.stats.summary();
-    match (
-        ops.get("chat.delivery.before"),
-        ops.get("chat.delivery.after"),
-    ) {
-        (Some(calm), Some(stall)) if calm.count > 0 && stall.count > 0 => {
-            let allowed = calm.p99_ms * p.contained + CONTAINED_FLOOR_MS;
-            ctx.checks.check("link.contained", stall.p99_ms <= allowed, || {
-                format!(
-                    "the room's p99 went from {:.2}ms to {:.2}ms once {} stalled, past {allowed:.2}ms",
-                    calm.p99_ms, stall.p99_ms, p.stalled
-                )
-            });
-        }
-        _ => ctx
-            .checks
-            .violated("link.contained", "no lines heard on one side of the stall"),
-    }
+    chat::contained(ctx, p.contained, &format!("{} stalled", p.stalled));
     if let Some(seen) = &seen {
         ctx.checks.check(
             "link.peer_dropped",
