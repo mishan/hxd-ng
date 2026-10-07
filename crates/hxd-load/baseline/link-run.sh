@@ -8,6 +8,9 @@
 # The scenario's ports must be a's 15500 and 15700 in [target] and b's
 # 16500 and 16700 in [[target.linked]]; `log = "@LOG@"` and
 # `log = "@LOG_B@"` name their logs. Both servers share SERVER_CPUS.
+# With [target.proxy], b dials the proxy the run starts (listen
+# 127.0.0.1:15601, upstream a's 15600) and the run waits for the link;
+# both servers take [interruption] grace as their [link] grace.
 # Environment as for run.sh, less ACCOUNTS and AFTER.
 set -u
 NAME=$1 SCEN=$2 SYNC=${3:-normal}
@@ -33,6 +36,12 @@ key() {
         base64 | tr '+/' '-_' | tr -d '='
 }
 KEY_A=$(key "$D/a") KEY_B=$(key "$D/b")
+DIAL=127.0.0.1:15600
+grep -q '^\[target.proxy\]' "$SCEN" && DIAL=127.0.0.1:15601
+GRACE=$(awk -F= '
+    /^[[:space:]]*\[/ { s = ($0 ~ /^[[:space:]]*\[interruption\][[:space:]]*(#.*)?$/) }
+    s { k = $1; gsub(/[[:space:]]/, "", k) }
+    s && k == "grace" { v = $2; sub(/#.*/, "", v); gsub(/[[:space:]]/, "", v); print v }' "$SCEN")
 
 server() { # dir port-base tag peer
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
@@ -64,6 +73,7 @@ key = "$1/key.pem"
 [link]
 tag = "$3"
 key = "$1/link.key"
+grace = ${GRACE:-60}
 $4
 CFG
     taskset -c "$SERVER_CPUS" "$BIN/hxd" --config "$1/hxd-ng.toml" > "$1/hxd.log" 2>&1 &
@@ -80,7 +90,7 @@ features = [\"chat\", \"msgs\", \"info\"]"
 PID_A=$!
 server "$D/b" 16 bb "[[link.peer]]
 name = \"aa\"
-dial = \"127.0.0.1:15600\"
+dial = \"$DIAL\"
 protection = \"key\"
 key = \"$KEY_A\"
 account = \"link-bb\"
@@ -89,16 +99,21 @@ PID_B=$!
 # Whatever ends the script, neither server outlives it to hold the ports
 # the next run binds.
 trap 'kill "$PID_A" "$PID_B" 2> /dev/null' EXIT
-linked() {
+# Up: both servers answer, and, dialing a directly, both have their link.
+# Through the proxy the link comes up only once the run starts it, and a
+# wait for it here would only push b's dialer further into its backoff.
+up() {
     for port in 15700 16700; do
-        curl -s "127.0.0.1:$port/metrics" | grep -q '^hxd_links_up [1-9]' || return 1
+        curl -s "127.0.0.1:$port/metrics" |
+            grep -q "${1:-}" || return 1
     done
 }
-for _ in $(seq 100); do linked && break; sleep 0.1; done
-if ! linked; then
-    echo "the servers never linked" >&2
+want='^hxd_links_up [1-9]'
+[ "$DIAL" = 127.0.0.1:15600 ] || want=
+for _ in $(seq 100); do up "$want" && break; sleep 0.1; done
+if ! up "$want"; then
+    echo "the servers never came up${want:+ linked}" >&2
     tail -n 5 "$D/a/hxd.log" "$D/b/hxd.log" >&2
-    kill "$PID_A" "$PID_B" 2> /dev/null
     exit 2
 fi
 

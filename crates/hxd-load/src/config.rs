@@ -43,6 +43,7 @@ pub struct Scenario {
     pub chat: Chat,
     pub slow_consumer: SlowConsumer,
     pub churn: Churn,
+    pub interruption: Interruption,
 }
 
 impl Scenario {
@@ -111,6 +112,7 @@ impl Scenario {
                     > 0
             }
             Kind::Churn => self.churn.legacy > 0,
+            Kind::Interruption => self.interruption.population_legacy > 0,
         };
         let needs_ng = match self.run.scenario {
             Kind::LoginStorm => self.login_storm.ng > 0,
@@ -119,9 +121,13 @@ impl Scenario {
                 self.chat.readers_ng + self.chat.talkers_ng + self.slow_consumer.stalled_ng > 0
             }
             Kind::Churn => self.churn.ng > 0,
+            Kind::Interruption => self.interruption.population_ng > 0,
         };
         if !self.target.linked.is_empty() {
             self.check_linked(needs_legacy, needs_ng)?;
+        }
+        if self.run.scenario == Kind::Interruption {
+            self.check_interruption()?;
         }
         if needs_legacy && self.target.legacy.is_none() {
             return Err(
@@ -164,7 +170,11 @@ impl Scenario {
                 self.login_storm.observers_legacy > 0,
                 self.login_storm.observers_ng > 0,
             ),
-            _ => return Err("[[target.linked]] is for chat and login_storm".into()),
+            Kind::Interruption => (
+                self.interruption.watchers_legacy > 0,
+                self.interruption.watchers_ng > 0,
+            ),
+            _ => return Err("[[target.linked]] is for chat, login_storm and interruption".into()),
         };
         if self.run.scenario == Kind::LoginStorm
             && self.login_storm.observers_legacy + self.login_storm.observers_ng == 0
@@ -189,6 +199,44 @@ impl Scenario {
         }
         Ok(())
     }
+}
+
+impl Scenario {
+    /// An interruption cuts the proxy every link runs through.
+    fn check_interruption(&self) -> Result<(), String> {
+        let i = &self.interruption;
+        if self.target.proxy.is_none() || self.target.linked.is_empty() {
+            return Err("interruption needs [target.proxy] and [[target.linked]]".into());
+        }
+        // Shorter, and the links' counts read after it could still be
+        // the ones from before it.
+        if i.cuts.is_empty() || !i.cuts.iter().all(|c| c.is_finite() && *c >= MIN_CUT) {
+            return Err(format!(
+                "[interruption] cuts must be at least {MIN_CUT} seconds"
+            ));
+        }
+        for (name, v) in [("recover", i.recover), ("between", i.between)] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(format!("[interruption] {name} must not be negative"));
+            }
+        }
+        if i.watchers_legacy + i.watchers_ng == 0 {
+            return Err("[interruption] needs watchers".into());
+        }
+        Ok(())
+    }
+}
+
+/// The shortest cut an interruption takes, in seconds.
+const MIN_CUT: f64 = 0.1;
+
+/// `linkproxy` (`proxy.rs`): where a linked server dials, and the peer
+/// port it is carried on to.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyAt {
+    pub listen: SocketAddr,
+    pub upstream: SocketAddr,
 }
 
 /// What the report calls `[target]` among the servers of a run.
@@ -249,6 +297,9 @@ pub struct Target {
     /// is spread over all of them, each client on the next server in
     /// turn; a login storm arrives here and is watched from them.
     pub linked: Vec<Server>,
+    /// A proxy the run starts and the linked servers dial through, for a
+    /// scenario that cuts their links.
+    pub proxy: Option<ProxyAt>,
 }
 
 impl Default for Target {
@@ -263,6 +314,7 @@ impl Default for Target {
             accounts: None,
             admin: None,
             linked: Vec::new(),
+            proxy: None,
         }
     }
 }
@@ -302,6 +354,51 @@ pub enum Kind {
     /// S6: sessions dropping and resuming, connections dying mid-way,
     /// kicks, all at once.
     Churn,
+    /// L-3: links cut and restored, and what the linked servers' users
+    /// are shown meanwhile.
+    Interruption,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Interruption {
+    /// Clients on `[target]`, idle: the users each cut puts at stake.
+    pub population_legacy: usize,
+    pub population_ng: usize,
+    /// Clients on each linked server, hearing what the cuts show them.
+    pub watchers_legacy: usize,
+    pub watchers_ng: usize,
+    /// Each cut's length in seconds, in order: one run sweeps across the
+    /// servers' grace period.
+    pub cuts: Vec<f64>,
+    /// The `[link] grace` the servers run with, in whole seconds as that
+    /// takes it: a cut shorter than it must show the watchers nobody
+    /// leaving.
+    pub grace: u64,
+    /// Seconds, after a cut ends, by which every link must be up again
+    /// and every watcher's list whole.
+    pub recover: f64,
+    /// Seconds of quiet between one recovery and the next cut, and never
+    /// less than the grace after the last cut began. Past a ping interval
+    /// (60 seconds) the next cut ends a link that has settled, as an
+    /// operator's would be; less, and back-to-back cuts measure a
+    /// flapping link's backoff.
+    pub between: f64,
+}
+
+impl Default for Interruption {
+    fn default() -> Self {
+        Interruption {
+            population_legacy: 25,
+            population_ng: 25,
+            watchers_legacy: 1,
+            watchers_ng: 1,
+            cuts: vec![5.0, 90.0],
+            grace: 60,
+            recover: 30.0,
+            between: 65.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -485,7 +582,7 @@ mod tests {
             Scenario::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             seen += 1;
         }
-        assert_eq!(seen, 6);
+        assert_eq!(seen, 7);
     }
 
     #[test]
@@ -536,7 +633,7 @@ mod tests {
             ),
             (
                 format!("{target}{linked}[run]\nscenario = \"churn\"\n[churn]\nng = 0\n"),
-                "chat and login_storm",
+                "is for chat",
             ),
         ] {
             let err = Scenario::parse(&bad).unwrap_err();

@@ -5,8 +5,8 @@ consumer and churn scenarios, and the invariant checks; the
 `hxd-testclient` crate it drives both wires with; and the baseline, a
 script that runs them all the same way every time (§7). The other
 scenarios, and a CI smoke run, are next. Server links (§8): the metrics,
-several servers in a run, and L-1 and L-2 are built; the rest is
-planned.
+several servers in a run, the proxy's cut, and L-1 to L-3 are built;
+the rest is planned.
 
 The point of loading this server is to find what only breaks under
 load, and where it slows down first; throughput numbers are a side
@@ -308,11 +308,17 @@ BIN=target/release crates/hxd-load/baseline/link-run.sh link-chat \
     crates/hxd-load/scenarios/link-chat.toml
 ```
 
-**`linkproxy`** (planned), a TCP proxy between each dialer and its
-peer, on a schedule from the scenario: latency and jitter, a bandwidth
-cap, one direction stalled, the connection cut or left half open. It
-copies bytes and never decrypts. More than two servers, for L-4 and
-L-8, come with it.
+**`linkproxy`** (`proxy.rs`), a TCP proxy a run starts at `[target.proxy]
+listen` and carries on to `upstream`, which the linked servers dial
+instead of their peer. It copies bytes and never decrypts. Built: the
+cut, which closes every connection it carries, and accepts and at once
+closes every new one until restored, so each side sees its link drop and
+the dialer a TLS handshake fail (a partition, where its connects would
+time out, is planned with the stall). Planned: latency and jitter, a bandwidth cap, one direction
+stalled, the connection left half open, and more than two servers, for
+L-4 and L-8. With `[target.proxy]` in the scenario, `link-run.sh` has
+`b` dial the proxy, and both servers take `[interruption] grace` as
+their `[link] grace`.
 
 ### 8.3 Scenarios
 
@@ -320,7 +326,7 @@ L-8, come with it.
 |---|---|---|---|---|
 | L-1 | Cross-link chat (built) | A-B, the room spread over both, client `i` on server `i` modulo their number; `chat.delivery.cross` times the lines heard on another server than their sender's | delivery latency against rate, `chat.delivery` every line and `chat.delivery.cross` those that crossed; once with `sync = "full"` | ghosts' lines not shown (`chat.all_heard` failing on the far side only), or local talkers slowed behind ghosts' commits |
 | L-2 | Presence storm (built) | a login storm on A; `[login_storm] observers_legacy` and `observers_ng` on each linked server time each arrival's join there (`link.join`) | from when an arrival was due to its join heard on B, against arrival rate | the ghost bound, exactly and no further; then a link's export queue (it starts over); then the feed (every link does) |
-| L-3 | Interruption | A holds N users, up to the bound; readers on B on both wires and detached ng sessions; the proxy cuts the link for C seconds, C swept across `grace` | time back up, snapshot time against N, the burst each local session takes | a local session dropped as `slow_consumer` by a netsplit's burst; only detached sessions should resync. Its numbers are what `grace` is tuned by |
+| L-3 | Interruption (built) | `[interruption] population_*` idle on A, `watchers_*` on B; the proxy cuts the link for each of `cuts` seconds in turn, swept across `grace`; `link.reconnect` times each link back, and the report each cut's parts and joins as the watchers heard them | time back up, snapshot time against N, the burst each local session takes | a local session dropped as `slow_consumer` by a netsplit's burst; only detached sessions should resync. Its numbers are what `grace` is tuned by |
 | L-4 | Slow peer | A-B and A-C; the proxy stalls or throttles A to B | C's and A's local latency, which should not move; A's memory, inside `QueueBudget` | A closing B as `slow_consumer` within a bound; anything that slows C or A's own users fails it |
 | L-5 | Churn across a link | the churn scenario on A, observers on B | B's roster against A's once quiet | ghosts left on B, a uid reused inside its quarantine |
 | L-6 | Requests | private messages and user info to ghosts, at rising ghost counts | round trip against the ghosts shown (the scan) | requests refused as rate limited, the per-hop wait under latency, the hub's lock showing in chat latency |
@@ -347,7 +353,9 @@ gap; a ghost's line past `chat_lines` does not, which is one more reason
 | `link.stayed_up` | With metrics, no link ended or came up during the run: none was cut. |
 | `link.no_ghosts` | With metrics, after everyone has left, each server holds no more ghosts than before the run. |
 | `link.joins_heard` | Every observer heard every arrival that logged in join its server. |
-| `link.recovered` (planned) | A link the scenario cut is back within a bound, and shows what its peer exports once quiet. |
+| `link.recovered` | After each cut, within `recover`: every link up again (with metrics; without, once the grace is past) and every watcher's server listing the whole population. |
+| `link.grace_held` | A cut shorter than `grace` showed no watcher anyone leaving. |
+| `link.stayed_connected` | Nobody in an interruption, watcher or population, lost their connection over it. |
 | `link.contained` (planned) | In L-4, the other link's and the local users' p99 stay within a margin of a run without the stall. |
 
 `roster.agrees` is held across servers as it is on one: every
@@ -360,5 +368,6 @@ server's ghosts would ask.
 Built: the metrics; several servers in `hxd-load` with L-1 and L-2,
 both also run small in `tests/scenarios.rs` against two servers in
 process (without `metrics`, so there the clients' checks hold and the
-link checks are the baseline's). Next: `linkproxy` with L-3 and L-4;
-then L-5 to L-8, and a link pass in the baseline's sweep.
+link checks are the baseline's); the proxy's cut and L-3, run small in
+process too. Next: the proxy's stall and more than two servers, with
+L-4; then L-5 to L-8, and a link pass in the baseline's sweep.

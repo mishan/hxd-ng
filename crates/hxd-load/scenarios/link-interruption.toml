@@ -1,0 +1,37 @@
+# L-3: b's link to a cut at a proxy for each of `cuts` seconds in turn,
+# across the servers' grace period. A cut inside it must show b's
+# watchers nobody leaving; one past it is a netsplit, and its burst is
+# what is measured. After each, every link must be back and every
+# watcher shown everyone again within `recover`.
+#
+#   baseline/link-run.sh link-interruption scenarios/link-interruption.toml
+
+[target]
+legacy = "127.0.0.1:15500"
+ng = "127.0.0.1:15700"
+metrics = true            # needs `--features metrics` and a [metrics] section
+log = "@LOG@"
+
+[target.proxy]
+listen = "127.0.0.1:15601"    # what b dials
+upstream = "127.0.0.1:15600"  # a's TLS port
+
+[[target.linked]]
+name = "b"
+legacy = "127.0.0.1:16500"
+ng = "127.0.0.1:16700"
+metrics = true
+log = "@LOG_B@"
+
+[run]
+scenario = "interruption"
+
+[interruption]
+population_legacy = 400
+population_ng = 400
+watchers_legacy = 5
+watchers_ng = 5
+cuts = [5, 15, 25]
+grace = 10                # link-run.sh gives both servers this [link] grace
+recover = 60
+between = 65              # a link up past a ping interval, as an operator's
