@@ -189,6 +189,25 @@ port refused by `[limits]` before a byte of it is read, past
 (`too_many_48`) or `ng_connections` (`full`),
 is counted as `wire="http"`: it was never a session on either wire.
 
+### Server links
+
+| Metric | Labels | |
+|---|---|---|
+| `hxd_links_up` | | links established now, whichever side dialed |
+| `hxd_link_establish_seconds` | | from a link session's start, after the login, to established: Hello each way, both server lists, the snapshot queued |
+| `hxd_link_ends_total` | `reason` | links ended, established or not, by the session's label: `closed_here`, `closed_by_peer`, `slow_consumer`, `dead`, `eof`, `establish_timeout`, `protocol_error`, `refused`, `version`, `unlinked`, `changed`, `replaced` |
+| `hxd_link_lagged_total` | `queue` | `feed`: the core's one export feed filled, and every link starts over from a snapshot; `export`: one link's share of it filled, or `relay`, what other links pass on through it, and that link does |
+| `hxd_link_dropped_total` | `what` | not carried out for a bound: `chat`, a ghost's line past the lines waiting to be logged; `ghost`, each time a user is refused for `max_ghosts`, the peer's `ghosts` or the uids (one the peer keeps sending counts each time); `request`, a request to a peer past those a link may have waiting |
+| `hxd_link_queue_depth` | `queue` | items waiting when the consumer took the next one: `feed`, `export`, `relay`, and `chat`, ghosts' lines on their way to be logged |
+| `hxd_link_snapshot_seconds`, `hxd_link_snapshot_users` | | a peer's snapshot applied, and the users it applied, the peer's `ghosts` at most: every ghost it shows, changes or parts, told to every local session |
+
+A link this server accepted is counted in `hxd_disconnects_total` as
+well, as the classic connection it arrived on; `hxd_link_ends_total`
+counts every link, dialed ones too. A link that fell behind its export
+or relay queue ends as `closed_here`, which is why `hxd_link_lagged_total` says
+so apart. Each link's frames are counted under `wire="legacy"`, and its
+writer's queue in `hxd_write_queued_*`.
+
 ### Read at scrape time
 
 | Metric | Labels | |
@@ -198,6 +217,7 @@ is counted as `wire="http"`: it was never a session on either wire.
 | `hxd_detached_broken` | | detached sessions whose buffer has broken |
 | `hxd_sessions_lagging` | | attached sessions cut off for falling behind, not yet gone (counted in `attached` too) |
 | `hxd_private_chats` | | rooms open |
+| `hxd_ghosts` | | other servers' users held here, shown or not (kicked here, excluded, or held by an interrupted link): the count `max_ghosts` bounds |
 | `hxd_queue_budget_bytes` | `of` | what every connection's queues hold together (`held`), against `[server] queue_budget_mb` (`limit`) |
 | `hxd_live_queued_events` | | events waiting in attached connections' channels |
 | `hxd_live_queued_bytes` | `of` | what those weigh, `sum` and `max` |

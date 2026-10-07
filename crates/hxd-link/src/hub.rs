@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use hxd_core::instrument;
 use hxd_core::roster::Uid;
 use hxd_core::server_link::{
     GhostBan, GhostInfo, GhostLine, LocalUser, NetworkBan, PeerEvent, PeerRefusal, PeerRouter,
@@ -239,6 +240,7 @@ impl Hub {
             let core = self.0.core.clone();
             tokio::task::spawn_blocking(move || {
                 while let Some(line) = lines.blocking_recv() {
+                    instrument::link_queue_depth("chat", lines.len());
                     core.ghost_chat(line);
                 }
             });
@@ -1121,7 +1123,11 @@ impl Hub {
         let mut state = self.0.state.lock().unwrap();
         for live in state.links.values_mut() {
             let Some(tx) = &live.exports else { continue };
-            if tx.try_send(export.clone()).is_err() {
+            if let Err(e) = tx.try_send(export.clone()) {
+                // Closed is a link already ending for its own reason.
+                if matches!(e, mpsc::error::TrySendError::Full(_)) {
+                    instrument::link_lagged("export");
+                }
                 live.exports = None;
                 if let Some(close) = live.close.take() {
                     let _ = close.send(Reason::Shutdown);
@@ -1183,13 +1189,13 @@ impl Hub {
             return Ok(());
         }
         if live.ghosts.len() >= limit || self.0.core.ghost_count() >= max_ghosts {
+            instrument::link_dropped("ghost");
             return Err("ghost bound reached");
         }
-        let uid = self
-            .0
-            .core
-            .ghost_attach(info)
-            .ok_or("no uid to give a ghost")?;
+        let Some(uid) = self.0.core.ghost_attach(info) else {
+            instrument::link_dropped("ghost");
+            return Err("no uid to give a ghost");
+        };
         let passed = relayed_group(uid, &g, live.features);
         live.ghosts.insert(g.id, Slot { uid, group: g });
         if transit {
@@ -1259,7 +1265,10 @@ impl Hub {
             return Ok(());
         };
         self.0.chat.try_send(line).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => "too many lines waiting to be logged",
+            mpsc::error::TrySendError::Full(_) => {
+                instrument::link_dropped("chat");
+                "too many lines waiting to be logged"
+            }
             mpsc::error::TrySendError::Closed(_) => "the task logging lines has ended",
         })
     }
@@ -1389,6 +1398,7 @@ fn derived_color(tag: &str) -> u32 {
 async fn feed(hub: Hub, mut rx: mpsc::Receiver<Export>) {
     loop {
         while let Some(export) = rx.recv().await {
+            instrument::link_queue_depth("feed", rx.len());
             hub.fan_out(export);
         }
         warn!("the link export feed fell behind; every link starts over");
@@ -1518,7 +1528,10 @@ fn relay(state: &mut State, from: &str, what: Relay) {
             continue;
         }
         let Some(tx) = &live.relays else { continue };
-        if tx.try_send((seq, what.clone())).is_err() {
+        if let Err(e) = tx.try_send((seq, what.clone())) {
+            if matches!(e, mpsc::error::TrySendError::Full(_)) {
+                instrument::link_lagged("relay");
+            }
             live.relays = None;
             if let Some(close) = live.close.take() {
                 let _ = close.send(Reason::Shutdown);
@@ -1591,7 +1604,10 @@ fn enqueue(
     let request = Request { ty, fields, reply };
     match live.requests.as_ref().map(|r| r.try_send(request)) {
         Some(Ok(())) => Ok(answer),
-        Some(Err(mpsc::error::TrySendError::Full(_))) => Err(PeerRefusal::RateLimited),
+        Some(Err(mpsc::error::TrySendError::Full(_))) => {
+            instrument::link_dropped("request");
+            Err(PeerRefusal::RateLimited)
+        }
         _ => Err(PeerRefusal::Unreachable),
     }
 }

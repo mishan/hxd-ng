@@ -278,3 +278,117 @@ async fn without_the_section_there_is_no_route() {
     let (status, _) = get(server.ng, "/metrics", &[]).await;
     assert_eq!(status, 404);
 }
+
+/// A server with a scrapeable `[metrics]` and a `[link]` keyed by `seed`
+/// repeated, linking by key mode as `peer` says; and its config, which a
+/// reload re-reads.
+async fn start_linked(
+    dir: &Path,
+    seed: u8,
+    tag: &str,
+    peer: &str,
+    tls: tokio::net::TcpListener,
+) -> (Server, hxd_link::Hub, std::path::PathBuf) {
+    let d = dir.display();
+    let seed_hex: String = [seed; 32].iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.join("link.key"), seed_hex).unwrap();
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(dir.join("cert.pem"), issued.cert.pem()).unwrap();
+    std::fs::write(dir.join("key.pem"), issued.signing_key.serialize_pem()).unwrap();
+    let text = format!(
+        "[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n[metrics]\n\
+         [tls]\ncert = \"{d}/cert.pem\"\nkey = \"{d}/key.pem\"\n\
+         [link]\ntag = \"{tag}\"\nkey = \"{d}/link.key\"\n{peer}\n"
+    );
+    let path = dir.join("hxd-ng.toml");
+    std::fs::write(&path, &text).unwrap();
+    let config = hxd::Config::load(&path).unwrap();
+    hxd::check_config(&config).unwrap();
+    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
+    let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
+        .unwrap()
+        .unwrap();
+    let hub = hxd::link::build(&config, ctx.core.clone())
+        .unwrap()
+        .unwrap();
+    let certs = std::sync::Arc::new(
+        hxd_session::LegacyTls::load(&dir.join("cert.pem"), &dir.join("key.pem")).unwrap(),
+    );
+    let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ng = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = Server {
+        legacy: legacy.local_addr().unwrap(),
+        ng: ng.local_addr().unwrap(),
+    };
+    tokio::spawn(hxd_session::serve(legacy, ctx.clone()));
+    tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
+    tokio::spawn(hxd_session::serve_tls_with_peers(
+        tls,
+        ctx,
+        certs,
+        Some(std::sync::Arc::new(hub.clone()) as std::sync::Arc<dyn hxd_session::PeerAcceptor>),
+    ));
+    hub.start();
+    (server, hub, path)
+}
+
+fn link_public(seed: u8) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(hxd_link::LinkKey::from_seed(&[seed; 32]).public())
+}
+
+/// The only test here that links, so the links the process-wide recorder
+/// counts are this pair's: one up at each end.
+#[tokio::test]
+async fn a_scrape_accounts_for_a_link_its_ghosts_and_its_end() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a_tls.local_addr().unwrap();
+    let (a, a_hub, a_config) = start_linked(
+        da.path(),
+        1,
+        "aa",
+        &format!(
+            "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
+             key = \"ed25519:{}\"\naccount = \"link-bb\"\n",
+            link_public(2)
+        ),
+        a_tls,
+    )
+    .await;
+    let (b, _b_hub, _) = start_linked(
+        db.path(),
+        2,
+        "bb",
+        &format!(
+            "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
+             key = \"{}\"\naccount = \"link-bb\"\n",
+            link_public(1)
+        ),
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+    )
+    .await;
+
+    let _guest = legacy::Client::login_at(a.legacy, &Login::guest("crosses"))
+        .await
+        .unwrap();
+    let text = scrape_until(&b, |t| {
+        value(t, "hxd_links_up") == Some(2.0) && value(t, "hxd_ghosts") == Some(1.0)
+    })
+    .await;
+    assert_eq!(value(&text, "hxd_link_establish_seconds_count"), Some(2.0));
+    assert_eq!(value(&scrape(&a).await, "hxd_ghosts"), Some(0.0));
+
+    let config = std::fs::read_to_string(&a_config).unwrap();
+    std::fs::write(&a_config, &config[..config.find("[[link.peer]]").unwrap()]).unwrap();
+    assert_eq!(hxd::link::reload(&a_hub, &a_config), Ok(0));
+    let text = scrape_until(&b, |t| {
+        value(t, "hxd_links_up") == Some(0.0) && value(t, "hxd_ghosts") == Some(0.0)
+    })
+    .await;
+    assert!(
+        has(&text, "hxd_link_ends_total", &["reason=\"closed_here\""]),
+        "{text}"
+    );
+}

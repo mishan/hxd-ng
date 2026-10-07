@@ -1313,6 +1313,9 @@ pub struct Census {
     pub buffered_max: usize,
     /// Private chat rooms open.
     pub chats: usize,
+    /// Other servers' users shown here, those an interrupted link holds
+    /// included.
+    pub ghosts: usize,
     /// Events waiting in attached connections' channels, hidden sessions'
     /// included, and what they weigh ([`Event::weight`]), in all and at
     /// most.
@@ -1978,6 +1981,7 @@ impl Core {
         let r = self.roster.lock().unwrap();
         let mut c = Census {
             chats: r.chats.len(),
+            ghosts: r.ghosts.len(),
             ..Census::default()
         };
         for sess in r.users.values() {
