@@ -33,6 +33,8 @@ use crate::wire::{feature, field, find, tx, Field, Hello, Reason, VERSION};
 /// behind, and events one link may hold before it does.
 const FEED_CAP: usize = 16384;
 const EXPORT_CAP: usize = 4096;
+/// The most events the feed task takes at once.
+const FEED_RUN: usize = 256;
 
 /// An export event, numbered in the roster's order, packed once for
 /// every link.
@@ -1417,8 +1419,14 @@ fn derived_color(tag: &str) -> u32 {
 async fn feed(hub: Hub, mut rx: mpsc::Receiver<(u64, PeerEvent)>) {
     loop {
         while let Some(export) = rx.recv().await {
+            // The feed's depth once for what is already waiting, which
+            // goes out with this.
             instrument::link_queue_depth("feed", rx.len());
             hub.fan_out(export);
+            for _ in 1..FEED_RUN {
+                let Ok(export) = rx.try_recv() else { break };
+                hub.fan_out(export);
+            }
         }
         warn!("the link export feed fell behind; every link starts over");
         // A new feed before the links close, so none can subscribe while

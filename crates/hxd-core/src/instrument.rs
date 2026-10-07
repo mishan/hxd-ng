@@ -695,7 +695,8 @@ pub fn link_dropped(what: &'static str) {
 }
 
 /// How many items were waiting in a link queue (`feed`, `export`,
-/// `relay`, `chat`) when its consumer took the next one.
+/// `relay`, `chat`) when its consumer woke for the next one: once for
+/// all it then takes together.
 pub fn link_queue_depth(queue: &'static str, depth: usize) {
     #[cfg(feature = "metrics")]
     handle!(histogram("hxd_link_queue_depth", "queue" => queue), |h| h.record(depth as f64));
