@@ -170,23 +170,25 @@ impl Scenario {
     /// The servers linked to the target: each named once, and with every
     /// port the clients a scenario puts there need.
     fn check_linked(&self, needs_legacy: bool, needs_ng: bool) -> Result<(), String> {
-        let (legacy, ng) = match self.run.scenario {
-            Kind::Chat => (needs_legacy, needs_ng),
-            Kind::LoginStorm => (
-                self.login_storm.observers_legacy > 0,
-                self.login_storm.observers_ng > 0,
-            ),
-            Kind::Interruption => (
-                self.interruption.watchers_legacy > 0,
-                self.interruption.watchers_ng > 0,
-            ),
-            Kind::SlowPeer => (needs_legacy, needs_ng),
-            _ => {
-                return Err(
-                    "[[target.linked]] is for chat, login_storm, interruption and slow_peer".into(),
-                )
-            }
-        };
+        let (legacy, ng) =
+            match self.run.scenario {
+                Kind::Chat => (needs_legacy, needs_ng),
+                Kind::LoginStorm => (
+                    self.login_storm.observers_legacy > 0,
+                    self.login_storm.observers_ng > 0,
+                ),
+                Kind::Interruption => (
+                    self.interruption.watchers_legacy > 0,
+                    self.interruption.watchers_ng > 0,
+                ),
+                Kind::SlowPeer => (needs_legacy, needs_ng),
+                // The watchers and lookers on each.
+                Kind::Churn => (false, true),
+                _ => return Err(
+                    "[[target.linked]] is for chat, login_storm, churn, interruption and slow_peer"
+                        .into(),
+                ),
+            };
         if self.run.scenario == Kind::LoginStorm
             && self.login_storm.observers_legacy + self.login_storm.observers_ng == 0
         {
@@ -672,7 +674,7 @@ mod tests {
             Scenario::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             seen += 1;
         }
-        assert_eq!(seen, 8);
+        assert_eq!(seen, 9);
     }
 
     #[test]
@@ -722,7 +724,7 @@ mod tests {
                 "observers",
             ),
             (
-                format!("{target}{linked}[run]\nscenario = \"churn\"\n[churn]\nng = 0\n"),
+                format!("{target}{linked}[run]\nscenario = \"slow_consumer\"\n"),
                 "is for chat",
             ),
         ] {

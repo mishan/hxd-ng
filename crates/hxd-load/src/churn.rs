@@ -23,13 +23,24 @@
 //! sent before it: a resync then means an event crossed that narrow
 //! window, and a run that shows many is worth looking into.
 //!
+//! With linked servers (L-5 of `docs/load-testing.md` §8), the churn
+//! is on `[target]`, and once its time is up it is held: every churner
+//! and the moderator say when they have stopped dropping, leaving and
+//! kicking, and then every linked server's list must be exactly the run's
+//! users `[target]` lists, user for user, so a stale ghost under a nick
+//! still in use counts (`link.mirrors`). Whether or not it is linked, a
+//! watcher on every server holds each uid it saw leave to the server's
+//! quarantine (`roster.uid_quarantined`): what that guards is an
+//! allocator that hands a freed uid out early, since the sequential one
+//! comes round to a uid again only after the whole space.
+//!
 //! The server must let this many sessions detach from one address: set
 //! its `[ng] max_detached_per_addr` to at least `[churn] ng`, and keep
 //! `[churn] away` well under its `[ng] grace`. Otherwise the server is
 //! right to end sessions this run expects to find again.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,7 +51,7 @@ use hxproto::messages::ClientHdr;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
-use crate::member::{retry_busy, Got, Member, Wire};
+use crate::member::{retry_busy, Got, Member, Parts, Rx, Tx, Wire};
 use crate::{ledger, Ctx};
 
 /// Sessions the moderator may kick, by uid, each with the flag it sets
@@ -50,8 +61,24 @@ type Targets = Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>;
 pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let c = &ctx.scenario.churn;
     let (stop, stopped) = watch::channel(false);
+    let (hold, held) = watch::channel(false);
+    let (no_kicks, kicks_stopped) = watch::channel(false);
+    let holding: Arc<Holding> = Arc::default();
     let targets: Targets = Arc::default();
     let mut tasks = Vec::new();
+
+    let mut watchers = Vec::new();
+    for (k, server) in ctx.servers.iter().enumerate() {
+        let wire = if server.ng.is_some() {
+            Wire::Ng
+        } else {
+            Wire::Legacy
+        };
+        let m = Member::join_at(ctx, server, wire, ctx.nick('Q', k), None)
+            .await
+            .map_err(|e| format!("a watcher on {} could not join: {e}", server.name))?;
+        watchers.push(tokio::spawn(watch_uids(ctx.clone(), m, stopped.clone())));
+    }
 
     // The steady talkers, one per wire that has a port.
     let mut talkers = Vec::new();
@@ -84,6 +111,8 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
             i,
             targets.clone(),
             stopped.clone(),
+            held.clone(),
+            holding.clone(),
         )));
     }
     for i in 0..c.legacy {
@@ -92,6 +121,8 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
             i,
             targets.clone(),
             stopped.clone(),
+            held.clone(),
+            holding.clone(),
         )));
     }
     if let Some(admin) = ctx.scenario.target.admin.clone() {
@@ -104,15 +135,191 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
             m,
             targets.clone(),
             stopped.clone(),
+            kicks_stopped.clone(),
+            holding.clone(),
         )));
+    } else {
+        holding.kicks_done.store(true, Ordering::SeqCst);
     }
 
     tokio::time::sleep(ctx.duration()).await;
+    if ctx.servers.len() > 1 {
+        // The kicks first, so that none is in flight once the churners
+        // say they are held: a kicked churner logs in again.
+        let _ = no_kicks.send(true);
+        let settle = Duration::from_secs_f64(ctx.scenario.run.settle);
+        let deadline = tokio::time::Instant::now() + settle;
+        while !holding.kicks_done.load(Ordering::SeqCst) {
+            if tokio::time::Instant::now() >= deadline {
+                ctx.checks.violated(
+                    "churn.kicks_stopped",
+                    "the moderator did not stop within settle",
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = hold.send(true);
+        let deadline = tokio::time::Instant::now() + settle;
+        let all = c.ng + c.legacy;
+        while holding.churners.load(Ordering::SeqCst) < all {
+            if tokio::time::Instant::now() >= deadline {
+                ctx.checks.violated(
+                    "link.mirrors",
+                    format!(
+                        "{} of {all} churners held within settle",
+                        holding.churners.load(Ordering::SeqCst)
+                    ),
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        mirrored(ctx).await;
+    }
     let _ = stop.send(true);
     for t in tasks {
         let _ = t.await;
     }
+    for w in watchers {
+        let (tx, rx, parts) = w.await.expect("a watcher does not panic");
+        let _ = Member::rejoin(tx, rx, parts).leave().await;
+    }
     Ok(json!({}))
+}
+
+/// Who has stopped churning once the run is held: the moderator, its
+/// last kick answered, then each churner, held where it is.
+#[derive(Default)]
+struct Holding {
+    kicks_done: AtomicBool,
+    churners: AtomicUsize,
+}
+
+impl Holding {
+    /// A churner held, counted once.
+    fn held(&self, said: &mut bool) {
+        if !*said {
+            *said = true;
+            self.churners.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// How long the server keeps a freed uid from anyone else: hxd-core's
+/// `UID_QUARANTINE`, which this must not outgrow unnoticed.
+const UID_QUARANTINE: Duration = Duration::from_secs(5 * 60);
+
+/// Hear users come and go until the run stops, holding every uid seen
+/// leaving to its quarantine.
+async fn watch_uids(ctx: Arc<Ctx>, m: Member, mut stop: watch::Receiver<bool>) -> (Tx, Rx, Parts) {
+    let (tx, mut rx, parts) = m.split();
+    let mut parted: HashMap<u64, std::time::Instant> = HashMap::new();
+    loop {
+        tokio::select! {
+            _ = stop.wait_for(|s| *s) => break,
+            got = rx.next() => match got {
+                Ok(Got::Parted(Some(uid))) => {
+                    parted.insert(uid, std::time::Instant::now());
+                }
+                // Counted only with a freed uid to hold it to: a join with
+                // none proves nothing.
+                Ok(Got::Joined { nick, uid: Some(uid) }) if !parted.is_empty() => {
+                    let early = parted
+                        .remove(&uid)
+                        .filter(|at| at.elapsed() < UID_QUARANTINE);
+                    ctx.checks.check("roster.uid_quarantined", early.is_none(), || {
+                        format!("{} saw uid {uid} given to {nick} {:?} after it was freed", parts.nick, early.map(|at| at.elapsed()))
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    ctx.checks.violated(
+                        "roster.uid_quarantined",
+                        format!("{} stopped watching: {e}", parts.nick),
+                    );
+                    break;
+                }
+            },
+        }
+    }
+    (tx, rx, parts)
+}
+
+/// With the churn held, every linked server lists exactly the run's
+/// users `[target]` lists, within `settle`: seen by a fresh client on
+/// each, apart from the watchers and these clients themselves.
+async fn mirrored(ctx: &Ctx) {
+    let mut lookers = Vec::new();
+    for (k, server) in ctx.servers.iter().enumerate() {
+        let wire = if server.ng.is_some() {
+            Wire::Ng
+        } else {
+            Wire::Legacy
+        };
+        match Member::join_at(ctx, server, wire, ctx.nick('V', k), None).await {
+            Ok(m) => lookers.push(m),
+            Err(e) => {
+                ctx.checks
+                    .violated("link.mirrors", format!("no client on {}: {e}", server.name));
+                return;
+            }
+        }
+    }
+    let ours = |nick: &String| {
+        ctx.ours(nick)
+            && !(0..ctx.servers.len())
+                .any(|k| *nick == ctx.nick('V', k) || *nick == ctx.nick('Q', k))
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(ctx.scenario.run.settle);
+    // User for user, not nick for nick: a ghost left behind by a session
+    // that ended shares its nick with the churner's session now.
+    let mut lists: Vec<Vec<String>> = Vec::new();
+    loop {
+        lists.clear();
+        for l in &mut lookers {
+            match l.nick_list().await {
+                Ok(nicks) => {
+                    let mut ours: Vec<String> = nicks.into_iter().filter(|n| ours(n)).collect();
+                    ours.sort();
+                    lists.push(ours);
+                }
+                Err(e) => {
+                    ctx.checks
+                        .violated("link.mirrors", format!("{} could not list: {e}", l.nick));
+                    return;
+                }
+            }
+        }
+        if lists.iter().all(|l| *l == lists[0]) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // The talkers and the held sessions at least: an empty list would
+    // match an empty one and prove nothing.
+    if lists[0].is_empty() {
+        ctx.checks.violated(
+            "link.mirrors",
+            format!("{} lists none of the run's users", ctx.servers[0].name),
+        );
+    }
+    for (k, list) in lists.iter().enumerate().skip(1) {
+        ctx.checks.check("link.mirrors", *list == lists[0], || {
+            let missing: Vec<_> = lists[0].iter().filter(|n| !list.contains(n)).collect();
+            let extra: Vec<_> = list.iter().filter(|n| !lists[0].contains(n)).collect();
+            format!(
+                "{} lists {} of the run's users to {}'s {}: missing {missing:?}, extra {extra:?}",
+                ctx.servers[k].name,
+                list.len(),
+                ctx.servers[0].name,
+                lists[0].len()
+            )
+        });
+    }
+    for l in lookers {
+        let _ = l.leave().await;
+    }
 }
 
 /// Chat on a schedule, and read (and discard) everything, so that the
@@ -157,7 +364,15 @@ async fn talker(
 /// that timed out — goes back through `resume` rather than a fresh
 /// login, which would leave the old session detached on the roster for
 /// the server's whole grace window and blame the server for the ghost.
-async fn ng_churner(ctx: Arc<Ctx>, i: usize, targets: Targets, mut stop: watch::Receiver<bool>) {
+async fn ng_churner(
+    ctx: Arc<Ctx>,
+    i: usize,
+    targets: Targets,
+    mut stop: watch::Receiver<bool>,
+    mut hold: watch::Receiver<bool>,
+    holding: Arc<Holding>,
+) {
+    let mut said = false;
     let addr = ctx.scenario.target.ng.expect("checked by the scenario");
     let accounts = ctx
         .scenario
@@ -190,13 +405,22 @@ async fn ng_churner(ctx: Arc<Ctx>, i: usize, targets: Targets, mut stop: watch::
             },
         };
 
-        // Attached: read for a while.
-        let until = tokio::time::Instant::now() + ctx.exp(ctx.scenario.churn.cycle);
+        // Attached: read for a while, or once held, until the run stops.
+        let until = tokio::time::Instant::now()
+            + if *hold.borrow() {
+                holding.held(&mut said);
+                Duration::from_secs(24 * 3600)
+            } else {
+                ctx.exp(ctx.scenario.churn.cycle)
+            };
         let mut lost = false;
+        let was_held = *hold.borrow();
         loop {
             tokio::select! {
                 _ = stop.changed() => break,
                 _ = tokio::time::sleep_until(until) => break,
+                // Held mid-read: stop the cycle here, and stay attached.
+                _ = hold.wait_for(|h| *h), if !was_held => break,
                 got = c.rx.next_forever() => match got {
                     Ok(Incoming::Event(e)) if e.ev == "kicked" => {
                         ctx.checks.check("churn.ended_only_by_kick", kicked.load(Ordering::SeqCst), || {
@@ -224,7 +448,7 @@ async fn ng_churner(ctx: Arc<Ctx>, i: usize, targets: Targets, mut stop: watch::
             finish(&ctx, &nick, &c.rx.seq_faults, &kicked, &targets);
             continue;
         }
-        if !lost && *stop.borrow() {
+        if !lost && (*stop.borrow() || *hold.borrow()) {
             session = Some((c, kicked));
             continue;
         }
@@ -381,10 +605,19 @@ async fn legacy_churner(
     i: usize,
     targets: Targets,
     mut stop: watch::Receiver<bool>,
+    mut hold: watch::Receiver<bool>,
+    holding: Arc<Holding>,
 ) {
+    let mut said = false;
     let addr = ctx.scenario.target.legacy.expect("checked by the scenario");
     let nick = ctx.nick('L', i);
     while !*stop.borrow() {
+        // Held while out: stay out.
+        if *hold.borrow() {
+            holding.held(&mut said);
+            let _ = stop.wait_for(|s| *s).await;
+            break;
+        }
         let way = (ctx.random() * 4.0) as u32;
         let outcome: Result<(), Error> = async {
             match way {
@@ -411,9 +644,15 @@ async fn legacy_churner(
                     let mut rx = crate::member::Rx::Legacy(rx);
                     let until = tokio::time::Instant::now() + ctx.exp(ctx.scenario.churn.cycle);
                     loop {
+                        let held = *hold.borrow();
+                        if held {
+                            holding.held(&mut said);
+                        }
                         tokio::select! {
                             _ = stop.changed() => break,
-                            _ = tokio::time::sleep_until(until) => break,
+                            // Held while in: stay in.
+                            _ = tokio::time::sleep_until(until), if !held => break,
+                            _ = hold.changed(), if !held => {}
                             got = rx.next() => match got {
                                 Ok(Got::Kicked) | Err(_) => break,
                                 Ok(_) => {}
@@ -435,20 +674,36 @@ async fn legacy_churner(
         }
         tokio::select! {
             _ = stop.changed() => {}
+            _ = hold.wait_for(|h| *h) => {}
             _ = tokio::time::sleep(ctx.exp(ctx.scenario.churn.cycle)) => {}
         }
     }
 }
 
 /// Kick someone every so often.
-async fn moderator(ctx: Arc<Ctx>, m: Member, targets: Targets, mut stop: watch::Receiver<bool>) {
+async fn moderator(
+    ctx: Arc<Ctx>,
+    m: Member,
+    targets: Targets,
+    mut stop: watch::Receiver<bool>,
+    mut no_kicks: watch::Receiver<bool>,
+    holding: Arc<Holding>,
+) {
     let crate::member::Conn::Ng(mut c) = m.conn else {
         unreachable!("the moderator is on ng");
     };
     loop {
         tokio::select! {
             _ = stop.changed() => break,
+            _ = no_kicks.wait_for(|n| *n) => {}
             _ = tokio::time::sleep(ctx.exp(ctx.scenario.churn.kick_every)) => {}
+        }
+        // Told to stop: no kick is in flight, since the last one was
+        // answered before this.
+        if *no_kicks.borrow() {
+            holding.kicks_done.store(true, Ordering::SeqCst);
+            let _ = stop.wait_for(|s| *s).await;
+            break;
         }
         let pick = {
             let t = targets.lock().unwrap();
@@ -476,5 +731,7 @@ async fn moderator(ctx: Arc<Ctx>, m: Member, targets: Targets, mut stop: watch::
         // Nothing here reads events; do not let them pile up.
         c.rx.take_backlog();
     }
+    // Done kicking however it ended, so the hold does not wait on it.
+    holding.kicks_done.store(true, Ordering::SeqCst);
     let _ = c.logout().await;
 }

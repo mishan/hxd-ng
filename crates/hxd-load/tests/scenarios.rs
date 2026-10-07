@@ -231,7 +231,8 @@ async fn start_linked_with(
     let text = format!(
         "[limits]\nchat_lines = 0\nspam_points = 0\nng_requests = 0\nnews_posts = 0\n\
          reconnect_seconds = 0\n\
-         [paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n\
+         [paths]\naccounts = \"{d}/accounts\"\n\
+         [ng]\nbind = \"127.0.0.1:0\"\nmax_detached_per_addr = 16\n\
          [tls]\ncert = \"{d}/cert.pem\"\nkey = \"{d}/key.pem\"\n\
          [link]\ntag = \"{tag}\"\nkey = \"{d}/link.key\"\n{peer}\n"
     );
@@ -486,4 +487,70 @@ async fn a_stalled_peer_is_dropped_and_costs_the_room_nothing() {
     assert_clean(&report);
     assert!(report.checks["link.contained"].held == 1);
     assert!(watched.await.unwrap(), "a never dropped b");
+}
+
+/// L-5 on two linked servers: the churn on `a`, held at the end so `b`'s
+/// list can be held to `a`'s, and every uid freed on either kept from
+/// anyone else while the run lasts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn churn_on_one_server_is_mirrored_on_the_other_and_freed_uids_stay_freed() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a_tls.local_addr().unwrap();
+    let a_peer = format!(
+        "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\n",
+        link_key(2)
+    );
+    let b_peer = format!(
+        "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\n",
+        link_key(1)
+    );
+    let b_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (a, b) = tokio::join!(
+        start_linked(da.path(), 1, "aa", &a_peer, a_tls),
+        start_linked(db.path(), 2, "bb", &b_peer, b_tls),
+    );
+    let accounts = Accounts {
+        prefix: "churn".into(),
+        count: 6,
+        password: "load-test".into(),
+    };
+    hxd_load::accounts::write(
+        &da.path().join("accounts"),
+        &accounts.prefix,
+        accounts.count,
+        &accounts.password,
+        Some("moderator"),
+    )
+    .unwrap();
+    let mut s = scenario(&a, Kind::Churn, 3.0);
+    s.target.accounts = Some(accounts);
+    s.target.admin = Some(Account {
+        login: "moderator".into(),
+        password: "load-test".into(),
+    });
+    s.target.linked = vec![hxd_load::config::Server {
+        name: "b".into(),
+        legacy: Some(b.legacy),
+        ng: Some(b.ng),
+        ..Default::default()
+    }];
+    s.churn.ng = 6;
+    s.churn.legacy = 4;
+    s.churn.cycle = 0.2;
+    s.churn.away = 0.05;
+    s.churn.chat_rate = 20.0;
+    s.churn.kick_every = 0.1;
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    assert_eq!(report.checks["link.mirrors"].held, 1);
+    // Users left and others joined after them, on both servers.
+    assert!(
+        report.checks["roster.uid_quarantined"].held > 0,
+        "{}",
+        report.summary()
+    );
+    assert_eq!(report.checks["roster.no_ghosts"].held, 2);
 }

@@ -1,0 +1,33 @@
+# L-5: the churn on a, linked to b. Held at the end, b must list exactly
+# the run's users a does (link.mirrors); on both, no uid freed may be
+# given to anyone else inside its quarantine (roster.uid_quarantined).
+#
+#   ACCOUNTS=50 baseline/link-run.sh link-churn scenarios/link-churn.toml
+
+[target]
+legacy = "127.0.0.1:15500"
+ng = "127.0.0.1:15700"
+metrics = true            # needs `--features metrics` and a [metrics] section
+log = "@LOG@"
+accounts = { prefix = "churn", count = 50, password = "pw" }
+admin = { login = "mod", password = "pw" }
+
+[[target.linked]]
+name = "b"
+legacy = "127.0.0.1:16500"
+ng = "127.0.0.1:16700"
+metrics = true
+log = "@LOG_B@"
+
+[run]
+scenario = "churn"
+duration = 60
+settle = 10
+
+[churn]
+ng = 50
+legacy = 50
+cycle = 0.5
+away = 0.2
+chat_rate = 20
+kick_every = 2.0

@@ -5,7 +5,7 @@ consumer and churn scenarios, and the invariant checks; the
 `hxd-testclient` crate it drives both wires with; and the baseline, a
 script that runs them all the same way every time (§7). The other
 scenarios, and a CI smoke run, are next. Server links (§8): the metrics,
-several servers in a run, the proxy's cut and stall, and L-1 to L-4 are
+several servers in a run, the proxy's cut and stall, and L-1 to L-5 are
 built; the rest is planned.
 
 The point of loading this server is to find what only breaks under
@@ -162,6 +162,10 @@ everything the chat scenario holds it to.
   always has something to replay.
 - With `[target] admin`, a moderator kicks someone every `kick_every`
   seconds on average, attached or detached.
+- A watcher on every server holds each uid it saw leave to the
+  server's quarantine: none may join again inside it. What that guards
+  is an allocator that hands a freed uid out early; the sequential one
+  comes round to a uid only after the whole space.
 
 The accounts come from `hxd-load accounts <dir> --prefix P --count N
 --password W --admin LOGIN`, run against the server's accounts
@@ -192,6 +196,7 @@ a rule the protocol does not make.
 | `churn.session_kept` | A detached session was still there when it came back, unless it was kicked. |
 | `churn.seq_never_back` | A resync never took a session's seq backwards. |
 | `roster.agrees` | Once things are quiet, every client's user list shows exactly the run's clients still present. |
+| `roster.uid_quarantined` | In churn, no uid a watcher saw freed was given to anyone inside the server's quarantine; counted for joins heard after a part, and a watcher that stops hearing is a violation. |
 | `roster.no_ghosts` | After everyone has left, a fresh client's list shows none of them. The observer has a nick of its own, as does the churn's moderator, so neither hides a client's ghost. |
 | `roster.sessions_return` | With metrics, the server's own session count returns to where it was. |
 | `server.log_clean` | With `log`, the server wrote no panic and no `ERROR` line during the run (terminal colors stripped). |
@@ -334,7 +339,7 @@ its `[link] grace`.
 | L-2 | Presence storm (built) | a login storm on A; `[login_storm] observers_legacy` and `observers_ng` on each linked server time each arrival's join there (`link.join`) | from when an arrival was due to its join heard on B, against arrival rate | the ghost bound, exactly and no further; then a link's export queue (it starts over); then the feed (every link does) |
 | L-3 | Interruption (built) | `[interruption] population_*` idle on A, `watchers_*` on B; the proxy cuts the link for each of `cuts` seconds in turn, swept across `grace`; `link.reconnect` times each link back, and the report each cut's parts and joins as the watchers heard them | time back up, snapshot time against N, the burst each local session takes | a local session dropped as `slow_consumer` by a netsplit's burst; only detached sessions should resync. Its numbers are what `grace` is tuned by |
 | L-4 | Slow peer (built) | A-B through the proxy and A-C directly, the `[chat]` room on A and C; `[slow_peer] stalled`'s link stalled from `stall_after` to the end of the talking; `chat.delivery.before` and `.after` the stall | C's and A's local latency, which should not move; A's memory, inside `QueueBudget` | A closing B as `slow_consumer` within a bound; anything that slows C or A's own users fails it |
-| L-5 | Churn across a link | the churn scenario on A, observers on B | B's roster against A's once quiet | ghosts left on B, a uid reused inside its quarantine |
+| L-5 | Churn across a link (built) | the churn scenario on A; once its time is up the kicks stop, then every churner says it is held, and B's list is compared with A's user for user; uid watchers on both | B's roster against A's once quiet | ghosts left on B, a uid reused inside its quarantine |
 | L-6 | Requests | private messages and user info to ghosts, at rising ghost counts | round trip against the ghosts shown (the scan) | requests refused as rate limited, the per-hop wait under latency, the hub's lock showing in chat latency |
 | L-7 | Moderation under load | kicks and bans across the link during L-1 | a ban stored and its ghost gone | a slow store write holding up the hub or the feed |
 | L-8 | Many links | a hub with K leaves, K doubling, under L-1 | per-event cost against K | the feed, past K times the rate |
@@ -359,6 +364,8 @@ gap; a ghost's line past `chat_lines` does not, which is one more reason
 | `link.stayed_up` | With metrics, no link ended or came up during the run: none was cut. |
 | `link.no_ghosts` | With metrics, after everyone has left, each server holds no more ghosts than before the run. |
 | `link.joins_heard` | Every observer heard every arrival that logged in join its server. |
+| `churn.kicks_stopped` | In L-5, the moderator stopped kicking within `settle` of being told to. |
+| `link.mirrors` | In L-5, every churner held within `settle`, and then every linked server lists exactly the run's users `[target]` does, user for user (a stale ghost under a nick still in use counts), within `settle`, and that is not none. |
 | `link.recovered` | After each cut within `recover`: every link up again (with metrics; without, once the grace is past) and every watcher's server listing the whole population. In L-4, with metrics, every link up again within `recover` of the stall's end. |
 | `link.grace_held` | A cut shorter than `grace` showed no watcher anyone leaving. |
 | `link.stayed_connected` | Nobody in an interruption, watcher or population, lost their connection over it. |
@@ -377,5 +384,5 @@ Built: the metrics; several servers in `hxd-load` with L-1 and L-2,
 both also run small in `tests/scenarios.rs` against two servers in
 process (without `metrics`, so there the clients' checks hold and the
 link checks are the baseline's); the proxy's cut and L-3, run small in
-process too; the stall and L-4 likewise, on three. Next: L-5 to L-8,
-and a link pass in the baseline's sweep.
+process too; the stall and L-4 likewise, on three; and L-5. Next: L-6
+to L-8, and a link pass in the baseline's sweep.
