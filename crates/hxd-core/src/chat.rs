@@ -340,16 +340,6 @@ impl Pending {
 }
 
 impl ChatCommit {
-    fn submit(
-        &self,
-        core: &Core,
-        line: Staged,
-    ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.submit_all(core, vec![line])
-            .pop()
-            .expect("an answer for each line")
-    }
-
     /// Lines from one caller, queued together in their order and answered
     /// in it: they share a commit, as lines from many callers at once do,
     /// rather than one each when the caller sends them one at a time.
@@ -536,40 +526,74 @@ impl Core {
         style: u16,
         media: Option<crate::media::Handle>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.chat_flood_check(from, 0, &text)?;
-        let mut text = text;
-        let (info, login, fingerprint, principal) = {
-            let r = self.roster.lock().unwrap();
-            let Some(sess) = r.users.get(&from) else {
-                return Err(ChatError::NoSuchUser);
-            };
-            if r.linked() {
-                crate::server_link::cut_to_link_bound(&mut text);
+        self.chat_public_all(from, vec![(text, style, media)])
+            .pop()
+            .expect("an answer for each line")
+    }
+
+    /// Public chat lines one session sent one after another, `(text,
+    /// style, media)`, answered in their order: they share a commit
+    /// rather than wait for one each, so a sender that got ahead of the
+    /// log catches up at once. Each is judged as [`Core::chat_public`]
+    /// judges one; a line that tips its sender over its chat lines kicks
+    /// it, and none from then on is logged.
+    pub fn chat_public_all(
+        &self,
+        from: Uid,
+        lines: Vec<(String, u16, Option<crate::media::Handle>)>,
+    ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
+        let mut results = vec![None; lines.len()];
+        let mut staged = Vec::with_capacity(lines.len());
+        let mut at = Vec::with_capacity(lines.len());
+        // The line that tips its sender over: the lines before it are
+        // heard before the room hears of the kick, as they would have
+        // been sent one at a time.
+        let mut tipped = None;
+        for (i, (mut text, style, media)) in lines.into_iter().enumerate() {
+            match self.chat_flood_count(from, &text) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tipped = Some(i);
+                    break;
+                }
+                Err(e) => {
+                    results[i] = Some(Err(e));
+                    continue;
+                }
             }
-            (
-                sess.info.clone(),
-                (sess.login != "guest").then(|| sess.login.clone()),
-                sess.identity,
-                crate::media::Principal::Session {
-                    uid: from,
-                    serial: sess.serial,
+            let (info, login, fingerprint, principal) = {
+                let r = self.roster.lock().unwrap();
+                let Some(sess) = r.users.get(&from) else {
+                    results[i] = Some(Err(ChatError::NoSuchUser));
+                    continue;
+                };
+                if r.linked() {
+                    crate::server_link::cut_to_link_bound(&mut text);
+                }
+                (
+                    sess.info.clone(),
+                    (sess.login != "guest").then(|| sess.login.clone()),
+                    sess.identity,
+                    crate::media::Principal::Session {
+                        uid: from,
+                        serial: sess.serial,
+                    },
+                )
+            };
+            // Before the line is logged: a handle that is not this
+            // sender's, or whose bytes have gone, means no line at all
+            // rather than a line whose reference resolves for nobody.
+            let media = match media {
+                Some(handle) => match self.media_for_send(from, &handle) {
+                    Ok(reference) => Some((handle, reference)),
+                    Err(_) => {
+                        results[i] = Some(Err(ChatError::NoSuchMedia));
+                        continue;
+                    }
                 },
-            )
-        };
-        // Before the line is logged: a handle that is not this sender's,
-        // or whose bytes have gone, means no line at all rather than a
-        // line whose reference resolves for nobody.
-        let media = match media {
-            Some(handle) => Some((
-                handle,
-                self.media_for_send(from, &handle)
-                    .map_err(|_| ChatError::NoSuchMedia)?,
-            )),
-            None => None,
-        };
-        self.chat_commit.submit(
-            self,
-            Staged {
+                None => None,
+            };
+            staged.push(Staged {
                 info,
                 login,
                 fingerprint,
@@ -579,8 +603,23 @@ impl Core {
                 style,
                 media,
                 at: SystemTime::now(),
-            },
-        )
+            });
+            at.push(i);
+        }
+        for (i, result) in at
+            .into_iter()
+            .zip(self.chat_commit.submit_all(self, staged))
+        {
+            results[i] = Some(result);
+        }
+        if let Some(i) = tipped {
+            let e = self.chat_flood_kick(from, 0);
+            results[i..].fill(Some(Err(e)));
+        }
+        results
+            .into_iter()
+            .map(|r| r.expect("every line answered"))
+            .collect()
     }
 
     /// A line a ghost said, logged and shown as a local one is. Blocking,
@@ -899,30 +938,38 @@ impl Core {
     /// has no chat commands and relays such a line like any other, so it
     /// counts like any other.
     pub(crate) fn chat_flood_check(&self, uid: Uid, cid: u32, text: &str) -> Result<(), ChatError> {
-        let nick = {
-            let mut r = self.roster.lock().unwrap();
-            let Some(sess) = r.users.get_mut(&uid) else {
-                return Ok(());
-            };
-            // On its way out: every line it had in flight would kick it
-            // again and tell the room again.
-            if sess.kicked {
-                return Err(ChatError::Flooding);
-            }
-            if sess.can_spam || sess.info.system {
-                return Ok(());
-            }
-            let lines = crate::limits::chat_lines(text);
-            if sess
-                .flood
-                .chat(lines, &self.flood_limits, std::time::Instant::now())
-            {
-                return Ok(());
-            }
-            match kick_in(&mut r, uid) {
-                Ok(nick) => nick,
-                Err(_) => return Err(ChatError::Flooding),
-            }
+        match self.chat_flood_count(uid, text)? {
+            true => Ok(()),
+            false => Err(self.chat_flood_kick(uid, cid)),
+        }
+    }
+
+    /// [`Core::chat_flood_check`]'s count alone: whether `text` is within
+    /// `uid`'s chat lines, the kick it earns when it is not left to
+    /// [`Core::chat_flood_kick`].
+    fn chat_flood_count(&self, uid: Uid, text: &str) -> Result<bool, ChatError> {
+        let mut r = self.roster.lock().unwrap();
+        let Some(sess) = r.users.get_mut(&uid) else {
+            return Ok(true);
+        };
+        // On its way out: every line it had in flight would kick it
+        // again and tell the room again.
+        if sess.kicked {
+            return Err(ChatError::Flooding);
+        }
+        if sess.can_spam || sess.info.system {
+            return Ok(true);
+        }
+        let lines = crate::limits::chat_lines(text);
+        Ok(sess
+            .flood
+            .chat(lines, &self.flood_limits, std::time::Instant::now()))
+    }
+
+    fn chat_flood_kick(&self, uid: Uid, cid: u32) -> ChatError {
+        let nick = match kick_in(&mut self.roster.lock().unwrap(), uid) {
+            Ok(nick) => nick,
+            Err(_) => return ChatError::Flooding,
         };
         warn!(uid, nick = %nick, "kicked for chat spamming");
         crate::instrument::flood_kick("chat");
@@ -932,7 +979,27 @@ impl Core {
             format!("{nick} was kicked for chat spamming"),
             true,
         );
-        Err(ChatError::Flooding)
+        ChatError::Flooding
+    }
+
+    /// The spam points `uid` may still spend without being kicked for
+    /// it: none once it has been, and every one for a session no budget
+    /// holds.
+    pub fn spam_room(&self, uid: Uid) -> u32 {
+        let limits = self.flood_limits;
+        let mut r = self.roster.lock().unwrap();
+        let Some(sess) = r.users.get_mut(&uid) else {
+            return u32::MAX;
+        };
+        if sess.kicked {
+            return 0;
+        }
+        if sess.can_spam || sess.info.system || limits.spam_points == 0 || limits.spam_per.is_zero()
+        {
+            return u32::MAX;
+        }
+        let (spent, _) = sess.flood.spam(0, &limits, std::time::Instant::now());
+        limits.spam_points.saturating_sub(spent).saturating_sub(1)
     }
 
     /// Spend `points` of `uid`'s spam points on a transaction it sent,
@@ -2622,6 +2689,45 @@ mod tests {
         let commits = log.commits.lock().unwrap();
         assert!(commits.len() < n / 10, "shared: {commits:?}");
         assert!(commits.iter().all(|&c| c <= COMMIT_BATCH));
+    }
+
+    #[test]
+    fn a_senders_run_is_one_commit_and_its_flood_heard_after_the_lines_before() {
+        let log = Arc::new(SlowLog {
+            inner: Default::default(),
+            commits: Default::default(),
+        });
+        let core = Arc::new(
+            Core::new()
+                .with_history(log.clone(), Default::default())
+                .with_flood_limits(flood_limits()),
+        );
+        let (_reader, mut rx) = test_attach(&core, "reader", chatter());
+        let (sender, _) = test_attach(&core, "spammer", chatter());
+        drain(&mut rx);
+        let lines = ["one", "two", "three", "four", "five"]
+            .map(|t| (t.to_string(), 0, None))
+            .into();
+        let answered = core.chat_public_all(sender, lines);
+        assert!(answered[..3].iter().all(|r| matches!(r, Ok(Some(_)))));
+        assert!(answered[3..].iter().all(|r| *r == Err(ChatError::Flooding)));
+        let heard: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Chat { text, .. } | Event::Notice { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            heard,
+            [
+                "one",
+                "two",
+                "three",
+                "spammer was kicked for chat spamming"
+            ]
+        );
+        assert_eq!(*log.commits.lock().unwrap(), [3], "one commit");
     }
 
     #[test]

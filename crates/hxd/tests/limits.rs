@@ -689,6 +689,43 @@ async fn a_classic_user_past_its_spam_points_is_banned() {
     );
 }
 
+/// Lines sent in one go are each charged as they always were: the line
+/// that reaches the budget is not heard, and those before it are, ahead
+/// of the announcement.
+#[tokio::test]
+async fn a_burst_of_chat_past_its_spam_points_is_heard_up_to_the_kick() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(
+        td.path(),
+        "connections_per_addr = 0\nreconnect_seconds = 0\nchat_lines = 0\n\
+         spam_points = 10\nspam_seconds = 60\n[server]\nban_time = 60",
+    )
+    .await;
+    let mut watcher = classic_guest(server.legacy, "watcher").await;
+    let mut spammer = classic_guest(server.legacy, "spammer").await;
+    let mut burst = Vec::new();
+    for i in 0..8 {
+        burst.extend(chat_frame(2 + i, &format!("line {i}")));
+    }
+    spammer.write_all(&burst).await.unwrap();
+    for i in 0..4 {
+        let heard = chat_push(&mut watcher).await;
+        assert!(
+            contains(&heard.body, &format!("line {i}")),
+            "{:?}",
+            heard.body
+        );
+    }
+    let notice = chat_push(&mut watcher).await;
+    assert_eq!(
+        notice.body,
+        b"\r<spammer has been banned by spammer: spam_max exceeded: \
+          10 >= 10, last transaction: 0x69>"
+            .as_slice()
+    );
+    closed(&mut spammer).await;
+}
+
 /// The ng wire charges `msg` what mhxd charges a message, and answers
 /// the one that reaches the budget `flooding` before the kick.
 #[tokio::test]
