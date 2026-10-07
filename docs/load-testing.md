@@ -320,12 +320,20 @@ BIN=target/release crates/hxd-load/baseline/link-run.sh link-chat \
     crates/hxd-load/scenarios/link-chat.toml
 ```
 
-On one host the hub shares its cores with every leaf, so what a run
-says about the hub is partly the leaves'. `HUB_HOST` runs `a` on
-another host over ssh instead, with that host to itself, the leaves
-and the harness reaching it at its address (`HUB_ADDR`) and let
-through its `[limits]` and its `[metrics] allow`; its CPU, memory and
-errors are read there. Not with `[target.proxy]`.
+On one host the hub shares its cores with every leaf, and the leaves
+one disk, so what a run says about any of them is partly the others'.
+`HUB_HOST` runs `a` on another host over ssh instead, and `LEAF_HOSTS`
+the leaves, in turn (`-` for this one); `host:/dir` puts a server's run
+under dir rather than that host's home, as on a disk of its own. A
+server elsewhere is not held to `SERVER_CPUS`; it is reached at its
+host's address, every server lets every host in the run through its
+`[limits]` and its `[metrics] allow`, and a remote server's CPU, memory
+and errors are read on its host. Not with `[target.proxy]`.
+
+```sh
+HUB_HOST=gauss LEAF_HOSTS="onyx -" KS=16 RATE=5000 \
+    crates/hxd-load/baseline/link-fanout.sh
+```
 
 **`linkproxy`** (`proxy.rs`), a TCP proxy a run starts at
 `[target.proxy] listen` and carries on to `upstream`, which the linked

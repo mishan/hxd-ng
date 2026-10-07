@@ -18,12 +18,16 @@
 # Environment as for run.sh, less AFTER; ACCOUNTS writes the same
 # accounts on every server, a ban across a link being placed on one.
 #
-# HUB_HOST runs `a` on another host instead, over ssh, with that host to
-# itself: the leaves sharing this one's cores with the hub is the very
-# thing a measurement of the hub must not have. HUB_ADDR is where the
-# leaves and the harness reach it (HUB_HOST's address by default); the
-# scenario still names a as 127.0.0.1, and the run points it there. Its
-# binaries and its run go in `hxd-link-run` in that host's home.
+# HUB_HOST runs `a` on another host instead, over ssh, and LEAF_HOSTS
+# the leaves, in turn (`-` for this host); either as `host:/dir` puts
+# that server's run under dir rather than the host's home. Servers sharing one host's
+# cores and disk measure each other as much as themselves. Every server
+# then listens beyond loopback and is reached at its host's IPv4
+# address, every host's address let through every server's [limits] and
+# allowed to scrape it; the scenario still names each as 127.0.0.1, and
+# the run points it there. A server elsewhere has the whole of its host
+# (no SERVER_CPUS), and its binaries go in `hxd-link-run` in that host's
+# home.
 set -u
 NAME=$1 SCEN=$2 SYNC=${3:-normal}
 BIN=${BIN:-target/release} OUT=${OUT:-out} WORK=${WORK:-work}
@@ -61,26 +65,64 @@ for s in $SERVERS; do
     k=$((k + 1))
 done
 KEY_A=${KEY[a]}
-HUB_HOST=${HUB_HOST:-}
-A=127.0.0.1 HERE=127.0.0.1
-if [ -n "$HUB_HOST" ]; then
-    # IPv4: the address goes into `host:port` as it is.
-    HUB_ADDR=${HUB_ADDR:-$(getent ahostsv4 "$HUB_HOST" | awk '{ print $1; exit }')}
-    A=$HUB_ADDR
-    # The address the hub sees this host's connections come from: let
-    # through its per-address limits, and allowed to scrape.
-    HERE=$(ip route get "$A" | sed -n 's/.* src \([^ ]*\).*/\1/p')
-    if [ -z "$A" ] || [ -z "$HERE" ]; then
-        echo "no route to $HUB_HOST; set HUB_ADDR" >&2
-        exit 2
+declare -A HOST ADDR RD RHOME UNDER
+read -ra LEAF_HOSTS <<< "${LEAF_HOSTS:-}"
+i=0
+for s in $SERVERS; do
+    if [ "$s" = a ]; then
+        HOST[a]=${HUB_HOST:-}
+    elif [ ${#LEAF_HOSTS[@]} -gt 0 ]; then
+        HOST[$s]=${LEAF_HOSTS[i % ${#LEAF_HOSTS[@]}]}
+        [ "${HOST[$s]}" = - ] && HOST[$s]=
+        i=$((i + 1))
+    else
+        HOST[$s]=
     fi
-    RHOME=$(ssh -n "$HUB_HOST" pwd) || exit 2
-    RD=$RHOME/hxd-link-run/$NAME RBIN=$RHOME/hxd-link-run/bin
+    case ${HOST[$s]} in
+    -:* | :*)
+        echo "${HOST[$s]}: a server here has its run in WORK" >&2
+        exit 2
+        ;;
+    *:/*) UNDER[$s]=${HOST[$s]#*:} HOST[$s]=${HOST[$s]%%:*} ;;
+    *:*)
+        # The server runs from its run's directory, so a relative one
+        # would be relative to itself.
+        echo "${HOST[$s]}: the directory must be absolute" >&2
+        exit 2
+        ;;
+    esac
+done
+REMOTES=$(for s in $SERVERS; do [ -n "${HOST[$s]}" ] && echo "${HOST[$s]}"; done | sort -u)
+v4() { getent ahostsv4 "$1" | awk '{ print $1; exit }'; }
+BIND=127.0.0.1 HERE=127.0.0.1 ALLOW=
+if [ -n "$REMOTES" ]; then
     if grep -q '^\[target.proxy\]' "$SCEN"; then
-        echo "HUB_HOST and [target.proxy] together are not supported" >&2
+        echo "servers on other hosts and [target.proxy] together are not supported" >&2
         exit 2
     fi
+    # This host's address as the others see it, and theirs.
+    HERE=$(ip route get "$(v4 "$(echo "$REMOTES" | head -1)")" 2> /dev/null |
+        sed -n 's/.* src \([^ ]*\).*/\1/p')
+    BIND=0.0.0.0 ALLOW=$HERE
+    for h in $REMOTES; do
+        addr=$(v4 "$h")
+        if [ -z "$addr" ] || [ -z "$HERE" ]; then
+            echo "no IPv4 route to $h" >&2
+            exit 2
+        fi
+        ALLOW="$ALLOW $addr"
+        RHOME[$h]=$(ssh -n "$h" pwd) || exit 2
+    done
 fi
+for s in $SERVERS; do
+    if [ -n "${HOST[$s]}" ]; then
+        ADDR[$s]=$(v4 "${HOST[$s]}")
+        RD[$s]=${UNDER[$s]:-${RHOME[${HOST[$s]}]}}/hxd-link-run/$NAME/$s
+    else
+        ADDR[$s]=$HERE
+    fi
+done
+A=${ADDR[a]}
 DIAL=$A:15600
 grep -q '^\[target.proxy\]' "$SCEN" && DIAL=127.0.0.1:15601
 GRACE=$(awk -F= '
@@ -88,20 +130,22 @@ GRACE=$(awk -F= '
     s { k = $1; gsub(/[[:space:]]/, "", k) }
     s && k == "grace" { v = $2; sub(/#.*/, "", v); gsub(/[[:space:]]/, "", v); print v }' "$SCEN")
 
-config() { # dir port-base tag peer [bind] [dir-as-the-server-sees-it]
-    local bind=${5:-127.0.0.1} at=${6:-$1}
+# Let through, and allowed to scrape: loopback, and every host in the run.
+LET=$(for x in $ALLOW; do printf ', "%s"' "$x"; done)
+config() { # dir port-base tag peer [dir-as-the-server-sees-it]
+    local at=${5:-$1}
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
         -subj /CN=localhost -keyout "$1/key.pem" -out "$1/cert.pem" 2> /dev/null
     cat > "$1/hxd-ng.toml" <<CFG
 [server]
-bind = "$bind:${2}500"
+bind = "$BIND:${2}500"
 [paths]
 accounts = "$at/accounts"
 [ng]
-bind = "$bind:${2}700"
+bind = "$BIND:${2}700"
 max_detached_per_addr = 1024
 [limits]
-exempt = ["127.0.0.0/8", "::1", "$HERE"]
+exempt = ["127.0.0.0/8", "::1"$LET]
 chat_lines = 0
 spam_points = 0
 ng_requests = 0
@@ -113,9 +157,9 @@ sync = "$SYNC"
 [history]
 [news]
 [metrics]
-allow = ["127.0.0.0/8", "::1", "$HERE"]
+allow = ["127.0.0.0/8", "::1"$LET]
 [tls]
-bind = "$bind:${2}600"
+bind = "$BIND:${2}600"
 cert = "$at/cert.pem"
 key = "$at/key.pem"
 [link]
@@ -125,9 +169,27 @@ grace = ${GRACE:-60}
 $4
 CFG
 }
-server() { # as config, and started here
-    config "$@"
-    taskset -c "$SERVER_CPUS" "$BIN/hxd" --config "$1/hxd-ng.toml" > "$1/hxd.log" 2>&1 &
+# A server elsewhere has the pid its host gave it, and everything about
+# it is asked over ssh.
+remote() { # server command
+    ssh -n "${HOST[$1]}" "$2"
+}
+server() { # server port-base tag peer
+    local s=$1 h=${HOST[$1]}
+    if [ -z "$h" ]; then
+        config "$D/$s" "${@:2}"
+        taskset -c "$SERVER_CPUS" "$BIN/hxd" --config "$D/$s/hxd-ng.toml" > "$D/$s/hxd.log" 2>&1 &
+        PID[$s]=$!
+        return
+    fi
+    local rd=${RD[$s]} rbin=${RHOME[$h]}/hxd-link-run/bin
+    config "$D/$s" "${@:2}" "$rd"
+    remote "$s" "rm -rf $rd && mkdir -p ${rd%/*}" || exit 2
+    scp -qr "$D/$s" "$h:$rd" || exit 2
+    # Only the server in the background, not a list around it, whose
+    # shell would hold ssh's output open for as long as it ran.
+    PID[$s]=$(remote "$s" "ulimit -n \$(ulimit -Hn); cd $rd || exit; \
+        nohup $rbin/hxd --config $rd/hxd-ng.toml > $rd/hxd.log 2>&1 < /dev/null & echo \$!")
 }
 
 accept() { # tag key
@@ -145,55 +207,42 @@ for s in $LEAVES; do
     PEERS_A="$PEERS_A
 $(accept "$s$s" "${KEY[$s]}")"
 done
-# On the far host, the hub's pid is the one that host gave it, and
-# everything about it is asked over ssh.
-remote() { ssh -n "$HUB_HOST" "$@"; }
-hub() { [ "$1" = a ] && [ -n "$HUB_HOST" ]; }
-if [ -n "$HUB_HOST" ]; then
-    config "$D/a" 15 aa "$PEERS_A" 0.0.0.0 "$RD"
-    remote "mkdir -p $RBIN && rm -rf $RD" || exit 2
-    for b in hxd hxd-load; do
-        [ "$(remote "sha256sum < $RBIN/$b" 2> /dev/null)" = "$(sha256sum < "$BIN/$b")" ] ||
-            scp -q "$BIN/$b" "$HUB_HOST:$RBIN/$b" || exit 2
-    done
-    scp -qr "$D/a" "$HUB_HOST:$RD" || exit 2
-    # Only the server in the background, not a list around it, whose
-    # shell would hold ssh's output open for as long as it ran.
-    PID[a]=$(remote "ulimit -n \$(ulimit -Hn); cd $RD || exit; \
-        nohup $RBIN/hxd --config $RD/hxd-ng.toml > $RD/hxd.log 2>&1 < /dev/null & echo \$!")
-else
-    server "$D/a" 15 aa "$PEERS_A"
-    PID[a]=$!
-fi
-for s in $LEAVES; do
-    to=$A:15600
-    [ "$s" = b ] && to=$DIAL
-    server "$D/$s" "${BASE[$s]}" "$s$s" "$(dial "$s$s" "$to")"
-    PID[$s]=$!
-done
 # Whatever ends the script, no server outlives it to hold the ports the
 # next run binds.
-# The hub on its own host is waited for there, so that its log is whole
-# when its errors are counted.
+# One elsewhere is waited for there, so that its log is whole when its
+# errors are counted.
 kill_all() {
     for s in $SERVERS; do
-        if hub "$s"; then
-            remote "kill ${PID[a]} && for _ in \$(seq 100); do
-                kill -0 ${PID[a]} || break; sleep 0.1; done" 2> /dev/null
+        [ -n "${PID[$s]:-}" ] || continue
+        if [ -n "${HOST[$s]}" ]; then
+            remote "$s" "kill ${PID[$s]} && for _ in \$(seq 100); do
+                kill -0 ${PID[$s]} || break; sleep 0.1; done" 2> /dev/null
         else
             kill "${PID[$s]}" 2> /dev/null
         fi
     done
 }
 trap kill_all EXIT
+for h in $REMOTES; do
+    rbin=${RHOME[$h]}/hxd-link-run/bin
+    ssh -n "$h" "mkdir -p $rbin" || exit 2
+    for b in hxd hxd-load; do
+        [ "$(ssh -n "$h" "sha256sum < $rbin/$b" 2> /dev/null)" = "$(sha256sum < "$BIN/$b")" ] ||
+            scp -q "$BIN/$b" "$h:$rbin/$b" || exit 2
+    done
+done
+server a 15 aa "$PEERS_A"
+for s in $LEAVES; do
+    to=$A:15600
+    [ "$s" = b ] && to=$DIAL
+    server "$s" "${BASE[$s]}" "$s$s" "$(dial "$s$s" "$to")"
+done
 # Up: every server answers, and, dialing a directly, has its link.
 # Through the proxy the link comes up only once the run starts it, and a
 # wait for it here would only push b's dialer further into its backoff.
 up() {
     for s in $SERVERS; do
-        host=127.0.0.1
-        [ "$s" = a ] && host=$A
-        curl -s "$host:${BASE[$s]}700/metrics" |
+        curl -s "${ADDR[$s]}:${BASE[$s]}700/metrics" |
             grep -q "${1:-}" || return 1
     done
 }
@@ -202,35 +251,39 @@ want='^hxd_links_up [1-9]'
 for _ in $(seq 100); do up "$want" && break; sleep 0.1; done
 if ! up "$want"; then
     echo "the servers never came up${want:+ linked}" >&2
-    tail -n 5 "$D"/*/hxd.log >&2
-    [ -n "$HUB_HOST" ] && remote "tail -n 5 $RD/hxd.log" >&2
+    for s in $SERVERS; do
+        if [ -n "${HOST[$s]}" ]; then
+            remote "$s" "tail -n 5 ${RD[$s]}/hxd.log" >&2
+        else
+            tail -n 5 "$D/$s/hxd.log" >&2
+        fi
+    done
     exit 2
 fi
 
 if [ -n "${ACCOUNTS:-}" ]; then
-    for s in $LEAVES; do
-        "$BIN/hxd-load" accounts "$D/$s/accounts" --prefix churn --count "$ACCOUNTS" \
-            --password pw --admin mod > /dev/null
+    for s in $SERVERS; do
+        if [ -n "${HOST[$s]}" ]; then
+            remote "$s" "${RHOME[${HOST[$s]}]}/hxd-link-run/bin/hxd-load accounts \
+                ${RD[$s]}/accounts --prefix churn --count $ACCOUNTS \
+                --password pw --admin mod > /dev/null"
+        else
+            "$BIN/hxd-load" accounts "$D/$s/accounts" --prefix churn --count "$ACCOUNTS" \
+                --password pw --admin mod > /dev/null
+        fi
     done
-    if [ -n "$HUB_HOST" ]; then
-        remote "$RBIN/hxd-load accounts $RD/accounts --prefix churn --count $ACCOUNTS \
-            --password pw --admin mod > /dev/null"
-    else
-        "$BIN/hxd-load" accounts "$D/a/accounts" --prefix churn --count "$ACCOUNTS" \
-            --password pw --admin mod > /dev/null
-    fi
 fi
 
 cpu() {
-    if hub "$1"; then
-        remote "awk '{ print \$14 + \$15 }' /proc/${PID[a]}/stat"
+    if [ -n "${HOST[$1]}" ]; then
+        remote "$1" "awk '{ print \$14 + \$15 }' /proc/${PID[$1]}/stat"
     else
         awk '{ print $14 + $15 }' "/proc/${PID[$1]}/stat"
     fi
 }
 rss() {
-    if hub "$1"; then
-        remote "awk '/VmHWM/ { print \$2 }' /proc/${PID[a]}/status"
+    if [ -n "${HOST[$1]}" ]; then
+        remote "$1" "awk '/VmHWM/ { print \$2 }' /proc/${PID[$1]}/status"
     else
         awk '/VmHWM/ { print $2 }' "/proc/${PID[$1]}/status"
     fi
@@ -241,9 +294,15 @@ for s in $SERVERS; do
     BEFORE[$s]=$(cpu "$s")
     LOGS="$LOGS; s#@LOG_${s^^}@#$D/$s/hxd.log#"
 done
-# The hub's log is on its own host, where the harness cannot tail it;
-# its errors are still counted below.
-[ -n "$HUB_HOST" ] && LOGS="/@LOG@/d; s#127.0.0.1:15\([57]\)00#$A:15\100#g; $LOGS"
+# A log elsewhere is out of the harness's reach; its errors are still
+# counted below.
+for s in $SERVERS; do
+    [ -n "${HOST[$s]}" ] || continue
+    tag=LOG_${s^^}
+    [ "$s" = a ] && tag=LOG
+    b=${BASE[$s]}
+    LOGS="/@$tag@/d; s#127.0.0.1:$b\([57]\)00#${ADDR[$s]}:$b\100#g; $LOGS"
+done
 sed "$LOGS" "$SCEN" > "$D/scenario.toml"
 TIMEFORMAT="harness_cpu_s=%U+%S"
 { time taskset -c "$HARNESS_CPUS" "$BIN/hxd-load" run "$D/scenario.toml" \
@@ -260,14 +319,16 @@ status=$?
 kill_all
 wait 2> /dev/null
 for s in $SERVERS; do
-    if hub "$s"; then
-        errors=$(remote "grep -cE ' ERROR |panicked' $RD/hxd.log")
+    if [ -n "${HOST[$s]}" ]; then
+        errors=$(remote "$s" "grep -cE ' ERROR |panicked' ${RD[$s]}/hxd.log")
     else
         errors=$(grep -cE ' ERROR |panicked' "$D/$s/hxd.log")
     fi
     echo "$s: server_errors=$errors" >> "$OUT/$NAME.txt"
 done
 rm -rf "$D"
-[ -n "$HUB_HOST" ] && remote "rm -rf $RD"
+for s in $SERVERS; do
+    [ -n "${HOST[$s]}" ] && remote "$s" "rm -rf ${RD[$s]%/*}"
+done
 cat "$OUT/$NAME.txt"
 exit "$status"
