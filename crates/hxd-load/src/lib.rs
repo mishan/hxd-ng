@@ -17,14 +17,18 @@
 //! - **S5** [`slow`]: the same, with clients that stop reading.
 //! - **S6** [`churn`]: sessions dropping and resuming, connections dying
 //!   mid-handshake, kicks.
+//! - **L-3** [`interruption`]: links between servers cut at a proxy
+//!   ([`proxy`]) and restored, across their grace period.
 
 pub mod accounts;
 pub mod chat;
 pub mod check;
 pub mod churn;
 pub mod config;
+pub mod interruption;
 pub mod ledger;
 pub mod member;
+pub mod proxy;
 pub mod report;
 pub mod slow;
 pub mod stats;
@@ -127,17 +131,21 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
             logs.push((s.name.clone(), target::LogTail::start(path)?));
         }
     }
-    let mut before = Vec::new();
-    for s in &ctx.servers {
-        before.push(scrape(s).await?);
-    }
-    links_up(&ctx, &before)?;
+    let proxy = match &ctx.scenario.target.proxy {
+        Some(p) => Some(proxy::Proxy::start(p.listen, p.upstream).await?),
+        None => None,
+    };
+    let before = links_up(&ctx).await?;
 
     let extra = match ctx.scenario.run.scenario {
         Kind::LoginStorm => storm::run(&ctx).await?,
         Kind::Chat => chat::run(&ctx).await?,
         Kind::SlowConsumer => slow::run(&ctx).await?,
         Kind::Churn => churn::run(&ctx).await?,
+        Kind::Interruption => {
+            let proxy = proxy.as_ref().expect("checked by the scenario");
+            interruption::run(&ctx, proxy, &before).await?
+        }
     };
 
     // Everyone this run brought has left; every roster should say so.
@@ -157,7 +165,7 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
             }
         });
     }
-    if ctx.servers.len() > 1 {
+    if ctx.servers.len() > 1 && ctx.scenario.run.scenario != Kind::Interruption {
         links_stayed(&ctx, &before, &after);
     }
     for (name, log) in logs {
@@ -187,20 +195,41 @@ async fn scrape(s: &config::Server) -> Result<Option<target::Scrape>, String> {
     }
 }
 
-/// A run across servers that are not linked would fail every check for
-/// the server's fault rather than the run's, so it does not start.
-fn links_up(ctx: &Ctx, before: &[Option<target::Scrape>]) -> Result<(), String> {
-    if ctx.servers.len() < 2 {
-        return Ok(());
-    }
-    for (s, b) in ctx.servers.iter().zip(before) {
-        if let Some(b) = b {
-            if b.get("hxd_links_up").unwrap_or(0.0) < 1.0 {
-                return Err(format!("{} has no link up", s.name));
+/// Every server's scrape once each with metrics has a link up. A run
+/// across servers that are not linked would fail every check for the
+/// server's fault rather than the run's, so it does not start; a link
+/// through the run's own proxy comes up only once the run has started
+/// it, and is waited for. Without metrics nothing is waited for here.
+async fn links_up(ctx: &Ctx) -> Result<Vec<Option<target::Scrape>>, String> {
+    let deadline = Instant::now() + LINK_WAIT;
+    loop {
+        let mut scrapes = Vec::new();
+        for s in &ctx.servers {
+            scrapes.push(scrape(s).await?);
+        }
+        let down = ctx
+            .servers
+            .iter()
+            .zip(&scrapes)
+            .filter(|(_, b)| ctx.servers.len() > 1 && b.as_ref().is_some_and(|b| !linked(b)))
+            .map(|(s, _)| s.name.clone())
+            .next();
+        match down {
+            None => return Ok(scrapes),
+            Some(name) if Instant::now() >= deadline => {
+                return Err(format!("{name} has no link up"))
             }
+            Some(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
-    Ok(())
+}
+
+/// How long a run waits for its servers' links before it gives up: a
+/// dialer refused while the proxy was not yet listening backs off.
+const LINK_WAIT: Duration = Duration::from_secs(30);
+
+pub fn linked(s: &target::Scrape) -> bool {
+    s.get("hxd_links_up").unwrap_or(0.0) >= 1.0
 }
 
 /// No link ended during the run, nor did one come up: the scenario cut

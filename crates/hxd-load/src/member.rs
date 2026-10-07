@@ -252,6 +252,8 @@ pub enum Got {
     Refused(Value),
     /// A user joined, or on the classic wire possibly changed: its nick.
     Joined(String),
+    /// A user left.
+    Parted,
     /// The server ended this session.
     Kicked,
     Other,
@@ -269,6 +271,7 @@ impl Rx {
                             .into_owned(),
                     ),
                     legacy::push::DISCONNECT_MSG => Got::Kicked,
+                    legacy::push::USER_PART => Got::Parted,
                     legacy::push::USER_CHANGE => Got::Joined(
                         String::from_utf8_lossy(&f.bytes(tag::NAME).unwrap_or_default())
                             .into_owned(),
@@ -283,6 +286,7 @@ impl Rx {
                     Got::Chat(e.data["text"].as_str().unwrap_or_default().to_owned())
                 }
                 ng::Incoming::Event(e) if e.ev == "kicked" => Got::Kicked,
+                ng::Incoming::Event(e) if e.ev == "user_parted" => Got::Parted,
                 ng::Incoming::Event(e) if e.ev == "user_joined" => Got::Joined(
                     e.data["user"]["nick"]
                         .as_str()

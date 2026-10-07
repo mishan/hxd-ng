@@ -206,6 +206,22 @@ async fn start_linked(
     peer: &str,
     tls: tokio::net::TcpListener,
 ) -> Server {
+    let (server, hub) = start_linked_with(dir, seed, tag, peer, tls).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while hub.status().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "{tag} never linked");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    server
+}
+
+async fn start_linked_with(
+    dir: &Path,
+    seed: u8,
+    tag: &str,
+    peer: &str,
+    tls: tokio::net::TcpListener,
+) -> (Server, hxd_link::Hub) {
     let d = dir.display();
     let seed_hex: String = [seed; 32].iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(dir.join("link.key"), seed_hex).unwrap();
@@ -248,12 +264,19 @@ async fn start_linked(
         Some(std::sync::Arc::new(hub.clone()) as std::sync::Arc<dyn hxd_session::PeerAcceptor>),
     ));
     hub.start();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while hub.status().is_empty() {
-        assert!(tokio::time::Instant::now() < deadline, "{tag} never linked");
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    server
+    (server, hub)
+}
+
+/// The same, not waited for: a server that dials through a proxy the run
+/// has yet to start.
+async fn start_unlinked(
+    dir: &Path,
+    seed: u8,
+    tag: &str,
+    peer: &str,
+    tls: tokio::net::TcpListener,
+) -> Server {
+    start_linked_with(dir, seed, tag, peer, tls).await.0
 }
 
 fn link_key(seed: u8) -> String {
@@ -319,4 +342,59 @@ async fn across_a_link_every_line_and_every_join_is_heard_on_the_other_server() 
     assert_clean(&report);
     assert_eq!(report.checks["link.joins_heard"].held, 2);
     assert!(report.ops["link.join"].count > 0, "{}", report.summary());
+}
+
+/// L-3 on two servers with a two-second grace, `b` dialing through the
+/// run's proxy: a cut inside the grace shows nobody leaving, one past it
+/// is a netsplit, and after each the watchers are shown everyone again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_inside_the_grace_shows_nothing_and_one_past_it_recovers() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a_tls.local_addr().unwrap();
+    // A port for the proxy, free again by the time the run binds it.
+    let listen = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let a_peer = format!(
+        "grace = 2\n[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\n",
+        link_key(2)
+    );
+    let b_peer = format!(
+        "grace = 2\n[[link.peer]]\nname = \"aa\"\ndial = \"{listen}\"\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\n",
+        link_key(1)
+    );
+    let b_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = start_unlinked(da.path(), 1, "aa", &a_peer, a_tls).await;
+    let b = start_unlinked(db.path(), 2, "bb", &b_peer, b_tls).await;
+
+    let mut s = scenario(&a, Kind::Interruption, 1.0);
+    s.target.linked = vec![hxd_load::config::Server {
+        name: "b".into(),
+        legacy: Some(b.legacy),
+        ng: Some(b.ng),
+        ..Default::default()
+    }];
+    s.target.proxy = Some(hxd_load::config::ProxyAt {
+        listen,
+        upstream: a_addr,
+    });
+    let i = &mut s.interruption;
+    (i.population_legacy, i.population_ng) = (4, 4);
+    i.cuts = vec![0.5, 4.0];
+    i.grace = 2;
+    i.recover = 20.0;
+    i.between = 0.5;
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    assert_eq!(report.checks["link.recovered"].held, 2);
+    assert_eq!(report.checks["link.grace_held"].held, 1);
+    let cuts = report.detail["cuts"].as_array().unwrap();
+    assert_eq!(cuts[0]["parts"], 0, "{cuts:?}");
+    assert_eq!(cuts[1]["parts"], 8, "{cuts:?}");
+    assert_eq!(cuts[1]["joins"], 8, "{cuts:?}");
 }

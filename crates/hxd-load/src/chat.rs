@@ -206,7 +206,7 @@ async fn read(
                     ctx.checks.violated("chat.stayed", format!("{} was kicked", parts.nick));
                     break;
                 }
-                Ok(Got::Other | Got::Joined(_)) => {}
+                Ok(Got::Other | Got::Joined(_) | Got::Parted) => {}
                 Err(e) => {
                     ctx.checks.violated("chat.stayed", format!("{} lost its connection: {e}", parts.nick));
                     break;
