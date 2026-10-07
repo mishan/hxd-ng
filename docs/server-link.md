@@ -329,8 +329,8 @@ buffer, as any direct message.
 ### 4.3 Ghost chat
 
 A ghost's line must keep its link's order, never run a commit on the
-reactor, and never stall the link's reader. `ChatCommit` is unchanged;
-the hub feeds it from one task of its own:
+reactor, and never stall the link's reader. The hub feeds `ChatCommit`
+from one task of its own:
 
 - **Staged on arrival.** The link resolves the ghost and asks
   `Core::ghost_line` for a `GhostLine`, under the roster lock: `None` for
@@ -338,9 +338,11 @@ the hub feeds it from one task of its own:
   the line with the ghost's `UserInfo` as it is now. Staging it then is
   what keeps the last line of a ghost whose 903 follows at once.
 - **One committer.** Every link's lines go, in the order they arrived,
-  into one bounded channel, and one `spawn_blocking` task submits them to
-  `ChatCommit` a line at a time (`Core::ghost_chat`), as a local sender
-  does; local lines share its commits. Past the channel's bound a line is
+  into one bounded channel, and one `spawn_blocking` task submits
+  everything waiting there to `ChatCommit` at once, in order
+  (`Core::ghost_chat_all`), so ghosts' lines share commits with each
+  other as well as with local lines; handed over one at a time, each
+  would take a commit of its own. Past the channel's bound a line is
   not shown here, and is logged: the extension's volume bound, held
   across every link. It is relayed onward whether it is shown here or
   not (§7.4.1).
