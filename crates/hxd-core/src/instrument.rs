@@ -17,9 +17,86 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{LockResult, Mutex, MutexGuard, PoisonError};
 
 #[cfg(feature = "metrics")]
+use std::cell::RefCell;
+#[cfg(feature = "metrics")]
+use std::collections::HashMap;
+#[cfg(feature = "metrics")]
+use std::hash::Hash;
+#[cfg(feature = "metrics")]
 use std::panic::Location;
 #[cfg(feature = "metrics")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "metrics")]
+use std::thread::LocalKey;
+#[cfg(feature = "metrics")]
 use std::time::{Duration, Instant};
+
+/// Whether the binary has installed its recorder. Until it has, every
+/// handle found records nowhere, and keeping one would keep it doing
+/// that for good.
+#[cfg(feature = "metrics")]
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Called by the binary once its recorder is the global one, after which
+/// the handles found are kept.
+pub fn installed() {
+    #[cfg(feature = "metrics")]
+    INSTALLED.store(true, Ordering::Release);
+}
+
+/// The handles one thread has found, by their label values. Finding a
+/// handle is most of what recording one value costs (building a key,
+/// copying it, hashing and comparing it in a registry every thread
+/// shares), and the handle found is the same every time.
+#[cfg(feature = "metrics")]
+type Handles<K, H> = RefCell<HashMap<K, H>>;
+
+/// `f` applied to the handle `cache` holds for `key`, found by `make` the
+/// first time. A thread being torn down, whose cache is already gone,
+/// finds it every time.
+#[cfg(feature = "metrics")]
+fn with_handle<K: Hash + Eq, H>(
+    cache: &'static LocalKey<Handles<K, H>>,
+    key: K,
+    make: impl FnOnce() -> H,
+    f: impl FnOnce(&H),
+) {
+    if !INSTALLED.load(Ordering::Acquire) {
+        return f(&make());
+    }
+    let mut work = Some((make, f));
+    let _ = cache.try_with(|c| {
+        let (make, f) = work.take().expect("taken once");
+        f(c.borrow_mut().entry(key).or_insert_with(make));
+    });
+    if let Some((make, f)) = work {
+        f(&make());
+    }
+}
+
+/// `metrics::$kind!(name, label => value, ...)` through this thread's
+/// cache, the values being `&'static str`, then `f` applied to it. A
+/// value is evaluated again when the handle is first found, so each is
+/// a plain place, never a call.
+#[cfg(feature = "metrics")]
+macro_rules! handle {
+    (@str $v:expr) => { &'static str };
+    (@type histogram) => { metrics::Histogram };
+    (@type counter) => { metrics::Counter };
+    (@type gauge) => { metrics::Gauge };
+    ($kind:ident($name:literal $(, $l:literal => $v:expr)*), $f:expr) => {{
+        thread_local! {
+            static CACHE: Handles<($(handle!(@str $v),)*), handle!(@type $kind)> =
+                RefCell::default();
+        }
+        with_handle(
+            &CACHE,
+            ($($v,)*),
+            || metrics::$kind!($name $(, $l => $v)*),
+            $f,
+        )
+    }};
+}
 
 /// A `std::sync::Mutex` that reports how long each caller waited for it
 /// and how long it held it, labeled by the lock's name and by the call
@@ -137,11 +214,29 @@ impl Held {
 
     fn finish(&self) {
         let held = self.got.elapsed();
-        let site = site_label(self.site);
-        metrics::histogram!("hxd_lock_wait_seconds", "lock" => self.lock, "site" => site.clone())
-            .record(self.got - self.asked);
-        metrics::histogram!("hxd_lock_hold_seconds", "lock" => self.lock, "site" => site)
-            .record(held);
+        thread_local! {
+            static CACHE: Handles<
+                (&'static str, &'static Location<'static>),
+                (metrics::Histogram, metrics::Histogram),
+            > = RefCell::default();
+        }
+        with_handle(
+            &CACHE,
+            (self.lock, self.site),
+            || {
+                let (lock, site) = (self.lock, site_label(self.site));
+                (
+                    metrics::histogram!("hxd_lock_wait_seconds",
+                        "lock" => lock, "site" => site.clone()),
+                    metrics::histogram!("hxd_lock_hold_seconds",
+                        "lock" => lock, "site" => site),
+                )
+            },
+            |(wait, hold)| {
+                wait.record(self.got - self.asked);
+                hold.record(held);
+            },
+        );
     }
 }
 
@@ -163,8 +258,9 @@ pub fn blocking<R>(what: &'static str, f: impl FnOnce() -> R) -> impl FnOnce() -
     move || {
         #[cfg(feature = "metrics")]
         let _running = {
-            metrics::histogram!("hxd_blocking_queue_seconds", "what" => what)
-                .record(queued.elapsed());
+            handle!(histogram("hxd_blocking_queue_seconds", "what" => what), |h| {
+                h.record(queued.elapsed())
+            });
             InFlight::enter()
         };
         #[cfg(not(feature = "metrics"))]
@@ -180,7 +276,7 @@ struct InFlight;
 #[cfg(feature = "metrics")]
 impl InFlight {
     fn enter() -> Self {
-        metrics::gauge!("hxd_blocking_in_flight").increment(1.0);
+        handle!(gauge("hxd_blocking_in_flight"), |h| h.increment(1.0));
         InFlight
     }
 }
@@ -188,7 +284,7 @@ impl InFlight {
 #[cfg(feature = "metrics")]
 impl Drop for InFlight {
     fn drop(&mut self) {
-        metrics::gauge!("hxd_blocking_in_flight").decrement(1.0);
+        handle!(gauge("hxd_blocking_in_flight"), |h| h.decrement(1.0));
     }
 }
 
@@ -217,8 +313,10 @@ impl Timer {
 pub fn fanout(event: &'static str, recipients: usize, took: Timer) {
     #[cfg(feature = "metrics")]
     {
-        metrics::histogram!("hxd_fanout_seconds", "event" => event).record(took.elapsed());
-        metrics::histogram!("hxd_fanout_recipients", "event" => event).record(recipients as f64);
+        handle!(histogram("hxd_fanout_seconds", "event" => event), |h| h.record(took.elapsed()));
+        handle!(histogram("hxd_fanout_recipients", "event" => event), |h| {
+            h.record(recipients as f64)
+        });
     }
     #[cfg(not(feature = "metrics"))]
     let _ = (event, recipients, took);
@@ -270,7 +368,7 @@ impl Tally {
             ("closed", self.closed),
         ] {
             if n > 0 {
-                metrics::counter!("hxd_events_pushed_total", "sink" => sink).increment(n);
+                handle!(counter("hxd_events_pushed_total", "sink" => sink), |h| h.increment(n));
             }
         }
     }
@@ -282,7 +380,7 @@ impl Tally {
 /// was spent (`server`, `crate::budget`).
 pub fn outbox_lagged(bound: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_outbox_lagged_total", "bound" => bound).increment(1);
+    handle!(counter("hxd_outbox_lagged_total", "bound" => bound), |h| h.increment(1));
     #[cfg(not(feature = "metrics"))]
     let _ = bound;
 }
@@ -316,7 +414,7 @@ pub fn checkpoint_busy(db: &str) {
 /// chat lines, `spam` past its spam points.
 pub fn flood_kick(what: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_flood_kicks_total", "what" => what).increment(1);
+    handle!(counter("hxd_flood_kicks_total", "what" => what), |h| h.increment(1));
     #[cfg(not(feature = "metrics"))]
     let _ = what;
 }
@@ -326,7 +424,9 @@ pub fn flood_kick(what: &'static str) {
 /// posts, `history` and `news_search` past their own.
 pub fn rate_limited(wire: &'static str, reason: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_rate_limited_total", "wire" => wire, "reason" => reason).increment(1);
+    handle!(counter("hxd_rate_limited_total", "wire" => wire, "reason" => reason), |h| {
+        h.increment(1)
+    });
     #[cfg(not(feature = "metrics"))]
     let _ = (wire, reason);
 }
@@ -335,7 +435,7 @@ pub fn rate_limited(wire: &'static str, reason: &'static str) {
 /// it takes (`Core::admit_login`).
 pub fn login_refused_busy() {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_logins_refused_busy_total").increment(1);
+    handle!(counter("hxd_logins_refused_busy_total"), |h| h.increment(1));
 }
 
 /// Something refused for coming too fast or too often from one address
@@ -347,7 +447,7 @@ pub fn login_refused_busy() {
 /// `upload` (an upload refused before its body was read).
 pub fn throttled(what: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_throttled_total", "what" => what).increment(1);
+    handle!(counter("hxd_throttled_total", "what" => what), |h| h.increment(1));
     #[cfg(not(feature = "metrics"))]
     let _ = what;
 }
@@ -355,7 +455,7 @@ pub fn throttled(what: &'static str) {
 /// A detached session's buffer overflowed; its resume will be a resync.
 pub fn outbox_broken() {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_outbox_broken_total").increment(1);
+    handle!(counter("hxd_outbox_broken_total"), |h| h.increment(1));
 }
 
 /// How many items were waiting in a connection's outbound queue when its
@@ -363,7 +463,7 @@ pub fn outbox_broken() {
 /// as the tail, long before it shows up anywhere else.
 pub fn queue_depth(wire: &'static str, depth: usize) {
     #[cfg(feature = "metrics")]
-    metrics::histogram!("hxd_outbox_depth", "wire" => wire).record(depth as f64);
+    handle!(histogram("hxd_outbox_depth", "wire" => wire), |h| h.record(depth as f64));
     #[cfg(not(feature = "metrics"))]
     let _ = (wire, depth);
 }
@@ -374,8 +474,8 @@ pub fn queue_depth(wire: &'static str, depth: usize) {
 pub fn write_queued(wire: &'static str, frames: i64, bytes: i64) {
     #[cfg(feature = "metrics")]
     {
-        metrics::gauge!("hxd_write_queued_frames", "wire" => wire).increment(frames as f64);
-        metrics::gauge!("hxd_write_queued_bytes", "wire" => wire).increment(bytes as f64);
+        handle!(gauge("hxd_write_queued_frames", "wire" => wire), |h| h.increment(frames as f64));
+        handle!(gauge("hxd_write_queued_bytes", "wire" => wire), |h| h.increment(bytes as f64));
     }
     #[cfg(not(feature = "metrics"))]
     let _ = (wire, frames, bytes);
@@ -385,7 +485,7 @@ pub fn write_queued(wire: &'static str, frames: i64, bytes: i64) {
 /// reading turns into time spent here.
 pub fn socket_write(wire: &'static str, took: Timer) {
     #[cfg(feature = "metrics")]
-    metrics::histogram!("hxd_socket_write_seconds", "wire" => wire).record(took.elapsed());
+    handle!(histogram("hxd_socket_write_seconds", "wire" => wire), |h| h.record(took.elapsed()));
     #[cfg(not(feature = "metrics"))]
     let _ = (wire, took);
 }
@@ -398,8 +498,8 @@ pub enum Dir {
 }
 
 /// What a frame is, as a label: a name, or a legacy transaction type,
-/// which is formatted only when something records it.
-#[derive(Clone, Copy)]
+/// which is formatted only the first time a thread records it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind<'a> {
     Name(&'a str),
     Type(u32),
@@ -407,7 +507,7 @@ pub enum Kind<'a> {
 
 /// One frame on a wire. The caller passes a [`Kind`] the server knows,
 /// or `Name("other")`: see the module note on label values.
-pub fn frame(wire: &'static str, dir: Dir, kind: Kind<'_>, bytes: usize) {
+pub fn frame(wire: &'static str, dir: Dir, kind: Kind<'static>, bytes: usize) {
     frames(wire, dir, kind, 1, bytes);
 }
 
@@ -415,21 +515,32 @@ pub fn frame(wire: &'static str, dir: Dir, kind: Kind<'_>, bytes: usize) {
 /// batch records, once per kind in it rather than once per frame, since
 /// finding a labeled counter is the cost here and a login storm writes
 /// millions of frames.
-pub fn frames(wire: &'static str, dir: Dir, kind: Kind<'_>, count: usize, bytes: usize) {
+pub fn frames(wire: &'static str, dir: Dir, kind: Kind<'static>, count: usize, bytes: usize) {
     #[cfg(feature = "metrics")]
     {
         let dir = match dir {
             Dir::In => "in",
             Dir::Out => "out",
         };
-        let kind = match kind {
-            Kind::Name(name) => name.to_owned(),
-            Kind::Type(ty) => ty.to_string(),
-        };
-        metrics::counter!("hxd_frames_total", "wire" => wire, "dir" => dir, "type" => kind)
-            .increment(count as u64);
-        metrics::counter!("hxd_frame_bytes_total", "wire" => wire, "dir" => dir)
-            .increment(bytes as u64);
+        thread_local! {
+            static CACHE: Handles<(&'static str, &'static str, Kind<'static>), metrics::Counter> =
+                RefCell::default();
+        }
+        with_handle(
+            &CACHE,
+            (wire, dir, kind),
+            || {
+                let kind = match kind {
+                    Kind::Name(name) => name.to_owned(),
+                    Kind::Type(ty) => ty.to_string(),
+                };
+                metrics::counter!("hxd_frames_total", "wire" => wire, "dir" => dir, "type" => kind)
+            },
+            |h| h.increment(count as u64),
+        );
+        handle!(counter("hxd_frame_bytes_total", "wire" => wire, "dir" => dir), |h| {
+            h.increment(bytes as u64)
+        });
     }
     #[cfg(not(feature = "metrics"))]
     let _ = (wire, dir, kind, count, bytes);
@@ -439,7 +550,9 @@ pub fn frames(wire: &'static str, dir: Dir, kind: Kind<'_>, count: usize, bytes:
 /// `auth` is how it logged in: `guest`, `password`, `identity`, `resume`.
 pub fn login(wire: &'static str, auth: &'static str, took: Timer) {
     #[cfg(feature = "metrics")]
-    metrics::histogram!("hxd_login_seconds", "wire" => wire, "auth" => auth).record(took.elapsed());
+    handle!(histogram("hxd_login_seconds", "wire" => wire, "auth" => auth), |h| {
+        h.record(took.elapsed())
+    });
     #[cfg(not(feature = "metrics"))]
     let _ = (wire, auth, took);
 }
@@ -447,7 +560,9 @@ pub fn login(wire: &'static str, auth: &'static str, took: Timer) {
 /// A connection ended, and why.
 pub fn disconnect(wire: &'static str, reason: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_disconnects_total", "wire" => wire, "reason" => reason).increment(1);
+    handle!(counter("hxd_disconnects_total", "wire" => wire, "reason" => reason), |h| {
+        h.increment(1)
+    });
     #[cfg(not(feature = "metrics"))]
     let _ = (wire, reason);
 }
@@ -455,7 +570,7 @@ pub fn disconnect(wire: &'static str, reason: &'static str) {
 /// One call into the media plane, made under the roster lock.
 pub fn voice_call(op: &'static str, took: Timer) {
     #[cfg(feature = "metrics")]
-    metrics::histogram!("hxd_voice_media_seconds", "op" => op).record(took.elapsed());
+    handle!(histogram("hxd_voice_media_seconds", "op" => op), |h| h.record(took.elapsed()));
     #[cfg(not(feature = "metrics"))]
     let _ = (op, took);
 }
@@ -464,7 +579,7 @@ pub fn voice_call(op: &'static str, took: Timer) {
 /// allowance (`crate::voice::VoiceLimits`): `join` or `video`.
 pub fn voice_refused(what: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_voice_refused_total", "what" => what).increment(1);
+    handle!(counter("hxd_voice_refused_total", "what" => what), |h| h.increment(1));
     #[cfg(not(feature = "metrics"))]
     let _ = what;
 }
@@ -473,7 +588,9 @@ pub fn voice_refused(what: &'static str) {
 /// `packets` of `stream` (`audio`, `camera`, `screen`).
 pub fn voice_policed(stream: &'static str, packets: u64) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_voice_policed_packets_total", "stream" => stream).increment(packets);
+    handle!(counter("hxd_voice_policed_packets_total", "stream" => stream), |h| {
+        h.increment(packets)
+    });
     #[cfg(not(feature = "metrics"))]
     let _ = (stream, packets);
 }
@@ -482,7 +599,7 @@ pub fn voice_policed(stream: &'static str, packets: u64) {
 /// for `audio`, or the publication, for `camera` or `screen`.
 pub fn voice_policed_end(stream: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_voice_policed_ends_total", "stream" => stream).increment(1);
+    handle!(counter("hxd_voice_policed_ends_total", "stream" => stream), |h| h.increment(1));
     #[cfg(not(feature = "metrics"))]
     let _ = stream;
 }
@@ -491,14 +608,14 @@ pub fn voice_policed_end(stream: &'static str) {
 /// already holds as many as it takes.
 pub fn voice_ice_ignored() {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_voice_ice_ignored_total").increment(1);
+    handle!(counter("hxd_voice_ice_ignored_total"), |h| h.increment(1));
 }
 
 /// A file transfer in progress, `download` or `upload`, until the guard
 /// drops.
 pub fn transfer_open(dir: &'static str) -> Open {
     #[cfg(feature = "metrics")]
-    metrics::gauge!("hxd_transfers_open", "dir" => dir).increment(1.0);
+    handle!(gauge("hxd_transfers_open", "dir" => dir), |h| h.increment(1.0));
     #[cfg(not(feature = "metrics"))]
     let _ = dir;
     Open {
@@ -517,7 +634,7 @@ pub struct Open {
 #[cfg(feature = "metrics")]
 impl Drop for Open {
     fn drop(&mut self) {
-        metrics::gauge!("hxd_transfers_open", "dir" => self.dir).decrement(1.0);
+        handle!(gauge("hxd_transfers_open", "dir" => self.dir), |h| h.decrement(1.0));
     }
 }
 
@@ -526,8 +643,9 @@ impl Drop for Open {
 pub fn link_up(took: Timer) -> LinkUp {
     #[cfg(feature = "metrics")]
     {
-        metrics::histogram!("hxd_link_establish_seconds").record(took.elapsed());
-        metrics::gauge!("hxd_links_up").increment(1.0);
+        handle!(histogram("hxd_link_establish_seconds"), |h| h
+            .record(took.elapsed()));
+        handle!(gauge("hxd_links_up"), |h| h.increment(1.0));
     }
     #[cfg(not(feature = "metrics"))]
     let _ = took;
@@ -541,7 +659,7 @@ pub struct LinkUp(());
 #[cfg(feature = "metrics")]
 impl Drop for LinkUp {
     fn drop(&mut self) {
-        metrics::gauge!("hxd_links_up").decrement(1.0);
+        handle!(gauge("hxd_links_up"), |h| h.decrement(1.0));
     }
 }
 
@@ -549,7 +667,7 @@ impl Drop for LinkUp {
 /// own label, whichever side dialed.
 pub fn link_end(reason: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_link_ends_total", "reason" => reason).increment(1);
+    handle!(counter("hxd_link_ends_total", "reason" => reason), |h| h.increment(1));
     #[cfg(not(feature = "metrics"))]
     let _ = reason;
 }
@@ -560,7 +678,7 @@ pub fn link_end(reason: &'static str) {
 /// after which that link does.
 pub fn link_lagged(queue: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_link_lagged_total", "queue" => queue).increment(1);
+    handle!(counter("hxd_link_lagged_total", "queue" => queue), |h| h.increment(1));
     #[cfg(not(feature = "metrics"))]
     let _ = queue;
 }
@@ -571,7 +689,7 @@ pub fn link_lagged(queue: &'static str) {
 /// a request past those a link may have waiting.
 pub fn link_dropped(what: &'static str) {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hxd_link_dropped_total", "what" => what).increment(1);
+    handle!(counter("hxd_link_dropped_total", "what" => what), |h| h.increment(1));
     #[cfg(not(feature = "metrics"))]
     let _ = what;
 }
@@ -580,7 +698,7 @@ pub fn link_dropped(what: &'static str) {
 /// `relay`, `chat`) when its consumer took the next one.
 pub fn link_queue_depth(queue: &'static str, depth: usize) {
     #[cfg(feature = "metrics")]
-    metrics::histogram!("hxd_link_queue_depth", "queue" => queue).record(depth as f64);
+    handle!(histogram("hxd_link_queue_depth", "queue" => queue), |h| h.record(depth as f64));
     #[cfg(not(feature = "metrics"))]
     let _ = (queue, depth);
 }
@@ -590,8 +708,10 @@ pub fn link_queue_depth(queue: &'static str, depth: usize) {
 pub fn link_snapshot(users: usize, took: Timer) {
     #[cfg(feature = "metrics")]
     {
-        metrics::histogram!("hxd_link_snapshot_seconds").record(took.elapsed());
-        metrics::histogram!("hxd_link_snapshot_users").record(users as f64);
+        handle!(histogram("hxd_link_snapshot_seconds"), |h| h
+            .record(took.elapsed()));
+        handle!(histogram("hxd_link_snapshot_users"), |h| h
+            .record(users as f64));
     }
     #[cfg(not(feature = "metrics"))]
     let _ = (users, took);
