@@ -132,6 +132,7 @@ mod recorder {
             .build_recorder();
         let handle = recorder.handle();
         metrics::set_global_recorder(recorder).map_err(|e| format!("metrics recorder: {e}"))?;
+        hxd_core::instrument::installed();
         // A histogram keeps every sample until upkeep folds it into the
         // buckets, and a scrape is not the only upkeep there must be: a
         // server nobody scraped for a while held every lock hold and every
