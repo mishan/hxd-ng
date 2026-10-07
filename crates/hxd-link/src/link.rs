@@ -26,6 +26,9 @@ use crate::server::{ServerGroup, ServerId};
 use crate::users::{of_local, UserGroup};
 use crate::wire::{chunks, feature, field, fields, find, tx, Field, Hello, Reason};
 
+/// The most exports a link takes off its queue at once.
+const EXPORT_RUN: usize = 256;
+
 /// The most a snapshot part this server sends carries, well below the
 /// frame limit either end reads with.
 const SNAPSHOT_PART: usize = 32 * 1024;
@@ -369,11 +372,24 @@ impl Link<'_> {
                 // is stopped at once rather than flushed for a while.
                 () = io.out.lagged() => return self.end("slow_consumer", None),
                 export = exports.recv() => match export {
-                    Some((n, packed)) if n > since => {
+                    // What else is already waiting goes with it, and the
+                    // queue's depth is recorded once for them all: a hub
+                    // hands every link every line.
+                    Some(first) => {
                         instrument::link_queue_depth("export", exports.len());
-                        self.export(io, packed);
+                        let (mut next, mut taken) = (Some(first), 0);
+                        while let Some((n, packed)) = next {
+                            if n > since {
+                                self.export(io, packed);
+                            }
+                            taken += 1;
+                            next = if taken < EXPORT_RUN {
+                                exports.try_recv().ok()
+                            } else {
+                                None
+                            };
+                        }
                     }
-                    Some(_) => {}
                     // The hub dropped this link's channel: it fell behind.
                     None => return self.close(io, Reason::Shutdown, "slow_consumer"),
                 },

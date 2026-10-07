@@ -17,7 +17,7 @@
 use crate::peer::peer_answer;
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -500,6 +500,11 @@ pub(crate) struct Backlog {
     pub(crate) lagged: Notify,
     /// Tells the writer to stop, whatever it is in the middle of.
     pub(crate) stop: Notify,
+    /// Frames and bytes queued since the write-queue gauges last heard:
+    /// the gauges are shared by every connection, and told once a write,
+    /// or once so much is queued, rather than once a frame, as a fan-out
+    /// queues a frame for each.
+    unpublished: (AtomicI64, AtomicI64),
 }
 
 impl Backlog {
@@ -509,7 +514,16 @@ impl Backlog {
             lagging: AtomicBool::new(false),
             lagged: Notify::new(),
             stop: Notify::new(),
+            unpublished: (AtomicI64::new(0), AtomicI64::new(0)),
         }
+    }
+
+    /// Tell the write-queue gauges what was queued since they last
+    /// heard, less `frames` and `bytes` written or dropped.
+    fn publish(&self, frames: i64, bytes: i64) {
+        let frames = self.unpublished.0.swap(0, Ordering::Relaxed) - frames;
+        let bytes = self.unpublished.1.swap(0, Ordering::Relaxed) - bytes;
+        instrument::write_queued(WIRE, frames, bytes);
     }
 
     fn lag(&self) {
@@ -534,10 +548,18 @@ pub(crate) fn enqueue(tx: &Tx, out: Outbound) {
         b.lag();
         return;
     }
-    instrument::write_queued(WIRE, 1, len as i64);
+    b.unpublished.0.fetch_add(1, Ordering::Relaxed);
+    let unpublished = b.unpublished.1.fetch_add(len as i64, Ordering::Relaxed) + len as i64;
+    // A writer stuck behind a client that stopped reading publishes
+    // nothing until its write gives up, and that backlog is the one the
+    // gauges are for.
+    if unpublished >= WRITE_BATCH as i64 {
+        b.publish(0, 0);
+    }
     if tx.out.send(out).is_err() {
         b.share.give(len);
-        instrument::write_queued(WIRE, -1, -(len as i64));
+        // The writer is gone, and with it the next publish.
+        b.publish(1, len as i64);
     }
 }
 
@@ -659,7 +681,7 @@ pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
                     // with the rest of the queue, below.
                     let len = out.wire_len();
                     backlog.share.give(len);
-                    instrument::write_queued(WIRE, -1, -(len as i64));
+                    backlog.publish(1, len as i64);
                     break;
                 }
             }
@@ -706,7 +728,7 @@ pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
         instrument::socket_write(WIRE, took);
         last_write = Some(tokio::time::Instant::now());
         let count: usize = frames.iter().map(|(_, n, _)| n).sum();
-        instrument::write_queued(WIRE, -(count as i64), -(queued as i64));
+        backlog.publish(count as i64, queued as i64);
         backlog.share.give(queued);
         match written {
             Ok(()) => {
@@ -726,11 +748,13 @@ pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
     // What was queued and will now never be written leaves the gauges
     // with the connection.
     rx.close();
+    let (mut frames, mut bytes) = (0, 0);
     while let Ok(out) = rx.try_recv() {
         let len = out.wire_len();
         backlog.share.give(len);
-        instrument::write_queued(WIRE, -1, -(len as i64));
+        (frames, bytes) = (frames + 1, bytes + len as i64);
     }
+    backlog.publish(frames, bytes);
     let _ = timeout(Duration::from_secs(1), wr.shutdown()).await;
 }
 
