@@ -8,10 +8,11 @@
 //! server list is empty.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hxd_session::frame::Frame;
-use hxd_session::peer::LinkIo;
+use hxd_session::peer::{LinkIo, Packed};
 use tokio::sync::oneshot;
 use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -141,6 +142,48 @@ async fn next_relay(relays: &mut Option<tokio::sync::mpsc::Receiver<Relayed>>) -
 /// sent it used (Text on a Link).
 pub(crate) fn link_line_endings(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
+}
+
+/// One export, packed as every link sends it: `own` and `epoch` are this
+/// server's, for a line's network-wide ID.
+pub(crate) fn pack(own: ServerId, epoch: [u8; 8], event: &PeerEvent) -> Packed {
+    match event {
+        PeerEvent::Shown(u) | PeerEvent::Changed(u) => {
+            Packed::new(tx::USER_UPDATE, chunks(&of_local(u, own)))
+        }
+        PeerEvent::Gone(uid, why) => {
+            let reason = match why {
+                GoneReason::Disconnected => Reason::Disconnected,
+                GoneReason::Banned => Reason::Banned,
+            };
+            Packed::new(
+                tx::USER_GONE,
+                chunks(&[
+                    Field::u16(field::USER_ID, *uid),
+                    Field::u16(field::REASON, reason as u16),
+                ]),
+            )
+        }
+        PeerEvent::Chat {
+            from,
+            text,
+            style,
+            line,
+        } => {
+            let mut line_id = own.0.to_vec();
+            line_id.extend(epoch);
+            line_id.extend(line.to_be_bytes());
+            let mut f = vec![
+                Field::u16(field::USER_ID, *from),
+                Field::new(field::DATA, link_line_endings(text).into_bytes()),
+                Field::new(field::LINE_ID, line_id),
+            ];
+            if *style == 1 {
+                f.push(Field::u16(field::CHAT_OPTIONS, 1));
+            }
+            Packed::new(tx::CHAT, chunks(&f))
+        }
+    }
 }
 
 impl Link<'_> {
@@ -326,9 +369,9 @@ impl Link<'_> {
                 // is stopped at once rather than flushed for a while.
                 () = io.out.lagged() => return self.end("slow_consumer", None),
                 export = exports.recv() => match export {
-                    Some((n, event)) if n > since => {
+                    Some((n, packed)) if n > since => {
                         instrument::link_queue_depth("export", exports.len());
-                        self.export(io, own, event);
+                        self.export(io, packed);
                     }
                     Some(_) => {}
                     // The hub dropped this link's channel: it fell behind.
@@ -484,47 +527,14 @@ impl Link<'_> {
         self.notify(io, ty, &part);
     }
 
-    /// One change to a local user, as the peer must hear it.
-    fn export(&mut self, io: &LinkIo, own: ServerId, event: PeerEvent) {
-        match event {
-            PeerEvent::Shown(u) | PeerEvent::Changed(u) => {
-                self.notify(io, tx::USER_UPDATE, &of_local(&u, own));
-            }
-            PeerEvent::Gone(uid, why) => {
-                let reason = match why {
-                    GoneReason::Disconnected => Reason::Disconnected,
-                    GoneReason::Banned => Reason::Banned,
-                };
-                self.notify(
-                    io,
-                    tx::USER_GONE,
-                    &[
-                        Field::u16(field::USER_ID, uid),
-                        Field::u16(field::REASON, reason as u16),
-                    ],
-                )
-            }
-            PeerEvent::Chat {
-                from,
-                text,
-                style,
-                line,
-            } if self.features & feature::PUBLIC_CHAT != 0 => {
-                let mut line_id = own.0.to_vec();
-                line_id.extend(self.hub.epoch());
-                line_id.extend(line.to_be_bytes());
-                let mut f = vec![
-                    Field::u16(field::USER_ID, from),
-                    Field::new(field::DATA, link_line_endings(&text).into_bytes()),
-                    Field::new(field::LINE_ID, line_id),
-                ];
-                if style == 1 {
-                    f.push(Field::u16(field::CHAT_OPTIONS, 1));
-                }
-                self.notify(io, tx::CHAT, &f);
-            }
-            PeerEvent::Chat { .. } => {}
+    /// One change to a local user, as the peer must hear it. Over a link
+    /// that did not negotiate public chat, a line is not sent.
+    fn export(&mut self, io: &LinkIo, packed: Arc<Packed>) {
+        if packed.ty() == tx::CHAT && self.features & feature::PUBLIC_CHAT == 0 {
+            return;
         }
+        io.out.notify_packed(packed);
+        self.last_sent = Instant::now();
     }
 
     /// A ghost's line (Link Chat). Over a link that did not negotiate

@@ -81,6 +81,27 @@ pub(crate) struct LinkPort {
     pub(crate) exporter: Option<[u8; EXPORTER_LEN]>,
 }
 
+/// A notification packed once for every link it goes to: with task id 0
+/// it is the same bytes on each, and building them was most of what a
+/// line cost a hub per link.
+pub struct Packed {
+    pub(crate) ty: u32,
+    /// Kept for the wire trace.
+    pub(crate) chunks: Vec<(u16, Vec<u8>)>,
+    pub(crate) frame: Vec<u8>,
+}
+
+impl Packed {
+    pub fn new(ty: u32, chunks: Vec<(u16, Vec<u8>)>) -> Self {
+        let frame = crate::frame::pack_frame(ty, 0, 0, &chunks);
+        Packed { ty, chunks, frame }
+    }
+
+    pub fn ty(&self) -> u32 {
+        self.ty
+    }
+}
+
 /// The writing half of a link session, over the connection's own writer,
 /// with its bound: a link that stops reading is dropped like any client.
 #[derive(Clone)]
@@ -95,6 +116,11 @@ impl LinkOut {
     /// A notification: task id 0, no reply.
     pub fn notify(&self, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
         enqueue(&self.0, Outbound::Notify { ty, chunks });
+    }
+
+    /// A notification already packed, as [`notify`](Self::notify) would.
+    pub fn notify_packed(&self, packed: Arc<Packed>) {
+        enqueue(&self.0, Outbound::Packed(packed));
     }
 
     pub fn reply(&self, trans: u32, error: bool, chunks: Vec<(u16, Vec<u8>)>) {

@@ -15,6 +15,7 @@
 //! commented.
 
 use crate::peer::peer_answer;
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -437,6 +438,8 @@ pub(crate) enum Outbound {
         trans: u32,
         chunks: Vec<(u16, Vec<u8>)>,
     },
+    /// A `Notify` packed once for every link it goes to.
+    Packed(Arc<crate::peer::Packed>),
 }
 
 impl Outbound {
@@ -450,6 +453,7 @@ impl Outbound {
             | Outbound::Push { chunks, .. }
             | Outbound::Notify { chunks, .. }
             | Outbound::Request { chunks, .. } => chunks,
+            Outbound::Packed(p) => &p.chunks,
         };
         hxproto::HL_HDR_LEN + chunks.iter().map(|(_, d)| 4 + d.len()).sum::<usize>()
     }
@@ -674,7 +678,7 @@ pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
         let mut next = Some(out);
         while let Some(out) = next {
             queued += out.wire_len();
-            let (label, frame) = pack_out(out, &mut push_trans);
+            let (label, frame) = pack_out(&out, &mut push_trans);
             let same = |k: &Kind| match (k, &label) {
                 (Kind::Name(a), Kind::Name(b)) => a == b,
                 (Kind::Type(a), Kind::Type(b)) => a == b,
@@ -744,35 +748,34 @@ const WRITE_BATCH: usize = 64 << 10;
 const COALESCE: Duration = Duration::from_millis(2);
 
 /// One queued frame on the wire, and what the metrics call it.
-fn pack_out(out: Outbound, push_trans: &mut u32) -> (Kind<'static>, Vec<u8>) {
-    match out {
+fn pack_out<'a>(out: &'a Outbound, push_trans: &mut u32) -> (Kind<'static>, Cow<'a, [u8]>) {
+    let (kind, ty, trans, flag, chunks) = match out {
         Outbound::Reply {
             trans,
             error,
             chunks,
-        } => {
-            trace_out(hdr::TASK, trans, error as u32, &chunks);
-            (
-                Kind::Name("reply"),
-                pack_frame(hdr::TASK, trans, error as u32, &chunks),
-            )
-        }
+        } => (
+            Kind::Name("reply"),
+            hdr::TASK,
+            *trans,
+            *error as u32,
+            chunks,
+        ),
         // The server's own push types: a set the code fixes.
         Outbound::Push { ty, chunks } => {
             let trans = *push_trans;
             *push_trans = push_trans.wrapping_add(1);
-            trace_out(ty, trans, 0, &chunks);
-            (Kind::Type(ty), pack_frame(ty, trans, 0, &chunks))
+            (Kind::Type(*ty), *ty, trans, 0, chunks)
         }
-        Outbound::Notify { ty, chunks } => {
-            trace_out(ty, 0, 0, &chunks);
-            (Kind::Type(ty), pack_frame(ty, 0, 0, &chunks))
+        Outbound::Notify { ty, chunks } => (Kind::Type(*ty), *ty, 0, 0, chunks),
+        Outbound::Request { ty, trans, chunks } => (Kind::Type(*ty), *ty, *trans, 0, chunks),
+        Outbound::Packed(p) => {
+            trace_out(p.ty, 0, 0, &p.chunks);
+            return (Kind::Type(p.ty), Cow::Borrowed(&p.frame));
         }
-        Outbound::Request { ty, trans, chunks } => {
-            trace_out(ty, trans, 0, &chunks);
-            (Kind::Type(ty), pack_frame(ty, trans, 0, &chunks))
-        }
-    }
+    };
+    trace_out(ty, trans, flag, chunks);
+    (kind, pack_frame(ty, trans, flag, chunks).into())
 }
 
 /// Reader task: frames the socket into a bounded channel (backpressure for
