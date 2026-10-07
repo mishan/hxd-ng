@@ -13,7 +13,8 @@
 # the run starts (listen 127.0.0.1:15601, upstream a's 15600) and the
 # run waits for the link; c always dials a directly. Every server takes
 # [interruption] grace as its [link] grace.
-# Environment as for run.sh, less AFTER; ACCOUNTS writes a's.
+# Environment as for run.sh, less AFTER; ACCOUNTS writes the same
+# accounts on every server, a ban across a link being placed on one.
 set -u
 NAME=$1 SCEN=$2 SYNC=${3:-normal}
 BIN=${BIN:-target/release} OUT=${OUT:-out} WORK=${WORK:-work}
@@ -127,8 +128,10 @@ if ! up "$want"; then
 fi
 
 if [ -n "${ACCOUNTS:-}" ]; then
-    "$BIN/hxd-load" accounts "$D/a/accounts" --prefix churn --count "$ACCOUNTS" \
-        --password pw --admin mod > /dev/null
+    for s in $SERVERS; do
+        "$BIN/hxd-load" accounts "$D/$s/accounts" --prefix churn --count "$ACCOUNTS" \
+            --password pw --admin mod > /dev/null
+    done
 fi
 
 cpu() { awk '{ print $14 + $15 }' "/proc/$1/stat"; }

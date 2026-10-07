@@ -657,3 +657,74 @@ async fn requests_across_a_slowed_link_take_its_round_trip() {
     let msg = &report.ops["request.msg"];
     assert!(msg.count > 0 && msg.p50_ms >= 300.0, "{}", report.summary());
 }
+
+/// L-7 on two linked servers: a moderator on `a` kicking and banning
+/// users of `b`'s accounts while the room talks on both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kicks_and_bans_across_a_link_are_carried_out_and_cost_the_room_nothing() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a_tls.local_addr().unwrap();
+    let a_peer = format!(
+        "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\nfeatures = [\"chat\"]\n",
+        link_key(2)
+    );
+    let b_peer = format!(
+        "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\nfeatures = [\"chat\"]\n",
+        link_key(1)
+    );
+    let b_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (a, b) = tokio::join!(
+        start_linked(da.path(), 1, "aa", &a_peer, a_tls),
+        start_linked(db.path(), 2, "bb", &b_peer, b_tls),
+    );
+    let accounts = Accounts {
+        prefix: "victim".into(),
+        count: 6,
+        password: "load-test".into(),
+    };
+    for dir in [&da, &db] {
+        hxd_load::accounts::write(
+            &dir.path().join("accounts"),
+            &accounts.prefix,
+            accounts.count,
+            &accounts.password,
+            Some("moderator"),
+        )
+        .unwrap();
+    }
+    let mut s = scenario(&a, Kind::Moderation, 4.0);
+    s.target.accounts = Some(accounts);
+    s.target.admin = Some(Account {
+        login: "moderator".into(),
+        password: "load-test".into(),
+    });
+    s.target.linked = vec![hxd_load::config::Server {
+        name: "b".into(),
+        legacy: Some(b.legacy),
+        ng: Some(b.ng),
+        ..Default::default()
+    }];
+    (s.chat.readers_legacy, s.chat.readers_ng) = (2, 2);
+    (s.chat.talkers_legacy, s.chat.talkers_ng) = (1, 1);
+    s.chat.rate = 40.0;
+    s.moderation.victims = 6;
+    s.moderation.acts_after = 1.0;
+    s.moderation.every = 0.4;
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    assert_eq!(
+        report.checks["link.acts_carried"].held,
+        6,
+        "{}",
+        report.summary()
+    );
+    let acts = &report.detail["acts"];
+    assert!(
+        acts["kicks"].as_u64() > Some(0) && acts["bans"].as_u64() > Some(0),
+        "{acts}"
+    );
+    assert!(report.checks["link.contained"].held == 1);
+}

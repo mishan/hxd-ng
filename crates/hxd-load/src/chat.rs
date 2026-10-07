@@ -234,7 +234,7 @@ async fn read(
                     ctx.checks.violated("chat.stayed", format!("{} was kicked", parts.nick));
                     break;
                 }
-                Ok(Got::Other | Got::Joined { .. } | Got::Parted(_) | Got::Msg(_)) => {}
+                Ok(Got::Other | Got::Joined { .. } | Got::Parted(_) | Got::Msg(_) | Got::Told(_)) => {}
                 Err(e) => {
                     ctx.checks.violated("chat.stayed", format!("{} lost its connection: {e}", parts.nick));
                     break;
@@ -256,5 +256,35 @@ pub async fn leave(ctx: &Ctx, members: Vec<Member>) {
         if let Err(e) = m.leave().await {
             ctx.stats.error("leave", &e.to_string());
         }
+    }
+}
+
+/// What `link.contained` allows past the factor: at a millisecond or two
+/// of p99, the factor alone would be scheduling noise.
+const CONTAINED_FLOOR_MS: f64 = 10.0;
+
+/// The room's p99 delivery from the split `speak_at` was given on, held
+/// to `factor` times its p99 before (`link.contained`): what happened
+/// then, `what`, must cost the room nothing.
+pub fn contained(ctx: &Ctx, factor: f64, what: &str) {
+    let ops = ctx.stats.summary();
+    match (
+        ops.get("chat.delivery.before"),
+        ops.get("chat.delivery.after"),
+    ) {
+        (Some(calm), Some(after)) if calm.count > 0 && after.count > 0 => {
+            let allowed = calm.p99_ms * factor + CONTAINED_FLOOR_MS;
+            ctx.checks
+                .check("link.contained", after.p99_ms <= allowed, || {
+                    format!(
+                    "the room's p99 went from {:.2}ms to {:.2}ms once {what}, past {allowed:.2}ms",
+                    calm.p99_ms, after.p99_ms
+                )
+                });
+        }
+        _ => ctx.checks.violated(
+            "link.contained",
+            format!("no lines heard on one side of when {what}"),
+        ),
     }
 }

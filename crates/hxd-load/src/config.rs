@@ -46,6 +46,7 @@ pub struct Scenario {
     pub interruption: Interruption,
     pub slow_peer: SlowPeer,
     pub requests: Requests,
+    pub moderation: Moderation,
 }
 
 impl Scenario {
@@ -117,6 +118,8 @@ impl Scenario {
             Kind::Interruption => self.interruption.population_legacy > 0,
             Kind::SlowPeer => self.chat.readers_legacy + self.chat.talkers_legacy > 0,
             Kind::Requests => self.requests.requesters_legacy > 0,
+            // The moderator, and the victims on the linked servers.
+            Kind::Moderation => true,
         };
         let needs_ng = match self.run.scenario {
             Kind::LoginStorm => self.login_storm.ng > 0,
@@ -128,6 +131,7 @@ impl Scenario {
             Kind::Interruption => self.interruption.population_ng > 0,
             Kind::SlowPeer => self.chat.readers_ng + self.chat.talkers_ng > 0,
             Kind::Requests => self.requests.requesters_ng > 0,
+            Kind::Moderation => self.chat.readers_ng + self.chat.talkers_ng > 0,
         };
         if !self.target.linked.is_empty() {
             self.check_linked(needs_legacy, needs_ng)?;
@@ -140,6 +144,9 @@ impl Scenario {
         }
         if self.run.scenario == Kind::Requests {
             self.check_requests()?;
+        }
+        if self.run.scenario == Kind::Moderation {
+            self.check_moderation()?;
         }
         if needs_legacy && self.target.legacy.is_none() {
             return Err(
@@ -191,9 +198,11 @@ impl Scenario {
             Kind::Churn => (false, true),
             // The users the requests are for, on both wires.
             Kind::Requests => (true, true),
+            // The victims, on the classic wire; the room as chat's.
+            Kind::Moderation => (true, needs_ng),
             _ => {
                 return Err("[[target.linked]] is for chat, login_storm, churn, \
-                                interruption, slow_peer and requests"
+                                interruption, slow_peer, requests and moderation"
                     .into())
             }
         };
@@ -308,6 +317,47 @@ impl Scenario {
         }
         if r.peer_latency_ms.is_some() && self.target.proxy.is_none() {
             return Err("[requests] peer_latency_ms needs [target.proxy]".into());
+        }
+        Ok(())
+    }
+}
+
+impl Scenario {
+    /// Moderation is a moderator on `[target]` acting on the users of the
+    /// servers linked to it, while the room talks.
+    fn check_moderation(&self) -> Result<(), String> {
+        let m = &self.moderation;
+        if self.target.linked.is_empty() || self.target.admin.is_none() {
+            return Err("moderation needs [[target.linked]] and [target] admin".into());
+        }
+        if m.victims == 0 {
+            return Err("[moderation] needs victims to act on".into());
+        }
+        let have = self.target.accounts.as_ref().map_or(0, |a| a.count);
+        if have < m.victims {
+            return Err(format!(
+                "[moderation] victims = {} needs that many [target] accounts, \
+                 on the linked servers too; there are {have}",
+                m.victims
+            ));
+        }
+        if self.chat.talkers_legacy + self.chat.talkers_ng == 0 || self.chat.rate <= 0.0 {
+            return Err("[chat] needs talkers and a positive rate".into());
+        }
+        for (name, v) in [
+            ("every", m.every),
+            ("acts_after", m.acts_after),
+            ("contained", m.contained),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(format!("[moderation] {name} must be positive"));
+            }
+        }
+        if !(0.0..=1.0).contains(&m.ban_share) {
+            return Err("[moderation] ban_share must be between 0 and 1".into());
+        }
+        if m.acts_after >= self.run.duration {
+            return Err("[moderation] acts_after must fall inside [run] duration".into());
         }
         Ok(())
     }
@@ -452,6 +502,38 @@ pub enum Kind {
     /// L-6: private messages and user info sent across a link, as the
     /// users behind it grow in number.
     Requests,
+    /// L-7: kicks and bans of other servers' users while the room talks.
+    Moderation,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Moderation {
+    /// Users on the linked servers, logged in to `[target] accounts`
+    /// (which those servers must have too, a ban being placed on an
+    /// account), each acted on once.
+    pub victims: usize,
+    /// Seconds into the talking when the acts begin.
+    pub acts_after: f64,
+    /// Seconds between acts, on a fixed schedule.
+    pub every: f64,
+    /// The share of acts that are bans rather than kicks.
+    pub ban_share: f64,
+    /// How much worse the room's p99 delivery may get once the acts
+    /// begin, as a factor of its p99 before.
+    pub contained: f64,
+}
+
+impl Default for Moderation {
+    fn default() -> Self {
+        Moderation {
+            victims: 20,
+            acts_after: 5.0,
+            every: 1.0,
+            ban_share: 0.5,
+            contained: 3.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -751,7 +833,7 @@ mod tests {
             Scenario::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             seen += 1;
         }
-        assert_eq!(seen, 11);
+        assert_eq!(seen, 12);
     }
 
     #[test]
