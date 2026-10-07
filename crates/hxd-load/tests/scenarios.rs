@@ -728,3 +728,53 @@ async fn kicks_and_bans_across_a_link_are_carried_out_and_cost_the_room_nothing(
     );
     assert!(report.checks["link.contained"].held == 1);
 }
+
+/// L-8, small: a hub `a` and three leaves, the talkers on the hub and
+/// the readers on every server; every reader hears every line, and each
+/// leaf lists the hub's users and its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hub_fans_its_rooms_lines_out_to_every_leaf() {
+    let dirs = [(); 4].map(|_| tempfile::tempdir().unwrap());
+    let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a_tls.local_addr().unwrap();
+    let names = ["bb", "cc", "dd"];
+    let accepts: String = names
+        .iter()
+        .zip(2u8..)
+        .map(|(name, seed)| {
+            format!(
+                "[[link.peer]]\nname = \"{name}\"\naccept = true\nprotection = \"key\"\n\
+                 key = \"{}\"\naccount = \"link-{name}\"\nfeatures = [\"chat\"]\n",
+                link_key(seed)
+            )
+        })
+        .collect();
+    let (a, _) = start_linked_with(dirs[0].path(), 1, "aa", &accepts, a_tls).await;
+    let mut leaves = Vec::new();
+    for ((name, seed), dir) in names.iter().zip(2u8..).zip(&dirs[1..]) {
+        let dial = format!(
+            "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
+             key = \"{}\"\naccount = \"link-{name}\"\nfeatures = [\"chat\"]\n",
+            link_key(1)
+        );
+        let tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let leaf = start_linked(dir.path(), seed, name, &dial, tls).await;
+        leaves.push(hxd_load::config::Server {
+            name: name.to_string(),
+            legacy: Some(leaf.legacy),
+            ng: Some(leaf.ng),
+            ..Default::default()
+        });
+    }
+    let mut s = scenario(&a, Kind::Chat, 2.0);
+    s.target.linked = leaves;
+    (s.chat.readers_legacy, s.chat.readers_ng) = (4, 4);
+    (s.chat.talkers_legacy, s.chat.talkers_ng) = (1, 1);
+    s.chat.talkers_at_target = true;
+    s.chat.rate = 40.0;
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    assert_eq!(report.checks["chat.all_heard"].held, 10 * 2);
+    assert_eq!(report.checks["roster.agrees"].held, 10);
+    assert!(report.ops["chat.delivery.cross"].count > 0);
+}

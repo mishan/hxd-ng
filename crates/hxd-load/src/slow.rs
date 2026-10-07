@@ -76,7 +76,7 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
         None => Vec::new(),
     };
     let stalled_nicks: Vec<String> = stalled.iter().map(|(_, _, p)| p.nick.clone()).collect();
-    member::roster_agrees(ctx, &mut members, &stalled_nicks).await;
+    member::roster_agrees(ctx, &mut members, &[], &stalled_nicks).await;
 
     let mut probed = Vec::new();
     for (_, rx, parts) in stalled {

@@ -5,7 +5,7 @@ consumer and churn scenarios, and the invariant checks; the
 `hxd-testclient` crate it drives both wires with; and the baseline, a
 script that runs them all the same way every time (§7). The other
 scenarios, and a CI smoke run, are next. Server links (§8): the metrics,
-several servers in a run, the proxy's cut and stall, and L-1 to L-7 are
+several servers in a run, the proxy's cut and stall, and L-1 to L-8 are
 built; the rest is planned.
 
 The point of loading this server is to find what only breaks under
@@ -299,12 +299,16 @@ is made on each, and the report carries each one's metrics under
 `linked`. A run whose servers have metrics and no link up does not
 start; nor does one until `[target]` has a link up to each of the
 others. Chat, the login storm and the scenarios below that cut or stall
-a link take linked servers.
+a link take linked servers. They are a star on `[target]`, linked
+without transit, so a server other than `[target]` lists only its own
+users and `[target]`'s, and a chat room across more than one linked
+server has its talkers on `[target]` (`talkers_at_target`).
 
 **`baseline/link-run.sh`** (built) runs one scenario as `run.sh` does,
-against two servers, or three when the scenario names a second linked
-one: `a` on run.sh's ports accepting key-mode links that `b`, on 16500
-and 16700, and `c`, on 17500 and 17700, dial over TLS, each with a fresh key,
+against `a` on run.sh's ports and one server for each linked one the
+scenario names, `b` on 16500 and 16700, `c` on 17500 and 17700, and so
+on, up to `q`: `a` accepts key-mode links that the others dial over
+TLS, each with a fresh key,
 certificate and database, `[limits]` at zero (a ghost's lines are held
 to `chat_lines` as a local user's are) and `show_tags` off, since the
 checks match the classic wire's nicks exactly and a tag would change
@@ -347,7 +351,7 @@ grace`.
 | L-5 | Churn across a link (built) | the churn scenario on A; once its time is up the kicks stop, then every churner says it is held, and B's list is compared with A's user for user; uid watchers on both | B's roster against A's once quiet | ghosts left on B, a uid reused inside its quarantine |
 | L-6 | Requests (built) | requesters on A sending private messages (both wires) and user info (classic) to B's users, open-loop, at each count in `[requests] ghosts`; each step reported apart | round trip against the ghosts shown (the scan) | requests refused once more wait on the peer than a link lets wait: each requester waits on its answer, so that takes more requesters than that cap and a round trip long enough to keep them waiting together (about the cap divided by the round trip, a second); and answers outlasting the server's wait for the peer, which the sender hears as refused while the message is still delivered (`link.msgs_delivered`, `scenarios/link-requests-slow.toml` with `peer_latency_ms`) |
 | L-7 | Moderation under load (built) | the room on A and B, and a moderator on A kicking or banning B's users, accounts there as on A, one every `every` seconds from `acts_after`; `chat.delivery.before` and `.after` the first act | each act answered (`moderation.kick`, `.ban`) and carried out on B (`moderation.carried`) | a slow store write holding up the hub or the feed |
-| L-8 | Many links | a hub with K leaves, K doubling, under L-1 | per-event cost against K | the feed, past K times the rate |
+| L-8 | Many links (built) | a hub with K leaves, K doubling (`baseline/link-fanout.sh`), the room's talkers on the hub (`[chat] talkers_at_target`) and its readers on every server | delivery to the leaves against K and rate; the hub's CPU | each leaf logging every line the hub fans out to it, one commit per ghost's line: past what a leaf can commit, its queue of ghosts' lines overflows and the lines are not shown there (`hxd_link_dropped_total{what="chat"}`), which every reader of it misses (`chat.all_heard`); sooner the more servers share a host |
 
 Each is swept one variable at a time from a fixed point, repeated, and
 compared only on one host, as §7 asks: users per side up to the bounds
@@ -395,5 +399,5 @@ both also run small in `tests/scenarios.rs` against two servers in
 process (without `metrics`, so there the clients' checks hold and the
 link checks are the baseline's); the proxy's cut and L-3, run small in
 process too; the stall and L-4 likewise, on three; and L-5 and L-6.
-The proxy's latency and L-6 across it too, and L-7. Next: L-8, and a
-link pass in the baseline's sweep.
+The proxy's latency and L-6 across it too, L-7, and L-8 on a hub and
+three leaves. Next: a link pass in the baseline's sweep.

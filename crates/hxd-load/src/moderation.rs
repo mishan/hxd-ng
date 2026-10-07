@@ -70,6 +70,7 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
             .map_err(|e| format!("the moderator could not log in: {e}"))?;
     let uids = shown(ctx, &mut moderator, &victims).await?;
     let room = chat::gather(ctx).await?;
+    let on = room.on.clone();
 
     let start = ctx.t0.elapsed() + Duration::from_millis(100);
     let acts_at = start + Duration::from_secs_f64(m.acts_after);
@@ -87,7 +88,7 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
     // the room, which lists them as it may.
     let mut apart = victims.clone();
     apart.push(ctx.nick('M', 0));
-    member::roster_agrees(ctx, &mut members, &apart).await;
+    member::roster_agrees(ctx, &mut members, &on, &apart).await;
     chat::leave(ctx, members).await;
     let _ = stop_tx.send(true);
     for l in listeners {
