@@ -5,7 +5,7 @@ consumer and churn scenarios, and the invariant checks; the
 `hxd-testclient` crate it drives both wires with; and the baseline, a
 script that runs them all the same way every time (§7). The other
 scenarios, and a CI smoke run, are next. Server links (§8): the metrics,
-several servers in a run, the proxy's cut and stall, and L-1 to L-5 are
+several servers in a run, the proxy's cut and stall, and L-1 to L-6 are
 built; the rest is planned.
 
 The point of loading this server is to find what only breaks under
@@ -340,7 +340,7 @@ its `[link] grace`.
 | L-3 | Interruption (built) | `[interruption] population_*` idle on A, `watchers_*` on B; the proxy cuts the link for each of `cuts` seconds in turn, swept across `grace`; `link.reconnect` times each link back, and the report each cut's parts and joins as the watchers heard them | time back up, snapshot time against N, the burst each local session takes | a local session dropped as `slow_consumer` by a netsplit's burst; only detached sessions should resync. Its numbers are what `grace` is tuned by |
 | L-4 | Slow peer (built) | A-B through the proxy and A-C directly, the `[chat]` room on A and C; `[slow_peer] stalled`'s link stalled from `stall_after` to the end of the talking; `chat.delivery.before` and `.after` the stall | C's and A's local latency, which should not move; A's memory, inside `QueueBudget` | A closing B as `slow_consumer` within a bound; anything that slows C or A's own users fails it |
 | L-5 | Churn across a link (built) | the churn scenario on A; once its time is up the kicks stop, then every churner says it is held, and B's list is compared with A's user for user; uid watchers on both | B's roster against A's once quiet | ghosts left on B, a uid reused inside its quarantine |
-| L-6 | Requests | private messages and user info to ghosts, at rising ghost counts | round trip against the ghosts shown (the scan) | requests refused as rate limited, the per-hop wait under latency, the hub's lock showing in chat latency |
+| L-6 | Requests (built) | requesters on A sending private messages (both wires) and user info (classic) to B's users, open-loop, at each count in `[requests] ghosts`; each step reported apart | round trip against the ghosts shown (the scan) | requests refused once more are waiting than a link holds: each requester waits on its answer, so that takes more requesters than the link's queue for the peer (or, behind it, more than it lets wait on the peer at once) and enough of them waiting together, which a peer slow to answer makes likelier: the per-hop wait under the proxy's latency, still to build |
 | L-7 | Moderation under load | kicks and bans across the link during L-1 | a ban stored and its ghost gone | a slow store write holding up the hub or the feed |
 | L-8 | Many links | a hub with K leaves, K doubling, under L-1 | per-event cost against K | the feed, past K times the rate |
 
@@ -364,6 +364,9 @@ gap; a ghost's line past `chat_lines` does not, which is one more reason
 | `link.stayed_up` | With metrics, no link ended or came up during the run: none was cut. |
 | `link.no_ghosts` | With metrics, after everyone has left, each server holds no more ghosts than before the run. |
 | `link.joins_heard` | Every observer heard every arrival that logged in join its server. |
+| `link.ghosts_shown` | In L-6, at each step `[target]` showed every one of the linked servers' users within `settle`. |
+| `link.msgs_delivered` | In L-6, every message `[target]` accepted was heard by its recipient once, and every one it refused never, after each step and again once the run is quiet. User info answered with the ghost's server alone, and a message queued, count as refused. |
+| `link.requests_answered` | In L-6, every requester was answered within a wait past the server's own for the peer; one that was not is dropped from the run. |
 | `churn.kicks_stopped` | In L-5, the moderator stopped kicking within `settle` of being told to. |
 | `link.mirrors` | In L-5, every churner held within `settle`, and then every linked server lists exactly the run's users `[target]` does, user for user (a stale ghost under a nick still in use counts), within `settle`, and that is not none. |
 | `link.recovered` | After each cut within `recover`: every link up again (with metrics; without, once the grace is past) and every watcher's server listing the whole population. In L-4, with metrics, every link up again within `recover` of the stall's end. |
@@ -384,5 +387,6 @@ Built: the metrics; several servers in `hxd-load` with L-1 and L-2,
 both also run small in `tests/scenarios.rs` against two servers in
 process (without `metrics`, so there the clients' checks hold and the
 link checks are the baseline's); the proxy's cut and L-3, run small in
-process too; the stall and L-4 likewise, on three; and L-5. Next: L-6
-to L-8, and a link pass in the baseline's sweep.
+process too; the stall and L-4 likewise, on three; and L-5 and L-6.
+Next: the proxy's latency (L-6's refusals, the per-hop wait), L-7 and
+L-8, and a link pass in the baseline's sweep.

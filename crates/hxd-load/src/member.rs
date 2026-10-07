@@ -146,12 +146,22 @@ impl Member {
 
     /// The same, one per user: two users under one nick are two entries.
     pub async fn nick_list(&mut self) -> Result<Vec<String>, Error> {
+        Ok(self.users().await?.into_iter().map(|(n, _)| n).collect())
+    }
+
+    /// Every user on this client's list, nick and uid.
+    pub async fn users(&mut self) -> Result<Vec<(String, u64)>, Error> {
         Ok(match &mut self.conn {
             Conn::Legacy(c) => c
                 .user_list()
                 .await?
                 .into_iter()
-                .map(|r| String::from_utf8_lossy(&r.nick).into_owned())
+                .map(|r| {
+                    (
+                        String::from_utf8_lossy(&r.nick).into_owned(),
+                        u64::from(r.uid),
+                    )
+                })
                 .collect(),
             Conn::Ng(c) => {
                 let ok = c.sync().await?;
@@ -159,7 +169,7 @@ impl Member {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter_map(|u| u["nick"].as_str().map(str::to_owned))
+                    .filter_map(|u| Some((u["nick"].as_str()?.to_owned(), u["uid"].as_u64()?)))
                     .collect()
             }
         })
@@ -262,6 +272,8 @@ pub enum Got {
     },
     /// A user left.
     Parted(Option<u64>),
+    /// A private message's text.
+    Msg(String),
     /// The server ended this session.
     Kicked,
     Other,
@@ -280,6 +292,10 @@ impl Rx {
                     ),
                     legacy::push::DISCONNECT_MSG => Got::Kicked,
                     legacy::push::USER_PART => Got::Parted(f.uint(tag::UID).map(u64::from)),
+                    legacy::push::MSG => Got::Msg(
+                        String::from_utf8_lossy(&f.bytes(tag::BODY).unwrap_or_default())
+                            .into_owned(),
+                    ),
                     legacy::push::USER_CHANGE => Got::Joined {
                         nick: String::from_utf8_lossy(&f.bytes(tag::NAME).unwrap_or_default())
                             .into_owned(),
@@ -295,6 +311,9 @@ impl Rx {
                     Got::Chat(e.data["text"].as_str().unwrap_or_default().to_owned())
                 }
                 ng::Incoming::Event(e) if e.ev == "kicked" => Got::Kicked,
+                ng::Incoming::Event(e) if e.ev == "msg" => {
+                    Got::Msg(e.data["text"].as_str().unwrap_or_default().to_owned())
+                }
                 ng::Incoming::Event(e) if e.ev == "user_parted" => {
                     Got::Parted(e.data["uid"].as_u64())
                 }
