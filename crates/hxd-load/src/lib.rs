@@ -21,6 +21,8 @@
 //!   ([`proxy`]) and restored, across their grace period.
 //! - **L-4** [`slow_peer`]: one server's link stalled at the proxy while
 //!   the room talks on the others.
+//! - **L-6** [`requests`]: private messages and user info to ghosts, as
+//!   there are more of them.
 
 pub mod accounts;
 pub mod chat;
@@ -32,6 +34,7 @@ pub mod ledger;
 pub mod member;
 pub mod proxy;
 pub mod report;
+pub mod requests;
 pub mod slow;
 pub mod slow_peer;
 pub mod stats;
@@ -153,6 +156,7 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
             let proxy = proxy.as_ref().expect("checked by the scenario");
             slow_peer::run(&ctx, proxy, &before).await?
         }
+        Kind::Requests => requests::run(&ctx).await?,
     };
 
     // Everyone this run brought has left; every roster should say so.

@@ -554,3 +554,55 @@ async fn churn_on_one_server_is_mirrored_on_the_other_and_freed_uids_stay_freed(
     );
     assert_eq!(report.checks["roster.no_ghosts"].held, 2);
 }
+
+/// L-6 on two linked servers: messages on both wires and user info from
+/// `a` to the users of `b`, at two counts of them; every message `a`
+/// accepted heard once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_to_ghosts_are_answered_and_every_message_accepted_is_heard_once() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a_tls.local_addr().unwrap();
+    let features = r#"features = ["chat", "msgs", "info"]"#;
+    let a_peer = format!(
+        "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\n{features}\n",
+        link_key(2)
+    );
+    let b_peer = format!(
+        "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\n{features}\n",
+        link_key(1)
+    );
+    let b_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (a, b) = tokio::join!(
+        start_linked(da.path(), 1, "aa", &a_peer, a_tls),
+        start_linked(db.path(), 2, "bb", &b_peer, b_tls),
+    );
+    let mut s = scenario(&a, Kind::Requests, 1.0);
+    s.target.linked = vec![hxd_load::config::Server {
+        name: "b".into(),
+        legacy: Some(b.legacy),
+        ng: Some(b.ng),
+        ..Default::default()
+    }];
+    s.requests.ghosts = vec![6, 20];
+    (s.requests.requesters_legacy, s.requests.requesters_ng) = (1, 1);
+    s.requests.rate = 40.0;
+    s.requests.step = 1.5;
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    assert_eq!(report.checks["link.ghosts_shown"].held, 2);
+    assert!(report.ops["request.msg"].count > 0, "{}", report.summary());
+    assert!(report.ops["request.info"].count > 0, "{}", report.summary());
+    // Nothing refused: user info answered by the peer, not by `a` alone.
+    for st in report.detail["steps"].as_array().unwrap() {
+        assert_eq!(st["refused"], 0, "{st}");
+    }
+    assert_eq!(
+        report.checks["link.msgs_delivered"].held,
+        report.ops["request.msg"].count,
+        "{}",
+        report.summary()
+    );
+}

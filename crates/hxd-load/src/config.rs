@@ -45,6 +45,7 @@ pub struct Scenario {
     pub churn: Churn,
     pub interruption: Interruption,
     pub slow_peer: SlowPeer,
+    pub requests: Requests,
 }
 
 impl Scenario {
@@ -115,6 +116,7 @@ impl Scenario {
             Kind::Churn => self.churn.legacy > 0,
             Kind::Interruption => self.interruption.population_legacy > 0,
             Kind::SlowPeer => self.chat.readers_legacy + self.chat.talkers_legacy > 0,
+            Kind::Requests => self.requests.requesters_legacy > 0,
         };
         let needs_ng = match self.run.scenario {
             Kind::LoginStorm => self.login_storm.ng > 0,
@@ -125,6 +127,7 @@ impl Scenario {
             Kind::Churn => self.churn.ng > 0,
             Kind::Interruption => self.interruption.population_ng > 0,
             Kind::SlowPeer => self.chat.readers_ng + self.chat.talkers_ng > 0,
+            Kind::Requests => self.requests.requesters_ng > 0,
         };
         if !self.target.linked.is_empty() {
             self.check_linked(needs_legacy, needs_ng)?;
@@ -134,6 +137,9 @@ impl Scenario {
         }
         if self.run.scenario == Kind::SlowPeer {
             self.check_slow_peer()?;
+        }
+        if self.run.scenario == Kind::Requests {
+            self.check_requests()?;
         }
         if needs_legacy && self.target.legacy.is_none() {
             return Err(
@@ -170,25 +176,27 @@ impl Scenario {
     /// The servers linked to the target: each named once, and with every
     /// port the clients a scenario puts there need.
     fn check_linked(&self, needs_legacy: bool, needs_ng: bool) -> Result<(), String> {
-        let (legacy, ng) =
-            match self.run.scenario {
-                Kind::Chat => (needs_legacy, needs_ng),
-                Kind::LoginStorm => (
-                    self.login_storm.observers_legacy > 0,
-                    self.login_storm.observers_ng > 0,
-                ),
-                Kind::Interruption => (
-                    self.interruption.watchers_legacy > 0,
-                    self.interruption.watchers_ng > 0,
-                ),
-                Kind::SlowPeer => (needs_legacy, needs_ng),
-                // The watchers and lookers on each.
-                Kind::Churn => (false, true),
-                _ => return Err(
-                    "[[target.linked]] is for chat, login_storm, churn, interruption and slow_peer"
-                        .into(),
-                ),
-            };
+        let (legacy, ng) = match self.run.scenario {
+            Kind::Chat => (needs_legacy, needs_ng),
+            Kind::LoginStorm => (
+                self.login_storm.observers_legacy > 0,
+                self.login_storm.observers_ng > 0,
+            ),
+            Kind::Interruption => (
+                self.interruption.watchers_legacy > 0,
+                self.interruption.watchers_ng > 0,
+            ),
+            Kind::SlowPeer => (needs_legacy, needs_ng),
+            // The watchers and lookers on each.
+            Kind::Churn => (false, true),
+            // The users the requests are for, on both wires.
+            Kind::Requests => (true, true),
+            _ => {
+                return Err("[[target.linked]] is for chat, login_storm, churn, \
+                                interruption, slow_peer and requests"
+                    .into())
+            }
+        };
         if self.run.scenario == Kind::LoginStorm
             && self.login_storm.observers_legacy + self.login_storm.observers_ng == 0
         {
@@ -273,6 +281,30 @@ impl Scenario {
             return Err(
                 "[slow_peer] stall_after + drop_within must fall inside [run] duration".into(),
             );
+        }
+        Ok(())
+    }
+}
+
+impl Scenario {
+    /// Requests go from `[target]` to the users of the servers linked to
+    /// it, step by step as there are more of them.
+    fn check_requests(&self) -> Result<(), String> {
+        let r = &self.requests;
+        if self.target.linked.is_empty() {
+            return Err("requests needs [[target.linked]]".into());
+        }
+        if r.requesters_legacy + r.requesters_ng == 0 {
+            return Err("[requests] needs requesters".into());
+        }
+        if r.ghosts.is_empty() || r.ghosts.windows(2).any(|w| w[0] >= w[1]) || r.ghosts[0] == 0 {
+            return Err("[requests] ghosts must be rising counts above zero".into());
+        }
+        if !(r.rate.is_finite() && r.rate > 0.0 && r.step.is_finite() && r.step > 0.0) {
+            return Err("[requests] rate and step must be positive".into());
+        }
+        if !(0.0..=1.0).contains(&r.info_share) {
+            return Err("[requests] info_share must be between 0 and 1".into());
         }
         Ok(())
     }
@@ -411,6 +443,40 @@ pub enum Kind {
     /// L-4: one linked server stops reading what its peer sends it, while
     /// the room talks on the others.
     SlowPeer,
+    /// L-6: private messages and user info sent across a link, as the
+    /// users behind it grow in number.
+    Requests,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Requests {
+    /// Idle users on the linked servers, each count a step: the ghosts
+    /// `[target]` shows, whom the requests are for.
+    pub ghosts: Vec<usize>,
+    /// Clients on `[target]` that send them.
+    pub requesters_legacy: usize,
+    pub requesters_ng: usize,
+    /// Requests a second, every requester together, on a fixed schedule.
+    pub rate: f64,
+    /// Seconds of requests at each step.
+    pub step: f64,
+    /// Of the classic requesters' requests, the share that ask for a
+    /// user's info rather than send a message; ng has no user info.
+    pub info_share: f64,
+}
+
+impl Default for Requests {
+    fn default() -> Self {
+        Requests {
+            ghosts: vec![50, 200, 800],
+            requesters_legacy: 2,
+            requesters_ng: 2,
+            rate: 50.0,
+            step: 10.0,
+            info_share: 0.5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -674,7 +740,7 @@ mod tests {
             Scenario::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             seen += 1;
         }
-        assert_eq!(seen, 9);
+        assert_eq!(seen, 10);
     }
 
     #[test]

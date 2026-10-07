@@ -1,0 +1,31 @@
+# L-6: private messages on both wires and user info, from requesters on
+# a to the users of b, as b's users grow step by step. Each step reports
+# the requests' round trip and refusals; every message a accepted must
+# be heard once, every one it refused never.
+#
+#   baseline/link-run.sh link-requests scenarios/link-requests.toml
+
+[target]
+legacy = "127.0.0.1:15500"
+ng = "127.0.0.1:15700"
+metrics = true            # needs `--features metrics` and a [metrics] section
+log = "@LOG@"
+
+[[target.linked]]
+name = "b"
+legacy = "127.0.0.1:16500"
+ng = "127.0.0.1:16700"
+metrics = true
+log = "@LOG_B@"
+
+[run]
+scenario = "requests"
+settle = 10
+
+[requests]
+ghosts = [50, 200, 800]
+requesters_legacy = 4
+requesters_ng = 4
+rate = 200                # requests a second, every requester together
+step = 15
+info_share = 0.5
