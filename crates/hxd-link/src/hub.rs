@@ -508,6 +508,13 @@ impl Hub {
         });
     }
 
+    /// The grace period, while what `peer`'s interrupted link learned is
+    /// held for it.
+    pub(crate) fn holding(&self, peer: &str) -> Option<std::time::Duration> {
+        let held = self.0.state.lock().unwrap().held.contains_key(peer);
+        held.then(|| self.0.config.lock().unwrap().grace)
+    }
+
     /// Whether this server is stopping, for a dialer to give up.
     pub(crate) fn shutting_down(&self) -> bool {
         self.0.state.lock().unwrap().shutting_down

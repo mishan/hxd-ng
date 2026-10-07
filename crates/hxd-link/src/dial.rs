@@ -69,16 +69,30 @@ async fn dial(hub: &Hub, peer: &str) -> bool {
             return true;
         };
         let next = dial_once(hub, &entry).await;
-        wait = match next {
-            Next::Stop => {
-                warn!(peer = %entry.name, "not redialing without an operator");
-                return false;
-            }
-            Next::Again => FIRST_RETRY,
-            Next::Backoff => (wait * 2).min(SLOWEST),
-            Next::Slow => SLOWEST,
-        };
+        if matches!(next, Next::Stop) {
+            warn!(peer = %entry.name, "not redialing without an operator");
+            return false;
+        }
+        wait = next_wait(wait, next, hub.holding(peer));
         tokio::time::sleep(jitter(wait)).await;
+    }
+}
+
+/// How long to wait before dialing again. While an interrupted link's
+/// servers and ghosts are held for the grace period, the peer is tried at
+/// least every quarter of it: an outage that ends inside the grace must
+/// come back inside it too, not whenever a backoff that doubled through
+/// the outage next gets round to it, by which time a short outage may
+/// have outlasted the grace and become a netsplit.
+fn next_wait(wait: Duration, next: Next, holding: Option<Duration>) -> Duration {
+    let wait = match next {
+        Next::Again => FIRST_RETRY,
+        Next::Backoff => (wait * 2).min(SLOWEST),
+        Next::Slow | Next::Stop => SLOWEST,
+    };
+    match holding {
+        Some(grace) => wait.min((grace / 4).max(FIRST_RETRY)),
+        None => wait,
     }
 }
 
@@ -297,6 +311,22 @@ mod tests {
     use super::*;
     use crate::wire::Field;
     use crate::LinkKey;
+
+    #[test]
+    fn a_held_link_is_redialed_often_enough_to_return_inside_its_grace() {
+        let grace = Duration::from_secs(60);
+        let mut held = FIRST_RETRY;
+        let mut free = FIRST_RETRY;
+        for _ in 0..10 {
+            held = next_wait(held, Next::Backoff, Some(grace));
+            free = next_wait(free, Next::Backoff, None);
+            assert!(held <= grace / 4, "{held:?}");
+        }
+        assert_eq!(free, SLOWEST);
+        // A grace shorter than the first retry does not make a dialer spin.
+        let short = next_wait(FIRST_RETRY, Next::Backoff, Some(Duration::ZERO));
+        assert_eq!(short, FIRST_RETRY);
+    }
 
     #[test]
     fn a_reply_is_accepted_only_with_the_configured_key_proven_to_this_server() {
