@@ -45,6 +45,8 @@ const MAX_SERVERS: usize = 256;
 pub(crate) struct End {
     pub(crate) label: &'static str,
     pub(crate) peer_reason: Option<Reason>,
+    /// Why this server closed it, when it did.
+    pub(crate) our_reason: Option<Reason>,
     pub(crate) established: bool,
     /// How long it was established for, zero if never.
     pub(crate) lasted: Duration,
@@ -80,7 +82,16 @@ pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
     } else {
         link.close(&io, Reason::Unlinked, "unlinked")
     };
-    hub.unregister(&entry.name, generation);
+    // Interrupted, not ended: dropped, gone quiet, or closed by either
+    // side for a `Shutdown` it expects to come back from, established or
+    // not, so a reconnection that fails inside the grace discards nothing.
+    let interrupted = match (end.label, end.peer_reason, end.our_reason) {
+        ("closed_by_peer", why, _) => why == Some(Reason::Shutdown),
+        ("establish_timeout", ..) => true,
+        (_, _, Some(why)) => why == Reason::Shutdown,
+        _ => true,
+    };
+    hub.unregister(&entry.name, generation, interrupted);
     info!(peer = %entry.name, reason = end.label, "link ended");
     end
 }
@@ -119,6 +130,7 @@ impl Link<'_> {
         End {
             label,
             peer_reason,
+            our_reason: None,
             established: self.established.is_some(),
             lasted: self.established.map_or(Duration::ZERO, |at| at.elapsed()),
         }
@@ -131,7 +143,10 @@ impl Link<'_> {
 
     fn close(&mut self, io: &LinkIo, reason: Reason, label: &'static str) -> End {
         self.notify(io, tx::CLOSE, &[Field::u16(field::REASON, reason as u16)]);
-        self.end(label, None)
+        End {
+            our_reason: Some(reason),
+            ..self.end(label, None)
+        }
     }
 
     /// The next transaction during establishment, answering pings, ending
@@ -220,6 +235,12 @@ impl Link<'_> {
 
         self.features = features & peer.features;
         self.peer_id = Some(peer.server.id);
+        self.hub.resume(
+            &self.entry.name,
+            self.generation,
+            peer.server.id,
+            peer.epoch,
+        );
         self.hub
             .set_features(&self.entry.name, self.generation, self.features);
 
@@ -228,6 +249,7 @@ impl Link<'_> {
         if let Err(end) = self.receive_servers(io, closed).await {
             return end;
         }
+        self.hub.servers_settled(&self.entry.name, self.generation);
         let Some(Subscribed {
             since,
             users,

@@ -3,8 +3,9 @@
 Status: partial, 2026-10. Built: L0 (the uid quarantine, Colored
 Nicknames), L1 (links by key mode, Hello, server lists, pings, close,
 reload), L2 (users crossing one link both ways, ghosts on both wires), L3
-(public chat both ways), L4 (private messages and user info) and L5's
-kicks and bans both ways. The rest is design. It implements fogWraith's
+(public chat both ways), L4 (private messages and user info), L5
+(moderation both ways) and L6 (interruption and its grace period). The
+rest is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -755,14 +756,34 @@ leaves it to be sent again.
 
 ### 7.6 Interruption
 
-A link that drops, or closes with `Shutdown`, keeps its ghosts for the
-grace period (`[link] grace`, default 60 seconds) without telling local
-clients or other links; requests through it meanwhile answer
-`Unreachable`. On reconnection it reconciles by epoch, including the
-peer's own server from its Hello: a Hello naming a different server ID
-means the old one is gone. A different epoch re-uses a ghost for a user
-with the same home server, name and icon; past the grace, everything
-learned over the link goes.
+A link that drops without a Close, goes quiet, or that either side
+closes for a `Shutdown`, is interrupted, established or not, so a
+reconnection that fails inside the grace discards nothing: what the
+link learned (the peer, its servers and their ghosts) is held for the
+grace period (`[link] grace`, seconds, default 60) without telling local
+clients or other links. Requests to a held ghost answer `Unreachable`,
+and a held server is still its link's to the Loop and Tag checks, so no
+other link can claim it meanwhile. A link replaced by a newer one for the
+same peer (a redial over a half-open link) is held the same way, for the
+new link to take back. Any other ending (`Unlinked`, `ProtocolError` and
+the rest) parts everyone at once, as does removing the peer while it is
+held.
+
+When the peer is back, `Hub::resume`, after its Hello, takes what was
+held: a Hello naming a different server means the old one is gone and
+its ghosts leave. Held servers return, and once the new Link Servers is
+complete (`Hub::servers_settled`) those it no longer names are forgotten
+with their users. The same epoch means its user IDs still name the same
+people, so the snapshot reconciles as it does any snapshot: ghosts it
+names stay, with their uids, and the rest leave. A new epoch means the
+peer restarted: a held ghost is re-used, under the ID the peer now
+gives it, for a user with the same home server, name and icon, and the
+rest leave. Past the grace without the peer back, everything held
+leaves, as do a restarted peer's ghosts still unmatched if its link
+drops before its snapshot. This server's own shutdown closes its links
+for a `Shutdown` and then lets none in and dials none, so its peers hold
+its users rather than take them into a link it is about to drop. Ghosts are not marked away meanwhile, and
+nothing is said in chat, both the extension's MAYs.
 
 ## 8. Server identity and configuration
 
@@ -790,7 +811,7 @@ learned over the link goes.
 tag = "hx"                  # 1-8 printable ASCII, unique in the network
 color = 0x3a7bd5            # suggested color for this server's users elsewhere
 show_tags = false           # on to tag every ghost, for clients without colors (§3.5)
-grace = "60s"
+grace = 60                  # seconds what an interrupted link learned is kept
 max_ghosts = 2000           # across all links (§3.6)
 # key = "link-server.key"
 

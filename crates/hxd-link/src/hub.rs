@@ -73,6 +73,9 @@ pub struct HubConfig {
     /// session's queue cap: a netsplit is one event per ghost to every
     /// local session at once.
     pub max_ghosts: usize,
+    /// How long what a link learned is kept once it is interrupted, so a
+    /// brief outage shows nobody leaving and coming back.
+    pub grace: std::time::Duration,
     pub peers: Vec<PeerEntry>,
 }
 
@@ -108,13 +111,38 @@ const CHAT_CAP: usize = 1024;
 #[derive(Default)]
 struct State {
     links: HashMap<String, Live>,
+    /// What interrupted links learned, kept for the grace period.
+    held: HashMap<String, Held>,
     generation: u64,
+    /// Stopping: no link is let in or dialed, so peers hold this server's
+    /// users rather than take them into a link it is about to drop.
+    shutting_down: bool,
     /// Peers with a dial loop running, so a reload never starts a second.
     dialing: std::collections::HashSet<String>,
 }
 
+/// An interrupted link's servers and ghosts, kept without telling anyone
+/// until it comes back or the grace period runs out (the extension's
+/// Interruption and Resynchronisation).
+struct Held {
+    /// Which interruption this is, for the timer that ends it.
+    generation: u64,
+    peer: ServerGroup,
+    epoch: [u8; 8],
+    servers: HashMap<ServerId, ServerGroup>,
+    ghosts: HashMap<u16, Slot>,
+}
+
 struct Live {
     generation: u64,
+    /// The peer's epoch from its Hello: a different one on its return
+    /// means its user IDs name other people now.
+    epoch: Option<[u8; 8]>,
+    /// Held ghosts of a peer that came back with a new epoch, until its
+    /// snapshot says which of them are still there.
+    stale: Vec<Slot>,
+    /// Held servers not yet named again in the peer's Link Servers.
+    unconfirmed: std::collections::HashSet<ServerId>,
     close: Option<oneshot::Sender<Reason>>,
     /// The peer itself, once its Hello was accepted.
     peer: Option<ServerGroup>,
@@ -283,7 +311,20 @@ impl Hub {
                 let _ = close.send(reason);
             }
         }
+        // A peer removed while its link was interrupted is not coming back.
+        let removed: Vec<String> = state
+            .held
+            .keys()
+            .filter(|name| !peers.iter().any(|p| &p.name == *name))
+            .cloned()
+            .collect();
+        let gone: Vec<Slot> = removed
+            .iter()
+            .filter_map(|name| state.held.remove(name))
+            .flat_map(|h| h.ghosts.into_values())
+            .collect();
         drop(state);
+        self.part(gone);
         // Only an entry that is new or changed: a dialer that stopped on
         // Unlinked, Replaced or VersionUnsupported waits for its operator
         // to act on it, and a SIGHUP sent for something else (a renewed
@@ -296,6 +337,20 @@ impl Hub {
             {
                 self.spawn_dialer(entry.name);
             }
+        }
+    }
+
+    /// Close every link for a `Shutdown`, which peers keep what they
+    /// learned through for their grace period, and wait a moment for the
+    /// Close to be written.
+    pub async fn shutdown(&self) {
+        self.0.state.lock().unwrap().shutting_down = true;
+        self.close_all(Reason::Shutdown);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !self.0.state.lock().unwrap().links.is_empty()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
 
@@ -343,11 +398,22 @@ impl Hub {
         let mut state = self.0.state.lock().unwrap();
         state.generation += 1;
         let generation = state.generation;
+        // Told to close as soon as it starts, when this server is stopping.
+        let close = match state.shutting_down {
+            true => {
+                let _ = tx.send(Reason::Shutdown);
+                None
+            }
+            false => Some(tx),
+        };
         let old = state.links.insert(
             peer.to_owned(),
             Live {
                 generation,
-                close: Some(tx),
+                epoch: None,
+                stale: Vec::new(),
+                unconfirmed: Default::default(),
+                close,
                 peer: None,
                 servers: HashMap::new(),
                 features: 0,
@@ -356,16 +422,141 @@ impl Hub {
                 requests: None,
             },
         );
-        drop(state);
         if let Some(mut old) = old {
             if let Some(close) = old.close.take() {
                 let _ = close.send(Reason::Replaced);
             }
             // Its late frames can no longer touch the new link, and its
-            // own ending finds a newer generation; its ghosts go now.
-            self.part(old.ghosts.into_values());
+            // own ending finds a newer generation. What it learned is the
+            // new link's to take back: a redial over a half-open link is
+            // an interruption too.
+            self.hold(&mut state, peer, old);
         }
         (generation, rx)
+    }
+
+    /// Keep what `live` learned for the grace period, under the hub's
+    /// lock; a link that never got as far as its peer's Hello has nothing
+    /// to keep, and its ghosts, if any, go.
+    fn hold(&self, state: &mut State, peer: &str, live: Live) {
+        // Ghosts of a restarted peer not yet matched against its snapshot:
+        // under IDs nothing can match any more.
+        let mut gone = live.stale;
+        let (Some(server), Some(epoch)) = (live.peer, live.epoch) else {
+            gone.extend(live.ghosts.into_values());
+            self.part_later(gone);
+            return;
+        };
+        let generation = live.generation;
+        let held = Held {
+            generation,
+            peer: server,
+            epoch,
+            servers: live.servers,
+            ghosts: live.ghosts,
+        };
+        // An earlier hold is resumed before a later one can begin, so one
+        // left here is a link's that never took it back: its ghosts go.
+        if let Some(earlier) = state.held.insert(peer.to_owned(), held) {
+            gone.extend(earlier.ghosts.into_values());
+        }
+        self.part_later(gone);
+        let (hub, peer) = (self.clone(), peer.to_owned());
+        tokio::spawn(async move {
+            // Read here, off the state lock it was held under: config and
+            // state are never taken together.
+            let grace = hub.0.config.lock().unwrap().grace;
+            tokio::time::sleep(grace).await;
+            hub.expire(&peer, generation);
+        });
+    }
+
+    /// Part ghosts from under the hub's lock, on a task of their own.
+    fn part_later(&self, slots: Vec<Slot>) {
+        if slots.is_empty() {
+            return;
+        }
+        let core = self.0.core.clone();
+        tokio::spawn(async move {
+            for slot in slots {
+                core.ghost_part(slot.uid);
+            }
+        });
+    }
+
+    /// Whether this server is stopping, for a dialer to give up.
+    pub(crate) fn shutting_down(&self) -> bool {
+        self.0.state.lock().unwrap().shutting_down
+    }
+
+    /// The grace period of the interruption `generation` has run out
+    /// without the link coming back: everything it learned goes.
+    fn expire(&self, peer: &str, generation: u64) {
+        let mut state = self.0.state.lock().unwrap();
+        if !state
+            .held
+            .get(peer)
+            .is_some_and(|h| h.generation == generation)
+        {
+            return;
+        }
+        let held = state.held.remove(peer).expect("checked");
+        drop(state);
+        tracing::info!(%peer, ghosts = held.ghosts.len(), "link not back within the grace period");
+        self.part(held.ghosts.into_values());
+    }
+
+    /// The peer is back: take what its interrupted link learned, to be
+    /// reconciled against what it sends now. A Hello naming another
+    /// server means the old one is gone; a new epoch, that its user IDs
+    /// name other people, so its ghosts wait for the snapshot to say which
+    /// are still there.
+    pub(crate) fn resume(&self, peer: &str, generation: u64, server: ServerId, epoch: [u8; 8]) {
+        let mut state = self.0.state.lock().unwrap();
+        let held = state.held.remove(peer);
+        let Some(live) = state
+            .links
+            .get_mut(peer)
+            .filter(|l| l.generation == generation)
+        else {
+            if let Some(held) = held {
+                state.held.insert(peer.to_owned(), held);
+            }
+            return;
+        };
+        live.epoch = Some(epoch);
+        let Some(held) = held else { return };
+        if held.peer.id != server {
+            drop(state);
+            self.part(held.ghosts.into_values());
+            return;
+        }
+        live.unconfirmed = held.servers.keys().copied().collect();
+        live.servers.extend(held.servers);
+        if held.epoch == epoch {
+            live.ghosts = held.ghosts;
+        } else {
+            live.stale = held.ghosts.into_values().collect();
+        }
+    }
+
+    /// The peer's Link Servers is complete: a held server it no longer
+    /// names is gone, with its users.
+    pub(crate) fn servers_settled(&self, peer: &str, generation: u64) {
+        let gone: Vec<ServerId> = {
+            let mut state = self.0.state.lock().unwrap();
+            let Some(live) = state
+                .links
+                .get_mut(peer)
+                .filter(|l| l.generation == generation)
+            else {
+                return;
+            };
+            live.unconfirmed.drain().collect()
+        };
+        for id in gone {
+            self.forget_server(peer, generation, id);
+        }
     }
 
     /// Ghosts leave, after the hub's lock is released: each is a broadcast
@@ -376,8 +567,10 @@ impl Hub {
         }
     }
 
-    /// The link has ended: everyone shown over it leaves.
-    pub(crate) fn unregister(&self, peer: &str, generation: u64) {
+    /// The link has ended. Interrupted (dropped, or closed for a
+    /// `Shutdown`), what it learned is kept for the grace period; ended
+    /// for good, everyone shown over it leaves now.
+    pub(crate) fn unregister(&self, peer: &str, generation: u64, interrupted: bool) {
         let mut state = self.0.state.lock().unwrap();
         if !state
             .links
@@ -386,11 +579,20 @@ impl Hub {
         {
             return;
         }
-        let gone = state.links.remove(peer);
-        drop(state);
-        if let Some(live) = gone {
-            self.part(live.ghosts.into_values());
+        let live = state.links.remove(peer).expect("checked");
+        if interrupted {
+            self.hold(&mut state, peer, live);
+            return;
         }
+        // Ended for good: nothing held for it stays either.
+        let held = state.held.remove(peer);
+        drop(state);
+        self.part(
+            live.ghosts
+                .into_values()
+                .chain(live.stale)
+                .chain(held.into_iter().flat_map(|h| h.ghosts.into_values())),
+        );
     }
 
     /// Accept a server group arriving over `peer`'s link (the extension's
@@ -443,12 +645,24 @@ impl Hub {
                 }
             }
         }
+        // Servers held for another peer's interrupted link are still its.
+        for (_, held) in state.held.iter().filter(|(name, _)| *name != peer) {
+            for known in std::iter::once(&held.peer).chain(held.servers.values()) {
+                if known.id == group.id {
+                    return Err(Reason::Loop);
+                }
+                if same_tag(&known.tag, &group.tag) {
+                    return Err(Reason::TagConflict);
+                }
+            }
+        }
         let live = state
             .links
             .get_mut(peer)
             .filter(|l| l.generation == generation)
             .ok_or(Reason::Replaced)?;
         let id = group.id;
+        live.unconfirmed.remove(&id);
         if own {
             live.peer = Some(group);
         } else {
@@ -584,16 +798,24 @@ impl Hub {
         build: impl FnOnce(u16) -> Vec<Field>,
     ) -> Result<oneshot::Receiver<Reply>, PeerRefusal> {
         let state = self.0.state.lock().unwrap();
-        let (live, id) = state
-            .links
-            .values()
-            .find_map(|l| {
-                l.ghosts
-                    .iter()
-                    .find(|(_, slot)| slot.uid == uid)
-                    .map(|(id, _)| (l, *id))
-            })
-            .ok_or(PeerRefusal::UnknownUser)?;
+        let found = state.links.values().find_map(|l| {
+            l.ghosts
+                .iter()
+                .find(|(_, slot)| slot.uid == uid)
+                .map(|(id, _)| (l, *id))
+        });
+        let Some((live, id)) = found else {
+            // Kept while its link is interrupted: there, but out of reach.
+            let held = state
+                .held
+                .values()
+                .any(|h| h.ghosts.values().any(|slot| slot.uid == uid));
+            return Err(if held {
+                PeerRefusal::Unreachable
+            } else {
+                PeerRefusal::UnknownUser
+            });
+        };
         // Zero is moderation, which every link carries.
         if feature != 0 && live.features & feature == 0 {
             return Err(PeerRefusal::FeatureNotNegotiated);
@@ -817,6 +1039,44 @@ impl Hub {
     /// A whole snapshot: everyone in it shown, everyone shown before and
     /// not in it gone.
     pub(crate) fn apply_snapshot(&self, peer: &str, generation: u64, groups: Vec<UserGroup>) {
+        // A peer back with a new epoch: a held ghost is the same user as
+        // one it now shows from the same home server under the same name
+        // and icon, under the ID it now uses; the rest are gone.
+        let unclaimed: Vec<Slot> = {
+            let mut state = self.0.state.lock().unwrap();
+            match state
+                .links
+                .get_mut(peer)
+                .filter(|l| l.generation == generation)
+            {
+                Some(live) => {
+                    let mut stale = std::mem::take(&mut live.stale);
+                    for g in &groups {
+                        // Homed where this link still reaches, and an ID
+                        // the snapshot gives once: a repeat claims nothing.
+                        let homed = live
+                            .peer
+                            .iter()
+                            .chain(live.servers.values())
+                            .any(|s| s.id == g.home);
+                        if !homed || live.ghosts.contains_key(&g.id) {
+                            continue;
+                        }
+                        let same = stale.iter().position(|s| {
+                            s.group.home == g.home
+                                && s.group.name == g.name
+                                && s.group.icon == g.icon
+                        });
+                        if let Some(at) = same {
+                            live.ghosts.insert(g.id, stale.swap_remove(at));
+                        }
+                    }
+                    stale
+                }
+                None => Vec::new(),
+            }
+        };
+        self.part(unclaimed);
         let ids: std::collections::HashSet<u16> = groups.iter().map(|g| g.id).collect();
         let stale: Vec<u16> = {
             let state = self.0.state.lock().unwrap();
@@ -1160,6 +1420,7 @@ mod tests {
                 color: None,
                 show_tags: false,
                 max_ghosts: 100,
+                grace: std::time::Duration::from_secs(60),
                 peers: vec![],
             },
             Arc::new(Core::new()),
@@ -1276,22 +1537,130 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_replaced_link_takes_its_ghosts_with_it() {
-        let h = hub_with_peer("a");
-        let (first, _) = h.register("a");
-        h.accept_server("a", first, group(2, "two", 0), true)
+    /// A link up to its snapshot, with the peer at `epoch` showing `users`.
+    fn linked(h: &Hub, epoch: u8, users: &[(u16, &str)]) -> u64 {
+        let (link, _) = h.register("a");
+        h.accept_server("a", link, group(2, "two", 0), true)
             .unwrap();
-        h.apply_user("a", first, user(9, 2)).unwrap();
-        assert_eq!(h.0.core.ghost_count(), 1);
-        let (second, _) = h.register("a");
+        h.resume("a", link, ServerId([2; 8]), [epoch; 8]);
+        h.servers_settled("a", link);
+        let groups = users.iter().map(|(id, nick)| named(*id, nick)).collect();
+        h.apply_snapshot("a", link, groups);
+        link
+    }
+
+    fn named(id: u16, nick: &str) -> UserGroup {
+        let local = LocalUser {
+            uid: id,
+            nick: nick.into(),
+            icon: 1,
+            away: false,
+            color: None,
+            exclude: vec![],
+        };
+        UserGroup::parse(&crate::users::of_local(&local, ServerId([2; 8]))).unwrap()
+    }
+
+    fn uids(h: &Hub) -> Vec<Uid> {
+        h.0.core.roster_rows().iter().map(|u| u.uid).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupted_link_shows_nothing_and_comes_back_as_it_was() {
+        let h = hub_with_peer("a");
+        let first = linked(&h, 1, &[(9, "bob"), (10, "eve")]);
+        let shown = uids(&h);
+        h.unregister("a", first, true);
+        assert_eq!(uids(&h), shown, "kept through the interruption");
+        // Back with the same epoch: the IDs still name the same people.
+        linked(&h, 1, &[(9, "bob")]);
+        assert_eq!(uids(&h), shown[..1], "eve left meanwhile, bob kept his uid");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_back_with_a_new_epoch_keeps_whom_it_still_shows() {
+        let h = hub_with_peer("a");
+        let first = linked(&h, 1, &[(9, "bob"), (10, "eve")]);
+        let bob = uids(&h)[0];
+        h.unregister("a", first, true);
+        // Restarted: bob is now 3, eve gone, carol new.
+        linked(&h, 2, &[(3, "bob"), (4, "carol")]);
+        let rows = h.0.core.roster_rows();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().any(|u| u.uid == bob && u.nick == "bob"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|u| u.nick == "carol"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interruption_past_the_grace_period_takes_everyone() {
+        let h = hub_with_peer("a");
+        let first = linked(&h, 1, &[(9, "bob")]);
+        h.unregister("a", first, true);
+        tokio::time::sleep(std::time::Duration::from_secs(61)).await;
         assert_eq!(h.0.core.ghost_count(), 0);
-        // The replaced link ending, late, leaves the new one's alone.
+        // Ended for good: at once.
+        let second = linked(&h, 1, &[(9, "bob")]);
+        h.unregister("a", second, false);
+        assert_eq!(h.0.core.ghost_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnection_that_fails_inside_the_grace_discards_nothing() {
+        let h = hub_with_peer("a");
+        let first = linked(&h, 1, &[(9, "bob")]);
+        let shown = uids(&h);
+        h.unregister("a", first, true);
+        // Back and gone again before its snapshot: still held.
+        let (second, _) = h.register("a");
         h.accept_server("a", second, group(2, "two", 0), true)
             .unwrap();
-        h.apply_user("a", second, user(9, 2)).unwrap();
-        h.unregister("a", first);
-        assert_eq!(h.0.core.ghost_count(), 1);
+        h.resume("a", second, ServerId([2; 8]), [1; 8]);
+        h.unregister("a", second, true);
+        linked(&h, 1, &[(9, "bob")]);
+        assert_eq!(uids(&h), shown);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_peers_unmatched_ghosts_go_if_its_snapshot_never_comes() {
+        let h = hub_with_peer("a");
+        let first = linked(&h, 1, &[(9, "bob")]);
+        h.unregister("a", first, true);
+        let (second, _) = h.register("a");
+        h.accept_server("a", second, group(2, "two", 0), true)
+            .unwrap();
+        h.resume("a", second, ServerId([2; 8]), [2; 8]);
+        h.unregister("a", second, false);
+        tokio::task::yield_now().await;
+        assert_eq!(h.0.core.ghost_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_server_is_still_its_links_to_the_loop_check() {
+        let h = hub_with_peer("a");
+        let first = linked(&h, 1, &[]);
+        h.unregister("a", first, true);
+        let (other, _) = h.register("b");
+        assert_eq!(
+            h.accept_server("b", other, group(2, "two", 0), true),
+            Err(Reason::Loop)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replaced_link_hands_its_ghosts_to_the_new_one() {
+        let h = hub_with_peer("a");
+        let first = linked(&h, 1, &[(9, "bob")]);
+        let shown = uids(&h);
+        let second = linked(&h, 1, &[(9, "bob")]);
+        assert_eq!(uids(&h), shown);
+        // The replaced link ending, late, leaves the new one's alone.
+        h.unregister("a", first, false);
+        assert_eq!(uids(&h), shown);
+        h.unregister("a", second, false);
+        assert!(uids(&h).is_empty());
     }
 
     #[test]
@@ -1301,7 +1670,7 @@ mod tests {
         let (second, _) = h.register("a");
         assert_eq!(closed.try_recv(), Ok(Reason::Replaced));
         // The replaced link ending leaves the new one alone.
-        h.unregister("a", first);
+        h.unregister("a", first, false);
         assert_eq!(
             h.accept_server("a", second, group(2, "two", 0), true),
             Ok(())

@@ -32,6 +32,11 @@ pub struct LinkSection {
     /// to every local session at once.
     #[serde(default = "default_max_ghosts")]
     pub max_ghosts: usize,
+    /// Seconds what an interrupted link learned is kept, so a brief outage
+    /// shows nobody leaving and coming back. Peers reload on SIGHUP; this
+    /// takes a restart, like the rest of `[link]`.
+    #[serde(default = "default_grace")]
+    pub grace: u64,
     #[serde(default)]
     pub peer: Vec<PeerSection>,
 }
@@ -66,6 +71,10 @@ fn default_key() -> PathBuf {
 
 fn default_max_ghosts() -> usize {
     2000
+}
+
+fn default_grace() -> u64 {
+    60
 }
 
 fn default_ghosts() -> usize {
@@ -201,6 +210,7 @@ pub fn build(config: &Config, core: Arc<hxd_core::Core>) -> Result<Option<hxd_li
             color: section.color,
             show_tags: section.show_tags,
             max_ghosts: section.max_ghosts,
+            grace: std::time::Duration::from_secs(section.grace),
             peers,
         },
         core,

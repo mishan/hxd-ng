@@ -1174,6 +1174,7 @@ tag = "hx"                         # 1-8 printable ASCII, unique in the network
 # show_tags = false                # on to put the home server's tag in every
                                    # other server's user's name
 # max_ghosts = 2000                # other servers' users shown, across links
+# grace = 60                       # seconds an interrupted link's users stay
 
 [[link.peer]]
 name = "janus-home"

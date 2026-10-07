@@ -59,6 +59,10 @@ pub(crate) async fn dial_loop(hub: Hub, peer: String) {
 async fn dial(hub: &Hub, peer: &str) -> bool {
     let mut wait = FIRST_RETRY;
     loop {
+        // A stopping server dials nobody: its peers hold its users.
+        if hub.shutting_down() {
+            return false;
+        }
         // Re-read each time: SIGHUP may have changed or removed the entry.
         let Some(entry) = hub.entry(peer).filter(|e| e.dial.is_some()) else {
             info!(%peer, "no longer configured; not dialing");
