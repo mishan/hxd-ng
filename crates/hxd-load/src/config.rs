@@ -7,6 +7,12 @@
 //! metrics = true              # scrape http://<ng>/metrics before, during, after
 //! log = "/var/log/hxd.log"    # tailed for panics and ERROR lines
 //!
+//! [[target.linked]]          # a server linked to it: chat and login_storm
+//! name = "b"
+//! legacy = "127.0.0.1:6500"
+//! ng = "127.0.0.1:6700"
+//! metrics = true
+//!
 //! [run]
 //! scenario = "chat"           # login_storm | chat | slow_consumer | churn
 //! duration = 30               # seconds of load
@@ -114,6 +120,9 @@ impl Scenario {
             }
             Kind::Churn => self.churn.ng > 0,
         };
+        if !self.target.linked.is_empty() {
+            self.check_linked(needs_legacy, needs_ng)?;
+        }
         if needs_legacy && self.target.legacy.is_none() {
             return Err(
                 "this scenario has legacy clients but [target] names no legacy port".into(),
@@ -145,6 +154,73 @@ impl Scenario {
         }
         Ok(())
     }
+
+    /// The servers linked to the target: each named once, and with every
+    /// port the clients a scenario puts there need.
+    fn check_linked(&self, needs_legacy: bool, needs_ng: bool) -> Result<(), String> {
+        let (legacy, ng) = match self.run.scenario {
+            Kind::Chat => (needs_legacy, needs_ng),
+            Kind::LoginStorm => (
+                self.login_storm.observers_legacy > 0,
+                self.login_storm.observers_ng > 0,
+            ),
+            _ => return Err("[[target.linked]] is for chat and login_storm".into()),
+        };
+        if self.run.scenario == Kind::LoginStorm
+            && self.login_storm.observers_legacy + self.login_storm.observers_ng == 0
+        {
+            return Err("[[target.linked]] in a login storm needs [login_storm] observers".into());
+        }
+        let mut names = vec![PRIMARY];
+        for l in &self.target.linked {
+            if l.name.is_empty() || names.contains(&l.name.as_str()) {
+                return Err(format!(
+                    "[[target.linked]] name {:?} is empty or not unique",
+                    l.name
+                ));
+            }
+            names.push(&l.name);
+            if legacy && l.legacy.is_none() {
+                return Err(format!("[[target.linked]] {} names no legacy port", l.name));
+            }
+            if (ng || l.metrics) && l.ng.is_none() {
+                return Err(format!("[[target.linked]] {} names no ng port", l.name));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What the report calls `[target]` among the servers of a run.
+pub const PRIMARY: &str = "target";
+
+/// One server of a run, its ports and what is read from it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Server {
+    pub name: String,
+    pub legacy: Option<SocketAddr>,
+    pub legacy_tls: Option<SocketAddr>,
+    pub ng: Option<SocketAddr>,
+    pub metrics: bool,
+    pub log: Option<PathBuf>,
+}
+
+impl Target {
+    /// Every server of the run: `[target]` first, then the linked ones.
+    pub fn servers(&self) -> Vec<Server> {
+        let primary = Server {
+            name: PRIMARY.into(),
+            legacy: self.legacy,
+            legacy_tls: self.legacy_tls,
+            ng: self.ng,
+            metrics: self.metrics,
+            log: self.log.clone(),
+        };
+        std::iter::once(primary)
+            .chain(self.linked.iter().cloned())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -169,6 +245,10 @@ pub struct Target {
     pub accounts: Option<Accounts>,
     /// An account allowed to disconnect users, for the kicks in churn.
     pub admin: Option<Account>,
+    /// Servers linked to this one (`docs/server-link.md`). A chat room
+    /// is spread over all of them, each client on the next server in
+    /// turn; a login storm arrives here and is watched from them.
+    pub linked: Vec<Server>,
 }
 
 impl Default for Target {
@@ -182,6 +262,7 @@ impl Default for Target {
             log: None,
             accounts: None,
             admin: None,
+            linked: Vec::new(),
         }
     }
 }
@@ -278,6 +359,10 @@ pub struct LoginStorm {
     /// it is not attempted, and counted as shed: the generator's limit,
     /// not the server's.
     pub max_in_flight: usize,
+    /// Clients on each `[[target.linked]]` server, there before the first
+    /// arrival, timing when each arrival is heard to join there.
+    pub observers_legacy: usize,
+    pub observers_ng: usize,
 }
 
 impl Default for LoginStorm {
@@ -292,6 +377,8 @@ impl Default for LoginStorm {
             ng: 1,
             accounts: false,
             max_in_flight: 4000,
+            observers_legacy: 0,
+            observers_ng: 0,
         }
     }
 }
@@ -398,7 +485,7 @@ mod tests {
             Scenario::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             seen += 1;
         }
-        assert_eq!(seen, 4);
+        assert_eq!(seen, 6);
     }
 
     #[test]
@@ -427,6 +514,34 @@ mod tests {
                     [chat]\nreaders_legacy = 0\ntalkers_legacy = 0\n";
         let err = Scenario::parse(text).unwrap_err();
         assert!(err.contains("legacy"), "{err}");
+    }
+
+    #[test]
+    fn a_linked_server_must_be_named_once_and_have_the_ports_its_clients_need() {
+        let target = "[target]\nng = \"127.0.0.1:1\"\nlegacy = \"127.0.0.1:2\"\n";
+        let linked = "[[target.linked]]\nname = \"b\"\nng = \"127.0.0.1:3\"\n";
+        assert!(Scenario::parse(&format!(
+            "{target}{linked}[chat]\nreaders_legacy = 0\ntalkers_legacy = 0\n"
+        ))
+        .is_ok());
+        for (bad, why) in [
+            (format!("{target}{linked}"), "legacy"),
+            (
+                format!("{target}{linked}{linked}[chat]\nreaders_legacy = 0\ntalkers_legacy = 0\n"),
+                "unique",
+            ),
+            (
+                format!("{target}{linked}[run]\nscenario = \"login_storm\"\n"),
+                "observers",
+            ),
+            (
+                format!("{target}{linked}[run]\nscenario = \"churn\"\n[churn]\nng = 0\n"),
+                "chat and login_storm",
+            ),
+        ] {
+            let err = Scenario::parse(&bad).unwrap_err();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
     }
 
     #[test]

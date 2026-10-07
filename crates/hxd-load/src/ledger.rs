@@ -50,6 +50,10 @@ pub struct Heard {
     in_order: u64,
     pub delivery: Histogram<u64>,
     pub echo: Histogram<u64>,
+    /// Across linked servers, whether each sender is on another server
+    /// than this reader, and those senders' lines' delivery apart.
+    pub elsewhere: Vec<bool>,
+    pub cross: Histogram<u64>,
 }
 
 impl Heard {
@@ -61,6 +65,8 @@ impl Heard {
             in_order: 0,
             delivery: stats::local(),
             echo: stats::local(),
+            elsewhere: Vec::new(),
+            cross: stats::local(),
         }
     }
 
@@ -74,6 +80,9 @@ impl Heard {
             stats::sample(&mut self.echo, late);
         }
         stats::sample(&mut self.delivery, late);
+        if self.elsewhere.get(sender) == Some(&true) {
+            stats::sample(&mut self.cross, late);
+        }
         let last = self.last.entry(sender).or_insert(0);
         if seq == *last + 1 {
             self.in_order += 1;

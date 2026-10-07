@@ -12,6 +12,7 @@ use hxproto::messages::tag;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::config::Server;
 use crate::Ctx;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +31,7 @@ impl Wire {
         }
     }
 
-    fn letter(self) -> char {
+    pub fn letter(self) -> char {
         match self {
             Wire::Legacy => 'L',
             Wire::LegacyTls => 'T',
@@ -57,7 +58,19 @@ impl Member {
     /// Connect client `i` on `wire` and log in: to an account when given
     /// one, else as a guest.
     pub async fn join(ctx: &Ctx, wire: Wire, i: usize, creds: Creds) -> Result<Member, Error> {
-        Member::join_as(ctx, wire, ctx.nick(wire.letter(), i), creds).await
+        Member::join_on(ctx, 0, wire, i, creds).await
+    }
+
+    /// The same, on the run's server `server` (`Ctx::servers`).
+    pub async fn join_on(
+        ctx: &Ctx,
+        server: usize,
+        wire: Wire,
+        i: usize,
+        creds: Creds,
+    ) -> Result<Member, Error> {
+        let nick = ctx.nick(wire.letter(), i);
+        Member::join_at(ctx, &ctx.servers[server], wire, nick, creds).await
     }
 
     /// The same, under a nick the caller chose: the observer's and the
@@ -68,16 +81,32 @@ impl Member {
         nick: String,
         creds: Creds,
     ) -> Result<Member, Error> {
+        Member::join_at(ctx, &ctx.servers[0], wire, nick, creds).await
+    }
+
+    /// The same, on `at`, under a nick the caller chose.
+    pub async fn join_at(
+        ctx: &Ctx,
+        at: &Server,
+        wire: Wire,
+        nick: String,
+        creds: Creds,
+    ) -> Result<Member, Error> {
         retry_busy(ctx, || {
-            Member::join_once(ctx, wire, nick.clone(), creds.clone())
+            Member::join_once(ctx, at, wire, nick.clone(), creds.clone())
         })
         .await
     }
 
     /// One try at it, on a connection of its own: the server closes one
     /// whose login it refused.
-    async fn join_once(ctx: &Ctx, wire: Wire, nick: String, creds: Creds) -> Result<Member, Error> {
-        let t = &ctx.scenario.target;
+    async fn join_once(
+        ctx: &Ctx,
+        t: &Server,
+        wire: Wire,
+        nick: String,
+        creds: Creds,
+    ) -> Result<Member, Error> {
         let conn = match wire {
             Wire::Legacy | Wire::LegacyTls => {
                 let mut c = if wire == Wire::Legacy {
@@ -85,7 +114,7 @@ impl Member {
                 } else {
                     legacy::Client::connect_tls(
                         t.legacy_tls.expect("checked by the scenario"),
-                        &t.tls_name,
+                        &ctx.scenario.target.tls_name,
                         tls::any(),
                     )
                     .await?
@@ -221,6 +250,8 @@ pub enum Got {
     Chat(String),
     /// An ng request refused.
     Refused(Value),
+    /// A user joined, or on the classic wire possibly changed: its nick.
+    Joined(String),
     /// The server ended this session.
     Kicked,
     Other,
@@ -238,6 +269,10 @@ impl Rx {
                             .into_owned(),
                     ),
                     legacy::push::DISCONNECT_MSG => Got::Kicked,
+                    legacy::push::USER_CHANGE => Got::Joined(
+                        String::from_utf8_lossy(&f.bytes(tag::NAME).unwrap_or_default())
+                            .into_owned(),
+                    ),
                     _ => Got::Other,
                 })
             }
@@ -248,6 +283,12 @@ impl Rx {
                     Got::Chat(e.data["text"].as_str().unwrap_or_default().to_owned())
                 }
                 ng::Incoming::Event(e) if e.ev == "kicked" => Got::Kicked,
+                ng::Incoming::Event(e) if e.ev == "user_joined" => Got::Joined(
+                    e.data["user"]["nick"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                ),
                 ng::Incoming::Event(_) => Got::Other,
             }),
         }
@@ -287,17 +328,18 @@ pub async fn roster_agrees(ctx: &Ctx, members: &mut [Member], either: &[String])
 }
 
 /// After everyone this run brought has left, nobody of theirs is still
-/// on the roster: seen by a fresh client's user list, and, with metrics,
-/// by the server's own count returning to where it was.
-pub async fn no_ghosts(ctx: &Ctx, before: Option<&crate::target::Scrape>) {
+/// on the roster of the run's server `k`: seen by a fresh client's user
+/// list, and, with metrics, by the server's own count of sessions
+/// returning to where it was, and of ghosts when servers are linked.
+pub async fn no_ghosts(ctx: &Ctx, k: usize, before: Option<&crate::target::Scrape>) {
     let deadline = Instant::now() + Duration::from_secs_f64(ctx.scenario.run.teardown);
-    let t = &ctx.scenario.target;
+    let t = &ctx.servers[k];
     let wire = if t.ng.is_some() {
         Wire::Ng
     } else {
         Wire::Legacy
     };
-    match Member::join_as(ctx, wire, ctx.nick('O', 0), None).await {
+    match Member::join_at(ctx, t, wire, ctx.nick('O', k), None).await {
         Ok(mut observer) => {
             let observer_nick = observer.nick.clone();
             let mut left = BTreeSet::new();
@@ -317,31 +359,56 @@ pub async fn no_ghosts(ctx: &Ctx, before: Option<&crate::target::Scrape>) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             ctx.checks.check("roster.no_ghosts", left.is_empty(), || {
-                format!("still listed after teardown: {left:?}")
+                format!("still listed at {} after teardown: {left:?}", t.name)
             });
             let _ = observer.leave().await;
         }
         Err(e) => ctx.stats.error("roster.observer", &e.to_string()),
     }
 
-    let (Some(before), Some(ng)) = (before.and_then(|b| b.sessions()), t.ng) else {
+    let (Some(before), Some(ng)) = (before.filter(|b| b.sessions().is_some()), t.ng) else {
         return;
     };
+    // Linked, the run's users are ghosts on the other servers, so a count
+    // above the one before is someone of this run's still shown here.
+    let linked = ctx.servers.len() > 1;
+    let ghosts = |s: &crate::target::Scrape| s.get("hxd_ghosts") <= before.get("hxd_ghosts");
     let mut now = None;
     loop {
         if let Ok(s) = crate::target::scrape(ng).await {
-            now = s.sessions();
+            now = Some(s);
         }
-        if now.is_some_and(|n| n <= before) || Instant::now() >= deadline {
+        let settled = now
+            .as_ref()
+            .is_some_and(|s| s.sessions() <= before.sessions() && (!linked || ghosts(s)));
+        if settled || Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let sessions = now.as_ref().and_then(|s| s.sessions());
     ctx.checks.check(
         "roster.sessions_return",
-        now.is_some_and(|n| n <= before),
-        || format!("the server counts {now:?} sessions, {before} before the run"),
+        sessions.is_some_and(|n| Some(n) <= before.sessions()),
+        || {
+            format!(
+                "{} counts {sessions:?} sessions, {:?} before the run",
+                t.name,
+                before.sessions()
+            )
+        },
     );
+    if linked {
+        ctx.checks
+            .check("link.no_ghosts", now.as_ref().is_some_and(ghosts), || {
+                format!(
+                    "{} shows {:?} ghosts, {:?} before the run",
+                    t.name,
+                    now.as_ref().and_then(|s| s.get("hxd_ghosts")),
+                    before.get("hxd_ghosts")
+                )
+            });
+    }
 }
 
 /// Whether the server refused a login as busy: past the logins it works

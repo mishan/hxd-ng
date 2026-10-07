@@ -1372,12 +1372,15 @@ dependencies = [
 name = "hxd-load"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "hdrhistogram",
  "hxd",
+ "hxd-link",
  "hxd-ng-session",
  "hxd-session",
  "hxd-testclient",
  "hxproto",
+ "rcgen",
  "serde",
  "serde_json",
  "tempfile",

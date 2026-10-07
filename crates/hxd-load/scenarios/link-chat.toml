@@ -1,0 +1,30 @@
+# L-1: public chat across two linked servers, the room spread over both.
+# Every reader must hear every line, once, in order, wherever it was
+# said; `chat.delivery.cross` times the lines that crossed the link.
+#
+#   baseline/link-run.sh link-chat scenarios/link-chat.toml
+
+[target]
+legacy = "127.0.0.1:15500"
+ng = "127.0.0.1:15700"
+metrics = true            # needs `--features metrics` and a [metrics] section
+log = "@LOG@"
+
+[[target.linked]]
+name = "b"
+legacy = "127.0.0.1:16500"
+ng = "127.0.0.1:16700"
+metrics = true
+log = "@LOG_B@"
+
+[run]
+scenario = "chat"
+duration = 30
+
+[chat]
+readers_legacy = 100
+readers_ng = 100
+talkers_legacy = 5
+talkers_ng = 5
+rate = 100                # lines a second, the whole room
+line_bytes = 64
