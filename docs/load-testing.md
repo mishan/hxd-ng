@@ -323,7 +323,9 @@ BIN=target/release crates/hxd-load/baseline/link-run.sh link-chat \
 On one host the hub shares its cores with every leaf, and the leaves
 one disk, so what a run says about any of them is partly the others'.
 `HUB_HOST` runs `a` on another host over ssh instead, and `LEAF_HOSTS`
-the leaves, in turn (`-` for this one): each server elsewhere has its
+the leaves, in turn (`-` for this one, `host:dir` for a run under dir
+rather than that host's home, as on a disk of its own): each server
+elsewhere has its
 host to itself, every server is reached at its host's address and lets
 every host in the run through its `[limits]` and its `[metrics]
 allow`, and a remote server's CPU, memory and errors are read there.

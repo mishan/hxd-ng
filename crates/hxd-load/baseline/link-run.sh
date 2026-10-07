@@ -19,14 +19,15 @@
 # accounts on every server, a ban across a link being placed on one.
 #
 # HUB_HOST runs `a` on another host instead, over ssh, and LEAF_HOSTS
-# the leaves, in turn (`-` for this host): servers sharing one host's
+# the leaves, in turn (`-` for this host); `host:dir` puts that server's
+# run under dir rather than the host's home. Servers sharing one host's
 # cores and disk measure each other as much as themselves. Every server
 # then listens beyond loopback and is reached at its host's IPv4
 # address, every host's address let through every server's [limits] and
 # allowed to scrape it; the scenario still names each as 127.0.0.1, and
 # the run points it there. A server elsewhere has the whole of its host
-# (no SERVER_CPUS), and its binaries and its run go in `hxd-link-run` in
-# that host's home.
+# (no SERVER_CPUS), and its binaries go in `hxd-link-run` in that host's
+# home.
 set -u
 NAME=$1 SCEN=$2 SYNC=${3:-normal}
 BIN=${BIN:-target/release} OUT=${OUT:-out} WORK=${WORK:-work}
@@ -64,7 +65,7 @@ for s in $SERVERS; do
     k=$((k + 1))
 done
 KEY_A=${KEY[a]}
-declare -A HOST ADDR RD RHOME
+declare -A HOST ADDR RD RHOME UNDER
 read -ra LEAF_HOSTS <<< "${LEAF_HOSTS:-}"
 i=0
 for s in $SERVERS; do
@@ -73,6 +74,7 @@ for s in $SERVERS; do
     elif [ ${#LEAF_HOSTS[@]} -gt 0 ]; then
         HOST[$s]=${LEAF_HOSTS[i % ${#LEAF_HOSTS[@]}]}
         [ "${HOST[$s]}" = - ] && HOST[$s]=
+        case ${HOST[$s]} in *:*) UNDER[$s]=${HOST[$s]#*:} HOST[$s]=${HOST[$s]%%:*} ;; esac
         i=$((i + 1))
     else
         HOST[$s]=
@@ -102,7 +104,8 @@ if [ -n "$REMOTES" ]; then
 fi
 for s in $SERVERS; do
     if [ -n "${HOST[$s]}" ]; then
-        ADDR[$s]=$(v4 "${HOST[$s]}") RD[$s]=${RHOME[${HOST[$s]}]}/hxd-link-run/$NAME/$s
+        ADDR[$s]=$(v4 "${HOST[$s]}")
+        RD[$s]=${UNDER[$s]:-${RHOME[${HOST[$s]}]}}/hxd-link-run/$NAME/$s
     else
         ADDR[$s]=$HERE
     fi
