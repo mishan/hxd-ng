@@ -29,6 +29,11 @@ use crate::wire::{field, Reason};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 const SLOWEST: Duration = Duration::from_secs(300);
+/// The slowest a peer this dialer has been linked to is tried again: an
+/// outage past the grace should end in a link as soon as the peer is
+/// back, not when a backoff that doubled through it next comes round.
+/// Slow enough that a peer gone for good costs one handshake a while.
+const RELINK_SLOWEST: Duration = Duration::from_secs(30);
 
 /// Why a dial ended, and so how soon to try again.
 enum Next {
@@ -58,6 +63,7 @@ pub(crate) async fn dial_loop(hub: Hub, peer: String) {
 /// entry is gone, false when the peer said not to come back.
 async fn dial(hub: &Hub, peer: &str) -> bool {
     let mut wait = FIRST_RETRY;
+    let mut linked = false;
     loop {
         // A stopping server dials nobody: its peers hold its users.
         if hub.shutting_down() {
@@ -68,12 +74,12 @@ async fn dial(hub: &Hub, peer: &str) -> bool {
             info!(%peer, "no longer configured; not dialing");
             return true;
         };
-        let next = dial_once(hub, &entry).await;
+        let next = dial_once(hub, &entry, &mut linked).await;
         if matches!(next, Next::Stop) {
             warn!(peer = %entry.name, "not redialing without an operator");
             return false;
         }
-        wait = next_wait(wait, next, hub.holding(peer));
+        wait = next_wait(wait, next, hub.holding(peer), linked);
         tokio::time::sleep(jitter(wait)).await;
     }
 }
@@ -83,11 +89,13 @@ async fn dial(hub: &Hub, peer: &str) -> bool {
 /// least every quarter of it: an outage that ends inside the grace must
 /// come back inside it too, not whenever a backoff that doubled through
 /// the outage next gets round to it, by which time a short outage may
-/// have outlasted the grace and become a netsplit.
-fn next_wait(wait: Duration, next: Next, holding: Option<Duration>) -> Duration {
+/// have outlasted the grace and become a netsplit. Past the grace, a peer
+/// once linked is still tried at least every `RELINK_SLOWEST`.
+fn next_wait(wait: Duration, next: Next, holding: Option<Duration>, linked: bool) -> Duration {
+    let slowest = if linked { RELINK_SLOWEST } else { SLOWEST };
     let wait = match next {
         Next::Again => FIRST_RETRY,
-        Next::Backoff => (wait * 2).min(SLOWEST),
+        Next::Backoff => (wait * 2).min(slowest),
         Next::Slow | Next::Stop => SLOWEST,
     };
     match holding {
@@ -105,7 +113,8 @@ fn jitter(d: Duration) -> Duration {
     d.mul_f64(f)
 }
 
-async fn dial_once(hub: &Hub, entry: &PeerEntry) -> Next {
+/// One dial; `linked` is set once a link it made was established.
+async fn dial_once(hub: &Hub, entry: &PeerEntry, linked: &mut bool) -> Next {
     let Some(addr) = entry.dial.as_deref() else {
         return Next::Stop;
     };
@@ -201,6 +210,7 @@ async fn dial_once(hub: &Hub, entry: &PeerEntry) -> Next {
     let (io, tasks) = hxd_session::peer::dialed(tls, peer_addr, hub.budget());
     let end = crate::link::run(hub.clone(), entry.clone(), io).await;
     tasks.close().await;
+    *linked |= end.established;
     match end.peer_reason {
         Some(Reason::Unlinked | Reason::VersionUnsupported | Reason::Replaced) => Next::Stop,
         Some(Reason::Suspended) => Next::Slow,
@@ -318,14 +328,25 @@ mod tests {
         let mut held = FIRST_RETRY;
         let mut free = FIRST_RETRY;
         for _ in 0..10 {
-            held = next_wait(held, Next::Backoff, Some(grace));
-            free = next_wait(free, Next::Backoff, None);
+            held = next_wait(held, Next::Backoff, Some(grace), false);
+            free = next_wait(free, Next::Backoff, None, false);
             assert!(held <= grace / 4, "{held:?}");
         }
         assert_eq!(free, SLOWEST);
         // A grace shorter than the first retry does not make a dialer spin.
-        let short = next_wait(FIRST_RETRY, Next::Backoff, Some(Duration::ZERO));
+        let short = next_wait(FIRST_RETRY, Next::Backoff, Some(Duration::ZERO), false);
         assert_eq!(short, FIRST_RETRY);
+    }
+
+    #[test]
+    fn a_peer_once_linked_is_redialed_soon_after_an_outage_past_its_grace() {
+        let mut wait = FIRST_RETRY;
+        for _ in 0..10 {
+            wait = next_wait(wait, Next::Backoff, None, true);
+            assert!(wait <= RELINK_SLOWEST, "{wait:?}");
+        }
+        // An operator's refusal is still waited out at the slowest pace.
+        assert_eq!(next_wait(wait, Next::Slow, None, true), SLOWEST);
     }
 
     #[test]

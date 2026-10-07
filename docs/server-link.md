@@ -790,7 +790,9 @@ and a held server is still its link's to the Loop and Tag checks, so no
 other link can claim it meanwhile. Its dialer, if this server dials,
 tries the peer at least every quarter of the grace while it holds them,
 whatever its backoff has reached, so an outage that ends inside the
-grace comes back inside it. A link replaced by a newer one for the
+grace comes back inside it; past the grace, a peer it has been linked
+to is still tried at least every half minute, so a longer outage ends
+in a link soon after it does. A link replaced by a newer one for the
 same peer (a redial over a half-open link) is held the same way, for the
 new link to take back. Any other ending (`Unlinked`, `ProtocolError` and
 the rest) parts everyone at once, as does removing the peer while it is
