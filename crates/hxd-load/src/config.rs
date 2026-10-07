@@ -44,6 +44,7 @@ pub struct Scenario {
     pub slow_consumer: SlowConsumer,
     pub churn: Churn,
     pub interruption: Interruption,
+    pub slow_peer: SlowPeer,
 }
 
 impl Scenario {
@@ -113,6 +114,7 @@ impl Scenario {
             }
             Kind::Churn => self.churn.legacy > 0,
             Kind::Interruption => self.interruption.population_legacy > 0,
+            Kind::SlowPeer => self.chat.readers_legacy + self.chat.talkers_legacy > 0,
         };
         let needs_ng = match self.run.scenario {
             Kind::LoginStorm => self.login_storm.ng > 0,
@@ -122,12 +124,16 @@ impl Scenario {
             }
             Kind::Churn => self.churn.ng > 0,
             Kind::Interruption => self.interruption.population_ng > 0,
+            Kind::SlowPeer => self.chat.readers_ng + self.chat.talkers_ng > 0,
         };
         if !self.target.linked.is_empty() {
             self.check_linked(needs_legacy, needs_ng)?;
         }
         if self.run.scenario == Kind::Interruption {
             self.check_interruption()?;
+        }
+        if self.run.scenario == Kind::SlowPeer {
+            self.check_slow_peer()?;
         }
         if needs_legacy && self.target.legacy.is_none() {
             return Err(
@@ -174,7 +180,12 @@ impl Scenario {
                 self.interruption.watchers_legacy > 0,
                 self.interruption.watchers_ng > 0,
             ),
-            _ => return Err("[[target.linked]] is for chat, login_storm and interruption".into()),
+            Kind::SlowPeer => (needs_legacy, needs_ng),
+            _ => {
+                return Err(
+                    "[[target.linked]] is for chat, login_storm, interruption and slow_peer".into(),
+                )
+            }
         };
         if self.run.scenario == Kind::LoginStorm
             && self.login_storm.observers_legacy + self.login_storm.observers_ng == 0
@@ -222,6 +233,44 @@ impl Scenario {
         }
         if i.watchers_legacy + i.watchers_ng == 0 {
             return Err("[interruption] needs watchers".into());
+        }
+        Ok(())
+    }
+}
+
+impl Scenario {
+    /// A slow peer stalls the proxy one linked server dials through, while
+    /// the room talks on the others.
+    fn check_slow_peer(&self) -> Result<(), String> {
+        let p = &self.slow_peer;
+        if self.target.proxy.is_none() {
+            return Err("slow_peer needs [target.proxy]".into());
+        }
+        if !self.target.linked.iter().any(|l| l.name == p.stalled) {
+            return Err(format!(
+                "[slow_peer] stalled = {:?} names no [[target.linked]] server",
+                p.stalled
+            ));
+        }
+        if self.chat.talkers_legacy + self.chat.talkers_ng == 0 || self.chat.rate <= 0.0 {
+            return Err("[chat] needs talkers and a positive rate".into());
+        }
+        for (name, v) in [
+            ("stall_after", p.stall_after),
+            ("contained", p.contained),
+            ("drop_within", p.drop_within),
+            ("recover", p.recover),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(format!("[slow_peer] {name} must be positive"));
+            }
+        }
+        // A stall shorter than the time allowed to drop it could end
+        // before the server was due to, and prove nothing either way.
+        if p.stall_after + p.drop_within > self.run.duration {
+            return Err(
+                "[slow_peer] stall_after + drop_within must fall inside [run] duration".into(),
+            );
         }
         Ok(())
     }
@@ -357,6 +406,47 @@ pub enum Kind {
     /// L-3: links cut and restored, and what the linked servers' users
     /// are shown meanwhile.
     Interruption,
+    /// L-4: one linked server stops reading what its peer sends it, while
+    /// the room talks on the others.
+    SlowPeer,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SlowPeer {
+    /// The `[[target.linked]]` server that dials through the proxy, whose
+    /// link is stalled. The `[chat]` room is spread over the rest.
+    pub stalled: String,
+    /// Seconds into the talking when the stall begins; it lasts until the
+    /// talking ends.
+    pub stall_after: f64,
+    /// How much worse the room's p99 delivery may get once the stall
+    /// begins, as a factor of its p99 before: past it, a slow peer cost
+    /// everyone else.
+    pub contained: f64,
+    /// Seconds from the stall by which, with metrics, `[target]` must
+    /// have dropped the stalled link as a slow consumer.
+    pub drop_within: f64,
+    /// Seconds from the stall's end by which every link must be back.
+    pub recover: f64,
+    /// The most `[target]`'s classic writers, the link's among them, may
+    /// hold queued, in bytes.
+    pub max_queued_bytes: u64,
+}
+
+impl Default for SlowPeer {
+    fn default() -> Self {
+        SlowPeer {
+            stalled: "b".into(),
+            stall_after: 10.0,
+            contained: 3.0,
+            // A stalled link is given up when a write has made no progress
+            // for a minute, after its socket's buffer has filled.
+            drop_within: 150.0,
+            recover: 60.0,
+            max_queued_bytes: 16 << 20,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -582,7 +672,7 @@ mod tests {
             Scenario::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             seen += 1;
         }
-        assert_eq!(seen, 7);
+        assert_eq!(seen, 8);
     }
 
     #[test]

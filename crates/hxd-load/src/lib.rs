@@ -19,6 +19,8 @@
 //!   mid-handshake, kicks.
 //! - **L-3** [`interruption`]: links between servers cut at a proxy
 //!   ([`proxy`]) and restored, across their grace period.
+//! - **L-4** [`slow_peer`]: one server's link stalled at the proxy while
+//!   the room talks on the others.
 
 pub mod accounts;
 pub mod chat;
@@ -31,6 +33,7 @@ pub mod member;
 pub mod proxy;
 pub mod report;
 pub mod slow;
+pub mod slow_peer;
 pub mod stats;
 pub mod storm;
 pub mod target;
@@ -146,6 +149,10 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
             let proxy = proxy.as_ref().expect("checked by the scenario");
             interruption::run(&ctx, proxy, &before).await?
         }
+        Kind::SlowPeer => {
+            let proxy = proxy.as_ref().expect("checked by the scenario");
+            slow_peer::run(&ctx, proxy, &before).await?
+        }
     };
 
     // Everyone this run brought has left; every roster should say so.
@@ -165,7 +172,13 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
             }
         });
     }
-    if ctx.servers.len() > 1 && ctx.scenario.run.scenario != Kind::Interruption {
+    // Either scenario that takes a link down on purpose has checks of its
+    // own for how it came back.
+    let cuts = matches!(
+        ctx.scenario.run.scenario,
+        Kind::Interruption | Kind::SlowPeer
+    );
+    if ctx.servers.len() > 1 && !cuts {
         links_stayed(&ctx, &before, &after);
     }
     for (name, log) in logs {
@@ -207,17 +220,26 @@ async fn links_up(ctx: &Ctx) -> Result<Vec<Option<target::Scrape>>, String> {
         for s in &ctx.servers {
             scrapes.push(scrape(s).await?);
         }
+        // Every topology a run builds is a star on `[target]`: it has a
+        // link to each of the others, and each of them one to it. Counted
+        // only once all are, a scenario's count of links before is whole.
+        let want = |k: usize| if k == 0 { ctx.servers.len() - 1 } else { 1 } as f64;
         let down = ctx
             .servers
             .iter()
             .zip(&scrapes)
-            .filter(|(_, b)| ctx.servers.len() > 1 && b.as_ref().is_some_and(|b| !linked(b)))
-            .map(|(s, _)| s.name.clone())
+            .enumerate()
+            .filter(|(k, (_, b))| {
+                ctx.servers.len() > 1
+                    && b.as_ref()
+                        .is_some_and(|b| b.get("hxd_links_up").unwrap_or(0.0) < want(*k))
+            })
+            .map(|(_, (s, _))| s.name.clone())
             .next();
         match down {
             None => return Ok(scrapes),
             Some(name) if Instant::now() >= deadline => {
-                return Err(format!("{name} has no link up"))
+                return Err(format!("{name} does not have all its links up"))
             }
             Some(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
@@ -227,10 +249,6 @@ async fn links_up(ctx: &Ctx) -> Result<Vec<Option<target::Scrape>>, String> {
 /// How long a run waits for its servers' links before it gives up: a
 /// dialer refused while the proxy was not yet listening backs off.
 const LINK_WAIT: Duration = Duration::from_secs(30);
-
-pub fn linked(s: &target::Scrape) -> bool {
-    s.get("hxd_links_up").unwrap_or(0.0) >= 1.0
-}
 
 /// No link ended during the run, nor did one come up: the scenario cut
 /// none, so either is a link that went down.

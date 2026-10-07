@@ -398,3 +398,92 @@ async fn a_cut_inside_the_grace_shows_nothing_and_one_past_it_recovers() {
     assert_eq!(cuts[1]["parts"], 8, "{cuts:?}");
     assert_eq!(cuts[1]["joins"], 8, "{cuts:?}");
 }
+
+/// L-4 on three servers: `a` accepting `b` through the run's proxy and
+/// `c` directly, the room on `a` and `c`, and `b`'s link stalled. Lines
+/// near the classic wire's longest, fast enough to fill `a`'s queue for
+/// `b` and its socket's buffer in seconds rather than wait out a write's
+/// minute without progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_peer_is_dropped_and_costs_the_room_nothing() {
+    let dirs = [(); 3].map(|_| tempfile::tempdir().unwrap());
+    let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a_tls.local_addr().unwrap();
+    let listen = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let accept = |name: &str, seed: u8| {
+        format!(
+            "[[link.peer]]\nname = \"{name}\"\naccept = true\nprotection = \"key\"\n\
+             key = \"{}\"\naccount = \"link-{name}\"\nfeatures = [\"chat\"]\n",
+            link_key(seed)
+        )
+    };
+    let dial = |to: std::net::SocketAddr, name: &str| {
+        format!(
+            "[[link.peer]]\nname = \"aa\"\ndial = \"{to}\"\nprotection = \"key\"\n\
+             key = \"{}\"\naccount = \"link-{name}\"\nfeatures = [\"chat\"]\n",
+            link_key(1)
+        )
+    };
+    let bind = || async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() };
+    let (a, a_hub) = start_linked_with(
+        dirs[0].path(),
+        1,
+        "aa",
+        &(accept("bb", 2) + &accept("cc", 3)),
+        a_tls,
+    )
+    .await;
+    let b = start_unlinked(dirs[1].path(), 2, "bb", &dial(listen, "bb"), bind().await).await;
+    let c = start_linked(dirs[2].path(), 3, "cc", &dial(a_addr, "cc"), bind().await).await;
+
+    let mut s = scenario(&a, Kind::SlowPeer, 16.0);
+    let linked = |name: &str, at: &Server| hxd_load::config::Server {
+        name: name.into(),
+        legacy: Some(at.legacy),
+        ng: Some(at.ng),
+        ..Default::default()
+    };
+    s.target.linked = vec![linked("b", &b), linked("c", &c)];
+    s.target.proxy = Some(hxd_load::config::ProxyAt {
+        listen,
+        upstream: a_addr,
+    });
+    (s.chat.readers_legacy, s.chat.readers_ng) = (2, 2);
+    (s.chat.talkers_legacy, s.chat.talkers_ng) = (2, 2);
+    s.chat.rate = 400.0;
+    s.chat.line_bytes = 4000;
+    s.slow_peer.stall_after = 2.0;
+    s.slow_peer.drop_within = 14.0;
+    s.slow_peer.recover = 20.0;
+
+    let b_id = hxd_link::LinkKey::from_seed(&[2; 32]).server_id();
+    let up = move |hub: &hxd_link::Hub| hub.status().iter().any(|l| l.server == b_id);
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watched = tokio::spawn({
+        let (a_hub, done) = (a_hub.clone(), done.clone());
+        async move {
+            // Dropped by `a` after it had been up longer than the talking
+            // runs before the stall: a flap earlier is not this.
+            let mut up_since = None;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                match (up(&a_hub), up_since) {
+                    (true, None) => up_since = Some(tokio::time::Instant::now()),
+                    (false, Some(t)) if t.elapsed().as_secs_f64() > 2.0 => return true,
+                    (false, Some(_)) => up_since = None,
+                    _ => {}
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        }
+    });
+    let report = hxd_load::run(s).await.unwrap();
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_clean(&report);
+    assert!(report.checks["link.contained"].held == 1);
+    assert!(watched.await.unwrap(), "a never dropped b");
+}

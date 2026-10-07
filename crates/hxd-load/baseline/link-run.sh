@@ -1,16 +1,18 @@
 #!/bin/bash
-# One run across two linked servers (docs/load-testing.md §8): run.sh's
-# server twice, `a` accepting a key-mode link that `b` dials over TLS,
+# One run across linked servers (docs/load-testing.md §8): run.sh's
+# server two or three times, `a` accepting key-mode links that `b`, and
+# `c` when the scenario names a second [[target.linked]], dial over TLS,
 # each with a fresh database and its own key and certificate.
 #
 #   link-run.sh NAME SCENARIO.toml [SYNC]
 #
 # The scenario's ports must be a's 15500 and 15700 in [target] and b's
-# 16500 and 16700 in [[target.linked]]; `log = "@LOG@"` and
-# `log = "@LOG_B@"` name their logs. Both servers share SERVER_CPUS.
-# With [target.proxy], b dials the proxy the run starts (listen
-# 127.0.0.1:15601, upstream a's 15600) and the run waits for the link;
-# both servers take [interruption] grace as their [link] grace.
+# 16500 and 16700 in [[target.linked]] (c's 17500 and 17700 in a
+# second); `log = "@LOG@"`, `"@LOG_B@"` and `"@LOG_C@"` name their logs.
+# The servers share SERVER_CPUS. With [target.proxy], b dials the proxy
+# the run starts (listen 127.0.0.1:15601, upstream a's 15600) and the
+# run waits for the link; c always dials a directly. Every server takes
+# [interruption] grace as its [link] grace.
 # Environment as for run.sh, less ACCOUNTS and AFTER.
 set -u
 NAME=$1 SCEN=$2 SYNC=${3:-normal}
@@ -23,7 +25,9 @@ half() {
 SERVER_CPUS=${SERVER_CPUS:-$(half 0)}
 HARNESS_CPUS=${HARNESS_CPUS:-$(half 1)}
 D=$WORK/$NAME
-mkdir -p "$OUT" && rm -rf "$D" && mkdir -p "$D/a" "$D/b" && D=$(cd "$D" && pwd)
+SERVERS="a b"
+[ "$(grep -c '^\[\[target.linked\]\]' "$SCEN")" -ge 2 ] && SERVERS="a b c"
+mkdir -p "$OUT" && rm -rf "$D" && for s in $SERVERS; do mkdir -p "$D/$s"; done && D=$(cd "$D" && pwd)
 
 # A key from a fresh seed: the seed in the hex file `hxd` reads, and the
 # public half, base64url, as a peer names it.
@@ -35,7 +39,8 @@ key() {
         openssl pkey -inform DER -pubout -outform DER | tail -c 32 |
         base64 | tr '+/' '-_' | tr -d '='
 }
-KEY_A=$(key "$D/a") KEY_B=$(key "$D/b")
+KEY_A=$(key "$D/a") KEY_B=$(key "$D/b") KEY_C=
+[ -d "$D/c" ] && KEY_C=$(key "$D/c")
 DIAL=127.0.0.1:15600
 grep -q '^\[target.proxy\]' "$SCEN" && DIAL=127.0.0.1:15601
 GRACE=$(awk -F= '
@@ -79,31 +84,35 @@ CFG
     taskset -c "$SERVER_CPUS" "$BIN/hxd" --config "$1/hxd-ng.toml" > "$1/hxd.log" 2>&1 &
 }
 
+accept() { # tag key
+    printf '[[link.peer]]\nname = "%s"\naccept = true\nprotection = "key"\nkey = "%s"\n' "$1" "$2"
+    printf 'account = "link-%s"\nfeatures = ["chat", "msgs", "info"]\n' "$1"
+}
+dial() { # tag address
+    printf '[[link.peer]]\nname = "aa"\ndial = "%s"\nprotection = "key"\nkey = "%s"\n' "$2" "$KEY_A"
+    printf 'account = "link-%s"\nfeatures = ["chat", "msgs", "info"]\n' "$1"
+}
+
 ulimit -n "$(ulimit -Hn)"
-server "$D/a" 15 aa "[[link.peer]]
-name = \"bb\"
-accept = true
-protection = \"key\"
-key = \"$KEY_B\"
-account = \"link-bb\"
-features = [\"chat\", \"msgs\", \"info\"]"
+PEERS_A=$(accept bb "$KEY_B")
+[ -n "$KEY_C" ] && PEERS_A="$PEERS_A
+$(accept cc "$KEY_C")"
+server "$D/a" 15 aa "$PEERS_A"
 PID_A=$!
-server "$D/b" 16 bb "[[link.peer]]
-name = \"aa\"
-dial = \"$DIAL\"
-protection = \"key\"
-key = \"$KEY_A\"
-account = \"link-bb\"
-features = [\"chat\", \"msgs\", \"info\"]"
-PID_B=$!
-# Whatever ends the script, neither server outlives it to hold the ports
-# the next run binds.
-trap 'kill "$PID_A" "$PID_B" 2> /dev/null' EXIT
-# Up: both servers answer, and, dialing a directly, both have their link.
+server "$D/b" 16 bb "$(dial bb "$DIAL")"
+PID_B=$! PID_C=
+if [ -n "$KEY_C" ]; then
+    server "$D/c" 17 cc "$(dial cc 127.0.0.1:15600)"
+    PID_C=$!
+fi
+# Whatever ends the script, no server outlives it to hold the ports the
+# next run binds.
+trap 'kill $PID_A $PID_B $PID_C 2> /dev/null' EXIT
+# Up: every server answers, and, dialing a directly, has its link.
 # Through the proxy the link comes up only once the run starts it, and a
 # wait for it here would only push b's dialer further into its backoff.
 up() {
-    for port in 15700 16700; do
+    for port in 15700 16700 ${PID_C:+17700}; do
         curl -s "127.0.0.1:$port/metrics" |
             grep -q "${1:-}" || return 1
     done
@@ -113,29 +122,32 @@ want='^hxd_links_up [1-9]'
 for _ in $(seq 100); do up "$want" && break; sleep 0.1; done
 if ! up "$want"; then
     echo "the servers never came up${want:+ linked}" >&2
-    tail -n 5 "$D/a/hxd.log" "$D/b/hxd.log" >&2
+    tail -n 5 "$D"/*/hxd.log >&2
     exit 2
 fi
 
 cpu() { awk '{ print $14 + $15 }' "/proc/$1/stat"; }
-before_a=$(cpu "$PID_A") before_b=$(cpu "$PID_B")
-sed "s#@LOG@#$D/a/hxd.log#; s#@LOG_B@#$D/b/hxd.log#" "$SCEN" > "$D/scenario.toml"
+for s in $SERVERS; do
+    pid=PID_${s^^}
+    declare "before_$s=$(cpu "${!pid}")"
+done
+sed "s#@LOG@#$D/a/hxd.log#; s#@LOG_B@#$D/b/hxd.log#; s#@LOG_C@#$D/c/hxd.log#" "$SCEN" > "$D/scenario.toml"
 TIMEFORMAT="harness_cpu_s=%U+%S"
 { time taskset -c "$HARNESS_CPUS" "$BIN/hxd-load" run "$D/scenario.toml" \
     --out "$OUT/$NAME.json" 2> "$OUT/$NAME.txt"; } 2> "$D/time"
 status=$?
 {
     echo "exit=$status"
-    for s in a b; do
+    for s in $SERVERS; do
         pid=PID_${s^^} before=before_$s
         echo "$s: server_cpu_s=$(( ($(cpu "${!pid}") - ${!before}) / $(getconf CLK_TCK) ))" \
             "peak_rss_mb=$(( $(awk '/VmHWM/ { print $2 }' "/proc/${!pid}/status") / 1024 ))"
     done
     cat "$D/time"
 } >> "$OUT/$NAME.txt"
-kill "$PID_A" "$PID_B"
+kill $PID_A $PID_B $PID_C
 wait 2> /dev/null
-for s in a b; do
+for s in $SERVERS; do
     echo "$s: server_errors=$(grep -cE ' ERROR |panicked' "$D/$s/hxd.log")" >> "$OUT/$NAME.txt"
 done
 rm -rf "$D"

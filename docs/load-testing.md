@@ -5,8 +5,8 @@ consumer and churn scenarios, and the invariant checks; the
 `hxd-testclient` crate it drives both wires with; and the baseline, a
 script that runs them all the same way every time (§7). The other
 scenarios, and a CI smoke run, are next. Server links (§8): the metrics,
-several servers in a run, the proxy's cut, and L-1 to L-3 are built;
-the rest is planned.
+several servers in a run, the proxy's cut and stall, and L-1 to L-4 are
+built; the rest is planned.
 
 The point of loading this server is to find what only breaks under
 load, and where it slows down first; throughput numbers are a side
@@ -291,16 +291,18 @@ the finding.
 server linked to the target. Every scrape, log check and roster check
 is made on each, and the report carries each one's metrics under
 `linked`. A run whose servers have metrics and no link up does not
-start. Only chat and the login storm take linked servers so far.
+start; nor does one until `[target]` has a link up to each of the
+others. Chat, the login storm and the scenarios below that cut or stall
+a link take linked servers.
 
 **`baseline/link-run.sh`** (built) runs one scenario as `run.sh` does,
-against two servers: `a` on run.sh's ports accepting a key-mode link
-that `b`, on 16500 and 16700, dials over TLS, each with a fresh key,
+against two servers, or three when the scenario names a second linked
+one: `a` on run.sh's ports accepting key-mode links that `b`, on 16500
+and 16700, and `c`, on 17500 and 17700, dial over TLS, each with a fresh key,
 certificate and database, `[limits]` at zero (a ghost's lines are held
 to `chat_lines` as a local user's are) and `show_tags` off, since the
 checks match the classic wire's nicks exactly and a tag would change
-them. `scenarios/link-chat.toml` and
-`scenarios/link-storm.toml` are written for it.
+them. The `scenarios/link-*.toml` are written for it.
 
 ```sh
 cargo build --release -p hxd --features metrics -p hxd-load
@@ -313,12 +315,16 @@ listen` and carries on to `upstream`, which the linked servers dial
 instead of their peer. It copies bytes and never decrypts. Built: the
 cut, which closes every connection it carries, and accepts and at once
 closes every new one until restored, so each side sees its link drop and
-the dialer a TLS handshake fail (a partition, where its connects would
-time out, is planned with the stall). Planned: latency and jitter, a bandwidth cap, one direction
-stalled, the connection left half open, and more than two servers, for
-L-4 and L-8. With `[target.proxy]` in the scenario, `link-run.sh` has
-`b` dial the proxy, and both servers take `[interruption] grace` as
-their `[link] grace`.
+the dialer a TLS handshake fail; and the stall, which stops reading what
+the peer sends the dialer while the dialer's own traffic still flows,
+so the peer hears from it as ever while its writes back up, as behind a
+server that stopped reading. Its receive buffer toward the peer is kept
+small, as such a server's would be, not loopback's megabytes. Planned:
+latency and jitter, a bandwidth cap, a partition where connects time
+out, and the connection left half open. With `[target.proxy]` in the
+scenario, `link-run.sh` has `b` dial the proxy (`c`, if there is one,
+dials `a` directly), and every server takes `[interruption] grace` as
+its `[link] grace`.
 
 ### 8.3 Scenarios
 
@@ -327,7 +333,7 @@ their `[link] grace`.
 | L-1 | Cross-link chat (built) | A-B, the room spread over both, client `i` on server `i` modulo their number; `chat.delivery.cross` times the lines heard on another server than their sender's | delivery latency against rate, `chat.delivery` every line and `chat.delivery.cross` those that crossed; once with `sync = "full"` | ghosts' lines not shown (`chat.all_heard` failing on the far side only), or local talkers slowed behind ghosts' commits |
 | L-2 | Presence storm (built) | a login storm on A; `[login_storm] observers_legacy` and `observers_ng` on each linked server time each arrival's join there (`link.join`) | from when an arrival was due to its join heard on B, against arrival rate | the ghost bound, exactly and no further; then a link's export queue (it starts over); then the feed (every link does) |
 | L-3 | Interruption (built) | `[interruption] population_*` idle on A, `watchers_*` on B; the proxy cuts the link for each of `cuts` seconds in turn, swept across `grace`; `link.reconnect` times each link back, and the report each cut's parts and joins as the watchers heard them | time back up, snapshot time against N, the burst each local session takes | a local session dropped as `slow_consumer` by a netsplit's burst; only detached sessions should resync. Its numbers are what `grace` is tuned by |
-| L-4 | Slow peer | A-B and A-C; the proxy stalls or throttles A to B | C's and A's local latency, which should not move; A's memory, inside `QueueBudget` | A closing B as `slow_consumer` within a bound; anything that slows C or A's own users fails it |
+| L-4 | Slow peer (built) | A-B through the proxy and A-C directly, the `[chat]` room on A and C; `[slow_peer] stalled`'s link stalled from `stall_after` to the end of the talking; `chat.delivery.before` and `.after` the stall | C's and A's local latency, which should not move; A's memory, inside `QueueBudget` | A closing B as `slow_consumer` within a bound; anything that slows C or A's own users fails it |
 | L-5 | Churn across a link | the churn scenario on A, observers on B | B's roster against A's once quiet | ghosts left on B, a uid reused inside its quarantine |
 | L-6 | Requests | private messages and user info to ghosts, at rising ghost counts | round trip against the ghosts shown (the scan) | requests refused as rate limited, the per-hop wait under latency, the hub's lock showing in chat latency |
 | L-7 | Moderation under load | kicks and bans across the link during L-1 | a ban stored and its ghost gone | a slow store write holding up the hub or the feed |
@@ -353,10 +359,12 @@ gap; a ghost's line past `chat_lines` does not, which is one more reason
 | `link.stayed_up` | With metrics, no link ended or came up during the run: none was cut. |
 | `link.no_ghosts` | With metrics, after everyone has left, each server holds no more ghosts than before the run. |
 | `link.joins_heard` | Every observer heard every arrival that logged in join its server. |
-| `link.recovered` | After each cut, within `recover`: every link up again (with metrics; without, once the grace is past) and every watcher's server listing the whole population. |
+| `link.recovered` | After each cut within `recover`: every link up again (with metrics; without, once the grace is past) and every watcher's server listing the whole population. In L-4, with metrics, every link up again within `recover` of the stall's end. |
 | `link.grace_held` | A cut shorter than `grace` showed no watcher anyone leaving. |
 | `link.stayed_connected` | Nobody in an interruption, watcher or population, lost their connection over it. |
-| `link.contained` (planned) | In L-4, the other link's and the local users' p99 stay within a margin of a run without the stall. |
+| `link.contained` | In L-4, the room's p99 from the stall on stays within `contained` times its p99 before (and a few milliseconds). |
+| `link.peer_dropped` | In L-4, with metrics, `[target]` gave up on the stalled link, as a slow consumer or a lagged queue, within `drop_within` of the stall. |
+| `link.bounded` | In L-4, with metrics, `[target]`'s classic writers, the link's among them, never held more than `max_queued_bytes`. |
 
 `roster.agrees` is held across servers as it is on one: every
 member's list, ghosts included, shows exactly the run's members on
@@ -369,5 +377,5 @@ Built: the metrics; several servers in `hxd-load` with L-1 and L-2,
 both also run small in `tests/scenarios.rs` against two servers in
 process (without `metrics`, so there the clients' checks hold and the
 link checks are the baseline's); the proxy's cut and L-3, run small in
-process too. Next: the proxy's stall and more than two servers, with
-L-4; then L-5 to L-8, and a link pass in the baseline's sweep.
+process too; the stall and L-4 likewise, on three. Next: L-5 to L-8,
+and a link pass in the baseline's sweep.

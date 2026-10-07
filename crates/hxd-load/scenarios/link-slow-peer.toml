@@ -1,0 +1,51 @@
+# L-4: a accepting b through a proxy and c directly, the room on a and
+# c, and b's link stalled from `stall_after` seconds into the talking: b
+# stops reading what a sends it. a must drop b as a slow consumer within
+# `drop_within`, hold its queues under `max_queued_bytes` meanwhile, and
+# cost the room nothing: its p99 from the stall on within `contained`
+# times its p99 before.
+#
+#   baseline/link-run.sh link-slow-peer scenarios/link-slow-peer.toml
+
+[target]
+legacy = "127.0.0.1:15500"
+ng = "127.0.0.1:15700"
+metrics = true            # needs `--features metrics` and a [metrics] section
+log = "@LOG@"
+
+[target.proxy]
+listen = "127.0.0.1:15601"    # what b dials
+upstream = "127.0.0.1:15600"  # a's TLS port
+
+[[target.linked]]
+name = "b"
+legacy = "127.0.0.1:16500"
+ng = "127.0.0.1:16700"
+metrics = true
+log = "@LOG_B@"
+
+[[target.linked]]
+name = "c"
+legacy = "127.0.0.1:17500"
+ng = "127.0.0.1:17700"
+metrics = true
+log = "@LOG_C@"
+
+[run]
+scenario = "slow_peer"
+duration = 170
+settle = 10
+
+[chat]
+readers_legacy = 50
+readers_ng = 50
+talkers_legacy = 5
+talkers_ng = 5
+rate = 200
+line_bytes = 512
+
+[slow_peer]
+stalled = "b"
+stall_after = 10
+drop_within = 150         # its socket's buffer filled, then a write's minute without progress
+recover = 60
