@@ -4,6 +4,10 @@
 //! Membership is fixed for the whole run: everyone joins before the first
 //! line is due and stays until the last is heard (or `settle` runs out),
 //! so a reader missing a line is a violation, not bad timing.
+//!
+//! With linked servers the room is spread over them, client `i` on server
+//! `i` modulo their number, and a line heard on another server than its
+//! sender's is timed again apart, as `chat.delivery.cross`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +25,8 @@ use crate::Ctx;
 pub struct Room {
     pub members: Vec<Member>,
     pub talkers: usize,
+    /// The server each member is on, by `Ctx::servers`.
+    pub on: Vec<usize>,
 }
 
 pub async fn gather(ctx: &Ctx) -> Result<Room, String> {
@@ -32,19 +38,23 @@ pub async fn gather(ctx: &Ctx) -> Result<Room, String> {
         (Wire::Ng, c.readers_ng),
     ];
     let mut members = Vec::new();
+    let mut on = Vec::new();
     let mut i = 0;
     for (wire, n) in plan {
         for _ in 0..n {
-            let m = Member::join(ctx, wire, i, None)
+            let server = i % ctx.servers.len();
+            let m = Member::join_on(ctx, server, wire, i, None)
                 .await
                 .map_err(|e| format!("{} {i} could not join: {e}", wire.name()))?;
             members.push(m);
+            on.push(server);
             i += 1;
         }
     }
     Ok(Room {
         members,
         talkers: c.talkers_legacy + c.talkers_ng,
+        on,
     })
 }
 
@@ -69,7 +79,11 @@ pub async fn speak(ctx: &Arc<Ctx>, room: Room) -> (Vec<Member>, Vec<u64>) {
     for (k, m) in room.members.into_iter().enumerate() {
         let (tx, rx, parts) = m.split();
         let own = (k < room.talkers).then_some(k);
-        let heard = Heard::new(parts.nick.clone(), own);
+        let mut heard = Heard::new(parts.nick.clone(), own);
+        heard.elsewhere = room.on[..room.talkers]
+            .iter()
+            .map(|&s| s != room.on[k])
+            .collect();
         readers.push(tokio::spawn(read(
             ctx.clone(),
             rx,
@@ -118,6 +132,9 @@ pub async fn speak(ctx: &Arc<Ctx>, room: Room) -> (Vec<Member>, Vec<u64>) {
         let (rx, heard, parts) = r.await.expect("a reader task does not panic");
         heard.account(&sent, &ctx.checks);
         ctx.stats.merge("chat.delivery", &heard.delivery);
+        if ctx.servers.len() > 1 {
+            ctx.stats.merge("chat.delivery.cross", &heard.cross);
+        }
         if k < room.talkers {
             ctx.stats.merge("chat.echo", &heard.echo);
         }
@@ -189,7 +206,7 @@ async fn read(
                     ctx.checks.violated("chat.stayed", format!("{} was kicked", parts.nick));
                     break;
                 }
-                Ok(Got::Other) => {}
+                Ok(Got::Other | Got::Joined(_)) => {}
                 Err(e) => {
                     ctx.checks.violated("chat.stayed", format!("{} lost its connection: {e}", parts.nick));
                     break;

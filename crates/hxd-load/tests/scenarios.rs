@@ -196,3 +196,127 @@ async fn a_slow_consumer_is_measured_and_costs_the_room_nothing() {
         2
     );
 }
+
+/// A server like `start`'s, with a TLS port and a `[link]` keyed by
+/// `seed` repeated, linking as `peer` says, waited for until it has.
+async fn start_linked(
+    dir: &Path,
+    seed: u8,
+    tag: &str,
+    peer: &str,
+    tls: tokio::net::TcpListener,
+) -> Server {
+    let d = dir.display();
+    let seed_hex: String = [seed; 32].iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.join("link.key"), seed_hex).unwrap();
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(dir.join("cert.pem"), issued.cert.pem()).unwrap();
+    std::fs::write(dir.join("key.pem"), issued.signing_key.serialize_pem()).unwrap();
+    let text = format!(
+        "[limits]\nchat_lines = 0\nspam_points = 0\nng_requests = 0\nnews_posts = 0\n\
+         reconnect_seconds = 0\n\
+         [paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n\
+         [tls]\ncert = \"{d}/cert.pem\"\nkey = \"{d}/key.pem\"\n\
+         [link]\ntag = \"{tag}\"\nkey = \"{d}/link.key\"\n{peer}\n"
+    );
+    let path = dir.join("hxd-ng.toml");
+    std::fs::write(&path, &text).unwrap();
+    let config = hxd::Config::load(&path).unwrap();
+    hxd::check_config(&config).unwrap();
+    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
+    let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
+        .unwrap()
+        .unwrap();
+    let hub = hxd::link::build(&config, ctx.core.clone())
+        .unwrap()
+        .unwrap();
+    let certs = std::sync::Arc::new(
+        hxd_session::LegacyTls::load(&dir.join("cert.pem"), &dir.join("key.pem")).unwrap(),
+    );
+    let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ngl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = Server {
+        legacy: legacy.local_addr().unwrap(),
+        ng: ngl.local_addr().unwrap(),
+    };
+    tokio::spawn(hxd_session::serve(legacy, ctx.clone()));
+    tokio::spawn(hxd_ng_session::serve(ngl, ng_ctx));
+    tokio::spawn(hxd_session::serve_tls_with_peers(
+        tls,
+        ctx,
+        certs,
+        Some(std::sync::Arc::new(hub.clone()) as std::sync::Arc<dyn hxd_session::PeerAcceptor>),
+    ));
+    hub.start();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while hub.status().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "{tag} never linked");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    server
+}
+
+fn link_key(seed: u8) -> String {
+    use base64::Engine;
+    let key = hxd_link::LinkKey::from_seed(&[seed; 32]).public();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
+}
+
+/// Without `metrics` in this build, the link checks that read the
+/// servers' own numbers (`link.stayed_up`, `link.no_ghosts`) are the
+/// baseline's to make; what the clients see is checked here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn across_a_link_every_line_and_every_join_is_heard_on_the_other_server() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a_tls.local_addr().unwrap();
+    let a_peer = format!(
+        "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\nfeatures = [\"chat\"]\n",
+        link_key(2)
+    );
+    let b_peer = format!(
+        "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
+         key = \"{}\"\naccount = \"link-bb\"\nfeatures = [\"chat\"]\n",
+        link_key(1)
+    );
+    let b_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (a, b) = tokio::join!(
+        start_linked(da.path(), 1, "aa", &a_peer, a_tls),
+        start_linked(db.path(), 2, "bb", &b_peer, b_tls),
+    );
+    let linked = |kind, duration| {
+        let mut s = scenario(&a, kind, duration);
+        s.target.linked = vec![hxd_load::config::Server {
+            name: "b".into(),
+            legacy: Some(b.legacy),
+            ng: Some(b.ng),
+            ..Default::default()
+        }];
+        s
+    };
+
+    let mut s = linked(Kind::Chat, 2.0);
+    s.chat.readers_legacy = 4;
+    s.chat.readers_ng = 4;
+    s.chat.talkers_legacy = 2;
+    s.chat.talkers_ng = 2;
+    s.chat.rate = 40.0;
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    assert_eq!(report.checks["chat.all_heard"].held, 12 * 4);
+    assert!(report.ops["chat.delivery.cross"].count > 0);
+    assert_eq!(report.checks["roster.agrees"].held, 12);
+    assert_eq!(report.checks["roster.no_ghosts"].held, 2);
+
+    let mut s = linked(Kind::LoginStorm, 2.0);
+    s.login_storm.rate = 10.0;
+    s.login_storm.ramp_step = 0.0;
+    s.login_storm.linger = 0.2;
+    s.login_storm.observers_legacy = 1;
+    s.login_storm.observers_ng = 1;
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    assert_eq!(report.checks["link.joins_heard"].held, 2);
+    assert!(report.ops["link.join"].count > 0, "{}", report.summary());
+}

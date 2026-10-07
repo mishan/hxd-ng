@@ -28,3 +28,7 @@ hxd = { path = "../hxd" }
 hxd-session = { workspace = true }
 hxd-ng-session = { workspace = true }
 tempfile = "3"
+# Two servers linked by key mode over loopback TLS, for the link runs.
+hxd-link = { workspace = true }
+base64 = "0.22"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

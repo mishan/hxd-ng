@@ -9,16 +9,22 @@
 //! A login the server refuses as busy tries again, as a client would
 //! (`member::retry_busy`), so the server's login gate shows as latency
 //! and in the report's `busy_logins` rather than as failed logins.
+//!
+//! With linked servers, observers on each of them time when each arrival
+//! is heard to join there (`link.join`), from when it was due, and each
+//! must hear every arrival that logged in (`link.joins_heard`).
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinHandle;
 
-use crate::member::{Member, Wire};
+use crate::member::{Got, Member, Parts, Rx, Tx, Wire};
 use crate::stats::{self, Summary};
 use crate::Ctx;
 
@@ -53,6 +59,9 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
     if total == 0 {
         return Err("[login_storm] weighs every wire at zero".into());
     }
+    let arrivals = Arc::new(Arrivals::default());
+    let (done_tx, done_rx) = watch::channel(None);
+    let observers = observe(ctx, &arrivals, done_rx).await?;
     let in_flight = Arc::new(Semaphore::new(s.max_in_flight));
     let steps: Arc<Mutex<Vec<Step>>> = Arc::new(Mutex::new(Vec::new()));
     let start = ctx.t0.elapsed() + Duration::from_millis(100);
@@ -97,16 +106,31 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
             due += Duration::from_secs_f64(1.0 / rate);
             continue;
         };
-        let (ctx2, steps2) = (ctx.clone(), steps.clone());
+        let (ctx2, steps2, arrivals2) = (ctx.clone(), steps.clone(), arrivals.clone());
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
-            arrive(&ctx2, wire, i, due, step, &steps2).await;
+            arrive(&ctx2, wire, i, due, step, &steps2, &arrivals2).await;
         }));
         i += 1;
         due += Duration::from_secs_f64(1.0 / rate);
     }
     for t in tasks {
         let _ = t.await;
+    }
+    let logged_in: HashSet<String> = arrivals
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, (_, ok))| *ok)
+        .map(|(nick, _)| nick.clone())
+        .collect();
+    let _ = done_tx.send(Some(Arc::new(logged_in)));
+    for o in observers {
+        let (tx, rx, parts) = o.await.expect("an observer task does not panic");
+        if let Err(e) = Member::rejoin(tx, rx, parts).leave().await {
+            ctx.stats.error("leave", &e.to_string());
+        }
     }
 
     let steps = std::mem::take(&mut *steps.lock().unwrap());
@@ -137,6 +161,7 @@ async fn arrive(
     due: Duration,
     step: usize,
     steps: &Mutex<Vec<Step>>,
+    arrivals: &Arrivals,
 ) {
     let s = &ctx.scenario.login_storm;
     let creds = if s.accounts {
@@ -149,6 +174,12 @@ async fn arrive(
         None
     };
     let op = format!("login.{}", wire.name());
+    let nick = ctx.nick(wire.letter(), i);
+    arrivals
+        .0
+        .lock()
+        .unwrap()
+        .insert(nick.clone(), (due, false));
     let joined = async {
         let mut m = Member::join(ctx, wire, i, creds).await?;
         m.nicks().await?;
@@ -166,6 +197,9 @@ async fn arrive(
     }
     match joined {
         Ok(m) => {
+            if let Some(a) = arrivals.0.lock().unwrap().get_mut(&nick) {
+                a.1 = true;
+            }
             ctx.stats.record(&op, took);
             tokio::time::sleep(Duration::from_secs_f64(s.linger)).await;
             if let Err(e) = m.leave().await {
@@ -174,4 +208,102 @@ async fn arrive(
         }
         Err(e) => ctx.stats.error(&op, &e.to_string()),
     }
+}
+
+/// Each arrival by nick: when it was due, and whether it logged in.
+#[derive(Default)]
+struct Arrivals(Mutex<HashMap<String, (Duration, bool)>>);
+
+/// The arrivals that logged in, once the last has.
+type Done = watch::Receiver<Option<Arc<HashSet<String>>>>;
+
+/// Join the observers on every linked server, each on a task that hears
+/// arrivals join until it has heard every one that logged in, or
+/// `settle` has passed since the last did.
+async fn observe(
+    ctx: &Arc<Ctx>,
+    arrivals: &Arc<Arrivals>,
+    done: Done,
+) -> Result<Vec<JoinHandle<(Tx, Rx, Parts)>>, String> {
+    let s = &ctx.scenario.login_storm;
+    let mut tasks = Vec::new();
+    let mut n = 0;
+    for (k, server) in ctx.servers.iter().enumerate().skip(1) {
+        for wire in std::iter::repeat_n(Wire::Legacy, s.observers_legacy)
+            .chain(std::iter::repeat_n(Wire::Ng, s.observers_ng))
+        {
+            let m = Member::join_at(ctx, server, wire, ctx.nick('W', n), None)
+                .await
+                .map_err(|e| format!("observer {n} on {} could not join: {e}", server.name))?;
+            n += 1;
+            let (tx, rx, parts) = m.split();
+            let (ctx, arrivals, done) = (ctx.clone(), arrivals.clone(), done.clone());
+            tasks.push(tokio::spawn(async move {
+                let rx = watch_joins(&ctx, rx, &parts, k, &arrivals, done).await;
+                (tx, rx, parts)
+            }));
+        }
+    }
+    Ok(tasks)
+}
+
+async fn watch_joins(
+    ctx: &Ctx,
+    mut rx: Rx,
+    parts: &Parts,
+    k: usize,
+    arrivals: &Arrivals,
+    mut done: Done,
+) -> Rx {
+    let settle = Duration::from_secs_f64(ctx.scenario.run.settle);
+    let mut heard = HashSet::new();
+    let mut latency = stats::local();
+    let mut deadline = None::<tokio::time::Instant>;
+    loop {
+        let logged_in = done.borrow().clone();
+        if let Some(all) = &logged_in {
+            if all.is_subset(&heard) {
+                break;
+            }
+            let d = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + settle);
+            if tokio::time::Instant::now() >= d {
+                break;
+            }
+        }
+        let wait = deadline.unwrap_or_else(|| tokio::time::Instant::now() + settle);
+        tokio::select! {
+            // The run gave up before the last arrival: nothing left to hear.
+            changed = done.changed(), if logged_in.is_none() => if changed.is_err() { break },
+            _ = tokio::time::sleep_until(wait) => {}
+            got = rx.next() => match got {
+                Ok(Got::Joined(nick)) => {
+                    let due = arrivals.0.lock().unwrap().get(&nick).map(|a| a.0);
+                    if let Some(due) = due.filter(|_| heard.insert(nick)) {
+                        stats::sample(&mut latency, ctx.t0.elapsed().saturating_sub(due));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    ctx.checks.violated(
+                        "link.joins_heard",
+                        format!("{} lost its connection: {e}", parts.nick),
+                    );
+                    break;
+                }
+            },
+        }
+    }
+    ctx.stats.merge("link.join", &latency);
+    let all = done.borrow().clone().unwrap_or_default();
+    let missed = all.difference(&heard).count();
+    ctx.checks.check("link.joins_heard", missed == 0, || {
+        format!(
+            "{} on {} heard {} of {} arrivals join",
+            parts.nick,
+            ctx.servers[k].name,
+            all.len() - missed,
+            all.len()
+        )
+    });
+    rx
 }

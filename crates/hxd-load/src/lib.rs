@@ -41,6 +41,8 @@ use stats::Stats;
 /// What every task of a run shares.
 pub struct Ctx {
     pub scenario: Scenario,
+    /// `[target]` and the servers linked to it, in that order.
+    pub servers: Vec<config::Server>,
     /// The run's clock: every due time and latency is measured on it.
     pub t0: Instant,
     /// A tag in every nick and chat line, so this run's traffic is told
@@ -60,6 +62,7 @@ impl Ctx {
             .map_or(0, |d| d.subsec_nanos());
         let seed = scenario.run.seed;
         Arc::new(Ctx {
+            servers: scenario.target.servers(),
             scenario,
             t0: Instant::now(),
             run: format!("{:04x}", nanos & 0xffff),
@@ -118,11 +121,17 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
     scenario.check()?;
     let started = SystemTime::now();
     let ctx = Ctx::new(scenario);
-    let log = match &ctx.scenario.target.log {
-        Some(path) => Some(target::LogTail::start(path)?),
-        None => None,
-    };
-    let before = scrape(&ctx).await?;
+    let mut logs = Vec::new();
+    for s in &ctx.servers {
+        if let Some(path) = &s.log {
+            logs.push((s.name.clone(), target::LogTail::start(path)?));
+        }
+    }
+    let mut before = Vec::new();
+    for s in &ctx.servers {
+        before.push(scrape(s).await?);
+    }
+    links_up(&ctx, &before)?;
 
     let extra = match ctx.scenario.run.scenario {
         Kind::LoginStorm => storm::run(&ctx).await?,
@@ -131,34 +140,122 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
         Kind::Churn => churn::run(&ctx).await?,
     };
 
-    // Everyone this run brought has left; the roster should say so.
-    member::no_ghosts(&ctx, before.as_ref()).await;
+    // Everyone this run brought has left; every roster should say so.
+    for (k, b) in before.iter().enumerate() {
+        member::no_ghosts(&ctx, k, b.as_ref()).await;
+    }
     // From here a failure is a finding, not a reason to lose the report:
     // a server that died under load is the run most worth keeping.
-    let after = match scrape(&ctx).await {
-        Ok(after) => after,
-        Err(e) => {
-            ctx.checks
-                .violated("server.reachable", format!("after the run: {e}"));
-            None
-        }
-    };
-    if let Some(log) = log {
+    let mut after = Vec::new();
+    for s in &ctx.servers {
+        after.push(match scrape(s).await {
+            Ok(after) => after,
+            Err(e) => {
+                ctx.checks
+                    .violated("server.reachable", format!("{} after the run: {e}", s.name));
+                None
+            }
+        });
+    }
+    if ctx.servers.len() > 1 {
+        links_stayed(&ctx, &before, &after);
+    }
+    for (name, log) in logs {
         match log.alarming() {
             Ok(lines) => ctx.checks.check("server.log_clean", lines.is_empty(), || {
-                format!("{} alarming lines, first: {}", lines.len(), lines[0])
+                format!(
+                    "{name}: {} alarming lines, first: {}",
+                    lines.len(),
+                    lines[0]
+                )
             }),
             Err(e) => ctx
                 .checks
-                .violated("server.log_clean", format!("unreadable: {e}")),
+                .violated("server.log_clean", format!("{name} unreadable: {e}")),
         }
     }
     Ok(report::Report::new(&ctx, started, extra, before, after))
 }
 
-async fn scrape(ctx: &Ctx) -> Result<Option<target::Scrape>, String> {
-    match (ctx.scenario.target.metrics, ctx.scenario.target.ng) {
-        (true, Some(ng)) => target::scrape(ng).await.map(Some),
+async fn scrape(s: &config::Server) -> Result<Option<target::Scrape>, String> {
+    match (s.metrics, s.ng) {
+        (true, Some(ng)) => target::scrape(ng)
+            .await
+            .map(Some)
+            .map_err(|e| format!("{}: {e}", s.name)),
         _ => Ok(None),
+    }
+}
+
+/// A run across servers that are not linked would fail every check for
+/// the server's fault rather than the run's, so it does not start.
+fn links_up(ctx: &Ctx, before: &[Option<target::Scrape>]) -> Result<(), String> {
+    if ctx.servers.len() < 2 {
+        return Ok(());
+    }
+    for (s, b) in ctx.servers.iter().zip(before) {
+        if let Some(b) = b {
+            if b.get("hxd_links_up").unwrap_or(0.0) < 1.0 {
+                return Err(format!("{} has no link up", s.name));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// No link ended during the run, nor did one come up: the scenario cut
+/// none, so either is a link that went down.
+fn links_stayed(ctx: &Ctx, before: &[Option<target::Scrape>], after: &[Option<target::Scrape>]) {
+    for ((s, b), a) in ctx.servers.iter().zip(before).zip(after) {
+        let (Some(b), Some(a)) = (b, a) else { continue };
+        let ends = |m: &target::Scrape| -> f64 {
+            m.0.iter()
+                .filter(|(k, _)| k.starts_with("hxd_link_ends_total"))
+                .map(|(_, v)| v)
+                .sum()
+        };
+        let (eb, ea) = (ends(b), ends(a));
+        let (ub, ua) = (b.get("hxd_links_up"), a.get("hxd_links_up"));
+        ctx.checks
+            .check("link.stayed_up", eb == ea && ub == ua, || {
+                format!(
+                    "{}: {} link ends during the run, links up {ub:?} then {ua:?}",
+                    s.name,
+                    ea - eb
+                )
+            });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scrape(series: &[(&str, f64)]) -> Option<target::Scrape> {
+        Some(target::Scrape(
+            series.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        ))
+    }
+
+    #[test]
+    fn a_link_that_ended_went_down_or_came_up_during_the_run_is_a_violation() {
+        let up = scrape(&[("hxd_links_up", 1.0)]);
+        let ended = scrape(&[
+            ("hxd_links_up", 1.0),
+            ("hxd_link_ends_total{reason=\"dead\"}", 1.0),
+        ]);
+        let down = scrape(&[("hxd_links_up", 0.0)]);
+        let another = scrape(&[("hxd_links_up", 2.0)]);
+        for (after, ok) in [
+            (&up, true),
+            (&ended, false),
+            (&down, false),
+            (&another, false),
+        ] {
+            let ctx = Ctx::new(Scenario::default());
+            links_stayed(&ctx, std::slice::from_ref(&up), std::slice::from_ref(after));
+            let r = ctx.checks.report();
+            assert_eq!(r["link.stayed_up"].violated == 0, ok, "{after:?}");
+        }
     }
 }

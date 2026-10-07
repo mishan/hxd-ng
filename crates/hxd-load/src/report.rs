@@ -37,6 +37,15 @@ pub struct Report {
     pub detail: Value,
     pub metrics_before: Option<Scrape>,
     pub metrics_after: Option<Scrape>,
+    /// The same, for each `[[target.linked]]` server, by name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub linked: BTreeMap<String, Metrics>,
+}
+
+#[derive(Serialize)]
+pub struct Metrics {
+    pub metrics_before: Option<Scrape>,
+    pub metrics_after: Option<Scrape>,
 }
 
 /// The scenario as it ran, less its passwords: a report is made to be
@@ -65,10 +74,25 @@ impl Report {
         ctx: &Ctx,
         started: SystemTime,
         detail: Value,
-        before: Option<Scrape>,
-        after: Option<Scrape>,
+        before: Vec<Option<Scrape>>,
+        after: Vec<Option<Scrape>>,
     ) -> Report {
         let checks = ctx.checks.report();
+        let mut scrapes = before.into_iter().zip(after);
+        let (metrics_before, metrics_after) = scrapes.next().unwrap_or_default();
+        let linked = ctx.servers[1..]
+            .iter()
+            .zip(scrapes)
+            .map(|(s, (metrics_before, metrics_after))| {
+                (
+                    s.name.clone(),
+                    Metrics {
+                        metrics_before,
+                        metrics_after,
+                    },
+                )
+            })
+            .collect();
         Report {
             harness: Harness {
                 version: env!("CARGO_PKG_VERSION"),
@@ -86,8 +110,9 @@ impl Report {
             checks,
             busy_logins: ctx.busy.summary(),
             detail,
-            metrics_before: before,
-            metrics_after: after,
+            metrics_before,
+            metrics_after,
+            linked,
         }
     }
 

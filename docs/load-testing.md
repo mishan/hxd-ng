@@ -4,8 +4,9 @@ Status: built. `hxd-load` with the login storm, public chat, slow
 consumer and churn scenarios, and the invariant checks; the
 `hxd-testclient` crate it drives both wires with; and the baseline, a
 script that runs them all the same way every time (§7). The other
-scenarios, and a CI smoke run, are next. Server links (§8) are planned:
-their metrics are built, the scenarios are not.
+scenarios, and a CI smoke run, are next. Server links (§8): the metrics,
+several servers in a run, and L-1 and L-2 are built; the rest is
+planned.
 
 The point of loading this server is to find what only breaks under
 load, and where it slows down first; throughput numbers are a side
@@ -62,6 +63,8 @@ from its own output.
 - `[target]`: the classic port, the classic TLS port and its name, the
   ng port, `metrics`, the server's `log`, the `accounts` and the `admin`
   account the churn uses.
+- `[[target.linked]]`: servers linked to the target, each with a `name`
+  and its own ports, `metrics` and `log` (§8).
 - `[run]`: `scenario`, `duration` in seconds, `seed` for every random
   choice, `settle` (how long readers may take to hear the last line;
   five seconds by default), `teardown` (how long the server has to
@@ -251,7 +254,7 @@ disagrees with its neighbors, so a result that matters is repeated
 before it is believed.
 
 
-## 8. Server links (planned)
+## 8. Server links
 
 What links cost as they grow, and how they give way: users per side,
 cross-link chat, the number of links, and the network between them,
@@ -282,27 +285,41 @@ the finding.
   ghosts** under the hub's lock, and the feed hands each event to every
   link under it.
 
-### 8.2 What the harness needs
+### 8.2 The harness
 
-1. **Several servers per run**: `[[target.server]]`, each with its
-   ports, metrics and log, and every scrape, log check and roster check
-   made per server, reported under its name.
-2. **A topology script** beside `baseline/run.sh`: N servers, their
-   link keys and `[[link.peer]]` entries, `[limits]` at zero on every
-   one (a ghost's lines are held to `chat_lines` as a local user's are),
-   `show_tags` off so nicks keep the run's tag, and each server pinned
-   to cores of its own.
-3. **`linkproxy`**, a TCP proxy between each dialer and its peer, on a
-   schedule from the scenario: latency and jitter, a bandwidth cap, one
-   direction stalled, the connection cut or left half open. It copies
-   bytes and never decrypts.
+**Several servers per run** (built): `[[target.linked]]` names each
+server linked to the target. Every scrape, log check and roster check
+is made on each, and the report carries each one's metrics under
+`linked`. A run whose servers have metrics and no link up does not
+start. Only chat and the login storm take linked servers so far.
+
+**`baseline/link-run.sh`** (built) runs one scenario as `run.sh` does,
+against two servers: `a` on run.sh's ports accepting a key-mode link
+that `b`, on 16500 and 16700, dials over TLS, each with a fresh key,
+certificate and database, `[limits]` at zero (a ghost's lines are held
+to `chat_lines` as a local user's are) and `show_tags` off, since the
+checks match the classic wire's nicks exactly and a tag would change
+them. `scenarios/link-chat.toml` and
+`scenarios/link-storm.toml` are written for it.
+
+```sh
+cargo build --release -p hxd --features metrics -p hxd-load
+BIN=target/release crates/hxd-load/baseline/link-run.sh link-chat \
+    crates/hxd-load/scenarios/link-chat.toml
+```
+
+**`linkproxy`** (planned), a TCP proxy between each dialer and its
+peer, on a schedule from the scenario: latency and jitter, a bandwidth
+cap, one direction stalled, the connection cut or left half open. It
+copies bytes and never decrypts. More than two servers, for L-4 and
+L-8, come with it.
 
 ### 8.3 Scenarios
 
 | | Scenario | Shape | Scales with | Expected to give way as |
 |---|---|---|---|---|
-| L-1 | Cross-link chat | A-B, readers and talkers on both sides and both wires | delivery latency, local and cross-link apart, against rate; once with `sync = "full"` | ghosts' lines not shown (`chat.all_heard` failing on the far side only), or local talkers slowed behind ghosts' commits |
-| L-2 | Presence storm | a login storm on A, observers on B | login on A to `Joined` on B, against arrival rate | the ghost bound, exactly and no further; then a link's export queue (it starts over); then the feed (every link does) |
+| L-1 | Cross-link chat (built) | A-B, the room spread over both, client `i` on server `i` modulo their number; `chat.delivery.cross` times the lines heard on another server than their sender's | delivery latency against rate, `chat.delivery` every line and `chat.delivery.cross` those that crossed; once with `sync = "full"` | ghosts' lines not shown (`chat.all_heard` failing on the far side only), or local talkers slowed behind ghosts' commits |
+| L-2 | Presence storm (built) | a login storm on A; `[login_storm] observers_legacy` and `observers_ng` on each linked server time each arrival's join there (`link.join`) | from when an arrival was due to its join heard on B, against arrival rate | the ghost bound, exactly and no further; then a link's export queue (it starts over); then the feed (every link does) |
 | L-3 | Interruption | A holds N users, up to the bound; readers on B on both wires and detached ng sessions; the proxy cuts the link for C seconds, C swept across `grace` | time back up, snapshot time against N, the burst each local session takes | a local session dropped as `slow_consumer` by a netsplit's burst; only detached sessions should resync. Its numbers are what `grace` is tuned by |
 | L-4 | Slow peer | A-B and A-C; the proxy stalls or throttles A to B | C's and A's local latency, which should not move; A's memory, inside `QueueBudget` | A closing B as `slow_consumer` within a bound; anything that slows C or A's own users fails it |
 | L-5 | Churn across a link | the churn scenario on A, observers on B | B's roster against A's once quiet | ghosts left on B, a uid reused inside its quarantine |
@@ -327,15 +344,21 @@ gap; a ghost's line past `chat_lines` does not, which is one more reason
 
 | Check | What must hold |
 |---|---|
-| `link.stayed_up` | No link ended that the scenario did not end. |
-| `link.recovered` | A link the scenario cut is back within a bound, and shows what its peer exports once quiet. |
-| `link.ghosts_agree` | Each server's ghosts are the run's users on the other side, up to the ghost bounds and never past them. |
-| `link.no_ghosts` | After everyone has left, no server shows a ghost of the run's. |
-| `link.contained` | In L-4, the other link's and the local users' p99 stay within a margin of a run without the stall. |
+| `link.stayed_up` | With metrics, no link ended or came up during the run: none was cut. |
+| `link.no_ghosts` | With metrics, after everyone has left, each server holds no more ghosts than before the run. |
+| `link.joins_heard` | Every observer heard every arrival that logged in join its server. |
+| `link.recovered` (planned) | A link the scenario cut is back within a bound, and shows what its peer exports once quiet. |
+| `link.contained` (planned) | In L-4, the other link's and the local users' p99 stay within a margin of a run without the stall. |
+
+`roster.agrees` is held across servers as it is on one: every
+member's list, ghosts included, shows exactly the run's members on
+every server. Up to the ghost bounds that is what a check of each
+server's ghosts would ask.
 
 ### 8.5 Order
 
-The metrics; then several servers in `hxd-load` with L-1 and L-2, each
-also run small in `tests/scenarios.rs` against two servers in process;
-then `linkproxy` with L-3 and L-4; then L-5 to L-8, and a link pass in
-the baseline's sweep.
+Built: the metrics; several servers in `hxd-load` with L-1 and L-2,
+both also run small in `tests/scenarios.rs` against two servers in
+process (without `metrics`, so there the clients' checks hold and the
+link checks are the baseline's). Next: `linkproxy` with L-3 and L-4;
+then L-5 to L-8, and a link pass in the baseline's sweep.

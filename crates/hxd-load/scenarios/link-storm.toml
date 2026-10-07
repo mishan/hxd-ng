@@ -1,0 +1,29 @@
+# L-2: a login storm on one server, watched from a linked one: each
+# observer times when every arrival is heard to join there (`link.join`)
+# and must hear every one that logged in.
+#
+#   baseline/link-run.sh link-storm scenarios/link-storm.toml
+
+[target]
+legacy = "127.0.0.1:15500"
+ng = "127.0.0.1:15700"
+metrics = true
+log = "@LOG@"
+
+[[target.linked]]
+name = "b"
+legacy = "127.0.0.1:16500"
+ng = "127.0.0.1:16700"
+metrics = true
+log = "@LOG_B@"
+
+[run]
+scenario = "login_storm"
+duration = 30
+
+[login_storm]
+rate = 20
+ramp_step = 20
+ramp_every = 5
+observers_legacy = 1
+observers_ng = 1
