@@ -18,7 +18,7 @@ use hxd_core::server_link::{
     RemoteRef, Requester, PEER_WAIT,
 };
 use hxd_core::Core;
-use hxd_session::peer::{LinkGrant, LinkIo, LinkLogin, PeerAcceptor};
+use hxd_session::peer::{LinkGrant, LinkIo, LinkLogin, Packed, PeerAcceptor};
 use hxd_session::{cap, Caps};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
@@ -34,8 +34,9 @@ use crate::wire::{feature, field, find, tx, Field, Hello, Reason, VERSION};
 const FEED_CAP: usize = 16384;
 const EXPORT_CAP: usize = 4096;
 
-/// An export event, numbered in the roster's order.
-pub(crate) type Export = (u64, PeerEvent);
+/// An export event, numbered in the roster's order, packed once for
+/// every link.
+pub(crate) type Export = (u64, Arc<Packed>);
 
 /// Links between this server and the farthest one it will accept.
 pub const MAX_HOPS: u16 = 8;
@@ -1133,11 +1134,15 @@ impl Hub {
 
     /// Hand one export to every established link. A link too far behind
     /// to take it is closed and starts over from a snapshot.
-    fn fan_out(&self, export: Export) {
+    fn fan_out(&self, (n, event): (u64, PeerEvent)) {
+        let mut packed = None;
         let mut state = self.0.state.lock().unwrap();
         for live in state.links.values_mut() {
             let Some(tx) = &live.exports else { continue };
-            if let Err(e) = tx.try_send(export.clone()) {
+            let packed = packed.get_or_insert_with(|| {
+                Arc::new(crate::link::pack(self.server_id(), self.epoch(), &event))
+            });
+            if let Err(e) = tx.try_send((n, packed.clone())) {
                 // Closed is a link already ending for its own reason.
                 if matches!(e, mpsc::error::TrySendError::Full(_)) {
                     instrument::link_lagged("export");
@@ -1409,7 +1414,7 @@ fn derived_color(tag: &str) -> u32 {
 
 /// Hand the core's export feed to every link, for as long as the process
 /// runs. A feed the core closed fell behind: every link starts over.
-async fn feed(hub: Hub, mut rx: mpsc::Receiver<Export>) {
+async fn feed(hub: Hub, mut rx: mpsc::Receiver<(u64, PeerEvent)>) {
     loop {
         while let Some(export) = rx.recv().await {
             instrument::link_queue_depth("feed", rx.len());
