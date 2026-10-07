@@ -320,6 +320,13 @@ BIN=target/release crates/hxd-load/baseline/link-run.sh link-chat \
     crates/hxd-load/scenarios/link-chat.toml
 ```
 
+On one host the hub shares its cores with every leaf, so what a run
+says about the hub is partly the leaves'. `HUB_HOST` runs `a` on
+another host over ssh instead, with that host to itself, the leaves
+and the harness reaching it at its address (`HUB_ADDR`) and let
+through its `[limits]` and its `[metrics] allow`; its CPU, memory and
+errors are read there. Not with `[target.proxy]`.
+
 **`linkproxy`** (`proxy.rs`), a TCP proxy a run starts at
 `[target.proxy] listen` and carries on to `upstream`, which the linked
 servers dial instead of their peer. It copies bytes and never decrypts.
