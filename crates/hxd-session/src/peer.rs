@@ -188,13 +188,15 @@ impl DialedLink {
     }
 }
 
-/// The answer to an act on a user of another server, or `Unreachable`
-/// once [`PEER_WAIT`] has passed without one.
+/// The answer to an act on a user of another server: `Unreachable` if
+/// nobody is left to give it, `Unanswered` once [`PEER_WAIT`] has passed
+/// without one.
 pub async fn peer_answer<T>(
     answer: tokio::sync::oneshot::Receiver<Result<T, PeerRefusal>>,
 ) -> Result<T, PeerRefusal> {
     match tokio::time::timeout(PEER_WAIT, answer).await {
         Ok(Ok(result)) => result,
-        _ => Err(PeerRefusal::Unreachable),
+        Ok(Err(_)) => Err(PeerRefusal::Unreachable),
+        Err(_) => Err(PeerRefusal::Unanswered),
     }
 }

@@ -15,7 +15,9 @@
 //! answered with the ghost's server alone, which is what the classic wire
 //! gives when the peer did not answer, and a message queued rather than
 //! delivered. What must hold is that every message accepted is heard by
-//! its recipient once, and every one refused never, checked after each
+//! its recipient once, and every one refused never (one the server calls
+//! unconfirmed, sent and not answered in time, is held to neither: it
+//! may arrive or not), checked after each
 //! step and again once the run is quiet (`link.msgs_delivered`); and that
 //! a requester is answered rather than cut off (`link.requests_answered`):
 //! one that is not is dropped from the run, and the rest go on.
@@ -285,9 +287,12 @@ async fn ask(
             }
             Ok(()) => stats::sample(&mut d.info, took),
             Err(Error::Refused { code, text }) => {
+                // Sent, and unanswered in time: it may yet arrive, so it
+                // is held to neither accounting.
+                let unknown = code == "unconfirmed" || text.contains("not known");
                 let why = if code.is_empty() { text } else { code };
                 *d.refusals.entry(why).or_default() += 1;
-                if msg {
+                if msg && !unknown {
                     d.refused.push((k, seq));
                 }
             }

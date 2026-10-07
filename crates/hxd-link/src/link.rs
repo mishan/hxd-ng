@@ -570,12 +570,9 @@ impl Link<'_> {
     }
 
     fn send_request(&mut self, io: &LinkIo, request: Request) {
-        // An asker that stopped waiting is no longer owed anything.
-        self.pending.retain(|_, asker| !asker.is_closed());
-        if self.pending.len() >= MAX_PENDING {
-            instrument::link_dropped("request");
+        let Some(request) = admit(&mut self.pending, request) else {
             return warn!(peer = %self.entry.name, "too many requests waiting; one not sent");
-        }
+        };
         let trans = self.next_trans;
         self.next_trans = self.next_trans.wrapping_add(1).max(1);
         io.out.request(request.ty, trans, chunks(&request.fields));
@@ -931,6 +928,21 @@ impl Link<'_> {
     }
 }
 
+/// A request the link may send, or `None` when as many already wait on
+/// the peer as it lets wait: then its asker is told, as rate limited, that
+/// the link is full, rather than left to hear nothing at all.
+fn admit(pending: &mut HashMap<u32, oneshot::Sender<Reply>>, request: Request) -> Option<Request> {
+    // An asker that stopped waiting is no longer owed anything.
+    pending.retain(|_, asker| !asker.is_closed());
+    if pending.len() < MAX_PENDING {
+        return Some(request);
+    }
+    instrument::link_dropped("request");
+    let full = vec![Field::u16(field::REASON, Reason::RateLimited as u16)];
+    let _ = request.reply.send((true, full));
+    None
+}
+
 /// The reply flag sits in the type word's second byte.
 fn is_reply(f: &Frame) -> bool {
     (f.ty >> 16) & 0xff == 1
@@ -975,6 +987,39 @@ fn refuse(io: &LinkIo, f: &Frame, reason: Reason) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_past_those_waiting_is_answered_as_rate_limited() {
+        let mut pending = HashMap::new();
+        let mut askers = Vec::new();
+        for trans in 0..MAX_PENDING as u32 {
+            let (reply, asker) = oneshot::channel();
+            pending.insert(trans, reply);
+            askers.push(asker);
+        }
+        let (reply, mut asker) = oneshot::channel();
+        let request = Request {
+            ty: tx::PRIVATE_MESSAGE,
+            fields: vec![],
+            reply,
+        };
+        assert!(admit(&mut pending, request).is_none());
+        let (error, fields) = asker.try_recv().unwrap();
+        assert!(error);
+        assert_eq!(
+            find(&fields, field::REASON).and_then(Field::uint),
+            Some(Reason::RateLimited as u32)
+        );
+        // One that has stopped waiting makes room.
+        drop(askers.pop());
+        let (reply, _asker) = oneshot::channel();
+        let request = Request {
+            ty: tx::PRIVATE_MESSAGE,
+            fields: vec![],
+            reply,
+        };
+        assert!(admit(&mut pending, request).is_some());
+    }
 
     #[test]
     fn a_link_carries_cr_line_endings() {

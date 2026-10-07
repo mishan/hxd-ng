@@ -1643,13 +1643,21 @@ async fn dispatch(
                                 // Cut off meanwhile: the wait is no excuse.
                                 () = lag.wait() => return Flow::Lagged,
                             };
-                            let out = match answer {
-                                Ok(Ok(Ok(()))) => reply_ok(req.id, json!({ "queued": false })),
-                                Ok(Ok(Err(why))) => reply_err(req.id, "not_delivered", why.text()),
-                                _ => {
-                                    let why = hxd_core::server_link::PeerRefusal::Unreachable;
-                                    reply_err(req.id, "not_delivered", why.text())
+                            use hxd_core::server_link::PeerRefusal;
+                            let why = match answer {
+                                Ok(Ok(Ok(()))) => None,
+                                Ok(Ok(Err(why))) => Some(why),
+                                Ok(Err(_)) => Some(PeerRefusal::Unreachable),
+                                Err(_) => Some(PeerRefusal::Unanswered),
+                            };
+                            let out = match why {
+                                None => reply_ok(req.id, json!({ "queued": false })),
+                                // Sent, and not answered: it may yet arrive,
+                                // so it is not called undelivered.
+                                Some(why @ PeerRefusal::Unanswered) => {
+                                    reply_err(req.id, "unconfirmed", why.text())
                                 }
+                                Some(why) => reply_err(req.id, "not_delivered", why.text()),
                             };
                             return finish(ws_tx, out).await;
                         }
