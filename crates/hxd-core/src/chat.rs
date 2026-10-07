@@ -345,27 +345,82 @@ impl ChatCommit {
         core: &Core,
         line: Staged,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        let me = Arc::new(Pending {
-            line: Mutex::new(Some(line)),
-            slot: Mutex::new(Slot::Waiting),
-            ready: Condvar::new(),
-        });
+        self.submit_all(core, vec![line])
+            .pop()
+            .expect("an answer for each line")
+    }
+
+    /// Lines from one caller, queued together in their order and answered
+    /// in it: they share a commit, as lines from many callers at once do,
+    /// rather than one each when the caller sends them one at a time.
+    /// Whenever one of them reaches the head of the queue the caller
+    /// leads that commit.
+    fn submit_all(
+        &self,
+        core: &Core,
+        lines: Vec<Staged>,
+    ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
+        // Nothing to queue must not take the lead: nobody would hand it on.
+        if lines.is_empty() {
+            return Vec::new();
+        }
+        let mine: Vec<Arc<Pending>> = lines
+            .into_iter()
+            .map(|line| {
+                Arc::new(Pending {
+                    line: Mutex::new(Some(line)),
+                    slot: Mutex::new(Slot::Waiting),
+                    ready: Condvar::new(),
+                })
+            })
+            .collect();
         let lead = {
             let mut st = self.state.lock().unwrap();
-            st.queue.push_back(me.clone());
+            st.queue.extend(mine.iter().cloned());
             !std::mem::replace(&mut st.leading, true)
         };
-        if !lead {
-            let mut slot = me.slot.lock().unwrap();
-            loop {
-                match std::mem::replace(&mut *slot, Slot::Waiting) {
-                    Slot::Waiting => slot = me.ready.wait(slot).unwrap(),
-                    Slot::Lead => break,
-                    Slot::Done(result) => return result,
-                }
-            }
+        if let (true, Some(first)) = (lead, mine.first()) {
+            first.set(Slot::Lead);
         }
-        // Leading: this line is at the head of the queue.
+        // A panic while leading goes on its way only once every line of
+        // this caller's is answered: one left in the queue would be led by
+        // nobody, and nothing behind it would be logged again.
+        let mut panicked = None;
+        let mut results = Vec::with_capacity(mine.len());
+        for p in &mine {
+            let mut slot = p.slot.lock().unwrap();
+            let result = loop {
+                match std::mem::replace(&mut *slot, Slot::Waiting) {
+                    Slot::Waiting => slot = p.ready.wait(slot).unwrap(),
+                    Slot::Done(result) => break result,
+                    Slot::Lead => {
+                        drop(slot);
+                        let (result, panic) = self.lead(core, p);
+                        panicked = panicked.or(panic);
+                        break result;
+                    }
+                }
+            };
+            results.push(result);
+        }
+        if let Some(panic) = panicked {
+            std::panic::resume_unwind(panic);
+        }
+        results
+    }
+
+    /// Commit the batch at the head of the queue, which `me` heads, answer
+    /// its lines and hand the lead on: `me`'s answer, and a panic the
+    /// commit raised, for the caller to raise once it is done.
+    #[allow(clippy::type_complexity)]
+    fn lead(
+        &self,
+        core: &Core,
+        me: &Arc<Pending>,
+    ) -> (
+        Result<Option<crate::history::LineId>, ChatError>,
+        Option<Box<dyn std::any::Any + Send>>,
+    ) {
         let batch: Vec<Arc<Pending>> = {
             let mut st = self.state.lock().unwrap();
             let n = st.queue.len().min(COMMIT_BATCH);
@@ -382,8 +437,7 @@ impl ChatCommit {
             })
             .collect();
         // A panic in the commit must not strand the lines waiting on it,
-        // or the next ones: they are answered, the lead is handed on, and
-        // only then does the panic go on its way.
+        // or the next ones: they are answered and the lead is handed on.
         let (results, panicked) =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 core.chat_commit_batch(lines)
@@ -396,14 +450,13 @@ impl ChatCommit {
             };
         let mut mine = None;
         for (p, result) in batch.iter().zip(results) {
-            if Arc::ptr_eq(p, &me) {
+            if Arc::ptr_eq(p, me) {
                 mine = Some(result);
             } else {
                 p.set(Slot::Done(result));
             }
         }
-        // The next line waiting leads the next commit; this caller has its
-        // answer and goes.
+        // The next line waiting leads the next commit.
         {
             let mut st = self.state.lock().unwrap();
             match st.queue.front() {
@@ -411,10 +464,10 @@ impl ChatCommit {
                 None => st.leading = false,
             }
         }
-        if let Some(panic) = panicked {
-            std::panic::resume_unwind(panic);
-        }
-        mine.expect("the leader's line is in its own batch")
+        (
+            mine.expect("the leader's line is in its own batch"),
+            panicked,
+        )
     }
 }
 
@@ -533,7 +586,16 @@ impl Core {
     /// A line a ghost said, logged and shown as a local one is. Blocking,
     /// like [`Core::chat_public`]: the caller runs it off the reactor.
     pub fn ghost_chat(&self, line: crate::server_link::GhostLine) {
-        let _ = self.chat_commit.submit(self, line.0);
+        self.ghost_chat_all(vec![line]);
+    }
+
+    /// Ghosts' lines, logged together in their order: a link's lines come
+    /// to one task that logs them, and handed over one at a time they
+    /// would each take a commit of their own.
+    pub fn ghost_chat_all(&self, lines: Vec<crate::server_link::GhostLine>) {
+        let _ = self
+            .chat_commit
+            .submit_all(self, lines.into_iter().map(|l| l.0).collect());
     }
 
     /// Log a batch of public lines in one commit and relay them in order,
@@ -2514,6 +2576,65 @@ mod tests {
         let commits = log.commits.lock().unwrap();
         assert!(commits.len() < heard.len(), "shared: {commits:?}");
         assert!(commits.iter().all(|&n| n <= COMMIT_BATCH));
+    }
+
+    #[test]
+    fn one_callers_lines_share_commits_beside_others_and_keep_their_order() {
+        let log = Arc::new(SlowLog {
+            inner: Default::default(),
+            commits: Default::default(),
+        });
+        let core = Arc::new(Core::new().with_history(log.clone(), Default::default()));
+        let (_reader, mut rx) = test_attach(&core, "reader", chatter());
+        let (sender, _) = test_attach(&core, "local", chatter());
+        let ghost = core.user(sender).unwrap();
+        drain(&mut rx);
+        let n = COMMIT_BATCH * 2 + 10;
+        let ghosts = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                let lines = (0..n)
+                    .map(|i| Staged::ghost(ghost.clone(), [7; 16], format!("g {i}"), 0))
+                    .collect();
+                core.chat_commit.submit_all(&core, lines)
+            })
+        };
+        let locals = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                for i in 0..20 {
+                    core.chat_public(sender, format!("l {i}"), 0, None).unwrap();
+                }
+            })
+        };
+        let answered = ghosts.join().unwrap();
+        locals.join().unwrap();
+        assert!(answered.iter().all(|r| matches!(r, Ok(Some(_)))));
+        let heard: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Chat { text, .. } if text.starts_with("g ") => Some(text),
+                _ => None,
+            })
+            .collect();
+        let want: Vec<String> = (0..n).map(|i| format!("g {i}")).collect();
+        assert_eq!(heard, want, "every ghost line, once, in its order");
+        let commits = log.commits.lock().unwrap();
+        assert!(commits.len() < n / 10, "shared: {commits:?}");
+        assert!(commits.iter().all(|&c| c <= COMMIT_BATCH));
+    }
+
+    #[test]
+    fn no_lines_at_all_leave_the_room_free_to_talk() {
+        let core = Core::new().with_history(
+            Arc::new(crate::history::MemoryLog::default()),
+            Default::default(),
+        );
+        let (sender, _rx) = test_attach(&core, "local", chatter());
+        core.ghost_chat_all(Vec::new());
+        assert!(core
+            .chat_public(sender, "still here".into(), 0, None)
+            .is_ok());
     }
 
     /// A log whose commits wait at a gate the test opens.

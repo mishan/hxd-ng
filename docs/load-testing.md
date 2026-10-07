@@ -281,9 +281,9 @@ the finding.
   max_ghosts`, each peer's `ghosts`). `docs/metrics.md` has a series
   for each.
 - **Ghosts' chat is one funnel**: one task commits every link's lines
-  through `ChatCommit`, under the same `log_serial` as local chat. A
-  line crossing a link is persisted on both servers, and a local talker
-  waits behind ghosts' commits.
+  through `ChatCommit`, everything waiting at once, under the same
+  `log_serial` as local chat. A line crossing a link is persisted on
+  both servers, and a local talker waits behind ghosts' commits.
 - **An interruption is held for `[link] grace`** and then is a
   netsplit: one part per ghost to every local session at once, and one
   join per user when the snapshot comes.
@@ -351,7 +351,7 @@ grace`.
 | L-5 | Churn across a link (built) | the churn scenario on A; once its time is up the kicks stop, then every churner says it is held, and B's list is compared with A's user for user; uid watchers on both | B's roster against A's once quiet | ghosts left on B, a uid reused inside its quarantine |
 | L-6 | Requests (built) | requesters on A sending private messages (both wires) and user info (classic) to B's users, open-loop, at each count in `[requests] ghosts`; each step reported apart | round trip against the ghosts shown (the scan) | requests refused once more wait on the peer than a link lets wait: each requester waits on its answer, so that takes more requesters than that cap and a round trip long enough to keep them waiting together (about the cap divided by the round trip, a second); and answers outlasting the server's wait for the peer, which the sender hears as refused while the message is still delivered (`link.msgs_delivered`, `scenarios/link-requests-slow.toml` with `peer_latency_ms`) |
 | L-7 | Moderation under load (built) | the room on A and B, and a moderator on A kicking or banning B's users, accounts there as on A, one every `every` seconds from `acts_after`; `chat.delivery.before` and `.after` the first act | each act answered (`moderation.kick`, `.ban`) and carried out on B (`moderation.carried`) | a slow store write holding up the hub or the feed |
-| L-8 | Many links (built) | a hub with K leaves, K doubling (`baseline/link-fanout.sh`), the room's talkers on the hub (`[chat] talkers_at_target`) and its readers on every server | delivery to the leaves against K and rate; the hub's CPU | each leaf logging every line the hub fans out to it, one commit per ghost's line: past what a leaf can commit, its queue of ghosts' lines overflows and the lines are not shown there (`hxd_link_dropped_total{what="chat"}`), which every reader of it misses (`chat.all_heard`); sooner the more servers share a host |
+| L-8 | Many links (built) | a hub with K leaves, K doubling (`baseline/link-fanout.sh`), the room's talkers on the hub (`[chat] talkers_at_target`) and its readers on every server | delivery to the leaves against K and rate; the hub's CPU | each leaf logging every line the hub fans out to it: past what a leaf can commit, its queue of ghosts' lines overflows and the lines are not shown there (`hxd_link_dropped_total{what="chat"}`), which every reader of it misses (`chat.all_heard`); sooner the more servers share a host. Past that, the hub's own fan-out, its lines reaching the leaves in bursts |
 
 Each is swept one variable at a time from a fixed point, repeated, and
 compared only on one host, as §7 asks: users per side up to the bounds

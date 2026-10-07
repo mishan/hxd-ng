@@ -239,9 +239,16 @@ impl Hub {
         if let Some(mut lines) = self.0.chat_rx.lock().unwrap().take() {
             let core = self.0.core.clone();
             tokio::task::spawn_blocking(move || {
-                while let Some(line) = lines.blocking_recv() {
+                // Everything waiting goes in one call, so ghosts' lines
+                // share commits as local lines do.
+                while let Some(first) = lines.blocking_recv() {
                     instrument::link_queue_depth("chat", lines.len());
-                    core.ghost_chat(line);
+                    let mut batch = vec![first];
+                    while batch.len() < CHAT_CAP {
+                        let Ok(line) = lines.try_recv() else { break };
+                        batch.push(line);
+                    }
+                    core.ghost_chat_all(batch);
                 }
             });
         }
