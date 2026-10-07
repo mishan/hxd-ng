@@ -255,7 +255,7 @@ fn listen(
 
 /// When every server had as many links up as before the run, polling
 /// until `deadline`.
-async fn links_back(
+pub(crate) async fn links_back(
     ctx: &Ctx,
     before: &[Option<Scrape>],
     deadline: Instant,
@@ -319,7 +319,7 @@ async fn roster_back(
 /// nothing reads them between looks, and an ng connection silent past
 /// the server's pong deadline is dropped, so every wait asks them for
 /// their lists at least every `KEEPALIVE`.
-struct Observers {
+pub(crate) struct Observers {
     members: Vec<Member>,
     touched: Instant,
 }

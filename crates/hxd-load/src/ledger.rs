@@ -54,6 +54,11 @@ pub struct Heard {
     /// than this reader, and those senders' lines' delivery apart.
     pub elsewhere: Vec<bool>,
     pub cross: Histogram<u64>,
+    /// When something is done to the servers mid-run, the lines due
+    /// before it and from it on, timed apart.
+    pub split: Option<Duration>,
+    pub before: Histogram<u64>,
+    pub after: Histogram<u64>,
 }
 
 impl Heard {
@@ -67,6 +72,9 @@ impl Heard {
             echo: stats::local(),
             elsewhere: Vec::new(),
             cross: stats::local(),
+            split: None,
+            before: stats::local(),
+            after: stats::local(),
         }
     }
 
@@ -82,6 +90,11 @@ impl Heard {
         stats::sample(&mut self.delivery, late);
         if self.elsewhere.get(sender) == Some(&true) {
             stats::sample(&mut self.cross, late);
+        }
+        match self.split {
+            Some(at) if due < at => stats::sample(&mut self.before, late),
+            Some(_) => stats::sample(&mut self.after, late),
+            None => {}
         }
         let last = self.last.entry(sender).or_insert(0);
         if seq == *last + 1 {

@@ -30,6 +30,12 @@ pub struct Room {
 }
 
 pub async fn gather(ctx: &Ctx) -> Result<Room, String> {
+    let all: Vec<usize> = (0..ctx.servers.len()).collect();
+    gather_on(ctx, &all).await
+}
+
+/// The room on `servers` alone, client `i` on the `i`th of them in turn.
+pub async fn gather_on(ctx: &Ctx, servers: &[usize]) -> Result<Room, String> {
     let c = &ctx.scenario.chat;
     let plan = [
         (Wire::Legacy, c.talkers_legacy),
@@ -42,7 +48,7 @@ pub async fn gather(ctx: &Ctx) -> Result<Room, String> {
     let mut i = 0;
     for (wire, n) in plan {
         for _ in 0..n {
-            let server = i % ctx.servers.len();
+            let server = servers[i % servers.len()];
             let m = Member::join_on(ctx, server, wire, i, None)
                 .await
                 .map_err(|e| format!("{} {i} could not join: {e}", wire.name()))?;
@@ -71,6 +77,24 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
 /// out. Returns the members, whole again, and how many lines each talker
 /// sent.
 pub async fn speak(ctx: &Arc<Ctx>, room: Room) -> (Vec<Member>, Vec<u64>) {
+    speak_at(
+        ctx,
+        room,
+        ctx.t0.elapsed() + Duration::from_millis(100),
+        None,
+    )
+    .await
+}
+
+/// The same, the first line due at `start` on the run's clock, and with
+/// `split`, the lines due before and from that moment timed apart as
+/// `chat.delivery.before` and `chat.delivery.after`.
+pub async fn speak_at(
+    ctx: &Arc<Ctx>,
+    room: Room,
+    start: Duration,
+    split: Option<Duration>,
+) -> (Vec<Member>, Vec<u64>) {
     let c = &ctx.scenario.chat;
     let (done_tx, done_rx) = watch::channel(None::<Arc<Vec<u64>>>);
     let mut readers: Vec<JoinHandle<(Rx, Heard, Parts)>> = Vec::new();
@@ -84,6 +108,7 @@ pub async fn speak(ctx: &Arc<Ctx>, room: Room) -> (Vec<Member>, Vec<u64>) {
             .iter()
             .map(|&s| s != room.on[k])
             .collect();
+        heard.split = split;
         readers.push(tokio::spawn(read(
             ctx.clone(),
             rx,
@@ -96,7 +121,6 @@ pub async fn speak(ctx: &Arc<Ctx>, room: Room) -> (Vec<Member>, Vec<u64>) {
     // Every talker on its own schedule, staggered so the room as a whole
     // hears `rate` lines a second, evenly.
     let every = Duration::from_secs_f64(room.talkers as f64 / c.rate);
-    let start = ctx.t0.elapsed() + Duration::from_millis(100);
     let end = start + ctx.duration();
     let mut rest = Vec::new();
     for (k, tx) in txs.into_iter().enumerate() {
@@ -134,6 +158,10 @@ pub async fn speak(ctx: &Arc<Ctx>, room: Room) -> (Vec<Member>, Vec<u64>) {
         ctx.stats.merge("chat.delivery", &heard.delivery);
         if ctx.servers.len() > 1 {
             ctx.stats.merge("chat.delivery.cross", &heard.cross);
+        }
+        if split.is_some() {
+            ctx.stats.merge("chat.delivery.before", &heard.before);
+            ctx.stats.merge("chat.delivery.after", &heard.after);
         }
         if k < room.talkers {
             ctx.stats.merge("chat.echo", &heard.echo);
