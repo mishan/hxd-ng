@@ -259,6 +259,9 @@ pub(crate) async fn run(
 
     let lag = events.lag();
     let mut last_write: Option<tokio::time::Instant> = None;
+    // An event waiting out `COALESCE` for others to go with it, and when
+    // it goes regardless.
+    let mut held: Option<(hxd_core::SeqEvent, tokio::time::Instant)> = None;
     let exit = loop {
         tokio::select! {
             // Biased, events first: a reply must never overtake an event
@@ -283,50 +286,22 @@ pub(crate) async fn run(
                 info!(uid = state.uid, "not keeping up; disconnecting");
                 break Exit::ConnectionLost("slow_consumer");
             }
-            ev = events.recv() => match ev {
+            ev = events.recv(), if held.is_none() => match ev {
                 Some(se) => {
                     // A connection that wrote a moment ago and has nothing
                     // else queued: let what is on its way catch up
-                    // (`COALESCE`). One with a backlog sends at once.
+                    // (`COALESCE`), held here rather than slept on, so a
+                    // request that comes meanwhile is not kept waiting for
+                    // it. One with a backlog sends at once.
                     let recent = last_write.and_then(|at| COALESCE.checked_sub(at.elapsed()));
                     if let Some(wait) = recent.filter(|_| events.is_empty()) {
-                        tokio::time::sleep(wait).await;
+                        held = Some((se, tokio::time::Instant::now() + wait));
+                        continue;
                     }
-                    instrument::queue_depth(WIRE, events.len());
-                    // Whatever else is already waiting goes out with it,
-                    // in one flush: one per event was most of what a login
-                    // storm cost, every join and part being an event to
-                    // everyone present. A kick is the batch's last word.
-                    let mut kicked = matches!(se.event, hxd_core::Event::Kicked);
-                    state.note(&se.event);
-                    let mut batch = vec![event_json(&se)];
-                    let mut bytes = batch[0].len();
-                    while !kicked && bytes < WRITE_BATCH {
-                        let Ok(se) = events.try_recv() else { break };
-                        kicked = matches!(se.event, hxd_core::Event::Kicked);
-                        state.note(&se.event);
-                        let text = event_json(&se);
-                        bytes += text.len();
-                        batch.push(text);
-                    }
-                    // The cut can come while this send is blocked on the
-                    // very client it is about.
+                    let sent = send_events(&ctx, &mut state, se, &mut events, &mut ws_tx, &lag).await;
                     last_write = Some(tokio::time::Instant::now());
-                    let sent = tokio::select! {
-                        sent = send_texts(&mut ws_tx, batch) => sent,
-                        _ = lag.wait() => {
-                            info!(uid = state.uid, "not keeping up; disconnecting");
-                            break Exit::ConnectionLost("slow_consumer");
-                        }
-                    };
-                    // A kick ends the session whether or not the client
-                    // heard about it: failing the send is no way to stay.
-                    if kicked {
-                        end_kicked(&ctx, &state, &mut ws_tx).await;
-                        break Exit::SessionOver("kicked");
-                    }
-                    if !sent {
-                        break Exit::ConnectionLost("send_failed");
+                    if let Some(exit) = sent {
+                        break exit;
                     }
                 }
                 // Closed by the domain: another connection took the
@@ -338,9 +313,43 @@ pub(crate) async fn run(
                 }
                 None => break Exit::Replaced,
             },
+            () = async {
+                if let Some((_, at)) = &held {
+                    tokio::time::sleep_until(*at).await
+                }
+            }, if held.is_some() => {
+                let (se, _) = held.take().expect("held");
+                let sent = send_events(&ctx, &mut state, se, &mut events, &mut ws_tx, &lag).await;
+                last_write = Some(tokio::time::Instant::now());
+                if let Some(exit) = sent {
+                    break exit;
+                }
+            }
             msg = ws_rx.next() => match msg {
                 Some(Ok(Message::Text(text))) => {
                     heard = tokio::time::Instant::now();
+                    // The events held for company go first, and all
+                    // that came with them, a batch at a time: a reply
+                    // never overtakes an event the session was handed
+                    // before its request.
+                    if let Some((mut se, _)) = held.take() {
+                        let exit = loop {
+                            let sent =
+                                send_events(&ctx, &mut state, se, &mut events, &mut ws_tx, &lag)
+                                    .await;
+                            if sent.is_some() {
+                                break sent;
+                            }
+                            match events.try_recv() {
+                                Ok(next) => se = next,
+                                Err(_) => break None,
+                            }
+                        };
+                        last_write = Some(tokio::time::Instant::now());
+                        if let Some(exit) = exit {
+                            break exit;
+                        }
+                    }
                     let Ok(req) = serde_json::from_str::<ReqEnvelope>(&text) else {
                         debug!("unparseable request frame");
                         break Exit::ConnectionLost("malformed");
@@ -1234,7 +1243,7 @@ enum Flow {
 /// `false` means the connection is gone, which every caller already
 /// treats as the end of it.
 /// Past this many bytes a batch of events takes no more of what is
-/// queued behind it (`run`).
+/// queued behind it (`send_events`).
 const WRITE_BATCH: usize = 64 << 10;
 
 /// How long after one batch of events a connection being sent a trickle
@@ -1242,6 +1251,49 @@ const WRITE_BATCH: usize = 64 << 10;
 /// to an idle connection goes at once, and so does a backlog; a flush per
 /// event was most of what a login storm cost.
 const COALESCE: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Send `first` and whatever else is already queued behind it, in one
+/// flush: one per event was most of what a login storm cost, every join
+/// and part being an event to everyone present. A kick is the batch's
+/// last word. The way the connection ends, if it does.
+async fn send_events(
+    ctx: &NgCtx,
+    state: &mut SessState,
+    first: hxd_core::SeqEvent,
+    events: &mut Events,
+    ws_tx: &mut WsTx,
+    lag: &hxd_core::Lag,
+) -> Option<Exit> {
+    instrument::queue_depth(WIRE, events.len());
+    let mut kicked = matches!(first.event, hxd_core::Event::Kicked);
+    state.note(&first.event);
+    let mut batch = vec![event_json(&first)];
+    let mut bytes = batch[0].len();
+    while !kicked && bytes < WRITE_BATCH {
+        let Ok(se) = events.try_recv() else { break };
+        kicked = matches!(se.event, hxd_core::Event::Kicked);
+        state.note(&se.event);
+        let text = event_json(&se);
+        bytes += text.len();
+        batch.push(text);
+    }
+    // The cut can come while this send is blocked on the very client it
+    // is about.
+    let sent = tokio::select! {
+        sent = send_texts(ws_tx, batch) => sent,
+        _ = lag.wait() => {
+            info!(uid = state.uid, "not keeping up; disconnecting");
+            return Some(Exit::ConnectionLost("slow_consumer"));
+        }
+    };
+    // A kick ends the session whether or not the client heard about it:
+    // failing the send is no way to stay.
+    if kicked {
+        end_kicked(ctx, state, ws_tx).await;
+        return Some(Exit::SessionOver("kicked"));
+    }
+    (!sent).then_some(Exit::ConnectionLost("send_failed"))
+}
 
 /// Send several text frames with one flush, all of it bounded by the pong
 /// deadline as one send is.
