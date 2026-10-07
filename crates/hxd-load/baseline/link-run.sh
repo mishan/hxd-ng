@@ -17,6 +17,8 @@
 # grace as its [link] grace.
 # Environment as for run.sh, less AFTER; ACCOUNTS writes the same
 # accounts on every server, a ban across a link being placed on one.
+# HISTORY=off runs every server without [history]: no public line is
+# logged anywhere, a network that keeps none.
 #
 # HUB_HOST runs `a` on another host instead, over ssh, and LEAF_HOSTS
 # the leaves, in turn (`-` for this host); either as `host:/dir` puts
@@ -30,6 +32,8 @@
 # home.
 set -u
 NAME=$1 SCEN=$2 SYNC=${3:-normal}
+HISTORY_SECTION='[history]'
+[ "${HISTORY:-on}" = off ] && HISTORY_SECTION=
 BIN=${BIN:-target/release} OUT=${OUT:-out} WORK=${WORK:-work}
 half() {
     lscpu -p=CPU,CORE | grep -v '^#' |
@@ -154,7 +158,7 @@ reconnect_seconds = 0
 [inbox]
 db = "$at/server.db"
 sync = "$SYNC"
-[history]
+$HISTORY_SECTION
 [news]
 [metrics]
 allow = ["127.0.0.0/8", "::1"$LET]

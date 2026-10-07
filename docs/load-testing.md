@@ -329,6 +329,8 @@ server elsewhere is not held to `SERVER_CPUS`; it is reached at its
 host's address, every server lets every host in the run through its
 `[limits]` and its `[metrics] allow`, and a remote server's CPU, memory
 and errors are read on its host. Not with `[target.proxy]`.
+`HISTORY=off` runs every server without `[history]`, a network that
+logs no public line anywhere.
 
 ```sh
 HUB_HOST=gauss LEAF_HOSTS="onyx -" KS=16 RATE=5000 \
