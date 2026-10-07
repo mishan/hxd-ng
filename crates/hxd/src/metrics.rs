@@ -122,6 +122,12 @@ mod recorder {
             .and_then(|b| {
                 b.set_buckets_for_metric(Matcher::Full("hxd_fanout_recipients".into()), COUNTS)
             })
+            .and_then(|b| {
+                b.set_buckets_for_metric(Matcher::Full("hxd_link_queue_depth".into()), COUNTS)
+            })
+            .and_then(|b| {
+                b.set_buckets_for_metric(Matcher::Full("hxd_link_snapshot_users".into()), COUNTS)
+            })
             .map_err(|e| format!("metrics recorder: {e}"))?
             .build_recorder();
         let handle = recorder.handle();
@@ -180,6 +186,7 @@ impl MetricsSource for Source {
             c.buffered_max as f64,
         );
         gauge("hxd_private_chats", &[], c.chats as f64);
+        gauge("hxd_ghosts", &[], c.ghosts as f64);
         let budget = self.core.queue_budget();
         gauge(
             "hxd_queue_budget_bytes",

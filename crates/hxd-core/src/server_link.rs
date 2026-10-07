@@ -319,7 +319,10 @@ impl RosterInner {
     fn export(&mut self, event: PeerEvent) {
         let Some(tx) = &self.feed.tx else { return };
         self.feed.seq += 1;
-        if tx.try_send((self.feed.seq, event)).is_err() {
+        if let Err(e) = tx.try_send((self.feed.seq, event)) {
+            if matches!(e, mpsc::error::TrySendError::Full(_)) {
+                crate::instrument::link_lagged("feed");
+            }
             self.feed.tx = None;
         }
     }

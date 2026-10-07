@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use hxd_core::instrument::{self, LinkUp, Timer};
 use hxd_core::server_link::{GoneReason, PeerEvent, PeerRefusal, MAX_LINK_TEXT, PEER_WAIT};
 
 use crate::hub::{reason_of, Hub, PeerEntry, Relay, Relayed, Reply, Request, Subscribed};
@@ -67,6 +68,7 @@ pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
         last_sent: Instant::now(),
         next_trans: 1,
         established: None,
+        _up: None,
         snapshot: None,
         features: 0,
         pending: HashMap::new(),
@@ -92,6 +94,7 @@ pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
         _ => true,
     };
     hub.unregister(&entry.name, generation, interrupted);
+    instrument::link_end(end.label);
     info!(peer = %entry.name, reason = end.label, "link ended");
     end
 }
@@ -104,6 +107,8 @@ struct Link<'a> {
     next_trans: u32,
     /// When the link was established, once it is.
     established: Option<Instant>,
+    /// Counts the link as up while it is established.
+    _up: Option<LinkUp>,
     /// The peer's snapshot while its parts arrive: nothing else about its
     /// users may come between them.
     snapshot: Option<Vec<UserGroup>>,
@@ -123,7 +128,11 @@ const MAX_PENDING: usize = 256;
 /// none.
 async fn next_relay(relays: &mut Option<tokio::sync::mpsc::Receiver<Relayed>>) -> Option<Relayed> {
     match relays {
-        Some(rx) => rx.recv().await,
+        Some(rx) => {
+            let next = rx.recv().await;
+            instrument::link_queue_depth("relay", rx.len());
+            next
+        }
         None => std::future::pending().await,
     }
 }
@@ -201,6 +210,7 @@ impl Link<'_> {
     }
 
     async fn session(&mut self, io: &mut LinkIo, closed: &mut oneshot::Receiver<Reason>) -> End {
+        let began = Timer::start();
         let features = self.entry.features & crate::hub::SUPPORTED;
         let hello = self.hub.hello(features);
         self.notify(io, tx::HELLO, &hello.to_fields());
@@ -295,6 +305,7 @@ impl Link<'_> {
             self.pass_on(io, what);
         }
         self.established = Some(Instant::now());
+        self._up = Some(instrument::link_up(began));
         info!(peer = %self.entry.name, server = ?peer.server.id, tag = %peer.server.tag, "link up");
         // Lifts asked while the ban's home server was out of reach go now,
         // not at the next reload. A store read, so off the reactor.
@@ -315,7 +326,10 @@ impl Link<'_> {
                 // is stopped at once rather than flushed for a while.
                 () = io.out.lagged() => return self.end("slow_consumer", None),
                 export = exports.recv() => match export {
-                    Some((n, event)) if n > since => self.export(io, own, event),
+                    Some((n, event)) if n > since => {
+                        instrument::link_queue_depth("export", exports.len());
+                        self.export(io, own, event);
+                    }
                     Some(_) => {}
                     // The hub dropped this link's channel: it fell behind.
                     None => return self.close(io, Reason::Shutdown, "slow_consumer"),
@@ -559,6 +573,7 @@ impl Link<'_> {
         // An asker that stopped waiting is no longer owed anything.
         self.pending.retain(|_, asker| !asker.is_closed());
         if self.pending.len() >= MAX_PENDING {
+            instrument::link_dropped("request");
             return warn!(peer = %self.entry.name, "too many requests waiting; one not sent");
         }
         let trans = self.next_trans;
@@ -819,15 +834,17 @@ impl Link<'_> {
             match g {
                 // Held to the link's ghost bound, so a peer that never
                 // sends its last part costs no more than it could show.
-                Ok(_) if pending.len() >= self.entry.ghosts => {}
+                Ok(_) if pending.len() >= self.entry.ghosts => instrument::link_dropped("ghost"),
                 Ok(g) => pending.push(g),
                 Err(e) => warn!(peer = %self.entry.name, "user in snapshot dropped: {e:?}"),
             }
         }
         if find(&fs, field::MORE).and_then(Field::uint) != Some(1) {
             let groups = self.snapshot.take().unwrap_or_default();
+            let (users, took) = (groups.len(), Timer::start());
             self.hub
                 .apply_snapshot(&self.entry.name, self.generation, groups);
+            instrument::link_snapshot(users, took);
         }
     }
 

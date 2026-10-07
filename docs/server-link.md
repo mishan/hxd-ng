@@ -4,8 +4,8 @@ Status: partial, 2026-10. Built: L0 (the uid quarantine, Colored
 Nicknames), L1 (links by key mode, Hello, server lists, pings, close,
 reload), L2 (users crossing one link both ways, ghosts on both wires), L3
 (public chat both ways), L4 (private messages and user info), L5
-(moderation both ways), L6 (interruption and its grace period) and L7
-(relaying between this server's links). The rest is design. It implements fogWraith's
+(moderation both ways), L6 (interruption and its grace period), L7
+(relaying between this server's links) and L8's metrics. The rest is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -910,7 +910,7 @@ use: dead code fails `-D warnings`.
 | L5 | Kick, ban and unban on both sides; the requester's ban records; purge of a ghost's lines | `link.rs` |
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
 | L7 | Relaying between this server's own links: servers, users, chat and requests passed on between transit links | `link.rs` |
-| L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge | `link.rs`, `limits.rs`, `metrics.rs` |
+| L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge (built; the rest planned) | `link.rs`, `limits.rs`, `metrics.rs` |
 | L9 | User keys, after the end-to-end document | later |
 
 L1 to L3 make a test link with Janus. **L5 is the minimum for a real
@@ -936,4 +936,5 @@ have to move ahead of L1.
   until someone needs it.
 - **Load.** A login storm on one server is a storm of joins on every linked
   server. The bounds above handle a burst, but `hxd-load` should grow a
-  two-server scenario before linking is on by default.
+  two-server scenario before linking is on by default
+  (`docs/load-testing.md` §8).

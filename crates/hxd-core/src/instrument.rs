@@ -521,6 +521,82 @@ impl Drop for Open {
     }
 }
 
+/// A server link established, `took` after its session began, counted as
+/// up until the guard drops.
+pub fn link_up(took: Timer) -> LinkUp {
+    #[cfg(feature = "metrics")]
+    {
+        metrics::histogram!("hxd_link_establish_seconds").record(took.elapsed());
+        metrics::gauge!("hxd_links_up").increment(1.0);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = took;
+    LinkUp(())
+}
+
+/// [`link_up`]'s guard.
+#[must_use = "the link counts as up until this drops"]
+pub struct LinkUp(());
+
+#[cfg(feature = "metrics")]
+impl Drop for LinkUp {
+    fn drop(&mut self) {
+        metrics::gauge!("hxd_links_up").decrement(1.0);
+    }
+}
+
+/// A server link ended, established or not, and why: the link session's
+/// own label, whichever side dialed.
+pub fn link_end(reason: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_link_ends_total", "reason" => reason).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = reason;
+}
+
+/// A link queue that could not take the next item: `feed`, the core's
+/// one export feed, after which every link starts over; `export`, one
+/// link's share of it, or `relay`, what other links pass on through it,
+/// after which that link does.
+pub fn link_lagged(queue: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_link_lagged_total", "queue" => queue).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = queue;
+}
+
+/// Something a peer sent or a local user asked of one, not carried out
+/// for a bound: `chat`, a ghost's line past the lines waiting to be
+/// logged; `ghost`, a user past the ghost bounds or the uids; `request`,
+/// a request past those a link may have waiting.
+pub fn link_dropped(what: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("hxd_link_dropped_total", "what" => what).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = what;
+}
+
+/// How many items were waiting in a link queue (`feed`, `export`,
+/// `relay`, `chat`) when its consumer took the next one.
+pub fn link_queue_depth(queue: &'static str, depth: usize) {
+    #[cfg(feature = "metrics")]
+    metrics::histogram!("hxd_link_queue_depth", "queue" => queue).record(depth as f64);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (queue, depth);
+}
+
+/// A peer's snapshot of `users`, applied here in `took`: every ghost it
+/// shows, changes or parts, told to every local session.
+pub fn link_snapshot(users: usize, took: Timer) {
+    #[cfg(feature = "metrics")]
+    {
+        metrics::histogram!("hxd_link_snapshot_seconds").record(took.elapsed());
+        metrics::histogram!("hxd_link_snapshot_users").record(users as f64);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (users, took);
+}
+
 /// A gauge whose value the binary reads at scrape time rather than one
 /// kept up to date as things happen.
 pub fn gauge(name: &'static str, labels: &[(&'static str, &'static str)], value: f64) {
