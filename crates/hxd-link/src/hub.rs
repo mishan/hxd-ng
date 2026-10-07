@@ -113,6 +113,8 @@ struct State {
     links: HashMap<String, Live>,
     /// What interrupted links learned, kept for the grace period.
     held: HashMap<String, Held>,
+    /// Numbers what links pass on to each other, in the order it happened.
+    relay_seq: u64,
     generation: u64,
     /// Stopping: no link is let in or dialed, so peers hold this server's
     /// users rather than take them into a link it is about to drop.
@@ -129,6 +131,8 @@ struct Held {
     generation: u64,
     peer: ServerGroup,
     epoch: [u8; 8],
+    /// The features the link had: what was relayed from it, and how.
+    features: u32,
     servers: HashMap<ServerId, ServerGroup>,
     ghosts: HashMap<u16, Slot>,
 }
@@ -153,6 +157,8 @@ struct Live {
     exports: Option<mpsc::Sender<Export>>,
     /// Requests this server sends the peer, once the link is established.
     requests: Option<mpsc::Sender<Request>>,
+    /// What other links pass on to this one, from its Link Servers on.
+    relays: Option<mpsc::Sender<Relayed>>,
     /// The peer's users shown here, by the ID the peer gives them.
     ghosts: HashMap<u16, Slot>,
 }
@@ -318,11 +324,15 @@ impl Hub {
             .filter(|name| !peers.iter().any(|p| &p.name == *name))
             .cloned()
             .collect();
-        let gone: Vec<Slot> = removed
-            .iter()
-            .filter_map(|name| state.held.remove(name))
-            .flat_map(|h| h.ghosts.into_values())
-            .collect();
+        let mut gone = Vec::new();
+        for name in &removed {
+            if let Some(held) = state.held.remove(name) {
+                if held.features & feature::TRANSIT != 0 {
+                    servers_gone(&mut state, name, &held.peer, held.servers.keys());
+                }
+                gone.extend(held.ghosts.into_values());
+            }
+        }
         drop(state);
         self.part(gone);
         // Only an entry that is new or changed: a dialer that stopped on
@@ -420,6 +430,7 @@ impl Hub {
                 exports: None,
                 ghosts: HashMap::new(),
                 requests: None,
+                relays: None,
             },
         );
         if let Some(mut old) = old {
@@ -448,10 +459,12 @@ impl Hub {
             return;
         };
         let generation = live.generation;
+        let features = live.features;
         let held = Held {
             generation,
             peer: server,
             epoch,
+            features,
             servers: live.servers,
             ghosts: live.ghosts,
         };
@@ -459,6 +472,15 @@ impl Hub {
         // left here is a link's that never took it back: its ghosts go.
         if let Some(earlier) = state.held.insert(peer.to_owned(), held) {
             gone.extend(earlier.ghosts.into_values());
+        }
+        if features & feature::TRANSIT != 0 {
+            for slot in &gone {
+                relay(
+                    state,
+                    peer,
+                    Relay::UserGone(gone_fields(slot.uid, Reason::Disconnected)),
+                );
+            }
         }
         self.part_later(gone);
         let (hub, peer) = (self.clone(), peer.to_owned());
@@ -501,6 +523,9 @@ impl Hub {
             return;
         }
         let held = state.held.remove(peer).expect("checked");
+        if held.features & feature::TRANSIT != 0 {
+            servers_gone(&mut state, peer, &held.peer, held.servers.keys());
+        }
         drop(state);
         tracing::info!(%peer, ghosts = held.ghosts.len(), "link not back within the grace period");
         self.part(held.ghosts.into_values());
@@ -511,33 +536,82 @@ impl Hub {
     /// server means the old one is gone; a new epoch, that its user IDs
     /// name other people, so its ghosts wait for the snapshot to say which
     /// are still there.
-    pub(crate) fn resume(&self, peer: &str, generation: u64, server: ServerId, epoch: [u8; 8]) {
+    pub(crate) fn resume(
+        &self,
+        peer: &str,
+        generation: u64,
+        server: ServerId,
+        epoch: [u8; 8],
+        features: u32,
+    ) {
         let mut state = self.0.state.lock().unwrap();
         let held = state.held.remove(peer);
-        let Some(live) = state
+        if !state
             .links
-            .get_mut(peer)
-            .filter(|l| l.generation == generation)
-        else {
+            .get(peer)
+            .is_some_and(|l| l.generation == generation)
+        {
             if let Some(held) = held {
                 state.held.insert(peer.to_owned(), held);
             }
             return;
+        }
+        let transit = features & feature::TRANSIT != 0;
+        // Back as another server, or back without the transit it had: what
+        // the other links were shown of it is gone.
+        let mut gone = Vec::new();
+        let held = match held {
+            Some(h) if h.peer.id != server || (h.features & feature::TRANSIT != 0 && !transit) => {
+                if h.features & feature::TRANSIT != 0 {
+                    servers_gone(&mut state, peer, &h.peer, h.servers.keys());
+                }
+                gone.extend(h.ghosts.into_values());
+                None
+            }
+            held => held,
         };
+        // Features and what was held settled under one lock, so no other
+        // link opening meanwhile sees one without the other.
+        let live = state.links.get_mut(peer).expect("checked");
         live.epoch = Some(epoch);
-        let Some(held) = held else { return };
-        if held.peer.id != server {
-            drop(state);
-            self.part(held.ghosts.into_values());
-            return;
+        live.features = features;
+        let mut servers: Vec<ServerGroup> = Vec::new();
+        let mut users: Vec<Vec<Field>> = Vec::new();
+        if let Some(h) = held {
+            // Held without transit and back with it: the other links have
+            // been shown none of this yet.
+            let gained = transit && h.features & feature::TRANSIT == 0;
+            live.unconfirmed = h.servers.keys().copied().collect();
+            if gained {
+                servers.extend(h.servers.values().map(farther));
+            }
+            live.servers.extend(h.servers);
+            if h.epoch == epoch {
+                if gained {
+                    users.extend(
+                        h.ghosts
+                            .values()
+                            .map(|s| relayed_group(s.uid, &s.group, features)),
+                    );
+                }
+                live.ghosts = h.ghosts;
+            } else {
+                live.stale = h.ghosts.into_values().collect();
+            }
         }
-        live.unconfirmed = held.servers.keys().copied().collect();
-        live.servers.extend(held.servers);
-        if held.epoch == epoch {
-            live.ghosts = held.ghosts;
-        } else {
-            live.stale = held.ghosts.into_values().collect();
+        // The peer, then what lies behind it, then whom: announced to the
+        // other transit links before anything homed on them.
+        if let Some(own) = live.peer.clone().filter(|_| transit) {
+            relay(&mut state, peer, Relay::Server(farther(&own)));
+            for group in servers {
+                relay(&mut state, peer, Relay::Server(group));
+            }
+            for group in users {
+                relay(&mut state, peer, Relay::User(group));
+            }
         }
+        drop(state);
+        self.part(gone);
     }
 
     /// The peer's Link Servers is complete: a held server it no longer
@@ -555,7 +629,7 @@ impl Hub {
             live.unconfirmed.drain().collect()
         };
         for id in gone {
-            self.forget_server(peer, generation, id);
+            self.forget_server(peer, generation, id, None);
         }
     }
 
@@ -584,8 +658,17 @@ impl Hub {
             self.hold(&mut state, peer, live);
             return;
         }
-        // Ended for good: nothing held for it stays either.
+        // Ended for good: nothing held for it stays either, and the other
+        // links hear that everything behind it has gone.
         let held = state.held.remove(peer);
+        if live.features & feature::TRANSIT != 0 {
+            if let Some(server) = &live.peer {
+                servers_gone(&mut state, peer, server, live.servers.keys());
+            }
+        }
+        if let Some(h) = held.as_ref().filter(|h| h.features & feature::TRANSIT != 0) {
+            servers_gone(&mut state, peer, &h.peer, h.servers.keys());
+        }
         drop(state);
         self.part(
             live.ghosts
@@ -663,6 +746,9 @@ impl Hub {
             .ok_or(Reason::Replaced)?;
         let id = group.id;
         live.unconfirmed.remove(&id);
+        // Passed on before any of its users; the peer's own group in its
+        // Hello waits for the features that Hello settles (`resume`).
+        let passed = (live.features & feature::TRANSIT != 0).then(|| farther(&group));
         if own {
             live.peer = Some(group);
         } else {
@@ -676,6 +762,9 @@ impl Hub {
             .filter(|slot| slot.group.home == id)
             .filter_map(|slot| Some((slot.uid, self.ghost_info(live, &slot.group, show_tags)?)))
             .collect();
+        if let Some(group) = passed {
+            relay(&mut state, peer, Relay::Server(group));
+        }
         drop(state);
         for (uid, info) in refreshed {
             self.0.core.ghost_update(uid, info);
@@ -685,14 +774,25 @@ impl Hub {
 
     /// A server is no longer reachable over the link: it goes, and every
     /// user homed there with it.
-    pub(crate) fn forget_server(&self, peer: &str, generation: u64, id: ServerId) {
+    pub(crate) fn forget_server(
+        &self,
+        peer: &str,
+        generation: u64,
+        id: ServerId,
+        came: Option<Vec<Field>>,
+    ) {
         let mut state = self.0.state.lock().unwrap();
         if let Some(live) = state
             .links
             .get_mut(peer)
             .filter(|l| l.generation == generation)
         {
-            live.servers.remove(&id);
+            // Only a server this link put behind it: a peer speaks for its
+            // own side of the network, never for another link's or this one.
+            if live.servers.remove(&id).is_none() {
+                return;
+            }
+            let transit = live.features & feature::TRANSIT != 0;
             let homed: Vec<u16> = live
                 .ghosts
                 .iter()
@@ -703,19 +803,13 @@ impl Hub {
                 .iter()
                 .filter_map(|peer_id| live.ghosts.remove(peer_id))
                 .collect();
+            // Server Gone stands for its users' departures: no User Gone.
+            if transit {
+                let fields = came.unwrap_or_else(|| vec![Field::new(field::SERVER_ID, id.0)]);
+                relay(&mut state, peer, Relay::ServerGone(fields));
+            }
             drop(state);
             self.part(gone);
-        }
-    }
-
-    pub(crate) fn set_features(&self, peer: &str, generation: u64, features: u32) {
-        let mut state = self.0.state.lock().unwrap();
-        if let Some(live) = state
-            .links
-            .get_mut(peer)
-            .filter(|l| l.generation == generation)
-        {
-            live.features = features;
         }
     }
 
@@ -734,12 +828,136 @@ impl Hub {
         live.exports = Some(tx);
         let (tx, requests) = mpsc::channel(REQUEST_CAP);
         live.requests = Some(tx);
+        let transit = live.features & feature::TRANSIT != 0;
+        // The users of the other transit links, as of this relay number:
+        // what was passed on before it is in here.
+        let relayed = if transit {
+            let links = state
+                .links
+                .iter()
+                .filter(|(name, l)| *name != peer && l.features & feature::TRANSIT != 0)
+                .map(|(_, l)| (l.features, &l.ghosts));
+            let held = state
+                .held
+                .iter()
+                .filter(|(name, h)| *name != peer && h.features & feature::TRANSIT != 0)
+                .map(|(_, h)| (h.features, &h.ghosts));
+            links
+                .chain(held)
+                .flat_map(|(features, ghosts)| {
+                    ghosts
+                        .values()
+                        .map(move |slot| relayed_group(slot.uid, &slot.group, features))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Some(Subscribed {
             since,
             users,
             exports,
             requests,
+            relayed,
+            relayed_up_to: state.relay_seq,
         })
+    }
+
+    /// What this link's Link Servers says, and where what other links pass
+    /// on to it arrives from now: the servers behind the other transit
+    /// links, one hop farther, over a link that negotiated transit itself.
+    pub(crate) fn relay_open(
+        &self,
+        peer: &str,
+        generation: u64,
+    ) -> (Vec<ServerGroup>, Option<mpsc::Receiver<Relayed>>) {
+        let mut state = self.0.state.lock().unwrap();
+        let transit = state
+            .links
+            .get(peer)
+            .filter(|l| l.generation == generation)
+            .is_some_and(|l| l.features & feature::TRANSIT != 0);
+        if !transit {
+            return (Vec::new(), None);
+        }
+        let links = state
+            .links
+            .iter()
+            .filter(|(name, l)| *name != peer && l.features & feature::TRANSIT != 0)
+            .flat_map(|(_, l)| l.peer.iter().chain(l.servers.values()));
+        let held = state
+            .held
+            .iter()
+            .filter(|(name, h)| *name != peer && h.features & feature::TRANSIT != 0)
+            .flat_map(|(_, h)| std::iter::once(&h.peer).chain(h.servers.values()));
+        let servers = links.chain(held).map(farther).collect();
+        let (tx, rx) = mpsc::channel(RELAY_CAP);
+        let live = state.links.get_mut(peer).expect("checked");
+        live.relays = Some(tx);
+        (servers, Some(rx))
+    }
+
+    /// A request from `from`'s peer about a user this server shows it as
+    /// `target`: `None` when that is no ghost, so the request is this
+    /// server's to answer. A ghost's goes on to the link it came from, its
+    /// IDs translated (`sender` is the peer's ID for the user it is from,
+    /// in a private message), over links that both negotiated transit, as
+    /// only then was the ghost shown to this peer.
+    pub(crate) fn forward(
+        &self,
+        from: &str,
+        generation: u64,
+        target: Uid,
+        request: &hxd_session::frame::Frame,
+        feature: u32,
+        sender: Option<u16>,
+    ) -> Option<Result<oneshot::Receiver<Reply>, Reason>> {
+        let state = self.0.state.lock().unwrap();
+        let found = state.links.iter().find_map(|(name, l)| {
+            l.ghosts
+                .iter()
+                .find(|(_, slot)| slot.uid == target)
+                .map(|(id, _)| (name, l, *id))
+        });
+        let Some((name, live, id)) = found else {
+            // Kept while its link is interrupted: there, but out of reach.
+            let held = state
+                .held
+                .values()
+                .any(|h| h.ghosts.values().any(|slot| slot.uid == target));
+            return held.then_some(Err(Reason::Unreachable));
+        };
+        let origin = state.links.get(from).filter(|l| l.generation == generation);
+        let Some(origin) = origin.filter(|o| {
+            name != from
+                && o.features & feature::TRANSIT != 0
+                && live.features & feature::TRANSIT != 0
+        }) else {
+            return Some(Err(Reason::UnknownUser));
+        };
+        if feature != 0 && live.features & feature == 0 {
+            return Some(Err(Reason::FeatureNotNegotiated));
+        }
+        let from_uid = match sender {
+            None => None,
+            Some(s) => match origin.ghosts.get(&s) {
+                Some(slot) => Some(slot.uid),
+                None => return Some(Err(Reason::UnknownUser)),
+            },
+        };
+        let mut passed = crate::wire::fields(request);
+        for f in &mut passed {
+            match f.id {
+                field::TARGET_ID => *f = Field::u16(field::TARGET_ID, id),
+                field::USER_ID => {
+                    if let Some(uid) = from_uid {
+                        *f = Field::u16(field::USER_ID, uid);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(enqueue(live, request.ty, passed).map_err(reason_of))
     }
 
     /// The server `id` as the link knows it, when it lies behind the link:
@@ -823,17 +1041,23 @@ impl Hub {
         enqueue(live, ty, build(id))
     }
 
-    /// Send a request for server `home` over the link it lies behind.
-    fn request_for(
+    /// Send a request for server `home` over the link it lies behind,
+    /// never back over the link `except` it came in on.
+    pub(crate) fn request_for(
         &self,
         home: ServerId,
         ty: u32,
         fields: Vec<Field>,
+        except: Option<&str>,
     ) -> Result<oneshot::Receiver<Reply>, PeerRefusal> {
         let state = self.0.state.lock().unwrap();
         let live = state
             .links
-            .values()
+            .iter()
+            .filter(|(name, _)| Some(name.as_str()) != except)
+            .map(|(_, l)| l)
+            // Relayed from another link: only over one with transit.
+            .filter(|l| except.is_none() || l.features & feature::TRANSIT != 0)
             .find(|l| {
                 l.peer
                     .iter()
@@ -865,7 +1089,7 @@ impl Hub {
                 Field::new(field::SERVER_ID, ban.home),
                 Field::new(field::REQUESTER, me.0),
             ];
-            let answer = match self.request_for(home, tx::UNBAN, fields) {
+            let answer = match self.request_for(home, tx::UNBAN, fields, None) {
                 Ok(answer) => answer,
                 Err(why) => {
                     warn!(id = ban.id, home = %ban.home_tag, ?why, "network unban not sent; again at the next reload");
@@ -946,9 +1170,16 @@ impl Hub {
             .ok_or("not homed behind this link")?;
         // Attached and counted under the hub's lock, so two links cannot
         // both take the last place under the caps.
+        let transit = live.features & feature::TRANSIT != 0;
         if let Some(slot) = live.ghosts.get_mut(&g.id) {
+            // A snapshot resends everyone: only a change goes on.
+            let changed = slot.group != g;
             slot.group = g;
             self.0.core.ghost_update(slot.uid, info);
+            let passed = relayed_group(slot.uid, &slot.group, live.features);
+            if transit && changed {
+                relay(&mut state, peer, Relay::User(passed));
+            }
             return Ok(());
         }
         if live.ghosts.len() >= limit || self.0.core.ghost_count() >= max_ghosts {
@@ -959,7 +1190,11 @@ impl Hub {
             .core
             .ghost_attach(info)
             .ok_or("no uid to give a ghost")?;
+        let passed = relayed_group(uid, &g, live.features);
         live.ghosts.insert(g.id, Slot { uid, group: g });
+        if transit {
+            relay(&mut state, peer, Relay::User(passed));
+        }
         Ok(())
     }
 
@@ -998,10 +1233,28 @@ impl Hub {
         id: u16,
         text: String,
         style: u16,
+        fields: &[Field],
     ) -> Result<(), &'static str> {
-        let uid = self
-            .ghost_uid(peer, generation, id)
-            .ok_or("no such user on this link")?;
+        let uid = {
+            let mut state = self.0.state.lock().unwrap();
+            let live = state
+                .links
+                .get(peer)
+                .filter(|l| l.generation == generation)
+                .ok_or("no such user on this link")?;
+            let uid = live.ghosts.get(&id).ok_or("no such user on this link")?.uid;
+            // Passed on whatever this server shows, its speaker named by
+            // the ID this server gives it.
+            let both = feature::TRANSIT | feature::PUBLIC_CHAT;
+            if live.features & both == both {
+                let mut passed = fields.to_vec();
+                for f in passed.iter_mut().filter(|f| f.id == field::USER_ID) {
+                    *f = Field::u16(field::USER_ID, uid);
+                }
+                relay(&mut state, peer, Relay::Chat(passed));
+            }
+            uid
+        };
         let Some(line) = self.0.core.ghost_line(uid, text, style) else {
             return Ok(());
         };
@@ -1023,14 +1276,25 @@ impl Hub {
         self.0.epoch
     }
 
-    pub(crate) fn user_gone(&self, peer: &str, generation: u64, id: u16) {
+    pub(crate) fn user_gone(&self, peer: &str, generation: u64, id: u16, came: Vec<Field>) {
         let mut state = self.0.state.lock().unwrap();
         if let Some(live) = state
             .links
             .get_mut(peer)
             .filter(|l| l.generation == generation)
         {
+            let transit = live.features & feature::TRANSIT != 0;
             let gone = live.ghosts.remove(&id);
+            if let Some(slot) = gone.as_ref().filter(|_| transit) {
+                let passed = came
+                    .into_iter()
+                    .map(|f| match f.id {
+                        field::USER_ID => Field::u16(field::USER_ID, slot.uid),
+                        _ => f,
+                    })
+                    .collect();
+                relay(&mut state, peer, Relay::UserGone(passed));
+            }
             drop(state);
             self.part(gone);
         }
@@ -1071,6 +1335,15 @@ impl Hub {
                             live.ghosts.insert(g.id, stale.swap_remove(at));
                         }
                     }
+                    if live.features & feature::TRANSIT != 0 {
+                        for slot in &stale {
+                            relay(
+                                &mut state,
+                                peer,
+                                Relay::UserGone(gone_fields(slot.uid, Reason::Disconnected)),
+                            );
+                        }
+                    }
                     stale
                 }
                 None => Vec::new(),
@@ -1094,7 +1367,7 @@ impl Hub {
                 .unwrap_or_default()
         };
         for id in stale {
-            self.user_gone(peer, generation, id);
+            self.user_gone(peer, generation, id, gone_fields(id, Reason::Disconnected));
         }
         for g in groups {
             if let Err(why) = self.apply_user(peer, generation, g) {
@@ -1207,6 +1480,107 @@ impl PeerAcceptor for Hub {
     }
 }
 
+/// What links pass on to each other (L7), numbered in the order it
+/// happened, as the export feed numbers what the core does.
+#[derive(Debug, Clone)]
+pub(crate) enum Relay {
+    /// A server newly reachable, or changed, at this server's distance.
+    Server(ServerGroup),
+    /// A server no longer reachable, with every user homed on it: the
+    /// Server Gone as it came, every field passed on.
+    ServerGone(Vec<Field>),
+    /// A ghost's user group, under this server's ID for it.
+    User(Vec<Field>),
+    /// A User Gone as it came, under this server's ID for the user.
+    UserGone(Vec<Field>),
+    /// A public chat line, its speaker under this server's ID for them.
+    Chat(Vec<Field>),
+}
+
+pub(crate) type Relayed = (u64, Relay);
+
+/// What one link may have waiting from the others; past it the link is
+/// too slow, and starts over.
+const RELAY_CAP: usize = 16384;
+
+/// Pass `what` from `from`'s link to every other established link that
+/// negotiated transit (and public chat, for a line), under the hub's lock
+/// so the order is the hub's. A link too far behind is closed.
+fn relay(state: &mut State, from: &str, what: Relay) {
+    state.relay_seq += 1;
+    let seq = state.relay_seq;
+    let chat = matches!(what, Relay::Chat(_));
+    for (name, live) in state.links.iter_mut() {
+        if name == from || live.features & feature::TRANSIT == 0 {
+            continue;
+        }
+        if chat && live.features & feature::PUBLIC_CHAT == 0 {
+            continue;
+        }
+        let Some(tx) = &live.relays else { continue };
+        if tx.try_send((seq, what.clone())).is_err() {
+            live.relays = None;
+            if let Some(close) = live.close.take() {
+                let _ = close.send(Reason::Shutdown);
+            }
+        }
+    }
+}
+
+/// Everything behind a link gone: the peer and the servers learned over
+/// it, each passed on as one Server Gone standing for its users.
+fn servers_gone<'a>(
+    state: &mut State,
+    from: &str,
+    peer: &ServerGroup,
+    servers: impl Iterator<Item = &'a ServerId>,
+) {
+    let ids: Vec<ServerId> = std::iter::once(peer.id).chain(servers.copied()).collect();
+    for id in ids {
+        relay(
+            state,
+            from,
+            Relay::ServerGone(vec![Field::new(field::SERVER_ID, id.0)]),
+        );
+    }
+}
+
+/// A User Gone this server makes itself, for a user it gives `uid`.
+fn gone_fields(uid: Uid, why: Reason) -> Vec<Field> {
+    vec![
+        Field::u16(field::USER_ID, uid),
+        Field::u16(field::REASON, why as u16),
+    ]
+}
+
+/// A server group as this server passes it on: one hop farther.
+fn farther(group: &ServerGroup) -> ServerGroup {
+    ServerGroup {
+        hops: group.hops.saturating_add(1),
+        ..group.clone()
+    }
+}
+
+/// A ghost's user group as this server passes it on: every field as it
+/// came, but the ID this server gives the user and this server's own flag
+/// rules, which refuse messages over a link that cannot carry them and
+/// never pass on an admin.
+fn relayed_group(uid: Uid, g: &UserGroup, features: u32) -> Vec<Field> {
+    // Private chat never crosses a link, so every ghost refuses it.
+    let mut flags = g.flags & (flag::AWAY | flag::REFUSES_MESSAGES) | flag::REFUSES_CHAT;
+    if features & feature::PRIVATE_MESSAGES == 0 {
+        flags |= flag::REFUSES_MESSAGES;
+    }
+    g.fields
+        .iter()
+        .map(|f| match f.id {
+            field::USER_ID => Field::u16(field::USER_ID, uid),
+            field::USER_FLAGS => Field::u16(field::USER_FLAGS, flags),
+            _ => f.clone(),
+        })
+        .collect()
+}
+
 /// Hand a request to a link's session loop.
 fn enqueue(
     live: &Live,
@@ -1229,6 +1603,10 @@ pub(crate) struct Subscribed {
     pub(crate) users: Vec<LocalUser>,
     pub(crate) exports: mpsc::Receiver<Export>,
     pub(crate) requests: mpsc::Receiver<Request>,
+    /// The other transit links' users, as user groups this server passes
+    /// on, and the relay number they stand at.
+    pub(crate) relayed: Vec<Vec<Field>>,
+    pub(crate) relayed_up_to: u64,
 }
 
 /// The hub as the core's [`PeerRouter`]: weak, so the core holding it
@@ -1474,7 +1852,13 @@ mod tests {
         let (generation, _) = h.register("a");
         h.accept_server("a", generation, group(2, "two", 0), true)
             .unwrap();
-        h.set_features("a", generation, feature::PRIVATE_MESSAGES);
+        h.resume(
+            "a",
+            generation,
+            ServerId([2; 8]),
+            [1; 8],
+            feature::PRIVATE_MESSAGES,
+        );
         h.apply_user("a", generation, user(9, 2)).unwrap();
         let mut link = h.subscribe("a", generation).unwrap();
         let ghost = h.ghost_uid("a", generation, 9).unwrap();
@@ -1514,7 +1898,7 @@ mod tests {
         h.accept_server("a", link, group(3, "drei", 1), false)
             .unwrap();
         assert_eq!(tag(&h).as_deref(), Some("drei"), "a 913 reaches it");
-        h.forget_server("a", link, ServerId([3; 8]));
+        h.forget_server("a", link, ServerId([3; 8]), None);
         assert_eq!(h.0.core.ghost_count(), 0, "a 914 takes it away");
     }
 
@@ -1542,7 +1926,7 @@ mod tests {
         let (link, _) = h.register("a");
         h.accept_server("a", link, group(2, "two", 0), true)
             .unwrap();
-        h.resume("a", link, ServerId([2; 8]), [epoch; 8]);
+        h.resume("a", link, ServerId([2; 8]), [epoch; 8], 0);
         h.servers_settled("a", link);
         let groups = users.iter().map(|(id, nick)| named(*id, nick)).collect();
         h.apply_snapshot("a", link, groups);
@@ -1617,7 +2001,7 @@ mod tests {
         let (second, _) = h.register("a");
         h.accept_server("a", second, group(2, "two", 0), true)
             .unwrap();
-        h.resume("a", second, ServerId([2; 8]), [1; 8]);
+        h.resume("a", second, ServerId([2; 8]), [1; 8], 0);
         h.unregister("a", second, true);
         linked(&h, 1, &[(9, "bob")]);
         assert_eq!(uids(&h), shown);
@@ -1631,7 +2015,7 @@ mod tests {
         let (second, _) = h.register("a");
         h.accept_server("a", second, group(2, "two", 0), true)
             .unwrap();
-        h.resume("a", second, ServerId([2; 8]), [2; 8]);
+        h.resume("a", second, ServerId([2; 8]), [2; 8], 0);
         h.unregister("a", second, false);
         tokio::task::yield_now().await;
         assert_eq!(h.0.core.ghost_count(), 0);
@@ -1647,6 +2031,19 @@ mod tests {
             h.accept_server("b", other, group(2, "two", 0), true),
             Err(Reason::Loop)
         );
+    }
+
+    #[test]
+    fn a_peer_cannot_take_away_a_server_another_link_put_there() {
+        let h = hub();
+        let (a, _ra) = h.register("a");
+        let (b, _rb) = h.register("b");
+        h.accept_server("a", a, group(2, "two", 0), true).unwrap();
+        h.accept_server("b", b, group(4, "four", 0), true).unwrap();
+        h.accept_server("b", b, group(5, "five", 1), false).unwrap();
+        h.forget_server("a", a, ServerId([5; 8]), None);
+        h.forget_server("a", a, h.server_id(), None);
+        assert!(h.knows_behind("b", b, ServerId([5; 8])), "still b's");
     }
 
     #[tokio::test(start_paused = true)]

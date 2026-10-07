@@ -1184,8 +1184,9 @@ key = "ed25519:base64url key"      # the peer's, as its log shows it (prefix opt
 account = "link-hx"                # the login the peer expects (no account here)
 features = ["chat", "msgs", "info", "transit"]
                                    # what this link carries, if the peer
-                                   # agrees; transit, to one peer only,
-                                   # joins this server to the peer's network
+                                   # agrees; transit joins this server to
+                                   # the peer's network, and relays between
+                                   # its links
 # ghosts = 1000                    # this link's users shown
 ```
 

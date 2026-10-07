@@ -368,7 +368,9 @@ Three layers, all `cargo test --workspace`:
   and user info crossing on both wires and refused where the link does
   not carry them, a kick hiding a ghost at its kicker and a ban placed
   and enforced by the user's home server, a peer's restart showing
-  nobody leaving, `show_tags`, and every
+  nobody leaving, a server in the middle of three relaying users, chat,
+  messages, user info and kicks between its links and nothing over a
+  link without transit, `show_tags`, and every
   transaction in `NAMES_A_USER`, and ng's `msg`, `block` and `kick`,
   refused for a ghost as for a uid nobody holds),
   `relay.rs` (a classic server behind `hlrelay`: a client that reaches
