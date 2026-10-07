@@ -582,6 +582,24 @@ struct UidData {
     uid: hxd_core::Uid,
 }
 
+#[derive(serde::Serialize)]
+struct ChatData<'a> {
+    from: FromData<'a>,
+    text: &'a str,
+    style: &'static str,
+    at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<hxd_core::history::LineId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media: Option<Value>,
+}
+
+#[derive(serde::Serialize)]
+struct FromData<'a> {
+    uid: hxd_core::Uid,
+    nick: &'a str,
+}
+
 /// Encode one domain event as a wire event frame.
 ///
 /// Events without an ng mapping in the MVP (the private-chat family) are
@@ -609,6 +627,35 @@ pub fn event_json(se: &SeqEvent) -> String {
         }
         _ => {}
     }
+    // Public chat too: every line is one of these to everyone present.
+    if let Event::Chat {
+        cid: 0,
+        from,
+        text,
+        style,
+        id,
+        at,
+        media,
+    } = &se.event
+    {
+        let data = ChatData {
+            from: FromData {
+                uid: from.uid,
+                nick: &from.nick,
+            },
+            text,
+            style: if *style == 1 { "action" } else { "normal" },
+            at: unix(*at),
+            id: *id,
+            media: media.as_ref().map(crate::media::media_json),
+        };
+        return serde_json::to_string(&EventOut {
+            seq: se.seq,
+            ev: "chat",
+            data,
+        })
+        .expect("these types always serialize");
+    }
     if let Event::Parted(uid) = &se.event {
         return serde_json::to_string(&EventOut {
             seq: se.seq,
@@ -618,29 +665,6 @@ pub fn event_json(se: &SeqEvent) -> String {
         .expect("these types always serialize");
     }
     let (ev, data) = match &se.event {
-        Event::Chat {
-            cid: 0,
-            from,
-            text,
-            style,
-            id,
-            at,
-            media,
-        } => {
-            let mut data = json!({
-                "from": { "uid": from.uid, "nick": from.nick },
-                "text": text,
-                "style": if *style == 1 { "action" } else { "normal" },
-                "at": unix(*at),
-            });
-            if let Some(id) = id {
-                data["id"] = json!(id);
-            }
-            if let Some(media) = media {
-                data["media"] = crate::media::media_json(media);
-            }
-            ("chat", data)
-        }
         Event::Notice { cid: 0, text, .. } => ("notice", json!({ "text": text })),
         Event::ChatSubject { cid: 0, subject } => ("subject", json!({ "subject": subject })),
         Event::Msg {
