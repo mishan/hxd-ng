@@ -1638,7 +1638,8 @@ struct Router(std::sync::Weak<Inner>);
 
 impl Router {
     /// Send a request and hand its reply's fields to `answer`, once they
-    /// come; a link that ends first answers `Unreachable`.
+    /// come; a link that ends first answers `Unreachable`, and a peer
+    /// that has not answered by `PEER_WAIT`, `Unanswered`.
     fn send<T: Send + 'static>(
         &self,
         uid: Uid,
@@ -1665,7 +1666,8 @@ impl Router {
                             Some(why) => Err(why),
                             None => answer(fields),
                         },
-                        _ => Err(PeerRefusal::Unreachable),
+                        Ok(Err(_)) => Err(PeerRefusal::Unreachable),
+                        Err(_) => Err(PeerRefusal::Unanswered),
                     };
                     let _ = tx.send(result);
                 });
@@ -1704,7 +1706,7 @@ pub(crate) fn reason_of(why: PeerRefusal) -> Reason {
         PeerRefusal::Excluded => Reason::Excluded,
         PeerRefusal::RateLimited => Reason::RateLimited,
         PeerRefusal::FeatureNotNegotiated => Reason::FeatureNotNegotiated,
-        PeerRefusal::Unreachable => Reason::Unreachable,
+        PeerRefusal::Unreachable | PeerRefusal::Unanswered => Reason::Unreachable,
         PeerRefusal::Refused | PeerRefusal::CannotCross => Reason::RefusedFields,
         PeerRefusal::UnknownBan => Reason::UnknownBan,
     }
@@ -1888,7 +1890,7 @@ mod tests {
         let answer = Router(Arc::downgrade(&h.0)).msg(1, ghost, "hi".into());
         let sent = link.requests.recv().await.unwrap();
         tokio::time::sleep(PEER_WAIT + std::time::Duration::from_secs(1)).await;
-        assert_eq!(answer.await.unwrap(), Err(PeerRefusal::Unreachable));
+        assert_eq!(answer.await.unwrap(), Err(PeerRefusal::Unanswered));
         assert!(sent.reply.is_closed(), "the link may forget it");
     }
 

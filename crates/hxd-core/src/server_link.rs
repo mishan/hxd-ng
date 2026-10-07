@@ -76,6 +76,9 @@ pub enum PeerRefusal {
     RateLimited,
     FeatureNotNegotiated,
     Unreachable,
+    /// Sent, and not answered within [`PEER_WAIT`]: whether it was done
+    /// is not known, and a message may still arrive.
+    Unanswered,
     /// No ban by that handle was made by that server.
     UnknownBan,
     /// The ghost's server refused it, for a reason this server has no
@@ -108,6 +111,9 @@ impl PeerRefusal {
                 "That user's server does not take this from this one."
             }
             PeerRefusal::Unreachable => "That user's server did not answer.",
+            PeerRefusal::Unanswered => {
+                "That user's server did not answer in time, so whether it went through is not known."
+            }
             PeerRefusal::Refused => "That user's server refused it.",
             PeerRefusal::UnknownBan => "No such ban.",
             PeerRefusal::NotExported => {

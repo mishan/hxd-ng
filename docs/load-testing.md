@@ -365,7 +365,7 @@ gap; a ghost's line past `chat_lines` does not, which is one more reason
 | `link.no_ghosts` | With metrics, after everyone has left, each server holds no more ghosts than before the run. |
 | `link.joins_heard` | Every observer heard every arrival that logged in join its server. |
 | `link.ghosts_shown` | In L-6, at each step `[target]` showed every one of the linked servers' users within `settle`. |
-| `link.msgs_delivered` | In L-6, every message `[target]` accepted was heard by its recipient once, and every one it refused never, after each step and again once the run is quiet. User info answered with the ghost's server alone, and a message queued, count as refused. |
+| `link.msgs_delivered` | In L-6, every message `[target]` accepted was heard by its recipient once, and every one it refused never, after each step and again once the run is quiet. User info answered with the ghost's server alone, and a message queued, count as refused; one unconfirmed (sent, not answered in time) is held to neither. |
 | `link.requests_answered` | In L-6, every requester was answered within a wait past the server's own for the peer; one that was not is dropped from the run. |
 | `churn.kicks_stopped` | In L-5, the moderator stopped kicking within `settle` of being told to. |
 | `link.mirrors` | In L-5, every churner held within `settle`, and then every linked server lists exactly the run's users `[target]` does, user for user (a stale ghost under a nick still in use counts), within `settle`, and that is not none. |
