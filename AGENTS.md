@@ -262,7 +262,12 @@ joins a queue, and whoever finds no commit under way logs everything
 queued in one transaction and relays it in order under `log_serial`,
 then hands the lead on. Queue order is the order lines are logged and
 heard in; anything else that must fall between two lines (a redaction,
-a purge) takes `log_serial` as before, between batches.
+a purge) takes `log_serial` as before, between batches. A classic
+session hands over the public lines it has already read together
+(`Core::chat_public_all`), so a sender that got ahead of the log
+catches up in one commit; a run stops short of an event handed to the
+session and of the line that would spend its last spam point, so what
+was sent before a kick is heard before it.
 
 **`assert!` over `debug_assert!`** for wire invariants — release builds
 must not skip them.
@@ -345,7 +350,8 @@ Three layers, all `cargo test --workspace`:
   wires, then a burst and a rate, a TLS handshake counted from accept,
   and an exempt address held to neither; a classic user's multi-line
   flood kicked once with the room told in mhxd's bytes, and a user past
-  its spam points on each wire banned, the ng one refused `flooding`;
+  its spam points on each wire banned, the ng one refused `flooding`,
+  and a burst of chat heard up to the line that spent the last point;
   an ng nick flood banned at User Change's price, a nick that changes
   nothing told to nobody on either wire, an account past its news posts
   told how long to wait, and the request limit answering `rate_limited`

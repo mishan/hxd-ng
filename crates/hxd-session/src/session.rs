@@ -2884,8 +2884,11 @@ async fn session_loop(
     ctx: &ServerCtx,
     sess: &mut Session,
 ) -> Option<&'static str> {
+    // A request read while gathering public chat that was not a line of
+    // it, next in turn.
+    let mut held = None;
     loop {
-        tokio::select! {
+        let f = tokio::select! {
             // Events first: one the session was handed before a request
             // arrived is in force for it. An administrator's change to
             // what this account may do is the one that matters — the
@@ -2897,6 +2900,7 @@ async fn session_loop(
                         info!(uid = sess.uid, "kicked");
                         return Some("kicked");
                     }
+                    continue;
                 }
                 // The domain closed the stream: this client fell a whole
                 // channel behind (`LIVE_QUEUE_CAP`), or the session was
@@ -2907,31 +2911,164 @@ async fn session_loop(
                 }
                 None => return Some("replaced"),
             },
-            maybe = frames.recv() => match maybe {
-                Some(f) => {
-                    trace_in(&f);
-                    // mhxd charges every transaction after login before
-                    // it looks at it, and one that spends the last of the
-                    // budget is never answered: the kick that follows is
-                    // the reply. Nor is anything after it. The kick is
-                    // already made; its ban is a store write, placed off
-                    // the reactor before this connection reads the kick
-                    // and closes, so it stands by the time the client
-                    // can reconnect.
-                    if let Err(flooded) = ctx.core.spend_spam(sess.uid, spam_points(f.ty), f.ty) {
-                        if let Some(ban) = flooded.ban {
-                            off_reactor(&ctx.core, move |c| c.place_spam_ban(ban)).await;
-                        }
-                        continue;
-                    }
-                    dispatch(&f, tx, ctx, sess).await;
-                }
+            () = std::future::ready(()), if held.is_some() => {
+                held.take().expect("held")
+            }
+            maybe = frames.recv(), if held.is_none() => match maybe {
+                Some(f) => f,
                 None => return None, // Reader exited: EOF, error, or bad frame.
             },
             _ = tx.backlog.lagged.notified() => {
                 info!(uid = sess.uid, "not keeping up; disconnecting");
                 return Some("slow_consumer");
             }
+        };
+        trace_in(&f);
+        if !spend(&f, ctx, sess).await {
+            continue;
+        }
+        if !public_chat_frame(&f) {
+            dispatch(&f, tx, ctx, sess).await;
+            continue;
+        }
+        // A sender that got ahead of the log: the public lines it sent
+        // since are already here, and are logged with this one rather
+        // than each after the last, which is how a backlog clears at the
+        // rate the log commits, not a line per commit.
+        // A run goes no further than an event the session was handed
+        // meanwhile, which is in force for what follows, or than the
+        // spam points the session has left: a line that would spend the
+        // last of them kicks it, and the lines before it are heard first.
+        let mut run = vec![f];
+        let mut room = ctx.core.spam_room(sess.uid);
+        let price = spam_points(ClientHdr::Chat.as_u32());
+        while run.len() < CHAT_RUN && events.is_empty() {
+            let Ok(next) = frames.try_recv() else { break };
+            if !public_chat_frame(&next) || room < price {
+                held = Some(next);
+                break;
+            }
+            room -= price;
+            trace_in(&next);
+            if !spend(&next, ctx, sess).await {
+                break;
+            }
+            run.push(next);
+        }
+        let lines = run
+            .iter()
+            .filter_map(|f| chat_send(f, sess).map(|c| c.line))
+            .collect();
+        public_chat(ctx, sess, lines).await;
+    }
+}
+
+/// The most public lines one gathering takes.
+const CHAT_RUN: usize = 64;
+
+/// Whether `f` is a chat send to the public room.
+fn public_chat_frame(f: &Frame) -> bool {
+    f.ty == ClientHdr::Chat.as_u32()
+        && f.chunks()
+            .filter(|c| c.tag == tag::CHAT_ID)
+            .last()
+            .is_none_or(|c| c.as_uint() == 0)
+}
+
+/// Charge `f` to the session's spam points, as mhxd charges every
+/// transaction after login before it looks at it. One that spends the
+/// last of the budget is never answered: the kick that follows is the
+/// reply. Nor is anything after it. The kick is already made; its ban is
+/// a store write, placed off the reactor before this connection reads
+/// the kick and closes, so it stands by the time the client can
+/// reconnect.
+async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
+    match ctx.core.spend_spam(sess.uid, spam_points(f.ty), f.ty) {
+        Ok(()) => true,
+        Err(flooded) => {
+            if let Some(ban) = flooded.ban {
+                off_reactor(&ctx.core, move |c| c.place_spam_ban(ban)).await;
+            }
+            false
+        }
+    }
+}
+
+/// A chat send (105) as the session will act on it: the chat it is for,
+/// 0 being the public room, and the line.
+struct ChatSend {
+    cid: u32,
+    line: (String, u16, Option<hxd_core::media::Handle>),
+}
+
+/// The chat send `f` is, or nothing when it is dropped, as the reference
+/// server drops what it will not relay: there is no task reply to refuse
+/// it with.
+fn chat_send(f: &Frame, sess: &Session) -> Option<ChatSend> {
+    let (mut cid, mut style, mut body) = (0u32, 0u16, String::new());
+    let (mut handle, mut declared) = (None, false);
+    for c in f.chunks() {
+        match c.tag {
+            tag::CHAT_ID => cid = c.as_uint(),
+            tag::STYLE => style = c.as_uint() as u16,
+            tag::BODY => body = sess.enc.decode_capped(c.data, MAX_CHAT_INPUT),
+            tag::CHAT_MEDIA_ID => handle = media::parse_handle(c.data),
+            tag::CHAT_MEDIA_TYPE => declared = true,
+            TAG_CHAT_AWAY => {} // No away state yet; rider ignored.
+            _ => {}
+        }
+    }
+    if !sess.can(bit::SEND_CHAT) {
+        debug!(uid = sess.uid, "chat dropped: no send_chat access");
+        return None;
+    }
+    // "Servers MUST drop these fields from any inbound
+    // transaction whose sender did not negotiate the
+    // capability" — the text still goes through as plain chat.
+    let media = match (handle, declared) {
+        _ if !sess.has_cap(cap::INLINE_MEDIA) => None,
+        // The two travel together or not at all. One without
+        // the other is a malformed send, and this transaction
+        // has no task reply to refuse it with, so it goes the
+        // way an unpermitted chat goes.
+        (Some(_), false) | (None, true) => {
+            debug!(uid = sess.uid, "chat dropped: media fields are unpaired");
+            return None;
+        }
+        (handle, _) => handle,
+    };
+    Some(ChatSend {
+        cid,
+        line: (body, style, media),
+    })
+}
+
+/// Public chat lines this session sent, logged together and in order.
+async fn public_chat(
+    ctx: &ServerCtx,
+    sess: &Session,
+    lines: Vec<(String, u16, Option<hxd_core::media::Handle>)>,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let from = sess.uid;
+    let Some(results) = off_reactor(&ctx.core, move |c| c.chat_public_all(from, lines)).await
+    else {
+        return;
+    };
+    for result in results {
+        match result {
+            Err(ChatError::NoSuchMedia) => {
+                debug!(
+                    uid = sess.uid,
+                    "chat dropped: media handle is not this sender's"
+                )
+            }
+            // Kicked for it; the kick is the answer.
+            Err(ChatError::Flooding) => debug!(uid = sess.uid, "chat dropped: flooding"),
+            Err(e) => warn!(uid = sess.uid, "public chat store failed: {e:?}"),
+            Ok(_) => {}
         }
     }
 }
@@ -3638,62 +3775,18 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
 
         // --- Chat -----------------------------------------------------
-        t if t == ClientHdr::Chat.as_u32() => {
-            let (mut cid, mut style, mut body) = (0u32, 0u16, String::new());
-            let (mut handle, mut declared) = (None, false);
-            for c in f.chunks() {
-                match c.tag {
-                    tag::CHAT_ID => cid = c.as_uint(),
-                    tag::STYLE => style = c.as_uint() as u16,
-                    tag::BODY => body = sess.enc.decode_capped(c.data, MAX_CHAT_INPUT),
-                    tag::CHAT_MEDIA_ID => handle = media::parse_handle(c.data),
-                    tag::CHAT_MEDIA_TYPE => declared = true,
-                    TAG_CHAT_AWAY => {} // No away state yet; rider ignored.
-                    _ => {}
+        t if t == ClientHdr::Chat.as_u32() => match chat_send(f, sess) {
+            Some(ChatSend { cid: 0, line }) => public_chat(ctx, sess, vec![line]).await,
+            Some(ChatSend {
+                cid,
+                line: (body, style, media),
+            }) => {
+                if let Err(e) = ctx.core.chat_private(cid, sess.uid, body, style, media) {
+                    debug!(uid = sess.uid, cid, "private chat dropped: {e:?}");
                 }
             }
-            // The reference server drops unpermitted chat silently (no
-            // task reply exists for a notification-style send).
-            if !sess.can(bit::SEND_CHAT) {
-                debug!(uid = sess.uid, "chat dropped: no send_chat access");
-                return;
-            }
-            // "Servers MUST drop these fields from any inbound
-            // transaction whose sender did not negotiate the
-            // capability" — the text still goes through as plain chat.
-            let media = match (handle, declared) {
-                _ if !sess.has_cap(cap::INLINE_MEDIA) => None,
-                // The two travel together or not at all. One without
-                // the other is a malformed send, and this transaction
-                // has no task reply to refuse it with, so it goes the
-                // way an unpermitted chat goes.
-                (Some(_), false) | (None, true) => {
-                    debug!(uid = sess.uid, "chat dropped: media fields are unpaired");
-                    return;
-                }
-                (handle, _) => handle,
-            };
-            if cid == 0 {
-                let from = sess.uid;
-                match off_reactor(&ctx.core, move |c| c.chat_public(from, body, style, media)).await
-                {
-                    Some(Err(ChatError::NoSuchMedia)) => {
-                        debug!(
-                            uid = sess.uid,
-                            "chat dropped: media handle is not this sender's"
-                        )
-                    }
-                    // Kicked for it; the kick is the answer.
-                    Some(Err(ChatError::Flooding)) => {
-                        debug!(uid = sess.uid, "chat dropped: flooding")
-                    }
-                    Some(Err(e)) => warn!(uid = sess.uid, "public chat store failed: {e:?}"),
-                    _ => {}
-                }
-            } else if let Err(e) = ctx.core.chat_private(cid, sess.uid, body, style, media) {
-                debug!(uid = sess.uid, cid, "private chat dropped: {e:?}");
-            }
-        }
+            None => {}
+        },
 
         t if t == ClientHdr::GetChatHistory.as_u32() => {
             if !sess.has_cap(cap::CHAT_HISTORY) {
