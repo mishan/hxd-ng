@@ -19,8 +19,8 @@
 # accounts on every server, a ban across a link being placed on one.
 #
 # HUB_HOST runs `a` on another host instead, over ssh, and LEAF_HOSTS
-# the leaves, in turn (`-` for this host); `host:dir` puts that server's
-# run under dir rather than the host's home. Servers sharing one host's
+# the leaves, in turn (`-` for this host); either as `host:/dir` puts
+# that server's run under dir rather than the host's home. Servers sharing one host's
 # cores and disk measure each other as much as themselves. Every server
 # then listens beyond loopback and is reached at its host's IPv4
 # address, every host's address let through every server's [limits] and
@@ -74,11 +74,23 @@ for s in $SERVERS; do
     elif [ ${#LEAF_HOSTS[@]} -gt 0 ]; then
         HOST[$s]=${LEAF_HOSTS[i % ${#LEAF_HOSTS[@]}]}
         [ "${HOST[$s]}" = - ] && HOST[$s]=
-        case ${HOST[$s]} in *:*) UNDER[$s]=${HOST[$s]#*:} HOST[$s]=${HOST[$s]%%:*} ;; esac
         i=$((i + 1))
     else
         HOST[$s]=
     fi
+    case ${HOST[$s]} in
+    -:* | :*)
+        echo "${HOST[$s]}: a server here has its run in WORK" >&2
+        exit 2
+        ;;
+    *:/*) UNDER[$s]=${HOST[$s]#*:} HOST[$s]=${HOST[$s]%%:*} ;;
+    *:*)
+        # The server runs from its run's directory, so a relative one
+        # would be relative to itself.
+        echo "${HOST[$s]}: the directory must be absolute" >&2
+        exit 2
+        ;;
+    esac
 done
 REMOTES=$(for s in $SERVERS; do [ -n "${HOST[$s]}" ] && echo "${HOST[$s]}"; done | sort -u)
 v4() { getent ahostsv4 "$1" | awk '{ print $1; exit }'; }
