@@ -306,6 +306,9 @@ impl Scenario {
         if !(0.0..=1.0).contains(&r.info_share) {
             return Err("[requests] info_share must be between 0 and 1".into());
         }
+        if r.peer_latency_ms.is_some() && self.target.proxy.is_none() {
+            return Err("[requests] peer_latency_ms needs [target.proxy]".into());
+        }
         Ok(())
     }
 }
@@ -320,6 +323,9 @@ const MIN_CUT: f64 = 0.1;
 pub struct ProxyAt {
     pub listen: SocketAddr,
     pub upstream: SocketAddr,
+    /// Milliseconds added to every byte it carries, each way.
+    #[serde(default)]
+    pub latency_ms: u64,
 }
 
 /// What the report calls `[target]` among the servers of a run.
@@ -464,6 +470,10 @@ pub struct Requests {
     /// Of the classic requesters' requests, the share that ask for a
     /// user's info rather than send a message; ng has no user info.
     pub info_share: f64,
+    /// With `[target.proxy]`, milliseconds it adds each way once the
+    /// links are up: a peer further off than a link could be set up
+    /// across, whose answers outlast the server's wait for them.
+    pub peer_latency_ms: Option<u64>,
 }
 
 impl Default for Requests {
@@ -475,6 +485,7 @@ impl Default for Requests {
             rate: 50.0,
             step: 10.0,
             info_share: 0.5,
+            peer_latency_ms: None,
         }
     }
 }
@@ -740,7 +751,7 @@ mod tests {
             Scenario::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             seen += 1;
         }
-        assert_eq!(seen, 10);
+        assert_eq!(seen, 11);
     }
 
     #[test]

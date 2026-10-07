@@ -138,7 +138,9 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
         }
     }
     let proxy = match &ctx.scenario.target.proxy {
-        Some(p) => Some(proxy::Proxy::start(p.listen, p.upstream).await?),
+        Some(p) => Some(
+            proxy::Proxy::start(p.listen, p.upstream, Duration::from_millis(p.latency_ms)).await?,
+        ),
         None => None,
     };
     let before = links_up(&ctx).await?;
@@ -156,7 +158,7 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
             let proxy = proxy.as_ref().expect("checked by the scenario");
             slow_peer::run(&ctx, proxy, &before).await?
         }
-        Kind::Requests => requests::run(&ctx).await?,
+        Kind::Requests => requests::run(&ctx, proxy.as_ref()).await?,
     };
 
     // Everyone this run brought has left; every roster should say so.
