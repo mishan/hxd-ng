@@ -333,7 +333,7 @@ and errors are read on its host. Not with `[target.proxy]`.
 logs no public line anywhere.
 
 ```sh
-HUB_HOST=gauss LEAF_HOSTS="onyx -" KS=16 RATE=5000 \
+HUB_HOST=hub.example LEAF_HOSTS="leaf.example -" KS=16 RATE=5000 \
     crates/hxd-load/baseline/link-fanout.sh
 ```
 

@@ -263,6 +263,75 @@ async fn a_key_changed_on_reload_closes_the_link() {
 }
 
 #[tokio::test]
+async fn a_suspended_peer_stays_unlinked_until_resumed() {
+    let (a, b, _dirs) = linked("").await;
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let _bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    let ghost = row(&mut ann, "bob").await;
+    let config = hxd::Config::load(&b.config).unwrap();
+    let section = config.link.as_ref().unwrap();
+    let status = tokio::spawn(hxd::link::write_status(
+        b.hub.clone(),
+        hxd::link::status_path(section),
+    ));
+
+    hxd::link::set_suspended(&config, "aa", true).unwrap();
+    assert_eq!(hxd::link::reload(&b.hub, &b.config), Ok(1));
+    goes_down(&a.hub, 2).await;
+    // Gone at once, not after the grace an interruption is given.
+    ann.rx
+        .recv_where(|f| f.ty == push::USER_PART && f.uint(tag::UID) == Some(ghost.uid.into()))
+        .await
+        .unwrap();
+    assert!(!comes_up(&a.hub, 2, Duration::from_secs(2)).await);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let shown = hxd::link::status(&config).unwrap();
+        if shown.lines().any(|l| l == "aa (dials): suspended") {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{shown}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    hxd::link::set_suspended(&config, "aa", false).unwrap();
+    assert_eq!(hxd::link::reload(&b.hub, &b.config), Ok(1));
+    assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
+    row(&mut ann, "bob").await;
+    status.abort();
+}
+
+#[tokio::test]
+async fn reset_id_waits_for_a_stopped_server_and_keeps_the_old_key() {
+    let (_a, b, dirs) = pair(2, 1).await;
+    let config = hxd::Config::load(&b.config).unwrap();
+    let path = hxd::link::status_path(config.link.as_ref().unwrap());
+    let status = tokio::spawn(hxd::link::write_status(b.hub.clone(), path.clone()));
+    while !path.exists() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(hxd::link::reset_id(&config)
+        .unwrap_err()
+        .contains("running"));
+
+    status.abort();
+    std::fs::remove_file(&path).unwrap();
+    let key = dirs[1].path().join("link.key");
+    let before = std::fs::read_to_string(&key).unwrap();
+    let said = hxd::link::reset_id(&config).unwrap();
+    assert!(!said.contains(&public(2)), "{said}");
+    assert_ne!(std::fs::read_to_string(&key).unwrap(), before);
+    assert_eq!(
+        std::fs::read_to_string(dirs[1].path().join("link.key.old")).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn a_link_login_on_the_plain_port_is_refused() {
     let (a, _b, _dirs) = pair(2, 1).await;
     let mut login = Login::account("link", "link-bb", "");

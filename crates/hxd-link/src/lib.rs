@@ -15,7 +15,7 @@ pub mod server;
 pub mod users;
 pub mod wire;
 
-pub use hub::{Hub, HubConfig, LinkStatus, PeerEntry};
+pub use hub::{Hub, HubConfig, LinkStatus, PeerEntry, PeerReport, PeerState};
 pub use key::{check_public, KeyError, LinkKey, Role};
 pub use server::{ServerGroup, ServerId, TagError};
 pub use wire::{Field, Hello};

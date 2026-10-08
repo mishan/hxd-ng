@@ -68,7 +68,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-testclient` | Scripted clients for the server's own tests: the classic wire over TCP or TLS, framed with the pinned `hxproto` rather than the server's framer and read through a buffer so a timeout cannot cut a frame, and the ng wire with every event's seq checked as it arrives. Both keep what arrives while they wait for something else. Shared by `hxd-load` and the e2e suites. |
 | `hxd-load` | The load harness (`docs/load-testing.md`): scenarios from TOML — the login storm, public chat, the slow consumer, churn — open-loop, timed from when each thing was due, with the server's invariants checked under load and a JSON report. `hxd-load accounts` writes the accounts churn logs in to. Its `tests/` run each scenario small against a real server. |
 | `hlrelay` | A relay (`docs/hotline-ng-auth.md` §10.2, `docs/relay.md`): discovery, `/trtp` and `/htxf` in front of a classic server that has never heard of Hotline-ng, each socket copied to a TCP connection of its own. Knows nothing about the bytes it carries and does not authenticate. |
-| `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing, the operator's commands (`hxd account` in `accounts.rs`, `hxd ban` and the rest of moderation in `moderation.rs`), and behind the `metrics` feature the recorder `GET /metrics` renders (`metrics.rs`, `docs/metrics.md`). Its `tests/` hold the e2e suites. |
+| `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, `HXD_DEBUG` tracing, the operator's commands (`hxd account` in `accounts.rs`, `hxd ban` and the rest of moderation in `moderation.rs`, `hxd link` in `link.rs`), and behind the `metrics` feature the recorder `GET /metrics` renders (`metrics.rs`, `docs/metrics.md`). Its `tests/` hold the e2e suites. |
 
 `tools/ng-client.mjs` is an interactive ng test client (Node 22+, or
 `npm install` in tools/ for the `ws` fallback) — `/drop` exercises
@@ -367,8 +367,9 @@ Three layers, all `cargo test --workspace`:
   not counted, and a login with no password not held to it),
   `link.rs` (two servers linked by key mode over loopback TLS, a key
   either side did not configure refused, a peer removed on reload
-  unlinked with its dialer stopped, a key changed on reload closing the
-  link, bit 11 on the plain port or a key proof without it refused, users
+  unlinked with its dialer stopped, a suspended one unlinked until
+  resumed, `hxd link reset-id` refused while the server runs, a key
+  changed on reload closing the link, bit 11 on the plain port or a key proof without it refused, users
   crossing both ways on both wires and leaving, public chat crossing
   both ways in order and formatted where it is heard, private messages
   and user info crossing on both wires and refused where the link does
