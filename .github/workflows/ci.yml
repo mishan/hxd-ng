@@ -72,6 +72,24 @@ jobs:
           cargo test --workspace --features hxd/metrics --lib
           cargo test -p hxd --features metrics --test metrics
 
+  # A minute per target from the seed corpus: long enough to catch a
+  # framing regression, not to explore.
+  fuzz:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fuzz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo run --example seeds
+      - name: Fuzz
+        run: for t in frame session; do cargo fuzz run "$t" -- -max_total_time=60; done
+
   node-client:
     runs-on: ubuntu-latest
     steps:

@@ -401,6 +401,11 @@ Three layers, all `cargo test --workspace`:
   a few seconds against a real server in process, on every `cargo
   test`, held to its invariants. Real runs are `hxd-load run` against a
   release build with `metrics` (`docs/load-testing.md`).
+- **Fuzzing**, in `fuzz/`, a workspace of its own on nightly: `frame`
+  (the classic framer and the field decoders) and `session` (a whole
+  classic connection, hello to dispatch). `cargo run --example seeds`
+  there writes a corpus of real frames, then `cargo +nightly fuzz run
+  <target>`.
 - **End-to-end, out of process**, in `e2e/` — `cd e2e && npm test`.
   These start the *binary*: a real config file `hxd` parses itself, a
   real directory it bootstraps into, real sockets. That is a layer the
