@@ -36,9 +36,9 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Shared with GtkHx (see the note at the top of this file).
-hxproto = { git = "https://github.com/mishan/hx-libs.git", rev = "e7705c1dc7b9b755ea0a22b4b61b2e0675eb61f5" }
-hxfiles-xfer = { git = "https://github.com/mishan/hx-libs.git", rev = "e7705c1dc7b9b755ea0a22b4b61b2e0675eb61f5" }
-hxhfs = { git = "https://github.com/mishan/hx-libs.git", rev = "e7705c1dc7b9b755ea0a22b4b61b2e0675eb61f5" }
+hxproto = { git = "https://github.com/mishan/hx-libs.git", rev = "4c428630ea847ab502d986387ca88b15fd75da42" }
+hxfiles-xfer = { git = "https://github.com/mishan/hx-libs.git", rev = "4c428630ea847ab502d986387ca88b15fd75da42" }
+hxhfs = { git = "https://github.com/mishan/hx-libs.git", rev = "4c428630ea847ab502d986387ca88b15fd75da42" }
 
 # Internal.
 hl-identity = { path = "crates/hl-identity" }
