@@ -561,6 +561,25 @@ pub fn ban_list(config: &Config, all: bool) -> Result<String, String> {
         .join("\n"))
 }
 
+/// Bans this server asked linked servers for that still stand: `hxd link
+/// reset-id` leaves no way to lift them.
+#[cfg(feature = "inbox")]
+pub fn network_bans_standing(config: &Config) -> Result<usize, String> {
+    if !db(config).is_some_and(|p| p.exists()) {
+        return Ok(0);
+    }
+    let now = std::time::SystemTime::now();
+    let bans = operator_core(config, true)?
+        .network_bans()
+        .map_err(refused)?;
+    Ok(bans.iter().filter(|b| b.standing(now)).count())
+}
+
+#[cfg(not(feature = "inbox"))]
+pub fn network_bans_standing(_config: &Config) -> Result<usize, String> {
+    Ok(0)
+}
+
 /// `hxd ban lift n<id>`: ask for a ban this server asked of a linked
 /// server lifted. A running server sends the request on SIGHUP, and its
 /// log says what came of it.

@@ -83,13 +83,35 @@ pub struct HubConfig {
     pub peers: Vec<PeerEntry>,
 }
 
-/// A live link, as `hxd link status` would show it.
+/// A live link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkStatus {
     pub peer: String,
     pub server: ServerId,
     pub servers: usize,
     pub ghosts: usize,
+}
+
+/// A configured peer, as `hxd link status` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerReport {
+    pub name: String,
+    pub dials: bool,
+    pub state: PeerState,
+    /// Servers behind it and its side's users, as known now or as held.
+    pub servers: usize,
+    pub ghosts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerState {
+    Linked(ServerId),
+    /// Connected, its Hello not yet accepted.
+    Linking,
+    /// Interrupted, and held for the grace period.
+    Held(ServerId),
+    Suspended,
+    Down,
 }
 
 #[derive(Clone)]
@@ -125,6 +147,9 @@ struct State {
     shutting_down: bool,
     /// Peers with a dial loop running, so a reload never starts a second.
     dialing: std::collections::HashSet<String>,
+    /// Peers the operator paused: every link with them is closed with
+    /// `Suspended`, and none is dialed.
+    suspended: std::collections::HashSet<String>,
 }
 
 /// An interrupted link's servers and ghosts, kept without telling anyone
@@ -336,15 +361,7 @@ impl Hub {
             .filter(|name| !peers.iter().any(|p| &p.name == *name))
             .cloned()
             .collect();
-        let mut gone = Vec::new();
-        for name in &removed {
-            if let Some(held) = state.held.remove(name) {
-                if held.features & feature::TRANSIT != 0 {
-                    servers_gone(&mut state, name, &held.peer, held.servers.keys());
-                }
-                gone.extend(held.ghosts.into_values());
-            }
-        }
+        let gone = forget_held(&mut state, removed.iter());
         drop(state);
         self.part(gone);
         // Only an entry that is new or changed: a dialer that stopped on
@@ -395,6 +412,67 @@ impl Hub {
         out
     }
 
+    /// Every configured peer, linked or not.
+    pub fn report(&self) -> Vec<PeerReport> {
+        let peers = self.0.config.lock().unwrap().peers.clone();
+        let state = self.0.state.lock().unwrap();
+        peers
+            .into_iter()
+            .map(|p| {
+                let live = state.links.get(&p.name);
+                let held = state.held.get(&p.name);
+                let (state, servers, ghosts) = match (live, held) {
+                    _ if state.suspended.contains(&p.name) => (PeerState::Suspended, 0, 0),
+                    (Some(l), _) => (
+                        l.peer
+                            .as_ref()
+                            .map_or(PeerState::Linking, |g| PeerState::Linked(g.id)),
+                        l.servers.len(),
+                        l.ghosts.len(),
+                    ),
+                    (None, Some(h)) => {
+                        (PeerState::Held(h.peer.id), h.servers.len(), h.ghosts.len())
+                    }
+                    (None, None) => (PeerState::Down, 0, 0),
+                };
+                PeerReport {
+                    name: p.name,
+                    dials: p.dial.is_some(),
+                    state,
+                    servers,
+                    ghosts,
+                }
+            })
+            .collect()
+    }
+
+    /// The peers the operator has paused, as the state file now lists
+    /// them. A link with one newly paused is closed with `Suspended`, and
+    /// what it showed goes at once rather than after the grace: a pause is
+    /// usually for an incident. A dialer resumes for one no longer paused.
+    pub fn suspend(&self, peers: std::collections::HashSet<String>) {
+        let mut state = self.0.state.lock().unwrap();
+        let resumed: Vec<String> = state.suspended.difference(&peers).cloned().collect();
+        for name in &peers {
+            if let Some(close) = state.links.get_mut(name).and_then(|l| l.close.take()) {
+                let _ = close.send(Reason::Suspended);
+            }
+        }
+        let gone = forget_held(&mut state, peers.iter());
+        state.suspended = peers;
+        drop(state);
+        self.part(gone);
+        for name in resumed {
+            if self.entry(&name).is_some_and(|e| e.dial.is_some()) {
+                self.spawn_dialer(name);
+            }
+        }
+    }
+
+    pub(crate) fn suspended(&self, peer: &str) -> bool {
+        self.0.state.lock().unwrap().suspended.contains(peer)
+    }
+
     pub(crate) fn hello(&self, features: u32) -> Hello {
         let config = self.0.config.lock().unwrap();
         Hello {
@@ -420,13 +498,19 @@ impl Hub {
         let mut state = self.0.state.lock().unwrap();
         state.generation += 1;
         let generation = state.generation;
-        // Told to close as soon as it starts, when this server is stopping.
-        let close = match state.shutting_down {
-            true => {
-                let _ = tx.send(Reason::Shutdown);
+        // Told to close as soon as it starts, when this server is stopping
+        // or the peer is suspended.
+        let refusal = match () {
+            _ if state.shutting_down => Some(Reason::Shutdown),
+            _ if state.suspended.contains(peer) => Some(Reason::Suspended),
+            _ => None,
+        };
+        let close = match refusal {
+            Some(reason) => {
+                let _ = tx.send(reason);
                 None
             }
-            false => Some(tx),
+            None => Some(tx),
         };
         let old = state.links.insert(
             peer.to_owned(),
@@ -1567,6 +1651,22 @@ fn relay(state: &mut State, from: &str, what: Relay) {
     }
 }
 
+/// What `peers`' interrupted links were holding, given up: the other
+/// links hear that the servers behind them went, and the ghosts are
+/// returned to be parted once the lock is let go.
+fn forget_held<'a>(state: &mut State, peers: impl Iterator<Item = &'a String>) -> Vec<Slot> {
+    let mut gone = Vec::new();
+    for name in peers {
+        if let Some(held) = state.held.remove(name) {
+            if held.features & feature::TRANSIT != 0 {
+                servers_gone(state, name, &held.peer, held.servers.keys());
+            }
+            gone.extend(held.ghosts.into_values());
+        }
+    }
+    gone
+}
+
 /// Everything behind a link gone: the peer and the servers learned over
 /// it, each passed on as one Server Gone standing for its users.
 fn servers_gone<'a>(
@@ -2130,6 +2230,17 @@ mod tests {
         assert_eq!(status[0].servers, 0);
         // Its old tag is free again for another server behind it.
         assert_eq!(h.accept_server("a", a, group(3, "two", 1), false), Ok(()));
+    }
+
+    #[test]
+    fn a_suspended_peer_is_closed_as_soon_as_it_links() {
+        let h = hub_with_peer("a");
+        h.suspend(["a".to_string()].into());
+        let (_, mut closed) = h.register("a");
+        assert_eq!(closed.try_recv(), Ok(Reason::Suspended));
+        h.suspend(Default::default());
+        let (_, mut closed) = h.register("a");
+        assert!(closed.try_recv().is_err());
     }
 
     fn hub_with_peer(name: &str) -> Hub {

@@ -74,6 +74,11 @@ async fn dial(hub: &Hub, peer: &str) -> bool {
             info!(%peer, "no longer configured; not dialing");
             return true;
         };
+        // Resuming it starts a dialer again.
+        if hub.suspended(peer) {
+            info!(%peer, "suspended; not dialing");
+            return false;
+        }
         let next = dial_once(hub, &entry, &mut linked).await;
         if matches!(next, Next::Stop) {
             warn!(peer = %entry.name, "not redialing without an operator");

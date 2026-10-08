@@ -5,7 +5,8 @@ Nicknames), L1 (links by key mode, Hello, server lists, pings, close,
 reload), L2 (users crossing one link both ways, ghosts on both wires), L3
 (public chat both ways), L4 (private messages and user info), L5
 (moderation both ways), L6 (interruption and its grace period), L7
-(relaying between this server's links) and L8's metrics. The rest is design. It implements fogWraith's
+(relaying between this server's links) and L8's metrics and `hxd link`
+commands. The rest is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -93,7 +94,8 @@ What does see them opts in, through lookups of its own:
 
 Counts stay local: the tracker counts with `snapshot()` (local-only), and
 `census()` and metrics count `users`, as the extension asks of tracker
-listings and the info port. A ghost gauge is separate (L8).
+listings and the info port. Ghosts have a gauge of their own,
+`hxd_ghosts` (`docs/metrics.md`).
 
 **Joins and parts for ghosts are the core's**: attaching a visible ghost
 broadcasts `Event::Joined` to visible local sessions, consuming a seq in
@@ -834,8 +836,11 @@ nothing is said in chat, both the extension's MAYs.
   costs: bans this server placed under its old ID can no longer be
   lifted, so an operator lifts the ones they want lifted first.
 - **The epoch** is random at each start.
-- **Suspensions** persist across restarts, in a state file beside the key,
-  as do trusted addresses (§7.1).
+- **Suspensions** persist across restarts, in a state file beside the key
+  (`link-state.toml`), as trusted addresses (§7.1) will. A suspended
+  peer's link is closed with `Suspended` and what it showed goes at once,
+  without the grace an interruption is given; every link it attempts is
+  closed the same way, and this server does not dial it.
 
 ```toml
 [link]
@@ -865,8 +870,10 @@ ghosts = 1000               # this link's bound
   specifies; a new entry starts dialing.
 - Operator commands are offline processes, as every `hxd` command is:
   `hxd link suspend <name>` and `resume` write the state file, which the
-  server applies on SIGHUP; `hxd link status` reads a status file the
-  server rewrites as links change; `hxd link reset-id` as above.
+  server applies on SIGHUP; `hxd link status` reads `link-status.toml`,
+  which the running server rewrites beside the key as links change and
+  removes when it stops; `hxd link reset-id` as above, refused while that
+  file is fresh, keeping the old key beside the new one, its name ending `.old`.
 
 ## 9. Testing
 
@@ -917,7 +924,7 @@ use: dead code fails `-D warnings`.
 | L5 | Kick, ban and unban on both sides; the requester's ban records; purge of a ghost's lines | `link.rs` |
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
 | L7 | Relaying between this server's own links: servers, users, chat and requests passed on between transit links | `link.rs` |
-| L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge (built; the rest planned) | `link.rs`, `limits.rs`, `metrics.rs` |
+| L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge (the commands, metrics and gauge built; the rest planned) | `link.rs`, `limits.rs`, `metrics.rs` |
 | L9 | User keys, after the end-to-end document | later |
 
 L1 to L3 make a test link with Janus. **L5 is the minimum for a real

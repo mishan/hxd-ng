@@ -275,6 +275,12 @@ enum Command {
     AccountRm {
         login: String,
     },
+    LinkStatus,
+    LinkSuspend {
+        peer: String,
+        suspend: bool,
+    },
+    LinkResetId,
 }
 
 const USAGE: &str = "usage:\n  \
@@ -303,7 +309,10 @@ hxd [--config …] account add <login> [--name N] [--access KEY,… | --like LOG
 (--password-stdin | --password-file F | --no-password)\n  \
 hxd [--config …] account passwd <login> (--password-stdin | --password-file F)\n  \
 hxd [--config …] account access <login> KEY=on|off…\n  \
-hxd [--config …] account rm <login>\n\n\
+hxd [--config …] account rm <login>\n  \
+hxd [--config …] link status\n  \
+hxd [--config …] link suspend|resume <peer>\n  \
+hxd [--config …] link reset-id\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
 `push rekey` replaces the server's VAPID key and drops every registered\n\
@@ -354,7 +363,14 @@ docs/access-bits.md), or from the account --like names; a password\n\
 never goes on the command line. `rm` leaves the account's mail for\n\
 `inbox purge`. A running server applies an edit to whoever is logged\n\
 in as the account on SIGHUP, ending the sessions of one removed; a\n\
-new login sees it at once.";
+new login sees it at once.\n\n\
+`link status` says how each [[link.peer]] stands, as the running server\n\
+last wrote it. `link suspend` pauses a peer's link: on SIGHUP it is\n\
+closed, what it showed goes, and every attempt to link is refused until\n\
+`link resume`; it outlasts a restart. `link reset-id` gives a stopped\n\
+server a new key, and so a new server ID: every peer must then be given\n\
+the new key, and bans this server asked of linked servers can no longer\n\
+be lifted, so lift the ones that should be first.";
 
 fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut config = PathBuf::from("hxd-ng.toml");
@@ -541,7 +557,9 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     if (fingerprint.is_some() || dry_run)
         && matches!(
             words.first(),
-            Some(&"history" | &"media" | &"reports" | &"moderation" | &"ban" | &"account")
+            Some(
+                &"history" | &"media" | &"reports" | &"moderation" | &"ban" | &"account" | &"link"
+            )
         )
     {
         return Err("--fingerprint and --dry-run belong to `inbox purge` and `purge`".to_string());
@@ -713,6 +731,12 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
         ["account", "rm", login] => Command::AccountRm {
             login: login.to_string(),
         },
+        ["link", "status"] => Command::LinkStatus,
+        ["link", verb @ ("suspend" | "resume"), peer] => Command::LinkSuspend {
+            peer: peer.to_string(),
+            suspend: verb == "suspend",
+        },
+        ["link", "reset-id"] => Command::LinkResetId,
         ["inbox", "purge", login] => Command::InboxPurge {
             login: login.to_string(),
             fingerprint,
@@ -896,6 +920,18 @@ async fn main() {
             }
             Command::BanLiftNetwork { id } => {
                 println!("{}", hxd::moderation::ban_lift_network(&config, *id)?);
+                return Ok(());
+            }
+            Command::LinkStatus => {
+                println!("{}", hxd::link::status(&config)?);
+                return Ok(());
+            }
+            Command::LinkSuspend { peer, suspend } => {
+                println!("{}", hxd::link::set_suspended(&config, peer, *suspend)?);
+                return Ok(());
+            }
+            Command::LinkResetId => {
+                println!("{}", hxd::link::reset_id(&config)?);
                 return Ok(());
             }
             Command::AccountList => {
@@ -1220,9 +1256,17 @@ async fn main() {
         // The audit trail's evidence window and closed reports' retention.
         tokio::spawn(hxd::moderation::pruner(ctx.core.clone()));
         let hub = hxd::link::build(&config, ctx.core.clone())?;
-        if let Some(hub) = &hub {
-            hub.start();
-        }
+        let link_status = config.link.as_ref().map(hxd::link::status_path);
+        let status_writer = match (&hub, &link_status) {
+            (Some(hub), Some(path)) => {
+                hub.start();
+                Some(tokio::spawn(hxd::link::write_status(
+                    hub.clone(),
+                    path.clone(),
+                )))
+            }
+            _ => None,
+        };
         #[cfg(unix)]
         tokio::spawn(reload_on_hangup(
             ctx.core.clone(),
@@ -1287,6 +1331,12 @@ async fn main() {
         // its users through the restart (their grace period).
         if let Some(hub) = link_hub {
             hub.shutdown().await;
+        }
+        // So `hxd link status` and `reset-id` know at once it stopped.
+        if let (Some(writer), Some(path)) = (status_writer, link_status) {
+            writer.abort();
+            let _ = writer.await;
+            let _ = std::fs::remove_file(path);
         }
         outcome
     }
