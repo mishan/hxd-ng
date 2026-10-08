@@ -599,16 +599,21 @@ impl Core {
 
     /// A private message from ghost `from` to `to`, a local user a link
     /// showed the ghost's server. Delivered live, as from the ghost: a
-    /// ghost has no mailbox, so nothing waits and nothing is blocked.
+    /// ghost has no mailbox, so nothing waits, and only a block the
+    /// recipient's session holds ([`Core::block_ghost`]) refuses it.
     pub fn ghost_msg(&self, from: Uid, to: Uid, text: String) -> Result<(), PeerRefusal> {
         let limits = self.flood_limits;
         let mut r = self.roster.lock().unwrap();
-        if !r.users.get(&to).is_some_and(exported) {
+        let r = &mut *r;
+        let Some(recipient) = r.users.get(&to).filter(|s| exported(s)) else {
             return Err(PeerRefusal::UnknownUser);
-        }
+        };
         let g = r.ghosts.get_mut(&from).ok_or(PeerRefusal::UnknownUser)?;
         if !g.visible {
             return Err(PeerRefusal::Excluded);
+        }
+        if recipient.blocked_ghosts.contains(&(from, g.key)) {
+            return Err(PeerRefusal::RefusesMessages);
         }
         // A message spends a line of the ghost's chat allowance: local
         // users' limit, which is all the extension asks.
@@ -630,6 +635,32 @@ impl Core {
             },
         );
         Ok(())
+    }
+
+    /// Refuse, or accept again, ghost `ghost`'s private messages to `uid`
+    /// for the rest of the session (`docs/server-link.md` §11). `None`
+    /// when `ghost` names no ghost, for the inbox's own block to answer.
+    pub(crate) fn block_ghost(
+        &self,
+        uid: Uid,
+        ghost: Uid,
+        blocked: bool,
+    ) -> Option<Result<(), crate::chat::ChatError>> {
+        let mut r = self.roster.lock().unwrap();
+        let r = &mut *r;
+        let g = r.ghosts.get(&ghost)?;
+        let Some(sess) = r.users.get_mut(&uid).filter(|_| g.visible) else {
+            return Some(Err(crate::chat::ChatError::NoSuchUser));
+        };
+        let ghosts = &r.ghosts;
+        // Those that have left go, so the list is never longer than the
+        // ghosts there are.
+        sess.blocked_ghosts
+            .retain(|(u, key)| ghosts.get(u).is_some_and(|g| g.key == *key) && *u != ghost);
+        if blocked {
+            sess.blocked_ghosts.push((ghost, g.key));
+        }
+        Some(Ok(()))
     }
 
     /// What a linked server's clients may read about a local user: what

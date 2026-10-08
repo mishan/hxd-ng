@@ -725,6 +725,10 @@ pub(crate) struct UserSession {
     /// Linked servers that kicked this session, by server ID: it is not
     /// shown at any of them for as long as it lasts (server-link.md §7.5).
     pub(crate) excluded_at: Vec<[u8; 8]>,
+    /// Ghosts this session refuses private messages from, by uid and the
+    /// ghost's key so a uid given to another ghost is not refused: a
+    /// ghost has no mailbox for a durable block to name.
+    pub(crate) blocked_ghosts: Vec<(Uid, [u8; 16])>,
     /// Banned, so its leaving crosses links as a ban, not a departure.
     pub(crate) banned: bool,
     /// Account policy: may private messages be stored for this account
@@ -1723,6 +1727,7 @@ impl Core {
                 can_detach: info.can_detach,
                 kicked: false,
                 excluded_at: Vec::new(),
+                blocked_ghosts: Vec::new(),
                 banned: false,
                 has_inbox: info.has_inbox,
                 attach_news: info.attach_news,

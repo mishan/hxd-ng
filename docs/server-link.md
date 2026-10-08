@@ -936,19 +936,22 @@ not link with anyone.
 If it is late, a test link with Janus needs verified TLS, which L8 would
 have to move ahead of L1.
 
-## 11. Open questions
+## 11. Settled questions
 
 - **Blocking a ghost.** The inbox's blocking keys on mailboxes, which a
-  ghost does not have, and the extension refuses acts it does not
-  translate. A local mute of a ghost may be worth having; a block that
-  follows a person needs user keys.
+  ghost does not have. An ng `block` by a ghost's uid refuses its
+  private messages for the rest of the session, as long as the ghost
+  stays, answering its home server `RefusesMessages`; `unblock` lifts
+  it, and `blocks`, which lists mailboxes, does not show it. Like a
+  local block it hides nothing in public chat. A block that follows a
+  person needs user keys (L9).
 - **Detached sessions.** A detached ng session stays on the roster as away
   and stays exported the same way, so a resume inside its grace is
   invisible to the network.
 - **The tunnel.** A peer that can reach hxd-ng only over WebSockets could
   link over `/trtp` if the ng port terminated TLS in process. Left out
   until someone needs it.
-- **Load.** A login storm on one server is a storm of joins on every linked
-  server. The bounds above handle a burst, but `hxd-load` should grow a
-  two-server scenario before linking is on by default
-  (`docs/load-testing.md` §8).
+- **Load.** A login storm on one server is a storm of joins on every
+  linked server. `hxd-load`'s two-server scenarios (`docs/load-testing.md`
+  §8) carry chat, the login storm and fan-out across links, and nothing
+  links without a `[[link.peer]]`, so there is no default to turn on.

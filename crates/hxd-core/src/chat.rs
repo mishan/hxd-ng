@@ -2169,6 +2169,9 @@ impl Core {
     /// block against but no account of its own, and a recipient who just
     /// received a message from one can only point at the roster row.
     pub fn inbox_block_uid(&self, uid: Uid, other: Uid, blocked: bool) -> Result<(), ChatError> {
+        if let Some(done) = self.block_ghost(uid, other, blocked) {
+            return done;
+        }
         let (store, mailbox) = self.inbox_of(uid)?;
         let other = {
             let r = self.roster.lock().unwrap();

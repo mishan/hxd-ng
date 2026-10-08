@@ -378,8 +378,9 @@ Three layers, all `cargo test --workspace`:
   nobody leaving, a server in the middle of three relaying users, chat,
   messages, user info and kicks between its links and nothing over a
   link without transit, `show_tags`, and every
-  transaction in `NAMES_A_USER`, and ng's `msg`, `block` and `kick`,
-  refused for a ghost as for a uid nobody holds),
+  transaction in `NAMES_A_USER` refused for a ghost as for a uid nobody
+  holds, and an ng `block` of a ghost refusing its messages until
+  `unblock`),
   `relay.rs` (a classic server behind `hlrelay`: a client that reaches
   it only over WebSockets logs in, chats with one on the TCP port, and
   downloads over `/htxf`), `slow_consumer.rs` (a room flooded while one
