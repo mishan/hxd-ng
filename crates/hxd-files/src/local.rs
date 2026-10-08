@@ -961,7 +961,8 @@ impl LocalFileSource {
                 .or_else(|| header_time(metadata.modified().ok())),
             // Read with LF line endings, whichever wire wrote them: each
             // wire renders a comment in its own (`TextEncoding::body`).
-            comment: (!hfs.comment.is_empty()).then(|| lf_lines(&text::to_utf8(&hfs.comment))),
+            comment: (!hfs.comment.is_empty())
+                .then(|| lf_lines(&text::mac_roman_to_utf8(&hfs.comment))),
         })
     }
 

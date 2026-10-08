@@ -126,13 +126,14 @@ impl TextEncoding {
         v
     }
 
-    /// Wire bytes → UTF-8. Mac Roman is injective, so legacy-origin text
-    /// round-trips exactly. Bytes that are not UTF-8 from a client that
+    /// Wire bytes → UTF-8. Mac Roman is injective, and read as Mac Roman
+    /// even where the bytes would also be valid UTF-8, so legacy-origin
+    /// text round-trips exactly. Bytes that are not UTF-8 from a client that
     /// said they would be become U+FFFD: the spec's best effort, and never
     /// a reason to drop the transaction.
     pub fn decode(self, bytes: &[u8]) -> String {
         match self {
-            TextEncoding::MacRoman => text::to_utf8(bytes),
+            TextEncoding::MacRoman => text::mac_roman_to_utf8(bytes),
             TextEncoding::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
         }
     }
@@ -144,7 +145,7 @@ impl TextEncoding {
     pub fn decode_capped(self, bytes: &[u8], max: usize) -> String {
         let bytes = &bytes[..bytes.len().min(max)];
         match self {
-            TextEncoding::MacRoman => text::to_utf8(bytes),
+            TextEncoding::MacRoman => text::mac_roman_to_utf8(bytes),
             TextEncoding::Utf8 => {
                 String::from_utf8_lossy(&bytes[..complete_prefix(bytes)]).into_owned()
             }
@@ -158,7 +159,7 @@ impl TextEncoding {
     /// bytes.
     pub fn decode_chars(self, bytes: &[u8], max: usize) -> String {
         match self {
-            TextEncoding::MacRoman => text::to_utf8(&bytes[..bytes.len().min(max)]),
+            TextEncoding::MacRoman => text::mac_roman_to_utf8(&bytes[..bytes.len().min(max)]),
             TextEncoding::Utf8 => String::from_utf8_lossy(bytes).chars().take(max).collect(),
         }
     }
@@ -258,6 +259,21 @@ mod tests {
         assert_eq!(MR.decode(b"caf\x8e"), "caf\u{e9}");
         // Unmappable leaves as `?`.
         assert_eq!(MR.encode("\u{3042}"), b"?");
+    }
+
+    #[test]
+    fn mac_roman_bytes_that_are_also_utf8_are_still_mac_roman() {
+        // "\u{221a}\u{a9}" typed on a classic Mac, and valid UTF-8 for "\u{e9}".
+        let typed = [0xC3, 0xA9];
+        for decoded in [
+            MR.decode(&typed),
+            MR.decode_capped(&typed, 31),
+            MR.decode_chars(&typed, 31),
+        ] {
+            assert_eq!(decoded, "\u{221a}\u{a9}");
+        }
+        let every: Vec<u8> = (0..=255).collect();
+        assert_eq!(MR.encode(&MR.decode(&every)), every);
     }
 
     #[test]
