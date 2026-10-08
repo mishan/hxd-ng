@@ -602,7 +602,9 @@ family document. Each family of §4 adds its own.
   names an existing block by the 52-character fingerprint `blocks`
   reports, and is valid only for `unblock`. A block keyed on a fingerprint
   lists with `fingerprint` present; one keyed on an account lists without
-  it.
+  it. A `uid` naming another server's user (`remote` in its
+  row) refuses that user's private messages for the rest of this
+  session, until it leaves, and is not listed.
 - **`logout`** ends the session at once, with no grace, and the server
   then closes the connection (§5).
 

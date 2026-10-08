@@ -472,6 +472,48 @@ async fn public_chat_crosses_the_link_both_ways_on_both_wires() {
 }
 
 #[tokio::test]
+async fn an_ng_block_of_a_ghost_refuses_its_messages_until_unblocked() {
+    let (a, b, _dirs) = linked("").await;
+    let (mut ann, _) = ng::Client::guest(a.ng, "ann").await.unwrap();
+    let mut bob = legacy::Client::login_at(b.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    let mut watcher = legacy::Client::login_at(a.legacy, &Login::guest("watcher"))
+        .await
+        .unwrap();
+    let bob_here = row(&mut watcher, "bob").await.uid;
+    let ann_there = row(&mut bob, "ann").await.uid;
+    let send = |text: &'static str| {
+        vec![
+            (tag::UID, ann_there.to_be_bytes().to_vec()),
+            (tag::BODY, text.as_bytes().to_vec()),
+        ]
+    };
+
+    ann.request("block", json!({ "uid": bob_here }))
+        .await
+        .unwrap();
+    match bob.call(ClientHdr::Msg.as_u32(), &send("blocked")).await {
+        Err(hxd_testclient::Error::Refused { text, .. }) => {
+            assert_eq!(text, "That user does not accept private messages.")
+        }
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+
+    ann.request("unblock", json!({ "uid": bob_here }))
+        .await
+        .unwrap();
+    bob.call(ClientHdr::Msg.as_u32(), &send("heard"))
+        .await
+        .unwrap();
+    let got = ann
+        .event_where("msg", |d| d["from"]["nick"] == "bob")
+        .await
+        .unwrap();
+    assert_eq!(got.data["text"], "heard");
+}
+
+#[tokio::test]
 async fn private_messages_and_user_info_cross_the_link() {
     let (a, b, _dirs) = linked("").await;
     let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
@@ -1036,25 +1078,6 @@ async fn no_act_on_another_user_reaches_a_ghost() {
             format!("{answer:?}"),
             format!("{absent:?}"),
             "{ty:?}: a ghost refused unlike a user who is not there"
-        );
-    }
-
-    // The same on the ng wire, from an account that may do each.
-    let (mut ngc, _) = ng::Client::account(a.ng, "admin", "pw", "ngc")
-        .await
-        .unwrap();
-    for method in ["block"] {
-        let to = |uid: u16| json!({ "uid": uid });
-        let answer = ngc.request(method, to(ghost)).await;
-        let absent = ngc.request(method, to(nobody)).await;
-        assert!(
-            matches!(&answer, Err(hxd_testclient::Error::Refused { code, .. }) if code != "access_denied"),
-            "{method}: {answer:?}"
-        );
-        assert_eq!(
-            format!("{answer:?}"),
-            format!("{absent:?}"),
-            "{method}: a ghost refused unlike a user who is not there"
         );
     }
 }
