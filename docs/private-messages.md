@@ -394,6 +394,11 @@ server, exactly. Two entry points:
 | Sender blocked by recipient | `ChatError::Blocked`, nothing stored (§9). |
 | Mailbox at its queue cap | `ChatError::MailboxFull`, nothing stored (§9). |
 | No session, no such account *or* no inbox | `ChatError::NoSuchUser` — one code for all of them, deliberately (§11). |
+| A sealed message (`e2e-messages.md`), session `Detached` | Buffer in the outbox, inbox or not. A sealed message is never stored, so there is no durable copy to flush. |
+| A sealed message, no session | `ChatError::NoSuchUser`. |
+
+A sealed message to an attached session is delivered live and, likewise,
+never stored, whatever the account's inbox.
 
 `Idle` sitting with `Active` is not a slip: idle means a connection is
 attached and got the event. It is a *notification* candidate (§10), not a
