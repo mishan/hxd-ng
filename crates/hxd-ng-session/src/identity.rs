@@ -1588,8 +1588,8 @@ mod tests {
             }
             Ok(a)
         }
-        fn logins(&self) -> Vec<String> {
-            self.accounts.lock().unwrap().keys().cloned().collect()
+        fn logins(&self) -> Result<Vec<String>, AuthError> {
+            Ok(self.accounts.lock().unwrap().keys().cloned().collect())
         }
         fn lookup(&self, login: &str) -> Result<Account, AuthError> {
             let login = if login.is_empty() { "guest" } else { login };

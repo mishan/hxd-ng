@@ -8,7 +8,8 @@
 //! is encoded. Nothing queued earlier is still waiting by then: the only
 //! frame before it is the reply to step 1, which the client has read, or
 //! it would not have sent step 2. The reader's slot is filled at the same
-//! moment, and the client sends nothing encoded until it has the reply.
+//! moment, and the client sends nothing encoded until it has the reply;
+//! one that does is dropped as malformed, as on mhxd.
 
 use std::io;
 use std::pin::Pin;
@@ -39,7 +40,7 @@ impl Slots {
             slot: self.recv.clone(),
             plain: Vec::new(),
             at: 0,
-            raw: vec![0; 16 << 10].into_boxed_slice(),
+            raw: Vec::new(),
         }
     }
 
@@ -48,7 +49,9 @@ impl Slots {
             inner,
             slot: self.send.clone(),
             pending: Vec::new(),
-            at: 0,
+            sent: 0,
+            owed: 0,
+            credited: 0,
         }
     }
 }
@@ -57,13 +60,19 @@ fn broken(e: hxhope::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
+/// Past this, a drained plaintext buffer is let go rather than kept: one
+/// read can decompress to megabytes, and a connection should not hold
+/// them for its life.
+const KEEP: usize = 64 << 10;
+
 pub(crate) struct HopeRead<R> {
     inner: R,
     slot: Arc<Mutex<Option<hxhope::Receiver>>>,
     /// Decoded and not yet read.
     plain: Vec<u8>,
     at: usize,
-    raw: Box<[u8]>,
+    /// Allocated with the transport: a connection with none needs none.
+    raw: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for HopeRead<R> {
@@ -79,13 +88,25 @@ impl<R: AsyncRead + Unpin> AsyncRead for HopeRead<R> {
                 buf.put_slice(&this.plain[this.at..this.at + n]);
                 this.at += n;
                 if this.at == this.plain.len() {
-                    this.plain.clear();
+                    if this.plain.capacity() > KEEP {
+                        this.plain = Vec::new();
+                    } else {
+                        this.plain.clear();
+                    }
                     this.at = 0;
                 }
                 return Poll::Ready(Ok(()));
             }
-            if this.slot.lock().unwrap().is_none() {
-                return Pin::new(&mut this.inner).poll_read(cx, buf);
+            {
+                // Held across the read, so a transport cannot be installed
+                // between finding none and reading what it would decode.
+                let slot = this.slot.lock().unwrap();
+                if slot.is_none() {
+                    return Pin::new(&mut this.inner).poll_read(cx, buf);
+                }
+            }
+            if this.raw.is_empty() {
+                this.raw.resize(16 << 10, 0);
             }
             let mut raw = ReadBuf::new(&mut this.raw);
             ready!(Pin::new(&mut this.inner).poll_read(cx, &mut raw))?;
@@ -102,64 +123,83 @@ impl<R: AsyncRead + Unpin> AsyncRead for HopeRead<R> {
 pub(crate) struct HopeWrite<W> {
     inner: W,
     slot: Arc<Mutex<Option<hxhope::Sender>>>,
-    /// Encoded and not yet written.
+    /// The encoding of the plaintext being written, and how much of it
+    /// has gone.
     pending: Vec<u8>,
-    at: usize,
-}
-
-impl<W: AsyncWrite + Unpin> HopeWrite<W> {
-    fn drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while self.at < self.pending.len() {
-            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.pending[self.at..]))?;
-            if n == 0 {
-                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-            }
-            self.at += n;
-        }
-        self.pending.clear();
-        self.at = 0;
-        Poll::Ready(Ok(()))
-    }
+    sent: usize,
+    /// That plaintext's length, and how much of it has been reported
+    /// written: in proportion to what has gone, so a caller timing its
+    /// writes by their progress sees progress as the socket takes the
+    /// encoding.
+    owed: usize,
+    credited: usize,
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for HopeWrite<W> {
-    /// Under a transport, `buf` is encoded whole, as one unit, and taken
-    /// at once: the writer hands over whole transactions, which is what a
-    /// Blowfish transport's rekey markers are placed by.
+    /// Under a transport, a `buf` the writer has not been handed before
+    /// is encoded whole, as one unit: the writer hands over whole
+    /// transactions, several at a time, which is what a Blowfish
+    /// transport's rekey markers are placed by. The calls that follow it,
+    /// with what is left of `buf`, write its encoding.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        ready!(this.drain(cx))?;
-        let encoded = match this.slot.lock().unwrap().as_mut() {
-            None => None,
-            Some(send) => Some(send.encode(buf).map_err(broken)?),
-        };
-        let Some(encoded) = encoded else {
-            return Pin::new(&mut this.inner).poll_write(cx, buf);
-        };
-        this.pending = encoded;
-        // Taken whether or not it all went: what is left goes at the next
-        // write or flush.
-        if let Poll::Ready(Err(e)) = this.drain(cx) {
-            return Poll::Ready(Err(e));
+        if this.owed == 0 {
+            let encoded = match this.slot.lock().unwrap().as_mut() {
+                None => None,
+                Some(send) => Some(send.encode(buf).map_err(broken)?),
+            };
+            let Some(encoded) = encoded else {
+                return Pin::new(&mut this.inner).poll_write(cx, buf);
+            };
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            (this.pending, this.sent, this.owed, this.credited) = (encoded, 0, buf.len(), 0);
         }
-        Poll::Ready(Ok(buf.len()))
+        loop {
+            let target = if this.sent == this.pending.len() {
+                this.owed
+            } else {
+                let share = this.sent as u128 * this.owed as u128 / this.pending.len() as u128;
+                (share as usize).min(this.owed - 1)
+            };
+            if target > this.credited {
+                let n = target - this.credited;
+                this.credited = target;
+                if this.credited == this.owed {
+                    this.pending.clear();
+                    (this.sent, this.owed, this.credited) = (0, 0, 0);
+                }
+                return Poll::Ready(Ok(n));
+            }
+            let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &this.pending[this.sent..]))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            this.sent += n;
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        ready!(this.drain(cx))?;
-        Pin::new(&mut this.inner).poll_flush(cx)
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        ready!(this.drain(cx))?;
-        Pin::new(&mut this.inner).poll_shutdown(cx)
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
+}
+
+/// What a HOPE login agreed, once its password checked.
+pub(crate) struct Agreed {
+    pub(crate) transport: hxhope::Transport,
+    pub(crate) negotiated: hxhope::Negotiated,
+    /// The password was empty, so the keys are anyone's who watched the
+    /// handshake, whatever cipher runs on them.
+    pub(crate) keyless: bool,
 }
 
 /// A HOPE login past step 2: what checks its password, and what the check
@@ -167,7 +207,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for HopeWrite<W> {
 pub(crate) struct Handshake {
     server: hxhope::server::Server,
     step2: hxhope::server::Step2,
-    agreed: Mutex<Option<(hxhope::Transport, hxhope::Negotiated)>>,
+    agreed: Mutex<Option<Agreed>>,
 }
 
 impl Handshake {
@@ -203,15 +243,106 @@ impl Handshake {
             .clone()
             .accept(&self.step2, &enc.encode(stored), random)
         {
-            Ok(agreed) => {
-                *self.agreed.lock().unwrap() = Some(agreed);
+            Ok((transport, negotiated)) => {
+                *self.agreed.lock().unwrap() = Some(Agreed {
+                    transport,
+                    negotiated,
+                    keyless: stored.is_empty(),
+                });
                 true
             }
             Err(_) => false,
         }
     }
 
-    pub(crate) fn agreed(&self) -> Option<(hxhope::Transport, hxhope::Negotiated)> {
+    pub(crate) fn agreed(&self) -> Option<Agreed> {
         self.agreed.lock().unwrap().take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Both ends' transports, from a Blowfish HOPE login run between
+    /// hxhope's client and server.
+    fn transports() -> (hxhope::Transport, hxhope::Transport) {
+        use hxhope::{client, server, Cipher, Mac};
+        let offer = client::Offer {
+            ciphers: vec![Cipher::Blowfish],
+            ..client::Offer::new(*b"TEST")
+        };
+        let policy = server::Policy {
+            macs: Mac::ALL.to_vec(),
+            ciphers: vec![Cipher::Blowfish],
+            compressions: vec![],
+            require_cipher: true,
+        };
+        let who = client::Login {
+            login: b"",
+            password: b"pw",
+            name: b"",
+            icon: 0,
+            version: 0,
+            caps: 0,
+        };
+        let step1 = client::step1(&offer, 1).unwrap();
+        let (srv, reply) = server::answer(&policy, &step1, [3; 64], 1).unwrap();
+        let est = client::step2(&offer, &reply, &who, 2, Box::new(|_: &mut [u8]| {})).unwrap();
+        let step2 = srv.step2(&est.step2).unwrap();
+        let (server, _) = srv
+            .accept(&step2, b"pw", Box::new(|_: &mut [u8]| {}))
+            .unwrap();
+        (est.transport, server)
+    }
+
+    fn frames(n: u32) -> Vec<u8> {
+        (0..n)
+            .flat_map(|i| crate::frame::pack_frame(105, i, 0, &[(101, vec![i as u8; 900])]))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_write_under_a_transport_reports_progress_as_its_encoding_goes() {
+        let (mut client, server) = transports();
+        let slots = Slots::default();
+        let (near, mut far) = tokio::io::duplex(1024);
+        let mut wr = slots.writer(near);
+        slots.install(server);
+        let sent = frames(40);
+        // The socket takes a kilobyte at a time, so the first write is
+        // reported short, as a plain socket's would be.
+        let first = wr.write(&sent).await.unwrap();
+        assert!(first > 0 && first < sent.len(), "{first}");
+        let reader = tokio::spawn(async move {
+            let mut wire = Vec::new();
+            far.read_to_end(&mut wire).await.unwrap();
+            wire
+        });
+        wr.write_all(&sent[first..]).await.unwrap();
+        wr.shutdown().await.unwrap();
+        drop(wr);
+        let mut got = Vec::new();
+        client.decode(&reader.await.unwrap(), &mut got).unwrap();
+        assert_eq!(got, sent);
+    }
+
+    #[tokio::test]
+    async fn reads_pass_through_until_a_transport_is_installed() {
+        let (mut client, server) = transports();
+        let slots = Slots::default();
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let mut rd = slots.reader(near);
+        far.write_all(b"plain").await.unwrap();
+        let mut got = [0; 5];
+        rd.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"plain");
+        slots.install(server);
+        let sent = frames(3);
+        far.write_all(&client.encode(&sent).unwrap()).await.unwrap();
+        let mut got = vec![0; sent.len()];
+        rd.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, sent);
     }
 }

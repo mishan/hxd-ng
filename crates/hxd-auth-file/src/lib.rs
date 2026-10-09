@@ -516,8 +516,12 @@ impl AuthBackend for FileAuth {
         Ok(file.into_account(login))
     }
 
-    fn logins(&self) -> Vec<String> {
-        FileAuth::logins(self)
+    fn logins(&self) -> Result<Vec<String>, AuthError> {
+        Ok(self
+            .entries()?
+            .into_iter()
+            .map(|(login, _)| login.to_ascii_lowercase())
+            .collect())
     }
 
     fn lookup(&self, login: &str) -> Result<Account, AuthError> {

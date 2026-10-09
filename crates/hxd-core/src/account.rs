@@ -241,7 +241,7 @@ pub trait AuthBackend: Send + Sync + 'static {
 
     /// Every login an account exists for: what HOPE, which names its login
     /// only as a MAC, has to try each of.
-    fn logins(&self) -> Vec<String>;
+    fn logins(&self) -> Result<Vec<String>, AuthError>;
 
     /// Load an account without a proof. For the identity paths, where
     /// possession of the key stood in for the password; callers must

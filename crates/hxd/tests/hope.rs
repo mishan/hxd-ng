@@ -120,6 +120,25 @@ async fn a_hope_login_runs_through_what_it_agrees() {
         .unwrap()
         .clone();
     assert_eq!(alice["transport"], "encrypted");
+
+    // The guest's empty password makes keys anyone who watched the
+    // handshake has: a cipher on them is not encryption.
+    let (_guest, _) = hope(
+        s.legacy,
+        &offer(&[Cipher::Blowfish], &[]),
+        &Login::guest("visitor"),
+    )
+    .await
+    .unwrap();
+    let (_ngc, hello) = ng::Client::guest(s.ng, "ngc2").await.unwrap();
+    let guest = hello["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["nick"] == "visitor")
+        .unwrap()
+        .clone();
+    assert_eq!(guest["transport"], "cleartext");
 }
 
 #[tokio::test]
@@ -167,6 +186,8 @@ async fn wrong_hope_passwords_count_as_any_others_do() {
         }
         other => panic!("{:?}", other.map(|_| ())),
     }
+    // The guest is no guess, by HOPE as by the plain login.
+    hope(s.legacy, &o, &Login::guest("g")).await.unwrap();
 }
 
 #[tokio::test]

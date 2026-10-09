@@ -503,6 +503,10 @@ pub(crate) struct Backlog {
     pub(crate) lagged: Notify,
     /// Tells the writer to stop, whatever it is in the middle of.
     pub(crate) stop: Notify,
+    /// What was queued could not be put on the wire at all: a HOPE
+    /// transport refused to encode it. Set with `lagging`, to end the
+    /// session under its own reason.
+    unsendable: AtomicBool,
     /// Frames and bytes queued since the write-queue gauges last heard:
     /// the gauges are shared by every connection, and told once a write,
     /// or once so much is queued, rather than once a frame, as a fan-out
@@ -517,6 +521,7 @@ impl Backlog {
             lagging: AtomicBool::new(false),
             lagged: Notify::new(),
             stop: Notify::new(),
+            unsendable: AtomicBool::new(false),
             unpublished: (AtomicI64::new(0), AtomicI64::new(0)),
         }
     }
@@ -572,6 +577,9 @@ enum WriteFailed {
     Stalled,
     /// The socket is gone.
     Closed,
+    /// The socket is there, and what was written cannot go on it: a HOPE
+    /// Blowfish transport takes no transaction over a megabyte.
+    Unsendable,
 }
 
 /// `write_all` and `flush`, each step bounded by [`WRITE_STALL`] of no
@@ -584,6 +592,9 @@ async fn write_stalling<W: AsyncWrite + Unpin>(
     while !bytes.is_empty() {
         match timeout(WRITE_STALL, wr.write(bytes)).await {
             Err(_) => return Err(WriteFailed::Stalled),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(WriteFailed::Unsendable)
+            }
             Ok(Ok(0)) | Ok(Err(_)) => return Err(WriteFailed::Closed),
             Ok(Ok(n)) => bytes = &bytes[n..],
         }
@@ -746,6 +757,12 @@ pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
                 break;
             }
             Err(WriteFailed::Closed) => break, // The reader sees the dead socket.
+            // The reader does not: the session is ended from here.
+            Err(WriteFailed::Unsendable) => {
+                backlog.unsendable.store(true, Ordering::Release);
+                backlog.lag();
+                break;
+            }
         }
     }
     // What was queued and will now never be written leaves the gauges
@@ -2116,8 +2133,10 @@ async fn login_phase(
         // Refused on an encrypted transport, the TLS port's included: the
         // same protection twice buys nothing, and GtkHx refuses the
         // combination from its side too.
+        // And on a tunnel with an identity, which can admit a login whose
+        // password was never checked, and so agreed no keys.
         let policy = match ctx.cfg.hope.as_ref() {
-            Some(policy) if !transport.encrypted => policy,
+            Some(policy) if !transport.encrypted && transport.identity.is_none() => policy,
             _ => {
                 reply_error(tx, f.trans, "Secure login (HOPE) is not offered here.");
                 return None;
@@ -2225,16 +2244,26 @@ async fn login_phase(
             );
             return (verdict, None);
         };
+        let logins = match auth.logins() {
+            Ok(logins) => logins,
+            Err(e) => return (Err(LoginRefused::Auth(e)), None),
+        };
         // A login no account has is a guess at the address like any
-        // other, under a name no account can have.
-        let login = h.resolve(&auth.logins(), enc);
+        // other, under a name no account can have. The guest's is no
+        // guess, as on the plain login, which sends it no password.
+        let login = h.resolve(&logins, enc);
+        let guess: &[u8] = if login.as_deref() == Some("") {
+            &[]
+        } else {
+            &password
+        };
         let check = |stored: &str| h.check(stored, enc);
         let verdict = reconcile_login(
             &*auth,
             &core,
             addr,
             login.as_deref().unwrap_or(UNKNOWN_HOPE_LOGIN),
-            &password,
+            guess,
             Some(&check),
             identity_fp,
             policy,
@@ -2248,11 +2277,12 @@ async fn login_phase(
     // a refusal after the password included; a login admitted without
     // its password checked agreed none, and cannot go on.
     let transport = match (&verdict, hope) {
-        (_, Some((agreed, negotiated))) => {
+        (_, Some(agreed)) => {
+            let negotiated = agreed.negotiated;
             info!(cipher = ?negotiated.cipher, compression = ?negotiated.compression, "HOPE login");
-            slots.install(agreed);
+            slots.install(agreed.transport);
             Transport {
-                encrypted: transport.encrypted || negotiated.cipher.is_some(),
+                encrypted: transport.encrypted || (negotiated.cipher.is_some() && !agreed.keyless),
                 ..transport
             }
         }
@@ -3058,6 +3088,10 @@ async fn session_loop(
                 None => return None, // Reader exited: EOF, error, or bad frame.
             },
             _ = tx.backlog.lagged.notified() => {
+                if tx.backlog.unsendable.load(Ordering::Acquire) {
+                    info!(uid = sess.uid, "a reply the transport cannot carry; disconnecting");
+                    return Some("unsendable");
+                }
                 info!(uid = sess.uid, "not keeping up; disconnecting");
                 return Some("slow_consumer");
             }

@@ -384,8 +384,9 @@ Three layers, all `cargo test --workspace`:
   `unblock`),
   `hope.rs` (HOPE logins through `hxhope`'s client against a server built
   from a real config: each compression under Blowfish carrying both
-  ways, an ng client seeing the session encrypted, the guest, a UTF-8
-  password, wrong passwords throttled as plain ones are, no cipher in
+  ways, an ng client seeing the session encrypted and a guest's not, the
+  guest, a UTF-8 password, wrong passwords throttled as plain ones are
+  and the guest not, no cipher in
   common refused only under `require_cipher`, and `[hope]` turned off;
   `tls.rs` has HOPE refused on the TLS port),
   `relay.rs` (a classic server behind `hlrelay`: a client that reaches

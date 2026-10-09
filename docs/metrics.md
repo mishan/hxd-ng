@@ -176,7 +176,8 @@ one whose IPv6 /48 holds as many as `connections_per_v6_48` (or, on
 the ng port, `http_connections_per_v6_48`) lets it, `full` for a
 connection past `[limits] ng_connections`, `handshake` and `login` for a connection that never got a
 session, `kicked`, `logout`, `replaced`,
-`send_failed`, `pong_deadline`, the ends of a server link accepted on the
+`send_failed`, `pong_deadline`, `unsendable` for a classic reply its
+HOPE transport cannot carry (`docs/hope.md` §3), the ends of a server link accepted on the
 TLS port (`docs/server-link.md`: `closed_here`, `closed_by_peer`,
 `establish_timeout`, `protocol_error`, `refused`, `version`,
 `too_many_servers`, `unlinked`, `changed`, `dead`), and `slow_consumer` for a client that

@@ -549,7 +549,7 @@ connection to the classic port would carry, in both directions.
   tunnel; the client learns it from the login exchange, as it would on
   TCP. A relay carries HOPE as it carries every other byte: whether it
   is negotiated is the legacy server's answer (*hxd-ng* refuses it inside
-an encrypted tunnel, `hope.md` §1).
+a tunnel with an identity or an encrypted one, `hope.md` §1).
 - The server SHOULD send a WebSocket ping on a quiet socket and MAY drop
   one that has sent nothing for several ping periods (*hxd-ng:* a ping
   every 30 seconds, dropped after three silent periods). Classic sessions

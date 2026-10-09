@@ -13,11 +13,11 @@ HOPE never sends its first step, and sees nothing different.
 
 ## 1. Where it is offered
 
-On the plain classic port, and inside a `/trtp` tunnel the client
-declared cleartext downstream. It is refused, with a reason the client
-shows, on any transport already encrypted: the TLS port and an encrypted
-tunnel. The same protection twice buys nothing, and GtkHx refuses the
-combination from its side too.
+On the plain classic port. It is refused, with a reason the client
+shows, on any transport already encrypted, the TLS port and an encrypted
+tunnel, since the same protection twice buys nothing and GtkHx refuses
+the combination from its side too; and on a tunnel with an identity
+(§2).
 
 ## 2. The login
 
@@ -42,7 +42,10 @@ plain login's are, Text-Encoding included.
   passwords (`Core::login_attempt` before, `Core::login_failed` after),
   the bans, the login permit, the move to the account's count, the
   identity reconciliation of a tunnel. A step 2 naming no account is a
-  wrong guess at its address alone.
+  wrong guess at its address alone; the guest's, as on the plain login,
+  is no guess. HOPE is not offered on a tunnel with an identity at all:
+  the identity can admit a login without its password, and so without
+  the keys it would agree.
 
 From the reply to step 2 on, both directions run through the transport,
 a refusal after the password included. A wrong password agrees nothing,
@@ -54,12 +57,21 @@ The connection's socket halves run through adaptors that pass bytes as
 they are until the password verifies, when the transport's sending half
 and receiving half go into them, before the reply to step 2 is queued.
 Nothing earlier is still waiting to be written: the only frame before it
-is the reply to step 1, which the client has read. The writer hands its
-adaptor whole transactions, which a Blowfish transport's rekey markers
-are placed by.
+is the reply to step 1, which the client has read; a client that sends
+before it has the reply to step 2 is dropped as malformed, as on mhxd.
+The writer hands its adaptor whole transactions, several at a time,
+which a Blowfish transport's rekey markers are placed by, and its
+writes count as progress as the encoding reaches the socket, so a slow
+link is held to the same stall timeout as a plain one. A transaction
+over a megabyte cannot go under Blowfish without compression, which is
+the protocol's limit and GtkHx's: a session sent one ends, as
+`unsendable`.
 
 A session under a cipher is `encrypted` (`hotline-ng-auth.md` §8): an ng
-client sees it so, and the cleartext marker is not set for it.
+client sees it so, and the cleartext marker is not set for it. Not when
+its password is empty, as the guest's usually is: the keys come from the
+password and the session key, which crossed in the clear, so anyone who
+watched the handshake can read the rest.
 
 RC4, which some legacy HOPE clients offer, is not: `hxhope` has no RC4,
 and it would not be counted as encrypted if it did. A client offering
