@@ -1036,9 +1036,14 @@ async fn a_reply_to_ones_own_account_reaches_its_other_session() {
     assert_eq!(legacy.msg(ng_uid, "yo").await.flag, 0);
     let m = ng.msg_event().await;
     assert_eq!(m["from"]["login"], "bob");
+    assert_eq!(
+        m["from"]["uid"], legacy.uid,
+        "named by its sender, not by its reader"
+    );
     ng.request_ok("msg", json!({ "to_login": "bob", "text": "hai" }))
         .await;
-    assert_eq!(legacy.private_message().await.0, "hai");
+    let (text, from, _) = legacy.private_message().await;
+    assert_eq!((text.as_str(), from), ("hai", ng_uid));
     ng.request_ok("ping", json!({})).await;
     assert!(
         ng.queued.iter().all(|v| v["ev"] != "msg"),
