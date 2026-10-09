@@ -410,6 +410,10 @@ fn error_reply(id: u64, error: FileError) -> String {
         FileError::TooDeep => ("too_deep", "Folders cannot be nested that deeply."),
         FileError::HoldsDropBox => ("access_denied", "That folder holds a drop box."),
         FileError::Busy => ("busy", "The file service is busy."),
+        FileError::TooManyTransfers => (
+            "busy",
+            "You are already transferring as many files as you may at once.",
+        ),
         FileError::Unavailable(_) => ("not_available", "The file service is unavailable."),
     };
     crate::proto::reply_err(id, code, message)

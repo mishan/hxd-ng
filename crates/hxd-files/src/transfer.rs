@@ -35,6 +35,8 @@ pub struct LegacyTransfer {
     pub type_code: [u8; 4],
     pub creator: [u8; 4],
     pub wire_comment: Vec<u8>,
+    /// Whose transfer limits it counts against (`Core::transfer_person`).
+    pub person: String,
 }
 
 pub struct UploadTransfer {
@@ -60,13 +62,15 @@ pub struct UploadTransfer {
     /// comment is stored as Mac Roman whichever wire it came from, since
     /// that is what the sidecar holds and what every reader decodes.
     pub comment_utf8: bool,
+    /// As for [`LegacyTransfer::person`].
+    pub person: String,
 }
 
 pub async fn prepare_legacy(
     registry: &TransferRegistry,
     source: Arc<dyn FileSource>,
     request: LegacyTransfer,
-) -> Result<(u32, u64), FileError> {
+) -> Result<(u32, u64, u16), FileError> {
     let info = source.info(&request.path).await?;
     let encoded = ffo::encode(
         &ffo::Metadata {
@@ -91,19 +95,22 @@ pub async fn prepare_legacy(
         _ => FileError::Unavailable(format!("FILP metadata: {e}")),
     })?;
     let size = encoded.transfer_len;
-    let reference = registry.issue(PreparedTransfer::Download(PreparedDownload {
-        principal: request.principal,
-        account: request.account,
-        peer: request.peer,
-        hope: request.hope,
-        path: request.path,
-        source,
-        offset: request.offset,
-        resource_offset: request.resource_offset,
-        large: request.large,
-        encoded,
-    }))?;
-    Ok((reference, size))
+    let (reference, queue) = registry.issue_as(
+        PreparedTransfer::Download(PreparedDownload {
+            principal: request.principal,
+            account: request.account,
+            peer: request.peer,
+            hope: request.hope,
+            path: request.path,
+            source,
+            offset: request.offset,
+            resource_offset: request.resource_offset,
+            large: request.large,
+            encoded,
+        }),
+        request.person,
+    )?;
+    Ok((reference, size, queue))
 }
 
 pub struct FolderTransfer {
@@ -115,6 +122,8 @@ pub struct FolderTransfer {
     pub hope: Option<crate::SealKeys>,
     pub large: bool,
     pub items: Vec<FolderItem>,
+    /// As for [`LegacyTransfer::person`].
+    pub person: String,
 }
 
 /// Issues a folder download: its reference, and the size its files'
@@ -123,7 +132,7 @@ pub fn prepare_folder(
     registry: &TransferRegistry,
     source: Arc<dyn FileSource>,
     request: FolderTransfer,
-) -> Result<(u32, u64), FileError> {
+) -> Result<(u32, u64, u16), FileError> {
     let mut size = 0u64;
     let mut fits = true;
     for item in &request.items {
@@ -140,17 +149,20 @@ pub fn prepare_folder(
             size = size.checked_add(len).ok_or(FileError::TooLarge)?;
         }
     }
-    let reference = registry.issue(PreparedTransfer::Folder(PreparedFolder {
-        principal: request.principal,
-        account: request.account,
-        peer: request.peer,
-        hope: request.hope,
-        source,
-        large: request.large,
-        fits,
-        items: request.items.into(),
-    }))?;
-    Ok((reference, size))
+    let (reference, queue) = registry.issue_as(
+        PreparedTransfer::Folder(PreparedFolder {
+            principal: request.principal,
+            account: request.account,
+            peer: request.peer,
+            hope: request.hope,
+            source,
+            large: request.large,
+            fits,
+            items: request.items.into(),
+        }),
+        request.person,
+    )?;
+    Ok((reference, size, queue))
 }
 
 pub async fn prepare_upload(
@@ -159,19 +171,22 @@ pub async fn prepare_upload(
     request: UploadTransfer,
 ) -> Result<(u32, Option<UploadQuote>), FileError> {
     let quote = check_upload(&source, &request).await?;
-    let reference = registry.issue(PreparedTransfer::Upload(PreparedUpload {
-        principal: request.principal,
-        peer: request.peer,
-        hope: request.hope,
-        path: request.path,
-        source,
-        owner: request.owner,
-        transfer_len: request.transfer_len,
-        large: request.large,
-        quote: quote.clone(),
-        blind: request.blind,
-        comment_utf8: request.comment_utf8,
-    }))?;
+    let (reference, _) = registry.issue_as(
+        PreparedTransfer::Upload(PreparedUpload {
+            principal: request.principal,
+            peer: request.peer,
+            hope: request.hope,
+            path: request.path,
+            source,
+            owner: request.owner,
+            transfer_len: request.transfer_len,
+            large: request.large,
+            quote: quote.clone(),
+            blind: request.blind,
+            comment_utf8: request.comment_utf8,
+        }),
+        request.person,
+    )?;
     Ok((reference, quote))
 }
 
@@ -380,7 +395,16 @@ async fn serve_one<S: HtxfStream>(
     if used != bytes.len() {
         return Err(FileError::InvalidPath);
     }
-    let transfer = registry.claim(&core, &preamble, peer.ip())?;
+    // A download still waiting for its turn holds the connection until
+    // then, as mhxd's does, for a client that did not wait for its
+    // Download Info; the session ending ends the wait.
+    let (transfer, running) = loop {
+        match registry.claim_running(&core, &preamble, peer.ip()) {
+            Err(FileError::Busy) => tokio::time::sleep(Duration::from_secs(1)).await,
+            claimed => break claimed?,
+        }
+    };
+    let cancel = running.as_ref().map(|r| r.cancel());
     // Claimed first, so a presentation under the wrong identity spends the
     // reference as a wrong address does.
     if let Some(identity) = identity {
@@ -402,16 +426,16 @@ async fn serve_one<S: HtxfStream>(
     };
     match transfer {
         PreparedTransfer::Download(transfer) => {
-            let alive = Liveness::new(core, transfer.principal);
+            let alive = Liveness::new(core, transfer.principal).ended_by(cancel);
             serve_download(stream, transfer, &alive, timeouts.idle).await
         }
         PreparedTransfer::Folder(transfer) => {
-            let alive = Liveness::new(core, transfer.principal);
+            let alive = Liveness::new(core, transfer.principal).ended_by(cancel);
             serve_folder(stream, transfer, &alive, timeouts.idle).await
         }
         PreparedTransfer::FolderUpload(transfer) => {
-            let alive = Liveness::new(core, transfer.principal);
-            serve_folder_upload(stream, transfer, &alive, timeouts.idle).await
+            let alive = Liveness::new(core, transfer.principal).ended_by(cancel);
+            serve_folder_upload(stream, transfer, running, &alive, timeouts.idle).await
         }
         // No `Liveness` check: a banner is at most 1 MiB, already in memory,
         // and finishes within `idle`; a kick mid-banner costs nothing worth
@@ -424,11 +448,14 @@ async fn serve_one<S: HtxfStream>(
                 .map_err(|e| FileError::Unavailable(e.to_string()))
         }
         PreparedTransfer::Upload(transfer) => {
-            let alive = Liveness::new(core, transfer.principal);
+            let alive = Liveness::new(core, transfer.principal).ended_by(cancel);
             let timeout = transfer.source.limits().upload_timeout;
-            tokio::time::timeout(timeout, serve_upload(stream, transfer, preamble, &alive))
-                .await
-                .map_err(|_| FileError::Unavailable("upload exceeded its time limit".into()))?
+            tokio::time::timeout(
+                timeout,
+                serve_upload(stream, transfer, preamble, running, &alive),
+            )
+            .await
+            .map_err(|_| FileError::Unavailable("upload exceeded its time limit".into()))?
         }
     }
 }
@@ -591,6 +618,7 @@ async fn serve_folder<S: HtxfStream>(
 async fn serve_folder_upload<S: HtxfStream>(
     mut stream: S,
     transfer: PreparedFolderUpload,
+    running: Option<crate::RunningTransfer>,
     alive: &Liveness,
     idle: Duration,
 ) -> Result<(), FileError> {
@@ -716,6 +744,8 @@ async fn serve_folder_upload<S: HtxfStream>(
             resume_requested: false,
             blind: false,
             comment_utf8: transfer.comment_utf8,
+            // Checked, never issued: the folder's own reference counts.
+            person: String::new(),
         };
         check_upload(source, &request).await?;
         let upload = PreparedUpload {
@@ -746,6 +776,8 @@ async fn serve_folder_upload<S: HtxfStream>(
         .await
         .map_err(|_| FileError::Unavailable("upload exceeded its time limit".into()))??;
     }
+    // As serve_upload gives its place up.
+    drop(running);
     tokio::time::timeout(idle, stream.shutdown())
         .await
         .map_err(|_| stalled())?
@@ -787,14 +819,20 @@ async fn read_exact_idle<S: AsyncRead + Unpin>(
         .map_err(|e| FileError::Unavailable(e.to_string()))
 }
 
+/// `running` is given up once the upload is published and before the
+/// connection closes: a client that sends its next upload when it sees
+/// this one close must not find this one still holding its place.
 async fn serve_upload<S: HtxfStream>(
     mut stream: S,
     transfer: PreparedUpload,
     preamble: htxf::Preamble,
+    running: Option<crate::RunningTransfer>,
     alive: &Liveness,
 ) -> Result<(), FileError> {
     let _open = hxd_core::instrument::transfer_open("upload");
-    receive_upload(&mut stream, &transfer, &preamble, alive).await
+    let received = receive_upload(&mut stream, &transfer, &preamble, alive).await;
+    drop(running);
+    received
 }
 
 /// One uploaded object, received into a partial and published.
@@ -1115,14 +1153,32 @@ fn unavailable(context: &str, error: std::io::Error) -> FileError {
 pub struct Liveness {
     core: Arc<Core>,
     principal: FilePrincipal,
+    killed: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Liveness {
     pub fn new(core: Arc<Core>, principal: FilePrincipal) -> Self {
-        Liveness { core, principal }
+        Liveness {
+            core,
+            principal,
+            killed: None,
+        }
+    }
+
+    /// Also ended when `killed` is set: by Kill Download.
+    pub fn ended_by(mut self, killed: Option<Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        self.killed = killed;
+        self
     }
 
     fn check(&self) -> Result<(), FileError> {
+        if self
+            .killed
+            .as_ref()
+            .is_some_and(|k| k.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(FileError::Unavailable("the transfer was killed".into()));
+        }
         if self.core.session_serial(self.principal.uid) == Some(self.principal.serial) {
             Ok(())
         } else {

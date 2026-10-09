@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use hxd_files::{
     DownloadTokens, EntryLimits, FileService, HttpManifestSource, HtxfTimeouts, LocalFileSource,
-    LocalLimits, ManifestLimits, TransferRegistry,
+    LocalLimits, ManifestLimits, TransferLimits, TransferRegistry,
 };
 
 use crate::Config;
@@ -77,14 +77,23 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
     let mut service = FileService::new(
         source,
         uploads,
-        Arc::new(TransferRegistry::new(
-            Duration::from_secs(section.reference_ttl),
-            EntryLimits {
-                total: section.max_references,
-                per_session: section.max_references_per_session,
-                per_account: section.max_references_per_account,
-            },
-        )),
+        Arc::new(
+            TransferRegistry::new(
+                Duration::from_secs(section.reference_ttl),
+                EntryLimits {
+                    total: section.max_references,
+                    per_session: section.max_references_per_session,
+                    per_account: section.max_references_per_account,
+                },
+            )
+            .with_transfer_limits(TransferLimits {
+                downloads_per_account: section.downloads_per_account,
+                uploads_per_account: section.uploads_per_account,
+                downloads: section.downloads,
+                uploads: section.uploads,
+                queue: section.queue,
+            }),
+        ),
         Arc::new(DownloadTokens::new(
             Duration::from_secs(section.download_ttl),
             EntryLimits {

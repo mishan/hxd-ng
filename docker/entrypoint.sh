@@ -313,6 +313,8 @@ generate() {
         echo 'bind = "0.0.0.0:5501"'
         num HXD_FILES_MAX_FILE_SIZE max_file_size
         num HXD_FILES_MAX_DEPTH max_depth
+        num HXD_FILES_DOWNLOADS_PER_ACCOUNT downloads_per_account
+        num HXD_FILES_UPLOADS_PER_ACCOUNT uploads_per_account
     fi
 
     # A banner file is fetched over HTXF, so it opens 5501 (and 5601 with

@@ -306,6 +306,7 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_SYSTEM_NICK` | `Server` | Its nick. |
 | `HXD_FILES_ROOT` | | A directory in the container to serve as the file area (`/srv/files` in the examples); mount one there. Uploads go into folders named `Uploads` or `Drop Box`. It must be writable by uid 10001 for uploads. |
 | `HXD_FILES_MAX_FILE_SIZE` | 64 GiB | Bytes per file. |
+| `HXD_FILES_DOWNLOADS_PER_ACCOUNT`, `HXD_FILES_UPLOADS_PER_ACCOUNT` | 1, 1 | Transfers one person runs at once, an account or a guest by its address; a download past it waits its turn, an upload past it is refused. 0 for no limit. |
 | `HXD_FILES_MAX_DEPTH` | 32 | The deepest a folder may be made or moved to, from the area's root; at most 64. |
 | `HXD_TLS_CERT` | | Turns on the TLS ports: a PEM certificate chain, leaf first, mounted into the container — Let's Encrypt's `fullchain.pem` where the server has a DNS name ([below](#tls-certificates)). `docker kill -s HUP hxd-ng` re-reads a renewed certificate without dropping anyone. |
 | `HXD_TLS_KEY` | | Its PEM private key, readable by uid 10001. |

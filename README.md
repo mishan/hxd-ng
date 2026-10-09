@@ -637,6 +637,12 @@ max_entries = 100000
 max_folder_items = 100000     # the most one folder transfer holds
 max_depth = 32                # the deepest a folder is made or moved to;
                               # at most 64
+downloads_per_account = 1     # transfers one person runs at once: an
+uploads_per_account = 1       # account, or a guest by its address; 0 for
+                              # no limit
+downloads = 0                 # and the server, 0 for no limit; a download
+uploads = 0                   # past either waits its turn, an upload past
+queue = 0                     # either is refused; downloads that may wait
 max_concurrent = 8
 max_partial_bytes = 68719476736
 max_partials = 1024          # global abandoned/in-progress upload cap
@@ -656,6 +662,15 @@ the client echoes the server's SHA-256 digest for the exact stored offset and
 trailing window. A folder is downloaded whole (Download Folder), with what a
 listing would show of it, and uploaded whole (Upload Folder), each file
 under the same limits as one uploaded alone.
+
+A transfer counts against those limits from when it is granted until it
+ends, or until its reference goes unclaimed. A download past one is
+answered with its place in the queue and started with a Download Info
+(211) when its turn comes, and a client that dials before then is held
+until it. mhxd counts a connection, which anyone can open another of,
+and refuses a download past a user's own limit rather than queue it; Kill Download (214)
+takes back a waiting or running transfer. Downloads over the ng port's
+HTTP are not counted.
 
 An interrupted upload stays unlisted until it completes, where mhxd shows the
 truncated file. A classic client that offers to resume only when it sees the

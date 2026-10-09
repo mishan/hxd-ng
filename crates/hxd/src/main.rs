@@ -1110,6 +1110,11 @@ async fn main() {
             // One pool of transfer connections, whichever port they came in on.
             let slots = hxd_files::HtxfSlots::default();
             let registry = htxf.registry.clone();
+            let core = ctx.core.clone();
+            registry.on_queue(std::sync::Arc::new(move |who, reference, position| {
+                core.transfer_queued(who.uid, who.serial, reference, position)
+            }));
+            tokio::spawn(hxd::transfer_sweeper(registry.clone(), ctx.core.clone()));
             let timeouts = htxf.timeouts;
             tokio::spawn(hxd_files::serve_htxf_with(
                 listener,

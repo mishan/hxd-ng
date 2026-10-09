@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -359,32 +361,250 @@ impl EntryLimits {
     }
 }
 
+/// How many downloads and uploads may run at once (`[files]`), a
+/// person's and the server's; 0 for no limit. A person is an account, or
+/// a guest by its address (`Core::transfer_person`), where mhxd counts a
+/// connection, which anyone can open another of. A transfer counts from
+/// when its reference is issued until it ends, or until the reference
+/// expires unclaimed. A download past a limit waits in a queue of at most
+/// `queue`, where mhxd refuses one past a user's own; an upload past one
+/// is refused, as on mhxd.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferLimits {
+    pub downloads_per_account: usize,
+    pub uploads_per_account: usize,
+    pub downloads: usize,
+    pub uploads: usize,
+    pub queue: usize,
+}
+
+/// Tells a session where its download now stands in the queue: the
+/// principal, the reference and the position, 0 when it may start.
+pub type QueueNotify = Arc<dyn Fn(FilePrincipal, u32, u16) + Send + Sync>;
+
 #[derive(Clone)]
 struct Entry {
     generation: [u8; 16],
     transfer: PreparedTransfer,
     expires: Instant,
+    /// Waiting in the queue, at the position its session was last told.
+    /// A waiting reference does not expire.
+    queued: Option<u16>,
+    /// Whose limits it counts against.
+    person: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Down,
+    Up,
+}
+
+fn direction(transfer: &PreparedTransfer) -> Option<Direction> {
+    match transfer {
+        PreparedTransfer::Download(_) | PreparedTransfer::Folder(_) => Some(Direction::Down),
+        PreparedTransfer::Upload(_) | PreparedTransfer::FolderUpload(_) => Some(Direction::Up),
+        PreparedTransfer::Banner(_) => None,
+    }
+}
+
+struct Running {
+    direction: Direction,
+    principal: FilePrincipal,
+    person: String,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct State {
+    entries: HashMap<u32, Entry>,
+    running: HashMap<u32, Running>,
+    queue: VecDeque<u32>,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    ttl: Duration,
+    limits: TransferLimits,
+    notify: OnceLock<QueueNotify>,
+}
+
+impl Shared {
+    /// What counts against `person`'s and everyone's limit for `dir`:
+    /// references issued and not waiting, and transfers running.
+    fn in_use(state: &State, dir: Direction, person: &str) -> (usize, usize) {
+        let issued = state.entries.values().filter_map(|entry| {
+            let counts = entry.queued.is_none() && direction(&entry.transfer) == Some(dir);
+            counts.then_some(entry.person.as_str())
+        });
+        let running = state
+            .running
+            .values()
+            .filter(|r| r.direction == dir)
+            .map(|r| r.person.as_str());
+        issued.chain(running).fold((0, 0), |(mine, all), owner| {
+            (mine + usize::from(owner == person), all + 1)
+        })
+    }
+
+    fn may_start(&self, state: &State, dir: Direction, person: &str) -> bool {
+        let (per_account, total) = match dir {
+            Direction::Down => (self.limits.downloads_per_account, self.limits.downloads),
+            Direction::Up => (self.limits.uploads_per_account, self.limits.uploads),
+        };
+        let (mine, all) = Self::in_use(state, dir, person);
+        (per_account == 0 || mine < per_account) && (total == 0 || all < total)
+    }
+
+    /// Starts what waits and now may, in the order it came, and renumbers
+    /// the rest. Returns whom to tell.
+    fn promote(&self, state: &mut State, now: Instant) -> Vec<(FilePrincipal, u32, u16)> {
+        let mut told = Vec::new();
+        let mut waiting = VecDeque::new();
+        let mut position = 0u16;
+        for reference in std::mem::take(&mut state.queue) {
+            let Some(entry) = state.entries.get(&reference) else {
+                continue;
+            };
+            let dir = direction(&entry.transfer).expect("only transfers wait");
+            let principal = entry.transfer.principal();
+            let person = entry.person.clone();
+            let start = self.may_start(state, dir, &person);
+            let entry = state.entries.get_mut(&reference).expect("looked up above");
+            if start {
+                entry.queued = None;
+                entry.expires = now + self.ttl;
+                told.push((principal, reference, 0));
+            } else {
+                position = position.saturating_add(1);
+                waiting.push_back(reference);
+                if entry.queued != Some(position) {
+                    entry.queued = Some(position);
+                    told.push((principal, reference, position));
+                }
+            }
+        }
+        state.queue = waiting;
+        told
+    }
+
+    /// Told with the registry locked, so two changes cannot cross on the
+    /// way and leave a session with an older place than its newest. The
+    /// callback takes only the roster's lock, which is never held while
+    /// the registry's is taken.
+    fn tell(&self, told: Vec<(FilePrincipal, u32, u16)>) {
+        if let Some(notify) = self.notify.get() {
+            for (principal, reference, position) in told {
+                notify(principal, reference, position);
+            }
+        }
+    }
+
+    /// Drops what has expired unclaimed, and starts what that made room for.
+    fn expire(&self, state: &mut State, now: Instant) -> Vec<(FilePrincipal, u32, u16)> {
+        let before = state.entries.len();
+        state
+            .entries
+            .retain(|_, entry| entry.queued.is_some() || entry.expires > now);
+        if state.entries.len() == before {
+            return Vec::new();
+        }
+        self.promote(state, now)
+    }
+}
+
+/// A claimed transfer while it runs: it counts against its account's
+/// limit until this drops, and [`TransferRegistry::kill`] ends it through
+/// [`Self::cancel`].
+pub struct RunningTransfer {
+    shared: Arc<Shared>,
+    reference: u32,
+    cancel: Arc<AtomicBool>,
+}
+
+impl RunningTransfer {
+    pub fn cancel(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for RunningTransfer {
+    fn drop(&mut self) {
+        // Run while unwinding too, so a poisoned lock is taken as it is.
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.running.remove(&self.reference);
+        let told = self.shared.promote(&mut state, Instant::now());
+        self.shared.tell(told);
+    }
 }
 
 pub struct TransferRegistry {
-    ttl: Duration,
     limits: EntryLimits,
-    entries: Mutex<HashMap<u32, Entry>>,
+    shared: Arc<Shared>,
 }
 
 impl TransferRegistry {
     pub fn new(ttl: Duration, limits: EntryLimits) -> Self {
         limits.assert_valid();
         TransferRegistry {
-            ttl,
             limits,
-            entries: Mutex::new(HashMap::new()),
+            shared: Arc::new(Shared {
+                state: Mutex::new(State::default()),
+                ttl,
+                limits: TransferLimits::default(),
+                notify: OnceLock::new(),
+            }),
         }
     }
 
+    pub fn with_transfer_limits(mut self, limits: TransferLimits) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("limits are set before the registry is shared")
+            .limits = limits;
+        self
+    }
+
+    /// Who to tell when a download moves in the queue. Set once.
+    pub fn on_queue(&self, notify: QueueNotify) {
+        let _ = self.shared.notify.set(notify);
+    }
+
+    /// Issues a reference counted against its account: a banner, which
+    /// counts against no limit, and the tests.
     pub fn issue(&self, transfer: PreparedTransfer) -> Result<u32, FileError> {
-        let mut entries = self.entries.lock().unwrap();
-        entries.retain(|_, value| value.expires > Instant::now());
+        let person = transfer.account().to_owned();
+        self.issue_as(transfer, person)
+            .map(|(reference, _)| reference)
+    }
+
+    /// Issues a reference counted against `person`'s limits, and says
+    /// where it waits: 0 when it may start now, otherwise its place in the
+    /// queue, which the session is told of as it moves. An upload past a
+    /// limit is refused rather than queued.
+    pub fn issue_as(
+        &self,
+        transfer: PreparedTransfer,
+        person: String,
+    ) -> Result<(u32, u16), FileError> {
+        let now = Instant::now();
+        let mut state = self.shared.state.lock().unwrap();
+        let told = self.shared.expire(&mut state, now);
+        self.shared.tell(told);
+        self.issue_locked(&mut state, transfer, person, now)
+    }
+
+    fn issue_locked(
+        &self,
+        state: &mut State,
+        transfer: PreparedTransfer,
+        person: String,
+        now: Instant,
+    ) -> Result<(u32, u16), FileError> {
+        let entries = &state.entries;
         // A banner is one reference per login, fetched or not, and many
         // guests share one account: counted against the file limits, a
         // burst of logins whose clients never dial the transfer port would
@@ -414,6 +634,20 @@ impl TransferRegistry {
         if !admitted || walking {
             return Err(FileError::Busy);
         }
+        let queued = match direction(&transfer) {
+            Some(dir) if !self.shared.may_start(state, dir, &person) => {
+                if dir == Direction::Up {
+                    return Err(FileError::TooManyTransfers);
+                }
+                let limit = self.shared.limits.queue;
+                if limit != 0 && state.queue.len() >= limit {
+                    return Err(FileError::Busy);
+                }
+                Some(u16::try_from(state.queue.len() + 1).unwrap_or(u16::MAX))
+            }
+            _ => None,
+        };
+        let entries = &mut state.entries;
         for _ in 0..64 {
             let mut bytes = [0; 4];
             getrandom::getrandom(&mut bytes)
@@ -431,10 +665,15 @@ impl TransferRegistry {
                     Entry {
                         generation,
                         transfer,
-                        expires: Instant::now() + self.ttl,
+                        expires: now + self.shared.ttl,
+                        queued,
+                        person,
                     },
                 );
-                return Ok(reference);
+                if queued.is_some() {
+                    state.queue.push_back(reference);
+                }
+                return Ok((reference, queued.unwrap_or(0)));
             }
         }
         Err(FileError::Unavailable(
@@ -446,16 +685,38 @@ impl TransferRegistry {
     ///
     /// A reference is spent by any presentation, the malformed and the
     /// misdirected included: a wrong guess must not leave it for the next.
+    #[cfg(test)]
     pub fn claim(
         &self,
         core: &Core,
         preamble: &htxf::Preamble,
         peer: IpAddr,
     ) -> Result<PreparedTransfer, FileError> {
+        self.claim_running(core, preamble, peer)
+            .map(|(transfer, _)| transfer)
+    }
+
+    /// Claims the reference a transfer connection from `peer` presented,
+    /// and the guard that counts the transfer against its person's limits
+    /// while it runs.
+    ///
+    /// A reference is spent by any presentation, the malformed and the
+    /// misdirected included: a wrong guess must not leave it for the next.
+    /// Except one still waiting, presented by its own client too early:
+    /// that is [`FileError::Busy`], and kept, and the connection waits for
+    /// its turn, as mhxd holds it.
+    pub fn claim_running(
+        &self,
+        core: &Core,
+        preamble: &htxf::Preamble,
+        peer: IpAddr,
+    ) -> Result<(PreparedTransfer, Option<RunningTransfer>), FileError> {
         let entry = self
-            .entries
+            .shared
+            .state
             .lock()
             .unwrap()
+            .entries
             .get(&preamble.reference)
             .cloned()
             .ok_or(FileError::NotFound)?;
@@ -468,15 +729,38 @@ impl TransferRegistry {
             .transfer
             .peer()
             .is_none_or(|expected| expected.to_canonical() == peer.to_canonical());
-        {
-            let mut entries = self.entries.lock().unwrap();
-            match entries.get(&preamble.reference) {
+        if live && from_peer && entry.queued.is_some() {
+            return Err(FileError::Busy);
+        }
+        // Spent, and running from here, in one step: a slot freed in
+        // between would let another start past the limit.
+        let running = {
+            let mut state = self.shared.state.lock().unwrap();
+            match state.entries.get(&preamble.reference) {
                 Some(current) if current.generation == entry.generation => {
-                    entries.remove(&preamble.reference);
+                    state.entries.remove(&preamble.reference);
+                    state.queue.retain(|r| *r != preamble.reference);
                 }
                 _ => return Err(FileError::NotFound),
             }
-        }
+            direction(&entry.transfer).map(|dir| {
+                let cancel = Arc::new(AtomicBool::new(false));
+                state.running.insert(
+                    preamble.reference,
+                    Running {
+                        direction: dir,
+                        principal,
+                        person: entry.person.clone(),
+                        cancel: cancel.clone(),
+                    },
+                );
+                RunningTransfer {
+                    shared: self.shared.clone(),
+                    reference: preamble.reference,
+                    cancel,
+                }
+            })
+        };
         if !live || !from_peer {
             return Err(FileError::NotFound);
         }
@@ -603,7 +887,59 @@ impl TransferRegistry {
             }
             upload.transfer_len = resolved_len;
         }
-        Ok(transfer)
+        Ok((transfer, running))
+    }
+
+    /// Kill Download (214): ends `reference` if it is `principal`'s,
+    /// waiting, issued or running. Whether it was.
+    pub fn kill(&self, principal: FilePrincipal, reference: u32) -> bool {
+        let mut state = self.shared.state.lock().unwrap();
+        if state
+            .entries
+            .get(&reference)
+            .is_some_and(|entry| entry.transfer.principal() == principal)
+        {
+            state.entries.remove(&reference);
+            let told = self.shared.promote(&mut state, Instant::now());
+            self.shared.tell(told);
+            return true;
+        }
+        match state.running.get(&reference) {
+            Some(running) if running.principal == principal => {
+                running.cancel.store(true, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drops what expired unclaimed and what waits for a session that has
+    /// ended, and starts what that made room for. Run every few seconds:
+    /// a waiting download is otherwise only moved on by another's change.
+    pub fn sweep(&self, core: &Core) {
+        let waiting: Vec<(u32, FilePrincipal)> = {
+            let state = self.shared.state.lock().unwrap();
+            state
+                .queue
+                .iter()
+                .filter_map(|r| Some((*r, state.entries.get(r)?.transfer.principal())))
+                .collect()
+        };
+        let gone: Vec<u32> = waiting
+            .into_iter()
+            .filter(|(_, p)| core.session_serial(p.uid) != Some(p.serial))
+            .map(|(r, _)| r)
+            .collect();
+        let now = Instant::now();
+        let mut state = self.shared.state.lock().unwrap();
+        for reference in gone {
+            state.entries.remove(&reference);
+        }
+        state
+            .entries
+            .retain(|_, entry| entry.queued.is_some() || entry.expires > now);
+        let told = self.shared.promote(&mut state, now);
+        self.shared.tell(told);
     }
 }
 
@@ -1263,5 +1599,112 @@ mod tests {
             tokens.issue(fourth, "shared", path, false),
             Err(FileError::Busy)
         ));
+    }
+
+    #[test]
+    fn a_download_past_its_accounts_limit_waits_and_starts_when_one_ends() {
+        let core = Core::new();
+        let alice = attach(&core, "alice");
+        let bob = attach(&core, "bob");
+        let registry = TransferRegistry::new(Duration::from_secs(30), limits(16, 8, 8))
+            .with_transfer_limits(TransferLimits {
+                downloads_per_account: 1,
+                uploads_per_account: 1,
+                queue: 2,
+                ..TransferLimits::default()
+            });
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let heard = told.clone();
+        registry.on_queue(Arc::new(move |_, reference, position| {
+            heard.lock().unwrap().push((reference, position));
+        }));
+
+        let (first, at) = registry
+            .issue_as(prepared(alice, "alice"), "alice".into())
+            .unwrap();
+        assert_eq!(at, 0);
+        let (second, at) = registry
+            .issue_as(prepared(alice, "alice"), "alice".into())
+            .unwrap();
+        assert_eq!(at, 1, "past the account's one");
+        let (_, at) = registry
+            .issue_as(prepared(bob, "bob"), "bob".into())
+            .unwrap();
+        assert_eq!(
+            at, 0,
+            "another account's has room, and does not queue behind"
+        );
+        let (third, _) = registry
+            .issue_as(prepared(alice, "alice"), "alice".into())
+            .unwrap();
+        assert!(
+            matches!(
+                registry.issue_as(prepared(alice, "alice"), "alice".into()),
+                Err(FileError::Busy)
+            ),
+            "the queue is full"
+        );
+
+        // Presented before its turn, a waiting reference is kept, and its
+        // connection waits.
+        assert!(matches!(
+            registry.claim(&core, &handshake(second, 0), HERE),
+            Err(FileError::Busy)
+        ));
+
+        // The running download ends, and the first waiting starts; the one
+        // behind it moves up.
+        let (_, running) = registry
+            .claim_running(&core, &handshake(first, 0), HERE)
+            .unwrap();
+        drop(running);
+        assert_eq!(
+            told.lock().unwrap().drain(..).collect::<Vec<_>>(),
+            [(second, 0), (third, 1)]
+        );
+        registry
+            .claim(&core, &handshake(second, 0), HERE)
+            .expect("its turn");
+    }
+
+    #[test]
+    fn an_upload_past_its_limit_is_refused_and_a_transfer_is_killed_by_its_owner() {
+        let core = Core::new();
+        let alice = attach(&core, "alice");
+        let bob = attach(&core, "bob");
+        let temp = tempfile::tempdir().unwrap();
+        let source =
+            Arc::new(LocalFileSource::open(temp.path(), crate::LocalLimits::default()).unwrap());
+        let registry = TransferRegistry::new(Duration::from_secs(30), limits(16, 8, 8))
+            .with_transfer_limits(TransferLimits {
+                downloads_per_account: 1,
+                uploads_per_account: 1,
+                ..TransferLimits::default()
+            });
+        let upload = || {
+            let mut upload = large_upload(alice, source.clone(), Some(1), None);
+            if let PreparedTransfer::Upload(u) = &mut upload {
+                u.owner = "alice".into();
+            }
+            upload
+        };
+        let first = registry.issue(upload()).unwrap();
+        assert!(matches!(
+            registry.issue(upload()),
+            Err(FileError::TooManyTransfers)
+        ));
+        assert!(registry.kill(alice, first));
+        registry.issue(upload()).expect("killed, its place is free");
+
+        let (download, _) = registry
+            .issue_as(prepared(alice, "alice"), "alice".into())
+            .unwrap();
+        let (_, running) = registry
+            .claim_running(&core, &handshake(download, 0), HERE)
+            .unwrap();
+        let running = running.unwrap();
+        assert!(!registry.kill(bob, download), "only its owner's");
+        assert!(registry.kill(alice, download));
+        assert!(running.cancel().load(Ordering::Relaxed));
     }
 }

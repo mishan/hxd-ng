@@ -473,10 +473,10 @@ async fn a_drop_box_takes_uploads_without_telling_what_it_holds() {
 }
 
 async fn run_service(service: Arc<FileService>, access: &str) -> Running {
-    run_service_with(service, access, Core::new()).await
+    run_service_with(service, access, Arc::new(Core::new())).await
 }
 
-async fn run_service_with(service: Arc<FileService>, access: &str, core: Core) -> Running {
+async fn run_service_with(service: Arc<FileService>, access: &str, core: Arc<Core>) -> Running {
     let temp = tempfile::tempdir().unwrap();
     let accounts = temp.path().join("accounts");
     std::fs::create_dir(&accounts).unwrap();
@@ -510,7 +510,6 @@ async fn run_service_with(service: Arc<FileService>, access: &str, core: Core) -
         )
         .unwrap();
     }
-    let core = Arc::new(core);
     let auth: Arc<dyn hxd_core::AuthBackend> = Arc::new(hxd_auth_file::FileAuth::new(&accounts));
     let legacy_ctx = ServerCtx {
         core: core.clone(),
@@ -630,6 +629,19 @@ impl Legacy {
             .await
             .unwrap();
         self.task(trans).await
+    }
+
+    /// The next frame of type `ty` the server sends unasked.
+    async fn pushed(&mut self, ty: u32) -> Frame {
+        loop {
+            let frame = timeout(Duration::from_secs(5), read_frame(&mut self.stream))
+                .await
+                .unwrap()
+                .unwrap();
+            if frame.ty == ty {
+                return frame;
+            }
+        }
     }
 
     async fn task(&mut self, trans: u32) -> Frame {
@@ -2214,11 +2226,11 @@ async fn folders_made_are_held_to_the_accounts_budget() {
         downloads(),
         IDLE,
     ));
-    let core = Core::new().with_request_limits(hxd_core::RequestLimits {
+    let core = Arc::new(Core::new().with_request_limits(hxd_core::RequestLimits {
         folders: 3,
         folders_per: Duration::from_secs(3600),
         ..hxd_core::RequestLimits::default()
-    });
+    }));
     let server = run_service_with(
         service,
         "upload_files = true\nupload_folders = true\nupload_anywhere = true\n\
@@ -2268,4 +2280,123 @@ async fn folders_made_are_held_to_the_accounts_budget() {
     upload.item(&["a", "f.txt"], Some(b"file")).await;
     upload.finish().await;
     assert_eq!(std::fs::read(tree.join("a/f.txt")).unwrap(), b"file");
+}
+
+#[tokio::test]
+async fn a_download_past_the_accounts_limit_waits_its_turn() {
+    const QUEUE: u32 = 0x00d3;
+    const KILL_DOWNLOAD: u32 = 0x00d6;
+    let temp = tempfile::tempdir().unwrap();
+    for (name, body) in [("a.txt", "first"), ("b.txt", "second"), ("c.txt", "third")] {
+        std::fs::write(temp.path().join(name), body).unwrap();
+    }
+    let source = Arc::new(LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap());
+    let core = Arc::new(Core::new());
+    let registry = TransferRegistry::new(Duration::from_secs(30), LIMITS).with_transfer_limits(
+        hxd_files::TransferLimits {
+            downloads_per_account: 1,
+            ..hxd_files::TransferLimits::default()
+        },
+    );
+    let told = core.clone();
+    registry.on_queue(Arc::new(move |who, reference, position| {
+        told.transfer_queued(who.uid, who.serial, reference, position)
+    }));
+    let service = Arc::new(FileService::new(
+        source.clone(),
+        Some(source),
+        Arc::new(registry),
+        downloads(),
+        IDLE,
+    ));
+    let server = run_service_with(
+        service,
+        "download_files = true\nread_chat = true\nuse_any_name = true\n",
+        core,
+    )
+    .await;
+    let mut classic = Legacy::login(server.legacy, false).await;
+    let get = |name: &str| [(tag::FILE_NAME, name.as_bytes().to_vec())];
+    let queue_of =
+        |frame: &Frame| field(frame, tag::QUEUE).map(|q| u16::from_be_bytes(q.try_into().unwrap()));
+
+    let first = classic.request(FILE_GET, &get("a.txt")).await;
+    assert_eq!(queue_of(&first), None);
+    // Another session of the same person, a guest at the same address,
+    // shares the one download.
+    let mut again = Legacy::login(server.legacy, false).await;
+    let second = again.request(FILE_GET, &get("b.txt")).await;
+    assert_eq!(queue_of(&second), Some(1), "past the person's one");
+
+    // A client that dials before its turn is held until then, not refused.
+    let early = tokio::spawn(transfer(
+        server.htxf,
+        classic_download(reference_of(&second)),
+    ));
+    let bytes = transfer(server.htxf, classic_download(reference_of(&first))).await;
+    assert!(bytes.windows(5).any(|w| w == b"first"));
+    let go = again.pushed(QUEUE).await;
+    assert_eq!(
+        field(&go, tag::HTXF_REF),
+        Some(reference_of(&second).to_be_bytes().to_vec())
+    );
+    assert_eq!(queue_of(&go), Some(0));
+    let bytes = early.await.unwrap();
+    assert!(bytes.windows(6).any(|w| w == b"second"));
+
+    // Kill Download takes a reference back, and its place with it.
+    let third = classic.request(FILE_GET, &get("c.txt")).await;
+    let reference = reference_of(&third).to_be_bytes().to_vec();
+    let killed = classic
+        .request(KILL_DOWNLOAD, &[(tag::HTXF_REF, reference)])
+        .await;
+    assert_eq!(killed.flag & 1, 0);
+    assert!(
+        transfer(server.htxf, classic_download(reference_of(&third)))
+            .await
+            .is_empty()
+    );
+    let fourth = classic.request(FILE_GET, &get("c.txt")).await;
+    assert_eq!(queue_of(&fourth), None, "its place was given back");
+}
+
+#[tokio::test]
+async fn a_finished_upload_gives_its_place_to_the_next() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("Uploads")).unwrap();
+    let source = Arc::new(LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap());
+    let registry = TransferRegistry::new(Duration::from_secs(30), LIMITS).with_transfer_limits(
+        hxd_files::TransferLimits {
+            uploads_per_account: 1,
+            ..hxd_files::TransferLimits::default()
+        },
+    );
+    let service = Arc::new(FileService::new(
+        source.clone(),
+        Some(source),
+        Arc::new(registry),
+        downloads(),
+        IDLE,
+    ));
+    let server = run_service(
+        service,
+        "upload_files = true\nread_chat = true\nuse_any_name = true\n",
+    )
+    .await;
+    let mut classic = Legacy::login(server.legacy, false).await;
+    let object = two_fork_object(b"queued upload");
+    for n in 0..3 {
+        let put = classic
+            .request(
+                FILE_PUT,
+                &[
+                    (tag::FILE_NAME, format!("f{n}").into_bytes()),
+                    (tag::DIR, dir(b"Uploads")),
+                    (tag::HTXF_SIZE, (object.len() as u32).to_be_bytes().to_vec()),
+                ],
+            )
+            .await;
+        assert_eq!(put.flag & 1, 0, "upload {n}");
+        upload(server.htxf, reference_of(&put), object.len(), &object).await;
+    }
 }

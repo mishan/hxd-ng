@@ -10,7 +10,7 @@ pub use manifest::{HttpManifestSource, ManifestLimits};
 pub use registry::{
     DecodeName, DownloadGrant, DownloadTokens, EntryLimits, FolderFile, FolderItem, PreparedBanner,
     PreparedDownload, PreparedFolder, PreparedFolderUpload, PreparedTransfer, PreparedUpload,
-    SealKeys, TransferRegistry, UploadQuote,
+    QueueNotify, RunningTransfer, SealKeys, TransferLimits, TransferRegistry, UploadQuote,
 };
 pub use transfer::{
     prepare_folder, prepare_legacy, prepare_upload, pump, serve_htxf, serve_htxf_with,
