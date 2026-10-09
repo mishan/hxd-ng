@@ -832,7 +832,33 @@ async fn serve_upload<S: HtxfStream>(
     let _open = hxd_core::instrument::transfer_open("upload");
     let received = receive_upload(&mut stream, &transfer, &preamble, alive).await;
     drop(running);
-    received
+    received?;
+    if !transfer.large {
+        drain_marker(&mut stream).await;
+    }
+    stream
+        .shutdown()
+        .await
+        .map_err(|e| FileError::Unavailable(e.to_string()))
+}
+
+/// GtkHx sends an empty resource fork's MACR header past the length it
+/// declared, which counts no fork it does not have. Closed with those bytes
+/// unread, the connection is reset, and the client reports as failed an
+/// upload that arrived; mhxd built with `CONFIG_WINDOS_CLIENT_FIX` reads
+/// them first, and so does this. It comes with the data and the client
+/// half-closes after it, so the wait is short, and a client that sends
+/// none costs no more than that.
+async fn drain_marker<S: AsyncRead + Unpin>(stream: &mut S) {
+    const MARKER_WAIT: Duration = Duration::from_millis(250);
+    let mut marker = [0; ffo::FORK_HEADER_LEN];
+    let mut got = 0;
+    while got < marker.len() {
+        match tokio::time::timeout(MARKER_WAIT, stream.read(&mut marker[got..])).await {
+            Ok(Ok(n)) if n > 0 => got += n,
+            _ => break,
+        }
+    }
 }
 
 /// One uploaded object, received into a partial and published.

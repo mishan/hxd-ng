@@ -2400,3 +2400,47 @@ async fn a_finished_upload_gives_its_place_to_the_next() {
         upload(server.htxf, reference_of(&put), object.len(), &object).await;
     }
 }
+
+#[tokio::test]
+async fn an_upload_with_gtkhxs_trailing_marker_closes_cleanly() {
+    let (server, root, _source) = start_local().await;
+    std::fs::create_dir(root.path().join("Uploads")).unwrap();
+    let mut classic = Legacy::login(server.legacy, false).await;
+    let object = two_fork_object(b"marked");
+    let put = classic
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"marked.txt".to_vec()),
+                (tag::DIR, dir(b"Uploads")),
+                (tag::HTXF_SIZE, (object.len() as u32).to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    // GtkHx declares the object without the empty MACR header it then
+    // sends anyway, and half-closes.
+    let mut stream = TcpStream::connect(server.htxf).await.unwrap();
+    let preamble = htxf::Preamble {
+        reference: reference_of(&put),
+        transfer_len: object.len() as u64,
+        type_code: 0,
+        flags: 0,
+        resume_digest: None,
+    };
+    stream.write_all(&preamble.encode().unwrap()).await.unwrap();
+    stream.write_all(&object).await.unwrap();
+    stream
+        .write_all(b"MACR\0\0\0\0\0\0\0\0\0\0\0\0")
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+    let mut rest = Vec::new();
+    timeout(IDLE, stream.read_to_end(&mut rest))
+        .await
+        .unwrap()
+        .expect("closed, not reset");
+    assert_eq!(
+        std::fs::read(root.path().join("Uploads/marked.txt")).unwrap(),
+        b"marked"
+    );
+}
