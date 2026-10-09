@@ -201,6 +201,10 @@ generate() {
     num HXD_CHALLENGES_PER_MINUTE challenges_per_minute
     num HXD_AVATAR_FETCHES_PER_MINUTE avatar_fetches_per_minute
     echo
+    echo "[hope]"
+    if on HXD_HOPE on; then echo "enabled = true"; else echo "enabled = false"; fi
+    if on HXD_HOPE_REQUIRE_CIPHER off; then echo "require_cipher = true"; fi
+    echo
     echo "[paths]"
     echo "accounts = \"$DATA/accounts\""
     agreement=${HXD_AGREEMENT_FILE:-}

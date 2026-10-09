@@ -153,6 +153,7 @@ async fn start_server_limited(
             // Offered, so a client that asks reads and writes UTF-8; one
             // that does not is Mac Roman, as ever.
             caps: Caps::empty().with(cap::TEXT_ENCODING),
+            hope: None,
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             news: legacy_news,

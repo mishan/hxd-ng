@@ -1578,12 +1578,18 @@ mod tests {
             if !a.has_password && a.identity.fingerprint.is_some() {
                 return Err(AuthError::BadProof);
             }
-            let Proof::Plain(pw) = proof;
-            let want: &[u8] = if a.has_password { b"pw" } else { b"" };
-            if pw != want {
+            let want = if a.has_password { "pw" } else { "" };
+            let ok = match proof {
+                Proof::Plain(pw) => pw == want.as_bytes(),
+                Proof::Keyed(check) => check(want),
+            };
+            if !ok {
                 return Err(AuthError::BadProof);
             }
             Ok(a)
+        }
+        fn logins(&self) -> Vec<String> {
+            self.accounts.lock().unwrap().keys().cloned().collect()
         }
         fn lookup(&self, login: &str) -> Result<Account, AuthError> {
             let login = if login.is_empty() { "guest" } else { login };

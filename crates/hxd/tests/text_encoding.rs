@@ -64,6 +64,7 @@ async fn start_server(dir: &Path, agreement: &str) -> SocketAddr {
             stamp_queued: true,
             // What the binary offers: bit 1 always.
             caps: Caps::empty().with(cap::TEXT_ENCODING),
+            hope: None,
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             news: Default::default(),

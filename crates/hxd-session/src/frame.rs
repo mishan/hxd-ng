@@ -36,6 +36,11 @@ impl Frame {
         self.buf.len()
     }
 
+    /// The frame as it came, header and all.
+    pub fn wire(&self) -> &[u8] {
+        &self.buf
+    }
+
     /// Iterate the data chunks.
     pub fn chunks(&self) -> ChunkIter<'_> {
         ChunkIter::over_message(&self.buf, self.buf.len())

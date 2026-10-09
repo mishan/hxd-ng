@@ -236,6 +236,7 @@ async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool, history: bool) ->
                     base
                 }
             },
+            hope: None,
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             news: Default::default(),

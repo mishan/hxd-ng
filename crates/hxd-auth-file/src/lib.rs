@@ -507,8 +507,17 @@ impl AuthBackend for FileAuth {
                     return Err(AuthError::BadProof);
                 }
             }
+            Proof::Keyed(check) => {
+                if !check(stored) {
+                    return Err(AuthError::BadProof);
+                }
+            }
         }
         Ok(file.into_account(login))
+    }
+
+    fn logins(&self) -> Vec<String> {
+        FileAuth::logins(self)
     }
 
     fn lookup(&self, login: &str) -> Result<Account, AuthError> {

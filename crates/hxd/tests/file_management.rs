@@ -124,6 +124,7 @@ async fn start_with(writable: bool) -> Running {
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
             caps: Caps::empty(),
+            hope: None,
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             stamp_queued: true,

@@ -10,6 +10,7 @@ pub mod encoding;
 mod file_manage;
 mod files;
 pub mod frame;
+mod hope;
 pub mod media;
 pub mod news;
 pub mod peer;

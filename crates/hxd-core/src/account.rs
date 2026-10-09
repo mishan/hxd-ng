@@ -176,12 +176,23 @@ impl Default for LinkAuthority {
 /// The client's proof of identity.
 ///
 /// `Plain` is the classic login (already de-obfuscated from the wire's
-/// XOR-0xff form). HOPE HMAC proofs join as a second variant when secure
-/// login lands — that's why this is an enum and not a bare byte slice.
-#[derive(Debug)]
+/// XOR-0xff form); `Keyed` is HOPE's.
 pub enum Proof<'a> {
     /// The password as typed, raw bytes (clients send Mac Roman).
     Plain(&'a [u8]),
+    /// A check the caller makes of the stored password itself: HOPE's MAC
+    /// of it, which also derives the session's keys from it, so the
+    /// password goes to the check and never back to the caller.
+    Keyed(&'a dyn Fn(&str) -> bool),
+}
+
+impl std::fmt::Debug for Proof<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Proof::Plain(_) => "Plain",
+            Proof::Keyed(_) => "Keyed",
+        })
+    }
 }
 
 /// Why an authentication failed.
@@ -227,6 +238,10 @@ pub trait AuthBackend: Send + Sync + 'static {
     /// The identity paths reach such accounts through
     /// [`AuthBackend::lookup`], having proved the key first.
     fn authenticate(&self, login: &str, proof: Proof<'_>) -> Result<Account, AuthError>;
+
+    /// Every login an account exists for: what HOPE, which names its login
+    /// only as a MAC, has to try each of.
+    fn logins(&self) -> Vec<String>;
 
     /// Load an account without a proof. For the identity paths, where
     /// possession of the key stood in for the password; callers must

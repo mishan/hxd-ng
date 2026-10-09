@@ -251,6 +251,8 @@ impl UserRow {
 /// The sending half of a connection.
 pub struct Sender {
     wr: WriteHalf<Box<dyn Io>>,
+    /// The transport a HOPE login agreed, once it has.
+    hope: Option<hxhope::Sender>,
     trans: u32,
     /// How long one write may take: a server that has stopped reading
     /// must not hold a sender forever.
@@ -268,6 +270,16 @@ impl Sender {
 
     /// Send raw bytes: a malformed frame, a half header.
     pub async fn send_raw(&mut self, bytes: &[u8]) -> Result<()> {
+        let encoded;
+        let bytes = match self.hope.as_mut() {
+            Some(hope) => {
+                encoded = hope
+                    .encode(bytes)
+                    .map_err(|e| Error::Protocol(e.to_string()))?;
+                &encoded[..]
+            }
+            None => bytes,
+        };
         let write = async {
             self.wr.write_all(bytes).await?;
             self.wr.flush().await
@@ -301,6 +313,7 @@ impl Sender {
 /// a read halfway loses nothing and cannot desync the stream.
 pub struct Receiver {
     rd: ReadHalf<Box<dyn Io>>,
+    hope: Option<hxhope::Receiver>,
     buf: Vec<u8>,
     /// Where the unread part of `buf` starts.
     pos: usize,
@@ -349,7 +362,12 @@ impl Receiver {
             if n == 0 {
                 return Err(Error::Closed);
             }
-            self.buf.extend_from_slice(&chunk[..n]);
+            match self.hope.as_mut() {
+                Some(hope) => hope
+                    .decode(&chunk[..n], &mut self.buf)
+                    .map_err(|e| Error::Protocol(e.to_string()))?,
+                None => self.buf.extend_from_slice(&chunk[..n]),
+            }
         }
     }
 
@@ -437,11 +455,13 @@ impl Client {
         Ok(Client {
             tx: Sender {
                 wr,
+                hope: None,
                 trans: 0,
                 timeout: DEFAULT_TIMEOUT,
             },
             rx: Receiver {
                 rd,
+                hope: None,
                 buf: Vec::new(),
                 pos: 0,
                 backlog: VecDeque::new(),
@@ -465,6 +485,68 @@ impl Client {
         let reply = self
             .call(ClientHdr::Login.as_u32(), &login.chunks())
             .await?;
+        self.logged_in(login, reply).await
+    }
+
+    /// Log in by HOPE, offering `offer`: step 1, then step 2 with the
+    /// login and a MAC of the password, from whose reply on everything
+    /// runs through the transport they agree. Returns the login reply and
+    /// what was agreed.
+    pub async fn login_hope(
+        &mut self,
+        offer: &hxhope::client::Offer,
+        login: &Login,
+    ) -> Result<(Frame, hxhope::Negotiated)> {
+        let refused = |e: hxhope::Error| Error::Protocol(e.to_string());
+        self.tx.trans = self.tx.trans.wrapping_add(1);
+        let trans = self.tx.trans;
+        self.tx
+            .send_raw(&hxhope::client::step1(offer, trans).map_err(refused)?)
+            .await?;
+        let answer = self.rx.reply(trans).await?;
+        if answer.is_error() {
+            return Err(Error::Refused {
+                code: String::new(),
+                text: answer.error_text().unwrap_or_default(),
+            });
+        }
+        self.tx.trans = self.tx.trans.wrapping_add(1);
+        let trans = self.tx.trans;
+        let who = hxhope::client::Login {
+            login: login.login.as_bytes(),
+            password: login.password.as_bytes(),
+            name: login.nick.as_bytes(),
+            icon: login.icon,
+            version: login.version,
+            caps: login.caps.unwrap_or(0),
+        };
+        // Where Blowfish's rekey markers go; nothing secret rides on it.
+        let mut x = 0x9e37_79b9u32;
+        let random: hxhope::Random = Box::new(move |b: &mut [u8]| {
+            for byte in b {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                *byte = x as u8;
+            }
+        });
+        let est =
+            hxhope::client::step2(offer, &answer.buf, &who, trans, random).map_err(refused)?;
+        self.tx.send_raw(&est.step2).await?;
+        let (send, recv) = est.transport.split();
+        (self.tx.hope, self.rx.hope) = (Some(send), Some(recv));
+        let reply = self.rx.reply(trans).await?;
+        if reply.is_error() {
+            return Err(Error::Refused {
+                code: String::new(),
+                text: reply.error_text().unwrap_or_default(),
+            });
+        }
+        Ok((self.logged_in(login, reply).await?, est.negotiated))
+    }
+
+    /// What follows a login's reply: the uid, and a 1.5 client's agreement.
+    async fn logged_in(&mut self, login: &Login, reply: Frame) -> Result<Frame> {
         self.uid = reply.uint(tag::UID).map(|u| u as u16);
         if login.version >= 150 {
             let agreement = self.rx.recv_type(push::AGREEMENT).await?;

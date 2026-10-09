@@ -237,6 +237,9 @@ no-version client).
 - HOPE negotiation + ciphers (ChaCha20-Poly1305, Blowfish OFB-64) and zlib
   compression, server side, via `hxcrypto`. Port the rekey-marker behavior
   byte for byte — it's wire-format-critical on this side too.
+  **Partly implemented 2026-10** (`docs/hope.md`): the login and Blowfish,
+  with gzip or LZ4, through hx-libs' `hxhope`; ChaCha20-Poly1305 waits for
+  encrypted file transfers.
 
 **Exit criteria:** a real multi-user chat server you can run for friends,
 administered entirely from GtkHx. This is the dogfooding point.
@@ -377,8 +380,7 @@ fetch a derivative by, and the mhxd importer.
   it; sessions on it are marked encrypted. A CA's certificate
   (Let's Encrypt, documented) or, opt-in, a self-signed one made on
   first start and kept; reloaded on SIGHUP; v3 tracker listings carry the port.
-  HOPE-on-TLS stays refused as redundant when HOPE lands, as the client
-  refuses it.
+  HOPE-on-TLS is refused as redundant, as the client refuses it.
 - **Tracker registration — implemented 2026-09.** Independent UDP heartbeat
   loops for explicitly configured v1 and v3 targets; live user/capability
   metadata, HMAC nonces, acknowledgments and per-target tokens, and v3

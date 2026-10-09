@@ -548,7 +548,8 @@ connection to the classic port would carry, in both directions.
 - A server MAY refuse to negotiate HOPE transport encryption inside the
   tunnel; the client learns it from the login exchange, as it would on
   TCP. A relay carries HOPE as it carries every other byte: whether it
-  is negotiated is the legacy server's answer (*hxd-ng* refuses it).
+  is negotiated is the legacy server's answer (*hxd-ng* refuses it inside
+an encrypted tunnel, `hope.md` §1).
 - The server SHOULD send a WebSocket ping on a quiet socket and MAY drop
   one that has sent nothing for several ping periods (*hxd-ng:* a ping
   every 30 seconds, dropped after three silent periods). Classic sessions
@@ -600,8 +601,8 @@ its client and the server is unencrypted as far as the server knows:
 | Either WebSocket path over WSS, `downstream` `local` or absent | `encrypted` |
 | Either WebSocket path over WSS, `downstream: "cleartext"` | `cleartext` |
 
-*hxd-ng* does not implement HOPE, so every classic TCP session is
-`cleartext`. It marks every WebSocket session by `downstream` alone,
+*hxd-ng* counts a classic TCP session `encrypted` once HOPE has agreed a
+cipher, and `cleartext` otherwise (`hope.md` §3). It marks every WebSocket session by `downstream` alone,
 assuming the TLS proxy `hotline-ng.md` §9 requires; it cannot check
 that one is there.
 

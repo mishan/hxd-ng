@@ -204,6 +204,8 @@ pub struct ServerConfig {
     /// flat category (`docs/news.md` §12). Read only when the core has
     /// news at all.
     pub news: LegacyNews,
+    /// What a HOPE login may agree (`docs/hope.md`); `None` refuses one.
+    pub hope: Option<hxhope::server::Policy>,
 }
 
 /// See [`ServerConfig::trtp_login`].
@@ -228,6 +230,7 @@ impl Default for ServerConfig {
             login_timeout: Duration::from_secs(10),
             ban_time: Duration::from_secs(1800),
             caps: Caps::empty(),
+            hope: None,
             mark_cleartext: false,
             trtp_login: TrtpLogin::Verify,
             stamp_queued: true,
@@ -1692,9 +1695,14 @@ async fn run_connection<S>(
         instrument::disconnect(WIRE, "handshake");
         return;
     }
-    let mut writer = tokio::spawn(writer_task(wr_for_magic, out_rx, tx.backlog.clone()));
+    let slots = crate::hope::Slots::default();
+    let mut writer = tokio::spawn(writer_task(
+        slots.writer(wr_for_magic),
+        out_rx,
+        tx.backlog.clone(),
+    ));
     let (frames_tx, mut frames) = mpsc::channel(32);
-    let mut reader = tokio::spawn(reader_task(rd, frames_tx));
+    let mut reader = tokio::spawn(reader_task(slots.reader(rd), frames_tx));
 
     // --- Login, then the session loop -----------------------------------
     let identified = transport.identity.is_some();
@@ -1707,6 +1715,7 @@ async fn run_connection<S>(
         link,
         &mut place,
         link_port.as_ref(),
+        &slots,
     )
     .await;
     let ended = if let Some(LoginOutcome::Link(grant, acceptor)) = outcome {
@@ -1775,6 +1784,10 @@ const ACCOUNT_FULL: &str =
 /// `[limits] reconnect_seconds` lets it.
 const ACCOUNT_TOO_FAST: &str = "This account is logging in too often. Try again shortly.";
 
+/// What an unresolved HOPE login counts against: a name no account can
+/// have, so its guesses are its address's alone.
+const UNKNOWN_HOPE_LOGIN: &str = "\u{1}hope";
+
 /// Does this login name the guest account? Empty is guest by convention
 /// (`AuthBackend::authenticate`), and so is the name itself.
 fn names_guest(login: &str) -> bool {
@@ -1820,6 +1833,7 @@ fn reconcile_login(
     addr: IpAddr,
     login: &str,
     password: &[u8],
+    keyed: Option<&dyn Fn(&str) -> bool>,
     identity_fp: Option<[u8; 32]>,
     policy: TrtpLogin,
     link: LinkAuthority,
@@ -1859,7 +1873,11 @@ fn reconcile_login(
                 .login_attempt(addr, login, password)
                 .map_err(LoginRefused::Throttled)?,
         };
-        let verdict = auth.authenticate(login, Proof::Plain(password));
+        let proof = match keyed {
+            Some(check) => Proof::Keyed(check),
+            None => Proof::Plain(password),
+        };
+        let verdict = auth.authenticate(login, proof);
         match &verdict {
             // The login goes on to succeed on the identity alone: a
             // login that succeeds is not a failure.
@@ -2022,6 +2040,50 @@ fn reconcile_login(
     }
 }
 
+/// HOPE's step 1 (`step1`) answered, and its step 2 read: the
+/// handshake, and step 2's frame. `None` when the client ended it or the
+/// two sides have nothing in common, which the client is told.
+async fn hope_steps(
+    policy: &hxhope::server::Policy,
+    step1: &Frame,
+    frames: &mut Receiver<Frame>,
+    tx: &Tx,
+    wait: Duration,
+) -> Option<(crate::hope::Handshake, Frame)> {
+    let mut session_key = [0u8; 64];
+    getrandom::getrandom(&mut session_key).expect("the OS CSPRNG");
+    let (server, answer) =
+        match hxhope::server::answer(policy, step1.wire(), session_key, step1.trans) {
+            Ok(answered) => answered,
+            Err(e) => {
+                info!("HOPE refused: {e}");
+                reply_error(tx, step1.trans, "Secure login failed: nothing in common.");
+                return None;
+            }
+        };
+    let answer = read_frame(&mut &answer[..])
+        .await
+        .expect("hxhope packs whole frames");
+    reply(
+        tx,
+        step1.trans,
+        answer.chunks().map(|c| (c.tag, c.data.to_vec())).collect(),
+    );
+    let step2 = match timeout(wait, frames.recv()).await {
+        Ok(Some(f)) => f,
+        _ => return None,
+    };
+    trace_in(&step2);
+    match server.step2(step2.wire()) {
+        Ok(read) => Some((crate::hope::Handshake::new(server, read), step2)),
+        Err(e) => {
+            info!("HOPE refused: {e}");
+            reply_error(tx, step2.trans, "Login failed.");
+            None
+        }
+    }
+}
+
 /// Wait for the LOGIN transaction and run the login flow. `None` = close.
 /// `place` is the connection's place in its address's count, moved to
 /// its account's if the login is a person's.
@@ -2035,6 +2097,7 @@ async fn login_phase(
     link: LinkAuthority,
     place: &mut ConnPermit,
     link_port: Option<&crate::peer::LinkPort>,
+    slots: &crate::hope::Slots,
 ) -> Option<LoginOutcome> {
     let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
         Ok(Some(f)) => f,
@@ -2046,14 +2109,27 @@ async fn login_phase(
         return None;
     }
 
-    let req = parse_login(&f);
+    let mut f = f;
+    let mut req = parse_login(&f);
+    let mut hope = None;
     if req.hope_probe {
-        // HOPE arrives with the secure-login work; refuse it cleanly
-        // rather than desync. When it lands it stays refused on the TLS
-        // port (`transport.encrypted`): the same protection twice buys
-        // nothing, and GtkHx refuses the combination from its side too.
-        reply_error(tx, f.trans, "Secure login (HOPE) is not supported yet.");
-        return None;
+        // Refused on an encrypted transport, the TLS port's included: the
+        // same protection twice buys nothing, and GtkHx refuses the
+        // combination from its side too.
+        let policy = match ctx.cfg.hope.as_ref() {
+            Some(policy) if !transport.encrypted => policy,
+            _ => {
+                reply_error(tx, f.trans, "Secure login (HOPE) is not offered here.");
+                return None;
+            }
+        };
+        let (handshake, step2) = hope_steps(policy, &f, frames, tx, ctx.cfg.login_timeout).await?;
+        // Step 2 is the login the rest of this reads, its login named only
+        // as a MAC, which `Handshake::resolve` finds the account for.
+        req = parse_login(&step2);
+        req.login.clear();
+        f = step2;
+        hope = Some(handshake);
     }
     // The encoding comes from the same frame as the credentials, so it is
     // settled before anything in that frame is read as text. Bit 1 needs
@@ -2133,20 +2209,59 @@ async fn login_phase(
     let identity_fp = transport.identity.as_ref().map(|t| t.fingerprint);
     let policy = ctx.cfg.trtp_login;
     let addr = peer.ip();
-    let verdict = tokio::task::spawn_blocking(instrument::blocking("login", move || {
-        reconcile_login(
+    let hoped = hope.is_some();
+    let (verdict, hope) = tokio::task::spawn_blocking(instrument::blocking("login", move || {
+        let Some(h) = hope else {
+            let verdict = reconcile_login(
+                &*auth,
+                &core,
+                addr,
+                &login_str,
+                &password,
+                None,
+                identity_fp,
+                policy,
+                link,
+            );
+            return (verdict, None);
+        };
+        // A login no account has is a guess at the address like any
+        // other, under a name no account can have.
+        let login = h.resolve(&auth.logins(), enc);
+        let check = |stored: &str| h.check(stored, enc);
+        let verdict = reconcile_login(
             &*auth,
             &core,
             addr,
-            &login_str,
+            login.as_deref().unwrap_or(UNKNOWN_HOPE_LOGIN),
             &password,
+            Some(&check),
             identity_fp,
             policy,
             link,
-        )
+        );
+        (verdict, h.agreed())
     }))
     .await
     .ok()?;
+    // Everything from the reply to step 2 on goes through the transport,
+    // a refusal after the password included; a login admitted without
+    // its password checked agreed none, and cannot go on.
+    let transport = match (&verdict, hope) {
+        (_, Some((agreed, negotiated))) => {
+            info!(cipher = ?negotiated.cipher, compression = ?negotiated.compression, "HOPE login");
+            slots.install(agreed);
+            Transport {
+                encrypted: transport.encrypted || negotiated.cipher.is_some(),
+                ..transport
+            }
+        }
+        (Ok(_), None) if hoped => {
+            reply_error(tx, f.trans, "Login failed.");
+            return None;
+        }
+        _ => transport,
+    };
 
     let account = match verdict {
         Ok(a) => a,

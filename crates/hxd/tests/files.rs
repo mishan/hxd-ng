@@ -518,6 +518,7 @@ async fn run_service(service: Arc<FileService>, access: &str) -> Running {
             caps: Caps::empty()
                 .with(cap::LARGE_FILES)
                 .with(cap::TEXT_ENCODING),
+            hope: None,
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             stamp_queued: true,
