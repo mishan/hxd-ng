@@ -580,9 +580,9 @@ family document. Each family of §4 adds its own.
 
 - **`chat`** needs the send-chat privilege. The text MAY contain line
   breaks and is relayed as one event. `media` is inline-media.md §8.3's.
-- **`nick`** changes this session's nick and icon. A new nick is honored
-  only with the use-any-name privilege and is otherwise ignored, as is an
-  empty one; either way the reply is `{}`.
+- **`nick`** changes this session's nick and icon. A new nick needs the
+  use-any-name privilege; without it the request is `access_denied` and
+  changes nothing, icon included. An empty nick is ignored.
 - **`msg`** needs the send-messages privilege, except to the server's own
   account (system-account.md §3). See §7.1.
 - **`history`** needs the chat-history privilege. It pages public chat by
