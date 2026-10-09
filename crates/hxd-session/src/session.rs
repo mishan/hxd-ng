@@ -70,6 +70,7 @@ mod hdr {
     pub const CHAT_USER_PART: u32 = 0x0000_0076;
     pub const CHAT_SUBJECT: u32 = 0x0000_0077;
     pub const ICON_CHANGE: u32 = 0x0000_0748;
+    pub const DOWNLOAD_INFO: u32 = 0x0000_00d3;
 }
 
 /// The transactions that name another user by uid, which must each fail
@@ -632,6 +633,7 @@ const HANDLED: &[ClientHdr] = &[
     ClientHdr::FilePut,
     ClientHdr::FilePutFolder,
     ClientHdr::GetChatHistory,
+    ClientHdr::KillDownload,
     ClientHdr::Login,
     ClientHdr::Msg,
     ClientHdr::MsgBroadcast,
@@ -2700,6 +2702,21 @@ fn system_msg(tx: &Tx, ctx: &ServerCtx, sess: &Session, text: &str) {
 /// must end (kicked).
 async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) -> bool {
     match ev {
+        // Download Info (211): the client waits for position 0 before it
+        // opens the transfer.
+        Event::TransferQueue {
+            reference,
+            position,
+        } => {
+            push(
+                tx,
+                hdr::DOWNLOAD_INFO,
+                vec![
+                    (tag::HTXF_REF, reference.to_be_bytes().to_vec()),
+                    (tag::QUEUE, position.to_be_bytes().to_vec()),
+                ],
+            );
+        }
         Event::Changed(u) => {
             push(
                 tx,
@@ -3705,6 +3722,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         serial,
                     },
                     account: sess.account.login.clone(),
+                    person: ctx.core.transfer_person(sess.uid).unwrap_or_default(),
                     peer: sess.transfer_addr,
                     hope: sess.transfer_keys.clone(),
                     path,
@@ -3718,7 +3736,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 },
             )
             .await;
-            let (reference, transfer_size) = match prepared {
+            let (reference, transfer_size, queue) = match prepared {
                 Ok(value) => value,
                 Err(error) => {
                     reply_error(tx, f.trans, file_error_text(&error));
@@ -3744,6 +3762,11 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 ));
                 chunks.push((tag::FILESIZE64, info.size.to_be_bytes().to_vec()));
                 chunks.push((tag::OFFSET64, offset.to_be_bytes().to_vec()));
+            }
+            // Waiting: the client opens the transfer when Download Info
+            // says 0 (hxd_core::Event::TransferQueue).
+            if queue != 0 {
+                chunks.push((tag::QUEUE, queue.to_be_bytes().to_vec()));
             }
             reply(tx, f.trans, chunks);
         }
@@ -3852,13 +3875,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         serial,
                     },
                     account: sess.account.login.clone(),
+                    person: ctx.core.transfer_person(sess.uid).unwrap_or_default(),
                     peer: sess.transfer_addr,
                     hope: sess.transfer_keys.clone(),
                     large,
                     items,
                 },
             );
-            let (reference, size) = match prepared {
+            let (reference, size, queue) = match prepared {
                 Ok(value) => value,
                 Err(error) => {
                     reply_error(tx, f.trans, file_error_text(&error));
@@ -3874,6 +3898,9 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             if large {
                 chunks.push((tag::XFERSIZE64, size.to_be_bytes().to_vec()));
                 chunks.push((tag::FOLDER_ITEM_COUNT64, count.to_be_bytes().to_vec()));
+            }
+            if queue != 0 {
+                chunks.push((tag::QUEUE, queue.to_be_bytes().to_vec()));
             }
             reply(tx, f.trans, chunks);
         }
@@ -3956,29 +3983,29 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 return;
             };
             let enc = sess.enc;
-            let issued = service
-                .transfers
-                .issue(hxd_files::PreparedTransfer::FolderUpload(
-                    hxd_files::PreparedFolderUpload {
-                        principal: FilePrincipal {
-                            uid: sess.uid,
-                            serial,
-                        },
-                        peer: sess.transfer_addr,
-                        hope: sess.transfer_keys.clone(),
-                        source: source.clone(),
-                        owner: sess.account.login.clone(),
-                        root: path,
-                        blind,
-                        merge,
-                        sees_drop_boxes: drop_boxes,
-                        comment_utf8: enc == TextEncoding::Utf8,
-                        decode: Arc::new(move |name: &[u8]| enc.decode(name)),
-                        max_items: service.max_folder_items,
+            let person = ctx.core.transfer_person(sess.uid).unwrap_or_default();
+            let issued = service.transfers.issue_as(
+                hxd_files::PreparedTransfer::FolderUpload(hxd_files::PreparedFolderUpload {
+                    principal: FilePrincipal {
+                        uid: sess.uid,
+                        serial,
                     },
-                ));
+                    peer: sess.transfer_addr,
+                    hope: sess.transfer_keys.clone(),
+                    source: source.clone(),
+                    owner: sess.account.login.clone(),
+                    root: path,
+                    blind,
+                    merge,
+                    sees_drop_boxes: drop_boxes,
+                    comment_utf8: enc == TextEncoding::Utf8,
+                    decode: Arc::new(move |name: &[u8]| enc.decode(name)),
+                    max_items: service.max_folder_items,
+                }),
+                person,
+            );
             match issued {
-                Ok(reference) => reply(
+                Ok((reference, _)) => reply(
                     tx,
                     f.trans,
                     vec![(tag::HTXF_REF, reference.to_be_bytes().to_vec())],
@@ -3987,6 +4014,29 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
         }
 
+        t if t == ClientHdr::KillDownload.as_u32() => {
+            let reference = f
+                .chunks()
+                .find(|chunk| chunk.tag == tag::HTXF_REF)
+                .and_then(|chunk| files::wire_uint(chunk.data))
+                .and_then(|r| u32::try_from(r).ok());
+            // Answered alike whether there was one: a cancel that crosses
+            // its transfer's end is no error to show.
+            if let (Some(service), Some(reference), Some(serial)) = (
+                ctx.files.as_ref(),
+                reference,
+                ctx.core.session_serial(sess.uid),
+            ) {
+                service.transfers.kill(
+                    FilePrincipal {
+                        uid: sess.uid,
+                        serial,
+                    },
+                    reference,
+                );
+            }
+            reply(tx, f.trans, vec![]);
+        }
         t if t == ClientHdr::FilePut.as_u32() => {
             if !sess.can(bit::UPLOAD_FILES) {
                 reply_error(tx, f.trans, "You are not allowed to upload files.");
@@ -4129,6 +4179,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     hope: sess.transfer_keys.clone(),
                     path,
                     owner: sess.account.login.clone(),
+                    person: ctx.core.transfer_person(sess.uid).unwrap_or_default(),
                     transfer_len,
                     large,
                     resume_requested,
@@ -5339,6 +5390,9 @@ fn file_error_text(error: &hxd_core::FileError) -> &'static str {
         hxd_core::FileError::TooDeep => "Folders cannot be nested that deeply.",
         hxd_core::FileError::HoldsDropBox => "That folder holds a drop box.",
         hxd_core::FileError::Busy => "The file service is busy.",
+        hxd_core::FileError::TooManyTransfers => {
+            "You are already transferring as many files as you may at once."
+        }
         hxd_core::FileError::Unavailable(_) => "The file service is unavailable.",
     }
 }

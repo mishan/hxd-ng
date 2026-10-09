@@ -391,6 +391,21 @@ pub struct FilesSection {
     /// The deepest a folder may be made or moved to, from the area's root.
     #[serde(default = "default_files_max_depth")]
     pub max_depth: usize,
+    /// Transfers one person may run at once, an account or a guest by its
+    /// address, where mhxd's `individual_downloads` and
+    /// `individual_uploads` count a connection; 0 for no limit.
+    #[serde(default = "default_files_one")]
+    pub downloads_per_account: usize,
+    #[serde(default = "default_files_one")]
+    pub uploads_per_account: usize,
+    /// Transfers the server runs at once, and downloads that may wait for
+    /// one; 0 for no limit.
+    #[serde(default)]
+    pub downloads: usize,
+    #[serde(default)]
+    pub uploads: usize,
+    #[serde(default)]
+    pub queue: usize,
     #[serde(default = "default_files_max_concurrent")]
     pub max_concurrent: usize,
     #[serde(default = "default_files_max_partial_bytes")]
@@ -437,6 +452,10 @@ fn default_files_max_entries() -> usize {
 }
 fn default_files_max_folder_items() -> usize {
     hxd_files::MAX_FOLDER_ITEMS
+}
+
+fn default_files_one() -> usize {
+    1
 }
 
 fn default_files_max_depth() -> usize {
@@ -3554,6 +3573,19 @@ pub async fn device_sweeper(core: Arc<Core>) {
         if gone > 0 {
             tracing::debug!(gone, "push devices expired");
         }
+    }
+}
+
+/// The transfer queue's housekeeping: references that expired unclaimed
+/// and downloads waiting for a session that has ended give their place
+/// up, and what that makes room for starts. Every few seconds, since a
+/// client waits on it.
+pub async fn transfer_sweeper(registry: Arc<hxd_files::TransferRegistry>, core: Arc<Core>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        registry.sweep(&core);
     }
 }
 

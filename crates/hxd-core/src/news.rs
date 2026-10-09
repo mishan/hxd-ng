@@ -2083,7 +2083,22 @@ impl Core {
         if sess.can_spam || sess.info.system {
             return None;
         }
-        Some(match (sess.is_person, sess.identity) {
+        Some(Self::person_key(sess))
+    }
+
+    /// Whose transfers `uid`'s count as (`[files] downloads_per_account`):
+    /// its account's, or a guest's address's, as its posts count. Every
+    /// guest shares one login, so counted by it they would share one
+    /// download.
+    pub fn transfer_person(&self, uid: Uid) -> Option<String> {
+        let r = self.roster.lock().unwrap();
+        r.users
+            .get(&uid)
+            .map(|sess| format!("{:?}", Self::person_key(sess)))
+    }
+
+    fn person_key(sess: &crate::roster::UserSession) -> crate::limits::PostKey {
+        match (sess.is_person, sess.identity) {
             (true, Some(fp)) => crate::limits::PostKey::Account(Some(fp), String::new()),
             (true, None) => crate::limits::PostKey::Account(None, sess.login.clone()),
             // A guest by its address, as its share of the articles is, so
@@ -2092,7 +2107,7 @@ impl Core {
                 Some(addr) => crate::limits::PostKey::Guest(addr),
                 None => crate::limits::PostKey::Session(sess.serial),
             },
-        })
+        }
     }
 
     /// Post an article or a reply, tell every reader their view of that

@@ -286,6 +286,12 @@ pub struct UserDetails {
 /// these to wire pushes; a future frontend encodes them differently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// A download this session asked for has moved in the server's queue:
+    /// `position` 0 means it may start (Hotline.md, Download Info).
+    TransferQueue {
+        reference: u32,
+        position: u16,
+    },
     /// A session became visible. Not delivered to the joiner itself.
     Joined(UserInfo),
     /// A visible session changed nick/icon/status. Delivered to everyone,
@@ -568,6 +574,7 @@ impl Event {
             Event::Changed(..) => "changed",
             Event::Parted(..) => "parted",
             Event::AvatarChanged(..) => "avatar_changed",
+            Event::TransferQueue { .. } => "transfer_queue",
             Event::Chat { .. } => "chat",
             Event::Notice { .. } => "notice",
             Event::ChatSubject { .. } => "chat_subject",
@@ -2103,6 +2110,21 @@ impl Core {
                 addr: s.addr,
                 connected_at: s.connected_at,
             })
+    }
+
+    /// Tell the session `uid`, if it is still the one with `serial`, where
+    /// its download `reference` now stands in the transfer queue.
+    pub fn transfer_queued(&self, uid: Uid, serial: u64, reference: u32, position: u16) {
+        let mut r = self.roster.lock().unwrap();
+        if r.users.get(&uid).is_some_and(|s| s.serial == serial) {
+            r.send_to(
+                uid,
+                Event::TransferQueue {
+                    reference,
+                    position,
+                },
+            );
+        }
     }
 
     /// The session's serial — the anti-uid-recycling token for external

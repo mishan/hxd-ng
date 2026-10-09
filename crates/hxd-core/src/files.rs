@@ -170,6 +170,8 @@ pub enum FileError {
     /// may not view drop boxes.
     HoldsDropBox,
     Busy,
+    /// The account is moving as many files at once as it may.
+    TooManyTransfers,
     Unavailable(String),
 }
 
@@ -189,6 +191,7 @@ impl fmt::Display for FileError {
             FileError::TooDeep => f.write_str("folders nest too deeply"),
             FileError::HoldsDropBox => f.write_str("folder holds a drop box"),
             FileError::Busy => f.write_str("file source is busy"),
+            FileError::TooManyTransfers => f.write_str("too many transfers at once"),
             FileError::Unavailable(reason) => write!(f, "file source unavailable: {reason}"),
         }
     }

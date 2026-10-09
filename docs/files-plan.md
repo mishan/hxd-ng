@@ -335,10 +335,26 @@ them; the item header and actions are `hxfiles_xfer::folder`.
   file is held to `upload_timeout` as one uploaded alone is. An upload
   that fails partway keeps what arrived and its folder, as mhxd's does,
   so finishing it takes the resume option.
-- **F3, the queue and limits.** Concurrent transfers per account,
-  configurable, defaulting to mhxd's one download and one upload; queue
-  positions in the replies and the Download Info (211) push; Kill Download
-  (214) ending the transfer it names, though GtkHx never sends it.
+- **F3, the queue and limits (built).** `[files] downloads_per_account`
+  and `uploads_per_account` (one each) bound a person, keyed as news
+  posts are: an account's sessions together, a guest by its address.
+  mhxd counts a connection, which anyone can open another of, and every
+  guest here shares one login. `downloads`, `uploads` and `queue` bound
+  the server (0, no limit). A transfer counts from when
+  its reference is issued until it ends or the reference expires
+  unclaimed; a banner never counts. A download past a limit is issued a
+  reference that waits, without expiring, at the place the reply's
+  `QUEUE` (116) gives; as places free, waiting downloads start in the
+  order they came, each told with Download Info (211), position 0 when it
+  may start and its new place otherwise, and a client that dials before
+  its turn is held until it, as mhxd holds it. One person at a limit
+  does not hold up another. mhxd refuses a download past a user's own
+  limit; here it waits. An upload past one is refused, as mhxd does.
+  Kill Download (214) takes back a reference the session holds, waiting
+  or issued, or ends a transfer it is running; GtkHx never sends it. A
+  sweep every few seconds drops what expired and what waits for a
+  session that has gone. Downloads over the ng port's HTTP are not
+  counted.
 - **Folder budget and depth (built).** Folders an account makes, by New
   Folder on either wire or in a folder upload, are held to `[limits]
   folders` in `folder_seconds` (500, then one each ten seconds), keyed
@@ -354,6 +370,5 @@ them; the item header and actions are `hxfiles_xfer::folder`.
 
 The following remain separate milestones:
 
-- the transfer queue and per-account limits (F3 above);
 - per-account quotas and background origin prefetching;
 - direct origin URLs in the ng client.

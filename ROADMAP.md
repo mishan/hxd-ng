@@ -265,7 +265,8 @@ background, not a separate implementation contract.
   no-resource MACR marker as mhxd does (Janus's failure to hangs real
   clients), and adding to a folder that is there when the client asks
   to resume.
-- Transfer queueing and per-account limits.
+- Transfer queueing and per-account limits — built (`docs/files-plan.md`,
+  "Folder transfers", F3).
 
 ## Phase 4 — News
 
