@@ -54,6 +54,7 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
                             io_timeout: Duration::from_secs(section.request_timeout),
                             upload_timeout: Duration::from_secs(section.upload_timeout),
                             partial_ttl: Duration::from_secs(section.partial_ttl),
+                            max_depth: section.max_depth,
                         },
                     )
                     .map_err(|error| format!("[files]: {error}"))?,

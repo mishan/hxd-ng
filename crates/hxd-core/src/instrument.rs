@@ -421,7 +421,8 @@ pub fn flood_kick(what: &'static str) {
 
 /// A request answered `rate_limited` on `wire`: `requests` past its
 /// session's request limit, `news_post` past its account's news
-/// posts, `history` and `news_search` past their own.
+/// posts, `folder` past its folders, `history` and `news_search` past
+/// their own.
 pub fn rate_limited(wire: &'static str, reason: &'static str) {
     #[cfg(feature = "metrics")]
     handle!(counter("hxd_rate_limited_total", "wire" => wire, "reason" => reason), |h| {

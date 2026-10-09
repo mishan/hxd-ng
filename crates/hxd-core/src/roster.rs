@@ -1176,6 +1176,8 @@ pub struct Core {
     /// What each account has left of its news posts. Its own lock, taken
     /// with nothing else held.
     pub(crate) post_rates: crate::limits::PostRates,
+    /// What each account has left of the folders it may make, likewise.
+    pub(crate) folder_rates: crate::limits::PostRates,
     /// Every standing ban, for matching without the store
     /// (`crate::ban`).
     pub(crate) bans: std::sync::RwLock<crate::ban::BanMatcher>,

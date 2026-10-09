@@ -2039,10 +2039,14 @@ impl Core {
     /// held to no flood budget.
     pub fn news_post_reserve(&self, uid: Uid) -> Result<(), Duration> {
         match self.post_key(uid) {
-            Some(key) => {
-                self.post_rates
-                    .reserve(key, &self.request_limits, std::time::Instant::now())
-            }
+            Some(key) => self.post_rates.reserve(
+                key,
+                (
+                    self.request_limits.news_posts,
+                    self.request_limits.news_posts_per,
+                ),
+                std::time::Instant::now(),
+            ),
             None => Ok(()),
         }
     }
@@ -2060,13 +2064,20 @@ impl Core {
     /// no such limit and is never refused by it.
     pub fn news_post_counted(&self, uid: Uid) {
         if let Some(key) = self.post_key(uid) {
-            self.post_rates
-                .count(key, &self.request_limits, std::time::Instant::now());
+            self.post_rates.count(
+                key,
+                (
+                    self.request_limits.news_posts,
+                    self.request_limits.news_posts_per,
+                ),
+                std::time::Instant::now(),
+            );
         }
     }
 
-    /// Whose posts `uid`'s count as, or `None` when they count as nobody's.
-    fn post_key(&self, uid: Uid) -> Option<crate::limits::PostKey> {
+    /// Whose posts, or folders, `uid`'s count as, or `None` when they
+    /// count as nobody's.
+    pub(crate) fn post_key(&self, uid: Uid) -> Option<crate::limits::PostKey> {
         let r = self.roster.lock().unwrap();
         let sess = r.users.get(&uid)?;
         if sess.can_spam || sess.info.system {

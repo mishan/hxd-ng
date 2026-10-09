@@ -192,6 +192,8 @@ generate() {
     num HXD_NG_REQUEST_SECONDS ng_request_seconds
     num HXD_NEWS_POSTS news_posts
     num HXD_NEWS_POST_SECONDS news_post_seconds
+    num HXD_FOLDERS folders
+    num HXD_FOLDER_SECONDS folder_seconds
     num HXD_LOGIN_FAILURES login_failures
     num HXD_LOGIN_FAILURES_PER_ADDR login_failures_per_addr
     num HXD_LOGIN_FAILURE_SECONDS login_failure_seconds
@@ -310,6 +312,7 @@ generate() {
         kv root "$HXD_FILES_ROOT"
         echo 'bind = "0.0.0.0:5501"'
         num HXD_FILES_MAX_FILE_SIZE max_file_size
+        num HXD_FILES_MAX_DEPTH max_depth
     fi
 
     # A banner file is fetched over HTXF, so it opens 5501 (and 5601 with

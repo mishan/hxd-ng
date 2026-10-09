@@ -285,6 +285,9 @@ ng_requests = 40             # 0 for no limit, or the request weight one ng
 ng_request_seconds = 2       # session may spend at once, earned back over this
 news_posts = 10              # 0 for no limit, or the news posts one account
 news_post_seconds = 300      # may make at once, earned back over this
+folders = 500                # 0 for no limit, or the folders one account
+folder_seconds = 5000        # may make at once, by New Folder or a folder
+                             # upload, earned back over this
 login_failures = 10          # wrong passwords one address may give for
 login_failure_seconds = 30   # one login, on any wire, then one more each
                              # this often; 0 failures = no limit
@@ -337,7 +340,8 @@ account's news posts are held to `news_posts`, earned back over
 `news_post_seconds`, the same way, and a guest's by its address (an
 IPv6 one's /64), so logging in again does not refill them; a classic
 post counts toward it but is never refused by it, since mhxd would take
-it. `can_spam` exempts
+it. Folders are held to `folders` alike, on both wires and in a folder
+upload, which ends past it and keeps what arrived. `can_spam` exempts
 from these as well. A load test wants `ng_requests` and `news_posts` at
 0 too.
 
@@ -631,6 +635,8 @@ root = "/srv/hxd/files"        # must already exist
 max_file_size = 68719476736   # data and resource forks combined
 max_entries = 100000
 max_folder_items = 100000     # the most one folder transfer holds
+max_depth = 32                # the deepest a folder is made or moved to;
+                              # at most 64
 max_concurrent = 8
 max_partial_bytes = 68719476736
 max_partials = 1024          # global abandoned/in-progress upload cap

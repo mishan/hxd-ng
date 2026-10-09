@@ -5118,6 +5118,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 account: &sess.account,
                 enc: sess.enc,
                 large: sess.has_cap(cap::LARGE_FILES),
+                core: &ctx.core,
+                uid: sess.uid,
             };
             let fields: Vec<_> = f.chunks().map(|c| (c.tag, c.data)).collect();
             match file_manage::transaction(ctx.files.as_deref(), who, t, &fields).await {
