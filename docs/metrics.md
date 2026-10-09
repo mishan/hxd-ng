@@ -152,7 +152,7 @@ constant rather than one per recipient.
 | `hxd_write_queued_frames`, `hxd_write_queued_bytes` | `wire` | queued for the legacy writers, all connections together |
 | `hxd_login_seconds` | `wire`, `auth` | first byte to a session on the roster; `auth` is `guest`, `password`, `identity` or `resume` |
 | `hxd_flood_kicks_total` | `what` | sessions kicked for talking faster than `[limits]` allows: `chat` past `chat_lines`, `spam` past `spam_points` |
-| `hxd_rate_limited_total` | `wire`, `reason` | requests answered `rate_limited`: `requests` past `[limits] ng_requests`, `news_post` past `news_posts`, `history` and `news_search` past their own |
+| `hxd_rate_limited_total` | `wire`, `reason` | requests answered `rate_limited`: `requests` past `[limits] ng_requests`, `news_post` past `news_posts`, `folder` past `folders`, `history` and `news_search` past their own |
 | `hxd_logins_refused_busy_total` | | logins refused because the server was already working on `[server] logins_in_flight` of them |
 | `hxd_throttled_total` | `what` | refused for coming too often from one address, account or session, before any work was done on it: `login` (past `[limits] login_failures` for one login, or `login_failures_per_addr` for every login together), `account` (a login or resume past `connections_per_account`, or past its account's rate at `reconnect_seconds`), `challenge` (`/identity/challenge`), `fetch` (an avatar or a news or media image), `upload` (an upload refused before its body was read) |
 | `hxd_disconnects_total` | `wire`, `reason` | why a connection ended |

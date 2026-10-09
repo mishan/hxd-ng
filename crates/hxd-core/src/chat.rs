@@ -3079,6 +3079,8 @@ mod tests {
             requests_per: Duration::from_secs(60),
             news_posts: 1,
             news_posts_per: Duration::from_secs(60),
+            folders: 2,
+            folders_per: Duration::from_secs(60),
         });
         let who = |login: &str, can_spam: bool, is_person: bool| crate::AttachInfo {
             nick: login.into(),
@@ -3141,6 +3143,17 @@ mod tests {
         core.news_post_counted(guest);
         assert_eq!(core.news_post_reserve(guest_too), Ok(()), "another guest");
         assert!(core.news_post_reserve(guest).is_err());
+
+        // Folders are an account's like its posts, in a budget of their own.
+        core.folder_reserve(alice).unwrap();
+        core.folder_reserve(alice_again).unwrap();
+        assert!(core.folder_reserve(alice).is_err(), "one account");
+        core.folder_refund(alice);
+        core.folder_reserve(alice_again)
+            .expect("a folder that was not made is given back");
+        for _ in 0..3 {
+            core.folder_reserve(admin).expect("can_spam");
+        }
     }
 
     /// Behind an address `[limits] exempt` — loopback here, a shared

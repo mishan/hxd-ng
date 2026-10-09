@@ -388,6 +388,9 @@ pub struct FilesSection {
     /// The most items one folder download or upload may hold.
     #[serde(default = "default_files_max_folder_items")]
     pub max_folder_items: usize,
+    /// The deepest a folder may be made or moved to, from the area's root.
+    #[serde(default = "default_files_max_depth")]
+    pub max_depth: usize,
     #[serde(default = "default_files_max_concurrent")]
     pub max_concurrent: usize,
     #[serde(default = "default_files_max_partial_bytes")]
@@ -434,6 +437,10 @@ fn default_files_max_entries() -> usize {
 }
 fn default_files_max_folder_items() -> usize {
     hxd_files::MAX_FOLDER_ITEMS
+}
+
+fn default_files_max_depth() -> usize {
+    hxd_files::LocalLimits::default().max_depth
 }
 
 fn default_files_max_concurrent() -> usize {
@@ -1807,6 +1814,12 @@ pub struct LimitsSection {
     pub news_posts: u32,
     #[serde(default = "default_news_post_seconds")]
     pub news_post_seconds: u64,
+    /// The folders one account may make at once, one at a time or in a
+    /// folder upload, earned back over `folder_seconds`; 0 for no limit.
+    #[serde(default = "default_folders")]
+    pub folders: u32,
+    #[serde(default = "default_folder_seconds")]
+    pub folder_seconds: u64,
     /// Wrong passwords one address may give for one login, on either
     /// wire, before a password from it for that login is refused until
     /// it earns one back, one every `login_failure_seconds`; 0 for no
@@ -1859,6 +1872,12 @@ fn default_news_posts() -> u32 {
 }
 fn default_news_post_seconds() -> u64 {
     hxd_core::RequestLimits::DEFAULT.news_posts_per.as_secs()
+}
+fn default_folders() -> u32 {
+    hxd_core::RequestLimits::DEFAULT.folders
+}
+fn default_folder_seconds() -> u64 {
+    hxd_core::RequestLimits::DEFAULT.folders_per.as_secs()
 }
 fn default_login_failures() -> u32 {
     hxd_core::LoginLimits::RECOMMENDED.failures
@@ -1932,6 +1951,8 @@ impl Default for LimitsSection {
             ng_request_seconds: default_ng_request_seconds(),
             news_posts: default_news_posts(),
             news_post_seconds: default_news_post_seconds(),
+            folders: default_folders(),
+            folder_seconds: default_folder_seconds(),
             login_failures: default_login_failures(),
             login_failures_per_addr: default_login_failures_per_addr(),
             login_failure_seconds: default_login_failure_seconds(),
@@ -1969,10 +1990,11 @@ impl LimitsSection {
         })
     }
 
-    /// The ng request limit and the news-post limit.
+    /// The ng request limit, the news-post limit and the folder limit.
     pub fn request_limits(&self) -> Result<hxd_core::RequestLimits, String> {
         if (self.ng_requests != 0 && self.ng_request_seconds == 0)
             || (self.news_posts != 0 && self.news_post_seconds == 0)
+            || (self.folders != 0 && self.folder_seconds == 0)
         {
             return Err("[limits] a count needs its seconds: set both, or the count to 0".into());
         }
@@ -1981,6 +2003,8 @@ impl LimitsSection {
             requests_per: Duration::from_secs(self.ng_request_seconds),
             news_posts: self.news_posts,
             news_posts_per: Duration::from_secs(self.news_post_seconds),
+            folders: self.folders,
+            folders_per: Duration::from_secs(self.folder_seconds),
         })
     }
 
@@ -2841,6 +2865,9 @@ pub fn check_config(config: &Config) -> Result<(), String> {
             || files.upload_timeout == 0
         {
             return Err("[files] timeout and TTL values must be non-zero".into());
+        }
+        if !(1..=64).contains(&files.max_depth) {
+            return Err("[files] max_depth must be between 1 and 64".into());
         }
     }
     if let Some(tracker) = &config.tracker {
@@ -5239,9 +5266,12 @@ sync = "full"
             "max_partials_per_account",
             "upload_timeout",
             "partial_ttl",
+            "max_depth",
         ] {
             let config = parse(&format!("[files]\nroot = \"files\"\n{key} = 0\n")).unwrap();
             assert!(check_config(&config).is_err(), "{key}");
         }
+        let deep = parse("[files]\nroot = \"files\"\nmax_depth = 65\n").unwrap();
+        assert!(check_config(&deep).unwrap_err().contains("max_depth"));
     }
 }

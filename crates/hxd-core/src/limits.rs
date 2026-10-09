@@ -843,6 +843,29 @@ pub struct LoginAttempt {
 }
 
 impl Core {
+    /// Take one folder from what `uid`'s account may make
+    /// ([`RequestLimits::folders`]), or say how long until one is there.
+    /// Taken before the folder is made, and given back by
+    /// [`Self::folder_refund`] when it is not.
+    pub fn folder_reserve(&self, uid: crate::Uid) -> Result<(), Duration> {
+        let limits = self.request_limits;
+        match self.post_key(uid) {
+            Some(key) => {
+                self.folder_rates
+                    .reserve(key, (limits.folders, limits.folders_per), Instant::now())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Give back what [`Self::folder_reserve`] took, for a folder that
+    /// was not made.
+    pub fn folder_refund(&self, uid: crate::Uid) {
+        if let Some(key) = self.post_key(uid) {
+            self.folder_rates.refund(&key, Instant::now());
+        }
+    }
+
     /// Hold failed logins to `limits` rather than
     /// [`LoginLimits::default`]. Addresses exempt from `[limits]` are
     /// held to none.
@@ -1113,12 +1136,14 @@ impl Flood {
     }
 }
 
-/// How fast one ng session may ask, and one account post news
-/// (`[limits]`), neither of which mhxd limits. `requests` is the weight
-/// one session may spend at once, across every connection it resumes
-/// on, earned back evenly over `requests_per`; `news_posts` the articles
-/// and replies one account may post at once, earned back over
-/// `news_posts_per`. A count of 0 is no
+/// How fast one ng session may ask, and one account post news and make
+/// folders (`[limits]`), none of which mhxd limits. `requests` is the
+/// weight one session may spend at once, across every connection it
+/// resumes on, earned back evenly over `requests_per`; `news_posts` the
+/// articles and replies one account may post at once, earned back over
+/// `news_posts_per`; `folders` the folders one account may make at
+/// once, one at a time or in a folder upload, earned back over
+/// `folders_per`. A count of 0 is no
 /// limit, which is what a `Core` built by hand has
 /// ([`RequestLimits::default`]); a server built from a config has
 /// [`RequestLimits::DEFAULT`] unless it says otherwise.
@@ -1128,6 +1153,8 @@ pub struct RequestLimits {
     pub requests_per: Duration,
     pub news_posts: u32,
     pub news_posts_per: Duration,
+    pub folders: u32,
+    pub folders_per: Duration,
 }
 
 impl RequestLimits {
@@ -1144,6 +1171,10 @@ impl RequestLimits {
         requests_per: Duration::from_secs(2),
         news_posts: 10,
         news_posts_per: Duration::from_secs(300),
+        // A tree of a few hundred folders uploads in one go, and an
+        // account repeating it makes a few hundred an hour.
+        folders: 500,
+        folders_per: Duration::from_secs(5_000),
     };
 }
 
@@ -1230,7 +1261,9 @@ pub(crate) enum PostKey {
     Session(u64),
 }
 
-/// Every account's news-post bucket ([`RequestLimits::news_posts`]).
+/// Every account's bucket of something it may do so many of: news posts
+/// ([`RequestLimits::news_posts`]) or folders made
+/// ([`RequestLimits::folders`]), each in a table of its own.
 #[derive(Debug, Default)]
 pub(crate) struct PostRates(Mutex<HashMap<PostKey, RateBucket>>);
 
@@ -1243,10 +1276,10 @@ impl PostRates {
     pub(crate) fn reserve(
         &self,
         key: PostKey,
-        limits: &RequestLimits,
+        (count, per): (u32, Duration),
         now: Instant,
     ) -> Result<(), Duration> {
-        let Some(fresh) = RateBucket::new(limits.news_posts, limits.news_posts_per, now) else {
+        let Some(fresh) = RateBucket::new(count, per, now) else {
             return Ok(());
         };
         self.with(key, fresh, now, |b| b.spend(1, now))
@@ -1261,8 +1294,8 @@ impl PostRates {
 
     /// Count one post of `key`'s, whether or not there was one left: a
     /// post that has landed has been made.
-    pub(crate) fn count(&self, key: PostKey, limits: &RequestLimits, now: Instant) {
-        let Some(fresh) = RateBucket::new(limits.news_posts, limits.news_posts_per, now) else {
+    pub(crate) fn count(&self, key: PostKey, (count, per): (u32, Duration), now: Instant) {
+        let Some(fresh) = RateBucket::new(count, per, now) else {
             return;
         };
         self.with(key, fresh, now, |b| b.charge(1, now));
@@ -2039,35 +2072,36 @@ mod tests {
             news_posts_per: Duration::from_secs(60),
             ..RequestLimits::default()
         };
+        let per = (limits.news_posts, limits.news_posts_per);
         let rates = PostRates::default();
         let t = Instant::now();
         let alice = || PostKey::Account(None, "alice".into());
-        rates.reserve(alice(), &limits, t).unwrap();
+        rates.reserve(alice(), per, t).unwrap();
         // A post refused for what it says is given back.
         rates.refund(&alice(), t);
-        rates.reserve(alice(), &limits, t).unwrap();
-        rates.reserve(alice(), &limits, t).unwrap();
+        rates.reserve(alice(), per, t).unwrap();
+        rates.reserve(alice(), per, t).unwrap();
         assert_eq!(
-            rates.reserve(alice(), &limits, t),
+            rates.reserve(alice(), per, t),
             Err(Duration::from_secs(30)),
             "taken when asked, so a second asker finds it gone"
         );
         // Counted past the limit, as a post on the other wire is.
-        rates.count(alice(), &limits, t);
+        rates.count(alice(), per, t);
         assert_eq!(
-            rates.reserve(alice(), &limits, t),
+            rates.reserve(alice(), per, t),
             Err(Duration::from_secs(30)),
             "empty, not in debt"
         );
         let here = || PostKey::Guest("192.0.2.7".parse().unwrap());
         let there = || PostKey::Guest("192.0.2.8".parse().unwrap());
-        rates.count(here(), &limits, t);
-        rates.count(there(), &limits, t);
-        rates.count(there(), &limits, t);
-        rates.reserve(here(), &limits, t).unwrap();
-        assert!(rates.reserve(there(), &limits, t).is_err());
+        rates.count(here(), per, t);
+        rates.count(there(), per, t);
+        rates.count(there(), per, t);
+        rates.reserve(here(), per, t).unwrap();
+        assert!(rates.reserve(there(), per, t).is_err());
         assert_eq!(
-            rates.reserve(alice(), &RequestLimits::default(), t),
+            rates.reserve(alice(), (0, Duration::ZERO), t),
             Ok(()),
             "no limit"
         );

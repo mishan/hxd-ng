@@ -473,6 +473,10 @@ async fn a_drop_box_takes_uploads_without_telling_what_it_holds() {
 }
 
 async fn run_service(service: Arc<FileService>, access: &str) -> Running {
+    run_service_with(service, access, Core::new()).await
+}
+
+async fn run_service_with(service: Arc<FileService>, access: &str, core: Core) -> Running {
     let temp = tempfile::tempdir().unwrap();
     let accounts = temp.path().join("accounts");
     std::fs::create_dir(&accounts).unwrap();
@@ -506,7 +510,7 @@ async fn run_service(service: Arc<FileService>, access: &str) -> Running {
         )
         .unwrap();
     }
-    let core = Arc::new(Core::new());
+    let core = Arc::new(core);
     let auth: Arc<dyn hxd_core::AuthBackend> = Arc::new(hxd_auth_file::FileAuth::new(&accounts));
     let legacy_ctx = ServerCtx {
         core: core.clone(),
@@ -2196,4 +2200,72 @@ async fn a_folder_uploads_item_by_item_and_resumes_into_what_is_there() {
         .request(FILE_PUT_FOLDER, &put("tree", false))
         .await;
     assert_ne!(refused.flag & 1, 0);
+}
+
+#[tokio::test]
+async fn folders_made_are_held_to_the_accounts_budget() {
+    const FILE_MKDIR: u32 = 0x00cd;
+    let temp = tempfile::tempdir().unwrap();
+    let source = Arc::new(LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap());
+    let service = Arc::new(FileService::new(
+        source.clone(),
+        Some(source),
+        transfers(),
+        downloads(),
+        IDLE,
+    ));
+    let core = Core::new().with_request_limits(hxd_core::RequestLimits {
+        folders: 3,
+        folders_per: Duration::from_secs(3600),
+        ..hxd_core::RequestLimits::default()
+    });
+    let server = run_service_with(
+        service,
+        "upload_files = true\nupload_folders = true\nupload_anywhere = true\n\
+         create_folders = true\nread_chat = true\nuse_any_name = true\n",
+        core,
+    )
+    .await;
+    let mut classic = Legacy::login(server.legacy, false).await;
+
+    // The upload's own folder and two inside it spend the budget, and the
+    // next one ends the upload, keeping what arrived.
+    let reply = classic
+        .request(FILE_PUT_FOLDER, &[(tag::FILE_NAME, b"tree".to_vec())])
+        .await;
+    let mut upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    upload.item(&["a"], None).await;
+    upload.item(&["b"], None).await;
+    upload.item(&["c"], None).await;
+    assert!(upload.ended().await);
+    let tree = temp.path().join("tree");
+    assert!(tree.join("a").is_dir() && tree.join("b").is_dir());
+    assert!(!tree.join("c").exists());
+
+    // New Folder draws on the same budget.
+    let refused = classic
+        .request(FILE_MKDIR, &[(tag::FILE_NAME, b"more".to_vec())])
+        .await;
+    assert_eq!(
+        field(&refused, tag::TASK_ERROR).as_deref(),
+        Some(&b"You are making folders too fast. Try again in a little while."[..])
+    );
+    assert!(!temp.path().join("more").exists());
+
+    // Resuming into the folders made so far costs nothing, so the upload
+    // that stopped can go on to its files.
+    let reply = classic
+        .request(
+            FILE_PUT_FOLDER,
+            &[
+                (tag::FILE_NAME, b"tree".to_vec()),
+                (tag::FILE_PREVIEW, 1u16.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    let mut upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    upload.item(&["a"], None).await;
+    upload.item(&["a", "f.txt"], Some(b"file")).await;
+    upload.finish().await;
+    assert_eq!(std::fs::read(tree.join("a/f.txt")).unwrap(), b"file");
 }

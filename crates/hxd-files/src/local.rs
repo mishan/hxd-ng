@@ -27,10 +27,10 @@ const UPLOAD_GENERATION_LEN: usize = 16;
 const PARTIAL_SUFFIXES: [&str; 4] = ["data", "rsrc", "fndrinfo", "generation"];
 /// The longest name Linux and macOS filesystems store, in bytes.
 const NAME_MAX: usize = 255;
-/// The deepest a folder may sit, in folders from the root of the area.
-/// New Folder and a move refuse to go past it, so a delete or move of any
-/// folder, which walks at most this far beneath it, reaches the bottom.
-pub(crate) const MAX_DEPTH: usize = 64;
+/// The deepest a delete or move walks beneath a folder, and so the most
+/// [`LocalLimits::max_depth`] may be: what is made within it can always
+/// be walked to the bottom.
+const MAX_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LocalLimits {
@@ -43,6 +43,9 @@ pub struct LocalLimits {
     pub io_timeout: Duration,
     pub upload_timeout: Duration,
     pub partial_ttl: Duration,
+    /// The deepest a folder may be made, or moved to, in folders from the
+    /// root of the area: by New Folder, a move or a folder upload.
+    pub max_depth: usize,
 }
 
 impl Default for LocalLimits {
@@ -57,6 +60,8 @@ impl Default for LocalLimits {
             io_timeout: Duration::from_secs(30),
             upload_timeout: Duration::from_secs(60 * 60),
             partial_ttl: Duration::from_secs(7 * 24 * 60 * 60),
+            // mhxd's cap on the folders a DIR field names.
+            max_depth: 32,
         }
     }
 }
@@ -105,10 +110,16 @@ impl LocalFileSource {
             || limits.io_timeout.is_zero()
             || limits.upload_timeout.is_zero()
             || limits.partial_ttl.is_zero()
+            || limits.max_depth == 0
         {
             return Err(FileError::Unavailable(
                 "local file limits and timeouts must be non-zero".into(),
             ));
+        }
+        if limits.max_depth > MAX_DEPTH {
+            return Err(FileError::Unavailable(format!(
+                "max_depth may be at most {MAX_DEPTH}"
+            )));
         }
         let root = Dir::open_ambient_dir(path, ambient_authority())
             .map_err(|error| unavailable("open local root", error))?;
@@ -1452,7 +1463,7 @@ impl LocalFileSource {
     }
 
     fn make_folder_sync(&self, path: &FilePath) -> Result<(), FileError> {
-        if path.components().len() > MAX_DEPTH {
+        if path.components().len() > self.inner.limits.max_depth {
             return Err(FileError::TooDeep);
         }
         let (parent, name) = self.open_parent(path)?;
@@ -1655,14 +1666,22 @@ impl LocalFileSource {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(map_lookup_error(error)),
         }
-        // A folder may not sit past `MAX_DEPTH`, nor anything inside it,
+        // A folder may not sit past the walk bound, nor anything inside it,
         // at its destination, whichever way it moves: what cannot be
         // walked cannot be deleted or moved again, and its sidecars could
         // not follow it. A subtree nested deeper behind the server's back
         // is refused even on a rename in place. The walk comes after every
         // cheaper check, so a move refused anyway costs none.
         if kind == FileKind::Folder {
-            let room = MAX_DEPTH
+            // Sunk deeper, it is held to `max_depth`; renamed in place or
+            // raised, only to the walk bound, so a tree made deeper before
+            // the limit was lowered can still be renamed and moved.
+            let limit = if to.components().len() > from.components().len() {
+                self.inner.limits.max_depth
+            } else {
+                MAX_DEPTH
+            };
+            let room = limit
                 .checked_sub(to.components().len())
                 .ok_or(FileError::TooDeep)?;
             let dir = self.descend(&from_parent, &from_name)?;
@@ -2746,7 +2765,11 @@ mod tests {
     #[tokio::test]
     async fn folders_nest_no_deeper_than_a_delete_or_move_walks() {
         let temp = tempfile::tempdir().unwrap();
-        let source = LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap();
+        let limits = LocalLimits {
+            max_depth: MAX_DEPTH,
+            ..LocalLimits::default()
+        };
+        let source = LocalFileSource::open(temp.path(), limits).unwrap();
         let folder = FileKind::Folder;
 
         // New Folder stops at the limit, and the deepest chain it makes
@@ -2830,6 +2853,41 @@ mod tests {
             Err(FileError::TooDeep)
         );
         assert!(temp.path().join("s").is_dir());
+    }
+
+    #[tokio::test]
+    async fn folders_are_made_and_moved_no_deeper_than_the_configured_depth() {
+        let temp = tempfile::tempdir().unwrap();
+        let limits = LocalLimits {
+            max_depth: 2,
+            ..LocalLimits::default()
+        };
+        let source = LocalFileSource::open(temp.path(), limits).unwrap();
+        let path = |p: &str| FilePath::parse(p).unwrap();
+        source.make_folder(&path("a")).await.unwrap();
+        source.make_folder(&path("a/b")).await.unwrap();
+        assert_eq!(
+            source.make_folder(&path("a/b/c")).await,
+            Err(FileError::TooDeep)
+        );
+        fs::create_dir_all(temp.path().join("x/y/z")).unwrap();
+        assert_eq!(
+            source
+                .rename(&path("x"), &path("a/x"), FileKind::Folder, true)
+                .await,
+            Err(FileError::TooDeep)
+        );
+        // A tree deeper than the limit, made before it was lowered, is
+        // still renamed where it is.
+        source
+            .rename(&path("x"), &path("x2"), FileKind::Folder, true)
+            .await
+            .unwrap();
+        let deeper = LocalLimits {
+            max_depth: MAX_DEPTH + 1,
+            ..LocalLimits::default()
+        };
+        assert!(LocalFileSource::open(temp.path(), deeper).is_err());
     }
 
     #[tokio::test]

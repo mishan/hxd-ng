@@ -171,7 +171,7 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
             }
         }
         "files_mkdir" | "files_delete" | "files_move" | "files_comment" => {
-            match manage(service, state, req).await {
+            match manage(&ctx.core, service, state, req).await {
                 Ok(()) => crate::proto::reply_ok(req.id, json!({})),
                 Err(Refusal::Denied(message)) => {
                     crate::proto::reply_err(req.id, "access_denied", message)
@@ -185,6 +185,15 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     crate::proto::reply_err(req.id, "read_only", "This file area is read-only.")
                 }
                 Err(Refusal::File(error)) => error_reply(req.id, error),
+                Err(Refusal::RateLimited(wait)) => {
+                    hxd_core::instrument::rate_limited("ng", "folder");
+                    crate::proto::reply_err_retry(
+                        req.id,
+                        "rate_limited",
+                        "Slow down.",
+                        crate::conn::retry_secs(wait),
+                    )
+                }
             }
         }
         _ => crate::proto::reply_err(req.id, "unknown_method", "Unknown request."),
@@ -196,6 +205,7 @@ enum Refusal {
     Malformed,
     ReadOnly,
     File(FileError),
+    RateLimited(std::time::Duration),
 }
 
 impl From<FileError> for Refusal {
@@ -216,6 +226,7 @@ fn entry_path(path: &str) -> Result<FilePath, Refusal> {
 /// `file_manage`): each act needs the bit for the kind of entry it acts
 /// on, and a path naming a drop box needs `view_drop_boxes` besides.
 async fn manage(
+    core: &hxd_core::Core,
     service: &FileService,
     state: &SessState,
     req: &ReqEnvelope,
@@ -257,7 +268,11 @@ async fn manage(
                 return Err(Refusal::Denied("You are not allowed to create folders."));
             }
             reach(&path)?;
-            source.make_folder(&path).await?;
+            core.folder_reserve(uid).map_err(Refusal::RateLimited)?;
+            if let Err(error) = source.make_folder(&path).await {
+                core.folder_refund(uid);
+                return Err(error.into());
+            }
             info!(uid, %path, "folder created");
         }
         "files_delete" => {

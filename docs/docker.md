@@ -229,6 +229,7 @@ is off (`HXD_VIDEO` without voice, say) is reported and ignored.
 | `HXD_PRIVATE_CHATS` | 4096 | Private chats open on the whole server; 0 for no limit. |
 | `HXD_NG_REQUESTS`, `HXD_NG_REQUEST_SECONDS` | 40, 2 | Request weight one ng session may spend at once, earned back over that many seconds; past it a request is answered `rate_limited` with how long to wait. 0 for no limit. |
 | `HXD_NEWS_POSTS`, `HXD_NEWS_POST_SECONDS` | 10, 300 | News posts one account may make at once, earned back over that many seconds; past it an ng post is answered `rate_limited`. 0 for no limit. |
+| `HXD_FOLDERS`, `HXD_FOLDER_SECONDS` | 500, 5000 | Folders one account may make at once, by New Folder or a folder upload, earned back over that many seconds. 0 for no limit. |
 | `HXD_LOGIN_FAILURES`, `HXD_LOGIN_FAILURE_SECONDS` | 10, 30 | Wrong passwords one address may give for one login, on any wire, before its password logins as that login are refused until it earns one back, one every that many seconds; 0 failures for no limit. Someone guessing at one account locks out that account from their address, and nobody else behind it. |
 | `HXD_LOGIN_FAILURES_PER_ADDR` | 50 | Wrong passwords one address may give for every login together, earned back at the same rate, before all its password logins are refused; 0 for no limit. The ceiling that keeps one address from guessing across every account. |
 | `HXD_HTTP_CONNECTIONS_PER_ADDR` | 16 | Connections one address may hold to the ng port, whatever they carry; 0 for no limit. Past it a connection is closed unanswered. A trusted proxy's connections are not counted per address. |
@@ -305,6 +306,7 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_SYSTEM_NICK` | `Server` | Its nick. |
 | `HXD_FILES_ROOT` | | A directory in the container to serve as the file area (`/srv/files` in the examples); mount one there. Uploads go into folders named `Uploads` or `Drop Box`. It must be writable by uid 10001 for uploads. |
 | `HXD_FILES_MAX_FILE_SIZE` | 64 GiB | Bytes per file. |
+| `HXD_FILES_MAX_DEPTH` | 32 | The deepest a folder may be made or moved to, from the area's root; at most 64. |
 | `HXD_TLS_CERT` | | Turns on the TLS ports: a PEM certificate chain, leaf first, mounted into the container — Let's Encrypt's `fullchain.pem` where the server has a DNS name ([below](#tls-certificates)). `docker kill -s HUP hxd-ng` re-reads a renewed certificate without dropping anyone. |
 | `HXD_TLS_KEY` | | Its PEM private key, readable by uid 10001. |
 | `HXD_TLS_SELF_SIGNED` | `off` | Turns on the TLS ports with a self-signed certificate made in the volume on first start and kept, for a server with no name a CA will certify. Clients ask users to trust it on first connect; the fingerprint is in the log to publish. `HXD_TLS_CERT` wins when both are set. |

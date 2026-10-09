@@ -746,7 +746,10 @@ news body is different: it declares its own type (news.md §5).
   replies (`news_posts` in `news_post_seconds`, ten and then one each
   half minute) — a guest, the guests from its address, IPv6 by the /64,
   so a fresh login is not a fresh allowance — past which `news_post` is
-  answered the same way; and
+  answered the same way; so many folders (`folders` in
+  `folder_seconds`, five hundred and then one each ten seconds, counted
+  with the classic wire's New Folder and folder uploads), past which
+  `files_mkdir` is too; and
   `history`, `news_search`, media and news-attachment uploads (asked
   before the body is read), media and news-image downloads, avatar
   fetches and enrollment have limits of their own. Login attempts are

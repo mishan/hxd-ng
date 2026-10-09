@@ -600,9 +600,11 @@ async fn serve_folder_upload<S: HtxfStream>(
     let root = if transfer.merge {
         transfer.root.clone()
     } else {
+        alive.folder_reserve()?;
         source
             .make_upload_folder(&transfer.root, transfer.blind)
-            .await?
+            .await
+            .inspect_err(|_| alive.folder_refund())?
     };
     let mut items = 0;
     loop {
@@ -622,7 +624,7 @@ async fn serve_folder_upload<S: HtxfStream>(
             return Err(protocol("more items than [files] max_folder_items"));
         }
         // Refused before a name is decoded: a header can name thousands.
-        if root.components().len() + item.path.len() > crate::local::MAX_DEPTH {
+        if root.components().len() + item.path.len() > source.limits().max_depth {
             return Err(FileError::TooDeep);
         }
         if item.path.iter().any(|name| name.len() > 128) {
@@ -640,12 +642,21 @@ async fn serve_folder_upload<S: HtxfStream>(
             return Err(FileError::NotFound);
         }
         if item.folder {
-            match source.make_folder(&path).await {
-                Err(FileError::AlreadyExists)
-                    if transfer.merge
-                        && source.info(&path).await?.kind == hxd_core::FileKind::Folder => {}
-                made => made?,
+            // Adding to a folder, one already there costs nothing, so a
+            // resume after the budget ran out goes on to its files.
+            if transfer.merge {
+                match source.info(&path).await {
+                    Ok(info) if info.kind == hxd_core::FileKind::Folder => continue,
+                    Ok(_) => return Err(FileError::AlreadyExists),
+                    Err(FileError::NotFound) => {}
+                    Err(error) => return Err(error),
+                }
             }
+            alive.folder_reserve()?;
+            source
+                .make_folder(&path)
+                .await
+                .inspect_err(|_| alive.folder_refund())?;
             continue;
         }
         let there = if transfer.merge {
@@ -1117,6 +1128,19 @@ impl Liveness {
         } else {
             Err(FileError::Unavailable("the session ended".into()))
         }
+    }
+
+    /// One folder from what the session's account may make (`[limits]
+    /// folders`): a folder upload that runs past it ends, keeping what
+    /// arrived for a resume to finish.
+    fn folder_reserve(&self) -> Result<(), FileError> {
+        self.core
+            .folder_reserve(self.principal.uid)
+            .map_err(|_| FileError::Unavailable("made folders faster than allowed".into()))
+    }
+
+    fn folder_refund(&self) {
+        self.core.folder_refund(self.principal.uid);
     }
 }
 

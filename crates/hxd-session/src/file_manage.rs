@@ -53,6 +53,8 @@ pub(crate) struct Asker<'a> {
     pub account: &'a Account,
     pub enc: TextEncoding,
     pub large: bool,
+    pub core: &'a hxd_core::Core,
+    pub uid: hxd_core::Uid,
 }
 
 impl Asker<'_> {
@@ -129,7 +131,17 @@ pub(crate) async fn transaction(
                 .await?;
         let path = files::new_name(&parent, &name, who.enc)?;
         who.reach(&path)?;
-        source.make_folder(&path).await?;
+        // A folder costs no spam points beyond its transaction's, so what
+        // one account may make is held to [limits] folders.
+        if who.core.folder_reserve(who.uid).is_err() {
+            return Err(Refusal::Text(
+                "You are making folders too fast. Try again in a little while.",
+            ));
+        }
+        if let Err(error) = source.make_folder(&path).await {
+            who.core.folder_refund(who.uid);
+            return Err(error.into());
+        }
         info!(%login, %path, "folder created");
         return Ok(());
     }

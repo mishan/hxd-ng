@@ -338,9 +338,17 @@ them; the item header and actions are `hxfiles_xfer::folder`.
 - **F3, the queue and limits.** Concurrent transfers per account,
   configurable, defaulting to mhxd's one download and one upload; queue
   positions in the replies and the Download Info (211) push; Kill Download
-  (214) ending the transfer it names, though GtkHx never sends it; and a
-  folder upload's items, folders included, charged to the account as the
-  transactions they stand for are.
+  (214) ending the transfer it names, though GtkHx never sends it.
+- **Folder budget and depth (built).** Folders an account makes, by New
+  Folder on either wire or in a folder upload, are held to `[limits]
+  folders` in `folder_seconds` (500, then one each ten seconds), keyed
+  as news posts are, so repeated uploads are bounded and not only one;
+  `can_spam` exempts. Charging them spam points instead would have an
+  ordinary upload of a few hundred folders kicked. A folder upload past
+  it ends, keeping what arrived. `[files] max_depth` (32, mhxd's cap on a
+  DIR path, and at most 64, the depth a delete or move walks) bounds
+  where a folder is made or moved to; a tree made on disk is not held
+  to it.
 
 ## Deferred work
 

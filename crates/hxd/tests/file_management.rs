@@ -84,7 +84,11 @@ async fn start() -> Running {
 
 async fn start_with(writable: bool) -> Running {
     let root = tempfile::tempdir().unwrap();
-    let source = Arc::new(LocalFileSource::open(root.path(), LocalLimits::default()).unwrap());
+    let deepest = LocalLimits {
+        max_depth: 64,
+        ..LocalLimits::default()
+    };
+    let source = Arc::new(LocalFileSource::open(root.path(), deepest).unwrap());
     let limits = EntryLimits {
         total: 64,
         per_session: 16,
