@@ -25,6 +25,8 @@ pub struct LegacyTransfer {
     /// The control connection's address when the transfer must come from
     /// it; see [`PreparedDownload::peer`].
     pub peer: Option<IpAddr>,
+    /// See [`PreparedDownload::hope`].
+    pub hope: Option<crate::SealKeys>,
     pub path: FilePath,
     pub offset: u64,
     pub resource_offset: u64,
@@ -39,6 +41,8 @@ pub struct UploadTransfer {
     pub principal: FilePrincipal,
     /// As for [`LegacyTransfer::peer`].
     pub peer: Option<IpAddr>,
+    /// See [`PreparedDownload::hope`].
+    pub hope: Option<crate::SealKeys>,
     pub path: FilePath,
     pub owner: String,
     /// The declared HTXF payload size. A request may leave it out, as
@@ -91,6 +95,7 @@ pub async fn prepare_legacy(
         principal: request.principal,
         account: request.account,
         peer: request.peer,
+        hope: request.hope,
         path: request.path,
         source,
         offset: request.offset,
@@ -133,6 +138,7 @@ pub async fn prepare_upload(
     let reference = registry.issue(PreparedTransfer::Upload(PreparedUpload {
         principal: request.principal,
         peer: request.peer,
+        hope: request.hope,
         path: request.path,
         source,
         owner: request.owner,
@@ -328,6 +334,14 @@ async fn serve_one<S: HtxfStream>(
             return Err(FileError::NotFound);
         }
     }
+    let mut stream: Box<dyn HtxfStream> = match transfer.hope() {
+        Some(seal) => Box::new(crate::sealed::Sealed::new(
+            stream,
+            &seal.keys,
+            preamble.reference,
+        )),
+        None => Box::new(stream),
+    };
     match transfer {
         PreparedTransfer::Download(transfer) => {
             let alive = Liveness::new(core, transfer.principal);

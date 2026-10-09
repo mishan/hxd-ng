@@ -98,6 +98,7 @@ hxd-testclient = { workspace = true }
 hlrelay = { workspace = true }
 hl-tunnel = { workspace = true }
 hxfiles-xfer = { workspace = true }
+hxcrypto = { workspace = true }
 # The media e2e stands real WebRTC clients up against the real SFU.
 hxd-voice = { workspace = true }
 # The inbox e2e uses the real store on a real file, not a fake.

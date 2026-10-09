@@ -1,7 +1,8 @@
 # HOPE: the secure login on the classic wire
 
-Status: partial, 2026-10. Built: the login, Blowfish OFB-64, `[hope]`. Planned: ChaCha20-Poly1305 with its encrypted
-file transfers (§5), and `DATA_LINK_USER_TRANSPORT` on server links (§6).
+Status: partial, 2026-10. Built: the login, ChaCha20-Poly1305 with its
+sealed file transfers and Blowfish OFB-64, `[hope]`. Planned:
+`DATA_LINK_USER_TRANSPORT` on server links (§6).
 
 HOPE replaces the classic login's XOR-scrambled password with a MAC of it
 under a key the server picks, and can go on to encrypt the rest of the
@@ -99,10 +100,22 @@ takes `HXD_HOPE` and `HXD_HOPE_REQUIRE_CIPHER` (`docker.md`).
 
 ## 5. ChaCha20-Poly1305 and file transfers
 
-A client that agrees ChaCha20-Poly1305 also encrypts its file transfers,
-with keys `hxhope` derives per transfer. Until the transfer port does the
-same, such a client's transfers would fail, so the cipher is not offered.
-When it is, a Blowfish session's transfers stay plaintext, as on mhxd.
+A client that agrees ChaCha20-Poly1305 also seals its file transfers, as
+GtkHx's does. The session keeps the `TransferKeys` its login agreed, and
+every transfer it asks for (a download, an upload, the banner) carries
+them; the transfer port reads the HTXF handshake in the clear, claims the
+reference, and runs the rest through sealed records under the keys
+`hxhope` derives from them and the reference, each direction its own.
+That is any transfer port, the TLS one included, should a client seal
+inside TLS too. An incoming record is held to a megabyte of plaintext,
+where the format allows 16 and fogWraith's spec says to enforce 16: a
+transfer holds a record in memory before it can check it, and GtkHx
+seals 60 KiB at a time. A client sealing more at once has its uploads
+refused. And no reference is issued twice to one session: its keys and
+the reference are all a transfer's keys come from, so a repeat would
+seal two transfers under one key and one run of nonces.
+
+A Blowfish session's transfers stay plaintext, as on mhxd.
 
 ## 6. Across server links
 

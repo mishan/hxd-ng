@@ -1483,6 +1483,9 @@ struct Session {
     /// tunnelled session's peer is whoever terminated its WebSocket, so it
     /// binds nothing.
     transfer_addr: Option<IpAddr>,
+    /// The keys its file transfers are sealed with, when its HOPE login
+    /// agreed ChaCha20-Poly1305 (`docs/hope.md` §5).
+    transfer_keys: Option<hxd_files::SealKeys>,
     /// This session has sent a nick color, so it is sent everyone's
     /// (fogWraith's Colored Nicknames, which has no capability bit either).
     nick_colors: bool,
@@ -2277,6 +2280,7 @@ async fn login_phase(
     // Everything from the reply to step 2 on goes through the transport,
     // a refusal after the password included; a login admitted without
     // its password checked agreed none, and cannot go on.
+    let mut transfer_keys = None;
     let transport = match (&verdict, hope) {
         (_, Some(agreed)) => {
             let negotiated = agreed.negotiated;
@@ -2286,6 +2290,7 @@ async fn login_phase(
                 reply_error(tx, f.trans, "Login failed.");
                 return None;
             }
+            transfer_keys = negotiated.transfer_keys.map(hxd_files::SealKeys::new);
             Transport {
                 encrypted: transport.encrypted || (negotiated.cipher.is_some() && !agreed.keyless),
                 ..transport
@@ -2564,6 +2569,7 @@ async fn login_phase(
         media_refill: Instant::now(),
         media_stream: None,
         transfer_addr: None,
+        transfer_keys,
         nick_colors: false,
         listed: false,
         gif_icons: false,
@@ -3405,6 +3411,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     },
                     account: sess.account.login.clone(),
                     peer: sess.transfer_addr,
+                    hope: sess.transfer_keys.clone(),
                     bytes: image.bytes,
                 },
             ));
@@ -3709,6 +3716,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     },
                     account: sess.account.login.clone(),
                     peer: sess.transfer_addr,
+                    hope: sess.transfer_keys.clone(),
                     path,
                     offset,
                     resource_offset,
@@ -3889,6 +3897,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         serial,
                     },
                     peer: sess.transfer_addr,
+                    hope: sess.transfer_keys.clone(),
                     path,
                     owner: sess.account.login.clone(),
                     transfer_len,
