@@ -1020,6 +1020,32 @@ async fn a_message_by_uid_goes_to_the_device_it_named() {
     );
 }
 
+/// One account on both wires, talking to itself: a reply to the login
+/// the message came from goes to the session that sent it, not back to
+/// the one replying, though that one has the lower uid.
+#[tokio::test]
+async fn a_reply_to_ones_own_account_reaches_its_other_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start(dir.path(), InboxPolicy::default()).await;
+
+    let (mut ng, hello) = Ng::login(srv.ng, "bob").await;
+    let ng_uid = hello["self"]["uid"].as_u64().unwrap() as u16;
+    let mut legacy = Legacy::login(srv.legacy, "bob").await;
+    assert!(ng_uid < legacy.uid);
+
+    assert_eq!(legacy.msg(ng_uid, "yo").await.flag, 0);
+    let m = ng.msg_event().await;
+    assert_eq!(m["from"]["login"], "bob");
+    ng.request_ok("msg", json!({ "to_login": "bob", "text": "hai" }))
+        .await;
+    assert_eq!(legacy.private_message().await.0, "hai");
+    ng.request_ok("ping", json!({})).await;
+    assert!(
+        ng.queued.iter().all(|v| v["ev"] != "msg"),
+        "the reply was not handed back to its sender"
+    );
+}
+
 #[tokio::test]
 async fn a_guest_reaches_the_attached_session_of_two() {
     let dir = tempfile::tempdir().unwrap();
