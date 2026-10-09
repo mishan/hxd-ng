@@ -563,6 +563,25 @@ async fn requests_whose_params_are_all_optional_may_omit_them() {
 }
 
 #[tokio::test]
+async fn a_nick_without_use_any_name_is_refused() {
+    let td = tempfile::tempdir().unwrap();
+    let (_legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;
+    std::fs::write(
+        td.path().join("accounts/carol.toml"),
+        "name = \"Carol\"\npassword = \"pw\"\n[access]\nread_chat = true\n",
+    )
+    .unwrap();
+    let (mut c, _) = Ng::login(ng_addr, "carol", "pw", "Carol").await;
+
+    let v = c
+        .request("nick", json!({ "nick": "Mallory", "icon": 7 }))
+        .await;
+    assert_eq!(v["error"]["code"], "access_denied", "{v}");
+    let v = c.request("nick", json!({ "icon": 7 })).await;
+    assert!(v["ok"].is_object(), "an icon alone needs no privilege: {v}");
+}
+
+#[tokio::test]
 async fn an_unknown_push_request_is_an_unknown_method() {
     let td = tempfile::tempdir().unwrap();
     let (_legacy_addr, ng_addr, _ctx) = start_server(td.path()).await;

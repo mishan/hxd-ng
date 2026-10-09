@@ -1622,15 +1622,23 @@ async fn dispatch(
         }
 
         "nick" => match params_or_default::<NickParams>(&req.params) {
+            // Refused rather than dropped, so the client can say why its
+            // name did not change; the legacy wire has no reply to say it in.
+            Ok(p)
+                if p.nick.as_deref().is_some_and(|n| !n.is_empty())
+                    && !state.access.has(bit::USE_ANY_NAME) =>
+            {
+                reply_err(
+                    req.id,
+                    "access_denied",
+                    "Your account may not choose its own name.",
+                )
+            }
             Ok(p) => {
-                let nick = p
-                    .nick
-                    .filter(|_| state.access.has(bit::USE_ANY_NAME))
-                    .filter(|n| !n.is_empty())
-                    .map(|mut n| {
-                        n.truncate_to_chars(NICK_MAX_CHARS);
-                        n
-                    });
+                let nick = p.nick.filter(|n| !n.is_empty()).map(|mut n| {
+                    n.truncate_to_chars(NICK_MAX_CHARS);
+                    n
+                });
                 ctx.core.update(state.uid, nick, p.icon);
                 reply_ok(req.id, json!({}))
             }
