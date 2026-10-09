@@ -141,15 +141,6 @@ pub(crate) fn sessions_of(r: &RosterInner, mailbox: &Mailbox) -> Vec<Uid> {
     uids
 }
 
-/// The uid of a visible session owning `mailbox`, if one is on the roster.
-/// Lowest uid wins, so the answer is stable when an account holds more
-/// than one (docs/private-messages.md §14 — the multi-device question this
-/// design defers). Used to name a *sender*, where any of their sessions
-/// will do.
-fn session_of(r: &RosterInner, mailbox: &Mailbox) -> Option<Uid> {
-    sessions_of(r, mailbox).into_iter().next()
-}
-
 /// The session to hand `mailbox`'s mail to: an *attached* one, lowest uid
 /// first, or none at all.
 ///
@@ -1999,6 +1990,10 @@ impl Core {
         let handles = self.media_states(&batch);
 
         let mut delivered = Vec::with_capacity(batch.len());
+        let sending = match target {
+            Target::Named { sender, .. } => Some(sender),
+            Target::Only(_) => None,
+        };
         let (uid, what) = {
             let mut r = self.roster.lock().unwrap();
             // Only an attached session receives. A detached one leaves its
@@ -2031,14 +2026,19 @@ impl Core {
                 Delivery::Delivered
             };
             for m in batch {
-                // The sender's uid, resolved now and by mailbox: the
+                // The message just sent names the session that sent it.
+                // Older ones resolve their sender now and by mailbox: the
                 // sending session is long gone and its uid may belong to
                 // someone else by now. Same identity, same person; nobody
-                // there, no uid.
-                let from = m
-                    .sender
-                    .as_ref()
-                    .and_then(|s| session_of(&r, s))
+                // there, no uid. Never the recipient's own uid, which is
+                // what mail between two sessions of one account would
+                // otherwise name, and a reply to it is to oneself.
+                let from = sending
+                    .filter(|s| Some(m.id) == fresh && r.users.contains_key(s))
+                    .or_else(|| {
+                        let s = m.sender.as_ref()?;
+                        sessions_of(&r, s).into_iter().find(|u| *u != uid)
+                    })
                     .unwrap_or(0);
                 let from_login = m
                     .sender
