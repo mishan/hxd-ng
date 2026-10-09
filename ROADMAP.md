@@ -237,9 +237,9 @@ no-version client).
 - HOPE negotiation + ciphers (ChaCha20-Poly1305, Blowfish OFB-64) and zlib
   compression, server side, via `hxcrypto`. Port the rekey-marker behavior
   byte for byte — it's wire-format-critical on this side too.
-  **Partly implemented 2026-10** (`docs/hope.md`): the login and Blowfish,
-  through hx-libs' `hxhope`, without compression (§3); ChaCha20-Poly1305 waits for
-  encrypted file transfers.
+  **Implemented 2026-10** (`docs/hope.md`): the login, ChaCha20-Poly1305
+  with its sealed file transfers and Blowfish, through hx-libs' `hxhope`,
+  without compression (§3).
 
 **Exit criteria:** a real multi-user chat server you can run for friends,
 administered entirely from GtkHx. This is the dogfooding point.

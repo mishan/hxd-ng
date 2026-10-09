@@ -12,6 +12,8 @@ hxd-core = { workspace = true }
 hxfiles-xfer = { workspace = true }
 hxhfs = { workspace = true }
 hxproto = { workspace = true }
+hxhope = { workspace = true }
+hxcrypto = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

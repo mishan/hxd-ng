@@ -389,7 +389,9 @@ Three layers, all `cargo test --workspace`:
   question marks, wrong passwords throttled as plain ones are and an
   empty one not, a guest account with a password throttled, a frame sent
   in the clear behind step 2 refusing the login, no cipher in
-  common refused only under `require_cipher`, and `[hope]` turned off;
+  common refused only under `require_cipher`, `[hope]` turned off, and
+  ChaCha20-Poly1305 sealing the session and its banner transfer while a
+  Blowfish session's stays plain;
   `tls.rs` has HOPE refused on the TLS port),
   `relay.rs` (a classic server behind `hlrelay`: a client that reaches
   it only over WebSockets logs in, chats with one on the TCP port, and
@@ -507,8 +509,7 @@ Hotline-ng MVP (roster + chat + PMs with detach/resume) is complete and
 cross-tested; voice and video are implemented on both wires, sharing one
 room and one SFU; the identity registrar is built, and a server applying
 what a registrar publishes (`docs/identity-registrar.md` §7) is next on
-that front. The large open fronts, in rough order: the rest of HOPE
-(ChaCha20-Poly1305 and its encrypted transfers, `docs/hope.md` §5), the ng rate-limit and
+that front. The large open fronts, in rough order: the ng rate-limit and
 client-quickstart polish, files/HTXF, the
 rest of news (the domain, store, search, subscriptions, markdown bodies,
 attachments, the ng wire, the legacy binding and moderation have

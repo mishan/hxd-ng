@@ -49,7 +49,7 @@ to another project.
 | [server-link.md](server-link.md) — joining fogWraith's linked network: ghosts, the link wire, key mode | no | all (ghosts are users to every client) | design, implements a fogWraith spec |
 | [voice.md](voice.md) — the SFU, one room across both signalling wires | yes | extended, ng | design, implements a fogWraith spec |
 | [capabilities-video.md](capabilities-video.md) — video publications and subscriptions | yes | ng; extended when GtkHx renders | spec, contributed to fogWraith's set |
-| [hope.md](hope.md) — HOPE, the secure login and transport encryption on the classic wire | the login and Blowfish; not ChaCha20-Poly1305 or its transfers | period and extended clients that speak HOPE | design |
+| [hope.md](hope.md) — HOPE, the secure login and transport encryption on the classic wire | yes, less `DATA_LINK_USER_TRANSPORT` | period and extended clients that speak HOPE | design |
 | [files-plan.md](files-plan.md) — the file area: browsing, downloads, the local area and uploads | yes, less folders and file management | all (ng browses and downloads) | design |
 | [file-sources.md](file-sources.md) — exploratory background for files | superseded | — | design |
 | [tracker-registration.md](tracker-registration.md) — HTRK v1/v3 server heartbeats, authentication and operator configuration | yes | server infrastructure | design; implements fogWraith specs |

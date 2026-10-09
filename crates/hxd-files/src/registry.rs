@@ -12,6 +12,30 @@ use sha2::{Digest, Sha256};
 
 use crate::LocalFileSource;
 
+/// A session's HOPE transfer keys, and every reference issued under them:
+/// a transfer's keys are the session's and its reference, so a reference
+/// drawn twice for one session would seal two transfers under one key and
+/// one run of nonces. Clones share the record.
+#[derive(Clone)]
+pub struct SealKeys {
+    pub(crate) keys: hxhope::TransferKeys,
+    issued: Arc<Mutex<std::collections::HashSet<u32>>>,
+}
+
+impl SealKeys {
+    pub fn new(keys: hxhope::TransferKeys) -> Self {
+        SealKeys {
+            keys,
+            issued: Arc::default(),
+        }
+    }
+
+    /// Whether `reference` is new to these keys, and so theirs now.
+    fn claim(&self, reference: u32) -> bool {
+        self.issued.lock().unwrap().insert(reference)
+    }
+}
+
 #[derive(Clone)]
 pub struct PreparedDownload {
     pub principal: FilePrincipal,
@@ -24,6 +48,9 @@ pub struct PreparedDownload {
     /// session has no such address: its peer is whoever terminated the
     /// WebSocket.
     pub peer: Option<IpAddr>,
+    /// The session's HOPE transfer keys, when it agreed ChaCha20-Poly1305:
+    /// past the handshake, the transfer is sealed (`docs/hope.md` §5).
+    pub hope: Option<SealKeys>,
     pub path: FilePath,
     pub source: Arc<dyn FileSource>,
     pub offset: u64,
@@ -60,6 +87,8 @@ pub struct PreparedUpload {
     pub principal: FilePrincipal,
     /// As for [`PreparedDownload::peer`].
     pub peer: Option<IpAddr>,
+    /// As for [`PreparedDownload::hope`].
+    pub hope: Option<SealKeys>,
     pub path: FilePath,
     pub source: Arc<LocalFileSource>,
     pub owner: String,
@@ -99,6 +128,8 @@ pub struct PreparedBanner {
     pub account: String,
     /// As for [`PreparedDownload::peer`].
     pub peer: Option<IpAddr>,
+    /// As for [`PreparedDownload::hope`].
+    pub hope: Option<SealKeys>,
     /// The image as it was when the reference was issued, so the size in
     /// the reply is the size that arrives even if the banner is reloaded
     /// in between.
@@ -137,6 +168,14 @@ impl PreparedTransfer {
             PreparedTransfer::Download(value) => &value.account,
             PreparedTransfer::Upload(value) => &value.owner,
             PreparedTransfer::Banner(value) => &value.account,
+        }
+    }
+
+    pub(crate) fn hope(&self) -> Option<&SealKeys> {
+        match self {
+            PreparedTransfer::Download(value) => value.hope.as_ref(),
+            PreparedTransfer::Upload(value) => value.hope.as_ref(),
+            PreparedTransfer::Banner(value) => value.hope.as_ref(),
         }
     }
 
@@ -236,7 +275,10 @@ impl TransferRegistry {
             getrandom::getrandom(&mut bytes)
                 .map_err(|e| FileError::Unavailable(format!("transfer reference: {e}")))?;
             let reference = u32::from_ne_bytes(bytes);
-            if reference != 0 && !entries.contains_key(&reference) {
+            if reference != 0
+                && !entries.contains_key(&reference)
+                && transfer.hope().is_none_or(|keys| keys.claim(reference))
+            {
                 let mut generation = [0; 16];
                 getrandom::getrandom(&mut generation)
                     .map_err(|e| FileError::Unavailable(format!("transfer generation: {e}")))?;
@@ -562,6 +604,7 @@ mod tests {
             principal,
             account: account.into(),
             peer: Some(HERE),
+            hope: None,
             path: FilePath::parse("file").unwrap(),
             source: Arc::new(UnusedSource),
             offset: 0,
@@ -667,6 +710,7 @@ mod tests {
             principal,
             account: account.into(),
             peer: Some(HERE),
+            hope: None,
             bytes: b"GIF89a".as_slice().into(),
         })
     }
@@ -821,6 +865,7 @@ mod tests {
             .issue(PreparedTransfer::Upload(PreparedUpload {
                 principal,
                 peer: None,
+                hope: None,
                 path: FilePath::parse("file").unwrap(),
                 source,
                 owner: "first".into(),
@@ -859,6 +904,7 @@ mod tests {
         PreparedTransfer::Upload(PreparedUpload {
             principal,
             peer: None,
+            hope: None,
             path: FilePath::parse("file").unwrap(),
             source,
             owner: "first".into(),
