@@ -180,7 +180,9 @@ For anything the variables don't reach, there are two ways out:
   do, which TOML refuses. Every key in it must sit under a section
   header: the fragment lands after whichever section was written last,
   so a key before its first header would join that one, and the entry
-  point refuses the file instead.
+  point refuses the file instead. It is copied in at start, so an edit to it
+  takes a restart (`docker compose restart`): SIGHUP re-reads the
+  generated file, which still holds the old fragment.
 - **A mounted config file wins outright.** When `/etc/hxd-ng/hxd-ng.toml`
   exists (or the file `HXD_CONFIG` names), it is used as it is and the
   variables are ignored. Relative paths in it resolve against
