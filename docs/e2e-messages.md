@@ -407,9 +407,10 @@ that cannot open sealed messages or whose current `device_enc` key is
 another; the sending server answers its client `cert_changed` or
 `not_sealed` to match. The check is needed because a ghost's ID
 promises no device: a link quarantines an old ID only for minutes, and
-not across a restart, so a 905 can reach whoever holds the ID now, and
-nothing carries a session's `sealed` across a link but the answer to
-915.
+a peer that restarted may re-use a ghost for any incoming user with the
+same home server, name and icon, who may be someone else on another
+device, so a 905 can reach whoever the ID stands for now, and nothing
+carries a session's `sealed` across a link but the answer to 915.
 
 Two of the draft's rules give way to this document's: its signature over
 "the recipient's device key" is this one's over the recipient's identity
