@@ -120,8 +120,8 @@ enum Target {
     /// user list is naming a *device*: an account with a phone on uid 2
     /// and a laptop on uid 3, both live, should hear it on the one that
     /// was clicked. §15's multi-device question, answered: prefer the
-    /// named session, else the lowest attached.
-    Named(Option<Uid>),
+    /// named session, else the lowest attached but the sender's.
+    Named { uid: Option<Uid>, sender: Uid },
 }
 
 /// Every visible session owning `mailbox`, lowest uid first.
@@ -162,10 +162,14 @@ fn session_of(r: &RosterInner, mailbox: &Mailbox) -> Option<Uid> {
 /// and dies with the grace window, so a message put there is a message
 /// stamped delivered and then lost. Mail stays pending until somebody is
 /// actually holding a socket.
-fn attached_session_of(r: &RosterInner, mailbox: &Mailbox) -> Option<Uid> {
+///
+/// Never the sender's own session: a message to one's own account is
+/// for its other sessions, and handed back to the one that wrote it, it
+/// reads as a reply from the account and is answered to itself.
+fn attached_session_of(r: &RosterInner, mailbox: &Mailbox, sender: Uid) -> Option<Uid> {
     sessions_of(r, mailbox)
         .into_iter()
-        .find(|uid| r.users.get(uid).is_some_and(is_live))
+        .find(|uid| *uid != sender && r.users.get(uid).is_some_and(is_live))
 }
 
 /// A store that would not answer is a server-side failure, not the
@@ -1469,7 +1473,7 @@ impl Core {
             // message rather than queue it.
             (
                 Sender::resolve(&r, from)?,
-                attached_session_of(&r, &mailbox),
+                attached_session_of(&r, &mailbox, from),
             )
         };
         self.deliver(
@@ -1538,6 +1542,7 @@ impl Core {
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
         let now = SystemTime::now();
+        let from = sender.uid;
 
         // The handle resolves before anything is delivered or stored: a
         // message carrying an image this sender may not attach is
@@ -1610,7 +1615,7 @@ impl Core {
             let uid = if to.has_inbox {
                 to.uid
                     .filter(attached)
-                    .or_else(|| attached_session_of(&r, &to.mailbox))
+                    .or_else(|| attached_session_of(&r, &to.mailbox, from))
                     .or_else(|| to.uid.filter(owns))
             } else {
                 to.uid
@@ -1692,7 +1697,7 @@ impl Core {
             let Some(uid) = to
                 .uid
                 .filter(attached)
-                .or_else(|| attached_session_of(&r, &to.mailbox))
+                .or_else(|| attached_session_of(&r, &to.mailbox, from))
             else {
                 return Err(ChatError::SendQuota);
             };
@@ -1770,7 +1775,14 @@ impl Core {
                 // waited. Naming it fresh would tell the recipient a
                 // message that sat there arrived just now.
                 let delivered = self
-                    .flush_to(Target::Named(to.uid), &to.mailbox, None)
+                    .flush_to(
+                        Target::Named {
+                            uid: to.uid,
+                            sender: from,
+                        },
+                        &to.mailbox,
+                        None,
+                    )
                     .contains(&m.id)
                     || !store
                         .is_pending(&to.mailbox, m.id)
@@ -1796,7 +1808,14 @@ impl Core {
         // Flushing (rather than sending this one row) is what keeps
         // delivery in id order when two senders race.
         let delivered = self
-            .flush_to(Target::Named(to.uid), &to.mailbox, Some(id))
+            .flush_to(
+                Target::Named {
+                    uid: to.uid,
+                    sender: from,
+                },
+                &to.mailbox,
+                Some(id),
+            )
             .contains(&id);
         // A concurrent flush may have been the one that carried it — in
         // which case ours came back without it, and telling the sender
@@ -1993,9 +2012,9 @@ impl Core {
             };
             let uid = match target {
                 Target::Only(uid) => Some(uid).filter(attached),
-                Target::Named(named) => named
+                Target::Named { uid, sender } => uid
                     .filter(attached)
-                    .or_else(|| attached_session_of(&r, mailbox)),
+                    .or_else(|| attached_session_of(&r, mailbox, sender)),
             };
             let Some(uid) = uid else {
                 return Vec::new();

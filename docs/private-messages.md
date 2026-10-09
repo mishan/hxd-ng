@@ -902,7 +902,9 @@ Each stage is a branch with tests, in the house style.
   real client has two devices. *Half-answered:* a message that **names a
   uid** goes to that session when it is attached, and to the lowest
   attached one otherwise — naming a uid names a device, and a legacy
-  user clicking a name in the user list means that one. Read state is
+  user clicking a name in the user list means that one. Never to the
+  sender's own session, though: mail to one's own account is for its
+  other sessions, and stays pending if there are none. Read state is
   still shared, which is the half that remains.
 - **Retention defaults.** 30 days unread and 7 read are guesses; the spec
   says 30 for its queue. The number that matters is whichever one an
