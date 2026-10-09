@@ -52,7 +52,7 @@ been exercised on newer toolchains; CI runs stable.
 | Crate | Role |
 |---|---|
 | `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation and bans, the news tree, avatars, access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
-| `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
+| `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), HOPE, the secure login, and the transport it agrees (`hope.rs`, `docs/hope.md`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs, and the registrar's requests, records and signed lists (with the one record verifier they all share) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
 | `hxd-link` | The link wire of fogWraith's Server Linking Extension (`docs/server-link.md`): the 900-block as ordered field lists (so a relay can pass a group on whole), server groups and Hello, user groups (`users.rs`), the key proof over the TLS 1.3 exporter, the hub (server table, loop and tag checks, newest-wins, the task fanning the core's export feed out to the links, and each link's ghosts), one session loop per link, and the dialer. Knows nothing about classic clients or the ng wire; `hxd-session` hands it a bit-11 login on the TLS port through `PeerAcceptor`. |
@@ -94,8 +94,9 @@ login, password, nick or subject is capped in characters, so one typed
 on either wire cuts at the same place. A body leaves with that
 connection's line ending (CR or LF) whatever the sender used.
 Credentials are canonicalized to UTF-8 from the connection's encoding
-before any auth backend sees them — HOPE proofs must use the same
-canonical form when that lands. Never let a wire type or encoding leak into `hxd-core`'s API; that separation is what makes
+before any auth backend sees them, and a HOPE proof is checked against
+the stored password encoded back the way the client typed it
+(`docs/hope.md` §2). Never let a wire type or encoding leak into `hxd-core`'s API; that separation is what makes
 the ng frontend (and any future one) possible.
 
 **Presence is user-scoped, not connection-scoped.** A `UserSession` owns a
@@ -381,6 +382,15 @@ Three layers, all `cargo test --workspace`:
   transaction in `NAMES_A_USER` refused for a ghost as for a uid nobody
   holds, and an ng `block` of a ghost refusing its messages until
   `unblock`),
+  `hope.rs` (HOPE logins through `hxhope`'s client against a server built
+  from a real config: Blowfish carrying both
+  ways, an ng client seeing the session encrypted and a guest's not, the
+  guest, a UTF-8 password, one Mac Roman cannot write refused as its
+  question marks, wrong passwords throttled as plain ones are and an
+  empty one not, a guest account with a password throttled, a frame sent
+  in the clear behind step 2 refusing the login, no cipher in
+  common refused only under `require_cipher`, and `[hope]` turned off;
+  `tls.rs` has HOPE refused on the TLS port),
   `relay.rs` (a classic server behind `hlrelay`: a client that reaches
   it only over WebSockets logs in, chats with one on the TCP port, and
   downloads over `/htxf`), `slow_consumer.rs` (a room flooded while one
@@ -497,8 +507,8 @@ Hotline-ng MVP (roster + chat + PMs with detach/resume) is complete and
 cross-tested; voice and video are implemented on both wires, sharing one
 room and one SFU; the identity registrar is built, and a server applying
 what a registrar publishes (`docs/identity-registrar.md` §7) is next on
-that front. The large open fronts, in rough order: HOPE + ciphers on the
-legacy wire (`hxcrypto` currently lives in GtkHx), the ng rate-limit and
+that front. The large open fronts, in rough order: the rest of HOPE
+(ChaCha20-Poly1305 and its encrypted transfers, `docs/hope.md` §5), the ng rate-limit and
 client-quickstart polish, files/HTXF, the
 rest of news (the domain, store, search, subscriptions, markdown bodies,
 attachments, the ng wire, the legacy binding and moderation have

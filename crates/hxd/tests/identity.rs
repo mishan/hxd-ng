@@ -242,6 +242,7 @@ async fn start_server_inner(
             login_timeout: Duration::from_secs(5),
             ban_time: Duration::from_secs(60),
             caps: hxd_session::Caps::empty(),
+            hope: None,
             mark_cleartext: true,
             stamp_queued: true,
             trtp_login,

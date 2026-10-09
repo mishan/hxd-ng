@@ -114,6 +114,7 @@ async fn start_with(
             } else {
                 Caps::empty()
             },
+            hope: None,
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             news: Default::default(),

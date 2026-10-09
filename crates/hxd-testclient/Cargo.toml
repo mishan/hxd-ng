@@ -12,6 +12,7 @@ publish = false
 # never with the server's own framer, so a framing bug on either side
 # shows up as a disagreement rather than cancelling out.
 hxproto = { workspace = true }
+hxhope = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

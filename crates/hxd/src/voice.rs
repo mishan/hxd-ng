@@ -158,6 +158,7 @@ mod tests {
             system: None,
             banner: None,
             avatars: None,
+            hope: Default::default(),
             metrics: None,
             link: None,
         }

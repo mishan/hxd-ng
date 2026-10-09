@@ -122,6 +122,7 @@ async fn start_full(dir: &Path, policy: ModerationPolicy, handle_ttl: Duration) 
             caps: Caps::empty()
                 .with(cap::CHAT_HISTORY)
                 .with(cap::INLINE_MEDIA),
+            hope: None,
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             news: Default::default(),

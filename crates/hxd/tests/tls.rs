@@ -98,6 +98,12 @@ async fn start(login_timeout: Duration) -> Running {
             ban_time: Duration::from_secs(60),
             stamp_queued: true,
             caps: Caps::empty().with(cap::LARGE_FILES),
+            hope: Some(hxhope::server::Policy {
+                macs: hxhope::Mac::ALL.to_vec(),
+                ciphers: vec![hxhope::Cipher::Blowfish],
+                compressions: vec![],
+                require_cipher: false,
+            }),
             mark_cleartext: true,
             trtp_login: hxd_session::TrtpLogin::Verify,
             news: Default::default(),
@@ -297,6 +303,27 @@ async fn a_tls_client_and_a_plaintext_one_share_one_room() {
         .send(CHAT_SEND, &[(tag::BODY, b"only you".to_vec())])
         .await;
     open.hear(b"\r       sealed:  only you").await;
+}
+
+#[tokio::test]
+async fn hope_is_refused_on_the_tls_port_and_offered_on_the_plain_one() {
+    use hxd_testclient::legacy::{Client, Login};
+    let server = start(Duration::from_secs(5)).await;
+    let offer = hxhope::client::Offer {
+        ciphers: vec![hxhope::Cipher::Blowfish],
+        ..hxhope::client::Offer::new(*b"TEST")
+    };
+    let mut over_tls = Client::over(Box::new(tls_stream(&server, server.tls).await))
+        .await
+        .unwrap();
+    match over_tls.login_hope(&offer, &Login::guest("g")).await {
+        Err(hxd_testclient::Error::Refused { text, .. }) => {
+            assert_eq!(text, "Secure login (HOPE) is not offered here.")
+        }
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    let mut plain = Client::connect(server.plain).await.unwrap();
+    plain.login_hope(&offer, &Login::guest("g")).await.unwrap();
 }
 
 #[tokio::test]

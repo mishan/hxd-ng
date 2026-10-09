@@ -107,6 +107,48 @@ pub struct Config {
     pub metrics: Option<metrics::MetricsSection>,
     /// Server linking (`docs/server-link.md`).
     pub link: Option<link::LinkSection>,
+    /// HOPE, the secure login, on the classic ports (`docs/hope.md`).
+    /// On unless `enabled = false`: a client that does not speak it
+    /// never notices.
+    #[serde(default)]
+    pub hope: HopeSection,
+}
+
+/// `[hope]`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HopeSection {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Refuse a HOPE login with no cipher in common rather than check its
+    /// password and go on in plaintext, as mhxd does by default.
+    #[serde(default)]
+    pub require_cipher: bool,
+}
+
+impl Default for HopeSection {
+    fn default() -> Self {
+        HopeSection {
+            enabled: true,
+            require_cipher: false,
+        }
+    }
+}
+
+impl HopeSection {
+    fn policy(&self) -> Option<hxhope::server::Policy> {
+        use hxhope::{Cipher, Mac};
+        self.enabled.then(|| hxhope::server::Policy {
+            macs: Mac::ALL.to_vec(),
+            // ChaCha20-Poly1305 waits for encrypted file transfers: a
+            // client that agrees it encrypts its transfers too.
+            ciphers: vec![Cipher::Blowfish],
+            // None: hxhope's decoders hold up to 16 MiB each of what a
+            // peer sends, which no budget here counts (`docs/hope.md` §3).
+            compressions: vec![],
+            require_cipher: self.require_cipher,
+        })
+    }
 }
 
 /// `[avatars]`: a user's picture, on both wires.
@@ -3732,6 +3774,7 @@ pub fn build_ctx(
                 .as_ref()
                 .map(NewsSection::to_legacy)
                 .unwrap_or_default(),
+            hope: config.hope.policy(),
         }),
         files: files.map(|value| value.service.clone()),
         banner,

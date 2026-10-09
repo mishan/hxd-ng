@@ -40,6 +40,7 @@ async fn start_server(accounts: &Path, agreement: Option<&str>) -> SocketAddr {
             ban_time: Duration::from_secs(60),
             stamp_queued: true,
             caps: hxd_session::Caps::empty(),
+            hope: None,
             mark_cleartext: false,
             trtp_login: hxd_session::TrtpLogin::Verify,
             news: Default::default(),
