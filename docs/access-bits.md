@@ -109,7 +109,7 @@ only on a local file area; a manifest area refuses them all as read-only.
 | 30 | `view_drop_boxes` | See the contents of a drop box, and change any path that names one (as on mhxd, a folder holding a drop box is not such a path) | **Enforced**, both wires |
 | 31 | `make_aliases` | Create an alias | Parsed — aliases are refused whoever asks, since the file area never follows a symlink |
 | 38 | `upload_folders` | Upload a whole folder | Parsed |
-| 39 | `download_folders` | Download a whole folder | Parsed |
+| 39 | `download_folders` | Download a whole folder | **Enforced**, classic wire |
 
 ### Chat (9, 10, 11)
 

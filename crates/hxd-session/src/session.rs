@@ -626,6 +626,7 @@ const HANDLED: &[ClientHdr] = &[
     ClientHdr::ChatSubject,
     ClientHdr::DownloadBanner,
     ClientHdr::FileGet,
+    ClientHdr::FileGetFolder,
     ClientHdr::FileGetInfo,
     ClientHdr::FileList,
     ClientHdr::FilePut,
@@ -3693,19 +3694,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "Session ended.");
                 return;
             };
-            let entry = FileEntry {
-                name: info.path.name().unwrap_or_default().to_owned(),
-                kind: info.kind,
-                size: info.size,
-                media_type: info.media_type.clone(),
-                modified: info.modified,
-            };
-            let (inferred_type, inferred_creator) = files::type_creator(&entry);
-            let type_code = info.type_code.unwrap_or(inferred_type);
-            let creator = info.creator_code.unwrap_or(inferred_creator);
-            let comment = sess
-                .enc
-                .body_capped(info.comment.as_deref().unwrap_or_default(), 255);
+            let (type_code, creator, comment) = files::file_metadata(sess.enc, &info);
             let prepared = hxd_files::prepare_legacy(
                 &service.transfers,
                 service.source.clone(),
@@ -3754,6 +3743,136 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 ));
                 chunks.push((tag::FILESIZE64, info.size.to_be_bytes().to_vec()));
                 chunks.push((tag::OFFSET64, offset.to_be_bytes().to_vec()));
+            }
+            reply(tx, f.trans, chunks);
+        }
+
+        t if t == ClientHdr::FileGetFolder.as_u32() => {
+            if !sess.can(bit::DOWNLOAD_FOLDERS) {
+                reply_error(tx, f.trans, "You are not allowed to download folders.");
+                return;
+            }
+            let Some(service) = ctx.files.as_ref() else {
+                reply_error(tx, f.trans, "Files are not available on this server.");
+                return;
+            };
+            let Some(name) = f.chunks().find(|chunk| chunk.tag == tag::FILE_NAME) else {
+                reply_error(tx, f.trans, "No folder name was supplied.");
+                return;
+            };
+            let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
+            let dir = dir.as_ref().map(|chunk| chunk.data);
+            let large = sess.has_cap(cap::LARGE_FILES);
+            let drop_boxes = sess.can(bit::VIEW_DROP_BOXES);
+            if !drop_boxes && files::spells_drop_box(sess.enc, dir, Some(name.data)) {
+                reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
+                return;
+            }
+            let source = service.source.as_ref();
+            let found =
+                files::resolve_entry(source, dir, name.data, large, sess.enc, drop_boxes).await;
+            let root = match found {
+                Ok((path, info, _)) if info.kind == FileKind::Folder => path,
+                Ok(_) => {
+                    reply_error(tx, f.trans, "That path is not a folder.");
+                    return;
+                }
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            if root.is_drop_box() && !drop_boxes {
+                reply_error(tx, f.trans, "You are not allowed to view drop boxes.");
+                return;
+            }
+            let walked = files::walk_folder(
+                source,
+                &root,
+                large,
+                sess.enc,
+                drop_boxes,
+                service.max_folder_items,
+            )
+            .await;
+            let walked = match walked {
+                Ok(Some(walked)) => walked,
+                Ok(None) => {
+                    reply_error(
+                        tx,
+                        f.trans,
+                        "That folder holds too many items to download at once.",
+                    );
+                    return;
+                }
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let mut items = Vec::with_capacity(walked.len());
+            for (wire, entry) in walked {
+                let file = if entry.entry.kind == FileKind::Folder {
+                    None
+                } else {
+                    let info = match source.info(&entry.path).await {
+                        Ok(info) => info,
+                        Err(error) => {
+                            reply_error(tx, f.trans, file_error_text(&error));
+                            return;
+                        }
+                    };
+                    let (type_code, creator, wire_comment) = files::file_metadata(sess.enc, &info);
+                    Some(hxd_files::FolderFile {
+                        path: entry.path,
+                        wire_name: entry.name,
+                        type_code,
+                        creator,
+                        wire_comment,
+                        created: info.created.unwrap_or(0),
+                        modified: info.modified.unwrap_or(0),
+                        data_len: info.size,
+                        resource_len: info.resource_size,
+                    })
+                };
+                items.push(hxd_files::FolderItem { path: wire, file });
+            }
+            let Some(serial) = ctx.core.session_serial(sess.uid) else {
+                reply_error(tx, f.trans, "Session ended.");
+                return;
+            };
+            let count = items.len() as u64;
+            let prepared = hxd_files::prepare_folder(
+                &service.transfers,
+                service.source.clone(),
+                hxd_files::FolderTransfer {
+                    principal: FilePrincipal {
+                        uid: sess.uid,
+                        serial,
+                    },
+                    account: sess.account.login.clone(),
+                    peer: sess.transfer_addr,
+                    hope: sess.transfer_keys.clone(),
+                    large,
+                    items,
+                },
+            );
+            let (reference, size) = match prepared {
+                Ok(value) => value,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let clamp = |value: u64| (value.min(u32::MAX as u64) as u32).to_be_bytes().to_vec();
+            let mut chunks = vec![
+                (tag::HTXF_REF, reference.to_be_bytes().to_vec()),
+                (tag::HTXF_SIZE, clamp(size)),
+                (tag::FILE_NFILES, clamp(count)),
+            ];
+            if large {
+                chunks.push((tag::XFERSIZE64, size.to_be_bytes().to_vec()));
+                chunks.push((tag::FOLDER_ITEM_COUNT64, count.to_be_bytes().to_vec()));
             }
             reply(tx, f.trans, chunks);
         }

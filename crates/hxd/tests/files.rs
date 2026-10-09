@@ -13,7 +13,7 @@ use hxd_files::{
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::frame::{pack_frame, read_frame, Frame};
 use hxd_session::{cap, Caps, ServerConfig, ServerCtx};
-use hxfiles_xfer::{ffo, htxf, rflt};
+use hxfiles_xfer::{ffo, folder, htxf, rflt};
 use hxproto::messages::tag;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,6 +27,7 @@ const FILE_LIST: u32 = 0x00c8;
 const FILE_GET_INFO: u32 = 0x00ce;
 const FILE_GET: u32 = 0x00ca;
 const FILE_PUT: u32 = 0x00cb;
+const FILE_GET_FOLDER: u32 = 0x00d2;
 const LIST_ENTRY: u16 = 0x00c8;
 const HUGE_SIZE: u64 = u32::MAX as u64 + 6;
 
@@ -1830,4 +1831,153 @@ async fn http_get_headers(address: SocketAddr, path: &str, headers: &str) -> Str
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).await.unwrap();
     String::from_utf8(bytes).unwrap()
+}
+
+/// One folder download's connection, driven as a client drives it.
+struct FolderDownload(TcpStream);
+
+impl FolderDownload {
+    async fn open(address: SocketAddr, reference: u32, type_code: u16) -> Self {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let preamble = htxf::Preamble {
+            reference,
+            transfer_len: 0,
+            type_code,
+            flags: 0,
+            resume_digest: None,
+        };
+        stream.write_all(&preamble.encode().unwrap()).await.unwrap();
+        FolderDownload(stream)
+    }
+
+    /// NEXT, and the header it is answered with, or `None` when the server
+    /// closes instead.
+    async fn next(&mut self) -> Option<folder::Item> {
+        self.0
+            .write_all(&folder::ACTION_NEXT.to_be_bytes())
+            .await
+            .unwrap();
+        let mut len = [0; 2];
+        match timeout(IDLE, self.0.read_exact(&mut len)).await.unwrap() {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+            Err(e) => panic!("{e}"),
+        }
+        let mut body = vec![0; usize::from(u16::from_be_bytes(len))];
+        self.0.read_exact(&mut body).await.unwrap();
+        Some(folder::Item::parse(&body).unwrap())
+    }
+
+    /// SEND, or RESUME from `data` bytes in, and the object that follows
+    /// behind its size.
+    async fn fetch(&mut self, data: u32) -> Vec<u8> {
+        if data == 0 {
+            self.0
+                .write_all(&folder::ACTION_SEND.to_be_bytes())
+                .await
+                .unwrap();
+        } else {
+            let record = rflt::encode(rflt::Resume { data, resource: 0 });
+            let mut action = folder::ACTION_RESUME.to_be_bytes().to_vec();
+            action.extend_from_slice(&(record.len() as u16).to_be_bytes());
+            action.extend_from_slice(&record);
+            self.0.write_all(&action).await.unwrap();
+        }
+        let mut size = [0; 4];
+        self.0.read_exact(&mut size).await.unwrap();
+        let mut object = vec![0; u32::from_be_bytes(size) as usize];
+        timeout(IDLE, self.0.read_exact(&mut object))
+            .await
+            .unwrap()
+            .unwrap();
+        object
+    }
+}
+
+#[tokio::test]
+async fn a_folder_downloads_item_by_item_as_the_client_asks() {
+    let (server, root, _source) = start_local_with(
+        "download_files = true\ndownload_folders = true\nread_chat = true\nuse_any_name = true\n",
+    )
+    .await;
+    let pkg = root.path().join("pkg");
+    std::fs::create_dir_all(pkg.join("sub")).unwrap();
+    std::fs::create_dir_all(pkg.join("Drop Box")).unwrap();
+    std::fs::write(pkg.join("b.txt"), "bee").unwrap();
+    std::fs::write(pkg.join("a.txt"), "hello world").unwrap();
+    std::fs::write(pkg.join("sub/c.txt"), "sea").unwrap();
+    std::fs::write(pkg.join("Drop Box/secret.txt"), "hidden").unwrap();
+    let mut classic = Legacy::login(server.legacy, false).await;
+
+    // Depth first, each folder before what it holds, in name order, and a
+    // drop box this account may not view sent empty. GtkHx names type 1.
+    let reply = classic
+        .request(FILE_GET_FOLDER, &[(tag::FILE_NAME, b"pkg".to_vec())])
+        .await;
+    assert_eq!(reply.flag & 1, 0);
+    let count = u32::from_be_bytes(field(&reply, tag::FILE_NFILES).unwrap().try_into().unwrap());
+    // A walked folder is held until it is fetched, one at a time.
+    let again = classic
+        .request(FILE_GET_FOLDER, &[(tag::FILE_NAME, b"pkg".to_vec())])
+        .await;
+    assert_ne!(again.flag & 1, 0);
+    let mut download = FolderDownload::open(server.htxf, reference_of(&reply), 1).await;
+    let mut seen = Vec::new();
+    while let Some(item) = download.next().await {
+        let path: Vec<_> = item
+            .path
+            .iter()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect();
+        let path = path.join("/");
+        if !item.folder {
+            // A resume asks for the rest of a file.
+            let resumed = path == "a.txt";
+            let object = download.fetch(if resumed { 6 } else { 0 }).await;
+            let body = match path.as_str() {
+                "a.txt" => "world",
+                "b.txt" => "bee",
+                _ => "sea",
+            };
+            assert!(object.windows(body.len()).any(|w| w == body.as_bytes()));
+            assert!(!object.windows(5).any(|w| w == b"hello"));
+        }
+        seen.push((path, item.folder));
+    }
+    let expected = [
+        ("Drop Box", true),
+        ("a.txt", false),
+        ("b.txt", false),
+        ("sub", true),
+        ("sub/c.txt", false),
+    ];
+    assert_eq!(
+        seen,
+        expected.map(|(path, folder)| (path.to_string(), folder))
+    );
+    assert_eq!(count as usize, expected.len());
+
+    // The size announced is what the files' objects come to. GtkHx's own
+    // test names type 0, and is served all the same.
+    let reply = classic
+        .request(FILE_GET_FOLDER, &[(tag::FILE_NAME, b"pkg".to_vec())])
+        .await;
+    let announced = u32::from_be_bytes(field(&reply, tag::HTXF_SIZE).unwrap().try_into().unwrap());
+    let mut download = FolderDownload::open(server.htxf, reference_of(&reply), 0).await;
+    let mut total = 0;
+    while let Some(item) = download.next().await {
+        if !item.folder {
+            total += download.fetch(0).await.len();
+        }
+    }
+    assert_eq!(total, announced as usize);
+
+    // An account without the bit is refused.
+    let (server, root, _source) = start_local().await;
+    std::fs::create_dir(root.path().join("pkg")).unwrap();
+    let refused = Legacy::login(server.legacy, false)
+        .await
+        .request(FILE_GET_FOLDER, &[(tag::FILE_NAME, b"pkg".to_vec())])
+        .await;
+    assert_ne!(refused.flag & 1, 0);
 }

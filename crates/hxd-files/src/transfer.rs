@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hxd_core::{Core, FileBody, FileError, FilePath, FilePrincipal, FileSource};
-use hxfiles_xfer::{ffo, htxf};
+use hxfiles_xfer::{ffo, folder, htxf, rflt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
@@ -12,8 +12,8 @@ use tracing::{debug, warn};
 
 use crate::local::PartialKey;
 use crate::{
-    LocalFileSource, PreparedDownload, PreparedTransfer, PreparedUpload, TransferRegistry,
-    UploadQuote,
+    FolderItem, LocalFileSource, PreparedDownload, PreparedFolder, PreparedTransfer,
+    PreparedUpload, TransferRegistry, UploadQuote,
 };
 
 /// How much of a body is read and written at a time.
@@ -102,6 +102,53 @@ pub async fn prepare_legacy(
         resource_offset: request.resource_offset,
         large: request.large,
         encoded,
+    }))?;
+    Ok((reference, size))
+}
+
+pub struct FolderTransfer {
+    pub principal: FilePrincipal,
+    pub account: String,
+    /// As for [`LegacyTransfer::peer`].
+    pub peer: Option<IpAddr>,
+    /// See [`PreparedDownload::hope`].
+    pub hope: Option<crate::SealKeys>,
+    pub large: bool,
+    pub items: Vec<FolderItem>,
+}
+
+/// Issues a folder download: its reference, and the size its files'
+/// objects come to, which is what the reply announces.
+pub fn prepare_folder(
+    registry: &TransferRegistry,
+    source: Arc<dyn FileSource>,
+    request: FolderTransfer,
+) -> Result<(u32, u64), FileError> {
+    let mut size = 0u64;
+    let mut fits = true;
+    for item in &request.items {
+        // A header the wire cannot carry is refused now, not partway.
+        folder::Item {
+            folder: item.file.is_none(),
+            path: item.path.clone(),
+        }
+        .encode()
+        .map_err(|_| FileError::TooDeep)?;
+        if let Some(file) = &item.file {
+            let len = file.encode(0, 0, request.large)?.transfer_len;
+            fits &= len <= u64::from(u32::MAX);
+            size = size.checked_add(len).ok_or(FileError::TooLarge)?;
+        }
+    }
+    let reference = registry.issue(PreparedTransfer::Folder(PreparedFolder {
+        principal: request.principal,
+        account: request.account,
+        peer: request.peer,
+        hope: request.hope,
+        source,
+        large: request.large,
+        fits,
+        items: request.items.into(),
     }))?;
     Ok((reference, size))
 }
@@ -347,6 +394,10 @@ async fn serve_one<S: HtxfStream>(
             let alive = Liveness::new(core, transfer.principal);
             serve_download(stream, transfer, &alive, timeouts.idle).await
         }
+        PreparedTransfer::Folder(transfer) => {
+            let alive = Liveness::new(core, transfer.principal);
+            serve_folder(stream, transfer, &alive, timeouts.idle).await
+        }
         // No `Liveness` check: a banner is at most 1 MiB, already in memory,
         // and finishes within `idle`; a kick mid-banner costs nothing worth
         // interrupting it for.
@@ -374,43 +425,176 @@ async fn serve_download<S: HtxfStream>(
     idle: Duration,
 ) -> Result<(), FileError> {
     let _open = hxd_core::instrument::transfer_open("download");
-    // A resume at the very end of a fork has nothing left to fetch from
-    // it, and the transfer carries that fork's header alone, as mhxd
-    // sends it.
-    let data = if transfer.encoded.data_remaining == 0 {
-        None
-    } else {
-        let body = transfer
-            .source
-            .open(&transfer.path, transfer.offset)
-            .await?;
-        if body.len != transfer.encoded.data_remaining {
-            return Err(FileError::OriginChanged);
-        }
-        Some(body)
-    };
-    write_idle(&mut stream, &transfer.encoded.prefix, idle).await?;
-    if let Some(body) = data {
-        let expected = body.len;
-        deliver(body, &mut stream, expected, idle, alive).await?;
-    }
-    write_idle(&mut stream, &transfer.encoded.resource_header, idle).await?;
-    if transfer.encoded.resource_remaining != 0 {
-        let resource = transfer
-            .source
-            .open_resource(&transfer.path, transfer.resource_offset)
-            .await?;
-        if resource.len != transfer.encoded.resource_remaining {
-            return Err(FileError::OriginChanged);
-        }
-        let expected = resource.len;
-        deliver(resource, &mut stream, expected, idle, alive).await?;
-    }
+    send_object(
+        &mut stream,
+        transfer.source.as_ref(),
+        &transfer.path,
+        &transfer.encoded,
+        (transfer.offset, transfer.resource_offset),
+        alive,
+        idle,
+    )
+    .await?;
     tokio::time::timeout(idle, stream.shutdown())
         .await
         .map_err(|_| stalled())?
         .map_err(|e| FileError::Unavailable(e.to_string()))?;
     Ok(())
+}
+
+/// One flattened file object: `encoded`'s framing around the forks of
+/// `path`, read from `offsets` (data, resource).
+async fn send_object<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    source: &dyn FileSource,
+    path: &FilePath,
+    encoded: &ffo::Encoded,
+    offsets: (u64, u64),
+    alive: &Liveness,
+    idle: Duration,
+) -> Result<(), FileError> {
+    // A resume at the very end of a fork has nothing left to fetch from
+    // it, and the transfer carries that fork's header alone, as mhxd
+    // sends it.
+    let data = if encoded.data_remaining == 0 {
+        None
+    } else {
+        let body = source.open(path, offsets.0).await?;
+        if body.len != encoded.data_remaining {
+            return Err(FileError::OriginChanged);
+        }
+        Some(body)
+    };
+    write_idle(stream, &encoded.prefix, idle).await?;
+    if let Some(body) = data {
+        let expected = body.len;
+        deliver(body, stream, expected, idle, alive).await?;
+    }
+    write_idle(stream, &encoded.resource_header, idle).await?;
+    if encoded.resource_remaining != 0 {
+        let resource = source.open_resource(path, offsets.1).await?;
+        if resource.len != encoded.resource_remaining {
+            return Err(FileError::OriginChanged);
+        }
+        let expected = resource.len;
+        deliver(resource, stream, expected, idle, alive).await?;
+    }
+    Ok(())
+}
+
+/// A folder download's dialog (Hotline.md, Download Folder): the client
+/// asks for each item's header with NEXT, then for a file's object with
+/// SEND or RESUME, and the server closes once NEXT finds nothing left.
+async fn serve_folder<S: HtxfStream>(
+    mut stream: S,
+    transfer: PreparedFolder,
+    alive: &Liveness,
+    idle: Duration,
+) -> Result<(), FileError> {
+    let _open = hxd_core::instrument::transfer_open("download");
+    let protocol = |what: &str| FileError::Unavailable(format!("folder download: {what}"));
+    let mut items = transfer.items.iter();
+    let mut current: Option<&FolderItem> = None;
+    loop {
+        // TLS, a sealed transfer and the tunnel may hold what was written
+        // until they are flushed, and the client answers only what it has.
+        tokio::time::timeout(idle, stream.flush())
+            .await
+            .map_err(|_| stalled())?
+            .map_err(|e| FileError::Unavailable(e.to_string()))?;
+        let Some(action) = read_action(&mut stream, idle).await? else {
+            break;
+        };
+        alive.check()?;
+        match action {
+            folder::ACTION_NEXT => {
+                let Some(item) = items.next() else {
+                    break;
+                };
+                current = Some(item);
+                let header = folder::Item {
+                    folder: item.file.is_none(),
+                    path: item.path.clone(),
+                }
+                .encode()
+                .map_err(|e| protocol(&e.to_string()))?;
+                write_idle(&mut stream, &header, idle).await?;
+            }
+            folder::ACTION_SEND | folder::ACTION_RESUME => {
+                // Once per item: a client wanting it again asks again.
+                let file = current
+                    .take()
+                    .and_then(|item| item.file.as_ref())
+                    .ok_or_else(|| protocol("a send names no file"))?;
+                let resume = if action == folder::ACTION_RESUME {
+                    let mut len = [0; 2];
+                    read_exact_idle(&mut stream, &mut len, idle).await?;
+                    let len = usize::from(u16::from_be_bytes(len));
+                    if len > folder::MAX_RESUME_LEN {
+                        return Err(protocol("an oversized resume"));
+                    }
+                    let mut record = vec![0; len];
+                    read_exact_idle(&mut stream, &mut record, idle).await?;
+                    rflt::parse_compatible(&record)
+                } else {
+                    rflt::Resume::default()
+                };
+                let offsets = (u64::from(resume.data), u64::from(resume.resource));
+                if offsets.0 != 0
+                    && offsets.0 < file.data_len
+                    && !transfer.source.supports_ranges(&file.path)
+                {
+                    return Err(protocol("a resume this file cannot make"));
+                }
+                let encoded = file.encode(offsets.0, offsets.1, transfer.large)?;
+                // Advisory past 32 bits (Capabilities-Large-File, "Per-item
+                // transfer size"): the receiver reads the object's own
+                // fork headers.
+                let size = u32::try_from(encoded.transfer_len).unwrap_or(0);
+                write_idle(&mut stream, &size.to_be_bytes(), idle).await?;
+                send_object(
+                    &mut stream,
+                    transfer.source.as_ref(),
+                    &file.path,
+                    &encoded,
+                    offsets,
+                    alive,
+                    idle,
+                )
+                .await?;
+            }
+            _ => return Err(protocol("an unknown action")),
+        }
+    }
+    tokio::time::timeout(idle, stream.shutdown())
+        .await
+        .map_err(|_| stalled())?
+        .map_err(|e| FileError::Unavailable(e.to_string()))
+}
+
+/// The receiver's next action, or `None` when it has closed between them.
+async fn read_action<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    idle: Duration,
+) -> Result<Option<u16>, FileError> {
+    let mut action = [0; 2];
+    if read_idle(stream, &mut action[..1], idle).await? == 0 {
+        return Ok(None);
+    }
+    read_exact_idle(stream, &mut action[1..], idle).await?;
+    Ok(Some(u16::from_be_bytes(action)))
+}
+
+async fn read_exact_idle<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    bytes: &mut [u8],
+    idle: Duration,
+) -> Result<(), FileError> {
+    tokio::time::timeout(idle, stream.read_exact(bytes))
+        .await
+        .map_err(|_| stalled())?
+        .map(|_| ())
+        .map_err(|e| FileError::Unavailable(e.to_string()))
 }
 
 async fn serve_upload<S: HtxfStream>(
@@ -964,5 +1148,66 @@ mod tests {
         let mut chunks = pump(body, CHUNK as u64, Duration::from_secs(5), alive);
         assert!(chunks.recv().await.unwrap().is_err());
         assert!(chunks.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_folder_download_flushes_before_it_waits_for_the_client() {
+        // A sealed transfer or the tunnel holds a write until it is flushed,
+        // as a buffered writer does; the client answers only what arrived.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), "ab").unwrap();
+        let source = Arc::new(LocalFileSource::open(temp.path(), Default::default()).unwrap());
+        let core = Arc::new(Core::new());
+        let principal = attach(&core);
+        let file = crate::FolderFile {
+            path: FilePath::root().join("a.txt").unwrap(),
+            wire_name: b"a.txt".to_vec(),
+            type_code: *b"TEXT",
+            creator: *b"ttxt",
+            wire_comment: Vec::new(),
+            created: 0,
+            modified: 0,
+            data_len: 2,
+            resource_len: 0,
+        };
+        let folder = PreparedFolder {
+            principal,
+            account: "reader".into(),
+            peer: None,
+            hope: None,
+            source,
+            large: false,
+            fits: true,
+            items: vec![FolderItem {
+                path: vec![b"a.txt".to_vec()],
+                file: Some(file),
+            }]
+            .into(),
+        };
+        let (near, mut far) = tokio::io::duplex(1 << 16);
+        let alive = Liveness::new(core.clone(), principal);
+        let idle = Duration::from_secs(5);
+        let served = tokio::spawn(async move {
+            serve_folder(tokio::io::BufWriter::new(near), folder, &alive, idle).await
+        });
+        let wait = Duration::from_secs(2);
+        for action in [folder::ACTION_NEXT, folder::ACTION_SEND] {
+            far.write_all(&action.to_be_bytes()).await.unwrap();
+            let mut answer = [0; 2];
+            tokio::time::timeout(wait, far.read_exact(&mut answer))
+                .await
+                .expect("the answer is flushed before the server waits")
+                .unwrap();
+        }
+        far.write_all(&folder::ACTION_NEXT.to_be_bytes())
+            .await
+            .unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(wait, far.read_to_end(&mut rest))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rest.windows(2).any(|w| w == b"ab"));
+        served.await.unwrap().unwrap();
     }
 }

@@ -114,6 +114,50 @@ async fn list_within(
     list(source, path, large, enc).await
 }
 
+/// What a folder download of `root` sends: every entry below it with its
+/// wire names, depth first, each folder before what it holds, in wire-name
+/// order. Names are the ones this connection is listed, so a client that
+/// asks for one later finds it. A drop box the asker may not view is sent
+/// as an empty folder, as a listing shows it. `None` past `max_items`.
+pub(crate) async fn walk_folder(
+    source: &dyn FileSource,
+    root: &FilePath,
+    large: bool,
+    enc: TextEncoding,
+    drop_boxes: bool,
+    max_items: usize,
+) -> Result<Option<Vec<(Vec<Vec<u8>>, WireEntry)>>, FileError> {
+    let children = |prefix: Vec<Vec<u8>>, path: FilePath| async move {
+        let mut entries = match list_within(source, &path, large, enc, drop_boxes).await {
+            Err(FileError::NotFound) if path.is_drop_box() => Vec::new(),
+            listed => listed?,
+        };
+        // Reversed, so the stack below pops them in name order.
+        entries.sort_by(|a, b| b.name.cmp(&a.name));
+        Ok::<_, FileError>(entries.into_iter().map(move |entry| {
+            let mut wire = prefix.clone();
+            wire.push(entry.name.clone());
+            (wire, entry)
+        }))
+    };
+    let mut pending: Vec<_> = children(Vec::new(), root.clone()).await?.collect();
+    let mut items = Vec::new();
+    while let Some((wire, entry)) = pending.pop() {
+        // A file whose name reads as a drop box is one FileGet refuses.
+        if entry.entry.kind == FileKind::File && entry.path.is_drop_box() && !drop_boxes {
+            continue;
+        }
+        if entry.entry.kind == FileKind::Folder {
+            pending.extend(children(wire.clone(), entry.path.clone()).await?);
+        }
+        items.push((wire, entry));
+        if items.len() + pending.len() > max_items {
+            return Ok(None);
+        }
+    }
+    Ok(Some(items))
+}
+
 /// The folder `components` name, each matched against the wire names its
 /// parent lists.
 pub(crate) async fn resolve_folders(
@@ -272,6 +316,24 @@ pub(crate) fn list_payload(entry: &WireEntry) -> Vec<u8> {
     out.extend_from_slice(&(entry.name.len() as u32).to_be_bytes());
     out.extend_from_slice(&entry.name);
     out
+}
+
+/// A file's type, creator and wire comment, as a download sends them in
+/// its object: what the area stores, else what its name suggests.
+pub(crate) fn file_metadata(enc: TextEncoding, info: &FileInfo) -> ([u8; 4], [u8; 4], Vec<u8>) {
+    let entry = FileEntry {
+        name: info.path.name().unwrap_or_default().to_owned(),
+        kind: info.kind,
+        size: info.size,
+        media_type: info.media_type.clone(),
+        modified: info.modified,
+    };
+    let (inferred_type, inferred_creator) = type_creator(&entry);
+    (
+        info.type_code.unwrap_or(inferred_type),
+        info.creator_code.unwrap_or(inferred_creator),
+        enc.body_capped(info.comment.as_deref().unwrap_or_default(), 255),
+    )
 }
 
 pub(crate) fn type_creator(entry: &FileEntry) -> ([u8; 4], [u8; 4]) {
