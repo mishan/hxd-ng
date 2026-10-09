@@ -766,6 +766,18 @@ async fn classic_hides_oversized_files_while_large_file_resume_is_exact() {
     );
 
     let mut capable = Legacy::login(server.legacy, true).await;
+    // Large files negotiated, a handshake without LARGE_FILE still
+    // downloads what 32 bits can carry, as GtkHx sends it, and nothing
+    // larger.
+    for (name, served) in [(&b"hello.txt"[..], true), (b"huge.bin", false)] {
+        let get = capable
+            .request(FILE_GET, &[(tag::FILE_NAME, name.to_vec())])
+            .await;
+        let reference = u32::from_be_bytes(field(&get, tag::HTXF_REF).unwrap().try_into().unwrap());
+        let bytes = transfer(server.htxf, classic_download(reference)).await;
+        assert_eq!(bytes.windows(11).any(|w| w == b"hello world"), served);
+        assert_eq!(bytes.is_empty(), !served);
+    }
     let listing = capable.request(FILE_LIST, &[]).await;
     let chunks: Vec<_> = listing.chunks().collect();
     let huge = chunks

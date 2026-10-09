@@ -353,8 +353,16 @@ impl TransferRegistry {
                 // Download File), mhxd reads it only for uploads, and
                 // mhxd's own client echoes the reply's transfer size
                 // instead, so both must work.
+                //
+                // A client that negotiated large files may still leave
+                // LARGE_FILE off a transfer 32 bits can carry, as GtkHx
+                // does: the object is then the same bytes either way.
                 let large_flag = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
-                if large_flag != transfer.large || preamble.flags & htxf::FLAG_RESUME != 0 {
+                let fits = transfer.encoded.transfer_len <= u64::from(u32::MAX);
+                if (large_flag && !transfer.large)
+                    || (!large_flag && !fits)
+                    || preamble.flags & htxf::FLAG_RESUME != 0
+                {
                     return Err(FileError::InvalidPath);
                 }
                 (false, None)
