@@ -5,7 +5,8 @@ built — §16 says which stages, and which keys of §13 the server accepts.
 The image part (§12.3) and the mhxd importer (§12.6) are designed and not
 built; both are deferred and get status lines of their own when
 scheduled. §10.7's `stale_after` floor is a 2026-09 amendment and is
-built.
+built. Feed-backed categories, RSS and Atom polled into read-only
+categories, are designed in [news-feeds.md](news-feeds.md).
 
 ROADMAP Phase 4 promises "1.2 flat news post/read, and the 1.5 threaded
 news tree (categories, bundles, threads)". When this was written nothing
