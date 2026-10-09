@@ -4,7 +4,8 @@ Status: first and second slices implemented, 2026-09-12, and file
 management on the local area since. The first slice is read-only
 manifest-backed HTTP; the second adds a capability-rooted local file area and
 single-file uploads; the third, New Folder, Delete, rename, Move and
-comments. This document is the execution plan and
+comments; Download Folder since 2026-10 (F1 of "Folder transfers"). This
+document is the execution plan and
 acceptance contract for the Files work across hxd-ng and its clients. The
 exploratory notes in
 [`file-sources.md`](file-sources.md) remain useful design background; this
@@ -287,10 +288,52 @@ The work is complete only when all of these are true:
 - the full hxd-ng Rust gates, hx-ng type/package/build gates, and the real
   cross-frontend e2e suite pass.
 
+## Folder transfers
+
+Download Folder (210) and Upload Folder (213) on the classic wire, as mhxd
+and GtkHx run them and Hotline.md and Capabilities-Large-File describe
+them; the item header and actions are `hxfiles_xfer::folder`.
+
+- **F1, Download Folder (built).** Needs `download_folders`. The folder is
+  walked when 210 arrives, depth first, each folder before what it holds,
+  in wire-name order, showing what a listing would: the names this
+  connection is listed, without what a listing leaves out, and a drop
+  box the account may not view sent as an empty folder (nor a file whose
+  name reads as one, which FileGet would refuse it). Past `[files]
+  max_folder_items` (default 100000) it is refused, and a session has one
+  folder waiting to be fetched at a time, since its items are held until
+  then. The reply carries the reference, the size
+  the files' objects come to, and the item count, files and folders alike
+  (mhxd counts the top level only, which disagrees with what it sends),
+  with `XFERSIZE64` and `FOLDER_ITEM_COUNT64` in large-file mode. On the
+  transfer port the client speaks first: NEXT for each item's header,
+  then SEND or RESUME (an RFLT behind its length, read as `rflt`'s
+  compatible parser reads one) for a file's object behind its 4-byte size,
+  which is 0 past 32 bits, once per NEXT; NEXT past the last item and the
+  server closes. A resume this area cannot make, or one past a fork's
+  end, ends the transfer.
+  The handshake's type is not read, since GtkHx's own test names 0. Sizes
+  come from the walk, so a file that changed since ends the transfer at
+  that item rather than send what was not announced. Names cross in the
+  connection's encoding, where mhxd sends raw bytes.
+- **F2, Upload Folder.** The server drives: NEXT, the client's item
+  header, SEND or RESUME for a file (GtkHx treats NEXT there as a protocol
+  error), its object; the client's close between items ends it. Folders
+  are made and files published through the single-file upload path. A
+  folder that already exists is refused unless the request sets the resume
+  option (204), when the upload merges into it and resumes partials. Into a
+  drop box the account may not view, the top folder is published blind,
+  under a free name, as single files are.
+- **F3, the queue and limits.** Concurrent transfers per account,
+  configurable, defaulting to mhxd's one download and one upload; queue
+  positions in the replies and the Download Info (211) push; Kill Download
+  (214) ending the transfer it names, though GtkHx never sends it.
+
 ## Deferred work
 
 The following remain separate milestones:
 
-- folder get/put transactions and their 64-bit aggregate counts;
-- transfer queueing, per-account quotas, and background origin prefetching;
+- Upload Folder, and the transfer queue and per-account limits (F2 and
+  F3 above);
+- per-account quotas and background origin prefetching;
 - direct origin URLs in the ng client.

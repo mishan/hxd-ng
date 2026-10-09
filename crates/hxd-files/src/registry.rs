@@ -147,9 +147,96 @@ impl std::fmt::Debug for PreparedBanner {
     }
 }
 
+/// A file a folder download sends, as it was when the folder was walked:
+/// the reply's size was summed from these, so a file that has changed
+/// since ends the transfer rather than send what was not announced.
+#[derive(Debug, Clone)]
+pub struct FolderFile {
+    pub path: FilePath,
+    pub wire_name: Vec<u8>,
+    pub type_code: [u8; 4],
+    pub creator: [u8; 4],
+    pub wire_comment: Vec<u8>,
+    pub created: u32,
+    pub modified: u32,
+    pub data_len: u64,
+    pub resource_len: u64,
+}
+
+impl FolderFile {
+    pub(crate) fn encode(
+        &self,
+        data_offset: u64,
+        resource_offset: u64,
+        large: bool,
+    ) -> Result<ffo::Encoded, FileError> {
+        ffo::encode(
+            &ffo::Metadata {
+                name: &self.wire_name,
+                type_code: self.type_code,
+                creator: self.creator,
+                comment: &self.wire_comment,
+                create_time: self.created,
+                modify_time: self.modified,
+            },
+            ffo::Forks {
+                data_len: self.data_len,
+                data_offset,
+                resource_len: self.resource_len,
+                resource_offset,
+            },
+            large,
+        )
+        .map_err(|e| match e {
+            ffo::Error::Range(_) => FileError::RangeInvalid,
+            ffo::Error::SizeOverflow => FileError::TooLarge,
+            _ => FileError::Unavailable(format!("FILP metadata: {e}")),
+        })
+    }
+}
+
+/// One item of a folder download: its wire names below the folder, and
+/// the file it is, or `None` for a folder.
+#[derive(Debug, Clone)]
+pub struct FolderItem {
+    pub path: Vec<Vec<u8>>,
+    pub file: Option<FolderFile>,
+}
+
+#[derive(Clone)]
+pub struct PreparedFolder {
+    pub principal: FilePrincipal,
+    pub account: String,
+    /// As for [`PreparedDownload::peer`].
+    pub peer: Option<IpAddr>,
+    /// As for [`PreparedDownload::hope`].
+    pub hope: Option<SealKeys>,
+    pub source: Arc<dyn FileSource>,
+    /// Large-file framing: negotiated when issued, and what the handshake
+    /// asked for once claimed.
+    pub large: bool,
+    /// Every item's object fits 32 bits, so a handshake without
+    /// LARGE_FILE can carry the folder.
+    pub fits: bool,
+    pub items: Arc<[FolderItem]>,
+}
+
+impl std::fmt::Debug for PreparedFolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedFolder")
+            .field("principal", &self.principal)
+            .field("account", &self.account)
+            .field("peer", &self.peer)
+            .field("large", &self.large)
+            .field("items", &self.items.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PreparedTransfer {
     Download(PreparedDownload),
+    Folder(PreparedFolder),
     Upload(PreparedUpload),
     Banner(PreparedBanner),
 }
@@ -158,6 +245,7 @@ impl PreparedTransfer {
     pub(crate) fn principal(&self) -> FilePrincipal {
         match self {
             PreparedTransfer::Download(value) => value.principal,
+            PreparedTransfer::Folder(value) => value.principal,
             PreparedTransfer::Upload(value) => value.principal,
             PreparedTransfer::Banner(value) => value.principal,
         }
@@ -166,6 +254,7 @@ impl PreparedTransfer {
     fn account(&self) -> &str {
         match self {
             PreparedTransfer::Download(value) => &value.account,
+            PreparedTransfer::Folder(value) => &value.account,
             PreparedTransfer::Upload(value) => &value.owner,
             PreparedTransfer::Banner(value) => &value.account,
         }
@@ -174,6 +263,7 @@ impl PreparedTransfer {
     pub(crate) fn hope(&self) -> Option<&SealKeys> {
         match self {
             PreparedTransfer::Download(value) => value.hope.as_ref(),
+            PreparedTransfer::Folder(value) => value.hope.as_ref(),
             PreparedTransfer::Upload(value) => value.hope.as_ref(),
             PreparedTransfer::Banner(value) => value.hope.as_ref(),
         }
@@ -182,6 +272,7 @@ impl PreparedTransfer {
     fn peer(&self) -> Option<IpAddr> {
         match self {
             PreparedTransfer::Download(value) => value.peer,
+            PreparedTransfer::Folder(value) => value.peer,
             PreparedTransfer::Upload(value) => value.peer,
             PreparedTransfer::Banner(value) => value.peer,
         }
@@ -267,7 +358,14 @@ impl TransferRegistry {
                 transfer.account(),
             )
         };
-        if !admitted {
+        // A folder's items are held until it is claimed, so a session
+        // waits for one before walking another.
+        let is_folder = |t: &PreparedTransfer| matches!(t, PreparedTransfer::Folder(_));
+        let walking = is_folder(&transfer)
+            && entries.values().any(|entry| {
+                is_folder(&entry.transfer) && entry.transfer.principal() == transfer.principal()
+            });
+        if !admitted || walking {
             return Err(FileError::Busy);
         }
         for _ in 0..64 {
@@ -342,6 +440,19 @@ impl TransferRegistry {
             // any type is taken. Nothing resumes a banner.
             PreparedTransfer::Banner(_) => {
                 if preamble.flags & htxf::FLAG_RESUME != 0 {
+                    return Err(FileError::InvalidPath);
+                }
+                (false, None)
+            }
+            // GtkHx's folder handshake names type 1 and its own test's
+            // names 0; mhxd reads neither, and the reference says what is
+            // fetched. A folder item resumes in the dialog, never here.
+            PreparedTransfer::Folder(folder) => {
+                let large_flag = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
+                if (large_flag && !folder.large)
+                    || (!large_flag && !folder.fits)
+                    || preamble.flags & htxf::FLAG_RESUME != 0
+                {
                     return Err(FileError::InvalidPath);
                 }
                 (false, None)
@@ -429,6 +540,9 @@ impl TransferRegistry {
             }
         };
         let mut transfer = entry.transfer;
+        if let PreparedTransfer::Folder(folder) = &mut transfer {
+            folder.large = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
+        }
         if let PreparedTransfer::Upload(upload) = &mut transfer {
             if declined_quote {
                 upload.quote = None;

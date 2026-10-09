@@ -73,7 +73,7 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
         .map(Ok)
         .unwrap_or_else(|| transfer_bind(&config.server.bind))?;
     let idle = Duration::from_secs(section.idle_timeout);
-    let service = Arc::new(FileService::new(
+    let mut service = FileService::new(
         source,
         uploads,
         Arc::new(TransferRegistry::new(
@@ -93,7 +93,9 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
             },
         )),
         idle,
-    ));
+    );
+    service.max_folder_items = section.max_folder_items;
+    let service = Arc::new(service);
     Ok(Some(Files {
         service,
         bind,

@@ -385,6 +385,9 @@ pub struct FilesSection {
     pub max_file_size: u64,
     #[serde(default = "default_files_max_entries")]
     pub max_entries: usize,
+    /// The most items one folder download may send.
+    #[serde(default = "default_files_max_folder_items")]
+    pub max_folder_items: usize,
     #[serde(default = "default_files_max_concurrent")]
     pub max_concurrent: usize,
     #[serde(default = "default_files_max_partial_bytes")]
@@ -429,6 +432,10 @@ fn default_files_max_size() -> u64 {
 fn default_files_max_entries() -> usize {
     100_000
 }
+fn default_files_max_folder_items() -> usize {
+    hxd_files::MAX_FOLDER_ITEMS
+}
+
 fn default_files_max_concurrent() -> usize {
     8
 }

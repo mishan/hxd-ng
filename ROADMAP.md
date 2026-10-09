@@ -258,13 +258,12 @@ background, not a separate implementation contract.
   and digest-verified Large File resume; drop boxes (upload-only folders);
   and, on a local area, New Folder, Delete, rename, Move and comments on
   both wires, each kind of entry under its own access bit. Make Alias is
-  refused: the area never follows or shows a symlink.
-- HTXF folder subchannels with resume (send well-formed RFLT;
-  *accept* sloppy ones — gtkhx's old malformed-RFLT bug is exactly the kind
-  of client to stay compatible with).
-- 1.5 folder transfers (GETFOLDER/PUTFOLDER) — and consume the trailing
-  no-resource MACR marker the way mhxd does; Janus's failure to do so hangs
-  real clients today.
+  refused: the area never follows or shows a symlink. Download Folder,
+  with a resume per item where the area can make one (RFLT read as
+  leniently as gtkhx's old malformed one needs; `docs/files-plan.md`,
+  "Folder transfers").
+- Upload Folder — and consume the trailing no-resource MACR marker the
+  way mhxd does; Janus's failure to do so hangs real clients today.
 - Transfer queueing and per-account limits.
 
 ## Phase 4 — News
