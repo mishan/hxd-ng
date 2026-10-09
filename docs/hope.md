@@ -1,7 +1,6 @@
 # HOPE: the secure login on the classic wire
 
-Status: partial, 2026-10. Built: the login, Blowfish OFB-64 with gzip or
-LZ4 beneath it, `[hope]`. Planned: ChaCha20-Poly1305 with its encrypted
+Status: partial, 2026-10. Built: the login, Blowfish OFB-64, `[hope]`. Planned: ChaCha20-Poly1305 with its encrypted
 file transfers (§5), and `DATA_LINK_USER_TRANSPORT` on server links (§6).
 
 HOPE replaces the classic login's XOR-scrambled password with a MAC of it
@@ -36,14 +35,16 @@ plain login's are, Text-Encoding included.
 - **The password is checked as the client typed it**: the account's
   stored password, encoded the way the connection reads text (Mac Roman,
   or UTF-8 when Text-Encoding was negotiated), is what the MAC must be
-  of. The check runs inside the auth backend (`Proof::Keyed`), which
+  of. A password the connection's encoding cannot write, a Cyrillic one
+  on a Mac Roman connection, cannot be logged in with that way: written,
+  it would be question marks, which anyone could type. The check runs inside the auth backend (`Proof::Keyed`), which
   derives the session's keys from the password and never hands it back.
 - **Everything else is the plain login's**: the throttle on wrong
   passwords (`Core::login_attempt` before, `Core::login_failed` after),
   the bans, the login permit, the move to the account's count, the
   identity reconciliation of a tunnel. A step 2 naming no account is a
-  wrong guess at its address alone; the guest's, as on the plain login,
-  is no guess. HOPE is not offered on a tunnel with an identity at all:
+  wrong guess at its address alone; an empty password, as on the plain
+  login, is no guess, whichever account it is for. HOPE is not offered on a tunnel with an identity at all:
   the identity can admit a login without its password, and so without
   the keys it would agree.
 
@@ -57,15 +58,22 @@ The connection's socket halves run through adaptors that pass bytes as
 they are until the password verifies, when the transport's sending half
 and receiving half go into them, before the reply to step 2 is queued.
 Nothing earlier is still waiting to be written: the only frame before it
-is the reply to step 1, which the client has read; a client that sends
-before it has the reply to step 2 is dropped as malformed, as on mhxd.
+is the reply to step 1, which the client has read. A client that sends
+anything after step 2 before it has the reply is refused: those bytes
+were read in the clear, and someone on the path could have put them
+there to run as the session's.
 The writer hands its adaptor whole transactions, several at a time,
 which a Blowfish transport's rekey markers are placed by, and its
 writes count as progress as the encoding reaches the socket, so a slow
 link is held to the same stall timeout as a plain one. A transaction
-over a megabyte cannot go under Blowfish without compression, which is
+over a megabyte cannot go under Blowfish, which is
 the protocol's limit and GtkHx's: a session sent one ends, as
 `unsendable`.
+
+No compression is offered, whatever the client asks for: hxhope's
+decoders hold up to 16 MiB each of what a peer sends, outside the queue
+budget every other buffer a client fills draws on. A client offering
+gzip or LZ4 runs without, which the protocol leaves to the server.
 
 A session under a cipher is `encrypted` (`hotline-ng-auth.md` §8): an ng
 client sees it so, and the cleartext marker is not set for it. Not when

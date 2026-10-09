@@ -592,7 +592,10 @@ async fn write_stalling<W: AsyncWrite + Unpin>(
     while !bytes.is_empty() {
         match timeout(WRITE_STALL, wr.write(bytes)).await {
             Err(_) => return Err(WriteFailed::Stalled),
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+            Ok(Err(e))
+                if e.get_ref()
+                    .is_some_and(|e| e.is::<crate::hope::Unencodable>()) =>
+            {
                 return Err(WriteFailed::Unsendable)
             }
             Ok(Ok(0)) | Ok(Err(_)) => return Err(WriteFailed::Closed),
@@ -2129,6 +2132,7 @@ async fn login_phase(
     let mut f = f;
     let mut req = parse_login(&f);
     let mut hope = None;
+    let mut handshake_len = 0;
     if req.hope_probe {
         // Refused on an encrypted transport, the TLS port's included: the
         // same protection twice buys nothing, and GtkHx refuses the
@@ -2143,6 +2147,7 @@ async fn login_phase(
             }
         };
         let (handshake, step2) = hope_steps(policy, &f, frames, tx, ctx.cfg.login_timeout).await?;
+        handshake_len = f.wire_len() + step2.wire_len();
         // Step 2 is the login the rest of this reads, its login named only
         // as a MAC, which `Handshake::resolve` finds the account for.
         req = parse_login(&step2);
@@ -2249,14 +2254,10 @@ async fn login_phase(
             Err(e) => return (Err(LoginRefused::Auth(e)), None),
         };
         // A login no account has is a guess at the address like any
-        // other, under a name no account can have. The guest's is no
-        // guess, as on the plain login, which sends it no password.
+        // other, under a name no account can have. An empty password is
+        // no guess, as on the plain login.
         let login = h.resolve(&logins, enc);
-        let guess: &[u8] = if login.as_deref() == Some("") {
-            &[]
-        } else {
-            &password
-        };
+        let guess: &[u8] = if h.empty_password() { &[] } else { &password };
         let check = |stored: &str| h.check(stored, enc);
         let verdict = reconcile_login(
             &*auth,
@@ -2280,7 +2281,11 @@ async fn login_phase(
         (_, Some(agreed)) => {
             let negotiated = agreed.negotiated;
             info!(cipher = ?negotiated.cipher, compression = ?negotiated.compression, "HOPE login");
-            slots.install(agreed.transport);
+            if !slots.install(agreed.transport, handshake_len) {
+                info!("HOPE login refused: the client sent more before the reply to step 2");
+                reply_error(tx, f.trans, "Login failed.");
+                return None;
+            }
             Transport {
                 encrypted: transport.encrypted || (negotiated.cipher.is_some() && !agreed.keyless),
                 ..transport

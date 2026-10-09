@@ -13,6 +13,7 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{ready, Context, Poll};
 
@@ -25,19 +26,32 @@ use crate::encoding::TextEncoding;
 pub(crate) struct Slots {
     send: Arc<Mutex<Option<hxhope::Sender>>>,
     recv: Arc<Mutex<Option<hxhope::Receiver>>>,
+    /// Bytes read as they are, before a transport.
+    passed: Arc<AtomicUsize>,
 }
 
 impl Slots {
-    pub(crate) fn install(&self, transport: hxhope::Transport) {
-        let (send, recv) = transport.split();
-        *self.recv.lock().unwrap() = Some(recv);
+    /// Install `transport` if exactly `read` bytes came before it: the
+    /// two steps of the handshake. Anything more was sent after step 2
+    /// without waiting for its reply, in the clear, and someone on the
+    /// path could have put it there; it is refused, not run as the
+    /// session's.
+    pub(crate) fn install(&self, transport: hxhope::Transport, read: usize) -> bool {
+        let mut recv = self.recv.lock().unwrap();
+        if self.passed.load(Ordering::Acquire) != read {
+            return false;
+        }
+        let (send, received) = transport.split();
+        *recv = Some(received);
         *self.send.lock().unwrap() = Some(send);
+        true
     }
 
     pub(crate) fn reader<R>(&self, inner: R) -> HopeRead<R> {
         HopeRead {
             inner,
             slot: self.recv.clone(),
+            passed: self.passed.clone(),
             plain: Vec::new(),
             at: 0,
             raw: Vec::new(),
@@ -60,6 +74,18 @@ fn broken(e: hxhope::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
+/// What the transport would not encode, which no retry can send.
+#[derive(Debug)]
+pub(crate) struct Unencodable(hxhope::Error);
+
+impl std::fmt::Display for Unencodable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for Unencodable {}
+
 /// Past this, a drained plaintext buffer is let go rather than kept: one
 /// read can decompress to megabytes, and a connection should not hold
 /// them for its life.
@@ -68,6 +94,7 @@ const KEEP: usize = 64 << 10;
 pub(crate) struct HopeRead<R> {
     inner: R,
     slot: Arc<Mutex<Option<hxhope::Receiver>>>,
+    passed: Arc<AtomicUsize>,
     /// Decoded and not yet read.
     plain: Vec<u8>,
     at: usize,
@@ -102,7 +129,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for HopeRead<R> {
                 // between finding none and reading what it would decode.
                 let slot = this.slot.lock().unwrap();
                 if slot.is_none() {
-                    return Pin::new(&mut this.inner).poll_read(cx, buf);
+                    let before = buf.filled().len();
+                    let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+                    this.passed
+                        .fetch_add(buf.filled().len() - before, Ordering::Release);
+                    return polled;
                 }
             }
             if this.raw.is_empty() {
@@ -150,7 +181,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for HopeWrite<W> {
         if this.owed == 0 {
             let encoded = match this.slot.lock().unwrap().as_mut() {
                 None => None,
-                Some(send) => Some(send.encode(buf).map_err(broken)?),
+                Some(send) => Some(
+                    send.encode(buf)
+                        .map_err(|e| io::Error::other(Unencodable(e)))?,
+                ),
             };
             let Some(encoded) = encoded else {
                 return Pin::new(&mut this.inner).poll_write(cx, buf);
@@ -233,16 +267,18 @@ impl Handshake {
 
     /// Whether step 2's MAC is of `stored`, the account's password as the
     /// client would have typed it in `enc`; if so, the transport it
-    /// agrees is kept for [`Handshake::agreed`].
+    /// agrees is kept for [`Handshake::agreed`]. A password `enc` cannot
+    /// write is refused: written, its characters would be `?`, and a
+    /// Cyrillic password would open to as many question marks.
     pub(crate) fn check(&self, stored: &str, enc: TextEncoding) -> bool {
+        let typed = enc.encode(stored);
+        if enc.decode(&typed) != stored {
+            return false;
+        }
         let random: hxhope::Random = Box::new(|b: &mut [u8]| {
             getrandom::getrandom(b).expect("the OS CSPRNG");
         });
-        match self
-            .server
-            .clone()
-            .accept(&self.step2, &enc.encode(stored), random)
-        {
+        match self.server.clone().accept(&self.step2, &typed, random) {
             Ok((transport, negotiated)) => {
                 *self.agreed.lock().unwrap() = Some(Agreed {
                     transport,
@@ -253,6 +289,13 @@ impl Handshake {
             }
             Err(_) => false,
         }
+    }
+
+    /// Whether step 2's password is empty: no guess, whichever account
+    /// it names, as on the plain login.
+    pub(crate) fn empty_password(&self) -> bool {
+        let none: hxhope::Random = Box::new(|_: &mut [u8]| {});
+        self.server.clone().accept(&self.step2, b"", none).is_ok()
     }
 
     pub(crate) fn agreed(&self) -> Option<Agreed> {
@@ -309,7 +352,7 @@ mod tests {
         let slots = Slots::default();
         let (near, mut far) = tokio::io::duplex(1024);
         let mut wr = slots.writer(near);
-        slots.install(server);
+        assert!(slots.install(server, 0));
         let sent = frames(40);
         // The socket takes a kilobyte at a time, so the first write is
         // reported short, as a plain socket's would be.
@@ -329,7 +372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_pass_through_until_a_transport_is_installed() {
+    async fn reads_pass_through_until_a_transport_is_installed_after_them() {
         let (mut client, server) = transports();
         let slots = Slots::default();
         let (near, mut far) = tokio::io::duplex(1 << 16);
@@ -338,7 +381,10 @@ mod tests {
         let mut got = [0; 5];
         rd.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"plain");
-        slots.install(server);
+        // Installed only after exactly what the handshake was read.
+        let (_, spare) = transports();
+        assert!(!slots.install(spare, 4));
+        assert!(slots.install(server, 5));
         let sent = frames(3);
         far.write_all(&client.encode(&sent).unwrap()).await.unwrap();
         let mut got = vec![0; sent.len()];

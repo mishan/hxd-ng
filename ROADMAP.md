@@ -238,7 +238,7 @@ no-version client).
   compression, server side, via `hxcrypto`. Port the rekey-marker behavior
   byte for byte — it's wire-format-critical on this side too.
   **Partly implemented 2026-10** (`docs/hope.md`): the login and Blowfish,
-  with gzip or LZ4, through hx-libs' `hxhope`; ChaCha20-Poly1305 waits for
+  through hx-libs' `hxhope`, without compression (§3); ChaCha20-Poly1305 waits for
   encrypted file transfers.
 
 **Exit criteria:** a real multi-user chat server you can run for friends,

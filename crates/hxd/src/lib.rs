@@ -137,13 +137,15 @@ impl Default for HopeSection {
 
 impl HopeSection {
     fn policy(&self) -> Option<hxhope::server::Policy> {
-        use hxhope::{Cipher, Compression, Mac};
+        use hxhope::{Cipher, Mac};
         self.enabled.then(|| hxhope::server::Policy {
             macs: Mac::ALL.to_vec(),
             // ChaCha20-Poly1305 waits for encrypted file transfers: a
             // client that agrees it encrypts its transfers too.
             ciphers: vec![Cipher::Blowfish],
-            compressions: vec![Compression::Gzip, Compression::Lz4],
+            // None: hxhope's decoders hold up to 16 MiB each of what a
+            // peer sends, which no budget here counts (`docs/hope.md` §3).
+            compressions: vec![],
             require_cipher: self.require_cipher,
         })
     }

@@ -15,13 +15,20 @@ struct Server {
     ng: SocketAddr,
 }
 
+/// A password Mac Roman cannot write: "parol'1" in Cyrillic.
+const CYRILLIC: &str = "\u{43f}\u{430}\u{440}\u{43e}\u{43b}\u{44c}1";
+
 /// A server with `more` appended to its config, and accounts `alice`
 /// (password `s3cret`) and `cafe` (password `café`).
 async fn start(dir: &Path, more: &str) -> Server {
     let d = dir.display();
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
-    for (login, password) in [("alice", "s3cret"), ("cafe", "caf\u{e9}")] {
+    for (login, password) in [
+        ("alice", "s3cret"),
+        ("cafe", "caf\u{e9}"),
+        ("ivan", CYRILLIC),
+    ] {
         std::fs::write(
             accounts.join(format!("{login}.toml")),
             format!("name = \"{login}\"\npassword = \"{password}\"\n[access]\nsend_chat = true\nread_chat = true\n"),
@@ -93,9 +100,10 @@ async fn a_hope_login_runs_through_what_it_agrees() {
         )
         .await
         .unwrap();
+        // Compression is not offered, whatever the client asks for.
         assert_eq!(
             (agreed.cipher, agreed.compression),
-            (Some(Cipher::Blowfish), compression)
+            (Some(Cipher::Blowfish), None)
         );
         // Both ways through the transport: a request and its reply,
         // pushes, and a chat line heard back.
@@ -155,6 +163,14 @@ async fn hope_checks_the_password_as_the_client_typed_it() {
     let mut cafe = Login::account("c", "cafe", "caf\u{e9}");
     cafe.caps = Some(1 << 1);
     hope(s.legacy, &o, &cafe).await.unwrap();
+    // One Mac Roman cannot write logs in under UTF-8 alone: written in
+    // Mac Roman it would be question marks, which anyone could type.
+    let mut ivan = Login::account("i", "ivan", CYRILLIC);
+    ivan.caps = Some(1 << 1);
+    hope(s.legacy, &o, &ivan).await.unwrap();
+    assert!(hope(s.legacy, &o, &Login::account("i", "ivan", "??????1"))
+        .await
+        .is_err());
     // A wrong password, and a login no account has: the transport never
     // starts, and the refusal is not one the client can read through it.
     for login in [
@@ -240,4 +256,77 @@ async fn hope_turned_off_is_refused_and_a_plain_login_still_works() {
     Client::login_at(s.legacy, &Login::account("a", "alice", "s3cret"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_guest_account_with_a_password_is_throttled_by_hope_as_any_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(
+        dir.path(),
+        "[limits]\nexempt = []\nlogin_failures = 2\nlogin_failure_seconds = 600\n",
+    )
+    .await;
+    std::fs::write(
+        dir.path().join("accounts/guest.toml"),
+        "name = \"guest\"\npassword = \"gpw\"\n[access]\nread_chat = true\n",
+    )
+    .unwrap();
+    let o = offer(&[Cipher::Blowfish], &[]);
+    let guest = |password: &str| Login {
+        password: password.into(),
+        ..Login::guest("g")
+    };
+    hope(s.legacy, &o, &guest("gpw")).await.unwrap();
+    for _ in 0..2 {
+        assert!(hope(s.legacy, &o, &guest("wrong")).await.is_err());
+    }
+    // Locked out: the right password is refused too.
+    assert!(hope(s.legacy, &o, &guest("gpw")).await.is_err());
+}
+
+#[tokio::test]
+async fn a_frame_sent_in_the_clear_after_step_2_is_refused_not_run() {
+    use hxd_testclient::legacy::{pack, read_frame};
+    use hxproto::messages::{tag, ClientHdr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "").await;
+    let mut stream = tokio::net::TcpStream::connect(s.legacy).await.unwrap();
+    stream.write_all(b"TRTPHOTL\x00\x01\x00\x02").await.unwrap();
+    stream.read_exact(&mut [0; 8]).await.unwrap();
+    let o = offer(&[Cipher::Blowfish], &[]);
+    stream
+        .write_all(&hxhope::client::step1(&o, 1).unwrap())
+        .await
+        .unwrap();
+    let answer = read_frame(&mut stream).await.unwrap();
+    let answer = pack(
+        answer.ty,
+        answer.trans,
+        answer.flag,
+        &answer
+            .chunks()
+            .map(|c| (c.tag, c.data.to_vec()))
+            .collect::<Vec<_>>(),
+    );
+    let who = hxhope::client::Login {
+        login: b"alice",
+        password: b"s3cret",
+        name: b"a",
+        icon: 1,
+        version: 150,
+        caps: 0,
+    };
+    let est = hxhope::client::step2(&o, &answer, &who, 2, Box::new(|_: &mut [u8]| {})).unwrap();
+    // Step 2 and, behind it without waiting, a request in the clear: what
+    // someone on the path could add to a real client's login.
+    let mut both = est.step2;
+    both.extend(pack(ClientHdr::UserGetList.as_u32(), 3, 0, &[]));
+    stream.write_all(&both).await.unwrap();
+    let refusal = read_frame(&mut stream).await.unwrap();
+    assert_eq!(refusal.trans, 2);
+    assert_eq!(
+        refusal.bytes(tag::TASK_ERROR).as_deref(),
+        Some(&b"Login failed."[..])
+    );
 }
