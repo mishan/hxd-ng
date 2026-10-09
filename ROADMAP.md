@@ -261,10 +261,11 @@ background, not a separate implementation contract.
   refused: the area never follows or shows a symlink. Download Folder,
   with a resume per item where the area can make one (RFLT read as
   leniently as gtkhx's old malformed one needs; `docs/files-plan.md`,
-  "Folder transfers"). And Upload Folder, consuming the trailing
-  no-resource MACR marker as mhxd does (Janus's failure to hangs real
-  clients), and adding to a folder that is there when the client asks
-  to resume.
+  "Folder transfers"). And Upload Folder, adding to a folder that is
+  there when the client asks to resume. Every upload consumes the
+  trailing no-resource MACR marker as mhxd does (Janus's failure to hangs
+  real clients): a folder item's counts it, and GtkHx sends one past a
+  single file's declared length.
 - Transfer queueing and per-account limits — built (`docs/files-plan.md`,
   "Folder transfers", F3).
 
