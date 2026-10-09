@@ -30,7 +30,7 @@ const NAME_MAX: usize = 255;
 /// The deepest a folder may sit, in folders from the root of the area.
 /// New Folder and a move refuse to go past it, so a delete or move of any
 /// folder, which walks at most this far beneath it, reaches the bottom.
-const MAX_DEPTH: usize = 64;
+pub(crate) const MAX_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LocalLimits {
@@ -1357,6 +1357,27 @@ impl LocalFileSource {
 /// bits: an entry replaced by one of the other kind in between is refused
 /// rather than acted on under the wrong one.
 impl LocalFileSource {
+    /// Makes a folder upload's top folder at `path`, or, when `blind`, at
+    /// the first name beside it that is free, as a blind upload's file is
+    /// published. Returns where it was made.
+    pub(crate) async fn make_upload_folder(
+        &self,
+        path: &FilePath,
+        blind: bool,
+    ) -> Result<FilePath, FileError> {
+        let path = path.clone();
+        self.mutate(move |source| {
+            let path = if blind {
+                source.free_name(&path)?
+            } else {
+                path
+            };
+            source.make_folder_sync(&path)?;
+            Ok(path)
+        })
+        .await
+    }
+
     /// Makes an empty folder at `path`. Never replaces an entry.
     pub async fn make_folder(&self, path: &FilePath) -> Result<(), FileError> {
         let path = path.clone();

@@ -630,7 +630,7 @@ root = "/srv/hxd/files"        # must already exist
 # bind = "0.0.0.0:5501"
 max_file_size = 68719476736   # data and resource forks combined
 max_entries = 100000
-max_folder_items = 100000     # the most one folder download sends
+max_folder_items = 100000     # the most one folder transfer holds
 max_concurrent = 8
 max_partial_bytes = 68719476736
 max_partials = 1024          # global abandoned/in-progress upload cap
@@ -648,7 +648,8 @@ under `.hxd-state`; that directory is reserved to the server and omitted from
 listings. Large File uploads use raw bytes. A resumed one is accepted only when
 the client echoes the server's SHA-256 digest for the exact stored offset and
 trailing window. A folder is downloaded whole (Download Folder), with what a
-listing would show of it; folder upload remains separate work.
+listing would show of it, and uploaded whole (Upload Folder), each file
+under the same limits as one uploaded alone.
 
 An interrupted upload stays unlisted until it completes, where mhxd shows the
 truncated file. A classic client that offers to resume only when it sees the

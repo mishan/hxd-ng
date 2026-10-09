@@ -28,6 +28,7 @@ const FILE_GET_INFO: u32 = 0x00ce;
 const FILE_GET: u32 = 0x00ca;
 const FILE_PUT: u32 = 0x00cb;
 const FILE_GET_FOLDER: u32 = 0x00d2;
+const FILE_PUT_FOLDER: u32 = 0x00d5;
 const LIST_ENTRY: u16 = 0x00c8;
 const HUGE_SIZE: u64 = u32::MAX as u64 + 6;
 
@@ -1978,6 +1979,221 @@ async fn a_folder_downloads_item_by_item_as_the_client_asks() {
     let refused = Legacy::login(server.legacy, false)
         .await
         .request(FILE_GET_FOLDER, &[(tag::FILE_NAME, b"pkg".to_vec())])
+        .await;
+    assert_ne!(refused.flag & 1, 0);
+}
+
+/// One folder upload's connection, driven as GtkHx drives it.
+struct FolderUpload(TcpStream);
+
+impl FolderUpload {
+    async fn open(address: SocketAddr, reference: u32) -> Self {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let preamble = htxf::Preamble {
+            reference,
+            transfer_len: 0,
+            type_code: 1,
+            flags: 0,
+            resume_digest: None,
+        };
+        stream.write_all(&preamble.encode().unwrap()).await.unwrap();
+        FolderUpload(stream)
+    }
+
+    async fn action(&mut self) -> u16 {
+        let mut action = [0; 2];
+        timeout(IDLE, self.0.read_exact(&mut action))
+            .await
+            .unwrap()
+            .unwrap();
+        u16::from_be_bytes(action)
+    }
+
+    /// Announces `path`, a folder or a file holding `body`, and sends what
+    /// the server asks for: the whole object, or its rest from a resume.
+    /// Returns the server's answer to a file.
+    async fn item(&mut self, path: &[&str], body: Option<&[u8]>) -> Option<u16> {
+        assert_eq!(self.action().await, folder::ACTION_NEXT);
+        let item = folder::Item {
+            folder: body.is_none(),
+            path: path.iter().map(|name| name.as_bytes().to_vec()).collect(),
+        };
+        self.0.write_all(&item.encode().unwrap()).await.unwrap();
+        let body = body?;
+        let answer = self.action().await;
+        let from = if answer == folder::ACTION_RESUME {
+            let mut len = [0; 2];
+            self.0.read_exact(&mut len).await.unwrap();
+            let mut record = vec![0; usize::from(u16::from_be_bytes(len))];
+            self.0.read_exact(&mut record).await.unwrap();
+            rflt::parse_compatible(&record).data as usize
+        } else {
+            0
+        };
+        let encoded = ffo::encode(
+            &ffo::Metadata {
+                name: b"hxd",
+                type_code: *b"TEXT",
+                creator: *b"ttxt",
+                comment: b"",
+                create_time: 0,
+                modify_time: 0,
+            },
+            ffo::Forks {
+                data_len: body.len() as u64,
+                data_offset: from as u64,
+                resource_len: 0,
+                resource_offset: 0,
+            },
+            false,
+        )
+        .unwrap();
+        let mut object = (encoded.transfer_len as u32).to_be_bytes().to_vec();
+        object.extend_from_slice(&encoded.prefix);
+        object.extend_from_slice(&body[from..]);
+        object.extend_from_slice(&encoded.resource_header);
+        self.0.write_all(&object).await.unwrap();
+        Some(answer)
+    }
+
+    /// Whether the server has hung up rather than ask for more.
+    async fn ended(&mut self) -> bool {
+        let mut action = [0; 2];
+        timeout(IDLE, self.0.read_exact(&mut action))
+            .await
+            .unwrap()
+            .is_err()
+    }
+
+    /// The client closes after its last item, and the server after it.
+    async fn finish(mut self) {
+        assert_eq!(self.action().await, folder::ACTION_NEXT);
+        self.0.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        timeout(IDLE, self.0.read_to_end(&mut rest))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_folder_uploads_item_by_item_and_resumes_into_what_is_there() {
+    let (server, root, _source) = start_local_with(
+        "download_files = true\nupload_files = true\nupload_folders = true\n\
+         upload_anywhere = true\nread_chat = true\nuse_any_name = true\n",
+    )
+    .await;
+    std::fs::create_dir(root.path().join("Drop Box")).unwrap();
+    std::fs::create_dir(root.path().join("Drop Box/tree")).unwrap();
+    std::fs::write(root.path().join("Drop Box/x.txt"), "secret").unwrap();
+    let mut classic = Legacy::login(server.legacy, false).await;
+    let put = |name: &str, resume: bool| {
+        let mut chunks = vec![(tag::FILE_NAME, name.as_bytes().to_vec())];
+        if resume {
+            chunks.push((tag::FILE_PREVIEW, 1u16.to_be_bytes().to_vec()));
+        }
+        chunks
+    };
+
+    let reply = classic.request(FILE_PUT_FOLDER, &put("tree", false)).await;
+    assert_eq!(reply.flag & 1, 0);
+    let mut upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    assert_eq!(
+        upload.item(&["a.txt"], Some(b"alpha")).await,
+        Some(folder::ACTION_SEND)
+    );
+    upload.item(&["sub"], None).await;
+    upload.item(&["sub", "b.txt"], Some(b"beta")).await;
+    upload.finish().await;
+    let tree = root.path().join("tree");
+    assert_eq!(std::fs::read(tree.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(tree.join("sub/b.txt")).unwrap(), b"beta");
+
+    // A folder that is there is refused, unless the client asks to resume:
+    // then what is there is kept, resumed from its end, and the rest sent.
+    let refused = classic.request(FILE_PUT_FOLDER, &put("tree", false)).await;
+    assert_ne!(refused.flag & 1, 0);
+    let reply = classic.request(FILE_PUT_FOLDER, &put("tree", true)).await;
+    assert_eq!(reply.flag & 1, 0);
+    let mut upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    assert_eq!(
+        upload.item(&["a.txt"], Some(b"ALPHA")).await,
+        Some(folder::ACTION_RESUME)
+    );
+    upload.item(&["sub"], None).await;
+    assert_eq!(
+        upload.item(&["c.txt"], Some(b"gamma")).await,
+        Some(folder::ACTION_SEND)
+    );
+    upload.finish().await;
+    assert_eq!(std::fs::read(tree.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(tree.join("c.txt")).unwrap(), b"gamma");
+
+    // Into a drop box this account may not view, the folder is made under a
+    // free name, refused for nothing that is there.
+    let blind = [
+        (tag::FILE_NAME, b"tree".to_vec()),
+        (tag::DIR, dir(b"Drop Box")),
+    ];
+    let reply = classic.request(FILE_PUT_FOLDER, &blind).await;
+    assert_eq!(reply.flag & 1, 0);
+    let mut upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    upload.item(&["d.txt"], Some(b"delta")).await;
+    upload.finish().await;
+    let made = root.path().join("Drop Box/tree 2/d.txt");
+    assert_eq!(std::fs::read(made).unwrap(), b"delta");
+
+    // Asked to add to the drop box itself, it is made beside it instead,
+    // and says nothing of what the drop box holds.
+    let reply = classic
+        .request(FILE_PUT_FOLDER, &put("Drop Box", true))
+        .await;
+    assert_eq!(reply.flag & 1, 0);
+    let mut upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    assert_eq!(
+        upload.item(&["x.txt"], Some(b"mine")).await,
+        Some(folder::ACTION_SEND)
+    );
+    upload.finish().await;
+    assert_eq!(
+        std::fs::read(root.path().join("Drop Box 2/x.txt")).unwrap(),
+        b"mine"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("Drop Box/x.txt")).unwrap(),
+        b"secret"
+    );
+
+    // An item that names its way out ends the upload, and makes nothing.
+    let reply = classic
+        .request(FILE_PUT_FOLDER, &put("escape", false))
+        .await;
+    let mut upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    upload.item(&["..", "evil"], None).await;
+    assert!(upload.ended().await);
+    assert!(!root.path().join("evil").exists());
+
+    // Without upload-anywhere, only where a file may go: an upload folder.
+    let (server, root, _source) = start_local_with(
+        "upload_files = true\nupload_folders = true\nread_chat = true\nuse_any_name = true\n",
+    )
+    .await;
+    std::fs::create_dir(root.path().join("Uploads")).unwrap();
+    let mut classic = Legacy::login(server.legacy, false).await;
+    let refused = classic.request(FILE_PUT_FOLDER, &put("tree", false)).await;
+    assert_ne!(refused.flag & 1, 0);
+    let into = [
+        (tag::FILE_NAME, b"tree".to_vec()),
+        (tag::DIR, dir(b"Uploads")),
+    ];
+    assert_eq!(classic.request(FILE_PUT_FOLDER, &into).await.flag & 1, 0);
+
+    // An account without the bit is refused.
+    let (server, _root, _source) = start_local().await;
+    let refused = Legacy::login(server.legacy, false)
+        .await
+        .request(FILE_PUT_FOLDER, &put("tree", false))
         .await;
     assert_ne!(refused.flag & 1, 0);
 }

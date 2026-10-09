@@ -630,6 +630,7 @@ const HANDLED: &[ClientHdr] = &[
     ClientHdr::FileGetInfo,
     ClientHdr::FileList,
     ClientHdr::FilePut,
+    ClientHdr::FilePutFolder,
     ClientHdr::GetChatHistory,
     ClientHdr::Login,
     ClientHdr::Msg,
@@ -3875,6 +3876,115 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 chunks.push((tag::FOLDER_ITEM_COUNT64, count.to_be_bytes().to_vec()));
             }
             reply(tx, f.trans, chunks);
+        }
+
+        t if t == ClientHdr::FilePutFolder.as_u32() => {
+            if !sess.can(bit::UPLOAD_FOLDERS) {
+                reply_error(tx, f.trans, "You are not allowed to upload folders.");
+                return;
+            }
+            let Some(service) = ctx.files.as_ref() else {
+                reply_error(tx, f.trans, "Files are not available on this server.");
+                return;
+            };
+            let Some(source) = service.uploads.as_ref() else {
+                reply_error(tx, f.trans, "This file area is read-only.");
+                return;
+            };
+            let Some(name) = f.chunks().find(|chunk| chunk.tag == tag::FILE_NAME) else {
+                reply_error(tx, f.trans, "No folder name was supplied.");
+                return;
+            };
+            let dir = f.chunks().find(|chunk| chunk.tag == tag::DIR);
+            let drop_boxes = sess.can(bit::VIEW_DROP_BOXES);
+            let path = match files::resolve_upload(
+                service.source.as_ref(),
+                dir.as_ref().map(|chunk| chunk.data),
+                name.data,
+                sess.has_cap(cap::LARGE_FILES),
+                sess.enc,
+                drop_boxes,
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            // Where a file may be uploaded, as FilePut has it.
+            if !sess.can(bit::UPLOAD_ANYWHERE)
+                && !path
+                    .parent()
+                    .is_some_and(|folder| folder.is_upload_folder())
+            {
+                reply_error(tx, f.trans, "You are not allowed to upload folders here.");
+                return;
+            }
+            // Its own name included: a folder upload named like a drop box
+            // would otherwise add to one.
+            let blind = !drop_boxes && path.is_drop_box();
+            let resume = match f.chunks().find(|chunk| chunk.tag == tag::FILE_PREVIEW) {
+                None => false,
+                Some(chunk) => match files::wire_uint(chunk.data) {
+                    Some(option) => option != 0,
+                    None => {
+                        reply_error(tx, f.trans, "Malformed upload resume option.");
+                        return;
+                    }
+                },
+            };
+            // A folder that is there is added to only when the client asks
+            // to resume, as mhxd has it. A blind upload never asks: it is
+            // made under a free name, so it learns nothing of what is taken.
+            let merge = match service.source.info(&path).await {
+                Err(hxd_core::FileError::NotFound) => false,
+                _ if blind => false,
+                Ok(info) if info.kind == FileKind::Folder && resume => true,
+                Ok(_) => {
+                    reply_error(tx, f.trans, "Something already exists at that path.");
+                    return;
+                }
+                Err(error) => {
+                    reply_error(tx, f.trans, file_error_text(&error));
+                    return;
+                }
+            };
+            let Some(serial) = ctx.core.session_serial(sess.uid) else {
+                reply_error(tx, f.trans, "Session ended.");
+                return;
+            };
+            let enc = sess.enc;
+            let issued = service
+                .transfers
+                .issue(hxd_files::PreparedTransfer::FolderUpload(
+                    hxd_files::PreparedFolderUpload {
+                        principal: FilePrincipal {
+                            uid: sess.uid,
+                            serial,
+                        },
+                        peer: sess.transfer_addr,
+                        hope: sess.transfer_keys.clone(),
+                        source: source.clone(),
+                        owner: sess.account.login.clone(),
+                        root: path,
+                        blind,
+                        merge,
+                        sees_drop_boxes: drop_boxes,
+                        comment_utf8: enc == TextEncoding::Utf8,
+                        decode: Arc::new(move |name: &[u8]| enc.decode(name)),
+                        max_items: service.max_folder_items,
+                    },
+                ));
+            match issued {
+                Ok(reference) => reply(
+                    tx,
+                    f.trans,
+                    vec![(tag::HTXF_REF, reference.to_be_bytes().to_vec())],
+                ),
+                Err(error) => reply_error(tx, f.trans, file_error_text(&error)),
+            }
         }
 
         t if t == ClientHdr::FilePut.as_u32() => {

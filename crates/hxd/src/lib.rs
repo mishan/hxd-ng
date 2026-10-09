@@ -385,7 +385,7 @@ pub struct FilesSection {
     pub max_file_size: u64,
     #[serde(default = "default_files_max_entries")]
     pub max_entries: usize,
-    /// The most items one folder download may send.
+    /// The most items one folder download or upload may hold.
     #[serde(default = "default_files_max_folder_items")]
     pub max_folder_items: usize,
     #[serde(default = "default_files_max_concurrent")]

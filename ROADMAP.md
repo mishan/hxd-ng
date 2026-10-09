@@ -261,9 +261,10 @@ background, not a separate implementation contract.
   refused: the area never follows or shows a symlink. Download Folder,
   with a resume per item where the area can make one (RFLT read as
   leniently as gtkhx's old malformed one needs; `docs/files-plan.md`,
-  "Folder transfers").
-- Upload Folder — and consume the trailing no-resource MACR marker the
-  way mhxd does; Janus's failure to do so hangs real clients today.
+  "Folder transfers"). And Upload Folder, consuming the trailing
+  no-resource MACR marker as mhxd does (Janus's failure to hangs real
+  clients), and adding to a folder that is there when the client asks
+  to resume.
 - Transfer queueing and per-account limits.
 
 ## Phase 4 — News

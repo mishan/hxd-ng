@@ -8,9 +8,9 @@ mod transfer;
 
 pub use manifest::{HttpManifestSource, ManifestLimits};
 pub use registry::{
-    DownloadGrant, DownloadTokens, EntryLimits, FolderFile, FolderItem, PreparedBanner,
-    PreparedDownload, PreparedFolder, PreparedTransfer, PreparedUpload, SealKeys, TransferRegistry,
-    UploadQuote,
+    DecodeName, DownloadGrant, DownloadTokens, EntryLimits, FolderFile, FolderItem, PreparedBanner,
+    PreparedDownload, PreparedFolder, PreparedFolderUpload, PreparedTransfer, PreparedUpload,
+    SealKeys, TransferRegistry, UploadQuote,
 };
 pub use transfer::{
     prepare_folder, prepare_legacy, prepare_upload, pump, serve_htxf, serve_htxf_with,
@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use hxd_core::FileSource;
 
-/// The most items one folder download sends unless configured otherwise.
+/// The most items one folder transfer holds unless configured otherwise.
 pub const MAX_FOLDER_ITEMS: usize = 100_000;
 
 /// The shared Files service mounted by both protocol frontends.
@@ -37,7 +37,7 @@ pub struct FileService {
     /// How long a download may make no progress toward its receiver, on
     /// either wire, before it is abandoned.
     pub idle_timeout: Duration,
-    /// The most items one folder download may send.
+    /// The most items one folder download or upload may hold.
     pub max_folder_items: usize,
 }
 
