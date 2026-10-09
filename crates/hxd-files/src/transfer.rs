@@ -12,8 +12,8 @@ use tracing::{debug, warn};
 
 use crate::local::PartialKey;
 use crate::{
-    FolderItem, LocalFileSource, PreparedDownload, PreparedFolder, PreparedTransfer,
-    PreparedUpload, TransferRegistry, UploadQuote,
+    FolderItem, LocalFileSource, PreparedDownload, PreparedFolder, PreparedFolderUpload,
+    PreparedTransfer, PreparedUpload, TransferRegistry, UploadQuote,
 };
 
 /// How much of a body is read and written at a time.
@@ -158,6 +158,30 @@ pub async fn prepare_upload(
     source: Arc<LocalFileSource>,
     request: UploadTransfer,
 ) -> Result<(u32, Option<UploadQuote>), FileError> {
+    let quote = check_upload(&source, &request).await?;
+    let reference = registry.issue(PreparedTransfer::Upload(PreparedUpload {
+        principal: request.principal,
+        peer: request.peer,
+        hope: request.hope,
+        path: request.path,
+        source,
+        owner: request.owner,
+        transfer_len: request.transfer_len,
+        large: request.large,
+        quote: quote.clone(),
+        blind: request.blind,
+        comment_utf8: request.comment_utf8,
+    }))?;
+    Ok((reference, quote))
+}
+
+/// What the local area says to an upload of `request`: refused (the name
+/// is taken, the quotas are spent), or allowed, with the partial it may
+/// resume.
+async fn check_upload(
+    source: &Arc<LocalFileSource>,
+    request: &UploadTransfer,
+) -> Result<Option<UploadQuote>, FileError> {
     let quote_source = source.clone();
     let key = partial_key(&request.owner, &request.path, request.blind)?;
     let path = request.path.clone();
@@ -182,20 +206,7 @@ pub async fn prepare_upload(
     {
         return Err(FileError::TooLarge);
     }
-    let reference = registry.issue(PreparedTransfer::Upload(PreparedUpload {
-        principal: request.principal,
-        peer: request.peer,
-        hope: request.hope,
-        path: request.path,
-        source,
-        owner: request.owner,
-        transfer_len: request.transfer_len,
-        large: request.large,
-        quote: quote.clone(),
-        blind: request.blind,
-        comment_utf8: request.comment_utf8,
-    }))?;
-    Ok((reference, quote))
+    Ok(quote)
 }
 
 fn partial_key(owner: &str, path: &FilePath, blind: bool) -> Result<PartialKey, FileError> {
@@ -398,6 +409,10 @@ async fn serve_one<S: HtxfStream>(
             let alive = Liveness::new(core, transfer.principal);
             serve_folder(stream, transfer, &alive, timeouts.idle).await
         }
+        PreparedTransfer::FolderUpload(transfer) => {
+            let alive = Liveness::new(core, transfer.principal);
+            serve_folder_upload(stream, transfer, &alive, timeouts.idle).await
+        }
         // No `Liveness` check: a banner is at most 1 MiB, already in memory,
         // and finishes within `idle`; a kick mid-banner costs nothing worth
         // interrupting it for.
@@ -498,10 +513,7 @@ async fn serve_folder<S: HtxfStream>(
     loop {
         // TLS, a sealed transfer and the tunnel may hold what was written
         // until they are flushed, and the client answers only what it has.
-        tokio::time::timeout(idle, stream.flush())
-            .await
-            .map_err(|_| stalled())?
-            .map_err(|e| FileError::Unavailable(e.to_string()))?;
+        flush_idle(&mut stream, idle).await?;
         let Some(action) = read_action(&mut stream, idle).await? else {
             break;
         };
@@ -572,6 +584,163 @@ async fn serve_folder<S: HtxfStream>(
         .map_err(|e| FileError::Unavailable(e.to_string()))
 }
 
+/// A folder upload's dialog (Hotline.md, Upload Folder): the server asks
+/// for each item with NEXT and answers a file's header with SEND, or with
+/// RESUME from the end of one already there, which it keeps; the client
+/// closes after its last item.
+async fn serve_folder_upload<S: HtxfStream>(
+    mut stream: S,
+    transfer: PreparedFolderUpload,
+    alive: &Liveness,
+    idle: Duration,
+) -> Result<(), FileError> {
+    let _open = hxd_core::instrument::transfer_open("upload");
+    let protocol = |what: &str| FileError::Unavailable(format!("folder upload: {what}"));
+    let source = &transfer.source;
+    let root = if transfer.merge {
+        transfer.root.clone()
+    } else {
+        source
+            .make_upload_folder(&transfer.root, transfer.blind)
+            .await?
+    };
+    let mut items = 0;
+    loop {
+        write_idle(&mut stream, &folder::ACTION_NEXT.to_be_bytes(), idle).await?;
+        flush_idle(&mut stream, idle).await?;
+        let mut len = [0; 2];
+        if read_idle(&mut stream, &mut len[..1], idle).await? == 0 {
+            break;
+        }
+        read_exact_idle(&mut stream, &mut len[1..], idle).await?;
+        let mut header = vec![0; usize::from(u16::from_be_bytes(len))];
+        read_exact_idle(&mut stream, &mut header, idle).await?;
+        let item = folder::Item::parse(&header).map_err(|e| protocol(&e.to_string()))?;
+        alive.check()?;
+        items += 1;
+        if items > transfer.max_items {
+            return Err(protocol("more items than [files] max_folder_items"));
+        }
+        // Refused before a name is decoded: a header can name thousands.
+        if root.components().len() + item.path.len() > crate::local::MAX_DEPTH {
+            return Err(FileError::TooDeep);
+        }
+        if item.path.iter().any(|name| name.len() > 128) {
+            return Err(FileError::InvalidPath);
+        }
+        let path = FilePath::from_components(
+            root.components()
+                .map(str::to_owned)
+                .chain(item.path.iter().map(|name| (transfer.decode)(name))),
+        )?;
+        // Added to, a folder that holds a drop box would answer for what is
+        // in it: whether an item is there, and how long. Decided on the
+        // spelling, as listing would hide it, not on what exists.
+        if transfer.merge && !transfer.sees_drop_boxes && path.is_drop_box() {
+            return Err(FileError::NotFound);
+        }
+        if item.folder {
+            match source.make_folder(&path).await {
+                Err(FileError::AlreadyExists)
+                    if transfer.merge
+                        && source.info(&path).await?.kind == hxd_core::FileKind::Folder => {}
+                made => made?,
+            }
+            continue;
+        }
+        let there = if transfer.merge {
+            match source.info(&path).await {
+                Ok(info) => Some(info),
+                Err(FileError::NotFound) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let mut size = [0; 4];
+        if let Some(info) = there {
+            // Resumed from its end, the client sends the object's headers
+            // alone, and what is there is kept: a client that cannot be
+            // told to skip an item can still be spared sending it. Any
+            // longer copy's tail is read and dropped.
+            if info.kind != hxd_core::FileKind::File {
+                return Err(FileError::AlreadyExists);
+            }
+            let end = |len: u64| u32::try_from(len).map_err(|_| FileError::TooLarge);
+            let record = rflt::encode(rflt::Resume {
+                data: end(info.size)?,
+                resource: end(info.resource_size)?,
+            });
+            let mut action = folder::ACTION_RESUME.to_be_bytes().to_vec();
+            action.extend_from_slice(&(record.len() as u16).to_be_bytes());
+            action.extend_from_slice(&record);
+            write_idle(&mut stream, &action, idle).await?;
+            flush_idle(&mut stream, idle).await?;
+            read_exact_idle(&mut stream, &mut size, idle).await?;
+            let size = u64::from(u32::from_be_bytes(size));
+            if size > source.limits().max_file_size.saturating_add(1_024) {
+                return Err(FileError::TooLarge);
+            }
+            let mut left = size;
+            let mut buffer = vec![0; CHUNK.min(size as usize)];
+            while left > 0 {
+                let at = buffer.len().min(left as usize);
+                read_exact_idle(&mut stream, &mut buffer[..at], idle).await?;
+                left -= at as u64;
+            }
+            continue;
+        }
+        write_idle(&mut stream, &folder::ACTION_SEND.to_be_bytes(), idle).await?;
+        flush_idle(&mut stream, idle).await?;
+        read_exact_idle(&mut stream, &mut size, idle).await?;
+        let transfer_len = u64::from(u32::from_be_bytes(size));
+        let request = UploadTransfer {
+            principal: transfer.principal,
+            peer: transfer.peer,
+            hope: transfer.hope.clone(),
+            path,
+            owner: transfer.owner.clone(),
+            transfer_len: Some(transfer_len),
+            large: false,
+            resume_requested: false,
+            blind: false,
+            comment_utf8: transfer.comment_utf8,
+        };
+        check_upload(source, &request).await?;
+        let upload = PreparedUpload {
+            principal: request.principal,
+            peer: request.peer,
+            hope: request.hope,
+            path: request.path,
+            source: source.clone(),
+            owner: request.owner,
+            transfer_len: request.transfer_len,
+            large: false,
+            quote: None,
+            blind: false,
+            comment_utf8: request.comment_utf8,
+        };
+        let preamble = htxf::Preamble {
+            reference: 0,
+            transfer_len,
+            type_code: 0,
+            flags: 0,
+            resume_digest: None,
+        };
+        // Each file is held to the time one uploaded alone would be.
+        tokio::time::timeout(
+            source.limits().upload_timeout,
+            receive_upload(&mut stream, &upload, &preamble, alive),
+        )
+        .await
+        .map_err(|_| FileError::Unavailable("upload exceeded its time limit".into()))??;
+    }
+    tokio::time::timeout(idle, stream.shutdown())
+        .await
+        .map_err(|_| stalled())?
+        .map_err(|e| FileError::Unavailable(e.to_string()))
+}
+
 /// The receiver's next action, or `None` when it has closed between them.
 async fn read_action<S: AsyncRead + Unpin>(
     stream: &mut S,
@@ -583,6 +752,16 @@ async fn read_action<S: AsyncRead + Unpin>(
     }
     read_exact_idle(stream, &mut action[1..], idle).await?;
     Ok(Some(u16::from_be_bytes(action)))
+}
+
+async fn flush_idle<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    idle: Duration,
+) -> Result<(), FileError> {
+    tokio::time::timeout(idle, stream.flush())
+        .await
+        .map_err(|_| stalled())?
+        .map_err(|e| FileError::Unavailable(e.to_string()))
 }
 
 async fn read_exact_idle<S: AsyncRead + Unpin>(
@@ -604,6 +783,16 @@ async fn serve_upload<S: HtxfStream>(
     alive: &Liveness,
 ) -> Result<(), FileError> {
     let _open = hxd_core::instrument::transfer_open("upload");
+    receive_upload(&mut stream, &transfer, &preamble, alive).await
+}
+
+/// One uploaded object, received into a partial and published.
+async fn receive_upload<S: HtxfStream>(
+    stream: &mut S,
+    transfer: &PreparedUpload,
+    preamble: &htxf::Preamble,
+    alive: &Liveness,
+) -> Result<(), FileError> {
     // Local I/O permits are taken around each piece of disk work rather
     // than for the whole upload: a client trickling bytes must not hold
     // capacity that listings and downloads share.
@@ -624,9 +813,9 @@ async fn serve_upload<S: HtxfStream>(
     })
     .await?;
     let result = if transfer.large {
-        receive_large(&mut stream, &transfer, &preamble, &files, alive).await
+        receive_large(stream, transfer, preamble, &files, alive).await
     } else {
-        receive_legacy(&mut stream, &transfer, &preamble, &files, alive).await
+        receive_legacy(stream, transfer, preamble, &files, alive).await
     };
     // Nothing is published for a session that ended while its bytes were
     // arriving.

@@ -233,10 +233,52 @@ impl std::fmt::Debug for PreparedFolder {
     }
 }
 
+/// Turns a name as the uploader's connection spells it into the area's.
+pub type DecodeName = Arc<dyn Fn(&[u8]) -> String + Send + Sync>;
+
+#[derive(Clone)]
+pub struct PreparedFolderUpload {
+    pub principal: FilePrincipal,
+    /// As for [`PreparedDownload::peer`].
+    pub peer: Option<IpAddr>,
+    /// As for [`PreparedDownload::hope`].
+    pub hope: Option<SealKeys>,
+    pub source: Arc<LocalFileSource>,
+    pub owner: String,
+    /// The folder the upload makes, or, with `merge`, adds to.
+    pub root: FilePath,
+    /// As for [`PreparedUpload::blind`]: the top folder is made under a
+    /// free name.
+    pub blind: bool,
+    /// The folder exists and the client asked to resume: what is already
+    /// there is kept, and only what is missing is sent.
+    pub merge: bool,
+    /// The uploader may view drop boxes, and so add to one.
+    pub sees_drop_boxes: bool,
+    /// As for [`PreparedUpload::comment_utf8`].
+    pub comment_utf8: bool,
+    pub decode: DecodeName,
+    pub max_items: usize,
+}
+
+impl std::fmt::Debug for PreparedFolderUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedFolderUpload")
+            .field("principal", &self.principal)
+            .field("peer", &self.peer)
+            .field("owner", &self.owner)
+            .field("root", &self.root)
+            .field("blind", &self.blind)
+            .field("merge", &self.merge)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PreparedTransfer {
     Download(PreparedDownload),
     Folder(PreparedFolder),
+    FolderUpload(PreparedFolderUpload),
     Upload(PreparedUpload),
     Banner(PreparedBanner),
 }
@@ -246,6 +288,7 @@ impl PreparedTransfer {
         match self {
             PreparedTransfer::Download(value) => value.principal,
             PreparedTransfer::Folder(value) => value.principal,
+            PreparedTransfer::FolderUpload(value) => value.principal,
             PreparedTransfer::Upload(value) => value.principal,
             PreparedTransfer::Banner(value) => value.principal,
         }
@@ -255,6 +298,7 @@ impl PreparedTransfer {
         match self {
             PreparedTransfer::Download(value) => &value.account,
             PreparedTransfer::Folder(value) => &value.account,
+            PreparedTransfer::FolderUpload(value) => &value.owner,
             PreparedTransfer::Upload(value) => &value.owner,
             PreparedTransfer::Banner(value) => &value.account,
         }
@@ -264,6 +308,7 @@ impl PreparedTransfer {
         match self {
             PreparedTransfer::Download(value) => value.hope.as_ref(),
             PreparedTransfer::Folder(value) => value.hope.as_ref(),
+            PreparedTransfer::FolderUpload(value) => value.hope.as_ref(),
             PreparedTransfer::Upload(value) => value.hope.as_ref(),
             PreparedTransfer::Banner(value) => value.hope.as_ref(),
         }
@@ -273,6 +318,7 @@ impl PreparedTransfer {
         match self {
             PreparedTransfer::Download(value) => value.peer,
             PreparedTransfer::Folder(value) => value.peer,
+            PreparedTransfer::FolderUpload(value) => value.peer,
             PreparedTransfer::Upload(value) => value.peer,
             PreparedTransfer::Banner(value) => value.peer,
         }
@@ -453,6 +499,14 @@ impl TransferRegistry {
                     || (!large_flag && !folder.fits)
                     || preamble.flags & htxf::FLAG_RESUME != 0
                 {
+                    return Err(FileError::InvalidPath);
+                }
+                (false, None)
+            }
+            // Each item's object is classic: GtkHx's folder uploads are,
+            // and an item has no handshake of its own to say otherwise.
+            PreparedTransfer::FolderUpload(_) => {
+                if preamble.flags != 0 {
                     return Err(FileError::InvalidPath);
                 }
                 (false, None)

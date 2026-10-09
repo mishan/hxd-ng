@@ -4,8 +4,8 @@ Status: first and second slices implemented, 2026-09-12, and file
 management on the local area since. The first slice is read-only
 manifest-backed HTTP; the second adds a capability-rooted local file area and
 single-file uploads; the third, New Folder, Delete, rename, Move and
-comments; Download Folder since 2026-10 (F1 of "Folder transfers"). This
-document is the execution plan and
+comments; Download Folder and Upload Folder since 2026-10 (F1 and F2 of
+"Folder transfers"). This document is the execution plan and
 acceptance contract for the Files work across hxd-ng and its clients. The
 exploratory notes in
 [`file-sources.md`](file-sources.md) remain useful design background; this
@@ -316,24 +316,36 @@ them; the item header and actions are `hxfiles_xfer::folder`.
   come from the walk, so a file that changed since ends the transfer at
   that item rather than send what was not announced. Names cross in the
   connection's encoding, where mhxd sends raw bytes.
-- **F2, Upload Folder.** The server drives: NEXT, the client's item
-  header, SEND or RESUME for a file (GtkHx treats NEXT there as a protocol
-  error), its object; the client's close between items ends it. Folders
-  are made and files published through the single-file upload path. A
-  folder that already exists is refused unless the request sets the resume
-  option (204), when the upload merges into it and resumes partials. Into a
-  drop box the account may not view, the top folder is published blind,
-  under a free name, as single files are.
+- **F2, Upload Folder (built).** Needs `upload_folders`, where FilePut
+  would take a file. The server drives: NEXT, the client's item header,
+  SEND or RESUME for a file (GtkHx treats NEXT there as a protocol error),
+  its object behind its size; the client's close between items ends it,
+  and so does `max_folder_items`. The top folder is made when the
+  transfer starts; each item is checked and published through the
+  single-file upload path, its quotas included, as a classic object (the
+  handshake may set no flags). A folder that already exists is refused
+  unless the request sets the resume option (204), when the upload merges
+  into it: a file already there is answered RESUME from its end, so the
+  client sends its headers alone and what is there is kept (a longer
+  copy's tail is read and dropped; GtkHx fails on its own side for a
+  shorter one), and the rest is sent whole, an interrupted one included.
+  Adding to a folder never reaches into a drop box the account may not
+  view. Into one, the top folder is made blind, under a free name, as
+  single files are published, and so is a folder named like one. Each
+  file is held to `upload_timeout` as one uploaded alone is. An upload
+  that fails partway keeps what arrived and its folder, as mhxd's does,
+  so finishing it takes the resume option.
 - **F3, the queue and limits.** Concurrent transfers per account,
   configurable, defaulting to mhxd's one download and one upload; queue
   positions in the replies and the Download Info (211) push; Kill Download
-  (214) ending the transfer it names, though GtkHx never sends it.
+  (214) ending the transfer it names, though GtkHx never sends it; and a
+  folder upload's items, folders included, charged to the account as the
+  transactions they stand for are.
 
 ## Deferred work
 
 The following remain separate milestones:
 
-- Upload Folder, and the transfer queue and per-account limits (F2 and
-  F3 above);
+- the transfer queue and per-account limits (F3 above);
 - per-account quotas and background origin prefetching;
 - direct origin URLs in the ng client.
