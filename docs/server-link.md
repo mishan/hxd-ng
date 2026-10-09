@@ -5,8 +5,8 @@ Nicknames), L1 (links by key mode, Hello, server lists, pings, close,
 reload), L2 (users crossing one link both ways, ghosts on both wires), L3
 (public chat both ways), L4 (private messages and user info), L5
 (moderation both ways), L6 (interruption and its grace period), L7
-(relaying between this server's links) and L8's metrics and `hxd link`
-commands. The rest is design. It implements fogWraith's
+(relaying between this server's links), L8's metrics and `hxd link`
+commands, and the user transport draft (§3.2). The rest is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -124,6 +124,23 @@ pub(crate) struct Ghost {
 and in order, rewriting only the user ID and flags, so the exclusion list,
 the user's own `DATA_COLOR` and fields outside the baseline go on as they
 came. The parsed fields beside it are what this server uses.
+
+**How a user is connected** crosses as fogWraith's user transport draft
+(`Server-Link-User-Transport.md`, `DATA_LINK_USER_TRANSPORT` = `0x0645`,
+not adopted), only on links whose operators both agreed to try it:
+`drafts = ["user_transport"]` on the peer's entry here, `Drafts:
+[UserTransport]` on Janus's. Over such a link this server says, for each
+user whose connection it saw rather than assumed, `1` encrypted (the TLS
+port, or HOPE under a cipher and a password) or `2` cleartext (the plain
+port, or HOPE with an empty password, whose keys anyone watching could
+derive, `hope.md` §3, or a hop the client itself declared cleartext); an
+ng session otherwise goes without the field, its TLS being a proxy's
+this server cannot check. A ghost learned over such a link shows
+what its home server said as its `transport` (`encrypted`, `cleartext`,
+or `weak` for RC4, `3`), and `unknown` otherwise or over any other link.
+A relay passes the field on as it passes every other, so servers beyond
+the peer see it too. Janus before 2.0.23 sends `1` for a HOPE session
+with an empty password, so the draft is tried with it from 2.0.23.
 
 `hidden_here` is local and survives later user updates, since the next
 complete group from the peer does not mention it. It clears only when the
@@ -397,8 +414,10 @@ alternative is losing it.
 A ghost's `user` object gains `remote: {server, tag, tagged}`, beside its
 `color`, which is its home server's. It has no
 `identity` (until user keys), no `avatar`, and `admin: false`. Its
-`transport` describes the user's own connection, which this server cannot
-know, so `hotline-ng.md` gains a third value, `unknown`, for ghosts.
+`transport` describes the user's own connection, which this server knows
+only as its home server said over a link trying the user transport draft
+(§3.2); otherwise it is `unknown`, a value `hotline-ng.md` gains for
+ghosts, as it gains `weak` for a home server's RC4.
 Clients already must not treat anything but `encrypted` as protected.
 `msg` events gain `from.remote` for a ghost sender, and chat events and
 `history` entries carry the ghost's `remote` in `from`. These are wire changes: they land in
@@ -859,6 +878,7 @@ key = "ed25519:b64..."      # the peer's public key, base64url, prefix optional 
 account = "link-hx"         # the account the peer issued this server, or this server's for the peer
 # password = "..."          # tls mode only: what the peer issued
 features = ["chat", "msgs", "info", "transit"]
+drafts = ["user_transport"]  # drafts tried with this peer, as its operator agreed (§3.2)
 ghosts = 1000               # this link's bound
 ```
 

@@ -126,12 +126,15 @@ async fn goes_down(hub: &hxd_link::Hub, seed: u8) {
 }
 
 /// Two servers, `a` (tag `aa`) accepting `b` (tag `bb`), with the key
-/// each holds for the other and more `[link]` keys for `a`.
+/// each holds for the other, more `[link]` keys for `a`, and more keys for
+/// `a`'s entry for `b` and `b`'s for `a`.
 async fn pair_with(
     a_holds: u8,
     b_holds: u8,
     a_link: &str,
     a_offers: &str,
+    a_extra: &str,
+    b_extra: &str,
 ) -> (Server, Server, [tempfile::TempDir; 2]) {
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a_tls = bind().await;
@@ -143,7 +146,7 @@ async fn pair_with(
         a_link,
         &format!(
             "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
-             key = \"ed25519:{}\"\naccount = \"link-bb\"\nfeatures = {a_offers}\n",
+             key = \"ed25519:{}\"\naccount = \"link-bb\"\nfeatures = {a_offers}\n{a_extra}\n",
             public(a_holds)
         ),
         a_tls,
@@ -156,7 +159,7 @@ async fn pair_with(
         "",
         &format!(
             "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
-             key = \"{}\"\naccount = \"link-bb\"\nfeatures = {EVERY_FEATURE}\n",
+             key = \"{}\"\naccount = \"link-bb\"\nfeatures = {EVERY_FEATURE}\n{b_extra}\n",
             public(b_holds)
         ),
         bind().await,
@@ -170,7 +173,7 @@ async fn pair_with(
 const EVERY_FEATURE: &str = r#"["chat", "msgs", "info"]"#;
 
 async fn pair(a_holds: u8, b_holds: u8) -> (Server, Server, [tempfile::TempDir; 2]) {
-    pair_with(a_holds, b_holds, "", EVERY_FEATURE).await
+    pair_with(a_holds, b_holds, "", EVERY_FEATURE, "", "").await
 }
 
 /// Two servers linked, waited for.
@@ -180,7 +183,7 @@ async fn linked(a_link: &str) -> (Server, Server, [tempfile::TempDir; 2]) {
 
 /// Two servers linked, `a` offering only `a_offers`.
 async fn linked_offering(a_link: &str, a_offers: &str) -> (Server, Server, [tempfile::TempDir; 2]) {
-    let servers = pair_with(2, 1, a_link, a_offers).await;
+    let servers = pair_with(2, 1, a_link, a_offers, "", "").await;
     assert!(comes_up(&servers.0.hub, 2, Duration::from_secs(10)).await);
     assert!(comes_up(&servers.1.hub, 1, Duration::from_secs(10)).await);
     servers
@@ -511,6 +514,63 @@ async fn an_ng_block_of_a_ghost_refuses_its_messages_until_unblocked() {
         .await
         .unwrap();
     assert_eq!(got.data["text"], "heard");
+}
+
+#[tokio::test]
+async fn a_peer_trying_the_user_transport_draft_is_told_how_each_user_connects() {
+    const DRAFT: &str = "drafts = [\"user_transport\"]";
+    // `b` trying the draft with `a`, then not: `a` says the same either
+    // way, and `b` reads it only when it tries the draft too.
+    for (b_extra, plain, sealed, guest) in [
+        (DRAFT, "cleartext", "encrypted", "cleartext"),
+        ("", "unknown", "unknown", "unknown"),
+    ] {
+        let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, DRAFT, b_extra).await;
+        assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
+        assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+        // On `a`: a classic client in the clear, one under HOPE's Blowfish
+        // with a password and one without, whose keys anyone watching
+        // could derive, and an ng client whose TLS is a proxy's that `a`
+        // cannot see.
+        let _plain = legacy::Client::login_at(a.legacy, &Login::guest("plain"))
+            .await
+            .unwrap();
+        let offer = hxhope::client::Offer {
+            ciphers: vec![hxhope::Cipher::Blowfish],
+            ..hxhope::client::Offer::new(*b"TEST")
+        };
+        let mut sealed_c = legacy::Client::connect(a.legacy).await.unwrap();
+        sealed_c
+            .login_hope(&offer, &Login::account("sealed", "admin", "pw"))
+            .await
+            .unwrap();
+        let mut guest_c = legacy::Client::connect(a.legacy).await.unwrap();
+        guest_c
+            .login_hope(&offer, &Login::guest("hopeguest"))
+            .await
+            .unwrap();
+        let (_ngu, _) = ng::Client::guest(a.ng, "ngu").await.unwrap();
+
+        let mut watcher = legacy::Client::login_at(b.legacy, &Login::guest("watcher"))
+            .await
+            .unwrap();
+        for nick in ["plain", "Admin", "hopeguest", "ngu"] {
+            row(&mut watcher, nick).await;
+        }
+        let (_ngc, hello) = ng::Client::guest(b.ng, "ngc").await.unwrap();
+        let transport = |nick: &str| {
+            hello["users"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|u| u["nick"] == nick)
+                .map(|u| u["transport"].clone())
+        };
+        assert_eq!(transport("plain"), Some(json!(plain)), "{b_extra}");
+        assert_eq!(transport("Admin"), Some(json!(sealed)), "{b_extra}");
+        assert_eq!(transport("hopeguest"), Some(json!(guest)), "{b_extra}");
+        assert_eq!(transport("ngu"), Some(json!("unknown")), "{b_extra}");
+    }
 }
 
 #[tokio::test]

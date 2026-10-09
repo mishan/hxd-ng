@@ -201,6 +201,11 @@ pub struct Transport {
     /// (TLS WebSocket, or a tunnelled legacy client). A plain TCP legacy
     /// session is not, and other users get warned before PMing it.
     pub encrypted: bool,
+    /// `encrypted` is the frontend's assumption rather than what it saw:
+    /// an ng socket, which `hotline-ng.md` §9 puts behind a TLS proxy the
+    /// server cannot check is there. Linked servers are not told such a
+    /// session is encrypted (`docs/server-link.md` §3.2).
+    pub assumed: bool,
     /// The transport identity, when the connection was authenticated
     /// with one. Never inferred — set only by a frontend that verified it.
     pub identity: Option<IdentityTag>,

@@ -56,6 +56,9 @@ pub mod field {
     pub const EXCLUDE: u16 = 0x063D;
     pub const REQUESTER: u16 = 0x063E;
     pub const LINE_ID: u16 = 0x063F;
+    /// The user transport draft's, reserved for it and not adopted: how a
+    /// user is connected to their home server.
+    pub const USER_TRANSPORT: u16 = 0x0645;
     pub use hxd_session::peer::field::{KEY_PROOF, SERVER_KEY};
 }
 

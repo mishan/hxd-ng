@@ -64,6 +64,10 @@ pub struct PeerEntry {
     /// The most ghosts this link may show here, counting every user
     /// behind it.
     pub ghosts: usize,
+    /// Trying the user transport draft with this peer: its operator
+    /// agreed to, so each local user's group says how they are connected,
+    /// and the peer's are read.
+    pub user_transport: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +186,8 @@ struct Live {
     /// Servers learned over this link, the peer excluded.
     servers: HashMap<ServerId, ServerGroup>,
     features: u32,
+    /// The entry it started under tries the user transport draft.
+    user_transport: bool,
     /// Where the export feed reaches this link, once it is established.
     exports: Option<mpsc::Sender<Export>>,
     /// Requests this server sends the peer, once the link is established.
@@ -495,6 +501,7 @@ impl Hub {
     /// a connection it has given up on.
     pub(crate) fn register(&self, peer: &str) -> (u64, oneshot::Receiver<Reason>) {
         let (tx, rx) = oneshot::channel();
+        let user_transport = self.entry(peer).is_some_and(|e| e.user_transport);
         let mut state = self.0.state.lock().unwrap();
         state.generation += 1;
         let generation = state.generation;
@@ -523,6 +530,7 @@ impl Hub {
                 peer: None,
                 servers: HashMap::new(),
                 features: 0,
+                user_transport,
                 exports: None,
                 ghosts: HashMap::new(),
                 requests: None,
@@ -1221,12 +1229,20 @@ impl Hub {
     /// Hand one export to every established link. A link too far behind
     /// to take it is closed and starts over from a snapshot.
     fn fan_out(&self, (n, event): (u64, PeerEvent)) {
-        let mut packed = None;
+        // At most two packings: with the user transport draft's field and
+        // without, each made the first time a link needs it.
+        let mut packed = [None, None];
         let mut state = self.0.state.lock().unwrap();
         for live in state.links.values_mut() {
             let Some(tx) = &live.exports else { continue };
-            let packed = packed.get_or_insert_with(|| {
-                Arc::new(crate::link::pack(self.server_id(), self.epoch(), &event))
+            let transport = live.user_transport;
+            let packed = packed[usize::from(transport)].get_or_insert_with(|| {
+                Arc::new(crate::link::pack(
+                    self.server_id(),
+                    self.epoch(),
+                    &event,
+                    transport,
+                ))
             });
             if let Err(e) = tx.try_send((n, packed.clone())) {
                 // Closed is a link already ending for its own reason.
@@ -1330,6 +1346,7 @@ impl Hub {
                 tagged: show_tags,
                 refuses_msgs: g.flags & flag::REFUSES_MESSAGES != 0
                     || live.features & feature::PRIVATE_MESSAGES == 0,
+                transport: g.transport.filter(|_| live.user_transport),
             },
             visible: !g.exclude.contains(&self.server_id()),
         })
@@ -1521,14 +1538,15 @@ async fn feed(hub: Hub, mut rx: mpsc::Receiver<(u64, PeerEvent)>) {
 }
 
 /// Whether two entries for a peer describe the same link: the same key,
-/// login and address, and the same features and ghost bound, which are
-/// settled when a link starts.
+/// login and address, and the same features, ghost bound and drafts,
+/// which are settled when a link starts.
 fn same_terms(a: &PeerEntry, b: &PeerEntry) -> bool {
     a.key == b.key
         && a.account == b.account
         && a.dial == b.dial
         && a.features == b.features
         && a.ghosts == b.ghosts
+        && a.user_transport == b.user_transport
 }
 
 impl PeerAcceptor for Hub {
@@ -2086,8 +2104,9 @@ mod tests {
             away: false,
             color: None,
             exclude: vec![],
+            encrypted: None,
         };
-        UserGroup::parse(&crate::users::of_local(&local, ServerId([2; 8]))).unwrap()
+        UserGroup::parse(&crate::users::of_local(&local, ServerId([2; 8]), false)).unwrap()
     }
 
     fn uids(h: &Hub) -> Vec<Uid> {
@@ -2252,6 +2271,7 @@ mod tests {
             account: "link".into(),
             features: 0,
             ghosts: 10,
+            user_transport: false,
         });
         h
     }
@@ -2264,8 +2284,9 @@ mod tests {
             away: false,
             color: None,
             exclude: vec![],
+            encrypted: None,
         };
-        UserGroup::parse(&crate::users::of_local(&local, ServerId([home; 8]))).unwrap()
+        UserGroup::parse(&crate::users::of_local(&local, ServerId([home; 8]), false)).unwrap()
     }
 
     impl ServerGroup {
