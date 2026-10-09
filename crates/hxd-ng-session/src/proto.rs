@@ -3,6 +3,7 @@
 //! module is its executable form.
 
 use hxd_core::media::MediaRef;
+use hxd_core::server_link::RemoteTransport;
 use hxd_core::video::{
     VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,
 };
@@ -522,10 +523,16 @@ impl serde::Serialize for UserOut<'_> {
         m.serialize_entry("status", status_str(u.status))?;
         // `docs/hotline-ng-auth.md` §7.2, §8: what other users may
         // know about this session's link.
-        // A ghost's connection is another server's, which this one
-        // cannot vouch for either way.
-        let transport = if u.remote.is_some() {
-            "unknown"
+        // A ghost's connection is another server's, which this one knows
+        // only as that server said, over a link trying the user transport
+        // draft.
+        let transport = if let Some(remote) = &u.remote {
+            match remote.transport {
+                Some(RemoteTransport::Encrypted) => "encrypted",
+                Some(RemoteTransport::Cleartext) => "cleartext",
+                Some(RemoteTransport::Weak) => "weak",
+                None => "unknown",
+            }
         } else if u.transport.encrypted {
             "encrypted"
         } else {

@@ -63,6 +63,11 @@ pub struct PeerSection {
     /// The most of this peer's side of the network shown here.
     #[serde(default = "default_ghosts")]
     pub ghosts: usize,
+    /// Drafts beside the extension this server tries with this peer, as
+    /// the peer's operator agreed to: so far `user_transport`
+    /// (`docs/server-link.md` §3.2).
+    #[serde(default)]
+    pub drafts: Vec<String>,
 }
 
 fn default_key() -> PathBuf {
@@ -162,6 +167,9 @@ pub fn check(config: &Config) -> Result<(), String> {
         }
         peer_key(peer)?;
         features(peer)?;
+        if let Some(d) = peer.drafts.iter().find(|d| *d != "user_transport") {
+            return Err(format!("[[link.peer]] {}: unknown draft {d:?}", peer.name));
+        }
     }
     Ok(())
 }
@@ -178,6 +186,7 @@ fn entries(section: &LinkSection) -> Result<Vec<hxd_link::PeerEntry>, String> {
                 account: p.account.clone(),
                 features: features(p)?,
                 ghosts: p.ghosts,
+                user_transport: p.drafts.iter().any(|d| d == "user_transport"),
             })
         })
         .collect()

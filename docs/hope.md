@@ -1,7 +1,7 @@
 # HOPE: the secure login on the classic wire
 
 Status: partial, 2026-10. Built: the login, ChaCha20-Poly1305 with its
-sealed file transfers and Blowfish OFB-64, `[hope]`. Planned:
+sealed file transfers and Blowfish OFB-64, `[hope]`, and
 `DATA_LINK_USER_TRANSPORT` on server links (§6).
 
 HOPE replaces the classic login's XOR-scrambled password with a MAC of it
@@ -119,7 +119,8 @@ A Blowfish session's transfers stay plaintext, as on mhxd.
 
 ## 6. Across server links
 
-`DATA_LINK_USER_TRANSPORT` (proposed `0x0645`) tells linked servers
-whether a user's own connection is encrypted. A HOPE session under
-Blowfish or ChaCha20-Poly1305 is `1`, one with no cipher `2`. Proposed to
-fogWraith and not yet assigned.
+`DATA_LINK_USER_TRANSPORT` (`0x0645`, the user transport draft, reserved
+and not adopted) tells linked servers that try the draft whether a
+user's own connection is encrypted: a HOPE session under Blowfish or
+ChaCha20-Poly1305 is `1`, one with no cipher or an empty password `2`
+(`server-link.md` §3.2).

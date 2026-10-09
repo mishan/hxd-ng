@@ -380,8 +380,9 @@ Three layers, all `cargo test --workspace`:
   messages, user info and kicks between its links and nothing over a
   link without transit, `show_tags`, and every
   transaction in `NAMES_A_USER` refused for a ghost as for a uid nobody
-  holds, and an ng `block` of a ghost refusing its messages until
-  `unblock`),
+  holds, an ng `block` of a ghost refusing its messages until `unblock`,
+  and the user transport draft telling a peer that tries it which users
+  are in the clear, under HOPE, or connected in a way unseen),
   `hope.rs` (HOPE logins through `hxhope`'s client against a server built
   from a real config: Blowfish carrying both
   ways, an ng client seeing the session encrypted and a guest's not, the

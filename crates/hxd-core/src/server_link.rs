@@ -31,6 +31,19 @@ pub struct RemoteRef {
     /// The ghost refuses private messages: its own flag, or because its
     /// path cannot carry them.
     pub refuses_msgs: bool,
+    /// How the ghost is connected to its home server, as that server said
+    /// (`DATA_LINK_USER_TRANSPORT`), over a link trying the draft.
+    pub transport: Option<RemoteTransport>,
+}
+
+/// A ghost's connection to its home server, as the user transport draft
+/// words it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTransport {
+    Encrypted,
+    Cleartext,
+    /// Encrypted under a cipher that does not hold up: HOPE's RC4.
+    Weak,
 }
 
 /// A ghost as a link describes it.
@@ -262,6 +275,9 @@ pub struct LocalUser {
     pub color: Option<u32>,
     /// Linked servers that kicked this user, which must not show it.
     pub exclude: Vec<[u8; 8]>,
+    /// Whether the user's connection here is encrypted, when this server
+    /// saw it rather than assumed it.
+    pub encrypted: Option<bool>,
 }
 
 impl LocalUser {
@@ -273,6 +289,10 @@ impl LocalUser {
             away: sess.info.status != SessionStatus::Active,
             color: sess.info.color,
             exclude: sess.excluded_at.clone(),
+            // An assumption is never sent as encrypted; a hop the client
+            // itself declared cleartext is cleartext whatever is in front.
+            encrypted: (!sess.info.transport.assumed || !sess.info.transport.encrypted)
+                .then_some(sess.info.transport.encrypted),
         }
     }
 }
@@ -959,6 +979,7 @@ mod tests {
                 home_name: "Elsewhere".into(),
                 tagged: false,
                 refuses_msgs: true,
+                transport: None,
             },
             visible,
         }

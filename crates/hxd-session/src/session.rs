@@ -5133,6 +5133,7 @@ mod tests {
                 home_name: "B".into(),
                 tagged: true,
                 refuses_msgs: true,
+                transport: None,
             }),
         };
         let long = "\u{3042}".repeat(12);

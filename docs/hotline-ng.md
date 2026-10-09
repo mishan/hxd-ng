@@ -645,7 +645,7 @@ counts in §3's sequence.
   "uid": 3, "nick": "Alice", "icon": 128,
   "admin": false,
   "status": "active",              // §2
-  "transport": "encrypted",        // encrypted | cleartext | unknown
+  "transport": "encrypted",        // encrypted | cleartext | weak | unknown
   "identity": {                    // absent unless the session proved one
     "fingerprint": "6htgz65…",     // 52 characters, Crockford base32
     "handle": "alice@hl.example"   // null when no attestation was accepted
@@ -663,7 +663,7 @@ counts in §3's sequence.
 | `nick`, `icon` | As shown to every other user, classic clients included. |
 | `admin` | The user may disconnect other users: the classic wire's admin color. |
 | `status` | §2. |
-| `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. `"unknown"` for a user of a linked server, whose connection is that server's (server-link.md §5); clients treat it as they would `cleartext`. |
+| `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. For a user of a linked server, whose connection is that server's: what that server said, where the two servers try the user transport draft (server-link.md §3.2), `"weak"` among it for a cipher that does not hold up (HOPE's RC4); `"unknown"` otherwise. Clients treat `"weak"`, `"unknown"` and any value they do not know as they would `cleartext`. |
 | `remote` | Present only for a user of a linked server (server-link.md): `{server, tag, tagged}`, the home server's name and tag and whether this server puts the tag in its users' names. A client MAY show the tag itself when `tagged` is false. Such a user's `color` is its home server's. |
 | `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1). It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. |
 | `avatar` | Present only when the user has one, on a server with the `avatars` capability (avatars.md §4.2). Clients SHOULD show it in place of the icon when they can, and fall back to `icon`. |

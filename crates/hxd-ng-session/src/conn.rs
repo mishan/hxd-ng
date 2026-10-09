@@ -727,6 +727,7 @@ async fn handle_login(
             // Blanking a rendered line is part of this wire.
             redactions: true,
             encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
+            assumed: true,
             identity: identity.map(TransportIdentity::tag),
             // Always, when the server has a pipeline at all: an ng
             // client is told what it may ignore rather than asked what

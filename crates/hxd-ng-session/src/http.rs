@@ -862,6 +862,7 @@ async fn upgrade(
                 // whatever the tunnel said it was (§5.2 `downstream`).
                 let transport = Transport {
                     encrypted: !identity.as_ref().is_some_and(|i| i.downstream_cleartext),
+                    assumed: true,
                     identity: identity.as_ref().map(TransportIdentity::tag),
                     // The tunnel is transport and knows nothing about
                     // what it carries: the legacy client inside it

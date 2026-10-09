@@ -147,12 +147,13 @@ pub(crate) fn link_line_endings(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
-/// One export, packed as every link sends it: `own` and `epoch` are this
+/// One export, packed as every link sends it, or with `transport` every
+/// link trying the user transport draft: `own` and `epoch` are this
 /// server's, for a line's network-wide ID.
-pub(crate) fn pack(own: ServerId, epoch: [u8; 8], event: &PeerEvent) -> Packed {
+pub(crate) fn pack(own: ServerId, epoch: [u8; 8], event: &PeerEvent, transport: bool) -> Packed {
     match event {
         PeerEvent::Shown(u) | PeerEvent::Changed(u) => {
-            Packed::new(tx::USER_UPDATE, chunks(&of_local(u, own)))
+            Packed::new(tx::USER_UPDATE, chunks(&of_local(u, own, transport)))
         }
         PeerEvent::Gone(uid, why) => {
             let reason = match why {
@@ -344,7 +345,9 @@ impl Link<'_> {
             }
         }
         let own = self.hub.server_id();
-        let mut groups: Vec<Vec<Field>> = users.iter().map(|u| of_local(u, own)).collect();
+        let transport = self.entry.user_transport;
+        let mut groups: Vec<Vec<Field>> =
+            users.iter().map(|u| of_local(u, own, transport)).collect();
         groups.extend(relayed);
         self.send_snapshot(io, groups);
         for what in after {
