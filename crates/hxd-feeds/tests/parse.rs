@@ -173,33 +173,46 @@ fn subjects_are_one_line_of_text_cut_at_a_character() {
 }
 
 #[test]
-fn a_long_body_is_cut_before_its_links() {
+fn a_long_body_is_cut_to_the_room_its_links_leave() {
     let item = format!(
         "<item><guid>g</guid><link>https://e.org/item</link>\
          <description>{}</description>\
          <enclosure url=\"https://e.org/f.bin\" length=\"1\" type=\"application/octet-stream\"/></item>",
         "word ".repeat(1000)
     );
-    for markdown in [true, false] {
-        let feed = parse(
+    let body = |markdown: bool, max_body: usize| {
+        parse(
             &rss(&item),
             &ParseOptions {
                 markdown,
-                max_body: 100,
+                max_body,
                 ..opts()
             },
         )
-        .unwrap();
-        let body = &feed.items[0].body;
-        let (text, links) = body.split_once("\n\nSource: ").unwrap();
-        assert!(text.len() <= 100 && text.ends_with('…'), "{text}");
+        .unwrap()
+        .items
+        .remove(0)
+        .body
+    };
+    for markdown in [true, false] {
+        let whole = body(markdown, 100);
+        assert!(whole.len() <= 100, "{whole}");
+        let (text, links) = whole.split_once("\n\nSource: ").unwrap();
+        assert!(text.ends_with('…'), "{text}");
         let want = if markdown {
             "<https://e.org/item>\n\nDownload: <https://e.org/f.bin>"
         } else {
             "https://e.org/item\n\nDownload: https://e.org/f.bin"
         };
         assert_eq!(links, want);
-        assert_eq!(feed.items[0].markdown, markdown);
+
+        let tight = body(markdown, 40);
+        assert!(tight.len() <= 40, "{tight}");
+        assert!(tight.contains("Source: "), "the source stays: {tight}");
+        assert!(
+            !tight.contains("Download: "),
+            "downloads give way first: {tight}"
+        );
     }
 }
 

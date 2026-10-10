@@ -446,3 +446,60 @@ async fn through_a_proxy_a_public_feed_is_checked_by_its_literal_addresses() {
         "{head}"
     );
 }
+
+/// A name server that answers loopback to the first lookup and its real,
+/// public address after: what a feed's host can do to be judged local
+/// and then have its redirects followed unchecked. Only the public
+/// address and the metadata one lead anywhere.
+struct RebindingNet {
+    lookups: std::sync::atomic::AtomicUsize,
+    route: SocketAddr,
+}
+
+impl Net for RebindingNet {
+    async fn resolve(&self, _: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        let first = self
+            .lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0;
+        let ip: IpAddr = if first { "127.0.0.1" } else { "93.184.216.34" }
+            .parse()
+            .unwrap();
+        Ok(vec![SocketAddr::new(ip, port)])
+    }
+    async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
+        match addr.ip().to_string().as_str() {
+            "93.184.216.34" | "169.254.169.254" => TcpStream::connect(self.route).await,
+            _ => Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+        }
+    }
+}
+
+#[tokio::test]
+async fn one_lookup_decides_where_a_feed_is_and_where_it_connects() {
+    let (route, log) = server(|head| match path(head) {
+        "/feed" => response(
+            "302 Found",
+            &[("Location", "http://169.254.169.254/latest/meta-data/")],
+            b"",
+        ),
+        _ => response("200 OK", &[], b"metadata"),
+    })
+    .await;
+    let net = RebindingNet {
+        lookups: Default::default(),
+        route,
+    };
+    let got = fetch_with(
+        &net,
+        &cfg(),
+        "http://rebind.test/feed",
+        &Validators::default(),
+    )
+    .await;
+    assert!(
+        matches!(got, Err(FetchError::Transport(_))),
+        "connected where the classifying lookup said, not where the next one did: {got:?}"
+    );
+    assert!(log.lock().unwrap().is_empty());
+}

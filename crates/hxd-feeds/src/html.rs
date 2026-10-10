@@ -9,7 +9,7 @@
 //! Nothing here writes HTML. Text is escaped wherever it lands outside a
 //! code span or block, which markdown never reads as markup; the only
 //! destinations written are `http`, `https` and `mailto` URLs, inside
-//! `<…>` so that whatever the URL holds cannot end the link.
+//! `<…>`, and never one holding a character that could end it.
 
 use html5gum::{DefaultEmitter, HtmlString, Token, Tokenizer};
 use std::collections::BTreeMap;
@@ -228,7 +228,13 @@ impl<'a> Writer<'a> {
             None => Url::parse(href),
         }
         .ok()?;
-        schemes.contains(&url.scheme()).then(|| url.to_string())
+        // A `mailto:` path is left as written, and a `<`, `>` or space in
+        // it would end the `<…>` the destination is written in.
+        let unsafe_char =
+            |c: char| matches!(c, '<' | '>' | '\\') || c.is_whitespace() || c.is_control();
+        let allowed = schemes.contains(&url.scheme());
+        let url = url.to_string();
+        (allowed && !url.contains(unsafe_char)).then_some(url)
     }
 
     fn start<S>(&mut self, name: &[u8], attrs: &BTreeMap<HtmlString, S>, self_closing: bool)
@@ -651,7 +657,11 @@ impl<'a> Writer<'a> {
         let room = self
             .max
             .saturating_sub(self.out.len() + head.len() + tail.len() + ELLIPSIS.len());
-        let cut = body[..floor_boundary(body, room)].trim_end();
+        let mut cut = body[..floor_boundary(body, room)].trim_end();
+        // An escape cut from its character would show as a backslash.
+        if self.markdown && (cut.len() - cut.trim_end_matches('\\').len()) % 2 == 1 {
+            cut = &cut[..cut.len() - 1];
+        }
         if !cut.is_empty() {
             self.out.push_str(head);
             self.out.push_str(cut);
@@ -737,6 +747,8 @@ mod tests {
                 "[mail](<mailto:a@b.c>)",
             ),
             ("<a href=\"javascript:alert(1)\">click</a>", "click"),
+            ("<a href=\"mailto:x<img src=x onerror=alert(1)>\"></a>", ""),
+            ("<a href=\"mailto:a>b\">m</a>", "m"),
             ("<a href=\"data:text/html,x\">d</a>", "d"),
             (
                 "<img src=\"i.png\" alt=\"a cat\">",

@@ -149,17 +149,20 @@ at a time per host.
 - **Addresses.** A feed whose configured URL names a non-public
   address, or a host every answer for which is one, is on the local
   network: the operator chose it, it exposes nothing, and it is fetched
-  as configured, redirects and all. Any other feed is held to public
-  addresses by the push sender's classifier, used where it is
-  (`hxd_core::push::endpoint`): a name is resolved once per connection,
-  every answer is checked, and the connection is made to a checked
-  address, so neither a redirect nor a name server can turn its fetch
-  inward. Through `proxy` the server cannot see what a name resolves
-  to, so the connection to the proxy is not checked, a name that does
-  not resolve here counts as public, and only a URL naming a literal
-  address is checked; the proxy's own rules decide the rest. The environment's proxy variables are not read, as they are not
-  for push: a setting that moves resolution out of sight is one the
-  operator writes down.
+  as configured, redirects and all. The lookup that decides it is the
+  one the first connection goes to, so a name server cannot answer
+  "local" to the question and something else to the connection. Any
+  other feed is held to public addresses by the push sender's
+  classifier, used where it is (`hxd_core::push::endpoint`): a name is
+  resolved once per connection, every answer is checked, and the
+  connection is made to a checked address, so neither a redirect nor a
+  name server can turn its fetch inward. Through `proxy` the server
+  cannot see what a name resolves to, so the connection to the proxy is
+  not checked, only a literal address makes a feed local, and for any
+  other feed only a URL naming a literal address is checked; the
+  proxy's own rules decide the rest. The environment's proxy variables
+  are not read, as they are not for push: a setting that moves
+  resolution out of sight is one the operator writes down.
 - **Failures back off**, doubling from the feed's interval to six hours,
   and a `Retry-After` on a `429` or `503` is honored when it is longer.
   Nothing is posted about a failure; it is logged, counted, and kept

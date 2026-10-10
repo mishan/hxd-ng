@@ -166,20 +166,31 @@ fn item(e: &Entry, json: bool, fallback: Option<&str>, opts: &ParseOptions) -> O
         (_, Some(s)) => (s.content.as_str(), !is_plain(s)),
         _ => ("", false),
     };
+    // The link lines are kept whole and the body is cut to the room they
+    // leave, so a long body never loses its source; downloads give way
+    // first, and each line is counted with the blank line before it.
+    let mut lines: Vec<String> = link
+        .iter()
+        .map(|u| ("Source", u))
+        .chain(enclosures.iter().map(|u| ("Download", u)))
+        .map(|(label, url)| match opts.markdown {
+            true => format!("{label}: <{url}>"),
+            false => format!("{label}: {url}"),
+        })
+        .collect();
+    let size = |lines: &[String]| lines.iter().map(|l| l.len() + 2).sum::<usize>();
+    while size(&lines) > opts.max_body {
+        lines.pop();
+    }
+    let room = opts.max_body - size(&lines);
     let mut body = if html_type {
-        html::html(content, link.as_ref(), opts.markdown, opts.max_body)
+        html::html(content, link.as_ref(), opts.markdown, room)
     } else {
-        html::text(content, opts.markdown, opts.max_body)
+        html::text(content, opts.markdown, room)
     };
-    let mut lines = link.iter().map(|u| ("Source", u)).collect::<Vec<_>>();
-    lines.extend(enclosures.iter().map(|u| ("Download", u)));
-    for (label, url) in lines {
+    for line in lines {
         body.push_str(if body.is_empty() { "" } else { "\n\n" });
-        if opts.markdown {
-            body.push_str(&format!("{label}: <{url}>"));
-        } else {
-            body.push_str(&format!("{label}: {url}"));
-        }
+        body.push_str(&line);
     }
 
     Some(Item {

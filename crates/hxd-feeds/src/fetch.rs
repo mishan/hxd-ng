@@ -34,6 +34,10 @@ use url::{Host, Url};
 
 const MAX_REDIRECTS: usize = 5;
 
+/// The longest `Retry-After` believed: a server asking for more is asked
+/// again after this.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(6 * 3600);
+
 /// How one fetch is made.
 #[derive(Clone, Debug)]
 pub struct FetchConfig {
@@ -189,11 +193,12 @@ async fn follow<N: Net>(
         None => None,
     };
     let mut url = checked(Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?)?;
-    let check = !on_local_network(net, &url).await;
+    let (local, mut pinned) = classify(net, &url, proxy.is_some()).await;
+    let check = !local;
     let mut moved_to = None;
     let mut permanent_so_far = true;
     for hop in 0..=MAX_REDIRECTS {
-        match get(net, cfg, proxy.as_ref(), &url, v, check).await? {
+        match get(net, cfg, proxy.as_ref(), &url, v, check, pinned.take()).await? {
             Answer::NotModified => return Ok(Fetched::NotModified),
             Answer::Body(bytes, validators) => {
                 return Ok(Fetched::Body {
@@ -231,16 +236,24 @@ fn proxy_url(p: &str) -> Result<Url, FetchError> {
 }
 
 /// Is the configured URL on the local network: a literal non-public
-/// address, or a name every answer for which is one? A name that does
-/// not resolve here, as behind a proxy, counts as public.
-async fn on_local_network<N: Net>(net: &N, url: &Url) -> bool {
+/// address, or a name every answer for which is one? For a name, the
+/// answers are returned too, and the first hop connects to them: a
+/// second lookup could answer otherwise, and a name server that called
+/// itself local for the check and public for the connect would have its
+/// redirects followed unchecked. Behind a proxy, which resolves names
+/// where this cannot see, only a literal is local.
+async fn classify<N: Net>(net: &N, url: &Url, proxied: bool) -> (bool, Option<Vec<SocketAddr>>) {
     let port = url.port_or_known_default().unwrap_or(80);
-    let addrs = match (literal(url), url.host()) {
-        (Some(ip), _) => return !is_public(ip),
-        (None, Some(Host::Domain(name))) => net.resolve(name, port).await.unwrap_or_default(),
-        _ => return false,
-    };
-    !addrs.is_empty() && addrs.iter().all(|a| !is_public(a.ip()))
+    match (literal(url), url.host()) {
+        (Some(ip), _) => (!is_public(ip), None),
+        (None, Some(Host::Domain(name))) if !proxied => match net.resolve(name, port).await {
+            Ok(addrs) if !addrs.is_empty() => {
+                (addrs.iter().all(|a| !is_public(a.ip())), Some(addrs))
+            }
+            _ => (false, None),
+        },
+        _ => (false, None),
+    }
 }
 
 fn literal(url: &Url) -> Option<IpAddr> {
@@ -301,11 +314,18 @@ async fn get<N: Net>(
     url: &Url,
     v: &Validators,
     check: bool,
+    pinned: Option<Vec<SocketAddr>>,
 ) -> Result<Answer, FetchError> {
     let https = url.scheme() == "https";
     let (tcp, absolute) = match proxy {
         None => {
-            let addrs = addresses(net, url, check).await?;
+            let addrs = match pinned {
+                Some(addrs) if check && addrs.iter().any(|a| !is_public(a.ip())) => {
+                    return Err(FetchError::AddressRefused)
+                }
+                Some(addrs) => addrs,
+                None => addresses(net, url, check).await?,
+            };
             (connect(net, &addrs).await?, false)
         }
         Some(proxy) => {
@@ -469,7 +489,7 @@ async fn answer(
             .then(|| header(&response, RETRY_AFTER))
             .flatten()
             .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
+            .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER));
         return Err(FetchError::Status {
             code: status,
             retry_after,
