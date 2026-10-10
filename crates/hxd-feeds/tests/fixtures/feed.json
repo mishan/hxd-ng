@@ -1,0 +1,21 @@
+{
+  "version": "https://jsonfeed.org/version/1.1",
+  "title": "JSON Feed",
+  "items": [
+    {
+      "id": "2",
+      "title": "Two",
+      "url": "https://example.io/2",
+      "content_html": "<p>Two <strong>bold</strong></p>",
+      "date_published": "2026-06-02T00:00:00Z",
+      "attachments": [{ "url": "https://example.io/2.mp3", "mime_type": "audio/mpeg" }]
+    },
+    {
+      "id": "1",
+      "title": "One",
+      "content_text": "One *plain*",
+      "date_published": "2026-06-01T00:00:00Z",
+      "authors": [{ "name": "Item Author" }]
+    }
+  ]
+}

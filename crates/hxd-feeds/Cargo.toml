@@ -1,0 +1,47 @@
+[package]
+name = "hxd-feeds"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "hxd-ng's feed reader: the checked fetch, the parse, and HTML to markdown"
+publish = false
+
+[dependencies]
+# The address classifier the push sender uses (`docs/news-feeds.md` §4).
+hxd-core = { workspace = true }
+tokio = { workspace = true }
+sha2 = { workspace = true }
+# RSS 0.9x–2.0, RDF, Atom and JSON Feed (MIT). Its XML reader is
+# quick-xml's, which resolves the predefined and character references and
+# leaves any other entity as written, so a DTD in a feed declares nothing
+# that grows. The `sanitize` feature is off: ammonia would hand us HTML
+# back, and the converter wants the feed's own.
+feed-rs = { version = "3", default-features = false }
+# A tokenizer, not a tree builder (MIT): the converter walks tokens with a
+# bounded stack of its own, so a document nested a million deep costs a
+# million tokens and no recursion. WHATWG tokenizing means entities and
+# malformed markup are read the way a browser would read them.
+html5gum = "0.8"
+# Already in the graph through feed-rs; redirect targets and the links in
+# a body are resolved with the same parser that read the feed.
+url = "2"
+# gzip, decoded under the body cap.
+flate2 = "1"
+# The client: one hyper HTTP/1 connection per hop, over a stream this
+# crate opens itself to an address it has checked, as the push sender's
+# (`docs/webpush-gateway.md` §6), and the same versions.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+webpki-roots = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+# Reads what the converter wrote, to check it holds no HTML.
+pulldown-cmark = { version = "0.13", default-features = false }

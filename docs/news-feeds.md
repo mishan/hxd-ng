@@ -1,6 +1,7 @@
 # News feeds: RSS and Atom as read-only categories
 
-Status: F1, the domain, is built; §9 stages the rest.
+Status: F1 and F2, the domain and the fetching crate, are built; §9
+stages the rest.
 
 An operator names a feed and a news category; the server polls the feed
 and posts each new item into the category as an article. Users read it
@@ -27,10 +28,11 @@ is a problem rather than a choice (§8).
   makes every reader an outbound request and every slow feed a slow
   category. A poller fetches on its own schedule and a reader reads
   the store.
-- **The address connected to is an address checked**, by the push
-  sender's rules (webpush-gateway.md §6) and its classifier, on every
-  hop of a redirect. The operator chooses the URL; the feed's host
-  chooses the redirects.
+- **A public feed stays off the local network.** Every connection its
+  fetch makes, every hop of a redirect, goes to an address checked by
+  the push sender's rules (webpush-gateway.md §6). The operator chooses
+  the URL, and a feed on the local network is theirs to choose; the
+  feed's host chooses the redirects.
 - **A feed keeps its newest items**, pruning its oldest beyond `keep`.
   A category that fills and stops taking new items is the failure this
   avoids.
@@ -88,7 +90,6 @@ category = "Software Updates/Mobius"   # as flat_category names one (news.md §1
 # keep = 50
 # author = "Mobius"             # in place of each item's own
 # replies = false               # may people reply to its articles
-# allow_private = false         # lift the address check for this feed (§4)
 ```
 
 `name` is the feed's identity, not its URL: a feed that moves keeps its
@@ -105,8 +106,7 @@ and its category becomes an ordinary category again, articles and all.
 
 `[[news.feed]]` without the `feeds` feature is a startup error, as
 `[news.attach]` without `media` is (news.md §13). So is a URL that is
-not absolute `http` or `https`, carries userinfo, or names a literal
-non-public address without `allow_private`.
+not absolute `http` or `https`, or carries userinfo.
 
 ## 3. Read-only, on both wires
 
@@ -146,14 +146,18 @@ at a time per host.
 - **Redirects**: at most five, each to an address checked again, never
   from `https` to `http`, and never remembered: a permanent redirect is
   logged so the operator can update the URL.
-- **Addresses.** The push sender's classifier (`hxd_core::push::endpoint`,
-  moved where both can use it): a name is resolved once per connection,
+- **Addresses.** A feed whose configured URL names a non-public
+  address, or a host every answer for which is one, is on the local
+  network: the operator chose it, it exposes nothing, and it is fetched
+  as configured, redirects and all. Any other feed is held to public
+  addresses by the push sender's classifier, used where it is
+  (`hxd_core::push::endpoint`): a name is resolved once per connection,
   every answer is checked, and the connection is made to a checked
-  address. `allow_private` lifts it for one feed, for an operator's own
-  intranet feed. Through `proxy` the server cannot see what a name
-  resolves to, so the connection to the proxy is not checked and only a
-  URL naming a literal address is; the proxy's own rules decide the
-  rest. The environment's proxy variables are not read, as they are not
+  address, so neither a redirect nor a name server can turn its fetch
+  inward. Through `proxy` the server cannot see what a name resolves
+  to, so the connection to the proxy is not checked, a name that does
+  not resolve here counts as public, and only a URL naming a literal
+  address is checked; the proxy's own rules decide the rest. The environment's proxy variables are not read, as they are not
   for push: a setting that moves resolution out of sight is one the
   operator writes down.
 - **Failures back off**, doubling from the feed's interval to six hours,
@@ -319,10 +323,9 @@ upstream as well.
    with first-poll, dedupe, edits, pruning, limits and events, fed by
    hand-built items; `news_edited` on the ng wire, and `hxd news feeds`.
    No network, no feature.
-2. **F2 — `hxd-feeds`.** The fetch with its address check (the
-   classifier moved out of `push`), the parse over fixtures of each
-   format, the converter with its hostile cases, all behind a transport
-   seam as the push sender's are.
+2. **F2 — `hxd-feeds`. Built.** The fetch with its address check, the
+   parse over fixtures of each format, the converter with its hostile
+   cases, all behind a transport seam as the push sender's are.
 3. **F3 — the wiring.** `[news.feeds]` and `[[news.feed]]`, the `feeds`
    feature, the poller and its backoff, the sweeper's seen-row rule, the
    ng `node.feed` field, metrics, and e2e: a feed served from a test

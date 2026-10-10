@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Atom Feed</title>
+  <author><name>Feed Author</name></author>
+  <id>urn:feed</id>
+  <updated>2026-05-01T00:00:00Z</updated>
+  <entry>
+    <title type="html">&lt;b&gt;Bold&lt;/b&gt;   news &amp;amp;
+      more</title>
+    <id>urn:entry:2</id>
+    <link rel="alternate" href="https://example.com/2"/>
+    <link rel="enclosure" href="https://example.com/2.zip"/>
+    <updated>2026-05-01T00:00:00Z</updated>
+    <content type="html">&lt;h1&gt;# Not *markdown*&lt;/h1&gt;&lt;img src="/i.png" alt="shot"&gt;</content>
+  </entry>
+  <entry>
+    <title>Own author</title>
+    <id>urn:entry:1</id>
+    <author><name>Entry Author</name></author>
+    <published>2026-04-01T00:00:00Z</published>
+    <updated>2026-04-30T00:00:00Z</updated>
+    <summary type="text">Plain *summary*</summary>
+  </entry>
+</feed>
