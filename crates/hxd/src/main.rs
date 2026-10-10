@@ -175,6 +175,8 @@ enum Command {
     },
     /// `news-reindex`.
     NewsReindex,
+    /// `news feeds`.
+    NewsFeeds,
     /// `push rekey`.
     PushRekey,
     /// `identity revoke <fingerprint> [--device] [--lift]`.
@@ -287,6 +289,7 @@ const USAGE: &str = "usage:\n  \
 hxd [--config hxd-ng.toml]\n  \
 hxd [--config …] inbox purge <login> [--fingerprint FP] [--dry-run]\n  \
 hxd [--config …] news-reindex\n  \
+hxd [--config …] news feeds\n  \
 hxd [--config …] push rekey\n  \
 hxd [--config …] identity revoke <fingerprint> [--device] [--lift]\n  \
 hxd [--config …] registrar freeze <fingerprint> [--lift]\n  \
@@ -315,6 +318,8 @@ hxd [--config …] link suspend|resume <peer>\n  \
 hxd [--config …] link reset-id\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
+`news feeds` lists the feeds the news database remembers: their\n\
+articles, when each last fetched, and why one is failing.\n\n\
 `push rekey` replaces the server's VAPID key and drops every registered\n\
 push device, which the old key's subscriptions were bound to; clients\n\
 re-register at their next login. Stop the server first.\n\n\
@@ -620,6 +625,10 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
         }
         ["news-reindex"] => Command::NewsReindex,
+        ["news", "feeds"] if fingerprint.is_some() || dry_run => {
+            return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
+        }
+        ["news", "feeds"] => Command::NewsFeeds,
         ["push", "rekey"] if fingerprint.is_some() || dry_run => {
             return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
         }
@@ -979,6 +988,10 @@ async fn main() {
         if let Command::PushRekey = command {
             let (dropped, public) = hxd::push::rekey(&config)?;
             println!("new VAPID key {public}; dropped {dropped} registered devices");
+            return Ok(());
+        }
+        if let Command::NewsFeeds = command {
+            println!("{}", hxd::news_feeds(&config)?);
             return Ok(());
         }
         if let Command::NewsReindex = command {

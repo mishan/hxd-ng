@@ -1,6 +1,7 @@
 # News feeds: RSS and Atom as read-only categories
 
-Status: designed, not built. §9 stages it.
+Status: F1 and F2, the domain and the fetching crate, are built; §9
+stages the rest.
 
 An operator names a feed and a news category; the server polls the feed
 and posts each new item into the category as an article. Users read it
@@ -12,10 +13,13 @@ is a problem rather than a choice (§8).
 
 **Decisions (2026-10):**
 
-- **A feed category is read-only.** Nobody posts into it or replies in
-  it, whatever their bits; a moderator may delete from it. What a feed
-  says is the feed's, and a reply thread under a release note is a
-  thread nobody upstream will read.
+- **A feed category is read-only.** Nobody starts a thread in it,
+  whatever their bits, and nobody replies unless the feed says
+  `replies = true`; a moderator may delete from it. What a feed says is
+  the feed's.
+- **An item edited upstream edits its article.** Each item's content is
+  hashed and the hash kept with it; a poll that brings a different hash
+  rewrites the article in place, unless a moderator deleted it.
 - **An article shows the item's own author.** The nick is the item's
   author as the feed gives it, with the feed's name alongside on the ng
   wire. No login, no fingerprint: the article is attributed to a feed,
@@ -24,10 +28,11 @@ is a problem rather than a choice (§8).
   makes every reader an outbound request and every slow feed a slow
   category. A poller fetches on its own schedule and a reader reads
   the store.
-- **The address connected to is an address checked**, by the push
-  sender's rules (webpush-gateway.md §6) and its classifier, on every
-  hop of a redirect. The operator chooses the URL; the feed's host
-  chooses the redirects.
+- **A public feed stays off the local network.** Every connection its
+  fetch makes, every hop of a redirect, goes to an address checked by
+  the push sender's rules (webpush-gateway.md §6). The operator chooses
+  the URL, and a feed on the local network is theirs to choose; the
+  feed's host chooses the redirects.
 - **A feed keeps its newest items**, pruning its oldest beyond `keep`.
   A category that fills and stops taking new items is the failure this
   avoids.
@@ -84,7 +89,7 @@ category = "Software Updates/Mobius"   # as flat_category names one (news.md §1
 # every = 3600
 # keep = 50
 # author = "Mobius"             # in place of each item's own
-# allow_private = false         # lift the address check for this feed (§4)
+# replies = false               # may people reply to its articles
 ```
 
 `name` is the feed's identity, not its URL: a feed that moves keeps its
@@ -101,8 +106,7 @@ and its category becomes an ordinary category again, articles and all.
 
 `[[news.feed]]` without the `feeds` feature is a startup error, as
 `[news.attach]` without `media` is (news.md §13). So is a URL that is
-not absolute `http` or `https`, carries userinfo, or names a literal
-non-public address without `allow_private`.
+not absolute `http` or `https`, or carries userinfo.
 
 ## 3. Read-only, on both wires
 
@@ -113,14 +117,16 @@ of making the category writable again.
 | Act | In a feed category |
 |---|---|
 | Read, list, search, follow | as anywhere |
-| Post or reply | refused: ng `read_only`, a legacy task error saying the category is a feed |
+| Start a thread | refused: ng `read_only`, a legacy task error saying the category is a feed |
+| Reply | the same, unless the feed has `replies = true` |
 | Delete an article | `DELETE_ARTICLES` (33). No ladder applies: a feed article's author has no sessions and no account |
-| Delete the category | refused while a feed names it: the next start would make it again |
-| 1.2 flat news | if `flat_category` is a feed category, 1.2 posts are refused the same way |
+| Rename or delete the category | refused while a feed names it: the next start would make it again |
+| 1.2 flat news | if `flat_category` is a feed category, a 1.2 post is held to the same rules: with `replies = true` and `flat_reply = "newest_thread"` it becomes a reply to the newest feed article, and otherwise it is refused |
 
 The ng `node` object gains `"feed": "mobius"` for a feed category, so a
-client can hide its post button rather than offer one that will fail;
-the legacy wire has no field for it and gets the refusal.
+client can hide its post button rather than offer one that will fail,
+and an article gains the same field beside its author (both F3); the
+legacy wire has no field for either and gets the refusal.
 
 A deleted feed article is a tombstone like any other (news.md §11), with
 its audit row. Its item stays seen, so the next poll does not bring it
@@ -140,16 +146,23 @@ at a time per host.
 - **Redirects**: at most five, each to an address checked again, never
   from `https` to `http`, and never remembered: a permanent redirect is
   logged so the operator can update the URL.
-- **Addresses.** The push sender's classifier (`hxd_core::push::endpoint`,
-  moved where both can use it): a name is resolved once per connection,
-  every answer is checked, and the connection is made to a checked
-  address. `allow_private` lifts it for one feed, for an operator's own
-  intranet feed. Through `proxy` the server cannot see what a name
-  resolves to, so the connection to the proxy is not checked and only a
-  URL naming a literal address is; the proxy's own rules decide the
-  rest. The environment's proxy variables are not read, as they are not
-  for push: a setting that moves resolution out of sight is one the
-  operator writes down.
+- **Addresses.** A feed whose configured URL names a non-public
+  address, or a host every answer for which is one, is on the local
+  network: the operator chose it, it exposes nothing, and it is fetched
+  as configured, redirects and all. The lookup that decides it is the
+  one the first connection goes to, so a name server cannot answer
+  "local" to the question and something else to the connection. Any
+  other feed is held to public addresses by the push sender's
+  classifier, used where it is (`hxd_core::push::endpoint`): a name is
+  resolved once per connection, every answer is checked, and the
+  connection is made to a checked address, so neither a redirect nor a
+  name server can turn its fetch inward. Through `proxy` the server
+  cannot see what a name resolves to, so the connection to the proxy is
+  not checked, only a literal address makes a feed local, and for any
+  other feed only a URL naming a literal address is checked; the
+  proxy's own rules decide the rest. The environment's proxy variables
+  are not read, as they are not for push: a setting that moves
+  resolution out of sight is one the operator writes down.
 - **Failures back off**, doubling from the feed's interval to six hours,
   and a `Retry-After` on a `429` or `503` is honored when it is longer.
   Nothing is posted about a failure; it is logged, counted, and kept
@@ -167,8 +180,15 @@ Each poll hands `Core::news_feed_import` the feed's items, oldest first.
 **Identity.** An item is its `id`/`guid`; failing that, its first
 `http(s)` link; failing that, its first enclosure. An item with none is
 skipped and counted. The seen key is SHA-256 of the identity, per feed.
-An item already seen is skipped even if it changed upstream: an edit to
-a release note does not re-post it (§10).
+
+**Edits.** Beside the key is a SHA-256 of what the item said: its
+subject, author, body and whether the body is markdown, as the fetcher
+normalized them. An item seen before with a different hash rewrites its
+article in place — subject, author, body and downgrade — and is
+announced as `news_edited` on the ng wire; the category's `add_sn`
+moves, so a 1.5 client refetches its listing. A moderator's deletion
+stands: a deleted article is not rewritten, and an item whose article
+was pruned only has its hash updated. An item is never re-posted.
 
 **The first poll** takes the newest `first_import` items and marks the
 rest of the backlog seen, so a new feed is not a hundred articles and a
@@ -191,8 +211,10 @@ The body is cut to `max_body` *before* the link lines are added, at a
 character boundary with a trailing `…`, so a long body never loses its
 source.
 
-**Pruning.** After posting, a feed with more than `keep` live articles
-deletes its oldest beyond it. Pruning is not moderation: it writes no
+**Pruning.** After posting, a feed removes its articles older than its
+`keep` newest live ones, tombstones among them. One with replies stays:
+the replies are people's, and retention is what ages a discussed thread
+out. Pruning is not moderation: it writes no
 audit row and the articles are removed rather than tombstoned, the way
 `retain_days` removes. Only the feed's own articles are ever pruned;
 articles from before the category was a feed are not the feed's.
@@ -204,10 +226,12 @@ and leaves the rest unseen for the next poll. `max_per_author` does not
 apply; `keep` is a feed's equivalent. `[limits] news_posts` is a
 budget for people and does not apply.
 
-**Events.** An import that posted anything is one `news_posted` per
-category, however many items it took, and followers of the category are
-told through news.md §10.6 with its catch-up rule and `max_per_hour`
-unchanged. The first poll notifies nobody.
+**Events.** An import that posted anything is one `news_posted`, naming
+the newest article, however many items it took, and followers of the
+category are told through news.md §10.6 with its catch-up rule and
+`max_per_hour` unchanged. The first poll notifies nobody, so its
+articles are unread to a follower, who is rung again once caught up.
+Each article an edit rewrites is one `news_edited { id, category }`.
 
 ## 6. The store
 
@@ -229,6 +253,7 @@ CREATE TABLE news_feed_item (
   feed       INTEGER NOT NULL REFERENCES news_feed(id),
   key        BLOB    NOT NULL,               -- SHA-256 of the item's identity
   article    INTEGER REFERENCES news_article(id),  -- NULL once pruned, or never posted
+  hash       BLOB    NOT NULL,               -- SHA-256 of what it said (§5)
   last_seen  INTEGER NOT NULL,               -- last poll that listed it
   PRIMARY KEY (feed, key)
 ) WITHOUT ROWID;
@@ -295,15 +320,15 @@ upstream as well.
 
 ## 9. Staging
 
-1. **F1 — the domain.** The read-only rule on both wires, `news_feed`,
-   `news_feed_item` and `news_article.feed` in both stores with the
-   conformance suite, and `Core::news_feed_import` with first-poll,
-   dedupe, pruning, limits and events, fed by hand-built items. No
-   network, no feature.
-2. **F2 — `hxd-feeds`.** The fetch with its address check (the
-   classifier moved out of `push`), the parse over fixtures of each
-   format, the converter with its hostile cases, all behind a transport
-   seam as the push sender's are.
+1. **F1 — the domain. Built.** The read-only rule on both wires and
+   `replies`, `news_feed`, `news_feed_item` and `news_article.feed` in
+   both stores with the conformance suite, and `Core::news_feed_import`
+   with first-poll, dedupe, edits, pruning, limits and events, fed by
+   hand-built items; `news_edited` on the ng wire, and `hxd news feeds`.
+   No network, no feature.
+2. **F2 — `hxd-feeds`. Built.** The fetch with its address check, the
+   parse over fixtures of each format, the converter with its hostile
+   cases, all behind a transport seam as the push sender's are.
 3. **F3 — the wiring.** `[news.feeds]` and `[[news.feed]]`, the `feeds`
    feature, the poller and its backoff, the sweeper's seen-row rule, the
    ng `node.feed` field, metrics, and e2e: a feed served from a test
@@ -314,17 +339,17 @@ upstream as well.
 
 F1 and F2 are independent. F3 needs both.
 
-## 10. Open
+## 10. The operator's view
 
-- **Upstream edits.** An item changed after it was imported is ignored.
-  Updating the article in place is possible (it is ours, unlike a
-  user's), but a release note that changes under its readers is its own
-  surprise.
-- **Replies.** A per-feed `replies = true` would let users discuss an
-  item under it. Off by the 2026-10 decision; easy to add later, since
-  pruning would then have to spare replied-to items.
-- **Images as attachments**: fetching an item's images into the blob
-  store (news.md §7) would show them inline, at the cost of the server
-  fetching what a feed names. Not without a reason.
-- **An operator view** of each feed's state beyond the log and metrics:
-  `hxd news feeds`, or the ng admin surface.
+`hxd news feeds` lists every feed the news database remembers, running
+server or not: its URL, its live articles and seen items, when it last
+fetched, and how many fetches in a row have failed and why. A feed taken
+out of the config is still listed, with its history, until its rows are
+removed by hand.
+
+## 11. Later
+
+- **Images as attachments** (v2): fetching an item's images into the
+  blob store (news.md §7) would show them inline, at the cost of the
+  server fetching what a feed names.
+- **The ng admin surface** for the same view as §10.

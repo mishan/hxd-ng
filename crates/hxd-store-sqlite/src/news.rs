@@ -11,23 +11,23 @@
 //! That range on `news_article_thread (category, path)` is how a thread
 //! comes back in display order with no recursive query.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use hxd_core::inbox::{Mailbox, StoreError};
 use hxd_core::media::MediaType;
 use hxd_core::news::{
-    Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, Author, BlobId, BodyType, Listed,
-    NewNode, NewPost, NewsError, NewsStore, NewsUsage, Node, NodeId, NodeKind, Posted, Reference,
-    StagedAttachment, SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage,
-    ThreadQuery, Writer,
+    Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, Author, BlobId, BodyType, FeedId,
+    FeedListing, FeedPoll, FeedState, Listed, NewNode, NewPost, NewsError, NewsStore, NewsUsage,
+    Node, NodeId, NodeKind, Posted, Reference, SeenItem, StagedAttachment, SubScope, Subscriber,
+    Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery, Writer,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
 use super::{bind, cutoff, fp_from_hex, fp_hex, from_unix, mailbox_sql, unix, SqliteStore};
 
 const ARTICLE_COLUMNS: &str = "id, category, parent, root, depth, nick, login, login_fp, \
-                               subject, body, mime, at, deleted_at IS NOT NULL, plain";
+                               subject, body, mime, at, deleted_at IS NOT NULL, plain, feed";
 
 const NODE_COLUMNS: &str = "n.id, n.parent, n.kind, n.name, n.guid, n.add_sn, n.delete_sn, \
      n.created_at, \
@@ -77,6 +77,7 @@ struct RawArticle {
     at: i64,
     deleted: bool,
     plain: Option<String>,
+    feed: Option<i64>,
 }
 
 fn raw_article(r: &Row<'_>) -> rusqlite::Result<RawArticle> {
@@ -95,6 +96,7 @@ fn raw_article(r: &Row<'_>) -> rusqlite::Result<RawArticle> {
         at: r.get(11)?,
         deleted: r.get(12)?,
         plain: r.get(13)?,
+        feed: r.get(14)?,
     })
 }
 
@@ -153,6 +155,12 @@ impl RawArticle {
                 });
             }
         }
+        let feed = match self.feed {
+            Some(f) => Some(sql(conn
+                .prepare_cached("SELECT name FROM news_feed WHERE id = ?1")
+                .and_then(|mut s| s.query_row(params![f], |r| r.get(0))))?),
+            None => None,
+        };
         Ok(Article {
             id,
             category: node_id(self.category)?,
@@ -175,6 +183,7 @@ impl RawArticle {
             refs,
             referenced_by: u32::try_from(referenced_by).unwrap_or(u32::MAX),
             attachments,
+            feed,
         })
     }
 }
@@ -364,6 +373,14 @@ fn thread_end(root: ArticleId) -> Vec<u8> {
 /// them. Returns how many articles went.
 fn remove_articles(conn: &Connection, which: &str, arg: i64) -> Result<u64, StoreError> {
     unindex(conn, which, arg)?;
+    // The item stays seen; only its article is gone.
+    sql(conn.execute(
+        &format!(
+            "UPDATE news_feed_item SET article = NULL
+              WHERE article IN (SELECT id FROM news_article WHERE {which})"
+        ),
+        params![arg],
+    ))?;
     release_attachments(conn, which, arg)?;
     sql(conn.execute(
         &format!(
@@ -947,8 +964,8 @@ impl NewsStore for SqliteStore {
         sql(tx.execute(
             "INSERT INTO news_article
                (category, parent, root, path, depth, nick, login, login_fp,
-                subject, body, mime, plain, at, guest_key)
-             VALUES (?1, ?2, 0, X'', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                subject, body, mime, plain, at, guest_key, feed)
+             VALUES (?1, ?2, 0, X'', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 clamp_node(p.category),
                 p.parent.map(i64::from),
@@ -962,6 +979,7 @@ impl NewsStore for SqliteStore {
                 p.plain,
                 unix(p.at),
                 guest_key(p),
+                p.feed.map(|f| f.feed as i64),
             ],
         ))?;
         // Past u32 is an article the legacy wire cannot name (§3.2). The
@@ -1002,6 +1020,22 @@ impl NewsStore for SqliteStore {
             "UPDATE news_node SET add_sn = (add_sn + 1) % ?2 WHERE id = ?1",
             params![clamp_node(p.category), WRAP],
         ))?;
+        if let Some(f) = p.feed {
+            sql(tx.execute(
+                "INSERT INTO news_feed_item (feed, key, article, hash, last_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (feed, key) DO UPDATE
+                   SET article = excluded.article, hash = excluded.hash,
+                       last_seen = excluded.last_seen",
+                params![
+                    f.feed as i64,
+                    f.key.as_slice(),
+                    i64::from(id),
+                    f.hash.as_slice(),
+                    unix(f.seen)
+                ],
+            ))?;
+        }
         // In the article's transaction, so no later article is given an
         // id before the row exists. It starts at this one, the thread's
         // newest.
@@ -1301,7 +1335,7 @@ impl NewsStore for SqliteStore {
                 .prepare_cached(
                     "SELECT COUNT(*) FROM news_article
                       WHERE login_fp IS NULL AND login IS NULL AND guest_key IS ?1
-                        AND deleted_at IS NULL",
+                        AND deleted_at IS NULL AND feed IS NULL",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_row(params![key.map(|k| k.to_hex())], |r| r.get(0))
@@ -2037,5 +2071,242 @@ impl NewsStore for SqliteStore {
             &format!("DELETE FROM news_sub WHERE {}", mailbox_sql(of, "owner", 1)),
             params![bind(of)],
         ))
+    }
+
+    fn feed_open(&self, name: &str, url: &str) -> Result<FeedState, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT INTO news_feed (name, url) VALUES (?1, ?2)
+             ON CONFLICT (name) DO UPDATE SET url = excluded.url",
+            params![name, url],
+        ))?;
+        sql(conn.query_row(
+            "SELECT id, etag, last_modified, last_ok, last_error, failures,
+                    EXISTS (SELECT 1 FROM news_feed_item i WHERE i.feed = f.id)
+               FROM news_feed f WHERE name = ?1",
+            params![name],
+            |r| {
+                Ok(FeedState {
+                    id: r.get::<_, i64>(0)? as FeedId,
+                    etag: r.get(1)?,
+                    last_modified: r.get(2)?,
+                    last_ok: r.get::<_, Option<i64>>(3)?.map(from_unix),
+                    last_error: r.get(4)?,
+                    failures: r.get(5)?,
+                    polled: r.get(6)?,
+                })
+            },
+        ))
+    }
+
+    fn feed_seen(
+        &self,
+        feed: FeedId,
+        keys: &[[u8; 32]],
+        now: SystemTime,
+    ) -> Result<HashMap<[u8; 32], SeenItem>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let mut seen = HashMap::new();
+        {
+            let mut stmt = sql(tx.prepare_cached(
+                "UPDATE news_feed_item SET last_seen = ?3 WHERE feed = ?1 AND key = ?2
+                 RETURNING article, hash",
+            ))?;
+            for key in keys {
+                let found: Option<(Option<i64>, Vec<u8>)> = sql(stmt
+                    .query_row(params![feed as i64, key.as_slice(), unix(now)], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .optional())?;
+                if let Some((article, hash)) = found {
+                    seen.insert(
+                        *key,
+                        SeenItem {
+                            article: article.map(article_id).transpose()?,
+                            hash: hash
+                                .try_into()
+                                .map_err(|_| StoreError::new("a feed item hash is not 32 bytes"))?,
+                        },
+                    );
+                }
+            }
+        }
+        sql(tx.commit())?;
+        Ok(seen)
+    }
+
+    fn feed_skip(
+        &self,
+        feed: FeedId,
+        items: &[([u8; 32], [u8; 32])],
+        now: SystemTime,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        {
+            let mut stmt = sql(tx.prepare_cached(
+                "INSERT INTO news_feed_item (feed, key, hash, last_seen) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (feed, key) DO UPDATE SET hash = excluded.hash",
+            ))?;
+            for (key, hash) in items {
+                sql(stmt.execute(params![
+                    feed as i64,
+                    key.as_slice(),
+                    hash.as_slice(),
+                    unix(now)
+                ]))?;
+            }
+        }
+        sql(tx.commit())
+    }
+
+    fn feed_revise(
+        &self,
+        article: ArticleId,
+        post: &NewPost,
+    ) -> Result<Option<NodeId>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        if let Some(f) = post.feed {
+            sql(tx.execute(
+                "UPDATE news_feed_item SET hash = ?3 WHERE feed = ?1 AND key = ?2",
+                params![f.feed as i64, f.key.as_slice(), f.hash.as_slice()],
+            ))?;
+        }
+        let id = i64::from(article);
+        let live: Option<i64> = sql(tx
+            .query_row(
+                "SELECT category FROM news_article WHERE id = ?1 AND deleted_at IS NULL",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional())?;
+        let Some(category) = live else {
+            sql(tx.commit())?;
+            return Ok(None);
+        };
+        // External-content FTS forgets a row by the text it indexed, so
+        // the old text goes out of the index before the row changes.
+        unindex(&tx, "id = ?1", id)?;
+        sql(tx.execute(
+            "UPDATE news_article SET nick = ?2, subject = ?3, body = ?4, mime = ?5, plain = ?6
+              WHERE id = ?1",
+            params![
+                id,
+                post.author.nick,
+                post.subject,
+                post.body,
+                post.mime.mime(),
+                post.plain
+            ],
+        ))?;
+        index_article(&tx, article)?;
+        sql(tx.execute(
+            "UPDATE news_node SET add_sn = (add_sn + 1) % ?2 WHERE id = ?1",
+            params![category, WRAP],
+        ))?;
+        sql(tx.commit())?;
+        node_id(category).map(Some)
+    }
+
+    fn feeds(&self) -> Result<Vec<FeedListing>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare(
+            "SELECT f.name, f.url, f.id, f.etag, f.last_modified, f.last_ok, f.last_error,
+                    f.failures,
+                    (SELECT COUNT(*) FROM news_feed_item i WHERE i.feed = f.id),
+                    (SELECT COUNT(*) FROM news_article a
+                      WHERE a.feed = f.id AND a.deleted_at IS NULL)
+               FROM news_feed f ORDER BY f.name",
+        ))?;
+        let rows = sql(stmt.query_map([], |r| {
+            let items: i64 = r.get(8)?;
+            Ok(FeedListing {
+                name: r.get(0)?,
+                url: r.get(1)?,
+                state: FeedState {
+                    id: r.get::<_, i64>(2)? as FeedId,
+                    etag: r.get(3)?,
+                    last_modified: r.get(4)?,
+                    last_ok: r.get::<_, Option<i64>>(5)?.map(from_unix),
+                    last_error: r.get(6)?,
+                    failures: r.get(7)?,
+                    polled: items > 0,
+                },
+                items: items as u64,
+                articles: r.get::<_, i64>(9)? as u64,
+            })
+        }))?;
+        rows.collect::<rusqlite::Result<_>>()
+            .map_err(StoreError::new)
+    }
+
+    fn feed_prune(&self, feed: FeedId, keep: usize) -> Result<u64, StoreError> {
+        if keep == 0 {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let oldest_kept: Option<(i64, i64)> = sql(tx
+            .query_row(
+                "SELECT id, category FROM news_article
+                  WHERE feed = ?1 AND deleted_at IS NULL
+                  ORDER BY id DESC LIMIT 1 OFFSET ?2",
+                params![feed as i64, keep as i64 - 1],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional())?;
+        let Some((oldest_kept, category)) = oldest_kept else {
+            return Ok(0);
+        };
+        let gone = remove_articles(
+            &tx,
+            &format!(
+                "feed = {} AND id < ?1 AND NOT EXISTS
+                   (SELECT 1 FROM news_article c WHERE c.parent = news_article.id)",
+                feed as i64
+            ),
+            oldest_kept,
+        )?;
+        if gone > 0 {
+            bump_delete_sn(&tx, category)?;
+            drop_orphan_subs(&tx)?;
+        }
+        sql(tx.commit())?;
+        Ok(gone)
+    }
+
+    fn feed_polled(&self, feed: FeedId, poll: &FeedPoll, at: SystemTime) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        match poll {
+            FeedPoll::Fetched {
+                etag,
+                last_modified,
+            } => sql(conn.execute(
+                "UPDATE news_feed SET etag = ?2, last_modified = ?3, last_ok = ?4,
+                        failures = 0, last_error = NULL WHERE id = ?1",
+                params![feed as i64, etag, last_modified, unix(at)],
+            )),
+            FeedPoll::NotModified => sql(conn.execute(
+                "UPDATE news_feed SET last_ok = ?2, failures = 0, last_error = NULL
+                  WHERE id = ?1",
+                params![feed as i64, unix(at)],
+            )),
+            FeedPoll::Failed(why) => sql(conn.execute(
+                "UPDATE news_feed SET failures = failures + 1, last_error = ?2 WHERE id = ?1",
+                params![feed as i64, why],
+            )),
+        }?;
+        Ok(())
+    }
+
+    fn feed_forget(&self, before: SystemTime) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let gone = sql(conn.execute(
+            "DELETE FROM news_feed_item WHERE article IS NULL AND last_seen < ?1",
+            params![unix(before)],
+        ))?;
+        Ok(gone as u64)
     }
 }

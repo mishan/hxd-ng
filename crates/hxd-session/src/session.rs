@@ -3062,7 +3062,8 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         // `NewsNotify` is a notice for one person: a legacy account is
         // notified through a system mailbox with a `stop` reply, which is
         // a feature of its own (`docs/news.md` §10.11).
-        Event::NewsDeleted { .. }
+        Event::NewsEdited { .. }
+        | Event::NewsDeleted { .. }
         | Event::NewsPurged { .. }
         | Event::NewsNode(_)
         | Event::NewsNodeDeleted { .. }

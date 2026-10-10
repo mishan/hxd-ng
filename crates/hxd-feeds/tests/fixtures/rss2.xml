@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Mobius Releases</title>
+    <link>https://example.org/</link>
+    <item>
+      <title>v2.0 &amp; friends</title>
+      <guid isPermaLink="false">release-2.0</guid>
+      <link>https://example.org/r/2.0</link>
+      <pubDate>Tue, 03 Mar 2026 10:00:00 GMT</pubDate>
+      <author>dev@example.org (Dev)</author>
+      <description>A summary that content replaces.</description>
+      <content:encoded><![CDATA[<p>New <a href="/notes">notes</a>.</p><script>alert(1)</script>]]></content:encoded>
+      <enclosure url="https://example.org/dl/2.0.tar.gz" length="10" type="application/gzip"/>
+    </item>
+    <item>
+      <title>v1.0</title>
+      <link>https://example.org/r/1.0</link>
+      <pubDate>Mon, 02 Feb 2026 10:00:00 GMT</pubDate>
+      <description>&lt;p&gt;First &lt;em&gt;release&lt;/em&gt;.&lt;/p&gt;</description>
+    </item>
+    <item>
+      <title>Podcast only</title>
+      <pubDate>Sun, 01 Feb 2026 10:00:00 GMT</pubDate>
+      <enclosure url="https://example.org/ep/1.mp3" length="10" type="audio/mpeg"/>
+    </item>
+    <item>
+      <title>Nothing to know it by</title>
+      <description>skipped</description>
+    </item>
+  </channel>
+</rss>

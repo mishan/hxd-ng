@@ -19,6 +19,7 @@ members = [
     "crates/hxd-voice",
     "crates/hxd-ng-session",
     "crates/hxd-push-webpush",
+    "crates/hxd-feeds",
     "crates/hxd-registrar",
     "crates/hxd-store-sqlite",
     "crates/hxd-testclient",
