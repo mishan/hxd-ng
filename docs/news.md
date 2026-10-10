@@ -1228,8 +1228,10 @@ or the article ceilings of §7.4 — about the server), `too_many_articles`
 (the author's share of them — about you, except for a guest, whose
 share is the one every guest from its address spends together and whose
 message says so),
-`name_taken`, `not_empty` (deleting a bundle with children), and
-`bad_body_type` (`text/markdown` against a server in `markdown = "off"`).
+`name_taken`, `not_empty` (deleting a bundle with children),
+`bad_body_type` (`text/markdown` against a server in `markdown = "off"`),
+and `read_only` (posting into, renaming or deleting a category a feed
+fills — [news-feeds.md](news-feeds.md) §3).
 
 There is deliberately **no error code for a bad search query**: §6.2
 compiles anything into something, so `news_search` answers with results
@@ -1335,6 +1337,7 @@ category list or a thread on screen has the same staleness problem a
 | `ev` | data |
 |---|---|
 | `news_posted` | `{ "id", "category", "root", "parent", "subject", "from": { "nick" }, "at", "attachments": 1 }` |
+| `news_edited` | `{ "id", "category" }` — a feed's article rewritten because its item changed ([news-feeds.md](news-feeds.md) §5) |
 | `news_deleted` | `{ "id", "category" }` |
 | `news_purged` | `{ "articles": [{ "id", "category" }, …] }` — many deleted at once |
 | `news_node` | `{ "node": { … } }` — created or renamed |

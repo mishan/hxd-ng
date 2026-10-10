@@ -327,8 +327,9 @@ Three layers, all `cargo test --workspace`:
   the tree an ng client built, reading both parts of a markdown article,
   posting and keeping house, and a 1.2 client reading the flat category,
   posting into it and hearing its push, read from the store once
-  however many classic clients hear it; and the news ceilings refused
-  on both wires), `moderation.rs` (the acts and
+  however many classic clients hear it; the news ceilings refused
+  on both wires; a feed's category read-only on both wires, and
+  `hxd news feeds`), `moderation.rs` (the acts and
   reports on both wires against one database: a redaction blanking a
   rendered line and paging as a tombstone on 700 and `history`, a
   revocation and its refused re-upload, a kick with a purge across the

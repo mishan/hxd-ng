@@ -780,6 +780,9 @@ pub fn event_json(se: &SeqEvent) -> String {
                 "attachments": attachments,
             }),
         ),
+        Event::NewsEdited { id, category } => {
+            ("news_edited", json!({ "id": id, "category": category }))
+        }
         Event::NewsDeleted { id, category } => {
             ("news_deleted", json!({ "id": id, "category": category }))
         }

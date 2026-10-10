@@ -70,7 +70,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -531,6 +531,35 @@ CREATE TABLE link_ban (
 const SCHEMA_V16: &str = "
 ALTER TABLE chat_line ADD COLUMN ghost BLOB;
 CREATE INDEX chat_line_ghost ON chat_line (ghost) WHERE ghost IS NOT NULL;
+";
+
+/// Feeds polled into news categories (`docs/news-feeds.md` §6): what
+/// each remembers between polls, the items it has seen with a hash of
+/// what each said, and which articles are a feed's. An item outlives its
+/// article, so a pruned or deleted one is not posted again.
+const SCHEMA_V17: &str = "
+CREATE TABLE news_feed (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  name          TEXT    NOT NULL UNIQUE,
+  url           TEXT    NOT NULL,
+  etag          TEXT,
+  last_modified TEXT,
+  last_ok       INTEGER,
+  last_error    TEXT,
+  failures      INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE news_feed_item (
+  feed      INTEGER NOT NULL REFERENCES news_feed(id),
+  key       BLOB    NOT NULL,
+  article   INTEGER REFERENCES news_article(id),
+  hash      BLOB    NOT NULL,
+  last_seen INTEGER NOT NULL,
+  PRIMARY KEY (feed, key)
+) WITHOUT ROWID;
+CREATE INDEX news_feed_item_article ON news_feed_item (article) WHERE article IS NOT NULL;
+CREATE INDEX news_feed_item_unlisted ON news_feed_item (last_seen) WHERE article IS NULL;
+ALTER TABLE news_article ADD COLUMN feed INTEGER REFERENCES news_feed(id);
+CREATE INDEX news_article_feed ON news_article (feed, id) WHERE feed IS NOT NULL;
 ";
 
 /// The bans this server asked linked servers for (`docs/server-link.md`
@@ -1181,6 +1210,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 16 {
         steps.push_str(SCHEMA_V16);
+    }
+    if version < 17 {
+        steps.push_str(SCHEMA_V17);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -2633,6 +2665,7 @@ mod tests {
                     attachment_owner: None,
                     guest: None,
                     attachment_cutoff: UNIX_EPOCH,
+                    feed: None,
                 },
                 32,
                 32,
@@ -2731,6 +2764,7 @@ mod tests {
             attachment_owner: Some(bob.clone()),
             guest: None,
             attachment_cutoff: UNIX_EPOCH,
+            feed: None,
         };
         assert!(matches!(
             store.post(&post, 32, 32),
@@ -3261,6 +3295,7 @@ mod tests {
                     attachments: Vec::new(),
                     attachment_owner: None,
                     attachment_cutoff: from_unix(0),
+                    feed: None,
                 },
                 32,
                 32,

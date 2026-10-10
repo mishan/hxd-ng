@@ -500,6 +500,12 @@ pub enum Event {
         at: SystemTime,
         attachments: u32,
     },
+    /// A feed's article changed because its item did upstream
+    /// (`docs/news-feeds.md` §5).
+    NewsEdited {
+        id: crate::news::ArticleId,
+        category: crate::news::NodeId,
+    },
     /// An article became a tombstone.
     NewsDeleted {
         id: crate::news::ArticleId,
@@ -596,6 +602,7 @@ impl Event {
             Event::VoiceStatus { .. } => "voice_status",
             Event::VideoStatus { .. } => "video_status",
             Event::NewsPosted { .. } => "news_posted",
+            Event::NewsEdited { .. } => "news_edited",
             Event::NewsDeleted { .. } => "news_deleted",
             Event::NewsPurged { .. } => "news_purged",
             Event::NewsNode(..) => "news_node",
@@ -1278,6 +1285,9 @@ pub struct Core {
     /// together, so two posts cannot both take the last place. Nothing
     /// is taken under it but the news store's own lock.
     pub(crate) news_post_serial: Mutex<()>,
+    /// The categories configured feeds fill, each under the first
+    /// feed's rule: read-only while named here (news-feeds.md §3).
+    pub(crate) news_feeds: std::sync::RwLock<HashMap<crate::news::NodeId, crate::news::FeedRule>>,
     /// Makes persisted id order and live fan-out order the same fact.
     /// Nothing but public chat takes this lock; order is it first, then
     /// (briefly) `roster`.

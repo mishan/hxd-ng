@@ -64,6 +64,10 @@ pub fn news_err(e: &NewsError) -> (&'static str, &'static str) {
             "That post has more attachments than this server allows.",
         ),
         NewsError::NewsFull => ("news_full", "This server's news storage is full."),
+        NewsError::ReadOnly => (
+            "read_only",
+            "A feed fills that category; it cannot be posted to or changed.",
+        ),
         NewsError::TooManyArticles { guests: false } => (
             "too_many_articles",
             "You have as many articles here as this server allows. Delete one first.",

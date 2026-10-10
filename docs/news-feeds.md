@@ -1,6 +1,6 @@
 # News feeds: RSS and Atom as read-only categories
 
-Status: designed, not built. §9 stages it.
+Status: F1, the domain, is built; §9 stages the rest.
 
 An operator names a feed and a news category; the server polls the feed
 and posts each new item into the category as an article. Users read it
@@ -12,10 +12,13 @@ is a problem rather than a choice (§8).
 
 **Decisions (2026-10):**
 
-- **A feed category is read-only.** Nobody posts into it or replies in
-  it, whatever their bits; a moderator may delete from it. What a feed
-  says is the feed's, and a reply thread under a release note is a
-  thread nobody upstream will read.
+- **A feed category is read-only.** Nobody starts a thread in it,
+  whatever their bits, and nobody replies unless the feed says
+  `replies = true`; a moderator may delete from it. What a feed says is
+  the feed's.
+- **An item edited upstream edits its article.** Each item's content is
+  hashed and the hash kept with it; a poll that brings a different hash
+  rewrites the article in place, unless a moderator deleted it.
 - **An article shows the item's own author.** The nick is the item's
   author as the feed gives it, with the feed's name alongside on the ng
   wire. No login, no fingerprint: the article is attributed to a feed,
@@ -84,6 +87,7 @@ category = "Software Updates/Mobius"   # as flat_category names one (news.md §1
 # every = 3600
 # keep = 50
 # author = "Mobius"             # in place of each item's own
+# replies = false               # may people reply to its articles
 # allow_private = false         # lift the address check for this feed (§4)
 ```
 
@@ -113,9 +117,10 @@ of making the category writable again.
 | Act | In a feed category |
 |---|---|
 | Read, list, search, follow | as anywhere |
-| Post or reply | refused: ng `read_only`, a legacy task error saying the category is a feed |
+| Start a thread | refused: ng `read_only`, a legacy task error saying the category is a feed |
+| Reply | the same, unless the feed has `replies = true` |
 | Delete an article | `DELETE_ARTICLES` (33). No ladder applies: a feed article's author has no sessions and no account |
-| Delete the category | refused while a feed names it: the next start would make it again |
+| Rename or delete the category | refused while a feed names it: the next start would make it again |
 | 1.2 flat news | if `flat_category` is a feed category, 1.2 posts are refused the same way |
 
 The ng `node` object gains `"feed": "mobius"` for a feed category, so a
@@ -167,8 +172,15 @@ Each poll hands `Core::news_feed_import` the feed's items, oldest first.
 **Identity.** An item is its `id`/`guid`; failing that, its first
 `http(s)` link; failing that, its first enclosure. An item with none is
 skipped and counted. The seen key is SHA-256 of the identity, per feed.
-An item already seen is skipped even if it changed upstream: an edit to
-a release note does not re-post it (§10).
+
+**Edits.** Beside the key is a SHA-256 of what the item said: its
+subject, author, body and whether the body is markdown, as the fetcher
+normalized them. An item seen before with a different hash rewrites its
+article in place — subject, author, body and downgrade — and is
+announced as `news_edited` on the ng wire; the category's `add_sn`
+moves, so a 1.5 client refetches its listing. A moderator's deletion
+stands: a deleted article is not rewritten, and an item whose article
+was pruned only has its hash updated. An item is never re-posted.
 
 **The first poll** takes the newest `first_import` items and marks the
 rest of the backlog seen, so a new feed is not a hundred articles and a
@@ -191,8 +203,10 @@ The body is cut to `max_body` *before* the link lines are added, at a
 character boundary with a trailing `…`, so a long body never loses its
 source.
 
-**Pruning.** After posting, a feed with more than `keep` live articles
-deletes its oldest beyond it. Pruning is not moderation: it writes no
+**Pruning.** After posting, a feed removes its articles older than its
+`keep` newest live ones, tombstones among them. One with replies stays:
+the replies are people's, and retention is what ages a discussed thread
+out. Pruning is not moderation: it writes no
 audit row and the articles are removed rather than tombstoned, the way
 `retain_days` removes. Only the feed's own articles are ever pruned;
 articles from before the category was a feed are not the feed's.
@@ -204,10 +218,12 @@ and leaves the rest unseen for the next poll. `max_per_author` does not
 apply; `keep` is a feed's equivalent. `[limits] news_posts` is a
 budget for people and does not apply.
 
-**Events.** An import that posted anything is one `news_posted` per
-category, however many items it took, and followers of the category are
-told through news.md §10.6 with its catch-up rule and `max_per_hour`
-unchanged. The first poll notifies nobody.
+**Events.** An import that posted anything is one `news_posted`, naming
+the newest article, however many items it took, and followers of the
+category are told through news.md §10.6 with its catch-up rule and
+`max_per_hour` unchanged. The first poll notifies nobody, so its
+articles are unread to a follower, who is rung again once caught up.
+Each article an edit rewrites is one `news_edited { id, category }`.
 
 ## 6. The store
 
@@ -229,6 +245,7 @@ CREATE TABLE news_feed_item (
   feed       INTEGER NOT NULL REFERENCES news_feed(id),
   key        BLOB    NOT NULL,               -- SHA-256 of the item's identity
   article    INTEGER REFERENCES news_article(id),  -- NULL once pruned, or never posted
+  hash       BLOB    NOT NULL,               -- SHA-256 of what it said (§5)
   last_seen  INTEGER NOT NULL,               -- last poll that listed it
   PRIMARY KEY (feed, key)
 ) WITHOUT ROWID;
@@ -295,11 +312,12 @@ upstream as well.
 
 ## 9. Staging
 
-1. **F1 — the domain.** The read-only rule on both wires, `news_feed`,
-   `news_feed_item` and `news_article.feed` in both stores with the
-   conformance suite, and `Core::news_feed_import` with first-poll,
-   dedupe, pruning, limits and events, fed by hand-built items. No
-   network, no feature.
+1. **F1 — the domain. Built.** The read-only rule on both wires and
+   `replies`, `news_feed`, `news_feed_item` and `news_article.feed` in
+   both stores with the conformance suite, and `Core::news_feed_import`
+   with first-poll, dedupe, edits, pruning, limits and events, fed by
+   hand-built items; `news_edited` on the ng wire, and `hxd news feeds`.
+   No network, no feature.
 2. **F2 — `hxd-feeds`.** The fetch with its address check (the
    classifier moved out of `push`), the parse over fixtures of each
    format, the converter with its hostile cases, all behind a transport
@@ -314,17 +332,17 @@ upstream as well.
 
 F1 and F2 are independent. F3 needs both.
 
-## 10. Open
+## 10. The operator's view
 
-- **Upstream edits.** An item changed after it was imported is ignored.
-  Updating the article in place is possible (it is ours, unlike a
-  user's), but a release note that changes under its readers is its own
-  surprise.
-- **Replies.** A per-feed `replies = true` would let users discuss an
-  item under it. Off by the 2026-10 decision; easy to add later, since
-  pruning would then have to spare replied-to items.
-- **Images as attachments**: fetching an item's images into the blob
-  store (news.md §7) would show them inline, at the cost of the server
-  fetching what a feed names. Not without a reason.
-- **An operator view** of each feed's state beyond the log and metrics:
-  `hxd news feeds`, or the ng admin surface.
+`hxd news feeds` lists every feed the news database remembers, running
+server or not: its URL, its live articles and seen items, when it last
+fetched, and how many fetches in a row have failed and why. A feed taken
+out of the config is still listed, with its history, until its rows are
+removed by hand.
+
+## 11. Later
+
+- **Images as attachments** (v2): fetching an item's images into the
+  blob store (news.md §7) would show them inline, at the cost of the
+  server fetching what a feed names.
+- **The ng admin surface** for the same view as §10.

@@ -725,3 +725,52 @@ fn stop_after_a_reply_silences_the_thread() {
         "a muted thread says nothing, reply or not"
     );
 }
+
+/// A feed's first poll is its backlog, which nobody is told of; after
+/// it, a follower of its category hears of new items as of any post,
+/// the catch-up rule included (`docs/news-feeds.md` §5).
+#[test]
+fn a_feed_rings_its_followers_from_its_second_poll() {
+    let s = Server::new(NotifyPolicy::default());
+    s.as_absent("alice", |alice| {
+        s.core
+            .news_subscribe(alice, SubScope::Category(s.cat))
+            .unwrap()
+    });
+    let feed = s
+        .core
+        .news_feeds_open(&[FeedSpec {
+            name: "mobius".into(),
+            url: "https://example.com/mobius.atom".into(),
+            category: vec!["General".into()],
+            keep: 100,
+            first_import: 100,
+            author: None,
+            replies: false,
+        }])
+        .unwrap()
+        .remove(0);
+    let item = |n: u8| FeedItem {
+        key: [n; 32],
+        subject: format!("Release {n}"),
+        author: None,
+        at: SystemTime::now(),
+        body: "Notes.".into(),
+        markdown: false,
+    };
+
+    s.core
+        .news_feed_import(&feed, vec![item(1), item(2)])
+        .unwrap();
+    assert!(s.gw.sent().is_empty(), "the backlog rings nobody");
+    let newest = s.core.news_store().unwrap().recent(s.cat, 1).unwrap()[0].id;
+    s.as_absent("alice", |alice| {
+        s.core
+            .news_seen(alice, SubScope::Category(s.cat), newest)
+            .unwrap()
+    });
+    s.core
+        .news_feed_import(&feed, vec![item(1), item(2), item(3)])
+        .unwrap();
+    assert_eq!(s.gw.to("alice"), 1);
+}

@@ -11,9 +11,9 @@ use std::time::{Duration, SystemTime};
 use futures_util::{SinkExt, StreamExt};
 use hxd_core::inbox::{Mailbox, StoreError};
 use hxd_core::news::{
-    Article, ArticleId, ArticlePage, Listed, NewNode, NewPost, NewsError, NewsStore, NewsUsage,
-    Node, NodeId, Posted, Reference, SearchPage, SearchQuery, SubScope, Subscriber, Subscription,
-    ThreadPage, ThreadQuery, Writer,
+    Article, ArticleId, ArticlePage, FeedId, FeedListing, FeedPoll, FeedState, Listed, NewNode,
+    NewPost, NewsError, NewsStore, NewsUsage, Node, NodeId, Posted, Reference, SearchPage,
+    SearchQuery, SeenItem, SubScope, Subscriber, Subscription, ThreadPage, ThreadQuery, Writer,
 };
 use hxd_core::{AttachmentPolicy, Core, MarkdownMode, NewsPolicy, NotifyPolicy, RequestLimits};
 use hxd_ng_session::{NgConfig, NgCtx, Registry, TrustedProxies};
@@ -3121,6 +3121,48 @@ impl NewsStore for CountingNews {
     fn subs_purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
         self.inner.subs_purge(of)
     }
+
+    fn feed_open(&self, name: &str, url: &str) -> Result<FeedState, StoreError> {
+        self.inner.feed_open(name, url)
+    }
+
+    fn feed_seen(
+        &self,
+        feed: FeedId,
+        keys: &[[u8; 32]],
+        now: SystemTime,
+    ) -> Result<std::collections::HashMap<[u8; 32], SeenItem>, StoreError> {
+        self.inner.feed_seen(feed, keys, now)
+    }
+
+    fn feed_skip(
+        &self,
+        feed: FeedId,
+        items: &[([u8; 32], [u8; 32])],
+        now: SystemTime,
+    ) -> Result<(), StoreError> {
+        self.inner.feed_skip(feed, items, now)
+    }
+
+    fn feed_revise(&self, article: ArticleId, post: &NewPost) -> Result<bool, StoreError> {
+        self.inner.feed_revise(article, post)
+    }
+
+    fn feeds(&self) -> Result<Vec<FeedListing>, StoreError> {
+        self.inner.feeds()
+    }
+
+    fn feed_prune(&self, feed: FeedId, keep: usize) -> Result<u64, StoreError> {
+        self.inner.feed_prune(feed, keep)
+    }
+
+    fn feed_polled(&self, feed: FeedId, poll: &FeedPoll, at: SystemTime) -> Result<(), StoreError> {
+        self.inner.feed_polled(feed, poll, at)
+    }
+
+    fn feed_forget(&self, before: SystemTime) -> Result<u64, StoreError> {
+        self.inner.feed_forget(before)
+    }
 }
 
 /// However many classic connections hear a post, the flat push reads the
@@ -3379,4 +3421,117 @@ async fn a_guest_logging_in_again_finds_its_address_post_rate_spent() {
     post(&mut elsewhere, general, None, "C", "another address").await;
     let (mut alice, _) = Ng::login(ng, "alice").await;
     post(&mut alice, general, None, "D", "a person").await;
+}
+
+/// A category a feed fills is read on both wires and posted to on
+/// neither: an ng post or reply, a 1.5 thread and a 1.2 flat post are
+/// each refused, and a moderator's delete is not undone by the next
+/// poll (`docs/news-feeds.md` §3).
+#[tokio::test]
+async fn a_feed_category_is_read_only_on_both_wires() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng, core) =
+        start_server_with(dir.path(), Some(news_server()), flat_general()).await;
+    let feed = core
+        .news_feeds_open(&[hxd_core::news::FeedSpec {
+            name: "mobius".into(),
+            url: "https://example.com/mobius.atom".into(),
+            category: vec!["General".into()],
+            keep: 100,
+            first_import: 100,
+            author: None,
+            replies: false,
+        }])
+        .unwrap()
+        .remove(0);
+    let item = hxd_core::news::FeedItem {
+        key: [1; 32],
+        subject: "Mobius 1.0".into(),
+        author: Some("Jeff".into()),
+        at: SystemTime::now(),
+        body: "Release notes.".into(),
+        markdown: false,
+    };
+    core.news_feed_import(&feed, vec![item.clone()]).unwrap();
+    let general = feed.category;
+
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let threads = alice
+        .ok("news_threads", json!({ "category": general }))
+        .await;
+    let release = &threads["threads"][0]["article"];
+    assert_eq!(release["subject"], "Mobius 1.0");
+    assert_eq!(release["from"]["nick"], "Jeff");
+    let release = release["id"].as_u64().unwrap();
+    for parent in [None, Some(release)] {
+        let request = json!({ "category": general, "parent": parent, "subject": "s", "body": "b" });
+        assert_eq!(alice.refused("news_post", request).await, "read_only");
+    }
+
+    let refusal = "A feed fills that category; it cannot be posted to or changed.";
+    let mut bob = Period::login(legacy, "bob").await;
+    assert_eq!(
+        bob.refused(
+            POST_THREAD,
+            vec![
+                news_path(&[b"General"]),
+                (tag::NEWSSUBJECT, b"s".to_vec()),
+                (tag::NEWSDATA, b"b".to_vec()),
+                id_field(tag::THREADID, release),
+            ],
+        )
+        .await,
+        refusal
+    );
+    assert_eq!(
+        bob.refused(NEWSFILE_POST, vec![(tag::BODY, b"flat".to_vec())])
+            .await,
+        refusal
+    );
+
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    admin.ok("news_delete", json!({ "id": release })).await;
+    assert_eq!(core.news_feed_import(&feed, vec![item]).unwrap().posted, 0);
+}
+
+/// `hxd news feeds` reads the database a config names, running server or
+/// not: each feed, what it holds, and why it is failing.
+#[test]
+fn the_operator_lists_the_feeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("news.sqlite");
+    let config = dir.path().join("hxd-ng.toml");
+    std::fs::write(&config, format!("[news]\ndb = \"{}\"\n", db.display())).unwrap();
+    let config = hxd::Config::load(&config).unwrap();
+    assert!(hxd::news_feeds(&config).is_err(), "no database yet");
+
+    let store = SqliteStore::open(&db, Synchronous::Normal).unwrap();
+    assert_eq!(hxd::news_feeds(&config).unwrap(), "no feeds");
+    let feed = store
+        .feed_open("mobius", "https://example.com/mobius.atom")
+        .unwrap()
+        .id;
+    store
+        .feed_open("quiet", "https://example.com/quiet.atom")
+        .unwrap();
+    store
+        .feed_skip(
+            feed,
+            &[([1; 32], [0; 32]), ([2; 32], [0; 32])],
+            SystemTime::now(),
+        )
+        .unwrap();
+    let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+    store.feed_polled(feed, &FeedPoll::NotModified, at).unwrap();
+    store
+        .feed_polled(feed, &FeedPoll::Failed("timed out".into()), at)
+        .unwrap();
+    assert_eq!(
+        hxd::news_feeds(&config).unwrap(),
+        "mobius https://example.com/mobius.atom\n  \
+         0 articles, 2 items seen, last fetched 1790000000\n  \
+         failing: 1 in a row, last: timed out\n\
+         quiet https://example.com/quiet.atom\n  \
+         0 articles, 0 items seen, never fetched"
+    );
 }

@@ -3444,6 +3444,53 @@ pub fn news_reindex(_config: &Config) -> Result<u64, String> {
     Err("this build has no news store (built without the `inbox` feature)".to_string())
 }
 
+/// `hxd news feeds`: every feed the news database remembers, one block
+/// each — what it holds, when it last fetched, and what went wrong since
+/// (`docs/news-feeds.md` §10).
+#[cfg(feature = "inbox")]
+pub fn news_feeds(config: &Config) -> Result<String, String> {
+    let path = news_db(config).ok_or("[news] is not configured; there are no feeds")?;
+    if !path.exists() {
+        return Err(format!("{}: no news database yet", path.display()));
+    }
+    let store = hxd_store_sqlite::SqliteStore::open_read_only(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let feeds = hxd_core::NewsStore::feeds(&store).map_err(|e| e.to_string())?;
+    if feeds.is_empty() {
+        return Ok("no feeds".into());
+    }
+    let unix = |t: std::time::SystemTime| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    };
+    Ok(feeds
+        .iter()
+        .map(|f| {
+            let fetched = match f.state.last_ok {
+                Some(at) => format!("last fetched {}", unix(at)),
+                None => "never fetched".into(),
+            };
+            let mut block = format!(
+                "{} {}\n  {} articles, {} items seen, {fetched}",
+                f.name, f.url, f.articles, f.items
+            );
+            if let Some(why) = &f.state.last_error {
+                block.push_str(&format!(
+                    "\n  failing: {} in a row, last: {why}",
+                    f.state.failures
+                ));
+            }
+            block
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+#[cfg(not(feature = "inbox"))]
+pub fn news_feeds(_config: &Config) -> Result<String, String> {
+    Err("this build has no news store (built without the `inbox` feature)".to_string())
+}
+
 /// A fingerprint as an operator has it: the 52-character Crockford form
 /// the account file's `[identity]` table and the roster both show, or
 /// raw hex for anyone reading it out of a hash. Crockford first — the

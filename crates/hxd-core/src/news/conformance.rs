@@ -11,12 +11,13 @@
 //! because the SQLite store keeps whole seconds, and never the wall
 //! clock.
 
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    ArticleId, Author, AutoFollow, BodyType, CompiledQuery, GuestKey, GuestKeyer, NewNode, NewPost,
-    NewsError, NewsStore, NewsUsage, NodeId, NodeKind, Posted, SearchOrder, SearchQuery, SubScope,
-    TextLen, ThreadQuery, Writer,
+    ArticleId, Author, AutoFollow, BodyType, CompiledQuery, FeedId, FeedPoll, FeedPost, GuestKey,
+    GuestKeyer, NewNode, NewPost, NewsError, NewsStore, NewsUsage, NodeId, NodeKind, Posted,
+    SearchOrder, SearchQuery, SeenItem, SubScope, TextLen, ThreadQuery, Writer,
 };
 use crate::inbox::Mailbox;
 
@@ -68,6 +69,14 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     a_legacy_listing_is_whole_threads_newest_first(&*new_store());
     a_legacy_listing_measures_rather_than_carries(&*new_store());
     the_flat_view_is_the_newest_articles_tombstones_and_all(&*new_store());
+    // Feeds (news-feeds.md §6).
+    a_feed_is_its_name_and_remembers_its_polls(&*new_store());
+    a_feed_post_is_seen_in_its_own_write(&*new_store());
+    pruning_a_feed_keeps_its_newest_and_their_items_seen(&*new_store());
+    an_item_outlives_its_article_until_it_leaves_the_feed(&*new_store());
+    pruning_spares_what_people_replied_to(&*new_store());
+    a_revised_item_rewrites_its_article_unless_it_was_deleted(&*new_store());
+    the_operator_sees_every_feed(&*new_store());
 }
 
 /// The corpus the search cases share: two categories, three authors, and
@@ -106,6 +115,7 @@ fn corpus(s: &dyn NewsStore) -> Corpus {
                 attachment_owner: None,
                 guest: None,
                 attachment_cutoff: t(0),
+                feed: None,
             },
             32,
             32,
@@ -883,6 +893,7 @@ fn new_post(category: NodeId, parent: Option<ArticleId>, body: &str, at: u64) ->
         attachment_owner: None,
         guest: None,
         attachment_cutoff: t(0),
+        feed: None,
     }
 }
 
@@ -1752,6 +1763,312 @@ fn pruning_takes_whole_threads_by_their_last_post(s: &dyn NewsStore) {
         0,
         "a window longer than the clock has run prunes nothing"
     );
+}
+
+fn feed_post(s: &dyn NewsStore, cat: NodeId, feed: FeedId, key: u8, at: u64) -> ArticleId {
+    s.post(
+        &NewPost {
+            author: Author {
+                nick: "Releases".into(),
+                login: None,
+                fingerprint: None,
+            },
+            feed: Some(FeedPost {
+                feed,
+                key: [key; 32],
+                hash: [key ^ 0xff; 32],
+            }),
+            ..new_post(cat, None, &format!("item {key}"), at)
+        },
+        32,
+        32,
+    )
+    .unwrap()
+    .id
+}
+
+fn seen_keys(s: &dyn NewsStore, feed: FeedId, keys: &[[u8; 32]], now: u64) -> HashSet<[u8; 32]> {
+    s.feed_seen(feed, keys, t(now))
+        .unwrap()
+        .into_keys()
+        .collect()
+}
+
+fn a_feed_is_its_name_and_remembers_its_polls(s: &dyn NewsStore) {
+    let first = s.feed_open("mobius", "https://example.com/a.atom").unwrap();
+    assert!(!first.polled);
+    assert_eq!(first.etag, None);
+    let moved = s.feed_open("mobius", "https://example.com/b.atom").unwrap();
+    assert_eq!(moved.id, first.id, "a feed is its name, wherever it moves");
+    assert_ne!(
+        s.feed_open("other", "https://example.com/a.atom")
+            .unwrap()
+            .id,
+        first.id
+    );
+
+    let fetched = FeedPoll::Fetched {
+        etag: Some("\"v1\"".into()),
+        last_modified: Some("Mon, 05 Oct 2026 10:00:00 GMT".into()),
+    };
+    s.feed_polled(first.id, &fetched, t(100)).unwrap();
+    s.feed_polled(first.id, &FeedPoll::Failed("timed out".into()), t(200))
+        .unwrap();
+    s.feed_polled(first.id, &FeedPoll::Failed("refused".into()), t(300))
+        .unwrap();
+    let failing = s.feed_open("mobius", "https://example.com/b.atom").unwrap();
+    assert_eq!(
+        failing.etag.as_deref(),
+        Some("\"v1\""),
+        "a failure keeps the validators"
+    );
+    assert_eq!(failing.last_ok, Some(t(100)));
+    assert_eq!(failing.failures, 2);
+    assert_eq!(failing.last_error.as_deref(), Some("refused"));
+
+    s.feed_polled(first.id, &FeedPoll::NotModified, t(400))
+        .unwrap();
+    let recovered = s.feed_open("mobius", "https://example.com/b.atom").unwrap();
+    assert_eq!(recovered.etag.as_deref(), Some("\"v1\""));
+    assert_eq!(recovered.last_ok, Some(t(400)));
+    assert_eq!((recovered.failures, recovered.last_error), (0, None));
+}
+
+fn a_feed_post_is_seen_in_its_own_write(s: &dyn NewsStore) {
+    let cat = category(s, "Releases");
+    let feed = s
+        .feed_open("mobius", "https://example.com/a.atom")
+        .unwrap()
+        .id;
+    let id = feed_post(s, cat, feed, 1, 100);
+    assert_eq!(
+        s.article(id).unwrap().unwrap().feed.as_deref(),
+        Some("mobius")
+    );
+    assert!(
+        s.feed_open("mobius", "https://example.com/a.atom")
+            .unwrap()
+            .polled
+    );
+    let seen = s.feed_seen(feed, &[[1; 32], [2; 32]], t(200)).unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[&[1; 32]],
+        SeenItem {
+            article: Some(id),
+            hash: [1 ^ 0xff; 32]
+        }
+    );
+    let other = s
+        .feed_open("other", "https://example.com/b.atom")
+        .unwrap()
+        .id;
+    assert!(
+        s.feed_seen(other, &[[1; 32]], t(200)).unwrap().is_empty(),
+        "an item is seen by its own feed only"
+    );
+
+    // A feed article has no login and no guest key, and is no guest's.
+    assert_eq!(s.written_by(&Writer::Guest(None)).unwrap(), 0);
+    post_by(
+        s,
+        Author {
+            nick: "guest".into(),
+            login: None,
+            fingerprint: None,
+        },
+        cat,
+        None,
+        "from a guest",
+        200,
+    );
+    assert_eq!(s.written_by(&Writer::Guest(None)).unwrap(), 1);
+
+    let local = post(s, cat, None, "a local article", 300);
+    assert_eq!(s.article(local).unwrap().unwrap().feed, None);
+}
+
+fn pruning_a_feed_keeps_its_newest_and_their_items_seen(s: &dyn NewsStore) {
+    let cat = category(s, "Releases");
+    let feed = s
+        .feed_open("mobius", "https://example.com/a.atom")
+        .unwrap()
+        .id;
+    let other = s
+        .feed_open("other", "https://example.com/b.atom")
+        .unwrap()
+        .id;
+    let local = post(s, cat, None, "from before it was a feed", 50);
+    let deleted = feed_post(s, cat, feed, 1, 100);
+    s.tombstone(deleted, "mod", t(150)).unwrap();
+    let old = feed_post(s, cat, feed, 2, 200);
+    let neighbor = feed_post(s, cat, other, 9, 250);
+    let kept = [
+        feed_post(s, cat, feed, 3, 300),
+        feed_post(s, cat, feed, 4, 400),
+    ];
+    let before = s.node(cat).unwrap().unwrap().delete_sn;
+    let live_before = s.node(cat).unwrap().unwrap().children;
+
+    assert_eq!(
+        s.feed_prune(feed, 0).unwrap(),
+        0,
+        "keep 0 leaves it to retention"
+    );
+    assert_eq!(
+        s.feed_prune(feed, 4).unwrap(),
+        0,
+        "short of keep, nothing goes"
+    );
+    assert_eq!(
+        s.feed_prune(feed, 3).unwrap(),
+        1,
+        "a tombstone older than what is kept"
+    );
+    assert_eq!(s.feed_prune(feed, 2).unwrap(), 1, "the oldest live one");
+    for gone in [deleted, old] {
+        assert!(s.article(gone).unwrap().is_none());
+    }
+    for stays in kept.into_iter().chain([local, neighbor]) {
+        assert!(
+            s.article(stays).unwrap().is_some(),
+            "#{stays} is not this feed's to prune"
+        );
+    }
+    assert_eq!(s.node(cat).unwrap().unwrap().delete_sn, before + 2);
+    assert_eq!(s.node(cat).unwrap().unwrap().children, live_before - 1);
+    assert_eq!(
+        s.feed_seen(feed, &[[1; 32], [2; 32], [3; 32], [4; 32]], t(500))
+            .unwrap()
+            .len(),
+        4,
+        "a pruned item stays seen"
+    );
+}
+
+fn pruning_spares_what_people_replied_to(s: &dyn NewsStore) {
+    let cat = category(s, "Releases");
+    let feed = s
+        .feed_open("mobius", "https://example.com/a.atom")
+        .unwrap()
+        .id;
+    let discussed = feed_post(s, cat, feed, 1, 100);
+    let reply = post(s, cat, Some(discussed), "what changed?", 150);
+    let quiet = feed_post(s, cat, feed, 2, 200);
+    feed_post(s, cat, feed, 3, 300);
+    assert_eq!(s.feed_prune(feed, 1).unwrap(), 1);
+    assert!(s.article(quiet).unwrap().is_none());
+    assert!(s.article(discussed).unwrap().is_some());
+    assert!(s.article(reply).unwrap().is_some());
+}
+
+fn a_revised_item_rewrites_its_article_unless_it_was_deleted(s: &dyn NewsStore) {
+    let cat = category(s, "Releases");
+    let feed = s
+        .feed_open("mobius", "https://example.com/a.atom")
+        .unwrap()
+        .id;
+    let id = feed_post(s, cat, feed, 1, 100);
+    let gone = feed_post(s, cat, feed, 2, 100);
+    s.tombstone(gone, "mod", t(150)).unwrap();
+    let before = s.node(cat).unwrap().unwrap().add_sn;
+    let revision = |key: u8, body: &str| NewPost {
+        author: Author {
+            nick: "Jeff".into(),
+            login: None,
+            fingerprint: None,
+        },
+        subject: "v1.0, corrected".into(),
+        feed: Some(FeedPost {
+            feed,
+            key: [key; 32],
+            hash: [0x42; 32],
+        }),
+        ..new_post(cat, None, body, 200)
+    };
+
+    assert!(s.feed_revise(id, &revision(1, "zanzibar notes")).unwrap());
+    let article = s.article(id).unwrap().unwrap();
+    assert_eq!(
+        (
+            article.subject.as_str(),
+            article.body.as_str(),
+            article.author.nick.as_str()
+        ),
+        ("v1.0, corrected", "zanzibar notes", "Jeff")
+    );
+    assert_eq!(s.node(cat).unwrap().unwrap().add_sn, before + 1);
+    assert_eq!(
+        found(s, &query("zanzibar")),
+        vec![id],
+        "search reads the new text"
+    );
+    assert!(
+        found(s, &query("item")).iter().all(|&a| a != id),
+        "and not the old"
+    );
+
+    assert!(!s
+        .feed_revise(gone, &revision(2, "back from the dead"))
+        .unwrap());
+    assert!(s.article(gone).unwrap().unwrap().deleted);
+    let seen = s.feed_seen(feed, &[[1; 32], [2; 32]], t(300)).unwrap();
+    assert!(
+        seen.values().all(|item| item.hash == [0x42; 32]),
+        "both hashes move"
+    );
+}
+
+fn the_operator_sees_every_feed(s: &dyn NewsStore) {
+    let cat = category(s, "Releases");
+    let feed = s
+        .feed_open("mobius", "https://example.com/a.atom")
+        .unwrap()
+        .id;
+    s.feed_open("idle", "https://example.com/idle.atom")
+        .unwrap();
+    feed_post(s, cat, feed, 1, 100);
+    s.feed_skip(feed, &[([2; 32], [0; 32])], t(100)).unwrap();
+    s.feed_polled(feed, &FeedPoll::Failed("timed out".into()), t(200))
+        .unwrap();
+    let listed = s.feeds().unwrap();
+    let names: Vec<&str> = listed.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["idle", "mobius"]);
+    let mobius = &listed[1];
+    assert_eq!((mobius.articles, mobius.items), (1, 2));
+    assert_eq!(mobius.url, "https://example.com/a.atom");
+    assert_eq!(mobius.state.last_error.as_deref(), Some("timed out"));
+    assert!(!listed[0].state.polled);
+}
+
+fn an_item_outlives_its_article_until_it_leaves_the_feed(s: &dyn NewsStore) {
+    let cat = category(s, "Releases");
+    let feed = s
+        .feed_open("mobius", "https://example.com/a.atom")
+        .unwrap()
+        .id;
+    s.feed_skip(feed, &[([1; 32], [0; 32]), ([2; 32], [0; 32])], t(100))
+        .unwrap();
+    assert!(
+        s.feed_open("mobius", "https://example.com/a.atom")
+            .unwrap()
+            .polled
+    );
+    let retained = feed_post(s, cat, feed, 3, 100);
+    let live = feed_post(s, cat, feed, 4, 5000);
+    s.prune(Duration::from_secs(1000), t(5000)).unwrap();
+    assert!(s.article(retained).unwrap().is_none());
+
+    // Item 2 is listed again later; 1 and 3 are not.
+    s.feed_seen(feed, &[[2; 32]], t(4000)).unwrap();
+    assert_eq!(s.feed_forget(t(3000)).unwrap(), 2);
+    let keys = [[1; 32], [2; 32], [3; 32], [4; 32]];
+    assert_eq!(
+        seen_keys(s, feed, &keys, 6000),
+        [[2u8; 32], [4; 32]].into_iter().collect(),
+        "forgotten: unlisted since the cutoff and without an article"
+    );
+    assert!(s.article(live).unwrap().is_some());
 }
 
 #[cfg(test)]

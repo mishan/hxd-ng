@@ -310,6 +310,7 @@ pub(crate) fn error_text(e: &NewsError) -> &'static str {
         NewsError::BadRequest(why) => why,
         NewsError::Protected => "That author's articles are protected.",
         NewsError::NewsFull => "This server's news is full.",
+        NewsError::ReadOnly => "A feed fills that category; it cannot be posted to or changed.",
         NewsError::TooManyArticles { guests: false } => {
             "You have as many articles here as this server allows. Delete one first."
         }
@@ -1248,6 +1249,7 @@ mod tests {
             refs: Vec::new(),
             referenced_by: 0,
             attachments: Vec::new(),
+            feed: None,
         }
     }
 

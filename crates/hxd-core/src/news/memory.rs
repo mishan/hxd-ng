@@ -6,15 +6,16 @@
 //! in SQL this says it in Rust, and [`super::conformance`] holds the two
 //! to the same answers.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use super::query::{words, Field, Term};
 use super::{
-    Article, ArticleId, ArticlePage, Author, BodyType, GuestKey, Hit, Listed, NewNode, NewPost,
-    NewsError, NewsStore, NewsUsage, Node, NodeId, NodeKind, Posted, Reference, SearchPage,
-    SearchQuery, SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery,
-    Writer,
+    Article, ArticleId, ArticlePage, Author, BodyType, FeedId, FeedListing, FeedPoll, FeedState,
+    GuestKey, Hit, Listed, NewNode, NewPost, NewsError, NewsStore, NewsUsage, Node, NodeId,
+    NodeKind, Posted, Reference, SearchPage, SearchQuery, SeenItem, SubScope, Subscriber,
+    Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery, Writer,
 };
 use crate::inbox::{Mailbox, StoreError};
 
@@ -136,6 +137,7 @@ struct ArticleRow {
     plain: Option<String>,
     at: SystemTime,
     deleted: bool,
+    feed: Option<FeedId>,
 }
 
 impl ArticleRow {
@@ -175,6 +177,27 @@ struct Inner {
     refs: Vec<(ArticleId, ArticleId)>,
     last_sub: u64,
     subs: Vec<SubRow>,
+    /// In id order; a feed's id is its place here plus one.
+    feeds: Vec<FeedRow>,
+    feed_items: HashMap<(FeedId, [u8; 32]), FeedItemRow>,
+}
+
+#[derive(Debug, Clone)]
+struct FeedRow {
+    name: String,
+    url: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    last_ok: Option<SystemTime>,
+    last_error: Option<String>,
+    failures: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FeedItemRow {
+    article: Option<ArticleId>,
+    hash: [u8; 32],
+    last_seen: SystemTime,
 }
 
 /// A [`NewsStore`] in a few `Vec`s.
@@ -268,6 +291,7 @@ impl Inner {
             refs,
             referenced_by,
             attachments: Vec::new(),
+            feed: a.feed.map(|f| self.feeds[f as usize - 1].name.clone()),
         }
     }
 
@@ -310,6 +334,11 @@ impl Inner {
     /// Remove articles outright, and every reference either side of
     /// them.
     fn remove_articles(&mut self, gone: &[ArticleId]) {
+        for item in self.feed_items.values_mut() {
+            if item.article.is_some_and(|a| gone.contains(&a)) {
+                item.article = None;
+            }
+        }
         self.articles.retain(|a| !gone.contains(&a.id));
         self.refs
             .retain(|(src, dst)| !gone.contains(src) && !gone.contains(dst));
@@ -578,7 +607,18 @@ impl NewsStore for MemoryNews {
             plain: p.plain.clone(),
             at: whole_seconds(p.at),
             deleted: false,
+            feed: p.feed.map(|f| f.feed),
         });
+        if let Some(f) = p.feed {
+            inner.feed_items.insert(
+                (f.feed, f.key),
+                FeedItemRow {
+                    article: Some(id),
+                    hash: f.hash,
+                    last_seen: whole_seconds(p.at),
+                },
+            );
+        }
         let cat = inner.node_mut(p.category).expect("checked above");
         cat.add_sn = cat.add_sn.wrapping_add(1);
         // Under the same lock as the article, so no later article is
@@ -757,7 +797,10 @@ impl NewsStore for MemoryNews {
             .filter(|a| match who {
                 Writer::Account(who) => a.author.is(who),
                 Writer::Guest(addr) => {
-                    a.author.login.is_none() && a.author.fingerprint.is_none() && a.guest == *addr
+                    a.feed.is_none()
+                        && a.author.login.is_none()
+                        && a.author.fingerprint.is_none()
+                        && a.guest == *addr
                 }
             })
             .count() as u64)
@@ -1120,6 +1163,206 @@ impl NewsStore for MemoryNews {
         let before = inner.subs.len();
         inner.subs.retain(|r| !owns(of, &r.owner));
         Ok(before - inner.subs.len())
+    }
+
+    fn feed_open(&self, name: &str, url: &str) -> Result<FeedState, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let id = match inner.feeds.iter().position(|f| f.name == name) {
+            Some(at) => {
+                inner.feeds[at].url = url.to_string();
+                at as FeedId + 1
+            }
+            None => {
+                inner.feeds.push(FeedRow {
+                    name: name.to_string(),
+                    url: url.to_string(),
+                    etag: None,
+                    last_modified: None,
+                    last_ok: None,
+                    last_error: None,
+                    failures: 0,
+                });
+                inner.feeds.len() as FeedId
+            }
+        };
+        let f = &inner.feeds[id as usize - 1];
+        Ok(FeedState {
+            id,
+            etag: f.etag.clone(),
+            last_modified: f.last_modified.clone(),
+            last_ok: f.last_ok,
+            last_error: f.last_error.clone(),
+            failures: f.failures,
+            polled: inner.feed_items.keys().any(|(feed, _)| *feed == id),
+        })
+    }
+
+    fn feed_seen(
+        &self,
+        feed: FeedId,
+        keys: &[[u8; 32]],
+        now: SystemTime,
+    ) -> Result<HashMap<[u8; 32], SeenItem>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut seen = HashMap::new();
+        for key in keys {
+            if let Some(item) = inner.feed_items.get_mut(&(feed, *key)) {
+                item.last_seen = whole_seconds(now);
+                seen.insert(
+                    *key,
+                    SeenItem {
+                        article: item.article,
+                        hash: item.hash,
+                    },
+                );
+            }
+        }
+        Ok(seen)
+    }
+
+    fn feed_skip(
+        &self,
+        feed: FeedId,
+        items: &[([u8; 32], [u8; 32])],
+        now: SystemTime,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        for (key, hash) in items {
+            let row = inner.feed_items.entry((feed, *key)).or_insert(FeedItemRow {
+                article: None,
+                hash: *hash,
+                last_seen: whole_seconds(now),
+            });
+            row.hash = *hash;
+        }
+        Ok(())
+    }
+
+    fn feed_revise(&self, article: ArticleId, post: &NewPost) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(f) = post.feed {
+            if let Some(item) = inner.feed_items.get_mut(&(f.feed, f.key)) {
+                item.hash = f.hash;
+            }
+        }
+        let Some(row) = inner
+            .articles
+            .iter_mut()
+            .find(|a| a.id == article && !a.deleted)
+        else {
+            return Ok(false);
+        };
+        row.author.nick = post.author.nick.clone();
+        row.subject = post.subject.clone();
+        row.body = post.body.clone();
+        row.mime = post.mime;
+        row.plain = post.plain.clone();
+        let category = row.category;
+        if let Some(cat) = inner.node_mut(category) {
+            cat.add_sn = cat.add_sn.wrapping_add(1);
+        }
+        Ok(true)
+    }
+
+    fn feeds(&self) -> Result<Vec<FeedListing>, StoreError> {
+        let listed: Vec<(String, String)> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .feeds
+                .iter()
+                .map(|f| (f.name.clone(), f.url.clone()))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for (name, url) in listed {
+            let state = self.feed_open(&name, &url)?;
+            let inner = self.inner.lock().unwrap();
+            out.push(FeedListing {
+                articles: inner
+                    .articles
+                    .iter()
+                    .filter(|a| a.feed == Some(state.id) && !a.deleted)
+                    .count() as u64,
+                items: inner
+                    .feed_items
+                    .keys()
+                    .filter(|(f, _)| *f == state.id)
+                    .count() as u64,
+                name,
+                url,
+                state,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    fn feed_prune(&self, feed: FeedId, keep: usize) -> Result<u64, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut live: Vec<ArticleId> = inner
+            .articles
+            .iter()
+            .filter(|a| a.feed == Some(feed) && !a.deleted)
+            .map(|a| a.id)
+            .collect();
+        if keep == 0 || live.len() < keep {
+            return Ok(0);
+        }
+        live.sort_unstable_by(|a, b| b.cmp(a));
+        let oldest_kept = live[keep - 1];
+        let replied: HashSet<ArticleId> = inner.articles.iter().filter_map(|a| a.parent).collect();
+        let gone: Vec<(ArticleId, NodeId)> = inner
+            .articles
+            .iter()
+            .filter(|a| a.feed == Some(feed) && a.id < oldest_kept && !replied.contains(&a.id))
+            .map(|a| (a.id, a.category))
+            .collect();
+        let ids: Vec<ArticleId> = gone.iter().map(|(id, _)| *id).collect();
+        inner.remove_articles(&ids);
+        inner.drop_orphan_subs();
+        if let Some(&(_, category)) = gone.first() {
+            if let Some(cat) = inner.node_mut(category) {
+                cat.delete_sn = cat.delete_sn.wrapping_add(1);
+            }
+        }
+        Ok(ids.len() as u64)
+    }
+
+    fn feed_polled(&self, feed: FeedId, poll: &FeedPoll, at: SystemTime) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let f = inner
+            .feeds
+            .get_mut((feed as usize).wrapping_sub(1))
+            .ok_or_else(|| StoreError::new(format!("no feed {feed}")))?;
+        match poll {
+            FeedPoll::Fetched {
+                etag,
+                last_modified,
+            } => {
+                f.etag = etag.clone();
+                f.last_modified = last_modified.clone();
+            }
+            FeedPoll::NotModified => {}
+            FeedPoll::Failed(why) => {
+                f.failures += 1;
+                f.last_error = Some(why.clone());
+                return Ok(());
+            }
+        }
+        f.last_ok = Some(whole_seconds(at));
+        f.failures = 0;
+        f.last_error = None;
+        Ok(())
+    }
+
+    fn feed_forget(&self, before: SystemTime) -> Result<u64, StoreError> {
+        let before = whole_seconds(before);
+        let mut inner = self.inner.lock().unwrap();
+        let had = inner.feed_items.len();
+        inner
+            .feed_items
+            .retain(|_, item| item.article.is_some() || item.last_seen >= before);
+        Ok((had - inner.feed_items.len()) as u64)
     }
 }
 

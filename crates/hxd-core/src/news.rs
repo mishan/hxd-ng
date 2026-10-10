@@ -27,7 +27,7 @@
 //! retention, search, and subscriptions with the notifications they earn
 //! ([`subs`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -40,6 +40,9 @@ use crate::inbox::{Mailbox, StoreError};
 use crate::roster::{Core, Event, Uid, UserSession};
 
 pub mod conformance;
+mod feed;
+#[cfg(test)]
+mod feed_tests;
 mod guest;
 pub mod memory;
 
@@ -52,6 +55,8 @@ mod subs;
 #[cfg(test)]
 mod subs_tests;
 
+pub(crate) use feed::FeedRule;
+pub use feed::{Feed, FeedImport, FeedItem, FeedSpec};
 pub use guest::{GuestKey, GuestKeyer, GUEST_SECRET_LEN};
 pub use memory::MemoryNews;
 pub use query::{CompiledQuery, Field, Term};
@@ -288,6 +293,9 @@ pub struct Article {
     pub referenced_by: u32,
     /// Durable image attachments, in display order (§7).
     pub attachments: Vec<Attachment>,
+    /// The name of the feed that posted it, for a feed's article
+    /// (news-feeds.md §5).
+    pub feed: Option<String>,
 }
 
 /// One article as the legacy 1.5 listing shows it (§12.3): what a
@@ -473,6 +481,66 @@ pub struct NewPost {
     /// not one person, which has none.
     pub attachment_owner: Option<crate::inbox::Mailbox>,
     pub attachment_cutoff: SystemTime,
+    /// A feed's item, recorded as seen in the post's own write, so no
+    /// crash between the two can post it twice.
+    pub feed: Option<FeedPost>,
+}
+
+pub type FeedId = u64;
+
+/// The feed and item a post is (news-feeds.md §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedPost {
+    pub feed: FeedId,
+    /// SHA-256 of the item's identity.
+    pub key: [u8; 32],
+    /// SHA-256 of what the item said, so a later poll can tell it changed.
+    pub hash: [u8; 32],
+}
+
+/// A seen item, as [`NewsStore::feed_seen`] finds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeenItem {
+    /// `None` once pruned, or for an item never posted.
+    pub article: Option<ArticleId>,
+    pub hash: [u8; 32],
+}
+
+/// A feed as `hxd news feeds` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedListing {
+    pub name: String,
+    pub url: String,
+    pub state: FeedState,
+    /// Live articles.
+    pub articles: u64,
+    /// Items remembered as seen.
+    pub items: u64,
+}
+
+/// What the store remembers of a feed between polls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedState {
+    pub id: FeedId,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub last_ok: Option<SystemTime>,
+    pub last_error: Option<String>,
+    pub failures: u32,
+    /// Has any item been seen? A feed that has not is on its first poll
+    /// (news-feeds.md §5).
+    pub polled: bool,
+}
+
+/// How a poll went, for [`NewsStore::feed_polled`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedPoll {
+    Fetched {
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+    NotModified,
+    Failed(String),
 }
 
 /// The subscription a post makes for its poster, **in the post's own
@@ -828,6 +896,9 @@ pub enum NewsError {
     /// or `max_text_bytes`. About the server, where `TooManyArticles` is
     /// about you.
     NewsFull,
+    /// A post into, or a change to, a category a feed fills
+    /// (news-feeds.md §3).
+    ReadOnly,
     /// The author already has `[news] max_per_author` live articles.
     /// `guests` when the author is a guest, whose allowance is the one
     /// every guest from its address shares, so the words cannot say it
@@ -1088,6 +1159,49 @@ pub trait NewsStore: Send + Sync + 'static {
 
     /// An account went: take its rows with it.
     fn subs_purge(&self, of: &Mailbox) -> Result<usize, StoreError>;
+
+    /// The feed called `name`, made on first sight, its `url` kept
+    /// current for the operator. The id outlives URL changes: a feed is
+    /// its name (news-feeds.md §2).
+    fn feed_open(&self, name: &str, url: &str) -> Result<FeedState, StoreError>;
+
+    /// Which of `keys` `feed` has seen, each found one marked listed at
+    /// `now`.
+    fn feed_seen(
+        &self,
+        feed: FeedId,
+        keys: &[[u8; 32]],
+        now: SystemTime,
+    ) -> Result<HashMap<[u8; 32], SeenItem>, StoreError>;
+
+    /// Record items, each a key and a hash, as seen without posting
+    /// them: a first poll's backlog, or a new hash for an item whose
+    /// article is gone.
+    fn feed_skip(
+        &self,
+        feed: FeedId,
+        items: &[([u8; 32], [u8; 32])],
+        now: SystemTime,
+    ) -> Result<(), StoreError>;
+
+    /// An item changed upstream: its article takes `post`'s subject,
+    /// author, body and downgrade, unless a moderator deleted it, and its
+    /// hash becomes `post`'s. Answers whether the article changed.
+    fn feed_revise(&self, article: ArticleId, post: &NewPost) -> Result<bool, StoreError>;
+
+    /// Every feed the store has seen, by name.
+    fn feeds(&self) -> Result<Vec<FeedListing>, StoreError>;
+
+    /// Remove `feed`'s articles older than its `keep` newest live ones,
+    /// tombstones among them, keeping their items seen. One with replies
+    /// stays: they are people's. Answers how many went.
+    fn feed_prune(&self, feed: FeedId, keep: usize) -> Result<u64, StoreError>;
+
+    fn feed_polled(&self, feed: FeedId, poll: &FeedPoll, at: SystemTime) -> Result<(), StoreError>;
+
+    /// Forget seen items with no article that no poll has listed since
+    /// `before`: an item that long out of its feed is not coming back.
+    fn feed_forget(&self, before: SystemTime) -> Result<u64, StoreError>;
 }
 
 /// How a search's hits are ordered.
@@ -1440,7 +1554,8 @@ struct Asker {
 /// about. Refused, never made room for, as the blob cap is.
 fn news_room(store: &dyn NewsStore, post: &NewPost, policy: NewsPolicy) -> Result<(), NewsError> {
     let failed = |e: StoreError| store_failed(e.into());
-    if policy.max_per_author > 0 {
+    // A feed is bounded by its own `keep` (news-feeds.md §5).
+    if policy.max_per_author > 0 && post.feed.is_none() {
         let who = match &post.author.login {
             Some(login) => Writer::Account(Mailbox {
                 login: login.clone(),
@@ -2119,6 +2234,11 @@ impl Core {
         if !asker.access.has(bit::POST_NEWS) {
             return Err(NewsError::AccessDenied);
         }
+        if let Some(rule) = self.news_feed_rule(req.category) {
+            if req.parent.is_none() || !rule.replies {
+                return Err(NewsError::ReadOnly);
+            }
+        }
         let policy = self.news_policy;
         if req.mime == BodyType::Markdown && policy.markdown == MarkdownMode::Off {
             return Err(NewsError::BadBodyType);
@@ -2155,6 +2275,7 @@ impl Core {
             attachment_cutoff: SystemTime::now()
                 .checked_sub(policy.attach.map_or(Duration::ZERO, |a| a.stage_ttl))
                 .unwrap_or(SystemTime::UNIX_EPOCH),
+            feed: None,
         };
         if !post.attachments.is_empty() {
             let attach = policy.attach.ok_or(NewsError::NoSuchMedia)?;
@@ -2320,6 +2441,11 @@ impl Core {
         if !asker.access.has(create_bit(node.kind)) {
             return Err(NewsError::AccessDenied);
         }
+        // The config names a feed's category by path; renamed, the next
+        // start would make it again beside this one.
+        if self.news_feed_of(id).is_some() {
+            return Err(NewsError::ReadOnly);
+        }
         let node = store
             .rename_node(id, &clean_name(name)?)
             .map_err(store_failed)?;
@@ -2341,6 +2467,9 @@ impl Core {
         };
         if !asker.access.has(needed) {
             return Err(NewsError::AccessDenied);
+        }
+        if self.news_feed_of(id).is_some() {
+            return Err(NewsError::ReadOnly);
         }
         // A category takes its articles with it: who wrote what, and the
         // reports waiting on any of it, are read before they go, for the
