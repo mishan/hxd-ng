@@ -75,6 +75,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     pruning_a_feed_keeps_its_newest_and_their_items_seen(&*new_store());
     an_item_outlives_its_article_until_it_leaves_the_feed(&*new_store());
     pruning_spares_what_people_replied_to(&*new_store());
+    an_item_is_remembered_from_its_poll_not_its_date(&*new_store());
     a_revised_item_rewrites_its_article_unless_it_was_deleted(&*new_store());
     the_operator_sees_every_feed(&*new_store());
 }
@@ -1777,6 +1778,7 @@ fn feed_post(s: &dyn NewsStore, cat: NodeId, feed: FeedId, key: u8, at: u64) -> 
                 feed,
                 key: [key; 32],
                 hash: [key ^ 0xff; 32],
+                seen: t(at),
             }),
             ..new_post(cat, None, &format!("item {key}"), at)
         },
@@ -1946,6 +1948,39 @@ fn pruning_a_feed_keeps_its_newest_and_their_items_seen(s: &dyn NewsStore) {
     );
 }
 
+fn an_item_is_remembered_from_its_poll_not_its_date(s: &dyn NewsStore) {
+    let cat = category(s, "Releases");
+    let feed = s
+        .feed_open("mobius", "https://example.com/a.atom")
+        .unwrap()
+        .id;
+    let old = s
+        .post(
+            &NewPost {
+                feed: Some(FeedPost {
+                    feed,
+                    key: [1; 32],
+                    hash: [0; 32],
+                    seen: t(5000),
+                }),
+                ..new_post(cat, None, "dated long ago", 100)
+            },
+            32,
+            32,
+        )
+        .unwrap()
+        .id;
+    feed_post(s, cat, feed, 2, 5000);
+    s.feed_prune(feed, 1).unwrap();
+    assert!(s.article(old).unwrap().is_none());
+    assert_eq!(
+        s.feed_forget(t(3000)).unwrap(),
+        0,
+        "listed at 5000, whatever its date"
+    );
+    assert_eq!(seen_keys(s, feed, &[[1; 32]], 6000).len(), 1);
+}
+
 fn pruning_spares_what_people_replied_to(s: &dyn NewsStore) {
     let cat = category(s, "Releases");
     let feed = s
@@ -1983,11 +2018,15 @@ fn a_revised_item_rewrites_its_article_unless_it_was_deleted(s: &dyn NewsStore) 
             feed,
             key: [key; 32],
             hash: [0x42; 32],
+            seen: t(200),
         }),
         ..new_post(cat, None, body, 200)
     };
 
-    assert!(s.feed_revise(id, &revision(1, "zanzibar notes")).unwrap());
+    assert_eq!(
+        s.feed_revise(id, &revision(1, "zanzibar notes")).unwrap(),
+        Some(cat)
+    );
     let article = s.article(id).unwrap().unwrap();
     assert_eq!(
         (
@@ -2008,9 +2047,11 @@ fn a_revised_item_rewrites_its_article_unless_it_was_deleted(s: &dyn NewsStore) 
         "and not the old"
     );
 
-    assert!(!s
-        .feed_revise(gone, &revision(2, "back from the dead"))
-        .unwrap());
+    assert_eq!(
+        s.feed_revise(gone, &revision(2, "back from the dead"))
+            .unwrap(),
+        None
+    );
     assert!(s.article(gone).unwrap().unwrap().deleted);
     let seen = s.feed_seen(feed, &[[1; 32], [2; 32]], t(300)).unwrap();
     assert!(

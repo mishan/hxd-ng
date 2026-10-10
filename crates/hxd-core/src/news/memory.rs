@@ -615,7 +615,7 @@ impl NewsStore for MemoryNews {
                 FeedItemRow {
                     article: Some(id),
                     hash: f.hash,
-                    last_seen: whole_seconds(p.at),
+                    last_seen: whole_seconds(f.seen),
                 },
             );
         }
@@ -1238,7 +1238,11 @@ impl NewsStore for MemoryNews {
         Ok(())
     }
 
-    fn feed_revise(&self, article: ArticleId, post: &NewPost) -> Result<bool, StoreError> {
+    fn feed_revise(
+        &self,
+        article: ArticleId,
+        post: &NewPost,
+    ) -> Result<Option<NodeId>, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         if let Some(f) = post.feed {
             if let Some(item) = inner.feed_items.get_mut(&(f.feed, f.key)) {
@@ -1250,7 +1254,7 @@ impl NewsStore for MemoryNews {
             .iter_mut()
             .find(|a| a.id == article && !a.deleted)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         row.author.nick = post.author.nick.clone();
         row.subject = post.subject.clone();
@@ -1261,7 +1265,7 @@ impl NewsStore for MemoryNews {
         if let Some(cat) = inner.node_mut(category) {
             cat.add_sn = cat.add_sn.wrapping_add(1);
         }
-        Ok(true)
+        Ok(Some(category))
     }
 
     fn feeds(&self) -> Result<Vec<FeedListing>, StoreError> {

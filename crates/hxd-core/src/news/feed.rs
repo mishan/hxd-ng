@@ -188,6 +188,28 @@ impl Core {
         self.news_feed_rule(category).map(|rule| rule.name)
     }
 
+    /// Is `id` a feed's category, or a bundle above one? Either renamed,
+    /// the config's path would name something else.
+    pub(crate) fn news_feed_beneath(
+        &self,
+        store: &dyn NewsStore,
+        id: NodeId,
+    ) -> Result<bool, NewsError> {
+        let categories: Vec<NodeId> = self.news_feeds.read().unwrap().keys().copied().collect();
+        for mut at in categories {
+            loop {
+                if at == id {
+                    return Ok(true);
+                }
+                match store.node(at)?.and_then(|n| n.parent) {
+                    Some(parent) => at = parent,
+                    None => break,
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn news_feed_rule(&self, category: NodeId) -> Option<FeedRule> {
         self.news_feeds.read().unwrap().get(&category).cloned()
     }
@@ -225,9 +247,9 @@ impl Core {
     }
 
     /// Post a poll's new items, oldest first, then prune the feed to its
-    /// `keep` (news-feeds.md §5). A first poll takes only the newest
-    /// `first_import` and tells nobody; after it, one `news_posted` names
-    /// the newest article however many arrived, and followers hear of
+    /// `keep` (news-feeds.md §5). One `news_posted` names the newest
+    /// article however many arrived. A first poll takes only the newest
+    /// `first_import` and notifies nobody; after it, followers hear of
     /// each under the catch-up rule.
     pub fn news_feed_import(
         &self,
@@ -253,11 +275,11 @@ impl Core {
                 Some(had) => match had.article {
                     Some(article) => {
                         let post = self.news_feed_post(feed, item, now);
-                        if store.feed_revise(article, &post).map_err(failed)? {
+                        if let Some(category) = store.feed_revise(article, &post).map_err(failed)? {
                             done.revised += 1;
                             self.news_fan_out(Event::NewsEdited {
                                 id: article,
-                                category: feed.category,
+                                category,
                             });
                         }
                     }
@@ -293,7 +315,6 @@ impl Core {
             }
         }
         done.posted = posted.len();
-        done.pruned = store.feed_prune(feed.id, feed.spec.keep).map_err(failed)?;
 
         if let Some((post, p)) = posted.last() {
             self.news_fan_out(Event::NewsPosted {
@@ -326,6 +347,12 @@ impl Core {
                 self.news_after_post(&asker, post, *p, notify);
             }
         }
+        // After the announcements, which a prune that fails must not
+        // take with it: the posts are committed either way.
+        match store.feed_prune(feed.id, feed.spec.keep) {
+            Ok(pruned) => done.pruned = pruned,
+            Err(e) => outcome = outcome.and(Err(failed(e))),
+        }
         outcome.map(|()| done)
     }
 
@@ -338,10 +365,10 @@ impl Core {
             subject = "(untitled)".into();
         }
         let mut nick = clean_subject(
-            feed.spec
-                .author
-                .as_deref()
-                .or(item.author.as_deref())
+            [feed.spec.author.as_deref(), item.author.as_deref()]
+                .into_iter()
+                .flatten()
+                .find(|a| !a.trim().is_empty())
                 .unwrap_or(&feed.spec.name),
         );
         cut(&mut nick, MAX_AUTHOR);
@@ -378,6 +405,7 @@ impl Core {
                 feed: feed.id,
                 key: item.key,
                 hash,
+                seen: now,
             }),
         }
     }

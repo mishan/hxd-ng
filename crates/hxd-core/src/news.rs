@@ -496,6 +496,9 @@ pub struct FeedPost {
     pub key: [u8; 32],
     /// SHA-256 of what the item said, so a later poll can tell it changed.
     pub hash: [u8; 32],
+    /// The poll that listed it, which is what keeps it remembered; never
+    /// the item's own date, which can be years old.
+    pub seen: SystemTime,
 }
 
 /// A seen item, as [`NewsStore::feed_seen`] finds it.
@@ -1186,8 +1189,10 @@ pub trait NewsStore: Send + Sync + 'static {
 
     /// An item changed upstream: its article takes `post`'s subject,
     /// author, body and downgrade, unless a moderator deleted it, and its
-    /// hash becomes `post`'s. Answers whether the article changed.
-    fn feed_revise(&self, article: ArticleId, post: &NewPost) -> Result<bool, StoreError>;
+    /// hash becomes `post`'s. Answers the article's category when the
+    /// article changed.
+    fn feed_revise(&self, article: ArticleId, post: &NewPost)
+        -> Result<Option<NodeId>, StoreError>;
 
     /// Every feed the store has seen, by name.
     fn feeds(&self) -> Result<Vec<FeedListing>, StoreError>;
@@ -2441,9 +2446,9 @@ impl Core {
         if !asker.access.has(create_bit(node.kind)) {
             return Err(NewsError::AccessDenied);
         }
-        // The config names a feed's category by path; renamed, the next
-        // start would make it again beside this one.
-        if self.news_feed_of(id).is_some() {
+        // The config names a feed's category by path; renamed, or a
+        // bundle above it renamed, the next start would make it again.
+        if self.news_feed_beneath(&**store, id)? {
             return Err(NewsError::ReadOnly);
         }
         let node = store

@@ -1032,7 +1032,7 @@ impl NewsStore for SqliteStore {
                     f.key.as_slice(),
                     i64::from(id),
                     f.hash.as_slice(),
-                    unix(p.at)
+                    unix(f.seen)
                 ],
             ))?;
         }
@@ -2161,7 +2161,11 @@ impl NewsStore for SqliteStore {
         sql(tx.commit())
     }
 
-    fn feed_revise(&self, article: ArticleId, post: &NewPost) -> Result<bool, StoreError> {
+    fn feed_revise(
+        &self,
+        article: ArticleId,
+        post: &NewPost,
+    ) -> Result<Option<NodeId>, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
         if let Some(f) = post.feed {
@@ -2180,7 +2184,7 @@ impl NewsStore for SqliteStore {
             .optional())?;
         let Some(category) = live else {
             sql(tx.commit())?;
-            return Ok(false);
+            return Ok(None);
         };
         // External-content FTS forgets a row by the text it indexed, so
         // the old text goes out of the index before the row changes.
@@ -2203,7 +2207,7 @@ impl NewsStore for SqliteStore {
             params![category, WRAP],
         ))?;
         sql(tx.commit())?;
-        Ok(true)
+        node_id(category).map(Some)
     }
 
     fn feeds(&self) -> Result<Vec<FeedListing>, StoreError> {

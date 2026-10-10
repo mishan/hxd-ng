@@ -121,11 +121,12 @@ of making the category writable again.
 | Reply | the same, unless the feed has `replies = true` |
 | Delete an article | `DELETE_ARTICLES` (33). No ladder applies: a feed article's author has no sessions and no account |
 | Rename or delete the category | refused while a feed names it: the next start would make it again |
-| 1.2 flat news | if `flat_category` is a feed category, 1.2 posts are refused the same way |
+| 1.2 flat news | if `flat_category` is a feed category, a 1.2 post is held to the same rules: with `replies = true` and `flat_reply = "newest_thread"` it becomes a reply to the newest feed article, and otherwise it is refused |
 
 The ng `node` object gains `"feed": "mobius"` for a feed category, so a
-client can hide its post button rather than offer one that will fail;
-the legacy wire has no field for it and gets the refusal.
+client can hide its post button rather than offer one that will fail,
+and an article gains the same field beside its author (both F3); the
+legacy wire has no field for either and gets the refusal.
 
 A deleted feed article is a tombstone like any other (news.md §11), with
 its audit row. Its item stays seen, so the next poll does not bring it

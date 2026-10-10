@@ -62,6 +62,7 @@ fn editor() -> AccessBits {
         .with(bit::DELETE_ARTICLES)
         .with(bit::CREATE_CATEGORIES)
         .with(bit::DELETE_CATEGORIES)
+        .with(bit::CREATE_NEWS_BUNDLES)
 }
 
 fn post(
@@ -399,4 +400,34 @@ fn replies_are_a_feeds_to_allow_and_keep_their_thread() {
         subjects(&core, feed.category),
         ["Release 1", "hello", "Release 3"]
     );
+}
+
+#[test]
+fn a_bundle_above_a_feed_keeps_its_name() {
+    let core = core_with(NewsPolicy::default());
+    let (ed, _rx) = test_attach(&core, "ed", editor());
+    open(&core, spec("mobius", &["Software", "Mobius"]));
+    let bundle = core.news_tree(ed, None, 1).unwrap().remove(0).node.id;
+    assert_eq!(
+        core.news_node_rename(ed, bundle, "Updates"),
+        Err(NewsError::ReadOnly)
+    );
+    let other = core
+        .news_node_create(ed, None, NodeKind::Bundle, "Elsewhere")
+        .unwrap()
+        .id;
+    core.news_node_rename(ed, other, "Somewhere").unwrap();
+}
+
+#[test]
+fn a_blank_author_is_the_feeds_name() {
+    let core = core_with(NewsPolicy::default());
+    let feed = open(&core, spec("mobius", &["Releases"]));
+    let blank = FeedItem {
+        author: Some("  ".into()),
+        ..item(1)
+    };
+    core.news_feed_import(&feed, vec![blank]).unwrap();
+    let posted = core.news_store().unwrap().recent(feed.category, 1).unwrap();
+    assert_eq!(posted[0].author.nick, "mobius");
 }

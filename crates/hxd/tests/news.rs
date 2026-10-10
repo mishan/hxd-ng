@@ -3144,7 +3144,11 @@ impl NewsStore for CountingNews {
         self.inner.feed_skip(feed, items, now)
     }
 
-    fn feed_revise(&self, article: ArticleId, post: &NewPost) -> Result<bool, StoreError> {
+    fn feed_revise(
+        &self,
+        article: ArticleId,
+        post: &NewPost,
+    ) -> Result<Option<NodeId>, StoreError> {
         self.inner.feed_revise(article, post)
     }
 
