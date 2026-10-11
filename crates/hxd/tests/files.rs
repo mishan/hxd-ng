@@ -1195,6 +1195,12 @@ async fn ng_previews_are_drawn_again_or_decoded_text() {
     std::fs::write(root.path().join("notes.txt"), &notes).unwrap();
     std::fs::write(root.path().join("blob.bin"), b"\x00\x01binary").unwrap();
     std::fs::create_dir(root.path().join("folder")).unwrap();
+    let mut mp4 = b"\0\0\0\x18ftypisom\0\0\x02\0isomiso2".to_vec();
+    mp4.resize(4096, 0);
+    std::fs::write(root.path().join("clip.mp4"), &mp4).unwrap();
+    let mut webm = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\x82\x84webm".to_vec();
+    webm.resize(4096, 0);
+    std::fs::write(root.path().join("clip.bin"), &webm).unwrap();
     let source = Arc::new(LocalFileSource::open(root.path(), LocalLimits::default()).unwrap());
     let mut service = FileService::new(source, None, transfers(), downloads(), IDLE);
     service.image_previews = Some(hxd_files::ImagePreviews::new(
@@ -1216,7 +1222,10 @@ async fn ng_previews_are_drawn_again_or_decoded_text() {
         .await
         .unwrap();
     let login = ng_request(&mut ws, 1, "login", json!({"nick": "reader"})).await;
-    assert_eq!(login["ok"]["files"]["previews"], json!(["image", "text"]));
+    assert_eq!(
+        login["ok"]["files"]["previews"],
+        json!(["image", "text", "video"])
+    );
 
     let image = ng_request(&mut ws, 2, "files_preview", json!({"path": "photo.png"})).await;
     assert_eq!(image["ok"]["kind"], "image", "{image}");
@@ -1245,6 +1254,27 @@ async fn ng_previews_are_drawn_again_or_decoded_text() {
     );
     assert!(body.starts_with("line\nline\n") && !body.contains('\r'));
     assert!(body.len() < hxd_files::TEXT_BYTES as usize);
+
+    // A video is the file itself, as its container says it is and in
+    // ranges, whatever its name.
+    for (id, path, media_type) in [(6, "clip.mp4", "video/mp4"), (7, "clip.bin", "video/webm")] {
+        let video = ng_request(&mut ws, id, "files_preview", json!({"path": path})).await;
+        assert_eq!(video["ok"]["kind"], "video", "{video}");
+        assert_eq!(video["ok"]["media_type"], media_type);
+        let url = video["ok"]["url"].as_str().unwrap();
+        let served = http_get_bytes(server.ng, url, "Range: bytes=0-3\r\n").await;
+        let split = served.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&served[..split]).to_lowercase();
+        assert!(head.starts_with("http/1.1 206"), "{head}");
+        assert!(
+            head.contains(&format!("content-type: {media_type}")),
+            "{head}"
+        );
+        assert_eq!(
+            served[split + 4..],
+            *if id == 6 { &mp4[..4] } else { &webm[..4] }
+        );
+    }
 
     for (id, path, code) in [(4, "blob.bin", "unsupported"), (5, "folder", "not_file")] {
         let refused = ng_request(&mut ws, id, "files_preview", json!({"path": path})).await;

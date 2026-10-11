@@ -1,7 +1,8 @@
 //! What a client is shown of a file before it downloads one
 //! (`docs/hotline-ng.md` §7.2): an image this server has decoded and drawn
-//! again, smaller, or the start of a text in UTF-8. Never the file's own
-//! bytes, so a preview is nothing a browser has to be trusted to parse.
+//! again, smaller, or the start of a text in UTF-8, neither of them the
+//! file's own bytes; or, for a video, the file itself, streamed as the
+//! player asks for it, with the type its container says it is.
 
 use std::sync::Arc;
 
@@ -48,6 +49,8 @@ impl ImagePreviews {
 pub enum PreviewKind {
     Image,
     Text,
+    /// Served from the file, so `bytes` is empty.
+    Video,
 }
 
 pub struct Preview {
@@ -90,11 +93,20 @@ pub async fn make(service: &FileService, info: &FileInfo) -> Result<Preview, Pre
     let mut head = Vec::new();
     read(
         &mut body.reader,
-        TEXT_BYTES.min(info.size),
+        SNIFF_BYTES.min(info.size),
         &mut head,
         service,
     )
     .await?;
+    if let Some(media_type) = video_type(&head) {
+        return Ok(Preview {
+            kind: PreviewKind::Video,
+            media_type,
+            bytes: Vec::new(),
+            truncated: false,
+            dimensions: None,
+        });
+    }
     if is_image(&head) {
         let Some(images) = service.image_previews.as_ref() else {
             return Err(PreviewError::Unsupported);
@@ -131,6 +143,13 @@ pub async fn make(service: &FileService, info: &FileInfo) -> Result<Preview, Pre
             truncated: false,
         });
     }
+    read(
+        &mut body.reader,
+        TEXT_BYTES.min(info.size) - head.len() as u64,
+        &mut head,
+        service,
+    )
+    .await?;
     let truncated = info.size > head.len() as u64;
     let declared = info.type_code == Some(*b"TEXT")
         || info
@@ -162,6 +181,30 @@ async fn read(
     Ok(())
 }
 
+/// Enough of a file to know an image or a video by.
+const SNIFF_BYTES: u64 = 64;
+
+/// The containers browsers play, by their magic, as the type a player is
+/// told to expect.
+fn video_type(head: &[u8]) -> Option<&'static str> {
+    if head.get(4..8) == Some(&b"ftyp"[..]) {
+        // The major brand: HEIF and AVIF photographs are the same box.
+        return match head.get(8..12)? {
+            b"heic" | b"heix" | b"mif1" | b"msf1" | b"avif" | b"avis" => None,
+            b"qt  " => Some("video/quicktime"),
+            _ => Some("video/mp4"),
+        };
+    }
+    if head.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        // Matroska's DocType, which WebM narrows, comes in its header.
+        return Some(match head.windows(4).any(|w| w == b"webm") {
+            true => "video/webm",
+            false => "video/x-matroska",
+        });
+    }
+    head.starts_with(b"OggS").then_some("video/ogg")
+}
+
 /// The three formats the pipeline takes, by their magic.
 fn is_image(head: &[u8]) -> bool {
     head.starts_with(&[0xff, 0xd8, 0xff])
@@ -191,7 +234,28 @@ fn text(head: &[u8], truncated: bool, declared: bool) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::text;
+    use super::{text, video_type};
+
+    #[test]
+    fn a_video_is_known_by_its_container_and_a_photo_in_one_is_not() {
+        let ftyp = |brand: &[u8]| [&[0, 0, 0, 0x18][..], b"ftyp", brand, &[0; 4]].concat();
+        let cases: [(&[u8], Option<&str>); 8] = [
+            (&ftyp(b"isom"), Some("video/mp4")),
+            (&ftyp(b"qt  "), Some("video/quicktime")),
+            (&ftyp(b"heic"), None),
+            (&ftyp(b"avif"), None),
+            (b"\x1a\x45\xdf\xa3\x9f\x42\x82\x84webm", Some("video/webm")),
+            (
+                b"\x1a\x45\xdf\xa3\x9f\x42\x82\x88matroska",
+                Some("video/x-matroska"),
+            ),
+            (b"OggS\0\x02", Some("video/ogg")),
+            (b"\0\0\0\x18ftyp", None),
+        ];
+        for (head, expected) in cases {
+            assert_eq!(video_type(head), expected, "{head:?}");
+        }
+    }
 
     #[test]
     fn text_is_utf8_or_declared_mac_roman_with_lf_endings() {

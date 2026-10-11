@@ -961,6 +961,9 @@ pub struct DownloadGrant {
 const PREVIEWS_HELD: usize = 64 << 20;
 const PREVIEWS_HELD_PER_ACCOUNT: usize = 16 << 20;
 
+/// How long a video's token outlives its last fetch: a pause.
+const VIDEO_IDLE: Duration = Duration::from_secs(3600);
+
 pub struct DownloadTokens {
     ttl: Duration,
     limits: EntryLimits,
@@ -987,16 +990,18 @@ impl DownloadTokens {
         self.issue_grant(principal, account, path, ranges, None)
     }
 
-    /// A token serving `preview` rather than the file at `path`, counted
-    /// against `account`, which for a preview names whose bytes it holds.
+    /// A token serving `preview` rather than the file at `path`, or, for a
+    /// video, the file as the preview's type; counted against `account`,
+    /// which for a preview names whose bytes it holds.
     pub fn issue_preview(
         &self,
         principal: FilePrincipal,
         account: &str,
         path: FilePath,
+        ranges: bool,
         preview: crate::Preview,
     ) -> Result<String, FileError> {
-        self.issue_grant(principal, account, path, false, Some(Arc::new(preview)))
+        self.issue_grant(principal, account, path, ranges, Some(Arc::new(preview)))
     }
 
     fn issue_grant(
@@ -1073,6 +1078,14 @@ impl DownloadTokens {
                 grants.remove(&digest);
             }
             return None;
+        }
+        // A video is fetched a range at a time for as long as it is
+        // watched, so once fetched its token lasts from each fetch. Until
+        // then it is any token, and holds its place no longer.
+        if grant.preview.as_ref().map(|p| p.kind) == Some(crate::PreviewKind::Video) {
+            if let Some(current) = self.grants.lock().unwrap().get_mut(&digest) {
+                current.expires_at = Instant::now() + VIDEO_IDLE.max(self.ttl);
+            }
         }
         Some(grant)
     }
@@ -1425,6 +1438,7 @@ mod tests {
                 principal,
                 holder,
                 FilePath::parse("f").unwrap(),
+                false,
                 crate::Preview {
                     kind: crate::PreviewKind::Image,
                     media_type: "image/png",
@@ -1438,6 +1452,40 @@ mod tests {
         issue("one").unwrap();
         assert!(matches!(issue("one"), Err(FileError::Busy)));
         issue("two").unwrap();
+    }
+
+    #[test]
+    fn a_fetched_video_token_lasts_from_its_fetch_and_others_from_their_issue() {
+        let core = Core::new();
+        let principal = attach(&core, "viewer");
+        let tokens = DownloadTokens::new(Duration::from_millis(50), limits(8, 4, 4));
+        let preview = |kind| crate::Preview {
+            kind,
+            media_type: "video/mp4",
+            bytes: Vec::new(),
+            truncated: false,
+            dimensions: None,
+        };
+        let issue = |kind| {
+            tokens
+                .issue_preview(
+                    principal,
+                    "viewer",
+                    FilePath::parse("f").unwrap(),
+                    true,
+                    preview(kind),
+                )
+                .unwrap()
+        };
+        let watched = issue(crate::PreviewKind::Video);
+        let unwatched = issue(crate::PreviewKind::Video);
+        let text = issue(crate::PreviewKind::Text);
+        assert!(tokens.resolve(&watched, &core).is_some());
+        assert!(tokens.resolve(&text, &core).is_some());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(tokens.resolve(&watched, &core).is_some());
+        assert!(tokens.resolve(&unwatched, &core).is_none());
+        assert!(tokens.resolve(&text, &core).is_none());
     }
 
     #[test]

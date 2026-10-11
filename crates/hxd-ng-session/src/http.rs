@@ -485,7 +485,12 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
         // indistinguishable: a bearer URL must not become a session oracle.
         return plain(StatusCode::NOT_FOUND, "not found");
     };
-    if let Some(preview) = grant.preview {
+    let video = grant
+        .preview
+        .as_ref()
+        .filter(|p| p.kind == hxd_files::PreviewKind::Video)
+        .map(|p| p.media_type);
+    if let Some(preview) = grant.preview.filter(|_| video.is_none()) {
         // Bytes this server made, as a news attachment's are, served so
         // that nothing reads them as anything else.
         return Response::builder()
@@ -554,8 +559,8 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
         )
         .header(
             CONTENT_TYPE,
-            info.media_type
-                .as_deref()
+            video
+                .or(info.media_type.as_deref())
                 .unwrap_or("application/octet-stream"),
         );
     if grant.ranges {
