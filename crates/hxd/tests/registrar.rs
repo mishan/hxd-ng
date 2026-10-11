@@ -1292,3 +1292,58 @@ async fn a_key_its_registrar_revokes_loses_its_session_here_and_a_banned_registr
         (403, json!("denied"))
     );
 }
+
+#[tokio::test]
+async fn a_key_admitted_while_its_registrar_was_down_is_still_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let card = attested(&r, &alice, "alice").await;
+
+    // Admitted on nothing held: the registrar does not answer.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = closed.local_addr().unwrap();
+    drop(closed);
+    let (v, identity) = verifier(
+        &there,
+        &r,
+        Trust::Key,
+        &format!("http://{addr}"),
+        "registrar_timeout = 1",
+    )
+    .await;
+    let mut alice_here = session_at(v, &alice, &card).await;
+
+    // It answers again, and she is revoked there.
+    let up = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let to = r.ng;
+    tokio::spawn(async move {
+        loop {
+            let (mut a, _) = up.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut b = TcpStream::connect(to).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+            });
+        }
+    });
+    let gone = hl_identity::IdentityRevocation {
+        identity: alice.public(),
+        time: now(),
+        reason: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    assert_eq!(
+        post(&r, "/registrar/records", json!({ "record": b64(&gone) }))
+            .await
+            .status,
+        200
+    );
+    next_list().await;
+    assert_eq!(identity.sweep_records().await.len(), 1);
+    alice_here.event("kicked").await.unwrap();
+}

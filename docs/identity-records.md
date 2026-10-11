@@ -72,10 +72,12 @@ is found, the records cache is durable, and the fetch is its own crate.
   its session is attached would otherwise keep that session until it
   next resumes, which can be days for a phone. So a sweep refreshes, on
   the records' own lifetime, the lists of identities with a live or
-  detached session, and applying a list that now refuses one ends its
-  sessions through the same path `set_revocations` uses. A rotation's
+  detached session, from the registrars that attested each when it was
+  admitted, reached then or not, and applying a list that now refuses
+  one ends its sessions through the same path `set_revocations` uses. A rotation's
   predecessor and a device revocation end theirs too; a freeze ends
-  them only when `frozen = deny`.
+  them only when `frozen = deny`. An attestation revocation waits for
+  the session's next admission.
 - **A ban on a registrar reads every attestation.** `banned_registrars`
   (and `*@host`) is checked against each attestation on the card,
   verified or not: a card is the identity's own signature, so an
@@ -84,8 +86,8 @@ is found, the records cache is durable, and the fetch is its own crate.
 
 ## 3. Applying records
 
-As §7.3's table, at each of its three points and at the sweep: a list
-is applied in `time` order; `AuthRefused` gains `Rotated { successor }`
+As §7.3's table, at each of its three points: a list is applied in
+`time` order; `AuthRefused` gains `Rotated { successor }`
 and the `frozen` outcomes; a device revocation also drops the device's
 cached card. An attestation revocation is applied before age is
 computed, and an identity left with no attestation is unattested, which
