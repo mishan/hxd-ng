@@ -565,6 +565,15 @@ impl LocalFileSource {
         })
     }
 
+    /// The generation of the partial `files` writes, which a later piece
+    /// of the same upload checks it is still writing.
+    pub(crate) fn upload_generation(
+        &self,
+        files: &UploadFiles,
+    ) -> Result<[u8; UPLOAD_GENERATION_LEN], FileError> {
+        self.read_upload_generation(&files.base)
+    }
+
     pub(crate) fn recheck_resume(
         &self,
         files: &UploadFiles,
@@ -1158,7 +1167,7 @@ fn partial_base(owner: &str, path: &FilePath) -> String {
 pub(crate) struct PartialKey {
     owner: String,
     base: String,
-    blind: bool,
+    pub(crate) blind: bool,
 }
 
 impl PartialKey {

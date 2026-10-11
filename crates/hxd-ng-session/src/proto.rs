@@ -120,6 +120,17 @@ pub struct FilesDownloadParams {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct FilesUploadParams {
+    pub path: String,
+    /// Decimal, as every size on this wire.
+    pub size: String,
+    #[serde(default)]
+    pub comment: Option<String>,
+    #[serde(default)]
+    pub fresh: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FilesMoveParams {
     pub path: String,
     /// The entry's new path: another folder, another name, or both.

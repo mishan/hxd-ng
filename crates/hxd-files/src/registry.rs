@@ -650,6 +650,7 @@ impl TransferRegistry {
             }
             _ => None,
         };
+        let running = &state.running;
         let entries = &mut state.entries;
         for _ in 0..64 {
             let mut bytes = [0; 4];
@@ -658,6 +659,7 @@ impl TransferRegistry {
             let reference = u32::from_ne_bytes(bytes);
             if reference != 0
                 && !entries.contains_key(&reference)
+                && !running.contains_key(&reference)
                 && transfer.hope().is_none_or(|keys| keys.claim(reference))
             {
                 let mut generation = [0; 16];
@@ -697,6 +699,50 @@ impl TransferRegistry {
     ) -> Result<PreparedTransfer, FileError> {
         self.claim_running(core, preamble, peer)
             .map(|(transfer, _)| transfer)
+    }
+
+    /// Counts an upload with no reference against `person`'s limits while
+    /// the guard lives: a piece of an ng upload, which has no transfer
+    /// connection to claim one with. Past the limit it is refused, as an
+    /// upload's reference is.
+    pub fn run_upload(
+        &self,
+        principal: FilePrincipal,
+        person: &str,
+    ) -> Result<RunningTransfer, FileError> {
+        let mut state = self.shared.state.lock().unwrap();
+        if !self.shared.may_start(&state, Direction::Up, person) {
+            return Err(FileError::TooManyTransfers);
+        }
+        for _ in 0..64 {
+            let mut bytes = [0; 4];
+            getrandom::getrandom(&mut bytes)
+                .map_err(|e| FileError::Unavailable(format!("transfer reference: {e}")))?;
+            let reference = u32::from_ne_bytes(bytes);
+            if reference != 0
+                && !state.entries.contains_key(&reference)
+                && !state.running.contains_key(&reference)
+            {
+                let cancel = Arc::new(AtomicBool::new(false));
+                state.running.insert(
+                    reference,
+                    Running {
+                        direction: Direction::Up,
+                        principal,
+                        person: person.to_owned(),
+                        cancel: cancel.clone(),
+                    },
+                );
+                return Ok(RunningTransfer {
+                    shared: self.shared.clone(),
+                    reference,
+                    cancel,
+                });
+            }
+        }
+        Err(FileError::Unavailable(
+            "could not allocate a transfer reference".into(),
+        ))
     }
 
     /// Claims the reference a transfer connection from `peer` presented,

@@ -272,6 +272,9 @@ background, not a separate implementation contract.
   drawn again by the media pipeline, or the start of a text as UTF-8,
   served behind a download token and never the file's own bytes; and a
   video, which is, streamed in ranges as its container's type.
+- Uploads on the ng wire (`files_upload`, `docs/ng-uploads.md`) —
+  built on the server: FilePut's rules, the bytes in pieces over HTTP,
+  resumed on a new session with the Large File digest.
 
 ## Phase 4 — News
 

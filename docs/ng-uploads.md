@@ -1,6 +1,6 @@
 # Uploads on the Hotline-ng wire
 
-Status: designed, not built. §8 stages it.
+Status: U1 (hxd-ng) built; hx-ng's side (U2) is next. §8 stages it.
 
 The ng wire browses, downloads and previews files and changes the area
 (`hotline-ng.md` §7.2), but has no way to put a file there: a phone or
@@ -85,17 +85,23 @@ Content-Range: bytes 0-8388607/48127330
   long) asks `files_upload` again with the same `path` and `size`, and
   is quoted its partial's length: partials are keyed by the account's
   login and the path, as classic ones are, and outlive the session.
-- Before the client sends from a quoted offset it proves it holds the
-  same bytes the partial does, the way Large File resume does: the
-  quote carries `digest`, the SHA-256 trailing-window digest of the
-  partial (`hxfiles_xfer::resume_digest`, a 64 KiB window), and the
-  client's first piece echoes the digest of its own file's window in
-  `Upload-Digest`. The server compares in constant time; a mismatch is
-  `409` and the client starts over with `"fresh": true`, which discards
-  the partial. A client that cannot compute it sends `fresh: true` and
-  loses only the resume.
-- A size that differs from the partial's is a different file: the quote
-  is `"0"` and the partial is replaced.
+- Before the client sends from a quoted offset it checks that the
+  partial is the start of its own file, the way Large File resume does:
+  the quote carries `digest`, the SHA-256 trailing-window digest of the
+  partial (`hxfiles_xfer::resume_digest`, a 64 KiB window), which the
+  client compares with the same digest of its own file at that offset.
+  It echoes the digest in the first piece's `Upload-Digest`, and the
+  server refuses a piece that does not with `409`, so a client cannot
+  carry on without having been told what it would be carrying on from.
+  The check is the client's: the server holds no copy of the client's
+  file, so the echo binds the piece to the quote, not to the bytes. A
+  client whose file is not the partial's starts over with
+  `"fresh": true`, which discards the partial; one that cannot compute
+  the digest sends `fresh: true` and loses only the resume.
+- The partial does not record the size it was begun with, so a client
+  asking with another size is quoted the partial all the same, unless
+  it is longer than the new size; the digest is what tells a client
+  whether the partial is its file.
 
 ## 4. Drop boxes
 
@@ -103,8 +109,11 @@ As FilePut: an account without `view_drop_boxes` may upload into a drop
 box but not into a folder inside one, and its upload is blind. A blind
 upload is never refused for a taken name; it is published under the
 first free one (`name 2.txt`). It is never quoted a partial (`offset`
-is always `"0"`) and its partial goes when its token does, so one guest
-can neither find nor finish another's.
+is always `"0"`), and it is sent in one piece (`piece` is its size):
+its partial lasts only while the request writing it does, as a classic
+blind upload's lasts only while its transfer does, so one guest can
+neither find nor finish another's, and a dropped connection starts it
+over.
 
 ## 5. What it costs
 

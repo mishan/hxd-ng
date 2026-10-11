@@ -931,7 +931,7 @@ async fn receive_upload<S: HtxfStream>(
 }
 
 /// Runs local disk work on the blocking pool, under an I/O permit.
-async fn on_disk<T: Send + 'static>(
+pub(crate) async fn on_disk<T: Send + 'static>(
     source: &Arc<LocalFileSource>,
     work: impl FnOnce(&LocalFileSource) -> Result<T, FileError> + Send + 'static,
 ) -> Result<T, FileError> {
@@ -1139,7 +1139,7 @@ fn spend(budget: &mut u64, amount: u64) -> Result<(), FileError> {
 /// dropping one does not push it to the file, so an upload that ends early
 /// would otherwise leave a partial the next resume quote measures as
 /// shorter than it is — or as empty, which discards it.
-async fn copy_exact<R: AsyncRead + Unpin>(
+pub(crate) async fn copy_exact<R: AsyncRead + Unpin>(
     reader: &mut R,
     writer: &mut tokio::fs::File,
     remaining: u64,
@@ -1216,7 +1216,7 @@ impl Liveness {
         self
     }
 
-    fn check(&self) -> Result<(), FileError> {
+    pub(crate) fn check(&self) -> Result<(), FileError> {
         if self
             .killed
             .as_ref()
