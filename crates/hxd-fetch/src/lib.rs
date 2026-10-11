@@ -1,4 +1,6 @@
-//! The fetch (`docs/news-feeds.md` §4).
+//! An HTTP GET to a URL the operator chose, from a news feed
+//! (`docs/news-feeds.md` §4) to a registrar (`docs/identity-records.md`):
+//! conditional, and bounded in time and in bytes after decompression.
 //!
 //! **The address connected to is an address checked.** As the push
 //! sender's (`docs/webpush-gateway.md` §6): each connection resolves its
@@ -6,10 +8,10 @@
 //! to those answers and nothing else, so a name server cannot answer the
 //! check one way and the connect another. Every hop of a redirect is a
 //! new connection and is checked the same way: the operator chose the
-//! URL, but the feed's host chooses where it redirects. A feed whose
-//! configured URL is itself on the local network is the operator's to
-//! choose and is fetched unchecked. There is no pool and no resolver but
-//! this one, and the environment's proxy variables are never read.
+//! URL, but its host chooses where it redirects. A URL that is itself on
+//! the local network is the operator's to choose and is fetched
+//! unchecked. There is no pool and no resolver but this one, and the
+//! environment's proxy variables are never read.
 
 use std::fmt;
 use std::io::{self, Read};
@@ -49,6 +51,8 @@ pub struct FetchConfig {
     /// to behind it is the proxy's business.
     pub proxy: Option<String>,
     pub user_agent: String,
+    /// The `Accept` header: what the caller can read.
+    pub accept: &'static str,
 }
 
 /// What makes the next fetch conditional.
@@ -64,8 +68,8 @@ pub enum Fetched {
     Body {
         bytes: Vec<u8>,
         validators: Validators,
-        /// Where a permanent redirect says the feed now lives, for the
-        /// operator to read in the log. Never followed next time.
+        /// Where a permanent redirect says the resource now lives, for
+        /// the operator to read in the log. Never followed next time.
         moved_to: Option<String>,
     },
 }
@@ -430,11 +434,7 @@ fn request(
     let mut r = Request::get(target)
         .header(HOST, authority(url, false))
         .header(USER_AGENT, cfg.user_agent.as_str())
-        .header(
-            ACCEPT,
-            "application/atom+xml, application/rss+xml, application/feed+json, \
-             application/xml;q=0.9, text/xml;q=0.9, application/json;q=0.9, */*;q=0.8",
-        )
+        .header(ACCEPT, cfg.accept)
         .header(ACCEPT_ENCODING, "gzip")
         .header(CONNECTION, "close");
     // A validator that is not a header value was never one this server

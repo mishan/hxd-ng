@@ -1454,16 +1454,25 @@ dependencies = [
 name = "hxd-feeds"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "feed-rs",
- "flate2",
  "html5gum",
+ "hxd-fetch",
+ "pulldown-cmark",
+ "sha2",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "hxd-fetch"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "flate2",
  "http-body-util",
  "hxd-core",
  "hyper",
  "hyper-util",
- "pulldown-cmark",
- "sha2",
  "tokio",
  "tokio-rustls",
  "url",
