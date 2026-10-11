@@ -132,11 +132,12 @@ fn image_previews() -> Option<hxd_files::ImagePreviews> {
         ..Default::default()
     })
     .with_own_permits(1);
-    Some(hxd_files::ImagePreviews {
-        codec: Arc::new(codec),
-        max_bytes: MAX_BYTES as u64,
-        max_dimension: 1024,
-    })
+    Some(hxd_files::ImagePreviews::new(
+        Arc::new(codec),
+        MAX_BYTES as u64,
+        1024,
+        2,
+    ))
 }
 
 #[cfg(not(feature = "media"))]

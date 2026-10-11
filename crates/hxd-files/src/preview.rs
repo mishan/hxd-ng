@@ -16,11 +16,32 @@ pub const TEXT_BYTES: u64 = 256 * 1024;
 /// The pipeline image previews are made with, and its bounds.
 #[derive(Clone)]
 pub struct ImagePreviews {
-    pub codec: Arc<dyn MediaCodec>,
+    codec: Arc<dyn MediaCodec>,
     /// The largest file read for one; the codec refuses larger itself.
-    pub max_bytes: u64,
+    max_bytes: u64,
     /// What a preview is fitted to, on its longer side.
-    pub max_dimension: u32,
+    max_dimension: u32,
+    /// Images read at once. A read holds the whole file before the codec
+    /// has a decode to give it, so the codec's own bound comes too late.
+    reads: Arc<tokio::sync::Semaphore>,
+}
+
+impl ImagePreviews {
+    /// `reads` images held at once for decoding: a few more than the
+    /// codec decodes at once, so one waits for a decode as the last ends.
+    pub fn new(
+        codec: Arc<dyn MediaCodec>,
+        max_bytes: u64,
+        max_dimension: u32,
+        reads: usize,
+    ) -> Self {
+        ImagePreviews {
+            codec,
+            max_bytes,
+            max_dimension,
+            reads: Arc::new(tokio::sync::Semaphore::new(reads)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +102,11 @@ pub async fn make(service: &FileService, info: &FileInfo) -> Result<Preview, Pre
         if info.size > images.max_bytes {
             return Err(PreviewError::TooLarge);
         }
+        let _read = images
+            .reads
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| PreviewError::Busy)?;
         read(
             &mut body.reader,
             info.size - head.len() as u64,

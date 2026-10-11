@@ -179,9 +179,12 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 ok["width"] = json!(width);
                 ok["height"] = json!(height);
             }
+            // Held against the person, as transfers are: guests share a
+            // login and not an address.
+            let holder = ctx.core.transfer_person(state.uid).unwrap_or(login);
             match service
                 .downloads
-                .issue_preview(principal, &login, info.path, preview)
+                .issue_preview(principal, &holder, info.path, preview)
             {
                 Ok(token) => {
                     ok["url"] = json!(format!("/files/{token}"));

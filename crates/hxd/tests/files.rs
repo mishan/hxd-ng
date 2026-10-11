@@ -1164,15 +1164,16 @@ async fn ng_previews_are_drawn_again_or_decoded_text() {
     std::fs::create_dir(root.path().join("folder")).unwrap();
     let source = Arc::new(LocalFileSource::open(root.path(), LocalLimits::default()).unwrap());
     let mut service = FileService::new(source, None, transfers(), downloads(), IDLE);
-    service.image_previews = Some(hxd_files::ImagePreviews {
-        codec: Arc::new(hxd_media::Codec::new(hxd_core::CodecLimits {
+    service.image_previews = Some(hxd_files::ImagePreviews::new(
+        Arc::new(hxd_media::Codec::new(hxd_core::CodecLimits {
             max_bytes: 16 << 20,
             max_pixels: 2048 * 1024,
             ..Default::default()
         })),
-        max_bytes: 16 << 20,
-        max_dimension: 1024,
-    });
+        16 << 20,
+        1024,
+        2,
+    ));
     let server = run_service(
         Arc::new(service),
         "download_files = true\nread_chat = true\nuse_any_name = true\n",

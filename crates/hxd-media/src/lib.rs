@@ -114,7 +114,9 @@ impl Codec {
     /// Everything before the decode: the cheap gates, in the order that
     /// makes each next one safe. Separated so the tests can reach it
     /// without a decoder, and so the expensive half has one entry.
-    fn inspect(&self, input: &[u8]) -> Result<walk::Walked, MediaReject> {
+    /// A caller that draws only a first frame (`still`) is not held to
+    /// the animation's budgets.
+    fn inspect(&self, input: &[u8], still: bool) -> Result<walk::Walked, MediaReject> {
         if input.len() < self.limits.min_bytes || input.len() > self.limits.max_bytes {
             return Err(MediaReject::TooLarge);
         }
@@ -153,6 +155,9 @@ impl Codec {
         // every cap above can pass and a hundred and fifty frames of two
         // thousand pixels square still decodes to gigabytes. Checked
         // from the walk's count, so it costs nothing.
+        if still {
+            return Ok(walked);
+        }
         if u64::from(walked.frames) * u64::from(w) * u64::from(h) * 4 > self.limits.max_alloc_bytes
         {
             debug!(
@@ -231,7 +236,11 @@ impl MediaCodec for Codec {
     }
 
     fn preview(&self, input: &[u8], max_dimension: u32) -> Result<Canonical, MediaReject> {
-        let walked = self.inspect(input)?;
+        // A file too small to be an image is not one, rather than too large.
+        if input.len() < self.limits.min_bytes {
+            return Err(MediaReject::Unsupported);
+        }
+        let walked = self.inspect(input, true)?;
         let _permit = self.permits.acquire(self.limits.permit_wait)?;
         let img = fit(self.decode_still(input, &walked)?, max_dimension);
         let (mime, bytes) = match walked.format {
@@ -248,7 +257,7 @@ impl MediaCodec for Codec {
     }
 
     fn canonicalize(&self, input: &[u8]) -> Result<Canonical, MediaReject> {
-        let walked = self.inspect(input)?;
+        let walked = self.inspect(input, false)?;
         // Only the expensive half needs a permit: everything above is
         // bounded arithmetic over the input, and making a client queue
         // for that would turn a cheap rejection into a slow one.
@@ -351,7 +360,7 @@ impl Codec {
         limits: &AvatarLimits,
     ) -> Result<AvatarImages, MediaReject> {
         let codec = self.with_max_bytes(limits.max_bytes);
-        let walked = codec.inspect(input)?;
+        let walked = codec.inspect(input, false)?;
         let _permit = self.permits.acquire(self.limits.permit_wait)?;
         if walked.format == Format::Gif && walked.frames > 1 {
             let (canonical, first) = codec.fit_animation(input, limits.max_dimension)?;
@@ -736,6 +745,27 @@ mod derivative_tests {
         assert!(codec.canonicalize(&png).is_ok());
         assert_eq!(apart.avatar(&png, &limits), Err(MediaReject::Busy));
         drop(own);
+    }
+
+    #[test]
+    fn a_preview_is_an_animations_first_frame_past_its_animation_budget() {
+        let mut gif = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(Cursor::new(&mut gif));
+            for i in 0..200u8 {
+                let frame = image::RgbaImage::from_pixel(32, 16, image::Rgba([i, 0, 0, 255]));
+                encoder.encode_frame(Frame::new(frame)).unwrap();
+            }
+        }
+        let codec = Codec::new(CodecLimits {
+            max_bytes: 1 << 20,
+            ..CodecLimits::default()
+        });
+        assert_eq!(codec.canonicalize(&gif), Err(MediaReject::TooLarge));
+        let preview = codec.preview(&gif, 8).unwrap();
+        assert_eq!(preview.mime, MediaType::Png);
+        assert_eq!((preview.width, preview.height), (8, 4));
+        assert_eq!(codec.preview(&gif[..10], 8), Err(MediaReject::Unsupported));
     }
 
     #[test]
