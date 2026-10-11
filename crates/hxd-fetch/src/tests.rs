@@ -61,6 +61,7 @@ fn cfg() -> FetchConfig {
         max_bytes: 1024,
         proxy: None,
         user_agent: "hxd-ng-test/1".into(),
+        accept: "*/*",
     }
 }
 

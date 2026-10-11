@@ -1,0 +1,32 @@
+[package]
+name = "hxd-fetch"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "hxd-ng's outbound HTTP GET: every address it connects to checked, bounded in time and bytes"
+publish = false
+
+[dependencies]
+# The address classifier the push sender uses (`docs/webpush-gateway.md` §6).
+hxd-core = { workspace = true }
+tokio = { workspace = true }
+# Redirect targets are resolved with the same parser that read the URL.
+url = "2"
+# gzip, decoded under the body cap.
+flate2 = "1"
+# The client: one hyper HTTP/1 connection per hop, over a stream this
+# crate opens itself to an address it has checked, as the push sender's
+# (`docs/webpush-gateway.md` §6), and the same versions.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+webpki-roots = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
