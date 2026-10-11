@@ -1,6 +1,6 @@
 # Applying a registrar's records: the verifying server
 
-Status: designed, not built. §6 stages it.
+Status: R1's admission half built (records fetched at `auth`, kept on disk and applied); the sweep that ends sessions and `banned_registrars` are next. §6 stages it.
 
 `identity-registrar.md` §7 says what a server that trusts a registrar
 does with what the registrar publishes: resolve its key, fetch the
@@ -52,13 +52,13 @@ is found, the records cache is durable, and the fetch is its own crate.
   configured by the operator and is fetched as a configured feed is,
   private address and all; a registrar learned any other way is not
   fetched at all (§7.1 resolves only trusted registrars).
-- **The identity code asks through a trait.** `hxd-ng-session` gains a
-  `RegistrarClient` (discover a host, fetch a fingerprint's records),
-  which `hxd` implements over `hxd-fetch` and the tests implement over a
-  real `hxd-registrar` in process, the way the e2e suites already stand
-  a registrar up. The handshake never blocks on the network for longer
-  than `[identity] registrar_timeout` (default 3 s); past it the cache
-  and `revocation_stale` decide, as for an unreachable registrar.
+- **The identity code fetches with `hxd-fetch` directly.** The tests
+  stand a real registrar up in process and point the verifying server at
+  it with `[identity.registrar_urls]`, which asks for the registrar by its
+  own name at an address the operator gives, as a LAN deployment would.
+  The handshake never blocks on the network for longer than
+  `[identity] registrar_timeout` (default 3 s); past it the cache and
+  `revocation_stale` decide, as for an unreachable registrar.
 - **The records cache is durable.** Lists are kept in a small SQLite
   table beside the bans (fingerprint, registrar, the signed bytes, their
   `expires`, when fetched), so `revocation_stale = cached` still has
@@ -91,6 +91,14 @@ computed, and an identity left with no attestation is unattested, which
 logged with the registrar, the record's `seq` and the fingerprint, and
 counted in `metrics` (`hxd_identity_records_applied_total{kind}`).
 
+An identity's records are fetched from the registrars that attested it,
+so a card shown without its attestations is not looked up: whoever holds
+a revoked identity key can drop the attestation and be admitted as the
+unattested key it then is. §7.2 says as much (an unattested identity "is
+never stale"); what refuses a stolen key everywhere is its holder
+revoking it, which every server that cached the list then applies, and
+the operator's own `revoked_identities`.
+
 ## 4. Rotation at the server
 
 §7.4 as written: accepted from a trusted registrar's list, or from an
@@ -114,16 +122,18 @@ a server may stop between two stores.
 ```toml
 [identity]
 registrar_timeout  = 3          # seconds a handshake waits on a registrar
+trusted_registrars = []         # hosts trusted on their discovery document's key
 revocation_max_age = 3600       # a list is used at most this long, whatever its `expires`
 revocation_stale   = "cached"   # cached | guest | deny, past both
 frozen             = "deny"     # deny | guest
 banned_registrars  = []         # hosts whose identities are refused with `denied`
 
-[identity.registrar_keys]       # unchanged; a host here skips discovery
+[identity.registrar_keys]       # trusted on this key; discovery is still read for endpoints
+[identity.registrar_urls]       # host → base URL, for a registrar not at https://<host>
 ```
 
-`trusted_registrars` (§11 there) is accepted as the list of hosts to
-trust by discovery; a host in both is trusted by its configured key.
+A host in both `trusted_registrars` and `registrar_keys` is trusted by
+its configured key.
 
 ## 6. Staging
 

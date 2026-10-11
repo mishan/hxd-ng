@@ -15,8 +15,9 @@
 //!
 //! Revocation is the operator's own list (`identity-registrar.md`),
 //! held by the core so that installing it can end the sessions it
-//! refuses; the registrar's published records, which need a registrar to
-//! fetch from, are not here yet, and are marked where they would go.
+//! refuses, and then what the registrars that attested the identity
+//! publish against it (§7.3 there), which `crate::registrars` fetches
+//! and keeps.
 //! Rate limiting is the HTTP layer's, in front of this: challenges per
 //! address, and the core's count of failed logins, which a password
 //! checked here shares with both wires' logins.
@@ -25,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hl_identity::{caps, Attestation, Fingerprint, LoginContext, PublicKey, ServerKey};
+use hl_identity::{caps, Attestation, Fingerprint, LoginContext, PublicKey, Record, ServerKey};
 use hxd_core::{
     AccessBits, Account, AuthBackend, AuthError, IdentityTag, LinkOutcome, Proof, UnlinkOutcome,
 };
@@ -53,6 +54,14 @@ pub enum Unattested {
     Allow,
 }
 
+/// What a freeze at a registrar does here (`identity-registrar.md` §7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Frozen {
+    Deny,
+    /// Admit the identity as though it were unattested.
+    Guest,
+}
+
 /// The `[identity]` section, already parsed. See the spec's §12 for the
 /// meaning of each.
 #[derive(Debug, Clone)]
@@ -78,6 +87,7 @@ pub struct IdentityConfig {
     /// Where successor commitments (§3.4) are persisted. `None` keeps
     /// them per-process, which the spec's §12 marks as the weaker mode.
     pub anchors: Option<std::path::PathBuf>,
+    pub frozen: Frozen,
 }
 
 impl Default for IdentityConfig {
@@ -93,6 +103,7 @@ impl Default for IdentityConfig {
             default_access: None,
             max_new_accounts_per_hour: Some(60),
             anchors: None,
+            frozen: Frozen::Deny,
         }
     }
 }
@@ -173,6 +184,25 @@ impl TransportIdentity {
             device: Fingerprint::of(&self.device).0,
             handle: self.handle.clone(),
         }
+    }
+}
+
+/// A login whose certificate, card and proof have verified, waiting to
+/// be admitted (`IdentityState::admit_verified`).
+pub struct Verified {
+    card: hl_identity::Card,
+    cert: hl_identity::DeviceCert,
+    card_bytes: Vec<u8>,
+    cert_bytes: Vec<u8>,
+}
+
+impl Verified {
+    pub fn identity(&self) -> &PublicKey {
+        &self.card.identity
+    }
+
+    pub fn attestations(&self) -> &[Attestation] {
+        &self.card.attestations
     }
 }
 
@@ -336,6 +366,8 @@ pub struct IdentityState {
     /// checks them, and admission must too, or `auth` with the card is a
     /// way around the check.
     registrar: Option<Arc<hxd_registrar::Registrar>>,
+    /// The registrars this server trusts, their keys and their records.
+    registrars: Option<Arc<crate::registrars::Registrars>>,
 }
 
 /// Credentials a client may add to `/identity/auth` (§5.4) to verify a
@@ -395,7 +427,7 @@ pub enum Downstream {
     Cleartext,
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -448,6 +480,7 @@ impl IdentityState {
             }),
             anchors,
             registrar: None,
+            registrars: None,
         }
     }
 
@@ -455,6 +488,15 @@ impl IdentityState {
     pub fn with_registrar(mut self, registrar: Option<Arc<hxd_registrar::Registrar>>) -> Self {
         self.registrar = registrar;
         self
+    }
+
+    pub fn with_registrars(mut self, registrars: Arc<crate::registrars::Registrars>) -> Self {
+        self.registrars = Some(registrars);
+        self
+    }
+
+    pub fn registrars(&self) -> Option<&Arc<crate::registrars::Registrars>> {
+        self.registrars.as_ref()
     }
 
     pub fn config(&self) -> &IdentityConfig {
@@ -512,6 +554,17 @@ impl IdentityState {
         proof: &[u8],
         req: AuthRequest<'_>,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
+        self.admit_verified(self.verify_proof(card, cert, proof)?, req)
+    }
+
+    /// Steps 1–3 of the proof binding (§5.2): the challenge spent, and the
+    /// certificate, card and proof verified.
+    pub fn verify_proof(
+        &self,
+        card: &[u8],
+        cert: &[u8],
+        proof: &[u8],
+    ) -> Result<Verified, AuthRefused> {
         // Peek at the challenge inside the proof so we can consume it
         // before doing any signature work; a bad proof still burns it.
         let challenge = match hl_identity::LoginProof::parse(proof) {
@@ -542,11 +595,28 @@ impl IdentityState {
             debug!("identity auth refused: {e}");
             classify(&e, card.len())
         })?;
+        Ok(Verified {
+            card: v.card,
+            cert: v.cert,
+            card_bytes: card.to_vec(),
+            cert_bytes: cert.to_vec(),
+        })
+    }
+
+    /// Admit a login [`Self::verify_proof`] or [`Self::verify_presented`]
+    /// verified: steps 4 onward. Between the two, the caller fetches what
+    /// the registrars publish against the identity, so that only a login
+    /// that proved its key can send this server to a registrar.
+    pub fn admit_verified(
+        &self,
+        v: Verified,
+        req: AuthRequest<'_>,
+    ) -> Result<(String, TransportIdentity), AuthRefused> {
         self.admit(
             v.card,
             v.cert,
-            cert.to_vec(),
-            card.to_vec(),
+            v.cert_bytes,
+            v.card_bytes,
             req,
             Assoc::Write,
         )
@@ -561,13 +631,28 @@ impl IdentityState {
         device: &PublicKey,
         req: AuthRequest<'_>,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
+        self.admit_verified(self.verify_presented(card, cert, device)?, req)
+    }
+
+    /// Steps 1–3 of the mTLS binding (§5.3).
+    pub fn verify_presented(
+        &self,
+        card: &[u8],
+        cert: &[u8],
+        device: &PublicKey,
+    ) -> Result<Verified, AuthRefused> {
         if cert.len() > hl_identity::cert::MAX_BYTES {
             return Err(AuthRefused::BadCert);
         }
         let (c, dc) =
             hl_identity::verify_presented(card, cert, device, now_unix(), self.cfg.clock_skew)
                 .map_err(|e| classify(&e, card.len()))?;
-        self.admit(c, dc, cert.to_vec(), card.to_vec(), req, Assoc::Write)
+        Ok(Verified {
+            card: c,
+            cert: dc,
+            card_bytes: card.to_vec(),
+            cert_bytes: cert.to_vec(),
+        })
     }
 
     /// Steps 5–6, account association (§8.1–§8.2), and the token issue,
@@ -602,9 +687,15 @@ impl IdentityState {
             return Err(AuthRefused::Revoked);
         }
 
-        // Step 5: attestations against the trusted table.
+        // Step 4, continued: what the registrars that attested it publish.
         let now = now_unix();
-        let (handle, age) = self.accept_attestations(&card.attestations, now);
+        let attestations = self.apply_records(&card, &cert, now)?;
+
+        // Step 5: attestations against the trusted registrars' keys.
+        let (handle, age) = match &attestations {
+            Some(atts) => self.accept_attestations(atts, now),
+            None => (None, 0),
+        };
 
         // A card that moves a committed successor is refused outright —
         // *first*, before any account is linked or created. Checking it
@@ -1038,14 +1129,89 @@ impl IdentityState {
         }
     }
 
+    /// `identity-registrar.md` §7.3: the records the registrars that
+    /// attested the identity publish against it, applied in time order.
+    /// A revocation of it or of this device refuses; a freeze, or records
+    /// past their lifetime, refuse or downgrade as configured. Answers the
+    /// attestations that survive, or `None` when the identity is to be
+    /// taken as unattested.
+    fn apply_records(
+        &self,
+        card: &hl_identity::Card,
+        cert: &hl_identity::DeviceCert,
+        now: u64,
+    ) -> Result<Option<Vec<Attestation>>, AuthRefused> {
+        let Some(registrars) = &self.registrars else {
+            return Ok(Some(card.attestations.clone()));
+        };
+        let fingerprint = Fingerprint::of(&card.identity);
+        let hosts: Vec<String> = card
+            .attestations
+            .iter()
+            .map(|a| a.registrar.clone())
+            .collect();
+        let found = registrars.lookup(&card.identity, &hosts, now);
+        let mut unattested = false;
+        if found.stale {
+            match registrars.config().stale {
+                crate::registrars::Stale::Cached => {
+                    info!(fingerprint = %fingerprint.short(), "registrar records past their lifetime; using what is held");
+                }
+                crate::registrars::Stale::Guest => unattested = true,
+                crate::registrars::Stale::Deny => return Err(AuthRefused::Denied),
+            }
+        }
+        let mut attestations = card.attestations.clone();
+        // A registrar's latest freeze record is its word; any registrar's
+        // standing freeze holds.
+        let mut frozen: HashMap<&str, bool> = HashMap::new();
+        for record in &found.records {
+            match record {
+                Record::RevokeIdentity(_) => {
+                    info!(fingerprint = %fingerprint.short(), "identity auth refused: revoked at its registrar");
+                    return Err(AuthRefused::Revoked);
+                }
+                Record::RevokeDevice(r) if r.device == cert.device => {
+                    info!(fingerprint = %fingerprint.short(), "identity auth refused: device revoked at its registrar");
+                    let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+                    t.devices.remove(&cert.device);
+                    return Err(AuthRefused::Revoked);
+                }
+                Record::Freeze(f) => {
+                    frozen.insert(&f.registrar, f.frozen);
+                }
+                Record::RevokeAttestation(r) => attestations.retain(|a| !r.voids(a)),
+                Record::RevokeDevice(_) | Record::Rotate(_) => {}
+            }
+        }
+        if frozen.values().any(|f| *f) {
+            match self.cfg.frozen {
+                Frozen::Deny => {
+                    info!(fingerprint = %fingerprint.short(), "identity auth refused: frozen at its registrar");
+                    return Err(AuthRefused::Denied);
+                }
+                Frozen::Guest => unattested = true,
+            }
+        }
+        Ok((!unattested).then_some(attestations))
+    }
+
     fn accept_attestations(&self, atts: &[Attestation], now: u64) -> (Option<String>, u64) {
         let mut best: Option<(String, u64)> = None;
         for a in atts {
-            let Some(expected) = self.cfg.registrar_keys.get(&a.registrar) else {
-                continue;
+            let keys = match &self.registrars {
+                Some(registrars) => registrars.keys(&a.registrar, &a.identity, now),
+                None => self
+                    .cfg
+                    .registrar_keys
+                    .get(&a.registrar)
+                    .into_iter()
+                    .copied()
+                    .collect(),
             };
-            if a.verify_registrar(expected, now, self.cfg.clock_skew)
-                .is_err()
+            if !keys
+                .iter()
+                .any(|k| a.verify_registrar(k, now, self.cfg.clock_skew).is_ok())
             {
                 continue;
             }
@@ -1102,6 +1268,15 @@ impl IdentityState {
     /// has no way to declare one itself. Signatures *are* re-checked
     /// rather than the cache's shape trusted; that's two verifications,
     /// which is why callers run this on the blocking pool.
+    /// The card a device on file is admitted under, as `identity_for_device`
+    /// would read it: for the caller to fetch its records first.
+    pub fn card_for_device(&self, device: &PublicKey) -> Option<hl_identity::Card> {
+        let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let rec = t.devices.get(device)?;
+        let bytes = &t.cards.get(&Fingerprint::of(&rec.identity))?.bytes;
+        hl_identity::Card::parse(bytes).ok()
+    }
+
     pub fn identity_for_device(&self, device: &PublicKey) -> Option<TransportIdentity> {
         let (card_bytes, cert_bytes, downstream) = {
             let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());

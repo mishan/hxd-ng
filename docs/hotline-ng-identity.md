@@ -276,8 +276,9 @@ continues in this order and fails on the first error:
 4. the server-local revocation list first (§12, `identity-registrar.md`
    §7.3), then records fetched per `identity-registrar.md` §7.2 and
    applied per §7.3 there; a stale cache is `[identity]
-   revocation_stale`. *(Built: the local list. The fetched records wait
-   on a registrar to fetch them from.)*
+   revocation_stale`. *(Built, but for rotation, which
+   `identity-records.md` stages as R2: records are fetched at `auth`,
+   and a certificate-only re-admission reads what is held.)*
 5. attestations verified against trusted registrars, expired or untrusted
    ones discarded, and, after attestation revocations are applied, age
    computed from the oldest surviving `registered`;
@@ -755,12 +756,15 @@ section because hxd-ng has one profile and one switch.
 | `[identity.probation] until_age` | `2592000` | *(not implemented; hxd-ng reads `min_attestation_age` today)* Own age before full access (`identity-registrar.md` §7.5). Replaces `min_attestation_age`, which gated the door; an alias for one release, with a startup warning |
 | `[identity.probation] clean_record` | `true` | *(not implemented)* A moderation action against the key restarts the clock (`identity-registrar.md` §7.5) |
 | `[identity.probation] access` | the four in `identity-registrar.md` §7.5 | *(not implemented)* Access mask while on probation, `access-bits.md` key names |
-| `[identity.registrar_keys]` | empty | Registrar host → base64url public key: an override consulted before discovery and never refreshed (`identity-registrar.md` §7.1). Until the discovery fetch is built it is also the only source, so **empty accepts no attestation at all** and every identity is unattested; there is no "empty means any" |
+| `[identity.registrar_keys]` | empty | Registrar host → base64url public key: trusted, on this key rather than its discovery document's, which is still fetched for its endpoints (`identity-registrar.md` §7.1). With `trusted_registrars` also empty, **no attestation is accepted** and every identity is unattested; there is no "empty means any" |
+| `[identity] trusted_registrars` | empty | Registrar hosts trusted on the key their discovery document at `https://<host>/.well-known/hotline` publishes, and any `retiring` key until its `until`; believed for a day, and fetched again sooner when a signature fails against it |
+| `[identity.registrar_urls]` | empty | Registrar host → base URL, for a registrar not reached at `https://<host>`: one on the local network, asked for under its own name (`identity-records.md`) |
+| `[identity] registrar_timeout` | `3` | Seconds an `auth` waits on registrars for an identity's records; past it, what is held decides, as for an unreachable registrar |
 | `[identity] trtp_login` | `verify` | `verify` or `trust`; see §8.3 |
 | `[identity] successors` | `identity-successors` | Where §3.4 successor commitments are kept, for the identities §13 says get one. `""` keeps them in the card cache only, which a restart forgets — and so does enough traffic to evict the card. Making the caches forget is the attack the commitment exists to stop |
-| `[identity] revocation_max_age` | `3600` | *(not implemented)* How long a fetched record list is cached: the smaller of this and the list's own `expires` (`identity-registrar.md` §7.2) |
-| `[identity] revocation_stale` | `cached` | *(not implemented)* `cached`, `guest`, `deny`: what §5.2 step 4 does when the registrar is unreachable and the cache is past its lifetime (`identity-registrar.md` §7.2) |
-| `[identity] frozen` | `deny` | *(not implemented)* `deny`, `guest`: what a frozen identity is admitted as (`identity-registrar.md` §7.3) |
+| `[identity] revocation_max_age` | `3600` | How long a fetched record list is current: the smaller of this and the list's own `expires` (`identity-registrar.md` §7.2). Lists are kept in the moderation store's database when there is one, so a restart still has them |
+| `[identity] revocation_stale` | `cached` | `cached`, `guest`, `deny`: what §5.2 step 4 does when the registrar is unreachable and the cache is past its lifetime, or holds nothing (`identity-registrar.md` §7.2) |
+| `[identity] frozen` | `deny` | `deny`, `guest`: what a frozen identity is admitted as (`identity-registrar.md` §7.3) |
 | `[identity] revoked_devices`, `revoked_identities` | empty | Fingerprints refused by hand, consulted before any registrar (`identity-registrar.md` §7.3). A revoked identity refuses every device of it; a revoked device, only itself. Refused at `/identity/auth` with `revoked`, and a token minted before the revocation no longer redeems. SIGHUP re-reads these two lists and nothing else, and installing them, at startup or on SIGHUP, ends every session they now refuse, live or detached, on either wire. `hxd identity revoke <fingerprint> [--device] [--lift]` edits them in the config file |
 | `[identity] banned_registrars` | empty | *(not implemented)* Hosts whose identities are refused outright, before the admission policy runs (`identity-registrar.md` §7.3) |
 | `[identity] newcomer_delay` | `120` | *(not implemented)* Seconds before a never-seen `unknown` key may chat, message or post; `0` disables (`identity-registrar.md` §7.3) |

@@ -1297,10 +1297,12 @@ pub struct Core {
     /// Where acts on a ghost go (`crate::server_link`), once a link hub
     /// has started.
     pub(crate) peer_router: std::sync::OnceLock<Arc<dyn crate::server_link::PeerRouter>>,
-    /// Keys the operator has refused by hand (`crate::revoked`). Read
-    /// under the roster lock by `attach`, and written with nothing held,
-    /// so the order is roster first, then this.
-    pub(crate) revoked: std::sync::RwLock<crate::revoked::Revocations>,
+    /// Keys refused by hand and by what registrars publish
+    /// (`crate::revoked`). Read under the roster lock by `attach`, and
+    /// written with nothing held, so the order is roster first, then this.
+    pub(crate) revoked: std::sync::RwLock<crate::revoked::Refused>,
+    /// Where the registrars' record lists are kept, beside the bans.
+    pub(crate) record_cache: Option<Arc<dyn crate::identity_records::RecordCache>>,
     /// The audit trail and the reports, or `None` — in which case every
     /// act and report is refused as a server without the feature
     /// refuses it. Store calls never happen under `roster`.

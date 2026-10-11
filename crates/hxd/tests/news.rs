@@ -3641,6 +3641,7 @@ async fn a_polled_feed_is_read_on_both_wires_and_follows_its_edits() {
         proxy: None,
         user_agent: "hxd-ng-test".into(),
         accept: hxd_feeds::FEED_ACCEPT,
+        name: None,
     };
     let done = hxd::feeds::poll_once(&core, &feed, &fetch).await.unwrap();
     assert_eq!(done.posted, 2);

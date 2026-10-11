@@ -16,6 +16,7 @@ pub mod budget;
 pub mod chat;
 pub mod files;
 pub mod history;
+pub mod identity_records;
 pub mod inbox;
 pub mod instrument;
 pub mod limits;

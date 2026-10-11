@@ -1664,10 +1664,34 @@ pub struct IdentitySection {
     /// `deny`, `guest`, or `allow`.
     #[serde(default = "default_unattested")]
     pub unattested: String,
-    /// Registrar host → base64url public key. Static until the registrar
-    /// spec's discovery fetch exists.
+    /// Registrar host → base64url public key: trusted, on the operator's
+    /// word for its key (`docs/identity-registrar.md` §7.1).
     #[serde(default)]
     pub registrar_keys: HashMap<String, String>,
+    /// Registrar hosts trusted on the key their discovery document
+    /// publishes, fetched from `https://<host>` and believed for a day.
+    #[serde(default)]
+    pub trusted_registrars: Vec<String>,
+    /// Registrar host → base URL, for a registrar not reached at
+    /// `https://<host>`: one on the local network, asked for under its
+    /// own name.
+    #[serde(default)]
+    pub registrar_urls: HashMap<String, String>,
+    /// Seconds a login waits on registrars for an identity's records
+    /// (`docs/identity-records.md`); past it, what is held decides.
+    #[serde(default = "default_registrar_timeout")]
+    pub registrar_timeout: u64,
+    /// Seconds a registrar's record list is used for at most, whatever
+    /// its own `expires` says.
+    #[serde(default = "default_revocation_max_age")]
+    pub revocation_max_age: u64,
+    /// `cached`, `guest` or `deny`: an identity whose records cannot be
+    /// had current (§7.2 there).
+    #[serde(default = "default_revocation_stale")]
+    pub revocation_stale: String,
+    /// `deny` or `guest`: an identity frozen at its registrar.
+    #[serde(default = "default_frozen")]
+    pub frozen: String,
     #[serde(default = "default_clock_skew")]
     pub clock_skew: u64,
     /// Serve the TRTP-over-WebSocket path.
@@ -1725,6 +1749,18 @@ pub struct IdentitySection {
 
 fn default_enroll_sessions() -> usize {
     256
+}
+fn default_registrar_timeout() -> u64 {
+    3
+}
+fn default_revocation_max_age() -> u64 {
+    3600
+}
+fn default_revocation_stale() -> String {
+    "cached".into()
+}
+fn default_frozen() -> String {
+    "deny".into()
 }
 fn default_enroll_per_address() -> usize {
     4
@@ -2858,6 +2894,58 @@ fn build_identity(
         let key = decode_key(b64).map_err(|e| format!("[identity] registrar_keys.{host}: {e}"))?;
         registrar_keys.insert(host.to_lowercase(), key);
     }
+    let frozen = match section.frozen.as_str() {
+        "deny" => hxd_ng_session::identity::Frozen::Deny,
+        "guest" => hxd_ng_session::identity::Frozen::Guest,
+        other => return Err(format!("[identity] frozen: unknown value {other:?}")),
+    };
+    let stale = match section.revocation_stale.as_str() {
+        "cached" => hxd_ng_session::registrars::Stale::Cached,
+        "guest" => hxd_ng_session::registrars::Stale::Guest,
+        "deny" => hxd_ng_session::registrars::Stale::Deny,
+        other => {
+            return Err(format!(
+                "[identity] revocation_stale: unknown value {other:?}"
+            ))
+        }
+    };
+    if section.revocation_max_age == 0 {
+        return Err(
+            "[identity] revocation_max_age must be at least 1: at 0 no list is ever current".into(),
+        );
+    }
+    let trusted: Vec<String> = section
+        .trusted_registrars
+        .iter()
+        .map(|h| h.to_lowercase())
+        .collect();
+    let mut registrar_urls = HashMap::new();
+    for (host, url) in &section.registrar_urls {
+        hxd_fetch::check_url(url).map_err(|e| format!("[identity] registrar_urls.{host}: {e}"))?;
+        let host = host.to_lowercase();
+        if !registrar_keys.contains_key(&host) && !trusted.contains(&host) {
+            tracing::warn!(
+                "[identity] registrar_urls.{host}: not a trusted registrar, so never asked"
+            );
+        }
+        registrar_urls.insert(host, url.clone());
+    }
+    let registrars = (!registrar_keys.is_empty() || !trusted.is_empty()).then(|| {
+        Arc::new(hxd_ng_session::registrars::Registrars::new(
+            hxd_ng_session::registrars::RegistrarsConfig {
+                keys: registrar_keys.clone(),
+                trusted,
+                urls: registrar_urls,
+                timeout: Duration::from_secs(section.registrar_timeout),
+                max_age: Duration::from_secs(section.revocation_max_age),
+                stale,
+                user_agent: format!("hxd-ng/{}", env!("CARGO_PKG_VERSION")),
+            },
+            core.record_cache().unwrap_or_else(|| {
+                Arc::new(hxd_core::identity_records::MemoryRecordCache::default())
+            }),
+        ))
+    });
     let default_access = match &section.default_access {
         None => None,
         Some(named) => {
@@ -2881,7 +2969,7 @@ fn build_identity(
     if section.new_accounts != "create" && section.default_access.is_some() {
         tracing::warn!("[identity] default_access has no effect unless new_accounts = create");
     }
-    Ok(IdentityState::new(
+    let state = IdentityState::new(
         key,
         IdentityConfig {
             new_accounts,
@@ -2898,10 +2986,15 @@ fn build_identity(
             } else {
                 Some(section.successors.clone())
             },
+            frozen,
         },
         auth,
         core,
-    ))
+    );
+    Ok(match registrars {
+        Some(registrars) => state.with_registrars(registrars),
+        None => state,
+    })
 }
 
 /// Config-level checks a `Deserialize` can't make: sections whose
@@ -3095,6 +3188,7 @@ struct RuntimeStores {
     news: Option<Arc<dyn hxd_core::NewsStore>>,
     devices: Option<Arc<dyn hxd_core::PushStore>>,
     moderation: Option<Arc<dyn hxd_core::ModerationStore>>,
+    records: Option<Arc<dyn hxd_core::identity_records::RecordCache>>,
     avatars: Option<Arc<dyn hxd_core::AvatarStore>>,
     /// The chat log's store as itself, for the tests to ask how it was
     /// opened.
@@ -3175,10 +3269,16 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
     };
     // Already open: the trail shares whichever of those files comes first
     // in `moderation::db`'s order.
-    let moderation = match keyed(&moderation::db(config))? {
-        Some(p) => Some(open(&p, Synchronous::Normal)? as Arc<dyn hxd_core::ModerationStore>),
+    let moderation_store = match keyed(&moderation::db(config))? {
+        Some(p) => Some(open(&p, Synchronous::Normal)?),
         None => None,
     };
+    let moderation = moderation_store
+        .clone()
+        .map(|s| s as Arc<dyn hxd_core::ModerationStore>);
+    // Beside the bans: what the registrars publish refuses keys as a ban
+    // does.
+    let records = moderation_store.map(|s| s as Arc<dyn hxd_core::identity_records::RecordCache>);
     // Avatars share whatever file there is, like devices.
     let avatars_path = config.avatars.as_ref().and_then(|a| {
         a.db.clone()
@@ -3229,6 +3329,7 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         news,
         devices,
         moderation,
+        records,
         avatars,
     })
 }
@@ -3265,6 +3366,7 @@ struct RuntimeStores {
     news: Option<Arc<dyn hxd_core::NewsStore>>,
     devices: Option<Arc<dyn hxd_core::PushStore>>,
     moderation: Option<Arc<dyn hxd_core::ModerationStore>>,
+    records: Option<Arc<dyn hxd_core::identity_records::RecordCache>>,
     avatars: Option<Arc<dyn hxd_core::AvatarStore>>,
 }
 
@@ -3294,6 +3396,7 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         news: None,
         devices: None,
         moderation: None,
+        records: None,
         avatars: None,
     })
 }
@@ -3999,6 +4102,10 @@ pub fn build_ctx(
             .unwrap_or_else(|| Arc::new(hxd_core::MemoryModeration::default())),
         moderation::policy(config),
     );
+    let core = match stores.records {
+        Some(records) => core.with_record_cache(records),
+        None => core,
+    };
     // The registry and the gateway together or not at all: a registry
     // with nothing to send from would take registrations and drop every
     // notification, which is worse than saying there is no push.

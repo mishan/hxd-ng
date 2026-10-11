@@ -513,8 +513,8 @@ presence, chat, private chats, PMs, broadcast, and moderation; the
 Hotline-ng MVP (roster + chat + PMs with detach/resume) is complete and
 cross-tested; voice and video are implemented on both wires, sharing one
 room and one SFU; the identity registrar is built, and a server applying
-what a registrar publishes (`docs/identity-registrar.md` §7) is next on
-that front. The large open fronts, in rough order: the ng rate-limit and
+what a registrar publishes (`docs/identity-registrar.md` §7) is under
+way, staged in `docs/identity-records.md`. The large open fronts, in rough order: the ng rate-limit and
 client-quickstart polish, files/HTXF, the
 rest of news (the domain, store, search, subscriptions, markdown bodies,
 attachments, the ng wire, the legacy binding and moderation have

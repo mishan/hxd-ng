@@ -21,6 +21,7 @@ mod news_blob;
 pub mod proto;
 pub mod push;
 mod registrar;
+pub mod registrars;
 mod registry;
 
 use std::future::Future;

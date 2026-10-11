@@ -60,6 +60,7 @@ impl Synchronous {
 
 mod avatar;
 mod blobs;
+mod identity_records;
 mod moderation;
 mod news;
 mod push;
@@ -70,7 +71,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -560,6 +561,19 @@ CREATE INDEX news_feed_item_article ON news_feed_item (article) WHERE article IS
 CREATE INDEX news_feed_item_unlisted ON news_feed_item (last_seen) WHERE article IS NULL;
 ALTER TABLE news_article ADD COLUMN feed INTEGER REFERENCES news_feed(id);
 CREATE INDEX news_article_feed ON news_article (feed, id) WHERE feed IS NOT NULL;
+";
+
+/// The record lists the registrars this server trusts publish against
+/// the identities it has admitted (`docs/identity-records.md` §2).
+const SCHEMA_V18: &str = "
+CREATE TABLE identity_records (
+  identity  BLOB    NOT NULL,
+  registrar TEXT    NOT NULL,
+  list      BLOB    NOT NULL,
+  fetched   INTEGER NOT NULL,
+  keys      BLOB    NOT NULL,
+  PRIMARY KEY (identity, registrar)
+) WITHOUT ROWID;
 ";
 
 /// The bans this server asked linked servers for (`docs/server-link.md`
@@ -1213,6 +1227,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 17 {
         steps.push_str(SCHEMA_V17);
+    }
+    if version < 18 {
+        steps.push_str(SCHEMA_V18);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
