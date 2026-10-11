@@ -1140,6 +1140,28 @@ async fn records_are_kept_for_when_the_registrar_cannot_be_reached() {
     let reply = auth_at(cached, &bob, &dev, &bob_card).await.json();
     assert_eq!(reply["handle"], "bobby@127.0.0.1", "{reply}");
 
+    // Configured to take a registrar it cannot reach as no registrar, it
+    // admits the identity without its handle, and still applies the
+    // revocation it holds.
+    let guest = verifier(
+        &there,
+        &r,
+        Trust::Discovery,
+        &nowhere,
+        "registrar_timeout = 1\nrevocation_stale = \"guest\"",
+    )
+    .await;
+    let reply = auth_at(guest, &alice, &dev, &alice_card).await;
+    assert_eq!(
+        (reply.status, reply.json()["error"].clone()),
+        (403, json!("revoked"))
+    );
+    let reply = auth_at(guest, &bob, &dev, &bob_card).await;
+    assert_eq!(
+        (reply.status, reply.json()["handle"].clone()),
+        (200, Value::Null)
+    );
+
     // Configured to refuse what it cannot check, it refuses a stranger to
     // the cache.
     let carol = IdentityKey::from_seed(&[3; 32]);
@@ -1156,5 +1178,63 @@ async fn records_are_kept_for_when_the_registrar_cannot_be_reached() {
     assert_eq!(
         (reply.status, reply.json()["error"].clone()),
         (403, json!("denied"))
+    );
+}
+
+#[tokio::test]
+async fn a_registrars_retiring_key_is_honored_until_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| {
+        let p = dir.path().join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    };
+    let before = start(&path("before"), "signup = \"open\"").await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let carol = IdentityKey::from_seed(&[3; 32]);
+    let dev = DeviceKey::from_seed(&[101; 32]);
+    let alice_card = attested(&before, &alice, "alice").await;
+
+    // The registrar moves to a new key, publishing the old one as
+    // retiring: until a deadline to come, and until one past.
+    let retiring = |until: u64| {
+        format!(
+            "signup = \"open\"\nretiring = [{{ key = \"{}\", until = {until} }}]",
+            b64(&before.registrar.public_key())
+        )
+    };
+    let rotated = start(&path("rotated"), &retiring(now() + 3600)).await;
+    let retired = start(&path("retired"), &retiring(now() - 1)).await;
+    let carol_card = attested(&rotated, &carol, "carol").await;
+
+    let v = verifier(
+        &path("verifier"),
+        &rotated,
+        Trust::Discovery,
+        &format!("http://{}", rotated.ng),
+        "",
+    )
+    .await;
+    assert_eq!(
+        auth_at(v, &alice, &dev, &alice_card).await.json()["handle"],
+        "alice@127.0.0.1"
+    );
+    assert_eq!(
+        auth_at(v, &carol, &dev, &carol_card).await.json()["handle"],
+        "carol@127.0.0.1"
+    );
+
+    let late = verifier(
+        &path("late"),
+        &retired,
+        Trust::Discovery,
+        &format!("http://{}", retired.ng),
+        "",
+    )
+    .await;
+    let reply = auth_at(late, &alice, &dev, &alice_card).await;
+    assert_eq!(
+        (reply.status, reply.json()["handle"].clone()),
+        (200, Value::Null)
     );
 }
