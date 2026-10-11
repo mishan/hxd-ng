@@ -51,6 +51,7 @@ to another project.
 | [capabilities-video.md](capabilities-video.md) — video publications and subscriptions | yes | ng; extended when GtkHx renders | spec, contributed to fogWraith's set |
 | [hope.md](hope.md) — HOPE, the secure login and transport encryption on the classic wire | yes, less `DATA_LINK_USER_TRANSPORT` | period and extended clients that speak HOPE | design |
 | [files-plan.md](files-plan.md) — the file area: browsing, downloads, the local area and uploads | yes, less folders and file management | all (ng browses and downloads) | design |
+| [ng-uploads.md](ng-uploads.md) — uploads on the ng wire: `files_upload`, pieces over HTTP, resume | no | ng | design |
 | [file-sources.md](file-sources.md) — exploratory background for files | superseded | — | design |
 | [tracker-registration.md](tracker-registration.md) — HTRK v1/v3 server heartbeats, authentication and operator configuration | yes | server infrastructure | design; implements fogWraith specs |
 | [metrics.md](metrics.md) — `GET /metrics`: locks, the store, the blocking pool, fan-out, the wires, the roster's census | yes, behind the `metrics` feature | operators | design |

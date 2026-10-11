@@ -506,7 +506,8 @@ still browse. `files_download` needs the `download_files` access bit. A
 drop box, any path naming "drop box" in any case, also lists, answers
 `files_info` and downloads only for `view_drop_boxes`, and the path is
 refused before anything is looked up, so a name a drop box does not hold
-is refused the same way as one it does. This wire has no upload method yet;
+is refused the same way as one it does. This wire has no upload method yet
+(`ng-uploads.md` designs one);
 a classic upload into a drop box by an account without `view_drop_boxes`
 is never refused for a name that is taken, nor offered a resume, but
 stored under a free name, so that it too learns nothing of what the drop
