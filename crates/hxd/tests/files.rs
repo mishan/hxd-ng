@@ -1308,6 +1308,315 @@ async fn ng_previews_are_drawn_again_or_decoded_text() {
         .starts_with("HTTP/1.1 404"));
 }
 
+/// One piece of an ng upload: the response's head and body.
+async fn put_piece(
+    address: SocketAddr,
+    url: &str,
+    range: Option<String>,
+    digest: Option<&str>,
+    body: &[u8],
+) -> String {
+    let mut headers = format!("Content-Length: {}\r\n", body.len());
+    if let Some(range) = range {
+        headers.push_str(&format!("Content-Range: {range}\r\n"));
+    }
+    if let Some(digest) = digest {
+        headers.push_str(&format!("Upload-Digest: {digest}\r\n"));
+    }
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!("PUT {url} HTTP/1.1\r\nHost: {address}\r\n{headers}Connection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8(response).unwrap().to_lowercase()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[tokio::test]
+async fn an_ng_upload_arrives_in_pieces_and_resumes_on_a_new_session() {
+    let (server, root, _source) = start_local().await;
+    let data: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
+    let mut ws = ng_login(server.ng, json!({"nick": "up"})).await;
+    let listed = ng_request(&mut ws, 2, "files_list", json!({})).await;
+    assert_eq!(listed["ok"]["uploadable"], true, "{listed}");
+
+    let begun = ng_request(
+        &mut ws,
+        3,
+        "files_upload",
+        json!({"path": "a.bin", "size": "300"}),
+    )
+    .await;
+    assert_eq!(begun["ok"]["offset"], "0", "{begun}");
+    assert_eq!(begun["ok"]["piece"], hxd_files::PIECE.to_string());
+    let url = begun["ok"]["url"].as_str().unwrap().to_owned();
+    let piece = |a: usize, b: usize| {
+        (
+            Some(format!("bytes {a}-{}/300", b - 1)),
+            data[a..b].to_vec(),
+        )
+    };
+    let (range, body) = piece(0, 100);
+    let sent = put_piece(server.ng, &url, range, None, &body).await;
+    assert!(
+        sent.starts_with("http/1.1 204") && sent.contains("upload-offset: 100"),
+        "{sent}"
+    );
+    // Not where the partial is: told where it is.
+    let (range, body) = piece(50, 150);
+    let sent = put_piece(server.ng, &url, range, None, &body).await;
+    assert!(
+        sent.starts_with("http/1.1 409") && sent.contains("upload-offset: 100"),
+        "{sent}"
+    );
+    let (range, body) = piece(100, 200);
+    assert!(put_piece(server.ng, &url, range, None, &body)
+        .await
+        .starts_with("http/1.1 204"));
+    assert!(
+        !root.path().join("a.bin").exists(),
+        "nothing is published before the last piece"
+    );
+
+    // The session ends, and its upload with it; the partial stays.
+    ng_request(&mut ws, 4, "logout", json!({})).await;
+    let (range, body) = piece(200, 300);
+    assert!(put_piece(server.ng, &url, range, None, &body)
+        .await
+        .starts_with("http/1.1 404"));
+
+    let mut ws = ng_login(server.ng, json!({"nick": "up"})).await;
+    let quoted = ng_request(
+        &mut ws,
+        2,
+        "files_upload",
+        json!({"path": "a.bin", "size": "300"}),
+    )
+    .await;
+    assert_eq!(quoted["ok"]["offset"], "200", "{quoted}");
+    let digest = hxfiles_xfer::resume_digest::encode(200, &data[..200]).unwrap();
+    assert_eq!(quoted["ok"]["digest"], hex(&digest));
+    let url = quoted["ok"]["url"].as_str().unwrap().to_owned();
+    // A first piece must echo the digest it was quoted.
+    let other = hxfiles_xfer::resume_digest::encode(200, &[0; 200]).unwrap();
+    let (range, body) = piece(200, 300);
+    let sent = put_piece(server.ng, &url, range.clone(), Some(&hex(&other)), &body).await;
+    assert!(sent.starts_with("http/1.1 409"), "{sent}");
+    let sent = put_piece(server.ng, &url, range, Some(&hex(&digest)), &body).await;
+    assert!(
+        sent.starts_with("http/1.1 201") && sent.contains(r#""path":"a.bin""#),
+        "{sent}"
+    );
+    assert_eq!(std::fs::read(root.path().join("a.bin")).unwrap(), data);
+
+    let again = ng_request(
+        &mut ws,
+        3,
+        "files_upload",
+        json!({"path": "a.bin", "size": "300"}),
+    )
+    .await;
+    assert_eq!(again["error"]["code"], "already_exists", "{again}");
+    let empty = ng_request(
+        &mut ws,
+        4,
+        "files_upload",
+        json!({"path": "empty.txt", "size": "0", "comment": "nothing"}),
+    )
+    .await;
+    let url = empty["ok"]["url"].as_str().unwrap();
+    assert!(put_piece(server.ng, url, None, None, b"")
+        .await
+        .starts_with("http/1.1 201"));
+    let info = ng_request(&mut ws, 5, "files_info", json!({"path": "empty.txt"})).await;
+    assert_eq!(
+        (info["ok"]["size"].as_str(), info["ok"]["comment"].as_str()),
+        (Some("0"), Some("nothing"))
+    );
+
+    // Asked to start over, it is quoted nothing; and a file past the
+    // area's limit is refused before anything is reserved.
+    let b = ng_request(
+        &mut ws,
+        6,
+        "files_upload",
+        json!({"path": "b.bin", "size": "300"}),
+    )
+    .await;
+    let url = b["ok"]["url"].as_str().unwrap().to_owned();
+    let (range, body) = piece(0, 100);
+    assert!(put_piece(server.ng, &url, range, None, &body)
+        .await
+        .starts_with("http/1.1 204"));
+    let quoted = ng_request(
+        &mut ws,
+        7,
+        "files_upload",
+        json!({"path": "b.bin", "size": "300"}),
+    )
+    .await;
+    assert_eq!(quoted["ok"]["offset"], "100", "{quoted}");
+    let fresh = ng_request(
+        &mut ws,
+        8,
+        "files_upload",
+        json!({"path": "b.bin", "size": "300", "fresh": true}),
+    )
+    .await;
+    assert_eq!(fresh["ok"]["offset"], "0", "{fresh}");
+    let huge = ng_request(
+        &mut ws,
+        9,
+        "files_upload",
+        json!({"path": "c.bin", "size": u64::MAX.to_string()}),
+    )
+    .await;
+    assert_eq!(huge["error"]["code"], "too_large", "{huge}");
+}
+
+#[tokio::test]
+async fn a_classic_upload_is_finished_over_the_ng_wire() {
+    let (server, root, _source) = start_local().await;
+    let mut capable = Legacy::login(server.legacy, true).await;
+    let put = capable
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"both.bin".to_vec()),
+                (tag::HTXF_SIZE, 11u32.to_be_bytes().to_vec()),
+                (tag::XFERSIZE64, 11u64.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    let mut interrupted = TcpStream::connect(server.htxf).await.unwrap();
+    interrupted
+        .write_all(
+            &htxf::Preamble {
+                reference: reference_of(&put),
+                transfer_len: 11,
+                type_code: 0,
+                flags: htxf::FLAG_LARGE_FILE | htxf::FLAG_SIZE64,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    interrupted.write_all(b"hello").await.unwrap();
+    interrupted.shutdown().await.unwrap();
+    let mut ignored = Vec::new();
+    interrupted.read_to_end(&mut ignored).await.unwrap();
+
+    // One account's partial, whichever wire began it.
+    let mut ws = ng_login(server.ng, json!({"nick": "up"})).await;
+    let quoted = ng_request(
+        &mut ws,
+        2,
+        "files_upload",
+        json!({"path": "both.bin", "size": "11"}),
+    )
+    .await;
+    assert_eq!(quoted["ok"]["offset"], "5", "{quoted}");
+    let digest = hxfiles_xfer::resume_digest::encode(5, b"hello").unwrap();
+    let url = quoted["ok"]["url"].as_str().unwrap();
+    let sent = put_piece(
+        server.ng,
+        url,
+        Some("bytes 5-10/11".into()),
+        Some(&hex(&digest)),
+        b" world",
+    )
+    .await;
+    assert!(sent.starts_with("http/1.1 201"), "{sent}");
+    assert_eq!(
+        std::fs::read(root.path().join("both.bin")).unwrap(),
+        b"hello world"
+    );
+}
+
+#[tokio::test]
+async fn an_ng_upload_follows_fileputs_rules_for_drop_boxes_and_bits() {
+    let (server, root, _source) =
+        start_local_with("upload_files = true\nread_chat = true\nuse_any_name = true\n").await;
+    std::fs::create_dir_all(root.path().join("Drop Box/inner")).unwrap();
+    std::fs::write(root.path().join("Drop Box/x.txt"), b"old").unwrap();
+    let mut ws = ng_login(server.ng, json!({"nick": "guest"})).await;
+    let listed = ng_request(&mut ws, 2, "files_list", json!({})).await;
+    assert_eq!(
+        listed["ok"]["uploadable"], false,
+        "only upload folders without upload_anywhere"
+    );
+
+    // Blind: one piece, never quoted, published under a free name.
+    let blind = ng_request(
+        &mut ws,
+        3,
+        "files_upload",
+        json!({"path": "Drop Box/x.txt", "size": "3"}),
+    )
+    .await;
+    assert_eq!(
+        (
+            blind["ok"]["offset"].as_str(),
+            blind["ok"]["piece"].as_str()
+        ),
+        (Some("0"), Some("3")),
+        "{blind}"
+    );
+    let url = blind["ok"]["url"].as_str().unwrap();
+    let sent = put_piece(server.ng, url, Some("bytes 0-2/3".into()), None, b"new").await;
+    assert!(sent.contains(r#""path":"drop box/x 2.txt""#), "{sent}");
+    assert_eq!(
+        std::fs::read(root.path().join("Drop Box/x 2.txt")).unwrap(),
+        b"new"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("Drop Box/x.txt")).unwrap(),
+        b"old"
+    );
+
+    for (id, path, code) in [
+        (4, "Drop Box/inner/y.txt", "not_found"),
+        (5, "y.txt", "access_denied"),
+        (6, "Missing Uploads/y.txt", "not_found"),
+    ] {
+        let refused = ng_request(
+            &mut ws,
+            id,
+            "files_upload",
+            json!({"path": path, "size": "1"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], code, "{path}: {refused}");
+    }
+    let mut browser = ng_login(
+        server.ng,
+        json!({"login": "browser", "password": "pw", "nick": "Browser"}),
+    )
+    .await;
+    let refused = ng_request(
+        &mut browser,
+        2,
+        "files_upload",
+        json!({"path": "Drop Box/z.txt", "size": "1"}),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "access_denied", "{refused}");
+}
+
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
 async fn ng_login(address: SocketAddr, params: Value) -> Ws {

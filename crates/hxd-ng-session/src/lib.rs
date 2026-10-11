@@ -10,6 +10,7 @@ pub mod banner;
 mod conn;
 pub mod enroll;
 mod files;
+mod files_upload;
 mod http;
 pub mod identity;
 pub mod media;

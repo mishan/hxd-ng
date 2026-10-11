@@ -2,12 +2,17 @@
 
 mod local;
 mod manifest;
+mod ng_upload;
 mod preview;
 mod registry;
 mod sealed;
 mod transfer;
 
+pub use hxfiles_xfer::resume_digest::ENCODED_LEN as RESUME_DIGEST_LEN;
 pub use manifest::{HttpManifestSource, ManifestLimits};
+pub use ng_upload::{
+    NgUploadRequest, NgUploadTicket, NgUploads, Piece, PieceError, PieceOutcome, PIECE,
+};
 pub use preview::{ImagePreviews, Preview, PreviewError, PreviewKind, TEXT_BYTES};
 pub use registry::{
     DecodeName, DownloadGrant, DownloadTokens, EntryLimits, FolderFile, FolderItem, PreparedBanner,
@@ -43,6 +48,8 @@ pub struct FileService {
     pub max_folder_items: usize,
     /// Without it, a file previews only as text.
     pub image_previews: Option<ImagePreviews>,
+    /// Uploads on the ng wire under way (`docs/ng-uploads.md`).
+    pub ng_uploads: Arc<NgUploads>,
 }
 
 impl FileService {
@@ -68,6 +75,7 @@ impl FileService {
             idle_timeout,
             max_folder_items: MAX_FOLDER_ITEMS,
             image_previews: None,
+            ng_uploads: Arc::new(NgUploads::new(Duration::from_secs(60))),
         }
     }
 }

@@ -8,13 +8,14 @@ use tracing::info;
 
 use crate::conn::SessState;
 use crate::proto::{
-    FilesCommentParams, FilesDownloadParams, FilesMoveParams, FilesPathParams, ReqEnvelope,
+    FilesCommentParams, FilesDownloadParams, FilesMoveParams, FilesPathParams, FilesUploadParams,
+    ReqEnvelope,
 };
 use crate::NgCtx;
 
 /// Every act of file management, by the name the login block's `may`
 /// lists it under, and the access bit it needs.
-const ACTS: [(&str, u8); 9] = [
+const ACTS: [(&str, u8); 11] = [
     ("create_folders", bit::CREATE_FOLDERS),
     ("delete_files", bit::DELETE_FILES),
     ("delete_folders", bit::DELETE_FOLDERS),
@@ -24,6 +25,8 @@ const ACTS: [(&str, u8); 9] = [
     ("move_folders", bit::MOVE_FOLDERS),
     ("comment_files", bit::COMMENT_FILES),
     ("comment_folders", bit::COMMENT_FOLDERS),
+    ("upload_files", bit::UPLOAD_FILES),
+    ("upload_anywhere", bit::UPLOAD_ANYWHERE),
 ];
 
 /// The login reply's `files` block, present exactly when the `files` cap
@@ -84,6 +87,8 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     req.id,
                     json!({
                         "path": path.as_slash_path(),
+                        "uploadable": service.uploads.is_some()
+                            && upload_refusal(state, &path).is_none(),
                         "entries": entries.into_iter().map(|entry| {
                             json!({
                                 "name": entry.name,
@@ -196,6 +201,7 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 Err(error) => error_reply(req.id, error),
             }
         }
+        "files_upload" => upload(ctx, service, state, req).await,
         "files_mkdir" | "files_delete" | "files_move" | "files_comment" => {
             match manage(&ctx.core, service, state, req).await {
                 Ok(()) => crate::proto::reply_ok(req.id, json!({})),
@@ -418,6 +424,129 @@ fn drop_box_refusal(id: u64, state: &SessState, path: &FilePath) -> Option<Strin
     })
 }
 
+/// Why this session may not upload into `folder`, by FilePut's rules: the
+/// upload bits, mhxd's upload folders for an account without
+/// upload-anywhere, and no folder inside a drop box for one that may not
+/// view drop boxes, which is not found, as on the classic wire.
+fn upload_refusal(state: &SessState, folder: &FilePath) -> Option<NoUpload> {
+    let may = |b: u8| state.access.has(b);
+    if !may(bit::UPLOAD_FILES) || (!may(bit::UPLOAD_ANYWHERE) && !folder.is_upload_folder()) {
+        return Some(NoUpload::Denied);
+    }
+    (!may(bit::VIEW_DROP_BOXES) && folder.parent().is_some_and(|above| above.is_drop_box()))
+        .then_some(NoUpload::Hidden)
+}
+
+enum NoUpload {
+    Denied,
+    /// Inside a drop box the uploader may not view.
+    Hidden,
+}
+
+async fn upload(
+    ctx: &NgCtx,
+    service: &FileService,
+    state: &SessState,
+    req: &ReqEnvelope,
+) -> String {
+    let denied = || {
+        crate::proto::reply_err(
+            req.id,
+            "access_denied",
+            "You are not allowed to upload files here.",
+        )
+    };
+    if !state.access.has(bit::UPLOAD_FILES) {
+        return denied();
+    }
+    if service.uploads.is_none() {
+        return crate::proto::reply_err(req.id, "read_only", "This file area is read-only.");
+    }
+    let params = serde_json::from_value::<FilesUploadParams>(req.params.clone()).ok();
+    let parsed = params.as_ref().and_then(|p| {
+        let path = FilePath::parse(&p.path)
+            .ok()
+            .filter(|path| !path.is_root())?;
+        let size = decimal(&p.size)?;
+        Some((path, size))
+    });
+    let (Some(params), Some((path, size))) = (params, parsed) else {
+        return crate::proto::reply_err(req.id, "bad_request", "Malformed files_upload.");
+    };
+    let folder = path
+        .parent()
+        .expect("a path that is not the root has a parent");
+    match upload_refusal(state, &folder) {
+        Some(NoUpload::Hidden) => return error_reply(req.id, FileError::NotFound),
+        Some(NoUpload::Denied) => return denied(),
+        None => {}
+    }
+    if !folder.is_root() {
+        match service.source.info(&folder).await {
+            Ok(info) if info.kind == FileKind::Folder => {}
+            Ok(_) => return error_reply(req.id, FileError::NotFolder),
+            Err(error) => return error_reply(req.id, error),
+        }
+    }
+    let (Some(serial), Some(details)) = (
+        ctx.core.session_serial(state.uid),
+        ctx.core.user_details(state.uid),
+    ) else {
+        return crate::proto::reply_err(req.id, "not_authorized", "Session ended.");
+    };
+    let blind = !state.access.has(bit::VIEW_DROP_BOXES) && folder.is_drop_box();
+    let person = ctx
+        .core
+        .transfer_person(state.uid)
+        .unwrap_or_else(|| details.login.clone());
+    let ticket = service
+        .ng_upload_begin(hxd_files::NgUploadRequest {
+            principal: FilePrincipal {
+                uid: state.uid,
+                serial,
+            },
+            owner: details.login,
+            person,
+            path,
+            size,
+            blind,
+            fresh: params.fresh,
+            comment: params.comment,
+        })
+        .await;
+    match ticket {
+        Ok(ticket) => {
+            let mut ok = json!({
+                "url": format!("/files/upload/{}", ticket.token),
+                "offset": ticket.offset.to_string(),
+                "piece": ticket.piece.to_string(),
+            });
+            if let Some(digest) = ticket.digest {
+                ok["digest"] = json!(digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>());
+            }
+            crate::proto::reply_ok(req.id, ok)
+        }
+        Err(error) => error_reply(req.id, error),
+    }
+}
+
+/// A decimal u64 in its one spelling: no sign, no leading zero.
+fn decimal(value: &str) -> Option<u64> {
+    let canonical = value == "0" || (!value.starts_with('0') && !value.is_empty());
+    canonical
+        .then(|| {
+            value
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| value.parse().ok())
+        })
+        .flatten()
+        .flatten()
+}
+
 /// The file a `files_download` or `files_preview` names, once this session
 /// may fetch it, and who is fetching; or the reply refusing it.
 async fn fetchable(
@@ -485,7 +614,13 @@ async fn fetchable(
 }
 
 fn error_reply(id: u64, error: FileError) -> String {
-    let (code, message) = match error {
+    let (code, message) = error_code(&error);
+    crate::proto::reply_err(id, code, message)
+}
+
+/// A file error as this wire names it, in a reply or an HTTP body.
+pub(crate) fn error_code(error: &FileError) -> (&'static str, &'static str) {
+    match error {
         FileError::InvalidPath => ("bad_request", "Malformed file path."),
         FileError::NotFound => ("not_found", "File not found."),
         FileError::NotFolder => ("not_folder", "Path is not a folder."),
@@ -507,6 +642,5 @@ fn error_reply(id: u64, error: FileError) -> String {
             "You are already transferring as many files as you may at once.",
         ),
         FileError::Unavailable(_) => ("not_available", "The file service is unavailable."),
-    };
-    crate::proto::reply_err(id, code, message)
+    }
 }

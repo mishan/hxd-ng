@@ -456,7 +456,9 @@ is slash-separated UTF-8 relative to its root; `""` names the root. Paths
 are values, not URLs, and `.` / `..`, empty components, leading slashes and
 trailing slashes are malformed.
 
-- `files_list { path? }` returns `{ path, entries }`. Each entry is
+- `files_list { path? }` returns `{ path, uploadable, entries }`, where
+  `uploadable` says whether `files_upload` would take a file into that
+  folder from this session. Each entry is
   `{ name, kind, size, media_type?, modified? }`, where `kind` is `file` or
   `folder`. In this section a `?` field is present and `null` when
   unknown, rather than absent.
@@ -484,6 +486,30 @@ trailing slashes are malformed.
   is none of these is `unsupported`, and an image past what the server
   will decode is `too_large`.
 
+- `files_upload { path, size, comment?, fresh? }` begins an upload of a
+  file of `size` bytes (decimal) to `path`, whose folder must exist, and
+  returns `{ url, offset, piece, digest? }`. The bytes go to `url` in
+  pieces, each a `PUT` of at most `piece` bytes with a `Content-Range`
+  starting at `offset` and then at each piece's end; a piece that does
+  not start there answers `409` with the offset in `Upload-Offset`, one
+  that does answers `204` with the next, and the last answers `201`
+  with `{ path }`, where the file was published. An empty file is one
+  `PUT` with no range. `offset` is not `"0"` when this account left part
+  of this file before: the client then compares `digest`, the Large
+  File resume digest of the part the server holds, with the same digest
+  of its own file, and echoes it in the first piece's `Upload-Digest`;
+  a piece without the echo answers `409`, and a client whose file
+  differs sends `fresh: true` to start over. The URL lasts as a
+  download's does, and from each piece, and ends with the session.
+  Besides those, a piece answers `404` when its upload is gone (ended
+  with its session, expired, or its part replaced by another upload),
+  which a client answers by asking `files_upload` again and being
+  quoted what is there; `413` when it is longer than `piece` or the
+  file is past this server's limit; `503` with `Retry-After` when the
+  server is busy or the piece could not be written, to be tried again;
+  and `422` with `{ error: { code, text } }` for a refusal in this
+  section's codes, such as `already_exists` when the path was taken
+  while the file arrived. The design is `ng-uploads.md`.
 - `files_mkdir { path }` makes an empty folder at `path`.
 - `files_delete { path }` deletes the entry at `path`, a folder with
   everything in it.
@@ -506,12 +532,16 @@ still browse. `files_download` needs the `download_files` access bit. A
 drop box, any path naming "drop box" in any case, also lists, answers
 `files_info` and downloads only for `view_drop_boxes`, and the path is
 refused before anything is looked up, so a name a drop box does not hold
-is refused the same way as one it does. This wire has no upload method yet
-(`ng-uploads.md` designs one);
-a classic upload into a drop box by an account without `view_drop_boxes`
-is never refused for a name that is taken, nor offered a resume, but
-stored under a free name, so that it too learns nothing of what the drop
-box holds (`files-plan.md`), and an upload method here will do the same.
+is refused the same way as one it does.
+
+`files_upload` keeps the legacy wire's FilePut rules (`files-plan.md`):
+it needs `upload_files`, and `upload_anywhere` too outside a folder
+whose path names an upload folder or a drop box. An account without
+`view_drop_boxes` may upload into a drop box but not into a folder
+inside one, which is `not_found`, and its upload into one is blind: it
+is never refused for a name that is taken, nor quoted a part to resume,
+but published under a free name, so that it learns nothing of what the
+drop box holds, and it is sent in one piece (`piece` is its size).
 
 The changes need the bit for the kind of entry they act on:
 `create_folders` for `files_mkdir`; `delete_files` or `delete_folders`
@@ -535,7 +565,8 @@ client can leave out what it would only be refused:
 `may` names the access bits above that this session holds, by their
 names in access-bits.md §2: some of `create_folders`, `delete_files`,
 `delete_folders`, `rename_files`, `rename_folders`, `move_files`,
-`move_folders`, `comment_files` and `comment_folders`.
+`move_folders`, `comment_files`, `comment_folders`, `upload_files` and
+`upload_anywhere`.
 
 These methods answer errors from this set:
 
@@ -553,7 +584,7 @@ These methods answer errors from this set:
 | `not_file` | `files_download` on a folder, or the other way round for a change |
 | `too_large` | the entry exceeds this server's size limit |
 | `too_deep` | a `files_mkdir` that would nest folders deeper than this server allows, a `files_move` of a folder that would leave it or anything inside it deeper than that, whichever way it moves, or a `files_delete` of a folder already nested deeper inside than it will walk; a refused delete removes nothing |
-| `busy` | this server's outstanding-download limits are reached; retry later |
+| `busy` | this server's outstanding-download limits, or its incomplete uploads' limits, are reached; retry later |
 | `range_unsupported`, `range_invalid`, `origin_changed` | the source refused the request as the corresponding HTTP failure would |
 
 All `size` values, including folder child counts, are decimal strings. A

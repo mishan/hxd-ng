@@ -106,6 +106,9 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
     );
     service.max_folder_items = section.max_folder_items;
     service.image_previews = image_previews();
+    service.ng_uploads = Arc::new(hxd_files::NgUploads::new(Duration::from_secs(
+        section.download_ttl,
+    )));
     let service = Arc::new(service);
     Ok(Some(Files {
         service,

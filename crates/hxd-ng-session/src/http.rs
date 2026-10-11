@@ -407,6 +407,16 @@ async fn route(
         return cors(resp);
     }
 
+    if let Some(token) = path.strip_prefix("/files/upload/") {
+        let resp = match req.method() {
+            &Method::PUT if !token.is_empty() && !token.contains('/') => {
+                boxed(crate::files_upload::piece(token, req, &ctx).await)
+            }
+            _ => plain(StatusCode::NOT_FOUND, "not found"),
+        };
+        return cors(resp);
+    }
+
     if path.starts_with("/files/") {
         let resp = match (req.method(), path.strip_prefix("/files/")) {
             (&Method::GET, Some(token)) if !token.is_empty() && !token.contains('/') => {
@@ -704,7 +714,9 @@ fn cors(mut resp: Resp) -> Resp {
     h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     h.insert(
         ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_static("ETag, Content-Length, Content-Range, Accept-Ranges, Retry-After"),
+        HeaderValue::from_static(
+            "ETag, Content-Length, Content-Range, Accept-Ranges, Retry-After, Upload-Offset",
+        ),
     );
     resp
 }
@@ -727,7 +739,8 @@ fn preflight() -> Resp {
         // preflight it triggers succeed.
         .header(
             ACCESS_CONTROL_ALLOW_HEADERS,
-            "content-type, authorization, if-none-match, range, x-attachment-name",
+            "content-type, authorization, if-none-match, range, x-attachment-name, \
+             content-range, upload-digest",
         )
         .header(ACCESS_CONTROL_MAX_AGE, "86400")
         .body(full(Bytes::new()))
