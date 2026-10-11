@@ -1033,11 +1033,7 @@ async fn transport_identity(
         };
         if let (Some(registrars), Ok(Some(card))) = (state.registrars(), card) {
             registrars
-                .refresh(
-                    &card.identity,
-                    &card.attestations,
-                    crate::identity::now_unix(),
-                )
+                .refresh(&card.identity, &card.attestations, state.clock().unix())
                 .await;
         }
         let state = state.clone();
@@ -1824,7 +1820,7 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx:
     .await;
     if let (Ok(Ok(v)), Some(registrars)) = (&verified, st.registrars()) {
         registrars
-            .refresh(v.identity(), v.attestations(), crate::identity::now_unix())
+            .refresh(v.identity(), v.attestations(), st.clock().unix())
             .await;
     }
     let st = st.clone();

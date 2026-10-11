@@ -444,6 +444,17 @@ Three layers, all `cargo test --workspace`:
   `hxproto` pin — and in a stack, each branch pins the client commit
   its own e2e cases need.
 
+**Time a test can move.** A `Core` carries a `Clock`
+(`hxd_core::clock`): real time plus an offset a test advances, so a test
+sees what the server decides a minute or a day on without waiting for
+it, while its sockets and timers run in real time. The verifying
+side's identity state and registrars read it (`IdentityState`,
+`Registrars`; `IdentityState::clock` hands it to a test), and code moved
+onto it reads no other clock; everything else, the registrar server and
+enrollment included, is on real time. A new test that would sleep past
+a deadline in that code advances the clock instead. More of the server
+moves onto it as tests need it.
+
 House rules: **tests fail loudly** — never skip around something broken.
 A chat sender receives its own echo, so tests must match events by
 predicate, not take-the-first. Name test files by subject, never by

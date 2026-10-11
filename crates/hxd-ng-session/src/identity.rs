@@ -26,7 +26,7 @@ use std::collections::HashMap;
 
 use futures_util::StreamExt;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use hl_identity::{caps, Attestation, Fingerprint, LoginContext, PublicKey, Record, ServerKey};
 use hxd_core::{
@@ -362,6 +362,8 @@ pub struct IdentityState {
     /// an identity; going through `Core` rather than the store is what
     /// keeps that call on the right side of the locking discipline.
     core: Arc<hxd_core::Core>,
+    /// The core's, read for every time this state keeps or checks.
+    clock: hxd_core::clock::Clock,
     tables: Mutex<Tables>,
     /// Persisted successor commitments (§3.4), by fingerprint. `None`
     /// when the operator configured no path, in which case anchoring is
@@ -433,9 +435,10 @@ pub enum Downstream {
     Cleartext,
 }
 
-pub(crate) fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+#[cfg(test)]
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
@@ -470,18 +473,20 @@ impl IdentityState {
         core: Arc<hxd_core::Core>,
     ) -> Self {
         let anchors = cfg.anchors.clone().map(Anchors::load);
+        let clock = core.clock().clone();
         IdentityState {
             key,
             cfg,
             auth,
             core,
+            clock: clock.clone(),
             tables: Mutex::new(Tables {
                 challenges: HashMap::new(),
                 tokens: HashMap::new(),
                 devices: HashMap::new(),
                 cards: HashMap::new(),
                 since_sweep: 0,
-                swept: Instant::now(),
+                swept: clock.now(),
                 created: Vec::new(),
             }),
             anchors,
@@ -499,6 +504,10 @@ impl IdentityState {
     pub fn with_registrars(mut self, registrars: Arc<crate::registrars::Registrars>) -> Self {
         self.registrars = Some(registrars);
         self
+    }
+
+    pub fn clock(&self) -> &hxd_core::clock::Clock {
+        &self.clock
     }
 
     pub fn registrars(&self) -> Option<&Arc<crate::registrars::Registrars>> {
@@ -520,7 +529,7 @@ impl IdentityState {
     /// endpoint, which needs no verification at all.
     pub fn issue_challenge(&self) -> Option<[u8; 32]> {
         let ch = random32();
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         t.since_sweep += 1;
         // Two triggers. The first is the ordinary one, every
@@ -580,14 +589,14 @@ impl IdentityState {
         {
             let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
             match t.challenges.remove(&hash(&challenge)) {
-                Some(issued) if issued.elapsed() < TTL => {}
+                Some(issued) if self.clock.since(issued) < TTL => {}
                 _ => return Err(AuthRefused::UnknownChallenge),
             }
         }
         let ctx = LoginContext {
             challenge: &challenge,
             server_key: &self.key.public(),
-            now: now_unix(),
+            now: self.clock.unix(),
             skew: self.cfg.clock_skew,
         };
         // The certificate's own limit, checked before anything is
@@ -650,9 +659,14 @@ impl IdentityState {
         if cert.len() > hl_identity::cert::MAX_BYTES {
             return Err(AuthRefused::BadCert);
         }
-        let (c, dc) =
-            hl_identity::verify_presented(card, cert, device, now_unix(), self.cfg.clock_skew)
-                .map_err(|e| classify(&e, card.len()))?;
+        let (c, dc) = hl_identity::verify_presented(
+            card,
+            cert,
+            device,
+            self.clock.unix(),
+            self.cfg.clock_skew,
+        )
+        .map_err(|e| classify(&e, card.len()))?;
         Ok(Verified {
             card: c,
             cert: dc,
@@ -707,7 +721,7 @@ impl IdentityState {
         }
 
         // Step 4, continued: what the registrars that attested it publish.
-        let now = now_unix();
+        let now = self.clock.unix();
         let attestations = self.apply_records(&card, &cert, now)?;
 
         // Step 5: attestations against the trusted registrars' keys.
@@ -949,7 +963,7 @@ impl IdentityState {
         // and a token minted there would sit unread in the table for a
         // minute per upgrade.
         let token = (assoc == Assoc::Write).then(random32);
-        let inst = Instant::now();
+        let inst = self.clock.now();
         {
             let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(token) = &token {
@@ -1030,7 +1044,7 @@ impl IdentityState {
         let Some(limit) = self.cfg.max_new_accounts_per_hour else {
             return true;
         };
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         t.created
             .retain(|at| now.duration_since(*at) < Duration::from_secs(3600));
@@ -1044,7 +1058,7 @@ impl IdentityState {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .created
-                .push(Instant::now());
+                .push(self.clock.now());
         }
     }
 
@@ -1267,7 +1281,7 @@ impl IdentityState {
         let expired = t
             .tokens
             .get(&key)
-            .is_none_or(|(_, issued)| issued.elapsed() >= TTL);
+            .is_none_or(|(_, issued)| self.clock.since(*issued) >= TTL);
         if expired {
             t.tokens.remove(&key);
             return None;
@@ -1307,7 +1321,7 @@ impl IdentityState {
             .into_iter()
             .map(Fingerprint)
             .collect();
-        let (now, sweep) = (now_unix(), std::time::Instant::now());
+        let (now, sweep) = (self.clock.unix(), self.clock.now());
         registrars.retain_attested(&live);
         futures_util::stream::iter(&live)
             .for_each_concurrent(8, |fp| {
@@ -1353,7 +1367,7 @@ impl IdentityState {
         let (card_bytes, cert_bytes, downstream) = {
             let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
             let rec = t.devices.get(device)?;
-            if rec.expires + self.cfg.clock_skew < now_unix() {
+            if rec.expires + self.cfg.clock_skew < self.clock.unix() {
                 return None;
             }
             let card = t.cards.get(&Fingerprint::of(&rec.identity))?.bytes.clone();
@@ -1363,7 +1377,7 @@ impl IdentityState {
             &card_bytes,
             &cert_bytes,
             device,
-            now_unix(),
+            self.clock.unix(),
             self.cfg.clock_skew,
         )
         .ok()?;
@@ -1408,7 +1422,7 @@ impl IdentityState {
             if t.cards.get(&fp).is_some_and(|e| card.updated <= e.updated) {
                 return Ok(false);
             }
-            remember_card(&mut t.cards, fp, &card, bytes.to_vec(), Instant::now());
+            remember_card(&mut t.cards, fp, &card, bytes.to_vec(), self.clock.now());
         }
         if let Some(s) = card.successor {
             self.anchor(ident, s);

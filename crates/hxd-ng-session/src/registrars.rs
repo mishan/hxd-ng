@@ -80,6 +80,7 @@ struct Discovered {
 
 pub struct Registrars {
     cfg: RegistrarsConfig,
+    clock: hxd_core::clock::Clock,
     discovered: Mutex<HashMap<String, Discovered>>,
     /// One discovery at a time per host, so logins arriving together
     /// wait on one fetch rather than each making their own.
@@ -113,9 +114,14 @@ pub struct Lookup {
 }
 
 impl Registrars {
-    pub fn new(cfg: RegistrarsConfig, cache: Arc<dyn RecordCache>) -> Self {
+    pub fn new(
+        cfg: RegistrarsConfig,
+        cache: Arc<dyn RecordCache>,
+        clock: hxd_core::clock::Clock,
+    ) -> Self {
         Registrars {
             cfg,
+            clock,
             discovered: Mutex::new(HashMap::new()),
             discovering: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
@@ -252,7 +258,7 @@ impl Registrars {
         self.attested
             .lock()
             .unwrap()
-            .retain(|fp, (_, at)| live.contains(fp) || at.elapsed() < ADMITTING);
+            .retain(|fp, (_, at)| live.contains(fp) || self.clock.since(*at) < ADMITTING);
     }
 
     async fn refresh_hosts(
@@ -282,7 +288,7 @@ impl Registrars {
                     self.failed
                         .lock()
                         .unwrap()
-                        .insert(host.to_string(), Instant::now());
+                        .insert(host.to_string(), self.clock.now());
                     warn!(registrar = host, "identity records: no answer in time");
                 }
             }
@@ -332,9 +338,9 @@ impl Registrars {
             let mut attested = self.attested.lock().unwrap();
             let (hosts, at) = attested
                 .entry(fp)
-                .or_insert_with(|| (HashSet::new(), Instant::now()));
+                .or_insert_with(|| (HashSet::new(), self.clock.now()));
             hosts.insert(host.to_owned());
-            *at = Instant::now();
+            *at = self.clock.now();
         }
         if current && held.as_ref().is_some_and(|l| self.under_configured_key(l)) {
             return Ok(());
@@ -360,7 +366,7 @@ impl Registrars {
                     self.failed
                         .lock()
                         .unwrap()
-                        .insert(host.to_owned(), Instant::now());
+                        .insert(host.to_owned(), self.clock.now());
                 })?;
             let page = SignedList::parse(&bytes, ListKind::Records, rk)
                 .map_err(|e| format!("record list did not verify: {e}"))?;
@@ -428,7 +434,7 @@ impl Registrars {
                 .lock()
                 .unwrap()
                 .get(host)
-                .filter(|d| d.at.elapsed() < fresh)
+                .filter(|d| self.clock.since(d.at) < fresh)
                 .map(|d| d.records.clone())
         };
         if let Some(records) = known() {
@@ -451,7 +457,7 @@ impl Registrars {
             .lock()
             .unwrap()
             .get(host)
-            .is_some_and(|at| at.elapsed() < REDISCOVERY)
+            .is_some_and(|at| self.clock.since(*at) < REDISCOVERY)
         {
             return Err("discovery failed within the minute".into());
         }
@@ -462,14 +468,14 @@ impl Registrars {
                 Discovered {
                     keys: Vec::new(),
                     records: RECORDS.into(),
-                    at: Instant::now(),
+                    at: self.clock.now(),
                 }
             }
             (Err(e), false) => {
                 self.failed
                     .lock()
                     .unwrap()
-                    .insert(host.to_owned(), Instant::now());
+                    .insert(host.to_owned(), self.clock.now());
                 return Err(format!("discovery: {e}"));
             }
         };
@@ -514,7 +520,7 @@ impl Registrars {
         Ok(Discovered {
             keys,
             records: records.trim_end_matches('/').to_owned(),
-            at: Instant::now(),
+            at: self.clock.now(),
         })
     }
 
@@ -676,6 +682,7 @@ mod tests {
                 user_agent: String::new(),
             },
             cache,
+            hxd_core::clock::Clock::default(),
         )
     }
 
