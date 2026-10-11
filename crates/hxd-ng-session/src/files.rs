@@ -33,8 +33,8 @@ const ACTS: [(&str, u8); 9] = [
 pub fn login_json(service: &FileService, access: AccessBits) -> Value {
     let writable = service.uploads.is_some();
     let previews = match service.image_previews {
-        Some(_) => &["image", "text"][..],
-        None => &["text"][..],
+        Some(_) => &["image", "text", "video"][..],
+        None => &["text", "video"][..],
     };
     json!({
         "writable": writable,
@@ -170,6 +170,7 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 "kind": match preview.kind {
                     PreviewKind::Image => "image",
                     PreviewKind::Text => "text",
+                    PreviewKind::Video => "video",
                 },
                 "media_type": preview.media_type,
                 "size": info.size.to_string(),
@@ -182,9 +183,11 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
             // Held against the person, as transfers are: guests share a
             // login and not an address.
             let holder = ctx.core.transfer_person(state.uid).unwrap_or(login);
+            let ranges =
+                preview.kind == PreviewKind::Video && service.source.supports_ranges(&info.path);
             match service
                 .downloads
-                .issue_preview(principal, &holder, info.path, preview)
+                .issue_preview(principal, &holder, info.path, ranges, preview)
             {
                 Ok(token) => {
                     ok["url"] = json!(format!("/files/{token}"));

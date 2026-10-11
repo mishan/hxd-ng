@@ -270,7 +270,8 @@ background, not a separate implementation contract.
   "Folder transfers", F3).
 - Previews on the ng wire (`files_preview`) — built: an image decoded and
   drawn again by the media pipeline, or the start of a text as UTF-8,
-  served behind a download token and never the file's own bytes.
+  served behind a download token and never the file's own bytes; and a
+  video, which is, streamed in ranges as its container's type.
 
 ## Phase 4 — News
 

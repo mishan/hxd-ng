@@ -474,9 +474,15 @@ trailing slashes are malformed.
   image decoded and drawn again as a still within 1024 pixels a side,
   `width` by `height`; for `text`, its first 256 KiB as UTF-8 with LF
   line endings, Mac Roman when the file is declared text and is not
-  UTF-8, and `truncated` when that is not all of it. `size` is the
-  file's. A file that is neither is `unsupported`, and an image past
-  what the server will decode is `too_large`.
+  UTF-8, and `truncated` when that is not all of it. For `video` (an
+  MP4, QuickTime, WebM, Matroska or Ogg container, by its magic), the
+  URL serves the file itself, with ranges where `files_download`'s
+  would, typed as `media_type` says, which a client checks it can play;
+  its token, once fetched, lasts an hour from each fetch rather than
+  from its issue, so a paused video can still seek. A HEIF or AVIF
+  photograph shares MP4's container and is not a video. `size` is the file's. A file that
+  is none of these is `unsupported`, and an image past what the server
+  will decode is `too_large`.
 
 - `files_mkdir { path }` makes an empty folder at `path`.
 - `files_delete { path }` deletes the entry at `path`, a folder with
@@ -520,7 +526,7 @@ client can leave out what it would only be refused:
 ```jsonc
 "files": {
   "writable": true,   // false: the area is read-only, and "may" is empty
-  "previews": ["image", "text"],   // the kinds files_preview makes here
+  "previews": ["image", "text", "video"],   // the kinds files_preview makes here
   "may": ["create_folders", "delete_files", "rename_files"]
 }
 ```
