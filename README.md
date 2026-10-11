@@ -961,6 +961,24 @@ reference = true                # does citing someone's article notify them
 max_subs = 200                  # threads and categories followed or muted, per account
 max_per_hour = 12               # news pushes per account; 0 = badges, no pushes
 stale_after = 604800            # seconds behind before a scope rings again anyway; 0 = never
+
+[news.feeds]                    # what every feed is held to; all optional
+every = 1800                    # seconds between polls
+min_every = 300                 # the shortest every a feed may ask for
+keep = 100                      # newest articles a feed keeps; 0 = retain_days decides
+first_import = 20               # items a feed's first poll takes from its backlog
+max_bytes = 4194304             # a response body, after decompression
+timeout = 30                    # seconds for a whole fetch, redirects included
+# proxy = "http://10.0.0.5:3128"  # HTTP(S)_PROXY in the environment is never read
+
+[[news.feed]]                   # one per feed; none = nothing is fetched
+name = "mobius"                 # the feed's identity, kept across a change of URL
+url = "https://github.com/jhalter/mobius/releases.atom"
+category = "Software/Mobius"    # made if missing, and read-only while configured
+# every = 3600
+# keep = 50
+# author = "Mobius"             # in place of each item's own
+# replies = false               # may people reply to its articles
 ```
 
 `markdown` decides what an article written in markdown gets. `render`
@@ -986,6 +1004,17 @@ never stages, since a staged image belongs to the person who uploaded it.
 News images go through the same pipeline as chat's: `[media]`'s dimension,
 pixel and frame caps and its `max_concurrent_decodes` hold for both, and
 only the byte ceiling is `[news.attach]`'s own.
+
+`[[news.feed]]` polls an RSS, Atom or JSON feed into a category, one
+article per item, with the item's own author; an item edited upstream
+edits its article (`news_edited` on ng), and a feed keeps its newest
+`keep`. Nobody posts into a feed's category, nor renames or deletes it
+while the feed is configured; a moderator may delete its articles, and
+a deleted item stays deleted. A feed whose URL is on the local network
+is fetched as configured; any other is held to public addresses on
+every connection, redirects included. Feeds are read at startup, and
+`hxd news feeds` says how each is doing. Needs the `feeds` feature. See
+[docs/news-feeds.md](docs/news-feeds.md).
 
 Who may read, post, delete and rearrange is the account's news bits —
 `read_news`, `post_news`, `delete_articles` and the category and bundle
@@ -1406,16 +1435,17 @@ nothing.
 
 ### Cargo features
 
-`voice`, `inbox`, `media`, `markdown` and `push` are all on by default, so
-CI covers them. The `inbox` feature supplies the shared SQLite store for
+`voice`, `inbox`, `media`, `markdown`, `push` and `feeds` are all on by
+default, so CI covers them. The `inbox` feature supplies the shared SQLite store for
 the inbox, history, news and devices; `media` supplies the image pipeline;
 `markdown` supplies the parser behind `[news] markdown = "render"`; `push`
 supplies the Web Push sender, and needs `inbox` for the store its devices
-live in. Building without one leaves its dependency out of the binary
-entirely — no WebRTC stack, no bundled SQLite, no image decoder, no
-markdown parser, no TLS client — and the matching config section, or for
-`markdown` the `render` mode, then becomes a startup error rather than a
-promise the build cannot keep.
+live in; `feeds` supplies the feed fetcher and parser, and needs `inbox`
+for the articles. Building without one leaves its dependency out of the
+binary entirely — no WebRTC stack, no bundled SQLite, no image decoder,
+no markdown parser, no TLS client, no feed parser — and the matching
+config section, or for `markdown` the `render` mode, then becomes a
+startup error rather than a promise the build cannot keep.
 
 `metrics` is off by default: it serves the server's own numbers at
 `GET /metrics` on the ng port, for load tests and dashboards, once a

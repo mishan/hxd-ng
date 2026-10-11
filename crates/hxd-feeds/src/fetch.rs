@@ -149,6 +149,17 @@ pub(crate) async fn fetch_with<N: Net>(
         .unwrap_or(Err(FetchError::Timeout))
 }
 
+/// Is `url` one [`fetch`] would ask for? For a config read before any
+/// fetch is made.
+pub fn check_url(url: &str) -> Result<(), FetchError> {
+    checked(Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?).map(drop)
+}
+
+/// Is `proxy` one [`FetchConfig::proxy`] can name?
+pub fn check_proxy(proxy: &str) -> Result<(), FetchError> {
+    proxy_url(proxy).map(drop)
+}
+
 /// A URL this fetches from: absolute `http` or `https` with a host and
 /// no userinfo.
 fn checked(url: Url) -> Result<Url, FetchError> {

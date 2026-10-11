@@ -1565,6 +1565,7 @@ mod tests {
             delete_sn: 2,
             children: 3,
             created_at: at(0),
+            feed: None,
         }
     }
 

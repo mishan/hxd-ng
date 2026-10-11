@@ -55,8 +55,7 @@ mod subs;
 #[cfg(test)]
 mod subs_tests;
 
-pub(crate) use feed::FeedRule;
-pub use feed::{Feed, FeedImport, FeedItem, FeedSpec};
+pub use feed::{Feed, FeedImport, FeedItem, FeedRule, FeedSpec};
 pub use guest::{GuestKey, GuestKeyer, GUEST_SECRET_LEN};
 pub use memory::MemoryNews;
 pub use query::{CompiledQuery, Field, Term};
@@ -135,6 +134,9 @@ pub struct Node {
     /// Sub-nodes for a bundle; live articles for a category.
     pub children: u32,
     pub created_at: SystemTime,
+    /// The feed filling a category, which no one may start a thread in
+    /// (news-feeds.md §3). `Core`'s to say: a store leaves it `None`.
+    pub feed: Option<FeedRule>,
 }
 
 /// Who wrote an article, **as they were when they wrote it** (§3.1). A
@@ -2039,18 +2041,21 @@ impl Core {
         if let Some(id) = parent {
             store.node(id)?.ok_or(NewsError::NoSuchNode)?;
         }
+        let feeds = self.news_feeds.read().unwrap().clone();
         fn level(
             store: &dyn NewsStore,
+            feeds: &std::collections::HashMap<NodeId, FeedRule>,
             parent: Option<NodeId>,
             depth: u8,
         ) -> Result<Vec<NodeTree>, NewsError> {
             store
                 .nodes(parent)?
                 .into_iter()
-                .map(|node| {
+                .map(|mut node| {
+                    node.feed = feeds.get(&node.id).cloned();
                     let children = match node.kind {
                         NodeKind::Bundle if depth > 1 => {
-                            Some(level(store, Some(node.id), depth - 1)?)
+                            Some(level(store, feeds, Some(node.id), depth - 1)?)
                         }
                         _ => None,
                     };
@@ -2058,7 +2063,7 @@ impl Core {
                 })
                 .collect()
         }
-        level(&**store, parent, depth.clamp(1, 4)).map_err(store_failed)
+        level(&**store, &feeds, parent, depth.clamp(1, 4)).map_err(store_failed)
     }
 
     pub fn news_threads(&self, uid: Uid, query: ThreadQuery) -> Result<ThreadPage, NewsError> {

@@ -45,9 +45,10 @@ pub struct FeedSpec {
 /// What a feed's category allows, held by `Core` while the feed is
 /// configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FeedRule {
-    pub(crate) name: String,
-    pub(crate) replies: bool,
+pub struct FeedRule {
+    pub name: String,
+    /// May people reply to its articles?
+    pub replies: bool,
 }
 
 /// An open feed: its spec, its id and the category it fills.

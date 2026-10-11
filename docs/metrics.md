@@ -209,6 +209,13 @@ or relay queue ends as `closed_here`, which is why `hxd_link_lagged_total` says
 so apart. Each link's frames are counted under `wire="legacy"`, and its
 writer's queue in `hxd_write_queued_*`.
 
+### News feeds
+
+| Metric | Labels | |
+|---|---|---|
+| `hxd_news_feed_polls_total` | `outcome` | each poll of a `[[news.feed]]`: `fetched`, `not_modified` (a 304), `failed` |
+| `hxd_news_feed_articles_total` | `what` | what imports did: `posted`, `revised` (an item edited upstream), `pruned` (past `keep`) |
+
 ### Read at scrape time
 
 | Metric | Labels | |

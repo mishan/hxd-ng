@@ -9,5 +9,6 @@ mod fetch;
 mod html;
 mod parse;
 
-pub use fetch::{fetch, FetchConfig, FetchError, Fetched, Validators};
+pub use fetch::{check_proxy, check_url, fetch, FetchConfig, FetchError, Fetched, Validators};
 pub use parse::{parse, Feed, Item, ParseError, ParseOptions};
+pub use url::Url;

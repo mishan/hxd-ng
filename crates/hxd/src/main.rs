@@ -1247,8 +1247,12 @@ async fn main() {
                 .or_else(|| config.history.as_ref().and_then(|h| h.db.as_ref()))
                 .expect("configuration validation requires a news database");
             tracing::info!("threaded news at {}", db.display());
-            if news.retain_days > 0 || news.attach.is_some() {
+            if news.retain_days > 0 || news.attach.is_some() || !news.feed.is_empty() {
                 tokio::spawn(hxd::news_pruner(ctx.core.clone()));
+            }
+            #[cfg(feature = "feeds")]
+            if !news.feed.is_empty() {
+                hxd::feeds::start(news, ctx.core.clone())?;
             }
         }
 

@@ -1271,7 +1271,8 @@ An `article` object:
   "root": 41,
   "depth": 2,
   "from": { "nick": "Alice", "login": "alice",
-            "fingerprint": "6htgz65…" },   // login/fingerprint absent for a guest
+            "fingerprint": "6htgz65…" },   // login/fingerprint absent for a guest;
+                                           // "feed": "mobius" for a feed's article
   "subject": "Re: Re: Phase 4 is open",
   "body": "This was settled in [the sizes thread](news:51).",
   "mime": "text/markdown",       // how to read "body"
@@ -1302,7 +1303,10 @@ read.
 A `node` object is `{ "id", "parent", "kind", "name", "count",
 "created_at" }` — `parent` null at the root, `count` the sub-nodes of a
 bundle or the live articles of a category — with `children` on a bundle
-that a `news_tree` of `depth` above 1 reached into. An article's
+that a `news_tree` of `depth` above 1 reached into, and `"feed": {
+"name", "replies" }` on a category a feed fills: nobody starts a thread
+there, and nobody replies unless `replies` is true
+([news-feeds.md](news-feeds.md) §3). An article's
 `parent` is likewise null for a thread's starter.
 
 **The `plain` downgrade never crosses the ng wire.** An ng client is
@@ -2348,6 +2352,9 @@ flat_default_subject = "(no subject)"  # also a 1.5 post's, with no subject or b
 # flat_masthead = "…"           # absent = a built-in line naming the category
                                 # and the two headers; "" = no masthead at all;
                                 # at most 4096 bytes
+
+# [news.feeds] and [[news.feed]]: feeds polled into read-only
+# categories, in news-feeds.md §2.
 
 [news.notify]                   # absent = no subscriptions, no notifications
 auto_subscribe = "participated" # or "own_thread", or "off"

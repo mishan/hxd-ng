@@ -253,6 +253,7 @@ impl Inner {
             delete_sn: n.delete_sn,
             children: children as u32,
             created_at: n.created_at,
+            feed: None,
         }
     }
 

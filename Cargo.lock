@@ -1389,6 +1389,7 @@ dependencies = [
  "hxcrypto",
  "hxd-auth-file",
  "hxd-core",
+ "hxd-feeds",
  "hxd-files",
  "hxd-link",
  "hxd-markdown",

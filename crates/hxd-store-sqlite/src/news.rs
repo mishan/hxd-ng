@@ -258,6 +258,7 @@ impl RawNode {
             delete_sn: serial(self.delete_sn)?,
             children: u32::try_from(self.children).unwrap_or(u32::MAX),
             created_at: from_unix(self.created_at),
+            feed: None,
         })
     }
 }

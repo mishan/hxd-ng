@@ -453,6 +453,33 @@ pub fn throttled(what: &'static str) {
     let _ = what;
 }
 
+/// A news feed's poll (`docs/news-feeds.md` §4): `fetched`,
+/// `not_modified` or `failed`.
+pub fn feed_poll(outcome: &'static str) {
+    #[cfg(feature = "metrics")]
+    handle!(counter("hxd_news_feed_polls_total", "outcome" => outcome), |h| {
+        h.increment(1)
+    });
+    #[cfg(not(feature = "metrics"))]
+    let _ = outcome;
+}
+
+/// What a feed's import did to its articles.
+pub fn feed_items(posted: usize, revised: usize, pruned: u64) {
+    #[cfg(feature = "metrics")]
+    for (what, n) in [
+        ("posted", posted as u64),
+        ("revised", revised as u64),
+        ("pruned", pruned),
+    ] {
+        handle!(counter("hxd_news_feed_articles_total", "what" => what), |h| {
+            h.increment(n)
+        });
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (posted, revised, pruned);
+}
+
 /// A detached session's buffer overflowed; its resume will be a resync.
 pub fn outbox_broken() {
     #[cfg(feature = "metrics")]
