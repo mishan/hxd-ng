@@ -251,6 +251,13 @@ pub trait MediaCodec: Send + Sync + 'static {
     ) -> Result<crate::avatar::AvatarImages, MediaReject> {
         Err(MediaReject::Unsupported)
     }
+
+    /// Make a file's preview (`docs/hotline-ng.md` §7.2): a still, its
+    /// first frame for an animation, fitted to `max_dimension`.
+    /// Implementations without previews refuse.
+    fn preview(&self, _input: &[u8], _max_dimension: u32) -> Result<Canonical, MediaReject> {
+        Err(MediaReject::Unsupported)
+    }
 }
 
 /// Who a download is for. Never a bare uid: uids recycle, and a set

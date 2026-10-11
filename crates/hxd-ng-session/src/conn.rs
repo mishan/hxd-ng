@@ -113,7 +113,7 @@ fn request_weight(req: &str) -> u32 {
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
         | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
-        | "account_list" => 4,
+        | "account_list" | "files_preview" => 4,
         _ => 1,
     }
 }

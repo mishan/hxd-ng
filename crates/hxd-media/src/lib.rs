@@ -230,6 +230,23 @@ impl MediaCodec for Codec {
         self.make_avatar(input, limits)
     }
 
+    fn preview(&self, input: &[u8], max_dimension: u32) -> Result<Canonical, MediaReject> {
+        let walked = self.inspect(input)?;
+        let _permit = self.permits.acquire(self.limits.permit_wait)?;
+        let img = fit(self.decode_still(input, &walked)?, max_dimension);
+        let (mime, bytes) = match walked.format {
+            Format::Jpeg => (MediaType::Jpeg, encode_jpeg(&img)?),
+            Format::Png | Format::Gif => (MediaType::Png, encode_png(&img)?),
+            _ => return Err(MediaReject::Unsupported),
+        };
+        Ok(Canonical {
+            mime,
+            width: img.width(),
+            height: img.height(),
+            bytes,
+        })
+    }
+
     fn canonicalize(&self, input: &[u8]) -> Result<Canonical, MediaReject> {
         let walked = self.inspect(input)?;
         // Only the expensive half needs a permit: everything above is

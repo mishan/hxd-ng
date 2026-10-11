@@ -54,8 +54,8 @@ use hyper::body::{Frame as BodyFrame, Incoming};
 use hyper::header::{
     HeaderValue, ACCEPT_RANGES, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
     ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
-    AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
-    ETAG, ORIGIN, RANGE, RETRY_AFTER,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
+    CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, ORIGIN, RANGE, RETRY_AFTER,
 };
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -485,6 +485,19 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
         // indistinguishable: a bearer URL must not become a session oracle.
         return plain(StatusCode::NOT_FOUND, "not found");
     };
+    if let Some(preview) = grant.preview {
+        // Bytes this server made, as a news attachment's are, served so
+        // that nothing reads them as anything else.
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, preview.media_type)
+            .header(CACHE_CONTROL, "private, no-store")
+            .header("x-content-type-options", "nosniff")
+            .header(CONTENT_DISPOSITION, "inline")
+            .header(CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'")
+            .body(full(Bytes::copy_from_slice(&preview.bytes)))
+            .unwrap();
+    }
     let info = match service.source.info(&grant.path).await {
         Ok(info) if info.kind == FileKind::File => info,
         _ => return plain(StatusCode::NOT_FOUND, "not found"),

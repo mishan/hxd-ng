@@ -105,6 +105,7 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
         idle,
     );
     service.max_folder_items = section.max_folder_items;
+    service.image_previews = image_previews();
     let service = Arc::new(service);
     Ok(Some(Files {
         service,
@@ -114,6 +115,33 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
             idle,
         },
     }))
+}
+
+/// A preview reads the whole image and decodes it, so the pipeline that
+/// makes one takes a camera's photograph, holds one decode at a time of
+/// its own beside chat's and avatars', and draws it no larger than a
+/// screen shows it.
+#[cfg(feature = "media")]
+fn image_previews() -> Option<hxd_files::ImagePreviews> {
+    const MAX_BYTES: usize = 16 << 20;
+    let codec = hxd_media::Codec::new(hxd_core::CodecLimits {
+        max_bytes: MAX_BYTES,
+        max_dimension: 8192,
+        max_pixels: 6000 * 4000,
+        max_alloc_bytes: 128 << 20,
+        ..Default::default()
+    })
+    .with_own_permits(1);
+    Some(hxd_files::ImagePreviews {
+        codec: Arc::new(codec),
+        max_bytes: MAX_BYTES as u64,
+        max_dimension: 1024,
+    })
+}
+
+#[cfg(not(feature = "media"))]
+fn image_previews() -> Option<hxd_files::ImagePreviews> {
+    None
 }
 
 /// The HTXF listener: where it binds, what it redeems, and how long it

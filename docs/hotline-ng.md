@@ -467,6 +467,16 @@ trailing slashes are malformed.
   `{ url, size, media_type? }`. `url` is a same-server bearer URL such as
   `/files/<token>`; it is short-lived and bound to the session that asked.
   `""` is `bad_request`.
+- `files_preview { path }` requires a file, as `files_download` does, and
+  returns `{ kind, url, media_type, size, truncated, width?, height? }`.
+  `url` is a token as `files_download`'s is, but what it serves is made
+  by the server rather than read from the file: for `kind` `image`, the
+  image decoded and drawn again as a still within 1024 pixels a side,
+  `width` by `height`; for `text`, its first 256 KiB as UTF-8 with LF
+  line endings, Mac Roman when the file is declared text and is not
+  UTF-8, and `truncated` when that is not all of it. `size` is the
+  file's. A file that is neither is `unsupported`, and an image past
+  what the server will decode is `too_large`.
 
 - `files_mkdir { path }` makes an empty folder at `path`.
 - `files_delete { path }` deletes the entry at `path`, a folder with
@@ -510,6 +520,7 @@ client can leave out what it would only be refused:
 ```jsonc
 "files": {
   "writable": true,   // false: the area is read-only, and "may" is empty
+  "previews": ["image", "text"],   // the kinds files_preview makes here
   "may": ["create_folders", "delete_files", "rename_files"]
 }
 ```

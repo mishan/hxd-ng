@@ -268,6 +268,9 @@ background, not a separate implementation contract.
   single file's declared length.
 - Transfer queueing and per-account limits — built (`docs/files-plan.md`,
   "Folder transfers", F3).
+- Previews on the ng wire (`files_preview`) — built: an image decoded and
+  drawn again by the media pipeline, or the start of a text as UTF-8,
+  served behind a download token and never the file's own bytes.
 
 ## Phase 4 — News
 
