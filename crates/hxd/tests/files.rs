@@ -1183,6 +1183,75 @@ async fn ng_lists_decimal_sizes_and_proxies_full_and_ranged_downloads() {
     assert!(stale.starts_with("HTTP/1.1 404 Not Found"));
 }
 
+#[tokio::test]
+async fn ng_previews_are_drawn_again_or_decoded_text() {
+    let root = tempfile::tempdir().unwrap();
+    let mut photo = image::RgbImage::new(2048, 1024);
+    for (x, y, pixel) in photo.enumerate_pixels_mut() {
+        *pixel = image::Rgb([(x % 256) as u8, (y % 256) as u8, 0x30]);
+    }
+    photo.save(root.path().join("photo.png")).unwrap();
+    let notes = "line\r\n".repeat(50_000);
+    std::fs::write(root.path().join("notes.txt"), &notes).unwrap();
+    std::fs::write(root.path().join("blob.bin"), b"\x00\x01binary").unwrap();
+    std::fs::create_dir(root.path().join("folder")).unwrap();
+    let source = Arc::new(LocalFileSource::open(root.path(), LocalLimits::default()).unwrap());
+    let mut service = FileService::new(source, None, transfers(), downloads(), IDLE);
+    service.image_previews = Some(hxd_files::ImagePreviews::new(
+        Arc::new(hxd_media::Codec::new(hxd_core::CodecLimits {
+            max_bytes: 16 << 20,
+            max_pixels: 2048 * 1024,
+            ..Default::default()
+        })),
+        16 << 20,
+        1024,
+        2,
+    ));
+    let server = run_service(
+        Arc::new(service),
+        "download_files = true\nread_chat = true\nuse_any_name = true\n",
+    )
+    .await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/", server.ng))
+        .await
+        .unwrap();
+    let login = ng_request(&mut ws, 1, "login", json!({"nick": "reader"})).await;
+    assert_eq!(login["ok"]["files"]["previews"], json!(["image", "text"]));
+
+    let image = ng_request(&mut ws, 2, "files_preview", json!({"path": "photo.png"})).await;
+    assert_eq!(image["ok"]["kind"], "image", "{image}");
+    assert_eq!(image["ok"]["media_type"], "image/png");
+    assert_eq!(
+        (image["ok"]["width"].clone(), image["ok"]["height"].clone()),
+        (json!(1024), json!(512))
+    );
+    let served = http_get_bytes(server.ng, image["ok"]["url"].as_str().unwrap(), "").await;
+    let split = served.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&served[..split]).to_lowercase();
+    assert!(head.contains("content-type: image/png"), "{head}");
+    assert!(head.contains("x-content-type-options: nosniff"), "{head}");
+    let drawn = image::load_from_memory(&served[split + 4..]).unwrap();
+    assert_eq!((drawn.width(), drawn.height()), (1024, 512));
+
+    let text = ng_request(&mut ws, 3, "files_preview", json!({"path": "notes.txt"})).await;
+    assert_eq!(text["ok"]["kind"], "text", "{text}");
+    assert_eq!(text["ok"]["truncated"], true);
+    assert_eq!(text["ok"]["size"], notes.len().to_string());
+    let served = http_get(server.ng, text["ok"]["url"].as_str().unwrap(), None).await;
+    let (head, body) = served.split_once("\r\n\r\n").unwrap();
+    assert!(
+        head.contains("content-type: text/plain; charset=utf-8"),
+        "{head}"
+    );
+    assert!(body.starts_with("line\nline\n") && !body.contains('\r'));
+    assert!(body.len() < hxd_files::TEXT_BYTES as usize);
+
+    for (id, path, code) in [(4, "blob.bin", "unsupported"), (5, "folder", "not_file")] {
+        let refused = ng_request(&mut ws, id, "files_preview", json!({"path": path})).await;
+        assert_eq!(refused["error"]["code"], code, "{refused}");
+    }
+}
+
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
 async fn ng_login(address: SocketAddr, params: Value) -> Ws {
@@ -1870,6 +1939,10 @@ async fn http_get(address: SocketAddr, path: &str, range: Option<&str>) -> Strin
 }
 
 async fn http_get_headers(address: SocketAddr, path: &str, headers: &str) -> String {
+    String::from_utf8(http_get_bytes(address, path, headers).await).unwrap()
+}
+
+async fn http_get_bytes(address: SocketAddr, path: &str, headers: &str) -> Vec<u8> {
     let mut stream = TcpStream::connect(address).await.unwrap();
     stream
         .write_all(
@@ -1880,7 +1953,7 @@ async fn http_get_headers(address: SocketAddr, path: &str, headers: &str) -> Str
         .unwrap();
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).await.unwrap();
-    String::from_utf8(bytes).unwrap()
+    bytes
 }
 
 /// One folder download's connection, driven as a client drives it.

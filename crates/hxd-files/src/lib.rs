@@ -2,11 +2,13 @@
 
 mod local;
 mod manifest;
+mod preview;
 mod registry;
 mod sealed;
 mod transfer;
 
 pub use manifest::{HttpManifestSource, ManifestLimits};
+pub use preview::{ImagePreviews, Preview, PreviewError, PreviewKind, TEXT_BYTES};
 pub use registry::{
     DecodeName, DownloadGrant, DownloadTokens, EntryLimits, FolderFile, FolderItem, PreparedBanner,
     PreparedDownload, PreparedFolder, PreparedFolderUpload, PreparedTransfer, PreparedUpload,
@@ -39,6 +41,15 @@ pub struct FileService {
     pub idle_timeout: Duration,
     /// The most items one folder download or upload may hold.
     pub max_folder_items: usize,
+    /// Without it, a file previews only as text.
+    pub image_previews: Option<ImagePreviews>,
+}
+
+impl FileService {
+    /// A preview of the file `info` describes.
+    pub async fn preview(&self, info: &hxd_core::FileInfo) -> Result<Preview, PreviewError> {
+        preview::make(self, info).await
+    }
 }
 
 impl FileService {
@@ -56,6 +67,7 @@ impl FileService {
             downloads,
             idle_timeout,
             max_folder_items: MAX_FOLDER_ITEMS,
+            image_previews: None,
         }
     }
 }

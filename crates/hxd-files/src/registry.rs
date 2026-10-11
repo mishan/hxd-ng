@@ -953,7 +953,13 @@ pub struct DownloadGrant {
     pub path: FilePath,
     pub ranges: bool,
     pub expires_at: Instant,
+    /// What the token serves in place of the file.
+    pub preview: Option<Arc<crate::Preview>>,
 }
+
+/// The most preview bytes tokens hold for everyone, and for one holder.
+const PREVIEWS_HELD: usize = 64 << 20;
+const PREVIEWS_HELD_PER_ACCOUNT: usize = 16 << 20;
 
 pub struct DownloadTokens {
     ttl: Duration,
@@ -978,8 +984,47 @@ impl DownloadTokens {
         path: FilePath,
         ranges: bool,
     ) -> Result<String, FileError> {
+        self.issue_grant(principal, account, path, ranges, None)
+    }
+
+    /// A token serving `preview` rather than the file at `path`, counted
+    /// against `account`, which for a preview names whose bytes it holds.
+    pub fn issue_preview(
+        &self,
+        principal: FilePrincipal,
+        account: &str,
+        path: FilePath,
+        preview: crate::Preview,
+    ) -> Result<String, FileError> {
+        self.issue_grant(principal, account, path, false, Some(Arc::new(preview)))
+    }
+
+    fn issue_grant(
+        &self,
+        principal: FilePrincipal,
+        account: &str,
+        path: FilePath,
+        ranges: bool,
+        preview: Option<Arc<crate::Preview>>,
+    ) -> Result<String, FileError> {
         let mut grants = self.grants.lock().unwrap();
         grants.retain(|_, value| value.expires_at > Instant::now());
+        if let Some(preview) = &preview {
+            let held = |of: Option<&str>| -> usize {
+                grants
+                    .values()
+                    .filter(|grant| of.is_none_or(|account| grant.account == account))
+                    .filter_map(|grant| grant.preview.as_ref())
+                    .map(|preview| preview.bytes.len())
+                    .sum()
+            };
+            let len = preview.bytes.len();
+            if held(None) + len > PREVIEWS_HELD
+                || held(Some(account)) + len > PREVIEWS_HELD_PER_ACCOUNT
+            {
+                return Err(FileError::Busy);
+            }
+        }
         if !self.limits.admits(
             grants.len(),
             grants
@@ -1003,6 +1048,7 @@ impl DownloadTokens {
                     path: path.clone(),
                     ranges,
                     expires_at: Instant::now() + self.ttl,
+                    preview,
                 });
                 return Ok(token);
             }
@@ -1367,6 +1413,31 @@ mod tests {
         let second = attach(&core, "second");
         assert_ne!(second.serial, first.serial);
         assert!(tokens.resolve(&token, &core).is_none());
+    }
+
+    #[test]
+    fn preview_bytes_are_held_within_one_holders_share() {
+        let core = Core::new();
+        let principal = attach(&core, "viewer");
+        let tokens = DownloadTokens::new(Duration::from_secs(30), limits(64, 64, 64));
+        let issue = |holder: &str| {
+            tokens.issue_preview(
+                principal,
+                holder,
+                FilePath::parse("f").unwrap(),
+                crate::Preview {
+                    kind: crate::PreviewKind::Image,
+                    media_type: "image/png",
+                    bytes: vec![0; 6 << 20],
+                    truncated: false,
+                    dimensions: Some((1, 1)),
+                },
+            )
+        };
+        issue("one").unwrap();
+        issue("one").unwrap();
+        assert!(matches!(issue("one"), Err(FileError::Busy)));
+        issue("two").unwrap();
     }
 
     #[test]

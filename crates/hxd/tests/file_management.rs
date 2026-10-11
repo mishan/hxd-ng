@@ -856,7 +856,8 @@ async fn a_read_only_area_refuses_every_change() {
     let (mut modern, hello) = ng::Client::account(server.ng, "admin", "pw", "modern")
         .await
         .unwrap();
-    assert_eq!(hello["files"], json!({ "writable": false, "may": [] }));
+    assert_eq!(hello["files"]["writable"], false);
+    assert_eq!(hello["files"]["may"], json!([]));
     assert_eq!(
         refused_ng(
             modern

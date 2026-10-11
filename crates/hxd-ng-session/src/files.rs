@@ -1,8 +1,8 @@
 //! Hotline-ng Files requests and HTTP download authorization.
 
 use hxd_core::access::{bit, AccessBits};
-use hxd_core::{FileError, FileKind, FilePath, FilePrincipal};
-use hxd_files::FileService;
+use hxd_core::{FileError, FileInfo, FileKind, FilePath, FilePrincipal};
+use hxd_files::{FileService, PreviewError, PreviewKind};
 use serde_json::{json, Value};
 use tracing::info;
 
@@ -32,8 +32,13 @@ const ACTS: [(&str, u8); 9] = [
 /// refused.
 pub fn login_json(service: &FileService, access: AccessBits) -> Value {
     let writable = service.uploads.is_some();
+    let previews = match service.image_previews {
+        Some(_) => &["image", "text"][..],
+        None => &["text"][..],
+    };
     json!({
         "writable": writable,
+        "previews": previews,
         "may": ACTS
             .iter()
             .filter(|(_, b)| writable && access.has(*b))
@@ -121,41 +126,14 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
             }
         }
         "files_download" => {
-            if !state.access.has(bit::DOWNLOAD_FILES) {
-                return crate::proto::reply_err(
-                    req.id,
-                    "access_denied",
-                    "You are not allowed to download files.",
-                );
-            }
-            let params = serde_json::from_value::<FilesDownloadParams>(req.params.clone());
-            let Ok(params) = params else {
-                return crate::proto::reply_err(req.id, "bad_request", "Malformed files_download.");
+            let (info, principal, login) = match fetchable(ctx, state, service, req).await {
+                Ok(fetchable) => fetchable,
+                Err(refusal) => return refusal,
             };
-            let path = match FilePath::parse(&params.path) {
-                Ok(path) if !path.is_root() => path,
-                _ => return crate::proto::reply_err(req.id, "bad_request", "Malformed file path."),
-            };
-            if let Some(refusal) = drop_box_refusal(req.id, state, &path) {
-                return refusal;
-            }
-            let info = match service.source.info(&path).await {
-                Ok(info) if info.kind == FileKind::File => info,
-                Ok(_) => return crate::proto::reply_err(req.id, "not_file", "Path is not a file."),
-                Err(error) => return error_reply(req.id, error),
-            };
-            let (Some(serial), Some(details)) = (
-                ctx.core.session_serial(state.uid),
-                ctx.core.user_details(state.uid),
-            ) else {
-                return crate::proto::reply_err(req.id, "not_authorized", "Session ended.");
-            };
+            let path = info.path.clone();
             match service.downloads.issue(
-                FilePrincipal {
-                    uid: state.uid,
-                    serial,
-                },
-                &details.login,
+                principal,
+                &login,
                 path.clone(),
                 service.source.supports_ranges(&path),
             ) {
@@ -167,6 +145,51 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                         "media_type": info.media_type,
                     }),
                 ),
+                Err(error) => error_reply(req.id, error),
+            }
+        }
+        "files_preview" => {
+            let (info, principal, login) = match fetchable(ctx, state, service, req).await {
+                Ok(fetchable) => fetchable,
+                Err(refusal) => return refusal,
+            };
+            let preview = match service.preview(&info).await {
+                Ok(preview) => preview,
+                Err(PreviewError::File(error)) => return error_reply(req.id, error),
+                Err(PreviewError::TooLarge) => return error_reply(req.id, FileError::TooLarge),
+                Err(PreviewError::Busy) => return error_reply(req.id, FileError::Busy),
+                Err(PreviewError::Unsupported) => {
+                    return crate::proto::reply_err(
+                        req.id,
+                        "unsupported",
+                        "This file has no preview.",
+                    )
+                }
+            };
+            let mut ok = json!({
+                "kind": match preview.kind {
+                    PreviewKind::Image => "image",
+                    PreviewKind::Text => "text",
+                },
+                "media_type": preview.media_type,
+                "size": info.size.to_string(),
+                "truncated": preview.truncated,
+            });
+            if let Some((width, height)) = preview.dimensions {
+                ok["width"] = json!(width);
+                ok["height"] = json!(height);
+            }
+            // Held against the person, as transfers are: guests share a
+            // login and not an address.
+            let holder = ctx.core.transfer_person(state.uid).unwrap_or(login);
+            match service
+                .downloads
+                .issue_preview(principal, &holder, info.path, preview)
+            {
+                Ok(token) => {
+                    ok["url"] = json!(format!("/files/{token}"));
+                    crate::proto::reply_ok(req.id, ok)
+                }
                 Err(error) => error_reply(req.id, error),
             }
         }
@@ -390,6 +413,72 @@ fn drop_box_refusal(id: u64, state: &SessState, path: &FilePath) -> Option<Strin
             "You are not allowed to view drop boxes.",
         )
     })
+}
+
+/// The file a `files_download` or `files_preview` names, once this session
+/// may fetch it, and who is fetching; or the reply refusing it.
+async fn fetchable(
+    ctx: &NgCtx,
+    state: &SessState,
+    service: &FileService,
+    req: &ReqEnvelope,
+) -> Result<(FileInfo, FilePrincipal, String), String> {
+    if !state.access.has(bit::DOWNLOAD_FILES) {
+        return Err(crate::proto::reply_err(
+            req.id,
+            "access_denied",
+            "You are not allowed to download files.",
+        ));
+    }
+    let Ok(params) = serde_json::from_value::<FilesDownloadParams>(req.params.clone()) else {
+        return Err(crate::proto::reply_err(
+            req.id,
+            "bad_request",
+            &format!("Malformed {}.", req.req),
+        ));
+    };
+    let path = match FilePath::parse(&params.path) {
+        Ok(path) if !path.is_root() => path,
+        _ => {
+            return Err(crate::proto::reply_err(
+                req.id,
+                "bad_request",
+                "Malformed file path.",
+            ))
+        }
+    };
+    if let Some(refusal) = drop_box_refusal(req.id, state, &path) {
+        return Err(refusal);
+    }
+    let info = match service.source.info(&path).await {
+        Ok(info) if info.kind == FileKind::File => info,
+        Ok(_) => {
+            return Err(crate::proto::reply_err(
+                req.id,
+                "not_file",
+                "Path is not a file.",
+            ))
+        }
+        Err(error) => return Err(error_reply(req.id, error)),
+    };
+    let (Some(serial), Some(details)) = (
+        ctx.core.session_serial(state.uid),
+        ctx.core.user_details(state.uid),
+    ) else {
+        return Err(crate::proto::reply_err(
+            req.id,
+            "not_authorized",
+            "Session ended.",
+        ));
+    };
+    Ok((
+        info,
+        FilePrincipal {
+            uid: state.uid,
+            serial,
+        },
+        details.login,
+    ))
 }
 
 fn error_reply(id: u64, error: FileError) -> String {
