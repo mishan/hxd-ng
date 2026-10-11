@@ -1168,9 +1168,16 @@ impl IdentityState {
             return Ok(Some(card.attestations.clone()));
         };
         let fingerprint = Fingerprint::of(&card.identity);
+        // Only an attestation under a key its registrar publishes was
+        // fetched for, so only its registrar can be stale.
         let hosts: Vec<String> = card
             .attestations
             .iter()
+            .filter(|a| {
+                registrars
+                    .keys(&a.registrar, &a.identity, now)
+                    .contains(&a.registrar_key)
+            })
             .map(|a| a.registrar.clone())
             .collect();
         let found = registrars.lookup(&card.identity, &hosts, now);
@@ -1300,11 +1307,12 @@ impl IdentityState {
             .into_iter()
             .map(Fingerprint)
             .collect();
-        let now = now_unix();
+        let (now, sweep) = (now_unix(), std::time::Instant::now());
+        registrars.retain_attested(&live);
         futures_util::stream::iter(&live)
             .for_each_concurrent(8, |fp| {
                 let registrars = registrars.clone();
-                async move { registrars.refresh_held(*fp, now).await }
+                async move { registrars.refresh_held(*fp, now, sweep).await }
             })
             .await;
         let frozen_refuses = self.cfg.frozen == Frozen::Deny;
@@ -1320,7 +1328,8 @@ impl IdentityState {
     }
 
     /// The card a device on file is admitted under, as `identity_for_device`
-    /// would read it: for the caller to fetch its records first.
+    /// would read it: for the caller to fetch its records first. Verifies
+    /// the card: called off the reactor.
     pub fn card_for_device(&self, device: &PublicKey) -> Option<hl_identity::Card> {
         let bytes = {
             let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());

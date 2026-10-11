@@ -7,7 +7,7 @@
 //! `identity.rs`'s; this only says what they are and whether they are
 //! current.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,11 +80,16 @@ pub struct Registrars {
     /// One discovery at a time per host, so logins arriving together
     /// wait on one fetch rather than each making their own.
     discovering: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// When a host's discovery document last could not be had: not asked
-    /// again for `REDISCOVERY`, so a registrar that is down costs one
-    /// failed fetch a minute rather than one for every login and every
-    /// identity a sweep refreshes.
+    /// When a host last could not be reached, or its discovery document
+    /// had: that document is not asked for again for `REDISCOVERY`, and a
+    /// sweep asks the host nothing more once it has failed in it, so a
+    /// registrar that is down costs a fetch a minute and a sweep, rather
+    /// than one for every login and every identity swept.
     failed: Mutex<HashMap<String, Instant>>,
+    /// The trusted registrars each identity admitted here was attested
+    /// by, for the sweep to ask even when admission held no list from
+    /// them. A restart forgets it, as it ends the sessions it is for.
+    attested: Mutex<HashMap<Fingerprint, HashSet<String>>>,
     /// Held across comparing a fetched list with the one held and
     /// replacing it, so two fetches finishing together cannot leave the
     /// older one.
@@ -109,6 +114,7 @@ impl Registrars {
             discovered: Mutex::new(HashMap::new()),
             discovering: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
+            attested: Mutex::new(HashMap::new()),
             storing: Arc::new(Mutex::new(())),
             cache,
         }
@@ -183,54 +189,98 @@ impl Registrars {
     /// wait. What cannot be had in it is left to [`Self::lookup`] to call
     /// stale. Asked only for an identity whose login has verified.
     pub async fn refresh(&self, identity: &PublicKey, attestations: &[Attestation], now: u64) {
-        let mut hosts: Vec<(&str, bool)> = attestations
+        let mut hosts: Vec<(&str, Vec<PublicKey>)> = attestations
             .iter()
             .map(|a| a.registrar.as_str())
             .filter(|h| self.trusts(h))
             .map(|host| {
-                // A key the registrar has not been heard to publish may be
-                // one it rotated to since this server last asked.
-                let known = self.keys_now(host, now);
-                let unknown = attestations
+                let named = attestations
                     .iter()
-                    .any(|a| a.registrar == host && !known.contains(&a.registrar_key));
-                (host, unknown)
+                    .filter(|a| a.registrar == host)
+                    .map(|a| a.registrar_key)
+                    .collect();
+                (host, named)
             })
             .collect();
         hosts.sort_unstable();
         hosts.dedup_by_key(|(host, _)| *host);
-        self.refresh_hosts(Fingerprint::of(identity), &hosts, now)
+        self.refresh_hosts(Fingerprint::of(identity), &hosts, now, None)
             .await;
     }
 
-    /// Refresh, where they are due, the lists already held for `fp`: the
-    /// registrars that attested it when it was admitted, whatever card it
-    /// shows now, which is what a sweep must keep asking.
-    pub async fn refresh_held(&self, fp: Fingerprint, now: u64) {
+    /// Refresh, where they are due, the lists of the registrars that
+    /// attested `fp` when it was admitted, whatever card it shows now,
+    /// which is what a sweep must keep asking: those it holds a list
+    /// from, and those it was admitted while unable to reach. A registrar
+    /// that has failed since `sweep` began is not asked again in it.
+    pub async fn refresh_held(&self, fp: Fingerprint, now: u64, sweep: Instant) {
         let cache = self.cache.clone();
         let held = crate::spawn_blocking("identity", move || cache.lists(&fp.0)).await;
-        let hosts: Vec<String> = match held {
+        let mut hosts: Vec<String> = match held {
             Ok(Ok(held)) => held.into_iter().map(|l| l.registrar).collect(),
             _ => return,
         };
-        let hosts: Vec<(&str, bool)> = hosts
+        hosts.extend(
+            self.attested
+                .lock()
+                .unwrap()
+                .get(&fp)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        hosts.sort_unstable();
+        hosts.dedup();
+        let hosts: Vec<(&str, Vec<PublicKey>)> = hosts
             .iter()
             .filter(|h| self.trusts(h))
-            .map(|h| (h.as_str(), false))
+            .map(|h| (h.as_str(), Vec::new()))
             .collect();
-        self.refresh_hosts(fp, &hosts, now).await;
+        self.refresh_hosts(fp, &hosts, now, Some(sweep)).await;
     }
 
-    async fn refresh_hosts(&self, fp: Fingerprint, hosts: &[(&str, bool)], now: u64) {
-        let each = hosts.iter().map(|&(host, unknown)| async move {
-            if let Err(e) = self.refresh_one(fp, host, now, unknown).await {
-                warn!(registrar = host, "identity records: {e}");
+    /// Forget the registrars that attested identities with no session
+    /// here now.
+    pub fn retain_attested(&self, live: &[Fingerprint]) {
+        self.attested
+            .lock()
+            .unwrap()
+            .retain(|fp, _| live.contains(fp));
+    }
+
+    async fn refresh_hosts(
+        &self,
+        fp: Fingerprint,
+        hosts: &[(&str, Vec<PublicKey>)],
+        now: u64,
+        sweep: Option<Instant>,
+    ) {
+        let each = hosts.iter().map(|(host, named)| async move {
+            let failed_since = |since: Instant| {
+                self.failed
+                    .lock()
+                    .unwrap()
+                    .get(*host)
+                    .is_some_and(|at| *at >= since)
+            };
+            if sweep.is_some_and(failed_since) {
+                return;
+            }
+            match tokio::time::timeout(self.cfg.timeout, self.refresh_one(fp, host, now, named))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(registrar = host, "identity records: {e}"),
+                Err(_) => {
+                    self.failed
+                        .lock()
+                        .unwrap()
+                        .insert(host.to_string(), Instant::now());
+                    warn!(registrar = host, "identity records: no answer in time");
+                }
             }
         });
-        let all = futures_util::future::join_all(each);
-        if tokio::time::timeout(self.cfg.timeout, all).await.is_err() {
-            warn!("identity records: registrars did not all answer in time");
-        }
+        futures_util::future::join_all(each).await;
     }
 
     async fn refresh_one(
@@ -238,27 +288,46 @@ impl Registrars {
         fp: Fingerprint,
         host: &str,
         now: u64,
-        unknown_key: bool,
+        named: &[PublicKey],
     ) -> Result<(), String> {
         let cache = self.cache.clone();
         let (owned, max_age) = (host.to_owned(), self.cfg.max_age);
         // Read, and checked against the clock, off the reactor: checking
         // is verifying signatures.
-        let current = crate::spawn_blocking("identity", move || {
-            Ok::<_, hxd_core::inbox::StoreError>(
-                cache
-                    .lists(&fp.0)?
-                    .iter()
-                    .any(|l| l.registrar == owned && current(l, max_age, now)),
-            )
+        let (held, current) = crate::spawn_blocking("identity", move || {
+            let held = cache
+                .lists(&fp.0)?
+                .into_iter()
+                .find(|l| l.registrar == owned);
+            let current = held.as_ref().is_some_and(|l| current(l, max_age, now));
+            Ok::<_, hxd_core::inbox::StoreError>((held, current))
         })
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.0)?;
-        if current && !unknown_key {
+        // An attestation is anyone's to write: only one under a key the
+        // registrar publishes sends this server to it, after asking once
+        // whether that key is one it has rotated to since.
+        let published = |this: &Self| {
+            let keys = this.keys_now(host, now);
+            named.is_empty() || named.iter().any(|k| keys.contains(k))
+        };
+        if !published(self) {
+            self.discover(host, true).await?;
+            if !published(self) {
+                return Err("attested under a key the registrar does not publish".into());
+            }
+        }
+        self.attested
+            .lock()
+            .unwrap()
+            .entry(fp)
+            .or_default()
+            .insert(host.to_owned());
+        if current && held.as_ref().is_some_and(|l| self.under_configured_key(l)) {
             return Ok(());
         }
-        let records = self.discover(host, now, unknown_key).await?;
+        let records = self.discover(host, false).await?;
         let keys = self.keys_until(host, now);
         let verify_keys = live(&keys, now);
         let rk = RegistrarKeys {
@@ -300,12 +369,14 @@ impl Registrars {
             let _one = storing.lock().unwrap_or_else(|e| e.into_inner());
             let held = cache.lists(&fp.0).map_err(|e| e.0)?;
             // A list issued before the one held, as a replay or a stale
-            // cache in between would bring, says less than what is held.
+            // cache in between would bring, says less than what is held;
+            // unless the one held claims to be from the future, which a
+            // registrar's clock briefly ahead would otherwise make final.
             if held
                 .iter()
                 .find(|l| l.registrar == list.registrar)
                 .and_then(issued)
-                .is_some_and(|held| held > fetched)
+                .is_some_and(|held| held > fetched && held <= now)
             {
                 return Err("record list is older than the one held".into());
             }
@@ -315,12 +386,22 @@ impl Registrars {
         .map_err(|e| e.to_string())?
     }
 
+    /// A list from an operator-keyed registrar counts only if it was
+    /// fetched under the key configured now: replacing a key is how an
+    /// operator stops trusting what the old one signed.
+    fn under_configured_key(&self, held: &CachedList) -> bool {
+        self.cfg
+            .keys
+            .get(&held.registrar)
+            .is_none_or(|key| held.keys.iter().any(|(k, _)| k == key))
+    }
+
     /// The records path at `host`, discovering it, and its keys, when
     /// what is known of it is a day old, or a minute old and `again`.
     /// An operator-keyed registrar whose document cannot be had is asked
     /// at the path a registrar serves by default, and not asked for the
     /// document again until the day is out.
-    async fn discover(&self, host: &str, now: u64, again: bool) -> Result<String, String> {
+    async fn discover(&self, host: &str, again: bool) -> Result<String, String> {
         let known = || {
             let fresh = if again { REDISCOVERY } else { DISCOVERY_TTL };
             self.discovered
@@ -372,14 +453,6 @@ impl Registrars {
                 return Err(format!("discovery: {e}"));
             }
         };
-        if !keyed
-            && found
-                .keys
-                .iter()
-                .all(|(_, until)| until.is_some_and(|u| u <= now))
-        {
-            return Err("discovery names no current key".into());
-        }
         let records = found.records.clone();
         self.discovered
             .lock()
@@ -441,7 +514,13 @@ impl Registrars {
         match hxd_fetch::fetch(&cfg, &format!("{base}{path}"), &Validators::default()).await {
             Ok(Fetched::Body { bytes, .. }) => Ok(bytes),
             Ok(Fetched::NotModified) => Err("not modified, unasked".into()),
-            Err(e) => Err(e.to_string()),
+            Err(e) => {
+                self.failed
+                    .lock()
+                    .unwrap()
+                    .insert(host.to_owned(), Instant::now());
+                Err(e.to_string())
+            }
         }
     }
 
@@ -491,14 +570,18 @@ impl Registrars {
         };
         let mut lookup = Lookup::default();
         for host in hosts.iter().filter(|h| self.trusts(h)) {
-            if !held
-                .iter()
-                .any(|l| &l.registrar == host && current(l, self.cfg.max_age, now))
-            {
+            if !held.iter().any(|l| {
+                &l.registrar == host
+                    && self.under_configured_key(l)
+                    && current(l, self.cfg.max_age, now)
+            }) {
                 lookup.stale = true;
             }
         }
-        for l in held.iter().filter(|l| self.trusts(&l.registrar)) {
+        for l in held
+            .iter()
+            .filter(|l| self.trusts(&l.registrar) && self.under_configured_key(l))
+        {
             let Some(pages) = verified(l) else {
                 continue;
             };
@@ -566,6 +649,38 @@ fn verified(held: &CachedList) -> Option<Vec<SignedList>> {
 mod tests {
     use super::*;
     use hl_identity::ServerKey;
+
+    #[test]
+    fn a_retiring_key_held_is_used_only_until_its_deadline() {
+        let (old, new) = ([1; 32], [2; 32]);
+        let cache = Arc::new(hxd_core::identity_records::MemoryRecordCache::default());
+        let identity = [9; 32];
+        cache
+            .put(
+                &Fingerprint::of(&identity).0,
+                &CachedList {
+                    registrar: "hl.example".into(),
+                    pages: vec![],
+                    keys: vec![(old, Some(100)), (new, None)],
+                    fetched: 1,
+                },
+            )
+            .unwrap();
+        let registrars = Registrars::new(
+            RegistrarsConfig {
+                keys: HashMap::new(),
+                trusted: vec!["hl.example".into()],
+                urls: HashMap::new(),
+                timeout: Duration::from_secs(1),
+                max_age: Duration::from_secs(1),
+                stale: Stale::Cached,
+                user_agent: String::new(),
+            },
+            cache,
+        );
+        assert_eq!(registrars.keys("hl.example", &identity, 99), [old, new]);
+        assert_eq!(registrars.keys("hl.example", &identity, 100), [new]);
+    }
 
     #[test]
     fn a_list_is_used_only_whole() {

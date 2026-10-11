@@ -1,8 +1,8 @@
 //! The record lists registrars publish against keys, as this server
 //! fetched them (`docs/identity-records.md` §2). Kept so that a restart
-//! while a registrar cannot be reached still has the last list to use;
-//! a cache and never a source of trust, since a list is verified again
-//! as it is read back.
+//! while a registrar cannot be reached still has the last list to use.
+//! A list is verified again as it is read back, under the keys kept
+//! with it.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
