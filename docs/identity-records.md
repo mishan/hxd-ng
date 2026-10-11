@@ -12,7 +12,7 @@ registrar's own server. This document is the plan for building §7: what
 exists, the decisions §7 leaves to the implementation, and the order.
 It changes no wire behavior §7 does not already specify.
 
-## 1. What exists
+## 1. What existed before R1
 
 - **Attestations** are verified at `auth` against `[identity.registrar_keys]`,
   a static host-to-key table whose hosts are the trusted set
@@ -60,11 +60,12 @@ is found, the records cache is durable, and the fetch is its own crate.
   `[identity] registrar_timeout` (default 3 s); past it the cache and
   `revocation_stale` decide, as for an unreachable registrar.
 - **The records cache is durable.** Lists are kept in a small SQLite
-  table beside the bans (fingerprint, registrar, the signed bytes, their
-  `expires`, when fetched), so `revocation_stale = cached` still has
-  something to use after a restart while the registrar is down. A list
-  is re-verified as it is read back, so the file is a cache and never a
-  source of trust.
+  table beside the bans (fingerprint, registrar, the signed pages, the
+  keys they verified under and when they took effect, when fetched), so
+  `revocation_stale = cached` still has something to use after a restart
+  while the registrar is down. A list is re-verified as it is read back,
+  so a row damaged is a list refused; the keys beside it are trusted as
+  the rest of the server's own files are.
 - **A revocation found ends sessions, as the local list's does.** §7
   fetches at three points, all of them admissions. A key revoked while
   its session is attached would otherwise keep that session until it
@@ -87,9 +88,8 @@ is applied in `time` order; `AuthRefused` gains `Rotated { successor }`
 and the `frozen` outcomes; a device revocation also drops the device's
 cached card. An attestation revocation is applied before age is
 computed, and an identity left with no attestation is unattested, which
-`unattested` (later `admission.unknown`) then decides. Every effect is
-logged with the registrar, the record's `seq` and the fingerprint, and
-counted in `metrics` (`hxd_identity_records_applied_total{kind}`).
+`unattested` (later `admission.unknown`) then decides. Every refusal is
+logged with the fingerprint.
 
 An identity's records are fetched from the registrars that attested it,
 so for a card shown without its attestations nothing is fetched: whoever

@@ -1145,9 +1145,16 @@ impl IdentityState {
             return Ok(Some(card.attestations.clone()));
         };
         let fingerprint = Fingerprint::of(&card.identity);
+        // Only an attestation under a key its registrar publishes was
+        // fetched for, so only its registrar can be stale.
         let hosts: Vec<String> = card
             .attestations
             .iter()
+            .filter(|a| {
+                registrars
+                    .keys(&a.registrar, &a.identity, now)
+                    .contains(&a.registrar_key)
+            })
             .map(|a| a.registrar.clone())
             .collect();
         let found = registrars.lookup(&card.identity, &hosts, now);
@@ -1258,6 +1265,18 @@ impl IdentityState {
         t.tokens.get(&key).map(|(ident, _)| ident.clone())
     }
 
+    /// The card a device on file is admitted under, as `identity_for_device`
+    /// would read it: for the caller to fetch its records first. Verifies
+    /// the card: called off the reactor.
+    pub fn card_for_device(&self, device: &PublicKey) -> Option<hl_identity::Card> {
+        let bytes = {
+            let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            let rec = t.devices.get(device)?;
+            t.cards.get(&Fingerprint::of(&rec.identity))?.bytes.clone()
+        };
+        hl_identity::Card::parse(&bytes).ok()
+    }
+
     /// The mTLS "connection is the credential" path (§5.3): a device on
     /// file with a still-valid certificate needs no token.
     ///
@@ -1268,15 +1287,6 @@ impl IdentityState {
     /// has no way to declare one itself. Signatures *are* re-checked
     /// rather than the cache's shape trusted; that's two verifications,
     /// which is why callers run this on the blocking pool.
-    /// The card a device on file is admitted under, as `identity_for_device`
-    /// would read it: for the caller to fetch its records first.
-    pub fn card_for_device(&self, device: &PublicKey) -> Option<hl_identity::Card> {
-        let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-        let rec = t.devices.get(device)?;
-        let bytes = &t.cards.get(&Fingerprint::of(&rec.identity))?.bytes;
-        hl_identity::Card::parse(bytes).ok()
-    }
-
     pub fn identity_for_device(&self, device: &PublicKey) -> Option<TransportIdentity> {
         let (card_bytes, cert_bytes, downstream) = {
             let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());

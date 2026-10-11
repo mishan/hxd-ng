@@ -1027,8 +1027,11 @@ async fn transport_identity(
         }
         // A device on file is re-admitted under its identity's records as
         // they are now (`identity-registrar.md` §7.2).
-        if let (Some(registrars), Some(card)) = (state.registrars(), state.card_for_device(&device))
-        {
+        let card = {
+            let state = state.clone();
+            crate::spawn_blocking("identity", move || state.card_for_device(&device)).await
+        };
+        if let (Some(registrars), Ok(Some(card))) = (state.registrars(), card) {
             registrars
                 .refresh(
                     &card.identity,

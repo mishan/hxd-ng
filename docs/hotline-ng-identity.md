@@ -278,7 +278,7 @@ continues in this order and fails on the first error:
    applied per §7.3 there; a stale cache is `[identity]
    revocation_stale`. *(Built, but for rotation, which
    `identity-records.md` stages as R2: records are fetched at `auth`,
-   and a certificate-only re-admission reads what is held.)*
+   and at a certificate-only re-admission.)*
 5. attestations verified against trusted registrars, expired or untrusted
    ones discarded, and, after attestation revocations are applied, age
    computed from the oldest surviving `registered`;
