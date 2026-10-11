@@ -27,6 +27,10 @@ const DISCOVERY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// client can show an attestation naming any key.
 const REDISCOVERY: Duration = Duration::from_secs(60);
 
+/// How long an identity's registrars are remembered without a session:
+/// a transport token's life, and the wait on registrars before it.
+const ADMITTING: Duration = Duration::from_secs(120);
+
 /// The largest discovery document or page read.
 const MAX_BYTES: usize = 1 << 20;
 
@@ -80,16 +84,17 @@ pub struct Registrars {
     /// One discovery at a time per host, so logins arriving together
     /// wait on one fetch rather than each making their own.
     discovering: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// When a host last could not be reached, or its discovery document
-    /// had: that document is not asked for again for `REDISCOVERY`, and a
-    /// sweep asks the host nothing more once it has failed in it, so a
-    /// registrar that is down costs a fetch a minute and a sweep, rather
-    /// than one for every login and every identity swept.
+    /// When a host's records last could not be fetched, or its discovery
+    /// document had: that document is not asked for again for
+    /// `REDISCOVERY`, and a sweep asks the host nothing more once it has
+    /// failed in it, so a registrar that is down costs a sweep one wait
+    /// rather than one for every identity swept.
     failed: Mutex<HashMap<String, Instant>>,
     /// The trusted registrars each identity admitted here was attested
-    /// by, for the sweep to ask even when admission held no list from
-    /// them. A restart forgets it, as it ends the sessions it is for.
-    attested: Mutex<HashMap<Fingerprint, HashSet<String>>>,
+    /// by, and when that was last seen, for the sweep to ask even when
+    /// admission held no list from them. A restart forgets it, as it ends
+    /// the sessions it is for.
+    attested: Mutex<HashMap<Fingerprint, (HashSet<String>, Instant)>>,
     /// Held across comparing a fetched list with the one held and
     /// replacing it, so two fetches finishing together cannot leave the
     /// older one.
@@ -226,7 +231,7 @@ impl Registrars {
                 .unwrap()
                 .get(&fp)
                 .into_iter()
-                .flatten()
+                .flat_map(|(hosts, _)| hosts)
                 .cloned(),
         );
         hosts.sort_unstable();
@@ -240,12 +245,14 @@ impl Registrars {
     }
 
     /// Forget the registrars that attested identities with no session
-    /// here now.
+    /// here now, but for one admitted within `ADMITTING`, whose session
+    /// may not have attached yet.
     pub fn retain_attested(&self, live: &[Fingerprint]) {
+        let live: HashSet<&Fingerprint> = live.iter().collect();
         self.attested
             .lock()
             .unwrap()
-            .retain(|fp, _| live.contains(fp));
+            .retain(|fp, (_, at)| live.contains(fp) || at.elapsed() < ADMITTING);
     }
 
     async fn refresh_hosts(
@@ -313,17 +320,22 @@ impl Registrars {
             named.is_empty() || named.iter().any(|k| keys.contains(k))
         };
         if !published(self) {
-            self.discover(host, true).await?;
+            // An operator's key is not one discovery can change.
+            if !self.cfg.keys.contains_key(host) {
+                self.discover(host, true).await?;
+            }
             if !published(self) {
                 return Err("attested under a key the registrar does not publish".into());
             }
         }
-        self.attested
-            .lock()
-            .unwrap()
-            .entry(fp)
-            .or_default()
-            .insert(host.to_owned());
+        {
+            let mut attested = self.attested.lock().unwrap();
+            let (hosts, at) = attested
+                .entry(fp)
+                .or_insert_with(|| (HashSet::new(), Instant::now()));
+            hosts.insert(host.to_owned());
+            *at = Instant::now();
+        }
         if current && held.as_ref().is_some_and(|l| self.under_configured_key(l)) {
             return Ok(());
         }
@@ -341,7 +353,15 @@ impl Registrars {
                 None => format!("{records}/{fp}"),
                 Some(seq) => format!("{records}/{fp}?since={seq}"),
             };
-            let bytes = self.get(host, &path, "application/cbor").await?;
+            let bytes = self
+                .get(host, &path, "application/cbor")
+                .await
+                .inspect_err(|_| {
+                    self.failed
+                        .lock()
+                        .unwrap()
+                        .insert(host.to_owned(), Instant::now());
+                })?;
             let page = SignedList::parse(&bytes, ListKind::Records, rk)
                 .map_err(|e| format!("record list did not verify: {e}"))?;
             if page.fingerprint != Some(fp.0) {
@@ -514,13 +534,7 @@ impl Registrars {
         match hxd_fetch::fetch(&cfg, &format!("{base}{path}"), &Validators::default()).await {
             Ok(Fetched::Body { bytes, .. }) => Ok(bytes),
             Ok(Fetched::NotModified) => Err("not modified, unasked".into()),
-            Err(e) => {
-                self.failed
-                    .lock()
-                    .unwrap()
-                    .insert(host.to_owned(), Instant::now());
-                Err(e.to_string())
-            }
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -650,6 +664,46 @@ mod tests {
     use super::*;
     use hl_identity::ServerKey;
 
+    fn registrars(cache: Arc<dyn RecordCache>) -> Registrars {
+        Registrars::new(
+            RegistrarsConfig {
+                keys: HashMap::new(),
+                trusted: vec!["hl.example".into()],
+                urls: HashMap::new(),
+                timeout: Duration::from_secs(1),
+                max_age: Duration::from_secs(1),
+                stale: Stale::Cached,
+                user_agent: String::new(),
+            },
+            cache,
+        )
+    }
+
+    #[test]
+    fn an_identity_still_being_admitted_keeps_its_registrars() {
+        let r = registrars(Arc::new(
+            hxd_core::identity_records::MemoryRecordCache::default(),
+        ));
+        let (admitting, gone, live) = (
+            Fingerprint([1; 32]),
+            Fingerprint([2; 32]),
+            Fingerprint([3; 32]),
+        );
+        let long_ago = Instant::now() - ADMITTING;
+        {
+            let mut attested = r.attested.lock().unwrap();
+            let hosts = || HashSet::from(["hl.example".to_owned()]);
+            attested.insert(admitting, (hosts(), Instant::now()));
+            attested.insert(gone, (hosts(), long_ago));
+            attested.insert(live, (hosts(), long_ago));
+        }
+        r.retain_attested(&[live]);
+        let attested = r.attested.lock().unwrap();
+        assert!(attested.contains_key(&admitting));
+        assert!(!attested.contains_key(&gone));
+        assert!(attested.contains_key(&live));
+    }
+
     #[test]
     fn a_retiring_key_held_is_used_only_until_its_deadline() {
         let (old, new) = ([1; 32], [2; 32]);
@@ -666,18 +720,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let registrars = Registrars::new(
-            RegistrarsConfig {
-                keys: HashMap::new(),
-                trusted: vec!["hl.example".into()],
-                urls: HashMap::new(),
-                timeout: Duration::from_secs(1),
-                max_age: Duration::from_secs(1),
-                stale: Stale::Cached,
-                user_agent: String::new(),
-            },
-            cache,
-        );
+        let registrars = registrars(cache);
         assert_eq!(registrars.keys("hl.example", &identity, 99), [old, new]);
         assert_eq!(registrars.keys("hl.example", &identity, 100), [new]);
     }
