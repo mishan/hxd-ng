@@ -1442,7 +1442,7 @@ mod tests {
                 crate::Preview {
                     kind: crate::PreviewKind::Image,
                     media_type: "image/png",
-                    bytes: vec![0; 6 << 20],
+                    bytes: vec![0; 6 << 20].into(),
                     truncated: false,
                     dimensions: Some((1, 1)),
                 },
@@ -1462,7 +1462,7 @@ mod tests {
         let preview = |kind| crate::Preview {
             kind,
             media_type: "video/mp4",
-            bytes: Vec::new(),
+            bytes: bytes::Bytes::new(),
             truncated: false,
             dimensions: None,
         };

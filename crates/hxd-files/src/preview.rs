@@ -56,7 +56,8 @@ pub enum PreviewKind {
 pub struct Preview {
     pub kind: PreviewKind,
     pub media_type: &'static str,
-    pub bytes: Vec<u8>,
+    /// Shared by every fetch of the token, so a fetch copies nothing.
+    pub bytes: bytes::Bytes,
     /// A text longer than [`TEXT_BYTES`], shown only in part.
     pub truncated: bool,
     /// An image's, as drawn.
@@ -102,7 +103,7 @@ pub async fn make(service: &FileService, info: &FileInfo) -> Result<Preview, Pre
         return Ok(Preview {
             kind: PreviewKind::Video,
             media_type,
-            bytes: Vec::new(),
+            bytes: bytes::Bytes::new(),
             truncated: false,
             dimensions: None,
         });
@@ -139,7 +140,7 @@ pub async fn make(service: &FileService, info: &FileInfo) -> Result<Preview, Pre
             kind: PreviewKind::Image,
             media_type: drawn.mime.mime(),
             dimensions: Some((drawn.width, drawn.height)),
-            bytes: drawn.bytes,
+            bytes: drawn.bytes.into(),
             truncated: false,
         });
     }
@@ -160,7 +161,7 @@ pub async fn make(service: &FileService, info: &FileInfo) -> Result<Preview, Pre
     Ok(Preview {
         kind: PreviewKind::Text,
         media_type: "text/plain; charset=utf-8",
-        bytes: text.into_bytes(),
+        bytes: text.into_bytes().into(),
         truncated,
         dimensions: None,
     })

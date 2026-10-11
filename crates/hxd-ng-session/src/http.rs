@@ -500,7 +500,7 @@ async fn download_file(token: &str, req: Request<Incoming>, ctx: &NgCtx) -> Resp
             .header("x-content-type-options", "nosniff")
             .header(CONTENT_DISPOSITION, "inline")
             .header(CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'")
-            .body(full(Bytes::copy_from_slice(&preview.bytes)))
+            .body(full(preview.bytes.clone()))
             .unwrap();
     }
     let info = match service.source.info(&grant.path).await {
