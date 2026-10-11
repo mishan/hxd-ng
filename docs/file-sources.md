@@ -52,7 +52,10 @@ A download is two connections, and the server must produce both.
 optionally `RFLT` (`0x00cb`). The reply carries `HTXF_REF` (`0x006b`) and
 `HTXF_SIZE` (`0x006c`). The client requires a non-zero ref — see
 `hx_htxf_reply_extract` in `gtkhx/src/proto_helpers.c:325` — and uses the
-size only to drive the progress bar.
+size only to drive the progress bar. A quick preview adds a non-zero
+`FILE_PREVIEW` (`0x00cc`): Hotline's own client sends 2, mhxd's 1, and
+the transfer is then the data fork alone, from the resume offset, with no
+FILP framing and no resource fork, and `HTXF_SIZE` counts just that.
 
 Browsing needs `FileList` (`0x00c8`), whose entries carry a 4-byte type,
 a 4-byte creator and **a size per entry**, and `FileGetInfo` (`0x00ce`)

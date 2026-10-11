@@ -58,6 +58,9 @@ pub struct PreparedDownload {
     pub offset: u64,
     pub resource_offset: u64,
     pub large: bool,
+    /// See [`crate::LegacyTransfer::preview`]; `encoded.transfer_len` is
+    /// then the data fork's alone.
+    pub preview: bool,
     pub encoded: ffo::Encoded,
 }
 
@@ -1122,6 +1125,7 @@ mod tests {
             offset: 0,
             resource_offset: 0,
             large: false,
+            preview: false,
             encoded,
         }
     }
