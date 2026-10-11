@@ -31,6 +31,8 @@ pub struct LegacyTransfer {
     pub offset: u64,
     pub resource_offset: u64,
     pub large: bool,
+    /// A classic client's quick preview: the data fork alone, unframed.
+    pub preview: bool,
     pub wire_name: Vec<u8>,
     pub type_code: [u8; 4],
     pub creator: [u8; 4],
@@ -72,7 +74,7 @@ pub async fn prepare_legacy(
     request: LegacyTransfer,
 ) -> Result<(u32, u64, u16), FileError> {
     let info = source.info(&request.path).await?;
-    let encoded = ffo::encode(
+    let mut encoded = ffo::encode(
         &ffo::Metadata {
             name: &request.wire_name,
             type_code: request.type_code,
@@ -94,6 +96,9 @@ pub async fn prepare_legacy(
         ffo::Error::SizeOverflow => FileError::TooLarge,
         _ => FileError::Unavailable(format!("FILP metadata: {e}")),
     })?;
+    if request.preview {
+        encoded.transfer_len = encoded.data_remaining;
+    }
     let size = encoded.transfer_len;
     let (reference, queue) = registry.issue_as(
         PreparedTransfer::Download(PreparedDownload {
@@ -106,6 +111,7 @@ pub async fn prepare_legacy(
             offset: request.offset,
             resource_offset: request.resource_offset,
             large: request.large,
+            preview: request.preview,
             encoded,
         }),
         request.person,
@@ -467,16 +473,29 @@ async fn serve_download<S: HtxfStream>(
     idle: Duration,
 ) -> Result<(), FileError> {
     let _open = hxd_core::instrument::transfer_open("download");
-    send_object(
-        &mut stream,
-        transfer.source.as_ref(),
-        &transfer.path,
-        &transfer.encoded,
-        (transfer.offset, transfer.resource_offset),
-        alive,
-        idle,
-    )
-    .await?;
+    if !transfer.preview {
+        send_object(
+            &mut stream,
+            transfer.source.as_ref(),
+            &transfer.path,
+            &transfer.encoded,
+            (transfer.offset, transfer.resource_offset),
+            alive,
+            idle,
+        )
+        .await?;
+    } else if transfer.encoded.data_remaining != 0 {
+        // mhxd sends a preview the data fork alone (`htxf.c`).
+        let body = transfer
+            .source
+            .open(&transfer.path, transfer.offset)
+            .await?;
+        if body.len != transfer.encoded.data_remaining {
+            return Err(FileError::OriginChanged);
+        }
+        let len = body.len;
+        deliver(body, &mut stream, len, idle, alive).await?;
+    }
     tokio::time::timeout(idle, stream.shutdown())
         .await
         .map_err(|_| stalled())?

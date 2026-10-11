@@ -988,6 +988,39 @@ async fn classic_resume_folders_and_get_info_follow_the_reference() {
 }
 
 #[tokio::test]
+async fn a_preview_is_the_data_fork_alone() {
+    let server = start().await;
+    let mut classic = Legacy::login(server.legacy, false).await;
+    // Hotline's own client sends 2, mhxd's sends 1.
+    for (option, offset, expected) in [
+        (vec![0, 2], 0, b"hello world".as_slice()),
+        (vec![0, 1], 6, b"world".as_slice()),
+    ] {
+        let resume = rflt::encode(rflt::Resume {
+            data: offset,
+            resource: 0,
+        });
+        let get = classic
+            .request(
+                FILE_GET,
+                &[
+                    (tag::FILE_NAME, b"hello.txt".to_vec()),
+                    (tag::FILE_PREVIEW, option),
+                    (tag::RFLT, resume.to_vec()),
+                ],
+            )
+            .await;
+        assert_eq!(get.flag & 1, 0);
+        assert_eq!(
+            field(&get, tag::HTXF_SIZE).as_deref(),
+            Some((expected.len() as u32).to_be_bytes().as_slice())
+        );
+        let bytes = transfer(server.htxf, classic_download(reference_of(&get))).await;
+        assert_eq!(bytes, expected);
+    }
+}
+
+#[tokio::test]
 async fn browsing_needs_no_access_bit_but_downloading_does() {
     let server = start().await;
     let mut browser = Legacy::login_as(server.legacy, "browser", "pw").await;

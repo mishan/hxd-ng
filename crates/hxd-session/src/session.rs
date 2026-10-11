@@ -3709,6 +3709,18 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "This file cannot be resumed.");
                 return;
             }
+            // Hotline's own client asks for a quick preview with 2, mhxd's
+            // with 1; either way it reads the data fork's bytes alone.
+            let preview = match f.chunks().find(|chunk| chunk.tag == tag::FILE_PREVIEW) {
+                None => false,
+                Some(chunk) => match files::wire_uint(chunk.data) {
+                    Some(option) => option != 0,
+                    None => {
+                        reply_error(tx, f.trans, "Malformed preview option.");
+                        return;
+                    }
+                },
+            };
             let Some(serial) = ctx.core.session_serial(sess.uid) else {
                 reply_error(tx, f.trans, "Session ended.");
                 return;
@@ -3730,6 +3742,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     offset,
                     resource_offset,
                     large,
+                    preview,
                     wire_name,
                     type_code,
                     creator,
