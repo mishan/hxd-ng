@@ -42,7 +42,8 @@ const RECORDS: &str = "/registrar/records";
 pub enum Stale {
     /// Use the last list fetched, however old.
     Cached,
-    /// Admit the identity as though it were unattested.
+    /// Admit the identity as though it were unattested, which the lists
+    /// held for it still apply to.
     Guest,
     Deny,
 }
@@ -76,6 +77,17 @@ struct Discovered {
 pub struct Registrars {
     cfg: RegistrarsConfig,
     discovered: Mutex<HashMap<String, Discovered>>,
+    /// One discovery at a time per host, so logins arriving together
+    /// wait on one fetch rather than each making their own.
+    discovering: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// When a host's discovery document last could not be had: not asked
+    /// again for `REDISCOVERY`, so a registrar that is down costs one
+    /// failed fetch a minute rather than one for every login.
+    failed: Mutex<HashMap<String, Instant>>,
+    /// Held across comparing a fetched list with the one held and
+    /// replacing it, so two fetches finishing together cannot leave the
+    /// older one.
+    storing: Arc<Mutex<()>>,
     cache: Arc<dyn RecordCache>,
 }
 
@@ -94,6 +106,9 @@ impl Registrars {
         Registrars {
             cfg,
             discovered: Mutex::new(HashMap::new()),
+            discovering: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
+            storing: Arc::new(Mutex::new(())),
             cache,
         }
     }
@@ -130,15 +145,20 @@ impl Registrars {
             .unwrap_or_default()
             .into_iter()
             .find(|l| l.registrar == host)
-            .map(|l| l.keys)
+            .map(|l| live(&l.keys, now))
             .unwrap_or_default()
     }
 
     /// The keys a list or an attestation from `host` is verified under
     /// now, without the store: the operator's, or the discovered ones.
     fn keys_now(&self, host: &str, now: u64) -> Vec<PublicKey> {
+        live(&self.keys_until(host, now), now)
+    }
+
+    /// [`Self::keys_now`], each with its `until`.
+    fn keys_until(&self, host: &str, now: u64) -> Vec<(PublicKey, Option<u64>)> {
         if let Some(key) = self.cfg.keys.get(host) {
-            return vec![*key];
+            return vec![(*key, None)];
         }
         if !self.trusts(host) {
             return Vec::new();
@@ -151,7 +171,7 @@ impl Registrars {
                 d.keys
                     .iter()
                     .filter(|(_, until)| until.is_none_or(|u| u > now))
-                    .map(|(k, _)| *k)
+                    .copied()
                     .collect()
             })
             .unwrap_or_default()
@@ -205,8 +225,12 @@ impl Registrars {
             return Ok(());
         }
         let records = self.discover(host, now, unknown_key).await?;
-        let keys = self.keys_now(host, now);
-        let rk = RegistrarKeys { host, keys: &keys };
+        let keys = self.keys_until(host, now);
+        let verify_keys = live(&keys, now);
+        let rk = RegistrarKeys {
+            host,
+            keys: &verify_keys,
+        };
         let mut pages = Vec::new();
         let mut since: Option<u64> = None;
         loop {
@@ -229,53 +253,38 @@ impl Registrars {
                 return Err(format!("record list is longer than {MAX_PAGES} pages"));
             }
         }
-        // A list issued before the one held, as a replay or a stale cache
-        // in between would bring, says less than what is held.
-        let issued = |pages: &[Vec<u8>], keys: &[PublicKey]| {
-            pages
-                .first()
-                .and_then(|p| {
-                    SignedList::parse(p, ListKind::Records, RegistrarKeys { host, keys }).ok()
-                })
-                .map(|l| l.issued)
-        };
-        if let Some(held) = &held {
-            if issued(&held.pages, &held.keys) > issued(&pages, &keys) {
-                return Err("record list is older than the one held".into());
-            }
-        }
         let list = CachedList {
             registrar: host.to_owned(),
             pages,
             fetched: now,
             keys,
         };
-        let cache = self.cache.clone();
-        crate::spawn_blocking("identity", move || cache.put(&fp.0, &list))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.0)
+        let (cache, storing) = (self.cache.clone(), self.storing.clone());
+        crate::spawn_blocking("identity", move || {
+            let issued = |l: &CachedList| verified(l).map(|pages| pages[0].issued);
+            let fetched = issued(&list).ok_or("record list is not one whole list")?;
+            let _one = storing.lock().unwrap_or_else(|e| e.into_inner());
+            let held = cache.lists(&fp.0).map_err(|e| e.0)?;
+            // A list issued before the one held, as a replay or a stale
+            // cache in between would bring, says less than what is held.
+            if held
+                .iter()
+                .find(|l| l.registrar == list.registrar)
+                .and_then(issued)
+                .is_some_and(|held| held > fetched)
+            {
+                return Err("record list is older than the one held".into());
+            }
+            cache.put(&fp.0, &list).map_err(|e| e.0)
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     /// A list fetched within `max_age` and not past its own `expires`.
     fn current(&self, held: &CachedList, now: u64) -> bool {
         now.saturating_sub(held.fetched) < self.cfg.max_age.as_secs()
-            && self
-                .verified(held)
-                .is_some_and(|pages| pages.iter().all(|p| p.expires > now))
-    }
-
-    /// Every page of `held`, verified under the keys it was fetched with,
-    /// or `None` if one of them fails.
-    fn verified(&self, held: &CachedList) -> Option<Vec<SignedList>> {
-        let rk = RegistrarKeys {
-            host: &held.registrar,
-            keys: &held.keys,
-        };
-        held.pages
-            .iter()
-            .map(|p| SignedList::parse(p, ListKind::Records, rk).ok())
-            .collect()
+            && verified(held).is_some_and(|pages| pages.iter().all(|p| p.expires > now))
     }
 
     /// The records path at `host`, discovering it, and its keys, when
@@ -284,13 +293,39 @@ impl Registrars {
     /// at the path a registrar serves by default, and not asked for the
     /// document again until the day is out.
     async fn discover(&self, host: &str, now: u64, again: bool) -> Result<String, String> {
-        if let Some(d) = self.discovered.lock().unwrap().get(host) {
+        let known = || {
             let fresh = if again { REDISCOVERY } else { DISCOVERY_TTL };
-            if d.at.elapsed() < fresh {
-                return Ok(d.records.clone());
-            }
+            self.discovered
+                .lock()
+                .unwrap()
+                .get(host)
+                .filter(|d| d.at.elapsed() < fresh)
+                .map(|d| d.records.clone())
+        };
+        if let Some(records) = known() {
+            return Ok(records);
+        }
+        let gate = self
+            .discovering
+            .lock()
+            .unwrap()
+            .entry(host.to_owned())
+            .or_default()
+            .clone();
+        let _gate = gate.lock().await;
+        if let Some(records) = known() {
+            return Ok(records);
         }
         let keyed = self.cfg.keys.contains_key(host);
+        if self
+            .failed
+            .lock()
+            .unwrap()
+            .get(host)
+            .is_some_and(|at| at.elapsed() < REDISCOVERY)
+        {
+            return Err("discovery failed within the minute".into());
+        }
         let found = match (self.fetch_discovery(host).await, keyed) {
             (Ok(found), _) => found,
             (Err(e), true) => {
@@ -301,7 +336,13 @@ impl Registrars {
                     at: Instant::now(),
                 }
             }
-            (Err(e), false) => return Err(format!("discovery: {e}")),
+            (Err(e), false) => {
+                self.failed
+                    .lock()
+                    .unwrap()
+                    .insert(host.to_owned(), Instant::now());
+                return Err(format!("discovery: {e}"));
+            }
         };
         if !keyed
             && found
@@ -398,12 +439,13 @@ impl Registrars {
             }
         }
         for l in held.iter().filter(|l| self.trusts(&l.registrar)) {
-            let Some(pages) = self.verified(l) else {
+            let Some(pages) = verified(l) else {
                 continue;
             };
+            let keys: Vec<PublicKey> = l.keys.iter().map(|(k, _)| *k).collect();
             let keys = RegistrarKeys {
                 host: &l.registrar,
-                keys: &l.keys,
+                keys: &keys,
             };
             for page in pages.iter().filter(|p| p.fingerprint == Some(fp.0)) {
                 for (_, bytes) in &page.entries {
@@ -417,5 +459,83 @@ impl Registrars {
         }
         lookup.records.sort_by_key(Record::time);
         lookup
+    }
+}
+
+/// The keys of `keys` whose `until` has not passed.
+fn live(keys: &[(PublicKey, Option<u64>)], now: u64) -> Vec<PublicKey> {
+    keys.iter()
+        .filter(|(_, until)| until.is_none_or(|u| u > now))
+        .map(|(k, _)| *k)
+        .collect()
+}
+
+/// Every page of `held`, verified under the keys it was fetched with, or
+/// `None` if one fails or they are not one whole list: from the start,
+/// each page taking up where the last left off, and the last not cut
+/// short. A page is verified under a key retired since, as it was when
+/// fetched.
+fn verified(held: &CachedList) -> Option<Vec<SignedList>> {
+    let keys: Vec<PublicKey> = held.keys.iter().map(|(k, _)| *k).collect();
+    let rk = RegistrarKeys {
+        host: &held.registrar,
+        keys: &keys,
+    };
+    let pages: Vec<SignedList> = held
+        .pages
+        .iter()
+        .map(|p| SignedList::parse(p, ListKind::Records, rk).ok())
+        .collect::<Option<_>>()?;
+    let mut since = None;
+    for page in &pages {
+        if page.since != since {
+            return None;
+        }
+        since = page.entries.last().map(|(seq, _)| *seq);
+    }
+    pages.last().is_some_and(|p| !p.more).then_some(pages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hl_identity::ServerKey;
+
+    #[test]
+    fn a_list_is_used_only_whole() {
+        let key = ServerKey::from_seed(&[3; 32]);
+        let page = |since: Option<u64>, seqs: &[u64], more: bool| {
+            SignedList {
+                registrar: "hl.example".into(),
+                issued: 1,
+                expires: 2,
+                fingerprint: Some([7; 32]),
+                since,
+                more,
+                entries: seqs.iter().map(|s| (*s, vec![])).collect(),
+            }
+            .sign(ListKind::Records, &key)
+        };
+        let whole = |pages: Vec<Vec<u8>>| {
+            verified(&CachedList {
+                registrar: "hl.example".into(),
+                pages,
+                keys: vec![(key.public(), None)],
+                fetched: 1,
+            })
+            .is_some()
+        };
+        assert!(whole(vec![page(None, &[], false)]));
+        assert!(whole(vec![
+            page(None, &[1, 2], true),
+            page(Some(2), &[3], false)
+        ]));
+        assert!(!whole(vec![]), "no pages");
+        assert!(!whole(vec![page(None, &[1, 2], true)]), "cut short");
+        assert!(
+            !whole(vec![page(None, &[1, 2], true), page(Some(5), &[6], false)]),
+            "a gap"
+        );
+        assert!(!whole(vec![page(Some(2), &[3], false)]), "no first page");
     }
 }

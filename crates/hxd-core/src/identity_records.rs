@@ -18,8 +18,9 @@ pub struct CachedList {
     pub pages: Vec<Vec<u8>>,
     /// The registrar's keys it verified under, which it is verified
     /// under again: a restart while the registrar cannot be reached has
-    /// no discovery document to read them from.
-    pub keys: Vec<[u8; 32]>,
+    /// no discovery document to read them from. Each with the `until`
+    /// a retiring key was published with.
+    pub keys: Vec<([u8; 32], Option<u64>)>,
     /// Unix seconds, when it was fetched.
     pub fetched: u64,
 }

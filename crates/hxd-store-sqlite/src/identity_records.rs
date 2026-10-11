@@ -34,6 +34,16 @@ fn decode(mut bytes: &[u8]) -> Vec<Vec<u8>> {
     pages
 }
 
+/// A key and its `until`, `u64::MAX` for none.
+fn key(b: &[u8]) -> ([u8; 32], Option<u64>) {
+    let (k, until) = b.split_at(32);
+    let until = u64::from_be_bytes(until.try_into().expect("8 bytes"));
+    (
+        k.try_into().expect("32 bytes"),
+        (until != u64::MAX).then_some(until),
+    )
+}
+
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<([u8; 32], CachedList)> {
     let identity: Vec<u8> = r.get(0)?;
     let fetched: i64 = r.get(3)?;
@@ -44,10 +54,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<([u8; 32], CachedList)> {
             registrar: r.get(1)?,
             pages: decode(&r.get::<_, Vec<u8>>(2)?),
             fetched: u64::try_from(fetched).unwrap_or(0),
-            keys: keys
-                .chunks_exact(32)
-                .map(|k| k.try_into().expect("32 bytes"))
-                .collect(),
+            keys: keys.chunks_exact(40).map(key).collect(),
         },
     ))
 }
@@ -65,7 +72,12 @@ impl RecordCache for SqliteStore {
                 list.registrar,
                 encode(&list.pages),
                 i64::try_from(list.fetched).unwrap_or(i64::MAX),
-                list.keys.concat(),
+                list.keys
+                    .iter()
+                    .flat_map(
+                        |(k, until)| [&k[..], &until.unwrap_or(u64::MAX).to_be_bytes()].concat()
+                    )
+                    .collect::<Vec<u8>>(),
             ],
         ))?;
         Ok(())
@@ -87,5 +99,25 @@ impl RecordCache for SqliteStore {
         ))?;
         let rows = sql(stmt.query_map([], row))?;
         rows.map(sql).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_list_comes_back_with_its_keys_deadlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SqliteStore::open(dir.path().join("server.db"), crate::Synchronous::Normal).unwrap();
+        let list = CachedList {
+            registrar: "hl.example".into(),
+            pages: vec![vec![1, 2, 3], vec![4]],
+            keys: vec![([1; 32], None), ([2; 32], Some(1_700_000_000))],
+            fetched: 1_600_000_000,
+        };
+        store.put(&[9; 32], &list).unwrap();
+        assert_eq!(store.lists(&[9; 32]).unwrap(), vec![list]);
     }
 }

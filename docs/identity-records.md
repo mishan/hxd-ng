@@ -92,12 +92,13 @@ logged with the registrar, the record's `seq` and the fingerprint, and
 counted in `metrics` (`hxd_identity_records_applied_total{kind}`).
 
 An identity's records are fetched from the registrars that attested it,
-so a card shown without its attestations is not looked up: whoever holds
-a revoked identity key can drop the attestation and be admitted as the
-unattested key it then is. §7.2 says as much (an unattested identity "is
-never stale"); what refuses a stolen key everywhere is its holder
-revoking it, which every server that cached the list then applies, and
-the operator's own `revoked_identities`.
+so for a card shown without its attestations nothing is fetched: whoever
+holds a revoked identity key can drop the attestation and be admitted as
+the unattested key it then is. §7.2 says as much (an unattested
+identity "is never stale"); what refuses a stolen key everywhere is its
+holder revoking it, which every server that cached the list then
+applies, and the operator's own `revoked_identities`. A list held is
+applied whatever the card shows, and whether or not it is current.
 
 ## 4. Rotation at the server
 
