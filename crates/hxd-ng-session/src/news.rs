@@ -131,7 +131,7 @@ pub fn node_json(n: &Node) -> Value {
         "created_at": unix(n.created_at),
     });
     if let Some(feed) = &n.feed {
-        v["feed"] = json!(feed);
+        v["feed"] = json!({ "name": feed.name, "replies": feed.replies });
     }
     v
 }

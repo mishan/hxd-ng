@@ -55,8 +55,7 @@ mod subs;
 #[cfg(test)]
 mod subs_tests;
 
-pub(crate) use feed::FeedRule;
-pub use feed::{Feed, FeedImport, FeedItem, FeedSpec};
+pub use feed::{Feed, FeedImport, FeedItem, FeedRule, FeedSpec};
 pub use guest::{GuestKey, GuestKeyer, GUEST_SECRET_LEN};
 pub use memory::MemoryNews;
 pub use query::{CompiledQuery, Field, Term};
@@ -135,9 +134,9 @@ pub struct Node {
     /// Sub-nodes for a bundle; live articles for a category.
     pub children: u32,
     pub created_at: SystemTime,
-    /// The feed filling a category, which no one may post into
+    /// The feed filling a category, which no one may start a thread in
     /// (news-feeds.md §3). `Core`'s to say: a store leaves it `None`.
-    pub feed: Option<String>,
+    pub feed: Option<FeedRule>,
 }
 
 /// Who wrote an article, **as they were when they wrote it** (§3.1). A
@@ -2053,7 +2052,7 @@ impl Core {
                 .nodes(parent)?
                 .into_iter()
                 .map(|mut node| {
-                    node.feed = feeds.get(&node.id).map(|rule| rule.name.clone());
+                    node.feed = feeds.get(&node.id).cloned();
                     let children = match node.kind {
                         NodeKind::Bundle if depth > 1 => {
                             Some(level(store, feeds, Some(node.id), depth - 1)?)

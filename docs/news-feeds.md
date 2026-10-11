@@ -123,8 +123,9 @@ of making the category writable again.
 | Rename or delete the category | refused while a feed names it: the next start would make it again |
 | 1.2 flat news | if `flat_category` is a feed category, a 1.2 post is held to the same rules: with `replies = true` and `flat_reply = "newest_thread"` it becomes a reply to the newest feed article, and otherwise it is refused |
 
-The ng `node` object gains `"feed": "mobius"` for a feed category, so a
-client can hide its post button rather than offer one that will fail,
+The ng `node` object gains `"feed": { "name": "mobius", "replies":
+false }` for a feed category, so a client can hide its post and reply
+buttons rather than offer ones that will fail,
 and an article gains the same field beside its author (both F3); the
 legacy wire has no field for either and gets the refusal.
 

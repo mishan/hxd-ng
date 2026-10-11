@@ -1303,8 +1303,9 @@ read.
 A `node` object is `{ "id", "parent", "kind", "name", "count",
 "created_at" }` — `parent` null at the root, `count` the sub-nodes of a
 bundle or the live articles of a category — with `children` on a bundle
-that a `news_tree` of `depth` above 1 reached into, and `"feed"` naming
-the feed that fills a category no one may post into
+that a `news_tree` of `depth` above 1 reached into, and `"feed": {
+"name", "replies" }` on a category a feed fills: nobody starts a thread
+there, and nobody replies unless `replies` is true
 ([news-feeds.md](news-feeds.md) §3). An article's
 `parent` is likewise null for a thread's starter.
 

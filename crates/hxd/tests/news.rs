@@ -3646,7 +3646,11 @@ async fn a_polled_feed_is_read_on_both_wires_and_follows_its_edits() {
 
     let (mut alice, _) = Ng::login(ng, "alice").await;
     let tree = alice.ok("news_tree", json!({})).await;
-    assert_eq!(tree["nodes"][0]["feed"], "mobius", "{tree}");
+    assert_eq!(
+        tree["nodes"][0]["feed"],
+        json!({ "name": "mobius", "replies": false }),
+        "{tree}"
+    );
     let threads = alice
         .ok("news_threads", json!({ "category": feed.category }))
         .await;
