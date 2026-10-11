@@ -41,6 +41,9 @@ restriction, and standing, probation and vouching (§7.5).
 
 ## 2. Decisions
 
+Decided 2026-10: a revoked key's sessions end as soon as the revocation
+is found, the records cache is durable, and the fetch is its own crate.
+
 - **One fetch client, shared.** The fetch moves out of `hxd-feeds` into
   a crate of its own, `hxd-fetch`, which `hxd-feeds` and the identity
   code both use: the address checks, the bounds and the conditional GET
@@ -139,17 +142,3 @@ trust by discovery; a host in both is trusted by its configured key.
   limited to attested (and, once R4 lands, vouched) keys.
 - **R4: standing and probation.** §7.5 and `identity-vouch.md`, which is
   a draft of its own and is designed further before it is staged.
-
-## 7. Open questions
-
-1. **Sessions on a revocation.** §2 ends a session as soon as its key is
-   found revoked, through a sweep. The alternative is §7's letter, which
-   checks only at admission and leaves a revoked key's session until it
-   next resumes.
-2. **The durable cache.** §2 keeps it in SQLite so a restart while a
-   registrar is down still has a list. In memory, a restart forgets it,
-   and `revocation_stale = cached` then has nothing and admits as though
-   no record existed.
-3. **The fetch crate.** §2 extracts `hxd-fetch`. The alternative is the
-   identity code depending on `hxd-feeds`, which ties identity to the
-   `feeds` feature.
