@@ -1,7 +1,6 @@
 # News feeds: RSS and Atom as read-only categories
 
-Status: F1 and F2, the domain and the fetching crate, are built; §9
-stages the rest.
+Status: built through F3; hx-ng's side (F4) is next. §9 stages it.
 
 An operator names a feed and a news category; the server polls the feed
 and posts each new item into the category as an article. Users read it
@@ -92,10 +91,11 @@ category = "Software Updates/Mobius"   # as flat_category names one (news.md §1
 # replies = false               # may people reply to its articles
 ```
 
-`name` is the feed's identity, not its URL: a feed that moves keeps its
+Feeds are read at startup; a change to them takes a restart. `name` is
+the feed's identity, not its URL: a feed that moves keeps its
 history by keeping its name, and a new name is a new feed. Names are
-unique; two feeds may share a category, and each keeps and prunes its
-own items.
+unique; two feeds may share a category, if they agree on `replies`, and
+each keeps and prunes its own items. `every` is at most a week.
 
 The category is made at startup if it is missing, bundles above it
 included, the way an operator would make it by hand. An existing
@@ -163,7 +163,8 @@ at a time per host.
   proxy's own rules decide the rest. The environment's proxy variables
   are not read, as they are not for push: a setting that moves
   resolution out of sight is one the operator writes down.
-- **Failures back off**, doubling from the feed's interval to six hours,
+- **Failures back off**, doubling from the feed's interval to six hours
+  (or to the interval, for a feed polled less often than that),
   and a `Retry-After` on a `429` or `503` is honored when it is longer.
   Nothing is posted about a failure; it is logged, counted, and kept
   with the feed's state (§6) for the operator.
@@ -329,11 +330,11 @@ upstream as well.
 2. **F2 — `hxd-feeds`. Built.** The fetch with its address check, the
    parse over fixtures of each format, the converter with its hostile
    cases, all behind a transport seam as the push sender's are.
-3. **F3 — the wiring.** `[news.feeds]` and `[[news.feed]]`, the `feeds`
-   feature, the poller and its backoff, the sweeper's seen-row rule, the
-   ng `node.feed` field, metrics, and e2e: a feed served from a test
-   server becoming articles both wires read, a post refused on both, a
-   delete that stays deleted.
+3. **F3 — the wiring. Built.** `[news.feeds]` and `[[news.feed]]`, the
+   `feeds` feature, the poller and its backoff, the sweeper's seen-row
+   rule, the ng `node.feed` field and an article's `from.feed`, metrics,
+   and e2e: a feed served from a test server becoming articles both
+   wires read, a 304 when nothing changed, and an edit followed.
 4. **F4 — the client.** hx-ng shows a feed category's name, hides its
    post button, and badges a feed article's author.
 

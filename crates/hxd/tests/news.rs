@@ -3539,3 +3539,153 @@ fn the_operator_lists_the_feeds() {
          0 articles, 0 items seen, never fetched"
     );
 }
+
+/// A feed served over HTTP on loopback, which is the local network and
+/// so fetched as configured: its `ETag` answers a conditional request
+/// with a 304, and `items` is what it lists now.
+struct FeedServer {
+    url: String,
+    items: Arc<std::sync::Mutex<String>>,
+    requests: Arc<AtomicUsize>,
+    not_modified: Arc<AtomicUsize>,
+}
+
+impl FeedServer {
+    async fn start() -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/releases.xml", listener.local_addr().unwrap());
+        let items = Arc::new(std::sync::Mutex::new(String::new()));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let not_modified = Arc::new(AtomicUsize::new(0));
+        let (served, counted, unchanged) = (items.clone(), requests.clone(), not_modified.clone());
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && sock.read(&mut byte).await.unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let body = format!(
+                    "<rss version=\"2.0\"><channel><title>Mobius</title>{}</channel></rss>",
+                    served.lock().unwrap()
+                );
+                let etag = format!("\"{}\"", body.len());
+                let head = String::from_utf8_lossy(&head).to_lowercase();
+                let reply = if head.contains(&format!("if-none-match: {etag}")) {
+                    unchanged.fetch_add(1, Ordering::SeqCst);
+                    "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nETag: {etag}\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        FeedServer {
+            url,
+            items,
+            requests,
+            not_modified,
+        }
+    }
+
+    fn list(&self, items: &[(&str, &str, &str)]) {
+        *self.items.lock().unwrap() = items
+            .iter()
+            .map(|(guid, title, notes)| {
+                format!(
+                    "<item><guid>{guid}</guid><title>{title}</title>\
+                     <author>jeff@example.org (Jeff)</author>\
+                     <description>&lt;p&gt;{notes}&lt;/p&gt;</description></item>"
+                )
+            })
+            .collect();
+    }
+}
+
+/// A feed polled over HTTP becomes articles both wires read: ng sees
+/// the category and each article as the feed's, a 1.2 client reads them
+/// in its flat view, a poll with nothing new is a 304, and an item edited
+/// upstream edits its article and says so (`docs/news-feeds.md` §4, §5).
+#[tokio::test]
+async fn a_polled_feed_is_read_on_both_wires_and_follows_its_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng, core) =
+        start_server_with(dir.path(), Some(news_server()), flat_general()).await;
+    let server = FeedServer::start().await;
+    server.list(&[
+        ("v2", "Mobius 2.0", "Faster."),
+        ("v1", "Mobius 1.0", "First."),
+    ]);
+    let feed = core
+        .news_feeds_open(&[hxd_core::news::FeedSpec {
+            name: "mobius".into(),
+            url: server.url.clone(),
+            category: vec!["General".into()],
+            keep: 100,
+            first_import: 20,
+            author: None,
+            replies: false,
+        }])
+        .unwrap()
+        .remove(0);
+    let fetch = hxd_feeds::FetchConfig {
+        timeout: Duration::from_secs(5),
+        max_bytes: 1 << 20,
+        proxy: None,
+        user_agent: "hxd-ng-test".into(),
+    };
+    let done = hxd::feeds::poll_once(&core, &feed, &fetch).await.unwrap();
+    assert_eq!(done.posted, 2);
+
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let tree = alice.ok("news_tree", json!({})).await;
+    assert_eq!(tree["nodes"][0]["feed"], "mobius", "{tree}");
+    let threads = alice
+        .ok("news_threads", json!({ "category": feed.category }))
+        .await;
+    let newest = &threads["threads"][0]["article"];
+    assert_eq!(newest["subject"], "Mobius 2.0");
+    assert_eq!(newest["from"], json!({ "nick": "Jeff", "feed": "mobius" }));
+    let first = threads["threads"][1]["article"]["id"].as_u64().unwrap();
+
+    let mut bob = Period::login(legacy, "bob").await;
+    let doc = news_text(&bob.ok(NEWSFILE_GET, vec![]).await);
+    assert!(
+        doc.contains("Mobius 1.0") && doc.contains("Mobius 2.0"),
+        "{doc}"
+    );
+
+    let done = hxd::feeds::poll_once(&core, &feed, &fetch).await.unwrap();
+    assert_eq!((done.posted, done.revised), (0, 0));
+    assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        server.not_modified.load(Ordering::SeqCst),
+        1,
+        "the second poll was conditional"
+    );
+
+    server.list(&[
+        ("v3", "Mobius 3.0", "Newer."),
+        ("v2", "Mobius 2.0", "Faster."),
+        ("v1", "Mobius 1.0", "First, corrected."),
+    ]);
+    let done = hxd::feeds::poll_once(&core, &feed, &fetch).await.unwrap();
+    assert_eq!((done.posted, done.revised), (1, 1));
+    alice.event("news_edited", |d| d["id"] == first).await;
+    let edited = alice.ok("news_article", json!({ "id": first })).await;
+    assert_eq!(edited["article"]["mime"], "text/markdown");
+    assert!(
+        edited["article"]["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("First, corrected"),
+        "{edited}"
+    );
+}

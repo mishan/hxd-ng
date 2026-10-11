@@ -176,7 +176,7 @@ For anything the variables don't reach, there are two ways out:
 
 - `HXD_EXTRA_CONFIG=/path/to/fragment.toml` appends a file to the
   generated config. It may add sections the variables don't write —
-  `[registrar]`, `[news.notify]`, `[media.rate]` — but not repeat one they
+  `[registrar]`, `[news.notify]`, `[media.rate]`, `[[news.feed]]` — but not repeat one they
   do, which TOML refuses. Every key in it must sit under a section
   header: the fragment lands after whichever section was written last,
   so a key before its first header would join that one, and the entry

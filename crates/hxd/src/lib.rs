@@ -23,6 +23,8 @@ use serde::Deserialize;
 
 pub mod accounts;
 pub mod banner;
+#[cfg(feature = "feeds")]
+pub mod feeds;
 pub mod files;
 pub mod link;
 pub mod metrics;
@@ -599,6 +601,13 @@ pub struct NewsSection {
     /// `[news.attach]`: durable image staging and article attachments.
     #[serde(default)]
     pub attach: Option<NewsAttachSection>,
+    /// `[news.feeds]`: what every feed is held to (`docs/news-feeds.md`
+    /// §2). Defaults when absent.
+    #[serde(default)]
+    pub feeds: NewsFeedsSection,
+    /// `[[news.feed]]`: the feeds, each polled into a read-only category.
+    #[serde(default)]
+    pub feed: Vec<NewsFeedEntry>,
     /// The most articles one 1.5 category listing carries (§12.3). The
     /// listing is one chunk, so 65 535 bytes may decide first.
     #[serde(default = "default_news_legacy_catlist_max")]
@@ -647,6 +656,60 @@ fn flat_names(path: &str) -> Vec<String> {
     path.split('/')
         .map(|name| name.trim().to_string())
         .collect()
+}
+
+/// `[news.feeds]` (`docs/news-feeds.md` §2, §4).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NewsFeedsSection {
+    /// Seconds between polls; a feed's own `every` overrides it.
+    pub every: u64,
+    /// The shortest `every` the config may ask for, here or on a feed.
+    pub min_every: u64,
+    /// Newest live articles a feed keeps; 0 leaves it to `retain_days`.
+    pub keep: usize,
+    /// Items a feed's first poll takes from its backlog.
+    pub first_import: usize,
+    /// A response body's limit, after decompression.
+    pub max_bytes: usize,
+    /// Seconds for a whole fetch, redirects included.
+    pub timeout: u64,
+    /// `http://host:port`; the environment's proxy variables are never
+    /// read.
+    pub proxy: Option<String>,
+}
+
+impl Default for NewsFeedsSection {
+    fn default() -> Self {
+        NewsFeedsSection {
+            every: 1800,
+            min_every: 300,
+            keep: 100,
+            first_import: 20,
+            max_bytes: 4 * 1024 * 1024,
+            timeout: 30,
+            proxy: None,
+        }
+    }
+}
+
+/// One `[[news.feed]]`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewsFeedEntry {
+    /// The feed's identity: what remembers the items it has seen, kept
+    /// across a change of URL.
+    pub name: String,
+    pub url: String,
+    /// The category's names from the root, as `flat_category` names one.
+    pub category: String,
+    pub every: Option<u64>,
+    pub keep: Option<usize>,
+    /// In place of each item's own author.
+    pub author: Option<String>,
+    /// May people reply to its articles?
+    #[serde(default)]
+    pub replies: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -786,6 +849,22 @@ impl NewsSection {
         }
     }
 
+    /// The `[[news.feed]]` entries as the domain opens them.
+    pub fn feed_specs(&self) -> Vec<hxd_core::news::FeedSpec> {
+        self.feed
+            .iter()
+            .map(|f| hxd_core::news::FeedSpec {
+                name: f.name.clone(),
+                url: f.url.clone(),
+                category: flat_names(&f.category),
+                keep: f.keep.unwrap_or(self.feeds.keep),
+                first_import: self.feeds.first_import,
+                author: f.author.clone(),
+                replies: f.replies,
+            })
+            .collect()
+    }
+
     /// How `[news]` reaches the legacy wire (§12).
     pub fn to_legacy(&self) -> hxd_session::LegacyNews {
         hxd_session::LegacyNews {
@@ -914,6 +993,7 @@ impl NewsSection {
                 return Err("[news.notify] max_per_hour must be at most 3600".into());
             }
         }
+        self.check_feeds()?;
         if let Some(attach) = &self.attach {
             if !cfg!(feature = "media") {
                 return Err(
@@ -929,6 +1009,72 @@ impl NewsSection {
                 || attach.per_hour == 0
             {
                 return Err("[news.attach] limits must all be greater than zero".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The longest a feed may go between polls.
+const MAX_FEED_EVERY: u64 = 7 * 24 * 3600;
+
+impl NewsSection {
+    fn check_feeds(&self) -> Result<(), String> {
+        let f = &self.feeds;
+        if f.min_every == 0 || f.every < f.min_every || f.every > MAX_FEED_EVERY {
+            return Err(
+                "[news.feeds] every must be at least min_every, which is above 0, \
+                 and at most a week"
+                    .into(),
+            );
+        }
+        if f.timeout == 0 || f.max_bytes == 0 {
+            return Err("[news.feeds] timeout and max_bytes must be greater than zero".into());
+        }
+        if self.feed.is_empty() {
+            return Ok(());
+        }
+        if !cfg!(feature = "feeds") {
+            return Err("[[news.feed]] is configured, but this build has no feeds \
+                 (built without the `feeds` feature)"
+                .into());
+        }
+        #[cfg(feature = "feeds")]
+        if let Some(proxy) = &f.proxy {
+            hxd_feeds::check_proxy(proxy).map_err(|e| format!("[news.feeds] proxy: {e}"))?;
+        }
+        let mut names = std::collections::HashSet::new();
+        let mut replies: HashMap<Vec<String>, bool> = HashMap::new();
+        for feed in &self.feed {
+            let named = format!("[[news.feed]] {:?}", feed.name);
+            if feed.name.trim().is_empty() || !names.insert(feed.name.as_str()) {
+                return Err(format!("{named}: every feed needs a name of its own"));
+            }
+            #[cfg(feature = "feeds")]
+            hxd_feeds::check_url(&feed.url).map_err(|e| format!("{named}: url: {e}"))?;
+            if flat_names(&feed.category).iter().any(|n| n.is_empty()) {
+                return Err(format!(
+                    "{named}: category is a category's names from the root, with / between"
+                ));
+            }
+            if feed
+                .every
+                .is_some_and(|every| every < f.min_every || every > MAX_FEED_EVERY)
+            {
+                return Err(format!(
+                    "{named}: every must be at least [news.feeds] min_every, and at most a week"
+                ));
+            }
+            // Feeds sharing a category share its rule, and the one that
+            // lost would be ignored without a word.
+            if *replies
+                .entry(flat_names(&feed.category))
+                .or_insert(feed.replies)
+                != feed.replies
+            {
+                return Err(format!(
+                    "{named}: feeds sharing a category must agree on replies"
+                ));
             }
         }
         Ok(())
@@ -3561,7 +3707,8 @@ pub async fn history_pruner(core: Arc<Core>, max_lines: u32, max_days: u32) {
 
 /// News retention: whole threads whose last post is older than `[news]
 /// retain_days`, then the attachment sweep — abandoned stages, and files
-/// no row keeps (`docs/news.md` §7.2). Hourly and on the blocking pool,
+/// no row keeps (`docs/news.md` §7.2) — and the feeds' items long gone
+/// from their feeds (`docs/news-feeds.md` §6). Hourly and on the blocking pool,
 /// like the other two — never on the request path.
 pub async fn news_pruner(core: Arc<Core>) {
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
@@ -3575,6 +3722,9 @@ pub async fn news_pruner(core: Arc<Core>) {
                 // A server without `[news.attach]`, which prunes anyway.
                 Ok(_) | Err(hxd_core::NewsError::Disabled) => {}
                 Err(e) => tracing::warn!("news attachment sweep: {e:?}"),
+            }
+            if let Err(e) = core.news_feeds_forget(SystemTime::now()) {
+                tracing::warn!("news feed sweep: {e:?}");
             }
             gone
         })
@@ -5051,6 +5201,53 @@ sync = "full"
     /// Parse a config the way [`Config::load`] would, without a file.
     fn parse(toml_text: &str) -> Result<Config, String> {
         toml::from_str(toml_text).map_err(|e| e.to_string())
+    }
+
+    #[cfg(feature = "feeds")]
+    #[test]
+    fn feeds_are_checked_before_any_is_polled() {
+        let feed = |extra: &str| {
+            format!(
+                "[news]\ndb = \"n.sqlite\"\n[[news.feed]]\nname = \"mobius\"\n\
+                 url = \"https://e.org/releases.atom\"\ncategory = \"Software/Mobius\"\n{extra}"
+            )
+        };
+        let good = parse(&format!(
+            "{}[[news.feed]]\nname = \"lan\"\nurl = \"http://10.0.0.5/feed.xml\"\n\
+             category = \"Local\"\nkeep = 5\nreplies = true\n",
+            feed("every = 3600\n")
+        ))
+        .unwrap();
+        check_config(&good).unwrap();
+        let specs = good.news.as_ref().unwrap().feed_specs();
+        assert_eq!(specs[0].category, ["Software", "Mobius"]);
+        assert_eq!((specs[0].keep, specs[0].replies), (100, false));
+        assert_eq!((specs[1].keep, specs[1].replies), (5, true));
+
+        for (config, says) in [
+            (feed("every = 60\n"), "min_every"),
+            (feed("category = \"Software//Mobius\"\n").replace("category = \"Software/Mobius\"\n", ""), "category"),
+            (feed("").replace("https://e.org", "ftp://e.org"), "url"),
+            (feed("").replace("https://", "https://user:pw@"), "url"),
+            (
+                format!("{}[[news.feed]]\nname = \"mobius\"\nurl = \"https://e.org/b\"\ncategory = \"B\"\n", feed("")),
+                "a name of its own",
+            ),
+            (feed("").replace("[[news.feed]]", "[news.feeds]\nproxy = \"socks5://p:1080\"\n[[news.feed]]"), "proxy"),
+            (feed("").replace("[[news.feed]]", "[news.feeds]\nevery = 100\n[[news.feed]]"), "min_every"),
+            (feed("every = 999999999\n"), "at most a week"),
+            (
+                format!(
+                    "{}[[news.feed]]\nname = \"b\"\nurl = \"https://e.org/b\"\n\
+                     category = \"Software/Mobius\"\nreplies = true\n",
+                    feed("")
+                ),
+                "agree on replies",
+            ),
+        ] {
+            let err = check_config(&parse(&config).unwrap()).unwrap_err();
+            assert!(err.contains(says), "{config}\n=> {err}");
+        }
     }
 
     /// A `[voice.video]` section with every field distinct, so a limit

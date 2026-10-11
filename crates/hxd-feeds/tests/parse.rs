@@ -10,6 +10,7 @@ fn opts() -> ParseOptions {
         max_body: 4096,
         // 2026-09-01.
         now: UNIX_EPOCH + Duration::from_secs(1_788_220_800),
+        base: None,
     }
 }
 
@@ -239,4 +240,42 @@ fn a_dtd_declares_nothing_that_grows() {
     assert_eq!(feed.title.as_deref(), Some("&lol9;"));
     assert_eq!(feed.items[0].subject, "&lol9;");
     assert_eq!(feed.items[0].body, "\\&lol9;");
+}
+
+#[test]
+fn a_relative_link_is_relative_to_the_feed() {
+    let item = "<item><link>/releases/1</link><title>One</title></item>";
+    let base = |base: Option<&str>| {
+        parse(
+            &rss(item),
+            &ParseOptions {
+                base: base.map(|b| url::Url::parse(b).unwrap()),
+                ..opts()
+            },
+        )
+        .unwrap()
+    };
+    let resolved = base(Some("https://e.org/feeds/news.xml"));
+    assert!(
+        resolved.items[0]
+            .body
+            .ends_with("Source: <https://e.org/releases/1>"),
+        "{}",
+        resolved.items[0].body
+    );
+    assert_eq!(
+        base(None).skipped,
+        1,
+        "nothing to know it by without the feed's URL"
+    );
+}
+
+#[test]
+fn an_rss_author_is_the_name_not_the_address() {
+    let feed = parse(
+        &rss("<item><guid>g</guid><author>jeff@example.org (Jeff Halter)</author></item>"),
+        &opts(),
+    )
+    .unwrap();
+    assert_eq!(feed.items[0].author.as_deref(), Some("Jeff Halter"));
 }

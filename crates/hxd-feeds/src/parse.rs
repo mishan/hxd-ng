@@ -20,6 +20,8 @@ pub struct ParseOptions {
     pub max_body: usize,
     /// The fetch time: an item with no date has it, and none is later.
     pub now: SystemTime,
+    /// The feed's own URL, which a relative link in it is relative to.
+    pub base: Option<Url>,
 }
 
 /// A feed, as far as news needs it.
@@ -74,7 +76,7 @@ pub fn parse(bytes: &[u8], opts: &ParseOptions) -> Result<Feed, ParseError> {
     let author = feed
         .authors
         .iter()
-        .find_map(|p| p.name.as_deref().map(collapse))
+        .find_map(|p| p.name.as_deref().map(person))
         .filter(|a| !a.is_empty());
     let fallback = author.clone().or_else(|| title.clone());
     // JSON Feed's attachments arrive as links with nothing but their
@@ -103,10 +105,13 @@ pub fn parse(bytes: &[u8], opts: &ParseOptions) -> Result<Feed, ParseError> {
     })
 }
 
-fn http(href: &str) -> Option<Url> {
-    Url::parse(href)
-        .ok()
-        .filter(|u| matches!(u.scheme(), "http" | "https"))
+fn http(href: &str, base: Option<&Url>) -> Option<Url> {
+    match base {
+        Some(base) => base.join(href),
+        None => Url::parse(href),
+    }
+    .ok()
+    .filter(|u| matches!(u.scheme(), "http" | "https"))
 }
 
 fn item(e: &Entry, json: bool, fallback: Option<&str>, opts: &ParseOptions) -> Option<Item> {
@@ -117,16 +122,15 @@ fn item(e: &Entry, json: bool, fallback: Option<&str>, opts: &ParseOptions) -> O
     let link = links
         .iter()
         .filter(|l| matches!(l.rel.as_deref(), None | Some("alternate")))
-        .find_map(|l| http(&l.href));
+        .find_map(|l| http(&l.href, opts.base.as_ref()));
     let enclosures: Vec<Url> = enclosures
         .iter()
-        .filter_map(|l| http(&l.href))
-        .chain(
-            e.media
-                .iter()
-                .flat_map(|m| &m.content)
-                .filter_map(|c| c.url.as_ref().and_then(|u| http(u.as_str()))),
-        )
+        .filter_map(|l| http(&l.href, opts.base.as_ref()))
+        .chain(e.media.iter().flat_map(|m| &m.content).filter_map(|c| {
+            c.url
+                .as_ref()
+                .and_then(|u| http(u.as_str(), opts.base.as_ref()))
+        }))
         .fold(Vec::new(), |mut all, u| {
             if !all.contains(&u) {
                 all.push(u);
@@ -149,7 +153,7 @@ fn item(e: &Entry, json: bool, fallback: Option<&str>, opts: &ParseOptions) -> O
     let author = e
         .authors
         .iter()
-        .find_map(|p| p.name.as_deref().map(collapse))
+        .find_map(|p| p.name.as_deref().map(person))
         .filter(|a| !a.is_empty())
         .or_else(|| fallback.map(str::to_owned));
     let at = e
@@ -222,6 +226,16 @@ fn as_text(t: &Text, max: usize) -> String {
     text[..html::floor_boundary(&text, max)]
         .trim_end()
         .to_owned()
+}
+
+/// A person's name as a feed gives it. RSS writes an author as
+/// `email (Name)`, which comes through as `(Name)`.
+fn person(s: &str) -> String {
+    let name = collapse(s);
+    match name.strip_prefix('(').and_then(|n| n.strip_suffix(')')) {
+        Some(inner) if !inner.trim().is_empty() => inner.trim().to_string(),
+        _ => name,
+    }
 }
 
 fn collapse(s: &str) -> String {

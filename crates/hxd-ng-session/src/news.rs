@@ -122,14 +122,18 @@ pub fn notified_json(n: &Notified) -> Value {
 }
 
 pub fn node_json(n: &Node) -> Value {
-    json!({
+    let mut v = json!({
         "id": n.id,
         "parent": n.parent,
         "kind": n.kind.name(),
         "name": n.name,
         "count": n.children,
         "created_at": unix(n.created_at),
-    })
+    });
+    if let Some(feed) = &n.feed {
+        v["feed"] = json!(feed);
+    }
+    v
 }
 
 fn tree_json(t: &NodeTree) -> Value {
@@ -180,6 +184,9 @@ pub fn article_json(a: &Article) -> Value {
     }
     if let Some(fp) = a.author.fingerprint {
         from["fingerprint"] = json!(hl_identity::Fingerprint(fp).to_string());
+    }
+    if let Some(feed) = &a.feed {
+        from["feed"] = json!(feed);
     }
     json!({
         "id": a.id,
