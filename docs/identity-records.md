@@ -1,6 +1,6 @@
 # Applying a registrar's records: the verifying server
 
-Status: R1's admission half built (records fetched at `auth`, kept on disk and applied); the sweep that ends sessions and `banned_registrars` are next. §6 stages it.
+Status: R1 built; R2, rotation at the server, is next. §6 stages it.
 
 `identity-registrar.md` §7 says what a server that trusts a registrar
 does with what the registrar publishes: resolve its key, fetch the
@@ -34,9 +34,10 @@ It changes no wire behavior §7 does not already specify.
   every address it connects to, redirects included, and fetches an
   operator-configured private host as configured.
 
-Absent: discovery and its cache, the records fetch and its cache, every
-effect in §7.3's table, `revocation_stale`, `frozen`, rotation at the
-server (§7.4), `banned_registrars`, `newcomer_delay`, the `create`
+Absent when this was planned, and built by R1: discovery and its cache,
+the records fetch and its cache, every effect in §7.3's table but
+rotation, `revocation_stale`, `frozen` and `banned_registrars`. Still
+absent: rotation at the server (§7.4), `newcomer_delay`, the `create`
 restriction, and standing, probation and vouching (§7.5).
 
 ## 2. Decisions

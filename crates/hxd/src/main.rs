@@ -1315,6 +1315,13 @@ async fn main() {
                     if id.config().trtp { "on" } else { "off" }
                 );
             }
+            if let Some(id) = ng_ctx
+                .identity
+                .as_ref()
+                .filter(|id| id.registrars().is_some())
+            {
+                tokio::spawn(hxd_ng_session::records_sweeper(id.clone()));
+            }
             let grace = ng_ctx.cfg.grace;
             tokio::spawn(hxd_ng_session::sweeper(
                 ng_ctx.core.clone(),

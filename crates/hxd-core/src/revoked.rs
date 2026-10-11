@@ -46,11 +46,37 @@ impl Revocations {
     }
 }
 
+/// What the registrars this server trusts publish against keys: the
+/// identities refused, and the devices refused *with the identity that
+/// revoked them*. A device revocation is its identity's to make, and a
+/// registrar takes one naming any device key, so a device refused alone
+/// would let one identity end another's sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Published {
+    pub identities: HashSet<[u8; 32]>,
+    /// `(identity, device)`.
+    pub devices: HashSet<([u8; 32], [u8; 32])>,
+}
+
+impl Published {
+    fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
+        self.identities.contains(identity) || self.devices.contains(&(*identity, *device))
+    }
+
+    fn refuses(&self, tag: &IdentityTag) -> bool {
+        self.is_revoked(&tag.fingerprint, &tag.device)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.identities.is_empty() && self.devices.is_empty()
+    }
+}
+
 /// Both lists: the operator's and the registrars'.
 #[derive(Debug, Default)]
 pub(crate) struct Refused {
     local: Revocations,
-    published: Revocations,
+    published: Published,
 }
 
 impl Refused {
@@ -93,35 +119,46 @@ impl Core {
     /// one should not be able to come back through it.
     pub fn set_revocations(&self, list: Revocations) -> Vec<(Uid, String)> {
         self.revoked.write().unwrap().local = list.clone();
-        self.end_revoked(&list)
+        if list.is_empty() {
+            return Vec::new();
+        }
+        self.end_revoked(|tag| list.refuses(tag))
+    }
+
+    /// The identity keys of every session on the roster, live or
+    /// detached: the ones whose records a sweep keeps current.
+    pub fn session_identities(&self) -> Vec<[u8; 32]> {
+        let r = self.roster.lock().unwrap();
+        let mut ids: Vec<[u8; 32]> = r
+            .users
+            .values()
+            .filter_map(|s| s.info.transport.identity.as_ref().map(|t| t.fingerprint))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     /// Install what the registrars this server trusts publish against
     /// keys, replacing the last, and end every session it now refuses, as
     /// [`Self::set_revocations`] does for the operator's own list.
-    pub fn set_published_revocations(&self, list: Revocations) -> Vec<(Uid, String)> {
+    pub fn set_published_revocations(&self, list: Published) -> Vec<(Uid, String)> {
         self.revoked.write().unwrap().published = list.clone();
-        self.end_revoked(&list)
+        if list.is_empty() {
+            return Vec::new();
+        }
+        self.end_revoked(|tag| list.refuses(tag))
     }
 
     /// The sessions `list` refuses, ended. Run after the list is written,
     /// and with nothing else held: an `attach` from then on is refused,
     /// and one that got in before is on the roster to be found here.
-    fn end_revoked(&self, list: &Revocations) -> Vec<(Uid, String)> {
-        if list.is_empty() {
-            return Vec::new();
-        }
+    fn end_revoked(&self, refuses: impl Fn(&IdentityTag) -> bool) -> Vec<(Uid, String)> {
         let mut r = self.roster.lock().unwrap();
         let ended: Vec<(Uid, String)> = r
             .users
             .iter()
-            .filter(|(_, s)| {
-                s.info
-                    .transport
-                    .identity
-                    .as_ref()
-                    .is_some_and(|tag| list.refuses(tag))
-            })
+            .filter(|(_, s)| s.info.transport.identity.as_ref().is_some_and(&refuses))
             .map(|(uid, s)| (*uid, s.info.nick.clone()))
             .collect();
         for (uid, nick) in &ended {

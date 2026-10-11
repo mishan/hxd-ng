@@ -370,6 +370,21 @@ pub async fn sweeper(
     }
 }
 
+/// Keep the records of the identities with sessions here current, and
+/// end the sessions of the ones they now refuse (`docs/identity-records.md`
+/// §2). A list is fetched again only once it is due, so a tick costs a
+/// cache read for each identity until one is.
+pub async fn records_sweeper(identity: Arc<identity::IdentityState>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        for (uid, nick) in identity.sweep_records().await {
+            info!(uid, nick = %nick, "session ended: its key is refused by its registrar");
+        }
+    }
+}
+
 /// `tokio::task::spawn_blocking`, with the pool's queue time and
 /// occupancy reported under `what` (`hxd_core::instrument::blocking`).
 pub(crate) fn spawn_blocking<R: Send + 'static>(

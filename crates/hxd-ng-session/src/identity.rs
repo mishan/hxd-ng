@@ -23,6 +23,8 @@
 //! checked here shares with both wires' logins.
 
 use std::collections::HashMap;
+
+use futures_util::StreamExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -88,6 +90,9 @@ pub struct IdentityConfig {
     /// them per-process, which the spec's §12 marks as the weaker mode.
     pub anchors: Option<std::path::PathBuf>,
     pub frozen: Frozen,
+    /// Registrar hosts whose identities are refused outright
+    /// (`identity-registrar.md` §7.3).
+    pub banned_registrars: Vec<String>,
 }
 
 impl Default for IdentityConfig {
@@ -104,6 +109,7 @@ impl Default for IdentityConfig {
             max_new_accounts_per_hour: Some(60),
             anchors: None,
             frozen: Frozen::Deny,
+            banned_registrars: Vec::new(),
         }
     }
 }
@@ -687,6 +693,19 @@ impl IdentityState {
             return Err(AuthRefused::Revoked);
         }
 
+        // A banned registrar refuses every identity that carries its
+        // attestation, verified or not, and whatever else the card
+        // carries: a card is its holder's own signature, so what is on it
+        // its holder chose, and nobody can put it on another's.
+        if card
+            .attestations
+            .iter()
+            .any(|a| self.cfg.banned_registrars.contains(&a.registrar))
+        {
+            info!(fingerprint = %fingerprint.short(), "identity auth refused: a banned registrar's attestation");
+            return Err(AuthRefused::Denied);
+        }
+
         // Step 4, continued: what the registrars that attested it publish.
         let now = now_unix();
         let attestations = self.apply_records(&card, &cert, now)?;
@@ -728,10 +747,14 @@ impl IdentityState {
         // device on file writes nothing, and the login on the socket it
         // opens is refused with the ban's reason, so that is left to it.
         if assoc == Assoc::Write {
-            if let Some(hit) =
+            // A ban's `*@host` is the registrar's, so it reads every
+            // handle the card names, as `banned_registrars` does.
+            let named = card.attestations.iter().map(|a| Some(a.full_handle()));
+            let hit = std::iter::once(handle.clone()).chain(named).find_map(|h| {
                 self.core
-                    .person_banned(None, Some(&fingerprint.0), handle.as_deref())
-            {
+                    .person_banned(None, Some(&fingerprint.0), h.as_deref())
+            });
+            if let Some(hit) = hit {
                 info!(fingerprint = %fingerprint.short(), ban = hit.id, "identity auth refused: banned");
                 return Err(AuthRefused::Banned);
             }
@@ -1258,6 +1281,55 @@ impl IdentityState {
         t.tokens.get(&key).map(|(ident, _)| ident.clone())
     }
 
+    /// `identity-records.md` §2: the lists of every identity with a
+    /// session here refreshed where they are due, a few at a time, and
+    /// what they now refuse installed in the core, which ends the
+    /// sessions it refuses there and then. Answers those, for the log.
+    ///
+    /// The lists asked for are the ones admission fetched, by the
+    /// identity's fingerprint, never the card it shows now: a card can be
+    /// replaced with one that names no registrar, and fall out of the
+    /// cache, while the session it was admitted under goes on.
+    pub async fn sweep_records(&self) -> Vec<(hxd_core::Uid, String)> {
+        let Some(registrars) = self.registrars.clone() else {
+            return Vec::new();
+        };
+        let live: Vec<Fingerprint> = self
+            .core
+            .session_identities()
+            .into_iter()
+            .map(Fingerprint)
+            .collect();
+        let now = now_unix();
+        futures_util::stream::iter(&live)
+            .for_each_concurrent(8, |fp| {
+                let registrars = registrars.clone();
+                async move { registrars.refresh_held(*fp, now).await }
+            })
+            .await;
+        let frozen_refuses = self.cfg.frozen == Frozen::Deny;
+        let refused = match crate::spawn_blocking("identity", move || {
+            registrars.refused(&live, frozen_refuses)
+        })
+        .await
+        {
+            Ok(refused) => refused,
+            Err(_) => return Vec::new(),
+        };
+        self.core.set_published_revocations(refused)
+    }
+
+    /// The card a device on file is admitted under, as `identity_for_device`
+    /// would read it: for the caller to fetch its records first.
+    pub fn card_for_device(&self, device: &PublicKey) -> Option<hl_identity::Card> {
+        let bytes = {
+            let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            let rec = t.devices.get(device)?;
+            t.cards.get(&Fingerprint::of(&rec.identity))?.bytes.clone()
+        };
+        hl_identity::Card::parse(&bytes).ok()
+    }
+
     /// The mTLS "connection is the credential" path (§5.3): a device on
     /// file with a still-valid certificate needs no token.
     ///
@@ -1268,15 +1340,6 @@ impl IdentityState {
     /// has no way to declare one itself. Signatures *are* re-checked
     /// rather than the cache's shape trusted; that's two verifications,
     /// which is why callers run this on the blocking pool.
-    /// The card a device on file is admitted under, as `identity_for_device`
-    /// would read it: for the caller to fetch its records first.
-    pub fn card_for_device(&self, device: &PublicKey) -> Option<hl_identity::Card> {
-        let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-        let rec = t.devices.get(device)?;
-        let bytes = &t.cards.get(&Fingerprint::of(&rec.identity))?.bytes;
-        hl_identity::Card::parse(bytes).ok()
-    }
-
     pub fn identity_for_device(&self, device: &PublicKey) -> Option<TransportIdentity> {
         let (card_bytes, cert_bytes, downstream) = {
             let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
