@@ -1195,6 +1195,8 @@ async fn ng_previews_are_drawn_again_or_decoded_text() {
     std::fs::write(root.path().join("notes.txt"), &notes).unwrap();
     std::fs::write(root.path().join("blob.bin"), b"\x00\x01binary").unwrap();
     std::fs::create_dir(root.path().join("folder")).unwrap();
+    std::fs::create_dir(root.path().join("Drop Box")).unwrap();
+    std::fs::write(root.path().join("Drop Box/inside.txt"), b"private").unwrap();
     let mut mp4 = b"\0\0\0\x18ftypisom\0\0\x02\0isomiso2".to_vec();
     mp4.resize(4096, 0);
     std::fs::write(root.path().join("clip.mp4"), &mp4).unwrap();
@@ -1276,10 +1278,34 @@ async fn ng_previews_are_drawn_again_or_decoded_text() {
         );
     }
 
-    for (id, path, code) in [(4, "blob.bin", "unsupported"), (5, "folder", "not_file")] {
+    for (id, path, code) in [
+        (4, "blob.bin", "unsupported"),
+        (5, "folder", "not_file"),
+        (8, "Drop Box/inside.txt", "access_denied"),
+    ] {
         let refused = ng_request(&mut ws, id, "files_preview", json!({"path": path})).await;
         assert_eq!(refused["error"]["code"], code, "{refused}");
     }
+    let mut browser = ng_login(
+        server.ng,
+        json!({"login": "browser", "password": "pw", "nick": "Browser"}),
+    )
+    .await;
+    let refused = ng_request(
+        &mut browser,
+        2,
+        "files_preview",
+        json!({"path": "notes.txt"}),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "access_denied", "{refused}");
+
+    // A preview's token ends with the session that asked for it.
+    let url = text["ok"]["url"].as_str().unwrap().to_owned();
+    ng_request(&mut ws, 9, "logout", json!({})).await;
+    assert!(http_get(server.ng, &url, None)
+        .await
+        .starts_with("HTTP/1.1 404"));
 }
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
