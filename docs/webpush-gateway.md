@@ -414,7 +414,7 @@ the same shape news uses for a server with no `[news.notify]`.
 1. **G1 — the registry. Built.** `Device`, `PushStore`, `MemoryDevices`,
    the SQLite table at schema version 7, the conformance suite over
    both, and the three obligations paid from `Core::inbox_claim`,
-   `inbox_rotate` and `inbox_purge` beside mail's and news's.
+   `rotate_identity` and `inbox_purge` beside mail's and news's.
    `hxd inbox purge` takes an account's devices with its mail, and
    `Core::sweep_devices` is the expiry housekeeping. No network, no
    crypto, nothing to configure.

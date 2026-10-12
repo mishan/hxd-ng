@@ -273,6 +273,13 @@ pub trait AuthBackend: Send + Sync + 'static {
     /// it refuses to leave a password-less account with no way in.
     fn unlink_identity(&self, fingerprint: &[u8; 32]) -> Result<UnlinkOutcome, AuthError>;
 
+    /// The identity `from` links rotated to `to` (`identity-registrar.md`
+    /// §7.4): its account links `to` instead, and is answered. Done once
+    /// `from` links nothing, so a retry is safe. An account `to` already
+    /// links keeps that link, and `from`'s is left where it is, refused
+    /// with its key, for the operator: one key cannot hold two accounts.
+    fn rotate_link(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Option<Account>, AuthError>;
+
     /// The account linked to `fingerprint`, creating one if there is
     /// none (`new_accounts = create`). `proposed` is the caller's
     /// suggested login; the backend may pick another if it collides.

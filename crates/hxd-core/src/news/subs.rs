@@ -318,19 +318,23 @@ impl Core {
     }
 
     /// A rotation and a purge forget the budget too, but only in the
-    /// process they run in. Nothing rotates yet, and a purge is
-    /// `hxd inbox purge`, a process of its own that never reaches a
-    /// running server's memory: there, a login deleted and taken again
-    /// within the hour can start with the previous holder's partly spent
-    /// budget. That costs a push delayed until the bucket refills — never
-    /// an event and never a count — and a restart forgets it.
-    pub(crate) fn news_subs_rotate(&self, from: &[u8; 32], to: &[u8; 32]) {
+    /// process they run in. A purge is `hxd inbox purge`, a process of
+    /// its own that never reaches a running server's memory: there, a
+    /// login deleted and taken again within the hour can start with the
+    /// previous holder's partly spent budget. That costs a push delayed
+    /// until the bucket refills — never an event and never a count — and
+    /// a restart forgets it.
+    pub(crate) fn news_rotate(
+        &self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+    ) -> Result<(), crate::inbox::StoreError> {
         self.forget_news_budget(&Mailbox::identified("", *from));
         if let Some(store) = self.news.as_ref() {
-            if let Err(e) = store.subs_rotate(from, to) {
-                warn!("news: rotating an identity's subscriptions: {e}");
-            }
+            store.subs_rotate(from, to)?;
+            store.authors_rotate(from, to)?;
         }
+        Ok(())
     }
 
     pub(crate) fn news_subs_purge(&self, of: &Mailbox) {
@@ -567,7 +571,7 @@ impl Core {
     }
 
     /// Drop the push budget kept for a mailbox that is going, or moving
-    /// to another key — in this process; see [`Self::news_subs_rotate`].
+    /// to another key — in this process; see [`Self::news_rotate`].
     fn forget_news_budget(&self, who: &Mailbox) {
         self.news_push.lock().unwrap().remove(&budget_key(who));
     }

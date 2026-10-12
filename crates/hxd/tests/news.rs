@@ -3118,6 +3118,10 @@ impl NewsStore for CountingNews {
         self.inner.subs_rotate(from, to)
     }
 
+    fn authors_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError> {
+        self.inner.authors_rotate(from, to)
+    }
+
     fn subs_purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
         self.inner.subs_purge(of)
     }

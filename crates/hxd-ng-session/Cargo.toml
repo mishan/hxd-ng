@@ -32,3 +32,6 @@ http-body-util = "0.1"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["io"] }
 base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

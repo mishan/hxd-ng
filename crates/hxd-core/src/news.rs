@@ -1162,6 +1162,11 @@ pub trait NewsStore: Send + Sync + 'static {
     /// An identity rotated to a successor key: move its rows.
     fn subs_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError>;
 
+    /// An identity rotated to a successor key: what it wrote and
+    /// uploaded is the successor's, and with it the right to edit and
+    /// delete it.
+    fn authors_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError>;
+
     /// An account went: take its rows with it.
     fn subs_purge(&self, of: &Mailbox) -> Result<usize, StoreError>;
 

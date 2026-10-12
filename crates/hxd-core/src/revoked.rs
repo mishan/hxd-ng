@@ -72,20 +72,26 @@ impl Published {
     }
 }
 
-/// Both lists: the operator's and the registrars'.
+/// Both lists, the operator's and the registrars', and the keys rotated
+/// away from, which stay refused.
 #[derive(Debug, Default)]
 pub(crate) struct Refused {
     local: Revocations,
     published: Published,
+    rotated: HashSet<[u8; 32]>,
 }
 
 impl Refused {
     pub(crate) fn refuses(&self, tag: &IdentityTag) -> bool {
-        self.local.refuses(tag) || self.published.refuses(tag)
+        self.local.refuses(tag)
+            || self.published.refuses(tag)
+            || self.rotated.contains(&tag.fingerprint)
     }
 
     fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
-        self.local.is_revoked(identity, device) || self.published.is_revoked(identity, device)
+        self.local.is_revoked(identity, device)
+            || self.published.is_revoked(identity, device)
+            || self.rotated.contains(identity)
     }
 }
 
@@ -150,15 +156,43 @@ impl Core {
         self.end_revoked(|tag| list.refuses(tag))
     }
 
+    /// Refuse `identity` from now on, as a key its holder rotated away
+    /// from (`identity-registrar.md` §7.4), and end its sessions.
+    pub fn refuse_rotated(&self, identity: [u8; 32]) -> Vec<(Uid, String)> {
+        if !self.revoked.write().unwrap().rotated.insert(identity) {
+            return Vec::new();
+        }
+        self.end_revoked(|tag| tag.fingerprint == identity)
+    }
+
+    /// End every session keyed by `identity`, whether it proved the key
+    /// or logged into the account the key linked with a password: once a
+    /// rotation has moved that account, what such a session writes
+    /// under the old key would be stranded there.
+    pub(crate) fn end_identity(&self, identity: [u8; 32]) -> Vec<(Uid, String)> {
+        self.end_sessions(|s| {
+            s.identity == Some(identity)
+                || s.info
+                    .transport
+                    .identity
+                    .as_ref()
+                    .is_some_and(|t| t.fingerprint == identity)
+        })
+    }
+
     /// The sessions `list` refuses, ended. Run after the list is written,
     /// and with nothing else held: an `attach` from then on is refused,
     /// and one that got in before is on the roster to be found here.
     fn end_revoked(&self, refuses: impl Fn(&IdentityTag) -> bool) -> Vec<(Uid, String)> {
+        self.end_sessions(|s| s.info.transport.identity.as_ref().is_some_and(&refuses))
+    }
+
+    fn end_sessions(&self, ends: impl Fn(&UserSession) -> bool) -> Vec<(Uid, String)> {
         let mut r = self.roster.lock().unwrap();
         let ended: Vec<(Uid, String)> = r
             .users
             .iter()
-            .filter(|(_, s)| s.info.transport.identity.as_ref().is_some_and(&refuses))
+            .filter(|(_, s)| ends(s))
             .map(|(uid, s)| (*uid, s.info.nick.clone()))
             .collect();
         for (uid, nick) in &ended {

@@ -207,9 +207,8 @@ pub trait PushStore: Send + Sync + 'static {
     /// An identity rotated to a successor key: **drop** the
     /// predecessor's devices, answering how many went.
     ///
-    /// The signature matches [`Self::devices_claim`] and
-    /// [`crate::news::NewsStore::subs_rotate`] so that whoever lands
-    /// rotation cannot pay one obligation and miss this one — but the
+    /// `Core::rotate_identity` calls it beside
+    /// [`crate::news::NewsStore::subs_rotate`] and the mail's, but the
     /// behavior deliberately differs. See this module's header, and
     /// push-notifications.md §5.1.
     fn devices_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError>;
@@ -371,14 +370,6 @@ impl crate::roster::Core {
         }
     }
 
-    pub(crate) fn devices_rotate(&self, from: &[u8; 32], to: &[u8; 32]) {
-        if let Some(store) = self.devices.as_ref() {
-            if let Err(e) = store.devices_rotate(from, to) {
-                tracing::warn!("push: dropping a rotated identity's devices: {e}");
-            }
-        }
-    }
-
     pub(crate) fn devices_purge(&self, of: &Mailbox) {
         if let Some(store) = self.devices.as_ref() {
             if let Err(e) = store.devices_purge(of) {
@@ -453,7 +444,7 @@ mod tests {
             "linking moved the device with the mail"
         );
 
-        core.inbox_rotate(&fp, &[8u8; 32]);
+        core.rotate_identity(&fp, &[8u8; 32]).unwrap();
         assert!(
             devices
                 .devices(&Mailbox::identified("alice", fp), now)
@@ -481,7 +472,7 @@ mod tests {
     fn without_a_registry_the_obligations_are_no_ops() {
         let core = Core::new();
         core.inbox_claim("alice", &[7; 32]);
-        core.inbox_rotate(&[7; 32], &[8; 32]);
+        core.rotate_identity(&[7; 32], &[8; 32]).unwrap();
         core.inbox_purge(&Mailbox::login("alice"));
         assert_eq!(core.sweep_devices(), 0);
     }

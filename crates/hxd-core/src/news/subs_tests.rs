@@ -293,7 +293,7 @@ fn no_pushes_an_hour_keeps_nothing() {
 #[test]
 fn a_purge_in_the_servers_own_process_forgets_the_push_budget() {
     // Only there: `hxd inbox purge` runs in a process of its own and
-    // never reaches these, which `news_subs_rotate` says out loud.
+    // never reaches these, which `news_rotate` says out loud.
     let s = Server::new(NotifyPolicy {
         max_per_hour: 1,
         ..NotifyPolicy::default()

@@ -175,6 +175,19 @@ fn a_guest_keeps_one_only_for_the_session_unless_it_proved_an_identity() {
 }
 
 #[test]
+fn a_rotated_identity_s_avatar_is_its_successor_s() {
+    let core = core();
+    let (old, _) = join(&core, Who::Guest(Some([4; 32])));
+    let meta = core.set_avatar(old, b"keyed").unwrap();
+    core.end_session(old);
+    core.rotate_identity(&[4; 32], &[5; 32]).unwrap();
+    let (new, _) = join(&core, Who::Guest(Some([5; 32])));
+    assert_eq!(user(&core, new).avatar, Some(meta));
+    let (gone, _) = join(&core, Who::Guest(Some([4; 32])));
+    assert!(user(&core, gone).avatar.is_none());
+}
+
+#[test]
 fn a_clear_is_announced_once_and_clearing_nothing_is_quiet() {
     let core = core();
     let (alice, mut rx) = join(&core, Who::Account("alice"));

@@ -240,6 +240,11 @@ pub enum AuthRefused {
     /// A ban on this identity, or on the registrar that issued its
     /// handle (`docs/moderation.md` §3.5).
     Banned,
+    /// The identity has rotated to `successor` (`identity-registrar.md`
+    /// §7.4); the client is told which key to use.
+    Rotated {
+        successor: Fingerprint,
+    },
     /// The auth backend failed; logged, not shown.
     Backend,
 }
@@ -260,6 +265,7 @@ impl AuthRefused {
             AuthRefused::WouldOrphan => "would_orphan",
             AuthRefused::NotLinked => "not_linked",
             AuthRefused::Banned => "banned",
+            AuthRefused::Rotated { .. } => "rotated",
             AuthRefused::Backend => "server_error",
         }
     }
@@ -271,7 +277,8 @@ impl AuthRefused {
             AuthRefused::Denied
             | AuthRefused::Revoked
             | AuthRefused::NoManage
-            | AuthRefused::Banned => 403,
+            | AuthRefused::Banned
+            | AuthRefused::Rotated { .. } => 403,
             AuthRefused::AlreadyLinked | AuthRefused::WouldOrphan | AuthRefused::NotLinked => 409,
             AuthRefused::Backend => 500,
             _ => 401,
@@ -413,6 +420,8 @@ pub struct AuthRequest<'a> {
     /// forever, which made linking an existing account impossible on
     /// such a server.
     pub create: bool,
+    /// §5.1: a rotation record naming this identity as the successor.
+    pub rotation: Option<&'a [u8]>,
 }
 
 impl Default for AuthRequest<'_> {
@@ -421,6 +430,7 @@ impl Default for AuthRequest<'_> {
             classic: None,
             downstream: Downstream::Local,
             create: true,
+            rotation: None,
         }
     }
 }
@@ -473,8 +483,11 @@ impl IdentityState {
         core: Arc<hxd_core::Core>,
     ) -> Self {
         let anchors = cfg.anchors.clone().map(Anchors::load);
+        for from in anchors.iter().flat_map(Anchors::rotated_from) {
+            core.refuse_rotated(from.0);
+        }
         let clock = core.clock().clone();
-        IdentityState {
+        let state = IdentityState {
             key,
             cfg,
             auth,
@@ -492,7 +505,9 @@ impl IdentityState {
             anchors,
             registrar: None,
             registrars: None,
-        }
+        };
+        state.finish_rotations(None);
+        state
     }
 
     /// Hold cards to `registrar`'s commitments as well as the anchors'.
@@ -695,6 +710,16 @@ impl IdentityState {
         // path cannot re-admit it from the cache. The registrar's
         // published records, when there is a registrar to fetch them
         // from, are consulted here too.
+        // A key rotated away from is told where it went, which
+        // `is_revoked` would not say.
+        if let Some(successor) = self.rotated_to(&fingerprint) {
+            debug!(fingerprint = %fingerprint.short(), successor = %successor.short(), "identity auth refused: rotated");
+            return Err(AuthRefused::Rotated { successor });
+        }
+        if let Some(bytes) = req.rotation {
+            self.rotation_shown(bytes, &fingerprint);
+        }
+        self.finish_rotations(Some(&fingerprint));
         let device = Fingerprint::of(&cert.device);
         if self.core.is_revoked(&fingerprint.0, &device.0) {
             debug!(
@@ -723,6 +748,18 @@ impl IdentityState {
         // Step 4, continued: what the registrars that attested it publish.
         let now = self.clock.unix();
         let attestations = self.apply_records(&card, &cert, now)?;
+        // A rotation to this key whose moves have not all landed would
+        // leave it to be admitted without the predecessor's account, and
+        // `new_accounts = create` to make it another one; it is admitted
+        // once the moves land, which this admission has just retried.
+        if self
+            .anchors
+            .as_ref()
+            .is_some_and(|a| !a.unmoved(Some(&fingerprint)).is_empty())
+        {
+            tracing::warn!(fingerprint = %fingerprint.short(), "identity auth refused: its rotation's moves have not all landed");
+            return Err(AuthRefused::Backend);
+        }
 
         // Step 5: attestations against the trusted registrars' keys.
         let (handle, age) = match &attestations {
@@ -1225,7 +1262,21 @@ impl IdentityState {
                     frozen.insert(&f.registrar, f.frozen);
                 }
                 Record::RevokeAttestation(r) => attestations.retain(|a| !r.voids(a)),
-                Record::RevokeDevice(_) | Record::Rotate(_) => {}
+                Record::Rotate(r) => {
+                    let (from, to) = (Fingerprint::of(&r.identity), Fingerprint::of(&r.successor));
+                    self.accept_rotation(from, to, "a registrar's records");
+                    // Refused only to a rotation accepted here, so one
+                    // the anchor overrules names nobody; with no file to
+                    // keep rotations in, the record is all there is.
+                    let accepted = match &self.anchors {
+                        Some(_) => self.rotated_to(&from),
+                        None => Some(to),
+                    };
+                    if let Some(successor) = accepted.filter(|_| from == fingerprint) {
+                        return Err(AuthRefused::Rotated { successor });
+                    }
+                }
+                Record::RevokeDevice(_) => {}
             }
         }
         if frozen.values().any(|f| *f) {
@@ -1311,7 +1362,7 @@ impl IdentityState {
     /// identity's fingerprint, never the card it shows now: a card can be
     /// replaced with one that names no registrar, and fall out of the
     /// cache, while the session it was admitted under goes on.
-    pub async fn sweep_records(&self) -> Vec<(hxd_core::Uid, String)> {
+    pub async fn sweep_records(self: &Arc<Self>) -> Vec<(hxd_core::Uid, String)> {
         let Some(registrars) = self.registrars.clone() else {
             return Vec::new();
         };
@@ -1330,8 +1381,19 @@ impl IdentityState {
             })
             .await;
         let frozen_refuses = self.cfg.frozen == Frozen::Deny;
+        let this = self.clone();
+        // A rotation found is accepted as at an admission, which refuses
+        // its predecessor unless an anchor here overrules it; with no
+        // file to keep rotations in, the record refuses it here.
         let refused = match crate::spawn_blocking("identity", move || {
-            registrars.refused(&live, frozen_refuses)
+            let (mut refused, rotations) = registrars.refused(&live, frozen_refuses);
+            for (from, to) in rotations {
+                this.accept_rotation(from, to, "a registrar's records");
+                if this.anchors.is_none() {
+                    refused.identities.insert(from.0);
+                }
+            }
+            refused
         })
         .await
         {
@@ -1360,7 +1422,8 @@ impl IdentityState {
     /// `/identity/auth`, so it doesn't get to repeat that call's side
     /// effects — no link, no account creation, and no token. It does
     /// carry the `downstream` the device last declared there, since it
-    /// has no way to declare one itself. Signatures *are* re-checked
+    /// has no way to declare one itself. A rotation learned here still
+    /// moves what it moves, as at any admission. Signatures *are* re-checked
     /// rather than the cache's shape trusted; that's two verifications,
     /// which is why callers run this on the blocking pool.
     pub fn identity_for_device(&self, device: &PublicKey) -> Option<TransportIdentity> {
@@ -1463,6 +1526,100 @@ impl IdentityState {
             .cards
             .get(fp)
             .and_then(|c| c.successor)
+    }
+
+    /// The key `fp` rotated to, as accepted here.
+    pub fn rotated_to(&self, fp: &Fingerprint) -> Option<Fingerprint> {
+        self.anchors.as_ref().and_then(|a| a.rotated(fp))
+    }
+
+    /// A rotation an `auth` request carries for the identity it admits
+    /// (§7.4): accepted only to the successor this server anchored for
+    /// the predecessor. Without an anchor nobody here can say the old
+    /// owner consented, so it is ignored, and the key is simply new.
+    fn rotation_shown(&self, bytes: &[u8], successor: &Fingerprint) {
+        let r = match hl_identity::Rotation::parse(bytes) {
+            Ok(r) if Fingerprint::of(&r.successor) == *successor => r,
+            Ok(_) => return debug!("rotation shown for another key; ignored"),
+            Err(e) => return debug!("rotation shown did not verify: {e}"),
+        };
+        let from = Fingerprint::of(&r.identity);
+        // The anchor on file, not the card cache behind
+        // `committed_successor`: a card a thief showed after the cache
+        // forgot the owner's would otherwise be the consent.
+        if self.anchors.as_ref().and_then(|a| a.get(&from)) == Some(successor.0) {
+            self.accept_rotation(from, *successor, "the successor's auth");
+        } else {
+            debug!(predecessor = %from.short(), "rotation shown for a key not anchored to it; ignored");
+        }
+    }
+
+    /// Accept `from`'s rotation to `to`, verified by whoever calls: it is
+    /// written beside the anchors, and `from`'s cached cards, devices and
+    /// tokens are dropped. The first rotation accepted for a key is the
+    /// one that stands, and one to a key other than the successor this
+    /// server anchored for it is ignored: the commitment exists to beat a
+    /// thief who signs a rotation with a stolen key, whoever publishes it.
+    fn accept_rotation(&self, from: Fingerprint, to: Fingerprint, source: &str) {
+        let Some(anchors) = &self.anchors else {
+            return;
+        };
+        if anchors.rotated(&from).is_some() {
+            return;
+        }
+        if self.committed_successor(&from).is_some_and(|c| c != to.0) {
+            tracing::warn!(predecessor = %from.short(), successor = %to.short(), source, "rotation to a key other than the one anchored; ignored");
+            return;
+        }
+        if !anchors.rotate(&from, &to) {
+            return;
+        }
+        info!(predecessor = %from, successor = %to, source, "identity rotated");
+        for (uid, nick) in self.core.refuse_rotated(from.0) {
+            info!(uid, nick = %nick, "session ended: its key rotated away");
+        }
+        {
+            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            t.cards.remove(&from);
+            t.devices
+                .retain(|_, d| Fingerprint::of(&d.identity) != from);
+            t.tokens.retain(|_, (ident, _)| ident.fingerprint != from);
+        }
+        self.finish_rotation(from, to);
+    }
+
+    /// Move what `from`'s rotation to `to` moves (`docs/identity-records.md`
+    /// §4): its account link, then what the core keeps under its key. It
+    /// is noted done only once all of it has moved; until then it is
+    /// asked again at each start and at every admission of the successor,
+    /// which every step allows.
+    fn finish_rotation(&self, from: Fingerprint, to: Fingerprint) {
+        let Some(anchors) = &self.anchors else {
+            return;
+        };
+        let account = match self.auth.rotate_link(&from.0, &to.0) {
+            Ok(account) => account,
+            Err(e) => {
+                tracing::warn!(predecessor = %from.short(), "rotation: the account link did not move: {e}");
+                return;
+            }
+        };
+        if let Err(e) = self.core.rotate_identity(&from.0, &to.0) {
+            tracing::warn!(predecessor = %from.short(), "rotation: what the server keeps did not all move: {e}");
+            return;
+        }
+        if let Some(account) = account {
+            info!(account = %account.login, successor = %to.short(), "rotation: the account now links the successor");
+        }
+        anchors.moved(&from);
+    }
+
+    /// [`Self::finish_rotation`] for each rotation, to `to` or to
+    /// anyone, whose moves have not all landed.
+    fn finish_rotations(&self, to: Option<&Fingerprint>) {
+        for (from, to) in self.anchors.iter().flat_map(|a| a.unmoved(to)) {
+            self.finish_rotation(from, to);
+        }
     }
 }
 
@@ -1571,6 +1728,9 @@ struct Anchors {
     /// Fingerprint → committed successor, mirroring the file. Read on
     /// every auth and every card update, so no I/O happens under it.
     map: Mutex<HashMap<Fingerprint, [u8; 32]>>,
+    /// Predecessor → successor, for each rotation accepted (§7.4), and
+    /// whether what it moves has all moved.
+    rotated: Mutex<HashMap<Fingerprint, (Fingerprint, bool)>>,
     /// Serialises appends without holding `map`.
     io: Mutex<()>,
     /// False when the file exists and could not be read. Writing from
@@ -1588,6 +1748,8 @@ const ANCHORS_HEADER: &str = "\
 # Successor commitments (docs/hotline-ng-identity.md §3.4).
 # One line per identity: <fingerprint> = <successor, base64url>.
 # Deleting a line un-anchors that identity; that is the attack.
+# A rotation accepted: <predecessor fingerprint> => <successor fingerprint>,
+# then again, ending in the word moved, once everything it moves has moved.
 ";
 
 impl Anchors {
@@ -1598,6 +1760,7 @@ impl Anchors {
     fn load(path: std::path::PathBuf) -> Anchors {
         use std::collections::hash_map::Entry;
         let mut map: HashMap<Fingerprint, [u8; 32]> = HashMap::new();
+        let mut rotated: HashMap<Fingerprint, (Fingerprint, bool)> = HashMap::new();
         let mut writable = true;
         let mut compact = false;
         match std::fs::read_to_string(&path) {
@@ -1605,6 +1768,40 @@ impl Anchors {
                 for (n, line) in text.lines().enumerate() {
                     let line = line.trim();
                     if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((from, to)) = line.split_once("=>") {
+                        let (to, moved) = match to.trim().strip_suffix("moved") {
+                            Some(to) => (to, true),
+                            None => (to, false),
+                        };
+                        match (
+                            Fingerprint::parse(from.trim()),
+                            Fingerprint::parse(to.trim()),
+                        ) {
+                            // The first rotation on file stands, as
+                            // `rotate` keeps it; a later line can only
+                            // say it has moved.
+                            (Some(from), Some(to)) => match rotated.entry(from) {
+                                Entry::Occupied(mut e) => {
+                                    compact = true;
+                                    if e.get().0 == to {
+                                        e.get_mut().1 |= moved;
+                                    }
+                                }
+                                Entry::Vacant(v) => {
+                                    v.insert((to, moved));
+                                }
+                            },
+                            _ => {
+                                compact = true;
+                                tracing::warn!(
+                                    "{}:{}: malformed rotation, skipped",
+                                    path.display(),
+                                    n + 1
+                                );
+                            }
+                        }
                         continue;
                     }
                     let parsed = line.split_once('=').and_then(|(fp, s)| {
@@ -1661,6 +1858,12 @@ impl Anchors {
             for (fp, s) in lines {
                 text.push_str(&format!("{fp} = {}\n", b64(s)));
             }
+            let mut lines: Vec<_> = rotated.iter().collect();
+            lines.sort_by_key(|(fp, _)| fp.to_string());
+            for (from, (to, moved)) in lines {
+                let moved = if *moved { " moved" } else { "" };
+                text.push_str(&format!("{from} => {to}{moved}\n"));
+            }
             if let Err(e) = write_private(&path, &text) {
                 tracing::warn!("{}: {e}; successor anchors not compacted", path.display());
             }
@@ -1668,6 +1871,7 @@ impl Anchors {
         Anchors {
             path,
             map: Mutex::new(map),
+            rotated: Mutex::new(rotated),
             io: Mutex::new(()),
             writable,
         }
@@ -1679,6 +1883,76 @@ impl Anchors {
             .unwrap_or_else(|e| e.into_inner())
             .get(fp)
             .copied()
+    }
+
+    fn rotated_from(&self) -> Vec<Fingerprint> {
+        let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+        rotated.keys().copied().collect()
+    }
+
+    fn rotated(&self, fp: &Fingerprint) -> Option<Fingerprint> {
+        self.rotated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(fp)
+            .map(|(to, _)| *to)
+    }
+
+    /// The rotations whose moves have not all landed, to `to` or, with
+    /// `None`, to anyone.
+    fn unmoved(&self, to: Option<&Fingerprint>) -> Vec<(Fingerprint, Fingerprint)> {
+        let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+        rotated
+            .iter()
+            .filter(|(_, (t, moved))| !moved && to.is_none_or(|to| t == to))
+            .map(|(from, (t, _))| (*from, *t))
+            .collect()
+    }
+
+    /// Note that `from`'s rotation has moved all it moves.
+    fn moved(&self, from: &Fingerprint) {
+        let to = {
+            let mut rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+            match rotated.get_mut(from) {
+                Some((to, moved)) if !*moved => {
+                    *moved = true;
+                    *to
+                }
+                _ => return,
+            }
+        };
+        if !self.writable {
+            return;
+        }
+        let _io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = append_private(&self.path, &format!("{from} => {to} moved\n")) {
+            tracing::error!("{}: {e}; a rotation's moves not noted", self.path.display());
+        }
+    }
+
+    /// Record `from`'s rotation to `to`, unless one is on file for it
+    /// already. False when nothing was recorded.
+    /// Kept in memory whether or not the file can take it: refusing the
+    /// predecessor is the safe direction, as an anchor kept only in
+    /// memory is.
+    fn rotate(&self, from: &Fingerprint, to: &Fingerprint) -> bool {
+        let full = {
+            let mut rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+            if rotated.contains_key(from) {
+                return false;
+            }
+            rotated.insert(*from, (*to, false));
+            rotated.len() > MAX_ANCHORS
+        };
+        if !self.writable || full {
+            tracing::warn!(predecessor = %from.short(), "rotation kept for this run only: the successor file is unwritable or full");
+            return true;
+        }
+        let _io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = append_private(&self.path, &format!("{from} => {to}\n")) {
+            tracing::error!("{}: {e}; rotation not persisted", self.path.display());
+        }
+        true
     }
 
     /// Record a first commitment. Never overwrites: a changed successor
@@ -1870,6 +2144,24 @@ mod tests {
                 .find(|a| a.identity.fingerprint == Some(*fp))
                 .cloned())
         }
+        fn rotate_link(
+            &self,
+            from: &[u8; 32],
+            to: &[u8; 32],
+        ) -> Result<Option<Account>, AuthError> {
+            let mut a = self.accounts.lock().unwrap();
+            if a.values().any(|x| x.identity.fingerprint == Some(*to)) {
+                return Ok(None);
+            }
+            let found = a
+                .values_mut()
+                .find(|x| x.identity.fingerprint == Some(*from));
+            Ok(found.map(|x| {
+                x.identity.fingerprint = Some(*to);
+                x.clone()
+            }))
+        }
+
         fn link_identity(&self, login: &str, fp: &[u8; 32]) -> Result<LinkOutcome, AuthError> {
             // The whole decision under one lock, as the trait requires.
             let mut a = self.accounts.lock().unwrap();
@@ -1962,6 +2254,46 @@ mod tests {
             auth,
             Arc::new(hxd_core::Core::new()),
         )
+    }
+
+    #[test]
+    fn a_rotation_is_kept_beside_the_anchors_and_refused_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("successors");
+        let (old, new, other) = (
+            IdentityKey::from_seed(&[1; 32]),
+            IdentityKey::from_seed(&[2; 32]),
+            IdentityKey::from_seed(&[3; 32]),
+        );
+        let anchors = Anchors::load(path.clone());
+        anchors.commit(&old.fingerprint(), new.fingerprint().0);
+        assert!(anchors.rotate(&old.fingerprint(), &new.fingerprint()));
+        assert!(!anchors.rotate(&old.fingerprint(), &other.fingerprint()));
+
+        assert_eq!(anchors.unmoved(None).len(), 1);
+
+        // A start finishes what the rotation moves, and the file says so.
+        let st = state(IdentityConfig {
+            anchors: Some(path.clone()),
+            ..Default::default()
+        });
+        assert!(Anchors::load(path).unmoved(None).is_empty());
+        assert_eq!(st.rotated_to(&old.fingerprint()), Some(new.fingerprint()));
+        assert_eq!(
+            st.committed_successor(&old.fingerprint()),
+            Some(new.fingerprint().0)
+        );
+        let dev = DeviceKey::from_seed(&[9; 32]);
+        let (card, cert) = objects(&old, &dev);
+        let ch = st.issue_challenge().unwrap();
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
+        assert_eq!(
+            st.auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+                .map(|_| ()),
+            Err(AuthRefused::Rotated {
+                successor: new.fingerprint()
+            })
+        );
     }
 
     fn objects(id: &IdentityKey, dev: &DeviceKey) -> (Vec<u8>, Vec<u8>) {

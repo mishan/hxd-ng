@@ -546,10 +546,16 @@ impl Registrars {
 
     /// What the held lists of `identities` (fingerprints) refuse, as one
     /// list: each identity revoked, or frozen when `frozen_refuses`, and
-    /// each device an identity revoked, as that identity's. Reads the
-    /// store and verifies: called off the reactor.
-    pub fn refused(&self, identities: &[Fingerprint], frozen_refuses: bool) -> hxd_core::Published {
+    /// each device an identity revoked, as that identity's; and, apart,
+    /// the rotations away from them, for the caller to accept or not.
+    /// Reads the store and verifies: called off the reactor.
+    pub fn refused(
+        &self,
+        identities: &[Fingerprint],
+        frozen_refuses: bool,
+    ) -> (hxd_core::Published, Vec<(Fingerprint, Fingerprint)>) {
         let mut refused = hxd_core::Published::default();
+        let mut rotations = Vec::new();
         for fp in identities {
             let mut frozen: HashMap<String, bool> = HashMap::new();
             for record in self.lookup_fp(*fp, &[], 0).records {
@@ -563,6 +569,9 @@ impl Registrars {
                     Record::Freeze(f) => {
                         frozen.insert(f.registrar, f.frozen);
                     }
+                    Record::Rotate(r) if Fingerprint::of(&r.identity) == *fp => {
+                        rotations.push((*fp, Fingerprint::of(&r.successor)));
+                    }
                     _ => {}
                 }
             }
@@ -570,7 +579,7 @@ impl Registrars {
                 refused.identities.insert(fp.0);
             }
         }
-        refused
+        (refused, rotations)
     }
 
     /// What the cached lists of the trusted registrars say of `identity`,
@@ -614,6 +623,11 @@ impl Registrars {
                 for (_, bytes) in &page.entries {
                     match Record::parse(bytes, Some(keys)) {
                         Ok(r) if Fingerprint::of(r.identity()) == fp => lookup.records.push(r),
+                        // A rotation is published under both keys, and the
+                        // successor's admission is where it is learned.
+                        Ok(Record::Rotate(r)) if Fingerprint::of(&r.successor) == fp => {
+                            lookup.records.push(Record::Rotate(r))
+                        }
                         Ok(_) => {}
                         Err(e) => debug!(registrar = %l.registrar, "a record did not verify: {e}"),
                     }

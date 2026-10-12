@@ -960,6 +960,17 @@ async fn verifier(
 
 /// `/identity/auth` at `at` as `dev` of `id`, showing `card`.
 async fn auth_at(at: SocketAddr, id: &IdentityKey, dev: &DeviceKey, card: &[u8]) -> Reply {
+    auth_with(at, id, dev, card, json!({})).await
+}
+
+/// [`auth_at`], with `extra`'s fields added to the request.
+async fn auth_with(
+    at: SocketAddr,
+    id: &IdentityKey,
+    dev: &DeviceKey,
+    card: &[u8],
+    extra: Value,
+) -> Reply {
     let cert = DeviceCert::for_device(id, dev, now() - 5, cert::RECOMMENDED_LIFETIME)
         .unwrap()
         .sign(id);
@@ -977,11 +988,11 @@ async fn auth_at(at: SocketAddr, id: &IdentityKey, dev: &DeviceKey, card: &[u8])
     let ch = json_post("/identity/challenge", Value::Null).await.json();
     let challenge: [u8; 32] = unb64(ch["challenge"].as_str().unwrap()).try_into().unwrap();
     let proof = LoginProof::sign(dev, &challenge, &s_key(&ch), now());
-    json_post(
-        "/identity/auth",
-        json!({ "card": b64(card), "device_cert": b64(&cert), "proof": b64(&proof) }),
-    )
-    .await
+    let mut body = json!({ "card": b64(card), "device_cert": b64(&cert), "proof": b64(&proof) });
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    json_post("/identity/auth", body).await
 }
 
 /// `id` registered at `r` as `handle`, and its card carrying the
@@ -991,6 +1002,36 @@ async fn attested(r: &Server, id: &IdentityKey, handle: &str) -> Vec<u8> {
     let att = unb64(reply["attestation"].as_str().unwrap());
     let att = hl_identity::cbor::decode_canonical(&att).unwrap();
     Card::new(id, handle, now()).sign(id, vec![att]).unwrap()
+}
+
+/// [`attested`], for an identity that commits to `next` as its successor
+/// on its card, and at the registrar too when `there`.
+async fn attested_committing(
+    r: &Server,
+    id: &IdentityKey,
+    handle: &str,
+    next: &IdentityKey,
+    there: bool,
+) -> Vec<u8> {
+    let mut req = request(id, handle);
+    req.successor = there.then(|| commitment(next));
+    let reply = register(r, req, id).await.json();
+    let att = unb64(reply["attestation"].as_str().unwrap());
+    let att = hl_identity::cbor::decode_canonical(&att).unwrap();
+    let mut card = Card::new(id, handle, now());
+    card.successor = Some(commitment(next));
+    card.sign(id, vec![att]).unwrap()
+}
+
+/// `from`'s rotation to `to`, signed by both.
+fn rotation(from: &IdentityKey, to: &IdentityKey) -> Vec<u8> {
+    Rotation {
+        identity: from.public(),
+        successor: to.public(),
+        time: now(),
+    }
+    .sign(from, to)
+    .unwrap()
 }
 
 /// A list fetched is current for `revocation_max_age`, a second here.
@@ -1444,5 +1485,111 @@ async fn a_registrar_that_moves_to_a_new_key_is_followed_within_the_minute() {
     assert_eq!(
         auth_at(v, &carol, &dev, &carol_card).await.json()["handle"],
         "carol@127.0.0.1"
+    );
+}
+
+#[tokio::test]
+async fn a_rotation_its_registrar_publishes_moves_the_identity_here() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let live = format!("http://{}", r.ng);
+    let (v, _) = verifier(&there, &r, Trust::Key, &live, "new_accounts = \"create\"").await;
+    let (old, new) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    let dev = DeviceKey::from_seed(&[101; 32]);
+    let old_card = attested_committing(&r, &old, "alice", &new, true).await;
+    let account = auth_at(v, &old, &dev, &old_card).await.json()["account"].clone();
+    assert!(account.is_string(), "{account}");
+    let mut old_here = session_at(v, &old, &old_card).await;
+
+    let posted = post(
+        &r,
+        "/registrar/records",
+        json!({ "record": b64(&rotation(&old, &new)) }),
+    )
+    .await;
+    assert_eq!(posted.json()["published"], true);
+    let new_card = attested(&r, &new, "alice").await;
+    next_list().await;
+
+    // The successor's admission is where the rotation is learned: it
+    // takes the predecessor's account, ends its session, and the
+    // predecessor is told where the identity went.
+    let reply = auth_at(v, &new, &dev, &new_card).await.json();
+    assert_eq!(
+        (reply["handle"].clone(), reply["account"].clone()),
+        (json!("alice@127.0.0.1"), account)
+    );
+    old_here.event("kicked").await.unwrap();
+    let reply = auth_at(v, &old, &dev, &old_card).await;
+    assert_eq!(
+        (
+            reply.status,
+            reply.json()["error"].clone(),
+            reply.json()["successor"].clone()
+        ),
+        (403, json!("rotated"), json!(new.fingerprint().to_string()))
+    );
+}
+
+#[tokio::test]
+async fn a_rotation_shown_at_auth_is_taken_only_to_the_anchored_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let live = format!("http://{}", r.ng);
+    let (v, _) = verifier(&there, &r, Trust::Key, &live, "").await;
+    let old = IdentityKey::from_seed(&[1; 32]);
+    let new = IdentityKey::from_seed(&[2; 32]);
+    let thief = IdentityKey::from_seed(&[6; 32]);
+    let dev = DeviceKey::from_seed(&[101; 32]);
+    let old_card = attested_committing(&r, &old, "alice", &new, false).await;
+    // Admitted with standing, so its commitment is anchored here.
+    assert_eq!(auth_at(v, &old, &dev, &old_card).await.status, 200);
+
+    // A thief with the old key gets a registrar that never held the
+    // commitment to publish a rotation to their own key. The anchor
+    // here outranks it: the old key is not told of any successor.
+    let posted = post(
+        &r,
+        "/registrar/records",
+        json!({ "record": b64(&rotation(&old, &thief)) }),
+    )
+    .await;
+    assert_eq!(posted.json()["published"], true);
+    next_list().await;
+    assert_eq!(auth_at(v, &old, &dev, &old_card).await.status, 200);
+
+    // A rotation signed with the old key to any other key is ignored:
+    // that key is admitted as itself, and the old one still is.
+    let card = |id: &IdentityKey| Card::new(id, "x", now()).sign(id, vec![]).unwrap();
+    let extra = json!({ "rotation": b64(&rotation(&old, &thief)) });
+    assert_eq!(
+        auth_with(v, &thief, &dev, &card(&thief), extra)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(auth_at(v, &old, &dev, &old_card).await.status, 200);
+
+    // To the anchored key it is taken.
+    let extra = json!({ "rotation": b64(&rotation(&old, &new)) });
+    assert_eq!(
+        auth_with(v, &new, &dev, &card(&new), extra).await.status,
+        200
+    );
+    let reply = auth_at(v, &old, &dev, &old_card).await;
+    assert_eq!(
+        (reply.status, reply.json()["successor"].clone()),
+        (403, json!(new.fingerprint().to_string()))
     );
 }
