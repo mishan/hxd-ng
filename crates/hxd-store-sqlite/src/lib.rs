@@ -71,7 +71,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -574,6 +574,16 @@ CREATE TABLE identity_records (
   keys      BLOB    NOT NULL,
   PRIMARY KEY (identity, registrar)
 ) WITHOUT ROWID;
+";
+
+/// When each identity key was first seen here, which the newcomer delay
+/// counts from (`identity-registrar.md` §7.3); kept a day.
+const SCHEMA_V19: &str = "
+CREATE TABLE identity_first_seen (
+  identity   BLOB    PRIMARY KEY,
+  first_seen INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX identity_first_seen_at ON identity_first_seen (first_seen);
 ";
 
 /// The bans this server asked linked servers for (`docs/server-link.md`
@@ -1230,6 +1240,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 18 {
         steps.push_str(SCHEMA_V18);
+    }
+    if version < 19 {
+        steps.push_str(SCHEMA_V19);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"

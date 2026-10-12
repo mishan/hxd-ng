@@ -1,9 +1,9 @@
 //! Registrars' record lists on SQLite (`docs/identity-records.md` §2):
 //! one row per identity and registrar, the last list fetched.
 
-use hxd_core::identity_records::{CachedList, RecordCache};
+use hxd_core::identity_records::{CachedList, RecordCache, FIRST_SEEN_KEPT};
 use hxd_core::inbox::StoreError;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use super::SqliteStore;
 
@@ -87,6 +87,34 @@ impl RecordCache for SqliteStore {
         let rows = sql(stmt.query_map(params![identity.to_vec()], row))?;
         rows.map(sql).collect()
     }
+
+    fn first_seen(&self, identity: &[u8; 32], now: u64) -> Result<u64, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction())?;
+        let stale = i64::try_from(now.saturating_sub(FIRST_SEEN_KEPT)).unwrap_or(i64::MAX);
+        let kept: Option<i64> = sql(tx
+            .query_row(
+                "SELECT first_seen FROM identity_first_seen WHERE identity = ?1 AND first_seen > ?2",
+                params![identity.to_vec(), stale],
+                |r| r.get(0),
+            )
+            .optional())?;
+        if let Some(at) = kept {
+            return Ok(u64::try_from(at).unwrap_or(0));
+        }
+        // A first sighting is when the table is kept to a day: rare, and
+        // the index makes it a range delete.
+        sql(tx.execute(
+            "DELETE FROM identity_first_seen WHERE first_seen <= ?1",
+            params![stale],
+        ))?;
+        sql(tx.execute(
+            "INSERT INTO identity_first_seen (identity, first_seen) VALUES (?1, ?2)",
+            params![identity.to_vec(), i64::try_from(now).unwrap_or(i64::MAX)],
+        ))?;
+        sql(tx.commit())?;
+        Ok(now)
+    }
 }
 
 #[cfg(test)]
@@ -106,5 +134,18 @@ mod tests {
         };
         store.put(&[9; 32], &list).unwrap();
         assert_eq!(store.lists(&[9; 32]).unwrap(), vec![list]);
+    }
+
+    #[test]
+    fn a_first_sighting_is_kept_a_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SqliteStore::open(dir.path().join("server.db"), crate::Synchronous::Normal).unwrap();
+        let t = 1_700_000_000;
+        assert_eq!(store.first_seen(&[1; 32], t).unwrap(), t);
+        assert_eq!(store.first_seen(&[1; 32], t + 60).unwrap(), t);
+        assert_eq!(store.first_seen(&[2; 32], t + 60).unwrap(), t + 60);
+        let later = t + FIRST_SEEN_KEPT;
+        assert_eq!(store.first_seen(&[1; 32], later).unwrap(), later);
     }
 }

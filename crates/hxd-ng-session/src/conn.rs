@@ -364,10 +364,20 @@ pub(crate) async fn run(
                         .core
                         .spend_request(state.uid, request_weight(&req.req))
                         .err();
+                    let newcomer = matches!(req.req.as_str(), "chat" | "msg" | "news_post")
+                        .then(|| ctx.core.newcomer_wait(state.uid))
+                        .flatten();
                     let flow = if let Some(wait) = over {
                         instrument::rate_limited(WIRE, "requests");
                         let secs = retry_secs(wait);
                         let out = reply_err_retry(req.id, "rate_limited", "Slow down.", secs);
+                        finish(&mut ws_tx, out).await
+                    } else if let Some(wait) = newcomer {
+                        // identity-registrar.md §7.3: a key new here waits
+                        // before it may chat, message or post.
+                        instrument::rate_limited(WIRE, "newcomer");
+                        let secs = retry_secs(wait);
+                        let out = reply_err_retry(req.id, "rate_limited", "You are new here.", secs);
                         finish(&mut ws_tx, out).await
                     } else if req.req == "sync" {
                         // `sync` is the one request that needs the event
@@ -728,7 +738,7 @@ async fn handle_login(
             redactions: true,
             encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
             assumed: true,
-            identity: identity.map(TransportIdentity::tag),
+            identity: identity.map(|i| i.tag().on_account(account.identity.fingerprint)),
             // Always, when the server has a pipeline at all: an ng
             // client is told what it may ignore rather than asked what
             // it supports, so an event with a `media` object is safe to

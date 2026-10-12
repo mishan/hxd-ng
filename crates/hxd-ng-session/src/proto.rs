@@ -928,6 +928,7 @@ mod tests {
                     fingerprint: [1; 32],
                     device: [2; 32],
                     handle: Some("ann@example.org".into()),
+                    quiet_until: None,
                 }),
                 ..Default::default()
             },

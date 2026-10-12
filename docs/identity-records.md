@@ -1,6 +1,7 @@
 # Applying a registrar's records: the verifying server
 
-Status: R1 and R2 built; R3, newcomers, is next. §6 stages it.
+Status: R1, R2 and R3 built; R4 is designed further before it is
+staged. §6 stages it.
 
 `identity-registrar.md` §7 says what a server that trusts a registrar
 does with what the registrar publishes: resolve its key, fetch the
@@ -36,9 +37,10 @@ It changes no wire behavior §7 does not already specify.
 
 Absent when this was planned, and built by R1: discovery and its cache,
 the records fetch and its cache, every effect in §7.3's table but
-rotation, `revocation_stale`, `frozen` and `banned_registrars`. Still
-absent: rotation at the server (§7.4), `newcomer_delay`, the `create`
-restriction, and standing, probation and vouching (§7.5).
+rotation, `revocation_stale`, `frozen` and `banned_registrars`; then
+rotation at the server (§7.4) by R2 and `newcomer_delay` by R3. The
+`create` restriction already held. Still absent: standing, probation
+and vouching (§7.5).
 
 ## 2. Decisions
 
@@ -196,6 +198,24 @@ its configured key.
   avatar, the old key's sessions ending) and the retry at start are
   unit tests.
 - **R3: newcomers.** `newcomer_delay`, and `new_accounts = create`
-  limited to attested (and, once R4 lands, vouched) keys.
+  limited to attested (and, once R4 lands, vouched) keys. A key with
+  no accepted attestation and no account is quiet for `newcomer_delay`
+  from when it was first seen here, a sighting kept a day beside the
+  records cache (`RecordCache::first_seen`, the `identity_first_seen`
+  table) so a reconnect does not start it again. The wait rides on the
+  session's identity tag and is checked as each wire dispatches: ng
+  answers `chat`, `msg` and `news_post` with `rate_limited` and
+  `retry_after`; the classic wire, reached by such a key only through
+  the tunnel, answers a private message or a news post with a task
+  error and drops a chat line, which has no reply to refuse it with.
+  A key its session's account links waits for nothing, however lately
+  the link was made, a tunnelled login that links as it logs in
+  included. The `create` restriction already held: an unattested key
+  reaches account creation only under `unattested = allow`, which §7.3
+  leaves as the operator's way to ask for exactly that, and an account
+  made that way is a link, so it waits for nothing either:
+  `max_new_accounts_per_hour` is then the bound, as §7.3 says. A key
+  that stays unattested and comes back after a day is first seen again
+  and waits again, which is the letter of "durable for a day".
 - **R4: standing and probation.** §7.5 and `identity-vouch.md`, which is
   a draft of its own and is designed further before it is staged.
