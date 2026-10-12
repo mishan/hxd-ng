@@ -72,20 +72,26 @@ impl Published {
     }
 }
 
-/// Both lists: the operator's and the registrars'.
+/// Both lists, the operator's and the registrars', and the keys rotated
+/// away from, which stay refused.
 #[derive(Debug, Default)]
 pub(crate) struct Refused {
     local: Revocations,
     published: Published,
+    rotated: HashSet<[u8; 32]>,
 }
 
 impl Refused {
     pub(crate) fn refuses(&self, tag: &IdentityTag) -> bool {
-        self.local.refuses(tag) || self.published.refuses(tag)
+        self.local.refuses(tag)
+            || self.published.refuses(tag)
+            || self.rotated.contains(&tag.fingerprint)
     }
 
     fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
-        self.local.is_revoked(identity, device) || self.published.is_revoked(identity, device)
+        self.local.is_revoked(identity, device)
+            || self.published.is_revoked(identity, device)
+            || self.rotated.contains(identity)
     }
 }
 
@@ -148,6 +154,15 @@ impl Core {
             return Vec::new();
         }
         self.end_revoked(|tag| list.refuses(tag))
+    }
+
+    /// Refuse `identity` from now on, as a key its holder rotated away
+    /// from (`identity-registrar.md` §7.4), and end its sessions.
+    pub fn refuse_rotated(&self, identity: [u8; 32]) -> Vec<(Uid, String)> {
+        if !self.revoked.write().unwrap().rotated.insert(identity) {
+            return Vec::new();
+        }
+        self.end_revoked(|tag| tag.fingerprint == identity)
     }
 
     /// The sessions `list` refuses, ended. Run after the list is written,

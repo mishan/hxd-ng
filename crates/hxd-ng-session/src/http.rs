@@ -1757,6 +1757,7 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx:
     // says `create: false`, so the server doesn't make it a new one
     // first and then refuse the link as `already_linked`.
     let create = body.get("create").and_then(Value::as_bool).unwrap_or(true);
+    let rotation = field("rotation");
     let proof = field("proof");
     // A client certificate stands in for `proof` (§5.3) — but only for a
     // caller that chose to present it. A browser does not: the TLS layer
@@ -1839,6 +1840,7 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx:
             classic,
             downstream,
             create,
+            rotation: rotation.as_deref(),
         };
         let result = st.admit_verified(verified, req);
         // A card shown at `auth` is cached like one that was `PUT`, so a
@@ -2103,9 +2105,7 @@ async fn read_json(req: Request<Incoming>, within: Duration) -> Option<Value> {
 }
 
 fn refused(e: AuthRefused) -> Resp {
-    json_resp(
-        StatusCode::from_u16(e.status()).unwrap(),
-        json!({ "error": e.code(), "text": match e {
+    let mut body = json!({ "error": e.code(), "text": match e {
             AuthRefused::BadCard => "the user card did not verify",
             AuthRefused::BadCert => "the device certificate did not verify or is not valid now",
             AuthRefused::BadProof => "the login proof did not verify",
@@ -2121,9 +2121,13 @@ fn refused(e: AuthRefused) -> Resp {
             AuthRefused::WouldOrphan => "set a password on the account before unlinking; it has no other way in",
             AuthRefused::NotLinked => "this identity has no linked account here",
             AuthRefused::Banned => "banned from this server",
+            AuthRefused::Rotated { .. } => "this identity has rotated to another key",
             AuthRefused::Backend => "server error",
-        } }),
-    )
+        } });
+    if let AuthRefused::Rotated { successor } = e {
+        body["successor"] = json!(successor.to_string());
+    }
+    json_resp(StatusCode::from_u16(e.status()).unwrap(), body)
 }
 
 fn json_resp(status: StatusCode, v: Value) -> Resp {

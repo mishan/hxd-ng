@@ -278,8 +278,8 @@ continues in this order and fails on the first error:
    applied per §7.3 there; a stale cache is `[identity]
    revocation_stale`. A minute's sweep keeps the lists of the
    identities with sessions here current, and ends a session as soon as
-   its list refuses it. *(Built, but for rotation, which
-   `identity-records.md` stages as R2.)*
+   its list refuses it. *(Built, but for what a rotation moves to its
+   successor, which `identity-records.md` stages as R2.)*
 5. attestations verified against trusted registrars, expired or untrusted
    ones discarded, and, after attestation revocations are applied, age
    computed from the oldest surviving `registered`;
@@ -803,7 +803,8 @@ to run on a server that also serves the legacy port.
   holds it only in memory hands an attacker "restart the server" as the
   way to move it, which is exactly the attack the commitment exists to
   stop. hxd-ng writes `[identity] successors`, one line per identity,
-  appended and compacted at load rather than rewritten per insert.
+  appended and compacted at load rather than rewritten per insert; a
+  rotation it accepts is a line there too, `<predecessor> => <successor>`.
 - **Who gets anchored.** Only an identity with *standing* on this server:
   one with an account here (linked or created) or an attestation the
   server accepted. Anchoring every card that ever authenticated

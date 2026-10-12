@@ -1,6 +1,7 @@
 # Applying a registrar's records: the verifying server
 
-Status: R1 built; R2, rotation at the server, is next. §6 stages it.
+Status: R1 built, and R2's first half: a rotation is recognized and its
+predecessor refused. What moves to the successor is next. §6 stages it.
 
 `identity-registrar.md` §7 says what a server that trusts a registrar
 does with what the registrar publishes: resolve its key, fetch the
@@ -106,7 +107,27 @@ applied whatever the card shows, and whether or not it is current.
 ## 4. Rotation at the server
 
 §7.4 as written: accepted from a trusted registrar's list, or from an
-`auth` request's `rotation` when the server anchored the predecessor.
+`auth` request's `rotation` when the server anchored the predecessor,
+with one rule added. A rotation to a key other than the successor this
+server anchored for the predecessor is ignored, whoever publishes it:
+the commitment exists to beat a thief who signs a rotation with a stolen
+key, and a registrar that never held the commitment publishes that
+rotation in good faith. The first rotation accepted for a key stands.
+
+Once accepted, the predecessor is refused `rotated`, naming the
+successor, at `auth`, and by the core everywhere else a key is checked
+(attach, resume, token redemption), which ends its sessions there and
+then; it is written beside the anchors, so a restart keeps refusing it.
+A rotation is learned at the successor's admission, from its own list
+or its request, at the predecessor's, from its list, and by the sweep.
+A rotation the file cannot take (unwritable, or past its ceiling) is
+kept for the run, which refuses the predecessor as one on file does.
+With `successors = ""` there is no file: a predecessor is refused only
+while its registrar's records say so, and an `auth` request's rotation
+is never taken, having no anchor to be checked against. A build from
+before rotation reads a rotation line as a malformed anchor and drops it
+when it compacts the file, so going back to one forgets every rotation.
+
 What moves to the successor, each in the store that keeps it:
 
 | What | Where |
