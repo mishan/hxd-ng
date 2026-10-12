@@ -2105,26 +2105,17 @@ mod tests {
     }
 
     fn account(login: &str, password: bool) -> Account {
-        Account {
-            login: login.into(),
-            name: login.into(),
-            access: AccessBits::empty(),
-            can_detach: password,
-            set_subject: false,
-            file_list: true,
-            file_getinfo: true,
-            has_password: password,
-            has_inbox: password,
-            attach_news: false,
-            set_avatar: password,
-            moderate: false,
-            can_spam: false,
-            identity: hxd_core::IdentityLink {
+        Account::new(
+            login.into(),
+            login.into(),
+            password,
+            hxd_core::IdentityLink {
                 identity_login: true,
                 allow_self_link: true,
                 ..Default::default()
             },
-        }
+            Default::default(),
+        )
     }
 
     impl MemAuth {

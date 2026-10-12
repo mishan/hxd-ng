@@ -38,8 +38,8 @@ use std::time::SystemTime;
 use hxd_core::access::{self, bit, AccessBits, NAMES};
 use hxd_core::inbox::Mailbox;
 use hxd_core::{
-    Account, AccountAdmin, AccountDirectory, AccountEdit, AdminError, AuthBackend, AuthError,
-    IdentityLink, LinkOutcome, Proof, UnlinkOutcome, WriteCheck,
+    Account, AccountAdmin, AccountConfig, AccountDirectory, AccountEdit, AdminError, AuthBackend,
+    AuthError, Extras, IdentityLink, LinkOutcome, Proof, UnlinkOutcome, WriteCheck,
 };
 use serde::Deserialize;
 
@@ -66,7 +66,7 @@ struct AccountFile {
     access: AccessTable,
     /// Server-local policy that never crosses the wire (mhxd's
     /// `access_extra` concept). Absent keys fall back to derived defaults
-    /// — see `authenticate`.
+    /// — see `AccountConfig::derive`.
     #[serde(default)]
     extra: ExtraTable,
     #[serde(default)]
@@ -135,7 +135,6 @@ impl AccountFile {
     /// Everything but the password check: shared by `authenticate` and
     /// `lookup`.
     fn into_account(self, login: String) -> Account {
-        let access = self.access_bits();
         let stored = self.password.as_deref().unwrap_or("");
         let has_password = !stored.is_empty();
         let fingerprint = self
@@ -144,67 +143,37 @@ impl AccountFile {
             .as_deref()
             .and_then(hl_identity::Fingerprint::parse)
             .map(|fp| fp.0);
-        Account {
-            name: self.name.clone().unwrap_or_else(|| login.clone()),
-            // A password makes an account a person rather than a door,
-            // and so does a linked identity: accounts made by
-            // `new_accounts = create` have no password and are still
-            // exactly one person's.
-            can_detach: self
-                .extra
-                .can_detach
-                .unwrap_or(has_password || fingerprint.is_some()),
-            set_subject: self
-                .extra
-                .set_subject
-                .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
-            file_list: self.extra.file_list.unwrap_or(true),
-            file_getinfo: self.extra.file_getinfo.unwrap_or(true),
-            has_password,
-            // The same rule `can_detach` derives by, and for the same
-            // reason: what disqualifies an account is not the absence of
-            // a password but the absence of a person behind it. Everyone
-            // who walks through `guest` shares one login, so queuing mail
-            // there hands it to whoever logs in next; a linked identity
-            // is proof of exactly one person, which is what makes
-            // `new_accounts = create`'s password-less accounts mailable.
-            has_inbox: self
-                .extra
-                .inbox
-                .unwrap_or(has_password || fingerprint.is_some()),
-            attach_news: self
-                .extra
-                .attach_news
-                .unwrap_or_else(|| access.has(bit::SEND_MEDIA)),
-            // A person, by the rule above: a picture set through `guest`
-            // would be decoded on anyone's say-so and shown to everyone.
-            set_avatar: self
-                .extra
-                .set_avatar
-                .unwrap_or(has_password || fingerprint.is_some()),
-            moderate: self
-                .extra
-                .moderate
-                .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
-            can_spam: self
-                .extra
-                .can_spam
-                .unwrap_or_else(|| access.has(bit::DISCONNECT_USERS)),
-            identity: IdentityLink {
-                fingerprint,
-                // Derived true on an account with no password, whatever
-                // the file says, as the identity spec has it: there the
-                // flag would refuse the only way in, and an account nobody can reach
-                // is a state worth making unrepresentable rather than
-                // warning about. The flag is the account's own only where
-                // a password is left to fall back on.
-                identity_login: !has_password || self.identity.login.unwrap_or(true),
-                allow_self_link: self.identity.allow_self_link.unwrap_or(true),
-                reserve_name: self.identity.reserve_name.unwrap_or(false),
+        let x = &self.extra;
+        let config = AccountConfig {
+            access: self.access_bits(),
+            history_named: self.access.named.contains_key("read_chat_history")
+                || self.access.named.contains_key("chat_history"),
+            extra: Extras {
+                can_detach: x.can_detach,
+                set_subject: x.set_subject,
+                inbox: x.inbox,
+                file_list: x.file_list,
+                file_getinfo: x.file_getinfo,
+                attach_news: x.attach_news,
+                set_avatar: x.set_avatar,
+                moderate: x.moderate,
+                can_spam: x.can_spam,
             },
-            access,
-            login,
-        }
+        };
+        let identity = IdentityLink {
+            fingerprint,
+            // Derived true on an account with no password, whatever
+            // the file says, as the identity spec has it: there the
+            // flag would refuse the only way in, and an account nobody can reach
+            // is a state worth making unrepresentable rather than
+            // warning about. The flag is the account's own only where
+            // a password is left to fall back on.
+            identity_login: !has_password || self.identity.login.unwrap_or(true),
+            allow_self_link: self.identity.allow_self_link.unwrap_or(true),
+            reserve_name: self.identity.reserve_name.unwrap_or(false),
+        };
+        let name = self.name.unwrap_or_else(|| login.clone());
+        Account::new(login, name, has_password, identity, config)
     }
 
     /// Is this a combination an operator should be told about at
@@ -241,15 +210,6 @@ impl AccountFile {
         }
         for b in &self.access.raw_bits {
             acc = acc.with(*b);
-        }
-        // fogWraith's fallback: on an access system where bit 56 has not
-        // been assigned explicitly, history follows ordinary read-chat.
-        // Resolve it here so SELFINFO and request policy report one truth.
-        if !self.access.named.contains_key("read_chat_history")
-            && !self.access.named.contains_key("chat_history")
-            && acc.has(bit::READ_CHAT)
-        {
-            acc = acc.with(bit::CHAT_HISTORY);
         }
         acc
     }

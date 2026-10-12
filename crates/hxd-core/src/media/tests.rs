@@ -56,6 +56,7 @@ fn attach(core: &Core, nick: &str, addr: Ipv4Addr) -> (Uid, Events) {
 fn attach_boxed(core: &Core, nick: &str) -> (Uid, Events) {
     let (uid, rx) = core
         .attach(AttachInfo {
+            account: None,
             nick: nick.into(),
             icon: 1,
             admin: false,
@@ -102,6 +103,7 @@ fn attach_with(
     }
     let (uid, rx) = core
         .attach(AttachInfo {
+            account: None,
             nick: nick.into(),
             icon: 1,
             admin: false,
@@ -133,6 +135,7 @@ fn attach_with(
 fn attach_guest(core: &Core, nick: &str, addr: IpAddr) -> Uid {
     let (uid, _) = core
         .attach(AttachInfo {
+            account: None,
             nick: nick.into(),
             icon: 1,
             admin: false,

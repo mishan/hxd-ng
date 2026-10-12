@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hxd_core::access::bit;
-use hxd_core::{AccessBits, Core};
+use hxd_core::{AccessBits, Core, DenyMask};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::{Caps, ServerConfig, ServerCtx};
 use hxd_testclient::legacy::{self, push, xor, Login};
@@ -52,6 +52,7 @@ struct Running {
     legacy: SocketAddr,
     ng: SocketAddr,
     accounts: tempfile::TempDir,
+    core: Arc<Core>,
 }
 
 impl Running {
@@ -97,7 +98,7 @@ async fn start() -> Running {
         banner: None,
     };
     let ng_ctx = NgCtx {
-        core,
+        core: core.clone(),
         auth,
         cfg: Arc::new(NgConfig {
             server_name: "accounts".into(),
@@ -119,6 +120,7 @@ async fn start() -> Running {
         legacy: legacy.local_addr().unwrap(),
         ng: ng.local_addr().unwrap(),
         accounts,
+        core,
     };
     tokio::spawn(hxd_session::serve(legacy, legacy_ctx));
     tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
@@ -528,6 +530,44 @@ async fn a_change_reaches_the_account_on_both_wires_at_once() {
         Err(Error::Refused { code, .. }) => assert_eq!(code, "access_denied"),
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_masked_session_is_told_without_what_its_mask_denies_through_an_edit() {
+    let server = start().await;
+    write(
+        server.accounts.path(),
+        "dana",
+        "password = \"pw\"\n[access]\nread_chat = true\nsend_chat = true\n",
+    );
+    let mut admin = classic(&server, "admin", "pw").await;
+    let mut dana = classic(&server, "dana", "pw").await;
+    let mask = DenyMask {
+        access: access(&[bit::READ_CHAT]),
+        ..Default::default()
+    };
+    assert!(server.core.set_session_mask(dana.uid.unwrap(), mask));
+    // Bit 56 followed bit 9, so it goes with it.
+    let left = access(&[bit::SEND_CHAT]);
+    let told = dana
+        .recv_where(|f| {
+            f.ty == push::SELFINFO && f.bytes(tag::ACCESS) == Some(left.to_wire().to_vec())
+        })
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+
+    let file = access(&[bit::READ_CHAT, bit::SEND_CHAT, bit::GET_USER_INFO]);
+    admin
+        .call(ACCOUNT_MODIFY, &user("dana", None, "dana", file))
+        .await
+        .unwrap();
+    let left = left.with(bit::GET_USER_INFO);
+    let told = dana
+        .recv_where(|f| {
+            f.ty == push::SELFINFO && f.bytes(tag::ACCESS) == Some(left.to_wire().to_vec())
+        })
+        .await;
+    assert!(told.is_ok(), "{told:?}");
 }
 
 fn refused_ng(result: hxd_testclient::Result<serde_json::Value>) -> String {

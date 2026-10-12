@@ -16,8 +16,8 @@
 //! An edit made beside the server reaches them on SIGHUP.
 
 use crate::access::bit;
-use crate::account::{Account, AccountAdmin, AccountEdit, AdminError, FIELD_MAX_CHARS};
-use crate::roster::{Core, Event, Uid};
+use crate::account::{Account, AccountAdmin, AccountEdit, AdminError, DenyMask, FIELD_MAX_CHARS};
+use crate::roster::{Core, Event, RosterInner, Uid};
 
 /// What [`Core::account_write`] may do about whether the account exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,44 +255,74 @@ impl Core {
             .filter(|(_, s)| !s.system && s.login == account.login)
             .map(|(u, _)| *u)
             .collect();
-        let admin = account.access.has(bit::DISCONNECT_USERS);
-        let name = (!account.access.has(bit::USE_ANY_NAME)).then(|| {
-            account
-                .name
-                .chars()
-                .take(FIELD_MAX_CHARS)
-                .collect::<String>()
-        });
         for &uid in &uids {
-            let Some(s) = r.users.get_mut(&uid) else {
-                continue;
-            };
-            s.access = account.access;
-            s.can_detach = account.can_detach;
-            s.has_inbox = account.has_inbox;
-            s.attach_news = account.attach_news;
-            s.set_avatar = account.set_avatar;
-            s.moderate = account.moderate;
-            s.can_spam = account.can_spam;
-            s.is_person = account.is_person();
-            let mut shown = s.info.admin != admin;
-            s.info.admin = admin;
-            let renamed = name.as_ref().is_some_and(|n| s.info.nick != *n);
-            if let Some(name) = &name {
-                s.info.nick = name.clone();
-            }
-            shown |= renamed;
-            let shown = (shown && s.visible).then(|| s.info.clone());
-            r.send_to(uid, Event::AccountChanged(Box::new(account.clone())));
-            if let Some(info) = shown {
-                r.broadcast_where(&Event::Changed(info), None, |_| true);
-                // The admin bit never crosses a link; only the name does.
-                if renamed {
-                    r.export_changed(uid);
-                }
-            }
+            give_account(&mut r, uid, account);
         }
         uids.len()
+    }
+
+    /// Deny session `uid` what `mask` names, whatever its account says,
+    /// and tell it as an account edit is told; an empty mask lifts it.
+    /// `false` when there is no such session, or no account behind it to
+    /// derive what is left from.
+    pub fn set_session_mask(&self, uid: Uid, mask: DenyMask) -> bool {
+        let mut r = self.roster.lock().unwrap();
+        let Some(s) = r.users.get_mut(&uid) else {
+            return false;
+        };
+        let Some(account) = s.account.clone() else {
+            return false;
+        };
+        s.mask = mask;
+        give_account(&mut r, uid, &account);
+        true
+    }
+
+    /// Session `uid`'s mask, for a frontend that reads its account again.
+    pub fn mask_of(&self, uid: Uid) -> DenyMask {
+        let r = self.roster.lock().unwrap();
+        r.users.get(&uid).map(|s| s.mask).unwrap_or_default()
+    }
+}
+
+/// Give session `uid` `account` as its mask leaves it, and tell it.
+fn give_account(r: &mut RosterInner, uid: Uid, account: &Account) {
+    let Some(s) = r.users.get_mut(&uid) else {
+        return;
+    };
+    let effective = account.masked(&s.mask);
+    s.account = Some(Box::new(account.clone()));
+    let admin = effective.access.has(bit::DISCONNECT_USERS);
+    let name = (!effective.access.has(bit::USE_ANY_NAME)).then(|| {
+        effective
+            .name
+            .chars()
+            .take(FIELD_MAX_CHARS)
+            .collect::<String>()
+    });
+    s.access = effective.access;
+    s.can_detach = effective.can_detach;
+    s.has_inbox = effective.has_inbox;
+    s.attach_news = effective.attach_news;
+    s.set_avatar = effective.set_avatar;
+    s.moderate = effective.moderate;
+    s.can_spam = effective.can_spam;
+    s.is_person = effective.is_person();
+    let mut shown = s.info.admin != admin;
+    s.info.admin = admin;
+    let renamed = name.as_ref().is_some_and(|n| s.info.nick != *n);
+    if let Some(name) = name {
+        s.info.nick = name;
+    }
+    shown |= renamed;
+    let shown = (shown && s.visible).then(|| s.info.clone());
+    r.send_to(uid, Event::AccountChanged(Box::new(effective)));
+    if let Some(info) = shown {
+        r.broadcast_where(&Event::Changed(info), None, |_| true);
+        // The admin bit never crosses a link; only the name does.
+        if renamed {
+            r.export_changed(uid);
+        }
     }
 }
 
@@ -302,7 +332,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::account::{IdentityLink, WriteCheck};
+    use crate::account::{AccountConfig, IdentityLink, WriteCheck};
     use crate::roster::test_attach;
     use crate::AccessBits;
 
@@ -311,22 +341,17 @@ mod tests {
     struct Accounts(Mutex<HashMap<String, Account>>);
 
     fn account(login: &str, access: AccessBits) -> Account {
-        Account {
-            login: login.into(),
-            name: login.into(),
+        let config = AccountConfig {
             access,
-            can_detach: false,
-            set_subject: false,
-            file_list: true,
-            file_getinfo: true,
-            has_password: true,
-            has_inbox: false,
-            attach_news: false,
-            set_avatar: false,
-            moderate: false,
-            can_spam: false,
-            identity: IdentityLink::default(),
-        }
+            ..Default::default()
+        };
+        Account::new(
+            login.into(),
+            login.into(),
+            true,
+            IdentityLink::default(),
+            config,
+        )
     }
 
     impl AccountAdmin for Accounts {
@@ -352,7 +377,7 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| account(&edit.login, AccessBits::empty()));
             if let Some(access) = edit.access {
-                after.access = access;
+                after = account(&edit.login, access);
             }
             check(existing.as_ref(), &after)?;
             self.0
@@ -428,5 +453,107 @@ mod tests {
         // epoch: a settled login does not look.
         accounts.0.lock().unwrap().remove("bob");
         assert!(core.account_settled(bob, epoch));
+    }
+
+    fn bits(bits: &[u8]) -> AccessBits {
+        bits.iter().fold(AccessBits::empty(), |a, b| a.with(*b))
+    }
+
+    /// What session `uid` may do as the roster has it, and as it was
+    /// last told.
+    fn seen(core: &Core, uid: Uid, rx: &mut crate::Events) -> (AccessBits, bool, Option<Account>) {
+        let told = crate::roster::drain(rx)
+            .into_iter()
+            .rev()
+            .find_map(|e| match e {
+                Event::AccountChanged(a) => Some(*a),
+                _ => None,
+            });
+        let r = core.roster.lock().unwrap();
+        let s = &r.users[&uid];
+        (s.access, s.attach_news, told)
+    }
+
+    #[test]
+    fn a_sessions_mask_outlasts_edits_and_reloads_of_its_account() {
+        let (core, accounts, root) = server();
+        let chat = bits(&[bit::READ_CHAT, bit::SEND_CHAT, bit::SEND_MEDIA]);
+        let root_bits = USERS
+            .iter()
+            .fold(chat.with(bit::SEND_MSGS), |a, b| a.with(*b));
+        for a in [account("root", root_bits), account("bob", chat)] {
+            accounts.0.lock().unwrap().insert(a.login.clone(), a);
+        }
+        let (bob, mut rx) = test_attach(&core, "bob", AccessBits::empty());
+        let mask = DenyMask {
+            access: bits(&[bit::READ_CHAT, bit::SEND_MEDIA]),
+            ..Default::default()
+        };
+        assert!(
+            !core.set_session_mask(bob, mask),
+            "no account to derive from"
+        );
+        core.reload_accounts();
+        assert_eq!(seen(&core, bob, &mut rx).0, chat.with(bit::CHAT_HISTORY));
+
+        // Bit 56 and attach_news derive from what the mask denies, so
+        // they go with it.
+        assert!(core.set_session_mask(bob, mask));
+        let (access, attach_news, told) = seen(&core, bob, &mut rx);
+        assert_eq!(access, bits(&[bit::SEND_CHAT]));
+        assert!(!attach_news);
+        let told = told.unwrap();
+        assert_eq!((told.access, told.attach_news), (access, false));
+
+        let edit = AccountEdit {
+            login: "bob".into(),
+            access: Some(chat.with(bit::SEND_MSGS)),
+            ..Default::default()
+        };
+        core.account_write(root, &edit, WriteMode::Modify).unwrap();
+        let (access, attach_news, told) = seen(&core, bob, &mut rx);
+        assert_eq!(access, bits(&[bit::SEND_CHAT, bit::SEND_MSGS]));
+        assert!(!attach_news);
+        assert_eq!(told.unwrap().access, access);
+
+        accounts
+            .0
+            .lock()
+            .unwrap()
+            .insert("bob".into(), account("bob", chat.with(bit::VOICE_CHAT)));
+        core.reload_accounts();
+        let (access, attach_news, _) = seen(&core, bob, &mut rx);
+        assert_eq!(access, bits(&[bit::SEND_CHAT, bit::VOICE_CHAT]));
+        assert!(!attach_news);
+
+        assert!(core.set_session_mask(bob, DenyMask::default()));
+        let (access, attach_news, told) = seen(&core, bob, &mut rx);
+        assert_eq!(access, chat.with(bit::VOICE_CHAT).with(bit::CHAT_HISTORY));
+        assert!(attach_news);
+        assert_eq!(told.unwrap().access, access);
+    }
+
+    #[test]
+    fn whom_an_administrator_may_change_is_judged_by_their_account_unmasked() {
+        let (core, accounts, root) = server();
+        let media = bits(&[bit::SEND_CHAT, bit::SEND_MEDIA]);
+        let root_bits = USERS.iter().fold(media, |a, b| a.with(*b));
+        accounts
+            .0
+            .lock()
+            .unwrap()
+            .insert("root".into(), account("root", root_bits));
+        core.reload_accounts();
+        let mask = DenyMask {
+            access: bits(&[bit::SEND_MEDIA]),
+            ..Default::default()
+        };
+        assert!(core.set_session_mask(root, mask));
+        let edit = AccountEdit {
+            login: "bob".into(),
+            access: Some(media),
+            ..Default::default()
+        };
+        core.account_write(root, &edit, WriteMode::Modify).unwrap();
     }
 }

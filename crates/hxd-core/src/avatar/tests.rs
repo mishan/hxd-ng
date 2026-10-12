@@ -65,6 +65,7 @@ fn join_from(core: &Core, who: Who, addr: IpAddr, set_avatar: bool) -> (Uid, Eve
     };
     let (uid, rx) = core
         .attach(AttachInfo {
+            account: None,
             nick: login.clone(),
             icon: 1,
             admin: false,

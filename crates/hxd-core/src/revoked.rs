@@ -257,6 +257,7 @@ mod tests {
 
     fn attach(core: &Core, nick: &str, identity: Option<IdentityTag>) -> Option<(Uid, Events)> {
         let (uid, rx) = core.attach(AttachInfo {
+            account: None,
             nick: nick.into(),
             icon: 0,
             admin: false,

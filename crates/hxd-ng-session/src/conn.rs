@@ -716,6 +716,7 @@ async fn handle_login(
     // because that is what one Mac Roman byte is worth (§8).
     nick.truncate_to_chars(NICK_MAX_CHARS);
     let attach = AttachInfo {
+        account: Some(Box::new(account.clone())),
         nick,
         icon: p.icon.unwrap_or(128),
         admin: account.access.has(bit::DISCONNECT_USERS),
@@ -1114,16 +1115,19 @@ async fn handle_resume(
     };
     let access = ctx.core.access_of(uid).unwrap_or_default();
     // The file extras live in the account rather than on the roster, so a
-    // resume reads them again: the session outlived its connection, not
-    // its account. An account that can no longer be read gets neither.
+    // resume reads them again, under the session's mask: the session
+    // outlived its connection, not its account. An account that can no
+    // longer be read gets neither.
     let auth = ctx.auth.clone();
     let login = ctx.core.user_details(uid).map(|details| details.login);
+    let mask = ctx.core.mask_of(uid);
     let account = crate::spawn_blocking("login", move || {
         login.and_then(|login| auth.lookup(&login).ok())
     })
     .await
     .ok()
-    .flatten();
+    .flatten()
+    .map(|account| account.masked(&mask));
     let state = SessState {
         uid,
         session_id: p.session.clone(),

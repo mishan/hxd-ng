@@ -1132,6 +1132,7 @@ mod tests {
         core.start_system_session().unwrap();
         let (uid, _events) = core
             .attach(hxd_core::AttachInfo {
+                account: None,
                 nick: "Visible".into(),
                 icon: 1,
                 admin: false,
