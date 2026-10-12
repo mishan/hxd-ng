@@ -555,6 +555,22 @@ pub enum Event {
         room: u32,
         event: Box<Event>,
     },
+    /// Inside [`Event::InRoom`]: a member the server parted, not one
+    /// that left, and why.
+    RoomParted {
+        uid: Uid,
+        reason: crate::rooms::PartReason,
+    },
+    /// A room this session may see was made, came back from the archive,
+    /// or became visible to it. Only to a rooms-aware session, as are the
+    /// two below (`docs/chat-rooms.md` §7).
+    RoomAdded(Box<crate::rooms::RoomView>),
+    /// A room it may see changed as it is listed.
+    RoomChanged(Box<crate::rooms::RoomView>),
+    /// A room it could see was archived or stopped being visible to it.
+    RoomRemoved {
+        room: u32,
+    },
 }
 
 impl Event {
@@ -596,6 +612,9 @@ impl Event {
                     * std::mem::size_of::<(crate::news::ArticleId, crate::news::NodeId)>()
             }
             Event::InRoom { event, .. } => return event.weight(),
+            Event::RoomAdded(v) | Event::RoomChanged(v) => {
+                v.room.name.len() + v.room.topic.text.len()
+            }
             _ => 0,
         };
         std::mem::size_of::<SeqEvent>() + text
@@ -637,6 +656,10 @@ impl Event {
             Event::NewsNodeDeleted { .. } => "news_node_deleted",
             Event::NewsNotify(..) => "news_notify",
             Event::InRoom { event, .. } => event.kind(),
+            Event::RoomParted { .. } => "room_parted",
+            Event::RoomAdded(..) => "room_added",
+            Event::RoomChanged(..) => "room_changed",
+            Event::RoomRemoved { .. } => "room_removed",
         }
     }
 }
@@ -795,6 +818,9 @@ pub(crate) struct UserSession {
     pub(crate) manage_rooms: bool,
     /// See [`AttachInfo::set_subject`].
     pub(crate) set_subject: bool,
+    /// Has it asked about rooms on a wire that shows them
+    /// (`Core::rooms_aware`)? Until then it is told nothing about one.
+    pub(crate) rooms_aware: bool,
     /// What this session has spent of its flood allowances.
     pub(crate) flood: crate::limits::Flood,
     /// And of its voice signaling allowances (`crate::voice`).
@@ -1840,6 +1866,7 @@ impl Core {
                 moderate: info.moderate,
                 can_spam: info.can_spam,
                 manage_rooms: info.manage_rooms,
+                rooms_aware: false,
                 set_subject: info.set_subject,
                 flood: Default::default(),
                 voice_flood: Default::default(),

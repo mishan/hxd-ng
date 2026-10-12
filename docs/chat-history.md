@@ -416,7 +416,7 @@ survives a re-login, a second device, and a lapsed grace window.
 
 | `req` | params | ok | errors |
 |---|---|---|---|
-| `history` | `before?` (id), `after?` (id), `limit?` (1–200, default 50) | `{ "lines": [ … ], "has_more": bool }` | `access_denied`, `not_available` (no `[history]`), `bad_request`, `rate_limited`, `server_error` |
+| `history` | `room?`, `before?` (id), `after?` (id), `limit?` (1–200, default 50) | `{ "lines": [ … ], "has_more": bool }` | `access_denied`, `not_available` (no `[history]`), `no_such_room`, `bad_request`, `rate_limited`, `server_error` |
 
 Supplying both cursors requests the exclusive range `after < id < before`.
 It pages forward from `after`, and `has_more` refers only to more rows before
@@ -438,7 +438,9 @@ to whoever holds the number now. Live `chat` events keep `uid` because
 the roster row is live. `from.login` is never sent (§3.3).
 
 The same clamps as the legacy wire: 200 lines a page, 10 requests a
-second, `channel` is not a parameter because there is one channel.
+second. `room` is the channel: absent or 0 is the lobby, and any other
+is a room the session may read (chat-rooms.md §7.2), its line ids a
+cursor for that room alone.
 
 The shape is built for a client that loads as the user scrolls, which
 is what hx-ng is expected to do where GtkHx has a button: each page's

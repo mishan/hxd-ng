@@ -82,7 +82,8 @@ pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};
 pub use revoked::{Published, Revocations};
 pub use rooms::{
-    MemoryRooms, Room, RoomEdit, RoomError, RoomFile, RoomPolicy, RoomStore, RoomView, Topic,
+    MemoryRooms, PartReason, Room, RoomEdit, RoomError, RoomFile, RoomPolicy, RoomStore, RoomView,
+    Topic,
 };
 pub use roster::{
     AttachInfo, Census, Core, Event, Events, IdentityTag, InboxPolicy, Lag, LoginPermit, Resume,

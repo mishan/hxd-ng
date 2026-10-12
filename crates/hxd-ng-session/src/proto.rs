@@ -50,6 +50,9 @@ pub struct ChatParams {
     /// present: the image is the message.
     #[serde(default)]
     pub media: Option<String>,
+    /// The room it is said in; 0 or absent is the lobby.
+    #[serde(default)]
+    pub room: u32,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -108,6 +111,9 @@ pub struct InboxParams {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct HistoryParams {
+    /// The room it pages; 0 or absent is the lobby.
+    #[serde(default)]
+    pub room: u32,
     #[serde(default)]
     pub before: Option<u64>,
     #[serde(default)]
@@ -820,12 +826,68 @@ pub fn event_json(se: &SeqEvent) -> String {
         // Addressed to one account, where the ones above go to every
         // reader: the one a client raises a badge on (§10.6).
         Event::NewsNotify(n) => ("news_notify", crate::news::notified_json(n)),
+        // A room's, only ever to a session that asked about rooms
+        // (`docs/chat-rooms.md` §7.3); the lobby's never carry `room`.
+        Event::InRoom { room, event } => in_room_json(*room, event),
+        Event::RoomAdded(v) => ("room_added", json!({ "room": crate::rooms::room_json(v) })),
+        Event::RoomChanged(v) => (
+            "room_changed",
+            json!({ "room": crate::rooms::room_json(v) }),
+        ),
+        Event::RoomRemoved { room } => ("room_removed", json!({ "room": room })),
         // No ng mapping yet (private-chat family, and any future event this
         // build predates): emit a placeholder so seq accounting stays
         // gapless. Clients ignore unknown `ev` values per spec.
         _ => ("unsupported", json!({})),
     };
     json!({ "seq": se.seq, "ev": ev, "data": data }).to_string()
+}
+
+/// An event about a room, as the lobby's would be with `room` added, or
+/// the placeholder for one this wire does not carry.
+fn in_room_json(room: u32, event: &Event) -> (&'static str, Value) {
+    let (ev, mut data) = match event {
+        Event::Chat {
+            from,
+            text,
+            style,
+            id,
+            at,
+            media,
+            ..
+        } => {
+            let data = ChatData {
+                from: FromData {
+                    uid: from.uid,
+                    nick: &from.nick,
+                },
+                text,
+                style: if *style == 1 { "action" } else { "normal" },
+                at: unix(*at),
+                id: *id,
+                media: media.as_ref().map(crate::media::media_json),
+            };
+            (
+                "chat",
+                serde_json::to_value(data).expect("always serializes"),
+            )
+        }
+        Event::Notice { text, .. } => ("notice", json!({ "text": text })),
+        Event::ChatSubject { subject, .. } => ("subject", json!({ "subject": subject })),
+        Event::ChatUserJoined { user, .. } => {
+            ("room_member_joined", json!({ "user": user_json(user) }))
+        }
+        Event::ChatUserParted { uid, .. } => ("room_member_parted", json!({ "uid": uid })),
+        Event::RoomParted { uid, reason } => (
+            "room_member_parted",
+            json!({ "uid": uid, "reason": reason.name() }),
+        ),
+        Event::ChatRedacted { id } => ("chat_redacted", json!({ "id": id })),
+        Event::ChatPurged { ids } => ("chat_purged", json!({ "ids": ids })),
+        _ => return ("unsupported", json!({})),
+    };
+    data["room"] = json!(room);
+    (ev, data)
 }
 
 /// Unix seconds, the shape every JSON timestamp here takes. Floored at the

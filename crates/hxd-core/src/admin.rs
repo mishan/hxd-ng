@@ -261,11 +261,13 @@ impl Core {
             .filter(|(_, s)| !s.system && s.login == account.login)
             .map(|(u, _)| *u)
             .collect();
+        let listed_before = r.room_shown(None, Some(&uids));
         for &uid in &uids {
             give_account(&mut r, uid, account);
         }
         // What it may read may have narrowed (docs/chat-rooms.md §5).
         r.room_reconcile();
+        r.room_announce(listed_before, None, Some(&uids));
         uids.len()
     }
 
@@ -282,8 +284,10 @@ impl Core {
             return false;
         };
         s.mask = mask;
+        let listed_before = r.room_shown(None, Some(&[uid]));
         give_account(&mut r, uid, &account);
         r.room_reconcile();
+        r.room_announce(listed_before, None, Some(&[uid]));
         true
     }
 

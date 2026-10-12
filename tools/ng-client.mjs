@@ -23,6 +23,9 @@
 //   /nick <nick>     change nickname
 //   /icon <n>        change icon
 //   /topic <text>    set the lobby's subject
+//   /rooms           list the rooms you may see
+//   /join <id>       join a room (/part <id> to leave it)
+//   /say <id> <text> chat in a room
 //   /users           re-request the roster (sync)
 //   /drop            kill the socket WITHOUT logout — tests detach; the
 //                    client auto-reconnects with resume after a moment
@@ -119,13 +122,15 @@ function showUser(u) {
 
 function handleEvent({ seq, ev, data }) {
   lastSeq = seq;
+  // A room's events carry it; the lobby's never do.
+  const where = data.room ? `[#${data.room}] ` : "";
   switch (ev) {
     case "chat":
-      if (data.style === "action") say(`*** ${data.from.nick} ${data.text}`);
-      else say(`<${data.from.nick}> ${data.text}`);
+      if (data.style === "action") say(`${where}*** ${data.from.nick} ${data.text}`);
+      else say(`${where}<${data.from.nick}> ${data.text}`);
       break;
     case "notice":
-      say(`-!- ${data.text}`);
+      say(`${where}-!- ${data.text}`);
       break;
     case "broadcast":
       say(`*** BROADCAST from ${data.from.nick}: ${data.text}`);
@@ -143,7 +148,7 @@ function handleEvent({ seq, ev, data }) {
       say(`<-- uid ${data.uid} left`);
       break;
     case "subject":
-      say(`-!- subject: ${data.subject}`);
+      say(`${where}-!- subject: ${data.subject}`);
       break;
     case "msg": {
       if (data.id != null && shown.has(data.id)) break;
@@ -337,6 +342,23 @@ rl.on("line", async (line) => {
       await request("nick", { icon: Number(line.slice(6)) });
     } else if (line.startsWith("/topic ")) {
       await request("room_topic", { topic: line.slice(7) });
+    } else if (line === "/rooms") {
+      const r = await request("rooms");
+      for (const room of r.list) {
+        say(`  #${room.id} ${room.name} (${room.members}) ${room.topic}`);
+      }
+    } else if (line.startsWith("/join ") || line.startsWith("/part ")) {
+      const room = Number(line.slice(6).trim());
+      const r = await request(line.startsWith("/join ") ? "room_join" : "room_part", { room });
+      if (r.members) say(`[#${room}] members: ${r.members.join(", ")}; topic: ${r.topic}`);
+    } else if (line.startsWith("/say ")) {
+      const rest = line.slice(5).trim();
+      const space = rest.indexOf(" ");
+      if (space < 0) {
+        say("usage: /say <room id> <text>");
+        return;
+      }
+      await request("chat", { room: Number(rest.slice(0, space)), text: rest.slice(space + 1) });
     } else if (line.startsWith("/")) {
       say("unknown command");
     } else {

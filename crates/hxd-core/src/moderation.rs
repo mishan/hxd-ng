@@ -1214,8 +1214,8 @@ impl Core {
     /// Tombstone lines, each `(id, channel)`, and tell every reader, in
     /// log order with the sends: under each line's room's serial, so a
     /// redaction can never reach a client ahead of the line it blanks. A
-    /// room's are told to its members alone, and the rooms are taken one
-    /// at a time, never two serials at once.
+    /// room's are told to whoever may read the room, and the rooms are
+    /// taken one at a time, never two serials at once.
     fn tombstone_lines(&self, acting: &Acting, lines: &[(LineId, u32)]) -> Result<(), ModError> {
         if lines.is_empty() {
             return Ok(());
@@ -1260,7 +1260,7 @@ impl Core {
                         |s: &UserSession| reads_public_chat(s) && s.info.transport.redactions;
                     r.broadcast_where(&ev, None, readers);
                 } else {
-                    r.room_send_where(room, ev, |s| s.info.transport.redactions);
+                    r.room_readers_send(room, ev);
                 }
             }
         }

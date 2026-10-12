@@ -47,8 +47,9 @@ describe('config', () => {
     await withServer({}, async (_server, crew) => {
       const probe = await crew.connect({ nick: 'Probe' });
       // `accounts` needs no section: every server administers its
-      // accounts directory.
-      assert.deepEqual(probe.conn.caps, ['accounts']);
+      // accounts directory. Nor does `rooms`, on unless `[rooms]
+      // enabled = false` (chat-rooms.md §7).
+      assert.deepEqual(probe.conn.caps, ['accounts', 'rooms']);
       assert.equal(probe.conn.media, null);
     });
   });

@@ -12,7 +12,7 @@
 //! Who may do what is §5's, decided here for every wire: a room a
 //! session may not see is answered exactly as a room that does not exist.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -176,13 +176,15 @@ impl std::fmt::Display for RoomError {
 }
 
 /// `[rooms]`'s limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomPolicy {
     /// Rooms one session may be in at once.
     pub max_joined: usize,
     /// Entries the file may hold, archived rooms and tombstones included,
     /// so rooms cannot be made, filled and archived without end.
     pub max_rooms: usize,
+    /// The lobby's name in listings.
+    pub lobby: String,
 }
 
 impl Default for RoomPolicy {
@@ -190,6 +192,25 @@ impl Default for RoomPolicy {
         RoomPolicy {
             max_joined: 32,
             max_rooms: 256,
+            lobby: "lobby".into(),
+        }
+    }
+}
+
+/// Why the server parted a member (`Event::RoomParted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartReason {
+    /// It may no longer be in the room.
+    Access,
+    /// The room was archived or deleted.
+    Archived,
+}
+
+impl PartReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            PartReason::Access => "access",
+            PartReason::Archived => "archived",
         }
     }
 }
@@ -329,6 +350,52 @@ pub(crate) fn sees(sess: &UserSession, room: &Room) -> bool {
         && (sess.manage_rooms || sess.moderate || (room.archived_at.is_none() && reads(sess, room)))
 }
 
+/// Is `room` in `sess`'s listing? What it sees, less the archive.
+fn listed(sess: &UserSession, room: &Room) -> bool {
+    sees(sess, room) && room.archived_at.is_none()
+}
+
+/// What a session's listing says of a room, to tell what changed: the
+/// gates only to a manager, who alone is told them.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Listed {
+    name: String,
+    topic: String,
+    position: i64,
+    max_lines: Option<u32>,
+    max_days: Option<u32>,
+    may_post: bool,
+    gates: Option<(Vec<String>, Vec<String>)>,
+}
+
+fn listed_as(sess: &UserSession, room: &Room) -> Listed {
+    Listed {
+        name: room.name.clone(),
+        topic: room.topic.text.clone(),
+        position: room.position,
+        max_lines: room.max_lines,
+        max_days: room.max_days,
+        may_post: may_post(sess, room),
+        gates: sess
+            .manage_rooms
+            .then(|| (room.read.clone(), room.post.clone())),
+    }
+}
+
+/// What each rooms-aware session was shown of each room it lists,
+/// [`RosterInner::room_shown`]'s, to compare with afterwards.
+pub(crate) type Shown = BTreeMap<(Uid, u32), Listed>;
+
+fn view(r: &RosterInner, sess: &UserSession, entry: &RoomEntry) -> RoomView {
+    RoomView {
+        room: entry.room.clone(),
+        members: entry.members.len(),
+        last_id: r.last_ids.get(&entry.room.id).copied(),
+        may_post: may_post(sess, &entry.room),
+        manages: sess.manage_rooms,
+    }
+}
+
 /// May `sess` be in `room`, joining or staying?
 fn admits(sess: &UserSession, room: &Room) -> bool {
     !room.deleted
@@ -369,6 +436,16 @@ impl RosterInner {
     /// Part `uid` from `room` and its voice room, telling the members
     /// left.
     pub(crate) fn room_part(&mut self, room: u32, uid: Uid) -> bool {
+        self.room_part_where(room, uid, |_| true)
+    }
+
+    /// [`RosterInner::room_part`], telling the members `pred` admits.
+    fn room_part_where(
+        &mut self,
+        room: u32,
+        uid: Uid,
+        pred: impl Fn(&UserSession) -> bool,
+    ) -> bool {
         self.voice_part_room(uid, room);
         let Some(entry) = self.rooms.get_mut(&room) else {
             return false;
@@ -377,7 +454,7 @@ impl RosterInner {
             return false;
         };
         entry.members.remove(pos);
-        self.room_send_where(room, Event::ChatUserParted { cid: room, uid }, |_| true);
+        self.room_send_where(room, Event::ChatUserParted { cid: room, uid }, pred);
         true
     }
 
@@ -396,16 +473,22 @@ impl RosterInner {
             if lost.is_empty() {
                 continue;
             }
+            let reason = if entry.room.archived_at.is_some() || entry.room.deleted {
+                PartReason::Archived
+            } else {
+                PartReason::Access
+            };
             self.rooms.get_mut(&room).expect("listed above").members = stay.clone();
+            let about = |event| Event::InRoom {
+                room,
+                event: Box::new(event),
+            };
             for &uid in &lost {
                 self.voice_part_room(uid, room);
-                let parted = |uid| Event::InRoom {
-                    room,
-                    event: Box::new(Event::ChatUserParted { cid: room, uid }),
-                };
-                self.send_to(uid, parted(uid));
+                // Why is the parted session's business alone.
+                self.send_to(uid, about(Event::RoomParted { uid, reason }));
                 for &member in &stay {
-                    self.send_to(member, parted(uid));
+                    self.send_to(member, about(Event::ChatUserParted { cid: room, uid }));
                 }
             }
         }
@@ -433,7 +516,9 @@ impl RosterInner {
         Ok(())
     }
 
-    /// Every room `uid` is in, parted, as its session ends.
+    /// Every room `uid` is in, parted, as its session ends. A rooms-aware
+    /// session is not told: the session's own departure says it, and a
+    /// part as well would be the same news twice (§7.3).
     pub(crate) fn room_leave_all(&mut self, uid: Uid) {
         let rooms: Vec<u32> = self
             .rooms
@@ -442,7 +527,100 @@ impl RosterInner {
             .map(|(id, _)| *id)
             .collect();
         for room in rooms {
-            self.room_part(room, uid);
+            self.room_part_where(room, uid, |s| !s.rooms_aware);
+        }
+    }
+
+    /// Send `event` about `room`'s lines to every session that may read
+    /// them, member or not, since one that paged them holds them too: a
+    /// rooms-aware one, or a member, whose wire shows redactions.
+    pub(crate) fn room_readers_send(&mut self, room: u32, event: Event) {
+        let Some(entry) = self.rooms.get(&room) else {
+            return;
+        };
+        let readers: Vec<Uid> = self
+            .users
+            .iter()
+            .filter(|(uid, s)| {
+                s.info.transport.redactions
+                    && sees(s, &entry.room)
+                    && (s.rooms_aware || entry.members.contains(uid))
+            })
+            .map(|(uid, _)| *uid)
+            .collect();
+        let ev = Event::InRoom {
+            room,
+            event: Box::new(event),
+        };
+        for uid in readers {
+            self.send_to(uid, ev.clone());
+        }
+    }
+
+    /// What the rooms-aware sessions are shown of the rooms, of `rooms`
+    /// and to `uids` where given, for [`RosterInner::room_announce`] to
+    /// compare with after a change.
+    pub(crate) fn room_shown(&self, rooms: Option<&[u32]>, uids: Option<&[Uid]>) -> Shown {
+        let entries: Vec<&RoomEntry> = match rooms {
+            Some(ids) => ids.iter().filter_map(|id| self.rooms.get(id)).collect(),
+            None => self.rooms.values().collect(),
+        };
+        let mut shown = Shown::new();
+        let sessions = self
+            .users
+            .iter()
+            .filter(|(uid, s)| s.rooms_aware && uids.is_none_or(|u| u.contains(uid)));
+        for (uid, sess) in sessions {
+            for entry in entries.iter().filter(|e| listed(sess, &e.room)) {
+                shown.insert((*uid, entry.room.id), listed_as(sess, &entry.room));
+            }
+        }
+        shown
+    }
+
+    /// Tell each rooms-aware session how its listing changed since
+    /// `before`, taken with the same `rooms` and `uids`: a room gone from
+    /// it, one new to it, and one that changed, except a topic to a
+    /// member, which heard it as the room's subject.
+    pub(crate) fn room_announce(
+        &mut self,
+        before: Shown,
+        rooms: Option<&[u32]>,
+        uids: Option<&[Uid]>,
+    ) {
+        let after = self.room_shown(rooms, uids);
+        let mut sends = Vec::new();
+        for &(uid, room) in before.keys().filter(|k| !after.contains_key(k)) {
+            sends.push((uid, Event::RoomRemoved { room }));
+        }
+        for (&(uid, room), now) in &after {
+            let (Some(sess), Some(entry)) = (self.users.get(&uid), self.rooms.get(&room)) else {
+                continue;
+            };
+            let added = match before.get(&(uid, room)) {
+                None => true,
+                Some(was) if was == now => continue,
+                Some(was) => {
+                    let topic_only = Listed {
+                        topic: now.topic.clone(),
+                        ..was.clone()
+                    } == *now;
+                    if topic_only && entry.members.contains(&uid) {
+                        continue;
+                    }
+                    false
+                }
+            };
+            let view = Box::new(view(self, sess, entry));
+            let ev = if added {
+                Event::RoomAdded(view)
+            } else {
+                Event::RoomChanged(view)
+            };
+            sends.push((uid, ev));
+        }
+        for (uid, ev) in sends {
+            self.send_to(uid, ev);
         }
     }
 
@@ -463,6 +641,8 @@ pub struct RoomView {
     /// The newest line in it, where there is a log.
     pub last_id: Option<LineId>,
     pub may_post: bool,
+    /// Whether the viewer manages rooms, and so may be told the gates.
+    pub manages: bool,
 }
 
 impl Core {
@@ -498,6 +678,28 @@ impl Core {
         self.room_state.store.is_some()
     }
 
+    /// `[rooms]`'s limits and the lobby's name, where there are rooms.
+    pub fn room_policy(&self) -> Option<&RoomPolicy> {
+        self.rooms_enabled().then_some(&self.room_state.policy)
+    }
+
+    /// `uid` has asked about rooms on a wire that shows them (§7): from
+    /// now on it is told of the rooms it may see changing, and of a
+    /// redaction in one it may read. Kept with the session, so a resume
+    /// keeps it.
+    pub fn rooms_aware(&self, uid: Uid) {
+        if self.rooms_enabled() {
+            if let Some(sess) = self.roster.lock().unwrap().users.get_mut(&uid) {
+                sess.rooms_aware = true;
+            }
+        }
+    }
+
+    /// The newest line logged in `room`, 0 the lobby, where there is a log.
+    pub fn last_line_id(&self, room: u32) -> Option<LineId> {
+        self.roster.lock().unwrap().last_ids.get(&room).copied()
+    }
+
     /// Read the rooms file again (SIGHUP), give entries without an id one
     /// and write them back, and apply the difference: a room archived or
     /// gone parts its members, a narrowed gate parts whoever it no longer
@@ -513,6 +715,15 @@ impl Core {
         self.flush_topics(store.as_ref(), true);
         let mut file = store.load().map_err(|e| e.to_string())?;
         check_file(&file)?;
+        // As one that does not parse: a reload may then announce at most
+        // so many rooms to each session at once.
+        let max = self.room_state.policy.max_rooms;
+        if file.rooms.len() > max {
+            return Err(format!(
+                "{} entries, past [rooms] max_rooms {max}",
+                file.rooms.len()
+            ));
+        }
         let mut drawn = Vec::new();
         let purge: Vec<u32>;
         {
@@ -553,6 +764,20 @@ impl Core {
         // newer than the file's.
         let mut dirty = self.room_state.dirty.lock().unwrap().clone();
         dirty.extend(self.room_state.unwritten.lock().unwrap().iter());
+        // Only the entries that changed: a reload changes no session.
+        let changed: Vec<u32> = file
+            .rooms
+            .iter()
+            .filter(|room| r.rooms.get(&room.id).is_none_or(|e| e.room != **room))
+            .map(|room| room.id)
+            .chain(
+                r.rooms
+                    .keys()
+                    .copied()
+                    .filter(|id| !file.rooms.iter().any(|room| room.id == *id)),
+            )
+            .collect();
+        let before = r.room_shown(Some(&changed), None);
         let mut old = std::mem::take(&mut r.rooms);
         for room in file.rooms.iter().filter(|r| r.id != 0) {
             let mut room = room.clone();
@@ -576,6 +801,7 @@ impl Core {
         r.room_reconcile();
         r.rooms
             .retain(|id, _| file.rooms.iter().any(|room| room.id == *id));
+        r.room_announce(before, Some(&changed), None);
         drop(r);
         if let Some(log) = self.history.as_ref() {
             for id in purge {
@@ -732,6 +958,7 @@ impl Core {
             RoomError::ServerError
         })?;
         let mut r = self.roster.lock().unwrap();
+        let before = r.room_shown(Some(&[room.id]), None);
         let entry = r.rooms.entry(room.id).or_insert_with(|| RoomEntry {
             room: room.clone(),
             members: Vec::new(),
@@ -749,6 +976,7 @@ impl Core {
             };
             r.room_send_where(room.id, subject, |_| true);
         }
+        r.room_announce(before, Some(&[room.id]), None);
         Ok(room)
     }
 
@@ -814,6 +1042,7 @@ impl Core {
                 return Err(RoomError::AccessDenied);
             }
             let text: String = text.chars().take(TOPIC_MAX).collect();
+            let before = r.room_shown(Some(&[id]), None);
             let topic = Topic {
                 text: text.clone(),
                 by: sess.info.nick.clone(),
@@ -828,6 +1057,7 @@ impl Core {
                 },
                 |_| true,
             );
+            r.room_announce(before, Some(&[id]), None);
             // Under the roster's lock, so a reload that holds it sees
             // the topic is newer than the file's.
             self.topic_changed(id);
@@ -848,7 +1078,8 @@ impl Core {
         ids
     }
 
-    /// The rooms `uid` may see, by position and then name.
+    /// The rooms `uid` may see and are not archived, by position and then
+    /// name.
     pub fn room_list(&self, uid: Uid) -> Vec<RoomView> {
         let r = self.roster.lock().unwrap();
         let Some(sess) = r.users.get(&uid) else {
@@ -857,16 +1088,19 @@ impl Core {
         let mut list: Vec<RoomView> = r
             .rooms
             .values()
-            .filter(|e| sees(sess, &e.room))
-            .map(|e| RoomView {
-                room: e.room.clone(),
-                members: e.members.len(),
-                last_id: r.last_ids.get(&e.room.id).copied(),
-                may_post: may_post(sess, &e.room),
-            })
+            .filter(|e| listed(sess, &e.room))
+            .map(|e| view(&r, sess, e))
             .collect();
         list.sort_by(|a, b| (a.room.position, &a.room.name).cmp(&(b.room.position, &b.room.name)));
         list
+    }
+
+    /// `room` as `uid` sees it, if it may.
+    pub fn room_view(&self, uid: Uid, room: u32) -> Option<RoomView> {
+        let r = self.roster.lock().unwrap();
+        let sess = r.users.get(&uid)?;
+        let entry = r.rooms.get(&room).filter(|e| sees(sess, &e.room))?;
+        Some(view(&r, sess, entry))
     }
 
     /// Is `uid` in `room`, may it send there, and is the room one it can
