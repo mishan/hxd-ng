@@ -1692,6 +1692,10 @@ pub struct IdentitySection {
     /// `deny` or `guest`: an identity frozen at its registrar.
     #[serde(default = "default_frozen")]
     pub frozen: String,
+    /// Registrar hosts whose identities are refused with `denied`, before
+    /// anything else is decided (`docs/identity-registrar.md` §7.3).
+    #[serde(default)]
+    pub banned_registrars: Vec<String>,
     #[serde(default = "default_clock_skew")]
     pub clock_skew: u64,
     /// Serve the TRTP-over-WebSocket path.
@@ -2987,6 +2991,11 @@ fn build_identity(
                 Some(section.successors.clone())
             },
             frozen,
+            banned_registrars: section
+                .banned_registrars
+                .iter()
+                .map(|h| h.to_lowercase())
+                .collect(),
         },
         auth,
         core,

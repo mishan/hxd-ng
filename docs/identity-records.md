@@ -1,6 +1,6 @@
 # Applying a registrar's records: the verifying server
 
-Status: R1's admission half built (records fetched at `auth`, kept on disk and applied); the sweep that ends sessions and `banned_registrars` are next. §6 stages it.
+Status: R1 built; R2, rotation at the server, is next. §6 stages it.
 
 `identity-registrar.md` §7 says what a server that trusts a registrar
 does with what the registrar publishes: resolve its key, fetch the
@@ -34,9 +34,10 @@ It changes no wire behavior §7 does not already specify.
   every address it connects to, redirects included, and fetches an
   operator-configured private host as configured.
 
-Absent: discovery and its cache, the records fetch and its cache, every
-effect in §7.3's table, `revocation_stale`, `frozen`, rotation at the
-server (§7.4), `banned_registrars`, `newcomer_delay`, the `create`
+Absent when this was planned, and built by R1: discovery and its cache,
+the records fetch and its cache, every effect in §7.3's table but
+rotation, `revocation_stale`, `frozen` and `banned_registrars`. Still
+absent: rotation at the server (§7.4), `newcomer_delay`, the `create`
 restriction, and standing, probation and vouching (§7.5).
 
 ## 2. Decisions
@@ -71,10 +72,12 @@ is found, the records cache is durable, and the fetch is its own crate.
   its session is attached would otherwise keep that session until it
   next resumes, which can be days for a phone. So a sweep refreshes, on
   the records' own lifetime, the lists of identities with a live or
-  detached session, and applying a list that now refuses one ends its
-  sessions through the same path `set_revocations` uses. A rotation's
+  detached session, from the registrars that attested each when it was
+  admitted, reached then or not, and applying a list that now refuses
+  one ends its sessions through the same path `set_revocations` uses. A rotation's
   predecessor and a device revocation end theirs too; a freeze ends
-  them only when `frozen = deny`.
+  them only when `frozen = deny`. An attestation revocation waits for
+  the session's next admission.
 - **A ban on a registrar reads every attestation.** `banned_registrars`
   (and `*@host`) is checked against each attestation on the card,
   verified or not: a card is the identity's own signature, so an
@@ -83,8 +86,8 @@ is found, the records cache is durable, and the fetch is its own crate.
 
 ## 3. Applying records
 
-As §7.3's table, at each of its three points and at the sweep: a list
-is applied in `time` order; `AuthRefused` gains `Rotated { successor }`
+As §7.3's table, at each of its three points: a list is applied in
+`time` order; `AuthRefused` gains `Rotated { successor }`
 and the `frozen` outcomes; a device revocation also drops the device's
 cached card. An attestation revocation is applied before age is
 computed, and an identity left with no attestation is unattested, which

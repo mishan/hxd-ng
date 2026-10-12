@@ -7,7 +7,7 @@
 //! `identity.rs`'s; this only says what they are and whether they are
 //! current.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,10 @@ const DISCOVERY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// a key rotation is not a day of refusals, and no more often, since any
 /// client can show an attestation naming any key.
 const REDISCOVERY: Duration = Duration::from_secs(60);
+
+/// How long an identity's registrars are remembered without a session:
+/// a transport token's life, and the wait on registrars before it.
+const ADMITTING: Duration = Duration::from_secs(120);
 
 /// The largest discovery document or page read.
 const MAX_BYTES: usize = 1 << 20;
@@ -80,10 +84,17 @@ pub struct Registrars {
     /// One discovery at a time per host, so logins arriving together
     /// wait on one fetch rather than each making their own.
     discovering: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// When a host's discovery document last could not be had: not asked
-    /// again for `REDISCOVERY`, so a registrar that is down costs one
-    /// failed fetch a minute rather than one for every login.
+    /// When a host's records last could not be fetched, or its discovery
+    /// document had: that document is not asked for again for
+    /// `REDISCOVERY`, and a sweep asks the host nothing more once it has
+    /// failed in it, so a registrar that is down costs a sweep one wait
+    /// rather than one for every identity swept.
     failed: Mutex<HashMap<String, Instant>>,
+    /// The trusted registrars each identity admitted here was attested
+    /// by, and when that was last seen, for the sweep to ask even when
+    /// admission held no list from them. A restart forgets it, as it ends
+    /// the sessions it is for.
+    attested: Mutex<HashMap<Fingerprint, (HashSet<String>, Instant)>>,
     /// Held across comparing a fetched list with the one held and
     /// replacing it, so two fetches finishing together cannot leave the
     /// older one.
@@ -108,6 +119,7 @@ impl Registrars {
             discovered: Mutex::new(HashMap::new()),
             discovering: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
+            attested: Mutex::new(HashMap::new()),
             storing: Arc::new(Mutex::new(())),
             cache,
         }
@@ -182,44 +194,124 @@ impl Registrars {
     /// wait. What cannot be had in it is left to [`Self::lookup`] to call
     /// stale. Asked only for an identity whose login has verified.
     pub async fn refresh(&self, identity: &PublicKey, attestations: &[Attestation], now: u64) {
-        let mut hosts: Vec<&str> = attestations
+        let mut hosts: Vec<(&str, Vec<PublicKey>)> = attestations
             .iter()
             .map(|a| a.registrar.as_str())
             .filter(|h| self.trusts(h))
+            .map(|host| {
+                let named = attestations
+                    .iter()
+                    .filter(|a| a.registrar == host)
+                    .map(|a| a.registrar_key)
+                    .collect();
+                (host, named)
+            })
             .collect();
         hosts.sort_unstable();
+        hosts.dedup_by_key(|(host, _)| *host);
+        self.refresh_hosts(Fingerprint::of(identity), &hosts, now, None)
+            .await;
+    }
+
+    /// Refresh, where they are due, the lists of the registrars that
+    /// attested `fp` when it was admitted, whatever card it shows now,
+    /// which is what a sweep must keep asking: those it holds a list
+    /// from, and those it was admitted while unable to reach. A registrar
+    /// that has failed since `sweep` began is not asked again in it.
+    pub async fn refresh_held(&self, fp: Fingerprint, now: u64, sweep: Instant) {
+        let cache = self.cache.clone();
+        let held = crate::spawn_blocking("identity", move || cache.lists(&fp.0)).await;
+        let mut hosts: Vec<String> = match held {
+            Ok(Ok(held)) => held.into_iter().map(|l| l.registrar).collect(),
+            _ => return,
+        };
+        hosts.extend(
+            self.attested
+                .lock()
+                .unwrap()
+                .get(&fp)
+                .into_iter()
+                .flat_map(|(hosts, _)| hosts)
+                .cloned(),
+        );
+        hosts.sort_unstable();
         hosts.dedup();
-        let each = hosts.into_iter().map(|host| async move {
-            let named: Vec<PublicKey> = attestations
-                .iter()
-                .filter(|a| a.registrar == host)
-                .map(|a| a.registrar_key)
-                .collect();
-            if let Err(e) = self.refresh_one(identity, host, now, &named).await {
-                warn!(registrar = host, "identity records: {e}");
+        let hosts: Vec<(&str, Vec<PublicKey>)> = hosts
+            .iter()
+            .filter(|h| self.trusts(h))
+            .map(|h| (h.as_str(), Vec::new()))
+            .collect();
+        self.refresh_hosts(fp, &hosts, now, Some(sweep)).await;
+    }
+
+    /// Forget the registrars that attested identities with no session
+    /// here now, but for one admitted within `ADMITTING`, whose session
+    /// may not have attached yet.
+    pub fn retain_attested(&self, live: &[Fingerprint]) {
+        let live: HashSet<&Fingerprint> = live.iter().collect();
+        self.attested
+            .lock()
+            .unwrap()
+            .retain(|fp, (_, at)| live.contains(fp) || at.elapsed() < ADMITTING);
+    }
+
+    async fn refresh_hosts(
+        &self,
+        fp: Fingerprint,
+        hosts: &[(&str, Vec<PublicKey>)],
+        now: u64,
+        sweep: Option<Instant>,
+    ) {
+        let each = hosts.iter().map(|(host, named)| async move {
+            let failed_since = |since: Instant| {
+                self.failed
+                    .lock()
+                    .unwrap()
+                    .get(*host)
+                    .is_some_and(|at| *at >= since)
+            };
+            if sweep.is_some_and(failed_since) {
+                return;
+            }
+            match tokio::time::timeout(self.cfg.timeout, self.refresh_one(fp, host, now, named))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(registrar = host, "identity records: {e}"),
+                Err(_) => {
+                    self.failed
+                        .lock()
+                        .unwrap()
+                        .insert(host.to_string(), Instant::now());
+                    warn!(registrar = host, "identity records: no answer in time");
+                }
             }
         });
-        let all = futures_util::future::join_all(each);
-        if tokio::time::timeout(self.cfg.timeout, all).await.is_err() {
-            warn!("identity records: registrars did not all answer in time");
-        }
+        futures_util::future::join_all(each).await;
     }
 
     async fn refresh_one(
         &self,
-        identity: &PublicKey,
+        fp: Fingerprint,
         host: &str,
         now: u64,
         named: &[PublicKey],
     ) -> Result<(), String> {
-        let fp = Fingerprint::of(identity);
         let cache = self.cache.clone();
-        let held = crate::spawn_blocking("identity", move || cache.lists(&fp.0))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.0)?
-            .into_iter()
-            .find(|l| l.registrar == host);
+        let (owned, max_age) = (host.to_owned(), self.cfg.max_age);
+        // Read, and checked against the clock, off the reactor: checking
+        // is verifying signatures.
+        let (held, current) = crate::spawn_blocking("identity", move || {
+            let held = cache
+                .lists(&fp.0)?
+                .into_iter()
+                .find(|l| l.registrar == owned);
+            let current = held.as_ref().is_some_and(|l| current(l, max_age, now));
+            Ok::<_, hxd_core::inbox::StoreError>((held, current))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.0)?;
         // An attestation is anyone's to write: only one under a key the
         // registrar publishes sends this server to it, after asking once
         // whether that key is one it has rotated to since.
@@ -228,12 +320,23 @@ impl Registrars {
             named.is_empty() || named.iter().any(|k| keys.contains(k))
         };
         if !published(self) {
-            self.discover(host, true).await?;
+            // An operator's key is not one discovery can change.
+            if !self.cfg.keys.contains_key(host) {
+                self.discover(host, true).await?;
+            }
             if !published(self) {
                 return Err("attested under a key the registrar does not publish".into());
             }
         }
-        if held.as_ref().is_some_and(|l| self.current(l, now)) {
+        {
+            let mut attested = self.attested.lock().unwrap();
+            let (hosts, at) = attested
+                .entry(fp)
+                .or_insert_with(|| (HashSet::new(), Instant::now()));
+            hosts.insert(host.to_owned());
+            *at = Instant::now();
+        }
+        if current && held.as_ref().is_some_and(|l| self.under_configured_key(l)) {
             return Ok(());
         }
         let records = self.discover(host, false).await?;
@@ -250,7 +353,15 @@ impl Registrars {
                 None => format!("{records}/{fp}"),
                 Some(seq) => format!("{records}/{fp}?since={seq}"),
             };
-            let bytes = self.get(host, &path, "application/cbor").await?;
+            let bytes = self
+                .get(host, &path, "application/cbor")
+                .await
+                .inspect_err(|_| {
+                    self.failed
+                        .lock()
+                        .unwrap()
+                        .insert(host.to_owned(), Instant::now());
+                })?;
             let page = SignedList::parse(&bytes, ListKind::Records, rk)
                 .map_err(|e| format!("record list did not verify: {e}"))?;
             if page.fingerprint != Some(fp.0) {
@@ -293,13 +404,6 @@ impl Registrars {
         })
         .await
         .map_err(|e| e.to_string())?
-    }
-
-    /// A list fetched within `max_age` and not past its own `expires`.
-    fn current(&self, held: &CachedList, now: u64) -> bool {
-        now.saturating_sub(held.fetched) < self.cfg.max_age.as_secs()
-            && self.under_configured_key(held)
-            && verified(held).is_some_and(|pages| pages.iter().all(|p| p.expires > now))
     }
 
     /// A list from an operator-keyed registrar counts only if it was
@@ -434,11 +538,43 @@ impl Registrars {
         }
     }
 
+    /// What the held lists of `identities` (fingerprints) refuse, as one
+    /// list: each identity revoked, or frozen when `frozen_refuses`, and
+    /// each device an identity revoked, as that identity's. Reads the
+    /// store and verifies: called off the reactor.
+    pub fn refused(&self, identities: &[Fingerprint], frozen_refuses: bool) -> hxd_core::Published {
+        let mut refused = hxd_core::Published::default();
+        for fp in identities {
+            let mut frozen: HashMap<String, bool> = HashMap::new();
+            for record in self.lookup_fp(*fp, &[], 0).records {
+                match record {
+                    Record::RevokeIdentity(_) => {
+                        refused.identities.insert(fp.0);
+                    }
+                    Record::RevokeDevice(r) => {
+                        refused.devices.insert((fp.0, Fingerprint::of(&r.device).0));
+                    }
+                    Record::Freeze(f) => {
+                        frozen.insert(f.registrar, f.frozen);
+                    }
+                    _ => {}
+                }
+            }
+            if frozen_refuses && frozen.values().any(|f| *f) {
+                refused.identities.insert(fp.0);
+            }
+        }
+        refused
+    }
+
     /// What the cached lists of the trusted registrars say of `identity`,
     /// and whether one of `hosts` (the registrars that attested it) has
     /// none current. Reads the store: called off the reactor.
     pub fn lookup(&self, identity: &PublicKey, hosts: &[String], now: u64) -> Lookup {
-        let fp = Fingerprint::of(identity);
+        self.lookup_fp(Fingerprint::of(identity), hosts, now)
+    }
+
+    fn lookup_fp(&self, fp: Fingerprint, hosts: &[String], now: u64) -> Lookup {
         let held = match self.cache.lists(&fp.0) {
             Ok(held) => held,
             Err(e) => {
@@ -448,10 +584,11 @@ impl Registrars {
         };
         let mut lookup = Lookup::default();
         for host in hosts.iter().filter(|h| self.trusts(h)) {
-            if !held
-                .iter()
-                .any(|l| &l.registrar == host && self.current(l, now))
-            {
+            if !held.iter().any(|l| {
+                &l.registrar == host
+                    && self.under_configured_key(l)
+                    && current(l, self.cfg.max_age, now)
+            }) {
                 lookup.stale = true;
             }
         }
@@ -470,7 +607,7 @@ impl Registrars {
             for page in pages.iter().filter(|p| p.fingerprint == Some(fp.0)) {
                 for (_, bytes) in &page.entries {
                     match Record::parse(bytes, Some(keys)) {
-                        Ok(r) if r.identity() == identity => lookup.records.push(r),
+                        Ok(r) if Fingerprint::of(r.identity()) == fp => lookup.records.push(r),
                         Ok(_) => {}
                         Err(e) => debug!(registrar = %l.registrar, "a record did not verify: {e}"),
                     }
@@ -480,6 +617,12 @@ impl Registrars {
         lookup.records.sort_by_key(Record::time);
         lookup
     }
+}
+
+/// A list fetched within `max_age` and not past its own `expires`.
+fn current(held: &CachedList, max_age: Duration, now: u64) -> bool {
+    now.saturating_sub(held.fetched) < max_age.as_secs()
+        && verified(held).is_some_and(|pages| pages.iter().all(|p| p.expires > now))
 }
 
 /// The keys of `keys` whose `until` has not passed.
@@ -521,6 +664,46 @@ mod tests {
     use super::*;
     use hl_identity::ServerKey;
 
+    fn registrars(cache: Arc<dyn RecordCache>) -> Registrars {
+        Registrars::new(
+            RegistrarsConfig {
+                keys: HashMap::new(),
+                trusted: vec!["hl.example".into()],
+                urls: HashMap::new(),
+                timeout: Duration::from_secs(1),
+                max_age: Duration::from_secs(1),
+                stale: Stale::Cached,
+                user_agent: String::new(),
+            },
+            cache,
+        )
+    }
+
+    #[test]
+    fn an_identity_still_being_admitted_keeps_its_registrars() {
+        let r = registrars(Arc::new(
+            hxd_core::identity_records::MemoryRecordCache::default(),
+        ));
+        let (admitting, gone, live) = (
+            Fingerprint([1; 32]),
+            Fingerprint([2; 32]),
+            Fingerprint([3; 32]),
+        );
+        let long_ago = Instant::now() - ADMITTING;
+        {
+            let mut attested = r.attested.lock().unwrap();
+            let hosts = || HashSet::from(["hl.example".to_owned()]);
+            attested.insert(admitting, (hosts(), Instant::now()));
+            attested.insert(gone, (hosts(), long_ago));
+            attested.insert(live, (hosts(), long_ago));
+        }
+        r.retain_attested(&[live]);
+        let attested = r.attested.lock().unwrap();
+        assert!(attested.contains_key(&admitting));
+        assert!(!attested.contains_key(&gone));
+        assert!(attested.contains_key(&live));
+    }
+
     #[test]
     fn a_retiring_key_held_is_used_only_until_its_deadline() {
         let (old, new) = ([1; 32], [2; 32]);
@@ -537,18 +720,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let registrars = Registrars::new(
-            RegistrarsConfig {
-                keys: HashMap::new(),
-                trusted: vec!["hl.example".into()],
-                urls: HashMap::new(),
-                timeout: Duration::from_secs(1),
-                max_age: Duration::from_secs(1),
-                stale: Stale::Cached,
-                user_agent: String::new(),
-            },
-            cache,
-        );
+        let registrars = registrars(cache);
         assert_eq!(registrars.keys("hl.example", &identity, 99), [old, new]);
         assert_eq!(registrars.keys("hl.example", &identity, 100), [new]);
     }

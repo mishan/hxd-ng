@@ -276,9 +276,10 @@ continues in this order and fails on the first error:
 4. the server-local revocation list first (§12, `identity-registrar.md`
    §7.3), then records fetched per `identity-registrar.md` §7.2 and
    applied per §7.3 there; a stale cache is `[identity]
-   revocation_stale`. *(Built, but for rotation, which
-   `identity-records.md` stages as R2: records are fetched at `auth`,
-   and at a certificate-only re-admission.)*
+   revocation_stale`. A minute's sweep keeps the lists of the
+   identities with sessions here current, and ends a session as soon as
+   its list refuses it. *(Built, but for rotation, which
+   `identity-records.md` stages as R2.)*
 5. attestations verified against trusted registrars, expired or untrusted
    ones discarded, and, after attestation revocations are applied, age
    computed from the oldest surviving `registered`;
@@ -766,7 +767,7 @@ section because hxd-ng has one profile and one switch.
 | `[identity] revocation_stale` | `cached` | `cached`, `guest`, `deny`: what §5.2 step 4 does when the registrar is unreachable and the cache is past its lifetime, or holds nothing (`identity-registrar.md` §7.2) |
 | `[identity] frozen` | `deny` | `deny`, `guest`: what a frozen identity is admitted as (`identity-registrar.md` §7.3) |
 | `[identity] revoked_devices`, `revoked_identities` | empty | Fingerprints refused by hand, consulted before any registrar (`identity-registrar.md` §7.3). A revoked identity refuses every device of it; a revoked device, only itself. Refused at `/identity/auth` with `revoked`, and a token minted before the revocation no longer redeems. SIGHUP re-reads these two lists and nothing else, and installing them, at startup or on SIGHUP, ends every session they now refuse, live or detached, on either wire. `hxd identity revoke <fingerprint> [--device] [--lift]` edits them in the config file |
-| `[identity] banned_registrars` | empty | *(not implemented)* Hosts whose identities are refused outright, before the admission policy runs (`identity-registrar.md` §7.3) |
+| `[identity] banned_registrars` | empty | Hosts whose identities are refused outright with `denied`, before the admission policy runs: any attestation on the card naming one, verified or not, refuses it (`identity-registrar.md` §7.3). At `/identity/auth`, a ban's `*@host` reads every attestation on the card the same way; a re-admission and a socket login read the accepted handle |
 | `[identity] newcomer_delay` | `120` | *(not implemented)* Seconds before a never-seen `unknown` key may chat, message or post; `0` disables (`identity-registrar.md` §7.3) |
 
 Account files gain an `[identity]` table: `fingerprint` (the 52-character

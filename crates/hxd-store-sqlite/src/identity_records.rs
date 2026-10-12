@@ -44,19 +44,15 @@ fn key(b: &[u8]) -> ([u8; 32], Option<u64>) {
     )
 }
 
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<([u8; 32], CachedList)> {
-    let identity: Vec<u8> = r.get(0)?;
-    let fetched: i64 = r.get(3)?;
-    let keys: Vec<u8> = r.get(4)?;
-    Ok((
-        identity.try_into().unwrap_or([0; 32]),
-        CachedList {
-            registrar: r.get(1)?,
-            pages: decode(&r.get::<_, Vec<u8>>(2)?),
-            fetched: u64::try_from(fetched).unwrap_or(0),
-            keys: keys.chunks_exact(40).map(key).collect(),
-        },
-    ))
+fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CachedList> {
+    let fetched: i64 = r.get(2)?;
+    let keys: Vec<u8> = r.get(3)?;
+    Ok(CachedList {
+        registrar: r.get(0)?,
+        pages: decode(&r.get::<_, Vec<u8>>(1)?),
+        fetched: u64::try_from(fetched).unwrap_or(0),
+        keys: keys.chunks_exact(40).map(key).collect(),
+    })
 }
 
 impl RecordCache for SqliteStore {
@@ -86,18 +82,9 @@ impl RecordCache for SqliteStore {
     fn lists(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = sql(conn.prepare_cached(
-            "SELECT identity, registrar, list, fetched, keys FROM identity_records WHERE identity = ?1",
+            "SELECT registrar, list, fetched, keys FROM identity_records WHERE identity = ?1",
         ))?;
         let rows = sql(stmt.query_map(params![identity.to_vec()], row))?;
-        rows.map(|r| sql(r).map(|(_, list)| list)).collect()
-    }
-
-    fn all(&self) -> Result<Vec<([u8; 32], CachedList)>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = sql(conn.prepare_cached(
-            "SELECT identity, registrar, list, fetched, keys FROM identity_records",
-        ))?;
-        let rows = sql(stmt.query_map([], row))?;
         rows.map(sql).collect()
     }
 }

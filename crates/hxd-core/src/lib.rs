@@ -76,7 +76,7 @@ pub use news::{
 };
 pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};
-pub use revoked::Revocations;
+pub use revoked::{Published, Revocations};
 pub use roster::{
     AttachInfo, Census, Core, Event, Events, IdentityTag, InboxPolicy, Lag, LoginPermit, Resume,
     SeqEvent, SessionStatus, Transport, Uid, UserDetails, UserInfo, LIVE_QUEUE_BYTES,

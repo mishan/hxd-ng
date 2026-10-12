@@ -30,8 +30,6 @@ pub trait RecordCache: Send + Sync {
     /// one said.
     fn put(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError>;
     fn lists(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError>;
-    /// Every identity's, for the sweep.
-    fn all(&self) -> Result<Vec<([u8; 32], CachedList)>, StoreError>;
 }
 
 /// A [`RecordCache`] a restart forgets, for a server without a store.
@@ -54,11 +52,6 @@ impl RecordCache for MemoryRecordCache {
             .filter(|((id, _), _)| id == identity)
             .map(|(_, list)| list.clone())
             .collect())
-    }
-
-    fn all(&self) -> Result<Vec<([u8; 32], CachedList)>, StoreError> {
-        let lists = self.0.lock().unwrap();
-        Ok(lists.iter().map(|((id, _), l)| (*id, l.clone())).collect())
     }
 }
 

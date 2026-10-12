@@ -919,7 +919,13 @@ enum Trust {
 
 /// A server that trusts the registrar `r` and reaches it at `url`,
 /// every path inside `dir`.
-async fn verifier(dir: &Path, r: &Server, trust: Trust, url: &str, extra: &str) -> SocketAddr {
+async fn verifier(
+    dir: &Path,
+    r: &Server,
+    trust: Trust,
+    url: &str,
+    extra: &str,
+) -> (SocketAddr, Arc<hxd_ng_session::IdentityState>) {
     let d = dir.display();
     let trust = match trust {
         Trust::Key => format!(
@@ -945,10 +951,11 @@ async fn verifier(dir: &Path, r: &Server, trust: Trust, url: &str, extra: &str) 
     let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
         .unwrap()
         .unwrap();
+    let identity = ng_ctx.identity.clone().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = listener.local_addr().unwrap();
     tokio::spawn(hxd_ng_session::serve(listener, ng_ctx));
-    ng
+    (ng, identity)
 }
 
 /// `/identity/auth` at `at` as `dev` of `id`, showing `card`.
@@ -999,7 +1006,9 @@ async fn a_verifying_server_applies_what_the_registrar_publishes() {
     let r = start(&at, "signup = \"open\"").await;
     let there = dir.path().join("verifier");
     std::fs::create_dir_all(&there).unwrap();
-    let v = verifier(&there, &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let v = verifier(&there, &r, Trust::Key, &format!("http://{}", r.ng), "")
+        .await
+        .0;
     let alice = IdentityKey::from_seed(&[1; 32]);
     let (phone, laptop) = (
         DeviceKey::from_seed(&[101; 32]),
@@ -1110,7 +1119,7 @@ async fn records_are_kept_for_when_the_registrar_cannot_be_reached() {
 
     // Trusted on its discovery document: the key, and the lists, fetched.
     let live = format!("http://{}", r.ng);
-    let v = verifier(&there, &r, Trust::Discovery, &live, "").await;
+    let v = verifier(&there, &r, Trust::Discovery, &live, "").await.0;
     assert_eq!(auth_at(v, &alice, &dev, &alice_card).await.status, 403);
     assert_eq!(
         auth_at(v, &bob, &dev, &bob_card).await.json()["handle"],
@@ -1131,7 +1140,8 @@ async fn records_are_kept_for_when_the_registrar_cannot_be_reached() {
         &nowhere,
         "registrar_timeout = 1",
     )
-    .await;
+    .await
+    .0;
     let reply = auth_at(cached, &alice, &dev, &alice_card).await;
     assert_eq!(
         (reply.status, reply.json()["error"].clone()),
@@ -1150,7 +1160,8 @@ async fn records_are_kept_for_when_the_registrar_cannot_be_reached() {
         &nowhere,
         "registrar_timeout = 1\nrevocation_stale = \"guest\"",
     )
-    .await;
+    .await
+    .0;
     let reply = auth_at(guest, &alice, &dev, &alice_card).await;
     assert_eq!(
         (reply.status, reply.json()["error"].clone()),
@@ -1173,12 +1184,191 @@ async fn records_are_kept_for_when_the_registrar_cannot_be_reached() {
         &nowhere,
         "registrar_timeout = 1\nrevocation_stale = \"deny\"",
     )
-    .await;
+    .await
+    .0;
     let reply = auth_at(strict, &carol, &dev, &carol_card).await;
     assert_eq!(
         (reply.status, reply.json()["error"].clone()),
         (403, json!("denied"))
     );
+}
+
+/// An ng session at `at` for `id`'s device, logged in with the token its
+/// `/identity/auth` gave.
+async fn session_at(at: SocketAddr, id: &IdentityKey, card: &[u8]) -> hxd_testclient::ng::Client {
+    let dev = DeviceKey::from_seed(&[101; 32]);
+    let token = auth_at(at, id, &dev, card).await.json()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tcp = TcpStream::connect(at).await.unwrap();
+    let url = format!("ws://{at}/ng?token={token}");
+    let mut c = hxd_testclient::ng::Client::over(Box::new(tcp), &url)
+        .await
+        .unwrap();
+    c.login(json!({})).await.unwrap();
+    c
+}
+
+#[tokio::test]
+async fn a_key_its_registrar_revokes_loses_its_session_here_and_a_banned_registrar_its_identities()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let live = format!("http://{}", r.ng);
+    let (v, identity) = verifier(&there, &r, Trust::Key, &live, "").await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let bob = IdentityKey::from_seed(&[2; 32]);
+    let dev = DeviceKey::from_seed(&[101; 32]);
+    let alice_card = attested(&r, &alice, "alice").await;
+    let mut alice_here = session_at(v, &alice, &alice_card).await;
+    let mut bob_here = session_at(v, &bob, &attested(&r, &bob, "bobby").await).await;
+    let mallory = IdentityKey::from_seed(&[4; 32]);
+    let mut mallory_here = session_at(v, &mallory, &attested(&r, &mallory, "mallory").await).await;
+
+    // Nothing against anyone yet: a sweep ends nothing.
+    assert!(identity.sweep_records().await.is_empty());
+
+    // Mallory revokes "a device" with the key every session here happens
+    // to use. A device revocation is its identity's own: it ends hers and
+    // touches nobody else's.
+    let theirs = hl_identity::DeviceRevocation {
+        identity: mallory.public(),
+        device: dev.public(),
+        time: now(),
+        until: now() + 3600,
+        reason: None,
+        signer: None,
+        signer_cert: None,
+    }
+    .sign(&mallory)
+    .unwrap();
+    assert_eq!(
+        post(&r, "/registrar/records", json!({ "record": b64(&theirs) }))
+            .await
+            .status,
+        200
+    );
+
+    // Alice shows a card that names no registrar, and is then revoked at
+    // hers: the sweep asks the registrar that attested her when she was
+    // admitted, not the one her card names now.
+    let token = auth_at(v, &alice, &dev, &alice_card).await.json()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bare = Card::new(&alice, "Alice", now() + 5)
+        .sign(&alice, vec![])
+        .unwrap();
+    let put = http_as(
+        v,
+        &v.to_string(),
+        "PUT",
+        "/identity/card",
+        &[
+            ("Authorization", &format!("Bearer {token}")),
+            ("Content-Type", "application/cbor"),
+        ],
+        &bare,
+    )
+    .await;
+    assert_eq!(put.status, 200, "{}", String::from_utf8_lossy(&put.body));
+    let gone = hl_identity::IdentityRevocation {
+        identity: alice.public(),
+        time: now(),
+        reason: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    assert_eq!(
+        post(&r, "/registrar/records", json!({ "record": b64(&gone) }))
+            .await
+            .status,
+        200
+    );
+    next_list().await;
+    let ended = identity.sweep_records().await;
+    assert_eq!(ended.len(), 2, "{ended:?}");
+    alice_here.event("kicked").await.unwrap();
+    mallory_here.event("kicked").await.unwrap();
+    bob_here.request("ping", json!({})).await.unwrap();
+
+    // A registrar banned here refuses every identity it attested.
+    let banned = dir.path().join("banning");
+    std::fs::create_dir_all(&banned).unwrap();
+    let (strict, _) = verifier(
+        &banned,
+        &r,
+        Trust::Key,
+        &live,
+        "banned_registrars = [\"127.0.0.1\"]",
+    )
+    .await;
+    let card = attested(&r, &IdentityKey::from_seed(&[3; 32]), "carol").await;
+    let reply = auth_at(strict, &IdentityKey::from_seed(&[3; 32]), &dev, &card).await;
+    assert_eq!(
+        (reply.status, reply.json()["error"].clone()),
+        (403, json!("denied"))
+    );
+}
+
+#[tokio::test]
+async fn a_key_admitted_while_its_registrar_was_down_is_still_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let card = attested(&r, &alice, "alice").await;
+
+    // Admitted on nothing held: the registrar does not answer.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = closed.local_addr().unwrap();
+    drop(closed);
+    let (v, identity) = verifier(
+        &there,
+        &r,
+        Trust::Key,
+        &format!("http://{addr}"),
+        "registrar_timeout = 1",
+    )
+    .await;
+    let mut alice_here = session_at(v, &alice, &card).await;
+
+    // It answers again, and she is revoked there.
+    let up = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let to = r.ng;
+    tokio::spawn(async move {
+        loop {
+            let (mut a, _) = up.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut b = TcpStream::connect(to).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+            });
+        }
+    });
+    let gone = hl_identity::IdentityRevocation {
+        identity: alice.public(),
+        time: now(),
+        reason: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    assert_eq!(
+        post(&r, "/registrar/records", json!({ "record": b64(&gone) }))
+            .await
+            .status,
+        200
+    );
+    next_list().await;
+    assert_eq!(identity.sweep_records().await.len(), 1);
+    alice_here.event("kicked").await.unwrap();
 }
 
 #[tokio::test]
@@ -1214,7 +1404,8 @@ async fn a_registrars_retiring_key_is_honored_until_its_deadline() {
         &format!("http://{}", rotated.ng),
         "",
     )
-    .await;
+    .await
+    .0;
     assert_eq!(
         auth_at(v, &alice, &dev, &alice_card).await.json()["handle"],
         "alice@127.0.0.1"
@@ -1231,7 +1422,8 @@ async fn a_registrars_retiring_key_is_honored_until_its_deadline() {
         &format!("http://{}", retired.ng),
         "",
     )
-    .await;
+    .await
+    .0;
     let reply = auth_at(late, &alice, &dev, &alice_card).await;
     assert_eq!(
         (reply.status, reply.json()["handle"].clone()),
