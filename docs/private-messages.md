@@ -573,8 +573,8 @@ draft of this section made delivery the read on that wire — the flush
 set both — on the argument that a permanently unread inbox for every 1.x
 user would make the count useless. The consequence it did not state is
 the one a person with a phone and a period client meets: the phone's
-badge drops to zero because the Mac received the message
-(hxd-ng-design-review-2026-09.md §5.2). So the two are split.
+badge drops to zero because the Mac received the message. So the two
+are split.
 **Delivery to a legacy session sets `delivered_at` only.** `read_at` is
 set by the ng `msg_read` request, and by nothing on the legacy wire.
 `inbox.unread`, and the login reply's count, are messages with no

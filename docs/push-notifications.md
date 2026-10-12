@@ -40,8 +40,7 @@ once identity landed:
   through a relay its publisher runs (§8.1, §8.2).
 
 **Decision, 2026-09: the first gateway is `WebPushGateway`, in-process.**
-The design review (`hxd-ng-design-review-2026-09.md` §3, action 1) is
-right that the sidecar is more than the first gateway needs. A native
+The sidecar is more than the first gateway needs. A native
 Web Push sender — VAPID (RFC 8292), the delivery protocol (RFC 8030) and
 the payload encryption (RFC 8291) — is one crate behind the existing
 `NotificationGateway` trait, no daemon, no Redis, and it is the escape
