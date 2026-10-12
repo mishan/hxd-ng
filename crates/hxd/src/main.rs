@@ -277,6 +277,32 @@ enum Command {
     AccountRm {
         login: String,
     },
+    AccountRoles {
+        login: String,
+        changes: Vec<String>,
+    },
+    RoleList,
+    RoleShow {
+        name: String,
+    },
+    RoleAdd {
+        name: String,
+        title: Option<String>,
+        color: Option<String>,
+        position: Option<i64>,
+        access: Option<String>,
+    },
+    RoleAccess {
+        name: String,
+        changes: Vec<String>,
+    },
+    RoleExtra {
+        name: String,
+        changes: Vec<String>,
+    },
+    RoleRm {
+        name: String,
+    },
     LinkStatus,
     LinkSuspend {
         peer: String,
@@ -313,6 +339,13 @@ hxd [--config …] account add <login> [--name N] [--access KEY,… | --like LOG
 hxd [--config …] account passwd <login> (--password-stdin | --password-file F)\n  \
 hxd [--config …] account access <login> KEY=on|off…\n  \
 hxd [--config …] account rm <login>\n  \
+hxd [--config …] account roles <login> [+ROLE|-ROLE…]\n  \
+hxd [--config …] role list\n  \
+hxd [--config …] role show <name>\n  \
+hxd [--config …] role add <name> [--title T] [--color 0xRRGGBB] [--position N]\n    \
+[--access KEY,…]\n  \
+hxd [--config …] role access|extra <name> KEY=on|off…\n  \
+hxd [--config …] role rm <name>\n  \
 hxd [--config …] link status\n  \
 hxd [--config …] link suspend|resume <peer>\n  \
 hxd [--config …] link reset-id\n\n\
@@ -368,7 +401,14 @@ docs/access-bits.md), or from the account --like names; a password\n\
 never goes on the command line. `rm` leaves the account's mail for\n\
 `inbox purge`. A running server applies an edit to whoever is logged\n\
 in as the account on SIGHUP, ending the sessions of one removed; a\n\
-new login sees it at once.\n\n\
+new login sees it at once. `roles` adds (+) or takes (-) the roles an\n\
+account lists, and `access` sets the account's own keys, which win over\n\
+its roles either way.\n\n\
+`role` edits the [roles] file, keeping its comments: a role grants its\n\
+access and extra keys to every account listing it, and `everyone` to\n\
+every account, the guest included. Off takes a key out of a role, which\n\
+only grants. `rm` takes the role out of every account first. A running\n\
+server applies a role edit to every session on SIGHUP.\n\n\
 `link status` says how each [[link.peer]] stands, as the running server\n\
 last wrote it. `link suspend` pauses a peer's link: on SIGHUP it is\n\
 closed, what it showed goes, and every attempt to link is refused until\n\
@@ -399,11 +439,28 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut name = None;
     let mut like = None;
     let mut access = None;
+    let mut title = None;
+    let mut color = None;
+    let mut position = None;
     let mut password = hxd::accounts::Password::None;
     let mut no_password = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            // `-name` takes a role from an account, and is no flag.
+            other
+                if !matches!(other, "-c" | "-h")
+                    && !other.starts_with("--")
+                    && other
+                        .strip_prefix('-')
+                        .is_some_and(hxd_auth_file::roles::valid_name)
+                    && matches!(
+                        rest.iter().map(String::as_str).collect::<Vec<_>>()[..],
+                        ["account", "roles", _, ..]
+                    ) =>
+            {
+                rest.push(other.to_string())
+            }
             "--config" | "-c" => {
                 config = args
                     .next()
@@ -462,6 +519,19 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             }
             "--access" => {
                 access = Some(args.next().ok_or("--access needs KEY,KEY…")?);
+            }
+            "--title" => {
+                title = Some(args.next().ok_or("--title needs a value")?);
+            }
+            "--color" => {
+                color = Some(args.next().ok_or("--color needs 0xRRGGBB")?);
+            }
+            "--position" => {
+                position = Some(
+                    args.next()
+                        .and_then(|n| n.parse::<i64>().ok())
+                        .ok_or("--position needs a number")?,
+                );
             }
             "--password-stdin" => password = hxd::accounts::Password::Stdin,
             "--password-file" => {
@@ -563,15 +633,29 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
         && matches!(
             words.first(),
             Some(
-                &"history" | &"media" | &"reports" | &"moderation" | &"ban" | &"account" | &"link"
+                &"history"
+                    | &"media"
+                    | &"reports"
+                    | &"moderation"
+                    | &"ban"
+                    | &"account"
+                    | &"role"
+                    | &"link"
             )
         )
     {
         return Err("--fingerprint and --dry-run belong to `inbox purge` and `purge`".to_string());
     }
     let adding = matches!(words[..], ["account", "add", _]);
-    if (name.is_some() || like.is_some() || access.is_some() || no_password) && !adding {
-        return Err("--name, --like, --access and --no-password belong to `account add`".into());
+    let adding_role = matches!(words[..], ["role", "add", _]);
+    if (name.is_some() || like.is_some() || no_password) && !adding {
+        return Err("--name, --like and --no-password belong to `account add`".into());
+    }
+    if access.is_some() && !adding && !adding_role {
+        return Err("--access belongs to `account add` and `role add`".into());
+    }
+    if (title.is_some() || color.is_some() || position.is_some()) && !adding_role {
+        return Err("--title, --color and --position belong to `role add`".into());
     }
     if !matches!(password, hxd::accounts::Password::None)
         && !adding
@@ -739,6 +823,32 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
         }
         ["account", "rm", login] => Command::AccountRm {
             login: login.to_string(),
+        },
+        ["account", "roles", login, ref changes @ ..] => Command::AccountRoles {
+            login: login.to_string(),
+            changes: changes.iter().map(|c| c.to_string()).collect(),
+        },
+        ["role", "list"] => Command::RoleList,
+        ["role", "show", name] => Command::RoleShow {
+            name: name.to_string(),
+        },
+        ["role", "add", name] => Command::RoleAdd {
+            name: name.to_string(),
+            title,
+            color,
+            position,
+            access,
+        },
+        ["role", "access", name, ref changes @ ..] if !changes.is_empty() => Command::RoleAccess {
+            name: name.to_string(),
+            changes: changes.iter().map(|c| c.to_string()).collect(),
+        },
+        ["role", "extra", name, ref changes @ ..] if !changes.is_empty() => Command::RoleExtra {
+            name: name.to_string(),
+            changes: changes.iter().map(|c| c.to_string()).collect(),
+        },
+        ["role", "rm", name] => Command::RoleRm {
+            name: name.to_string(),
         },
         ["link", "status"] => Command::LinkStatus,
         ["link", verb @ ("suspend" | "resume"), peer] => Command::LinkSuspend {
@@ -981,6 +1091,50 @@ async fn main() {
             }
             Command::AccountRm { login } => {
                 println!("{}", hxd::accounts::remove(&config, login)?);
+                return Ok(());
+            }
+            Command::AccountRoles { login, changes } => {
+                println!("{}", hxd::accounts::set_roles(&config, login, changes)?);
+                return Ok(());
+            }
+            Command::RoleList => {
+                println!("{}", hxd::roles::list(&config)?);
+                return Ok(());
+            }
+            Command::RoleShow { name } => {
+                println!("{}", hxd::roles::show(&config, name)?);
+                return Ok(());
+            }
+            Command::RoleAdd {
+                name,
+                title,
+                color,
+                position,
+                access,
+            } => {
+                println!(
+                    "{}",
+                    hxd::roles::add(
+                        &config,
+                        name,
+                        title.as_deref(),
+                        color.as_deref(),
+                        *position,
+                        access.as_deref(),
+                    )?
+                );
+                return Ok(());
+            }
+            Command::RoleAccess { name, changes } => {
+                println!("{}", hxd::roles::set_access(&config, name, changes)?);
+                return Ok(());
+            }
+            Command::RoleExtra { name, changes } => {
+                println!("{}", hxd::roles::set_extra(&config, name, changes)?);
+                return Ok(());
+            }
+            Command::RoleRm { name } => {
+                println!("{}", hxd::roles::remove(&config, name)?);
                 return Ok(());
             }
             _ => {}

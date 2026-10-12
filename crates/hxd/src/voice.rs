@@ -142,6 +142,7 @@ mod tests {
             },
             limits: Default::default(),
             paths: Default::default(),
+            roles: Default::default(),
             ng: None,
             voice,
             identity: None,

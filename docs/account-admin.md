@@ -24,9 +24,9 @@ anyone: a session may write or delete only an account that may do
 nothing the session's own account may not, and may not leave one able
 to. "May do" is the access bits and the server-local policy the file
 grants beside them — `moderate`, `can_spam`, `set_subject`,
-`attach_news`, `file_list`, `file_getinfo` — whether said in `[extra]`
-or derived, since a new account given the kick bit moderates by
-default. Not `can_detach`, `inbox` or `set_avatar`: those follow from a
+`attach_news`, `file_list`, `file_getinfo`, `manage_roles` — whether
+said in `[extra]`, granted by a role (roles.md) or derived, since a new
+account given the kick bit moderates by default. Not `can_detach`, `inbox` or `set_avatar`: those follow from a
 password and say an account is one person, not what it may do to
 anyone else, so a password-less administrator may still give an account
 a password. Without that, `modify_users` is every privilege there is,
@@ -53,7 +53,10 @@ The file backend rewrites only the keys an edit's bits change, with
 survive any number of edits from any client. A set bit with no name goes
 to `raw_bits`. Bit 56 (`read_chat_history`) with no key follows
 `read_chat` (access-bits.md), so it is written out only where it parts
-from it, and an account that never named it goes on following it.
+from it, and an account that never named it goes on following it. A
+bit the account's roles give is written only as `false`, while it is
+unset; set, it has no key and goes on following the roles (roles.md
+§6.1).
 
 Passwords are capped at 31 characters on every path, since a classic
 login cuts its password there and a longer one could never be typed on
@@ -194,18 +197,36 @@ hxd account add <login> [--name N] [--access KEY,… | --like LOGIN] \
     (--password-stdin | --password-file F | --no-password)
 hxd account passwd <login> (--password-stdin | --password-file F)
 hxd account access <login> KEY=on|off…
+hxd account roles <login> [+ROLE|-ROLE…]
 hxd account rm <login>
+
+hxd role list
+hxd role show <name>
+hxd role add <name> [--title T] [--color 0xRRGGBB] [--position N] [--access KEY,…]
+hxd role access <name> KEY=on|off…
+hxd role extra <name> KEY=on|off…
+hxd role rm <name>
 ```
 
 Against the accounts directory directly, so they work with the server
 down; a running server applies them on SIGHUP (§3). A password never
 goes on the command line, where `ps` shows it to everyone on the host.
 `add` takes its access from `--access`, from the account `--like` names
-(the guest account is the usual template), or none; an account with no
-password and no linked identity is an open door, so `--no-password` has
-to be said. `access` leaves history as the file has it — following
-`read_chat`, or set apart from it — unless the same command names
-`read_chat_history`.
+(the guest account is the usual template), or what `everyone` gives;
+`--like` copies that account's roles and `[access]` keys. An account
+with no password and no linked identity is an open door, so
+`--no-password` has to be said. `access` sets the file's own keys, which win over its roles either way,
+writing `off` only where something else grants the bit, and leaves
+history as the file has it — following `read_chat`, or set apart from
+it — unless the same command names `read_chat_history`. `roles` adds or
+takes the roles an account lists; with no changes it shows them, and
+`show` prints the roles apart from the file's own keys.
+
+`hxd role` edits the roles file (roles.md §2.3) the same way, and a
+running server reads it again on SIGHUP with the accounts, telling
+every session what its account now resolves to. A role only grants, so
+`off` takes a key out of it. `rm` refuses `everyone`, and takes the role
+out of every account file listing it before the roles file.
 
 The command line and the server do not hold one lock between them, so
 an edit made while the server links an identity to the same account can

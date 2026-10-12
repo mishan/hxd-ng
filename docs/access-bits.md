@@ -60,7 +60,7 @@ send_msgs = true
 raw_bits = [58]
 ```
 
-Three rules worth knowing:
+Rules worth knowing:
 
 - **A key that is not a name is a startup warning, not a silent no.** A
   typo'd `send_msg` is logged as an unknown access key and ignored,
@@ -73,6 +73,12 @@ Three rules worth knowing:
   `read_chat_history` nor `chat_history` and grants `read_chat`, bit 56
   is set too — fogWraith's rule for an access system that predates the
   allocation. An explicit key, either way, wins.
+- **Roles come first, and the file's own keys win either way.** What
+  `everyone` and the roles an account lists grant (roles.md §3) is
+  where its file starts: a key set `true` grants what no role does, one
+  set `false` withholds what a role grants, and `raw_deny = [58]` does
+  that for a bit with no name. Without roles, `false` and absent are
+  the same.
 - **Defaults derive after a session's mask.** A session can be denied
   bits and `[extra]` keys whatever its account says (`DenyMask`, the
   probation mask of §5), and a denied bit takes what derives from it
@@ -220,7 +226,9 @@ bit and no client-visible representation, which is exactly why they are
 here and not in the bitmap. Every one of them is optional, and an absent
 key derives a default rather than being false: from the bits a session's
 mask leaves (§1), and never past a mask that denies the key or the bit
-it derives from.
+it derives from. A role may grant any of them but `can_detach`, `inbox`,
+`set_avatar` and `vouch`, which say an account is one person
+(roles.md §5); a key a role grants is as good as `true` in the file.
 
 | `[extra]` key | Meaning | Default when absent |
 |---|---|---|
@@ -232,6 +240,7 @@ it derives from.
 | `can_spam` | Is this account held to no flood or request limit (`[limits]` `chat_lines`, `spam_points`, `ng_requests`, `news_posts`): mhxd's `can_spam` | Tracks `disconnect_users`, as mhxd's administrators have it |
 | `attach_news` | May this account stage durable images for news posts | Tracks `send_media` (bit 57), so image-upload policy has one default on both chat and news while an operator may narrow either account. Either way only an account that is one person stages: a staged handle is its uploader's, and `guest` is several people |
 | `set_avatar` | May this account set an avatar, on either wire (`avatars.md` §2). GIF Icons has no bit for it and the bitmap should not grow one | The same rule as `can_detach`: a password *or* a linked identity. Every change is decoded by this server and announced to every session on it, so the bootstrap guest does not get one. Clearing is never refused |
+| `manage_roles` | May this account create and edit roles (roles.md §5). One of the keys an administrator must hold to give | `false` |
 | `vouch` | May this account vouch for an identity key — `identity-vouch.md` §3.1, the requests in §3.2 there. *Design; not read by the server yet* | The same rule as `can_detach`: a password *or* a linked identity. An account that was itself created on the strength of a vouch derives `false` until the operator sets it |
 
 ---

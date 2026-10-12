@@ -7,12 +7,15 @@
 //! # accounts/alice.toml
 //! name = "Alice"
 //! password = "secret"     # omit or leave empty for password-less accounts
+//! roles = ["moderators"]  # what they grant comes first (`roles.rs`)
 //!
 //! [access]
 //! use_any_name = true
 //! send_msgs = true
 //! read_users = true
-//! # any named bit below; plus raw_bits = [55] as an escape hatch
+//! send_media = false      # false withholds what a role grants
+//! # any named bit below; plus raw_bits = [55] as an escape hatch, and
+//! # raw_deny = [58] to withhold a bit with no name
 //!
 //! [identity]              # portable identity (docs/hotline-ng-identity.md §8)
 //! fingerprint = "318s87c…" # 52-char fingerprint of the linked identity; set by
@@ -32,7 +35,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use hxd_core::access::{self, bit, AccessBits, NAMES};
@@ -42,6 +45,9 @@ use hxd_core::{
     AuthError, Extras, IdentityLink, LinkOutcome, Proof, UnlinkOutcome, WriteCheck,
 };
 use serde::Deserialize;
+
+pub mod roles;
+pub use roles::{Role, Roles, EVERYONE};
 
 /// The bit an account file's access key names, if any. Exposed so the
 /// binary can validate `[identity.default_access]` against the same
@@ -62,6 +68,9 @@ struct AccountFile {
     name: Option<String>,
     /// Plaintext-equivalent secret; omit/empty = password-less.
     password: Option<String>,
+    /// The roles whose grants come before this file's own keys.
+    #[serde(default)]
+    roles: Vec<String>,
     #[serde(default)]
     access: AccessTable,
     /// Server-local policy that never crosses the wire (mhxd's
@@ -118,6 +127,8 @@ struct ExtraTable {
     /// Is this account held to no flood limit? mhxd's `can_spam`.
     /// Default: the disconnect_users (kick) bit.
     can_spam: Option<bool>,
+    /// May this account create and edit roles? Default: false.
+    manage_roles: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -125,6 +136,10 @@ struct AccessTable {
     /// Escape hatch for bits without a name (reserved / future).
     #[serde(default)]
     raw_bits: Vec<u8>,
+    /// Bits withheld by number, whatever a role grants: a list of numbers
+    /// has no way to say `false`.
+    #[serde(default)]
+    raw_deny: Vec<u8>,
     /// Named bits — collected loosely so a typo is a startup-log warning,
     /// not a silently ignored key.
     #[serde(flatten)]
@@ -134,7 +149,7 @@ struct AccessTable {
 impl AccountFile {
     /// Everything but the password check: shared by `authenticate` and
     /// `lookup`.
-    fn into_account(self, login: String) -> Account {
+    fn into_account(self, login: String, roles: &Roles) -> Account {
         let stored = self.password.as_deref().unwrap_or("");
         let has_password = !stored.is_empty();
         let fingerprint = self
@@ -143,23 +158,7 @@ impl AccountFile {
             .as_deref()
             .and_then(hl_identity::Fingerprint::parse)
             .map(|fp| fp.0);
-        let x = &self.extra;
-        let config = AccountConfig {
-            access: self.access_bits(),
-            history_named: self.access.named.contains_key("read_chat_history")
-                || self.access.named.contains_key("chat_history"),
-            extra: Extras {
-                can_detach: x.can_detach,
-                set_subject: x.set_subject,
-                inbox: x.inbox,
-                file_list: x.file_list,
-                file_getinfo: x.file_getinfo,
-                attach_news: x.attach_news,
-                set_avatar: x.set_avatar,
-                moderate: x.moderate,
-                can_spam: x.can_spam,
-            },
-        };
+        let config = self.configure(roles);
         let identity = IdentityLink {
             fingerprint,
             // Derived true on an account with no password, whatever
@@ -173,7 +172,61 @@ impl AccountFile {
             reserve_name: self.identity.reserve_name.unwrap_or(false),
         };
         let name = self.name.unwrap_or_else(|| login.clone());
-        Account::new(login, name, has_password, identity, config)
+        let mut account = Account::new(login, name, has_password, identity, config);
+        account.roles = self.roles;
+        account
+    }
+
+    /// The configuration half of `docs/roles.md` §3: what `everyone` and
+    /// the listed roles grant, then this file's own keys over it either
+    /// way. A role names bit 56 only by granting it; the file names it
+    /// with either key or by withholding it in `raw_deny`.
+    fn configure(&self, roles: &Roles) -> AccountConfig {
+        let (mut access, granted) = roles.held(&self.roles).fold(
+            (AccessBits::empty(), Extras::<bool>::default()),
+            |(access, extra), role| {
+                (
+                    AccessBits::from_raw(access.raw() | role.access.raw()),
+                    extra.zip_with(role.extra, |a, b| a || b),
+                )
+            },
+        );
+        let mut history_named = access.has(bit::CHAT_HISTORY);
+        for (key, on) in &self.access.named {
+            if let Some(b) = named_bit(key) {
+                access = if *on {
+                    access.with(b)
+                } else {
+                    access.without(b)
+                };
+                history_named |= b == bit::CHAT_HISTORY;
+            }
+        }
+        for b in &self.access.raw_bits {
+            access = access.with(*b);
+        }
+        for b in &self.access.raw_deny {
+            access = access.without(*b);
+            history_named |= *b == bit::CHAT_HISTORY;
+        }
+        let x = &self.extra;
+        let own = Extras {
+            can_detach: x.can_detach,
+            set_subject: x.set_subject,
+            inbox: x.inbox,
+            file_list: x.file_list,
+            file_getinfo: x.file_getinfo,
+            attach_news: x.attach_news,
+            set_avatar: x.set_avatar,
+            moderate: x.moderate,
+            can_spam: x.can_spam,
+            manage_roles: x.manage_roles,
+        };
+        AccountConfig {
+            access,
+            history_named,
+            extra: own.zip_with(granted, |own, role| own.or(role.then_some(true))),
+        }
     }
 
     /// Is this a combination an operator should be told about at
@@ -197,21 +250,6 @@ impl AccountFile {
             ),
             _ => None,
         }
-    }
-
-    fn access_bits(&self) -> AccessBits {
-        let mut acc = AccessBits::empty();
-        for (key, on) in &self.access.named {
-            match named_bit(key) {
-                Some(b) if *on => acc = acc.with(b),
-                Some(_) => {}
-                None => {}
-            }
-        }
-        for b in &self.access.raw_bits {
-            acc = acc.with(*b);
-        }
-        acc
     }
 }
 
@@ -237,6 +275,9 @@ pub struct FileAuth {
     /// answered `NoSuchAccount` because as far as a would-be logger-in
     /// is concerned there is no account there.
     reserved: Option<String>,
+    /// The roles file, when there is one to read again on a reload.
+    roles_file: Option<PathBuf>,
+    roles: RwLock<Arc<Roles>>,
 }
 
 /// Enough of a file's metadata to notice an edit.
@@ -253,7 +294,62 @@ impl FileAuth {
             assoc: Mutex::new(()),
             index: Mutex::new(HashMap::new()),
             reserved: None,
+            roles_file: None,
+            roles: RwLock::new(Arc::new(Roles::default())),
         }
+    }
+
+    /// Resolve accounts with the roles the file at `path` defines, none
+    /// if there is no file there. One that does not parse is an error:
+    /// a server must not come up without roles it was configured with.
+    pub fn with_roles(mut self, path: impl Into<PathBuf>) -> Result<Self, String> {
+        let path = path.into();
+        self.roles = RwLock::new(Arc::new(Roles::load(&path)?));
+        self.roles_file = Some(path);
+        Ok(self)
+    }
+
+    /// The roles accounts are resolved with now.
+    pub fn roles(&self) -> Arc<Roles> {
+        self.roles.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The account file `login` names, as written, for an editor that
+    /// shows or copies what the file says rather than what it resolves to.
+    pub fn document(&self, login: &str) -> Result<toml_edit::DocumentMut, AdminError> {
+        let login = admin_login(login)?;
+        if self.is_reserved(&login) {
+            return Err(AdminError::NoSuchAccount);
+        }
+        let path = self.dir.join(format!("{login}.toml"));
+        let text = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => AdminError::NoSuchAccount,
+            _ => AdminError::Backend(format!("{}: {e}", path.display())),
+        })?;
+        text.parse()
+            .map_err(|e| AdminError::Backend(format!("{}: {e}", path.display())))
+    }
+
+    /// Change the existing account file `login` names with `f`, keeping
+    /// its comments, for the operator's commands that set single keys:
+    /// what `f` leaves must read as an account. Answers the account as
+    /// it now reads.
+    pub fn edit_account(
+        &self,
+        login: &str,
+        f: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
+    ) -> Result<Account, AdminError> {
+        let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
+        let mut doc = self.document(login)?;
+        f(&mut doc).map_err(AdminError::Backend)?;
+        let login = admin_login(login)?;
+        let path = self.dir.join(format!("{login}.toml"));
+        let failed =
+            |e: &dyn std::fmt::Display| AdminError::Backend(format!("{}: {e}", path.display()));
+        let text = doc.to_string();
+        let file: AccountFile = toml::from_str(&text).map_err(|e| failed(&e))?;
+        write_atomic(&path, &text).map_err(|e| failed(&e))?;
+        Ok(file.into_account(login, &self.roles()))
     }
 
     /// Reserve a login. Nothing authenticates as it and nothing looks it
@@ -288,8 +384,8 @@ impl FileAuth {
 
     /// Read every account file and report what an operator would want to
     /// know: files that do not parse, unreachable accounts, filenames that
-    /// lookup canonicalization cannot reach, and ignored identity/access
-    /// fields.
+    /// lookup canonicalization cannot reach, ignored identity/access
+    /// fields, and roles that do not exist.
     ///
     /// At startup, because that is where an operator looks. Warning from
     /// the *read* instead put the message where only the locked-out
@@ -306,6 +402,33 @@ impl FileAuth {
             }
         };
         let mut found = Vec::new();
+        let roles = self.roles();
+        if let Some(everyone) = roles.get(EVERYONE) {
+            // What `everyone` grants, the guest gets too.
+            let weighty = [
+                bit::CREATE_USERS,
+                bit::DELETE_USERS,
+                bit::READ_USERS,
+                bit::MODIFY_USERS,
+                bit::DISCONNECT_USERS,
+                bit::CANT_BE_DISCONNECTED,
+            ]
+            .into_iter()
+            .fold(AccessBits::empty(), AccessBits::with);
+            let mut given =
+                access::names_of(AccessBits::from_raw(everyone.access.raw() & weighty.raw())).0;
+            if everyone.extra.manage_roles {
+                given.push("manage_roles");
+            }
+            if !given.is_empty() {
+                let complaint = format!(
+                    "role {EVERYONE} grants {}, and every account holds it, the guest included",
+                    given.join(", ")
+                );
+                tracing::warn!("{complaint}");
+                found.push(complaint);
+            }
+        }
         for (login, _) in entries {
             if login != login.to_ascii_lowercase() {
                 let complaint = format!(
@@ -331,6 +454,12 @@ impl FileAuth {
                             "{login}.toml: identity.fingerprint is not a valid fingerprint; \
                              identity login will ignore it"
                         );
+                        tracing::warn!("{complaint}");
+                        found.push(complaint);
+                    }
+                    for name in f.roles.iter().filter(|name| roles.get(name).is_none()) {
+                        let complaint =
+                            format!("{login}.toml: no role {name:?}; it grants nothing");
                         tracing::warn!("{complaint}");
                         found.push(complaint);
                     }
@@ -473,7 +602,7 @@ impl AuthBackend for FileAuth {
                 }
             }
         }
-        Ok(file.into_account(login))
+        Ok(file.into_account(login, &self.roles()))
     }
 
     fn logins(&self) -> Result<Vec<String>, AuthError> {
@@ -491,7 +620,7 @@ impl AuthBackend for FileAuth {
             return Err(AuthError::NoSuchAccount);
         }
         let file = self.load(&login)?;
-        Ok(file.into_account(login))
+        Ok(file.into_account(login, &self.roles()))
     }
 
     fn find_by_fingerprint(&self, fingerprint: &[u8; 32]) -> Result<Option<Account>, AuthError> {
@@ -587,7 +716,7 @@ impl AuthBackend for FileAuth {
         // operator puts a `raw_bits` entry for a bit this build has no
         // name for yet; `write_access` keeps those.
         let mut acc = toml_edit::Table::new();
-        write_access(&mut acc, access, false);
+        write_access(&mut acc, access, self.roles().granted(&[]), false);
         doc["access"] = toml_edit::Item::Table(acc);
         let mut id = toml_edit::Table::new();
         id["fingerprint"] = toml_edit::value(hl_identity::Fingerprint(*fingerprint).to_string());
@@ -645,7 +774,7 @@ impl AccountAdmin for FileAuth {
     fn read_account(&self, login: &str) -> Result<Account, AdminError> {
         let login = admin_login(login)?;
         self.load(&login)
-            .map(|file| file.into_account(login))
+            .map(|file| file.into_account(login, &self.roles()))
             .map_err(admin_error)
     }
 
@@ -673,9 +802,10 @@ impl AccountAdmin for FileAuth {
         let path = self.dir.join(format!("{login}.toml"));
         let failed =
             |e: &dyn std::fmt::Display| AdminError::Backend(format!("{}: {e}", path.display()));
+        let roles = self.roles();
         let read = |text: &str| -> Result<Account, AdminError> {
             let file: AccountFile = toml::from_str(text).map_err(|e| failed(&e))?;
-            Ok(file.into_account(login.clone()))
+            Ok(file.into_account(login.clone(), &roles))
         };
         let old = match std::fs::read_to_string(&path) {
             Ok(text) => Some(text),
@@ -702,7 +832,14 @@ impl AccountAdmin for FileAuth {
             let table = table
                 .as_table_like_mut()
                 .ok_or_else(|| failed(&"access is not a table"))?;
-            write_access(table, edit.access.unwrap_or_default(), edit.history_unsaid);
+            let listed = existing.as_ref().map_or(&[][..], |a| &a.roles[..]);
+            let baseline = roles.granted(listed);
+            write_access(
+                table,
+                edit.access.unwrap_or_default(),
+                baseline,
+                edit.history_unsaid,
+            );
         }
         let text = doc.to_string();
         // Also what makes sure no file is left behind that the next login
@@ -718,6 +855,16 @@ impl AccountAdmin for FileAuth {
             write_atomic(&path, &text).map_err(|e| failed(&e))?;
         }
         Ok(after)
+    }
+
+    fn reload(&self) -> Result<(), String> {
+        let Some(path) = &self.roles_file else {
+            return Ok(());
+        };
+        let roles =
+            Roles::load(path).map_err(|e| format!("{e}; the roles in use are unchanged"))?;
+        *self.roles.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(roles);
+        Ok(())
     }
 
     fn delete_account(
@@ -753,13 +900,22 @@ fn admin_error(e: AuthError) -> AdminError {
     }
 }
 
-/// Make an `[access]` table say `access`, changing no more of it than
-/// that takes: a key whose bit already reads right is left as written,
-/// comment and all, a set bit with no key gets one, and `raw_bits`
-/// becomes the set bits that have no name. Read-chat-history with no key
-/// follows read-chat, so it is written only where it parts from it; with
-/// `history_unsaid` it is not touched at all.
-fn write_access(table: &mut dyn toml_edit::TableLike, access: AccessBits, history_unsaid: bool) {
+/// Make an `[access]` table say `access`, over the bits its roles give
+/// (`baseline`), changing no more of it than that takes
+/// (`docs/roles.md` §6.1). A bit no role gives keeps the old rule: a key
+/// whose bit already reads right is left as written, comment and all, and
+/// a set bit with no key gets one. A bit a role gives has no key while it
+/// is set, so it goes on following the role, and `false` while it is not.
+/// `raw_bits` becomes the set bits that have no name and no role, and
+/// `raw_deny` gains the unset ones a role gives and loses any set bit.
+/// Read-chat-history with no key follows read-chat, so it is written only
+/// where it parts from it; with `history_unsaid` it is not touched at all.
+fn write_access(
+    table: &mut dyn toml_edit::TableLike,
+    access: AccessBits,
+    baseline: AccessBits,
+    history_unsaid: bool,
+) {
     if !history_unsaid {
         if let Some(old) = table.remove("chat_history") {
             if !table.contains_key("read_chat_history") {
@@ -773,52 +929,87 @@ fn write_access(table: &mut dyn toml_edit::TableLike, access: AccessBits, histor
             continue;
         }
         let on = access.has(*b);
-        match table.get_mut(key).and_then(|item| item.as_value_mut()) {
-            Some(v) if v.as_bool() == Some(on) => {}
-            Some(v) => {
-                let decor = v.decor().clone();
-                *v = on.into();
-                *v.decor_mut() = decor;
+        if baseline.has(*b) {
+            if on {
+                table.remove(key);
+            } else {
+                set_bool(table, key, false);
             }
+            continue;
+        }
+        match table.get(key).and_then(|item| item.as_value()) {
+            Some(v) if v.as_bool() == Some(on) => {}
+            Some(_) => set_bool(table, key, on),
             None if (on && !history) || (history && on != access.has(bit::READ_CHAT)) => {
                 table.insert(key, toml_edit::value(on));
             }
             None => {}
         }
     }
-    let raw_history = || {
+    let listed = |table: &dyn toml_edit::TableLike, key: &str| -> Vec<i64> {
         table
-            .get("raw_bits")
+            .get(key)
             .and_then(|item| item.as_array())
-            .is_some_and(|a| {
-                a.iter()
-                    .any(|v| v.as_integer() == Some(bit::CHAT_HISTORY.into()))
-            })
+            .map(|a| a.iter().filter_map(|v| v.as_integer()).collect())
+            .unwrap_or_default()
     };
-    let mut unnamed: Vec<i64> = access::names_of(access)
-        .1
-        .into_iter()
-        .map(i64::from)
-        .collect();
+    let history_kept = |list: &[i64]| history_unsaid && list.contains(&bit::CHAT_HISTORY.into());
+    let unnamed = |bits: AccessBits| -> Vec<i64> {
+        access::names_of(bits)
+            .1
+            .into_iter()
+            .map(i64::from)
+            .collect()
+    };
+    let mut raw = unnamed(AccessBits::from_raw(access.raw() & !baseline.raw()));
     // History granted by number is as much the file's to keep as by name.
-    if history_unsaid && raw_history() {
-        unnamed.push(bit::CHAT_HISTORY.into());
-        unnamed.sort_unstable();
+    if history_kept(&listed(table, "raw_bits")) {
+        raw.push(bit::CHAT_HISTORY.into());
     }
+    // An operator's own denial stays while the bit stays unset.
+    let mut deny: Vec<i64> = listed(table, "raw_deny")
+        .into_iter()
+        .filter(|b| u8::try_from(*b).is_ok_and(|b| !access.has(b)) || history_kept(&[*b]))
+        .collect();
+    deny.extend(unnamed(AccessBits::from_raw(
+        baseline.raw() & !access.raw(),
+    )));
+    set_numbers(table, "raw_bits", raw);
+    set_numbers(table, "raw_deny", deny);
+}
+
+/// Set `key` to `on`, keeping the comment on a value already there.
+fn set_bool(table: &mut dyn toml_edit::TableLike, key: &str, on: bool) {
+    match table.get_mut(key).and_then(|item| item.as_value_mut()) {
+        Some(v) => {
+            let decor = v.decor().clone();
+            *v = on.into();
+            *v.decor_mut() = decor;
+        }
+        None => {
+            table.insert(key, toml_edit::value(on));
+        }
+    }
+}
+
+/// Make the list of bit numbers at `key` say `bits`, untouched if it does.
+fn set_numbers(table: &mut dyn toml_edit::TableLike, key: &str, mut bits: Vec<i64>) {
+    bits.sort_unstable();
+    bits.dedup();
     let same = table
-        .get("raw_bits")
+        .get(key)
         .and_then(|item| item.as_array())
         .is_some_and(|a| {
             a.iter()
                 .map(|v| v.as_integer())
-                .eq(unnamed.iter().map(|b| Some(*b)))
+                .eq(bits.iter().map(|b| Some(*b)))
         });
-    if unnamed.is_empty() {
-        table.remove("raw_bits");
+    if bits.is_empty() {
+        table.remove(key);
     } else if !same {
         table.insert(
-            "raw_bits",
-            toml_edit::value(unnamed.into_iter().collect::<toml_edit::Array>()),
+            key,
+            toml_edit::value(bits.into_iter().collect::<toml_edit::Array>()),
         );
     }
 }
@@ -1064,7 +1255,7 @@ impl AccountDirectory for FileAuth {
         // Through `into_account`, so the mailbox key and the account's
         // own view of its identity cannot drift apart: this is the one
         // place a fingerprint is parsed.
-        let account = self.load(&login).ok()?.into_account(login);
+        let account = self.load(&login).ok()?.into_account(login, &self.roles());
         account
             .has_inbox
             .then(|| match account.identity.fingerprint {
@@ -1083,7 +1274,7 @@ impl AccountDirectory for FileAuth {
                 if !valid_login(&login) {
                     return None;
                 }
-                let account = self.load(&login).ok()?.into_account(login);
+                let account = self.load(&login).ok()?.into_account(login, &self.roles());
                 // An unidentified mailbox names an account with no
                 // identity and nothing else. One that has linked since is
                 // addressed by its fingerprint now, and its subscriptions
@@ -1102,7 +1293,7 @@ impl AccountDirectory for FileAuth {
         if !valid_login(&login) {
             return None;
         }
-        let account = self.load(&login).ok()?.into_account(login);
+        let account = self.load(&login).ok()?.into_account(login, &self.roles());
         Some(keyed(account))
     }
 
@@ -2052,5 +2243,346 @@ mod tests {
         // And the answers for "no such account" are the same `None`.
         assert_eq!(auth.mailbox_access(&Mailbox::login("nobody")), None);
         assert_eq!(auth.mailbox_access(&Mailbox::login("../quiet")), None);
+    }
+
+    /// What `key` resolves to: a named bit, `raw:N`, or an `[extra]` key.
+    fn has(a: &Account, key: &str) -> bool {
+        match key {
+            "moderate" => a.moderate,
+            "attach_news" => a.attach_news,
+            "manage_roles" => a.manage_roles,
+            _ => match key.strip_prefix("raw:") {
+                Some(n) => a.access.has(n.parse().unwrap()),
+                None => a.access.has(named_bit(key).unwrap()),
+            },
+        }
+    }
+
+    #[test]
+    fn roles_grant_and_the_account_file_overrides_either_way() {
+        const MEDIA: &str = "[role.r]\naccess = { send_media = true }\n";
+        const HISTORY: &str = "[role.r]\naccess = { read_chat_history = true }\n";
+        const READ: &str = "[role.r]\naccess = { read_chat = true }\n";
+        const KICK: &str = "[role.r]\naccess = { disconnect_users = true }\n";
+        const MODERATE: &str = "[role.r]\nextra = { moderate = true }\n";
+        const RAW: &str = "[role.r]\naccess = { raw_bits = [58] }\n";
+        const LISTED: &str = "roles = [\"r\"]\n";
+        // The roles file, the account file, the key, what it resolves to.
+        let rows: &[(&str, &str, &str, bool)] = &[
+            (MEDIA, LISTED, "send_media", true),
+            (
+                MEDIA,
+                "roles = [\"r\"]\n[access]\nsend_media = false\n",
+                "send_media",
+                false,
+            ),
+            (MEDIA, "", "send_media", false),
+            ("", "[access]\nsend_media = true\n", "send_media", true),
+            ("", "[access]\nsend_media = false\n", "send_media", false),
+            ("", "", "send_media", false),
+            // Bit 56 follows bit 9 where nothing names it.
+            (
+                "",
+                "[access]\nread_chat = true\n",
+                "read_chat_history",
+                true,
+            ),
+            (
+                "",
+                "[access]\nread_chat = true\nread_chat_history = false\n",
+                "read_chat_history",
+                false,
+            ),
+            (READ, LISTED, "read_chat_history", true),
+            (HISTORY, LISTED, "read_chat_history", true),
+            (
+                HISTORY,
+                "roles = [\"r\"]\n[access]\nread_chat = true\nread_chat_history = false\n",
+                "read_chat_history",
+                false,
+            ),
+            (
+                "",
+                "[access]\nread_chat = true\nraw_deny = [56]\n",
+                "read_chat_history",
+                false,
+            ),
+            // A derived key derives from the bits as roles and file leave them.
+            (KICK, LISTED, "moderate", true),
+            (
+                KICK,
+                "roles = [\"r\"]\n[extra]\nmoderate = false\n",
+                "moderate",
+                false,
+            ),
+            (
+                KICK,
+                "roles = [\"r\"]\n[access]\ndisconnect_users = false\n",
+                "moderate",
+                false,
+            ),
+            (MODERATE, LISTED, "moderate", true),
+            (
+                MODERATE,
+                "roles = [\"r\"]\n[extra]\nmoderate = false\n",
+                "moderate",
+                false,
+            ),
+            (MEDIA, LISTED, "attach_news", true),
+            ("", "", "manage_roles", false),
+            (
+                "[role.r]\nextra = { manage_roles = true }\n",
+                LISTED,
+                "manage_roles",
+                true,
+            ),
+            (RAW, LISTED, "raw:58", true),
+            (
+                RAW,
+                "roles = [\"r\"]\n[access]\nraw_deny = [58]\n",
+                "raw:58",
+                false,
+            ),
+            ("", "[access]\nraw_bits = [58]\n", "raw:58", true),
+            // `everyone` reaches an account that lists nothing, the guest's.
+            (
+                "[role.everyone]\naccess = { read_news = true }\n",
+                "name = \"guest\"\n",
+                "read_news",
+                true,
+            ),
+            (
+                "[role.everyone]\naccess = { send_media = true }\n",
+                "[access]\nsend_media = false\n",
+                "send_media",
+                false,
+            ),
+        ];
+        for (roles, account, key, want) in rows {
+            let roles = Roles::parse(roles).unwrap();
+            let file: AccountFile = toml::from_str(account).unwrap();
+            let got = has(&file.into_account("x".into(), &roles), key);
+            assert_eq!(
+                got, *want,
+                "{key} with roles {roles:?} and account {account:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_roles_file_that_would_grant_wrongly_does_not_load() {
+        let rows = [
+            ("[role.r]\nextra = { can_detach = true }\n", "one person"),
+            ("[role.r]\nextra = { inbox = true }\n", "one person"),
+            ("[role.r]\nextra = { flying = true }\n", "no [extra] key"),
+            ("[role.Mods]\n", "lowercase"),
+            ("[role.-mods]\n", "starting with"),
+            (&*format!("[role.{}]\n", "a".repeat(31)), "1 to 30"),
+            ("[role.muted]\nkind = \"restriction\"\n", "not supported"),
+            (
+                "[role.muted]\ndeny = { send_chat = true }\n",
+                "not supported",
+            ),
+            ("[role.r]\naccess = { send_msg = true }\n", "no access key"),
+            ("[role.r]\naccess = { raw_deny = [58] }\n", "raw_deny"),
+            (
+                &*format!("[role.r]\ntitle = \"{}\"\n", "t".repeat(32)),
+                "31",
+            ),
+        ];
+        for (text, said) in rows {
+            let e = Roles::parse(text).unwrap_err();
+            assert!(e.contains(said), "{text:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_role_is_told_and_grants_nothing_and_a_bad_reload_keeps_the_roles() {
+        let td = tempfile::tempdir().unwrap();
+        let roles = td.path().join("roles.toml");
+        let accounts = td.path().join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        write(
+            &accounts,
+            "al.toml",
+            "password = \"pw\"\nroles = [\"ghost\", \"staff\"]\n",
+        );
+        write(
+            td.path(),
+            "roles.toml",
+            "[role.staff]\naccess = { send_media = true }\n",
+        );
+        let auth = FileAuth::new(&accounts).with_roles(&roles).unwrap();
+        assert!(auth
+            .audit()
+            .iter()
+            .any(|c| c.contains("al.toml: no role \"ghost\"")));
+        write(
+            td.path(),
+            "roles.toml",
+            "[role.everyone]\naccess = { read_news = true, disconnect_users = true }\n",
+        );
+        auth.reload().unwrap();
+        let said = auth.audit();
+        assert!(
+            said.iter()
+                .any(|c| c.contains("everyone grants disconnect_users,")),
+            "{said:?}"
+        );
+        write(
+            td.path(),
+            "roles.toml",
+            "[role.staff]\naccess = { send_media = true }\n",
+        );
+        auth.reload().unwrap();
+        let al = auth.lookup("al").unwrap();
+        assert_eq!(al.roles, ["ghost", "staff"]);
+        assert!(al.access.has(bit::SEND_MEDIA));
+
+        write(
+            td.path(),
+            "roles.toml",
+            "[role.staff]\nkind = \"restriction\"\n",
+        );
+        assert!(FileAuth::new(&accounts).with_roles(&roles).is_err());
+        assert!(auth.reload().is_err());
+        assert!(auth.lookup("al").unwrap().access.has(bit::SEND_MEDIA));
+        write(td.path(), "roles.toml", "");
+        auth.reload().unwrap();
+        assert!(!auth.lookup("al").unwrap().access.has(bit::SEND_MEDIA));
+    }
+
+    #[test]
+    fn a_save_writes_only_where_the_editor_parts_from_the_roles() {
+        const ROLES: &str = "[role.r]\naccess = { send_media = true, \
+            read_chat_history = true, raw_bits = [58] }\n";
+        const HELD: &str = "password = \"pw\"\nroles = [\"r\"]\n[access]\nread_chat = true\n";
+        const PLAIN: &str = "password = \"pw\"\n# kept\n[access]\nread_chat = true # mine\n\
+            send_chat = true\nraw_bits = [41]\nraw_deny = [42]\n";
+        const UNREAD: &str = "password = \"pw\"\nroles = [\"r\"]\n[access]\nread_chat = false\n";
+        use bit::{CHAT_HISTORY as HISTORY, READ_CHAT as READ, SEND_MEDIA as MEDIA};
+        // The file, the bits the editor flips from what it opened, whether
+        // it leaves history unsaid as the classic editor does, and the
+        // file the save leaves.
+        type Row<'a> = (&'a str, &'a [(u8, bool)], bool, String);
+        let rows: &[Row] = &[
+            (HELD, &[], true, HELD.into()),
+            (HELD, &[], false, HELD.into()),
+            (PLAIN, &[], true, PLAIN.into()),
+            (
+                HELD,
+                &[(MEDIA, false)],
+                true,
+                format!("{HELD}send_media = false\n"),
+            ),
+            (
+                &format!("{HELD}send_media = false\n"),
+                &[(MEDIA, true)],
+                true,
+                HELD.into(),
+            ),
+            (
+                HELD,
+                &[(58, false)],
+                true,
+                format!("{HELD}raw_deny = [58]\n"),
+            ),
+            (
+                &format!("{HELD}raw_deny = [58]\n"),
+                &[(58, true)],
+                true,
+                HELD.into(),
+            ),
+            // Bit 56 a role gives is the role's on the ng editor too,
+            // whatever read-chat does.
+            (
+                HELD,
+                &[(HISTORY, false)],
+                false,
+                format!("{HELD}read_chat_history = false\n"),
+            ),
+            (
+                &format!("{HELD}read_chat_history = false\n"),
+                &[(HISTORY, true)],
+                false,
+                HELD.into(),
+            ),
+            (HELD, &[(READ, false)], false, UNREAD.into()),
+            (
+                HELD,
+                &[(READ, false), (HISTORY, false)],
+                false,
+                format!("{UNREAD}read_chat_history = false\n"),
+            ),
+        ];
+        for (before, flips, unsaid, after) in rows {
+            let td = tempfile::tempdir().unwrap();
+            write(td.path(), "roles.toml", ROLES);
+            write(td.path(), "al.toml", before);
+            let auth = FileAuth::new(td.path())
+                .with_roles(td.path().join("roles.toml"))
+                .unwrap();
+            let mut access = auth.read_account("al").unwrap().access;
+            for (b, on) in flips.iter() {
+                access = if *on {
+                    access.with(*b)
+                } else {
+                    access.without(*b)
+                };
+            }
+            let edit = AccountEdit {
+                login: "al".into(),
+                access: Some(access),
+                history_unsaid: *unsaid,
+                ..Default::default()
+            };
+            auth.write_account(&edit, &|_, _| Ok(())).unwrap();
+            let saved = std::fs::read_to_string(td.path().join("al.toml")).unwrap();
+            assert_eq!(&saved, after, "{before:?} with {flips:?}, unsaid {unsaid}");
+            assert_eq!(auth.read_account("al").unwrap().access, access);
+        }
+
+        // A save leaves a role's bit the role's, so taking it from the
+        // role later takes it from the account.
+        let td = tempfile::tempdir().unwrap();
+        write(td.path(), "roles.toml", ROLES);
+        write(td.path(), "al.toml", HELD);
+        let auth = FileAuth::new(td.path())
+            .with_roles(td.path().join("roles.toml"))
+            .unwrap();
+        let edit = AccountEdit {
+            login: "al".into(),
+            access: Some(auth.read_account("al").unwrap().access),
+            ..Default::default()
+        };
+        auth.write_account(&edit, &|_, _| Ok(())).unwrap();
+        write(td.path(), "roles.toml", "");
+        auth.reload().unwrap();
+        let access = auth.read_account("al").unwrap().access;
+        assert!(!access.has(bit::SEND_MEDIA) && !access.has(58));
+    }
+
+    #[test]
+    fn an_account_an_identity_makes_follows_everyone() {
+        let (td, _) = backend();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let roles = elsewhere.path().join("roles.toml");
+        std::fs::write(&roles, "[role.everyone]\naccess = { read_news = true }\n").unwrap();
+        let auth = FileAuth::new(td.path()).with_roles(roles).unwrap();
+        // What the guest account resolves to, `everyone` included.
+        let access = AccessBits::empty()
+            .with(bit::READ_NEWS)
+            .with(bit::SEND_CHAT);
+        let (account, created) = auth
+            .find_or_create_linked("newbie", "Newbie", &[5u8; 32], access)
+            .unwrap();
+        assert!(created);
+        assert_eq!(account.access, access);
+        let file =
+            std::fs::read_to_string(td.path().join(format!("{}.toml", account.login))).unwrap();
+        assert!(
+            file.contains("send_chat = true") && !file.contains("read_news"),
+            "{file}"
+        );
     }
 }

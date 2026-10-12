@@ -23,7 +23,7 @@ HXD_CONFIG=${HXD_CONFIG:-/etc/hxd-ng/hxd-ng.toml}
 GENERATED=/run/hxd-ng/hxd-ng.toml
 
 case ${1:-} in
-    "" | -* | inbox | news-reindex | push | identity | registrar) ;;
+    "" | -* | inbox | news-reindex | push | identity | registrar | account | role) ;;
     *) exec "$@" ;;
 esac
 
@@ -214,6 +214,9 @@ generate() {
         agreement=$DATA/agreement.txt
     fi
     [ -z "$agreement" ] || kv agreement "$agreement"
+    echo
+    echo "[roles]"
+    echo "file = \"$DATA/roles.toml\""
 
     if $ng; then
         echo
