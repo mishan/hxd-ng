@@ -34,8 +34,9 @@ use crate::proto::{
     reply_err_account, reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users,
     stored_msg_json, user_json, video_limits_json, video_reply_err, voice_reply_err, BlockParams,
     ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams,
-    ReqEnvelope, ResumeParams, VideoStartParams, VideoStateParams, VideoStopParams,
-    VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
+    ReqEnvelope, ResumeParams, RoomTopicParams, VideoStartParams, VideoStateParams,
+    VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams,
+    VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -61,6 +62,7 @@ fn req_label(req: &str) -> &'static str {
         "nick",
         "ping",
         "resume",
+        "room_topic",
         "sync",
         "unblock",
         "video_start",
@@ -109,7 +111,7 @@ fn request_weight(req: &str) -> u32 {
         | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
         | "files_upload" | "files_mkdir" | "files_delete" | "files_move" | "files_comment"
         | "report_close" | "redact" | "revoke" | "kick" | "account_get" | "account_create"
-        | "account_update" | "account_delete" => 2,
+        | "account_update" | "account_delete" | "room_topic" => 2,
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
         | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
@@ -137,10 +139,11 @@ pub(crate) struct SessState {
     /// one: what `push_register` files the registration under and what
     /// decides whether it may (`crate::push`).
     pub(crate) device: Option<crate::push::DeviceOnSocket>,
-    /// The account's `[extra] file_list` and `file_getinfo`, which the
-    /// roster does not carry.
+    /// The account's `[extra] file_list`, `file_getinfo` and
+    /// `set_subject`, which the roster does not carry.
     pub(crate) file_list: bool,
     pub(crate) file_getinfo: bool,
+    pub(crate) set_subject: bool,
 }
 
 impl SessState {
@@ -150,6 +153,7 @@ impl SessState {
             self.access = account.access;
             self.file_list = account.file_list;
             self.file_getinfo = account.file_getinfo;
+            self.set_subject = account.set_subject;
         }
     }
 }
@@ -1041,6 +1045,7 @@ async fn handle_login(
             device,
             file_list: account.file_list,
             file_getinfo: account.file_getinfo,
+            set_subject: account.set_subject,
         },
         events,
     ))
@@ -1114,10 +1119,10 @@ async fn handle_resume(
         }
     };
     let access = ctx.core.access_of(uid).unwrap_or_default();
-    // The file extras live in the account rather than on the roster, so a
-    // resume reads them again, under the session's mask: the session
+    // The `[extra]` flags live in the account rather than on the roster, so
+    // a resume reads them again, under the session's mask: the session
     // outlived its connection, not its account. An account that can no
-    // longer be read gets neither.
+    // longer be read gets none of them.
     let auth = ctx.auth.clone();
     let login = ctx.core.user_details(uid).map(|details| details.login);
     let mask = ctx.core.mask_of(uid);
@@ -1138,6 +1143,7 @@ async fn handle_resume(
         device: ctx.registry.device(&p.session),
         file_list: account.as_ref().is_some_and(|account| account.file_list),
         file_getinfo: account.as_ref().is_some_and(|account| account.file_getinfo),
+        set_subject: account.as_ref().is_some_and(|account| account.set_subject),
     };
 
     // From here the session is attached: any send failure means the new
@@ -1484,7 +1490,8 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
 /// mhxd's spam points (`hxd_core::FloodLimits`), charged for the
 /// requests that stand for a classic transaction it charges, at its
 /// price and under its type: `chat` for its Chat and `msg` for its
-/// Message, 2 each; `nick` for User Change, 20; and the news writes for
+/// Message, 2 each; `room_topic` for Set Chat Subject, 2; `nick` for
+/// User Change, 20; and the news writes for
 /// the 1.5 transactions they are, `news_post` a threaded post, 10 each
 /// as the table's default prices every one of them. (Its 20 for a post
 /// is the 1.2 flat one's, which an ng post is not, and at that price an
@@ -1499,6 +1506,7 @@ fn spam_charge(req: &str) -> Option<(u32, u32)> {
     match req {
         "chat" => Some((0x69, 2)),
         "msg" => Some((0x6c, 2)),
+        "room_topic" => Some((0x78, 2)),
         "nick" => Some((0x130, 20)),
         "news_post" => Some((0x19a, 10)),
         "news_delete" => Some((0x19b, 10)),
@@ -1659,6 +1667,27 @@ async fn dispatch(
                 reply_ok(req.id, json!({}))
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed nick."),
+        },
+
+        // Until rooms exist the lobby is the only room there is
+        // (`docs/chat-rooms.md` §7.2).
+        "room_topic" => match serde_json::from_value::<RoomTopicParams>(req.params.clone()) {
+            Ok(p) if p.room != 0 => reply_err(req.id, "no_such_room", "No such room."),
+            // Refused rather than dropped as the classic wire does: that
+            // wire has no reply to say it in.
+            Ok(_) if !state.set_subject => reply_err(
+                req.id,
+                "access_denied",
+                "You are not allowed to set the subject.",
+            ),
+            Ok(p) => {
+                let mut topic = p.topic;
+                topic.truncate_to_chars(SUBJECT_MAX_CHARS);
+                // The lobby's subject is the roster's; setting it cannot fail.
+                let _ = ctx.core.chat_subject(0, state.uid, topic);
+                reply_ok(req.id, json!({}))
+            }
+            Err(_) => reply_err(req.id, "bad_request", "Malformed room_topic."),
         },
 
         "msg" => match serde_json::from_value::<MsgParams>(req.params.clone()) {
@@ -2212,6 +2241,10 @@ pub(crate) fn retry_secs(wait: std::time::Duration) -> u64 {
 /// that a 1.x client would have carried whole, and cut it for every
 /// viewer including the ng ones.
 const NICK_MAX_CHARS: usize = 31;
+
+/// The classic wire's bound on a subject, which its 120 applies in
+/// characters too (`docs/hotline-ng.md` §8).
+const SUBJECT_MAX_CHARS: usize = 255;
 
 /// `String::truncate` panics off char boundaries; caps shouldn't.
 trait TruncateToCharBoundary {

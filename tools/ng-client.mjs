@@ -22,6 +22,7 @@
 //   /me <text>       action-style chat
 //   /nick <nick>     change nickname
 //   /icon <n>        change icon
+//   /topic <text>    set the lobby's subject
 //   /users           re-request the roster (sync)
 //   /drop            kill the socket WITHOUT logout — tests detach; the
 //                    client auto-reconnects with resume after a moment
@@ -334,6 +335,8 @@ rl.on("line", async (line) => {
       await request("nick", { nick: line.slice(6) });
     } else if (line.startsWith("/icon ")) {
       await request("nick", { icon: Number(line.slice(6)) });
+    } else if (line.startsWith("/topic ")) {
+      await request("room_topic", { topic: line.slice(7) });
     } else if (line.startsWith("/")) {
       say("unknown command");
     } else {

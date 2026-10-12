@@ -616,6 +616,7 @@ family document. Each family of §4 adds its own.
 | `login` / `resume` / `sync` | §6 | §6 | §6 |
 | `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?` | `{}` | `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
+| `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
 | `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?` | `{ "queued": bool }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `server_error` |
 | `history` | `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `server_error` |
 | `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
@@ -632,6 +633,11 @@ family document. Each family of §4 adds its own.
 - **`nick`** changes this session's nick and icon. A new nick needs the
   use-any-name privilege; without it the request is `access_denied` and
   changes nothing, icon included. An empty nick is ignored.
+- **`room_topic`** sets the public chat's subject, which everyone hears
+  as `subject`. It needs the set-subject privilege (*hxd-ng:* `[extra]
+  set_subject`, as the classic 120). It is chat-rooms.md §7.2's request:
+  until rooms exist, an absent `room` or `room` 0 is the lobby and any
+  other room is `no_such_room`.
 - **`msg`** needs the send-messages privilege, except to the server's own
   account (system-account.md §3). See §7.1.
 - **`history`** needs the chat-history privilege. It pages public chat by
@@ -882,6 +888,7 @@ news body is different: it declares its own type (news.md §5).
 | `session_expired` | `resume` | Log in again. |
 | `resync_required` | `resume` | Attached; follow with `sync`. |
 | `not_available` | `history`, `files_*`, family requests | The server does not offer this. |
+| `no_such_room` | `room_topic` | No such room, or one this session may not see (chat-rooms.md §5). |
 | `no_such_user` | `msg`, `block`, `unblock` | No such uid, no such account, or that account takes no offline mail — one answer for all three. |
 | `no_inbox` | `inbox`, `msg_read`, `block`, `unblock`, `blocks` | *Your* account has no inbox, or the server has none: the `inbox` family's "not available" code. |
 | `mailbox_full` | `msg` | The recipient's inbox is at its cap. |
