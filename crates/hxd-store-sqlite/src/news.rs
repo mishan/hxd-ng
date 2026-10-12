@@ -2066,6 +2066,22 @@ impl NewsStore for SqliteStore {
         Ok(dropped + moved)
     }
 
+    fn authors_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let (from, to) = (fp_hex(from), fp_hex(to));
+        let articles = sql(tx.execute(
+            "UPDATE news_article SET login_fp = ?2 WHERE login_fp = ?1",
+            params![from, to],
+        ))?;
+        let attachments = sql(tx.execute(
+            "UPDATE news_attach SET uploader_fp = ?2 WHERE uploader_fp = ?1",
+            params![from, to],
+        ))?;
+        sql(tx.commit())?;
+        Ok(articles + attachments)
+    }
+
     fn subs_purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
         sql(conn.execute(

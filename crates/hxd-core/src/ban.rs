@@ -817,7 +817,7 @@ impl crate::Core {
     /// NAT as the one they ban. And a session holding
     /// `cant_be_disconnected` is not, as no kick ends it either. Both are
     /// refused at their next connection like anyone else.
-    fn end_refused(&self, target: &BanTarget, spare: Option<crate::Uid>) {
+    pub(crate) fn end_refused(&self, target: &BanTarget, spare: Option<crate::Uid>) {
         let matcher = BanMatcher::load([Ban {
             id: 0,
             target: target.clone(),
@@ -1011,6 +1011,32 @@ mod tests {
         m.remove(2);
         assert!(m.is_empty());
         assert!(m.person(Some("alice"), None, None, at(0)).is_none());
+    }
+
+    #[test]
+    fn an_identity_ban_follows_its_rotation() {
+        use crate::moderation::{Actor, MemoryModeration, ModerationPolicy};
+        let core = crate::Core::new().with_moderation(
+            std::sync::Arc::new(MemoryModeration::default()),
+            ModerationPolicy::default(),
+        );
+        core.place_ban(
+            Actor::Operator,
+            NewBan {
+                target: BanTarget::Identity([4; 32]),
+                reason: "spam".into(),
+                note: None,
+                expires_at: None,
+                source: BanSource::Cli,
+            },
+        )
+        .unwrap();
+        core.rotate_identity(&[4; 32], &[5; 32]).unwrap();
+        let hit = core.person_banned(None, Some(&[5; 32]), None).unwrap();
+        assert_eq!(hit.reason, "spam");
+        // Again, as a retry would: still the one ban.
+        core.rotate_identity(&[4; 32], &[5; 32]).unwrap();
+        assert_eq!(core.list_bans(true, None, 10).unwrap().len(), 2);
     }
 
     #[test]

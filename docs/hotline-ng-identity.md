@@ -278,8 +278,7 @@ continues in this order and fails on the first error:
    applied per §7.3 there; a stale cache is `[identity]
    revocation_stale`. A minute's sweep keeps the lists of the
    identities with sessions here current, and ends a session as soon as
-   its list refuses it. *(Built, but for what a rotation moves to its
-   successor, which `identity-records.md` stages as R2.)*
+   its list refuses it. *(Built.)*
 5. attestations verified against trusted registrars, expired or untrusted
    ones discarded, and, after attestation revocations are applied, age
    computed from the oldest surviving `registered`;

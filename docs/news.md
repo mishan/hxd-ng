@@ -1477,9 +1477,11 @@ durable to address.
 **And a subscription moves the way mail does.** Linking an identity,
 rotating one and deleting an account each owe the mailbox an obligation
 (private-messages.md §4), and each is paid for subscriptions in the same
-call — `inbox_claim`, `inbox_rotate`, `inbox_purge` — so a link site that
-remembers one cannot forget the other. Authorship is not re-stamped: an
-article records its author as they were when they wrote it (§3.1). So an
+call — `inbox_claim`, `rotate_identity`, `inbox_purge` — so a link site
+that remembers one cannot forget the other. A link does not re-stamp
+authorship: an article records its author as they were when they wrote
+it (§3.1). A rotation does, since the successor is the same person and
+keeps the right to edit and delete what they wrote. So an
 account that links an identity is not rung about replies to articles it
 wrote before the link. It still follows those threads, because the
 subscriptions moved.

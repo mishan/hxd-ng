@@ -571,6 +571,21 @@ impl AuthBackend for FileAuth {
         Ok(LinkOutcome::Linked(self.lookup(&account.login)?))
     }
 
+    fn rotate_link(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Option<Account>, AuthError> {
+        let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(login) = self.login_for(from)? else {
+            return Ok(None);
+        };
+        if let Some(other) = self.login_for(to)? {
+            tracing::warn!(
+                "{login}: its identity rotated to a key that account {other} already links; left as it was"
+            );
+            return Ok(None);
+        }
+        self.write_link(&login, Some(*to))?;
+        self.lookup(&login).map(Some)
+    }
+
     fn unlink_identity(&self, fingerprint: &[u8; 32]) -> Result<UnlinkOutcome, AuthError> {
         let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
         let Some(account) = self.find_by_fingerprint(fingerprint)? else {

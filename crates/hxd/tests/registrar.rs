@@ -1497,13 +1497,15 @@ async fn a_rotation_its_registrar_publishes_moves_the_identity_here() {
     let there = dir.path().join("verifier");
     std::fs::create_dir_all(&there).unwrap();
     let live = format!("http://{}", r.ng);
-    let (v, _) = verifier(&there, &r, Trust::Key, &live, "").await;
+    let (v, _) = verifier(&there, &r, Trust::Key, &live, "new_accounts = \"create\"").await;
     let (old, new) = (
         IdentityKey::from_seed(&[1; 32]),
         IdentityKey::from_seed(&[2; 32]),
     );
     let dev = DeviceKey::from_seed(&[101; 32]);
     let old_card = attested_committing(&r, &old, "alice", &new, true).await;
+    let account = auth_at(v, &old, &dev, &old_card).await.json()["account"].clone();
+    assert!(account.is_string(), "{account}");
     let mut old_here = session_at(v, &old, &old_card).await;
 
     let posted = post(
@@ -1517,10 +1519,13 @@ async fn a_rotation_its_registrar_publishes_moves_the_identity_here() {
     next_list().await;
 
     // The successor's admission is where the rotation is learned: it
-    // ends the predecessor's session, and the predecessor is told where
-    // the identity went.
-    let reply = auth_at(v, &new, &dev, &new_card).await;
-    assert_eq!(reply.json()["handle"], "alice@127.0.0.1");
+    // takes the predecessor's account, ends its session, and the
+    // predecessor is told where the identity went.
+    let reply = auth_at(v, &new, &dev, &new_card).await.json();
+    assert_eq!(
+        (reply["handle"].clone(), reply["account"].clone()),
+        (json!("alice@127.0.0.1"), account)
+    );
     old_here.event("kicked").await.unwrap();
     let reply = auth_at(v, &old, &dev, &old_card).await;
     assert_eq!(

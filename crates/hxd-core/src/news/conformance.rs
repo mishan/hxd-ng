@@ -63,6 +63,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     an_audience_row_dates_what_it_has_not_read(&*new_store());
     the_two_kinds_of_mailbox_never_meet(&*new_store());
     linking_rotating_and_deleting_move_the_rows(&*new_store());
+    a_rotated_identity_keeps_what_it_wrote(&*new_store());
     rows_go_with_what_they_follow(&*new_store());
     a_listing_is_newest_first_and_says_what_it_follows(&*new_store());
     // The legacy wire: a category as one 1.5 listing, and as 1.2 news.
@@ -783,6 +784,21 @@ fn linking_rotating_and_deleting_move_the_rows(s: &dyn NewsStore) {
 
     assert_eq!(s.subs_purge(&rotated).unwrap(), 2);
     assert!(s.subscriptions(&rotated).unwrap().is_empty());
+}
+
+fn a_rotated_identity_keeps_what_it_wrote(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let mine = post(s, cat, None, "mine", 100);
+    let bob = Author {
+        nick: "Bob".into(),
+        login: Some("bob".into()),
+        fingerprint: Some([9u8; 32]),
+    };
+    let theirs = post_by(s, bob, cat, None, "theirs", 101);
+    s.authors_rotate(&[7u8; 32], &[8u8; 32]).unwrap();
+    let by = |id| s.article(id).unwrap().unwrap().author.fingerprint;
+    assert_eq!(by(mine), Some([8u8; 32]));
+    assert_eq!(by(theirs), Some([9u8; 32]));
 }
 
 fn rows_go_with_what_they_follow(s: &dyn NewsStore) {

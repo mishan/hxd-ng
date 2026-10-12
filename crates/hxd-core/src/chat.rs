@@ -2263,45 +2263,12 @@ impl Core {
         }
     }
 
-    /// An identity rotated to a successor key: move its mailbox and its
-    /// blocks — see [`crate::inbox::MessageStore::rotate`]. Its news
-    /// subscriptions move with them; its **devices are dropped** rather
-    /// than moved, because a successor has not vouched for them
-    /// (`crate::push::PushStore::devices_rotate`).
-    ///
-    /// **Nothing calls this yet, because nothing rotates yet**: §8.5 of
-    /// the identity spec describes rotation and the registrar spec owns
-    /// it. This exists so that landing rotation is a call rather than a
-    /// design question — and so that the obligation is written down
-    /// somewhere the compiler will show whoever lands it.
-    ///
-    /// **Unlinking owes nothing**, deliberately. Mail is addressed to a
-    /// person, and under the strict mailbox rule the fingerprint *is* the
-    /// person; an account that gives up its link gives up the mailbox
-    /// that link addressed, and that mail goes wherever the identity
-    /// links next. The alternative — mail follows the account — would
-    /// hand an account's history to whoever links to it afterwards.
-    pub fn inbox_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> usize {
-        self.news_subs_rotate(from, to);
-        self.devices_rotate(from, to);
-        let Some(store) = self.inbox.as_ref() else {
-            return 0;
-        };
-        match store.rotate(from, to) {
-            Ok(n) => n,
-            Err(e) => {
-                warn!("inbox: rotating an identity's mail: {e}");
-                0
-            }
-        }
-    }
-
     /// An account has been deleted: take its mail, its news
     /// subscriptions and its push devices with it, so a later holder of
     /// the freed login inherits none of them. Its news push budget goes too, but that is
     /// memory, and only a purge in the server's own process reaches it —
     /// `hxd inbox purge` purges the stores from a process of its own (see
-    /// `news_subs_rotate`). Returns how much mail went.
+    /// `news_rotate`). Returns how much mail went.
     pub fn inbox_purge(&self, of: &Mailbox) -> usize {
         self.news_subs_purge(of);
         self.devices_purge(of);
@@ -4501,6 +4468,58 @@ mod inbox_tests {
     }
 
     // --- The mailbox key (docs/private-messages.md §5.4) -----------------
+
+    #[test]
+    fn a_rotation_takes_the_mailbox_the_blocks_and_the_subscriptions() {
+        use crate::news::{MemoryNews, NewNode, NewsPolicy, NewsStore, NodeKind, SubScope};
+        let store = Arc::new(MemoryStore::new());
+        let news = Arc::new(MemoryNews::new());
+        let dir = Arc::new(Directory(vec![
+            Mailbox::identified("alice", fp(10)),
+            Mailbox::login("sender"),
+        ]));
+        let core = Arc::new(
+            Core::new()
+                .with_inbox(store.clone(), dir, InboxPolicy::default())
+                .with_news(news.clone(), NewsPolicy::default()),
+        );
+        let (s, _rs) = attach(&core, "sender", true);
+        core.msg_login(s, "alice", "private".into(), None, None)
+            .unwrap();
+        let (old, new) = (
+            Mailbox::identified("alice", fp(10)),
+            Mailbox::identified("alice", fp(12)),
+        );
+        let now = SystemTime::now();
+        store
+            .set_blocked(&old, &Mailbox::login("sender"), true, now)
+            .unwrap();
+        let node = NewNode {
+            parent: None,
+            kind: NodeKind::Category,
+            name: "General".into(),
+            guid: [1; 16],
+            at: now,
+        };
+        let cat = news.create_node(&node, 16).unwrap().id;
+        news.subscribe(&old, SubScope::Category(cat), 16, now)
+            .unwrap();
+
+        // A session on the account's old key, as a password login to it
+        // has: what it would write next would stay behind, so it ends.
+        let (_stale, mut stale) = attach_identified(&core, "alice", fp(10));
+
+        core.rotate_identity(&fp(10), &fp(12)).unwrap();
+        assert!(drain(&mut stale).iter().any(|e| matches!(e, Event::Kicked)));
+        let (alice, mut ra) = attach_identified(&core, "alice", fp(12));
+        assert_eq!(core.flush_inbox(alice), 1);
+        assert!(matches!(
+            &msgs(drain(&mut ra))[..],
+            [Event::Msg { text, .. }] if text == "private"
+        ));
+        assert_eq!(store.blocked(&new).unwrap(), [Mailbox::login("sender")]);
+        assert_eq!(news.subscriptions(&new).unwrap().len(), 1);
+    }
 
     #[test]
     fn a_rename_takes_the_mailbox_and_the_freed_login_inherits_nothing() {

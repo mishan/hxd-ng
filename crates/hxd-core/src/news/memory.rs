@@ -1159,6 +1159,18 @@ impl NewsStore for MemoryNews {
         Ok(moved)
     }
 
+    fn authors_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut moved = 0;
+        for row in &mut inner.articles {
+            if row.author.fingerprint.as_ref() == Some(from) {
+                row.author.fingerprint = Some(*to);
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+
     fn subs_purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let before = inner.subs.len();

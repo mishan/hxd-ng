@@ -1,7 +1,6 @@
 # Applying a registrar's records: the verifying server
 
-Status: R1 built, and R2's first half: a rotation is recognized and its
-predecessor refused. What moves to the successor is next. §6 stages it.
+Status: R1 and R2 built; R3, newcomers, is next. §6 stages it.
 
 `identity-registrar.md` §7 says what a server that trusts a registrar
 does with what the registrar publishes: resolve its key, fetch the
@@ -132,15 +131,33 @@ What moves to the successor, each in the store that keeps it:
 
 | What | Where |
 |---|---|
-| the account link | the account file's `[identity]`, rewritten with `toml_edit` |
-| bans | the moderation store |
+| the account link | the account file's `[identity]`, rewritten with `toml_edit` (`AuthBackend::rotate_link`) |
+| bans | the moderation store: each standing identity ban placed again on the successor |
 | block-list entries | the inbox store |
 | stored mail | the inbox store's mailbox key |
+| news subscriptions and mutes | the news store |
+| news authorship | the news store's articles and attachments, with the right to edit and delete them |
+| an avatar kept by fingerprint | the avatar store |
+| push devices | dropped, not moved: the successor has not vouched for them |
 | the anchor | `[identity] successors`, the predecessor written as *rotated to X* |
 
 Each move is idempotent and the whole is retried until it completes,
 since a rotation is seen at whichever of several points comes first and
-a server may stop between two stores.
+a server may stop between two stores: the account link first, then
+what the core keeps (`Core::rotate_identity`), and only when all of it
+has landed is the rotation's line written again ending in `moved`. Until
+then it is retried at each start and at every admission of the
+successor, which is refused, as a server error, until they have. Once
+the account link has moved, every session still keyed by the
+predecessor ends, a password login to the account included, so nothing
+is written under the old key afterwards. A successor already linked to
+another account keeps that link, and the predecessor's account is left
+linked to the refused key for the operator, since one key cannot hold
+two accounts.
+
+What stays as it was is the record: chat history, the moderation
+trail and its reports, and who an image already sent may be shown to
+(a handle lives for hours, and its audience is fixed when it is sent).
 
 ## 5. Settings
 
@@ -171,8 +188,13 @@ its configured key.
   lift, the registrar unreachable under each `revocation_stale`, and a
   key rotation at the registrar honored through `retiring`.
 - **R2: rotation.** §7.4 and the moves of §4, with the `auth` request's
-  `rotation`, e2e from `hlid rotate` to a session on the successor
-  holding the predecessor's account, mail and bans.
+  `rotation`. The e2e has a rotation the registrar publishes end the
+  predecessor's session and hand its account to the successor, and one
+  shown at `auth` taken only to the anchored key, a registrar's
+  rotation the anchor overrules leaving the predecessor admitted; the
+  core's moves (mail, blocks, subscriptions, authorship, bans, the
+  avatar, the old key's sessions ending) and the retry at start are
+  unit tests.
 - **R3: newcomers.** `newcomer_delay`, and `new_accounts = create`
   limited to attested (and, once R4 lands, vouched) keys.
 - **R4: standing and probation.** §7.5 and `identity-vouch.md`, which is

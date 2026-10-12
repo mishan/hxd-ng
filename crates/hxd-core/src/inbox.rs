@@ -416,8 +416,8 @@ pub trait MessageStore: Send + Sync + 'static {
     /// **Key rotation must call this**, or a rotated identity loses its
     /// mailbox and its blocks quietly stop applying — the second being
     /// the worse half, because a block that has stopped working looks
-    /// exactly like a block that was never made. Nothing calls it today;
-    /// nothing rotates today either (identity spec §8.5).
+    /// exactly like a block that was never made. `Core::rotate_identity`
+    /// calls it.
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError>;
 
     /// An account has linked an identity: stamp everything currently

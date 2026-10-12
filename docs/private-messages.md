@@ -176,14 +176,12 @@ locking discipline.
   through `IdentityState::link_exclusive`, which is one place to forget
   it rather than three; the fourth is the tunnel's, in the legacy
   frontend's `reconcile_login`.
-- **Rotating a key must call `rotate`** (`Core::inbox_rotate`), which
+- **Rotating a key must call `rotate`** (`Core::rotate_identity`), which
   re-stamps mail in both directions and both sides of every block.
   Without it a rotated identity loses its mailbox, and — the worse half —
   its blocks quietly stop applying, which looks exactly like blocks that
-  were never made. **Not wired, because there is no rotation path yet:**
-  §8.5 of the identity spec describes it and the registrar spec owns it.
-  `Core::inbox_rotate` exists so that landing rotation is a call and not
-  a design question.
+  were never made. **Wired**, with the rest of what a rotation moves
+  (`identity-records.md` §4).
 - **Deleting an account must call `purge`** (`Core::inbox_purge`). A
   freed login can be registered by someone else, and a later `claim`
   would otherwise hand them the previous holder's mail. There is no

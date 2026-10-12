@@ -810,9 +810,9 @@ key. With no anchor and no registrar there is nobody to say the old
 owner consented, and a rotation is the one act that locks the old key
 out permanently, so the server takes nobody's word for it.
 
-On acceptance: the account link, bans, reserved name, block-list entries
-and stored mail keyed on the predecessor's fingerprint move to the
-successor; the predecessor's fingerprint is written to the same durable
+On acceptance: the account link, bans, reserved name, block-list entries,
+stored mail, news subscriptions and authorship, and an avatar keyed on
+the predecessor's fingerprint move to the successor; the predecessor's fingerprint is written to the same durable
 file as anchors (`[identity] successors`) as *rotated to X*; the
 predecessor's cached cards and certificates are dropped; both
 fingerprints are logged. A later `auth` by the predecessor is refused
