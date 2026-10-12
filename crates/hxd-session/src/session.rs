@@ -3023,8 +3023,14 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         Event::ChatRedacted { .. } | Event::ChatPurged { .. } => {}
         // A period client is shown a room as a private chat it was
         // invited to (docs/chat-rooms.md §6), which this wire does not
-        // do yet: nothing about a room may pass for a private chat.
-        Event::InRoom { .. } => {}
+        // do yet: nothing about a room may pass for a private chat. A
+        // listing's changes go to rooms-aware sessions, which this wire's
+        // never are.
+        Event::InRoom { .. }
+        | Event::RoomParted { .. }
+        | Event::RoomAdded(..)
+        | Event::RoomChanged(..)
+        | Event::RoomRemoved { .. } => {}
         // A report reaches a legacy moderator as a private message from
         // the system account (moderation.md §4.5): a window that opens,
         // and nothing a period client has to understand beyond that.

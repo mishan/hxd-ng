@@ -347,7 +347,13 @@ Three layers, all `cargo test --workspace`:
   from the system account and an ng one as an event, `/report`, and a
   reported image outliving its TTL for the moderator), `bans.rs` (`hxd
   ban` against a running server's database and SIGHUP, a banned login
-  refused on both wires, and a ban outliving its server) and
+  refused on both wires, and a ban outliving its server), `rooms.rs`
+  (rooms on the ng wire: made, listed, joined, talked in and paged, a
+  room an outsider may not see answered as one that does not exist on
+  every request naming it, a read-only room, an archive parting its
+  members, a client that never asks about rooms told nothing of them,
+  a redaction reaching a room's readers alone, and a resync catching
+  up per room) and
   `registrar.rs` (the registrar built from a real
   `[registrar]` section: discovery under its own host only, handles,
   rotations published under both keys, a card's commitment, invites from

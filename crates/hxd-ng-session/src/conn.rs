@@ -34,9 +34,8 @@ use crate::proto::{
     reply_err_account, reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users,
     stored_msg_json, user_json, video_limits_json, video_reply_err, voice_reply_err, BlockParams,
     ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams,
-    ReqEnvelope, ResumeParams, RoomTopicParams, VideoStartParams, VideoStateParams,
-    VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams,
-    VoiceRoomParams,
+    ReqEnvelope, ResumeParams, VideoStartParams, VideoStateParams, VideoStopParams,
+    VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -62,7 +61,7 @@ fn req_label(req: &str) -> &'static str {
         "nick",
         "ping",
         "resume",
-        "room_topic",
+        "rooms",
         "sync",
         "unblock",
         "video_start",
@@ -78,7 +77,7 @@ fn req_label(req: &str) -> &'static str {
     if let Some(k) = KNOWN.iter().find(|k| **k == req) {
         return k;
     }
-    for family in ["news_", "push_", "files_", "account_"] {
+    for family in ["news_", "push_", "files_", "account_", "room_"] {
         if req.starts_with(family) {
             return family.trim_end_matches('_');
         }
@@ -111,11 +110,12 @@ fn request_weight(req: &str) -> u32 {
         | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
         | "files_upload" | "files_mkdir" | "files_delete" | "files_move" | "files_comment"
         | "report_close" | "redact" | "revoke" | "kick" | "account_get" | "account_create"
-        | "account_update" | "account_delete" | "room_topic" => 2,
+        | "account_update" | "account_delete" | "room_topic" | "room_join" | "room_part" => 2,
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
         | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
-        | "account_list" | "files_preview" => 4,
+        | "account_list" | "files_preview" | "room_create" | "room_edit" | "room_archive"
+        | "room_unarchive" => 4,
         _ => 1,
     }
 }
@@ -871,6 +871,10 @@ async fn handle_login(
     if account.moderate {
         me_json["moderator"] = json!(true);
     }
+    // Likewise the room management controls (docs/chat-rooms.md §7.1).
+    if account.manage_rooms && ctx.core.rooms_enabled() {
+        me_json["manage_rooms"] = json!(true);
+    }
     if let Some(i) = identity {
         // `age` and `outcome` are for the user themself, never the roster.
         // The outcome reflects the account this session actually landed
@@ -921,6 +925,10 @@ async fn handle_login(
     // And `accounts`, whenever accounts can be administered here.
     if ctx.core.accounts_enabled() && !caps.iter().any(|c| c == "accounts") {
         caps.push("accounts".into());
+    }
+    // And `rooms`, unless `[rooms] enabled = false`.
+    if ctx.core.rooms_enabled() && !caps.iter().any(|c| c == "rooms") {
+        caps.push("rooms".into());
     }
     // And `banner`, whenever there is one to show.
     if ctx.banner.is_some() && !caps.iter().any(|c| c == "banner") {
@@ -1023,6 +1031,9 @@ async fn handle_login(
     }
     if let Some(banner) = ctx.banner.as_deref() {
         ok["banner"] = crate::banner::login_json(banner);
+    }
+    if let Some(rooms) = crate::rooms::login_json(&ctx.core, uid) {
+        ok["rooms"] = rooms;
     }
     let reply = reply_ok_with_users(req.id, ok, &users);
     drop(users);
@@ -1225,7 +1236,7 @@ pub(crate) async fn off_reactor<T: Send + 'static>(
 /// not build a struct from a JSON null, which is what an absent `params`
 /// arrives as; without this, "no params" is `bad_request` for exactly the
 /// requests that need none.
-fn params_or_default<T: serde::de::DeserializeOwned + Default>(
+pub(crate) fn params_or_default<T: serde::de::DeserializeOwned + Default>(
     params: &Value,
 ) -> Result<T, serde_json::Error> {
     if params.is_null() {
@@ -1454,6 +1465,11 @@ async fn handle_sync(
     if ctx.core.accounts_enabled() {
         ok["accounts"] = crate::accounts::access_json(state.access);
     }
+    // The rooms it is in and how far each has got, for a client to catch
+    // up on each with `history` (docs/chat-rooms.md §7.4).
+    if let Some(rooms) = crate::rooms::sync_json(&ctx.core, state.uid) {
+        ok["rooms"] = rooms;
+    }
     let out = reply_ok_with_users(req.id, ok, &ctx.core.roster_rows());
     if !send_frame(ws_tx, Message::Text(out)).await {
         return Flow::Dead;
@@ -1492,7 +1508,8 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
 /// mhxd's spam points (`hxd_core::FloodLimits`), charged for the
 /// requests that stand for a classic transaction it charges, at its
 /// price and under its type: `chat` for its Chat and `msg` for its
-/// Message, 2 each; `room_topic` for Set Chat Subject, 2; `nick` for
+/// Message, 2 each; `room_topic` for Set Chat Subject, 2, and
+/// `room_join` and `room_part` for Join and Leave Chat, 2 and 1; `nick` for
 /// User Change, 20; and the news writes for
 /// the 1.5 transactions they are, `news_post` a threaded post, 10 each
 /// as the table's default prices every one of them. (Its 20 for a post
@@ -1509,6 +1526,8 @@ fn spam_charge(req: &str) -> Option<(u32, u32)> {
         "chat" => Some((0x69, 2)),
         "msg" => Some((0x6c, 2)),
         "room_topic" => Some((0x78, 2)),
+        "room_join" => Some((0x73, 2)),
+        "room_part" => Some((0x74, 1)),
         "nick" => Some((0x130, 20)),
         "news_post" => Some((0x19a, 10)),
         "news_delete" => Some((0x19b, 10)),
@@ -1548,6 +1567,10 @@ async fn dispatch(
             return finish(ws_tx, out).await;
         }
     }
+    // Before the request acts, so what it sets off reaches it.
+    if crate::rooms::makes_aware(req) {
+        ctx.core.rooms_aware(state.uid);
+    }
     let out = match req.req.as_str() {
         "ping" => reply_ok(req.id, json!({})),
 
@@ -1576,10 +1599,25 @@ async fn dispatch(
                 };
                 let mut text = p.text;
                 text.truncate_to_char_boundary(4096);
-                let uid = state.uid;
-                match off_reactor(&ctx.core, move |c| c.chat_public(uid, text, style, media)).await
-                {
+                let (uid, room) = (state.uid, p.room);
+                let said = off_reactor(&ctx.core, move |c| {
+                    c.chat_public_all(uid, room, vec![(text, style, media)])
+                        .pop()
+                })
+                .await
+                .flatten();
+                match said {
                     Some(Ok(_)) => reply_ok(req.id, json!({})),
+                    // Sending does not join (docs/chat-rooms.md §7.2).
+                    Some(Err(ChatError::NoSuchChat)) => {
+                        reply_err(req.id, "no_such_room", "No such room.")
+                    }
+                    Some(Err(ChatError::NotAMember)) => {
+                        reply_err(req.id, "not_a_member", "You are not in that room.")
+                    }
+                    Some(Err(ChatError::ReadOnly)) => {
+                        reply_err(req.id, "read_only", "You may not send in that room.")
+                    }
                     // Not this session's upload, or its bytes have gone.
                     // One answer for both, so a send cannot be used to
                     // test whether someone else's handle exists.
@@ -1618,7 +1656,7 @@ async fn dispatch(
                 match params_or_default::<HistoryParams>(&req.params) {
                     Ok(p) if p.limit.is_none_or(|n| n != 0) => {
                         let query = hxd_core::HistoryQuery {
-                            channel: 0,
+                            channel: p.room,
                             before: p.before.filter(|id| *id != 0),
                             after: p.after.filter(|id| *id != 0),
                             limit: p.limit.unwrap_or(50).min(policy.max_page),
@@ -1638,6 +1676,9 @@ async fn dispatch(
                                     req.id,
                                     json!({ "lines": lines, "has_more": page.has_more }),
                                 )
+                            }
+                            Some(Err(ChatError::NoSuchChat)) => {
+                                reply_err(req.id, "no_such_room", "No such room.")
                             }
                             _ => reply_err(req.id, "server_error", "Server error."),
                         }
@@ -1669,27 +1710,6 @@ async fn dispatch(
                 reply_ok(req.id, json!({}))
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed nick."),
-        },
-
-        // Until rooms exist the lobby is the only room there is
-        // (`docs/chat-rooms.md` §7.2).
-        "room_topic" => match serde_json::from_value::<RoomTopicParams>(req.params.clone()) {
-            Ok(p) if p.room != 0 => reply_err(req.id, "no_such_room", "No such room."),
-            // Refused rather than dropped as the classic wire does: that
-            // wire has no reply to say it in.
-            Ok(_) if !state.set_subject => reply_err(
-                req.id,
-                "access_denied",
-                "You are not allowed to set the subject.",
-            ),
-            Ok(p) => {
-                let mut topic = p.topic;
-                topic.truncate_to_chars(SUBJECT_MAX_CHARS);
-                // The lobby's subject is the roster's; setting it cannot fail.
-                let _ = ctx.core.chat_subject(0, state.uid, topic);
-                reply_ok(req.id, json!({}))
-            }
-            Err(_) => reply_err(req.id, "bad_request", "Malformed room_topic."),
         },
 
         "msg" => match serde_json::from_value::<MsgParams>(req.params.clone()) {
@@ -2184,6 +2204,7 @@ async fn dispatch(
         // Reports and the acts (docs/moderation.md §5).
         r if crate::moderation::handles(r) => crate::moderation::handle(ctx, state, req).await,
         r if crate::accounts::handles(r) => crate::accounts::handle(ctx, state, req).await,
+        r if crate::rooms::handles(r) => crate::rooms::handle(ctx, state, req).await,
 
         // --- Files (docs/files-plan.md) -------------------------------
         r if r.starts_with("files_") => crate::files::handle(ctx, state, req).await,
@@ -2243,10 +2264,6 @@ pub(crate) fn retry_secs(wait: std::time::Duration) -> u64 {
 /// that a 1.x client would have carried whole, and cut it for every
 /// viewer including the ng ones.
 const NICK_MAX_CHARS: usize = 31;
-
-/// The classic wire's bound on a subject, which its 120 applies in
-/// characters too (`docs/hotline-ng.md` §8).
-const SUBJECT_MAX_CHARS: usize = 255;
 
 /// `String::truncate` panics off char boundaries; caps shouldn't.
 trait TruncateToCharBoundary {

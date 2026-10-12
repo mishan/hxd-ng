@@ -507,7 +507,8 @@ fn losing_access_to_a_room_parts_its_members() {
 #[test]
 fn a_session_mask_takes_management_and_membership_away() {
     let core = with_rooms(Core::new());
-    let (boss, _) = attach(&core, manager("boss"));
+    let (boss, mut rb) = attach(&core, manager("boss"));
+    core.rooms_aware(boss);
     let open = core.room_create(boss, named("lounge")).unwrap().id;
     let staff = core
         .room_create(
@@ -524,6 +525,7 @@ fn a_session_mask_takes_management_and_membership_away() {
     core.room_join(alice, open).unwrap();
     let listed = |uid| -> Vec<u32> { core.room_list(uid).iter().map(|v| v.room.id).collect() };
     assert!(listed(boss).contains(&staff));
+    drain(&mut rb);
 
     let unmanaged = crate::DenyMask {
         extra: crate::Extras {
@@ -539,6 +541,7 @@ fn a_session_mask_takes_management_and_membership_away() {
     );
     assert_eq!(listed(boss), [open]);
     assert!(core.rooms_of(boss).is_empty());
+    assert!(drain(&mut rb).contains(&Event::RoomRemoved { room: staff }));
 
     let unread = crate::DenyMask {
         access: AccessBits::empty().with(bit::READ_CHAT),
@@ -546,6 +549,49 @@ fn a_session_mask_takes_management_and_membership_away() {
     };
     assert!(core.set_session_mask(alice, unread));
     assert!(core.rooms_of(alice).is_empty());
+}
+
+/// A listing's changes reach the rooms-aware alone, and a topic reaches
+/// a member as the room's subject and anyone else as the room changed.
+#[test]
+fn a_topic_is_a_subject_to_members_and_a_change_to_the_rest_of_the_aware() {
+    let core = with_rooms(Core::new());
+    let (boss, _) = attach(&core, manager("boss"));
+    let room = core.room_create(boss, named("lounge")).unwrap().id;
+    let (inside, mut ri) = attach(&core, member("inside"));
+    let (outside, mut ro) = attach(&core, member("outside"));
+    let (_, mut unaware) = attach(&core, member("unaware"));
+    for uid in [inside, outside] {
+        core.rooms_aware(uid);
+    }
+    core.room_join(inside, room).unwrap();
+    for rx in [&mut ri, &mut ro, &mut unaware] {
+        drain(rx);
+    }
+    core.room_edit(
+        boss,
+        room,
+        RoomEdit {
+            topic: Some("quiet".into()),
+            ..RoomEdit::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        about(&drain(&mut ri), room),
+        [Event::ChatSubject {
+            cid: room,
+            subject: "quiet".into()
+        }]
+    );
+    let heard = drain(&mut ro);
+    assert!(
+        matches!(&heard[..], [Event::RoomChanged(v)] if v.room.topic.text == "quiet"),
+        "{heard:?}"
+    );
+    core.room_archive(boss, room, true).unwrap();
+    assert!(drain(&mut unaware).is_empty());
+    assert_eq!(drain(&mut ro), [Event::RoomRemoved { room }]);
 }
 
 #[test]
@@ -771,9 +817,9 @@ fn archiving_a_full_room_tells_each_member_once() {
     for (uid, rx) in &mut members {
         assert_eq!(
             about(&drain(rx), room),
-            [Event::ChatUserParted {
-                cid: room,
-                uid: *uid
+            [Event::RoomParted {
+                uid: *uid,
+                reason: PartReason::Archived
             }]
         );
     }

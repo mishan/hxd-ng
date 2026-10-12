@@ -76,6 +76,7 @@ impl RoomsSection {
         RoomPolicy {
             max_joined: self.max_joined,
             max_rooms: self.max_rooms,
+            lobby: self.lobby.clone(),
         }
     }
 

@@ -175,6 +175,7 @@ over them.
 | `avatars` | Users' pictures: `avatar` on the `user` object, `avatar_clear`, bytes over HTTP | avatars.md §4 | `avatars` |
 | `banner` | The server banner: where its image is, where a click goes, and `GET /banner` | banner.md §3 | `banner` |
 | `accounts` | Account administration: `account_list`, `account_get`, `account_create`, `account_update`, `account_delete`, and `account_changed` | account-admin.md §5 | `accounts` |
+| `rooms` | Curated rooms: `rooms`, `room_*`, `room` on `chat` and `history`, and the `room_*` events | chat-rooms.md §7 | `rooms`, and in `sync`'s reply |
 
 - `video` MUST NOT appear without `voice`.
 - A login reply block is present exactly when its capability is, except
@@ -371,7 +372,9 @@ time after the handshake.
 from: the next event it receives has a greater one. With the `accounts`
 capability it also carries that family's block, as the login reply does
 (account-admin.md §5.1), since an `account_changed` may have been lost
-in the gap.
+in the gap, and with the `rooms` capability that family's block, with
+the rooms this session is in and the newest line in each
+(chat-rooms.md §7.4).
 
 - **The server MUST NOT send an event with a seq at or below `sync`'s
   `seq` after the `sync` reply** (rationale §5). A server that cannot keep
@@ -443,7 +446,11 @@ delivered at all, and is `no_such_user`.
 `sync`; then `inbox`, to find the private messages the gap held — they
 were marked delivered when they entered it, and the store is now the only
 copy; then `history` with `after` set to the last chat line id it holds,
-repeated while `has_more`, to recover the gap's public chat. A line
+repeated while `has_more`, to recover the gap's public chat; and with
+the `rooms` capability, the same for each room `sync` lists in
+`rooms.joined` whose `last_id` is past the client's cursor for that room,
+with `room` set, since a line id is a cursor in its own room alone
+(chat-rooms.md §7.4). A line
 returned by `history` has the same id as its live `chat` event, so the
 client deduplicates by id. Mail that arrived while no connection was
 attached was never in the buffer; it is still pending, and `sync`
@@ -614,11 +621,11 @@ family document. Each family of §4 adds its own.
 | `req` | `params` | `ok` | Errors besides §10's universal set |
 |---|---|---|---|
 | `login` / `resume` / `sync` | §6 | §6 | §6 |
-| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?` | `{}` | `server_error` |
+| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?` | `{}` | `no_such_room`, `not_a_member`, `read_only`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
 | `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?` | `{ "queued": bool }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `server_error` |
-| `history` | `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `server_error` |
+| `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message id) | `{ "unread", "total" }` | `no_inbox`, `server_error` |
 | `block` | exactly one of `uid` / `login` | `{}` | `no_such_user`, `no_inbox`, `server_error` |
@@ -633,11 +640,13 @@ family document. Each family of §4 adds its own.
 - **`nick`** changes this session's nick and icon. A new nick needs the
   use-any-name privilege; without it the request is `access_denied` and
   changes nothing, icon included. An empty nick is ignored.
-- **`room_topic`** sets the public chat's subject, which everyone hears
-  as `subject`. It needs the set-subject privilege (*hxd-ng:* `[extra]
-  set_subject`, as the classic 120). It is chat-rooms.md §7.2's request:
-  until rooms exist, an absent `room` or `room` 0 is the lobby and any
-  other room is `no_such_room`.
+- **`room_topic`** with an absent `room` or `room` 0 sets the public
+  chat's subject, which everyone hears as `subject`. It needs the
+  set-subject privilege (*hxd-ng:* `[extra] set_subject`, as the classic
+  120), and is answered whether or not the server has the `rooms`
+  capability. Any other `room` is chat-rooms.md §7.2's.
+- **`room`** on `chat`, `history` and `room_topic` is the `rooms`
+  capability's (chat-rooms.md §7.2): absent or 0 is the lobby.
 - **`msg`** needs the send-messages privilege, except to the server's own
   account (system-account.md §3). See §7.1.
 - **`history`** needs the chat-history privilege. It pages public chat by
@@ -664,8 +673,9 @@ family document. Each family of §4 adds its own.
   then closes the connection (§5).
 
 **News** (`news_*`), **push** (`push_register`, `push_unregister`),
-**voice** (`voice_*`), **video** (`video_*`) and **files** (`files_*`)
-requests are specified where §4 says.
+**voice** (`voice_*`), **video** (`video_*`), **files** (`files_*`)
+and **rooms** (`rooms`, `room_*` but the lobby's `room_topic`) requests
+are specified where §4 says.
 
 `rate_limited` from `chat`, `msg` and the news posts during a never-seen
 key's newcomer delay carries `retry_after` (seconds) in the error object,
@@ -679,15 +689,15 @@ blind (identity-registrar.md §7.3).
 | `user_joined` | `{ "user": {…} }` | A session joins the roster. |
 | `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag or status changes. |
 | `user_parted` | `{ "uid": n }` | A session leaves the roster. |
-| `chat` | `{ "from": { uid, nick }, "text", "style", "at", "id"?, "media"? }` | A line of public chat. `id` is present when the server kept the line (the `history` capability). |
-| `notice` | `{ "text" }` | A server notice, such as a kick announcement. |
-| `subject` | `{ "subject" }` | The public chat's subject changed. |
+| `chat` | `{ "from": { uid, nick }, "text", "style", "at", "id"?, "media"?, "room"? }` | A line of public chat. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. |
+| `notice` | `{ "text", "room"? }` | A server notice, such as a kick announcement. |
+| `subject` | `{ "subject", "room"? }` | The public chat's subject, or a room's topic, changed. |
 | `broadcast` | `{ "from": { uid, nick }, "text" }` | An administrator's broadcast. |
 | `msg` | `{ "from": { uid, nick, login? }, "text", "at", "queued", "id"?, "media"? }` | A private message (§7.1). |
 | `kicked` | `{}` | This session was kicked. The server then closes the connection (§5) and the session is over. |
 
 Timestamps (`at`) are integer Unix seconds. Events of the extension
-families — `voice_*`, `video_status`, `news_*` — are specified where §4
+families — `voice_*`, `video_status`, `news_*`, `room_*` — are specified where §4
 says, and `media_revoked`, `chat_redacted`, `chat_purged`, `report` and `report_closed`
 in moderation.md §5, whose requests — `report`, `redact`, `revoke`,
 `purge`, `kick` and the rest — are specified there too. Every event, of any family,
@@ -888,7 +898,12 @@ news body is different: it declares its own type (news.md §5).
 | `session_expired` | `resume` | Log in again. |
 | `resync_required` | `resume` | Attached; follow with `sync`. |
 | `not_available` | `history`, `files_*`, family requests | The server does not offer this. |
-| `no_such_room` | `room_topic` | No such room, or one this session may not see (chat-rooms.md §5). |
+| `no_such_room` | `room_*`, `chat`, `history` | No such room, or one this session may not see (chat-rooms.md §5). |
+| `not_a_member` | `room_part`, `chat` | Not in that room, which this session may see. |
+| `read_only` | `chat` | This session may read that room and not send in it. |
+| `too_many_rooms` | `room_join` | This session is in as many rooms as it may be. |
+| `rooms_full` | `room_create` | The server holds as many rooms as it may. |
+| `name_taken` | `room_create`, `room_edit` | A room has that name already. |
 | `no_such_user` | `msg`, `block`, `unblock` | No such uid, no such account, or that account takes no offline mail — one answer for all three. |
 | `no_inbox` | `inbox`, `msg_read`, `block`, `unblock`, `blocks` | *Your* account has no inbox, or the server has none: the `inbox` family's "not available" code. |
 | `mailbox_full` | `msg` | The recipient's inbox is at its cap. |

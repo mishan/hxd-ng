@@ -76,7 +76,9 @@ Condensed; the spec is normative and this is the checklist.
   already in `hxd-core::access`). It says a user may join voice; it does
   **not** say which room. Room membership is enforced separately: public
   chat (cid 0) is open to anyone with the bit, a private chat's voice
-  room only to that chat's current members.
+  room only to that chat's current members. A curated room's voice room
+  is its id (chat-rooms.md §9), open to its members, and a room the user
+  may not see answers as a cid nobody holds, never "not a member".
 - **Room identifiers MUST be server-allocated from a CSPRNG** and unique
   among rooms in use, because a voice room is addressed by a bare cid and
   a guessable cid lets a voice-capable client join a room it was never
@@ -392,7 +394,9 @@ Everything else on this wire is plain chunk assembly.
 A transliteration of the same six messages into the request/event shapes
 of [hotline-ng.md](hotline-ng.md) §5. The login reply's `caps` list
 (hotline-ng.md §4) gains
-`"voice"` when the SFU is wired.
+`"voice"` when the SFU is wired. A room's `cid` is its `room`
+(chat-rooms.md §9), so a client joins voice in a room it is in by its id;
+one it may not see answers `no_such_chat`.
 
 | `req` | params | ok | errors |
 |---|---|---|---|

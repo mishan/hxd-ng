@@ -419,8 +419,8 @@ Events:
 
 | `ev` | data | to |
 |---|---|---|
-| `chat_redacted` | `{ "id" }` | everyone reading public chat; a client blanks the line in place |
-| `chat_purged` | `{ "ids": [id, …] }` | the same; a client blanks every line in place |
+| `chat_redacted` | `{ "id", "room"? }` | everyone reading public chat, or for a room's line, every session that may read the room (chat-rooms.md §7.3); a client blanks the line in place |
+| `chat_purged` | `{ "ids": [id, …], "room"? }` | the same, one event per room the purge touched, each carrying that room's ids; a client blanks every line in place |
 | `media_revoked` | `{ "id" }` | everyone who could fetch it; a client drops the image and keeps the placeholder |
 | `report` | the report object | moderators |
 | `report_closed` | `{ "id", "outcome", "yours" }` | the reporter (`yours: true`), if they have a mailbox and a session; and moderators |

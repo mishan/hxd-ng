@@ -1,8 +1,9 @@
 # Chat rooms: curated, persistent, logged
 
-Status: R1 is built (§13): rooms in the domain, the rooms file and `hxd
-room`, carried by no wire yet. The ng wire of §7 is the spec part; the
-rest binds nobody but this server.
+Status: R1 and R2 are built (§13): rooms in the domain, the rooms file
+and `hxd room`, and the ng wire of §7. The classic wire carries none
+yet. The ng wire of §7 is the spec part; the rest binds nobody but this
+server.
 
 Public chat today is one room everybody shares, and a private chat is a
 room that exists while someone is in it and leaves no record.
@@ -244,8 +245,9 @@ lines carry no id, as the lobby's do today, `history` answers
 - **What else takes a serial takes the room's.** A redaction takes the
   serial of the line's room. A purge across rooms takes each room's in
   turn, never two at once, so no order of acquisition can deadlock.
-  Until the wire of §7 pages a room's history, a room's redactions and
-  purges go to its members.
+  A room's redactions and purges go to every session that may read
+  the room (§7.3), member or not, since one that paged its history holds
+  its lines too.
 - **Line ids remain global**, from one `AUTOINCREMENT`, so they never
   collide, and a redaction, a report or a purge names a line by id
   alone and finds its room from the row. A reader can see the gaps
@@ -525,10 +527,14 @@ Capability `"rooms"` in the login reply's `caps`, present unless
 `[rooms] enabled = false`, whether or not any room exists yet. Requests
 of the family on a server without it answer `not_available`.
 
-**A session is rooms-aware once it sends a request of this family.**
-Before that, it is sent no `room_*` event and no event about a room it
-could not have joined, so a client written before rooms sees today's
-protocol exactly. The lobby's events are unchanged in every case.
+**A session is rooms-aware once it sends a request of this family**,
+or a `chat` or `history` naming a room other than the lobby. Before
+that, it is sent no `room_*` event and no event about a room it could
+not have joined, so a client written before rooms sees today's protocol
+exactly. The lobby's events are unchanged in every case. Awareness is
+the session's, so a resume keeps it. The login reply's listing is as it
+stood at login: a client that wants it kept current sends `rooms`, which
+makes it aware.
 
 **Room 0 and an absent `room`.** A server MUST omit `room` in events
 about the lobby. It MUST accept an absent `room` and `room: 0` alike as
@@ -553,9 +559,12 @@ A `rooms` block beside `history`:
 ```
 
 `list` is the rooms this session may see, sorted by position then name,
-never including the lobby. `last_id` is the newest line id in the room,
-absent without history. `may_post` is whether this session may send
-there. `self` gains `"manage_rooms": true` when it is.
+never including the lobby or an archived room (a moderator or a manager
+still pages an archived room by its id). `last_id` is the newest line id
+in the room, absent without history. `may_post` is whether this session
+may send there. `max_lines` and `max_days` are present when the room
+has a retention of its own (§3). `self` gains `"manage_rooms": true`
+when it is.
 
 `last_id` lets a client that keeps its own read cursor per room badge
 the rooms it has not joined. **It is not pushed:** nothing is sent
@@ -565,7 +574,8 @@ fresh badges asks `rooms` again, and the request is priced for that
 state or fanning every line out to everyone who could see it.
 
 The room object carries `read` and `post` only to a session that may
-manage rooms. To anyone else, who is admitted is not their business.
+manage rooms, and to it `"archived": true` on an archived room. To anyone
+else, who is admitted is not their business.
 
 ### 7.2 Requests
 
@@ -611,11 +621,11 @@ manage rooms. To anyone else, who is admitted is not their business.
 | `notice` | gains `room` | A server notice in a room, such as a kick or the §6.2 line |
 | `subject` | gains `room` | A room's topic changed, to its members; the lobby's, to everyone, as now |
 | `room_member_joined` | `{ "room", "user": {…} }` | A session joined a room this session is in |
-| `room_member_parted` | `{ "room", "uid", "reason"? }` | A session left a room this session is in. `reason` is `"access"` or `"archived"` when the server parted it. Not sent when the session left the server: `user_parted` says that |
+| `room_member_parted` | `{ "room", "uid", "reason"? }` | A session left a room this session is in, or this session was parted. `reason`, `"access"` or `"archived"`, is sent to the session the server parted, and to nobody else: why someone lost access is not the room's business. Not sent when the session left the server: `user_parted` says that |
 | `room_added` | `{ "room": {…} }` | A room this session may see was created, unarchived, or became visible to it |
-| `room_changed` | `{ "room": {…} }` | A visible room's name, position or gates changed, or its topic, to sessions that may see it and are not in it (members hear `subject`) |
+| `room_changed` | `{ "room": {…} }` | A visible room's name, position, retention, gates or this session's `may_post` changed, to sessions that may see it; or its topic alone, to those that may see it and are not in it (members hear `subject`). Gates count only for a manager, who alone is shown them |
 | `room_removed` | `{ "room" }` | A room was archived, or stopped being visible to this session. If it was a member, it was parted first |
-| `chat_redacted` | gains `room` | moderation.md §5, for a line in a room: sent only to sessions that may read that room |
+| `chat_redacted` | gains `room` | moderation.md §5, for a line in a room: sent only to sessions that may read that room, and of those to the rooms-aware and its members |
 | `chat_purged` | gains `room` | moderation.md §5. One event per room the purge touched, carrying that room's ids, each sent only to sessions that may read that room. The lobby's is unchanged and has no `room` |
 
 Every one of them takes a seq, as every event does (hotline-ng.md §3).
@@ -702,11 +712,12 @@ Parting a room parts its voice room, as parting a private chat does.
   bare cid. A room's are wrapped, `Event::InRoom { room, event }`, so
   the ng encoder can emit a room's events and keep a private chat's an
   `unsupported` placeholder until the ng private-chat work lands, and a
-  frontend that shows no rooms leaves them out whole: until R2 and R3
-  the classic wire drops them and the ng wire sends the placeholder. A
-  session's end is told to its rooms as a part, as to its private
-  chats; whether the ng wire says it, where `user_parted` already does
-  (§7.3), is R2's to settle.
+  frontend that shows no rooms leaves them out whole: until R3 the
+  classic wire drops them, and the ng wire sends the placeholder for any
+  it does not carry. A session's end is told to its rooms as a part, as
+  to its private chats, except to a rooms-aware session, which hears it
+  as `user_parted` alone (§7.3). The domain leaves that part out rather
+  than the encoder, which could only turn it into a placeholder.
 - **Server links.** Only the lobby crosses (§3). A ghost cannot be
   invited into a room, for the reason it cannot be invited into a
   private chat: every exported user refuses private chat. Linked rooms
@@ -754,7 +765,13 @@ All keys optional. The rooms themselves are not in the config: they
 are in `[rooms] file`, managed by hand, by `hxd room` and by the ng
 requests (§4). Whether their lines are logged is `[history]`'s
 business, as it is the lobby's. `max_rooms` counts archived entries
-too, so a manager cannot create, fill and archive rooms without end.
+and tombstones too, so a manager cannot create, fill and archive rooms
+without end, and a file holding more entries is refused as one that
+does not parse (§4). It also bounds what one reload tells a session:
+about one event per room. A `max_rooms` past what a detached session
+buffers (hotline-ng.md §3, 512 events in this server) lets a reload
+that adds or removes that many rooms at once send such a session to
+`resync_required` on its resume, never a gap.
 Docker's entrypoint keeps the file in its data directory, and gains
 `HXD_ROOMS_ANNOUNCE` and nothing else (docs/docker.md).
 
@@ -785,7 +802,8 @@ Docker's entrypoint keeps the file in its data directory, and gains
    answering `no_such_room` to every request and `voice_join` naming
    it; a read-only room; archive parting members; resync catching up
    per room; a client that never sends a rooms request seeing no
-   `room_*` event.
+   `room_*` event; a redaction reaching a room's reader and not an
+   outsider; a member leaving the server told once.
 3. **R3 — period clients.** The system commands, the invite mapping,
    the notices of §6.2–§6.5. E2E: a scripted 1.5 client `/join`s,
    accepts the invite, and talks with an ng client in the room; 113,

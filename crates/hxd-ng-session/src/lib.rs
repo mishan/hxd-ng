@@ -23,6 +23,7 @@ pub mod push;
 mod registrar;
 pub mod registrars;
 mod registry;
+pub mod rooms;
 
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
