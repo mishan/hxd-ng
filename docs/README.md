@@ -43,6 +43,7 @@ to another project.
 | [account-admin.md](account-admin.md) — the user editor, the ng `accounts` family, `hxd account` | yes, less renames and the 1.8 batch editor | all | design; §5 is the ng spec |
 | [private-messages.md](private-messages.md) — the offline inbox | yes | all (period receives) | design |
 | [chat-history.md](chat-history.md) — server-held scrollback, fogWraith's Get Chat History | yes | extended, ng | design, implements a fogWraith spec |
+| [chat-rooms.md](chat-rooms.md) — curated, persistent rooms gated by `read` and `post` lists, logged where history is; public chat as the lobby; period clients join through the system account | no | all (period joins by invite) | design; §7 is the ng spec |
 | [inline-media.md](inline-media.md) — images in chat, fogWraith's Inline Media | yes | extended, ng (period sees the caption) | design, implements a fogWraith spec |
 | [moderation.md](moderation.md) — reports, redaction, revocation, purge | yes, less vouching | all (period reports and is moderated) | design; §5 is the ng spec |
 | [news.md](news.md) — threaded news, references, follows, search, markdown, the legacy bindings | yes, less the image part and the importer | all | design; §9–§10 are the ng spec |
