@@ -2,8 +2,8 @@
 
 Status: the ng wire and the legacy 1.2 and 1.5 bindings (§12) are
 built — §16 says which stages, and which keys of §13 the server accepts.
-The image part (§12.3) and the mhxd importer (§12.6) are designed and not
-built; both are deferred and get status lines of their own when
+The image part (§12.3) is built too. The importer (§12.6) is designed
+and not built; it is deferred and gets a status line of its own when
 scheduled. §10.7's `stale_after` floor is a 2026-09 amendment and is
 built. Feed-backed categories, RSS and Atom polled into read-only
 categories, are designed in [news-feeds.md](news-feeds.md).
@@ -256,7 +256,7 @@ pub struct Attachment {
     pub width: u32,
     pub height: u32,
     pub bytes: u32,               // canonical size
-    pub legacy_bytes: Option<u32>,// the ≤60 000 B derivative, when one exists
+    pub legacy: Option<(MediaType, u64)>, // the ≤60 000 B derivative's type and size
     pub name: Option<String>,     // the uploader's file name, for display only
 }
 ```
@@ -513,6 +513,7 @@ CREATE TABLE news_blob (
   height      INTEGER NOT NULL,
   bytes       INTEGER NOT NULL,
   derivative  INTEGER,                      -- size of the legacy derivative, or NULL
+  derivative_mime TEXT,                     -- its own type (schema 20), or NULL
   refs        INTEGER NOT NULL DEFAULT 0,
   at          INTEGER NOT NULL
 );
@@ -2049,13 +2050,14 @@ send the richer one, which is what lets a client skip a refetch.
 
 ### 12.3 The article listing, and its parts
 
-**Deferred.** The `image/*` part this section ends on — the §7.3
-derivative listed as a third part — is not on the path to a usable
-client: no period client renders it, and an ng client fetches the
-canonical bytes over HTTP (§9.4). It stays here as the shape the wire
-was designed for, and gets a status line of its own when it is
-scheduled (hxd-ng-design-review-2026-09.md §3). The listing itself and
-the `text/*` parts are not deferred; they are W9.
+**Built**, the `image/*` part with the rest: the listing and the
+`text/*` parts were W9, and the image part, the §7.3 derivative listed
+after them, followed. A derivative's type is its own (JPEG for an opaque
+image, PNG otherwise), kept beside its size since schema version 20;
+one made before that is listed only when it is a JPEG's, the one case
+whose type is certain. A client names a part by MIME type alone, so an
+article lists the first image of each type and no more, in the order
+they were attached: a second picture of a type it could not ask for.
 
 `NEWS_LISTCATEGORY` replies with one `CATLIST` chunk: a `post_count` header,
 then per post `postid`, an 8-byte Mac date, `parentid`, flags,
@@ -2302,9 +2304,10 @@ that opened W9 (§1).
 ### 12.6 Importing an mhxd tree
 
 **Deferred.** The importer is not on the path to a usable client and is
-not scheduled; it gets a status line of its own when it is
-(hxd-ng-design-review-2026-09.md §3). What follows is kept so the
-id-remapping and reference rules are decided once.
+not scheduled; it gets a status line of its own when it is. When it is,
+it reads Mobius's news as well as mhxd's: the operators it is for run
+both. What follows is kept so the id-remapping and reference rules are
+decided once.
 
 `hxd import-mhxd-news <dir>` walks a period news directory: `cat_`-
 prefixed directories are categories, others are bundles, and each file
@@ -2529,7 +2532,7 @@ Each lands separately with tests, roughly a branch apiece.
    edges, the 1.2 flat view of §12.5 — renderer, header-block parser,
    defaults and the push — and `hxd import-mhxd-news`.
 
-**Landed:** W1 through W8, and W9 without its two deferred parts. Markdown is `hxd-markdown` on pulldown-cmark behind
+**Landed:** W1 through W8, and W9 but for the importer. Markdown is `hxd-markdown` on pulldown-cmark behind
 `BodyRenderer` and the `markdown` feature. It has the three modes of
 §5.5, the downgrade stored in `plain` (which the index and the
 notification excerpt read instead of the source), and references from
@@ -2568,8 +2571,9 @@ UTF-8 edges, and the 1.2 flat view — renderer, header-block parser,
 defaults and the `NEWSFILE_POST` push — behind `legacy_catlist_max` and
 the `flat_*` keys. The store gained the two reads the legacy wire needs
 and the ng wire does not: a category as one listing, measured rather
-than carried, and a category's newest articles. Not in it: the `image/*`
-part (§12.3) and `hxd import-mhxd-news` (§12.6), both deferred. The
+than carried, and a category's newest articles. The `image/*` part
+(§12.3) followed it. Not in it: `hxd import-mhxd-news` (§12.6),
+deferred. The
 legacy e2e is in `crates/hxd/tests/news.rs` beside the ng one, and
 `e2e/legacy-news.test.mjs` reads the keys from a real config file.
 

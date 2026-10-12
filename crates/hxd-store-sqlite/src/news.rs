@@ -40,7 +40,22 @@ const NODE_COLUMNS: &str = "n.id, n.parent, n.kind, n.name, n.guid, n.add_sn, n.
 /// A serial is a u32 on the legacy wire and wraps there, so it wraps here.
 const WRAP: i64 = 1 << 32;
 
-type AttachmentRow = (Vec<u8>, String, i64, i64, i64, Option<String>);
+type AttachmentRow = (
+    Vec<u8>,
+    String,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+/// A legacy derivative's type and size, from `news_blob`'s two columns:
+/// none when there is no derivative or its type was never recorded.
+fn legacy_of(mime: Option<String>, bytes: Option<i64>) -> Option<(MediaType, u64)> {
+    Some((MediaType::from_mime(&mime?)?, u64::try_from(bytes?).ok()?))
+}
 
 fn sql<T>(r: rusqlite::Result<T>) -> Result<T, StoreError> {
     r.map_err(StoreError::new)
@@ -123,7 +138,8 @@ impl RawArticle {
         let mut attachments = Vec::new();
         {
             let mut stmt = sql(conn.prepare_cached(
-                "SELECT a.handle, b.mime, b.width, b.height, b.bytes, a.name
+                "SELECT a.handle, b.mime, b.width, b.height, b.bytes, a.name,
+                        b.derivative_mime, b.derivative
                    FROM news_attach a JOIN news_blob b ON b.hash = a.hash
                   WHERE a.article = ?1 ORDER BY a.ord",
             ))?;
@@ -135,10 +151,13 @@ impl RawArticle {
                     r.get::<_, i64>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
                 ))
             }))?;
             for row in rows {
-                let (handle, mime, width, height, bytes, name) = sql(row)?;
+                let (handle, mime, width, height, bytes, name, legacy_mime, legacy_bytes) =
+                    sql(row)?;
                 attachments.push(Attachment {
                     id: handle
                         .try_into()
@@ -152,6 +171,7 @@ impl RawArticle {
                     bytes: u64::try_from(bytes)
                         .map_err(|_| StoreError::new("attachment size is negative"))?,
                     name,
+                    legacy: legacy_of(legacy_mime, legacy_bytes),
                 });
             }
         }
@@ -1541,6 +1561,11 @@ impl NewsStore for SqliteStore {
               WHERE category = ?1 AND path >= ?2 AND path < ?3
               ORDER BY path LIMIT ?4",
         ))?;
+        let mut images = sql(conn.prepare_cached(
+            "SELECT b.derivative_mime, b.derivative
+               FROM news_attach a JOIN news_blob b ON b.hash = a.hash
+              WHERE a.article = ?1 ORDER BY a.ord",
+        ))?;
         let mut out = Vec::new();
         for (root, _) in roots {
             let root = article_id(root)?;
@@ -1570,7 +1595,20 @@ impl NewsStore for SqliteStore {
                         .as_str_or_null()
                         .map_err(StoreError::new)?
                         .map(TextLen::of),
+                    images: Vec::new(),
                 });
+                let listed = out.last_mut().expect("just pushed");
+                if !listed.deleted {
+                    let rows = sql(images
+                        .query_map(params![listed.id], |r| Ok(legacy_of(r.get(0)?, r.get(1)?))))?;
+                    for image in rows {
+                        if let Some(image) = sql(image)? {
+                            if !listed.images.iter().any(|(m, _)| *m == image.0) {
+                                listed.images.push(image);
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(out)
@@ -1607,18 +1645,23 @@ impl NewsStore for SqliteStore {
         let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
         sql(tx.execute(
             "INSERT INTO news_blob
-               (hash, mime, width, height, bytes, derivative, refs, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
+               (hash, mime, width, height, bytes, derivative, derivative_mime, refs, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?8, 0, ?7)
              ON CONFLICT(hash) DO UPDATE SET
-               derivative = COALESCE(news_blob.derivative, excluded.derivative)",
+               derivative = COALESCE(excluded.derivative, news_blob.derivative),
+               derivative_mime = COALESCE(excluded.derivative_mime, news_blob.derivative_mime)",
             params![
                 staged.blob.as_slice(),
                 staged.attachment.mime.mime(),
                 i64::from(staged.attachment.width),
                 i64::from(staged.attachment.height),
                 i64::try_from(staged.attachment.bytes).unwrap_or(i64::MAX),
-                staged.legacy_bytes.and_then(|n| i64::try_from(n).ok()),
+                staged
+                    .attachment
+                    .legacy
+                    .and_then(|(_, n)| i64::try_from(n).ok()),
                 unix(staged.staged_at),
+                staged.attachment.legacy.map(|(mime, _)| mime.mime()),
             ],
         ))?;
         sql(tx.execute(
@@ -1659,7 +1702,8 @@ impl NewsStore for SqliteStore {
             )
         });
         let sql_text = format!(
-            "SELECT a.hash, b.mime, b.width, b.height, b.bytes, a.name
+            "SELECT a.hash, b.mime, b.width, b.height, b.bytes, a.name,
+                    b.derivative_mime, b.derivative
                FROM news_attach a JOIN news_blob b ON b.hash = a.hash
                LEFT JOIN news_article n ON n.id = a.article
               WHERE a.handle = ?1 AND
@@ -1673,6 +1717,8 @@ impl NewsStore for SqliteStore {
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
             ))
         };
         let row: Option<AttachmentRow> = sql(match uploader {
@@ -1684,25 +1730,29 @@ impl NewsStore for SqliteStore {
             None => conn.query_row(&sql_text, params![id.as_slice()], columns),
         }
         .optional())?;
-        row.map(|(hash, mime, width, height, bytes, name)| {
-            Ok(AttachmentFetch {
-                blob: hash
-                    .try_into()
-                    .map_err(|_| StoreError::new("a news blob hash is not 32 bytes"))?,
-                attachment: Attachment {
-                    id: *id,
-                    mime: MediaType::from_mime(&mime)
-                        .ok_or_else(|| StoreError::new(format!("unknown image type {mime:?}")))?,
-                    width: u32::try_from(width)
-                        .map_err(|_| StoreError::new("attachment width is not a u32"))?,
-                    height: u32::try_from(height)
-                        .map_err(|_| StoreError::new("attachment height is not a u32"))?,
-                    bytes: u64::try_from(bytes)
-                        .map_err(|_| StoreError::new("attachment size is negative"))?,
-                    name,
-                },
-            })
-        })
+        row.map(
+            |(hash, mime, width, height, bytes, name, legacy_mime, legacy_bytes)| {
+                Ok(AttachmentFetch {
+                    blob: hash
+                        .try_into()
+                        .map_err(|_| StoreError::new("a news blob hash is not 32 bytes"))?,
+                    attachment: Attachment {
+                        id: *id,
+                        mime: MediaType::from_mime(&mime).ok_or_else(|| {
+                            StoreError::new(format!("unknown image type {mime:?}"))
+                        })?,
+                        width: u32::try_from(width)
+                            .map_err(|_| StoreError::new("attachment width is not a u32"))?,
+                        height: u32::try_from(height)
+                            .map_err(|_| StoreError::new("attachment height is not a u32"))?,
+                        bytes: u64::try_from(bytes)
+                            .map_err(|_| StoreError::new("attachment size is negative"))?,
+                        name,
+                        legacy: legacy_of(legacy_mime, legacy_bytes),
+                    },
+                })
+            },
+        )
         .transpose()
     }
 

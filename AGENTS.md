@@ -529,7 +529,7 @@ way, staged in `docs/identity-records.md`. The large open fronts, in rough order
 client-quickstart polish, files/HTXF, the
 rest of news (the domain, store, search, subscriptions, markdown bodies,
 attachments, the ng wire, the legacy binding and moderation have
-landed; the legacy image part and the mhxd importer are staged in
+landed; the importer, for mhxd's news and Mobius's, is staged in
 `docs/news.md` §16), the push gateway itself
 (`docs/push-notifications.md` P3 onward — the domain already decides who
 is notified, for private messages and for news), and eventually the
