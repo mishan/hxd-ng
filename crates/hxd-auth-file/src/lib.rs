@@ -355,6 +355,15 @@ impl FileAuth {
                 tracing::warn!("{complaint}");
                 found.push(complaint);
             }
+            if is_role_login(&login) {
+                let complaint = format!(
+                    "{login}.toml: logins beginning with @ are reserved for roles; the \
+                     account still logs in, but no editor will change it, and @role \
+                     editing will be disabled while it exists; rename or remove the file to clear it"
+                );
+                tracing::warn!("{complaint}");
+                found.push(complaint);
+            }
             match self.load(&login) {
                 Ok(f) => {
                     if let Some(reason) = f.unreachable_reason() {
@@ -466,6 +475,13 @@ fn valid_login(login: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@'))
         && !login.starts_with('.')
+}
+
+/// A login beginning with `@` names a role in the period user editor
+/// (`roles.md` §6.4), so nothing here writes one. A file that already has
+/// one stays an account, and `audit` says so.
+fn is_role_login(login: &str) -> bool {
+    login.starts_with('@')
 }
 
 /// Logins the server gives its own meaning to, so an account created
@@ -706,7 +722,7 @@ impl AccountAdmin for FileAuth {
         check: WriteCheck<'_>,
     ) -> Result<Account, AdminError> {
         let login = admin_login(&edit.login)?;
-        if self.is_reserved(&login) {
+        if self.is_reserved(&login) || is_role_login(&login) {
             return Err(AdminError::InvalidLogin);
         }
         let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
@@ -1844,6 +1860,44 @@ mod tests {
         assert!(made);
         assert_eq!(acct.login, "server-2");
         assert!(!td.path().join("server.toml").exists());
+    }
+
+    #[test]
+    fn a_login_beginning_with_at_is_left_to_roles() {
+        let (td, auth) = backend();
+        write(td.path(), "@old.toml", "password = \"pw\"\n");
+        assert_eq!(
+            auth.authenticate("@old", Proof::Plain(b"pw"))
+                .unwrap()
+                .login,
+            "@old"
+        );
+        assert!(
+            auth.audit()
+                .iter()
+                .any(|s| s.starts_with("@old.toml") && s.contains("reserved for roles")),
+            "an account already holding one is named at startup"
+        );
+        assert_eq!(
+            auth.authenticate("@mods", Proof::Plain(b"")).unwrap_err(),
+            AuthError::NoSuchAccount
+        );
+        for login in ["@mods", "@old"] {
+            let edit = AccountEdit {
+                login: login.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                auth.write_account(&edit, &|_, _| Ok(())).unwrap_err(),
+                AdminError::InvalidLogin,
+                "{login}"
+            );
+        }
+        assert!(!td.path().join("@mods.toml").exists());
+        let (made, _) = auth
+            .find_or_create_linked("@mods", "Mods", &[5u8; 32], AccessBits::empty())
+            .unwrap();
+        assert_eq!(made.login, "mods");
     }
 
     #[test]

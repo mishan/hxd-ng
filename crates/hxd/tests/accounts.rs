@@ -178,6 +178,14 @@ async fn an_administrator_makes_reads_edits_and_deletes_an_account() {
         ),
         "That account already exists."
     );
+    assert_eq!(
+        refused(
+            admin
+                .call(ACCOUNT_CREATE, &user("@mods", None, "Mods", chatter))
+                .await
+        ),
+        "A login is up to 31 letters, digits and _ - . @, not starting with a dot or @."
+    );
 
     // Open User names its login in the clear, and its reply never
     // carries the password.
@@ -649,6 +657,16 @@ async fn an_ng_administrator_keeps_accounts_and_its_target_hears() {
             "invalid_login",
         ),
         (
+            "account_create",
+            json!({ "login": "@mods" }),
+            "invalid_login",
+        ),
+        (
+            "account_update",
+            json!({ "login": "@mods", "name": "M" }),
+            "invalid_login",
+        ),
+        (
             "account_get",
             json!({ "login": "nobody" }),
             "no_such_account",
@@ -719,6 +737,7 @@ async fn the_command_line_keeps_accounts_and_a_reload_reaches_their_sessions() {
     assert!(added.contains("password: set"), "{added}");
     assert!(hxd::accounts::list(&config).unwrap().contains("frank"));
     assert!(hxd::accounts::add(&config, "frank", None, None, None, &password).is_err());
+    assert!(hxd::accounts::add(&config, "@mods", None, None, None, &password).is_err());
 
     std::fs::write(&secret, "second").unwrap();
     hxd::accounts::passwd(&config, "frank", &password).unwrap();

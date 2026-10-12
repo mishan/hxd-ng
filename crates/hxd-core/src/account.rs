@@ -336,7 +336,7 @@ pub enum AdminError {
     /// A create named a login an account already has.
     Exists,
     /// Not a login this backend can store, or one reserved for the
-    /// server.
+    /// server or for roles.
     InvalidLogin,
     /// This server has no account administration.
     Unsupported,
@@ -354,7 +354,7 @@ impl std::fmt::Display for AdminError {
             AdminError::NoSuchAccount => "There is no such account.",
             AdminError::Exists => "That account already exists.",
             AdminError::InvalidLogin => {
-                "A login is up to 31 letters, digits and _ - . @, not starting with a dot."
+                "A login is up to 31 letters, digits and _ - . @, not starting with a dot or @."
             }
             AdminError::Unsupported => "This server does not administer accounts.",
             AdminError::Backend(e) => return write!(f, "account store: {e}"),
