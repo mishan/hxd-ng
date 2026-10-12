@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hxd_core::history::{
-    ChatLog, HistoryPage, HistoryQuery, LineFlags, LineId, LogLine, MediaMeta, NewLine,
+    ChatLog, HistoryPage, HistoryQuery, LineFlags, LineId, LogLine, MediaMeta, NewLine, Retention,
 };
 use hxd_core::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
@@ -2206,21 +2206,21 @@ impl ChatLog for SqliteStore {
 
     fn lines_by_ghost(
         &self,
-        channel: u32,
+        channel: Option<u32>,
         ghost: [u8; 16],
         since: SystemTime,
     ) -> Result<Vec<LogLine>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
             "SELECT {HISTORY_COLUMNS} FROM chat_line
-              WHERE channel = ?1 AND at >= ?2 AND deleted_at IS NULL
+              WHERE (?1 IS NULL OR channel = ?1) AND at >= ?2 AND deleted_at IS NULL
                 AND ghost = ?3
               ORDER BY id ASC"
         );
         let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
         let rows = stmt
             .query_map(
-                params![i64::from(channel), unix(since), &ghost[..]],
+                params![channel.map(i64::from), unix(since), &ghost[..]],
                 history_row,
             )
             .map_err(StoreError::new)?;
@@ -2229,7 +2229,7 @@ impl ChatLog for SqliteStore {
 
     fn lines_by(
         &self,
-        channel: u32,
+        channel: Option<u32>,
         who: &Mailbox,
         since: SystemTime,
     ) -> Result<Vec<LogLine>, StoreError> {
@@ -2239,14 +2239,14 @@ impl ChatLog for SqliteStore {
         // matches no mailbox, which is the rule's own answer.
         let sql = format!(
             "SELECT {HISTORY_COLUMNS} FROM chat_line
-              WHERE channel = ?1 AND at >= ?2 AND deleted_at IS NULL AND {}
+              WHERE (?1 IS NULL OR channel = ?1) AND at >= ?2 AND deleted_at IS NULL AND {}
               ORDER BY id ASC",
             mailbox_sql(who, "login", 3)
         );
         let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
         let rows = stmt
             .query_map(
-                params![i64::from(channel), unix(since), bind(who)],
+                params![channel.map(i64::from), unix(since), bind(who)],
                 history_row,
             )
             .map_err(StoreError::new)?;
@@ -2275,35 +2275,85 @@ impl ChatLog for SqliteStore {
         Ok(changed != 0)
     }
 
-    fn prune(
-        &self,
-        max_lines: usize,
-        max_age: Option<Duration>,
-        now: SystemTime,
-    ) -> Result<usize, StoreError> {
+    fn prune(&self, keep: &Retention, now: SystemTime) -> Result<usize, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(StoreError::new)?;
         let mut gone = 0;
-        if let Some(age) = max_age {
+        // By age: a channel with a rule of its own by that rule, and every
+        // other in one statement, since `at` is indexed.
+        for &(channel, _, age) in &keep.channels {
+            if let Some(age) = age {
+                gone += tx
+                    .execute(
+                        "DELETE FROM chat_line WHERE channel = ?1 AND at < ?2",
+                        params![i64::from(channel), cutoff(now, age)],
+                    )
+                    .map_err(StoreError::new)?;
+            }
+        }
+        if let Some(age) = keep.max_age {
+            let own: Vec<String> = keep.channels.iter().map(|c| c.0.to_string()).collect();
             gone += tx
                 .execute(
-                    "DELETE FROM chat_line WHERE at < ?1",
+                    &format!(
+                        "DELETE FROM chat_line WHERE at < ?1 AND channel NOT IN ({})",
+                        own.join(",")
+                    ),
                     params![cutoff(now, age)],
                 )
                 .map_err(StoreError::new)?;
         }
-        if max_lines > 0 {
+        // By count, a channel at a time.
+        let channels: Vec<i64> = tx
+            .prepare("SELECT DISTINCT channel FROM chat_line")
+            .and_then(|mut stmt| stmt.query_map([], |r| r.get(0))?.collect())
+            .map_err(StoreError::new)?;
+        for channel in channels {
+            let max = u32::try_from(channel).map_or(0, |c| keep.of(c).0);
+            if max == 0 {
+                continue;
+            }
             gone += tx
                 .execute(
-                    "DELETE FROM chat_line WHERE id IN (
-                       SELECT id FROM chat_line ORDER BY id DESC LIMIT -1 OFFSET ?1
+                    "DELETE FROM chat_line WHERE channel = ?1 AND id < (
+                       SELECT id FROM chat_line WHERE channel = ?1
+                        ORDER BY id DESC LIMIT 1 OFFSET ?2
                      )",
-                    params![max_lines.min(i64::MAX as usize) as i64],
+                    params![channel, (max - 1).min(i64::MAX as usize) as i64],
                 )
                 .map_err(StoreError::new)?;
         }
         tx.commit().map_err(StoreError::new)?;
         Ok(gone)
+    }
+
+    fn channels(&self) -> Result<Vec<(u32, LineId)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT channel, MAX(id) FROM chat_line GROUP BY channel ORDER BY channel")
+            .map_err(StoreError::new)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(StoreError::new)?;
+        rows.map(|row| {
+            let (channel, id) = row.map_err(StoreError::new)?;
+            Ok((
+                u32::try_from(channel)
+                    .map_err(|_| StoreError::new(format!("chat channel {channel} is not a u32")))?,
+                LineId::try_from(id)
+                    .map_err(|_| StoreError::new(format!("chat line id {id} is not an id")))?,
+            ))
+        })
+        .collect()
+    }
+
+    fn delete_channel(&self, channel: u32) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM chat_line WHERE channel = ?1",
+            params![i64::from(channel)],
+        )
+        .map_err(StoreError::new)
     }
 
     fn attach_media(&self, id: LineId, media: &MediaMeta) -> Result<(), StoreError> {

@@ -32,6 +32,7 @@ pub mod moderation;
 pub mod push;
 pub mod registrar;
 pub mod roles;
+pub mod rooms;
 pub mod tls;
 pub mod voice;
 pub use files::Files;
@@ -119,6 +120,10 @@ pub struct Config {
     /// never notices.
     #[serde(default)]
     pub hope: HopeSection,
+    /// Curated rooms (`docs/chat-rooms.md` §12). On unless `enabled =
+    /// false`; the rooms themselves are in `[rooms] file`.
+    #[serde(default)]
+    pub rooms: rooms::RoomsSection,
 }
 
 /// `[hope]`.
@@ -3178,6 +3183,7 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     if let Some(avatars) = &config.avatars {
         avatars.check()?;
     }
+    config.rooms.check()?;
     Ok(())
 }
 
@@ -4114,6 +4120,8 @@ pub fn build_ctx(
         (None, None) => core,
         _ => return Err("[history] store was not opened".into()),
     };
+    // After the log, whose channels no room's id may be.
+    let core = rooms::with_rooms(core, config)?;
     let core = match (stores.news, config.news.as_ref()) {
         // The accounts too, whether or not there is an inbox: whether a
         // subscriber may still read the news is a question about an

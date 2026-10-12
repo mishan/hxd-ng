@@ -262,8 +262,10 @@ still migrates to v2 — an empty table is not a feature.
 
 `max_lines` (default 10 000) and `max_days` (default 0 = unlimited),
 pruned by the existing hourly sweeper, never on a request. Pruning
-deletes the oldest rows past the count and any row older than the age;
-tombstones age out like everything else. Both values are advertised at
+deletes the oldest rows past the count in each channel and any row
+older than the age, by a room's own `max_lines` and `max_days` where
+it has them (chat-rooms.md §3); tombstones age out like everything
+else. Both values are advertised at
 LOGIN (§6.1) and in the ng login reply (§7.1) whenever non-zero.
 
 Tombstoned rows keep their id and timestamp with `body` and `nick`

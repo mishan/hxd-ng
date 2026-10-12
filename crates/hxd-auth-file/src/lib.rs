@@ -129,6 +129,9 @@ struct ExtraTable {
     can_spam: Option<bool>,
     /// May this account create and edit roles? Default: false.
     manage_roles: Option<bool>,
+    /// May this account manage rooms (`docs/chat-rooms.md` §5)? Default:
+    /// false, even for an administrator.
+    manage_rooms: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -221,6 +224,7 @@ impl AccountFile {
             moderate: x.moderate,
             can_spam: x.can_spam,
             manage_roles: x.manage_roles,
+            manage_rooms: x.manage_rooms,
         };
         AccountConfig {
             access,
@@ -419,6 +423,9 @@ impl FileAuth {
                 access::names_of(AccessBits::from_raw(everyone.access.raw() & weighty.raw())).0;
             if everyone.extra.manage_roles {
                 given.push("manage_roles");
+            }
+            if everyone.extra.manage_rooms {
+                given.push("manage_rooms");
             }
             if !given.is_empty() {
                 let complaint = format!(
@@ -2305,6 +2312,7 @@ mod tests {
             "moderate" => a.moderate,
             "attach_news" => a.attach_news,
             "manage_roles" => a.manage_roles,
+            "manage_rooms" => a.manage_rooms,
             _ => match key.strip_prefix("raw:") {
                 Some(n) => a.access.has(n.parse().unwrap()),
                 None => a.access.has(named_bit(key).unwrap()),
@@ -2388,6 +2396,13 @@ mod tests {
                 "[role.r]\nextra = { manage_roles = true }\n",
                 LISTED,
                 "manage_roles",
+                true,
+            ),
+            ("", "", "manage_rooms", false),
+            (
+                "[role.r]\nextra = { manage_rooms = true }\n",
+                LISTED,
+                "manage_rooms",
                 true,
             ),
             (RAW, LISTED, "raw:58", true),

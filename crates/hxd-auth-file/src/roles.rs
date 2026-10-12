@@ -138,6 +138,7 @@ pub const EXTRA_KEYS: &[&str] = &[
     "moderate",
     "can_spam",
     "manage_roles",
+    "manage_rooms",
 ];
 
 fn extra_slot<'a>(x: &'a mut Extras<bool>, key: &str) -> Option<&'a mut bool> {
@@ -149,6 +150,7 @@ fn extra_slot<'a>(x: &'a mut Extras<bool>, key: &str) -> Option<&'a mut bool> {
         "moderate" => &mut x.moderate,
         "can_spam" => &mut x.can_spam,
         "manage_roles" => &mut x.manage_roles,
+        "manage_rooms" => &mut x.manage_rooms,
         _ => return None,
     })
 }

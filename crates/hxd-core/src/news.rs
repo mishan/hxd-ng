@@ -2714,6 +2714,8 @@ mod tests {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person,
                 reads_on_delivery: false,
                 identity: None,

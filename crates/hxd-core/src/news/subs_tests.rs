@@ -161,6 +161,8 @@ impl Server {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person: login != "guest",
                 reads_on_delivery: classic,
                 identity,

@@ -51,7 +51,7 @@ been exercised on newer toolchains; CI runs stable.
 
 | Crate | Role |
 |---|---|
-| `hxd-core` | The domain: presence roster, chat rooms, messaging, moderation and bans, the news tree, avatars, access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
+| `hxd-core` | The domain: presence roster, chat rooms, curated rooms and the `RoomStore` their file is behind (`rooms`), messaging, moderation and bans, the news tree, avatars, access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), HOPE, the secure login, and the transport it agrees (`hope.rs`, `docs/hope.md`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs, and the registrar's requests, records and signed lists (with the one record verifier they all share) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
@@ -70,7 +70,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-testclient` | Scripted clients for the server's own tests: the classic wire over TCP or TLS, framed with the pinned `hxproto` rather than the server's framer and read through a buffer so a timeout cannot cut a frame, and the ng wire with every event's seq checked as it arrives. Both keep what arrives while they wait for something else. Shared by `hxd-load` and the e2e suites. |
 | `hxd-load` | The load harness (`docs/load-testing.md`): scenarios from TOML — the login storm, public chat, the slow consumer, churn — open-loop, timed from when each thing was due, with the server's invariants checked under load and a JSON report. `hxd-load accounts` writes the accounts churn logs in to. Its `tests/` run each scenario small against a real server. |
 | `hlrelay` | A relay (`docs/hotline-ng-auth.md` §10.2, `docs/relay.md`): discovery, `/trtp` and `/htxf` in front of a classic server that has never heard of Hotline-ng, each socket copied to a TCP connection of its own. Knows nothing about the bytes it carries and does not authenticate. |
-| `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, the news feed poller (`feeds.rs`), `HXD_DEBUG` tracing, the operator's commands (`hxd account` in `accounts.rs`, `hxd role` in `roles.rs`, `hxd ban` and the rest of moderation in `moderation.rs`, `hxd link` in `link.rs`), and behind the `metrics` feature the recorder `GET /metrics` renders (`metrics.rs`, `docs/metrics.md`). Its `tests/` hold the e2e suites. |
+| `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, the news feed poller (`feeds.rs`), `HXD_DEBUG` tracing, the operator's commands (`hxd account` in `accounts.rs`, `hxd role` in `roles.rs`, `hxd ban` and the rest of moderation in `moderation.rs`, `hxd link` in `link.rs`, `hxd room` and the rooms file in `rooms.rs`), and behind the `metrics` feature the recorder `GET /metrics` renders (`metrics.rs`, `docs/metrics.md`). Its `tests/` hold the e2e suites. |
 
 `tools/ng-client.mjs` is an interactive ng test client (Node 22+, or
 `npm install` in tools/ for the `ws` fallback) — `/drop` exercises
@@ -260,15 +260,21 @@ being sent a trickle of events at most every couple of milliseconds
 (`COALESCE`), because one write per event was most of what a storm
 cost; a task reply never waits.
 
-**Public chat is committed in groups** (`chat::ChatCommit`): a line
-joins a queue, and whoever finds no commit under way logs everything
-queued in one transaction and relays it in order under `log_serial`,
-then hands the lead on. Queue order is the order lines are logged and
-heard in; anything else that must fall between two lines (a redaction,
-a purge) takes `log_serial` as before, between batches. A classic
-session hands over the public lines it has already read together
-(`Core::chat_public_all`), so a sender that got ahead of the log
-catches up in one commit; a run stops short of an event handed to the
+**Public chat is committed in groups, a room at a time**
+(`chat::ChatCommit`): the lobby, and each room (`docs/chat-rooms.md`
+§3), has a queue and a serial of its own — the lobby's `chat_commit`
+and `log_serial`, a room's `Core::room_channel`. A line joins its
+room's queue, and whoever finds no commit under way there logs
+everything queued in one transaction and relays it in order under that
+serial, then hands the lead on. Queue order is the order a room's lines
+are logged and heard in, so ids ascend within a room; across rooms
+nobody can tell. Anything else that must fall between two lines (a
+redaction, a purge) takes the serial of the line's room, between
+batches, one room at a time. Only the lobby's lines cross a link, and
+a room's go to its members alone, its images authorized to them. A
+classic session hands over the public lines it has already read
+together (`Core::chat_public_all`), so a sender that got ahead of the
+log catches up in one commit; a run stops short of an event handed to the
 session and of the line that would spend its last spam point, so what
 was sent before a kick is heard before it.
 

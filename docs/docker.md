@@ -59,7 +59,7 @@ layout under `/srv/hxd-ng`:
 
 | On the host | In the container | What | Mounted |
 |---|---|---|---|
-| `/srv/hxd-ng/data` | `/var/lib/hxd-ng` | All state: accounts, the SQLite store, news blobs, the identity, VAPID and self-signed TLS keys, and the secret guests' news is counted under. | Always, or the named volume instead. |
+| `/srv/hxd-ng/data` | `/var/lib/hxd-ng` | All state: accounts, the rooms file, the SQLite store, news blobs, the identity, VAPID and self-signed TLS keys, and the secret guests' news is counted under. | Always, or the named volume instead. |
 | `/srv/hxd-ng/etc` | `/etc/hxd-ng` | A config file of the operator's own. | Only for [a mounted config](#configuration). |
 | `/srv/hxd-ng/tls` | `/etc/hxd-ng/tls`, read-only | A certificate and key from a CA. | Only for [TLS certificates](#tls-certificates). |
 | `/srv/hxd-ng/files` | `/srv/files` | The file area, with `HXD_FILES_ROOT=/srv/files`. | Only for files. |
@@ -190,7 +190,9 @@ For anything the variables don't reach, there are two ways out:
   every key. hxd's own defaults apply to what it leaves out, and those
   are not the container's: `[ng]` binds `127.0.0.1:5700` unless the file
   says otherwise, which nothing outside the container can reach, so set
-  `bind = "0.0.0.0:5700"` there.
+  `bind = "0.0.0.0:5700"` there. Keep `[rooms] file` relative, or under
+  `/var/lib/hxd-ng`: the server writes room ids and topics to it, so it
+  belongs with the rest of the state.
 
   `hxd identity revoke` edits the file in place: it writes
   `hxd-ng.toml.revoke` beside it and renames that over the original. So
@@ -257,7 +259,9 @@ with `docker exec -it hxd-ng sh` or from the volume. hxd reads them at
 each login, so there is nothing to restart. Roles, which accounts list
 by name ([roles.md](roles.md)), are `/var/lib/hxd-ng/roles.toml`,
 edited with `docker exec hxd-ng hxd-entrypoint role …`; a running server applies a
-role edit to everyone logged in on SIGHUP (`docker kill -s HUP hxd-ng`).
+role edit to everyone logged in on SIGHUP (`docker kill -s HUP hxd-ng`). Rooms
+([chat-rooms.md](chat-rooms.md)) are `/var/lib/hxd-ng/rooms.toml`, edited
+the same way with `hxd-entrypoint room …` and applied on SIGHUP.
 
 ### Hotline-ng and identity
 

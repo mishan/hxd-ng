@@ -27,6 +27,7 @@ pub mod news;
 pub mod notify;
 pub mod push;
 pub mod revoked;
+pub mod rooms;
 pub mod roster;
 pub mod rotation;
 pub mod server_link;
@@ -52,7 +53,7 @@ pub use files::{
 };
 pub use history::{
     ChatLog, HistoryPage, HistoryPolicy, HistoryQuery, LineFlags, LineId, LogLine, MediaMeta,
-    MemoryLog, NewLine,
+    MemoryLog, NewLine, Retention,
 };
 pub use inbox::{
     Delivery, InboxCounts, MemoryStore, MessageId, MessageStore, NewMessage, Pushed, Sent,
@@ -80,6 +81,9 @@ pub use news::{
 pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};
 pub use revoked::{Published, Revocations};
+pub use rooms::{
+    MemoryRooms, Room, RoomEdit, RoomError, RoomFile, RoomPolicy, RoomStore, RoomView, Topic,
+};
 pub use roster::{
     AttachInfo, Census, Core, Event, Events, IdentityTag, InboxPolicy, Lag, LoginPermit, Resume,
     SeqEvent, SessionStatus, Transport, Uid, UserDetails, UserInfo, LIVE_QUEUE_BYTES,

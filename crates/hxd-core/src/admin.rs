@@ -46,6 +46,7 @@ fn beyond(actor: &Account, target: &Account) -> bool {
             (target.moderate, actor.moderate),
             (target.can_spam, actor.can_spam),
             (target.manage_roles, actor.manage_roles),
+            (target.manage_rooms, actor.manage_rooms),
         ]
         .iter()
         .any(|(t, a)| *t && !*a)
@@ -252,7 +253,7 @@ impl Core {
 
     /// Give every session logged in as `account` what it now says.
     /// Answers how many were told.
-    fn apply_account(&self, account: &Account) -> usize {
+    pub(crate) fn apply_account(&self, account: &Account) -> usize {
         let mut r = self.roster.lock().unwrap();
         let uids: Vec<Uid> = r
             .users
@@ -263,6 +264,8 @@ impl Core {
         for &uid in &uids {
             give_account(&mut r, uid, account);
         }
+        // What it may read may have narrowed (docs/chat-rooms.md §5).
+        r.room_reconcile();
         uids.len()
     }
 
@@ -280,6 +283,7 @@ impl Core {
         };
         s.mask = mask;
         give_account(&mut r, uid, &account);
+        r.room_reconcile();
         true
     }
 
@@ -312,6 +316,8 @@ fn give_account(r: &mut RosterInner, uid: Uid, account: &Account) {
     s.set_avatar = effective.set_avatar;
     s.moderate = effective.moderate;
     s.can_spam = effective.can_spam;
+    s.manage_rooms = effective.manage_rooms;
+    s.set_subject = effective.set_subject;
     s.is_person = effective.is_person();
     let mut shown = s.info.admin != admin;
     s.info.admin = admin;

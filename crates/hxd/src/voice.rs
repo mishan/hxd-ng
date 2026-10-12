@@ -162,6 +162,7 @@ mod tests {
             hope: Default::default(),
             metrics: None,
             link: None,
+            rooms: Default::default(),
         }
     }
 

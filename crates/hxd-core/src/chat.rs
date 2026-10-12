@@ -302,8 +302,11 @@ const COMMIT_BATCH: usize = 256;
 /// Order is the queue's, which is the order lines reached it; the log's
 /// lock is taken per batch, so a redaction or a purge still falls between
 /// two batches and never overtakes a line it names.
+///
+/// One for the lobby, room 0, and one for each room (`crate::rooms`).
 #[derive(Default)]
 pub(crate) struct ChatCommit {
+    room: u32,
     state: Mutex<CommitState>,
 }
 
@@ -335,6 +338,13 @@ impl Pending {
 }
 
 impl ChatCommit {
+    pub(crate) fn for_room(room: u32) -> ChatCommit {
+        ChatCommit {
+            room,
+            state: Mutex::default(),
+        }
+    }
+
     /// Lines from one caller, queued together in their order and answered
     /// in it: they share a commit, as lines from many callers at once do,
     /// rather than one each when the caller sends them one at a time.
@@ -425,7 +435,7 @@ impl ChatCommit {
         // or the next ones: they are answered and the lead is handed on.
         let (results, panicked) =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                core.chat_commit_batch(lines)
+                core.chat_commit_batch(self.room, lines)
             })) {
                 Ok(results) => (results, None),
                 Err(panic) => (
@@ -494,6 +504,8 @@ pub enum ChatError {
     /// been kicked for it, or had been kicked already and is on its way
     /// out.
     Flooding,
+    /// The sender may read the room and not send in it.
+    ReadOnly,
     /// The server couldn't complete the operation — a chat id the OS
     /// CSPRNG refused to produce, or an inbox that would not write. Not
     /// the client's fault and not something it can retry usefully.
@@ -521,22 +533,30 @@ impl Core {
         style: u16,
         media: Option<crate::media::Handle>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.chat_public_all(from, vec![(text, style, media)])
+        self.chat_public_all(from, 0, vec![(text, style, media)])
             .pop()
             .expect("an answer for each line")
     }
 
-    /// Public chat lines one session sent one after another, `(text,
-    /// style, media)`, answered in their order: they share a commit
-    /// rather than wait for one each, so a sender that got ahead of the
-    /// log catches up at once. Each is judged as [`Core::chat_public`]
-    /// judges one; a line that tips its sender over its chat lines kicks
-    /// it, and none from then on is logged.
+    /// Public chat lines one session sent one after another into `room`,
+    /// the lobby for 0, `(text, style, media)`, answered in their order:
+    /// they share a commit rather than wait for one each, so a sender that
+    /// got ahead of the log catches up at once. Each is judged as
+    /// [`Core::chat_public`] judges one; a line that tips its sender over
+    /// its chat lines kicks it, and none from then on is logged. A room's
+    /// lines go to its members, from a member that may send there.
     pub fn chat_public_all(
         &self,
         from: Uid,
+        room: u32,
         lines: Vec<(String, u16, Option<crate::media::Handle>)>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
+        // Before the lines are counted, as a private chat's are.
+        if room != 0 {
+            if let Err(e) = self.room_may_send(from, room) {
+                return lines.iter().map(|_| Err(e)).collect();
+            }
+        }
         let mut results = vec![None; lines.len()];
         let mut staged = Vec::with_capacity(lines.len());
         let mut at = Vec::with_capacity(lines.len());
@@ -562,7 +582,8 @@ impl Core {
                     results[i] = Some(Err(ChatError::NoSuchUser));
                     continue;
                 };
-                if r.linked() {
+                // Only the lobby crosses a link.
+                if room == 0 && r.linked() {
                     crate::server_link::cut_to_link_bound(&mut text);
                 }
                 (
@@ -601,14 +622,13 @@ impl Core {
             });
             at.push(i);
         }
-        for (i, result) in at
-            .into_iter()
-            .zip(self.chat_commit.submit_all(self, staged))
-        {
+        let channel = (room != 0).then(|| self.room_channel(room));
+        let commit = channel.as_ref().map_or(&self.chat_commit, |c| &c.commit);
+        for (i, result) in at.into_iter().zip(commit.submit_all(self, staged)) {
             results[i] = Some(result);
         }
         if let Some(i) = tipped {
-            let e = self.chat_flood_kick(from, 0);
+            let e = self.chat_flood_kick(from, room);
             results[i..].fill(Some(Err(e)));
         }
         results
@@ -632,14 +652,19 @@ impl Core {
             .submit_all(self, lines.into_iter().map(|l| l.0).collect());
     }
 
-    /// Log a batch of public lines in one commit and relay them in order,
-    /// under the log's lock, so a line's id order and the order everyone
-    /// hears it in are one fact, as they were a line at a time.
+    /// Log a batch of `room`'s lines in one commit and relay them in
+    /// order, under the room's serial, so a line's id order and the order
+    /// the room hears it in are one fact, as they were a line at a time.
+    /// The lobby's lines go to every reader and the links, a room's to its
+    /// members alone.
     fn chat_commit_batch(
         &self,
+        room: u32,
         mut batch: Vec<Staged>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
-        let _serial = self.log_serial.lock().unwrap();
+        let channel = (room != 0).then(|| self.room_channel(room));
+        let serial = channel.as_ref().map_or(&self.log_serial, |c| &c.serial);
+        let _serial = serial.lock().unwrap();
         let mut results: Vec<Option<Result<Option<crate::history::LineId>, ChatError>>> =
             vec![None; batch.len()];
         // A line waited in the queue, and the room may have moved on: its
@@ -665,7 +690,14 @@ impl Core {
                     continue;
                 };
                 match r.users.get(&uid) {
-                    Some(sess) if sess.serial == serial => s.info = sess.info.clone(),
+                    Some(sess) if sess.serial == serial => {
+                        // Parted from the room meanwhile, or no longer let
+                        // post there: not heard there.
+                        match (room != 0).then(|| r.room_send_check(room, uid, sess)) {
+                            Some(Err(e)) => *result = Some(Err(e)),
+                            _ => s.info = sess.info.clone(),
+                        }
+                    }
                     _ => *result = Some(Err(ChatError::NoSuchUser)),
                 }
             }
@@ -692,7 +724,7 @@ impl Core {
                             None => s.info.nick.clone(),
                         };
                         NewLine {
-                            channel: 0,
+                            channel: room,
                             ghost: s.ghost,
                             from_nick,
                             from_login: s.login.clone(),
@@ -740,7 +772,7 @@ impl Core {
         for (i, id) in live.into_iter().zip(ids) {
             let s = batch[i].take().expect("each line relayed once");
             let ev = Event::Chat {
-                cid: 0,
+                cid: room,
                 from: s.info,
                 text: s.text,
                 style: s.style,
@@ -752,22 +784,35 @@ impl Core {
             // everyone else's roster work for all of it: the log's lock is
             // what keeps the lines in order.
             let mut r = self.roster.lock().unwrap();
-            r.broadcast_where(&ev, None, reads_public_chat);
-            if let Event::Chat {
-                from, text, style, ..
-            } = &ev
-            {
-                if s.principal.is_some() && !text.is_empty() {
-                    r.export_chat(from.uid, text, *style);
-                }
+            if let Some(id) = id {
+                r.last_ids.insert(room, id);
             }
             // The authorization set, fixed at relay time: the sender, and
             // every session this line just went to whose wire can carry
             // the reference. Captured under the roster's lock and stored
             // under the media store's, which is the one order those two
             // are ever taken in.
-            if let Some((handle, _)) = &s.media {
-                let audience = r.media_audience(None, reads_public_chat);
+            let audience = if room == 0 {
+                r.broadcast_where(&ev, None, reads_public_chat);
+                if let Event::Chat {
+                    from, text, style, ..
+                } = &ev
+                {
+                    if s.principal.is_some() && !text.is_empty() {
+                        r.export_chat(from.uid, text, *style);
+                    }
+                }
+                s.media
+                    .as_ref()
+                    .map(|_| r.media_audience(None, reads_public_chat))
+            } else {
+                r.room_send_where(room, ev, |_| true);
+                let members = r.rooms.get(&room).map(|e| e.members.clone());
+                s.media
+                    .as_ref()
+                    .map(|_| r.media_audience_of(&members.unwrap_or_default()))
+            };
+            if let (Some((handle, _)), Some(audience)) = (&s.media, audience) {
                 self.media_capture(handle, audience.into_iter().chain(s.principal));
             }
             drop(r);
@@ -857,6 +902,9 @@ impl Core {
         if !self.roster.lock().unwrap().users.contains_key(&uid) {
             return Err(ChatError::NoSuchUser);
         }
+        if query.channel != 0 && !self.room_readable(uid, query.channel) {
+            return Err(ChatError::NoSuchChat);
+        }
         self.history
             .as_ref()
             .ok_or(ChatError::ServerError)?
@@ -902,19 +950,23 @@ impl Core {
         out
     }
 
-    /// Retention work for the binary's hourly sweeper.
+    /// Retention work for the binary's hourly sweeper: `max_lines` and
+    /// `max_age` for each channel, and a room's own where it has one.
     pub fn prune_history(&self, max_lines: usize, max_age: Option<Duration>) -> usize {
+        let keep = crate::history::Retention {
+            max_lines,
+            max_age,
+            channels: self.room_retention(max_lines, max_age),
+        };
         self.history
             .as_ref()
-            .and_then(
-                |log| match log.prune(max_lines, max_age, SystemTime::now()) {
-                    Ok(gone) => Some(gone),
-                    Err(e) => {
-                        warn!("history retention: {e}");
-                        None
-                    }
-                },
-            )
+            .and_then(|log| match log.prune(&keep, SystemTime::now()) {
+                Ok(gone) => Some(gone),
+                Err(e) => {
+                    warn!("history retention: {e}");
+                    None
+                }
+            })
             .unwrap_or(0)
     }
 
@@ -1141,6 +1193,8 @@ impl Core {
         };
         if cid == 0 {
             r.broadcast_where(&ev, None, reads_public_chat);
+        } else if r.rooms.contains_key(&cid) {
+            r.room_send_where(cid, ev, |_| true);
         } else if let Some(members) = r.chats.get(&cid).map(|c| c.members.clone()) {
             for uid in members {
                 r.send_to(uid, ev.clone());
@@ -1284,7 +1338,8 @@ impl Core {
     }
 
     /// Set a chat's subject. cid 0 is the public subject (policy-gated by
-    /// the caller); private chats require membership.
+    /// the caller), kept in the rooms file where there is one; private
+    /// chats require membership.
     pub fn chat_subject(&self, cid: u32, uid: Uid, subject: String) -> Result<(), ChatError> {
         let mut r = self.roster.lock().unwrap();
         let ev = Event::ChatSubject {
@@ -1292,8 +1347,18 @@ impl Core {
             subject: subject.clone(),
         };
         if cid == 0 {
-            r.public_subject = subject;
+            r.lobby_topic = crate::rooms::Topic {
+                text: subject,
+                by: r
+                    .users
+                    .get(&uid)
+                    .map(|s| s.info.nick.clone())
+                    .unwrap_or_default(),
+                at: Some(SystemTime::now()),
+            };
             r.broadcast_where(&ev, None, |_| true);
+            drop(r);
+            self.topic_changed(0);
             return Ok(());
         }
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
@@ -2524,7 +2589,7 @@ mod tests {
     impl crate::history::ChatLog for SlowLog {
         fn lines_by_ghost(
             &self,
-            channel: u32,
+            channel: Option<u32>,
             ghost: [u8; 16],
             since: SystemTime,
         ) -> Result<Vec<crate::history::LogLine>, StoreError> {
@@ -2550,7 +2615,7 @@ mod tests {
         }
         fn lines_by(
             &self,
-            channel: u32,
+            channel: Option<u32>,
             who: &Mailbox,
             since: SystemTime,
         ) -> Result<Vec<crate::history::LogLine>, StoreError> {
@@ -2566,11 +2631,16 @@ mod tests {
         }
         fn prune(
             &self,
-            max_lines: usize,
-            older_than: Option<Duration>,
+            keep: &crate::history::Retention,
             now: SystemTime,
         ) -> Result<usize, StoreError> {
-            self.inner.prune(max_lines, older_than, now)
+            self.inner.prune(keep, now)
+        }
+        fn channels(&self) -> Result<Vec<(u32, crate::history::LineId)>, StoreError> {
+            self.inner.channels()
+        }
+        fn delete_channel(&self, channel: u32) -> Result<usize, StoreError> {
+            self.inner.delete_channel(channel)
         }
         fn attach_media(
             &self,
@@ -2697,7 +2767,7 @@ mod tests {
         let lines = ["one", "two", "three", "four", "five"]
             .map(|t| (t.to_string(), 0, None))
             .into();
-        let answered = core.chat_public_all(sender, lines);
+        let answered = core.chat_public_all(sender, 0, lines);
         assert!(answered[..3].iter().all(|r| matches!(r, Ok(Some(_)))));
         assert!(answered[3..].iter().all(|r| *r == Err(ChatError::Flooding)));
         let heard: Vec<String> = drain(&mut rx)
@@ -2742,7 +2812,7 @@ mod tests {
     impl crate::history::ChatLog for GatedLog {
         fn lines_by_ghost(
             &self,
-            channel: u32,
+            channel: Option<u32>,
             ghost: [u8; 16],
             since: SystemTime,
         ) -> Result<Vec<crate::history::LogLine>, StoreError> {
@@ -2770,7 +2840,7 @@ mod tests {
         }
         fn lines_by(
             &self,
-            channel: u32,
+            channel: Option<u32>,
             who: &Mailbox,
             since: SystemTime,
         ) -> Result<Vec<crate::history::LogLine>, StoreError> {
@@ -2786,11 +2856,16 @@ mod tests {
         }
         fn prune(
             &self,
-            max_lines: usize,
-            older_than: Option<Duration>,
+            keep: &crate::history::Retention,
             now: SystemTime,
         ) -> Result<usize, StoreError> {
-            self.inner.prune(max_lines, older_than, now)
+            self.inner.prune(keep, now)
+        }
+        fn channels(&self) -> Result<Vec<(u32, crate::history::LineId)>, StoreError> {
+            self.inner.channels()
+        }
+        fn delete_channel(&self, channel: u32) -> Result<usize, StoreError> {
+            self.inner.delete_channel(channel)
         }
         fn attach_media(
             &self,
@@ -2991,6 +3066,8 @@ mod tests {
                 attach_news: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 set_avatar: false,
                 is_person: false,
                 reads_on_delivery: false,
@@ -3065,6 +3142,8 @@ mod tests {
             set_avatar: false,
             moderate: false,
             can_spam,
+            manage_rooms: false,
+            set_subject: false,
             is_person,
             reads_on_delivery: false,
             identity: None,
@@ -3154,6 +3233,8 @@ mod tests {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person,
                 reads_on_delivery: false,
                 identity: None,
@@ -3219,6 +3300,8 @@ mod tests {
                 set_avatar: false,
                 moderate,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,
@@ -3300,6 +3383,8 @@ mod tests {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,
@@ -3360,6 +3445,8 @@ mod tests {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person,
                 reads_on_delivery: false,
                 identity,
@@ -3743,6 +3830,8 @@ mod inbox_tests {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: Some(fingerprint),
@@ -3772,6 +3861,8 @@ mod inbox_tests {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person: has_inbox,
                 reads_on_delivery: false,
                 identity: None,
@@ -4640,6 +4731,8 @@ mod inbox_tests {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(3)),
@@ -4684,6 +4777,8 @@ mod inbox_tests {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: Some(fp(7)),

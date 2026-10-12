@@ -732,6 +732,8 @@ async fn handle_login(
         set_avatar: account.set_avatar,
         moderate: account.moderate,
         can_spam: account.can_spam,
+        manage_rooms: account.manage_rooms,
+        set_subject: account.set_subject,
         // The plaintext listener is loopback-only and WSS is mandatory in
         // production (`docs/hotline-ng.md` §9), so ng sockets are
         // encrypted by construction — unless the client told us at

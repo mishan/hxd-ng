@@ -80,6 +80,11 @@ pub struct Account {
     /// May this account create and edit roles (`docs/roles.md` §5)? The
     /// `[extra] manage_roles` key. Backend default: no.
     pub manage_roles: bool,
+    /// May this account make, change and archive rooms, and see, join
+    /// and send in every one (`docs/chat-rooms.md` §5)? The `[extra]
+    /// manage_rooms` key. Backend default: no, even for an administrator,
+    /// since an operator usually wants one person reorganizing the rooms.
+    pub manage_rooms: bool,
     /// The roles the account's file lists, as listed: for display and
     /// editors. What they grant is already in the fields above.
     pub roles: Vec<String>,
@@ -117,6 +122,7 @@ impl Account {
             moderate: false,
             can_spam: false,
             manage_roles: false,
+            manage_rooms: false,
             roles: Vec::new(),
             identity,
             config,
@@ -148,6 +154,7 @@ impl Account {
         self.moderate = x.moderate;
         self.can_spam = x.can_spam;
         self.manage_roles = x.manage_roles;
+        self.manage_rooms = x.manage_rooms;
     }
 
     /// Is exactly one person behind this account — a password, or a
@@ -174,6 +181,7 @@ pub struct Extras<T> {
     pub moderate: T,
     pub can_spam: T,
     pub manage_roles: T,
+    pub manage_rooms: T,
 }
 
 impl<T: Copy> Extras<T> {
@@ -190,6 +198,7 @@ impl<T: Copy> Extras<T> {
             moderate: f(self.moderate, other.moderate),
             can_spam: f(self.can_spam, other.can_spam),
             manage_roles: f(self.manage_roles, other.manage_roles),
+            manage_rooms: f(self.manage_rooms, other.manage_rooms),
         }
     }
 }
@@ -255,6 +264,7 @@ impl AccountConfig {
             moderate: key(x.moderate, kick, m.moderate || unkick),
             can_spam: key(x.can_spam, kick, m.can_spam || unkick),
             manage_roles: key(x.manage_roles, false, m.manage_roles),
+            manage_rooms: key(x.manage_rooms, false, m.manage_rooms),
             attach_news: key(
                 x.attach_news,
                 media,
@@ -640,6 +650,7 @@ mod tests {
             "moderate" => &mut x.moderate,
             "can_spam" => &mut x.can_spam,
             "set_subject" => &mut x.set_subject,
+            "manage_rooms" => &mut x.manage_rooms,
             _ => unreachable!("{key}"),
         }
     }
@@ -679,6 +690,10 @@ mod tests {
             ("attach_news", &[], Some(true), &[], false, true),
             ("attach_news", &[], Some(true), &[MEDIA], false, false),
             ("attach_news", &[], None, &[], false, false),
+            // Not even an administrator's unless named.
+            ("manage_rooms", &[KICK], None, &[], false, false),
+            ("manage_rooms", &[], Some(true), &[], false, true),
+            ("manage_rooms", &[], Some(true), &[], true, false),
         ];
         for key in ["moderate", "can_spam", "set_subject"] {
             rows.extend([

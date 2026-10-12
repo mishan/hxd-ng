@@ -24,9 +24,10 @@ anyone: a session may write or delete only an account that may do
 nothing the session's own account may not, and may not leave one able
 to. "May do" is the access bits and the server-local policy the file
 grants beside them — `moderate`, `can_spam`, `set_subject`,
-`attach_news`, `file_list`, `file_getinfo`, `manage_roles` — whether
-said in `[extra]`, granted by a role (roles.md) or derived, since a new
-account given the kick bit moderates by default. Not `can_detach`, `inbox` or `set_avatar`: those follow from a
+`attach_news`, `file_list`, `file_getinfo`, `manage_roles`,
+`manage_rooms` — whether said in `[extra]`, granted by a role
+(roles.md) or derived, since a new account given the kick bit moderates
+by default. Not `can_detach`, `inbox` or `set_avatar`: those follow from a
 password and say an account is one person, not what it may do to
 anyone else, so a password-less administrator may still give an account
 a password. Without that, `modify_users` is every privilege there is,
