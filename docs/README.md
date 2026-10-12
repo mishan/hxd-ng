@@ -41,6 +41,7 @@ to another project.
 |---|---|---|---|
 | [access-bits.md](access-bits.md) — every access bit, `[extra]` policy, `[identity]` flags | yes | all | design |
 | [account-admin.md](account-admin.md) — the user editor, the ng `accounts` family, `hxd account` | yes, less renames and the 1.8 batch editor | all | design; §5 is the ng spec |
+| [roles.md](roles.md) — named sets of grants accounts hold; configuration and a deny mask resolved to the access every wire sees; restrictions; `@role` in the period editor; `read`/`post` gates for rooms and news; role and person mentions | no | all (period sees effective bits) | design; §7, §9.4, §11.3, §12.5 are the ng spec |
 | [private-messages.md](private-messages.md) — the offline inbox | yes | all (period receives) | design |
 | [chat-history.md](chat-history.md) — server-held scrollback, fogWraith's Get Chat History | yes | extended, ng | design, implements a fogWraith spec |
 | [chat-rooms.md](chat-rooms.md) — curated, persistent rooms gated by `read` and `post` lists, logged where history is; public chat as the lobby; period clients join through the system account | no | all (period joins by invite) | design; §7 is the ng spec |
