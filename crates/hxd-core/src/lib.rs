@@ -14,6 +14,7 @@ pub mod avatar;
 pub mod ban;
 pub mod budget;
 pub mod chat;
+pub mod clock;
 pub mod files;
 pub mod history;
 pub mod identity_records;

@@ -1316,6 +1316,20 @@ async fn a_key_its_registrar_revokes_loses_its_session_here_and_a_banned_registr
     );
 }
 
+/// Carries every connection to `listener` to wherever `to` says now.
+fn forward(listener: tokio::net::TcpListener, to: Arc<std::sync::Mutex<SocketAddr>>) {
+    tokio::spawn(async move {
+        loop {
+            let (mut a, _) = listener.accept().await.unwrap();
+            let to = *to.lock().unwrap();
+            tokio::spawn(async move {
+                let mut b = TcpStream::connect(to).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+            });
+        }
+    });
+}
+
 #[tokio::test]
 async fn a_key_admitted_while_its_registrar_was_down_is_still_swept() {
     let dir = tempfile::tempdir().unwrap();
@@ -1342,17 +1356,10 @@ async fn a_key_admitted_while_its_registrar_was_down_is_still_swept() {
     let mut alice_here = session_at(v, &alice, &card).await;
 
     // It answers again, and she is revoked there.
-    let up = tokio::net::TcpListener::bind(addr).await.unwrap();
-    let to = r.ng;
-    tokio::spawn(async move {
-        loop {
-            let (mut a, _) = up.accept().await.unwrap();
-            tokio::spawn(async move {
-                let mut b = TcpStream::connect(to).await.unwrap();
-                let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
-            });
-        }
-    });
+    forward(
+        tokio::net::TcpListener::bind(addr).await.unwrap(),
+        Arc::new(std::sync::Mutex::new(r.ng)),
+    );
     let gone = hl_identity::IdentityRevocation {
         identity: alice.public(),
         time: now(),
@@ -1372,7 +1379,7 @@ async fn a_key_admitted_while_its_registrar_was_down_is_still_swept() {
 }
 
 #[tokio::test]
-async fn a_registrars_retiring_key_is_honored_until_its_deadline() {
+async fn a_registrar_that_moves_to_a_new_key_is_followed_within_the_minute() {
     let dir = tempfile::tempdir().unwrap();
     let path = |name: &str| {
         let p = dir.path().join(name);
@@ -1385,48 +1392,57 @@ async fn a_registrars_retiring_key_is_honored_until_its_deadline() {
     let dev = DeviceKey::from_seed(&[101; 32]);
     let alice_card = attested(&before, &alice, "alice").await;
 
-    // The registrar moves to a new key, publishing the old one as
-    // retiring: until a deadline to come, and until one past.
-    let retiring = |until: u64| {
-        format!(
-            "signup = \"open\"\nretiring = [{{ key = \"{}\", until = {until} }}]",
-            b64(&before.registrar.public_key())
-        )
-    };
-    let rotated = start(&path("rotated"), &retiring(now() + 3600)).await;
-    let retired = start(&path("retired"), &retiring(now() - 1)).await;
-    let carol_card = attested(&rotated, &carol, "carol").await;
-
-    let v = verifier(
-        &path("verifier"),
-        &rotated,
-        Trust::Discovery,
-        &format!("http://{}", rotated.ng),
-        "",
-    )
-    .await
-    .0;
+    // The registrar is reached at one address whichever key it has.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let to = Arc::new(std::sync::Mutex::new(before.ng));
+    forward(listener, to.clone());
+    let (v, identity) = verifier(&path("verifier"), &before, Trust::Discovery, &url, "").await;
+    let clock = identity.clock().clone();
     assert_eq!(
         auth_at(v, &alice, &dev, &alice_card).await.json()["handle"],
         "alice@127.0.0.1"
     );
+
+    // It moves to a new key, keeping the old one for two minutes.
+    let rotated = start(
+        &path("rotated"),
+        &format!(
+            "signup = \"open\"\nretiring = [{{ key = \"{}\", until = {} }}]",
+            b64(&before.registrar.public_key()),
+            now() + 120
+        ),
+    )
+    .await;
+    *to.lock().unwrap() = rotated.ng;
+    let carol_card = attested(&rotated, &carol, "carol").await;
+
+    // A key not heard of sends this server back to the registrar at most
+    // once a minute, since anyone can name one.
+    let reply = auth_at(v, &carol, &dev, &carol_card).await;
+    assert_eq!(
+        (reply.status, reply.json()["handle"].clone()),
+        (200, Value::Null)
+    );
+    clock.advance(Duration::from_secs(61));
     assert_eq!(
         auth_at(v, &carol, &dev, &carol_card).await.json()["handle"],
         "carol@127.0.0.1"
     );
+    assert_eq!(
+        auth_at(v, &alice, &dev, &alice_card).await.json()["handle"],
+        "alice@127.0.0.1"
+    );
 
-    let late = verifier(
-        &path("late"),
-        &retired,
-        Trust::Discovery,
-        &format!("http://{}", retired.ng),
-        "",
-    )
-    .await
-    .0;
-    let reply = auth_at(late, &alice, &dev, &alice_card).await;
+    // Past the old key's deadline, what it signed is no attestation.
+    clock.advance(Duration::from_secs(70));
+    let reply = auth_at(v, &alice, &dev, &alice_card).await;
     assert_eq!(
         (reply.status, reply.json()["handle"].clone()),
         (200, Value::Null)
+    );
+    assert_eq!(
+        auth_at(v, &carol, &dev, &carol_card).await.json()["handle"],
+        "carol@127.0.0.1"
     );
 }

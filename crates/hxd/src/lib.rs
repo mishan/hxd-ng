@@ -2948,6 +2948,7 @@ fn build_identity(
             core.record_cache().unwrap_or_else(|| {
                 Arc::new(hxd_core::identity_records::MemoryRecordCache::default())
             }),
+            core.clock().clone(),
         ))
     });
     let default_access = match &section.default_access {

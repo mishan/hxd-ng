@@ -1301,6 +1301,9 @@ pub struct Core {
     /// (`crate::revoked`). Read under the roster lock by `attach`, and
     /// written with nothing held, so the order is roster first, then this.
     pub(crate) revoked: std::sync::RwLock<crate::revoked::Refused>,
+    /// The time for whatever built on this core reads a clock
+    /// (`crate::clock`).
+    pub(crate) clock: crate::clock::Clock,
     /// Where the registrars' record lists are kept, beside the bans.
     pub(crate) record_cache: Option<Arc<dyn crate::identity_records::RecordCache>>,
     /// The audit trail and the reports, or `None` — in which case every
@@ -1444,6 +1447,10 @@ pub(crate) struct LogSerial;
 impl Core {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn clock(&self) -> &crate::clock::Clock {
+        &self.clock
     }
 
     /// Give the domain a durable inbox. Without one, a private message to
