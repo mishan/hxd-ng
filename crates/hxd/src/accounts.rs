@@ -61,7 +61,7 @@ fn refused(login: &str, e: AdminError) -> String {
         AdminError::Exists => format!("{login:?} already exists"),
         AdminError::InvalidLogin => format!(
             "{login:?} is not a login: up to 31 letters, digits and _ - . @, \
-             not the server's own"
+             not starting with . or @, not the server's own"
         ),
         e => format!("{login}: {e}"),
     }

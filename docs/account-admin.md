@@ -172,7 +172,7 @@ the server.
 | `outranked` | The account may do, or would be left able to do, something the session's own account may not: an access bit or the `[extra]` policy of §1. |
 | `no_such_account` | `account_get`, `account_update`, `account_delete` of a login with no account. |
 | `already_exists` | `account_create` of a login that has one. |
-| `invalid_login` | Not a login: up to 31 letters, digits and `_ - . @`, not starting with `.`. A write to the server's own login answers it too; `account_get` and `account_delete` answer `no_such_account` for that login. |
+| `invalid_login` | Not a login: up to 31 letters, digits and `_ - . @`, not starting with `.` or `@`, which is reserved for roles (`roles.md` §6.4). A write to the server's own login, or to an existing account whose login begins with `@`, answers it too. `account_get` and `account_delete` answer `no_such_account` for the server's own login, and act on an existing `@` account as on any other, so it can be cleared away. |
 | `bad_request` | Malformed, an access name that names no bit, a raw bit past 63, or a name or password past 31 characters. |
 | `not_available` | The server does not administer accounts, whatever the session may do. |
 
