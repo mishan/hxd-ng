@@ -908,3 +908,333 @@ async fn hlid_registers_revokes_and_rotates() {
         .attestations[0];
     assert_eq!(a.registered, card.attestations[0].registered);
 }
+
+/// How a verifier trusts the registrar.
+enum Trust {
+    /// On the key in its config.
+    Key,
+    /// On the key the registrar's discovery document publishes.
+    Discovery,
+}
+
+/// A server that trusts the registrar `r` and reaches it at `url`,
+/// every path inside `dir`.
+async fn verifier(dir: &Path, r: &Server, trust: Trust, url: &str, extra: &str) -> SocketAddr {
+    let d = dir.display();
+    let trust = match trust {
+        Trust::Key => format!(
+            "[identity.registrar_keys]\n\"{HOST}\" = \"{}\"\n",
+            b64(&r.registrar.public_key())
+        ),
+        Trust::Discovery => String::new(),
+    };
+    let text = format!(
+        "[paths]\naccounts = \"{d}/accounts\"\n\
+         [inbox]\ndb = \"{d}/server.db\"\n\
+         [ng]\nbind = \"127.0.0.1:0\"\n\
+         [identity]\nkey = \"{d}/server.key\"\nsuccessors = \"{d}/successors\"\nenroll = false\n\
+         revocation_max_age = 1\ntrusted_registrars = [\"{HOST}\"]\n{extra}\n\
+         {trust}\
+         [identity.registrar_urls]\n\"{HOST}\" = \"{url}\"\n"
+    );
+    let config_path = dir.join("hxd-ng.toml");
+    std::fs::write(&config_path, &text).unwrap();
+    let config = hxd::Config::load(&config_path).unwrap();
+    hxd::check_config(&config).unwrap();
+    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
+    let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
+        .unwrap()
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ng = listener.local_addr().unwrap();
+    tokio::spawn(hxd_ng_session::serve(listener, ng_ctx));
+    ng
+}
+
+/// `/identity/auth` at `at` as `dev` of `id`, showing `card`.
+async fn auth_at(at: SocketAddr, id: &IdentityKey, dev: &DeviceKey, card: &[u8]) -> Reply {
+    let cert = DeviceCert::for_device(id, dev, now() - 5, cert::RECOMMENDED_LIFETIME)
+        .unwrap()
+        .sign(id);
+    let json_post = |path: &'static str, body: Value| async move {
+        http_as(
+            at,
+            &at.to_string(),
+            "POST",
+            path,
+            &[("Content-Type", "application/json")],
+            body.to_string().as_bytes(),
+        )
+        .await
+    };
+    let ch = json_post("/identity/challenge", Value::Null).await.json();
+    let challenge: [u8; 32] = unb64(ch["challenge"].as_str().unwrap()).try_into().unwrap();
+    let proof = LoginProof::sign(dev, &challenge, &s_key(&ch), now());
+    json_post(
+        "/identity/auth",
+        json!({ "card": b64(card), "device_cert": b64(&cert), "proof": b64(&proof) }),
+    )
+    .await
+}
+
+/// `id` registered at `r` as `handle`, and its card carrying the
+/// attestation.
+async fn attested(r: &Server, id: &IdentityKey, handle: &str) -> Vec<u8> {
+    let reply = register(r, request(id, handle), id).await.json();
+    let att = unb64(reply["attestation"].as_str().unwrap());
+    let att = hl_identity::cbor::decode_canonical(&att).unwrap();
+    Card::new(id, handle, now()).sign(id, vec![att]).unwrap()
+}
+
+/// A list fetched is current for `revocation_max_age`, a second here.
+async fn next_list() {
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+}
+
+#[tokio::test]
+async fn a_verifying_server_applies_what_the_registrar_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let v = verifier(&there, &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    let fp = alice.fingerprint().to_string();
+    let refused = |reply: &Reply| (reply.status, reply.json()["error"].clone());
+
+    let ok = auth_at(v, &alice, &phone, &card).await;
+    assert_eq!(ok.status, 200, "{}", String::from_utf8_lossy(&ok.body));
+    assert_eq!(ok.json()["handle"], "alice@127.0.0.1");
+
+    // A device revoked at the registrar is refused here; her others not.
+    let revocation = hl_identity::DeviceRevocation {
+        identity: alice.public(),
+        device: phone.public(),
+        time: now(),
+        until: now() + 3600,
+        reason: None,
+        signer: None,
+        signer_cert: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    let posted = post(
+        &r,
+        "/registrar/records",
+        json!({ "record": b64(&revocation) }),
+    )
+    .await;
+    assert_eq!(
+        posted.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    next_list().await;
+    assert_eq!(
+        refused(&auth_at(v, &alice, &phone, &card).await),
+        (403, json!("revoked"))
+    );
+    assert_eq!(auth_at(v, &alice, &laptop, &card).await.status, 200);
+
+    // Frozen, she is denied; lifted, she is back.
+    hxd::registrar::freeze(&r.config, &fp, false).unwrap();
+    next_list().await;
+    assert_eq!(
+        refused(&auth_at(v, &alice, &laptop, &card).await),
+        (403, json!("denied"))
+    );
+    hxd::registrar::freeze(&r.config, &fp, true).unwrap();
+    next_list().await;
+    assert_eq!(auth_at(v, &alice, &laptop, &card).await.status, 200);
+
+    // Her handle revoked, the attestation on her card counts for nothing.
+    hxd::registrar::revoke(&r.config, "alice", "abuse").unwrap();
+    next_list().await;
+    let unattested = auth_at(v, &alice, &laptop, &card).await.json();
+    assert_eq!(unattested["handle"], Value::Null, "{unattested}");
+    assert_eq!(unattested["outcome"], "unattested_guest");
+
+    // And revoked outright, she is refused.
+    let gone = hl_identity::IdentityRevocation {
+        identity: alice.public(),
+        time: now(),
+        reason: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    let posted = post(&r, "/registrar/records", json!({ "record": b64(&gone) })).await;
+    assert_eq!(posted.status, 200);
+    next_list().await;
+    assert_eq!(
+        refused(&auth_at(v, &alice, &laptop, &card).await),
+        (403, json!("revoked"))
+    );
+}
+
+#[tokio::test]
+async fn records_are_kept_for_when_the_registrar_cannot_be_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let bob = IdentityKey::from_seed(&[2; 32]);
+    let dev = DeviceKey::from_seed(&[101; 32]);
+    let (alice_card, bob_card) = (
+        attested(&r, &alice, "alice").await,
+        attested(&r, &bob, "bobby").await,
+    );
+    let gone = hl_identity::IdentityRevocation {
+        identity: alice.public(),
+        time: now(),
+        reason: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    assert_eq!(
+        post(&r, "/registrar/records", json!({ "record": b64(&gone) }))
+            .await
+            .status,
+        200
+    );
+
+    // Trusted on its discovery document: the key, and the lists, fetched.
+    let live = format!("http://{}", r.ng);
+    let v = verifier(&there, &r, Trust::Discovery, &live, "").await;
+    assert_eq!(auth_at(v, &alice, &dev, &alice_card).await.status, 403);
+    assert_eq!(
+        auth_at(v, &bob, &dev, &bob_card).await.json()["handle"],
+        "bobby@127.0.0.1"
+    );
+
+    // A server on the same database whose registrar does not answer still
+    // has the lists, past their lifetime, and the keys they verified
+    // under, and by default uses both.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let nowhere = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    next_list().await;
+    let cached = verifier(
+        &there,
+        &r,
+        Trust::Discovery,
+        &nowhere,
+        "registrar_timeout = 1",
+    )
+    .await;
+    let reply = auth_at(cached, &alice, &dev, &alice_card).await;
+    assert_eq!(
+        (reply.status, reply.json()["error"].clone()),
+        (403, json!("revoked"))
+    );
+    let reply = auth_at(cached, &bob, &dev, &bob_card).await.json();
+    assert_eq!(reply["handle"], "bobby@127.0.0.1", "{reply}");
+
+    // Configured to take a registrar it cannot reach as no registrar, it
+    // admits the identity without its handle, and still applies the
+    // revocation it holds.
+    let guest = verifier(
+        &there,
+        &r,
+        Trust::Discovery,
+        &nowhere,
+        "registrar_timeout = 1\nrevocation_stale = \"guest\"",
+    )
+    .await;
+    let reply = auth_at(guest, &alice, &dev, &alice_card).await;
+    assert_eq!(
+        (reply.status, reply.json()["error"].clone()),
+        (403, json!("revoked"))
+    );
+    let reply = auth_at(guest, &bob, &dev, &bob_card).await;
+    assert_eq!(
+        (reply.status, reply.json()["handle"].clone()),
+        (200, Value::Null)
+    );
+
+    // Configured to refuse what it cannot check, it refuses a stranger to
+    // the cache.
+    let carol = IdentityKey::from_seed(&[3; 32]);
+    let carol_card = attested(&r, &carol, "carol").await;
+    let strict = verifier(
+        &there,
+        &r,
+        Trust::Key,
+        &nowhere,
+        "registrar_timeout = 1\nrevocation_stale = \"deny\"",
+    )
+    .await;
+    let reply = auth_at(strict, &carol, &dev, &carol_card).await;
+    assert_eq!(
+        (reply.status, reply.json()["error"].clone()),
+        (403, json!("denied"))
+    );
+}
+
+#[tokio::test]
+async fn a_registrars_retiring_key_is_honored_until_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| {
+        let p = dir.path().join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    };
+    let before = start(&path("before"), "signup = \"open\"").await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let carol = IdentityKey::from_seed(&[3; 32]);
+    let dev = DeviceKey::from_seed(&[101; 32]);
+    let alice_card = attested(&before, &alice, "alice").await;
+
+    // The registrar moves to a new key, publishing the old one as
+    // retiring: until a deadline to come, and until one past.
+    let retiring = |until: u64| {
+        format!(
+            "signup = \"open\"\nretiring = [{{ key = \"{}\", until = {until} }}]",
+            b64(&before.registrar.public_key())
+        )
+    };
+    let rotated = start(&path("rotated"), &retiring(now() + 3600)).await;
+    let retired = start(&path("retired"), &retiring(now() - 1)).await;
+    let carol_card = attested(&rotated, &carol, "carol").await;
+
+    let v = verifier(
+        &path("verifier"),
+        &rotated,
+        Trust::Discovery,
+        &format!("http://{}", rotated.ng),
+        "",
+    )
+    .await;
+    assert_eq!(
+        auth_at(v, &alice, &dev, &alice_card).await.json()["handle"],
+        "alice@127.0.0.1"
+    );
+    assert_eq!(
+        auth_at(v, &carol, &dev, &carol_card).await.json()["handle"],
+        "carol@127.0.0.1"
+    );
+
+    let late = verifier(
+        &path("late"),
+        &retired,
+        Trust::Discovery,
+        &format!("http://{}", retired.ng),
+        "",
+    )
+    .await;
+    let reply = auth_at(late, &alice, &dev, &alice_card).await;
+    assert_eq!(
+        (reply.status, reply.json()["handle"].clone()),
+        (200, Value::Null)
+    );
+}

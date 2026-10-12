@@ -63,6 +63,7 @@ pub fn fetch_config(news: &NewsSection) -> FetchConfig {
         proxy: news.feeds.proxy.clone(),
         user_agent: format!("hxd-ng/{}", env!("CARGO_PKG_VERSION")),
         accept: hxd_feeds::FEED_ACCEPT,
+        name: None,
     }
 }
 

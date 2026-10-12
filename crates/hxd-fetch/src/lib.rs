@@ -53,6 +53,11 @@ pub struct FetchConfig {
     pub user_agent: String,
     /// The `Accept` header: what the caller can read.
     pub accept: &'static str,
+    /// The name the configured URL's server is asked for, in `Host` and
+    /// in TLS's server name, where the URL reaches it by an address the
+    /// operator gave: a registrar on the local network that answers only
+    /// to its own name. A redirect's hops are asked for by their own.
+    pub name: Option<String>,
 }
 
 /// What makes the next fetch conditional.
@@ -213,7 +218,12 @@ async fn follow<N: Net>(
     let mut moved_to = None;
     let mut permanent_so_far = true;
     for hop in 0..=MAX_REDIRECTS {
-        match get(net, cfg, proxy.as_ref(), &url, v, check, pinned.take()).await? {
+        let route = Route {
+            check,
+            pinned: pinned.take(),
+            name: if hop == 0 { cfg.name.as_deref() } else { None },
+        };
+        match get(net, cfg, proxy.as_ref(), &url, v, route).await? {
             Answer::NotModified => return Ok(Fetched::NotModified),
             Answer::Body(bytes, validators) => {
                 return Ok(Fetched::Body {
@@ -321,6 +331,16 @@ async fn connect<N: Net>(net: &N, addrs: &[SocketAddr]) -> Result<TcpStream, Fet
     Err(FetchError::Transport(last))
 }
 
+/// How one hop reaches its server, beyond its URL.
+struct Route<'a> {
+    /// Whether the addresses it connects to are checked.
+    check: bool,
+    /// The configured URL's addresses, as its classification found them.
+    pinned: Option<Vec<SocketAddr>>,
+    /// See [`FetchConfig::name`].
+    name: Option<&'a str>,
+}
+
 /// One hop: a connection of its own, one request, one answer.
 async fn get<N: Net>(
     net: &N,
@@ -328,9 +348,13 @@ async fn get<N: Net>(
     proxy: Option<&Url>,
     url: &Url,
     v: &Validators,
-    check: bool,
-    pinned: Option<Vec<SocketAddr>>,
+    route: Route<'_>,
 ) -> Result<Answer, FetchError> {
+    let Route {
+        check,
+        pinned,
+        name,
+    } = route;
     let https = url.scheme() == "https";
     let (tcp, absolute) = match proxy {
         None => {
@@ -356,21 +380,25 @@ async fn get<N: Net>(
         }
     };
     let io: Box<dyn Io> = if https {
-        let name = rustls::pki_types::ServerName::try_from(literal(url).map_or_else(
-            || url.host_str().unwrap_or_default().to_owned(),
-            |ip| ip.to_string(),
-        ))
-        .map_err(|_| FetchError::BadUrl("not a TLS server name".into()))?;
+        let server = match name {
+            Some(name) => name.to_owned(),
+            None => literal(url).map_or_else(
+                || url.host_str().unwrap_or_default().to_owned(),
+                |ip| ip.to_string(),
+            ),
+        };
+        let name_for_tls = rustls::pki_types::ServerName::try_from(server)
+            .map_err(|_| FetchError::BadUrl("not a TLS server name".into()))?;
         Box::new(
             tls()
-                .connect(name, tcp)
+                .connect(name_for_tls, tcp)
                 .await
                 .map_err(|e| transport(format!("TLS: {e}")))?,
         )
     } else {
         Box::new(tcp)
     };
-    exchange(io, request(cfg, url, v, absolute)?, cfg.max_bytes).await
+    exchange(io, request(cfg, url, v, absolute, name)?, cfg.max_bytes).await
 }
 
 fn tls() -> &'static TlsConnector {
@@ -423,6 +451,7 @@ fn request(
     url: &Url,
     v: &Validators,
     absolute: bool,
+    name: Option<&str>,
 ) -> Result<Request<Empty<Bytes>>, FetchError> {
     let mut target = url.clone();
     target.set_fragment(None);
@@ -432,7 +461,15 @@ fn request(
         target[url::Position::BeforePath..].to_string()
     };
     let mut r = Request::get(target)
-        .header(HOST, authority(url, false))
+        .header(
+            HOST,
+            match name {
+                Some(name) => url
+                    .port()
+                    .map_or(name.to_owned(), |p| format!("{name}:{p}")),
+                None => authority(url, false),
+            },
+        )
         .header(USER_AGENT, cfg.user_agent.as_str())
         .header(ACCEPT, cfg.accept)
         .header(ACCEPT_ENCODING, "gzip")

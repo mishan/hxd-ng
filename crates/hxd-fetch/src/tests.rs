@@ -62,6 +62,7 @@ fn cfg() -> FetchConfig {
         proxy: None,
         user_agent: "hxd-ng-test/1".into(),
         accept: "*/*",
+        name: None,
     }
 }
 
@@ -503,4 +504,34 @@ async fn one_lookup_decides_where_a_feed_is_and_where_it_connects() {
         "connected where the classifying lookup said, not where the next one did: {got:?}"
     );
     assert!(log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_server_reached_by_address_is_asked_for_by_its_name_and_a_redirect_by_its_own() {
+    let (addr, log) = server(move |head| match path(head) {
+        "/a" => response("302 Found", &[("Location", "/b")], b""),
+        _ => response("200 OK", &[], b"ok"),
+    })
+    .await;
+    let named = FetchConfig {
+        name: Some("reg.test".into()),
+        ..cfg()
+    };
+    let url = format!("http://{addr}/a");
+    assert_eq!(
+        body(get_url(named, url, Validators::default()).await).0,
+        b"ok"
+    );
+    let heads = log.lock().unwrap().clone();
+    let port = addr.port();
+    assert!(
+        heads[0].contains(&format!("host: reg.test:{port}\r\n")),
+        "{}",
+        heads[0]
+    );
+    assert!(
+        heads[1].contains(&format!("host: 127.0.0.1:{port}\r\n")),
+        "{}",
+        heads[1]
+    );
 }

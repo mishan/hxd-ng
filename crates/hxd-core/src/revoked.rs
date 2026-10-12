@@ -1,6 +1,7 @@
-//! Server-local revocation (`docs/identity-registrar.md`): identity and
-//! device fingerprints the operator has refused by hand, with no
-//! registrar involved.
+//! Revocation at this server (`docs/identity-registrar.md` §7.3): identity
+//! and device fingerprints the operator has refused by hand, with no
+//! registrar involved, and those refused by what the registrars this
+//! server trusts publish (`docs/identity-records.md`). Either refuses.
 //!
 //! The only other remedy for a stolen device key is its certificate's
 //! expiry, and for a stolen identity key a successor committed in
@@ -45,6 +46,23 @@ impl Revocations {
     }
 }
 
+/// Both lists: the operator's and the registrars'.
+#[derive(Debug, Default)]
+pub(crate) struct Refused {
+    local: Revocations,
+    published: Revocations,
+}
+
+impl Refused {
+    pub(crate) fn refuses(&self, tag: &IdentityTag) -> bool {
+        self.local.refuses(tag) || self.published.refuses(tag)
+    }
+
+    fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
+        self.local.is_revoked(identity, device) || self.published.is_revoked(identity, device)
+    }
+}
+
 impl Core {
     /// Is this identity, or this device of it, revoked here?
     pub fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
@@ -74,10 +92,22 @@ impl Core {
     /// dies with the session, which is the point: an attacker holding
     /// one should not be able to come back through it.
     pub fn set_revocations(&self, list: Revocations) -> Vec<(Uid, String)> {
-        // Written first and with nothing else held: an `attach` from here
-        // on is refused, and one that got in before is on the roster for
-        // the sweep below to find.
-        *self.revoked.write().unwrap() = list.clone();
+        self.revoked.write().unwrap().local = list.clone();
+        self.end_revoked(&list)
+    }
+
+    /// Install what the registrars this server trusts publish against
+    /// keys, replacing the last, and end every session it now refuses, as
+    /// [`Self::set_revocations`] does for the operator's own list.
+    pub fn set_published_revocations(&self, list: Revocations) -> Vec<(Uid, String)> {
+        self.revoked.write().unwrap().published = list.clone();
+        self.end_revoked(&list)
+    }
+
+    /// The sessions `list` refuses, ended. Run after the list is written,
+    /// and with nothing else held: an `attach` from then on is refused,
+    /// and one that got in before is on the roster to be found here.
+    fn end_revoked(&self, list: &Revocations) -> Vec<(Uid, String)> {
         if list.is_empty() {
             return Vec::new();
         }
@@ -205,7 +235,7 @@ mod tests {
         // And a session that somehow is parked is not resumed.
         let (parked, _rx) = attach(&core, "parked", Some(tag(2, 20))).unwrap();
         assert!(core.connection_lost(parked, 10));
-        *core.revoked.write().unwrap() = list(&[2], &[]);
+        core.revoked.write().unwrap().local = list(&[2], &[]);
         assert!(matches!(
             core.resume(parked, 0),
             crate::roster::Resume::Gone

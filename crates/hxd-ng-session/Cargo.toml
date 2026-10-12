@@ -11,6 +11,7 @@ publish = false
 hxd-core = { workspace = true }
 hxd-files = { workspace = true }
 hl-identity = { workspace = true }
+hxd-fetch = { workspace = true }
 hl-tunnel = { workspace = true }
 hxd-registrar = { workspace = true }
 tokio = { workspace = true }
@@ -18,7 +19,7 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
 tokio-tungstenite = "0.24"
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 sha2 = "0.10"
 getrandom = "0.2"
 # The HTTP layer in front of the WebSocket (docs/hotline-ng-auth.md

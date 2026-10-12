@@ -1025,6 +1025,21 @@ async fn transport_identity(
                  accepted in place of one on a request that carries Origin",
             )));
         }
+        // A device on file is re-admitted under its identity's records as
+        // they are now (`identity-registrar.md` §7.2).
+        let card = {
+            let state = state.clone();
+            crate::spawn_blocking("identity", move || state.card_for_device(&device)).await
+        };
+        if let (Some(registrars), Ok(Some(card))) = (state.registrars(), card) {
+            registrars
+                .refresh(
+                    &card.identity,
+                    &card.attestations,
+                    crate::identity::now_unix(),
+                )
+                .await;
+        }
         let state = state.clone();
         let found = crate::spawn_blocking("identity", move || state.identity_for_device(&device))
             .await
@@ -1394,7 +1409,10 @@ fn discovery(ctx: &NgCtx, host: Option<&str>) -> Resp {
                     crate::identity::NewAccounts::Create => "create",
                 },
                 "min_attestation_age": cfg.min_attestation_age,
-                "trusted_registrars": cfg.registrar_keys.keys().collect::<Vec<_>>(),
+                "trusted_registrars": st
+                    .registrars()
+                    .map(|r| r.hosts())
+                    .unwrap_or_default(),
                 "association": "server",
                 "endpoints": endpoints,
             });
@@ -1791,11 +1809,29 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx:
         None => None,
     };
     // The state does signature checks and, with credentials or a
-    // create policy, file I/O: off the reactor.
+    // create policy, file I/O: off the reactor. The login is verified
+    // first, its challenge spent; then what the registrars that attest it
+    // publish against it is fetched, within their own bound, so only a
+    // client that proved its key can send this server to a registrar;
+    // then it is admitted.
+    let verifier = st.clone();
+    let shown = card.clone();
+    let verified = crate::spawn_blocking("identity", move || match (proof, device_from_cert) {
+        (Some(proof), _) => verifier.verify_proof(&shown, &cert, &proof),
+        (None, Some(device)) => verifier.verify_presented(&shown, &cert, &device),
+        (None, None) => unreachable!("checked above"),
+    })
+    .await;
+    if let (Ok(Ok(v)), Some(registrars)) = (&verified, st.registrars()) {
+        registrars
+            .refresh(v.identity(), v.attestations(), crate::identity::now_unix())
+            .await;
+    }
     let st = st.clone();
     let registrar = ctx.registrar.clone();
     let presented = card.clone();
     let result = crate::spawn_blocking("identity", move || {
+        let verified = verified.map_err(|_| AuthRefused::Backend)??;
         let classic = login
             .as_deref()
             .zip(password.as_deref())
@@ -1808,11 +1844,7 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx:
             downstream,
             create,
         };
-        let result = match (proof, device_from_cert) {
-            (Some(proof), _) => st.auth_with_proof(&card, &cert, &proof, req),
-            (None, Some(device)) => st.auth_presented(&card, &cert, &device, req),
-            (None, None) => unreachable!("checked above"),
-        };
+        let result = st.admit_verified(verified, req);
         // A card shown at `auth` is cached like one that was `PUT`, so a
         // registrar records its commitment the same way (§5.4) — and
         // holds it to one it already has, which admission checked.
