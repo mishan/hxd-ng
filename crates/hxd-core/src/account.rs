@@ -77,6 +77,12 @@ pub struct Account {
     /// `can_spam` extra, the `[extra] can_spam` key. Backend default: the
     /// disconnect-users (kick) bit, as mhxd's administrators have it.
     pub can_spam: bool,
+    /// May this account create and edit roles (`docs/roles.md` §5)? The
+    /// `[extra] manage_roles` key. Backend default: no.
+    pub manage_roles: bool,
+    /// The roles the account's file lists, as listed: for display and
+    /// editors. What they grant is already in the fields above.
+    pub roles: Vec<String>,
     /// Portable-identity association (`docs/hotline-ng-identity.md` §8).
     /// Its `fingerprint` is the durable half of a
     /// [`crate::inbox::Mailbox`]: a login can be renamed and
@@ -110,6 +116,8 @@ impl Account {
             set_avatar: false,
             moderate: false,
             can_spam: false,
+            manage_roles: false,
+            roles: Vec::new(),
             identity,
             config,
         };
@@ -139,6 +147,7 @@ impl Account {
         self.set_avatar = x.set_avatar;
         self.moderate = x.moderate;
         self.can_spam = x.can_spam;
+        self.manage_roles = x.manage_roles;
     }
 
     /// Is exactly one person behind this account — a password, or a
@@ -164,6 +173,25 @@ pub struct Extras<T> {
     pub set_avatar: T,
     pub moderate: T,
     pub can_spam: T,
+    pub manage_roles: T,
+}
+
+impl<T: Copy> Extras<T> {
+    /// Each key of `self` and `other` combined by `f`.
+    pub fn zip_with<U: Copy, V>(self, other: Extras<U>, f: impl Fn(T, U) -> V) -> Extras<V> {
+        Extras {
+            can_detach: f(self.can_detach, other.can_detach),
+            set_subject: f(self.set_subject, other.set_subject),
+            inbox: f(self.inbox, other.inbox),
+            file_list: f(self.file_list, other.file_list),
+            file_getinfo: f(self.file_getinfo, other.file_getinfo),
+            attach_news: f(self.attach_news, other.attach_news),
+            set_avatar: f(self.set_avatar, other.set_avatar),
+            moderate: f(self.moderate, other.moderate),
+            can_spam: f(self.can_spam, other.can_spam),
+            manage_roles: f(self.manage_roles, other.manage_roles),
+        }
+    }
 }
 
 /// What an account's files say, before any default derives: the
@@ -226,6 +254,7 @@ impl AccountConfig {
             set_subject: key(x.set_subject, kick, m.set_subject || unkick),
             moderate: key(x.moderate, kick, m.moderate || unkick),
             can_spam: key(x.can_spam, kick, m.can_spam || unkick),
+            manage_roles: key(x.manage_roles, false, m.manage_roles),
             attach_news: key(
                 x.attach_news,
                 media,
@@ -534,6 +563,13 @@ pub trait AccountAdmin: Send + Sync + 'static {
         login: &str,
         check: &dyn Fn(&Account) -> Result<(), AdminError>,
     ) -> Result<(), AdminError>;
+
+    /// Read again what the backend keeps beside the accounts, such as
+    /// roles, for [`crate::Core::reload_accounts`]. On failure what it
+    /// had stays in force, and the answer says why.
+    fn reload(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A read-only look at accounts nobody is logged into.

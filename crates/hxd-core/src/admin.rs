@@ -45,6 +45,7 @@ fn beyond(actor: &Account, target: &Account) -> bool {
             (target.attach_news, actor.attach_news),
             (target.moderate, actor.moderate),
             (target.can_spam, actor.can_spam),
+            (target.manage_roles, actor.manage_roles),
         ]
         .iter()
         .any(|(t, a)| *t && !*a)
@@ -199,15 +200,19 @@ impl Core {
     }
 
     /// Bring every session up to date with its account file, for an
-    /// operator who edited accounts outside the server (`hxd account`,
-    /// or by hand) and sent SIGHUP: each account is applied as an
-    /// administrator's edit is, and the sessions of one that is gone are
-    /// disconnected. Answers how many sessions were told and ended.
+    /// operator who edited accounts or roles outside the server (`hxd
+    /// account`, `hxd role`, or by hand) and sent SIGHUP: each account is
+    /// applied as an administrator's edit is, and the sessions of one
+    /// that is gone are disconnected. Answers how many sessions were told
+    /// and ended.
     pub fn reload_accounts(&self) -> (usize, usize) {
         let Some(admin) = self.admin.as_deref() else {
             return (0, 0);
         };
         let _writing = self.begin_account_write();
+        if let Err(e) = admin.reload() {
+            tracing::error!("account reload: {e}");
+        }
         let mut logins: Vec<String> = {
             let r = self.roster.lock().unwrap();
             r.users

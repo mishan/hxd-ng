@@ -31,6 +31,7 @@ pub mod metrics;
 pub mod moderation;
 pub mod push;
 pub mod registrar;
+pub mod roles;
 pub mod tls;
 pub mod voice;
 pub use files::Files;
@@ -52,6 +53,10 @@ pub struct Config {
     pub limits: LimitsSection,
     #[serde(default)]
     pub paths: PathsSection,
+    /// Roles (`docs/roles.md`): grants accounts share by name. Without
+    /// its file there are none, and every account reads as its own.
+    #[serde(default)]
+    pub roles: RolesSection,
     /// The Hotline-ng WebSocket frontend. Absent = disabled.
     pub ng: Option<NgSection>,
     /// Voice chat. Absent = disabled, which is the spec's default and
@@ -1894,6 +1899,27 @@ pub struct PathsSection {
     pub accounts: PathBuf,
     /// Agreement text file (UTF-8). Optional; absent = no agreement.
     pub agreement: Option<PathBuf>,
+}
+
+/// `[roles]`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RolesSection {
+    /// The roles file (`docs/roles.md` §2.3), edited by `hxd role`.
+    #[serde(default = "default_roles_file")]
+    pub file: PathBuf,
+}
+
+impl Default for RolesSection {
+    fn default() -> Self {
+        RolesSection {
+            file: default_roles_file(),
+        }
+    }
+}
+
+fn default_roles_file() -> PathBuf {
+    "roles.toml".into()
 }
 
 fn default_bind() -> String {
@@ -4055,10 +4081,7 @@ pub fn build_ctx(
 
     // The reserved login is refused at the one place every frontend's
     // login goes through, so none of them can miss it.
-    let auth = Arc::new(match config.system.as_ref() {
-        Some(system) => FileAuth::new(&config.paths.accounts).reserving(&system.login),
-        None => FileAuth::new(&config.paths.accounts),
-    });
+    let auth = Arc::new(accounts::backend(config)?);
     // Say at startup what an operator would otherwise learn from a user:
     // an account file that does not parse, or one nothing can log in to.
     auth.audit();

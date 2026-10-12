@@ -1,7 +1,10 @@
 # Roles: permissions shared by name
 
-Status: design, not built. §14 stages it. §7, §9.4, §11.3 and §12.5 are
-the ng spec; the rest binds nobody but this server.
+Status: G1 is built (§14): the roles file, resolution, `everyone`,
+reload, §6.1's minimal overrides and the command line. Its `@` login
+reservation is built on its own.
+The rest is design. §7, §9.4, §11.3 and §12.5 are the ng spec; the rest
+binds nobody but this server.
 
 An account's permissions today are its own: an access bitmap and an
 `[extra]` table in its file, written one account at a time. That is
@@ -89,7 +92,7 @@ every moderator. KDX had account *classes* for this; Discord has
 
 | Field | Meaning |
 |---|---|
-| `name` | The key: 1–30 characters, lowercase ASCII letters, digits, `-` and `_`. Unique. 30, so that `@name` fits a classic login's 31 (§6.4) |
+| `name` | The key: 1–30 characters, lowercase ASCII letters, digits, `-` and `_`, starting with a letter or digit, since a leading `-` reads as taking a role away on a command line. Unique. 30, so that `@name` fits a classic login's 31 (§6.4) |
 | `title` | What clients show, e.g. `Moderators`. Up to 31 characters, a classic `NAME`'s. Defaults to `name` |
 | `color` | Optional `0xRRGGBB`. §8 |
 | `position` | Display order: the user list groups by it and the highest colored role colors a nick. It is **not** authority (§5) |
@@ -108,7 +111,8 @@ a gate (§10).
 
 ### 2.3 Where roles live
 
-One file, `[roles] file` (default `roles.toml` beside the config),
+One file, `[roles] file` (default `roles.toml`, in the working
+directory like every relative path in the config),
 edited through `toml_edit` so comments survive, like account files and
 the rooms file:
 
@@ -156,12 +160,19 @@ send_media = false      # an override: regulars may, Alice may not
   reload leaves the roles as they were and logs why. A server that came
   up without its roles would come up without every restriction's
   definition, and a mute that silently lifts at a restart is worse than
-  a server that will not start.
+  a server that will not start. A file naming an access key that does
+  not exist is refused the same way, where an account's is a warning: a
+  typo in a role fails every holder at once. Until restrictions are built (G7), an
+  entry with `kind` or `deny` is refused the same way, so a file
+  written for them is never read as granting what it meant to withhold.
+- **`false` in a role means nothing**, so `hxd role access … KEY=off`
+  removes the key rather than writing it.
 - **Writes are serialized** under a roles-write lock held across the
   file write and its application, as rooms' are (chat-rooms.md §4).
   The account-write lock is taken first, then roles, then rooms, by
   every operation that needs more than one. The file is written whole
-  and renamed into place.
+  and renamed into place. Until the server writes it (G3), only `hxd
+  role` does, beside it, and there is no lock to take.
 
 ## 3. Resolving an account
 
@@ -174,7 +185,9 @@ Resolution has two halves, in two places.
 2. **The account's own keys.** Each `[access]` and `[extra]` key
    present sets its value, true or false, over step 1. `raw_bits`
    grants raw bits and `raw_deny` withholds them, since a list of numbers
-   has no way to say `false`.
+   has no way to say `false`. Bit 56 is named by either of its keys, by
+   `raw_deny`, or by a role granting it, and only then stops following
+   bit 9.
 
 **The mask**, held by `hxd-core` on the `UserSession`:
 
@@ -237,9 +250,10 @@ its writer's byte budget like any other burst. A role's color
 reaches classic clients as each holder's next 301 or login, not as a
 burst of its own.
 
-`hxd role` edits the file and sends SIGHUP, and `Core::reload_accounts`
-re-resolves every session, keeping its mask. A hand edit of the roles
-file is followed by the same signal.
+`hxd role` edits the file, as `hxd account` does an account's, and the
+operator sends SIGHUP (`systemctl reload`); `Core::reload_accounts`
+then reads the roles again and re-resolves every session, keeping its
+mask. A hand edit of the roles file is followed by the same signal.
 
 ## 5. Who may
 
@@ -316,7 +330,10 @@ exactly these bits":
   show it, so this wire leaves it as the account had it.
 
 The cost: an override pins its bit against later role edits. That is
-what the administrator asked for, and easy to forget. `hxd account
+what the administrator asked for, and easy to forget. And 353 carries
+the bitmap as it stood at 352, so a role narrowed, or the account's
+roles changed, between opening and saving is written back as an
+override; remembering the configuration a session opened is G2's. `hxd account
 show`, the ng editor and §6.3's `/role` show overrides apart from what
 roles give, so they can be found and cleared.
 
@@ -917,14 +934,19 @@ the room. Both should exist.
   files directly, so they work with the server down. A running server
   applies them on SIGHUP. `rm` checks §5's delete rule against the
   rooms file and, where the news store can be opened, the news gates,
-  and refuses when it cannot tell.
+  and refuses when it cannot tell; until gates are built (G4, G8) there
+  is nothing to check. It takes the name out of the account files
+  first, so a removal cut short can be run again. `hxd account access`
+  sets the file's own keys, and writes `false` only where something
+  else grants the bit.
 - **Server links.** Roles do not cross. A ghost has none, and its home
   server decides what it may do.
 - **Tests.** `crates/hxd/tests/accounts.rs` grows the role cases
-  (§14). Resolution (§3) is a table-driven unit test in `hxd-core`,
-  one row per combination of role grant, account `true`, account
-  `false`, absence and mask, for a bit, for bit 56 and for each derived
-  `[extra]` key.
+  (§14). Configuration (§3's steps 1 and 2) is a table-driven unit test
+  in `hxd-auth-file`, one row per combination of role grant, account
+  `true`, account `false` and absence, for a bit, for bit 56 and for a
+  derived `[extra]` key; the mask's rows are `hxd-core`'s, beside
+  derivation.
 
 - **Configuration**, all keys optional:
 
@@ -968,14 +990,17 @@ the room. Both should exist.
 
 1. **G1 — resolution and files.** The roles file, `roles` in account
    files, §3's two halves with derivation last, `everyone`, `hxd role`
-   and the account CLI's additions, reload, and the `@` reservation, so
-   no account can take one before G6. No wire changes: a role's grants
-   are simply there, in SELFINFO and on every gate.
+   and the account CLI's additions, reload, §6.1's minimal overrides,
+   and the `@` reservation, so no account can take one before G6. The
+   overrides come this early because every save of an account goes
+   through them: one that wrote a role's bits into the file would pin
+   them there, and a role taken away later would take nothing. Unit
+   tests: saving unchanged writes nothing, unchecking a role's bit
+   writes `false`, re-checking clears it. No wire changes: a role's
+   grants are simply there, in SELFINFO and on every gate.
 2. **G2 — who may, and the classic editor.** §5's checks in
-   `hxd_core::admin`, §6.1's minimal overrides on 352/353/350, §6.2's
-   info line, §6.3's commands. E2E in `accounts.rs`: a 1.5 editor
-   unchecking a role's bit writes `false`, re-checking clears it, and
-   saving unchanged writes nothing; a moderator refused a role that
+   `hxd_core::admin`, §6.2's info line, §6.3's commands. E2E in
+   `accounts.rs`: a moderator refused a role that
    grants what it lacks; a role edit refused while an administrator
    holds the role; a role granting `manage_rooms` refused to someone
    without it; a role edit reaching a holder's session on both wires.

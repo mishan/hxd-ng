@@ -360,6 +360,20 @@ async fn each_act_needs_its_bit_and_nobody_grants_what_they_do_not_hold() {
         assert_eq!(refused(lim.call(ty, &fields).await), outranked, "{ty:#x}");
     }
     assert!(!server.file("alt").exists());
+    // Managing roles is one such grant, and no bit gives it: not even
+    // `admin` may delete an account that may.
+    write(
+        server.accounts.path(),
+        "keeper",
+        "password = \"pw\"\n[extra]\nmanage_roles = true\n",
+    );
+    let mut admin = classic(&server, "admin", "pw").await;
+    let fields = [(tag::LOGIN, xor(b"keeper"))];
+    assert_eq!(
+        refused(admin.call(ACCOUNT_DELETE, &fields).await),
+        outranked
+    );
+    assert!(server.file("keeper").exists());
 
     // An account deleting itself is not disconnected for it, and edits
     // nothing more: its file is what it is measured against.
@@ -847,4 +861,117 @@ async fn the_command_line_keeps_accounts_and_a_reload_reaches_their_sessions() {
         }
     };
     assert!(matches!(closed, Error::Closed), "{closed:?}");
+}
+
+/// Does `f` carry self-info whose access has `b` as `on`?
+fn self_access(f: &legacy::Frame, b: u8, on: bool) -> bool {
+    f.ty == push::SELFINFO
+        && f.bytes(tag::ACCESS)
+            .is_some_and(|a| AccessBits::from_wire(a.try_into().unwrap()).has(b) == on)
+}
+
+#[tokio::test]
+async fn a_role_grants_its_holders_and_an_edit_reaches_them_on_reload() {
+    let td = tempfile::tempdir().unwrap();
+    let d = td.path().display();
+    let path = td.path().join("hxd-ng.toml");
+    std::fs::write(
+        &path,
+        format!("[paths]\naccounts = \"{d}/accounts\"\n[roles]\nfile = \"{d}/roles.toml\"\n"),
+    )
+    .unwrap();
+    let config = hxd::Config::load(&path).unwrap();
+    std::fs::create_dir(td.path().join("accounts")).unwrap();
+    write(
+        &td.path().join("accounts"),
+        "rita",
+        "password = \"pw\"\nroles = [\"staff\"]\n[access]\nread_chat = true\n",
+    );
+    std::fs::write(
+        td.path().join("roles.toml"),
+        "[role.staff]\naccess = { get_user_info = true }\n",
+    )
+    .unwrap();
+    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
+    let core = ctx.core.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(hxd_session::serve(listener, ctx));
+
+    let mut rita = legacy::Client::login_at(addr, &Login::account("r", "rita", "pw"))
+        .await
+        .unwrap();
+    let told = rita
+        .recv_where(|f| self_access(f, bit::GET_USER_INFO, true))
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+
+    hxd::roles::set_access(&config, "staff", &["send_chat=on".into()]).unwrap();
+    assert_eq!(core.reload_accounts(), (1, 0));
+    let told = rita
+        .recv_where(|f| self_access(f, bit::SEND_CHAT, true))
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+
+    // The account's own `false` withholds what the role grants.
+    hxd::accounts::set_access(&config, "rita", &["send_chat=off".into()]).unwrap();
+    assert_eq!(core.reload_accounts(), (1, 0));
+    let told = rita
+        .recv_where(|f| self_access(f, bit::SEND_CHAT, false))
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+
+    // A key set by name is not outvoted by the same bit's number, and
+    // the old name for history is renamed rather than doubled.
+    write(
+        &td.path().join("accounts"),
+        "uma",
+        "password = \"pw\"\n[access]\nchat_history = true\nraw_bits = [57]\n",
+    );
+    let shown = hxd::accounts::set_access(
+        &config,
+        "uma",
+        &["send_media=off".into(), "read_chat_history=off".into()],
+    )
+    .unwrap();
+    assert!(
+        !shown.contains("send_media") && !shown.contains("history"),
+        "{shown}"
+    );
+    let file = std::fs::read_to_string(td.path().join("accounts/uma.toml")).unwrap();
+    assert!(
+        !file.contains("raw_bits") && !file.contains("\nchat_history"),
+        "{file}"
+    );
+
+    // A roles file broken meanwhile leaves the roles as they were.
+    std::fs::write(td.path().join("roles.toml"), "[role.staff]\nkind = \"x\"\n").unwrap();
+    assert!(hxd::build_ctx(&config, None, None, None, None).is_err());
+    assert_eq!(core.reload_accounts(), (1, 0));
+    let told = rita.recv_type(push::SELFINFO).await.unwrap();
+    assert!(self_access(&told, bit::GET_USER_INFO, true));
+    std::fs::write(td.path().join("roles.toml"), "").unwrap();
+    hxd::roles::add(&config, "staff", None, None, None, Some("get_user_info")).unwrap();
+    let password = hxd::accounts::Password::None;
+    let added = hxd::accounts::add(&config, "sam", None, Some("rita"), None, &password).unwrap();
+    assert!(added.contains("roles: staff"), "{added}");
+
+    // A removed role is taken out of the accounts listing it, and with it
+    // what it granted.
+    let said = hxd::roles::remove(&config, "staff").unwrap();
+    assert!(said.contains("2 accounts"), "{said}");
+    assert!(
+        !std::fs::read_to_string(td.path().join("accounts/rita.toml"))
+            .unwrap()
+            .contains("staff")
+    );
+    assert!(hxd::roles::remove(&config, "everyone").is_err());
+    assert_eq!(core.reload_accounts(), (1, 0));
+    let told = rita
+        .recv_where(|f| self_access(f, bit::GET_USER_INFO, false))
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+    let shown = hxd::accounts::set_roles(&config, "rita", &[]).unwrap();
+    assert!(!shown.contains("roles:"), "{shown}");
+    assert!(hxd::accounts::set_roles(&config, "rita", &["+staff".into()]).is_err());
 }

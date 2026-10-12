@@ -239,9 +239,9 @@ fn operator_core(config: &Config, read_only: bool) -> Result<Core, String> {
     } else {
         crate::open_sqlite(&path, Synchronous::Normal)?
     };
-    let core = Core::new().with_accounts(Arc::new(hxd_auth_file::FileAuth::new(
-        &config.paths.accounts,
-    )));
+    let core = Core::new().with_accounts(Arc::new(
+        hxd_auth_file::FileAuth::new(&config.paths.accounts).with_roles(&config.roles.file)?,
+    ));
     // Only what shares the trail's file is reachable here: a `[news]`
     // with a database of its own keeps its articles where this cannot
     // see them, and a purge says what it took rather than guessing.

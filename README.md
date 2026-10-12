@@ -250,6 +250,10 @@ logins_in_flight = 32   # logins worked on at once, a quarter of them from
 [paths]
 accounts = "accounts"
 agreement = "agreement.txt"
+
+[roles]
+file = "roles.toml"     # grants accounts share by name (docs/roles.md);
+                        # no file there means no roles
 ```
 
 ### Limits
@@ -1257,6 +1261,12 @@ what each one gates, which of them this server enforces today, and which
 numbers are reserved — is in
 [docs/access-bits.md](docs/access-bits.md). First run writes a `guest.toml`
 with the bits a stranger can be trusted with; delete it to turn guests off.
+
+An account can also list `roles = ["moderators"]`, named grants defined
+once in the roles file and edited with `hxd role`; `everyone` is held by
+every account, the guest included. The account's own keys win over its
+roles either way, so `send_media = false` withholds what a role grants
+([docs/roles.md](docs/roles.md) §3).
 
 An account links to an identity through an `[identity]` table in its file,
 written by linking or by hand: `fingerprint`, `login = true` (the identity

@@ -254,7 +254,10 @@ changed in the file stays changed, and once the file exists the password
 variable can be removed. Other accounts are TOML files in
 `/var/lib/hxd-ng/accounts` ([access-bits.md](access-bits.md)); edit them
 with `docker exec -it hxd-ng sh` or from the volume. hxd reads them at
-each login, so there is nothing to restart.
+each login, so there is nothing to restart. Roles, which accounts list
+by name ([roles.md](roles.md)), are `/var/lib/hxd-ng/roles.toml`,
+edited with `docker exec hxd-ng hxd-entrypoint role …`; a running server applies a
+role edit to everyone logged in on SIGHUP (`docker kill -s HUP hxd-ng`).
 
 ### Hotline-ng and identity
 

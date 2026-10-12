@@ -2,11 +2,13 @@
 //! accounts directory directly, so it works with the server down. A
 //! running server applies an edit to whoever is logged in as the account
 //! on SIGHUP (`Core::reload_accounts`); a new login sees it at once.
+//! Commands that set single keys edit the file's own keys, never what
+//! its roles give it, so a role's grant is not copied into the file.
 //!
 //! The operator is above the rule a session is held to: any account may
 //! be given anything.
 
-use hxd_auth_file::FileAuth;
+use hxd_auth_file::{FileAuth, EVERYONE};
 use hxd_core::access::{self, AccessBits};
 use hxd_core::account::FIELD_MAX_CHARS;
 use hxd_core::{Account, AccountAdmin, AccountEdit, AdminError};
@@ -48,10 +50,69 @@ impl Password {
     }
 }
 
-fn backend(config: &Config) -> FileAuth {
-    match config.system.as_ref() {
-        Some(system) => FileAuth::new(&config.paths.accounts).reserving(&system.login),
-        None => FileAuth::new(&config.paths.accounts),
+/// The accounts as the server reads them, its roles included.
+pub(crate) fn backend(config: &Config) -> Result<FileAuth, String> {
+    let auth = FileAuth::new(&config.paths.accounts).with_roles(&config.roles.file)?;
+    Ok(match config.system.as_ref() {
+        Some(system) => auth.reserving(&system.login),
+        None => auth,
+    })
+}
+
+/// `key=on` or `key=off`.
+pub(crate) fn parse_change(change: &str) -> Result<(&str, bool), String> {
+    change
+        .split_once('=')
+        .and_then(|(k, v)| match v {
+            "on" | "true" | "yes" => Some((k, true)),
+            "off" | "false" | "no" => Some((k, false)),
+            _ => None,
+        })
+        .ok_or_else(|| format!("{change:?} is not key=on or key=off"))
+}
+
+/// Set `key` in `table`, keeping the comment on a value already there.
+fn set_key(table: &mut dyn toml_edit::TableLike, key: &str, on: bool) {
+    match table.get_mut(key).and_then(|item| item.as_value_mut()) {
+        Some(v) => {
+            let decor = v.decor().clone();
+            *v = on.into();
+            *v.decor_mut() = decor;
+        }
+        None => {
+            table.insert(key, toml_edit::value(on));
+        }
+    }
+}
+
+/// Take bit `b` out of the list of numbers at `key`, and the list with it
+/// once empty.
+fn drop_number(table: &mut dyn toml_edit::TableLike, key: &str, b: u8) {
+    let Some(list) = table.get_mut(key).and_then(|item| item.as_array_mut()) else {
+        return;
+    };
+    list.retain(|v| v.as_integer() != Some(b.into()));
+    if list.is_empty() {
+        table.remove(key);
+    }
+}
+
+/// Change the roles an account file lists with `f`.
+pub(crate) fn edit_listed(doc: &mut toml_edit::DocumentMut, f: impl FnOnce(&mut Vec<String>)) {
+    let mut listed: Vec<String> = doc
+        .get("roles")
+        .and_then(|item| item.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    f(&mut listed);
+    if listed.is_empty() {
+        doc.remove("roles");
+    } else {
+        doc["roles"] = toml_edit::value(listed.into_iter().collect::<toml_edit::Array>());
     }
 }
 
@@ -90,6 +151,9 @@ fn describe(a: &Account) -> String {
     if let Some(fp) = &a.identity.fingerprint {
         out += &format!("  identity: {}\n", hl_identity::Fingerprint(*fp));
     }
+    if !a.roles.is_empty() {
+        out += &format!("  roles: {}\n", a.roles.join(" "));
+    }
     out += &format!("  access: {}", names.join(" "));
     if !raw.is_empty() {
         out += &format!("\n  raw_bits: {raw:?}");
@@ -99,7 +163,7 @@ fn describe(a: &Account) -> String {
 
 /// `hxd account list`.
 pub fn list(config: &Config) -> Result<String, String> {
-    let all = backend(config)
+    let all = backend(config)?
         .list_accounts()
         .map_err(|e| refused("", e))?;
     Ok(all
@@ -125,16 +189,38 @@ pub fn list(config: &Config) -> Result<String, String> {
         .join("\n"))
 }
 
-/// `hxd account show <login>`.
+/// `hxd account show <login>`: the account as it resolves, and the keys
+/// its own file sets over its roles.
 pub fn show(config: &Config, login: &str) -> Result<String, String> {
-    let account = backend(config)
-        .read_account(login)
-        .map_err(|e| refused(login, e))?;
-    Ok(describe(&account))
+    let auth = backend(config)?;
+    let account = auth.read_account(login).map_err(|e| refused(login, e))?;
+    let doc = auth.document(login).map_err(|e| refused(login, e))?;
+    let mut own = Vec::new();
+    for (table, prefix) in [("access", ""), ("extra", "extra.")] {
+        let Some(table) = doc.get(table).and_then(|t| t.as_table_like()) else {
+            continue;
+        };
+        for (key, item) in table.iter() {
+            if let Some(v) = item.as_value() {
+                let mut v = v.clone();
+                v.decor_mut().clear();
+                own.push(format!("{prefix}{key}={v}"));
+            }
+        }
+    }
+    if own.is_empty() {
+        own.push("none".into());
+    }
+    Ok(format!(
+        "{}\n  own keys: {}",
+        describe(&account),
+        own.join(" ")
+    ))
 }
 
-/// `hxd account add <login>`: access from `--access`, else from the
-/// account `--like` names, else none.
+/// `hxd account add <login>`: access from `--access`, else the roles
+/// and `[access]` keys of the account `--like` names, else what
+/// `everyone` gives.
 pub fn add(
     config: &Config,
     login: &str,
@@ -143,16 +229,16 @@ pub fn add(
     access: Option<&str>,
     password: &Password,
 ) -> Result<String, String> {
-    let auth = backend(config);
-    let access = match (access, like) {
-        (Some(list), _) => parse_access(list)?,
-        (None, Some(like)) => {
-            auth.read_account(like)
-                .map_err(|e| refused(like, e))?
-                .access
-        }
-        (None, None) => AccessBits::empty(),
-    };
+    let auth = backend(config)?;
+    let template = like
+        .map(|like| auth.document(like).map_err(|e| refused(like, e)))
+        .transpose()?;
+    // With no list, a new account follows `everyone` rather than
+    // withholding what it grants.
+    let access = access
+        .map(parse_access)
+        .transpose()?
+        .unwrap_or_else(|| auth.roles().granted(&[]));
     let edit = AccountEdit {
         login: login.to_owned(),
         name,
@@ -160,12 +246,24 @@ pub fn add(
         access: Some(access),
         history_unsaid: false,
     };
-    let account = auth
+    let mut account = auth
         .write_account(&edit, &|existing, _| match existing {
             Some(_) => Err(AdminError::Exists),
             None => Ok(()),
         })
         .map_err(|e| refused(login, e))?;
+    if let Some(template) = template {
+        account = auth
+            .edit_account(login, |doc| {
+                for key in ["roles", "access"] {
+                    if let Some(item) = template.get(key) {
+                        doc[key] = item.clone();
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|e| refused(login, e))?;
+    }
     Ok(describe(&account))
 }
 
@@ -185,7 +283,7 @@ pub fn passwd(config: &Config, login: &str, password: &Password) -> Result<Strin
         ),
         ..Default::default()
     };
-    backend(config)
+    backend(config)?
         .write_account(&edit, &exists)
         .map_err(|e| refused(login, e))?;
     Ok(format!(
@@ -193,46 +291,96 @@ pub fn passwd(config: &Config, login: &str, password: &Password) -> Result<Strin
     ))
 }
 
-/// `hxd account access <login> key=on|off…`.
+/// `hxd account access <login> key=on|off…`: each key set in the file,
+/// where `off` withholds what a role grants. Turning off a bit nothing
+/// gives the account writes nothing.
 pub fn set_access(config: &Config, login: &str, changes: &[String]) -> Result<String, String> {
-    let auth = backend(config);
-    let mut access = auth
+    let auth = backend(config)?;
+    let changes = changes
+        .iter()
+        .map(|c| {
+            let (key, on) = parse_change(c)?;
+            let b = access::named(key).ok_or_else(|| format!("no access key {key:?}"))?;
+            Ok((key, b, on))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let had = auth
         .read_account(login)
         .map_err(|e| refused(login, e))?
         .access;
-    for change in changes {
-        let (key, on) = change
-            .split_once('=')
-            .and_then(|(k, v)| match v {
-                "on" | "true" | "yes" => Some((k, true)),
-                "off" | "false" | "no" => Some((k, false)),
-                _ => None,
-            })
-            .ok_or_else(|| format!("{change:?} is not key=on or key=off"))?;
-        let b = access::named(key).ok_or_else(|| format!("no access key {key:?}"))?;
-        access = if on {
-            access.with(b)
-        } else {
-            access.without(b)
-        };
-    }
-    let edit = AccountEdit {
-        login: login.to_owned(),
-        access: Some(access),
-        // History stays as the file has it — following read-chat, or set
-        // apart from it — unless this command names it.
-        history_unsaid: !changes.iter().any(|c| c.starts_with("read_chat_history=")),
-        ..Default::default()
-    };
     let account = auth
-        .write_account(&edit, &exists)
+        .edit_account(login, |doc| {
+            let table = doc["access"]
+                .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+                .as_table_like_mut()
+                .ok_or("access is not a table")?;
+            if changes
+                .iter()
+                .any(|(_, b, _)| *b == access::bit::CHAT_HISTORY)
+            {
+                if let Some(old) = table.remove("chat_history") {
+                    if !table.contains_key("read_chat_history") {
+                        table.insert("read_chat_history", old);
+                    }
+                }
+            }
+            for (key, b, on) in &changes {
+                // A number would outvote the name: `raw_bits` is applied
+                // after the named keys, and `raw_deny` after that.
+                for list in ["raw_bits", "raw_deny"] {
+                    drop_number(table, list, *b);
+                }
+                if *on || table.contains_key(key) || had.has(*b) {
+                    set_key(table, key, *on);
+                }
+            }
+            Ok(())
+        })
         .map_err(|e| refused(login, e))?;
+    Ok(describe(&account))
+}
+
+/// `hxd account roles <login> [+role|-role…]`: with no changes, the roles
+/// the account lists.
+pub fn set_roles(config: &Config, login: &str, changes: &[String]) -> Result<String, String> {
+    let auth = backend(config)?;
+    let roles = auth.roles();
+    let mut edits = Vec::new();
+    for change in changes {
+        match (change.get(..1), change.get(1..)) {
+            (Some("+"), Some(EVERYONE)) => {
+                return Err(format!("every account holds {EVERYONE} already"))
+            }
+            (Some("+"), Some(name)) if roles.get(name).is_none() => {
+                return Err(format!("there is no role {name:?}"))
+            }
+            (Some(sign @ ("+" | "-")), Some(name)) => edits.push((sign == "+", name)),
+            _ => return Err(format!("{change:?} is not +role or -role")),
+        }
+    }
+    let account = if edits.is_empty() {
+        auth.read_account(login)
+    } else {
+        auth.edit_account(login, |doc| {
+            edit_listed(doc, |listed| {
+                for (add, name) in edits {
+                    if !add {
+                        listed.retain(|n| n != name);
+                    } else if !listed.iter().any(|n| n == name) {
+                        listed.push(name.to_owned());
+                    }
+                }
+            });
+            Ok(())
+        })
+    }
+    .map_err(|e| refused(login, e))?;
     Ok(describe(&account))
 }
 
 /// `hxd account rm <login>`.
 pub fn remove(config: &Config, login: &str) -> Result<String, String> {
-    let auth = backend(config);
+    let auth = backend(config)?;
     // Read first: once the file is gone, nothing says which identity's
     // mail, subscriptions and devices were the account's.
     let account = auth.read_account(login).map_err(|e| refused(login, e))?;
