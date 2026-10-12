@@ -165,6 +165,23 @@ impl Core {
         self.end_revoked(|tag| tag.fingerprint == identity)
     }
 
+    /// How long `uid`'s key must wait to chat, message or post, as a key
+    /// new here (`identity-registrar.md` §7.3), or `None` if it need not.
+    pub fn newcomer_wait(&self, uid: Uid) -> Option<std::time::Duration> {
+        let until = {
+            let r = self.roster.lock().unwrap();
+            r.users
+                .get(&uid)?
+                .info
+                .transport
+                .identity
+                .as_ref()?
+                .quiet_until?
+        };
+        let now = self.clock.unix();
+        (until > now).then(|| std::time::Duration::from_secs(until - now))
+    }
+
     /// End every session keyed by `identity`, whether it proved the key
     /// or logged into the account the key linked with a password: once a
     /// rotation has moved that account, what such a session writes
@@ -218,7 +235,24 @@ mod tests {
             fingerprint: [identity; 32],
             device: [device; 32],
             handle: None,
+            quiet_until: None,
         }
+    }
+
+    #[test]
+    fn a_newcomer_waits_until_its_time_on_the_core_s_clock() {
+        let core = Core::new();
+        let until = core.clock().unix() + 120;
+        let newcomer = IdentityTag {
+            quiet_until: Some(until),
+            ..tag(1, 1)
+        };
+        let (uid, _rx) = attach(&core, "new", Some(newcomer)).unwrap();
+        let (known, _rx2) = attach(&core, "known", Some(tag(2, 2))).unwrap();
+        assert!(core.newcomer_wait(uid).is_some_and(|w| w.as_secs() <= 120));
+        assert_eq!(core.newcomer_wait(known), None);
+        core.clock().advance(std::time::Duration::from_secs(120));
+        assert_eq!(core.newcomer_wait(uid), None);
     }
 
     fn attach(core: &Core, nick: &str, identity: Option<IdentityTag>) -> Option<(Uid, Events)> {

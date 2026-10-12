@@ -5344,3 +5344,41 @@ async fn htxf_needs_a_token_and_a_server_with_transfers() {
         "{refused:?}"
     );
 }
+
+#[tokio::test]
+async fn a_tunnelled_newcomer_waits_and_one_that_links_its_account_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig {
+        newcomer_delay: 120,
+        ..Default::default()
+    };
+    let (_legacy, ng, _ctx) =
+        start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+    const REQ_MSG: u32 = 0x6c;
+    let msg = [
+        (tag::UID, 1u16.to_be_bytes().to_vec()),
+        (tag::BODY, b"hi".to_vec()),
+    ];
+    let error = |f: &Frame| {
+        f.chunks()
+            .find(|c| c.tag == tag::TASK_ERROR)
+            .map(|c| String::from_utf8_lossy(c.data).into_owned())
+            .unwrap_or_default()
+    };
+
+    // A key nobody here answers for, as a guest: told how long to wait.
+    let mut t = tunnel_login(ng, &person(40, "New"), b"", b"")
+        .await
+        .expect("guest login");
+    t.send(REQ_MSG, &msg).await;
+    let refused = error(&t.recv_type(HDR_TASK).await);
+    assert!(refused.contains("new here"), "{refused}");
+
+    // A fresh key that links an account as it logs in is that account's.
+    let mut t = tunnel_login(ng, &person(41, "Bobby"), b"bob", b"s3cret")
+        .await
+        .expect("bob");
+    t.send(REQ_MSG, &msg).await;
+    let answer = error(&t.recv_type(HDR_TASK).await);
+    assert!(!answer.contains("new here"), "{answer}");
+}

@@ -243,6 +243,21 @@ pub struct IdentityTag {
     pub device: [u8; 32],
     /// `handle@registrar`, when an attestation was accepted.
     pub handle: Option<String>,
+    /// For a key nobody here answers for: unix seconds before which it
+    /// may not chat, message or post (`identity-registrar.md` §7.3).
+    pub quiet_until: Option<u64>,
+}
+
+impl IdentityTag {
+    /// This tag as a session on an account linking `linked` wears it: a
+    /// key its account links is answered for, and waits for nothing,
+    /// however lately the link was made (`identity-registrar.md` §7.3).
+    pub fn on_account(mut self, linked: Option<[u8; 32]>) -> Self {
+        if linked == Some(self.fingerprint) {
+            self.quiet_until = None;
+        }
+        self
+    }
 }
 
 /// The visible-to-others part of a session: what a user-list row shows.

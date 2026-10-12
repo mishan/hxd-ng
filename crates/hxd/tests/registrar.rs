@@ -1593,3 +1593,41 @@ async fn a_rotation_shown_at_auth_is_taken_only_to_the_anchored_key() {
         (403, json!(new.fingerprint().to_string()))
     );
 }
+
+#[tokio::test]
+async fn a_key_nobody_answers_for_waits_before_it_may_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let live = format!("http://{}", r.ng);
+    let (v, identity) = verifier(&there, &r, Trust::Key, &live, "").await;
+
+    // No attestation and no account: admitted, and quiet for a while.
+    let stranger = IdentityKey::from_seed(&[7; 32]);
+    let card = Card::new(&stranger, "Stranger", now())
+        .sign(&stranger, vec![])
+        .unwrap();
+    let mut c = session_at(v, &stranger, &card).await;
+    let id = c.tx.send("chat", json!({ "text": "hello" })).await.unwrap();
+    let reply = loop {
+        if let hxd_testclient::ng::Incoming::Reply(r) = c.next().await.unwrap() {
+            if r["reply"] == id {
+                break r;
+            }
+        }
+    };
+    let wait = reply["error"]["retry_after"].as_u64().unwrap();
+    assert_eq!(reply["error"]["code"], "rate_limited");
+    assert!((1..=120).contains(&wait), "{reply}");
+
+    // An attested key is not held to it.
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let mut a = session_at(v, &alice, &attested(&r, &alice, "alice").await).await;
+    a.chat("hi").await.unwrap();
+
+    identity.clock().advance(Duration::from_secs(wait));
+    c.chat("hello").await.unwrap();
+}

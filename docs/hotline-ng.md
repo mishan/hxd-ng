@@ -664,7 +664,7 @@ requests are specified where §4 says.
 `rate_limited` from `chat`, `msg` and the news posts during a never-seen
 key's newcomer delay carries `retry_after` (seconds) in the error object,
 so a client can disable its compose box for that long rather than retry
-blind (identity-registrar.md §7.3). *Design, with the registrar.*
+blind (identity-registrar.md §7.3).
 
 ### 7.4 The core events
 

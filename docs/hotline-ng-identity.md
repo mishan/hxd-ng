@@ -767,7 +767,7 @@ section because hxd-ng has one profile and one switch.
 | `[identity] frozen` | `deny` | `deny`, `guest`: what a frozen identity is admitted as (`identity-registrar.md` §7.3) |
 | `[identity] revoked_devices`, `revoked_identities` | empty | Fingerprints refused by hand, consulted before any registrar (`identity-registrar.md` §7.3). A revoked identity refuses every device of it; a revoked device, only itself. Refused at `/identity/auth` with `revoked`, and a token minted before the revocation no longer redeems. SIGHUP re-reads these two lists and nothing else, and installing them, at startup or on SIGHUP, ends every session they now refuse, live or detached, on either wire. `hxd identity revoke <fingerprint> [--device] [--lift]` edits them in the config file |
 | `[identity] banned_registrars` | empty | Hosts whose identities are refused outright with `denied`, before the admission policy runs: any attestation on the card naming one, verified or not, refuses it (`identity-registrar.md` §7.3). At `/identity/auth`, a ban's `*@host` reads every attestation on the card the same way; a re-admission and a socket login read the accepted handle |
-| `[identity] newcomer_delay` | `120` | *(not implemented)* Seconds before a never-seen `unknown` key may chat, message or post; `0` disables (`identity-registrar.md` §7.3) |
+| `[identity] newcomer_delay` | `120` | Seconds, from when it was first seen here, before a key with no accepted attestation and no account may chat, message or post; `0` disables (`identity-registrar.md` §7.3) |
 
 Account files gain an `[identity]` table: `fingerprint` (the 52-character
 form), `login` (bool, default true; on an account with no password it is

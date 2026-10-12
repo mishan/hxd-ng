@@ -2418,6 +2418,9 @@ async fn login_phase(
     }
     let transport = Transport {
         inline_media: caps.has(cap::INLINE_MEDIA),
+        identity: transport
+            .identity
+            .map(|t| t.on_account(account.identity.fingerprint)),
         ..transport
     };
 
@@ -3128,6 +3131,24 @@ async fn session_loop(
             }
         };
         trace_in(&f);
+        if let Some(wait) = newcomer_frame(&f)
+            .then(|| ctx.core.newcomer_wait(sess.uid))
+            .flatten()
+        {
+            // Before the spam points, which the ng port charges only
+            // after it too: a wait is not flooding. A chat line has
+            // no reply to refuse it with, so it is dropped, as the
+            // reference server drops what it will not relay.
+            if f.ty != ClientHdr::Chat.as_u32() {
+                let secs = wait.as_secs().max(1);
+                reply_error(
+                    tx,
+                    f.trans,
+                    &format!("You are new here: wait {secs} seconds before sending this."),
+                );
+            }
+            continue;
+        }
         if !spend(&f, ctx, sess).await {
             continue;
         }
@@ -3169,6 +3190,19 @@ async fn session_loop(
 
 /// The most public lines one gathering takes.
 const CHAT_RUN: usize = 64;
+
+/// What a key new here may not send yet (`identity-registrar.md` §7.3):
+/// chat, a private message, a news post.
+fn newcomer_frame(f: &Frame) -> bool {
+    [
+        ClientHdr::Chat,
+        ClientHdr::Msg,
+        ClientHdr::NewsPost,
+        ClientHdr::PostThread,
+    ]
+    .iter()
+    .any(|h| h.as_u32() == f.ty)
+}
 
 /// Whether `f` is a chat send to the public room.
 fn public_chat_frame(f: &Frame) -> bool {

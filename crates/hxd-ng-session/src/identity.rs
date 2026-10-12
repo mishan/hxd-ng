@@ -93,6 +93,10 @@ pub struct IdentityConfig {
     /// Registrar hosts whose identities are refused outright
     /// (`identity-registrar.md` §7.3).
     pub banned_registrars: Vec<String>,
+    /// Seconds a key nobody here answers for waits, from when it was
+    /// first seen, before it may chat, message or post
+    /// (`identity-registrar.md` §7.3). 0 is none.
+    pub newcomer_delay: u64,
 }
 
 impl Default for IdentityConfig {
@@ -110,6 +114,7 @@ impl Default for IdentityConfig {
             anchors: None,
             frozen: Frozen::Deny,
             banned_registrars: Vec::new(),
+            newcomer_delay: 0,
         }
     }
 }
@@ -174,6 +179,9 @@ pub struct TransportIdentity {
     /// warning fires; the server has no way to check this and takes the
     /// conservative claim at face value.
     pub downstream_cleartext: bool,
+    /// Unix seconds before which a key new here may not chat, message or
+    /// post (`identity-registrar.md` §7.3).
+    pub quiet_until: Option<u64>,
 }
 
 impl TransportIdentity {
@@ -189,6 +197,7 @@ impl TransportIdentity {
             fingerprint: self.fingerprint.0,
             device: Fingerprint::of(&self.device).0,
             handle: self.handle.clone(),
+            quiet_until: self.quiet_until,
         }
     }
 }
@@ -371,6 +380,9 @@ pub struct IdentityState {
     core: Arc<hxd_core::Core>,
     /// The core's, read for every time this state keeps or checks.
     clock: hxd_core::clock::Clock,
+    /// Where first sightings are kept: the core's record cache, durable
+    /// with a store.
+    seen: Arc<dyn hxd_core::identity_records::RecordCache>,
     tables: Mutex<Tables>,
     /// Persisted successor commitments (§3.4), by fingerprint. `None`
     /// when the operator configured no path, in which case anchoring is
@@ -487,12 +499,16 @@ impl IdentityState {
             core.refuse_rotated(from.0);
         }
         let clock = core.clock().clone();
+        let seen = core
+            .record_cache()
+            .unwrap_or_else(|| Arc::new(hxd_core::identity_records::MemoryRecordCache::default()));
         let state = IdentityState {
             key,
             cfg,
             auth,
             core,
             clock: clock.clone(),
+            seen,
             tables: Mutex::new(Tables {
                 challenges: HashMap::new(),
                 tokens: HashMap::new(),
@@ -982,6 +998,23 @@ impl IdentityState {
             },
         };
 
+        // §7.3: a key nobody here answers for, with no accepted
+        // attestation and no account, waits `newcomer_delay` from when it
+        // was first seen before it may chat, message or post. Counted
+        // from the first sighting, so reconnecting does not reset it.
+        let quiet_until = (self.cfg.newcomer_delay > 0 && handle.is_none() && account.is_none())
+            .then(|| {
+                let first = self
+                    .seen
+                    .first_seen(&fingerprint.0, now)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("first sightings: {}", e.0);
+                        now
+                    });
+                first.saturating_add(self.cfg.newcomer_delay)
+            })
+            .filter(|until| *until > now);
+
         let ident = TransportIdentity {
             identity: card.identity,
             device: cert.device,
@@ -993,6 +1026,7 @@ impl IdentityState {
             device_expires: cert.expires,
             account,
             downstream_cleartext: req.downstream == Downstream::Cleartext,
+            quiet_until,
         };
 
         // A token only for a fresh `/identity/auth`. Re-admitting a device
@@ -2531,6 +2565,7 @@ mod tests {
             device_expires: u64::MAX,
             account: None,
             downstream_cleartext: false,
+            quiet_until: None,
         }
     }
 
@@ -2561,6 +2596,31 @@ mod tests {
     fn proof_for(st: &IdentityState, dev: &DeviceKey) -> Vec<u8> {
         let ch = st.issue_challenge().unwrap();
         LoginProof::sign(dev, &ch, &st.server_key(), now_unix())
+    }
+
+    #[test]
+    fn a_key_nobody_answers_for_waits_from_when_it_was_first_seen() {
+        let st = state(IdentityConfig {
+            newcomer_delay: 120,
+            ..Default::default()
+        });
+        let id = IdentityKey::from_seed(&[40u8; 32]);
+        let dev = DeviceKey::from_seed(&[41u8; 32]);
+        let (card, cert) = objects(&id, &dev);
+        let auth = || {
+            let proof = proof_for(&st, &dev);
+            st.auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+                .unwrap()
+                .1
+                .quiet_until
+        };
+        let first = auth().expect("a stranger waits");
+        assert!(first > now_unix() && first <= now_unix() + 120);
+        // Reconnecting does not start the clock again.
+        st.clock().advance(Duration::from_secs(60));
+        assert_eq!(auth(), Some(first));
+        st.clock().advance(Duration::from_secs(61));
+        assert_eq!(auth(), None);
     }
 
     #[test]

@@ -1696,6 +1696,10 @@ pub struct IdentitySection {
     /// anything else is decided (`docs/identity-registrar.md` §7.3).
     #[serde(default)]
     pub banned_registrars: Vec<String>,
+    /// Seconds a key nobody here answers for waits before it may chat,
+    /// message or post (`docs/identity-registrar.md` §7.3); 0 disables.
+    #[serde(default = "default_newcomer_delay")]
+    pub newcomer_delay: u64,
     #[serde(default = "default_clock_skew")]
     pub clock_skew: u64,
     /// Serve the TRTP-over-WebSocket path.
@@ -1756,6 +1760,9 @@ fn default_enroll_sessions() -> usize {
 }
 fn default_registrar_timeout() -> u64 {
     3
+}
+fn default_newcomer_delay() -> u64 {
+    120
 }
 fn default_revocation_max_age() -> u64 {
     3600
@@ -2997,6 +3004,7 @@ fn build_identity(
                 .iter()
                 .map(|h| h.to_lowercase())
                 .collect(),
+            newcomer_delay: section.newcomer_delay,
         },
         auth,
         core,
