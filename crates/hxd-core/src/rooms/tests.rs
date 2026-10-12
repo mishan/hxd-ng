@@ -63,6 +63,10 @@ fn account(who: &Who) -> crate::Account {
 }
 
 fn attach(core: &Core, who: Who) -> (Uid, Events) {
+    attach_from(core, who, None)
+}
+
+fn attach_from(core: &Core, who: Who, addr: Option<std::net::IpAddr>) -> (Uid, Events) {
     let account = Box::new(account(&who));
     let (uid, rx) = core
         .attach(AttachInfo {
@@ -71,7 +75,7 @@ fn attach(core: &Core, who: Who) -> (Uid, Events) {
             admin: false,
             access: who.access,
             login: who.login,
-            addr: None,
+            addr,
             can_detach: true,
             transport: Transport {
                 inline_media: true,
@@ -309,6 +313,51 @@ fn rooms_need_no_history() {
         &about(&drain(&mut rb), room)[..],
         [Event::Chat { text, id: None, .. }] if text == "hi"
     ));
+}
+
+/// `/rooms` is one private message: past its length the list is cut,
+/// and says how to narrow it.
+#[test]
+fn a_long_room_list_is_cut_to_one_message() {
+    let core = with_rooms(Core::new()).with_system(crate::SystemPolicy::default());
+    let (boss, _) = attach(&core, manager("boss"));
+    for i in 0..40 {
+        let edit = RoomEdit {
+            topic: Some("t".repeat(200)),
+            ..named(&format!("room-{i:02}"))
+        };
+        core.room_create(boss, edit).unwrap();
+    }
+    let (alice, _ra) = attach(&core, member("alice"));
+    let all = core.system_command(alice, "/rooms").unwrap();
+    assert!(all.len() <= 4096, "{}", all.len());
+    assert!(
+        all.ends_with("\n… and more; /rooms <word> narrows it"),
+        "{all}"
+    );
+    let narrowed = core.system_command(alice, "/rooms #room-1").unwrap();
+    assert_eq!(narrowed.lines().count(), 10, "{narrowed}");
+    assert!(narrowed.starts_with("#room-10 — "));
+}
+
+/// Guests share one login, so the lobby notice remembers a guest by its
+/// address: a second guest from elsewhere is told, one from the same
+/// address is not.
+#[test]
+fn the_lobby_notice_knows_a_guest_by_its_address() {
+    let core = with_rooms(Core::new()).with_system(crate::SystemPolicy::default());
+    let (boss, _) = attach(&core, manager("boss"));
+    core.room_create(boss, named("lounge")).unwrap();
+    let here: std::net::IpAddr = [192, 0, 2, 1].into();
+    let there: std::net::IpAddr = [192, 0, 2, 2].into();
+    for (addr, told) in [(here, true), (there, true), (here, false)] {
+        let (uid, _rx) = attach_from(&core, member("guest"), Some(addr));
+        assert_eq!(
+            core.rooms_announcement(uid).is_some(),
+            told,
+            "{addr} told: {told}"
+        );
+    }
 }
 
 /// What a session may do in a room, by what the room and its account

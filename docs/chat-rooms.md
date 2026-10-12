@@ -1,9 +1,10 @@
 # Chat rooms: curated, persistent, logged
 
-Status: R1 and R2 are built (§13): rooms in the domain, the rooms file
-and `hxd room`, and the ng wire of §7. The classic wire carries none
-yet. The ng wire of §7 is the spec part; the rest binds nobody but this
-server.
+Status: R1 to R3 are built (§13): rooms in the domain, the rooms file
+and `hxd room`, the ng wire of §7, and period clients' rooms of §6 but
+for `700` (§6.7, R4). R3's exit, real 1.2, 1.5 and 1.9 clients against
+a real server, has not been run. The ng wire of §7 is the spec part;
+the rest binds nobody but this server.
 
 Public chat today is one room everybody shares, and a private chat is a
 room that exists while someone is in it and leaves no record.
@@ -410,10 +411,15 @@ like `/report` and `/msg`:
 
 | Command | Does | Needs |
 |---|---|---|
-| `/rooms` | Lists the rooms this session may join, one per line: `#name — topic (n here)`, members first. One message, capped at a private message's length, ending `… and more; /rooms <word> narrows it` when cut | — |
+| `/rooms` | Lists the rooms this session may join, one per line: `#name — topic (n here)`, members first. One message, capped at a private message's length (4096 bytes), ending `… and more; /rooms <word> narrows it` when cut | — |
 | `/rooms <word>` | Only rooms whose name or topic contains the word | — |
 | `/join <name>` | Invites this session into the room (§6.2). `#` before the name is accepted and ignored. Answers `ok: invited to #name`, `ok: already in #name` (and sends no invite), or `error: no such room` | §5, see |
-| `/part <name>` | Leaves the room, for a client whose window closed without sending 116 | — |
+| `/part <name>` | Leaves the room, for a client whose window closed without sending 116. Answers `ok: left #name`, `error: you are not in #name`, or `error: no such room` | — |
+
+They run as the session that sent them, from either wire. From the ng
+wire, which has no invite to answer, `/join` joins at once and answers
+`ok: joined #name`; an ng client should still use `room_join`. On a
+server without rooms they are unknown commands, answered with the help.
 
 ### 6.2 The invite, and the window
 
@@ -429,7 +435,10 @@ like `/report` and `/msg`:
 4. After that reply, on the same writer, the server sends the joiner
    one notice in the room, never logged: `\r *** #lounge — this room is
    public and logged`, or `public` alone on a server without
-   `[history]`, and `read-only` when the session may not post. A period
+   `[history]`, and `public, logged and read-only` (or `public and
+   read-only`) when the session may not post. It and every other line
+   of §6 come from the system account's uid, or the session's own on a
+   server without one. A period
    client shows the room in a *private chat* window. The window's look
    promises privacy that the room does not have, so the line is
    load-bearing. It goes out on every join.
@@ -471,7 +480,8 @@ When the server parts a classic session from a room (an archive, a
 narrowed gate, a lost role), it sends a notice in the room,
 `*** you were removed from #staff`, then **118** naming the session's
 own uid, so the window's member list loses the user and every later
-line from it is refused rather than silently lost. What a 1.2, 1.5 or
+line from it is refused rather than silently lost. A room deleted from
+the file has no name left to say, and is `this room`. What a 1.2, 1.5 or
 1.9 client does with a 118 naming itself is R3's to test (§13).
 
 ### 6.5 The lobby notice
@@ -491,6 +501,9 @@ in place of `Server`. It is sent only when there is a room the session
 may see, the session holds bit 9, and `[system] commands` is on (the
 line points at commands). It is sent at most once a day per account,
 remembered in memory, so a client that reconnects is not told again.
+Guests share an account, so a guest is remembered by its identity, or
+else by its address. The memory is bounded: past the bound, whoever was
+told longest ago is forgotten first.
 `[rooms] announce = false` turns it off. It is not sent to ng
 sessions, which list rooms natively, or to a classic session that
 negotiated §8's capability.
@@ -712,12 +725,13 @@ Parting a room parts its voice room, as parting a private chat does.
   bare cid. A room's are wrapped, `Event::InRoom { room, event }`, so
   the ng encoder can emit a room's events and keep a private chat's an
   `unsupported` placeholder until the ng private-chat work lands, and a
-  frontend that shows no rooms leaves them out whole: until R3 the
-  classic wire drops them, and the ng wire sends the placeholder for any
-  it does not carry. A session's end is told to its rooms as a part, as
-  to its private chats, except to a rooms-aware session, which hears it
-  as `user_parted` alone (§7.3). The domain leaves that part out rather
-  than the encoder, which could only turn it into a placeholder.
+  frontend that shows no rooms leaves them out whole: the classic wire
+  unwraps them into a private chat's transactions (§6), and the ng wire
+  sends the placeholder for any it does not carry. A session's end is
+  told to its rooms as a part, as to its private chats, except to a
+  rooms-aware session, which hears it as `user_parted` alone (§7.3).
+  The domain leaves that part out rather than the encoder, which could
+  only turn it into a placeholder.
 - **Server links.** Only the lobby crosses (§3). A ghost cannot be
   invited into a room, for the reason it cannot be invited into a
   private chat: every exported user refuses private chat. Linked rooms

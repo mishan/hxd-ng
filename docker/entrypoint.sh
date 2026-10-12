@@ -221,6 +221,7 @@ generate() {
     echo
     echo "[rooms]"
     echo "file = \"$DATA/rooms.toml\""
+    if on HXD_ROOMS_ANNOUNCE on; then echo "announce = true"; else echo "announce = false"; fi
 
     if $ng; then
         echo
@@ -310,6 +311,8 @@ generate() {
         str HXD_SYSTEM_NICK nick
     else
         unused HXD_SYSTEM_NICK "HXD_SYSTEM is off"
+        # The lobby notice points at the account's commands.
+        unused HXD_ROOMS_ANNOUNCE "HXD_SYSTEM is off"
     fi
 
     if [ -n "${HXD_FILES_ROOT:-}" ]; then

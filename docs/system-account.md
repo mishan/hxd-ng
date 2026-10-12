@@ -2,16 +2,17 @@
 
 Status: partial. Built: the account on the roster, the reserved login,
 the command line and `/help`, `/msg`, `/report`, `/block`, `/unblock`,
-`/blocks` and `/stop`, the rate limit, `[system]`, and moderation's
-report lines to legacy moderators. Not built: `/vouch`, which waits on
-vouching, and §4's queued-mail option, which is not to be defaulted on
-before it has been seen on a real 1.5 client. This document is the rule three others
-were each half-stating: `moderation.md` §6 rejected a `/report` chat
-command, `private-messages.md` §7 rejected a `/msg <login>` pseudo-user,
-and `news.md` §10.11 then required "a real mailbox for the server" that
-can be replied to with `stop`. All three were reasoning about the same
-thing from different ends. This is the one place it is decided, and
-the other three cite it.
+`/blocks`, `/stop`, `/rooms`, `/join` and `/part`, the rate limit,
+`[system]`, and moderation's report lines to legacy moderators. Not
+built: `/vouch`, which waits on vouching, and §4's queued-mail option,
+which is not to be defaulted on before it has been seen on a real 1.5
+client. This document is the rule three others were each half-stating:
+`moderation.md` §6 rejected a `/report` chat command,
+`private-messages.md` §7 rejected a `/msg <login>` pseudo-user, and
+`news.md` §10.11 then required "a real mailbox for the server" that can
+be replied to with `stop`. All three were reasoning about the same thing
+from different ends. This is the one place it is decided, and the other
+three cite it.
 
 ---
 
@@ -110,6 +111,8 @@ has.
 | `/msg <login> <text…>` | Sends a private message to an account by login, whether or not it holds a session — the ng `msg { to_login }` request. The answer says `sent` or `queued`. This is the addressing mechanism `private-messages.md` §7 declined to invent as a pseudo-user; as a command to the account that already exists it costs nothing it was worried about | `send_msgs` |
 | `/block <who>`, `/unblock <who>`, `/blocks` | The three ng block requests | — |
 | `/stop [#article]` | Stops the news scope of the most recent notification this account sent the user, or the thread of the named article. A thread is **muted** rather than unfollowed, because a reply to your article or a citation of it reaches you with no subscription at all and only a mute silences it; a category is unfollowed. `news.md` §10.11 | — |
+| `/rooms [word]` | The rooms this session may join, one a line, its own first, or those whose name or topic holds the word: [chat-rooms.md](chat-rooms.md) §6.1 | — |
+| `/join <room>`, `/part <room>` | Invites this session into a room, which a period client joins with 115, or leaves one: chat-rooms.md §6.1–§6.2. A room it may not see is `error: no such room` | the room's gates |
 | `/vouch <who>`, `/unvouch <who>`, `/vouches` *(not built)* | `identity-vouch.md` §3.2, by nick: the roster session's identity fingerprint is what gets vouched for, so a period client can vouch for the person it can see | `[extra] vouch` |
 
 Every command runs **as the session that sent it**, with that session's
@@ -119,8 +122,9 @@ check. A command an ng client could not make, this cannot make either.
 
 **Answers are one private message, one or two lines, plain words**:
 `ok: …` or `error: …` followed by what the equivalent ng error code
-means in English. Never a wall of text; `/help` is the one exception
-and it is under ten lines. An ng client that sends commands here gets
+means in English. Never a wall of text; `/help` and `/rooms` are the
+exceptions, `/help` under ten lines and `/rooms` one message cut to a
+private message's length. An ng client that sends commands here gets
 the same answers, and should not: it has requests, and the reply to a
 request is structured. The parser exists for wires that have nothing
 else.

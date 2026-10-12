@@ -193,8 +193,8 @@ pub enum SessionStatus {
 
 /// What the session layer knows about the connection carrying a session,
 /// as far as other users are entitled to see it (`docs/hotline-ng-auth.md`
-/// §7.2, §8). Purely descriptive: the domain never acts on it, it only
-/// carries it to the roster so frontends can mark sessions.
+/// §7.2, §8). Mostly descriptive, carried to the roster so frontends
+/// can mark sessions; the domain acts only on what a field says it does.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Transport {
     /// The link to this session's client is encrypted end to end
@@ -230,6 +230,10 @@ pub struct Transport {
     /// to cut a period client off over events it would never show. The
     /// ng frontend sets it; nothing else does.
     pub redactions: bool,
+    /// This wire joins rooms itself, so a `/join` sent from it joins at
+    /// once where a classic client is sent an invite to answer
+    /// (`docs/chat-rooms.md` §6.1). The ng frontend sets it.
+    pub joins_rooms: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and

@@ -743,6 +743,7 @@ async fn handle_login(
         transport: hxd_core::Transport {
             // Blanking a rendered line is part of this wire.
             redactions: true,
+            joins_rooms: true,
             encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
             assumed: true,
             identity: identity.map(|i| i.tag().on_account(account.identity.fingerprint)),

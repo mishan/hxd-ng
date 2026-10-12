@@ -353,7 +353,13 @@ Three layers, all `cargo test --workspace`:
   every request naming it, a read-only room, an archive parting its
   members, a client that never asks about rooms told nothing of them,
   a redaction reaching a room's readers alone, and a resync catching
-  up per room) and
+  up per room), `rooms_classic.rs` (rooms for a period client: `/join`
+  to the system account and the invite it sends, 115's reply and the
+  line after it, a room talked in with an ng client, a room out of
+  sight answered byte for byte as a chat that does not exist, the
+  read-only and removal notices, the lobby notice once a day and never
+  to ng, a `/join` from ng joining at once, and a client that joins
+  nothing hearing nothing of rooms) and
   `registrar.rs` (the registrar built from a real
   `[registrar]` section: discovery under its own host only, handles,
   rotations published under both keys, a card's commitment, invites from

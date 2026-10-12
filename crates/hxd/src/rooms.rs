@@ -77,6 +77,9 @@ impl RoomsSection {
             max_joined: self.max_joined,
             max_rooms: self.max_rooms,
             lobby: self.lobby.clone(),
+            announce: self.announce,
+            announce_names: self.announce_names,
+            invites_declined: false,
         }
     }
 
@@ -102,7 +105,10 @@ pub fn with_rooms(core: Core, config: &Config) -> Result<Core, String> {
     }
     core.with_rooms(
         Arc::new(FileRooms::new(&config.rooms.file)),
-        config.rooms.policy(),
+        RoomPolicy {
+            invites_declined: config.server.version < 151,
+            ..config.rooms.policy()
+        },
     )
 }
 

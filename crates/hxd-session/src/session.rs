@@ -1514,6 +1514,9 @@ struct Session {
     /// as on mhxd, which is all a client showing it needs. Kept rather
     /// than read again, so the bytes are the ones the push described.
     banner_image: Option<crate::banner::Image>,
+    /// The rooms this session has been told are read-only, which it is
+    /// told once a room rather than once a dropped line.
+    told_read_only: Vec<u32>,
 }
 
 impl Session {
@@ -2589,6 +2592,7 @@ async fn login_phase(
         icon_list_refill: Instant::now(),
         banner_sent: false,
         banner_image: None,
+        told_read_only: Vec::new(),
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -2705,9 +2709,72 @@ fn system_msg(tx: &Tx, ctx: &ServerCtx, sess: &Session, text: &str) {
     );
 }
 
+/// A line from the server to this session alone, in a room or, for 0, the
+/// lobby: mhxd's action form, `\r *** text`, from the system account's
+/// uid where there is one (`docs/chat-rooms.md` §6). Never logged.
+fn server_line(tx: &Tx, ctx: &ServerCtx, sess: &Session, cid: u32, text: &str) {
+    let from = ctx.core.system_uid().unwrap_or(sess.uid);
+    push_notice(tx, sess, cid, from, text, true);
+}
+
+/// The legacy rendering of a server notice: `\r<text>`, or mhxd's action
+/// form, `\r *** text`, for the one notice it says that way.
+fn push_notice(tx: &Tx, sess: &Session, cid: u32, from: Uid, text: &str, action: bool) {
+    let mut line = Vec::with_capacity(text.len() + 6);
+    if action {
+        line.extend_from_slice(b"\r *** ");
+        line.extend_from_slice(&sess.enc.encode(text));
+    } else {
+        line.push(b'\r');
+        line.push(b'<');
+        line.extend_from_slice(&sess.enc.encode(text));
+        line.push(b'>');
+    }
+    let mut chunks = vec![(tag::BODY, line)];
+    if cid != 0 {
+        chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
+    }
+    chunks.push((tag::UID, from.to_be_bytes().to_vec()));
+    push(tx, hdr::CHAT, chunks);
+}
+
 /// Encode one domain event onto the wire. Returns `false` when the session
 /// must end (kicked).
 async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) -> bool {
+    // A room is a private chat to this wire (`docs/chat-rooms.md` §6):
+    // its events carry its id as their chat id, and are encoded as a
+    // private chat's are. Only a member is sent them.
+    let ev = match ev {
+        Event::InRoom { room, event } => match *event {
+            // The wire has no "you are no longer in this chat": a line
+            // says so, and a part naming the session itself takes it out
+            // of the window's list (§6.4).
+            Event::RoomParted { uid, .. } => {
+                let name = ctx
+                    .core
+                    .room_name(room)
+                    .map_or_else(|| "this room".to_string(), |n| format!("#{n}"));
+                server_line(
+                    tx,
+                    ctx,
+                    sess,
+                    room,
+                    &format!("you were removed from {name}"),
+                );
+                push(
+                    tx,
+                    hdr::CHAT_USER_PART,
+                    vec![
+                        (tag::CHAT_ID, room.to_be_bytes().to_vec()),
+                        (tag::UID, uid.to_be_bytes().to_vec()),
+                    ],
+                );
+                return true;
+            }
+            event => event,
+        },
+        ev => ev,
+    };
     match ev {
         // Download Info (211): the client waits for position 0 before it
         // opens the transfer.
@@ -2802,27 +2869,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             from,
             text,
             action,
-        } => {
-            // The legacy rendering of a server notice: `\r<text>`, or
-            // mhxd's action form, `\r *** text`, for the one notice it
-            // says that way.
-            let mut line = Vec::with_capacity(text.len() + 6);
-            if action {
-                line.extend_from_slice(b"\r *** ");
-                line.extend_from_slice(&sess.enc.encode(&text));
-            } else {
-                line.push(b'\r');
-                line.push(b'<');
-                line.extend_from_slice(&sess.enc.encode(&text));
-                line.push(b'>');
-            }
-            let mut chunks = vec![(tag::BODY, line)];
-            if cid != 0 {
-                chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
-            }
-            chunks.push((tag::UID, from.to_be_bytes().to_vec()));
-            push(tx, hdr::CHAT, chunks);
-        }
+        } => push_notice(tx, sess, cid, from, &text, action),
         Event::ChatSubject { cid, subject } => {
             push(
                 tx,
@@ -3021,9 +3068,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         // transaction to unsend it (moderation.md §6). History (700)
         // shows the tombstone, which is what a capable client reads.
         Event::ChatRedacted { .. } | Event::ChatPurged { .. } => {}
-        // A period client is shown a room as a private chat it was
-        // invited to (docs/chat-rooms.md §6), which this wire does not
-        // do yet: nothing about a room may pass for a private chat. A
+        // Unwrapped above, and a room's events are never nested. A
         // listing's changes go to rooms-aware sessions, which this wire's
         // never are.
         Event::InRoom { .. }
@@ -3166,10 +3211,10 @@ async fn session_loop(
         if !spend(&f, ctx, sess).await {
             continue;
         }
-        if !public_chat_frame(&f) {
+        let Some(cid) = public_chat_frame(&f, ctx) else {
             dispatch(&f, tx, ctx, sess).await;
             continue;
-        }
+        };
         // A sender that got ahead of the log: the public lines it sent
         // since are already here, and are logged with this one rather
         // than each after the last, which is how a backlog clears at the
@@ -3183,7 +3228,7 @@ async fn session_loop(
         let price = spam_points(ClientHdr::Chat.as_u32());
         while run.len() < CHAT_RUN && events.is_empty() {
             let Ok(next) = frames.try_recv() else { break };
-            if !public_chat_frame(&next) || room < price {
+            if public_chat_frame(&next, ctx) != Some(cid) || room < price {
                 held = Some(next);
                 break;
             }
@@ -3196,9 +3241,9 @@ async fn session_loop(
         }
         let lines = run
             .iter()
-            .filter_map(|f| chat_send(f, sess).map(|c| c.line))
+            .filter_map(|f| chat_send(f, sess, cid != 0).map(|c| c.line))
             .collect();
-        public_chat(ctx, sess, lines).await;
+        public_chat(tx, ctx, sess, cid, lines).await;
     }
 }
 
@@ -3218,13 +3263,18 @@ fn newcomer_frame(f: &Frame) -> bool {
     .any(|h| h.as_u32() == f.ty)
 }
 
-/// Whether `f` is a chat send to the public room.
-fn public_chat_frame(f: &Frame) -> bool {
-    f.ty == ClientHdr::Chat.as_u32()
-        && f.chunks()
-            .filter(|c| c.tag == tag::CHAT_ID)
-            .last()
-            .is_none_or(|c| c.as_uint() == 0)
+/// The room `f` is a chat send to, 0 the lobby, when it is one rather
+/// than a private chat's: a run of lines is gathered for one room.
+fn public_chat_frame(f: &Frame, ctx: &ServerCtx) -> Option<u32> {
+    if f.ty != ClientHdr::Chat.as_u32() {
+        return None;
+    }
+    let cid = f
+        .chunks()
+        .filter(|c| c.tag == tag::CHAT_ID)
+        .last()
+        .map_or(0, |c| c.as_uint());
+    (cid == 0 || ctx.core.is_room(cid)).then_some(cid)
 }
 
 /// Charge `f` to the session's spam points, as mhxd charges every
@@ -3255,8 +3305,9 @@ struct ChatSend {
 
 /// The chat send `f` is, or nothing when it is dropped, as the reference
 /// server drops what it will not relay: there is no task reply to refuse
-/// it with.
-fn chat_send(f: &Frame, sess: &Session) -> Option<ChatSend> {
+/// it with. A line for a `room` is left to the room's gates, bit 10 among
+/// them, which tell a member that may not post there so.
+fn chat_send(f: &Frame, sess: &Session, room: bool) -> Option<ChatSend> {
     let (mut cid, mut style, mut body) = (0u32, 0u16, String::new());
     let (mut handle, mut declared) = (None, false);
     for c in f.chunks() {
@@ -3270,7 +3321,7 @@ fn chat_send(f: &Frame, sess: &Session) -> Option<ChatSend> {
             _ => {}
         }
     }
-    if !sess.can(bit::SEND_CHAT) {
+    if !room && !sess.can(bit::SEND_CHAT) {
         debug!(uid = sess.uid, "chat dropped: no send_chat access");
         return None;
     }
@@ -3295,22 +3346,38 @@ fn chat_send(f: &Frame, sess: &Session) -> Option<ChatSend> {
     })
 }
 
-/// Public chat lines this session sent, logged together and in order.
+/// Public chat lines this session sent into `room`, the lobby for 0,
+/// logged together and in order.
 async fn public_chat(
+    tx: &Tx,
     ctx: &ServerCtx,
-    sess: &Session,
+    sess: &mut Session,
+    room: u32,
     lines: Vec<(String, u16, Option<hxd_core::media::Handle>)>,
 ) {
     if lines.is_empty() {
         return;
     }
     let from = sess.uid;
-    let Some(results) = off_reactor(&ctx.core, move |c| c.chat_public_all(from, 0, lines)).await
+    let Some(results) = off_reactor(&ctx.core, move |c| c.chat_public_all(from, room, lines)).await
     else {
         return;
     };
     for result in results {
         match result {
+            // 105 has no reply, and a line that vanishes with no word is
+            // a bug to the person typing it (`docs/chat-rooms.md` §6.3).
+            Err(ChatError::ReadOnly) => {
+                if !sess.told_read_only.contains(&room) {
+                    sess.told_read_only.push(room);
+                    server_line(tx, ctx, sess, room, "this room is read-only");
+                }
+            }
+            // Not in the room, or a room it may not see: dropped as a
+            // line to a chat that does not exist is.
+            Err(ChatError::NotAMember | ChatError::NoSuchChat) => {
+                debug!(uid = sess.uid, room, "room chat dropped")
+            }
             Err(ChatError::NoSuchMedia) => {
                 debug!(
                     uid = sess.uid,
@@ -3323,6 +3390,46 @@ async fn public_chat(
             Ok(_) => {}
         }
     }
+}
+
+/// 115 naming a room (`docs/chat-rooms.md` §6.2): the room's gates
+/// decide, whatever invite came before. The reply is a private chat's,
+/// and a line after it says what the window really is.
+fn room_join(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session, room: u32) {
+    let (rows, topic) = match ctx.core.room_join(sess.uid, room) {
+        Ok(joined) => joined,
+        Err(hxd_core::RoomError::TooManyRooms) => {
+            return reply_error(
+                tx,
+                f.trans,
+                "You are in as many rooms as you may be. Leave one first.",
+            );
+        }
+        Err(_) => return reply_error(tx, f.trans, err_text(ChatError::NoSuchChat)),
+    };
+    let mut chunks: Vec<(u16, Vec<u8>)> = rows
+        .iter()
+        .map(|u| {
+            (
+                tag::USER_LIST,
+                userlist_payload(u, ctx.cfg.mark_cleartext, sess.enc, sess.nick_colors),
+            )
+        })
+        .collect();
+    chunks.push((tag::CHAT_SUBJECT, wire_subject(sess.enc, &topic.text)));
+    reply(tx, f.trans, chunks);
+    let Some(view) = ctx.core.room_view(sess.uid, room) else {
+        return;
+    };
+    // The window promises a privacy the room does not have.
+    let what = match (ctx.core.history_policy().is_some(), view.may_post) {
+        (true, true) => "public and logged",
+        (false, true) => "public",
+        (true, false) => "public, logged and read-only",
+        (false, false) => "public and read-only",
+    };
+    let text = format!("#{} — this room is {what}", view.room.name);
+    server_line(tx, ctx, sess, room, &text);
 }
 
 async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
@@ -3346,6 +3453,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 wire_subject(sess.enc, &ctx.core.public_subject()),
             ));
             reply(tx, f.trans, chunks);
+            let first_list = !sess.listed;
             sess.listed = true;
             // Optional compatibility replay, only for clients that did
             // not negotiate history and only after their first user list.
@@ -3375,6 +3483,13 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             }
                         }
                     }
+                }
+            }
+            // That rooms exist, at the moment replay picked: the client
+            // is ready to draw (`docs/chat-rooms.md` §6.5).
+            if first_list {
+                if let Some(text) = ctx.core.rooms_announcement(sess.uid) {
+                    server_line(tx, ctx, sess, 0, &text);
                 }
             }
         }
@@ -4304,8 +4419,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         }
 
         // --- Chat -----------------------------------------------------
-        t if t == ClientHdr::Chat.as_u32() => match chat_send(f, sess) {
-            Some(ChatSend { cid: 0, line }) => public_chat(ctx, sess, vec![line]).await,
+        t if t == ClientHdr::Chat.as_u32() => match chat_send(f, sess, false) {
+            Some(ChatSend { cid: 0, line }) => public_chat(tx, ctx, sess, 0, vec![line]).await,
             Some(ChatSend {
                 cid,
                 line: (body, style, media),
@@ -4456,6 +4571,15 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     _ => {}
                 }
             }
+            // A room's topic, under its gates; rooms have no passwords.
+            if ctx.core.is_room(cid) {
+                if let Some(s) = subject {
+                    if let Err(e) = ctx.core.room_topic(sess.uid, cid, s) {
+                        debug!(uid = sess.uid, cid, "topic refused: {e:?}");
+                    }
+                }
+                return;
+            }
             // Public-subject policy: the account file's [extra]
             // set_subject flag (default: tracks the admin bit) — the
             // reference server's config-granted privilege, done properly.
@@ -4547,6 +4671,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     _ => {}
                 }
             }
+            if ctx.core.is_room(cid) {
+                room_join(f, tx, ctx, sess, cid);
+                return;
+            }
             match ctx.core.chat_join(cid, sess.uid, &password) {
                 Ok((rows, subject)) => {
                     let mut chunks: Vec<(u16, Vec<u8>)> = rows
@@ -4576,7 +4704,11 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .find(|c| c.tag == tag::CHAT_ID)
                 .map(|c| c.as_uint())
             {
-                ctx.core.chat_part(cid, sess.uid);
+                if ctx.core.is_room(cid) {
+                    let _ = ctx.core.room_part(sess.uid, cid);
+                } else {
+                    ctx.core.chat_part(cid, sess.uid);
+                }
             }
             // No reply, like the reference.
         }

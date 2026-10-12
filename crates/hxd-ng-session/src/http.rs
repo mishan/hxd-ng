@@ -903,6 +903,7 @@ async fn upgrade(
                     // Nor can it take a line back: the classic wire has no
                     // way to.
                     redactions: false,
+                    joins_rooms: false,
                 };
                 // §8.2: the tunnelled login can self-link, which is a
                 // write of an association — so it needs the same `manage`
