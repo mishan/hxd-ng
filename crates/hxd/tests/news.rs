@@ -3699,3 +3699,92 @@ async fn a_polled_feed_is_read_on_both_wires_and_follows_its_edits() {
         "{edited}"
     );
 }
+
+#[tokio::test]
+async fn a_period_client_is_served_an_image_as_its_legacy_derivative() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut policy = news_server();
+    policy.attach = Some(AttachmentPolicy {
+        max_bytes: 16 * 1024,
+        max_count: 2,
+        max_total_bytes: 1024 * 1024,
+        stage_ttl: Duration::from_secs(30 * 60),
+        per_hour: 20,
+        legacy_derivative: true,
+    });
+    let (legacy, ng) = start_server(dir.path(), Some(policy)).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let staged = http(
+        ng,
+        "POST",
+        "/news/blob",
+        &[
+            ("Authorization", &alice.bearer),
+            ("Content-Type", "image/png"),
+        ],
+        &png(20, 10),
+    )
+    .await;
+    let handle = staged.json()["blob"]["id"].as_str().unwrap().to_owned();
+    let general = category(&mut admin, None, "General").await;
+    let article = alice
+        .ok(
+            "news_post",
+            json!({ "category": general, "subject": "Shot", "body": "Look.",
+                    "attach": [&handle] }),
+        )
+        .await["id"]
+        .as_u64()
+        .unwrap();
+
+    // The text, then the picture as the derivative a 1.5 client can be
+    // given: a type of its own and a size a u16 can spell.
+    let mut period = Period::login(legacy, "lurker").await;
+    let listing = period
+        .ok(LIST_CATEGORY, vec![news_path(&[b"General"])])
+        .await;
+    let posts = catlist(&listing);
+    let [post] = &posts[..] else {
+        panic!("one post: {posts:?}");
+    };
+    let [text, image] = &post.parts[..] else {
+        panic!("two parts: {:?}", post.parts);
+    };
+    assert_eq!(text.mime_type, b"text/plain");
+    let mime = image.mime_type.clone();
+    assert!(mime == b"image/jpeg" || mime == b"image/png", "{mime:?}");
+
+    let got = period
+        .ok(
+            GET_THREAD,
+            vec![
+                news_path(&[b"General"]),
+                id_field(tag::THREADID, article),
+                (tag::NEWSTYPE, mime.clone()),
+            ],
+        )
+        .await;
+    assert_eq!(field(&got, tag::NEWSTYPE), mime);
+    let bytes = field(&got, tag::NEWSDATA);
+    assert_eq!(bytes.len(), image.size as usize, "the listing's size");
+    let magic: &[u8] = if mime == b"image/png" {
+        b"\x89PNG"
+    } else {
+        b"\xff\xd8\xff"
+    };
+    assert!(bytes.starts_with(magic), "{:?}", &bytes[..8]);
+
+    // The text is still the text.
+    let plain = period
+        .ok(
+            GET_THREAD,
+            vec![
+                news_path(&[b"General"]),
+                id_field(tag::THREADID, article),
+                (tag::NEWSTYPE, b"text/plain".to_vec()),
+            ],
+        )
+        .await;
+    assert_eq!(field(&plain, tag::NEWSDATA), b"Look.");
+}

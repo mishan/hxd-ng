@@ -597,12 +597,19 @@ fn catlist_post(core: &Core, who: Asker, l: &Listed) -> Vec<u8> {
         )
     };
     let parts = parts(l);
-    let mut v = Vec::with_capacity(24 + subject.len() + sender.len() + parts.len() * 16);
+    // Only what can be fetched: a server that has stopped taking
+    // attachments serves none, whatever its articles were posted with.
+    let images = match core.news_policy().and_then(|p| p.attach) {
+        Some(_) => l.images.as_slice(),
+        None => &[],
+    };
+    let count = parts.len() + images.len();
+    let mut v = Vec::with_capacity(24 + subject.len() + sender.len() + count * 16);
     v.extend_from_slice(&l.id.to_be_bytes());
     v.extend_from_slice(&wire_date(l.at));
     v.extend_from_slice(&l.parent.unwrap_or(0).to_be_bytes());
     v.extend_from_slice(&0u32.to_be_bytes());
-    v.extend_from_slice(&(parts.len() as u16).to_be_bytes());
+    v.extend_from_slice(&(count as u16).to_be_bytes());
     v.push(subject.len() as u8);
     v.extend_from_slice(&subject);
     v.push(sender.len() as u8);
@@ -625,7 +632,43 @@ fn catlist_post(core: &Core, who: Asker, l: &Listed) -> Vec<u8> {
         v.extend_from_slice(mime.as_bytes());
         v.extend_from_slice(&(size as u16).to_be_bytes());
     }
+    // Each image as its legacy derivative (§12.3, §7.3), which is made to
+    // fit the u16 the size is spelled in.
+    for (mime, bytes) in images {
+        let mime = mime.mime();
+        v.push(mime.len() as u8);
+        v.extend_from_slice(mime.as_bytes());
+        v.extend_from_slice(&u16::try_from(*bytes).unwrap_or(u16::MAX).to_be_bytes());
+    }
     v
+}
+
+/// The legacy derivative of `a`'s first image of the type `mime` names,
+/// as the listing lists it (§12.3).
+fn legacy_image(
+    core: &Core,
+    who: Asker,
+    a: &Article,
+    mime: &[u8],
+) -> Result<Option<(&'static str, Vec<u8>)>, NewsError> {
+    let Some(want) = std::str::from_utf8(mime)
+        .ok()
+        .and_then(hxd_core::media::MediaType::from_mime)
+    else {
+        return Ok(None);
+    };
+    let Some(image) = a
+        .attachments
+        .iter()
+        .find(|i| i.legacy.is_some_and(|(m, _)| m == want))
+    else {
+        return Ok(None);
+    };
+    match core.news_attachment(who.uid, &image.id, true) {
+        Ok(found) => Ok(found.map(|(_, _, bytes)| (want.mime(), bytes))),
+        Err(NewsError::Disabled) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// An article in the category `path` names, live or a tombstone. One in
@@ -652,16 +695,25 @@ fn get_thread(
     mime: &[u8],
 ) -> Result<Chunks, NewsError> {
     let a = article_in(core, who, path, id)?;
-    // The part asked for by its MIME type (§12.3). The markdown source
-    // to a client that names it, and the plain text to everyone else —
-    // including a client naming a type this server does not list, which
-    // is better answered with the body than with an error.
-    let (label, text) = if a.deleted {
-        ("text/plain", "")
-    } else if mime == b"text/markdown" && a.mime == BodyType::Markdown {
-        ("text/markdown", a.body.as_str())
-    } else {
-        ("text/plain", a.plain.as_deref().unwrap_or(&a.body))
+    // The part asked for by its MIME type (§12.3). An image's derivative
+    // to a client that names its type, the markdown source to one that
+    // names that, and the plain text to everyone else — including a
+    // client naming a type this server does not list, which is better
+    // answered with the body than with an error.
+    let image = match a.deleted {
+        true => None,
+        false => legacy_image(core, who, &a, mime)?,
+    };
+    let (label, data) = match image {
+        Some(image) => image,
+        None if a.deleted => ("text/plain", Vec::new()),
+        None if mime == b"text/markdown" && a.mime == BodyType::Markdown => {
+            ("text/markdown", wire_text(who.enc, &a.body))
+        }
+        None => (
+            "text/plain",
+            wire_text(who.enc, a.plain.as_deref().unwrap_or(&a.body)),
+        ),
     };
     let (subject, poster) = if a.deleted {
         (Vec::new(), Vec::new())
@@ -675,7 +727,7 @@ fn get_thread(
     // directory order, which says nothing, and a client that walks them
     // is served better by its own listing.
     Ok(vec![
-        (tag::NEWSDATA, wire_text(who.enc, text)),
+        (tag::NEWSDATA, data),
         (tag::PREVTHREADID, 0u32.to_be_bytes().to_vec()),
         (tag::NEXTTHREADID, 0u32.to_be_bytes().to_vec()),
         (
@@ -1404,6 +1456,7 @@ mod tests {
             height: 1,
             bytes: 1,
             name: Some("screenshot.png".into()),
+            legacy: None,
         }];
         let entry = render_entry(&a);
         assert!(entry.contains("\n\nbold words\n[image: screenshot.png]\n"));
@@ -1614,17 +1667,33 @@ mod tests {
             deleted: false,
             body_len: TextLen::of("caf\u{e9}"),
             plain_len: None,
+            images: Vec::new(),
         }
     }
 
     #[test]
     fn a_post_and_its_parts_parse_as_a_client_parses_them() {
-        let core = Core::new();
+        // Taking attachments, so the image part is one it would serve.
+        let core = Core::new().with_news(
+            Arc::new(hxd_core::news::MemoryNews::new()),
+            hxd_core::NewsPolicy {
+                attach: Some(hxd_core::news::AttachmentPolicy {
+                    max_bytes: 1 << 20,
+                    max_count: 4,
+                    max_total_bytes: 1 << 30,
+                    stage_ttl: Duration::from_secs(1800),
+                    per_hour: 20,
+                    legacy_derivative: true,
+                }),
+                ..Default::default()
+            },
+        );
         let who = Asker { uid: 1, enc: MR };
         let mut marked = listed(2, Some(1));
         marked.mime = BodyType::Markdown;
         marked.body_len = TextLen::of("**bold**");
         marked.plain_len = Some(TextLen::of("bold"));
+        marked.images = vec![(hxd_core::media::MediaType::Png, 59_000)];
         let mut stone = listed(3, Some(1));
         stone.deleted = true;
         let mut body = Vec::new();
@@ -1653,7 +1722,14 @@ mod tests {
             .iter()
             .map(|p| (p.mime_type.as_slice(), p.size))
             .collect();
-        assert_eq!(parts, [(&b"text/plain"[..], 4), (&b"text/markdown"[..], 8)]);
+        assert_eq!(
+            parts,
+            [
+                (&b"text/plain"[..], 4),
+                (&b"text/markdown"[..], 8),
+                (&b"image/png"[..], 59_000)
+            ]
+        );
 
         assert_eq!(stone.subject, b"");
         assert_eq!(stone.sender, b"");

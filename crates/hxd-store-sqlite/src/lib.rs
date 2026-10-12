@@ -71,7 +71,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -584,6 +584,16 @@ CREATE TABLE identity_first_seen (
   first_seen INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX identity_first_seen_at ON identity_first_seen (first_seen);
+";
+
+/// The legacy derivative's own type (`docs/news.md` §7.3): JPEG for an
+/// opaque image and PNG otherwise, so not the canonical's. A derivative
+/// of a JPEG is a JPEG; one written before this of anything else stays
+/// unknown, and is not listed on the 1.5 wire.
+const SCHEMA_V20: &str = "
+ALTER TABLE news_blob ADD COLUMN derivative_mime TEXT;
+UPDATE news_blob SET derivative_mime = 'image/jpeg'
+ WHERE derivative IS NOT NULL AND mime = 'image/jpeg';
 ";
 
 /// The bans this server asked linked servers for (`docs/server-link.md`
@@ -1243,6 +1253,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 19 {
         steps.push_str(SCHEMA_V19);
+    }
+    if version < 20 {
+        steps.push_str(SCHEMA_V20);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -2720,6 +2733,71 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_names_the_first_image_of_each_type() {
+        use hxd_core::media::MediaType;
+        use hxd_core::news::{Attachment, NewsStore, StagedAttachment};
+
+        let (store, cat) = news_fixture();
+        let alice = hxd_core::inbox::Mailbox::login("alice");
+        let images = [
+            (MediaType::Png, 10),
+            (MediaType::Png, 20),
+            (MediaType::Jpeg, 30),
+        ];
+        for (n, legacy) in images.into_iter().enumerate() {
+            store
+                .stage_attachment(&StagedAttachment {
+                    attachment: Attachment {
+                        id: [n as u8 + 1; 16],
+                        mime: MediaType::Png,
+                        width: 3,
+                        height: 2,
+                        bytes: 81,
+                        name: None,
+                        legacy: Some(legacy),
+                    },
+                    blob: [n as u8 + 1; 32],
+                    owner: alice.clone(),
+                    staged_at: UNIX_EPOCH + Duration::from_secs(20),
+                })
+                .unwrap();
+        }
+        store
+            .post(
+                &hxd_core::news::NewPost {
+                    category: cat,
+                    parent: None,
+                    author: hxd_core::news::Author {
+                        nick: "Alice".into(),
+                        login: Some("alice".into()),
+                        fingerprint: None,
+                    },
+                    subject: "Three pictures".into(),
+                    body: "See them.".into(),
+                    mime: hxd_core::news::BodyType::Plain,
+                    plain: None,
+                    refs: Vec::new(),
+                    at: UNIX_EPOCH + Duration::from_secs(30),
+                    follow: None,
+                    attachments: vec![[1; 16], [2; 16], [3; 16]],
+                    attachment_owner: Some(alice.clone()),
+                    guest: None,
+                    attachment_cutoff: UNIX_EPOCH,
+                    feed: None,
+                },
+                32,
+                32,
+            )
+            .unwrap();
+        let listed = store.listing(cat, 10).unwrap();
+        assert_eq!(
+            listed[0].images,
+            [(MediaType::Png, 10), (MediaType::Jpeg, 30)],
+            "a second PNG could not be asked for by its type"
+        );
+    }
+
+    #[test]
     fn a_news_attachment_is_private_while_staged_and_public_when_posted() {
         use hxd_core::media::MediaType;
         use hxd_core::news::{Attachment, NewsStore, StagedAttachment};
@@ -2735,9 +2813,9 @@ mod tests {
                 height: 2,
                 bytes: 81,
                 name: Some("diagram.png".into()),
+                legacy: Some((MediaType::Png, 60)),
             },
             blob: [9; 32],
-            legacy_bytes: Some(60),
             owner: alice.clone(),
             staged_at: UNIX_EPOCH + Duration::from_secs(20),
         };

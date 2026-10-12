@@ -949,6 +949,8 @@ impl NewsStore for MemoryNews {
                 deleted: a.deleted,
                 body_len: TextLen::of(&a.body),
                 plain_len: a.plain.as_deref().map(TextLen::of),
+                // This store keeps no attachments.
+                images: Vec::new(),
             }));
             if out.len() >= limit {
                 break;

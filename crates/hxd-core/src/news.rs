@@ -318,6 +318,10 @@ pub struct Listed {
     pub body_len: TextLen,
     /// The downgrade's, where [`Article::plain`] has one.
     pub plain_len: Option<TextLen>,
+    /// Its attachments' legacy derivatives, the first of each type, in
+    /// the order they were attached: one MIME type names one part on the
+    /// 1.5 wire (§12.3), so a second of a type could not be fetched.
+    pub images: Vec<(crate::media::MediaType, u64)>,
 }
 
 /// How long a text is, both ways a wire might ask: in characters, which
@@ -350,6 +354,9 @@ pub struct Attachment {
     pub height: u32,
     pub bytes: u64,
     pub name: Option<String>,
+    /// The legacy derivative (§7.3), its type and size, when one was
+    /// made: what the 1.5 wire lists and serves as an image part.
+    pub legacy: Option<(crate::media::MediaType, u64)>,
 }
 
 /// A staged attachment and the fields the durable store needs to bind it
@@ -358,7 +365,6 @@ pub struct Attachment {
 pub struct StagedAttachment {
     pub attachment: Attachment,
     pub blob: BlobId,
-    pub legacy_bytes: Option<u64>,
     pub owner: crate::inbox::Mailbox,
     pub staged_at: SystemTime,
 }
@@ -1913,9 +1919,9 @@ impl Core {
                 height: canonical.height,
                 bytes: canonical.bytes.len() as u64,
                 name: clean_attachment_name(name),
+                legacy: derivative.as_ref().map(|d| (d.mime, d.bytes.len() as u64)),
             },
             blob,
-            legacy_bytes: derivative.as_ref().map(|d| d.bytes.len() as u64),
             owner,
             staged_at: SystemTime::now(),
         };
