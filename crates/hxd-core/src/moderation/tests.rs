@@ -159,6 +159,8 @@ fn attach(core: &Core, who: Who) -> (Uid, Events) {
             set_avatar: false,
             moderate: who.moderate,
             can_spam: false,
+            manage_rooms: false,
+            set_subject: false,
             is_person: who.person,
             reads_on_delivery: false,
             identity: who.identity,

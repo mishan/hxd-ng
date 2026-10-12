@@ -1,7 +1,8 @@
 # Chat rooms: curated, persistent, logged
 
-Status: design, not built. §13 stages it. The ng wire of §7 is the spec
-part; the rest binds nobody but this server.
+Status: R1 is built (§13): rooms in the domain, the rooms file and `hxd
+room`, carried by no wire yet. The ng wire of §7 is the spec part; the
+rest binds nobody but this server.
 
 Public chat today is one room everybody shares, and a private chat is a
 room that exists while someone is in it and leaves no record.
@@ -191,11 +192,14 @@ cheaper than to everyone who could be.
   may point at a line in it.
 - **Unarchive**: `hxd room unarchive`. It comes back with its id and
   its history.
-- **Delete**: `hxd room delete` only, from the CLI only. It deletes
-  the room's lines when there is a log, and leaves the entry as a
-  tombstone (an id and `deleted = true`, no name), so the id is still
-  not reused. The moderation table records it, with a room target and
-  a room-delete kind it gains for the purpose (§11).
+- **Delete**: `hxd room delete` only, from the CLI only. It leaves the
+  entry as a tombstone (an id and `deleted = true`, no name), so the id
+  is still not reused, and the server that loads the tombstone parts
+  the room's members and then deletes its lines when there is a log.
+  The moderation table records it, with a room target and a
+  room-delete kind it gains for the purpose (§11); R1's command does
+  not record it yet. An entry no server has loaded has no id and no
+  lines, and is deleted by taking it out of the file.
 
 There is no room a user can create. A user who wants a conversation
 the operator did not plan for opens a private chat, which is the
@@ -240,6 +244,8 @@ lines carry no id, as the lobby's do today, `history` answers
 - **What else takes a serial takes the room's.** A redaction takes the
   serial of the line's room. A purge across rooms takes each room's in
   turn, never two at once, so no order of acquisition can deadlock.
+  Until the wire of §7 pages a room's history, a room's redactions and
+  purges go to its members.
 - **Line ids remain global**, from one `AUTOINCREMENT`, so they never
   collide, and a redaction, a report or a purge names a line by id
   alone and finds its room from the row. A reader can see the gaps
@@ -262,7 +268,10 @@ parts, and the notices of §6.
 ## 4. Storage
 
 Rooms are a short list an operator curates, so they live in a file,
-`[rooms] file` (default `rooms.toml` beside the config), not a database.
+`[rooms] file` (default `rooms.toml`, relative to the working directory
+as every path in the config is), not a database. `hxd room` resolves it
+from its own working directory, so it is run from the server's, as
+`docker exec` does in the image.
 A server with no store at all has rooms. The operator can read and edit
 it, and comments survive every edit the server makes, because edits go
 through `toml_edit` as account files' do:
@@ -315,17 +324,23 @@ beside `chats`.
   written whole to a temporary file and renamed over the old one, so a
   crash leaves one version or the other.
 - **Topics are debounced.** A topic change takes effect at once in
-  memory and on every wire. The file is rewritten at most every few
-  seconds and at shutdown, so a stream of 120s, which have no reply and
-  cost little, cannot become a stream of file writes.
+  memory and on every wire. The file is rewritten at most every five
+  seconds and at shutdown, and then with the topic alone, so a stream
+  of 120s, which have no reply and cost little, cannot become a stream
+  of file writes. A write that fails is logged, keeps the topic newer
+  than the file's, and is tried again at the next reload or shutdown
+  rather than every five seconds.
 - **A reload diffs.** `hxd room` edits the file and sends SIGHUP, and
   a hand edit is followed by one, as `hxd account` is. The server
   rereads the file, assigns ids to entries without one and writes them
   back, and diffs the result against the roster: a room that appeared
-  is announced, one that was archived parts its members, and one whose
-  gates narrowed parts whoever lost access. The CLI and the server do
-  not share a lock, so an edit made while a manager edits from an ng
-  client can lose one of the two, as with accounts.
+  is announced, one that was archived or taken out of the file parts its
+  members, and one whose gates narrowed parts whoever lost access. The
+  lobby's subject is read at startup only: a reload leaves it as the
+  server has it. An id that is a private chat's makes the file one that
+  does not parse. The CLI and the server do not share a lock, so an
+  edit made while a manager edits from an ng client can lose one of the
+  two, as with accounts.
 - **A file that does not parse** leaves the rooms as they were on a
   reload, and logs why. At startup it is an error: a server that came
   up without its rooms would show a restricted room's name to nobody,
@@ -357,7 +372,8 @@ list leaves the decision to the access bit:
   without holding it.
 - **A moderator** (moderation.md §2) may see, join and page every
   room, and redact and purge in any room, restricted or archived,
-  because judging a report means reading what it is about. News gives
+  because judging a report means reading what it is about. An archived
+  room is seen and paged, and joined by nobody. News gives
   moderators the same reach (roles.md §11.1), so the rule is one rule.
 - **A guest** passes an empty `read` when its bits allow, and a
   non-empty one only if it names `guest`. A gate naming `@everyone` is
@@ -683,9 +699,14 @@ Parting a room parts its voice room, as parting a private chat does.
   `chat_flood_kick(uid, cid)` already does for any cid.
 - **The domain's chat events say which kind of chat they are about.**
   `Event::Chat`, `Notice`, `ChatSubject` and the member events carry a
-  bare cid today. They gain whether the cid is a room, so the ng
-  encoder can emit a room's events and keep a private chat's an
-  `unsupported` placeholder until the ng private-chat work lands.
+  bare cid. A room's are wrapped, `Event::InRoom { room, event }`, so
+  the ng encoder can emit a room's events and keep a private chat's an
+  `unsupported` placeholder until the ng private-chat work lands, and a
+  frontend that shows no rooms leaves them out whole: until R2 and R3
+  the classic wire drops them and the ng wire sends the placeholder. A
+  session's end is told to its rooms as a part, as to its private
+  chats; whether the ng wire says it, where `user_parted` already does
+  (§7.3), is R2's to settle.
 - **Server links.** Only the lobby crosses (§3). A ghost cannot be
   invited into a room, for the reason it cannot be invited into a
   private chat: every exported user refuses private chat. Linked rooms
@@ -721,7 +742,7 @@ Parting a room parts its voice room, as parting a private chat does.
 ```toml
 [rooms]
 enabled = true
-file = "rooms.toml"      # §4; relative to the config file
+file = "rooms.toml"      # §4; relative to the working directory
 lobby = "lobby"          # the lobby's name in listings and the ng rail
 max_joined = 32          # rooms one session may be in
 max_rooms = 256          # every entry, archived and tombstones included
@@ -734,12 +755,13 @@ are in `[rooms] file`, managed by hand, by `hxd room` and by the ng
 requests (§4). Whether their lines are logged is `[history]`'s
 business, as it is the lobby's. `max_rooms` counts archived entries
 too, so a manager cannot create, fill and archive rooms without end.
-Docker's entrypoint gains `HXD_ROOMS_ANNOUNCE` and nothing else
-(docs/docker.md).
+Docker's entrypoint keeps the file in its data directory, and gains
+`HXD_ROOMS_ANNOUNCE` and nothing else (docs/docker.md).
 
 `hxd room` subcommands: `list [--archived]`, `create <name> [--topic …]
-[--read entry,…] [--post entry,…] [--position n]`, `edit <name> …`,
-`archive <name>`, `unarchive <name>`, `delete <name> --purge`.
+[--read entry,…] [--post entry,…] [--position n] [--max-lines n]
+[--max-days n]`, `edit <name> [--name new] …`, `archive <name>`,
+`unarchive <name>`, `delete <name> --purge`.
 
 ## 13. Staging
 

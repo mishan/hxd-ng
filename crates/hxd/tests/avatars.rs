@@ -897,6 +897,8 @@ async fn an_identitys_avatar_is_pruned_from_the_database_once_it_stops_coming_ba
                 set_avatar: true,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person,
                 reads_on_delivery: false,
                 identity,

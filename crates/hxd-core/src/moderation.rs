@@ -914,18 +914,16 @@ impl Core {
 
     // --- The acts (§3) ------------------------------------------------
 
-    /// Redact a public line (§3.1): the audit row takes its words, the
-    /// log keeps its id and time, and every reader is told to blank it.
-    /// An image it carried is revoked in the same act.
+    /// Redact a logged line (§3.1), the lobby's or a room's: the audit
+    /// row takes its words, the log keeps its id and time, and every
+    /// reader is told to blank it. An image it carried is revoked in the
+    /// same act.
     pub fn redact_line(&self, by: Actor, id: LineId, why: &str) -> Result<(), ModError> {
         let acting = self.acting(by)?;
         let why = reason(why, MAX_ACT_REASON)?;
         let store = self.moderation_store()?.clone();
         let log = self.history.as_ref().ok_or(ModError::Disabled)?;
-        let line = log
-            .line(id)?
-            .filter(|l| l.channel == 0)
-            .ok_or(ModError::NoSuchLine)?;
+        let line = log.line(id)?.ok_or(ModError::NoSuchLine)?;
         if line.flags.contains(LineFlags::DELETED) {
             // Somebody got there first. Still an answer the reports on
             // it are owed.
@@ -948,7 +946,7 @@ impl Core {
         act.evidence = Some(line_evidence(&line));
         store.record(&act)?;
 
-        self.tombstone_lines(&acting, &[id])?;
+        self.tombstone_lines(&acting, &[(id, line.channel)])?;
         if let (Some(handle), Some(record)) = (media, record) {
             self.revoke_quietly(&acting, &handle, record.hash, true);
             self.close_reports_on(&acting, &ReportTarget::Media(handle), None);
@@ -1080,7 +1078,7 @@ impl Core {
             .checked_sub(within)
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let lines = match self.history.as_ref() {
-            Some(log) => log.lines_by(0, who, since)?,
+            Some(log) => log.lines_by(None, who, since)?,
             None => Vec::new(),
         };
         let articles = match self.news.as_ref() {
@@ -1130,7 +1128,8 @@ impl Core {
         act.evidence = Some(evidence.join("\n"));
         store.record(&act)?;
 
-        self.tombstone_lines(&acting, &purged.lines)?;
+        let ids: Vec<(LineId, u32)> = lines.iter().map(|l| (l.id, l.channel)).collect();
+        self.tombstone_lines(&acting, &ids)?;
         for handle in &purged.media {
             if let Some(record) = self.media_record(handle) {
                 self.revoke_quietly(&acting, handle, record.hash, true);
@@ -1190,7 +1189,7 @@ impl Core {
             .checked_sub(within)
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let lines = match self.history.as_ref() {
-            Some(log) => log.lines_by_ghost(0, ghost.key, since)?,
+            Some(log) => log.lines_by_ghost(None, ghost.key, since)?,
             None => Vec::new(),
         };
         // A ghost has no login or key here to file the act under: the
@@ -1201,7 +1200,8 @@ impl Core {
         act.evidence = Some(evidence.collect::<Vec<_>>().join("\n"));
         store.record(&act)?;
         let ids: Vec<LineId> = lines.iter().map(|l| l.id).collect();
-        self.tombstone_lines(&acting, &ids)?;
+        let in_rooms: Vec<(LineId, u32)> = lines.iter().map(|l| (l.id, l.channel)).collect();
+        self.tombstone_lines(&acting, &in_rooms)?;
         let targets: HashSet<ReportTarget> = ids.iter().map(|id| ReportTarget::Line(*id)).collect();
         self.close_reports_on_any(&acting, &targets);
         Ok(Purged {
@@ -1211,37 +1211,57 @@ impl Core {
         })
     }
 
-    /// Tombstone lines and tell every reader, in log order with the
-    /// sends: under the log's own lock, so a redaction can never reach a
-    /// client ahead of the line it blanks.
-    fn tombstone_lines(&self, acting: &Acting, ids: &[LineId]) -> Result<(), ModError> {
-        if ids.is_empty() {
+    /// Tombstone lines, each `(id, channel)`, and tell every reader, in
+    /// log order with the sends: under each line's room's serial, so a
+    /// redaction can never reach a client ahead of the line it blanks. A
+    /// room's are told to its members alone, and the rooms are taken one
+    /// at a time, never two serials at once.
+    fn tombstone_lines(&self, acting: &Acting, lines: &[(LineId, u32)]) -> Result<(), ModError> {
+        if lines.is_empty() {
             return Ok(());
         }
         let log = self.history.as_ref().ok_or(ModError::Disabled)?;
-        let _serial = self.log_serial.lock().unwrap();
-        let now = SystemTime::now();
-        let mut gone = Vec::with_capacity(ids.len());
-        for id in ids {
-            if log.tombstone(*id, &acting.name, now)? {
-                gone.push(*id);
-            }
+        let mut by_room: std::collections::BTreeMap<u32, Vec<LineId>> = Default::default();
+        for &(id, room) in lines {
+            by_room.entry(room).or_default().push(id);
         }
-        let readers = |s: &UserSession| reads_public_chat(s) && s.info.transport.redactions;
-        let mut r = self.roster.lock().unwrap();
-        if gone.len() <= PURGE_SINGLY {
-            for id in gone {
-                r.broadcast_where(&Event::ChatRedacted { id }, None, readers);
+        for (room, ids) in by_room {
+            let channel = (room != 0).then(|| self.room_channel(room));
+            let _serial = channel
+                .as_ref()
+                .map_or(&self.log_serial, |c| &c.serial)
+                .lock()
+                .unwrap();
+            let now = SystemTime::now();
+            let mut gone = Vec::with_capacity(ids.len());
+            for id in ids {
+                if log.tombstone(id, &acting.name, now)? {
+                    gone.push(id);
+                }
             }
-        } else {
-            // A purge of a flood is thousands of lines, and one event
-            // each would be thousands of slots in every reader's bounded
-            // channel at once — enough to cut them off, the moderator
-            // who asked included, since their session is not reading
-            // while it waits for this.
-            for ids in gone.chunks(PURGE_EVENT_IDS) {
-                let ev = Event::ChatPurged { ids: ids.to_vec() };
-                r.broadcast_where(&ev, None, readers);
+            let events: Vec<Event> = if gone.len() <= PURGE_SINGLY {
+                gone.into_iter()
+                    .map(|id| Event::ChatRedacted { id })
+                    .collect()
+            } else {
+                // A purge of a flood is thousands of lines, and one event
+                // each would be thousands of slots in every reader's
+                // bounded channel at once — enough to cut them off, the
+                // moderator who asked included, since their session is not
+                // reading while it waits for this.
+                gone.chunks(PURGE_EVENT_IDS)
+                    .map(|ids| Event::ChatPurged { ids: ids.to_vec() })
+                    .collect()
+            };
+            let mut r = self.roster.lock().unwrap();
+            for ev in events {
+                if room == 0 {
+                    let readers =
+                        |s: &UserSession| reads_public_chat(s) && s.info.transport.redactions;
+                    r.broadcast_where(&ev, None, readers);
+                } else {
+                    r.room_send_where(room, ev, |s| s.info.transport.redactions);
+                }
             }
         }
         Ok(())
@@ -1487,7 +1507,7 @@ impl Core {
                 let log = self.history.as_ref().ok_or(ModError::Disabled)?;
                 let line = log
                     .line(id)?
-                    .filter(|l| l.channel == 0)
+                    .filter(|l| l.channel == 0 || self.room_readable(by, l.channel))
                     .ok_or(ModError::NoSuchTarget)?;
                 let gone = line.flags.contains(LineFlags::DELETED);
                 // The image a line carried is part of what was reported:

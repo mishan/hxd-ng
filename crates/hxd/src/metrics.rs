@@ -187,6 +187,7 @@ impl MetricsSource for Source {
             c.buffered_max as f64,
         );
         gauge("hxd_private_chats", &[], c.chats as f64);
+        gauge("hxd_rooms", &[], c.rooms as f64);
         gauge("hxd_ghosts", &[], c.ghosts as f64);
         let budget = self.core.queue_budget();
         gauge(

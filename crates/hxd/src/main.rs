@@ -62,8 +62,8 @@ fn init_tracing() {
 /// do it. `systemctl reload` sends exactly this. It also re-reads
 /// `[tls]`'s certificate and key from the paths the server started with,
 /// so a renewal reaches the next handshake without dropping a session,
-/// `[banner]`'s file, which the next client to agree is shown, and the
-/// account files of everyone logged in.
+/// `[banner]`'s file, which the next client to agree is shown, the
+/// account files of everyone logged in, and the rooms file.
 #[cfg(unix)]
 async fn reload_on_hangup(
     core: std::sync::Arc<hxd_core::Core>,
@@ -100,6 +100,18 @@ async fn reload_on_hangup(
                 tracing::info!("SIGHUP: accounts reloaded; {told} sessions told, {ended} ended")
             }
             Err(e) => tracing::error!("SIGHUP: account reload failed: {e}"),
+        }
+        // What `hxd room` or a hand edit changed meanwhile.
+        if core.rooms_enabled() {
+            let rooms = core.clone();
+            match tokio::task::spawn_blocking(move || rooms.reload_rooms()).await {
+                Ok(Ok(file)) => tracing::info!(
+                    "SIGHUP: {} rooms",
+                    file.rooms.iter().filter(|r| !r.deleted).count()
+                ),
+                Ok(Err(e)) => tracing::error!("SIGHUP: rooms: {e}; the rooms are unchanged"),
+                Err(e) => tracing::error!("SIGHUP: room reload failed: {e}"),
+            }
         }
         if let Some(reg) = registrar.as_deref() {
             match hxd::registrar::reload(reg, &path) {
@@ -309,6 +321,8 @@ enum Command {
         suspend: bool,
     },
     LinkResetId,
+    /// `room …`: the words after `room`.
+    Room(Vec<String>),
 }
 
 const USAGE: &str = "usage:\n  \
@@ -348,7 +362,8 @@ hxd [--config …] role access|extra <name> KEY=on|off…\n  \
 hxd [--config …] role rm <name>\n  \
 hxd [--config …] link status\n  \
 hxd [--config …] link suspend|resume <peer>\n  \
-hxd [--config …] link reset-id\n\n\
+hxd [--config …] link reset-id\n  \
+hxd [--config …] room list|create|edit|archive|unarchive|delete …\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
 `news feeds` lists the feeds the news database remembers: their\n\
@@ -409,6 +424,14 @@ access and extra keys to every account listing it, and `everyone` to\n\
 every account, the guest included. Off takes a key out of a role, which\n\
 only grants. `rm` takes the role out of every account first. A running\n\
 server applies a role edit to every session on SIGHUP.\n\n\
+`room` edits the rooms file ([rooms] file), keeping its comments:\n\
+`create <name>` with --topic, --read and --post (logins, comma-separated;\n\
+an empty list leaves it to the access bits), --position, --max-lines and\n\
+--max-days; `edit <name>` takes the same and --name to rename it;\n\
+`archive` hides a room and parts its members, keeping its lines;\n\
+`delete <name> --purge` leaves only its id, taken for good, and the\n\
+server deletes its lines. `room` alone lists every flag. A running\n\
+server applies an edit on SIGHUP, and gives a new room its id then.\n\n\
 `link status` says how each [[link.peer]] stands, as the running server\n\
 last wrote it. `link suspend` pauses a peer's link: on SIGHUP it is\n\
 closed, what it showed goes, and every attempt to link is refused until\n\
@@ -574,6 +597,11 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                 std::process::exit(0);
             }
             other if other.starts_with('-') => return Err(format!("unknown argument {other:?}")),
+            // Its flags are its own (`hxd::rooms::command`).
+            "room" if rest.is_empty() => {
+                rest.push("room".into());
+                rest.extend(args.by_ref());
+            }
             other => rest.push(other.to_string()),
         }
     }
@@ -641,6 +669,7 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                     | &"account"
                     | &"role"
                     | &"link"
+                    | &"room"
             )
         )
     {
@@ -674,6 +703,9 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     }
     if (fingerprint.is_some() || dry_run) && words.first() == Some(&"registrar") {
         return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string());
+    }
+    if let Some(("room", words)) = rest.split_first().map(|(w, r)| (w.as_str(), r)) {
+        return Ok((config, Command::Room(words.to_vec())));
     }
     // `purge` shares `--fingerprint` and `--dry-run` with `inbox purge`,
     // and is the only other command that does. After every other flag's
@@ -1137,6 +1169,10 @@ async fn main() {
                 println!("{}", hxd::roles::remove(&config, name)?);
                 return Ok(());
             }
+            Command::Room(args) => {
+                println!("{}", hxd::rooms::command(&config, args)?);
+                return Ok(());
+            }
             _ => {}
         }
         if let Command::PushRekey = command {
@@ -1429,6 +1465,9 @@ async fn main() {
         {
             tokio::spawn(hxd::avatar_pruner(ctx.core.clone()));
         }
+        if ctx.core.rooms_enabled() {
+            tokio::spawn(hxd::rooms::topic_flusher(ctx.core.clone()));
+        }
         // The audit trail's evidence window and closed reports' retention.
         tokio::spawn(hxd::moderation::pruner(ctx.core.clone()));
         let hub = hxd::link::build(&config, ctx.core.clone())?;
@@ -1487,6 +1526,7 @@ async fn main() {
         }
 
         let link_hub = hub.clone();
+        let rooms = ctx.core.clone();
         if let (Some((listener, _)), Some(tls)) = (tls_listener, tls.as_ref()) {
             tokio::spawn(hxd_session::serve_tls_with_peers(
                 listener,
@@ -1510,6 +1550,8 @@ async fn main() {
         if let Some(tracker) = tracker {
             tracker.shutdown().await;
         }
+        // The topics set since the last write (§4 of docs/chat-rooms.md).
+        let _ = tokio::task::spawn_blocking(move || rooms.flush_room_topics(true)).await;
         // Peers told this server is stopping and coming back, so they keep
         // its users through the restart (their grace period).
         if let Some(hub) = link_hub {

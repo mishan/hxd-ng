@@ -79,6 +79,8 @@ fn server_with(policy: NewsPolicy, renderer: Option<Arc<Fake>>) -> (Core, Uid, N
             set_avatar: false,
             moderate: false,
             can_spam: false,
+            manage_rooms: false,
+            set_subject: false,
             is_person: true,
             reads_on_delivery: false,
             identity: None,

@@ -23,7 +23,7 @@ HXD_CONFIG=${HXD_CONFIG:-/etc/hxd-ng/hxd-ng.toml}
 GENERATED=/run/hxd-ng/hxd-ng.toml
 
 case ${1:-} in
-    "" | -* | inbox | news-reindex | push | identity | registrar | account | role) ;;
+    "" | -* | inbox | news-reindex | push | identity | registrar | account | role | room) ;;
     *) exec "$@" ;;
 esac
 
@@ -217,6 +217,10 @@ generate() {
     echo
     echo "[roles]"
     echo "file = \"$DATA/roles.toml\""
+    # With the rest of the state, where the server writes ids and topics.
+    echo
+    echo "[rooms]"
+    echo "file = \"$DATA/rooms.toml\""
 
     if $ng; then
         echo

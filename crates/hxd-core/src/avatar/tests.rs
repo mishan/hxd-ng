@@ -79,6 +79,8 @@ fn join_from(core: &Core, who: Who, addr: IpAddr, set_avatar: bool) -> (Uid, Eve
             set_avatar,
             moderate: false,
             can_spam: false,
+            manage_rooms: false,
+            set_subject: false,
             is_person,
             reads_on_delivery: false,
             identity,

@@ -1,4 +1,5 @@
-//! Server-held public-chat history.
+//! Server-held chat history: the lobby's, channel 0, and each room's
+//! under its id (`docs/chat-rooms.md` §3).
 //!
 //! The log is deliberately wire-free: both frontends page the same UTF-8
 //! lines and do their own encoding. Private chats never reach this module.
@@ -118,6 +119,27 @@ pub struct HistoryPage {
     pub has_more: bool,
 }
 
+/// What retention keeps of each channel: its newest `max_lines` (0 for
+/// any number), none older than `max_age`, unless `channels` gives it a
+/// rule of its own, `(channel, max_lines, max_age)`. Per channel, so a
+/// busy lobby cannot evict a quiet room's history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Retention {
+    pub max_lines: usize,
+    pub max_age: Option<Duration>,
+    pub channels: Vec<(u32, usize, Option<Duration>)>,
+}
+
+impl Retention {
+    /// `channel`'s `(max_lines, max_age)`.
+    pub fn of(&self, channel: u32) -> (usize, Option<Duration>) {
+        self.channels
+            .iter()
+            .find(|(c, ..)| *c == channel)
+            .map_or((self.max_lines, self.max_age), |&(_, n, age)| (n, age))
+    }
+}
+
 /// Did `who` send this line? The mailbox rule over the line's two
 /// columns. A line with neither — a plain guest's — is nobody's, because
 /// `guest` is a login several people share.
@@ -141,13 +163,14 @@ pub trait ChatLog: Send + Sync + 'static {
     /// One line by id, tombstone or not: what a redaction reads before it
     /// clears the line, and what a report names.
     fn line(&self, id: LineId) -> Result<Option<LogLine>, StoreError>;
-    /// Every live line `who` sent into `channel` at or after `since`,
-    /// oldest first ([`sent_by`]'s rule): what a purge selects
-    /// (`docs/moderation.md` §3.3). By sender identity rather than by
-    /// uid, because the sender may be gone and the uid someone else's.
+    /// Every live line `who` sent into `channel`, or into any channel
+    /// for `None`, at or after `since`, oldest first ([`sent_by`]'s rule):
+    /// what a purge selects (`docs/moderation.md` §3.3). By sender
+    /// identity rather than by uid, because the sender may be gone and the
+    /// uid someone else's.
     fn lines_by(
         &self,
-        channel: u32,
+        channel: Option<u32>,
         who: &Mailbox,
         since: SystemTime,
     ) -> Result<Vec<LogLine>, StoreError>;
@@ -155,22 +178,24 @@ pub trait ChatLog: Send + Sync + 'static {
     /// text go. `by` is who did it, the column's fast answer to what the
     /// moderation record says at length.
     fn tombstone(&self, id: LineId, by: &str, at: SystemTime) -> Result<bool, StoreError>;
-    fn prune(
-        &self,
-        max_lines: usize,
-        max_age: Option<Duration>,
-        now: SystemTime,
-    ) -> Result<usize, StoreError>;
+    fn prune(&self, keep: &Retention, now: SystemTime) -> Result<usize, StoreError>;
     fn attach_media(&self, id: LineId, media: &MediaMeta) -> Result<(), StoreError>;
     /// [`ChatLog::lines_by`] for a linked server's user, by the key its
     /// lines were logged with ([`NewLine::ghost`]): a ghost has no login to
     /// purge by, and its name may be anyone's.
     fn lines_by_ghost(
         &self,
-        channel: u32,
+        channel: Option<u32>,
         ghost: [u8; 16],
         since: SystemTime,
     ) -> Result<Vec<LogLine>, StoreError>;
+    /// Every channel that has lines, with its newest line's id: what a
+    /// room's id is drawn against, so a new room never inherits an old
+    /// one's lines, and where a room's newest id starts.
+    fn channels(&self) -> Result<Vec<(u32, LineId)>, StoreError>;
+    /// Delete every line in `channel`, answering how many: a deleted
+    /// room's (`hxd room delete --purge`).
+    fn delete_channel(&self, channel: u32) -> Result<usize, StoreError>;
 }
 
 #[derive(Default)]
@@ -242,7 +267,7 @@ impl ChatLog for MemoryLog {
 
     fn lines_by_ghost(
         &self,
-        channel: u32,
+        channel: Option<u32>,
         ghost: [u8; 16],
         since: SystemTime,
     ) -> Result<Vec<LogLine>, StoreError> {
@@ -251,7 +276,7 @@ impl ChatLog for MemoryLog {
             .lines
             .iter()
             .filter(|l| {
-                l.channel == channel
+                channel.is_none_or(|c| l.channel == c)
                     && l.at >= since
                     && !l.flags.contains(LineFlags::DELETED)
                     && inner.ghosts.get(&l.id) == Some(&ghost)
@@ -262,7 +287,7 @@ impl ChatLog for MemoryLog {
 
     fn lines_by(
         &self,
-        channel: u32,
+        channel: Option<u32>,
         who: &Mailbox,
         since: SystemTime,
     ) -> Result<Vec<LogLine>, StoreError> {
@@ -271,7 +296,7 @@ impl ChatLog for MemoryLog {
             .lines
             .iter()
             .filter(|line| {
-                line.channel == channel
+                channel.is_none_or(|c| line.channel == c)
                     && line.at >= since
                     && !line.flags.contains(LineFlags::DELETED)
                     && sent_by(line, who)
@@ -295,22 +320,47 @@ impl ChatLog for MemoryLog {
         Ok(true)
     }
 
-    fn prune(
-        &self,
-        max_lines: usize,
-        max_age: Option<Duration>,
-        now: SystemTime,
-    ) -> Result<usize, StoreError> {
+    fn prune(&self, keep: &Retention, now: SystemTime) -> Result<usize, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let before = inner.lines.len();
-        if let Some(age) = max_age {
-            let cutoff = now.checked_sub(age).unwrap_or(SystemTime::UNIX_EPOCH);
-            inner.lines.retain(|line| line.at >= cutoff);
+        inner.lines.retain(|line| {
+            keep.of(line.channel)
+                .1
+                .is_none_or(|age| line.at >= now.checked_sub(age).unwrap_or(SystemTime::UNIX_EPOCH))
+        });
+        // Newest first, so each channel's count is of the lines it keeps.
+        let mut seen: std::collections::HashMap<u32, usize> = Default::default();
+        let mut kept: Vec<LogLine> = inner
+            .lines
+            .drain(..)
+            .rev()
+            .filter(|line| {
+                let n = seen.entry(line.channel).or_default();
+                *n += 1;
+                let max = keep.of(line.channel).0;
+                max == 0 || *n <= max
+            })
+            .collect();
+        kept.reverse();
+        inner.lines = kept;
+        let MemoryInner { lines, ghosts, .. } = &mut *inner;
+        ghosts.retain(|id, _| lines.iter().any(|line| line.id == *id));
+        Ok(before - inner.lines.len())
+    }
+
+    fn channels(&self) -> Result<Vec<(u32, LineId)>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut newest = std::collections::BTreeMap::new();
+        for line in &inner.lines {
+            newest.insert(line.channel, line.id);
         }
-        if max_lines > 0 && inner.lines.len() > max_lines {
-            let excess = inner.lines.len() - max_lines;
-            inner.lines.drain(..excess);
-        }
+        Ok(newest.into_iter().collect())
+    }
+
+    fn delete_channel(&self, channel: u32) -> Result<usize, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.lines.len();
+        inner.lines.retain(|line| line.channel != channel);
         let MemoryInner { lines, ghosts, .. } = &mut *inner;
         ghosts.retain(|id, _| lines.iter().any(|line| line.id == *id));
         Ok(before - inner.lines.len())
@@ -360,6 +410,94 @@ pub mod conformance {
         a_senders_lines_are_found_by_the_mailbox_rule(new_log());
         lines_appended_together_keep_their_order(new_log());
         a_ghosts_lines_are_found_by_its_key(new_log());
+        retention_is_per_channel(new_log());
+        a_senders_lines_are_found_in_every_channel(new_log());
+        channels_are_listed_and_deleted_whole(new_log());
+    }
+
+    fn in_channel(n: u64, channel: u32) -> NewLine {
+        NewLine { channel, ..line(n) }
+    }
+
+    fn ids_in(log: &dyn ChatLog, channel: u32) -> Vec<LineId> {
+        log.query(&HistoryQuery {
+            channel,
+            before: None,
+            after: None,
+            limit: 100,
+        })
+        .unwrap()
+        .lines
+        .iter()
+        .map(|l| l.id)
+        .collect()
+    }
+
+    /// A busy channel keeps its newest lines and a quiet one all of its
+    /// own, and a channel with a rule of its own is held to that rule.
+    fn retention_is_per_channel(log: Box<dyn ChatLog>) {
+        for n in 1..=12 {
+            let channel = match n {
+                3 | 7 => 7,
+                5 | 9 | 11 => 9,
+                _ => 0,
+            };
+            log.append(&in_channel(n, channel)).unwrap();
+        }
+        let keep = Retention {
+            max_lines: 3,
+            max_age: None,
+            channels: vec![(9, 1, None)],
+        };
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        assert_eq!(log.prune(&keep, now).unwrap(), 6);
+        assert_eq!(ids_in(&*log, 0), [8, 10, 12]);
+        assert_eq!(ids_in(&*log, 7), [3, 7]);
+        assert_eq!(ids_in(&*log, 9), [11]);
+        // An age of its own reaches its channel only.
+        let keep = Retention {
+            channels: vec![(7, 0, Some(Duration::from_secs(95)))],
+            ..Retention::default()
+        };
+        assert_eq!(log.prune(&keep, now).unwrap(), 1);
+        assert_eq!(ids_in(&*log, 7), [7]);
+        assert_eq!(ids_in(&*log, 0), [8, 10, 12]);
+    }
+
+    /// What a purge selects: one channel's lines, or every channel's.
+    fn a_senders_lines_are_found_in_every_channel(log: Box<dyn ChatLog>) {
+        log.append(&line(1)).unwrap();
+        log.append(&in_channel(1, 7)).unwrap();
+        log.append(&NewLine {
+            ghost: Some([3; 16]),
+            ..in_channel(2, 9)
+        })
+        .unwrap();
+        let who = Mailbox::identified("login-1", [1; 32]);
+        let ids = |channel| -> Vec<LineId> {
+            log.lines_by(channel, &who, SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .iter()
+                .map(|l| l.id)
+                .collect()
+        };
+        assert_eq!(ids(None), [1, 2]);
+        assert_eq!(ids(Some(7)), [2]);
+        let ghost = |channel| log.lines_by_ghost(channel, [3; 16], SystemTime::UNIX_EPOCH);
+        assert_eq!(ghost(None).unwrap().len(), 1);
+        assert!(ghost(Some(0)).unwrap().is_empty());
+    }
+
+    fn channels_are_listed_and_deleted_whole(log: Box<dyn ChatLog>) {
+        assert!(log.channels().unwrap().is_empty());
+        for (n, channel) in [(1, 0), (2, 7), (3, 0), (4, 7), (5, 9)] {
+            log.append(&in_channel(n, channel)).unwrap();
+        }
+        assert_eq!(log.channels().unwrap(), [(0, 3), (7, 4), (9, 5)]);
+        assert_eq!(log.delete_channel(7).unwrap(), 2);
+        assert!(ids_in(&*log, 7).is_empty());
+        assert_eq!(ids_in(&*log, 0), [1, 3]);
+        assert_eq!(log.channels().unwrap(), [(0, 3), (9, 5)]);
     }
 
     /// A linked server's user's lines, by the key this server gave it, and
@@ -375,7 +513,7 @@ pub mod conformance {
         }
         let since = SystemTime::UNIX_EPOCH;
         let ids = |key| -> Vec<LineId> {
-            log.lines_by_ghost(0, key, since)
+            log.lines_by_ghost(Some(0), key, since)
                 .unwrap()
                 .iter()
                 .map(|l| l.id)
@@ -386,7 +524,10 @@ pub mod conformance {
         assert!(log.tombstone(3, "carol", SystemTime::now()).unwrap());
         assert_eq!(ids([7; 16]), [1], "a tombstone is purged already");
         let later = SystemTime::UNIX_EPOCH + Duration::from_secs(102);
-        assert!(log.lines_by_ghost(0, [7; 16], later).unwrap().is_empty());
+        assert!(log
+            .lines_by_ghost(Some(0), [7; 16], later)
+            .unwrap()
+            .is_empty());
     }
 
     /// Several lines at once are logged as a line at a time would log
@@ -539,12 +680,13 @@ pub mod conformance {
 
     fn pruning_combines_age_and_count(log: Box<dyn ChatLog>) {
         fill(&*log, 6);
+        let keep = Retention {
+            max_lines: 2,
+            max_age: Some(Duration::from_secs(3)),
+            channels: Vec::new(),
+        };
         let gone = log
-            .prune(
-                2,
-                Some(Duration::from_secs(3)),
-                SystemTime::UNIX_EPOCH + Duration::from_secs(106),
-            )
+            .prune(&keep, SystemTime::UNIX_EPOCH + Duration::from_secs(106))
             .unwrap();
         assert_eq!(gone, 4);
         let page = log
@@ -607,11 +749,15 @@ pub mod conformance {
         };
         assert_eq!(log.append(&guest).unwrap(), 7);
         let ids = |who: &Mailbox, since: u64| {
-            log.lines_by(0, who, SystemTime::UNIX_EPOCH + Duration::from_secs(since))
-                .unwrap()
-                .iter()
-                .map(|l| l.id)
-                .collect::<Vec<_>>()
+            log.lines_by(
+                Some(0),
+                who,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(since),
+            )
+            .unwrap()
+            .iter()
+            .map(|l| l.id)
+            .collect::<Vec<_>>()
         };
         // By fingerprint whatever the login says, live lines only, oldest
         // first, and bounded by time.

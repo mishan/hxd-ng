@@ -360,20 +360,23 @@ async fn each_act_needs_its_bit_and_nobody_grants_what_they_do_not_hold() {
         assert_eq!(refused(lim.call(ty, &fields).await), outranked, "{ty:#x}");
     }
     assert!(!server.file("alt").exists());
-    // Managing roles is one such grant, and no bit gives it: not even
-    // `admin` may delete an account that may.
-    write(
-        server.accounts.path(),
-        "keeper",
-        "password = \"pw\"\n[extra]\nmanage_roles = true\n",
-    );
+    // Managing roles or rooms is such a grant, and no bit gives either:
+    // not even `admin` may delete an account that may.
     let mut admin = classic(&server, "admin", "pw").await;
-    let fields = [(tag::LOGIN, xor(b"keeper"))];
-    assert_eq!(
-        refused(admin.call(ACCOUNT_DELETE, &fields).await),
-        outranked
-    );
-    assert!(server.file("keeper").exists());
+    for (login, key) in [("keeper", "manage_roles"), ("curator", "manage_rooms")] {
+        write(
+            server.accounts.path(),
+            login,
+            &format!("password = \"pw\"\n[extra]\n{key} = true\n"),
+        );
+        let fields = [(tag::LOGIN, xor(login.as_bytes()))];
+        assert_eq!(
+            refused(admin.call(ACCOUNT_DELETE, &fields).await),
+            outranked,
+            "{key}"
+        );
+        assert!(server.file(login).exists(), "{key}");
+    }
 
     // An account deleting itself is not disconnected for it, and edits
     // nothing more: its file is what it is measured against.

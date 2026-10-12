@@ -225,6 +225,7 @@ writer's queue in `hxd_write_queued_*`.
 | `hxd_detached_broken` | | detached sessions whose buffer has broken |
 | `hxd_sessions_lagging` | | attached sessions cut off for falling behind, not yet gone (counted in `attached` too) |
 | `hxd_private_chats` | | rooms open |
+| `hxd_rooms` | | curated rooms neither archived nor deleted (`chat-rooms.md`) |
 | `hxd_ghosts` | | other servers' users held here, shown or not (kicked here, excluded, or held by an interrupted link): the count `max_ghosts` bounds |
 | `hxd_queue_budget_bytes` | `of` | what every connection's queues hold together (`held`), against `[server] queue_budget_mb` (`limit`) |
 | `hxd_live_queued_events` | | events waiting in attached connections' channels |

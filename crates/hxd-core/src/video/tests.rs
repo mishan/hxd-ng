@@ -1012,6 +1012,8 @@ fn losing_the_connection_ends_the_publication_even_though_the_session_lives() {
             set_avatar: false,
             moderate: false,
             can_spam: false,
+            manage_rooms: false,
+            set_subject: false,
             is_person: true,
             reads_on_delivery: false,
             identity: None,

@@ -241,6 +241,7 @@ it derives from. A role may grant any of them but `can_detach`, `inbox`,
 | `attach_news` | May this account stage durable images for news posts | Tracks `send_media` (bit 57), so image-upload policy has one default on both chat and news while an operator may narrow either account. Either way only an account that is one person stages: a staged handle is its uploader's, and `guest` is several people |
 | `set_avatar` | May this account set an avatar, on either wire (`avatars.md` §2). GIF Icons has no bit for it and the bitmap should not grow one | The same rule as `can_detach`: a password *or* a linked identity. Every change is decoded by this server and announced to every session on it, so the bootstrap guest does not get one. Clearing is never refused |
 | `manage_roles` | May this account create and edit roles (roles.md §5). One of the keys an administrator must hold to give | `false` |
+| `manage_rooms` | May this account create, edit and archive rooms, and see, join and send in every one (`chat-rooms.md` §5) | `false`, even for an administrator: an operator usually wants one person reorganizing the rooms |
 | `vouch` | May this account vouch for an identity key — `identity-vouch.md` §3.1, the requests in §3.2 there. *Design; not read by the server yet* | The same rule as `can_detach`: a password *or* a linked identity. An account that was itself created on the strength of a vouch derives `false` until the operator sets it |
 
 ---

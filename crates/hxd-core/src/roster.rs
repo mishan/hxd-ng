@@ -544,6 +544,17 @@ pub enum Event {
     /// (`docs/news.md` §10.6). **Targeted**, where the four above go to
     /// every reader: this is the one a client raises a badge on.
     NewsNotify(crate::news::Notified),
+
+    /// An event about a room (`crate::rooms`), to its members: what
+    /// `event` would be about a private chat, with the room's id as its
+    /// cid (a line, a notice, a topic, someone joining or leaving), or a
+    /// redaction or purge of the room's lines. Apart from the private
+    /// chats' events so that a frontend that does not show rooms leaves
+    /// it out whole rather than taking a room for a private chat.
+    InRoom {
+        room: u32,
+        event: Box<Event>,
+    },
 }
 
 impl Event {
@@ -584,6 +595,7 @@ impl Event {
                 articles.len()
                     * std::mem::size_of::<(crate::news::ArticleId, crate::news::NodeId)>()
             }
+            Event::InRoom { event, .. } => return event.weight(),
             _ => 0,
         };
         std::mem::size_of::<SeqEvent>() + text
@@ -624,6 +636,7 @@ impl Event {
             Event::NewsNode(..) => "news_node",
             Event::NewsNodeDeleted { .. } => "news_node_deleted",
             Event::NewsNotify(..) => "news_notify",
+            Event::InRoom { event, .. } => event.kind(),
         }
     }
 }
@@ -778,6 +791,10 @@ pub(crate) struct UserSession {
     pub(crate) moderate: bool,
     /// See [`AttachInfo::can_spam`].
     pub(crate) can_spam: bool,
+    /// See [`AttachInfo::manage_rooms`].
+    pub(crate) manage_rooms: bool,
+    /// See [`AttachInfo::set_subject`].
+    pub(crate) set_subject: bool,
     /// What this session has spent of its flood allowances.
     pub(crate) flood: crate::limits::Flood,
     /// And of its voice signaling allowances (`crate::voice`).
@@ -845,6 +862,13 @@ pub struct AttachInfo {
     /// account's `[extra] can_spam`, mhxd's, which defaults to the kick
     /// bit.
     pub can_spam: bool,
+    /// May this session make, change and archive rooms, and see, join and
+    /// send in every one (`docs/chat-rooms.md` §5)? The account's
+    /// `[extra] manage_rooms`.
+    pub manage_rooms: bool,
+    /// May this session set a subject or a topic? The account's `[extra]
+    /// set_subject`. The frontends hold the lobby's to it themselves.
+    pub set_subject: bool,
     /// Is exactly one person behind this account? [`Account::is_person`]:
     /// what news records authorship against, independent of `has_inbox`.
     ///
@@ -955,8 +979,17 @@ pub(crate) struct RosterInner {
     pub(crate) ghosts: HashMap<Uid, crate::server_link::Ghost>,
     pub(crate) feed: crate::server_link::Feed,
     last_serial: u64,
-    pub(crate) public_subject: String,
+    pub(crate) lobby_topic: crate::rooms::Topic,
     pub(crate) chats: HashMap<u32, PrivateChat>,
+    /// Every room the rooms file holds, archived rooms and tombstones
+    /// included, with its members (`crate::rooms`).
+    pub(crate) rooms: HashMap<u32, crate::rooms::RoomEntry>,
+    /// Ids no chat or room may be given: every room's, the file's or one
+    /// drawn for a room still being written, and every channel the log
+    /// had lines in at startup, so a room never inherits another's lines.
+    pub(crate) taken_ids: HashSet<u32>,
+    /// The newest line in each channel, 0 the lobby's.
+    pub(crate) last_ids: HashMap<u32, crate::history::LineId>,
     pub(crate) voice: crate::voice::VoiceState,
 }
 
@@ -1014,12 +1047,20 @@ impl RosterInner {
             let mut raw = [0u8; 4];
             getrandom::getrandom(&mut raw).ok()?;
             let cid = u32::from_be_bytes(raw);
-            // 0 is the public chat and never appears in the registry.
-            if cid != 0 && !self.chats.contains_key(&cid) {
+            if self.chat_id_free(cid) {
                 return Some(cid);
             }
         }
         None
+    }
+
+    /// May `cid` be given to a new chat or room? Not 0, the public chat,
+    /// nor any id a chat or room holds or has held (`taken_ids`).
+    pub(crate) fn chat_id_free(&self, cid: u32) -> bool {
+        cid != 0
+            && !self.chats.contains_key(&cid)
+            && !self.rooms.contains_key(&cid)
+            && !self.taken_ids.contains(&cid)
     }
 
     pub(crate) fn send_to(&mut self, uid: Uid, ev: Event) {
@@ -1101,6 +1142,7 @@ impl RosterInner {
         // that has nothing to do with the chat rooms below.
         self.voice_part(uid);
         crate::Core::leave_all_chats(self, uid);
+        self.room_leave_all(uid);
         let Some(sess) = self.users.remove(&uid) else {
             return;
         };
@@ -1320,6 +1362,8 @@ pub struct Core {
     pub(crate) log_serial: TimedMutex<LogSerial>,
     /// Public lines waiting to be committed together (`crate::chat`).
     pub(crate) chat_commit: crate::chat::ChatCommit,
+    /// The rooms file, and each room's commit queue (`crate::rooms`).
+    pub(crate) room_state: crate::rooms::RoomState,
     /// Where acts on a ghost go (`crate::server_link`), once a link hub
     /// has started.
     pub(crate) peer_router: std::sync::OnceLock<Arc<dyn crate::server_link::PeerRouter>>,
@@ -1372,6 +1416,8 @@ pub struct Census {
     pub buffered_max: usize,
     /// Private chat rooms open.
     pub chats: usize,
+    /// Rooms neither archived nor deleted.
+    pub rooms: usize,
     /// Other servers' users shown here, those an interrupted link holds
     /// included.
     pub ghosts: usize,
@@ -1793,6 +1839,8 @@ impl Core {
                 set_avatar: info.set_avatar,
                 moderate: info.moderate,
                 can_spam: info.can_spam,
+                manage_rooms: info.manage_rooms,
+                set_subject: info.set_subject,
                 flood: Default::default(),
                 voice_flood: Default::default(),
                 requests: crate::RateBucket::new(
@@ -2047,6 +2095,7 @@ impl Core {
         let r = self.roster.lock().unwrap();
         let mut c = Census {
             chats: r.chats.len(),
+            rooms: r.room_count(),
             ghosts: r.ghosts.len(),
             ..Census::default()
         };
@@ -2204,7 +2253,7 @@ impl Core {
 
     /// The public chat subject.
     pub fn public_subject(&self) -> String {
-        self.roster.lock().unwrap().public_subject.clone()
+        self.roster.lock().unwrap().lobby_topic.text.clone()
     }
 }
 
@@ -2257,6 +2306,8 @@ pub(crate) fn test_attach(core: &Core, nick: &str, access: AccessBits) -> (Uid, 
             set_avatar: false,
             moderate: false,
             can_spam: false,
+            manage_rooms: false,
+            set_subject: false,
             is_person: false,
             reads_on_delivery: false,
             identity: None,
@@ -2333,6 +2384,8 @@ mod tests {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person: true,
                 reads_on_delivery: false,
                 identity: None,
@@ -2415,6 +2468,8 @@ mod tests {
                 set_avatar: false,
                 moderate: false,
                 can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
                 is_person: false,
                 reads_on_delivery: false,
                 identity: None,

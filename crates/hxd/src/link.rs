@@ -274,8 +274,10 @@ fn read_state(path: &std::path::Path) -> Result<LinkState, String> {
 }
 
 /// Replace `path` whole, so a reader never sees half of it.
-fn write_whole(path: &std::path::Path, text: &str) -> Result<(), String> {
-    let tmp = path.with_extension("tmp");
+pub(crate) fn write_whole(path: &std::path::Path, text: &str) -> Result<(), String> {
+    // Per process: the server and `hxd` beside it may write one file at
+    // once, and neither may rename the other's half-written one.
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&tmp, text)
         .and_then(|()| std::fs::rename(&tmp, path))
         .map_err(|e| format!("{}: {e}", path.display()))

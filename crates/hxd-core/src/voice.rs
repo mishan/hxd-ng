@@ -875,9 +875,17 @@ impl Core {
             return Err(VoiceError::NotAMember);
         }
         // Room membership, which the access bit does not cover: the
-        // public chat is open to anyone, a private chat's voice room
-        // only to that chat's current members.
-        if cid != 0 {
+        // public chat is open to anyone, a room's voice room and a private
+        // chat's only to its current members, and a room the user may not
+        // see is a chat that does not exist (docs/chat-rooms.md §9).
+        if let Some(entry) = r.rooms.get(&cid) {
+            if !crate::rooms::sees(&r.users[&uid], &entry.room) {
+                return Err(VoiceError::NoSuchChat);
+            }
+            if !entry.members.contains(&uid) {
+                return Err(VoiceError::NotAMember);
+            }
+        } else if cid != 0 {
             let chat = r.chats.get(&cid).ok_or(VoiceError::NoSuchChat)?;
             if !chat.members.contains(&uid) {
                 return Err(VoiceError::NotAMember);

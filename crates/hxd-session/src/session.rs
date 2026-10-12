@@ -1162,6 +1162,7 @@ fn err_text(e: ChatError) -> &'static str {
         // a send cannot be used to test whether a handle exists.
         ChatError::NoSuchMedia => "Media rejected",
         ChatError::Flooding => "You were kicked for flooding.",
+        ChatError::ReadOnly => "That room is read-only.",
         ChatError::ServerError => "Server error.",
     }
 }
@@ -2438,6 +2439,8 @@ async fn login_phase(
         set_avatar: account.set_avatar,
         moderate: account.moderate,
         can_spam: account.can_spam,
+        manage_rooms: account.manage_rooms,
+        set_subject: account.set_subject,
         is_person: account.is_person(),
         // This wire has no `msg_read` and never will — a private message
         // is a window that opens and nothing comes back — so handing one
@@ -3018,6 +3021,10 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         // transaction to unsend it (moderation.md §6). History (700)
         // shows the tombstone, which is what a capable client reads.
         Event::ChatRedacted { .. } | Event::ChatPurged { .. } => {}
+        // A period client is shown a room as a private chat it was
+        // invited to (docs/chat-rooms.md §6), which this wire does not
+        // do yet: nothing about a room may pass for a private chat.
+        Event::InRoom { .. } => {}
         // A report reaches a legacy moderator as a private message from
         // the system account (moderation.md §4.5): a window that opens,
         // and nothing a period client has to understand beyond that.
@@ -3292,7 +3299,7 @@ async fn public_chat(
         return;
     }
     let from = sess.uid;
-    let Some(results) = off_reactor(&ctx.core, move |c| c.chat_public_all(from, lines)).await
+    let Some(results) = off_reactor(&ctx.core, move |c| c.chat_public_all(from, 0, lines)).await
     else {
         return;
     };
