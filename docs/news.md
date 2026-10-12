@@ -1737,10 +1737,9 @@ Three floors sit under it:
   as stated silences a scope until `news_seen`, and a client that never
   calls it — a push-only endpoint, a client with its badge hidden, a
   legacy client once §10.11's digest exists — would be told about a
-  scope exactly once for the life of the subscription
-  (hxd-ng-design-review-2026-09.md §5.1). So a subscriber who has been
-  un-caught-up for longer than `stale_after` is **treated as caught up
-  for the purpose of the rule**, and the post rings. "How long" is
+  scope exactly once for the life of the subscription. So a subscriber
+  who has been un-caught-up for longer than `stale_after` is **treated
+  as caught up for the purpose of the rule**, and the post rings. "How long" is
   measured from the oldest unread article in the scope, which the
   audience scan already reads, and it is asked in units of
   `stale_after`: the post rings if that age has crossed a multiple of

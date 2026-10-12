@@ -526,8 +526,8 @@ handle that never existed, is **404**, one answer, the spec's
 non-distinguishing rule in HTTP's own words. A handle that *was* the
 caller's and is gone — swept at `handle_ttl`, evicted under
 `max_total_bytes` (§4), or revoked — is **410 Gone**, so a client can
-render "expired" rather than "forbidden". *(Decided 2026-09 from the
-design review's §5.3; not yet in code, which answers 404 for both.)*
+render "expired" rather than "forbidden". *(Decided 2026-09; not yet
+in code, which answers 404 for both.)*
 This narrows the spec's "never distinguish expired from unauthorized"
 deliberately: the spec lets a server delete early, and a handle it
 deleted is one it may say it deleted — to the people who could have
