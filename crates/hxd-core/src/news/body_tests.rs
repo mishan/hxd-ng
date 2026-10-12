@@ -63,6 +63,7 @@ fn server_with(policy: NewsPolicy, renderer: Option<Arc<Fake>>) -> (Core, Uid, N
     }
     let (uid, _rx) = core
         .attach(AttachInfo {
+            account: None,
             nick: "alice".into(),
             icon: 1,
             admin: false,

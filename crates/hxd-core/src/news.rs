@@ -2700,6 +2700,7 @@ mod tests {
     ) -> Uid {
         let (uid, _rx) = core
             .attach(AttachInfo {
+                account: None,
                 nick: login.to_string(),
                 icon: 1,
                 admin: false,

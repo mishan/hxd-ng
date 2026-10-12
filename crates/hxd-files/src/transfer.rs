@@ -1353,6 +1353,7 @@ mod tests {
     fn attach(core: &Core) -> FilePrincipal {
         let (uid, _events) = core
             .attach(AttachInfo {
+                account: None,
                 nick: "reader".into(),
                 icon: 0,
                 admin: false,

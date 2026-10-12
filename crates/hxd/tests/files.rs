@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hxd_core::{Core, FileSource};
+use hxd_core::{Core, DenyMask, FileSource};
 use hxd_files::{
     DownloadTokens, EntryLimits, FileService, HttpManifestSource, HtxfTimeouts, LocalFileSource,
     LocalLimits, ManifestLimits, TransferRegistry,
@@ -1107,6 +1107,54 @@ async fn listing_and_get_info_are_separate_extras() {
     assert_eq!(listed["error"]["code"], "access_denied");
     let answer = ng_request(&mut ws, 3, "files_info", json!({"path": "hello.txt"})).await;
     assert!(answer.get("ok").is_some(), "{answer}");
+}
+
+#[tokio::test]
+async fn a_resumed_session_reads_its_extras_again_under_its_mask() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = Arc::new(LocalFileSource::open(temp.path(), LocalLimits::default()).unwrap());
+    let service = Arc::new(FileService::new(
+        source.clone(),
+        Some(source),
+        transfers(),
+        downloads(),
+        IDLE,
+    ));
+    let core = Arc::new(Core::new());
+    let server = run_service_with(service, "read_chat = true\n", core.clone()).await;
+    let url = format!("ws://{}/", server.ng);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let login = ng_request(
+        &mut ws,
+        1,
+        "login",
+        json!({"login": "browser", "password": "pw", "nick": "Browser"}),
+    )
+    .await;
+    let listed = ng_request(&mut ws, 2, "files_list", json!({})).await;
+    assert!(listed.get("ok").is_some(), "{listed}");
+    let uid = login["ok"]["self"]["uid"].as_u64().unwrap() as u16;
+    let mut mask = DenyMask::default();
+    mask.extra.file_list = true;
+    assert!(core.set_session_mask(uid, mask));
+    let (session, token) = (
+        login["ok"]["session"].as_str().unwrap().to_owned(),
+        login["ok"]["token"].as_str().unwrap().to_owned(),
+    );
+    drop(ws);
+    // From before the mask's account_changed, so nothing is replayed and
+    // only the resume's own read of the account can refuse.
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let resumed = ng_request(
+        &mut ws,
+        1,
+        "resume",
+        json!({"session": session, "token": token, "last_seq": 0}),
+    )
+    .await;
+    assert_eq!(resumed["error"]["code"], "resync_required", "{resumed}");
+    let listed = ng_request(&mut ws, 2, "files_list", json!({})).await;
+    assert_eq!(listed["error"]["code"], "access_denied", "{listed}");
 }
 
 #[tokio::test]

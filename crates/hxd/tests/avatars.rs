@@ -883,6 +883,7 @@ async fn an_identitys_avatar_is_pruned_from_the_database_once_it_stops_coming_ba
     let join = |login: &str, is_person: bool, identity: Option<[u8; 32]>| {
         let (uid, _rx) = core
             .attach(AttachInfo {
+                account: None,
                 nick: login.into(),
                 icon: 1,
                 admin: false,

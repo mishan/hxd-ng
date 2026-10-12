@@ -141,6 +141,7 @@ fn guest() -> Who {
 fn attach(core: &Core, who: Who) -> (Uid, Events) {
     let (uid, rx) = core
         .attach(AttachInfo {
+            account: None,
             nick: who.login.to_uppercase(),
             icon: 1,
             admin: who.moderate,

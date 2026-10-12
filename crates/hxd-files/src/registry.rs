@@ -1176,6 +1176,7 @@ mod tests {
     fn attach(core: &Core, login: &str) -> FilePrincipal {
         let (uid, _events) = core
             .attach(AttachInfo {
+                account: None,
                 nick: login.into(),
                 icon: 0,
                 admin: false,

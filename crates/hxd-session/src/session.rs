@@ -2425,6 +2425,7 @@ async fn login_phase(
     };
 
     let attach = AttachInfo {
+        account: Some(Box::new(account.clone())),
         nick,
         icon: req.icon,
         admin: account.access.has(bit::DISCONNECT_USERS),

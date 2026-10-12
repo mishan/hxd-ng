@@ -1219,6 +1219,7 @@ mod tests {
         let mut feed = core.peer_feed(16);
         let (ann, mut rx) = core
             .attach(crate::roster::AttachInfo {
+                account: None,
                 nick: "ann".into(),
                 icon: 1,
                 admin: false,
@@ -1290,6 +1291,7 @@ mod tests {
         );
         let (ann, _rx) = core
             .attach(crate::roster::AttachInfo {
+                account: None,
                 nick: "ann".into(),
                 icon: 1,
                 admin: false,

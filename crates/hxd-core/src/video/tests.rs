@@ -998,6 +998,7 @@ fn losing_the_connection_ends_the_publication_even_though_the_session_lives() {
     let (core, media) = videoed();
     let (a, mut rx_a) = core
         .attach(crate::AttachInfo {
+            account: None,
             nick: "mobile".into(),
             icon: 1,
             admin: false,

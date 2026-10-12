@@ -13,7 +13,7 @@
 //! password hashing arrives with the Hotline-ng protocol and applies only
 //! to accounts that opt out of legacy access.
 
-use crate::access::AccessBits;
+use crate::access::{bit, AccessBits};
 
 /// A resolved account: what the auth backend hands the session layer after
 /// a successful authentication.
@@ -82,9 +82,65 @@ pub struct Account {
     /// [`crate::inbox::Mailbox`]: a login can be renamed and
     /// re-registered, a fingerprint cannot.
     pub identity: IdentityLink,
+    /// What the fields above were derived from, kept so a session's mask
+    /// can derive them again rather than mask what has derived already.
+    pub config: AccountConfig,
 }
 
 impl Account {
+    /// An account as `config` resolves for it, with nothing masked.
+    pub fn new(
+        login: String,
+        name: String,
+        has_password: bool,
+        identity: IdentityLink,
+        config: AccountConfig,
+    ) -> Self {
+        let mut account = Account {
+            login,
+            name,
+            access: AccessBits::empty(),
+            can_detach: false,
+            set_subject: false,
+            file_list: false,
+            file_getinfo: false,
+            has_password,
+            has_inbox: false,
+            attach_news: false,
+            set_avatar: false,
+            moderate: false,
+            can_spam: false,
+            identity,
+            config,
+        };
+        account.derive(&DenyMask::default());
+        account
+    }
+
+    /// This account as a session under `mask` has it. With nothing
+    /// masked it is the account as it reads.
+    pub fn masked(&self, mask: &DenyMask) -> Account {
+        let mut account = self.clone();
+        if *mask != DenyMask::default() {
+            account.derive(mask);
+        }
+        account
+    }
+
+    fn derive(&mut self, mask: &DenyMask) {
+        let (access, x) = self.config.derive(self.is_person(), mask);
+        self.access = access;
+        self.can_detach = x.can_detach;
+        self.set_subject = x.set_subject;
+        self.has_inbox = x.inbox;
+        self.file_list = x.file_list;
+        self.file_getinfo = x.file_getinfo;
+        self.attach_news = x.attach_news;
+        self.set_avatar = x.set_avatar;
+        self.moderate = x.moderate;
+        self.can_spam = x.can_spam;
+    }
+
     /// Is exactly one person behind this account — a password, or a
     /// linked identity? The rule `has_inbox` defaults to, but a fact
     /// about the account rather than a switch an operator can flip: it
@@ -93,6 +149,90 @@ impl Account {
     /// nobody's, nor turning it on for `guest` make them everybody's.
     pub fn is_person(&self) -> bool {
         self.has_password || self.identity.fingerprint.is_some()
+    }
+}
+
+/// One value per `[extra]` key (`docs/access-bits.md` §4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Extras<T> {
+    pub can_detach: T,
+    pub set_subject: T,
+    pub inbox: T,
+    pub file_list: T,
+    pub file_getinfo: T,
+    pub attach_news: T,
+    pub set_avatar: T,
+    pub moderate: T,
+    pub can_spam: T,
+}
+
+/// What an account's files say, before any default derives: the
+/// configuration half of `docs/roles.md` §3.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountConfig {
+    /// Every bit granted, before bit 56 follows bit 9.
+    pub access: AccessBits,
+    /// Was bit 56 named, either way? Only then does it not follow bit 9.
+    pub history_named: bool,
+    /// Each `[extra]` key as named, `None` where it is left to derive.
+    pub extra: Extras<Option<bool>>,
+}
+
+/// What a session is denied whatever its account says: probation's and
+/// restrictions' half of `docs/roles.md` §3. It only ever takes away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DenyMask {
+    pub access: AccessBits,
+    pub extra: Extras<bool>,
+}
+
+impl AccountConfig {
+    /// The access bits and `[extra]` keys this configuration resolves to
+    /// under `mask`, for an account that is one person (`person`, see
+    /// [`Account::is_person`]) or not.
+    ///
+    /// Defaults derive after the mask, so a denied bit leaves nothing
+    /// derived from it behind; and a denied bit takes what derives from
+    /// it even where the configuration named that, since otherwise a
+    /// mask would mean less on an account whose file spelled it out.
+    pub fn derive(&self, person: bool, mask: &DenyMask) -> (AccessBits, Extras<bool>) {
+        let denied = |b| mask.access.has(b);
+        let mut access = AccessBits::from_raw(self.access.raw() & !mask.access.raw());
+        // fogWraith's fallback: on an access system where bit 56 has not
+        // been assigned explicitly, history follows ordinary read-chat.
+        if !self.history_named && access.has(bit::READ_CHAT) {
+            access = access.with(bit::CHAT_HISTORY);
+        }
+        if denied(bit::READ_CHAT) || denied(bit::CHAT_HISTORY) {
+            access = access.without(bit::CHAT_HISTORY);
+        }
+        let kick = access.has(bit::DISCONNECT_USERS);
+        let unkick = denied(bit::DISCONNECT_USERS);
+        let media = access.has(bit::SEND_MEDIA);
+        let (x, m) = (&self.extra, &mask.extra);
+        let key =
+            |named: Option<bool>, default: bool, masked: bool| !masked && named.unwrap_or(default);
+        let extras = Extras {
+            // A password makes an account a person rather than a door,
+            // and so does a linked identity: `guest` is one login many
+            // people share, so detaching, mail and an avatar are each
+            // handed to whoever walks through it next.
+            can_detach: key(x.can_detach, person, m.can_detach),
+            inbox: key(x.inbox, person, m.inbox),
+            set_avatar: key(x.set_avatar, person, m.set_avatar),
+            // mhxd's, on for every account that does not turn it off.
+            file_list: key(x.file_list, true, m.file_list),
+            file_getinfo: key(x.file_getinfo, true, m.file_getinfo),
+            set_subject: key(x.set_subject, kick, m.set_subject || unkick),
+            moderate: key(x.moderate, kick, m.moderate || unkick),
+            can_spam: key(x.can_spam, kick, m.can_spam || unkick),
+            attach_news: key(
+                x.attach_news,
+                media,
+                m.attach_news || denied(bit::SEND_MEDIA),
+            ),
+        };
+        (access, extras)
     }
 }
 
@@ -451,5 +591,102 @@ pub trait AccountDirectory: Send + Sync + 'static {
         let mailbox = crate::inbox::Mailbox::identified(String::new(), *fingerprint);
         let access = self.mailbox_access(&mailbox)?;
         Some((mailbox, access))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot<'a, T>(x: &'a mut Extras<T>, key: &str) -> &'a mut T {
+        match key {
+            "attach_news" => &mut x.attach_news,
+            "moderate" => &mut x.moderate,
+            "can_spam" => &mut x.can_spam,
+            "set_subject" => &mut x.set_subject,
+            _ => unreachable!("{key}"),
+        }
+    }
+
+    fn bits(bits: &[u8]) -> AccessBits {
+        bits.iter().fold(AccessBits::empty(), |a, b| a.with(*b))
+    }
+
+    /// The key, the bits granted, the key as named, the bits denied,
+    /// whether the key is denied, and what the key resolves to.
+    type Row = (
+        &'static str,
+        &'static [u8],
+        Option<bool>,
+        &'static [u8],
+        bool,
+        bool,
+    );
+
+    #[test]
+    fn defaults_derive_after_the_mask_and_a_denial_takes_what_derives_from_it() {
+        const HISTORY: &str = "read_chat_history";
+        use bit::{DISCONNECT_USERS as KICK, READ_CHAT as READ, SEND_MEDIA as MEDIA};
+        let mut rows: Vec<Row> = vec![
+            (HISTORY, &[READ], None, &[], false, true),
+            (HISTORY, &[READ], None, &[READ], false, false),
+            (HISTORY, &[READ], None, &[], true, false),
+            (HISTORY, &[READ], Some(false), &[], false, false),
+            (HISTORY, &[READ], Some(true), &[], false, true),
+            (HISTORY, &[READ], Some(true), &[READ], false, false),
+            (HISTORY, &[], Some(true), &[], false, true),
+            (HISTORY, &[], None, &[], false, false),
+            ("attach_news", &[MEDIA], None, &[], false, true),
+            ("attach_news", &[MEDIA], None, &[MEDIA], false, false),
+            ("attach_news", &[MEDIA], None, &[], true, false),
+            ("attach_news", &[MEDIA], Some(false), &[], false, false),
+            ("attach_news", &[], Some(true), &[], false, true),
+            ("attach_news", &[], Some(true), &[MEDIA], false, false),
+            ("attach_news", &[], None, &[], false, false),
+        ];
+        for key in ["moderate", "can_spam", "set_subject"] {
+            rows.extend([
+                (key, &[KICK][..], None, &[][..], false, true),
+                (key, &[KICK], None, &[KICK], false, false),
+                (key, &[KICK], None, &[], true, false),
+                (key, &[KICK], Some(false), &[], false, false),
+                (key, &[], Some(true), &[], false, true),
+                (key, &[], Some(true), &[KICK], false, false),
+                (key, &[], Some(true), &[], true, false),
+                (key, &[], None, &[KICK], false, false),
+            ]);
+        }
+        for (key, granted, named, denied, key_denied, want) in rows {
+            let mut config = AccountConfig {
+                access: bits(granted),
+                ..Default::default()
+            };
+            let mut mask = DenyMask {
+                access: bits(denied),
+                ..Default::default()
+            };
+            if key == HISTORY {
+                config.history_named = named.is_some();
+                if named == Some(true) {
+                    config.access = config.access.with(bit::CHAT_HISTORY);
+                }
+                if key_denied {
+                    mask.access = mask.access.with(bit::CHAT_HISTORY);
+                }
+            } else {
+                *slot(&mut config.extra, key) = named;
+                *slot(&mut mask.extra, key) = key_denied;
+            }
+            let (access, mut extras) = config.derive(false, &mask);
+            let got = if key == HISTORY {
+                access.has(bit::CHAT_HISTORY)
+            } else {
+                *slot(&mut extras, key)
+            };
+            assert_eq!(
+                got, want,
+                "{key}: granted {granted:?}, named {named:?}, denied {denied:?}, key denied {key_denied}"
+            );
+        }
     }
 }

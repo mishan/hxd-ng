@@ -423,9 +423,10 @@ pub enum Event {
     /// The recipient has been kicked; its transport should close.
     Kicked,
     /// An administrator changed the account this session is logged in
-    /// as (`Core::account_write`): the account as it now reads, for a
-    /// frontend that keeps its own copy of what the session may do. The
-    /// roster's copy has already changed.
+    /// as (`Core::account_write`), or its mask changed
+    /// (`Core::set_session_mask`): the account as the session now has
+    /// it, for a frontend that keeps its own copy of what the session may
+    /// do. The roster's copy has already changed.
     AccountChanged(Box<crate::Account>),
     /// A public line was redacted (`docs/moderation.md` §3.1). Delivered
     /// to every session that reads public chat; a client that rendered
@@ -811,6 +812,11 @@ pub(crate) struct UserSession {
     /// The avatar `info.avatar` describes, with its bytes.
     pub(crate) avatar: Option<crate::avatar::Avatar>,
     pub(crate) outbox: Outbox,
+    /// See [`AttachInfo::account`].
+    pub(crate) account: Option<Box<crate::Account>>,
+    /// What this session is denied whatever its account says
+    /// ([`Core::set_session_mask`]).
+    pub(crate) mask: crate::DenyMask,
 }
 
 /// What a transport hands the roster at login.
@@ -876,6 +882,11 @@ pub struct AttachInfo {
     /// admits a session to an account only when the account is linked to
     /// that identity or is unlinked.
     pub identity: Option<[u8; 32]>,
+    /// The account as it read at login, unmasked: what the fields above
+    /// are derived again from when the session's mask changes. `None`
+    /// for a session with no account file behind it, which can be given
+    /// no mask.
+    pub account: Option<Box<crate::Account>>,
 }
 
 /// The outcome of a [`Core::resume`].
@@ -1800,6 +1811,8 @@ impl Core {
                 visible: false,
                 avatar: None,
                 outbox: Outbox::live(tx, conn),
+                account: info.account,
+                mask: Default::default(),
             },
         );
         Some((uid, rx))
@@ -2230,6 +2243,7 @@ pub(crate) fn is_live(sess: &UserSession) -> bool {
 pub(crate) fn test_attach(core: &Core, nick: &str, access: AccessBits) -> (Uid, Events) {
     let (uid, rx) = core
         .attach(AttachInfo {
+            account: None,
             nick: nick.to_string(),
             icon: 1,
             admin: false,
@@ -2303,6 +2317,7 @@ mod tests {
     fn ng_attach(core: &Core, nick: &str, addr: &str) -> (Uid, Events) {
         let (uid, rx) = core
             .attach(AttachInfo {
+                account: None,
                 nick: nick.to_string(),
                 icon: 1,
                 admin: false,
@@ -2386,6 +2401,7 @@ mod tests {
         let (_a, mut rx_a) = test_attach(&core, "alice", AccessBits::empty());
         let (b, _rx_b) = core
             .attach(AttachInfo {
+                account: None,
                 nick: "ghost".into(),
                 icon: 2,
                 admin: false,

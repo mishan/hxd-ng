@@ -2978,6 +2978,7 @@ mod tests {
         let core = Core::new().with_flood_limits(flood_limits());
         let (talker, mut rx_t) = core
             .attach(crate::AttachInfo {
+                account: None,
                 nick: "talker".into(),
                 icon: 1,
                 admin: false,
@@ -3050,6 +3051,7 @@ mod tests {
             folders_per: Duration::from_secs(60),
         });
         let who = |login: &str, can_spam: bool, is_person: bool| crate::AttachInfo {
+            account: None,
             nick: login.into(),
             icon: 1,
             admin: false,
@@ -3138,6 +3140,7 @@ mod tests {
         let shared: IpAddr = "127.0.0.1".parse().unwrap();
         let attach = |login: &str, is_person: bool| {
             core.attach(crate::AttachInfo {
+                account: None,
                 nick: login.into(),
                 icon: 1,
                 admin: false,
@@ -3202,6 +3205,7 @@ mod tests {
         let shared: IpAddr = "127.0.0.1".parse().unwrap();
         let attach = |login: &str, moderate: bool| {
             core.attach(crate::AttachInfo {
+                account: None,
                 nick: login.into(),
                 icon: 1,
                 admin: false,
@@ -3282,6 +3286,7 @@ mod tests {
         );
         let attach = |login: &str, addr: &str| {
             core.attach(crate::AttachInfo {
+                account: None,
                 nick: login.into(),
                 icon: 1,
                 admin: false,
@@ -3341,6 +3346,7 @@ mod tests {
         );
         let attach = |login: &str, is_person: bool, identity, addr: &str| {
             core.attach(crate::AttachInfo {
+                account: None,
                 nick: login.into(),
                 icon: 1,
                 admin: false,
@@ -3721,6 +3727,7 @@ mod inbox_tests {
     ) -> (Uid, Events) {
         let (uid, rx) = core
             .attach(AttachInfo {
+                account: None,
                 nick: login.to_string(),
                 icon: 1,
                 admin: false,
@@ -3749,6 +3756,7 @@ mod inbox_tests {
     pub(super) fn attach(core: &Core, login: &str, has_inbox: bool) -> (Uid, Events) {
         let (uid, rx) = core
             .attach(AttachInfo {
+                account: None,
                 nick: login.to_string(),
                 icon: 1,
                 admin: false,
@@ -4618,6 +4626,7 @@ mod inbox_tests {
         let (m, _rm) = attach(&core, "dave", true);
         let (g, _rg) = core
             .attach(AttachInfo {
+                account: None,
                 nick: "drifter".into(),
                 icon: 1,
                 admin: false,
@@ -4661,6 +4670,7 @@ mod inbox_tests {
         let (m, _rm) = attach(&core, "dave", true);
         let (g, _rg) = core
             .attach(AttachInfo {
+                account: None,
                 nick: "drifter".into(),
                 icon: 1,
                 admin: false,

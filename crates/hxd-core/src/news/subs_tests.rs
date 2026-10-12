@@ -147,6 +147,7 @@ impl Server {
         let (uid, rx) = self
             .core
             .attach(AttachInfo {
+                account: None,
                 nick: login.to_string(),
                 icon: 1,
                 admin: false,

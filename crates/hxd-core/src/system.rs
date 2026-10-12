@@ -124,6 +124,7 @@ impl Core {
         let system = self.system.as_ref()?;
         let uid = self
             .attach(AttachInfo {
+                account: None,
                 nick: system.policy.nick.clone(),
                 icon: system.policy.icon,
                 // A 1.x user list draws an admin in red, which is the
@@ -594,6 +595,7 @@ mod tests {
             let (uid, rx) = self
                 .core
                 .attach(AttachInfo {
+                    account: None,
                     nick: login.to_string(),
                     icon: 1,
                     admin: false,
@@ -847,6 +849,7 @@ mod tests {
         let (carol, mut carol_rx) = s
             .core
             .attach(AttachInfo {
+                account: None,
                 nick: "carol".into(),
                 icon: 1,
                 admin: true,

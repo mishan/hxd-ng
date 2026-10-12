@@ -14,6 +14,7 @@ fn core_with(policy: NewsPolicy) -> Core {
 fn editor(core: &Core) -> Uid {
     let (uid, _rx) = core
         .attach(AttachInfo {
+            account: None,
             nick: "Editor".into(),
             icon: 1,
             admin: false,

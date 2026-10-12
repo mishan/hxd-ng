@@ -73,6 +73,13 @@ Three rules worth knowing:
   `read_chat_history` nor `chat_history` and grants `read_chat`, bit 56
   is set too — fogWraith's rule for an access system that predates the
   allocation. An explicit key, either way, wins.
+- **Defaults derive after a session's mask.** A session can be denied
+  bits and `[extra]` keys whatever its account says (`DenyMask`, the
+  probation mask of §5), and a denied bit takes what derives from it
+  even where the file named that: denying `read_chat` takes bit 56,
+  `send_media` takes `attach_news`, and `disconnect_users` takes
+  `moderate`, `can_spam` and `set_subject`. Account edits and SIGHUP
+  derive again under the mask rather than washing it out.
 
 ---
 
@@ -211,7 +218,9 @@ belongs in `[extra]`, which costs no wire vocabulary at all.
 mhxd's `access_extra` concept. These are per-account decisions with no
 bit and no client-visible representation, which is exactly why they are
 here and not in the bitmap. Every one of them is optional, and an absent
-key derives a default rather than being false.
+key derives a default rather than being false: from the bits a session's
+mask leaves (§1), and never past a mask that denies the key or the bit
+it derives from.
 
 | `[extra]` key | Meaning | Default when absent |
 |---|---|---|
@@ -258,7 +267,13 @@ account for which the state is intended.
 §4's `[extra]` tables, validated against the same table as an account
 file; a session on probation has its resolved access masked by it, and
 a key absent from the mask leaves that permission as the account has
-it. *Design, with the registrar.*
+it. It is a session mask as §1 describes, so what derives from a key it
+denies is denied too. It must be in force from the login reply itself,
+carried in at attach rather than sent after it as an account change. And
+an account write by a session on probation must judge what it grants
+against the actor's masked access, so probation cannot grant another
+account what it denies, while whom the session may touch is still judged
+unmasked. *Design, with the registrar.*
 
 ---
 
@@ -286,7 +301,8 @@ is a startup error rather than a surprise later. It has no effect unless
 | | |
 |---|---|
 | `crates/hxd-core/src/access.rs` | `AccessBits`, the `bit` constants, the wire round-trip, the tests that pin the numbering |
-| `crates/hxd-auth-file/src/lib.rs` | `NAMED_BITS`, the `[access]`/`[extra]`/`[identity]` tables, the bit-56 fallback, the guest bootstrap |
+| `crates/hxd-core/src/account.rs` | `AccountConfig::derive`: the bit-56 fallback, the `[extra]` defaults and a session's mask, in one place |
+| `crates/hxd-auth-file/src/lib.rs` | `named_bit` over `hxd_core::access::NAMES`, the `[access]`/`[extra]`/`[identity]` tables, the guest bootstrap |
 | `crates/hxd-session/src/session.rs` | Legacy-wire gates, and `SELFINFO`'s real bitmap |
 | `crates/hxd-ng-session/src/conn.rs` | ng gates, all answering `access_denied` |
 | `crates/hxd-session/src/file_manage.rs`, `crates/hxd-ng-session/src/files.rs` | The file-management bits, one per kind of entry, on each wire |

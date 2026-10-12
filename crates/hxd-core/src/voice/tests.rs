@@ -630,6 +630,7 @@ fn losing_the_connection_leaves_voice_even_when_the_session_survives() {
     let (a, mut rx_a) = quiet(&core, "alice");
     let (b, _rx_b) = core
         .attach(crate::AttachInfo {
+            account: None,
             nick: "mobile".into(),
             icon: 1,
             admin: false,
@@ -682,6 +683,7 @@ fn the_departure_from_voice_is_waiting_in_the_replay_tail() {
     let (a, _rx_a) = quiet(&core, "alice");
     let (b, mut rx_b) = core
         .attach(crate::AttachInfo {
+            account: None,
             nick: "mobile".into(),
             icon: 1,
             admin: false,
