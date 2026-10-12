@@ -29,6 +29,7 @@ const REQ_LOGIN: u32 = 0x6b;
 const REQ_CHAT: u32 = 0x69;
 const REQ_MSG: u32 = 0x6c;
 const HDR_MSG: u32 = 0x68;
+const HDR_CHAT_SUBJECT: u32 = 0x77;
 
 async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, NgCtx) {
     let accounts = dir.join("accounts");
@@ -579,6 +580,64 @@ async fn a_nick_without_use_any_name_is_refused() {
     assert_eq!(v["error"]["code"], "access_denied", "{v}");
     let v = c.request("nick", json!({ "icon": 7 })).await;
     assert!(v["ok"].is_object(), "an icon alone needs no privilege: {v}");
+}
+
+#[tokio::test]
+async fn room_topic_sets_the_lobby_subject_on_both_wires() {
+    let td = tempfile::tempdir().unwrap();
+    let (legacy_addr, ng_addr, ctx) = start_server(td.path()).await;
+    std::fs::write(
+        td.path().join("accounts/dave.toml"),
+        "name = \"Dave\"\npassword = \"pw\"\n[access]\nread_chat = true\n\
+         [extra]\nset_subject = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        td.path().join("accounts/carol.toml"),
+        "name = \"Carol\"\npassword = \"pw\"\n[access]\nread_chat = true\n",
+    )
+    .unwrap();
+    let mut alice = Legacy::login(legacy_addr, "alice").await;
+    let (mut dave, _) = Ng::login(ng_addr, "dave", "pw", "Dave").await;
+    let (mut carol, _) = Ng::login(ng_addr, "carol", "pw", "Carol").await;
+
+    for (may_set, params, code) in [
+        (false, json!({ "topic": "mine now" }), "access_denied"),
+        (
+            false,
+            json!({ "room": 0, "topic": "mine now" }),
+            "access_denied",
+        ),
+        (
+            true,
+            json!({ "room": 12345, "topic": "elsewhere" }),
+            "no_such_room",
+        ),
+    ] {
+        let who = if may_set { &mut dave } else { &mut carol };
+        let v = who.request("room_topic", params.clone()).await;
+        assert_eq!(v["error"]["code"], code, "{params}: {v}");
+    }
+    assert_eq!(ctx.core.public_subject(), "");
+
+    dave.request_ok("room_topic", json!({ "room": 0, "topic": "welcome" }))
+        .await;
+    let ev = carol.event("subject").await;
+    assert_eq!(ev["data"]["subject"], "welcome");
+    let f = alice.recv_type(HDR_CHAT_SUBJECT).await;
+    assert_eq!(chunk(&f, tag::CHAT_SUBJECT).unwrap(), b"welcome".to_vec());
+
+    // An absent room is the lobby too, and a topic is held to the classic
+    // wire's 255 characters.
+    let long = "\u{e9}".repeat(300);
+    dave.request_ok("room_topic", json!({ "topic": long }))
+        .await;
+    let ev = carol
+        .event_matching("subject", |d| d["subject"] != "welcome")
+        .await;
+    assert_eq!(ev["data"]["subject"].as_str().unwrap().chars().count(), 255);
+    let f = alice.recv_type(HDR_CHAT_SUBJECT).await;
+    assert_eq!(chunk(&f, tag::CHAT_SUBJECT).unwrap().len(), 255);
 }
 
 #[tokio::test]

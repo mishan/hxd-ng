@@ -58,6 +58,15 @@ pub struct NickParams {
     pub icon: Option<u16>,
 }
 
+/// An absent `room` and `room: 0` are both the lobby
+/// (`docs/chat-rooms.md` §7).
+#[derive(Debug, Deserialize)]
+pub struct RoomTopicParams {
+    #[serde(default)]
+    pub room: u32,
+    pub topic: String,
+}
+
 /// A private message names its recipient one of two ways: `to` is a uid
 /// on the roster, `to_login` an account whether or not it holds a session.
 /// Exactly one, and the frontend refuses both or neither rather than
