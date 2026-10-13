@@ -2096,12 +2096,13 @@ A tombstoned article lists as a post with an empty subject, its
 original sender cleared, and one zero-length `text/plain` part, so the
 thread structure a client already drew stays intact.
 
-**No period client renders an image part** — GtkHx's news browser asks
-for `text/plain` and shows text — so this is a capability waiting for a
-client rather than one in use. It is still the right shape: it is what
-the wire was designed for, it costs one extra part in a listing, and
-it means the client work is a client change and not a protocol
-negotiation. §18 has what to raise upstream.
+**GtkHx renders the image part** (mishan/gtkhx#822): its news browser
+fetches the article's first `text/*` part as the text and each PNG,
+JPEG or GIF part as a picture, and shows the pictures below the text. A
+period client asks only for `text/plain` and never sees them. It is the
+right shape: it is what the wire was designed for, it costs one extra
+part in a listing, and the client work was a client change and not a
+protocol negotiation. §18 has what to raise upstream.
 
 ### 12.4 Sizes, and the 65 535 that shows up twice
 
