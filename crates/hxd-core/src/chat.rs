@@ -1252,9 +1252,12 @@ impl Core {
         Ok((cid, me))
     }
 
-    /// Invite `target` to a chat the inviter is in.
+    /// Invite `target` to a chat the inviter is in, or to a room.
     pub fn chat_invite(&self, cid: u32, by: Uid, target: Uid) -> Result<(), ChatError> {
         let mut r = self.roster.lock().unwrap();
+        if r.rooms.contains_key(&cid) {
+            return r.room_invite(cid, by, target);
+        }
         let by_nick = r
             .users
             .get(&by)

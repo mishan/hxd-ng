@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::warn;
 
@@ -185,6 +185,14 @@ pub struct RoomPolicy {
     pub max_rooms: usize,
     /// The lobby's name in listings.
     pub lobby: String,
+    /// Tell a classic session at login that rooms exist (§6.5).
+    pub announce: bool,
+    /// Rooms that notice names before "and n more".
+    pub announce_names: usize,
+    /// The server reports a version below 151, to which a period client
+    /// set to refuse private chat or to answer automatically declines an
+    /// invite by itself (§6.2), so `/join` says what to turn off.
+    pub invites_declined: bool,
 }
 
 impl Default for RoomPolicy {
@@ -193,6 +201,9 @@ impl Default for RoomPolicy {
             max_joined: 32,
             max_rooms: 256,
             lobby: "lobby".into(),
+            announce: true,
+            announce_names: 3,
+            invites_declined: false,
         }
     }
 }
@@ -330,7 +341,18 @@ pub(crate) struct RoomState {
     /// then. Taken as `dirty` is.
     pub(crate) unwritten: Mutex<BTreeSet<u32>>,
     pub(crate) channels: Mutex<HashMap<u32, Arc<RoomChannel>>>,
+    /// Who was told at login that rooms exist, and when (§6.5): memory,
+    /// because forgetting costs one more notice and nothing else.
+    pub(crate) announced: Mutex<HashMap<Announced, Instant>>,
 }
+
+/// Whom the lobby notice was sent: an account, or a guest by its
+/// identity and else its address, since every guest shares one login.
+pub(crate) type Announced = (String, Option<[u8; 32]>, Option<std::net::IpAddr>);
+
+/// How many [`RoomState::announced`] entries are kept: past it those
+/// older than a day are let go, and then the oldest.
+const ANNOUNCED_KEPT: usize = 4096;
 
 /// Does `list` name this session's account? `@role` names nobody yet.
 fn named(list: &[String], sess: &UserSession) -> bool {
@@ -513,6 +535,41 @@ impl RosterInner {
         if !may_post(sess, &entry.room) {
             return Err(crate::ChatError::ReadOnly);
         }
+        Ok(())
+    }
+
+    /// A member of `room` invites `target` (§6.3), refused in a private
+    /// chat's order; a room either of them may not see is a chat that
+    /// does not exist.
+    pub(crate) fn room_invite(
+        &mut self,
+        room: u32,
+        by: Uid,
+        target: Uid,
+    ) -> Result<(), crate::ChatError> {
+        use crate::ChatError;
+        let (Some(inviter), Some(invitee)) = (self.users.get(&by), self.users.get(&target)) else {
+            return Err(ChatError::NoSuchUser);
+        };
+        let entry = self.rooms.get(&room).ok_or(ChatError::NoSuchChat)?;
+        if !sees(inviter, &entry.room) {
+            return Err(ChatError::NoSuchChat);
+        }
+        if !entry.members.contains(&by) {
+            return Err(ChatError::NotAMember);
+        }
+        if !sees(invitee, &entry.room) {
+            return Err(ChatError::NoSuchChat);
+        }
+        if entry.members.contains(&target) {
+            return Err(ChatError::AlreadyThere);
+        }
+        let ev = Event::ChatInvite {
+            cid: room,
+            from: by,
+            from_nick: inviter.info.nick.clone(),
+        };
+        self.send_to(target, ev);
         Ok(())
     }
 
@@ -1101,6 +1158,96 @@ impl Core {
         let sess = r.users.get(&uid)?;
         let entry = r.rooms.get(&room).filter(|e| sees(sess, &e.room))?;
         Some(view(&r, sess, entry))
+    }
+
+    /// Is `id` a room's, rather than a private chat's or nobody's? Says
+    /// nothing about who may see it: what a transaction naming it is
+    /// answered decides that.
+    pub fn is_room(&self, id: u32) -> bool {
+        id != 0 && self.roster.lock().unwrap().rooms.contains_key(&id)
+    }
+
+    /// `room`'s name, while it has one.
+    pub fn room_name(&self, room: u32) -> Option<String> {
+        let r = self.roster.lock().unwrap();
+        r.rooms
+            .get(&room)
+            .map(|e| e.room.name.clone())
+            .filter(|n| !n.is_empty())
+    }
+
+    /// [`Core::room_list`], the rooms `uid` is in first.
+    pub fn room_list_members_first(&self, uid: Uid) -> Vec<RoomView> {
+        let joined = self.rooms_of(uid);
+        let mut list = self.room_list(uid);
+        list.sort_by_key(|v| !joined.contains(&v.room.id));
+        list
+    }
+
+    /// The lobby notice a classic session is sent after its user list
+    /// (§6.5), when it is to be sent: a room it may see, bit 9, commands
+    /// to point at, and not already told today.
+    pub fn rooms_announcement(&self, uid: Uid) -> Option<String> {
+        let policy = self.room_policy().filter(|p| p.announce)?;
+        let system = self.system.as_ref().filter(|s| s.policy.commands)?;
+        let key = {
+            let r = self.roster.lock().unwrap();
+            let sess = r.users.get(&uid)?;
+            if !sess.access.has(bit::READ_CHAT) {
+                return None;
+            }
+            let guest = sess.login == "guest" && sess.identity.is_none();
+            (
+                sess.login.clone(),
+                sess.identity,
+                sess.addr.filter(|_| guest),
+            )
+        };
+        let list = self.room_list_members_first(uid);
+        if list.is_empty() {
+            return None;
+        }
+        let now = self.clock.now();
+        const DAY: Duration = Duration::from_secs(24 * 3600);
+        {
+            let mut told = self.room_state.announced.lock().unwrap();
+            if told
+                .get(&key)
+                .is_some_and(|at| now.saturating_duration_since(*at) < DAY)
+            {
+                return None;
+            }
+            if told.len() >= ANNOUNCED_KEPT {
+                told.retain(|_, at| now.saturating_duration_since(*at) < DAY);
+            }
+            // Past the bound with the day's own, the oldest is forgotten
+            // first: the one most nearly due again anyway.
+            if told.len() >= ANNOUNCED_KEPT {
+                if let Some(oldest) = told
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(k, _)| k.clone())
+                {
+                    told.remove(&oldest);
+                }
+            }
+            told.insert(key, now);
+        }
+        let names: Vec<String> = list
+            .iter()
+            .take(policy.announce_names)
+            .map(|v| format!("#{}", v.room.name))
+            .collect();
+        let more = list.len() - names.len();
+        let rooms = match (names.is_empty(), more) {
+            (true, n) => format!("{n}"),
+            (false, 0) => names.join(", "),
+            (false, n) => format!("{} and {n} more", names.join(", ")),
+        };
+        Some(format!(
+            "Rooms: {rooms}. Send /rooms to {} to see them, /join <name> to join one.",
+            system.policy.nick
+        ))
     }
 
     /// Is `uid` in `room`, may it send there, and is the room one it can

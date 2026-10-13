@@ -100,6 +100,10 @@ enum Rationed {
 /// `/stop #398` still works, and so does unfollowing from a client.
 const NOTIFIED_KEPT: usize = 4096;
 
+/// The longest answer, in bytes: a private message's length on either
+/// wire.
+const ANSWER_MAX: usize = 4096;
+
 impl Core {
     /// The reserved account. Absent means there is no system account at
     /// all: nothing is on the roster, and a private message is a private
@@ -319,6 +323,11 @@ impl Core {
                 self.command_report(from, who, &reason)
             }
             "stop" => self.command_stop(from, words.next()),
+            "rooms" if self.rooms_enabled() => self.command_rooms(from, words.next()),
+            "join" | "part" if self.rooms_enabled() => match words.next() {
+                Some(name) => self.command_join_part(from, name, command == "join"),
+                None => format!("error: /{command} <room>"),
+            },
             _ => self.help(),
         }
     }
@@ -327,13 +336,122 @@ impl Core {
         // Under ten lines, and only the commands this server can
         // actually run: a help text that lists something unimplemented
         // is worse than one that is short.
-        "commands (send them to me as a private message):\n\
-         /help — this\n\
-         /msg <login> <message> — message an account, online or not\n\
-         /block <nick or login>, /unblock <…>, /blocks — who may message you\n\
-         /report <nick or login> <reason> — tell the moderators about someone\n\
-         /stop [#article] — stop following a news thread"
-            .into()
+        let mut help = String::from(
+            "commands (send them to me as a private message):\n\
+             /help — this\n\
+             /msg <login> <message> — message an account, online or not\n\
+             /block <nick or login>, /unblock <…>, /blocks — who may message you\n\
+             /report <nick or login> <reason> — tell the moderators about someone\n\
+             /stop [#article] — stop following a news thread",
+        );
+        if self.rooms_enabled() {
+            help.push_str(
+                "\n/rooms [word] — the rooms you may join\n\
+                 /join <room>, /part <room> — join a room, or leave one",
+            );
+        }
+        help
+    }
+
+    /// `/rooms`: one line a room, the session's own first, cut to one
+    /// message's length (`docs/chat-rooms.md` §6.1).
+    fn command_rooms(&self, from: Uid, word: Option<&str>) -> String {
+        let mut list = self.room_list_members_first(from);
+        if let Some(word) = word {
+            let word = word.trim_start_matches('#').to_lowercase();
+            list.retain(|v| {
+                v.room.name.contains(&word) || v.room.topic.text.to_lowercase().contains(&word)
+            });
+        }
+        if list.is_empty() {
+            return match word {
+                Some(_) => "ok: no room matches that".into(),
+                None => "ok: there are no rooms you may join".into(),
+            };
+        }
+        const MORE: &str = "… and more; /rooms <word> narrows it";
+        let mut out = String::new();
+        for (i, v) in list.iter().enumerate() {
+            let line = match v.room.topic.text.as_str() {
+                "" => format!("#{} ({} here)", v.room.name, v.members),
+                topic => format!("#{} — {topic} ({} here)", v.room.name, v.members),
+            };
+            let tail = if i + 1 == list.len() {
+                0
+            } else {
+                MORE.len() + 1
+            };
+            if out.len() + line.len() + 1 + tail > ANSWER_MAX {
+                out.push_str(MORE);
+                break;
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        if out.ends_with('\n') {
+            out.pop();
+        }
+        out
+    }
+
+    /// `/join` and `/part`, by a name the session may see. A join is an
+    /// invite from this account, which a period client answers with 115,
+    /// and that is checked as any join is (`docs/chat-rooms.md` §6.2).
+    fn command_join_part(&self, from: Uid, name: &str, join: bool) -> String {
+        let name = name.trim_start_matches('#').to_ascii_lowercase();
+        let Some(id) = self
+            .room_list(from)
+            .into_iter()
+            .find(|v| v.room.name == name)
+            .map(|v| v.room.id)
+        else {
+            return "error: no such room".into();
+        };
+        if !join {
+            return match self.room_part(from, id) {
+                Ok(()) => format!("ok: left #{name}"),
+                Err(crate::RoomError::NotAMember) => format!("error: you are not in #{name}"),
+                Err(_) => "error: no such room".into(),
+            };
+        }
+        if self.rooms_of(from).contains(&id) {
+            return format!("ok: already in #{name}");
+        }
+        let joins = {
+            let r = self.roster.lock().unwrap();
+            r.users
+                .get(&from)
+                .is_some_and(|s| s.info.transport.joins_rooms)
+        };
+        // A wire with no invite to answer joins now, and asked about a
+        // room, so it is told of rooms from here on (§7).
+        if joins {
+            self.rooms_aware(from);
+            return match self.room_join(from, id) {
+                Ok(_) => format!("ok: joined #{name}"),
+                Err(crate::RoomError::TooManyRooms) => {
+                    "error: you are in as many rooms as you may be; /part one first".into()
+                }
+                Err(_) => "error: no such room".into(),
+            };
+        }
+        let (Some(system), Some(me)) = (self.system.as_ref(), self.system_uid()) else {
+            return "error: that did not work".into();
+        };
+        let ev = Event::ChatInvite {
+            cid: id,
+            from: me,
+            from_nick: system.policy.nick.clone(),
+        };
+        self.roster.lock().unwrap().send_to(from, ev);
+        if self.room_state.policy.invites_declined {
+            format!(
+                "ok: invited to #{name} — if no window opens, turn off \"refuse private chat\" \
+                 and \"automatic response\""
+            )
+        } else {
+            format!("ok: invited to #{name}")
+        }
     }
 
     fn command_msg(&self, from: Uid, who: &str, body: String) -> String {
