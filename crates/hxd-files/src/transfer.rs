@@ -1008,7 +1008,7 @@ async fn receive_legacy<S: HtxfStream>(
         ffo::parse_fork_header(&fixed[24..], false).map_err(|_| FileError::InvalidPath)?;
     let max_info = ffo::INFO_FIXED_LEN + ffo::MAX_NAME_LEN + ffo::MAX_COMMENT_LEN;
     if &info_header.tag != b"INFO"
-        || info_header.length < ffo::INFO_FIXED_LEN as u64
+        || info_header.length < ffo::MIN_INFO_LEN as u64
         || info_header.length > max_info as u64
     {
         return Err(FileError::InvalidPath);

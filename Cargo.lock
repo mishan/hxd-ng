@@ -1362,7 +1362,7 @@ checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 [[package]]
 name = "hxcrypto"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=10d47dba88f3369a94ef30d12f7030a03e760d5a#10d47dba88f3369a94ef30d12f7030a03e760d5a"
+source = "git+https://github.com/mishan/hx-libs.git?rev=51050aac32a38052f2b33a9cb0fd6fe0b24fc413#51050aac32a38052f2b33a9cb0fd6fe0b24fc413"
 dependencies = [
  "blowfish",
  "chacha20poly1305",
@@ -1678,7 +1678,7 @@ dependencies = [
 [[package]]
 name = "hxfiles-xfer"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=10d47dba88f3369a94ef30d12f7030a03e760d5a#10d47dba88f3369a94ef30d12f7030a03e760d5a"
+source = "git+https://github.com/mishan/hx-libs.git?rev=51050aac32a38052f2b33a9cb0fd6fe0b24fc413#51050aac32a38052f2b33a9cb0fd6fe0b24fc413"
 dependencies = [
  "sha2",
 ]
@@ -1686,12 +1686,12 @@ dependencies = [
 [[package]]
 name = "hxhfs"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=10d47dba88f3369a94ef30d12f7030a03e760d5a#10d47dba88f3369a94ef30d12f7030a03e760d5a"
+source = "git+https://github.com/mishan/hx-libs.git?rev=51050aac32a38052f2b33a9cb0fd6fe0b24fc413#51050aac32a38052f2b33a9cb0fd6fe0b24fc413"
 
 [[package]]
 name = "hxhope"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=10d47dba88f3369a94ef30d12f7030a03e760d5a#10d47dba88f3369a94ef30d12f7030a03e760d5a"
+source = "git+https://github.com/mishan/hx-libs.git?rev=51050aac32a38052f2b33a9cb0fd6fe0b24fc413#51050aac32a38052f2b33a9cb0fd6fe0b24fc413"
 dependencies = [
  "flate2",
  "hxcrypto",
@@ -1702,7 +1702,7 @@ dependencies = [
 [[package]]
 name = "hxproto"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=10d47dba88f3369a94ef30d12f7030a03e760d5a#10d47dba88f3369a94ef30d12f7030a03e760d5a"
+source = "git+https://github.com/mishan/hx-libs.git?rev=51050aac32a38052f2b33a9cb0fd6fe0b24fc413#51050aac32a38052f2b33a9cb0fd6fe0b24fc413"
 
 [[package]]
 name = "hybrid-array"
