@@ -1747,6 +1747,60 @@ async fn an_upload_comment_is_stored_the_same_from_either_encoding() {
 }
 
 #[tokio::test]
+async fn an_info_fork_may_end_after_the_name() {
+    let (server, root, source) = start_local().await;
+    let mut classic = Legacy::login(server.legacy, false).await;
+    // The Nostalgia client and hlservd leave an empty comment's length out,
+    // so 72 bytes, an empty name's fork, is the least taken.
+    // (stored as, name in the INFO fork, bytes cut from its end, stored)
+    for (name, wire_name, cut, stored) in [
+        ("one.txt", &b"c"[..], 2, true),
+        ("empty.txt", b"", 2, true),
+        ("short.txt", b"", 3, false),
+    ] {
+        let encoded = ffo::encode(
+            &ffo::Metadata {
+                name: wire_name,
+                type_code: *b"ZZZZ",
+                creator: *b"zzzz",
+                comment: b"",
+                create_time: 0,
+                modify_time: 0,
+            },
+            ffo::Forks {
+                data_len: 2,
+                data_offset: 0,
+                resource_len: 0,
+                resource_offset: 0,
+            },
+            false,
+        )
+        .unwrap();
+        let mut object = encoded.prefix;
+        let info_len = ffo::INFO_FIXED_LEN + wire_name.len() - cut;
+        object.drain(40 + info_len..40 + info_len + cut);
+        object[36..40].copy_from_slice(&(info_len as u32).to_be_bytes());
+        object.extend_from_slice(b"hi");
+        let put = classic
+            .request(FILE_PUT, &[(tag::FILE_NAME, name.as_bytes().to_vec())])
+            .await;
+        assert_eq!(put.flag & 1, 0);
+        upload(server.htxf, reference_of(&put), object.len(), &object).await;
+        assert_eq!(root.path().join(name).exists(), stored, "{name}");
+        if stored {
+            let info = source
+                .info(&hxd_core::FilePath::parse(name).unwrap())
+                .await
+                .unwrap();
+            // Codes no extension maps to: the short fork was read.
+            assert_eq!(info.type_code, Some(*b"ZZZZ"), "{name}");
+            assert_eq!(info.creator_code, Some(*b"zzzz"), "{name}");
+            assert_eq!(info.comment, None, "{name}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn local_file_put_preserves_forks_refuses_escape_and_resumes_large_raw_data() {
     let (server, root, source) = start_local().await;
     let mut classic = Legacy::login(server.legacy, false).await;
