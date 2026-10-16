@@ -632,8 +632,9 @@ async fn serve_folder<S: HtxfStream>(
 
 /// A folder upload's dialog (Hotline.md, Upload Folder): the server asks
 /// for each item with NEXT and answers a file's header with SEND, or with
-/// RESUME from the end of one already there, which it keeps; the client
-/// closes after its last item.
+/// RESUME from the end of one already there, which it keeps, or of the
+/// partial an interrupted upload left; the client closes after its last
+/// item.
 async fn serve_folder_upload<S: HtxfStream>(
     mut stream: S,
     transfer: PreparedFolderUpload,
@@ -725,13 +726,7 @@ async fn serve_folder_upload<S: HtxfStream>(
                 return Err(FileError::AlreadyExists);
             }
             let end = |len: u64| u32::try_from(len).map_err(|_| FileError::TooLarge);
-            let record = rflt::encode(rflt::Resume {
-                data: end(info.size)?,
-                resource: end(info.resource_size)?,
-            });
-            let mut action = folder::ACTION_RESUME.to_be_bytes().to_vec();
-            action.extend_from_slice(&(record.len() as u16).to_be_bytes());
-            action.extend_from_slice(&record);
+            let action = resume_action(end(info.size)?, end(info.resource_size)?);
             write_idle(&mut stream, &action, idle).await?;
             flush_idle(&mut stream, idle).await?;
             read_exact_idle(&mut stream, &mut size, idle).await?;
@@ -748,24 +743,50 @@ async fn serve_folder_upload<S: HtxfStream>(
             }
             continue;
         }
-        write_idle(&mut stream, &folder::ACTION_SEND.to_be_bytes(), idle).await?;
-        flush_idle(&mut stream, idle).await?;
-        read_exact_idle(&mut stream, &mut size, idle).await?;
-        let transfer_len = u64::from(u32::from_be_bytes(size));
-        let request = UploadTransfer {
+        let mut request = UploadTransfer {
             principal: transfer.principal,
             peer: transfer.peer,
             hope: transfer.hope.clone(),
             path,
             owner: transfer.owner.clone(),
-            transfer_len: Some(transfer_len),
+            transfer_len: None,
             large: false,
-            resume_requested: false,
+            resume_requested: transfer.merge,
             blind: false,
             comment_utf8: transfer.comment_utf8,
             // Checked, never issued: the folder's own reference counts.
             person: String::new(),
         };
+        // What an interrupted upload of this folder left of the file is
+        // resumed from its end, as FILE_PUT resumes it. One no classic
+        // resume can make (past 32 bits, or without its generation) is
+        // started over, rather than end the folder until it expires; the
+        // check after the size still holds the file to every limit.
+        let quote = if transfer.merge {
+            match check_upload(source, &request).await {
+                Err(FileError::TooLarge | FileError::OriginChanged) => None,
+                quoted => quoted?,
+            }
+        } else {
+            None
+        };
+        let resumed = match &quote {
+            // Not large, so check_upload has held both offsets to 32 bits.
+            Some(quote) => {
+                let action = resume_action(quote.data_offset as u32, quote.resource_offset as u32);
+                write_idle(&mut stream, &action, idle).await?;
+                quote.data_offset + quote.resource_offset
+            }
+            None => {
+                write_idle(&mut stream, &folder::ACTION_SEND.to_be_bytes(), idle).await?;
+                0
+            }
+        };
+        flush_idle(&mut stream, idle).await?;
+        read_exact_idle(&mut stream, &mut size, idle).await?;
+        let transfer_len = u64::from(u32::from_be_bytes(size));
+        request.transfer_len = Some(resumed.saturating_add(transfer_len));
+        request.resume_requested = false;
         check_upload(source, &request).await?;
         let upload = PreparedUpload {
             principal: request.principal,
@@ -776,7 +797,7 @@ async fn serve_folder_upload<S: HtxfStream>(
             owner: request.owner,
             transfer_len: request.transfer_len,
             large: false,
-            quote: None,
+            quote,
             blind: false,
             comment_utf8: request.comment_utf8,
         };
@@ -801,6 +822,15 @@ async fn serve_folder_upload<S: HtxfStream>(
         .await
         .map_err(|_| stalled())?
         .map_err(|e| FileError::Unavailable(e.to_string()))
+}
+
+/// A folder upload's RESUME, with the RFLT of what the server holds.
+fn resume_action(data: u32, resource: u32) -> Vec<u8> {
+    let record = rflt::encode(rflt::Resume { data, resource });
+    let mut action = folder::ACTION_RESUME.to_be_bytes().to_vec();
+    action.extend_from_slice(&(record.len() as u16).to_be_bytes());
+    action.extend_from_slice(&record);
+    action
 }
 
 /// The receiver's next action, or `None` when it has closed between them.
