@@ -2572,8 +2572,9 @@ async fn a_folder_downloads_item_by_item_as_the_client_asks() {
     assert_ne!(refused.flag & 1, 0);
 }
 
-/// One folder upload's connection, driven as GtkHx drives it.
-struct FolderUpload(TcpStream);
+/// One folder upload's connection, driven as GtkHx drives it, and the
+/// data offset the server last resumed a file from.
+struct FolderUpload(TcpStream, usize);
 
 impl FolderUpload {
     async fn open(address: SocketAddr, reference: u32) -> Self {
@@ -2586,7 +2587,7 @@ impl FolderUpload {
             resume_digest: None,
         };
         stream.write_all(&preamble.encode().unwrap()).await.unwrap();
-        FolderUpload(stream)
+        FolderUpload(stream, 0)
     }
 
     async fn action(&mut self) -> u16 {
@@ -2609,6 +2610,36 @@ impl FolderUpload {
         };
         self.0.write_all(&item.encode().unwrap()).await.unwrap();
         let body = body?;
+        let (answer, object) = self.answer(body).await;
+        self.0.write_all(&object.concat()).await.unwrap();
+        Some(answer)
+    }
+
+    /// Announces the file `path` holding `body`, sends `sent` bytes of it,
+    /// and hangs up: an upload interrupted part way through a file.
+    async fn interrupt(mut self, path: &[&str], body: &[u8], sent: usize) {
+        assert_eq!(self.action().await, folder::ACTION_NEXT);
+        let item = folder::Item {
+            folder: false,
+            path: path.iter().map(|name| name.as_bytes().to_vec()).collect(),
+        };
+        self.0.write_all(&item.encode().unwrap()).await.unwrap();
+        let (answer, [head, _]) = self.answer(body).await;
+        assert_eq!(answer, folder::ACTION_SEND);
+        let cut = head.len() - (body.len() - sent);
+        self.0.write_all(&head[..cut]).await.unwrap();
+        self.0.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        timeout(IDLE, self.0.read_to_end(&mut rest))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The server's answer to a file holding `body`, and what that asks to
+    /// be sent, the whole object or its rest from a resume: everything up
+    /// to the end of the data fork, then the resource fork's header.
+    async fn answer(&mut self, body: &[u8]) -> (u16, [Vec<u8>; 2]) {
         let answer = self.action().await;
         let from = if answer == folder::ACTION_RESUME {
             let mut len = [0; 2];
@@ -2619,6 +2650,7 @@ impl FolderUpload {
         } else {
             0
         };
+        self.1 = from;
         let encoded = ffo::encode(
             &ffo::Metadata {
                 name: b"hxd",
@@ -2640,9 +2672,7 @@ impl FolderUpload {
         let mut object = (encoded.transfer_len as u32).to_be_bytes().to_vec();
         object.extend_from_slice(&encoded.prefix);
         object.extend_from_slice(&body[from..]);
-        object.extend_from_slice(&encoded.resource_header);
-        self.0.write_all(&object).await.unwrap();
-        Some(answer)
+        (answer, [object, encoded.resource_header.to_vec()])
     }
 
     /// Whether the server has hung up rather than ask for more.
@@ -2785,6 +2815,84 @@ async fn a_folder_uploads_item_by_item_and_resumes_into_what_is_there() {
         .request(FILE_PUT_FOLDER, &put("tree", false))
         .await;
     assert_ne!(refused.flag & 1, 0);
+}
+
+#[tokio::test]
+async fn a_resumed_folder_upload_resumes_the_file_it_was_interrupted_in() {
+    let (server, root, _source) = start_local_with(
+        "upload_files = true\nupload_folders = true\nupload_anywhere = true\n\
+         read_chat = true\nuse_any_name = true\n",
+    )
+    .await;
+    let mut classic = Legacy::login(server.legacy, false).await;
+    let put = |resume: bool| {
+        let mut chunks = vec![(tag::FILE_NAME, b"tree".to_vec())];
+        if resume {
+            chunks.push((tag::FILE_PREVIEW, 1u16.to_be_bytes().to_vec()));
+        }
+        chunks
+    };
+    let reply = classic.request(FILE_PUT_FOLDER, &put(false)).await;
+    let mut upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    upload.item(&["a.txt"], Some(b"alpha")).await;
+    upload.item(&["sub"], None).await;
+    upload
+        .interrupt(&["sub", "b.txt"], b"bravo, bravo", 5)
+        .await;
+    let tree = root.path().join("tree");
+    assert!(!tree.join("sub/b.txt").exists());
+
+    // Without asking to resume, the folder that is there is refused.
+    let refused = classic.request(FILE_PUT_FOLDER, &put(false)).await;
+    assert_ne!(refused.flag & 1, 0);
+
+    // Resumed, the whole file is kept, the folder gone into, and the file
+    // cut short finished from where it stopped.
+    let reply = classic.request(FILE_PUT_FOLDER, &put(true)).await;
+    assert_eq!(reply.flag & 1, 0);
+    let mut upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    assert_eq!(
+        upload.item(&["a.txt"], Some(b"alpha")).await,
+        Some(folder::ACTION_RESUME)
+    );
+    upload.item(&["sub"], None).await;
+    assert_eq!(
+        upload.item(&["sub", "b.txt"], Some(b"bravo, bravo")).await,
+        Some(folder::ACTION_RESUME)
+    );
+    assert_eq!(upload.1, 5);
+    assert_eq!(
+        upload.item(&["sub", "c.txt"], Some(b"charlie")).await,
+        Some(folder::ACTION_SEND)
+    );
+    upload.finish().await;
+    assert_eq!(std::fs::read(tree.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(
+        std::fs::read(tree.join("sub/b.txt")).unwrap(),
+        b"bravo, bravo"
+    );
+    assert_eq!(std::fs::read(tree.join("sub/c.txt")).unwrap(), b"charlie");
+
+    // A partial that cannot be resumed is sent again whole, and the
+    // upload goes on.
+    let reply = classic.request(FILE_PUT_FOLDER, &put(true)).await;
+    let upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    upload.interrupt(&["sub", "d.txt"], b"delta", 3).await;
+    let partials = root.path().join(".hxd-state/partials");
+    for entry in std::fs::read_dir(&partials).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "generation") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let reply = classic.request(FILE_PUT_FOLDER, &put(true)).await;
+    let mut upload = FolderUpload::open(server.htxf, reference_of(&reply)).await;
+    assert_eq!(
+        upload.item(&["sub", "d.txt"], Some(b"delta")).await,
+        Some(folder::ACTION_SEND)
+    );
+    upload.finish().await;
+    assert_eq!(std::fs::read(tree.join("sub/d.txt")).unwrap(), b"delta");
 }
 
 #[tokio::test]

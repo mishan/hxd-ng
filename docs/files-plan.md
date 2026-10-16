@@ -328,7 +328,14 @@ them; the item header and actions are `hxfiles_xfer::folder`.
   into it: a file already there is answered RESUME from its end, so the
   client sends its headers alone and what is there is kept (a longer
   copy's tail is read and dropped; GtkHx fails on its own side for a
-  shorter one), and the rest is sent whole, an interrupted one included.
+  shorter one); one the account's interrupted upload left a partial of
+  is answered RESUME from the partial's forks and finished as FilePut
+  finishes a resume; and the rest is sent whole, a partial no classic
+  resume can make (past 32 bits, or without its generation) included.
+  The official server, by GtkHx's notes, answers NEXT for a file that is
+  there, and mhxd RESUME from its size, a partial or not; NEXT is not
+  sent, since GtkHx fails on it, and a subfolder that is there is gone
+  into, where mhxd's `mkdir` fails and ends the transfer.
   Adding to a folder never reaches into a drop box the account may not
   view. Into one, the top folder is made blind, under a free name, as
   single files are published, and so is a folder named like one. Each
