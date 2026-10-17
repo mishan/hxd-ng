@@ -3,8 +3,9 @@
 Status: R1 to R3 are built (§13): rooms in the domain, the rooms file
 and `hxd room`, the ng wire of §7, and period clients' rooms of §6 but
 for `700` (§6.7, R4). R3's exit, real 1.2, 1.5 and 1.9 clients against
-a real server, has not been run. The ng wire of §7 is the spec part;
-the rest binds nobody but this server.
+a real server, has not been run. Secure rooms (§5.1) and rooms across
+links (§8.1) are design. The ng wire of §7 is the spec part; the rest
+binds nobody but this server.
 
 Public chat today is one room everybody shares, and a private chat is a
 room that exists while someone is in it and leaves no record.
@@ -54,6 +55,10 @@ what to propose upstream for extended ones.
   [roles.md](roles.md), `@role`. An empty list leaves it to the access
   bit, as the lobby is. News categories gate with the same two lists
   (roles.md §11), so there is one shape and one resolver.
+- **A room can admit only encrypted connections**, and a room is this
+  server's alone unless the operator links it. A gated room is never
+  linked: its gates name this server's logins and roles, which mean
+  nothing to a peer.
 
 ---
 
@@ -115,6 +120,8 @@ undoes:
 | `position` | Sort order in a listing. Ties sort by name |
 | `read` | Who may see, join and read it. §5 |
 | `post` | Who may send in it. §5 |
+| `secure` | Only encrypted connections may join or read it. §5.1 |
+| `linked` | Crosses server links. False, and refused when true, until §8.1 is built |
 | `max_lines`, `max_days` | This room's retention, over `[history]`'s. §3 |
 | `archived_at` | Set on archive. §2.4 |
 
@@ -297,6 +304,7 @@ position = 0
 id = 811937042
 name = "staff"
 read = ["@moderators", "carol"]
+secure = true
 max_lines = 50000
 
 [[room]]
@@ -338,7 +346,8 @@ beside `chats`.
   rereads the file, assigns ids to entries without one and writes them
   back, and diffs the result against the roster: a room that appeared
   is announced, one that was archived or taken out of the file parts its
-  members, and one whose gates narrowed parts whoever lost access. The
+  members, and one whose gates narrowed or that was made secure parts
+whoever lost access. The
   lobby's subject is read at startup only: a reload leaves it as the
   server has it. An id that is a private chat's makes the file one that
   does not parse. The CLI and the server do not share a lock, so an
@@ -357,7 +366,7 @@ list leaves the decision to the access bit:
 
 | Act | Needs |
 |---|---|
-| See it listed, join it, read it | bit 9 (read chat), and, if `read` is not empty, an entry naming the account or a role it holds |
+| See it listed, join it, read it | bit 9 (read chat), and, if `read` is not empty, an entry naming the account or a role it holds. Join and read also need §5.1 in a secure room |
 | Send in it | bit 10 (send chat), may read it, and, if `post` is not empty, an entry naming the account or a role it holds |
 | Set its topic | may post in it, and `[extra] set_subject` (the lobby's rule) |
 | Page its history | bit 56, and may read it |
@@ -394,6 +403,58 @@ list leaves the decision to the access bit:
   takes away someone's access, parts their sessions at once (§6.4 for
   how a period client is told).
 
+### 5.1 Secure rooms
+
+A room with `secure = true` admits only a session whose connection is
+`encrypted`, in the sense the ng `user` object's `transport` already
+gives it (hotline-ng.md §7.4, hotline-ng-auth.md §7.2, §8): the TLS
+port, a WebSocket path whose downstream is not declared cleartext, or
+HOPE under a cipher and a password (hope.md §3). The plain TCP port,
+HOPE with an empty password, whose keys anyone watching the handshake
+could derive, and RC4 are not. A classic client in a tunnel that
+declared its downstream cleartext never is, since HOPE is refused
+there. It is a second condition beside §5's, never in place of one.
+The lobby is never secure: it is every period client's, and crosses
+every link (§3).
+
+- **It binds everyone.** Joining, reading, paging its history (`700`
+  and `history`) and voice in it all need the encrypted connection,
+  for managers and moderators too. A moderator reading a secure room
+  over plain TCP would put on the wire exactly what the room keeps off
+  it; a moderator who needs to judge a line reconnects on the TLS port.
+- **An ng session is taken at its word.** The server cannot see the
+  TLS proxy hotline-ng.md §9 requires in front of the ng port, so it
+  counts a WebSocket session encrypted, as it does for other users.
+  There is no key to distrust the proxy for secure rooms alone: an
+  operator whose ng port is not behind TLS already has every ng session
+  shown to everyone as encrypted, and that is the thing to fix.
+- **It is a session's, fixed at login.** A session's `transport` is
+  set when it logs in, and a resume keeps it (hotline-ng-auth.md §7.2),
+  so a member stays admissible for the session's life. Setting `secure`
+  on a room parts the members it does not admit, as a narrowed gate
+  does (§5), with `reason: "insecure"` (§7.3).
+- **A secure room is not hidden.** §5's rule hides a room from whoever
+  its gates leave out, because who it admits is information. `secure`
+  says how to connect, not who may, so a session its gates admit still
+  sees the room listed, marked secure, and is told why a join failed:
+  `/join` answers `error: #name needs an encrypted connection`, 115
+  answers the task error `This room needs an encrypted connection.`,
+  `room_join` and `history` answer `encryption_required`, and an
+  invite (113) of such a session is refused with the task error `They
+  need an encrypted connection for this room.` That tells a classic
+  inviter how the invitee is connected, which an ng user is already
+  shown as `transport`.
+- **Its images stay on encrypted connections.** A handle relayed in a
+  secure room carries the room's rule, and `media_fetch` answers it as
+  not found to a session that is not encrypted, a moderator judging a
+  report included (inline-media.md §5). A report about a secure room's
+  line reaches a moderator on such a connection without the reason,
+  which may quote the line.
+- **What it is not.** Secure means the connection, not the content.
+  The server reads every line and logs it as it logs any room's (§3).
+  A conversation that should leave no record is a private chat, and
+  end-to-end encryption is a different feature.
+
 ## 6. The classic wire, for period clients
 
 A room appears to a 1.5 client as a private chat it has been invited
@@ -411,9 +472,9 @@ like `/report` and `/msg`:
 
 | Command | Does | Needs |
 |---|---|---|
-| `/rooms` | Lists the rooms this session may join, one per line: `#name — topic (n here)`, members first. One message, capped at a private message's length (4096 bytes), ending `… and more; /rooms <word> narrows it` when cut | — |
+| `/rooms` | Lists the rooms this session may see, one per line: `#name — topic (n here)`, members first, with `(encrypted connections only)` after a secure room's count. One message, capped at a private message's length (4096 bytes), ending `… and more; /rooms <word> narrows it` when cut | — |
 | `/rooms <word>` | Only rooms whose name or topic contains the word | — |
-| `/join <name>` | Invites this session into the room (§6.2). `#` before the name is accepted and ignored. Answers `ok: invited to #name`, `ok: already in #name` (and sends no invite), or `error: no such room` | §5, see |
+| `/join <name>` | Invites this session into the room (§6.2). `#` before the name is accepted and ignored. Answers `ok: invited to #name`, `ok: already in #name` (and sends no invite), `error: #name needs an encrypted connection` (§5.1), or `error: no such room` | §5, see |
 | `/part <name>` | Leaves the room, for a client whose window closed without sending 116. Answers `ok: left #name`, `error: you are not in #name`, or `error: no such room` | — |
 
 They run as the session that sent them, from either wire. From the ng
@@ -436,7 +497,8 @@ server without rooms they are unknown commands, answered with the help.
    one notice in the room, never logged: `\r *** #lounge — this room is
    public and logged`, or `public` alone on a server without
    `[history]`, and `public, logged and read-only` (or `public and
-   read-only`) when the session may not post. It and every other line
+   read-only`) when the session may not post, each followed by `, for
+   encrypted connections only` in a secure room. It and every other line
    of §6 come from the system account's uid, or the session's own on a
    server without one. A period
    client shows the room in a *private chat* window. The window's look
@@ -477,8 +539,8 @@ private_chats_per_user`, which counts the private chats a user creates.
 
 The classic wire has no message for "you are no longer in this chat".
 When the server parts a classic session from a room (an archive, a
-narrowed gate, a lost role), it sends a notice in the room,
-`*** you were removed from #staff`, then **118** naming the session's
+narrowed gate, a lost role, a room made secure), it sends a notice in
+the room, `*** you were removed from #staff`, then **118** naming the session's
 own uid, so the window's member list loses the user and every later
 line from it is refused rather than silently lost. A room deleted from
 the file has no name left to say, and is `this room`. What a 1.2, 1.5 or
@@ -498,7 +560,8 @@ never logged, as an action-form notice from the system account's uid:
 That is `\r *** %s` (mhxd's server-line form), with up to `[rooms]
 announce_names` names, members first, and the system account's nick
 in place of `Server`. It is sent only when there is a room the session
-may see, the session holds bit 9, and `[system] commands` is on (the
+may see (a secure one counts, and `/rooms` marks it), the session
+holds bit 9, and `[system] commands` is on (the
 line points at commands). It is sent at most once a day per account,
 remembered in memory, so a client that reconnects is not told again.
 Guests share an account, so a guest is remembered by its identity, or
@@ -575,9 +638,11 @@ A `rooms` block beside `history`:
 never including the lobby or an archived room (a moderator or a manager
 still pages an archived room by its id). `last_id` is the newest line id
 in the room, absent without history. `may_post` is whether this session
-may send there. `max_lines` and `max_days` are present when the room
-has a retention of its own (§3). `self` gains `"manage_rooms": true`
-when it is.
+may send there. `secure` is present and true on a secure room (§5.1),
+here and in every room object, so a client on a connection it would
+refuse can say so before a join. `max_lines` and `max_days` are
+present when the room has a retention of its own (§3). `self` gains
+`"manage_rooms": true` when it is.
 
 `last_id` lets a client that keeps its own read cursor per room badge
 the rooms it has not joined. **It is not pushed:** nothing is sent
@@ -595,12 +660,12 @@ else, who is admitted is not their business.
 | `req` | `params` | `ok` | Errors besides hotline-ng.md §10's universal set |
 |---|---|---|---|
 | `rooms` | — | `{ "list": […] }`, as in the login reply | `not_available` |
-| `room_join` | `room` | `{ "members": [ uid… ], "topic", "topic_by"?, "topic_at"?, "last_id"?, "may_post" }` | `no_such_room`, `too_many_rooms` |
+| `room_join` | `room` | `{ "members": [ uid… ], "topic", "topic_by"?, "topic_at"?, "last_id"?, "may_post" }` | `no_such_room`, `too_many_rooms`, `encryption_required` |
 | `room_part` | `room` | `{}` | `no_such_room`, `not_a_member` |
 | `room_topic` | `room`, `topic` | `{}` | `no_such_room`, `access_denied` |
 | `chat` | gains `room?` | `{}` | gains `no_such_room`, `not_a_member`, `read_only` |
-| `history` | gains `room?` | as now | gains `no_such_room` |
-| `room_create` | `name`, `topic?`, `position?`, `read?`, `post?`, `max_lines?`, `max_days?` | `{ "room": {…} }` | `access_denied`, `name_taken`, `rooms_full`, `bad_request` |
+| `history` | gains `room?` | as now | gains `no_such_room`, `encryption_required` |
+| `room_create` | `name`, `topic?`, `position?`, `read?`, `post?`, `secure?`, `max_lines?`, `max_days?` | `{ "room": {…} }` | `access_denied`, `name_taken`, `rooms_full`, `bad_request` |
 | `room_edit` | `room`, then any of `room_create`'s fields | `{ "room": {…} }` | `access_denied`, `no_such_room`, `name_taken`, `bad_request` |
 | `room_archive` / `room_unarchive` | `room` | `{}` | `access_denied`, `no_such_room` |
 
@@ -612,6 +677,8 @@ else, who is admitted is not their business.
 - `chat` naming a room the session has not joined is `not_a_member`:
   sending does not imply joining. `read_only` is a room it may read but
   not post in.
+- `encryption_required` is a secure room on a connection that is not
+  encrypted (§5.1).
 - `too_many_rooms` is this session's `max_joined`; `rooms_full` is the
   server's `max_rooms`.
 - In `room_create` and `room_edit`, `read` and `post` replace the list
@@ -634,9 +701,9 @@ else, who is admitted is not their business.
 | `notice` | gains `room` | A server notice in a room, such as a kick or the §6.2 line |
 | `subject` | gains `room` | A room's topic changed, to its members; the lobby's, to everyone, as now |
 | `room_member_joined` | `{ "room", "user": {…} }` | A session joined a room this session is in |
-| `room_member_parted` | `{ "room", "uid", "reason"? }` | A session left a room this session is in, or this session was parted. `reason`, `"access"` or `"archived"`, is sent to the session the server parted, and to nobody else: why someone lost access is not the room's business. Not sent when the session left the server: `user_parted` says that |
+| `room_member_parted` | `{ "room", "uid", "reason"? }` | A session left a room this session is in, or this session was parted. `reason`, `"access"`, `"archived"` or `"insecure"` (§5.1), is sent to the session the server parted, and to nobody else: why someone lost access is not the room's business. Not sent when the session left the server: `user_parted` says that |
 | `room_added` | `{ "room": {…} }` | A room this session may see was created, unarchived, or became visible to it |
-| `room_changed` | `{ "room": {…} }` | A visible room's name, position, retention, gates or this session's `may_post` changed, to sessions that may see it; or its topic alone, to those that may see it and are not in it (members hear `subject`). Gates count only for a manager, who alone is shown them |
+| `room_changed` | `{ "room": {…} }` | A visible room's name, position, retention, gates, `secure` or this session's `may_post` changed, to sessions that may see it; or its topic alone, to those that may see it and are not in it (members hear `subject`). Gates count only for a manager, who alone is shown them |
 | `room_removed` | `{ "room" }` | A room was archived, or stopped being visible to this session. If it was a member, it was parted first |
 | `chat_redacted` | gains `room` | moderation.md §5, for a line in a room: sent only to sessions that may read that room, and of those to the rooms-aware and its members |
 | `chat_purged` | gains `room` | moderation.md §5. One event per room the purge touched, carrying that room's ids, each sent only to sessions that may read that room. The lobby's is unchanged and has no `room` |
@@ -663,9 +730,10 @@ session is in, each with its `last_id`:
 A client that resumes normally gets the room events it missed from the
 outbox like any other, and needs nothing new.
 
-## 8. Extended classic clients: what to propose upstream
+## 8. What to propose upstream
 
-GtkHx and other clients that negotiate capabilities are better served
+For extended classic clients: GtkHx and others that negotiate
+capabilities are better served
 by real channel transactions than by §6's invite mapping. The
 reservations fit this design. The proposal:
 
@@ -691,6 +759,43 @@ reservations fit this design. The proposal:
 
 This goes to fogWraith as a proposal (`docs/proposals/`) once R2 has
 shown the ng shape works, not before.
+
+### 8.1 Rooms across server links
+
+The extension links one public chat today. Named rooms that cross a
+link are its to define. What this server would ask of that definition,
+so its rooms fit:
+
+- **Local is the default.** A room crosses only when its operator sets
+  `linked = true`, so a room made before linking existed, or made
+  without thinking of it, never reaches a peer by accident.
+- **A gated room is never linked.** `read` and `post` name this
+  server's logins and roles, which a peer's users do not have, so a
+  peer's ghosts would either pass every gate or fail every one. A file
+  setting `linked` on a room with a gate does not parse. Gates across
+  servers need a user identity both servers trust, which the extension
+  does not have.
+- **One server hosts a room.** It assigns the id, keeps the topic, logs
+  the lines and moderates, as each server does for its own public chat
+  today. A room crosses by name and host (`#lounge` on the server it
+  came from, shown with its tag where `show_tags` is on), since a
+  room's id is the host's chat id (§2.2) and means nothing on a peer.
+  Peers relay lines and membership, and a ghost joins as a member.
+- **A linked secure room admits only ghosts their home server reports
+  `encrypted`**, over the user transport draft (server-link.md §3.2).
+  `weak`, `cleartext` and `unknown` are refused, so it is never linked
+  over a link that does not try the draft. The link itself is TLS, so
+  the hop between servers needs nothing new. An ng session goes over a
+  link without the field today, its TLS being a proxy its server
+  assumes (server-link.md §3.2), so the draft would need a value for
+  that, or every ng user would be refused a peer's secure room.
+- **What a peer must do with a foreign room.** Give it a chat id of its
+  own for its classic members' 113, 115 and 106, since §2.2's one id
+  cannot hold across servers; relay the host's redactions and purges to
+  its readers; and leave history and voice at the host, which pages the
+  log and runs the SFU.
+
+Until that lands, `linked = true` is refused when the file is read.
 
 ## 9. Voice and video
 
@@ -734,9 +839,8 @@ Parting a room parts its voice room, as parting a private chat does.
   only turn it into a placeholder.
 - **Server links.** Only the lobby crosses (§3). A ghost cannot be
   invited into a room, for the reason it cannot be invited into a
-  private chat: every exported user refuses private chat. Linked rooms
-  belong with the extension's own "private chat across links" future
-  work.
+  private chat: every exported user refuses private chat. §8.1 is what
+  linked rooms would need.
 - **The compatibility replay** (chat-history.md §6.4) stays lobby-only.
 - **Metrics.** A rooms gauge beside `hxd_private_chats`, and room
   members, so a room nobody uses is visible.
@@ -755,10 +859,14 @@ Parting a room parts its voice room, as parting a private chat does.
   "never a private chat". §4.2: retention per channel. §6.2: a room's
   channel is accepted (§6.7). §7.2: `room` is a parameter.
 - **moderation.md** §5: the audiences of `chat_redacted` and
-  `chat_purged` (§7.3). §7: the room target and room-delete kind.
-- **system-account.md** §3: `/rooms`, `/join` and `/part`, and `/rooms`
-  as an exception to "one or two lines", as `/help` is.
+  `chat_purged` (§7.3). §4.4: a secure room's report to a moderator
+  on a connection that is not encrypted (§5.1). §7: the room target and
+  room-delete kind.
+- **system-account.md** §3: `/rooms`, `/join` and `/part`, `/rooms`
+  as an exception to "one or two lines", as `/help` is, and §5.1's
+  marker and `/join` error.
 - **voice.md** §2: a room's voice rule (§9).
+- **inline-media.md** §5: a secure room's handle (§5.1).
 - **account-admin.md** §1 and **access-bits.md** §4: `manage_rooms`.
 - **AGENTS.md**: the public-chat invariant (§10).
 
@@ -790,9 +898,10 @@ Docker's entrypoint keeps the file in its data directory, and gains
 `HXD_ROOMS_ANNOUNCE` and nothing else (docs/docker.md).
 
 `hxd room` subcommands: `list [--archived]`, `create <name> [--topic …]
-[--read entry,…] [--post entry,…] [--position n] [--max-lines n]
-[--max-days n]`, `edit <name> [--name new] …`, `archive <name>`,
-`unarchive <name>`, `delete <name> --purge`.
+[--read entry,…] [--post entry,…] [--secure] [--position n]
+[--max-lines n] [--max-days n]`, `edit <name> [--name new]
+[--no-secure] …`, `archive <name>`, `unarchive <name>`, `delete <name>
+--purge`.
 
 ## 13. Staging
 
@@ -830,7 +939,15 @@ Docker's entrypoint keeps the file in its data directory, and gains
    window.
 5. **R5 — hx-ng.** In that repository, then the e2e pin advances with
    cases using it (AGENTS.md's e2e rule).
-6. **R6 — upstream.** §8's proposal.
+6. **R6 — upstream.** §8's proposal, and §8.1 as input to the
+   extension's own.
+7. **R7 — secure rooms.** §5.1 on both wires. E2E: a plain TCP client
+   seeing a secure room in `/rooms` and refused its join with the
+   reason, while a TLS client joins it; a HOPE client with a password
+   joining and the guest refused; `700` and `history` refused to a
+   member's plain session; an ng session resumed through a tunnel that
+   declared its downstream cleartext parted with `insecure`; `secure`
+   set on a room parting its plain members.
 
 `@role` gate entries arrive with roles.md's G4. Until then a gate holds
 logins.
@@ -849,5 +966,5 @@ logins.
   does for mail.
 - **A room's history in the period replay.** §10 says no. An operator
   might want `replay` per room, and it is cheap if asked for.
-- **Rooms across server links**, with the hosting server moderating,
-  when the extension grows that notion.
+- **Rooms across server links**, §8.1, when the extension defines
+  them.
