@@ -574,8 +574,10 @@ The pieces:
    ([docs/webpush-gateway.md](docs/webpush-gateway.md)): the server is its
    own sender, with no sidecar and no vendor account, and hx-ng receives
    private messages and news replies while closed. Mentions are not a
-   notification kind yet, and the APNs / FCM sidecar waits for a native
-   app.
+   notification kind yet. A second gateway through uniqush-push, beside
+   the first and chosen by config, is scheduled behind uniqush-push
+   2.11.0 (docs/push-notifications.md §4.1, §9 P3); its APNs and FCM
+   devices wait for a native app.
 4. **The persistence slice arrives here** (moved from the old Phase 7):
    durable storage behind `AccountStore` and the new session/token, inbox,
    and push-registration stores. Detached sessions, offline messages and

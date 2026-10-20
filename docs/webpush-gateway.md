@@ -41,6 +41,12 @@ left to the implementation.
 | Unauthenticated local port | the deployment hazard §7 is about | none. There is no port |
 | APNs, FCM | uniqush's backends | not here. A native app reaches them through the publisher's relay (§8.2 there), which speaks Web Push to us like any other endpoint |
 
+The sidecar column is uniqush-push through 2.10.0. 2.11.0 closes its
+TTL, urgency and `Topic` row and narrows its unauthenticated port to one
+that takes a token or a Unix socket, and push-notifications.md §4.1 is
+the sidecar as a second gateway beside this one, with this registry as
+its record.
+
 The one thing the sidecar had that this does not is **vendor breadth**,
 and §8.2 of that document is why it costs us nothing today: an app that
 needs APNs registers a relay endpoint, and every server it talks to still
@@ -127,13 +133,14 @@ server may skip and still be correct.
 **What §5.1 promised is revocation, and it has not landed.** §5.1 says a
 lost phone stops buzzing *when its key is revoked*. The server-local
 revocation list that would do that (`[identity] revoked_devices`,
-[`identity-registrar.md`](identity-registrar.md) §7.3) is designed and not
-built. Until it is, a lost identity device is silenced by the owner —
+[`identity-registrar.md`](identity-registrar.md) §7.3) is built and
+refuses the key, but deletes no push rows yet. Until it does, a lost
+identity device is silenced by the owner —
 `push_unregister` naming it, or `all: true`, from a device holding
 `manage` (§7) — or by its certificate expiring, which with the
 recommended lifetimes can be weeks. That gap is real and is this
-design's, not the sidecar's; when the list lands it deletes the rows of
-a named device fingerprint at the same moment it refuses the key.
+design's, not the sidecar's; when the list deletes rows, it deletes those
+of a named device fingerprint at the same moment it refuses the key.
 
 ## 3. The credential
 
