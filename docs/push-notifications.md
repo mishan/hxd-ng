@@ -354,6 +354,11 @@ the two from disagreeing where it matters:
   new one. It reads the log after a push that reported a drop and on a
   period, keeps the cursor in the store, and starts without one from the
   oldest entry uniqush keeps, which is harmless for the same reason.
+  Retiring a row unsubscribes it like any other delete, though uniqush
+  has dropped the device already: uniqush names a device by its mailbox
+  and triple, so a row subscribed again before its removal was logged or
+  read has the delivery point it had, and the unsubscribe takes back
+  what that subscribe left.
 - **A device uniqush does not have is subscribed again, never retired.**
   A targeted delivery point uniqush answers `UNIQUSH_NOT_SUBSCRIBED`, a
   log answering `truncated` or refusing a cursor it no longer knows (as
@@ -373,10 +378,11 @@ the two from disagreeing where it matters:
   `content = "full"` trusts the sidecar with the text (§6), and `sender`
   is the recommendation.
 - **The VAPID keypair is still the server's file** (webpush-gateway.md
-  §3), handed to uniqush with `/addpsp` at startup, with the `mailto:`
-  of `[push] contact` stripped, since the PSP takes an address. The
+  §3), handed to uniqush with `/addpsp` at startup with `[push] contact`
+  as it stands, which 2.11.0 accepts as a `mailto:` or `https:` URL. The
   service, public key and contact last handed over are kept in the
-  store, and `/psps` is read to compare. A PSP that differs from them is
+  store, and `/psps` is read to compare, minding that uniqush shows a
+  `mailto:` contact as its bare address. A PSP that differs from them is
   not this server's to replace, and the gateway refuses to start; one
   that differs from the file, after `hxd push rekey`, is sent again with
   `replace=true`. A rekey deletes every row, so the devices of the old
@@ -392,14 +398,14 @@ the two from disagreeing where it matters:
   refused at send.
 - **The sidecar is one origin to the breaker, and only the sidecar's own
   failures count**: a refused connection, a timeout, a `5xx`, a failing
-  `/health`. A device's failure inside a `/push` response never does, so
-  an account that registers a slow endpoint cannot open the breaker for
-  everyone, which is the failure webpush-gateway.md §5 is built against.
-  `/push` waits for the first attempt at each device, so `[push]
-  timeout` here must be longer than uniqush's `[webpush]`
-  `request_timeout`. `max_inflight_per_origin` does not apply. uniqush's
-  `record_size` stays at its default, which is the ceiling the payload
-  is built to.
+  `/health`. A device's failure inside a `/push` response never does,
+  `UNIQUSH_PUSH_RETRYING` included, so an account that registers a slow
+  endpoint cannot open the breaker for everyone, which is the failure
+  webpush-gateway.md §5 is built against. `/push` waits for the first
+  attempt at each device, so `[push] timeout` here must be longer than
+  uniqush's `[webpush]` `request_timeout`. `max_inflight_per_origin`
+  does not apply. uniqush's `record_size` stays at its default, which is
+  the ceiling the payload is built to.
 
 Every row is subscribed as `webpush`: the store does not keep which of
 the two names a client registered under, and uniqush sends both the same
