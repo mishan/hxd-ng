@@ -300,8 +300,11 @@ The in-process gateway's registry — `PushStore`, its rows and its
 obligations (webpush-gateway.md §2) — is what this gateway uses as the
 "thin index" §5 and §8 call for: the same rows, the same cap, the same
 claim, purge, rotation and expiry, the same ng requests. uniqush holds a
-second copy of each row. The rule that keeps the two from disagreeing
-where it matters:
+second copy of each row. Two copies are the price of running uniqush
+whole, its registry included, which is the production use the 2026-10
+decision is for; a stateless send that left the rows here alone would
+make uniqush a different program, and was declined. The rule that keeps
+the two from disagreeing where it matters:
 
 - **A push names its devices.** Each row keeps the delivery point
   uniqush gave it at `/subscribe` (`<type>:<hash>`, §5), and `/push`
