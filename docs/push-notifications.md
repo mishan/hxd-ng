@@ -1,15 +1,16 @@
-# Push notifications: delegating the device registry to uniqush-push
+# Push notifications: the notify decision, and the uniqush-push gateway
 
 Status: the first gateway is built. It is not the one this document was
 written around: it is in-process Web Push, whose own design is
 [`webpush-gateway.md`](webpush-gateway.md), and which hx-ng receives.
 What that document does not restate — the seam (§4), the subscriber
 model (§5, §5.1), when a push happens and what it may contain (§6), and
-the protocol additions (§8, §8.1) — is normative here for either gateway. The uniqush sidecar of
-§1–§3, §7 and §9's P3 is the multi-vendor path, kept and not scheduled;
-the two rules in §7 that hold for any gateway — the account comes from
-the session, and a guest has no mailbox to register — are restated in §8
-and bind either one.
+the protocol additions (§8, §8.1) — is normative here for either gateway.
+The uniqush sidecar of §1–§3, §7 and §9's P3 is **scheduled, as a second
+gateway beside the first** (2026-10, below), and waits on uniqush-push
+2.11.0. The two rules in §7 that hold for any gateway — the account comes
+from the session, and a guest has no mailbox to register — are restated
+in §8 and bind either one.
 
 Phase 7 item 3 promises "a `NotificationGateway` trait (APNs / FCM /
 UnifiedPush / WebPush behind it) plus a device-token registry." This
@@ -21,8 +22,10 @@ drive over HTTP as a sidecar. It also says exactly where the seam goes,
 what hxd-ng still owes, and how to stage the work.
 
 **Written against uniqush-push 2.8.0 (released 2026-09-03), and
-re-checked against it 2026-09-05.** 2.8.0 is the minimum: 2.7.0 has no
-Web Push backend at all and cannot deliver to APNs or FCM.
+re-checked against 2.10.0 in 2026-10.** The minimum is **2.11.0**, for
+the features §0's 2026-10 decision names; where this document
+describes 2.8.0's behavior below, it says so. 2.7.0 has no Web Push
+backend at all.
 
 **Decision (2026-08): yes, with the trait kept honest.** `NotificationGateway`
 ships with a no-op default and a `UniqushGateway` HTTP implementation.
@@ -47,13 +50,25 @@ the payload encryption (RFC 8291) — is one crate behind the existing
 hatch §3 and §10 already reserve. It goes first; the license review §3
 mentions for a native implementation comes before the crate. The
 uniqush design the rest of this document describes is **kept**, as the
-multi-vendor path for when there is an iOS app that needs APNs; when
-that is scheduled, this document moves to `docs/proposals/`. The Web
-Push gateway has its own, [`webpush-gateway.md`](webpush-gateway.md),
+multi-vendor path, and is scheduled by the 2026-10 decision below. The
+Web Push gateway has its own, [`webpush-gateway.md`](webpush-gateway.md),
 whose §1 tabulates what moving the sender in-process changes and whose
 §9 stages it. Nothing below is withdrawn — the seam (§4),
 the subscriber model (§5), the payload rules (§6) and the protocol
 additions (§8) hold for either gateway; only the order changed.
+
+**Decision, 2026-10: uniqush beside it, not instead of it.**
+`hxd-push-uniqush` is built as a second `NotificationGateway`, chosen by
+`[push] gateway`, with the in-process sender staying the default a server
+gets with no daemon to run. The reason is uniqush's rather than hxd-ng's:
+it needs production use, and an hxd-ng deployment that pushes through it
+is that. The in-process sender stays as the baseline to measure it
+against, which is also §10's guard against maintainer bias. What the
+sidecar could not do in 2.10.0 — set Web Push's TTL, urgency and `Topic`
+per push, authenticate its callers, tell its caller which devices it
+pruned — would have made it a regression from the in-process sender, so
+uniqush-push 2.11.0 adds them and is this gateway's minimum. What
+moving back out of process changes is §4.1.
 
 ---
 
@@ -69,14 +84,16 @@ storage. Its model is three nouns:
   `(service, subscriber)` pair (`/subscribe`).
 
 The endpoints that matter to us: `/addpsp`, `/subscribe`,
-`/unsubscribe`, `/push`, `/subscriptions`, `/nrdp`, `/previewpush`, and
-`/checkdb` for operators. `/addpsp` refuses to overwrite a PSP whose fixed
-data differs (the VAPID *public* key is fixed; the private key is not, so a
-mistyped private key is just re-sent) — the way out is `/addpsp` again with
-`replace=true`, which keeps every subscription. **Not `/rmpsp`**: it does
-not delete subscriptions in 2.8.0, but it is the wrong tool for a
-credential change and in 2.7.0 it silently unsubscribed every device in
-the service. The deployment docs should say `replace=true`, once.
+`/unsubscribe`, `/push`, `/previewpush`, `/psps`, `/health`, and from
+2.11.0 `/removed` (§4.1); `/subscriptions`, `/nrdp`, `/checkdb`,
+`/stats` and `/metrics` are for operators. `/addpsp` refuses to
+overwrite a PSP whose fixed data differs (the VAPID *public* key is
+fixed; the private key is not, so a mistyped private key is just
+re-sent) — the way out is `/addpsp` again with `replace=true`, which
+keeps every subscription. **Not `/rmpsp`**: it does not delete
+subscriptions in 2.8.0, but it is the wrong tool for a credential change
+and in 2.7.0 it silently unsubscribed every device in the service. The
+deployment docs should say `replace=true`, once.
 
 `/push` takes a `service`, one or more `subscriber`s (comma-separated
 under `subscriber` or `subscribers`), and payload fields; it fans out to
@@ -123,8 +140,9 @@ Android-first for the reasons that remain (§3).
 - The **device registry**: `(service, subscriber) → many delivery points`,
   with add/remove/query and Redis persistence. This is most of Phase 7's
   "device-token registry" — we still keep a thin index of our own for the
-  operations uniqush's API can't express (§5), but not the storage, not
-  the vendor-specific credential shapes, and not the pruning.
+  operations uniqush's API can't express (§5), and that index is now the
+  in-process gateway's whole registry (§4.1), but not the vendor-specific
+  credential shapes, and not the pruning.
 - **Token lifecycle.** Vendors report unregistered/invalid tokens on
   delivery; uniqush prunes them. Every push system that skips this
   eventually accumulates a graveyard of dead tokens and a mystery about
@@ -147,7 +165,8 @@ because everything on it is domain policy that belongs in hxd-core anyway:
 - **Read state**, and therefore notification dismissal/badge accuracy.
 - **Notification content policy** (full text vs. "you have a message") —
   our config knob, applied when we build the payload.
-- **Authorization.** Its REST API has no authentication whatsoever (§7).
+- **Authorization.** Its REST API authenticates the caller, from 2.11.0,
+  and nothing about who that caller is acting for (§7).
 
 ## 3. Why this fits *this* project specifically
 
@@ -230,7 +249,9 @@ means the same thing, is one state too many; `Core` holds
 
 **No registration methods, yet.** `register` and `unregister` answer the
 ng protocol requests in §8, which arrive with the gateway crate; the
-domain has nothing to say about a device. The message path is what had to
+domain has nothing to say about a device. The in-process gateway needed
+none, since its registry is the store; the sidecar needs one, to hear
+what the store gained and lost (§4.1). The message path is what had to
 exist first, and it is what §11's "the notify decision must live in the
 domain" is about.
 
@@ -247,9 +268,9 @@ and the same failure if it is broken.
 builds a different payload for each — a conversation to open, a thread to
 open — and `to()` answers the mailbox either way.
 
-`UniqushGateway` lives in its own crate (`hxd-push-uniqush`) so that a
-build without push pulls in no HTTP client at all, and so that a future
-`hxd-push-webpush` is a sibling rather than a rewrite.
+`UniqushGateway` lives in its own crate (`hxd-push-uniqush`), a sibling
+of `hxd-push-webpush`, behind a Cargo feature of its own, so a build
+without it pulls in nothing of it.
 
 **`notify` is fire-and-forget from the domain's point of view, and this is
 not a stylistic preference.** uniqush's `/push` answers only after the *first
@@ -269,9 +290,139 @@ in the background with a backoff that honours the provider's `Retry-After`
 (capped at 30 minutes), long after the HTTP response we saw, so a delivery
 point dropped *on retry* never appears in the `droppedCount` we saw and an
 abandoned retry surfaces only as `UNIQUSH_ERROR_FAILED_RETRY` in uniqush's
-own log. Our
-view of the registry is eventually-consistent with uniqush's, and the
-gateway must not treat its own bookkeeping as authoritative.
+own log. uniqush's view of the registry is eventually consistent with
+ours, and §4.1 is how it is kept so: the store is the record, and what
+uniqush reports changes the store only by the rules there.
+
+### 4.1 Two registries, one record
+
+The in-process gateway's registry — `PushStore`, its rows and its
+obligations (webpush-gateway.md §2) — is what this gateway uses as the
+"thin index" §5 and §8 call for: the same rows, the same cap, the same
+claim, purge, rotation and expiry, the same ng requests. uniqush holds a
+second copy of each row. Two copies are the price of running uniqush
+whole, its registry included, which is the production use the 2026-10
+decision is for; a stateless send that left the rows here alone would
+make uniqush a different program, and was declined. The rule that keeps
+the two from disagreeing where it matters:
+
+- **A push names its devices.** Each row keeps the delivery point
+  uniqush gave it at `/subscribe` (`<type>:<hash>`, §5), and `/push`
+  sends with `delivery_point_id` set to the rows `PushStore` answers for
+  that mailbox now, never to the subscriber's every device: a mailbox
+  none of whose rows has a delivery point yet gets no `/push` at all,
+  since one without the parameter reaches every device uniqush has.
+  uniqush matches an id only among the named subscriber's own devices,
+  and answers one outside them `UNIQUSH_NOT_SUBSCRIBED` without pushing,
+  which 2.11.0 documents and pins with a test, so a stale or mistaken id
+  cannot reach someone else's device. A device uniqush still has and the
+  store does not — an expired certificate before the sweep, a crash
+  between a delete and its `/unsubscribe`, a row deleted offline or
+  while another gateway ran — costs storage in uniqush, never a ring.
+  Every rule below is about keeping uniqush tidy and the store honest,
+  not about who hears what.
+- **The store is the record.** `push_register` writes the row and
+  answers, as it does now. A row with no delivery point is one uniqush
+  does not have yet. A re-registration with a changed triple clears it,
+  and one with the same triple, which a client sends at every login,
+  keeps it. The gateway subscribes rows without one in a task of its own,
+  with backoff while the sidecar is down, and looks for them at every
+  start and on a period, so a restart mid-backoff strands nothing. A
+  delivery point is written only while the row still holds the triple
+  it was made for, so a subscribe overtaken by a replacement leaves
+  nothing behind but a device nothing targets.
+- **A row the store deletes is unsubscribed**, best effort, with the
+  triple it held, unless another row of the mailbox still holds it,
+  since uniqush keeps one delivery point for both. That covers
+  `push_unregister`, a replaced endpoint, the expired rows a registration
+  clears before counting, the account purge, an identity claim or
+  rotation (§5), the expiry sweep, and revocation when it lands (§5.1,
+  webpush-gateway.md §2). A claim, which moves a row from `hx-l-` to
+  `hx-f-`, is an `/unsubscribe` and a new subscription. The deletes made
+  with the server stopped — `hxd push rekey`, `hxd inbox purge` — and
+  those made under another gateway leave their devices in uniqush,
+  named by no row.
+- **A device uniqush prunes is retired from the store.** uniqush deletes
+  a device its push service called dead (§1). From 2.11.0 it says so in
+  a `removed` entry, which names the delivery point and the `devid` the
+  gateway gave it at `/subscribe`: in the `/push` response for one
+  pruned during that push, and in the `GET /removed` log for every
+  removal, background retries' and APNs' included. The log is the record
+  and the response a fast path, since a timeout loses the response. The
+  gateway retires every row of the mailbox that still has that delivery
+  point, so a removal that crosses a re-registration does not delete the
+  new one. It reads the log after a push that reported a drop and on a
+  period, keeps the cursor in the store, and starts without one from the
+  oldest entry uniqush keeps, which is harmless for the same reason.
+- **A device uniqush does not have is subscribed again, never retired.**
+  A targeted delivery point uniqush answers `UNIQUSH_NOT_SUBSCRIBED`, a
+  log answering `truncated` or refusing a cursor it no longer knows (as
+  after a reset of uniqush's database), and a `service` that differs
+  from the one the store recorded all clear the delivery points they
+  concern, and the task subscribes those rows again. A Redis that lost
+  its data, or a renamed service, costs a push or two, not every device.
+- **The payload is the in-process sender's, byte for byte.** It goes in
+  `uniqush.payload.webpush`, which uniqush encrypts and sends verbatim,
+  so a client cannot tell the two gateways apart and hx-ng's service
+  worker needs nothing new. Each kind's TTL and urgency go in `ttl` and
+  `uniqush.urgency`, and the collapse key in `msggroup` as the same keyed
+  hash the in-process sender puts in `Topic` (webpush-gateway.md §4), so
+  uniqush and the push service behind it learn that two pushes collapse
+  and never what they are about. The plaintext crosses the hop to
+  uniqush again, and waits in its retry queue: with this gateway,
+  `content = "full"` trusts the sidecar with the text (§6), and `sender`
+  is the recommendation.
+- **The VAPID keypair is still the server's file** (webpush-gateway.md
+  §3), handed to uniqush with `/addpsp` at startup, with the `mailto:`
+  of `[push] contact` stripped, since the PSP takes an address. The
+  service, public key and contact last handed over are kept in the
+  store, and `/psps` is read to compare. A PSP that differs from them is
+  not this server's to replace, and the gateway refuses to start; one
+  that differs from the file, after `hxd push rekey`, is sent again with
+  `replace=true`. A rekey deletes every row, so the devices of the old
+  key stay in uniqush bound to a key nothing holds, and nothing pushes
+  at them.
+- **Destinations are checked by both.** The store refuses what
+  webpush-gateway.md §6 refuses at registration, its shape and literal
+  addresses; resolving a name and checking where it leads, before every
+  send, is uniqush's here (§7). Its `[webpush]` section's
+  `allow_private_addresses` therefore has to agree with
+  `allow_private_endpoints`, and its `allowed_hosts` be unset or wider
+  than anything the store accepts, or a registration accepted here is
+  refused at send.
+- **The sidecar is one origin to the breaker, and only the sidecar's own
+  failures count**: a refused connection, a timeout, a `5xx`, a failing
+  `/health`. A device's failure inside a `/push` response never does, so
+  an account that registers a slow endpoint cannot open the breaker for
+  everyone, which is the failure webpush-gateway.md §5 is built against.
+  `/push` waits for the first attempt at each device, so `[push]
+  timeout` here must be longer than uniqush's `[webpush]`
+  `request_timeout`. `max_inflight_per_origin` does not apply. uniqush's
+  `record_size` stays at its default, which is the ceiling the payload
+  is built to.
+
+Every row is subscribed as `webpush`: the store does not keep which of
+the two names a client registered under, and uniqush sends both the same
+way.
+
+**What the store and the core need for it**, all in P3. The rows gain
+the delivery point, and the store a record of the service, PSP key and
+contact, and the log's cursor: a schema migration. `PushStore` gains a
+conditional set and clear of a row's delivery point, the rows without
+one, and a retire by delivery point. Every delete answers with the rows
+it took rather than a count or a bool — `unregister`, a replacing
+`register` and the expired rows it clears, the unregister-all, purge,
+claim, rotation and sweep. And `Core`, which calls the store for each of
+those, tells the gateway what it added and took, through a second method
+on `NotificationGateway` that the in-process gateway ignores: that is
+the registration method §4 left for "the gateway crate". The conformance
+suite gains cases for each.
+
+What the sidecar can do that the in-process sender cannot is the
+backends behind it, for an operator who ships their own app and
+registers `apns` or `fcm` devices (§8). Those rows hold a token and no
+keys, a shape the store does not have, so they are a stage of their own
+(§9, P3b).
 
 ## 5. Subscriber identity — the one real gotcha
 
@@ -351,7 +502,8 @@ consequences we have to design around:
   re-provisioning, a reinstalled app) creates a **new** delivery point and
   leaves the old one in place until a vendor 404/410 retires it. Devices
   therefore accumulate rather than converge, and a user can end up being
-  pushed at addresses they no longer read.
+  pushed at addresses they no longer read, unless the caller unsubscribes
+  the old one and targets its pushes, as §4.1 does.
 
 The `devid` field does not help here: uniqush stores it (with `old_devid`
 and `subscribe_date`) as *volatile* data, outside the identity hash, and
@@ -366,10 +518,16 @@ That means the gateway keeps its own small `account → devices` table
 (one row per registration, holding the uniqush fixed-data triple) — which
 is not the device registry we were trying to avoid building, but a thin
 index over uniqush's, and it is what makes the next paragraph possible.
+That table is now `PushStore` (§4.1). The gateway still sends `devid` at
+`/subscribe`, so that uniqush can name the device it pruned.
 
-The `service` name is one constant per server instance (config
-`[push] service`, default `hxd`), which lets one uniqush deployment serve
-several hxd-ng instances.
+The `service` name is one constant per server instance,
+`[push.uniqush] service`, which lets one uniqush deployment serve several
+hxd-ng instances. **It is required and has no default**: two servers
+left on one default would share `hx-l-alice`, and one would push the
+other's alice, which is the wrong-person failure §10 rates highest. A
+PSP already under the service that this server did not hand over makes
+the gateway refuse to start (§4.1).
 
 ### 5.1 With an identity, the device names itself
 
@@ -476,15 +634,15 @@ also trusts Apple or Google. That is a meaningful improvement and a second
 independent argument for UnifiedPush as the first-class backend — but it
 is not end-to-end encryption and the docs must not imply it is.
 
-Two Web Push limits to design within (re-checked in 2.8.0's
-`srv/webpush/push_service.go`): uniqush hardcodes a 12-hour TTL and
-`Urgency: normal` with no per-push override — the `ttl` parameter applies
-to APNs, FCM and ADM only — and the plaintext payload ceiling is under
-4 KB. `content = "full"` on a long message must truncate on our side
-rather than discover the ceiling at delivery time. uniqush also does not
-set the RFC 8030 `Topic` header, which is Web Push's collapse key; that is
-an upstream change we can make when the coalescing question (§11) is
-decided, and `msggroup` already covers FCM's.
+Web Push's limits through uniqush: through 2.10.0 it hardcodes a 12-hour
+TTL and `Urgency: normal` and sets no RFC 8030 `Topic`, which is why
+2.11.0 is the minimum. From it, `ttl` and `msggroup` apply to Web Push as
+to the other backends (`msggroup` as `Topic`), and `uniqush.urgency`
+carries Web Push's four levels (§4.1). The plaintext payload ceiling is
+3993 bytes at uniqush's default record size since 2.9.0, which the
+gateway assumes (§4.1); `content = "full"` on a long message
+must truncate on our side rather than discover the ceiling at delivery
+time.
 
 Payloads are shaped per backend, and the gateway builds them
 accordingly: for Web Push the parameters become a JSON body the app
@@ -499,35 +657,50 @@ is how the payload builder's tests should check themselves.
 Someone answered your article, cited it, or posted in something you
 follow. It is a push only when you had caught up with that thread or
 category, so a busy one rings once per visit. The notice carries the
-scope, and `SubScope::key()` — `thread:398` — is its collapse key:
-`msggroup` for FCM, and the RFC 8030 `Topic` header once uniqush sets one.
+scope, and `SubScope::key()` — `thread:398` — is its collapse key,
+keyed-hashed before it leaves the server: `Topic` from the in-process
+sender, `msggroup` through uniqush.
 The payload names a thread to open rather than a message, and content
 policy applies to its excerpt as it does to a message's text.
 
 ## 7. Deployment and security posture
 
-**uniqush's REST API is unauthenticated.** There is no token, no basic
-auth, no TLS — the shipped config binds `localhost:9898` and that is the
-entire access control story. (`restapi_unix.go` is signal handling, not a
-unix-socket listener; don't be misled by the name.)
+**uniqush's REST API was unauthenticated through 2.10.0.** There was no
+token, no basic auth, no TLS — the shipped config binds `localhost:9898`
+and that was the entire access control story. 2.11.0 adds a bearer
+token, read from a file its `[WebFrontend]` section names, and a
+Unix-socket listener (`addr=unix:`, mode `socket_mode`), with `/health`
+exempt so a container's health check needs no secret. Under the packaged
+systemd unit, whose user is dynamic, hxd-ng reaches the socket through a
+drop-in that sets the unit's `User=` and `Group=`, or over TCP with the
+token, which is also the way of the compose example P3 adds. This
+gateway requires the socket, the token, or both: a gateway given an
+`http` address and no token file refuses to start.
+What follows is what either one guards, and it is why the bind rules
+below stay when the token is there.
 
 **Exposing that port is not "leaking a device registry," it is handing
 over the devices.** `GET /subscriptions?subscriber=…` returns each
-delivery point's fixed data — for Web Push, the `endpoint`, `p256dh` and
-`auth` triple, which is the complete credential set for sending arbitrary
-encrypted pushes straight to that user's phone, bypassing uniqush
-entirely. `GET /psps` returns every provider including the **VAPID
-private key itself**. And `GET /stop` — no method check, no auth — shuts
-the daemon down. Therefore:
+delivery point's fixed data — for Web Push the `endpoint` and `p256dh`,
+and from 2.9.0 the `auth` secret only when asked for — and the three
+together are the complete credential set for sending arbitrary encrypted
+pushes straight to that user's phone, bypassing uniqush entirely. `/push`
+sends as this server to any of its subscribers. `GET /psps` returned the
+**VAPID private key itself** until 2.9.0 redacted it. And `GET /stop`
+shuts the daemon down. Therefore:
 
 - uniqush binds loopback, or a private interface hxd-ng alone can reach.
   There is no configuration in which that port faces the internet.
-- If hxd-ng and uniqush are ever on different hosts, that link needs a
-  proxy that adds authentication, or a network the operator controls
-  end to end. Say this in the deployment docs, once, loudly.
+- If hxd-ng and uniqush are ever on different hosts, that link carries
+  the token and every payload's plaintext, so it needs TLS, from a proxy
+  in front of uniqush, or a network the operator controls end to end.
+  Say this in the deployment docs, once, loudly.
 - Redis persistence must be on (uniqush's own README stresses this):
-  losing the delivery-point set means every device silently stops getting
-  pushes until it re-registers.
+  losing the delivery-point set costs every device a push or two while
+  the gateway finds it gone and subscribes it again (§4.1), and every
+  push sent in between. The removal log of §4.1 is a Redis
+  stream, so 2.11.0 needs Redis 5.0 or newer, or a Valkey, as one server
+  or a primary with replicas: not a cluster, and not behind twemproxy.
 
 **Web Push SSRF.** The Web Push destination is chosen by whoever calls
 `/subscribe` — in our case by a client's UnifiedPush distributor. uniqush
@@ -535,7 +708,8 @@ already refuses non-globally-routable destinations by default, does not
 follow redirects, and re-checks before every push rather than only at
 subscribe time. We inherit that for free and should not relax it; the
 `allow_private_addresses` escape hatch is for operators running their own
-push server on a private network, and belongs in their config, not ours.
+push server on a private network, set in uniqush's config to match
+`allow_private_endpoints` in ours (§4.1).
 
 **Registration is authenticated by us, not by uniqush.** The
 `push_register` request (§8) only ever arrives on an authenticated ng
@@ -572,14 +746,13 @@ or `manage` for another device), `too_many_devices` (a new `devid` past
 the server's per-account cap), `bad_request` (a triple that is not one).
 
 **`push_unregister` is harder than it looks, and the gateway absorbs
-that.** uniqush has no unsubscribe-all endpoint, `/unsubscribe` will not
-accept a delivery-point id, and for Web Push it demands the full
-`(endpoint, p256dh, auth)` triple back. The only path through uniqush's
-own API is `GET /subscriptions` followed by a replayed `/unsubscribe` per
-device — an N+1 round trip against the endpoint that hands out device
-credentials (§7). That is why the gateway keeps its own device index
-(§5): with it, `push_unregister` is a local lookup and N `/unsubscribe`
-calls, and we never call `/subscriptions` in normal operation at all.
+that.** `/unsubscribe` will not accept a delivery-point id, and for Web
+Push it demands the full `(endpoint, p256dh, auth)` triple back. 2.9.0
+added `alldevices=1`, which removes every device a subscriber has, but
+the store's rows are the record (§4.1), so the gateway unsubscribes the
+rows it deletes, one `/unsubscribe` each, and never asks uniqush what a
+subscriber has: `/subscriptions` is not called in normal operation at
+all.
 
 The login reply grows `caps: ["push"]` when a gateway is configured —
 this is the moment the ng MVP anticipated for the capability list (now
@@ -587,8 +760,8 @@ hotline-ng.md §4), so it arrives here rather than being retrofitted.
 
 `logout` does **not** unregister devices. Logging out of the app is the
 single most common moment to want a push about what you're missing; only
-an explicit `push_unregister` (or a vendor telling uniqush the token is
-dead) removes a device.
+an explicit `push_unregister`, a push service calling the device dead, or
+§5.1's expiry, and its revocation when that lands, remove a device.
 
 Nothing about this touches the legacy wire. A 1.x client has no devices.
 
@@ -704,27 +877,41 @@ Phase 7 item 2 and are listed because item 3 is worthless without them.
    that was never stored is a doorbell for nothing. Idle notifies too, by
    the rule, though nothing sets idle yet (hotline-ng.md §12). Mention
    parsing and cross-device dedup remain open.
-3. **P3 — `hxd-push-uniqush`.** The HTTP client: the subscriber-id
-   mapping with its two prefixes (§5), the device index keyed
-   `(subscriber, devid)` with each certificate's expiry beside it (§5.1),
-   `/subscribe`, `/unsubscribe`, `/push`, payload construction per kind of
-   notice and per content policy (minding the reserved field names and
-   the Web Push size ceiling), dropped-delivery-point logging, and — not
-   optional, see §4 — an aggressive client timeout plus a circuit breaker,
-   so a wedged sidecar degrades to no-push rather than to backpressure.
-   Tested against a mock HTTP server; no uniqush needed in CI.
-4. **P4 — ng protocol.** `push_register` / `push_unregister` with the
-   device taken from the certificate on an identity session, the `caps`
-   entry and the login reply's `push` block (§8.1), the VAPID keypair
-   generated on first start, config (`[push]` block), the claim, purge and
-   rotation calls of §5 and §5.1, and the docs including the §7 warnings.
-   E2E with the scripted ng client and a stub gateway, and in hx-ng, whose
-   browser client is the first thing that can actually say yes to a
-   permission prompt.
+3. **P3 — `hxd-push-uniqush`.** Waits on uniqush-push 2.11.0, and is
+   built against that release's API document rather than this one where
+   the two differ. The HTTP client over TCP with the token, or over the
+   Unix socket; the subscriber-id mapping with its two prefixes (§5); and
+   §4.1 whole — the delivery point on each row and pushes that name
+   them, subscribing after the store in a task of the gateway's own with
+   backoff, an `/unsubscribe` for the rows the store deletes, the
+   removals uniqush reports retired with their cursor in the store, the
+   in-process payload with `ttl`, `msggroup` and `uniqush.urgency`, and
+   `/addpsp` against the key and contact the store recorded. In the
+   store, a migration for the delivery point and that record, deletes
+   that answer with the rows they took, and conformance cases for both.
+   The timeout and circuit breaker `[push]` already has, not optional
+   (§4), so a wedged sidecar degrades to no-push rather than to
+   backpressure. `[push] gateway = "uniqush"` and a `[push.uniqush]`
+   section (`addr`, `token_file`, `service`, the last required), Docker's
+   variables for it and a compose example beside uniqush and Valkey, and
+   the §7 warnings in docs/docker.md. Tested two ways: against a mock
+   HTTP server in the Rust suites, for the failure cases a real daemon
+   will not produce on demand; and against the real uniqush, its GHCR
+   image and a Valkey as service containers in a CI job of its own, for
+   everything the mock would only be agreeing with itself about.
+   **P3b**, the `apns` and `fcm` registration types and the rows that
+   carry a token, follows when an operator has an app to point at them.
+4. **P4 — ng protocol.** ✅ **Done 2026-09, by the in-process gateway**
+   (webpush-gateway.md §9 G3): `push_register` / `push_unregister`, the
+   `caps` entry and the login reply's `push` block (§8.1), the VAPID
+   keypair, `[push]`, and the claim, purge and rotation calls of §5 and
+   §5.1. P3 adds no request and changes none.
 5. **P5 — a real end-to-end.** A UnifiedPush distributor (ntfy) on a real
    Android device, a real uniqush, a real hxd-ng: DM a detached user, watch
    the phone buzz. This is the exit criterion; everything before it is
-   plumbing that hasn't met a vendor yet.
+   plumbing that hasn't met a vendor yet. It is webpush-gateway.md's G5
+   run a second time with `gateway = "uniqush"`, and the one test that
+   the two gateways look the same from the phone.
 
 6. **P6 — sealed payloads.** The `hl-identity/push/v1` sealing to a
    device's `device_enc` (§5.1), specified and vectored in `hl-identity`,
@@ -752,14 +939,15 @@ for an operator who publishes their own build, where each is a different
 | FCM delivery to an Android device unverified (browser verified) | Low **for us** — no Play Store presence either | UnifiedPush covers de-Googled Android; the browser path is a cheap P5b |
 | APNs never delivered to a real device | Low now, blocking later | Needs an Apple account and an app; P5 is Android-first by design |
 | Second daemon + Redis is real operational weight for a small server | Medium | Push is optional and off by default; a small legacy-only server is unaffected |
-| Maintainer bias toward our own project | Medium — it's the kind of bias that doesn't feel like one | The trait, the separate crate, and a `WebPushGateway` escape hatch are the mitigation; re-evaluate at P3 if the sidecar is fighting us |
-| uniqush's unauthenticated API exposed | **High if misconfigured** — `/subscriptions` hands out send-capable device credentials, `/stop` kills the daemon | Loopback only, documented at §7 and repeated in the deployment docs; the gateway's own device index means we never call `/subscriptions` in normal operation |
+| Maintainer bias toward our own project | Medium — it's the kind of bias that doesn't feel like one | The trait, the separate crate, and the in-process gateway beside it as the default and the baseline (§0, 2026-10); the sidecar is chosen for uniqush's sake, and said so |
+| uniqush's API exposed | **High if misconfigured** — `/subscriptions` hands out send-capable device credentials, `/stop` kills the daemon | 2.11.0's token or Unix socket, required by the gateway; loopback still, documented at §7 and repeated in the deployment docs; the store being the record means we never call `/subscriptions` in normal operation |
 | Subscriber-id collision, uid reuse, or a retaken login | **High** — wrong person's DMs | The mailbox mapping (§5) never touches uids, keys identities by fingerprint, keeps the two kinds apart by prefix, and gives login-keyed subscribers the mailbox's purge and claim obligations |
 | Stale delivery points accumulate as endpoints rotate | Medium — pushes to addresses nobody reads | The device index is keyed `(subscriber, devid)`, so a re-registration replaces; on identity sessions `devid` is the certificate's and cannot drift (§5.1); vendor 404/410 is the backstop, not the plan |
 | A lost or stolen device keeps receiving notifications | Medium — a stranger reads the lock screen | Identity devices stop at certificate revocation or expiry (§5.1); password devices only at `push_unregister`, which is one more reason identity accounts are the recommended case |
 | The app publisher's relay (§8.2) goes down or goes bad | Medium for mobile, none for the browser | It sees metadata and never content; failing to ring loses nothing; a browser or UnifiedPush device does not use it |
 | `/push` blocks; a slow provider becomes our latency | Medium | `notify` is spawned, never awaited; client timeout + circuit breaker in P3 |
-| Redis loses the delivery-point set | Medium | Persistence required and documented; devices re-register on login, so recovery is a login cycle |
+| Redis loses the delivery-point set | Medium | Persistence required and documented; the store still holds every row, and the gateway subscribes each again when uniqush answers that it lacks it (§4.1) |
+| The two registries drift | Medium — storage in uniqush the store forgot, or rows for devices uniqush pruned | §4.1: pushes name their devices, so a lost unsubscribe costs storage only; uniqush's removals retire rows by their delivery point, and a device it lacks is subscribed again |
 
 ## 11. Open questions
 
@@ -793,7 +981,7 @@ for an operator who publishes their own build, where each is a different
   what "mark as read" means across them, is the app's to design. The
   protocol gives it one thing to hold on to: an identity fingerprint is
   the same on every server that identity uses.
-- Whether uniqush should be vendored for
-  version-pinning and reproducible deployment, or simply documented as an
-  external dependency with a minimum version — which is **2.8.0** either
-  way, and which needs Go 1.25+ to build.
+- ~~**Whether uniqush should be vendored.**~~ — **answered 2026-10: no.**
+  It is an external dependency with a minimum version, **2.11.0**, run
+  from its GHCR image or its packages, and built with the Go its
+  `go.mod` names.
