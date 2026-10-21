@@ -142,6 +142,17 @@ impl Vapid {
         &self.public_b64
     }
 
+    /// The private scalar, base64url: what a sidecar that signs for this
+    /// server is handed (push-notifications.md §4.1), and nothing else.
+    pub fn private_key(&self) -> String {
+        B64.encode(self.key.to_bytes())
+    }
+
+    /// `[push] contact`, as it was configured.
+    pub fn contact(&self) -> &str {
+        &self.contact
+    }
+
     /// The `Authorization` header value for a push to `origin`, valid
     /// from `now`.
     ///

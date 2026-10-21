@@ -134,4 +134,11 @@ pub trait NotificationGateway: Send + Sync + 'static {
     /// a lost message — the message is in the inbox, and the article is in
     /// its thread, either way.
     fn notify(&self, n: &Notification<'_>);
+
+    /// The device registry gained a row (`added`) or lost the rows in
+    /// `taken`, as they were. For a gateway that keeps a second copy of
+    /// the registry, as a sidecar does (push-notifications.md §4.1); one
+    /// whose registry is the store has nothing to do. Must not block,
+    /// for the reason `notify` must not.
+    fn devices_changed(&self, _added: bool, _taken: &[crate::push::Device]) {}
 }

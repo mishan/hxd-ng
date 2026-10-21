@@ -6,9 +6,10 @@ written around: it is in-process Web Push, whose own design is
 What that document does not restate — the seam (§4), the subscriber
 model (§5, §5.1), when a push happens and what it may contain (§6), and
 the protocol additions (§8, §8.1) — is normative here for either gateway.
-The uniqush sidecar of §1–§3, §7 and §9's P3 is **scheduled, as a second
-gateway beside the first** (2026-10, below), and waits on uniqush-push
-2.11.0. The two rules in §7 that hold for any gateway — the account comes
+The uniqush sidecar of §1–§3, §7 and §9's P3 is **built, as a second
+gateway beside the first** (2026-10, below), against uniqush-push
+2.11.0: `hxd-push-uniqush`, chosen by `[push] gateway = "uniqush"`. The
+two rules in §7 that hold for any gateway — the account comes
 from the session, and a guest has no mailbox to register — are restated
 in §8 and bind either one.
 
@@ -50,7 +51,7 @@ the payload encryption (RFC 8291) — is one crate behind the existing
 hatch §3 and §10 already reserve. It goes first; the license review §3
 mentions for a native implementation comes before the crate. The
 uniqush design the rest of this document describes is **kept**, as the
-multi-vendor path, and is scheduled by the 2026-10 decision below. The
+multi-vendor path, and is built by the 2026-10 decision below. The
 Web Push gateway has its own, [`webpush-gateway.md`](webpush-gateway.md),
 whose §1 tabulates what moving the sender in-process changes and whose
 §9 stages it. Nothing below is withdrawn — the seam (§4),
@@ -385,7 +386,11 @@ the two from disagreeing where it matters:
   `mailto:` contact as its bare address. A PSP that differs from them is
   not this server's to replace, and the gateway refuses to start; one
   that differs from the file, after `hxd push rekey`, is sent again with
-  `replace=true`. A rekey deletes every row, so the devices of the old
+  `replace=true`. A uniqush that does not answer at startup does not
+  stop the server, which is worth running without push: the gateway
+  checks the PSP before its first push, retrying with the backoff
+  above, and a PSP it then finds is not this server's stops it pushing
+  with an error in the log rather than a server that will not start. A rekey deletes every row, so the devices of the old
   key stay in uniqush bound to a key nothing holds, and nothing pushes
   at them.
 - **Destinations are checked by both.** The store refuses what
@@ -395,17 +400,30 @@ the two from disagreeing where it matters:
   `allow_private_addresses` therefore has to agree with
   `allow_private_endpoints`, and its `allowed_hosts` be unset or wider
   than anything the store accepts, or a registration accepted here is
-  refused at send.
+  refused at send. hxd-ng cannot read uniqush's config to check: with
+  `allow_private_endpoints` on, the gateway says at startup what
+  uniqush's must be.
 - **The sidecar is one origin to the breaker, and only the sidecar's own
-  failures count**: a refused connection, a timeout, a `5xx`, a failing
-  `/health`. A device's failure inside a `/push` response never does,
-  `UNIQUSH_PUSH_RETRYING` included, so an account that registers a slow
-  endpoint cannot open the breaker for everyone, which is the failure
-  webpush-gateway.md §5 is built against. `/push` waits for the first
-  attempt at each device, so `[push] timeout` here must be longer than
-  uniqush's `[webpush]` `request_timeout`. `max_inflight_per_origin`
-  does not apply. uniqush's `record_size` stays at its default, which is
-  the ceiling the payload is built to.
+  failures count**: a refused connection, a timeout, a `5xx`, an answer
+  that is not uniqush's JSON. A device's failure inside a `/push`
+  response never does, `UNIQUSH_PUSH_RETRYING` included, so an account
+  that registers a slow endpoint cannot open the breaker for everyone,
+  which is the failure webpush-gateway.md §5 is built against. For the
+  same reason a `/push` that times out, which may be that account's
+  endpoints rather than uniqush, counts only if a `/health` asked at
+  once fails too. `/push` waits for the first attempt at each device,
+  so `[push] timeout` here must be longer than uniqush's `[webpush]`
+  `request_timeout`: it defaults to 40 seconds with this gateway, and
+  one no longer than uniqush's default of 30 is refused at startup. A
+  raised `request_timeout` is uniqush's config, which hxd-ng cannot
+  read, and needs `[push] timeout` raised past it by hand. A `/push`
+  names at most 16 devices, the number uniqush tries at once, so that
+  one call waits on one `request_timeout`; a notification starts no
+  batch past `[push] timeout` and a few seconds, and a mailbox has at
+  most two in flight, so one account's slow endpoints hold little of
+  `max_inflight`. `max_inflight_per_origin` does not apply. uniqush's
+  `record_size` stays at its default, which is the ceiling the payload
+  is built to.
 
 Every row is subscribed as `webpush`: the store does not keep which of
 the two names a client registered under, and uniqush sends both the same
@@ -698,8 +716,10 @@ shuts the daemon down. Therefore:
 - uniqush binds loopback, or a private interface hxd-ng alone can reach.
   There is no configuration in which that port faces the internet.
 - If hxd-ng and uniqush are ever on different hosts, that link carries
-  the token and every payload's plaintext, so it needs TLS, from a proxy
-  in front of uniqush, or a network the operator controls end to end.
+  the token and every payload's plaintext, so it needs TLS, or a network
+  the operator controls end to end. The gateway speaks plain HTTP or a
+  Unix socket, so the TLS is a tunnel's (WireGuard, SSH) rather than a
+  proxy's in front of uniqush that hxd-ng would speak `https` to.
   Say this in the deployment docs, once, loudly.
 - Redis persistence must be on (uniqush's own README stresses this):
   losing the delivery-point set costs every device a push or two while
@@ -883,9 +903,9 @@ Phase 7 item 2 and are listed because item 3 is worthless without them.
    that was never stored is a doorbell for nothing. Idle notifies too, by
    the rule, though nothing sets idle yet (hotline-ng.md §12). Mention
    parsing and cross-device dedup remain open.
-3. **P3 — `hxd-push-uniqush`.** Waits on uniqush-push 2.11.0, and is
-   built against that release's API document rather than this one where
-   the two differ. The HTTP client over TCP with the token, or over the
+3. **P3 — `hxd-push-uniqush`.** ✅ **Done 2026-10**, against uniqush-push
+   2.11.0's API and a running 2.11.0 rather than this document where the
+   two differed. The HTTP client over TCP with the token, or over the
    Unix socket; the subscriber-id mapping with its two prefixes (§5); and
    §4.1 whole — the delivery point on each row and pushes that name
    them, subscribing after the store in a task of the gateway's own with
@@ -903,7 +923,8 @@ Phase 7 item 2 and are listed because item 3 is worthless without them.
    the §7 warnings in docs/docker.md. Tested two ways: against a mock
    HTTP server in the Rust suites, for the failure cases a real daemon
    will not produce on demand; and against the real uniqush, its GHCR
-   image and a Valkey as service containers in a CI job of its own, for
+   image started beside a Valkey service container in a CI job of its
+   own, for
    everything the mock would only be agreeing with itself about.
    **P3b**, the `apns` and `fcm` registration types and the rows that
    carry a token, follows when an operator has an app to point at them.

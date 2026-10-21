@@ -1,5 +1,6 @@
-//! Wiring the Web Push gateway into the server
-//! (`docs/webpush-gateway.md` §8).
+//! Wiring a push gateway into the server: the in-process Web Push
+//! sender (`docs/webpush-gateway.md` §8), or a uniqush-push sidecar
+//! (`docs/push-notifications.md` §4.1) behind the `uniqush` feature.
 //!
 //! A Cargo feature as well as a config section, as voice and media are:
 //! a server that wants no TLS client and no elliptic curves in its
@@ -40,8 +41,16 @@ mod imp {
         config: hxd_push_webpush::Config,
         policy: hxd_core::push::PushPolicy,
         timeout: Duration,
+        #[cfg(feature = "uniqush")]
+        uniqush: Option<hxd_push_uniqush::Config>,
         info: OnceLock<Arc<PushInfo>>,
     }
+
+    /// How long uniqush gives a push service by default (its `[webpush]
+    /// request_timeout`). `/push` answers only after the first attempt at
+    /// each device, so a client that gives up sooner hears nothing of
+    /// what happened (`docs/push-notifications.md` §4.1).
+    pub const UNIQUSH_REQUEST_TIMEOUT: u64 = 30;
 
     impl Push {
         /// Read the key — creating it only when `devices` is empty, which
@@ -57,14 +66,18 @@ mod imp {
                 .map_err(|e| format!("[push] reading the device registry: {e}"))?;
             let vapid = Vapid::load_or_create(&self.vapid_key, &self.contact, first_start)
                 .map_err(|e| format!("[push] {e}"))?;
-            // The public key in the log, so an operator reading two
-            // servers' logs can tell whose subscriptions are whose — and
-            // can see at a glance that a restart did not change it.
-            tracing::info!(vapid = %vapid.public_key(), "push: Web Push gateway configured");
             let _ = self.info.set(Arc::new(PushInfo {
                 vapid: vapid.public_key().to_string(),
                 content: self.config.content.name().to_string(),
             }));
+            #[cfg(feature = "uniqush")]
+            if let Some(uniqush) = &self.uniqush {
+                return uniqush::start(devices, vapid, self, uniqush.clone());
+            }
+            // The public key in the log, so an operator reading two
+            // servers' logs can tell whose subscriptions are whose — and
+            // can see at a glance that a restart did not change it.
+            tracing::info!(vapid = %vapid.public_key(), "push: Web Push gateway configured");
             let transport =
                 hxd_push_webpush::http::shared(self.timeout, self.policy.allow_private_endpoints)?;
             Ok(Arc::new(WebPushGateway::new(
@@ -105,12 +118,50 @@ mod imp {
         if section.max_inflight_per_origin == 0 {
             return Err("[push] max_inflight_per_origin must be at least 1".into());
         }
-        if section.timeout == 0 {
-            return Err("[push] timeout must be at least a second".into());
-        }
         hxd_push_webpush::vapid::check_contact(&section.contact)
             .map_err(|e| format!("[push] {e}"))?;
-        let timeout = Duration::from_secs(section.timeout);
+        let (uniqush, timeout) = match (section.gateway.as_str(), &section.uniqush) {
+            ("webpush", None) => (None, section.timeout.unwrap_or(10)),
+            ("webpush", Some(_)) => {
+                return Err(
+                    "[push.uniqush] is configured, but [push] gateway is \"webpush\"".into(),
+                )
+            }
+            ("uniqush", None) => {
+                return Err("[push] gateway = \"uniqush\" needs a [push.uniqush] section".into())
+            }
+            ("uniqush", Some(u)) => {
+                let timeout = section.timeout.unwrap_or(UNIQUSH_REQUEST_TIMEOUT + 10);
+                if timeout <= UNIQUSH_REQUEST_TIMEOUT {
+                    return Err(format!(
+                        "[push] timeout = {timeout}: through uniqush it must be longer than \
+                         uniqush's own [webpush] request_timeout, {UNIQUSH_REQUEST_TIMEOUT} \
+                         seconds unless its config changes it, since /push answers only \
+                         after that"
+                    ));
+                }
+                (Some(u), timeout)
+            }
+            (other, _) => {
+                return Err(format!(
+                    "[push] gateway = {other:?}: it is \"webpush\" or \"uniqush\""
+                ))
+            }
+        };
+        if timeout == 0 {
+            return Err("[push] timeout must be at least a second".into());
+        }
+        #[cfg(feature = "uniqush")]
+        let uniqush = uniqush.map(uniqush::config).transpose()?;
+        #[cfg(not(feature = "uniqush"))]
+        if uniqush.is_some() {
+            return Err(
+                "[push] gateway = \"uniqush\", but this build has no uniqush gateway \
+                        (built without the `uniqush` feature)"
+                    .into(),
+            );
+        }
+        let timeout = Duration::from_secs(timeout);
         Ok(Some(Push {
             vapid_key: section.vapid_key.clone(),
             contact: section.contact.clone(),
@@ -130,6 +181,8 @@ mod imp {
                 allow_private_endpoints: section.allow_private_endpoints,
             },
             timeout,
+            #[cfg(feature = "uniqush")]
+            uniqush,
             info: OnceLock::new(),
         }))
     }
@@ -159,6 +212,109 @@ mod imp {
         let vapid = Vapid::rekey(&section.vapid_key, &section.contact)
             .map_err(|e| format!("[push] {e}"))?;
         Ok((dropped, vapid.public_key().to_string()))
+    }
+
+    /// The sidecar half, behind a feature of its own so a build without it
+    /// carries nothing of it.
+    #[cfg(feature = "uniqush")]
+    mod uniqush {
+        use std::sync::Arc;
+
+        use hxd_core::push::PushStore;
+        use hxd_core::NotificationGateway;
+        use hxd_push_uniqush::{Addr, Refused, UniqushGateway};
+        use hxd_push_webpush::Vapid;
+
+        use crate::UniqushSection;
+
+        /// `[push.uniqush]`, checked, with its token read.
+        pub fn config(section: &UniqushSection) -> Result<hxd_push_uniqush::Config, String> {
+            let addr =
+                Addr::parse(&section.addr).map_err(|e| format!("[push.uniqush] addr {e}"))?;
+            if !hxd_push_uniqush::valid_service(&section.service) {
+                return Err(format!(
+                    "[push.uniqush] service = {:?}: letters, digits, '-', '_', '@' and '.'",
+                    section.service
+                ));
+            }
+            let token = match &section.token_file {
+                Some(path) => {
+                    let token = std::fs::read_to_string(path).map_err(|e| {
+                        format!("[push.uniqush] token_file {}: {e}", path.display())
+                    })?;
+                    let token = token.trim();
+                    if token.is_empty()
+                        || token.chars().any(|c| c.is_whitespace() || c.is_control())
+                    {
+                        return Err(format!(
+                            "[push.uniqush] token_file {}: not one token",
+                            path.display()
+                        ));
+                    }
+                    Some(token.to_string())
+                }
+                None => None,
+            };
+            if token.is_none() && matches!(addr, Addr::Tcp { .. }) {
+                return Err(
+                    "[push.uniqush] needs token_file over TCP: whoever reaches uniqush's \
+                            API reads every device and pushes as this server. Or use its Unix \
+                            socket, addr = \"unix:/path\""
+                        .into(),
+                );
+            }
+            Ok(hxd_push_uniqush::Config {
+                addr,
+                token,
+                service: section.service.clone(),
+            })
+        }
+
+        /// Build the gateway and check uniqush's provider before anything
+        /// binds: one that is not this server's refuses the start. A uniqush
+        /// that does not answer yet does not, since the Hotline server is
+        /// worth running without push; the gateway keeps trying, and pushes
+        /// once it answers.
+        pub fn start(
+            devices: Arc<dyn PushStore>,
+            vapid: Vapid,
+            push: &super::Push,
+            config: hxd_push_uniqush::Config,
+        ) -> Result<Arc<dyn NotificationGateway>, String> {
+            if push.policy.allow_private_endpoints {
+                tracing::warn!(
+                    "push: [push] allow_private_endpoints is on; uniqush checks where each push \
+                     goes, so its [webpush] allow_private_addresses must be true, and its \
+                     allowed_hosts unset or naming every private push service, or those \
+                     devices are refused at send"
+                );
+            }
+            let gateway =
+                UniqushGateway::new(devices, Arc::new(vapid), push.config.clone(), config);
+            // A runtime cannot be blocked on from inside itself, so the check
+            // gets a thread and a runtime of its own, and holds up the start
+            // for no more than its few seconds a call.
+            let checked = std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| Refused::Fatal(e.to_string()))?
+                        .block_on(gateway.prepare())
+                })
+                .join()
+                .unwrap_or_else(|_| Err(Refused::Fatal("the check panicked".into())))
+            });
+            match checked {
+                Ok(()) => {}
+                Err(Refused::Fatal(e)) => return Err(format!("[push.uniqush] {e}")),
+                Err(Refused::Unreachable(e)) => {
+                    tracing::warn!("push: uniqush is not answering ({e}); pushing once it does")
+                }
+            }
+            gateway.start();
+            Ok(Arc::new(gateway))
+        }
     }
 }
 

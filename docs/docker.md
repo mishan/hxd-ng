@@ -304,6 +304,11 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_AVATARS` | `on` | Users' pictures on both wires ([avatars.md](avatars.md)), kept in the database. |
 | `HXD_PUSH_CONTACT` | | Turns on Web Push; a `mailto:` or `https:` contact for push services ([webpush-gateway.md](webpush-gateway.md)). The VAPID key is generated into the volume, and losing it silently breaks every subscription — back it up. |
 | `HXD_PUSH_CONTENT` | `sender` | `full`, `sender` or `generic`. |
+| `HXD_PUSH_GATEWAY` | `webpush` | `webpush` sends from the server itself; `uniqush` through a uniqush-push sidecar ([below](#push-through-uniqush)). |
+| `HXD_PUSH_TIMEOUT` | 10, or 40 through uniqush | Seconds a push may take. Through uniqush it must be longer than uniqush's own `[webpush] request_timeout`, 30 unless its config changes it. |
+| `HXD_PUSH_UNIQUSH_SERVICE` | | Required with `uniqush`: this server's name there, which no other server sharing that uniqush may use. |
+| `HXD_PUSH_UNIQUSH_ADDR` | `http://localhost:9898` | `http://host:port`, or `unix:/path` to its socket mounted into the container. |
+| `HXD_PUSH_UNIQUSH_TOKEN_FILE` | | uniqush's bearer token, a file in the container readable by uid 10001. Required over `http`. |
 
 ### Everything else
 
@@ -368,6 +373,55 @@ A server reached only by address cannot get one; `HXD_TLS_SELF_SIGNED=on`
 is for that case. The pair lives in `/var/lib/hxd-ng/tls` and belongs in
 the backups: a new one means every client that pinned the old one
 warns.
+
+### Push through uniqush
+
+With `HXD_PUSH_GATEWAY=uniqush` the server hands its notifications to
+[uniqush-push](https://github.com/uniqush/uniqush-push) 2.11 or newer,
+which encrypts and sends them, and keeps the devices in step with it
+([push-notifications.md](push-notifications.md) §4.1). A client cannot
+tell the two gateways apart, and switching between them needs no client
+to re-register. `docker/compose.uniqush.yaml` runs the three together:
+hxd-ng, uniqush, and the Valkey uniqush keeps its devices in. Pin
+uniqush's image at `ghcr.io/uniqush/uniqush-push:2.11`, never `:edge`:
+2.11.0 is built with Go 1.27.3, which refuses certificates from the
+compromised eMudhra intermediates, and every Web Push endpoint is checked
+against those roots.
+
+What to know before running it:
+
+- **uniqush's API faces nothing but hxd-ng.** Whoever reaches it reads
+  every device's subscription, which is enough to push to that phone
+  without uniqush, and pushes as this server. Publish no port for it;
+  bind it to loopback or a network only hxd-ng is on. The token
+  (`token_file` in uniqush's config, `HXD_PUSH_UNIQUSH_TOKEN_FILE` here)
+  or its Unix socket is required, and is not a reason to expose it.
+- **On another host, the link needs TLS of its own.** hxd-ng speaks
+  plain HTTP or a Unix socket to uniqush, and that link carries the
+  token and every notification's text. Run it over a network you
+  control end to end, or a tunnel (WireGuard, SSH).
+- **Valkey or Redis must persist.** `--appendonly yes`, as the example
+  has. Losing its data costs every device a push or two while hxd-ng
+  finds them gone and subscribes them again. uniqush 2.11 needs Redis 5.0
+  or newer, or Valkey, as one server or a primary with replicas: not a
+  cluster, and not behind twemproxy.
+- **The text goes to uniqush.** It encrypts each push, so it is handed
+  the plaintext and holds it while it retries. `HXD_PUSH_CONTENT=full`
+  trusts uniqush with every message; `sender`, the default, is the
+  recommendation.
+- **Private push services need both sides.** uniqush checks where each
+  push goes. With `[push] allow_private_endpoints` on in a mounted
+  config, set `allow_private_addresses=true` in uniqush's `[webpush]`
+  section, and leave its `allowed_hosts` unset or naming every private
+  push service; otherwise a device accepted here is refused at send.
+- **`HXD_PUSH_TIMEOUT` waits for uniqush's own.** `/push` answers after
+  uniqush's first try at each device, so a uniqush whose `[webpush]
+  request_timeout` is raised needs this raised past it.
+- **A service is one server's.** hxd-ng will not push through a
+  service holding a Web Push key it did not hand over, and refuses to
+  start over one when uniqush answers at startup. It records the key it
+  did hand over, so that `hxd push rekey` replaces it in uniqush too.
+  Two servers sharing a service would push each other's users.
 
 ## State and backups
 

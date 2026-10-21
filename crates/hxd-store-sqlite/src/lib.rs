@@ -71,7 +71,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -594,6 +594,21 @@ const SCHEMA_V20: &str = "
 ALTER TABLE news_blob ADD COLUMN derivative_mime TEXT;
 UPDATE news_blob SET derivative_mime = 'image/jpeg'
  WHERE derivative IS NOT NULL AND mime = 'image/jpeg';
+";
+
+/// What a sidecar push gateway keeps beside the devices
+/// (`docs/push-notifications.md` §4.1): the name it gave each row's
+/// subscription, and one row of what it last handed the sidecar and how
+/// far it has read the sidecar's log of removals.
+const SCHEMA_V21: &str = "
+ALTER TABLE push_device ADD COLUMN delivery_point TEXT;
+CREATE TABLE push_sidecar (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  service    TEXT NOT NULL,
+  public_key TEXT NOT NULL,
+  contact    TEXT NOT NULL,
+  cursor     TEXT
+);
 ";
 
 /// The bans this server asked linked servers for (`docs/server-link.md`
@@ -1256,6 +1271,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 20 {
         steps.push_str(SCHEMA_V20);
+    }
+    if version < 21 {
+        steps.push_str(SCHEMA_V21);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"

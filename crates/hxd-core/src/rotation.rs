@@ -23,7 +23,8 @@ impl Core {
         }
         self.news_rotate(from, to)?;
         if let Some(store) = self.devices.as_ref() {
-            store.devices_rotate(from, to)?;
+            let taken = store.devices_rotate(from, to)?;
+            self.devices_changed(false, &taken);
         }
         if let Some(avatars) = self.avatars.as_ref() {
             let (old, new) = (AvatarOwner::Identity(*from), AvatarOwner::Identity(*to));

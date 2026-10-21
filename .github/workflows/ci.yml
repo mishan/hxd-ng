@@ -76,6 +76,62 @@ jobs:
           cargo test --workspace --features hxd/metrics --lib
           cargo test -p hxd --features metrics --test metrics
 
+  # The uniqush gateway against a real uniqush-push and Valkey
+  # (docs/push-notifications.md §9 P3): what the Rust suites' mock would
+  # only be agreeing with itself about. uniqush takes its token from its
+  # config file, which a service container cannot be given before the
+  # checkout, so Valkey is the service and uniqush is started beside it
+  # once the file is written. The test runs the push service uniqush
+  # sends to, on this machine, which it reaches through the host gateway.
+  uniqush:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: valkey/valkey:8-alpine
+        options: >-
+          --health-cmd "valkey-cli ping" --health-interval 2s
+          --health-timeout 2s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start uniqush with a token
+        run: |
+          mkdir -p "$RUNNER_TEMP/uniqush"
+          openssl rand -hex 32 > "$RUNNER_TEMP/uniqush/api-token"
+          # The image runs as 65534, which must read both files.
+          chmod 0755 "$RUNNER_TEMP/uniqush"
+          chmod 0644 "$RUNNER_TEMP/uniqush/api-token"
+          cat > "$RUNNER_TEMP/uniqush/uniqush-push.conf" <<'EOF'
+          logfile=
+          [WebFrontend]
+          addr=0.0.0.0:9898
+          token_file=/etc/uniqush/api-token
+          [Database]
+          host=redis
+          [webpush]
+          allow_private_addresses=true
+          EOF
+          docker run -d --name uniqush --network ${{ job.services.redis.network }} \
+            -p 127.0.0.1:9898:9898 --add-host=host.docker.internal:host-gateway \
+            -v "$RUNNER_TEMP/uniqush:/etc/uniqush:ro" ghcr.io/uniqush/uniqush-push:2.11
+          for _ in $(seq 60); do curl -fs http://127.0.0.1:9898/health && exit 0; sleep 1; done
+          docker logs uniqush
+          exit 1
+
+      - name: The gateway against it
+        env:
+          HXD_TEST_UNIQUSH: http://127.0.0.1:9898
+          HXD_TEST_UNIQUSH_PUSH_HOST: host.docker.internal
+        run: |
+          export HXD_TEST_UNIQUSH_TOKEN_FILE="$RUNNER_TEMP/uniqush/api-token"
+          cargo test -p hxd-push-uniqush --test uniqush -- --nocapture
+
+      - name: uniqush's log
+        if: failure()
+        run: docker logs uniqush
+
   # A minute per target from the seed corpus: long enough to catch a
   # framing regression, not to explore.
   fuzz:

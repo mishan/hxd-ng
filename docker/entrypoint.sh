@@ -303,6 +303,25 @@ generate() {
         echo "vapid_key = \"$DATA/vapid.key\""
         [ -z "$db" ] || echo "db = $db"
         str HXD_PUSH_CONTENT content
+        num HXD_PUSH_TIMEOUT timeout
+        case ${HXD_PUSH_GATEWAY:-webpush} in
+            webpush)
+                for v in HXD_PUSH_UNIQUSH_ADDR HXD_PUSH_UNIQUSH_TOKEN_FILE HXD_PUSH_UNIQUSH_SERVICE; do
+                    unused "$v" "HXD_PUSH_GATEWAY is not uniqush"
+                done
+                ;;
+            uniqush)
+                [ -n "${HXD_PUSH_UNIQUSH_SERVICE:-}" ] ||
+                    die "HXD_PUSH_GATEWAY=uniqush needs HXD_PUSH_UNIQUSH_SERVICE, this server's name in uniqush"
+                echo 'gateway = "uniqush"'
+                echo
+                echo "[push.uniqush]"
+                kv service "$HXD_PUSH_UNIQUSH_SERVICE"
+                str HXD_PUSH_UNIQUSH_ADDR addr
+                str HXD_PUSH_UNIQUSH_TOKEN_FILE token_file
+                ;;
+            *) die "HXD_PUSH_GATEWAY is webpush or uniqush, got \"$HXD_PUSH_GATEWAY\"" ;;
+        esac
     fi
 
     if on HXD_SYSTEM off; then

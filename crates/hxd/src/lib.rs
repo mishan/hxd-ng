@@ -261,10 +261,16 @@ pub struct PushSection {
     /// `[history]` or `[news]` names, in that order, which it then
     /// shares; with none of those it is required.
     pub db: Option<PathBuf>,
+    /// Which gateway sends: `webpush`, this process itself, or
+    /// `uniqush`, a uniqush-push sidecar that `[push.uniqush]` names
+    /// (`docs/push-notifications.md` §4.1).
+    #[serde(default = "default_push_gateway")]
+    pub gateway: String,
+    pub uniqush: Option<UniqushSection>,
     /// Seconds to wait for a push service before giving up on one
-    /// notification.
-    #[serde(default = "default_push_timeout")]
-    pub timeout: u64,
+    /// notification: 10 by default, and through uniqush longer than its
+    /// own wait for a push service, since `/push` answers only after it.
+    pub timeout: Option<u64>,
     /// How long a push service should hold a private message's
     /// notification for a device that is offline.
     #[serde(default = "default_message_ttl")]
@@ -295,14 +301,35 @@ pub struct PushSection {
     pub allow_private_endpoints: bool,
 }
 
+/// `[push.uniqush]`: where the sidecar is, and this server's name in it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UniqushSection {
+    /// `http://host:port` or `unix:/path`, as uniqush's `[WebFrontend]
+    /// addr` has it.
+    #[serde(default = "default_uniqush_addr")]
+    pub addr: String,
+    /// The file holding uniqush's bearer token, its `token_file`.
+    /// Required over TCP: uniqush's API hands out devices and sends as
+    /// this server to whoever reaches it (`docs/push-notifications.md`
+    /// §7).
+    pub token_file: Option<PathBuf>,
+    /// This server's service in uniqush. Required, with no default: two
+    /// servers on one name would push each other's accounts.
+    pub service: String,
+}
+
+fn default_uniqush_addr() -> String {
+    "http://localhost:9898".into()
+}
+fn default_push_gateway() -> String {
+    "webpush".into()
+}
 fn default_push_content() -> String {
     "sender".into()
 }
 fn default_vapid_key() -> PathBuf {
     PathBuf::from("vapid.key")
-}
-fn default_push_timeout() -> u64 {
-    10
 }
 fn default_message_ttl() -> u64 {
     4 * 7 * 24 * 60 * 60
@@ -3700,7 +3727,9 @@ fn purge_devices(
             .map_err(|e| e.to_string());
     }
     let store = open_sqlite(&path, hxd_store_sqlite::Synchronous::Normal)?;
-    hxd_core::PushStore::devices_purge(&*store, mailbox).map_err(|e| e.to_string())
+    hxd_core::PushStore::devices_purge(&*store, mailbox)
+        .map(|d| d.len())
+        .map_err(|e| e.to_string())
 }
 
 /// Without the feature there is no store to inspect, and saying so beats
@@ -4988,6 +5017,65 @@ sync = "full"
         assert!(check_config(&none).unwrap_err().contains("max_devices"));
     }
 
+    /// `gateway = "uniqush"`: the section it needs, a token over TCP, a
+    /// service uniqush accepts, and a timeout longer than uniqush's own.
+    #[cfg(feature = "uniqush")]
+    #[test]
+    fn a_uniqush_gateway_is_checked_before_anything_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("api-token");
+        std::fs::write(&token, "s3cret\n").unwrap();
+        let push = "[push]\ncontact = \"mailto:a@example.org\"\n";
+        let uniqush = format!("{push}gateway = \"uniqush\"\n");
+        let section = format!("[push.uniqush]\nservice = \"hxd\"\ntoken_file = {token:?}\n");
+
+        assert!(
+            crate::push::build(&parse(&format!("{uniqush}{section}")).unwrap())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            crate::push::build(
+                &parse(&format!(
+                    "{uniqush}[push.uniqush]\nservice = \"hxd\"\naddr = \"unix:/run/uniqush.sock\"\n"
+                ))
+                .unwrap()
+            )
+            .is_ok(),
+            "a socket needs no token"
+        );
+        assert!(
+            parse(&format!(
+                "{uniqush}[push.uniqush]\ntoken_file = {token:?}\n"
+            ))
+            .is_err(),
+            "service has no default"
+        );
+        for (toml, says) in [
+            (uniqush.clone(), "[push.uniqush]"),
+            // A section the configured gateway would ignore.
+            (format!("{push}{section}"), "gateway"),
+            (
+                format!("{uniqush}[push.uniqush]\nservice = \"hxd\"\n"),
+                "token_file",
+            ),
+            (
+                format!("{uniqush}[push.uniqush]\nservice = \"h x d\"\ntoken_file = {token:?}\n"),
+                "service",
+            ),
+            (
+                format!("{uniqush}timeout = 30\n{section}"),
+                "request_timeout",
+            ),
+            (format!("{push}gateway = \"apns\"\n"), "gateway"),
+        ] {
+            match crate::push::build(&parse(&toml).unwrap()) {
+                Err(e) => assert!(e.contains(says), "{toml:?}: {e}"),
+                Ok(_) => panic!("{toml:?} should have been refused"),
+            }
+        }
+    }
+
     /// A missing key is a first start only when there are no devices: a
     /// deleted file, or a moved `vapid_key`, must not mint a key every
     /// registered device is already invalid against.
@@ -5014,6 +5102,7 @@ sync = "full"
                     expires: None,
                     registered_at: std::time::SystemTime::now(),
                     last_push_at: None,
+                    delivery_point: None,
                 },
                 8,
             )
@@ -5071,6 +5160,7 @@ sync = "full"
                         expires: None,
                         registered_at: std::time::SystemTime::now(),
                         last_push_at: None,
+                        delivery_point: None,
                     },
                     8,
                 )
@@ -5106,6 +5196,7 @@ sync = "full"
                         expires: None,
                         registered_at: std::time::SystemTime::now(),
                         last_push_at: None,
+                        delivery_point: None,
                     },
                     8,
                 )

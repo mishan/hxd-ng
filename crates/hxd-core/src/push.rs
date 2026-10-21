@@ -123,6 +123,32 @@ pub struct Device {
     /// Advanced on every accepted send, so an operator can see which
     /// devices are live without reading a provider's logs.
     pub last_push_at: Option<SystemTime>,
+    /// The name a sidecar gave this row's subscription, for a gateway
+    /// that keeps a second copy of the registry: `None` until it has one
+    /// (push-notifications.md §4.1). Pushes name these, so a row without
+    /// one is not pushed at through the sidecar.
+    pub delivery_point: Option<String>,
+}
+
+impl Device {
+    /// Does `other` hold the subscription this row holds? A sidecar names
+    /// a device by its mailbox and these three, so two rows that agree on
+    /// them are one device there.
+    pub fn same_subscription(&self, other: &Device) -> bool {
+        self.endpoint == other.endpoint && self.p256dh == other.p256dh && self.auth == other.auth
+    }
+}
+
+/// What a sidecar gateway was last told, kept beside the rows it
+/// subscribed (push-notifications.md §4.1): which service, which VAPID
+/// public key and contact it handed over, and how far it has read the
+/// sidecar's log of removals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarRecord {
+    pub service: String,
+    pub public_key: String,
+    pub contact: String,
+    pub cursor: Option<String>,
 }
 
 /// What [`PushStore::register`] did.
@@ -153,11 +179,20 @@ pub trait PushStore: Send + Sync + 'static {
     ///
     /// `registered_at` is taken from the argument and `last_push_at` is
     /// cleared: a re-registration is a new subscription even when the
-    /// key it is filed under is old.
-    fn register(&self, device: &Device, max: usize) -> Result<Registered, StoreError>;
+    /// key it is filed under is old. Its `delivery_point` is kept from
+    /// the row it replaces when that row held the same subscription, and
+    /// is `None` otherwise, whatever `device` says.
+    ///
+    /// Answers with the rows it took as well: the mailbox's expired ones,
+    /// and the one it replaced where the subscription changed.
+    fn register(
+        &self,
+        device: &Device,
+        max: usize,
+    ) -> Result<(Registered, Vec<Device>), StoreError>;
 
-    /// Forget one device, answering whether there was one.
-    fn unregister(&self, owner: &Mailbox, devid: &DeviceId) -> Result<bool, StoreError>;
+    /// Forget one device, answering with it if there was one.
+    fn unregister(&self, owner: &Mailbox, devid: &DeviceId) -> Result<Option<Device>, StoreError>;
 
     /// Forget one device **only if it still has `endpoint`**, answering
     /// whether it did. This is the gateway's delete, for a push service
@@ -178,8 +213,8 @@ pub trait PushStore: Send + Sync + 'static {
     fn any_devices(&self) -> Result<bool, StoreError>;
 
     /// Forget every device of a mailbox — `push_unregister { all: true }`
-    /// — answering how many went.
-    fn unregister_all(&self, owner: &Mailbox) -> Result<usize, StoreError>;
+    /// — answering with the rows that went.
+    fn unregister_all(&self, owner: &Mailbox) -> Result<Vec<Device>, StoreError>;
 
     /// The devices a push to `owner` should reach, newest registration
     /// first. **Expired rows are not returned**: `now` is compared
@@ -192,30 +227,74 @@ pub trait PushStore: Send + Sync + 'static {
     fn touch(&self, owner: &Mailbox, devid: &DeviceId, at: SystemTime) -> Result<(), StoreError>;
 
     /// Delete every row whose certificate expired before `now`, answering
-    /// how many went. The comparison in [`Self::devices`] is what keeps
-    /// an expired device from being pushed at; this is only housekeeping,
-    /// and a server that never calls it is correct and slightly fatter.
-    fn sweep_expired(&self, now: SystemTime) -> Result<usize, StoreError>;
+    /// with the rows that went. The comparison in [`Self::devices`] is
+    /// what keeps an expired device from being pushed at; this is only
+    /// housekeeping, and a server that never calls it is correct and
+    /// slightly fatter.
+    fn sweep_expired(&self, now: SystemTime) -> Result<Vec<Device>, StoreError>;
 
     /// An account linked an identity: stamp its rows with the
     /// fingerprint. The twin of [`crate::inbox::MessageStore::claim`],
     /// owed at the same call sites. A row the identity already holds for
     /// the same `devid` wins, because it is the one the device itself
     /// last registered.
-    fn devices_claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError>;
+    ///
+    /// Answers with every row the login held, as it was: each has left
+    /// the login's subscriber, and a moved row's delivery point is
+    /// cleared, since a sidecar knows it under the subscriber it left.
+    fn devices_claim(&self, login: &str, fingerprint: &[u8; 32])
+        -> Result<Vec<Device>, StoreError>;
 
     /// An identity rotated to a successor key: **drop** the
-    /// predecessor's devices, answering how many went.
+    /// predecessor's devices, answering with the rows that went.
     ///
     /// `Core::rotate_identity` calls it beside
     /// [`crate::news::NewsStore::subs_rotate`] and the mail's, but the
     /// behavior deliberately differs. See this module's header, and
     /// push-notifications.md §5.1.
-    fn devices_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError>;
+    fn devices_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Vec<Device>, StoreError>;
 
     /// An account went: take its devices with it, so a later holder of
     /// the freed login inherits nobody's phone.
-    fn devices_purge(&self, of: &Mailbox) -> Result<usize, StoreError>;
+    fn devices_purge(&self, of: &Mailbox) -> Result<Vec<Device>, StoreError>;
+
+    /// Record the delivery point a sidecar named this row's subscription
+    /// by, **only while the row still holds that subscription**, and
+    /// answer whether it did. A subscribe overtaken by a replacement
+    /// writes nothing (push-notifications.md §4.1).
+    fn set_delivery_point(&self, device: &Device, delivery_point: &str)
+        -> Result<bool, StoreError>;
+
+    /// Forget the delivery point on each of `owner`'s rows that has it,
+    /// answering how many did: the sidecar does not have it, and those
+    /// rows are subscribed again.
+    fn clear_delivery_point(
+        &self,
+        owner: &Mailbox,
+        delivery_point: &str,
+    ) -> Result<usize, StoreError>;
+
+    /// Forget every delivery point, answering how many there were: the
+    /// sidecar may have lost any of them.
+    fn clear_delivery_points(&self) -> Result<usize, StoreError>;
+
+    /// The live rows a sidecar has not named yet, oldest registration
+    /// first.
+    fn unsubscribed(&self, now: SystemTime) -> Result<Vec<Device>, StoreError>;
+
+    /// Delete each of `owner`'s rows that has `delivery_point`, answering
+    /// with them: the sidecar pruned that device. A row subscribed afresh
+    /// since has another, or none yet, and stays.
+    fn retire_delivery_point(
+        &self,
+        owner: &Mailbox,
+        delivery_point: &str,
+    ) -> Result<Vec<Device>, StoreError>;
+
+    /// What a sidecar gateway was last told, if one ever was.
+    fn sidecar(&self) -> Result<Option<SidecarRecord>, StoreError>;
+
+    fn set_sidecar(&self, record: &SidecarRecord) -> Result<(), StoreError>;
 }
 
 /// Why a device was not registered.
@@ -318,6 +397,7 @@ impl crate::roster::Core {
                     expires: r.expires,
                     registered_at: SystemTime::now(),
                     last_push_at: None,
+                    delivery_point: None,
                 },
                 policy.max_devices,
             )
@@ -325,6 +405,8 @@ impl crate::roster::Core {
                 tracing::warn!("push: registering a device: {e}");
                 PushError::StoreFailed
             })?;
+        let (registered, taken) = registered;
+        self.devices_changed(registered != Registered::Full, &taken);
         match registered {
             Registered::Added => Ok(false),
             Registered::Replaced => Ok(true),
@@ -341,14 +423,28 @@ impl crate::roster::Core {
     pub fn push_unregister(&self, uid: Uid, devid: Option<DeviceId>) -> Result<(), PushError> {
         let store = self.devices.as_ref().ok_or(PushError::NotAvailable)?;
         let owner = self.push_mailbox(uid)?;
-        let result = match devid {
-            Some(devid) => store.unregister(&owner, &devid).map(|_| ()),
-            None => store.unregister_all(&owner).map(|_| ()),
-        };
-        result.map_err(|e| {
+        let taken = match devid {
+            Some(devid) => store
+                .unregister(&owner, &devid)
+                .map(|d| d.into_iter().collect()),
+            None => store.unregister_all(&owner),
+        }
+        .map_err(|e| {
             tracing::warn!("push: unregistering a device of {}: {e}", owner.login);
             PushError::StoreFailed
-        })
+        })?;
+        self.devices_changed(false, &taken);
+        Ok(())
+    }
+
+    /// Tell the gateway what the registry gained and lost, for one that
+    /// keeps a copy of its own (`NotificationGateway::devices_changed`).
+    pub(crate) fn devices_changed(&self, added: bool, taken: &[Device]) {
+        if let Some(gateway) = self.gateway.as_ref() {
+            if added || !taken.is_empty() {
+                gateway.devices_changed(added, taken);
+            }
+        }
     }
 
     /// The mailbox a registration belongs to: a session's own, and only
@@ -364,16 +460,18 @@ impl crate::roster::Core {
 
     pub(crate) fn devices_claim(&self, login: &str, fingerprint: &[u8; 32]) {
         if let Some(store) = self.devices.as_ref() {
-            if let Err(e) = store.devices_claim(login, fingerprint) {
-                tracing::warn!("push: claiming {login}'s devices: {e}");
+            match store.devices_claim(login, fingerprint) {
+                Ok(taken) => self.devices_changed(!taken.is_empty(), &taken),
+                Err(e) => tracing::warn!("push: claiming {login}'s devices: {e}"),
             }
         }
     }
 
     pub(crate) fn devices_purge(&self, of: &Mailbox) {
         if let Some(store) = self.devices.as_ref() {
-            if let Err(e) = store.devices_purge(of) {
-                tracing::warn!("push: purging {}'s devices: {e}", of.login);
+            match store.devices_purge(of) {
+                Ok(taken) => self.devices_changed(false, &taken),
+                Err(e) => tracing::warn!("push: purging {}'s devices: {e}", of.login),
             }
         }
     }
@@ -387,7 +485,10 @@ impl crate::roster::Core {
             return 0;
         };
         match store.sweep_expired(SystemTime::now()) {
-            Ok(n) => n,
+            Ok(taken) => {
+                self.devices_changed(false, &taken);
+                taken.len()
+            }
             Err(e) => {
                 tracing::warn!("push: sweeping expired devices: {e}");
                 0
@@ -413,6 +514,7 @@ mod tests {
             expires: None,
             registered_at: SystemTime::now(),
             last_push_at: None,
+            delivery_point: None,
         }
     }
 
@@ -465,6 +567,119 @@ mod tests {
             .devices(&Mailbox::login("bob"), now)
             .unwrap()
             .is_empty());
+    }
+
+    /// A gateway that keeps a copy of the registry hears every row the
+    /// obligations take, as it was, and that a claim gave rows to
+    /// subscribe under the identity.
+    #[test]
+    fn the_gateway_hears_what_the_obligations_take() {
+        #[derive(Default)]
+        struct Heard(std::sync::Mutex<Vec<(bool, Vec<String>)>>);
+        impl crate::notify::NotificationGateway for Heard {
+            fn notify(&self, _: &crate::notify::Notification<'_>) {}
+            fn devices_changed(&self, added: bool, taken: &[Device]) {
+                let taken = taken.iter().map(|d| d.devid.as_str().to_string()).collect();
+                self.0.lock().unwrap().push((added, taken));
+            }
+        }
+        let devices = Arc::new(MemoryDevices::new());
+        let heard = Arc::new(Heard::default());
+        let core = Core::new()
+            .with_devices(devices.clone())
+            .with_notifications(heard.clone());
+        let fp = [7u8; 32];
+        let last = || heard.0.lock().unwrap().pop();
+
+        devices
+            .register(&device(Mailbox::login("alice"), "alices-phone"), 8)
+            .unwrap();
+        core.inbox_claim("alice", &fp);
+        assert_eq!(last(), Some((true, vec!["alices-phone".into()])));
+        core.rotate_identity(&fp, &[8u8; 32]).unwrap();
+        assert_eq!(last(), Some((false, vec!["alices-phone".into()])));
+
+        devices
+            .register(&device(Mailbox::login("bob"), "bobs-phone!!"), 8)
+            .unwrap();
+        core.inbox_purge(&Mailbox::login("bob"));
+        assert_eq!(last(), Some((false, vec!["bobs-phone!!".into()])));
+
+        let mut lapsed = device(Mailbox::login("carol"), "carols-phone");
+        lapsed.expires = Some(SystemTime::now() - std::time::Duration::from_secs(1));
+        devices.register(&lapsed, 8).unwrap();
+        core.sweep_devices();
+        assert_eq!(last(), Some((false, vec!["carols-phone".into()])));
+
+        core.sweep_devices();
+        assert_eq!(last(), None, "nothing taken, nothing said");
+    }
+
+    /// A registration and an unregistration reach the gateway too: the
+    /// subscription a re-registration replaced, and the row taken.
+    #[test]
+    fn registering_and_unregistering_reach_the_gateway() {
+        #[derive(Default)]
+        struct Heard(std::sync::Mutex<Vec<(bool, Vec<String>)>>);
+        impl crate::notify::NotificationGateway for Heard {
+            fn notify(&self, _: &crate::notify::Notification<'_>) {}
+            fn devices_changed(&self, added: bool, taken: &[Device]) {
+                let taken = taken.iter().map(|d| d.endpoint.clone()).collect();
+                self.0.lock().unwrap().push((added, taken));
+            }
+        }
+        let heard = Arc::new(Heard::default());
+        let core = Core::new()
+            .with_devices(Arc::new(MemoryDevices::new()))
+            .with_notifications(heard.clone());
+        let (uid, _events) = core
+            .attach(crate::roster::AttachInfo {
+                account: None,
+                nick: "bob".into(),
+                icon: 1,
+                admin: false,
+                access: crate::access::AccessBits::empty(),
+                login: "bob".into(),
+                addr: None,
+                can_detach: true,
+                transport: crate::roster::Transport::default(),
+                has_inbox: true,
+                attach_news: false,
+                set_avatar: false,
+                moderate: false,
+                can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
+                is_person: true,
+                reads_on_delivery: false,
+                identity: None,
+                system: false,
+            })
+            .unwrap();
+        let registration = |endpoint: &str| Registration {
+            devid: DeviceId::parse("phone-install").unwrap(),
+            endpoint: endpoint.into(),
+            p256dh: [4; 65],
+            auth: [9; 16],
+            expires: None,
+        };
+        let last = || heard.0.lock().unwrap().pop();
+
+        core.push_register(uid, registration("https://push.example/1"))
+            .unwrap();
+        assert_eq!(last(), Some((true, vec![])));
+        core.push_register(uid, registration("https://push.example/2"))
+            .unwrap();
+        assert_eq!(
+            last(),
+            Some((true, vec!["https://push.example/1".into()])),
+            "the subscription it replaced"
+        );
+        core.push_unregister(uid, DeviceId::parse("phone-install"))
+            .unwrap();
+        assert_eq!(last(), Some((false, vec!["https://push.example/2".into()])));
+        core.push_unregister(uid, None).unwrap();
+        assert_eq!(last(), None, "nothing taken, nothing said");
     }
 
     /// A server with no `[push]` pays nothing and says nothing.
