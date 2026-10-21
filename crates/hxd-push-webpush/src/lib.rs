@@ -27,12 +27,14 @@ use hxd_core::push::{Device, PushStore};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
+pub mod breaker;
 pub mod encrypt;
 pub mod endpoint;
 pub mod http;
 pub mod payload;
 pub mod vapid;
 
+pub use breaker::Breaker;
 pub use payload::Content;
 pub use vapid::{Vapid, VapidError};
 
@@ -134,19 +136,6 @@ pub trait Transport: Send + Sync + 'static {
     fn post(&self, push: Push) -> Pin<Box<dyn Future<Output = Outcome> + Send>>;
 }
 
-/// One origin's recent history, for the breaker.
-#[derive(Debug, Default, Clone, Copy)]
-struct Breaker {
-    consecutive: u32,
-    /// When the cooldown ends, for an origin that is currently open.
-    open_until: Option<Instant>,
-    /// The cooldown ended and one send has been let through to see
-    /// whether the origin is back. Every other send is skipped until it
-    /// answers; without this, the first caller after a cooldown would
-    /// clear the gate and the whole fan-out behind it would follow.
-    probing: bool,
-}
-
 /// A lock that a panic elsewhere does not turn into a panic here. The
 /// maps behind these locks hold nothing a half-finished update can make
 /// unsafe to read, and a poisoned breaker must not become push that is
@@ -158,7 +147,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// `now + d`, without the panic `Instant`'s `+` has for a `d` it cannot
 /// represent. The durations here come from configuration and from push
 /// services, and neither is ours to trust that far.
-fn after(now: Instant, d: Duration) -> Instant {
+pub(crate) fn after(now: Instant, d: Duration) -> Instant {
     now.checked_add(d)
         .or_else(|| now.checked_add(http::MAX_RETRY_AFTER))
         .unwrap_or(now)
@@ -248,22 +237,11 @@ impl WebPushGateway {
 
 impl Inner {
     /// Is this origin currently skipped? Takes the breaker's lock and
-    /// nothing else. When the cooldown ends exactly one probe is let
-    /// through, and everything else waits for its answer.
+    /// nothing else.
     fn breaker_allows(&self, origin: &str, now: Instant) -> bool {
-        let mut breakers = lock(&self.breakers);
-        let Some(b) = breakers.get_mut(origin) else {
-            return true;
-        };
-        match b.open_until {
-            Some(until) if until > now => false,
-            Some(_) if b.probing => false,
-            Some(_) => {
-                b.probing = true;
-                true
-            }
-            None => true,
-        }
+        lock(&self.breakers)
+            .get_mut(origin)
+            .is_none_or(|b| b.allows(now))
     }
 
     /// What an origin's answer says about its health. `failed` only for
@@ -275,11 +253,12 @@ impl Inner {
             breakers.remove(origin);
             return;
         }
-        let b = breakers.entry(origin.to_string()).or_default();
-        b.consecutive = b.consecutive.saturating_add(1);
-        if b.probing || b.consecutive >= self.config.breaker_failures {
-            b.open_until = Some(after(now, self.config.breaker_cooldown));
-            b.probing = false;
+        let opened = breakers.entry(origin.to_string()).or_default().failed(
+            now,
+            self.config.breaker_failures,
+            self.config.breaker_cooldown,
+        );
+        if opened {
             debug!(origin, "push: skipping an origin that keeps failing");
         }
     }
@@ -413,10 +392,7 @@ impl Inner {
             return;
         }
         let bytes = body.len();
-        let ttl = match kind {
-            Kind::Message => self.config.message_ttl,
-            Kind::News => self.config.news_ttl,
-        };
+        let ttl = kind.ttl(&self.config);
         let outcome = self
             .transport
             .post(Push {
@@ -510,20 +486,20 @@ impl Inner {
 
 /// The two kinds of notification, as far as a push is concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub enum Kind {
     Message,
     News,
 }
 
 impl Kind {
-    fn of(n: &Notification<'_>) -> Self {
+    pub fn of(n: &Notification<'_>) -> Self {
         match n {
             Notification::Message(_) => Kind::Message,
             Notification::News(_) => Kind::News,
         }
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Kind::Message => "message",
             Kind::News => "news",
@@ -533,10 +509,17 @@ impl Kind {
     /// A private message is worth waking a phone for; a news notice can
     /// wait for the screen to come on. The kind's, and not derived from
     /// the TTLs, which an operator may set in any order.
-    fn urgency(self) -> &'static str {
+    pub fn urgency(self) -> &'static str {
         match self {
             Kind::Message => "high",
             Kind::News => "normal",
+        }
+    }
+
+    pub fn ttl(self, config: &Config) -> Duration {
+        match self {
+            Kind::Message => config.message_ttl,
+            Kind::News => config.news_ttl,
         }
     }
 }
@@ -650,6 +633,7 @@ mod tests {
             expires: None,
             registered_at: SystemTime::now(),
             last_push_at: None,
+            delivery_point: None,
         }
     }
 

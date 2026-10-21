@@ -9,7 +9,7 @@
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use super::{Device, DeviceId, PushStore, Registered};
+use super::{Device, DeviceId, PushStore, Registered, SidecarRecord};
 use crate::inbox::{Mailbox, StoreError};
 
 /// Does a row owned by `row` belong to `who`? The mailbox rule, which is
@@ -28,6 +28,14 @@ fn live(d: &Device, now: SystemTime) -> bool {
 pub struct MemoryDevices {
     /// In registration order, which is what "newest first" reverses.
     rows: Mutex<Vec<Device>>,
+    sidecar: Mutex<Option<SidecarRecord>>,
+}
+
+/// Take the rows `gone` picks out of `rows`, answering with them.
+fn take(rows: &mut Vec<Device>, gone: impl Fn(&Device) -> bool) -> Vec<Device> {
+    let (taken, kept) = std::mem::take(rows).into_iter().partition(gone);
+    *rows = kept;
+    taken
 }
 
 impl MemoryDevices {
@@ -37,15 +45,27 @@ impl MemoryDevices {
 }
 
 impl PushStore for MemoryDevices {
-    fn register(&self, device: &Device, max: usize) -> Result<Registered, StoreError> {
+    fn register(
+        &self,
+        device: &Device,
+        max: usize,
+    ) -> Result<(Registered, Vec<Device>), StoreError> {
         let mut rows = self.rows.lock().unwrap();
-        rows.retain(|r| !owns(&device.owner, &r.owner) || live(r, device.registered_at));
+        let mut taken = take(&mut rows, |r| {
+            owns(&device.owner, &r.owner) && !live(r, device.registered_at)
+        });
         let had = rows
             .iter()
             .position(|r| r.devid == device.devid && owns(&device.owner, &r.owner));
+        let mut delivery_point = None;
         match had {
             Some(i) => {
-                rows.remove(i);
+                let old = rows.remove(i);
+                if old.same_subscription(device) {
+                    delivery_point = old.delivery_point;
+                } else {
+                    taken.push(old);
+                }
             }
             None => {
                 if rows
@@ -54,26 +74,26 @@ impl PushStore for MemoryDevices {
                     .count()
                     >= max
                 {
-                    return Ok(Registered::Full);
+                    return Ok((Registered::Full, taken));
                 }
             }
         }
         rows.push(Device {
             last_push_at: None,
+            delivery_point,
             ..device.clone()
         });
-        Ok(if had.is_some() {
+        let registered = if had.is_some() {
             Registered::Replaced
         } else {
             Registered::Added
-        })
+        };
+        Ok((registered, taken))
     }
 
-    fn unregister(&self, owner: &Mailbox, devid: &DeviceId) -> Result<bool, StoreError> {
+    fn unregister(&self, owner: &Mailbox, devid: &DeviceId) -> Result<Option<Device>, StoreError> {
         let mut rows = self.rows.lock().unwrap();
-        let before = rows.len();
-        rows.retain(|r| !(r.devid == *devid && owns(owner, &r.owner)));
-        Ok(rows.len() != before)
+        Ok(take(&mut rows, |r| r.devid == *devid && owns(owner, &r.owner)).pop())
     }
 
     fn retire(
@@ -99,11 +119,9 @@ impl PushStore for MemoryDevices {
         Ok(!self.rows.lock().unwrap().is_empty())
     }
 
-    fn unregister_all(&self, owner: &Mailbox) -> Result<usize, StoreError> {
+    fn unregister_all(&self, owner: &Mailbox) -> Result<Vec<Device>, StoreError> {
         let mut rows = self.rows.lock().unwrap();
-        let before = rows.len();
-        rows.retain(|r| !owns(owner, &r.owner));
-        Ok(before - rows.len())
+        Ok(take(&mut rows, |r| owns(owner, &r.owner)))
     }
 
     fn devices(&self, owner: &Mailbox, now: SystemTime) -> Result<Vec<Device>, StoreError> {
@@ -127,14 +145,16 @@ impl PushStore for MemoryDevices {
         Ok(())
     }
 
-    fn sweep_expired(&self, now: SystemTime) -> Result<usize, StoreError> {
+    fn sweep_expired(&self, now: SystemTime) -> Result<Vec<Device>, StoreError> {
         let mut rows = self.rows.lock().unwrap();
-        let before = rows.len();
-        rows.retain(|r| live(r, now));
-        Ok(before - rows.len())
+        Ok(take(&mut rows, |r| !live(r, now)))
     }
 
-    fn devices_claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError> {
+    fn devices_claim(
+        &self,
+        login: &str,
+        fingerprint: &[u8; 32],
+    ) -> Result<Vec<Device>, StoreError> {
         let mut rows = self.rows.lock().unwrap();
         let identified = Mailbox::identified(login, *fingerprint);
         let held: Vec<DeviceId> = rows
@@ -142,32 +162,100 @@ impl PushStore for MemoryDevices {
             .filter(|r| owns(&identified, &r.owner))
             .map(|r| r.devid.clone())
             .collect();
-        let mut moved = 0;
+        let mut moved = Vec::new();
         rows.retain_mut(|r| {
             if r.owner.fingerprint.is_some() || r.owner.login != login {
                 return true;
             }
-            moved += 1;
+            moved.push(r.clone());
             // The identity's own row for that device is the one the
             // device last registered; the login's is the older fact.
             if held.contains(&r.devid) {
                 return false;
             }
             r.owner.fingerprint = Some(*fingerprint);
+            r.delivery_point = None;
             true
         });
         Ok(moved)
     }
 
-    fn devices_rotate(&self, from: &[u8; 32], _to: &[u8; 32]) -> Result<usize, StoreError> {
+    fn devices_rotate(&self, from: &[u8; 32], _to: &[u8; 32]) -> Result<Vec<Device>, StoreError> {
         let mut rows = self.rows.lock().unwrap();
-        let before = rows.len();
-        rows.retain(|r| r.owner.fingerprint.as_ref() != Some(from));
-        Ok(before - rows.len())
+        Ok(take(&mut rows, |r| {
+            r.owner.fingerprint.as_ref() == Some(from)
+        }))
     }
 
-    fn devices_purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
+    fn devices_purge(&self, of: &Mailbox) -> Result<Vec<Device>, StoreError> {
         self.unregister_all(of)
+    }
+
+    fn set_delivery_point(
+        &self,
+        device: &Device,
+        delivery_point: &str,
+    ) -> Result<bool, StoreError> {
+        let mut rows = self.rows.lock().unwrap();
+        let row = rows.iter_mut().find(|r| {
+            r.devid == device.devid && owns(&device.owner, &r.owner) && r.same_subscription(device)
+        });
+        Ok(row
+            .map(|r| r.delivery_point = Some(delivery_point.to_string()))
+            .is_some())
+    }
+
+    fn clear_delivery_point(
+        &self,
+        owner: &Mailbox,
+        delivery_point: &str,
+    ) -> Result<usize, StoreError> {
+        let mut rows = self.rows.lock().unwrap();
+        let mut n = 0;
+        for r in rows.iter_mut().filter(|r| {
+            owns(owner, &r.owner) && r.delivery_point.as_deref() == Some(delivery_point)
+        }) {
+            r.delivery_point = None;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn clear_delivery_points(&self) -> Result<usize, StoreError> {
+        let mut rows = self.rows.lock().unwrap();
+        Ok(rows
+            .iter_mut()
+            .filter_map(|r| r.delivery_point.take())
+            .count())
+    }
+
+    fn unsubscribed(&self, now: SystemTime) -> Result<Vec<Device>, StoreError> {
+        let rows = self.rows.lock().unwrap();
+        Ok(rows
+            .iter()
+            .filter(|r| r.delivery_point.is_none() && live(r, now))
+            .cloned()
+            .collect())
+    }
+
+    fn retire_delivery_point(
+        &self,
+        owner: &Mailbox,
+        delivery_point: &str,
+    ) -> Result<Vec<Device>, StoreError> {
+        let mut rows = self.rows.lock().unwrap();
+        Ok(take(&mut rows, |r| {
+            owns(owner, &r.owner) && r.delivery_point.as_deref() == Some(delivery_point)
+        }))
+    }
+
+    fn sidecar(&self) -> Result<Option<SidecarRecord>, StoreError> {
+        Ok(self.sidecar.lock().unwrap().clone())
+    }
+
+    fn set_sidecar(&self, record: &SidecarRecord) -> Result<(), StoreError> {
+        *self.sidecar.lock().unwrap() = Some(record.clone());
+        Ok(())
     }
 }
 

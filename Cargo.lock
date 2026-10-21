@@ -1396,6 +1396,7 @@ dependencies = [
  "hxd-markdown",
  "hxd-media",
  "hxd-ng-session",
+ "hxd-push-uniqush",
  "hxd-push-webpush",
  "hxd-registrar",
  "hxd-session",
@@ -1586,6 +1587,23 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "hxd-push-uniqush"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "form_urlencoded",
+ "http-body-util",
+ "hxd-core",
+ "hxd-push-webpush",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

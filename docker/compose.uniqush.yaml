@@ -1,0 +1,102 @@
+# hxd-ng pushing through uniqush-push, with Valkey behind it
+# (docs/docker.md, "Push through uniqush").
+#
+#   (umask 077; echo "UNIQUSH_API_TOKEN=$(openssl rand -hex 32)" >> docker/.env)
+#   docker compose -f docker/compose.uniqush.yaml up -d
+#
+# Like compose.yaml it stands alone, and runs the published images.
+# uniqush's API sends as this server to every device it holds and hands
+# out their subscriptions, so it is published on no port: hxd-ng reaches
+# it over the compose network, with the token.
+
+services:
+  hxd-ng:
+    image: ghcr.io/mishan/hxd-ng:latest
+    container_name: hxd-ng
+    restart: unless-stopped
+    depends_on:
+      uniqush:
+        condition: service_healthy
+    ports:
+      - "5500:5500"
+      - "5501:5501"
+      - "127.0.0.1:5700:5700"
+    environment:
+      HXD_NAME: "My Hotline Server"
+      HXD_NG_TRUSTED_PROXIES: "127.0.0.1,::1,gateway"
+      HXD_ADMIN_LOGIN: admin
+      HXD_ADMIN_PASSWORD: ${HXD_ADMIN_PASSWORD:-}
+      HXD_PUSH_CONTACT: "mailto:admin@hl.example"
+      HXD_PUSH_GATEWAY: uniqush
+      HXD_PUSH_UNIQUSH_ADDR: "http://uniqush:9898"
+      HXD_PUSH_UNIQUSH_TOKEN_FILE: /run/secrets/uniqush_token
+      # This server's own name in uniqush; never one another server uses.
+      HXD_PUSH_UNIQUSH_SERVICE: hl-example
+    # Copied in from the environment, so owned by the user each image
+    # runs as: a file-based secret keeps the host file's owner and mode.
+    secrets:
+      - source: uniqush_token
+        target: uniqush_token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    volumes:
+      - hxd-ng:/var/lib/hxd-ng
+
+  uniqush:
+    # 2.11 at least, and never :edge. 2.11.0 is built with Go 1.27.3,
+    # whose x509 refuses the compromised eMudhra intermediates.
+    image: ghcr.io/uniqush/uniqush-push:2.11
+    restart: unless-stopped
+    depends_on:
+      valkey:
+        condition: service_healthy
+    # The image's HEALTHCHECK supplies the test.
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    secrets:
+      - source: uniqush_token
+        target: uniqush_token
+        uid: "65534"
+        gid: "65534"
+        mode: 0400
+    configs:
+      - source: uniqush_conf
+        target: /etc/uniqush/uniqush-push.conf
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    # Every device uniqush holds, and its log of removals, live here.
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - valkey:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    restart: unless-stopped
+
+secrets:
+  uniqush_token:
+    environment: UNIQUSH_API_TOKEN
+
+configs:
+  uniqush_conf:
+    content: |
+      logfile=
+      [WebFrontend]
+      addr=0.0.0.0:9898
+      token_file=/run/secrets/uniqush_token
+      [Database]
+      host=valkey
+      # hxd-ng refuses private push endpoints here, as uniqush does by
+      # default: leave [webpush] allow_private_addresses unset to agree.
+
+volumes:
+  hxd-ng:
+    name: hxd-ng
+  valkey:

@@ -64,6 +64,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-registrar` | The identity registrar (`docs/identity-registrar.md`): handles and their lifecycle, attestations, the records it publishes (revocation, rotation, freeze), the issuance log and stats, rate limits and replay, the operator's freeze, revoke and recover. Signed bytes in, signed bytes out; no HTTP, no roster, no account table beyond the reserved names it is handed. Its `RegistrarStore` trait, an in-memory store and the conformance suite live here. |
 | `hxd-store-sqlite` | The durable store for the private-message inbox, chat history, news, the moderation trail and the bans: one SQLite file, WAL checkpointed by a thread and a connection of its own (never inside a commit, and one checkpointer to a file), public chat's log on a connection of its own beside the others' (`open_beside`), the schema and migrations of `docs/private-messages.md` §5, `docs/news.md` §4 and `docs/moderation.md` §7, and the conformance suites both stores of each kind are run against. Behind `hxd-core`'s `MessageStore`, `ChatLog`, `NewsStore`, `ModerationStore` and `AvatarStore` traits and the `inbox` Cargo feature; the in-memory stores beside them in `hxd-core` are what the domain tests use. The registrar's store is here too, in a file and a schema of its own. |
 | `hxd-push-webpush` | The push sender (`docs/webpush-gateway.md`): a VAPID keypair and its RFC 8292 token, RFC 8291 payload encryption, RFC 8030's headers, the destination check a client-chosen URL demands, and a per-origin circuit breaker. Behind `hxd-core`'s `NotificationGateway` trait, reading the devices out of its `PushStore`, and knowing nothing about Hotline. |
+| `hxd-push-uniqush` | The second gateway (`docs/push-notifications.md` §4.1): a uniqush-push sidecar over TCP with its token or over its Unix socket, the mailbox as a subscriber (`subscriber.rs`), the store's rows kept as the record with uniqush's copy subscribed, unsubscribed and pruned in step by a task of its own, and the in-process sender's payload, collapse key and breaker. Behind the same trait and the `uniqush` Cargo feature, chosen by `[push] gateway`. |
 | `hxd-feeds` | The feed reader (`docs/news-feeds.md` §5, §7): the fetch, through `hxd-fetch`; the parse of RSS, RDF, Atom and JSON Feed into items oldest first, each known by a hash of its identity; and the conversion of a feed's HTML into markdown that holds none, over a tokenizer and a stack it bounds itself. Hands its caller normalized items and knows nothing about Hotline. |
 | `hxd-fetch` | The outbound GET to a URL the operator chose (`docs/news-feeds.md` §4), for feeds and, by `docs/identity-records.md`, registrars: conditional and bounded in time and in bytes after decompression, a URL on the local network fetched as configured and any other's every hop of a redirect resolved once and checked by the push sender's classifier before it is connected to, and a proxy only when one is configured. |
 | `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1), and on the port after it for the client's file transfers and banner, carried to `/htxf`; `register`, `revoke` and `rotate` talk to a registrar. |
@@ -439,6 +440,16 @@ Three layers, all `cargo test --workspace`:
   a few seconds against a real server in process, on every `cargo
   test`, held to its invariants. Real runs are `hxd-load run` against a
   release build with `metrics` (`docs/load-testing.md`).
+- **The uniqush gateway**, in `crates/hxd-push-uniqush/tests/`:
+  `gateway.rs` against a scripted uniqush, for the answers a real one
+  gives only once something has gone wrong (a pruned device, one it
+  lost, a trimmed log, a cursor it does not know, a provider that is not
+  ours, a wedged sidecar), and `uniqush.rs` against a real uniqush-push
+  2.11 and Valkey, delivering to a push service of its own. That one is
+  gated on `HXD_TEST_UNIQUSH` (with `HXD_TEST_UNIQUSH_TOKEN_FILE` and
+  `HXD_TEST_UNIQUSH_PUSH_HOST`), says it skipped when unset, and is
+  CI's `uniqush` job, which starts uniqush beside a Valkey service
+  container.
 - **Fuzzing**, in `fuzz/`, a workspace of its own on nightly: `frame`
   (the classic framer and the field decoders) and `session` (a whole
   classic connection, hello to dispatch). `cargo run --example seeds`
@@ -493,6 +504,7 @@ cargo test -p hxd --features metrics --test metrics
 node --check tools/ng-client.mjs
 cd e2e && npm install && npm test   # needs a sibling ../hx-ng; CI pins it
 docker build -t hxd-ng . && docker/smoke-test.sh hxd-ng
+HXD_TEST_UNIQUSH=... cargo test -p hxd-push-uniqush --test uniqush  # needs a uniqush; CI's uniqush job
 ```
 
 The best end-to-end check of all: point a real GtkHx at the legacy port

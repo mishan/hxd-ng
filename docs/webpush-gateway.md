@@ -85,6 +85,9 @@ pub struct Device {
     /// Advanced on every accepted send, so an operator can see which
     /// devices are live without reading a provider's logs.
     pub last_push_at: Option<SystemTime>,
+    /// The uniqush gateway's name for the subscription
+    /// (push-notifications.md §4.1). Unused by this one.
+    pub delivery_point: Option<String>,
 }
 ```
 
@@ -401,7 +404,8 @@ contact = "mailto:admin@example.org"  # VAPID `sub`; required
 content = "sender"                    # full | sender | generic (§6 there)
 vapid_key = "vapid.key"               # generated on first start, 0600
 db = "server.sqlite"                  # default: [inbox]'s, [history]'s or [news]'s file
-timeout = 10
+gateway = "webpush"                   # or "uniqush", with [push.uniqush] (push-notifications.md §4.1)
+timeout = 10                          # 40 through uniqush
 message_ttl = 2419200                 # 4 weeks
 news_ttl = 86400
 breaker_failures = 5

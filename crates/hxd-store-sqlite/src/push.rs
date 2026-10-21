@@ -12,13 +12,13 @@
 use std::time::SystemTime;
 
 use hxd_core::inbox::{Mailbox, StoreError};
-use hxd_core::push::{Device, DeviceId, PushStore, Registered};
-use rusqlite::{params, Connection, TransactionBehavior};
+use hxd_core::push::{Device, DeviceId, PushStore, Registered, SidecarRecord};
+use rusqlite::{params, Connection, OptionalExtension, Params, TransactionBehavior};
 
 use super::{bind, fp_hex, from_unix, mailbox_sql, unix, SqliteStore};
 
-const COLUMNS: &str =
-    "owner, owner_fp, devid, endpoint, p256dh, auth, expires, registered_at, last_push_at";
+const COLUMNS: &str = "owner, owner_fp, devid, endpoint, p256dh, auth, expires, \
+                       registered_at, last_push_at, delivery_point";
 
 /// `sql` in the parent module's sense: a rusqlite error is an operator's
 /// problem, said once.
@@ -39,6 +39,7 @@ fn device_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Device, StoreErro
     let expires: Option<i64> = r.get(6)?;
     let registered_at: i64 = r.get(7)?;
     let last_push_at: Option<i64> = r.get(8)?;
+    let delivery_point: Option<String> = r.get(9)?;
     Ok((|| {
         let owner = match fp {
             Some(hex) => Mailbox::identified(login.clone(), super::fp_from_hex(&hex)?),
@@ -58,8 +59,17 @@ fn device_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Device, StoreErro
             expires: expires.map(from_unix),
             registered_at: from_unix(registered_at),
             last_push_at: last_push_at.map(from_unix),
+            delivery_point,
         })
     })())
+}
+
+/// The rows a statement answers with, as devices: a `SELECT` of
+/// [`COLUMNS`], or a `DELETE ... RETURNING` them.
+fn collect(conn: &Connection, sql_text: &str, p: impl Params) -> Result<Vec<Device>, StoreError> {
+    let mut stmt = sql(conn.prepare(sql_text))?;
+    let rows = sql(stmt.query_map(p, device_of))?.collect::<rusqlite::Result<Vec<_>>>();
+    sql(rows)?.into_iter().collect()
 }
 
 /// Every device of `owner`, newest registration first, optionally only
@@ -87,23 +97,39 @@ fn rows_of(
 }
 
 impl PushStore for SqliteStore {
-    fn register(&self, device: &Device, max: usize) -> Result<Registered, StoreError> {
+    fn register(
+        &self,
+        device: &Device,
+        max: usize,
+    ) -> Result<(Registered, Vec<Device>), StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let owner = mailbox_sql(&device.owner, "owner", 1);
         // The mailbox's own lapsed rows first, so they do not count
         // against the cap they will never be pushed under again.
-        sql(tx.execute(
+        let mut taken = collect(
+            &tx,
             &format!(
                 "DELETE FROM push_device WHERE {owner} \
-                   AND expires IS NOT NULL AND expires <= ?2"
+                   AND expires IS NOT NULL AND expires <= ?2 RETURNING {COLUMNS}"
             ),
             params![bind(&device.owner), unix(device.registered_at)],
-        ))?;
-        let replaced = sql(tx.execute(
-            &format!("DELETE FROM push_device WHERE {owner} AND devid = ?2"),
+        )?;
+        let old = collect(
+            &tx,
+            &format!("DELETE FROM push_device WHERE {owner} AND devid = ?2 RETURNING {COLUMNS}"),
             params![bind(&device.owner), device.devid.as_str()],
-        ))? > 0;
+        )?
+        .pop();
+        let replaced = old.is_some();
+        let delivery_point = match old {
+            Some(old) if old.same_subscription(device) => old.delivery_point,
+            Some(old) => {
+                taken.push(old);
+                None
+            }
+            None => None,
+        };
         if !replaced {
             let held: i64 = sql(tx.query_row(
                 &format!("SELECT COUNT(*) FROM push_device WHERE {owner}"),
@@ -112,13 +138,13 @@ impl PushStore for SqliteStore {
             ))?;
             if held as u64 >= max as u64 {
                 sql(tx.commit())?;
-                return Ok(Registered::Full);
+                return Ok((Registered::Full, taken));
             }
         }
         sql(tx.execute(
             &format!(
                 "INSERT INTO push_device ({COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)"
             ),
             params![
                 device.owner.login,
@@ -129,14 +155,16 @@ impl PushStore for SqliteStore {
                 device.auth.as_slice(),
                 device.expires.map(unix),
                 unix(device.registered_at),
+                delivery_point,
             ],
         ))?;
         sql(tx.commit())?;
-        Ok(if replaced {
+        let registered = if replaced {
             Registered::Replaced
         } else {
             Registered::Added
-        })
+        };
+        Ok((registered, taken))
     }
 
     fn retire(
@@ -170,27 +198,29 @@ impl PushStore for SqliteStore {
         )
     }
 
-    fn unregister(&self, owner: &Mailbox, devid: &DeviceId) -> Result<bool, StoreError> {
+    fn unregister(&self, owner: &Mailbox, devid: &DeviceId) -> Result<Option<Device>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let gone = sql(conn.execute(
+        Ok(collect(
+            &conn,
             &format!(
-                "DELETE FROM push_device WHERE {} AND devid = ?2",
+                "DELETE FROM push_device WHERE {} AND devid = ?2 RETURNING {COLUMNS}",
                 mailbox_sql(owner, "owner", 1)
             ),
             params![bind(owner), devid.as_str()],
-        ))?;
-        Ok(gone > 0)
+        )?
+        .pop())
     }
 
-    fn unregister_all(&self, owner: &Mailbox) -> Result<usize, StoreError> {
+    fn unregister_all(&self, owner: &Mailbox) -> Result<Vec<Device>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        sql(conn.execute(
+        collect(
+            &conn,
             &format!(
-                "DELETE FROM push_device WHERE {}",
+                "DELETE FROM push_device WHERE {} RETURNING {COLUMNS}",
                 mailbox_sql(owner, "owner", 1)
             ),
             params![bind(owner)],
-        ))
+        )
     }
 
     fn devices(&self, owner: &Mailbox, now: SystemTime) -> Result<Vec<Device>, StoreError> {
@@ -210,46 +240,173 @@ impl PushStore for SqliteStore {
         Ok(())
     }
 
-    fn sweep_expired(&self, now: SystemTime) -> Result<usize, StoreError> {
+    fn sweep_expired(&self, now: SystemTime) -> Result<Vec<Device>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        sql(conn.execute(
-            "DELETE FROM push_device WHERE expires IS NOT NULL AND expires <= ?1",
+        collect(
+            &conn,
+            &format!(
+                "DELETE FROM push_device WHERE expires IS NOT NULL AND expires <= ?1 \
+                 RETURNING {COLUMNS}"
+            ),
             params![unix(now)],
-        ))
+        )
     }
 
-    fn devices_claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError> {
+    fn devices_claim(
+        &self,
+        login: &str,
+        fingerprint: &[u8; 32],
+    ) -> Result<Vec<Device>, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let fp = fp_hex(fingerprint);
+        let held = collect(
+            &tx,
+            &format!(
+                "SELECT {COLUMNS} FROM push_device WHERE owner_fp IS NULL AND owner = ?1 \
+                 ORDER BY id"
+            ),
+            params![login],
+        )?;
         // A device the identity already holds keeps the identity's row:
         // that is the one the device itself last registered, and the
         // login's is the older fact.
-        let moved = sql(tx.execute(
+        sql(tx.execute(
             "DELETE FROM push_device \
               WHERE owner_fp IS NULL AND owner = ?1 \
                 AND devid IN (SELECT devid FROM push_device WHERE owner_fp = ?2)",
             params![login, fp],
         ))?;
-        let stamped = sql(tx.execute(
-            "UPDATE push_device SET owner_fp = ?2 WHERE owner_fp IS NULL AND owner = ?1",
+        sql(tx.execute(
+            "UPDATE push_device SET owner_fp = ?2, delivery_point = NULL \
+              WHERE owner_fp IS NULL AND owner = ?1",
             params![login, fp],
         ))?;
         sql(tx.commit())?;
-        Ok(moved + stamped)
+        Ok(held)
     }
 
-    fn devices_rotate(&self, from: &[u8; 32], _to: &[u8; 32]) -> Result<usize, StoreError> {
+    fn devices_rotate(&self, from: &[u8; 32], _to: &[u8; 32]) -> Result<Vec<Device>, StoreError> {
         // Drops, and does not move: see the trait's documentation and
         // push-notifications.md §5.1.
         let conn = self.conn.lock().unwrap();
-        sql(conn.execute(
-            "DELETE FROM push_device WHERE owner_fp = ?1",
+        collect(
+            &conn,
+            &format!("DELETE FROM push_device WHERE owner_fp = ?1 RETURNING {COLUMNS}"),
             params![fp_hex(from)],
+        )
+    }
+
+    fn devices_purge(&self, of: &Mailbox) -> Result<Vec<Device>, StoreError> {
+        self.unregister_all(of)
+    }
+
+    fn set_delivery_point(
+        &self,
+        device: &Device,
+        delivery_point: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let set = sql(conn.execute(
+            &format!(
+                "UPDATE push_device SET delivery_point = ?2 \
+                  WHERE {} AND devid = ?3 AND endpoint = ?4 AND p256dh = ?5 AND auth = ?6",
+                mailbox_sql(&device.owner, "owner", 1)
+            ),
+            params![
+                bind(&device.owner),
+                delivery_point,
+                device.devid.as_str(),
+                device.endpoint,
+                device.p256dh.as_slice(),
+                device.auth.as_slice(),
+            ],
+        ))?;
+        Ok(set > 0)
+    }
+
+    fn clear_delivery_point(
+        &self,
+        owner: &Mailbox,
+        delivery_point: &str,
+    ) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            &format!(
+                "UPDATE push_device SET delivery_point = NULL WHERE {} AND delivery_point = ?2",
+                mailbox_sql(owner, "owner", 1)
+            ),
+            params![bind(owner), delivery_point],
         ))
     }
 
-    fn devices_purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
-        self.unregister_all(of)
+    fn clear_delivery_points(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "UPDATE push_device SET delivery_point = NULL WHERE delivery_point IS NOT NULL",
+            [],
+        ))
+    }
+
+    fn unsubscribed(&self, now: SystemTime) -> Result<Vec<Device>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        collect(
+            &conn,
+            &format!(
+                "SELECT {COLUMNS} FROM push_device \
+                  WHERE delivery_point IS NULL AND (expires IS NULL OR expires > ?1) \
+                  ORDER BY id"
+            ),
+            params![unix(now)],
+        )
+    }
+
+    fn retire_delivery_point(
+        &self,
+        owner: &Mailbox,
+        delivery_point: &str,
+    ) -> Result<Vec<Device>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        collect(
+            &conn,
+            &format!(
+                "DELETE FROM push_device WHERE {} AND delivery_point = ?2 RETURNING {COLUMNS}",
+                mailbox_sql(owner, "owner", 1)
+            ),
+            params![bind(owner), delivery_point],
+        )
+    }
+
+    fn sidecar(&self) -> Result<Option<SidecarRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn
+            .query_row(
+                "SELECT service, public_key, contact, cursor FROM push_sidecar",
+                [],
+                |r| {
+                    Ok(SidecarRecord {
+                        service: r.get(0)?,
+                        public_key: r.get(1)?,
+                        contact: r.get(2)?,
+                        cursor: r.get(3)?,
+                    })
+                },
+            )
+            .optional())
+    }
+
+    fn set_sidecar(&self, record: &SidecarRecord) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT OR REPLACE INTO push_sidecar (id, service, public_key, contact, cursor) \
+             VALUES (1, ?1, ?2, ?3, ?4)",
+            params![
+                record.service,
+                record.public_key,
+                record.contact,
+                record.cursor
+            ],
+        ))?;
+        Ok(())
     }
 }
