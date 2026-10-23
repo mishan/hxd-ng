@@ -1199,10 +1199,11 @@ async fn main() {
         // a missing key is a first start — and still before anything
         // binds, because every subscription is bound to that key.
         let push = hxd::push::build(&config)?;
+        let classic = config.server.classic;
         // Bind HTXF before either frontend advertises Files. A configured
         // but unavailable transfer port is a startup failure, never a
         // capability promise that downloads cannot fulfill.
-        let htxf_listener = match htxf.as_ref() {
+        let htxf_listener = match htxf.as_ref().filter(|_| classic) {
             Some(htxf) => Some(
                 TcpListener::bind(&htxf.bind)
                     .await
@@ -1244,11 +1245,19 @@ async fn main() {
             );
         }
 
-        let listener = TcpListener::bind(&config.server.bind)
-            .await
-            .map_err(|e| format!("bind {}: {e}", config.server.bind))?;
+        let listener = if classic {
+            Some(
+                TcpListener::bind(&config.server.bind)
+                    .await
+                    .map_err(|e| format!("bind {}: {e}", config.server.bind))?,
+            )
+        } else {
+            None
+        };
         let legacy_addr = listener
-            .local_addr()
+            .as_ref()
+            .map(TcpListener::local_addr)
+            .transpose()
             .map_err(|e| format!("legacy listener address: {e}"))?;
         let tls_listener = match tls.as_ref() {
             Some(tls) => {
@@ -1272,12 +1281,19 @@ async fn main() {
             }
             None => None,
         };
-        tracing::info!(
-            "hxd-ng listening on {} (server name {:?}, version {})",
-            config.server.bind,
-            config.server.name,
-            config.server.version
-        );
+        if classic {
+            tracing::info!(
+                "hxd-ng listening on {} (server name {:?}, version {})",
+                config.server.bind,
+                config.server.name,
+                config.server.version
+            );
+        } else {
+            tracing::info!(
+                "hxd-ng serving ng clients only (server name {:?}); [server] classic = false",
+                config.server.name
+            );
+        }
 
         // The ng context is built before voice is consumed below, so its
         // capability list can see it.
@@ -1297,14 +1313,22 @@ async fn main() {
                         .map(|origin| format!("HTTP origin {origin}"))
                 })
                 .expect("validated Files source");
-            tracing::info!("Files from {} with HTXF on {}", source, files.bind);
+            if classic {
+                tracing::info!("Files from {} with HTXF on {}", source, files.bind);
+            } else {
+                tracing::info!("Files from {} for ng clients", source);
+            }
         }
         if let Some(banner) = banner.as_deref() {
-            match (banner.image_len(), htxf.as_ref()) {
+            match (banner.image_len(), htxf.as_ref().filter(|_| classic)) {
                 (Some(len), Some(htxf)) => tracing::info!(
                     "banner {} ({len} bytes) with HTXF on {}",
                     String::from_utf8_lossy(&banner.kind()),
                     htxf.bind
+                ),
+                (Some(len), None) => tracing::info!(
+                    "banner {} ({len} bytes) for ng clients",
+                    String::from_utf8_lossy(&banner.kind())
                 ),
                 _ => tracing::info!("banner from its URL"),
             }
@@ -1354,7 +1378,10 @@ async fn main() {
 
         let tracker = match &config.tracker {
             Some(section) => {
-                let advertised_port = section.advertised_port.unwrap_or(legacy_addr.port());
+                let advertised_port = section
+                    .advertised_port
+                    .or(legacy_addr.map(|a| a.port()))
+                    .expect("check_config refuses [tracker] without the classic listener");
                 tracing::info!(
                     "tracker registration to {} target(s), advertising TCP port {}",
                     section.targets.len(),
@@ -1505,7 +1532,11 @@ async fn main() {
                 tracing::info!(
                     "identity enabled (server key {}, TRTP tunnel {})",
                     hl_identity::Fingerprint::of(&id.server_key()).short(),
-                    if id.config().trtp { "on" } else { "off" }
+                    if id.config().trtp && ng_ctx.tunnel.is_some() {
+                        "on"
+                    } else {
+                        "off"
+                    }
                 );
             }
             if let Some(id) = ng_ctx
@@ -1537,8 +1568,14 @@ async fn main() {
                 }),
             ));
         }
+        let classic_wire = async move {
+            match listener {
+                Some(listener) => hxd_session::serve(listener, ctx).await,
+                None => std::future::pending().await,
+            }
+        };
         let outcome = tokio::select! {
-            () = hxd_session::serve(listener, ctx) => {
+            () = classic_wire => {
                 unreachable!("the accept loop waits out its errors and never returns")
             }
             signal = shutdown_signal() => {

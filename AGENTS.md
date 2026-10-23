@@ -421,7 +421,9 @@ Three layers, all `cargo test --workspace`:
   `tls.rs` has HOPE refused on the TLS port),
   `relay.rs` (a classic server behind `hlrelay`: a client that reaches
   it only over WebSockets logs in, chats with one on the TCP port, and
-  downloads over `/htxf`), `slow_consumer.rs` (a room flooded while one
+  downloads over `/htxf`), `ng_only.rs` (the binary run with `[server]
+  classic = false` and the classic ports held: it starts, offers no
+  tunnel, and serves an ng login), `slow_consumer.rs` (a room flooded while one
   client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the
@@ -459,10 +461,10 @@ Three layers, all `cargo test --workspace`:
 - **End-to-end, out of process**, in `e2e/` — `cd e2e && npm test`.
   These start the *binary*: a real config file `hxd` parses itself, a
   real directory it bootstraps into, real sockets. That is a layer the
-  suites above deliberately do not reach, since they build `Core` /
-  `ServerCtx` / `NgCtx` by hand — so `Config::load`, `check_config`, the
-  feature-gated section errors, the ng sweeper and the pruners have no
-  other coverage anywhere. They are driven by `@hotline-ng/client`, the
+  suites above, `ng_only.rs` aside, deliberately do not reach, since they
+  build `Core` / `ServerCtx` / `NgCtx` by hand — so `Config::load`,
+  `check_config`, the feature-gated section errors, the ng sweeper and
+  the pruners have little other coverage. They are driven by `@hotline-ng/client`, the
   browser client's library: a second implementation of the ng wire
   written from the spec by the client rather than by us, so where the
   two agree the agreement is evidence rather than a tautology. Node

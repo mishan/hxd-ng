@@ -4,7 +4,8 @@
 # discovery, and the image's own health check passes. Then start it again
 # in relay mode in front of the first, and check the relay answers
 # discovery and carries a WebSocket on /trtp to the server's classic
-# port. What CI runs before it publishes anything, and runnable as it is
+# port, and once more with HXD_CLASSIC=off, healthy on the ng port
+# alone. What CI runs before it publishes anything, and runnable as it is
 # against a local build:
 #
 #   docker build -t hxd-ng . && docker/smoke-test.sh hxd-ng
@@ -13,10 +14,15 @@ set -euo pipefail
 image=${1:?usage: smoke-test.sh IMAGE}
 name=hxd-ng-smoke-$$
 relay=$name-relay
+ngonly=$name-ng-only
 
 fail() {
     echo "smoke-test: $*" >&2
     docker logs "$name" >&2 || true
+    if docker inspect "$ngonly" >/dev/null 2>&1; then
+        echo "smoke-test: the ng-only server's log:" >&2
+        docker logs "$ngonly" >&2 || true
+    fi
     if docker inspect "$relay" >/dev/null 2>&1; then
         echo "smoke-test: the relay's log:" >&2
         docker logs "$relay" >&2 || true
@@ -30,6 +36,7 @@ cleanup() {
     # -v: the image declares a volume, and the relay, which mounts none,
     # is given an anonymous one.
     docker rm -f -v "$relay" >/dev/null 2>&1 || true
+    docker rm -f -v "$ngonly" >/dev/null 2>&1 || true
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker volume rm -f "$name" >/dev/null 2>&1 || true
     docker network rm "$name" >/dev/null 2>&1 || true
@@ -155,7 +162,32 @@ health=$(docker inspect -f '{{index .Config.Healthcheck.Test 3}}' "$relay")
 docker exec "$relay" bash -c "$health" ||
     fail "the relay's health check fails"
 
-for container in "$relay" "$name"; do
+# An ng-only server: nothing on 5500, so the health check asks the ng
+# port. Asked every second here, rather than waiting out the interval.
+docker run -d --name "$ngonly" --health-interval 1s \
+    -p 127.0.0.1::5700 \
+    -e HXD_CLASSIC=off -e HXD_NAME=smoke-ng-only \
+    "$image" >/dev/null
+ngport=$(docker port "$ngonly" 5700/tcp | head -n1)
+state=
+for _ in $(seq 60); do
+    state=$(docker inspect -f '{{.State.Health.Status}}' "$ngonly")
+    [ "$state" = healthy ] && break
+    [ "$(docker inspect -f '{{.State.Running}}' "$ngonly")" = true ] ||
+        fail "the ng-only server exited"
+    sleep 1
+done
+[ "$state" = healthy ] || fail "the ng-only server is $state"
+discovery=$(curl -fsS --max-time 5 "http://$ngport/.well-known/hotline") ||
+    fail "no discovery on $ngport"
+case $discovery in
+    *'"trtp"'*) fail "an ng-only server offers /trtp: $discovery" ;;
+    *'"smoke-ng-only"'*) ;;
+    *) fail "discovery does not name the ng-only server: $discovery" ;;
+esac
+echo "smoke-test: ng-only server healthy, discovery on $ngport"
+
+for container in "$ngonly" "$relay" "$name"; do
     docker stop "$container" >/dev/null
     status=$(docker inspect -f '{{.State.ExitCode}}' "$container")
     [ "$status" = 0 ] || fail "$container exited $status on SIGTERM"

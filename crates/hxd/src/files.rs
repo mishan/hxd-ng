@@ -68,11 +68,12 @@ pub fn build(config: &Config) -> Result<Option<Files>, String> {
             );
             }
         };
-    let bind = section
-        .bind
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(|| transfer_bind(&config.server.bind))?;
+    let bind = match &section.bind {
+        Some(bind) => bind.clone(),
+        // Never bound: HTXF serves only the classic wire.
+        None if !config.server.classic => String::new(),
+        None => transfer_bind(&config.server.bind)?,
+    };
     let idle = Duration::from_secs(section.idle_timeout);
     let mut service = FileService::new(
         source,
@@ -186,11 +187,15 @@ pub fn htxf(config: &Config, files: Option<&Files>) -> Result<Option<Htxf>, Stri
         )),
         // Only a banner brings this listener up, so the error says so
         // rather than pointing at a [files] section that is not there.
-        bind: transfer_bind(&config.server.bind).map_err(|_| {
-            "a [banner] file is fetched on the control port plus one, which needs a numeric \
-             [server] bind (an address, not a host name)"
-                .to_string()
-        })?,
+        bind: if config.server.classic {
+            transfer_bind(&config.server.bind).map_err(|_| {
+                "a [banner] file is fetched on the control port plus one, which needs a numeric \
+                 [server] bind (an address, not a host name)"
+                    .to_string()
+            })?
+        } else {
+            String::new()
+        },
         timeouts: HtxfTimeouts {
             handshake: Duration::from_secs(crate::default_files_handshake_timeout()),
             idle: Duration::from_secs(crate::default_files_idle_timeout()),

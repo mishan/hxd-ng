@@ -1881,9 +1881,15 @@ fn default_max_detached() -> usize {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
-    /// Listen address.
+    /// Listen address, and the base the transfer and voice ports are
+    /// derived from; with `classic` off, still the voice port's.
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Serve the classic wire: this listener, `[tls]`, HTXF, and TRTP
+    /// and HTXF over WebSocket. Off, the classic login, whose password
+    /// is a plaintext equivalent, is not offered anywhere.
+    #[serde(default = "default_true")]
+    pub classic: bool,
     /// Advertised server name.
     #[serde(default = "default_name")]
     pub name: String,
@@ -2343,6 +2349,7 @@ impl Default for ServerSection {
     fn default() -> Self {
         ServerSection {
             bind: default_bind(),
+            classic: true,
             name: default_name(),
             version: default_version(),
             login_timeout: default_login_timeout(),
@@ -3081,6 +3088,37 @@ fn build_identity(
 /// startup rather than wondering why identity does nothing, or why
 /// messages never arrive.
 pub fn check_config(config: &Config) -> Result<(), String> {
+    if !config.server.classic {
+        let refused = [
+            (
+                config.ng.is_none(),
+                "[server] classic = false needs [ng]: without either frontend nothing \
+                 listens for clients",
+            ),
+            (
+                config.link.is_some(),
+                "[link] needs [server] classic: links are made on the classic TLS port",
+            ),
+            (
+                config.tls.is_some(),
+                "[tls] needs [server] classic: it serves the classic wire, which \
+                 classic = false turns off",
+            ),
+            (
+                config.tracker.is_some(),
+                "[tracker] needs [server] classic: trackers list the classic port, which \
+                 classic = false does not open",
+            ),
+            (
+                config.files.as_ref().is_some_and(|f| f.bind.is_some()),
+                "[files] bind needs [server] classic: it is the classic clients' transfer \
+                 port, and ng clients transfer on the ng port",
+            ),
+        ];
+        if let Some((_, why)) = refused.iter().find(|(refused, _)| *refused) {
+            return Err((*why).into());
+        }
+    }
     if config.identity.is_some() && config.ng.is_none() {
         return Err(
             "[identity] needs [ng]: the identity endpoints and the TRTP tunnel are \
@@ -4011,8 +4049,11 @@ pub fn build_ng_ctx(
         }
         None => None,
     };
+    // `/trtp` and `/htxf` are the classic wire too, so with it off
+    // discovery lists neither and both are refused.
     let tunnel: Option<Arc<dyn TunnelSink>> = identity
         .as_ref()
+        .filter(|_| config.server.classic)
         .map(|_| Arc::new(LegacyTunnel(legacy.clone())) as Arc<dyn TunnelSink>);
     // Needs `[identity]` for the same reason the other identity routes
     // do — it is part of that surface — but nothing inside it: the
@@ -4512,6 +4553,40 @@ hmac_secret = "new secret"
         )
         .unwrap();
         check_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn an_ng_only_server_refuses_what_only_the_classic_wire_serves() {
+        let ng_only = "[server]\nclassic = false\n[ng]\n";
+        check_config(
+            &parse(&format!(
+                "{ng_only}[identity]\n[files]\nroot = \"files\"\n[banner]\nfile = \"b.gif\"\n"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        for (toml, says) in [
+            ("[server]\nclassic = false\n".to_string(), "needs [ng]"),
+            (
+                format!("{ng_only}[link]\ntag = \"x\"\n"),
+                "[link] needs [server] classic",
+            ),
+            (
+                format!("{ng_only}[tls]\ncert = \"c.pem\"\nkey = \"k.pem\"\n"),
+                "[tls] needs [server] classic",
+            ),
+            (
+                format!("{ng_only}[tracker]\n"),
+                "[tracker] needs [server] classic",
+            ),
+            (
+                format!("{ng_only}[files]\nroot = \"files\"\nbind = \"0.0.0.0:5501\"\n"),
+                "[files] bind needs [server] classic",
+            ),
+        ] {
+            let err = check_config(&parse(&toml).unwrap()).unwrap_err();
+            assert!(err.contains(says), "{toml:?}: {err}");
+        }
     }
 
     #[test]
