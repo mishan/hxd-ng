@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, Stream, StreamExt};
-use hl_identity::{cert, Card, DeviceCert, DeviceKey, IdentityKey, LoginProof, ServerKey};
+use hl_identity::{
+    cert, Card, DeviceCert, DeviceKey, IdentityKey, LoginProof, ServerChallenge, ServerKey,
+};
 use hxd_core::push::PushStore;
 use hxd_core::Core;
 use hxd_ng_session::{IdentityConfig, IdentityState, NgConfig, NgCtx, Registry, TunnelSink};
@@ -259,6 +261,13 @@ async fn start_server_inner(
     // normally on the server's own origin, and since `hlid enroll` draws
     // a QR only for one that is, the harness has to be able to say so.
     let web_client = web_client.map(|w| w.replace("{ng}", &ng_addr.to_string()));
+    // The name the tests reach the server by, which is likewise only
+    // known now: a server with no names takes no `v = 2` proof. A test
+    // that names hosts of its own keeps just those.
+    let mut cfg = cfg;
+    if cfg.hosts.is_empty() {
+        cfg.hosts.push(ng_addr.to_string());
+    }
 
     let identity = IdentityState::new(
         ServerKey::from_seed(&[0x55; 32]),
@@ -332,9 +341,12 @@ async fn http(
 ) -> HttpReply {
     let mut s = TcpStream::connect(addr).await.unwrap();
     let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
     );
+    if !extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        req.push_str(&format!("Host: {addr}\r\n"));
+    }
     for (k, v) in extra {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -431,7 +443,7 @@ async fn try_authenticate(ng: SocketAddr, p: &Person, extra: Value) -> HttpReply
     let server_key: [u8; 32] = unb64(ch["server_key"].as_str().unwrap())
         .try_into()
         .unwrap();
-    let proof = LoginProof::sign(&p.dev, &challenge, &server_key, now());
+    let proof = LoginProof::sign(&p.dev, &challenge, &server_key, &ng.to_string(), now()).unwrap();
     let mut body =
         json!({ "card": b64(&p.card), "device_cert": b64(&p.cert), "proof": b64(&proof) });
     for (k, v) in extra.as_object().unwrap() {
@@ -632,6 +644,117 @@ async fn discovery_challenge_auth_and_authenticated_json_login() {
     assert!(ok2["ok"]["self"].get("identity").is_none());
 }
 
+/// A challenge asked for under `host`: the challenge, the server key, and
+/// the server's signature over them if it gave one.
+async fn challenge_as(ng: SocketAddr, host: &str) -> ([u8; 32], [u8; 32], Option<Vec<u8>>) {
+    let ch = http(ng, "POST", "/identity/challenge", &[("Host", host)], b"").await;
+    assert_eq!(ch.status, 200);
+    let ch = ch.json();
+    (
+        unb64(ch["challenge"].as_str().unwrap()).try_into().unwrap(),
+        unb64(ch["server_key"].as_str().unwrap())
+            .try_into()
+            .unwrap(),
+        ch["server_challenge"].as_str().map(unb64),
+    )
+}
+
+/// `auth` with `proof`, sent under `host`.
+async fn auth_as(ng: SocketAddr, host: &str, p: &Person, proof: &[u8]) -> HttpReply {
+    let body = json!({ "card": b64(&p.card), "device_cert": b64(&p.cert), "proof": b64(proof) });
+    http(
+        ng,
+        "POST",
+        "/identity/auth",
+        &[("Host", host)],
+        body.to_string().as_bytes(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_login_proof_is_bound_to_the_host_it_was_sent_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(2, "Alice");
+    let here = ng.to_string();
+
+    // The server vouches for its key under the name it was asked by.
+    let (challenge, server_key, signed) = challenge_as(ng, &here).await;
+    let sc = ServerChallenge::parse(&signed.expect("a signed challenge")).unwrap();
+    assert_eq!(sc.check(&challenge, &server_key, &here, now(), 0), Ok(()));
+    assert_eq!(
+        sc.check(&challenge, &server_key, "b.example", now(), 0),
+        Err(hl_identity::Error::HostMismatch)
+    );
+
+    // A relay: b.example handed this server's challenge to its own user,
+    // who signed for b.example, and posts the answer here under this
+    // server's name.
+    let proof = LoginProof::sign(&p.dev, &challenge, &server_key, "b.example", now()).unwrap();
+    let r = auth_as(ng, &here, &p, &proof).await;
+    assert_eq!(r.status, 421, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["error"], "wrong_host");
+
+    let (challenge, server_key, _) = challenge_as(ng, &here).await;
+    let proof = LoginProof::sign(&p.dev, &challenge, &server_key, &here, now()).unwrap();
+    assert_eq!(auth_as(ng, &here, &p, &proof).await.status, 200);
+}
+
+#[tokio::test]
+async fn a_server_with_hosts_answers_as_them_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig {
+        hosts: vec!["hl.example".into()],
+        ..Default::default()
+    };
+    let (_legacy, ng, _ctx) =
+        start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+    let p = person(2, "Alice");
+
+    // Reached under another name, as a relay that sends its own `Host`
+    // on to a server that answers any would: nothing is vouched for, and
+    // a proof made for that name is refused.
+    let (challenge, server_key, signed) = challenge_as(ng, "b.example").await;
+    assert_eq!(signed, None);
+    let proof = LoginProof::sign(&p.dev, &challenge, &server_key, "b.example", now()).unwrap();
+    let r = auth_as(ng, "b.example", &p, &proof).await;
+    assert_eq!(r.status, 421, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.json()["error"], "wrong_host");
+
+    // Its own name, in whatever case and with the default port.
+    let (challenge, server_key, signed) = challenge_as(ng, "HL.example:443").await;
+    let sc = ServerChallenge::parse(&signed.expect("a signed challenge")).unwrap();
+    assert_eq!(sc.host, "hl.example");
+    let proof = LoginProof::sign(&p.dev, &challenge, &server_key, "hl.example", now()).unwrap();
+    let r = auth_as(ng, "hl.example", &p, &proof).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+}
+
+#[tokio::test]
+async fn a_v1_proof_is_accepted_only_while_login_proof_v1_is_on() {
+    for (accept, status, error) in [(true, 200, None), (false, 401, Some("unsupported_proof"))] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = IdentityConfig {
+            login_proof_v1: accept,
+            ..Default::default()
+        };
+        let (_legacy, ng, _ctx) =
+            start_server_with(dir.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+        let p = person(2, "Alice");
+        let here = ng.to_string();
+        let (challenge, server_key, _) = challenge_as(ng, &here).await;
+        let proof = LoginProof::sign_v1(&p.dev, &challenge, &server_key, now());
+        let r = auth_as(ng, &here, &p, &proof).await;
+        assert_eq!(r.status, status, "login_proof_v1 = {accept}");
+        assert_eq!(
+            r.json()["error"].as_str(),
+            error,
+            "login_proof_v1 = {accept}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn bad_proof_and_stale_challenge_are_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -641,7 +764,7 @@ async fn bad_proof_and_stale_challenge_are_refused() {
     // A proof for a challenge the server never issued.
     let bogus = [9u8; 32];
     let sk = ServerKey::from_seed(&[0x55; 32]).public();
-    let proof = LoginProof::sign(&p.dev, &bogus, &sk, now());
+    let proof = LoginProof::sign(&p.dev, &bogus, &sk, &ng.to_string(), now()).unwrap();
     let body = json!({ "card": b64(&p.card), "device_cert": b64(&p.cert), "proof": b64(&proof) })
         .to_string();
     let r = http(ng, "POST", "/identity/auth", &[], body.as_bytes()).await;
@@ -654,7 +777,7 @@ async fn bad_proof_and_stale_challenge_are_refused() {
         .json();
     let challenge: [u8; 32] = unb64(ch["challenge"].as_str().unwrap()).try_into().unwrap();
     let stranger = DeviceKey::from_seed(&[77; 32]);
-    let proof = LoginProof::sign(&stranger, &challenge, &sk, now());
+    let proof = LoginProof::sign(&stranger, &challenge, &sk, &ng.to_string(), now()).unwrap();
     let body = json!({ "card": b64(&p.card), "device_cert": b64(&p.cert), "proof": b64(&proof) })
         .to_string();
     let r = http(ng, "POST", "/identity/auth", &[], body.as_bytes()).await;
@@ -662,7 +785,7 @@ async fn bad_proof_and_stale_challenge_are_refused() {
     assert_eq!(r.json()["error"], "bad_proof");
 
     // And the challenge was burned by the failed attempt.
-    let proof = LoginProof::sign(&p.dev, &challenge, &sk, now());
+    let proof = LoginProof::sign(&p.dev, &challenge, &sk, &ng.to_string(), now()).unwrap();
     let body = json!({ "card": b64(&p.card), "device_cert": b64(&p.cert), "proof": b64(&proof) })
         .to_string();
     let r = http(ng, "POST", "/identity/auth", &[], body.as_bytes()).await;
@@ -3962,6 +4085,53 @@ fn code_in(line: &str) -> Option<String> {
                     .all(|(i, c)| i == 4 || c.is_ascii_alphanumeric())
         })
         .map(str::to_owned)
+}
+
+/// `hlid auth --server http://{ng}` with the identity in `home`.
+async fn hlid_auth(hlid: &Path, home: &Path, ng: SocketAddr) -> std::process::Output {
+    let mut cmd = std::process::Command::new(hlid);
+    cmd.env("HLID_HOME", home)
+        .args(["auth", "--server", &format!("http://{ng}")]);
+    tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn hlid_auth_signs_for_the_host_it_addressed_and_no_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let hlid = hlid_binary();
+    let home = dir.path().join("hlid");
+    let init = std::process::Command::new(&hlid)
+        .env("HLID_HOME", &home)
+        .args(["init", "--name", "Alice"])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let out = hlid_auth(&hlid, &home, ng).await;
+    assert!(
+        out.status.success(),
+        "hlid auth: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(reply["token"].is_string(), "{reply}");
+
+    // A server reached under a name it does not answer as vouches for
+    // nothing, and hlid signs nothing for it.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let cfg = IdentityConfig {
+        hosts: vec!["hl.example".into()],
+        ..Default::default()
+    };
+    let (_legacy, ng, _ctx) =
+        start_server_with(elsewhere.path(), cfg, hxd_session::TrtpLogin::Verify).await;
+    let out = hlid_auth(&hlid, &home, ng).await;
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("did not sign its challenge"), "{err}");
 }
 
 #[tokio::test]

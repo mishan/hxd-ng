@@ -125,10 +125,48 @@ nothing and is ignored.
 
 ## 5. The challenge binding
 
-The proof echoes `server_key` so that a challenge relayed from another
-server is useless. `challenge` is free for the caller and costs the
-server a random draw, which is why it wants a rate limit and, until one
-exists, a bounded table.
+The `v = 1` proof echoes `server_key` so that a challenge relayed from
+another server would be useless. It was not enough, because the client
+learns `server_key` from the server it is talking to, and nothing made
+that server show it holds the key. A hostile server B publishes server
+A's key in its discovery and its challenge reply, fetches a challenge
+from A, hands it to a user of B, and posts the proof the user signs to
+A's `auth`: B is logged in to A as that user, and may link, act and
+speak as them there. Anyone who uses one identity on two servers, which
+is what a portable identity is for, is exposed to every server they
+visit.
+
+Two things bind now, one per side. The `v = 2` proof names the host the
+client addressed, and the server checks it against the `Host` the
+proof arrived with: to reach A, B must address A, and the proof says B.
+That protects a careless client, since the check is the server's. It
+holds only against names A was configured with: `Host` is whatever the
+sender wrote, and an A that took any as its own would, reached by
+address, sign B's name for B and accept the proof made for it. So a
+server with no names signs nothing and takes no `v = 2` proof; it is
+not required to have them, because a configuration written before them
+should still start, and its `v = 1` clients still log in. And the
+challenge reply carries the server key's signature over the
+challenge and the host it was asked under, which a client verifies
+before signing: A signs only the names it lists, so B cannot get A's
+signature for B's name, and a signature A made for its own name does
+not match what the client addressed.
+That is what a client can pin a server's key on, per host.
+
+The mTLS binding never had the hole. A client certificate is presented
+in the TLS handshake with whoever the client connected to, and proves
+possession only within that session; B cannot carry it into a session
+of its own with A, and A believes the header that names one only from
+its own proxies.
+
+The `v = 1` proof stays acceptable for a while, behind a setting, so
+that clients that predate `v = 2` keep logging in. It is still exactly
+as relayable as before; the warning in the log is there so that an
+operator knows when it is safe to turn it off.
+
+`challenge` is free for the caller and costs the server a random draw
+and a signature, which is why it wants a rate limit and a bounded table
+both.
 
 **`downstream` goes one way.** The server cannot verify what a client
 says about the hop behind it, so it takes the claim at face value only in

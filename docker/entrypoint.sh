@@ -247,6 +247,7 @@ generate() {
         str HXD_IDENTITY_NEW_ACCOUNTS new_accounts
         str HXD_IDENTITY_UNATTESTED unattested
         str HXD_IDENTITY_WEB web
+        [ -z "${HXD_IDENTITY_HOSTS:-}" ] || kvlist hosts "$HXD_IDENTITY_HOSTS"
         # The generated file is rewritten at every start, so these are the
         # only lists that last; `hxd identity revoke` is refused below.
         fingerprints HXD_REVOKED_IDENTITIES revoked_identities

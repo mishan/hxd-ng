@@ -35,6 +35,9 @@ pub enum Error {
     ClockSkew,
     /// A proof echoes a different challenge or server key than expected.
     ChallengeMismatch,
+    /// A proof or a server's challenge names a different host than the
+    /// one the request was addressed to.
+    HostMismatch,
     /// The device certificate doesn't grant the capability being used.
     CapabilityMissing,
     /// The object exceeds its size limit.
@@ -56,6 +59,7 @@ impl fmt::Display for Error {
             Error::NotYetValid => write!(f, "not yet valid"),
             Error::ClockSkew => write!(f, "timestamp outside clock-skew tolerance"),
             Error::ChallengeMismatch => write!(f, "challenge or server key mismatch"),
+            Error::HostMismatch => write!(f, "host mismatch"),
             Error::CapabilityMissing => {
                 write!(f, "device certificate lacks the required capability")
             }

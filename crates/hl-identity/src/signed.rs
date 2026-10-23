@@ -12,6 +12,7 @@ pub const VERSION: u64 = 1;
 /// verified — the caller knows which key applies.
 pub(crate) struct Envelope {
     pub value: Value,
+    pub v: u64,
     pub signed_bytes: Vec<u8>,
     pub sig: [u8; 64],
 }
@@ -20,28 +21,39 @@ impl Envelope {
     /// Decode and split. Checks canonical form, map-ness, `v`, and the
     /// shape of `sig`; nothing else.
     pub fn open(bytes: &[u8]) -> Result<Envelope, Error> {
+        Self::open_upto(bytes, VERSION)
+    }
+
+    /// [`Envelope::open`] for a type that has had more than one version:
+    /// any `v` from 1 to `newest` is read, and the caller reads `v`.
+    pub fn open_upto(bytes: &[u8], newest: u64) -> Result<Envelope, Error> {
         let value = cbor::decode_canonical(bytes)?;
-        Self::from_value(value)
+        Self::from_value_upto(value, newest)
     }
 
     /// Same as [`Envelope::open`] for a map already decoded as part of a
     /// larger object (attestations inside a card). The bytes are known
     /// canonical because the enclosing object was.
     pub fn from_value(value: Value) -> Result<Envelope, Error> {
+        Self::from_value_upto(value, VERSION)
+    }
+
+    fn from_value_upto(value: Value, newest: u64) -> Result<Envelope, Error> {
         if !matches!(value, Value::Map(_)) {
             return Err(Error::NotAMap);
         }
-        // `!=`, not `>`: `v = 0` is not "an older version we can read",
-        // it is a version that never existed, and accepting it would let
-        // one object's bytes be re-read as another version later.
+        // Not just `> newest`: `v = 0` is not "an older version we can
+        // read", it is a version that never existed, and accepting it
+        // would let one object's bytes be re-read as another version later.
         let v = uint(&value, "v")?;
-        if v != VERSION {
+        if v == 0 || v > newest {
             return Err(Error::UnsupportedVersion(v));
         }
         let sig = bytes32x2(&value, "sig")?;
         let signed_bytes = cbor::encode(&value.without("sig"));
         Ok(Envelope {
             value,
+            v,
             signed_bytes,
             sig,
         })

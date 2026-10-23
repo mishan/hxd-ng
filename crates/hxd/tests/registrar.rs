@@ -34,10 +34,15 @@ struct Server {
 /// `[identity]` and a `[registrar]`, every path inside `dir`.
 async fn start(dir: &Path, registrar_extra: &str) -> Server {
     let d = dir.display();
+    // Bound first, so that `hosts` can name the address the tests reach
+    // it by: without a name, no `v = 2` proof logs in.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ng = listener.local_addr().unwrap();
     let text = format!(
         "[paths]\naccounts = \"{d}/accounts\"\n\
          [ng]\nbind = \"127.0.0.1:0\"\n\
          [identity]\nkey = \"{d}/server.key\"\nsuccessors = \"{d}/successors\"\nenroll = false\n\
+         hosts = [\"{ng}\"]\n\
          [registrar]\nhost = \"{HOST}\"\nkey = \"{d}/registrar.key\"\n\
          store = \"{d}/registrar.db\"\ninvites = \"{d}/invites\"\n{registrar_extra}\n"
     );
@@ -50,8 +55,6 @@ async fn start(dir: &Path, registrar_extra: &str) -> Server {
         .unwrap()
         .unwrap();
     let registrar = ng_ctx.registrar.clone().expect("[registrar] builds one");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ng = listener.local_addr().unwrap();
     tokio::spawn(hxd_ng_session::serve(listener, ng_ctx));
     Server {
         ng,
@@ -444,7 +447,7 @@ async fn token(s: &Server, id: &IdentityKey, dev: &DeviceKey, card: &[u8]) -> St
         .sign(id);
     let ch = post(s, "/identity/challenge", Value::Null).await.json();
     let challenge: [u8; 32] = unb64(ch["challenge"].as_str().unwrap()).try_into().unwrap();
-    let proof = LoginProof::sign(dev, &challenge, &s_key(&ch), now());
+    let proof = LoginProof::sign(dev, &challenge, &s_key(&ch), &s.ng.to_string(), now()).unwrap();
     let r = post(
         s,
         "/identity/auth",
@@ -476,7 +479,7 @@ async fn a_card_put_here_must_keep_the_registrars_commitment() {
         .sign(&alice);
     let ch = post(&s, "/identity/challenge", Value::Null).await.json();
     let challenge: [u8; 32] = unb64(ch["challenge"].as_str().unwrap()).try_into().unwrap();
-    let proof = LoginProof::sign(&dev, &challenge, &s_key(&ch), now());
+    let proof = LoginProof::sign(&dev, &challenge, &s_key(&ch), &s.ng.to_string(), now()).unwrap();
     let r = post(
         &s,
         "/identity/auth",
@@ -934,11 +937,14 @@ async fn verifier(
         ),
         Trust::Discovery => String::new(),
     };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ng = listener.local_addr().unwrap();
     let text = format!(
         "[paths]\naccounts = \"{d}/accounts\"\n\
          [inbox]\ndb = \"{d}/server.db\"\n\
          [ng]\nbind = \"127.0.0.1:0\"\n\
          [identity]\nkey = \"{d}/server.key\"\nsuccessors = \"{d}/successors\"\nenroll = false\n\
+         hosts = [\"{ng}\"]\n\
          revocation_max_age = 1\ntrusted_registrars = [\"{HOST}\"]\n{extra}\n\
          {trust}\
          [identity.registrar_urls]\n\"{HOST}\" = \"{url}\"\n"
@@ -952,8 +958,6 @@ async fn verifier(
         .unwrap()
         .unwrap();
     let identity = ng_ctx.identity.clone().unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ng = listener.local_addr().unwrap();
     tokio::spawn(hxd_ng_session::serve(listener, ng_ctx));
     (ng, identity)
 }
@@ -987,7 +991,7 @@ async fn auth_with(
     };
     let ch = json_post("/identity/challenge", Value::Null).await.json();
     let challenge: [u8; 32] = unb64(ch["challenge"].as_str().unwrap()).try_into().unwrap();
-    let proof = LoginProof::sign(dev, &challenge, &s_key(&ch), now());
+    let proof = LoginProof::sign(dev, &challenge, &s_key(&ch), &at.to_string(), now()).unwrap();
     let mut body = json!({ "card": b64(card), "device_cert": b64(&cert), "proof": b64(&proof) });
     body.as_object_mut()
         .unwrap()

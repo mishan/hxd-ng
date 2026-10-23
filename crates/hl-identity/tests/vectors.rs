@@ -12,7 +12,7 @@ use hl_identity::{
     attestation, card, cert, enroll, proof, Attestation, AttestationRevocation, Bundle, Card,
     DeviceCert, DeviceKey, DeviceRevocation, EnrollRequest, Freeze, IdentityKey,
     IdentityRevocation, ListKind, LoginContext, LoginProof, Record, RegisterRequest, RegistrarKeys,
-    Rotation, ServerKey, SessionClaim, SignedList,
+    Rotation, ServerChallenge, ServerKey, SessionClaim, SignedList,
 };
 use serde_json::Value as Json;
 
@@ -246,7 +246,7 @@ fn login_proof_vector_and_composed_login() {
     let time = u64_of(&e["fields"], "time");
     let signed = unhex(str_of(e, "signed_hex"));
     assert_eq!(
-        LoginProof::sign(&k.dev, &challenge, &server_key, time),
+        LoginProof::sign_v1(&k.dev, &challenge, &server_key, time),
         signed
     );
     let p = LoginProof::parse(&signed).unwrap();
@@ -257,6 +257,7 @@ fn login_proof_vector_and_composed_login() {
     let ctx = LoginContext {
         challenge: &challenge,
         server_key: &k.srv.public(),
+        host: None,
         now: u64_of(login, "now"),
         skew: u64_of(login, "skew"),
     };
@@ -278,6 +279,82 @@ fn login_proof_vector_and_composed_login() {
 }
 
 #[test]
+fn login_proof_v2_vector_binds_the_host() {
+    let v = vectors();
+    let k = keys(&v);
+    let lp = &v["login_proof_v2"];
+    let e = &lp["object"];
+    assert_eq!(str_of(e, "domain"), proof::DOMAIN);
+    assert_eq!(u64_of(&e["fields"], "v"), proof::HOST_VERSION);
+    let challenge = unhex32(str_of(lp, "challenge_hex"));
+    let server_key = unhex32(str_of(lp, "server_key_hex"));
+    let host = str_of(lp, "host");
+    let time = u64_of(&e["fields"], "time");
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(
+        LoginProof::sign(&k.dev, &challenge, &server_key, host, time).unwrap(),
+        signed
+    );
+    assert_eq!(
+        LoginProof::parse(&signed).unwrap().host.as_deref(),
+        Some(host)
+    );
+    check_signed(e, proof::DOMAIN, &k.dev.public(), &signed);
+
+    let login = &v["login"];
+    let verify = |host| {
+        hl_identity::verify_login(
+            &unhex(str_of(&v["card"], "signed_hex")),
+            &unhex(str_of(&v["device_cert"], "signed_hex")),
+            &signed,
+            LoginContext {
+                challenge: &challenge,
+                server_key: &k.srv.public(),
+                host,
+                now: u64_of(login, "now"),
+                skew: u64_of(login, "skew"),
+            },
+        )
+        .map(|ok| ok.fingerprint().to_string())
+    };
+    assert_eq!(
+        verify(Some(host)).as_deref(),
+        Ok(str_of(login, "identity_fingerprint"))
+    );
+    assert_eq!(
+        verify(Some("relay.example")),
+        Err(hl_identity::Error::HostMismatch)
+    );
+}
+
+#[test]
+fn server_challenge_vector() {
+    let v = vectors();
+    let k = keys(&v);
+    let e = &v["server_challenge"]["object"];
+    let f = &e["fields"];
+    assert_eq!(str_of(e, "domain"), proof::SERVER_DOMAIN);
+    let challenge = unhex32(str_of(f, "challenge"));
+    let host = str_of(f, "host");
+    let expires = u64_of(f, "expires");
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(
+        ServerChallenge::sign(&k.srv, &challenge, host, expires).unwrap(),
+        signed
+    );
+    let c = ServerChallenge::parse(&signed).unwrap();
+    assert_eq!(c.server_key, unhex32(str_of(f, "server_key")));
+    assert_eq!(
+        (c.challenge, c.host.as_str(), c.expires),
+        (challenge, host, expires)
+    );
+    assert!(c
+        .check(&challenge, &k.srv.public(), host, expires, 0)
+        .is_ok());
+    check_signed(e, proof::SERVER_DOMAIN, &k.srv.public(), &signed);
+}
+
+#[test]
 fn rejects() {
     let v = vectors();
     for r in v["rejects"].as_array().unwrap() {
@@ -287,6 +364,7 @@ fn rejects() {
             "attestation" => Attestation::parse(&bytes).unwrap_err(),
             "card" => Card::parse(&bytes).unwrap_err(),
             "login_proof" => LoginProof::parse(&bytes).unwrap_err(),
+            "server_challenge" => ServerChallenge::parse(&bytes).unwrap_err(),
             "revoke_device" => DeviceRevocation::parse(&bytes).unwrap_err(),
             "rotate" => Rotation::parse(&bytes).unwrap_err(),
             other => panic!("unknown object kind {other}"),

@@ -40,7 +40,7 @@ pub use cert::{caps, DeviceCert};
 pub use enroll::{EnrollRequest, SessionClaim};
 pub use error::Error;
 pub use keys::{DeviceKey, Fingerprint, IdentityKey, PublicKey, ServerKey};
-pub use proof::LoginProof;
+pub use proof::{LoginProof, ServerChallenge};
 pub use registrar::{
     AttestationRevocation, DeviceRevocation, Freeze, IdentityRevocation, ListKind, Record,
     RegisterRequest, RegistrarKeys, Rotation, SignedList, Stats,
@@ -54,6 +54,9 @@ pub struct LoginContext<'a> {
     pub challenge: &'a [u8; 32],
     /// This server's public key.
     pub server_key: &'a PublicKey,
+    /// The `Host` the request carrying the proof was sent with, which a
+    /// `v = 2` proof must name; `None` when it had none.
+    pub host: Option<&'a str>,
     /// The server's clock, Unix seconds.
     pub now: u64,
     /// Clock-skew tolerance in seconds (`[identity] clock_skew`).
@@ -86,8 +89,8 @@ impl VerifiedLogin {
 /// Steps 1–3 of `/identity/auth` for the challenge binding, in the spec's
 /// order and failing on the first error:
 ///
-/// 1. the proof verifies, answers this challenge for this server, and is
-///    fresh;
+/// 1. the proof verifies, answers this challenge for this server (and,
+///    from `v = 2`, for the host the request was sent to), and is fresh;
 /// 2. the certificate verifies, names the proof's device key, is within
 ///    its validity window, and grants login;
 /// 3. the card verifies and belongs to the certificate's identity.
@@ -104,7 +107,7 @@ pub fn verify_login(
     ctx: LoginContext<'_>,
 ) -> Result<VerifiedLogin, Error> {
     let proof = LoginProof::parse(proof)?;
-    proof.check(ctx.challenge, ctx.server_key, ctx.now, ctx.skew)?;
+    proof.check(ctx.challenge, ctx.server_key, ctx.host, ctx.now, ctx.skew)?;
 
     let cert = DeviceCert::parse(cert)?;
     if cert.device != proof.device {
@@ -179,10 +182,12 @@ mod tests {
     fn happy_path() {
         let w = world();
         let ch = [7u8; 32];
-        let proof = LoginProof::sign(&w.dev, &ch, &w.srv.public(), 1_700_000_500);
+        let proof =
+            LoginProof::sign(&w.dev, &ch, &w.srv.public(), "hl.example", 1_700_000_500).unwrap();
         let ctx = LoginContext {
             challenge: &ch,
             server_key: &w.srv.public(),
+            host: Some("hl.example"),
             now: 1_700_000_600,
             skew: 300,
         };
@@ -197,10 +202,12 @@ mod tests {
         let w = world();
         let stranger = DeviceKey::from_seed(&[8u8; 32]);
         let ch = [7u8; 32];
-        let proof = LoginProof::sign(&stranger, &ch, &w.srv.public(), 1_700_000_500);
+        let proof =
+            LoginProof::sign(&stranger, &ch, &w.srv.public(), "hl.example", 1_700_000_500).unwrap();
         let ctx = LoginContext {
             challenge: &ch,
             server_key: &w.srv.public(),
+            host: Some("hl.example"),
             now: 1_700_000_500,
             skew: 300,
         };
@@ -216,10 +223,12 @@ mod tests {
         let other = IdentityKey::from_seed(&[9u8; 32]);
         let card = Card::new(&other, "Other", 1).sign(&other, vec![]).unwrap();
         let ch = [7u8; 32];
-        let proof = LoginProof::sign(&w.dev, &ch, &w.srv.public(), 1_700_000_500);
+        let proof =
+            LoginProof::sign(&w.dev, &ch, &w.srv.public(), "hl.example", 1_700_000_500).unwrap();
         let ctx = LoginContext {
             challenge: &ch,
             server_key: &w.srv.public(),
+            host: Some("hl.example"),
             now: 1_700_000_500,
             skew: 300,
         };
@@ -233,10 +242,12 @@ mod tests {
     fn expired_cert_and_missing_login_cap() {
         let w = world();
         let ch = [7u8; 32];
-        let proof = LoginProof::sign(&w.dev, &ch, &w.srv.public(), 1_800_000_000);
+        let proof =
+            LoginProof::sign(&w.dev, &ch, &w.srv.public(), "hl.example", 1_800_000_000).unwrap();
         let ctx = LoginContext {
             challenge: &ch,
             server_key: &w.srv.public(),
+            host: Some("hl.example"),
             now: 1_800_000_000,
             skew: 300,
         };
@@ -248,10 +259,12 @@ mod tests {
         let mut c = DeviceCert::for_device(&w.id, &w.dev, 1_700_000_000, 1000).unwrap();
         c.caps = Some(caps::MESSAGE);
         let cert = c.sign(&w.id);
-        let proof = LoginProof::sign(&w.dev, &ch, &w.srv.public(), 1_700_000_100);
+        let proof =
+            LoginProof::sign(&w.dev, &ch, &w.srv.public(), "hl.example", 1_700_000_100).unwrap();
         let ctx = LoginContext {
             challenge: &ch,
             server_key: &w.srv.public(),
+            host: Some("hl.example"),
             now: 1_700_000_100,
             skew: 300,
         };

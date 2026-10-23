@@ -97,6 +97,16 @@ pub struct IdentityConfig {
     /// first seen, before it may chat, message or post
     /// (`identity-registrar.md` §7.3). 0 is none.
     pub newcomer_delay: u64,
+    /// The hosts this server answers as, in `canonical_host` form
+    /// (`hotline-ng-auth.md` §6.2). Only these are vouched for and
+    /// accepted in a `v = 2` proof: a `Host` is whatever the sender put
+    /// there, so taking any would let another server name itself to
+    /// this one and be vouched for under its own name. Empty, there are
+    /// none, and only `v = 1` proofs log in.
+    pub hosts: Vec<String>,
+    /// Accept a `v = 1` login proof, which names no host and so can be
+    /// relayed (`hotline-ng-auth.md` §6.2).
+    pub login_proof_v1: bool,
 }
 
 impl Default for IdentityConfig {
@@ -115,6 +125,8 @@ impl Default for IdentityConfig {
             frozen: Frozen::Deny,
             banned_registrars: Vec::new(),
             newcomer_delay: 0,
+            hosts: Vec::new(),
+            login_proof_v1: true,
         }
     }
 }
@@ -231,6 +243,12 @@ pub enum AuthRefused {
     Denied,
     CardTooLarge,
     UnknownChallenge,
+    /// A `v = 2` proof made for a host other than the one the request
+    /// was sent to, or than any this server answers as: a relay, or a
+    /// proxy that rewrites `Host`.
+    WrongHost,
+    /// A `v = 1` proof, with `[identity] login_proof_v1 = false`.
+    UnsupportedProof,
     /// `login`/`password` didn't verify (§5.4).
     LoginFailed,
     /// `login`/`password` named the guest account, which links to no
@@ -268,6 +286,8 @@ impl AuthRefused {
             AuthRefused::Denied => "denied",
             AuthRefused::CardTooLarge => "card_too_large",
             AuthRefused::UnknownChallenge => "unknown_challenge",
+            AuthRefused::WrongHost => "wrong_host",
+            AuthRefused::UnsupportedProof => "unsupported_proof",
             AuthRefused::LoginFailed | AuthRefused::GuestLink => "login_failed",
             AuthRefused::NoManage => "no_manage",
             AuthRefused::AlreadyLinked => "already_linked",
@@ -280,7 +300,8 @@ impl AuthRefused {
     }
 
     /// 401 for "prove it again", 403 for "no", 409 for "that conflicts
-    /// with the account's state", 500 for us.
+    /// with the account's state", 421 for "not the server you meant",
+    /// 500 for us.
     pub fn status(self) -> u16 {
         match self {
             AuthRefused::Denied
@@ -289,6 +310,7 @@ impl AuthRefused {
             | AuthRefused::Banned
             | AuthRefused::Rotated { .. } => 403,
             AuthRefused::AlreadyLinked | AuthRefused::WouldOrphan | AuthRefused::NotLinked => 409,
+            AuthRefused::WrongHost => 421,
             AuthRefused::Backend => 500,
             _ => 401,
         }
@@ -353,6 +375,8 @@ struct Tables {
     /// When accounts were created by `new_accounts = create`, newest
     /// last; trimmed to the last hour.
     created: Vec<Instant>,
+    /// When a `v = 1` login was last warned about.
+    v1_warned: Option<Instant>,
 }
 
 /// What association work `admit` is allowed to do.
@@ -517,6 +541,7 @@ impl IdentityState {
                 since_sweep: 0,
                 swept: clock.now(),
                 created: Vec::new(),
+                v1_warned: None,
             }),
             anchors,
             registrar: None,
@@ -589,32 +614,52 @@ impl IdentityState {
         Some(ch)
     }
 
+    /// Whether `host`, a request's `Host`, is one of the names this
+    /// server was configured with.
+    pub fn answers_as(&self, host: Option<&str>) -> bool {
+        host.and_then(hl_identity::proof::canonical_host)
+            .is_some_and(|h| self.cfg.hosts.contains(&h))
+    }
+
+    /// The server key's signature over a challenge issued to a request
+    /// sent with `host` (§6.2), or `None` for a host this server does not
+    /// answer as — which a `v = 2` client then refuses to sign for.
+    pub fn sign_challenge(&self, challenge: &[u8; 32], host: Option<&str>) -> Option<Vec<u8>> {
+        let host = host.filter(|h| self.answers_as(Some(h)))?;
+        let expires = self.clock.unix() + TTL.as_secs();
+        hl_identity::ServerChallenge::sign(&self.key, challenge, host, expires).ok()
+    }
+
     /// `POST /identity/auth`, challenge binding: the spec's step list
     /// (§5.2) with steps 4 and 6's revocation half stubbed. Consumes the
     /// challenge whether or not verification succeeds — a failed attempt
-    /// doesn't get to retry against the same nonce.
+    /// doesn't get to retry against the same nonce. `host` is the
+    /// request's `Host`, as for [`Self::verify_proof`].
     pub fn auth_with_proof(
         &self,
         card: &[u8],
         cert: &[u8],
         proof: &[u8],
+        host: Option<&str>,
         req: AuthRequest<'_>,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
-        self.admit_verified(self.verify_proof(card, cert, proof)?, req)
+        self.admit_verified(self.verify_proof(card, cert, proof, host)?, req)
     }
 
     /// Steps 1–3 of the proof binding (§5.2): the challenge spent, and the
-    /// certificate, card and proof verified.
+    /// certificate, card and proof verified. `host` is the request's
+    /// `Host`, which a `v = 2` proof must name.
     pub fn verify_proof(
         &self,
         card: &[u8],
         cert: &[u8],
         proof: &[u8],
+        host: Option<&str>,
     ) -> Result<Verified, AuthRefused> {
         // Peek at the challenge inside the proof so we can consume it
         // before doing any signature work; a bad proof still burns it.
-        let challenge = match hl_identity::LoginProof::parse(proof) {
-            Ok(p) => p.challenge,
+        let (challenge, v1) = match hl_identity::LoginProof::parse(proof) {
+            Ok(p) => (p.challenge, p.host.is_none()),
             Err(_) => return Err(AuthRefused::BadProof),
         };
         {
@@ -624,9 +669,16 @@ impl IdentityState {
                 _ => return Err(AuthRefused::UnknownChallenge),
             }
         }
+        if v1 && !self.cfg.login_proof_v1 {
+            return Err(AuthRefused::UnsupportedProof);
+        }
+        if !v1 && !self.answers_as(host) {
+            return Err(AuthRefused::WrongHost);
+        }
         let ctx = LoginContext {
             challenge: &challenge,
             server_key: &self.key.public(),
+            host,
             now: self.clock.unix(),
             skew: self.cfg.clock_skew,
         };
@@ -641,12 +693,35 @@ impl IdentityState {
             debug!("identity auth refused: {e}");
             classify(&e, card.len())
         })?;
+        if v1 {
+            self.warn_v1(&v.fingerprint());
+        }
         Ok(Verified {
             card: v.card,
             cert: v.cert,
             card_bytes: card.to_vec(),
             cert_bytes: cert.to_vec(),
         })
+    }
+
+    /// A `v = 1` login is one a relaying server could have made, so the
+    /// operator hears of them, once a minute at most, until clients have
+    /// moved on and `login_proof_v1` can be turned off.
+    fn warn_v1(&self, fingerprint: &Fingerprint) {
+        let now = self.clock.now();
+        let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        if t.v1_warned
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(60))
+        {
+            return;
+        }
+        t.v1_warned = Some(now);
+        drop(t);
+        tracing::warn!(
+            fingerprint = %fingerprint.short(),
+            "accepted a v1 login proof, which a relaying server can forward \
+             (hotline-ng-auth.md §6.2); [identity] login_proof_v1 = false refuses them"
+        );
     }
 
     /// Admit a login [`Self::verify_proof`] or [`Self::verify_presented`]
@@ -2083,6 +2158,7 @@ fn classify(e: &hl_identity::Error, card_len: usize) -> AuthRefused {
         // future caller that reaches verification without that pre-check.
         E::TooLarge => AuthRefused::BadCert,
         E::ChallengeMismatch | E::ClockSkew => AuthRefused::BadProof,
+        E::HostMismatch => AuthRefused::WrongHost,
         E::Expired | E::NotYetValid | E::CapabilityMissing => AuthRefused::BadCert,
         // KeyMismatch is "these objects aren't about the same keys";
         // the proof is the one the client is most likely to have gotten
@@ -2263,7 +2339,11 @@ mod tests {
         }
     }
 
-    fn state(cfg: IdentityConfig) -> IdentityState {
+    /// The name the tests' requests are addressed to.
+    const TEST_HOST: &str = "hl.example";
+
+    fn state(mut cfg: IdentityConfig) -> IdentityState {
+        cfg.hosts.push(TEST_HOST.into());
         IdentityState::new(
             ServerKey::from_seed(&[5u8; 32]),
             cfg,
@@ -2272,7 +2352,8 @@ mod tests {
         )
     }
 
-    fn state_with(cfg: IdentityConfig, auth: Arc<MemAuth>) -> IdentityState {
+    fn state_with(mut cfg: IdentityConfig, auth: Arc<MemAuth>) -> IdentityState {
+        cfg.hosts.push(TEST_HOST.into());
         IdentityState::new(
             ServerKey::from_seed(&[5u8; 32]),
             cfg,
@@ -2311,10 +2392,16 @@ mod tests {
         let dev = DeviceKey::from_seed(&[9; 32]);
         let (card, cert) = objects(&old, &dev);
         let ch = st.issue_challenge().unwrap();
-        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now_unix()).unwrap();
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof, AuthRequest::default())
-                .map(|_| ()),
+            st.auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default()
+            )
+            .map(|_| ()),
             Err(AuthRefused::Rotated {
                 successor: new.fingerprint()
             })
@@ -2340,9 +2427,15 @@ mod tests {
         let dev = DeviceKey::from_seed(&[2u8; 32]);
         let (card, cert) = objects(&id, &dev);
         let ch = st.issue_challenge().unwrap();
-        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now_unix()).unwrap();
         let (token, ident) = st
-            .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default(),
+            )
             .unwrap();
         assert_eq!(ident.outcome, Outcome::UnattestedGuest);
         assert_eq!(ident.fingerprint, id.fingerprint());
@@ -2350,9 +2443,15 @@ mod tests {
         assert_eq!(redeemed.device, dev.public());
         assert!(st.redeem(&token, true).is_none(), "single use");
         // The challenge is consumed too.
-        let proof2 = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
+        let proof2 = LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now_unix()).unwrap();
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof2, AuthRequest::default()),
+            st.auth_with_proof(
+                &card,
+                &cert,
+                &proof2,
+                Some(TEST_HOST),
+                AuthRequest::default()
+            ),
             Err(AuthRefused::UnknownChallenge)
         );
         // And the card is cached byte-exactly.
@@ -2376,7 +2475,8 @@ mod tests {
             downstream: Downstream::Cleartext,
             ..AuthRequest::default()
         };
-        st.auth_with_proof(&card, &cert, &proof, req).unwrap();
+        st.auth_with_proof(&card, &cert, &proof, Some(TEST_HOST), req)
+            .unwrap();
 
         let tokens = st.tables.lock().unwrap().tokens.len();
         let on_file = st.identity_for_device(&dev.public()).unwrap();
@@ -2386,8 +2486,14 @@ mod tests {
 
         // A later auth that says `local` is what the device is now.
         let proof = proof_for(&st, &dev);
-        st.auth_with_proof(&card, &cert, &proof, AuthRequest::default())
-            .unwrap();
+        st.auth_with_proof(
+            &card,
+            &cert,
+            &proof,
+            Some(TEST_HOST),
+            AuthRequest::default(),
+        )
+        .unwrap();
         assert!(
             !st.identity_for_device(&dev.public())
                 .unwrap()
@@ -2406,7 +2512,13 @@ mod tests {
         let (card, cert) = objects(&id, &dev);
         let proof = proof_for(&st, &dev);
         let (_, ident) = st
-            .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default(),
+            )
             .unwrap();
 
         let mut tokens = HashMap::new();
@@ -2428,7 +2540,13 @@ mod tests {
         cert.resize(cert::MAX_BYTES + 1, 0);
         let proof = proof_for(&st, &dev);
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof, AuthRequest::default()),
+            st.auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default()
+            ),
             Err(AuthRefused::BadCert)
         );
     }
@@ -2444,10 +2562,16 @@ mod tests {
             ..Default::default()
         });
         let ch = st.issue_challenge().unwrap();
-        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now_unix()).unwrap();
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof, AuthRequest::default())
-                .unwrap_err(),
+            st.auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default()
+            )
+            .unwrap_err(),
             AuthRefused::Denied
         );
 
@@ -2456,9 +2580,15 @@ mod tests {
             ..Default::default()
         });
         let ch = st.issue_challenge().unwrap();
-        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now_unix()).unwrap();
         assert!(st
-            .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default()
+            )
             .is_ok());
 
         let st = state(IdentityConfig {
@@ -2466,10 +2596,16 @@ mod tests {
             ..Default::default()
         });
         let ch = st.issue_challenge().unwrap();
-        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now_unix());
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now_unix()).unwrap();
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof, AuthRequest::default())
-                .unwrap_err(),
+            st.auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default()
+            )
+            .unwrap_err(),
             AuthRefused::Denied
         );
     }
@@ -2504,9 +2640,15 @@ mod tests {
         cfg.registrar_keys.insert("hl.example".into(), reg.public());
         let st = state(cfg);
         let ch = st.issue_challenge().unwrap();
-        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now);
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now).unwrap();
         let (_, ident) = st
-            .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default(),
+            )
             .unwrap();
         assert_eq!(ident.handle.as_deref(), Some("alice@hl.example"));
         assert!(ident.age >= 1000);
@@ -2522,9 +2664,15 @@ mod tests {
         cfg.registrar_keys.insert("hl.example".into(), reg.public());
         let st = state(cfg);
         let ch = st.issue_challenge().unwrap();
-        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now);
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now).unwrap();
         let (_, ident) = st
-            .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default(),
+            )
             .unwrap();
         // The handle is still reported — it verified — but the identity
         // counts as unattested for policy.
@@ -2534,9 +2682,15 @@ mod tests {
         // Same card, registrar not trusted: unattested.
         let st = state(IdentityConfig::default());
         let ch = st.issue_challenge().unwrap();
-        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), now);
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now).unwrap();
         let (_, ident) = st
-            .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default(),
+            )
             .unwrap();
         assert_eq!(ident.handle, None);
         assert_eq!(ident.outcome, Outcome::UnattestedGuest);
@@ -2584,9 +2738,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_a_configured_host_is_vouched_for_or_logged_in_as() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = DeviceKey::from_seed(&[2u8; 32]);
+        let (card, cert) = objects(&id, &dev);
+        for (hosts, host, signed, login) in [
+            (vec![], "b.example", false, Err(AuthRefused::WrongHost)),
+            (
+                vec!["hl.example".to_owned()],
+                "b.example",
+                false,
+                Err(AuthRefused::WrongHost),
+            ),
+            (
+                vec!["hl.example".to_owned()],
+                "HL.example:443",
+                true,
+                Ok(()),
+            ),
+        ] {
+            let st = IdentityState::new(
+                ServerKey::from_seed(&[5u8; 32]),
+                IdentityConfig {
+                    hosts: hosts.clone(),
+                    ..Default::default()
+                },
+                MemAuth::new(),
+                Arc::new(hxd_core::Core::new()),
+            );
+            let ch = st.issue_challenge().unwrap();
+            assert_eq!(
+                st.sign_challenge(&ch, Some(host)).is_some(),
+                signed,
+                "{hosts:?} {host}"
+            );
+            let proof = LoginProof::sign(&dev, &ch, &st.server_key(), host, now_unix()).unwrap();
+            assert_eq!(
+                st.verify_proof(&card, &cert, &proof, Some(host))
+                    .map(|_| ()),
+                login,
+                "{hosts:?} {host}"
+            );
+        }
+    }
+
     fn proof_for(st: &IdentityState, dev: &DeviceKey) -> Vec<u8> {
         let ch = st.issue_challenge().unwrap();
-        LoginProof::sign(dev, &ch, &st.server_key(), now_unix())
+        LoginProof::sign(dev, &ch, &st.server_key(), TEST_HOST, now_unix()).unwrap()
     }
 
     #[test]
@@ -2600,10 +2799,16 @@ mod tests {
         let (card, cert) = objects(&id, &dev);
         let auth = || {
             let proof = proof_for(&st, &dev);
-            st.auth_with_proof(&card, &cert, &proof, AuthRequest::default())
-                .unwrap()
-                .1
-                .quiet_until
+            st.auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default(),
+            )
+            .unwrap()
+            .1
+            .quiet_until
         };
         let first = auth().expect("a stranger waits");
         assert!(first > now_unix() && first <= now_unix() + 120);
@@ -2650,7 +2855,7 @@ mod tests {
         };
         let proof = proof_for(&st, &dev);
         assert_eq!(
-            st.auth_with_proof(&card, &cert, &proof, classic())
+            st.auth_with_proof(&card, &cert, &proof, Some(TEST_HOST), classic())
                 .unwrap_err(),
             AuthRefused::Denied
         );
@@ -2671,7 +2876,9 @@ mod tests {
             auth,
         );
         let proof = proof_for(&st, &dev);
-        let (_, ident) = st.auth_with_proof(&card, &cert, &proof, classic()).unwrap();
+        let (_, ident) = st
+            .auth_with_proof(&card, &cert, &proof, Some(TEST_HOST), classic())
+            .unwrap();
         assert_eq!(ident.outcome, Outcome::ClassicPendingLink);
     }
 
@@ -2694,6 +2901,7 @@ mod tests {
                 &card,
                 &cert,
                 &proof,
+                Some(TEST_HOST),
                 AuthRequest {
                     classic: Some(bad),
                     ..Default::default()
@@ -2718,6 +2926,7 @@ mod tests {
                 &card,
                 &cert,
                 &proof,
+                Some(TEST_HOST),
                 AuthRequest {
                     classic: Some(ok),
                     ..Default::default()
@@ -2737,7 +2946,13 @@ mod tests {
         // Next auth with no credentials finds the link.
         let proof = proof_for(&st, &dev);
         let (_, ident) = st
-            .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default(),
+            )
             .unwrap();
         assert_eq!(ident.outcome, Outcome::Linked);
         assert_eq!(st.account_for(&ident).unwrap().unwrap().login, "alice");
@@ -2752,6 +2967,7 @@ mod tests {
                 &card2,
                 &cert2,
                 &proof,
+                Some(TEST_HOST),
                 AuthRequest {
                     classic: Some(ClassicLogin {
                         login: "alice",
@@ -2834,7 +3050,13 @@ mod tests {
             .sign(&id);
         let proof = proof_for(&st, &dev);
         let (_, ident) = st
-            .auth_with_proof(&card, &cert, &proof, AuthRequest::default())
+            .auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default(),
+            )
             .unwrap();
         assert_eq!(ident.outcome, Outcome::Created);
         // `alice` exists already, so the handle's local part got a suffix.
@@ -2852,7 +3074,13 @@ mod tests {
         let (card3, cert3) = objects(&id3, &dev3);
         let proof = proof_for(&st, &dev3);
         let (_, ident3) = st
-            .auth_with_proof(&card3, &cert3, &proof, AuthRequest::default())
+            .auth_with_proof(
+                &card3,
+                &cert3,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default(),
+            )
             .unwrap();
         assert_eq!(ident3.outcome, Outcome::UnattestedGuest);
     }

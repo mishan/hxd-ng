@@ -21,6 +21,9 @@ sha2 = "0.10"
 hmac = "0.12"
 getrandom = "0.2"
 zeroize = "1"
+# The WHATWG serialization a login proof's `host` is compared in, which is
+# what browsers and HTTP clients put in `Host`.
+url = "2"
 
 [dev-dependencies]
 serde = { workspace = true }

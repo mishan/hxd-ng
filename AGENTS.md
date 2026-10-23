@@ -305,7 +305,8 @@ Three layers, all `cargo test --workspace`:
   frontend, **including cross-frontend scenarios** — a scripted 1.5 client
   and a WS client on one server, chat and PMs crossing both wire eras,
   detach showing as the away color, resume replay), `identity.rs` (the
-  identity endpoints, linking, the `/trtp` tunnel, anchors — a real
+  identity endpoints, a login proof held to the host it was made for,
+  linking, the `/trtp` tunnel, anchors — a real
   server per case with its own accounts directory), `media.rs` (inline
   media on both wires: the capability echo and its limits, single-shot
   and chunked upload, sliced downloads, a capable and a classic client
