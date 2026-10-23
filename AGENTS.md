@@ -4,8 +4,9 @@
 > is the map, not the territory: the product plan and phase status live in
 > **[ROADMAP.md](ROADMAP.md)**, the Hotline-ng protocol spec in
 > **[docs/hotline-ng.md](docs/hotline-ng.md)**, and how-to-run in
-> **[README.md](README.md)**. Git history is the record of how we got here —
-> the commit messages are written to be read.
+> **[README.md](README.md)** and **[docs/operating.md](docs/operating.md)**.
+> Git history is the record of how we got here — the commit messages are
+> written to be read.
 
 ## What this is
 

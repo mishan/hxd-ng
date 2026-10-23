@@ -1,6 +1,6 @@
 # Uploads on the Hotline-ng wire
 
-Status: U1 (hxd-ng) built; hx-ng's side (U2) is next. §8 stages it.
+Status: U1 (hxd-ng) and U2 (hx-ng) built. §8 stages it.
 
 The ng wire browses, downloads and previews files and changes the area
 (`hotline-ng.md` §7.2), but has no way to put a file there: a phone or

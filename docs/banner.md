@@ -2,7 +2,7 @@
 
 The image a server shows above its client's windows: a strip of the
 operator's own decoration, often with somewhere to click. One banner,
-configured once in `[banner]` (README), shown on both wires.
+configured once in `[banner]` ([operating.md](operating.md#banner)), shown on both wires.
 
 ## 1. What a banner is
 

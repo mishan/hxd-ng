@@ -27,11 +27,12 @@ to another project.
 | [relay.md](relay.md) — running `hlrelay`, the WebSocket front for a classic server | without authentication or its own bans | ng clients reaching a classic server | design |
 | [hotline-ng-identity.md](hotline-ng-identity.md) — the identity objects, the identity profile at auth, cards, account association | yes, to the registrar stub | ng, tunnel | spec |
 | [identity-enrollment.md](identity-enrollment.md) — certifying a device through a mailbox and a code | server side | ng | spec |
-| [identity-registrar.md](identity-registrar.md) — handles, revocation, rotation, freeze, key backup, transparency, standing and probation | the registrar and the server-local revocation list; not a server applying a registrar's records, or key backup | ng | spec |
-| [identity-records.md](identity-records.md) — a verifying server applying a registrar's records: plan and staging for registrar §7 | no | ng | design |
+| [identity-registrar.md](identity-registrar.md) — handles, revocation, rotation, freeze, key backup, transparency, standing and probation | the registrar, the server-local revocation list, and a server applying a registrar's records; not standing and probation, or key backup | ng | spec |
+| [identity-records.md](identity-records.md) — a verifying server applying a registrar's records: plan and staging for registrar §7 | R1–R3; not standing and probation (R4) | ng | design |
 | [identity-vouch.md](identity-vouch.md) — a member lending standing to a key | no | ng; local form from any account | spec |
 | [identity-threat-model.md](identity-threat-model.md) — what identity defends against | — | — | design |
 | [identity-test-vectors.json](identity-test-vectors.json) — signed objects and reject cases | yes | — | spec |
+| [e2e-messages.md](e2e-messages.md) — end-to-end private messages under the identity's `device_enc` key | no | ng | spec |
 | [push-notifications.md](push-notifications.md) — the notify decision, the subscriber model, and the multi-vendor sidecar | yes, through the Web Push gateway or a uniqush-push 2.11 sidecar; not the sidecar's APNs and FCM devices | ng | design |
 | [webpush-gateway.md](webpush-gateway.md) — the in-process Web Push sender and the device registry | yes | ng | design |
 
@@ -41,23 +42,28 @@ to another project.
 |---|---|---|---|
 | [access-bits.md](access-bits.md) — every access bit, `[extra]` policy, `[identity]` flags | yes | all | design |
 | [account-admin.md](account-admin.md) — the user editor, the ng `accounts` family, `hxd account` | yes, less renames and the 1.8 batch editor | all | design; §5 is the ng spec |
-| [roles.md](roles.md) — named sets of grants accounts hold; configuration and a deny mask resolved to the access every wire sees; restrictions; `@role` in the period editor; `read`/`post` gates for rooms and news; role and person mentions | no | all (period sees effective bits) | design; §7, §9.4, §11.3, §12.5 are the ng spec |
+| [roles.md](roles.md) — named sets of grants accounts hold; configuration and a deny mask resolved to the access every wire sees; restrictions; `@role` in the period editor; `read`/`post` gates for rooms and news; role and person mentions | the roles file, resolution, `everyone` and the command line (G1) | all (period sees effective bits) | design; §7, §9.4, §11.3, §12.5 are the ng spec |
 | [private-messages.md](private-messages.md) — the offline inbox | yes | all (period receives) | design |
 | [chat-history.md](chat-history.md) — server-held scrollback, fogWraith's Get Chat History | yes | extended, ng | design, implements a fogWraith spec |
-| [chat-rooms.md](chat-rooms.md) — curated, persistent rooms gated by `read` and `post` lists, logged where history is; public chat as the lobby; period clients join through the system account | no | all (period joins by invite) | design; §7 is the ng spec |
+| [chat-rooms.md](chat-rooms.md) — curated, persistent rooms gated by `read` and `post` lists, logged where history is; public chat as the lobby; period clients join through the system account | R1–R3; not `700` per room, secure rooms or rooms across links | all (period joins by invite) | design; §7 is the ng spec |
+| [avatars.md](avatars.md) — a user's picture on both wires: fogWraith's GIF Icons and the ng `avatars` capability | yes | extended, ng | design, implements a fogWraith spec |
+| [banner.md](banner.md) — the server banner, held or by URL, on both wires | yes | all | design |
 | [inline-media.md](inline-media.md) — images in chat, fogWraith's Inline Media | yes | extended, ng (period sees the caption) | design, implements a fogWraith spec |
 | [moderation.md](moderation.md) — reports, redaction, revocation, purge | yes, less vouching | all (period reports and is moderated) | design; §5 is the ng spec |
+| [news-feeds.md](news-feeds.md) — RSS, Atom and JSON Feed polled into read-only news categories | through F3; not hx-ng's side (F4) | all | design |
 | [news.md](news.md) — threaded news, references, follows, search, markdown, the legacy bindings | yes, less the image part and the importer | all | design; §9–§10 are the ng spec |
 | [system-account.md](system-account.md) — the reserved server account: commands and notifications on the classic wire | yes, less `/vouch` and queued mail | all | design |
-| [server-link.md](server-link.md) — joining fogWraith's linked network: ghosts, the link wire, key mode | no | all (ghosts are users to every client) | design, implements a fogWraith spec |
+| [server-link.md](server-link.md) — joining fogWraith's linked network: ghosts, the link wire, key mode | users, chat, messages, user info and moderation across links, and relaying between them | all (ghosts are users to every client) | design, implements a fogWraith spec |
 | [voice.md](voice.md) — the SFU, one room across both signalling wires | yes | extended, ng | design, implements a fogWraith spec |
 | [capabilities-video.md](capabilities-video.md) — video publications and subscriptions | yes | ng; extended when GtkHx renders | spec, contributed to fogWraith's set |
-| [hope.md](hope.md) — HOPE, the secure login and transport encryption on the classic wire | yes, less `DATA_LINK_USER_TRANSPORT` | period and extended clients that speak HOPE | design |
-| [files-plan.md](files-plan.md) — the file area: browsing, downloads, the local area and uploads | yes, less folders and file management | all (ng browses and downloads) | design |
+| [hope.md](hope.md) — HOPE, the secure login and transport encryption on the classic wire | yes | period and extended clients that speak HOPE | design |
+| [files-plan.md](files-plan.md) — the file area: browsing, downloads, the local area and uploads | yes, less aliases and folder transfers on ng | all | design |
 | [ng-uploads.md](ng-uploads.md) — uploads on the ng wire: `files_upload`, pieces over HTTP, resume | yes, server | ng | design |
 | [file-sources.md](file-sources.md) — exploratory background for files | superseded | — | design |
 | [tracker-registration.md](tracker-registration.md) — HTRK v1/v3 server heartbeats, authentication and operator configuration | yes | server infrastructure | design; implements fogWraith specs |
 | [metrics.md](metrics.md) — `GET /metrics`: locks, the store, the blocking pool, fan-out, the wires, the roster's census | yes, behind the `metrics` feature | operators | design |
+| [operating.md](operating.md) — running a server: install, ports, the proxy, accounts, backups, SIGHUP, every config key | yes | operators | design |
+| [docker.md](docker.md) — the image, its variables, the proxy, state and backups, relay mode | yes | operators | design |
 | [load-testing.md](load-testing.md) — `hxd-load`: scenarios on both wires, open-loop, with the invariants checked under load | yes: login storm, chat, slow consumer, churn | operators, developers | design |
 
 ## Proposals

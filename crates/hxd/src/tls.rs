@@ -135,7 +135,7 @@ fn provision(section: &TlsSection, server_name: &str) -> Result<(), String> {
     tracing::warn!(
         "[tls] made a self-signed certificate at {}: clients will ask their users to \
          trust it on first connect. A certificate from Let's Encrypt avoids that for a \
-         server with a DNS name (README, \"TLS on the legacy wire\")",
+         server with a DNS name (docs/operating.md, \"TLS on the classic wire\")",
         section.cert.display()
     );
     Ok(())
