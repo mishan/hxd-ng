@@ -299,6 +299,48 @@ fn a_room_line_its_image_and_its_redaction_stay_in_the_room() {
     }
 }
 
+/// A guid is its sender's in one room: the same one in the lobby and in
+/// a room is two lines, and sent again in the room is one, its guid on
+/// the sender's copy alone.
+#[test]
+fn a_guid_is_held_per_room() {
+    let core = with_rooms(
+        Core::new().with_history(Arc::new(MemoryLog::default()), HistoryPolicy::default()),
+    );
+    let (boss, _) = attach(&core, manager("boss"));
+    let room = core.room_create(boss, named("lounge")).unwrap().id;
+    let (alice, mut ra) = attach(&core, member("alice"));
+    let (bob, mut rb) = attach(&core, member("bob"));
+    core.room_join(alice, room).unwrap();
+    core.room_join(bob, room).unwrap();
+    drain(&mut ra);
+    drain(&mut rb);
+    let guid = crate::inbox::MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
+    let send = |room, text: &str| {
+        core.chat_public_guid(alice, room, (text.into(), 0, None), Some(guid.clone()))
+            .unwrap()
+            .expect("a logged line")
+    };
+    let lobby = send(0, "lobby");
+    let first = send(room, "room");
+    assert_ne!(lobby, first);
+    assert_eq!(send(room, "room again"), first);
+    let said = |events: Vec<Event>| -> Vec<(String, Option<crate::inbox::MessageGuid>)> {
+        about(&events, room)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Chat { text, guid, .. } => Some((text, guid)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        said(drain(&mut ra)),
+        [("room".to_string(), Some(guid.clone()))]
+    );
+    assert_eq!(said(drain(&mut rb)), [("room".to_string(), None)]);
+}
+
 #[test]
 fn rooms_need_no_history() {
     let core = with_rooms(Core::new());
@@ -679,6 +721,7 @@ fn a_room_id_is_never_drawn_again() {
         text: "a line from before".into(),
         flags: Default::default(),
         at: SystemTime::now(),
+        guid: None,
     })
     .unwrap();
     let store = Arc::new(MemoryRooms::new(RoomFile {

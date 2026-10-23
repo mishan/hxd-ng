@@ -28,7 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hxd_core::history::{
-    ChatLog, HistoryPage, HistoryQuery, LineFlags, LineId, LogLine, MediaMeta, NewLine, Retention,
+    Appended, ChatLog, HistoryPage, HistoryQuery, LineFlags, LineId, LogLine, MediaMeta, NewLine,
+    Retention,
 };
 use hxd_core::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
@@ -71,7 +72,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -611,6 +612,18 @@ CREATE TABLE push_sidecar (
 );
 ";
 
+/// A public chat line's guid and the mailbox it is held under
+/// (`docs/hotline-ng.md` §7.3), so a repeat after a restart is answered
+/// as its line: one line per channel, sender and guid while the line is
+/// kept. The sender is `hxd_core::history::guid_sender_key`'s, written
+/// whole, so nothing here needs backfilling.
+const SCHEMA_V22: &str = "
+ALTER TABLE chat_line ADD COLUMN guid TEXT;
+ALTER TABLE chat_line ADD COLUMN guid_from TEXT;
+CREATE UNIQUE INDEX chat_line_guid ON chat_line (channel, guid_from, guid)
+  WHERE guid IS NOT NULL;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -650,28 +663,65 @@ CREATE INDEX moderation_evidence_at ON moderation (at)
 CREATE INDEX report_closed_at ON report (closed_at) WHERE closed_at IS NOT NULL;
 ";
 
-fn insert_line(conn: &Connection, line: &NewLine) -> Result<LineId, StoreError> {
+/// A line, or for one whose guid is logged already, nothing, answering
+/// that line's id: a repeat that raced its original past the caller's
+/// lookup is still the one line.
+fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError> {
+    let inserted = conn
+        .prepare_cached(
+            "INSERT INTO chat_line
+           (channel, nick, login, login_fp, icon, flags, body, at, ghost, guid, guid_from)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT (channel, guid_from, guid) WHERE guid IS NOT NULL DO NOTHING",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                i64::from(line.channel),
+                line.from_nick,
+                line.from_login,
+                line.from_fingerprint.as_ref().map(fp_hex),
+                i64::from(line.icon),
+                i64::from(line.flags.bits()),
+                line.text,
+                unix(line.at),
+                line.ghost.as_ref().map(|k| &k[..]),
+                line.guid.as_ref().map(|(_, g)| g.as_str()),
+                line.guid.as_ref().map(|(sender, _)| sender),
+            ])
+        })
+        .map_err(StoreError::new)?;
+    if inserted == 0 {
+        let (sender, guid) = line
+            .guid
+            .as_ref()
+            .ok_or_else(|| StoreError::new("a chat line without a guid was not inserted"))?;
+        let id = find_line_guid(conn, line.channel, sender, guid)?
+            .ok_or_else(|| StoreError::new("a chat line's guid conflicts with no line"))?;
+        return Ok(Appended { id, new: false });
+    }
+    let id = LineId::try_from(conn.last_insert_rowid())
+        .map_err(|_| StoreError::new("SQLite issued a negative chat line id"))?;
+    Ok(Appended { id, new: true })
+}
+
+fn find_line_guid(
+    conn: &Connection,
+    channel: u32,
+    sender: &str,
+    guid: &MessageGuid,
+) -> Result<Option<LineId>, StoreError> {
     conn.prepare_cached(
-        "INSERT INTO chat_line
-           (channel, nick, login, login_fp, icon, flags, body, at, ghost)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "SELECT id FROM chat_line WHERE channel = ?1 AND guid_from = ?2 AND guid = ?3",
     )
     .and_then(|mut stmt| {
-        stmt.execute(params![
-            i64::from(line.channel),
-            line.from_nick,
-            line.from_login,
-            line.from_fingerprint.as_ref().map(fp_hex),
-            i64::from(line.icon),
-            i64::from(line.flags.bits()),
-            line.text,
-            unix(line.at),
-            line.ghost.as_ref().map(|k| &k[..]),
-        ])
+        stmt.query_row(params![i64::from(channel), sender, guid.as_str()], |r| {
+            r.get::<_, i64>(0)
+        })
+        .optional()
     })
-    .map_err(StoreError::new)?;
-    LineId::try_from(conn.last_insert_rowid())
-        .map_err(|_| StoreError::new("SQLite issued a negative chat line id"))
+    .map_err(StoreError::new)?
+    .map(|id| LineId::try_from(id).map_err(|_| StoreError::new("negative chat line id")))
+    .transpose()
 }
 
 /// The mailbox-matching rule (`hxd_core::inbox::Mailbox`) as a SQL
@@ -1274,6 +1324,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 21 {
         steps.push_str(SCHEMA_V21);
+    }
+    if version < 22 {
+        steps.push_str(SCHEMA_V22);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -2117,15 +2170,10 @@ fn collect_history(
 }
 
 impl ChatLog for SqliteStore {
-    fn append(&self, line: &NewLine) -> Result<LineId, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        insert_line(&conn, line)
-    }
-
     /// One transaction: one commit, and one write of each page the lines
     /// touch, where a commit each wrote the table's and its indexes' last
     /// pages again for every line, and with `sync = "full"` synced them.
-    fn append_all(&self, lines: &[NewLine]) -> Result<Vec<LineId>, StoreError> {
+    fn append_all(&self, lines: &[NewLine]) -> Result<Vec<Appended>, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(StoreError::new)?;
         let ids = lines
@@ -2374,6 +2422,15 @@ impl ChatLog for SqliteStore {
         .map_err(StoreError::new)
     }
 
+    fn find_guid(
+        &self,
+        channel: u32,
+        sender: &str,
+        guid: &MessageGuid,
+    ) -> Result<Option<LineId>, StoreError> {
+        find_line_guid(&self.conn.lock().unwrap(), channel, sender, guid)
+    }
+
     fn attach_media(&self, id: LineId, media: &MediaMeta) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let changed = conn
@@ -2435,6 +2492,7 @@ mod tests {
                     text: text.clone(),
                     flags: Default::default(),
                     at: SystemTime::now(),
+                    guid: None,
                 })
                 .unwrap();
         }
@@ -2502,6 +2560,7 @@ mod tests {
                     text: text.clone(),
                     flags: Default::default(),
                     at: SystemTime::now(),
+                    guid: None,
                 })
                 .unwrap();
             std::thread::sleep(Duration::from_millis(1));
@@ -2541,6 +2600,7 @@ mod tests {
             text: "x".repeat(64),
             flags: Default::default(),
             at: SystemTime::now(),
+            guid: None,
         };
         store.append(&line()).unwrap();
         // An operator's shell, say, in the middle of a read.
@@ -2670,6 +2730,7 @@ mod tests {
             text: "beside".into(),
             flags: Default::default(),
             at: SystemTime::now(),
+            guid: None,
         };
         let began = std::time::Instant::now();
         let ids = beside.append_all(&[line.clone(), line]).unwrap();
@@ -2685,7 +2746,10 @@ mod tests {
             .unwrap();
         let bodies: Vec<_> = page.lines.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(bodies, ["held", "beside", "beside"]);
-        assert_eq!(page.lines.last().map(|l| l.id), ids.last().copied());
+        assert_eq!(
+            page.lines.last().map(|l| l.id),
+            ids.last().map(|done| done.id)
+        );
     }
 
     /// A closed store leaves no WAL behind: the checkpointer's connection

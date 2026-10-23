@@ -840,7 +840,11 @@ async fn the_ng_join_reply_mirrors_the_legacy_one() {
     let (_legacy, ng, media) = start_both(td.path(), true).await;
 
     let mut a = Ng::login(ng, "talker").await;
-    assert_eq!(a.caps, json!(["voice"]), "the login reply feature-detects");
+    assert_eq!(
+        a.caps,
+        json!(["voice", "chat_guid"]),
+        "the login reply feature-detects"
+    );
 
     let ok = a.ok("voice_join", json!({ "cid": 0 })).await;
     assert_eq!(ok["codec"], json!("PCMU"));
@@ -964,7 +968,7 @@ async fn a_server_without_an_sfu_says_so_on_the_ng_wire_too() {
     let td = tempfile::tempdir().unwrap();
     let (_legacy, ng, _media) = start_both(td.path(), false).await;
     let mut a = Ng::login(ng, "talker").await;
-    assert_eq!(a.caps, json!([]));
+    assert_eq!(a.caps, json!(["chat_guid"]));
     let (code, _) = a.request("voice_join", json!({})).await.unwrap_err();
     assert_eq!(code, "voice_disabled");
 }

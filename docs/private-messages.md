@@ -503,7 +503,7 @@ neither rather than guessing — a client that sent both meant something.
 
 | `req` | params | ok | notes |
 |---|---|---|---|
-| `msg` | `to` (uid) **or** `to_login`, `text`, `guid?` | `{ "queued": bool }` | exactly one address; a repeated `guid` is the same message (§5) |
+| `msg` | `to` (uid) **or** `to_login`, `text`, `guid?` | `{ "queued": bool, "id"? }`, `id` when queued and the sender has an inbox | exactly one address; a repeated `guid` is the same message (§5) |
 | `inbox` | `before?` (id), `limit?` (default 50, max 200) | `{ messages, unread, total }` | newest first, paginating backwards |
 | `msg_read` | `up_to` (id) | `{ unread, total }` | marks everything of the caller's up to that id |
 | `block` / `unblock` | `uid` **or** `login` (`unblock` may instead use `fingerprint`) | `{}` | §9; the uid form names a sender with no account login |

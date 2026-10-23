@@ -935,6 +935,12 @@ async fn handle_login(
     if ctx.banner.is_some() && !caps.iter().any(|c| c == "banner") {
         caps.push("banner".into());
     }
+    // And `chat_guid` always: a client that finds it may send a line
+    // again under its guid, where to a server without it a retry is a
+    // second line.
+    if !caps.iter().any(|c| c == "chat_guid") {
+        caps.push("chat_guid".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
@@ -1598,17 +1604,29 @@ async fn dispatch(
                             .await
                     }
                 };
+                // Parsed as `msg`'s is, so the room's memory of guids
+                // holds only canonical UUIDs.
+                let guid = match p.guid.as_deref().map(MessageGuid::parse) {
+                    None => None,
+                    Some(Some(g)) => Some(g),
+                    Some(None) => {
+                        return finish(
+                            ws_tx,
+                            reply_err(req.id, "bad_request", "`guid` is not a UUID."),
+                        )
+                        .await
+                    }
+                };
                 let mut text = p.text;
                 text.truncate_to_char_boundary(4096);
                 let (uid, room) = (state.uid, p.room);
                 let said = off_reactor(&ctx.core, move |c| {
-                    c.chat_public_all(uid, room, vec![(text, style, media)])
-                        .pop()
+                    c.chat_public_guid(uid, room, (text, style, media), guid)
                 })
-                .await
-                .flatten();
+                .await;
                 match said {
-                    Some(Ok(_)) => reply_ok(req.id, json!({})),
+                    Some(Ok(None)) => reply_ok(req.id, json!({})),
+                    Some(Ok(Some(id))) => reply_ok(req.id, json!({ "id": id })),
                     // Sending does not join (docs/chat-rooms.md §7.2).
                     Some(Err(ChatError::NoSuchChat)) => {
                         reply_err(req.id, "no_such_room", "No such room.")
@@ -1819,12 +1837,12 @@ async fn dispatch(
                 // One mapping for both ways of addressing, so a code
                 // cannot be added to one and forgotten on the other.
                 match outcome {
-                    // The reply says whether it waited, and nothing else:
-                    // the message id is the *recipient's* handle for
-                    // marking read, and handing a monotonic id to the
-                    // sender would tell them how much mail this server
-                    // carries.
                     Ok(MsgOutcome::Delivered) => reply_ok(req.id, json!({ "queued": false })),
+                    // Only to a sender with an inbox, which could read the
+                    // same counter by mailing itself (rationale §5).
+                    Ok(MsgOutcome::Queued(id)) if ctx.core.has_inbox(from) => {
+                        reply_ok(req.id, json!({ "queued": true, "id": id }))
+                    }
                     Ok(MsgOutcome::Queued(_)) => reply_ok(req.id, json!({ "queued": true })),
                     Err(ChatError::MailboxFull) => {
                         reply_err(req.id, "mailbox_full", "That user's mailbox is full.")

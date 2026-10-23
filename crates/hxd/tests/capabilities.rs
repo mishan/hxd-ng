@@ -195,13 +195,14 @@ async fn ng_login_reply_carries_the_capability_list() {
     let (_legacy, ng) = start_server(td.path(), Caps::empty(), &["voice"]).await;
 
     let ok = ng_login(ng).await;
-    assert_eq!(ok["caps"], json!(["voice"]));
+    assert_eq!(ok["caps"], json!(["voice", "chat_guid"]));
 
     // The list is always present, so a client can test it without
-    // distinguishing "no capabilities" from "old server".
+    // distinguishing "no capabilities" from "old server"; and every
+    // server of this build honors a chat line's guid.
     let td2 = tempfile::tempdir().unwrap();
     let (_legacy, ng) = start_server(td2.path(), Caps::empty(), &[]).await;
-    assert_eq!(ng_login(ng).await["caps"], json!([]));
+    assert_eq!(ng_login(ng).await["caps"], json!(["chat_guid"]));
 }
 
 async fn ng_login(addr: SocketAddr) -> Value {

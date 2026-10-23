@@ -4750,6 +4750,7 @@ sync = "full"
                 text: "hello".into(),
                 flags: Default::default(),
                 at: SystemTime::now(),
+                guid: None,
             })
             .unwrap();
         let page = history

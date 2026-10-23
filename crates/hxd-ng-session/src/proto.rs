@@ -53,6 +53,10 @@ pub struct ChatParams {
     /// The room it is said in; 0 or absent is the lobby.
     #[serde(default)]
     pub room: u32,
+    /// The client's own id for the line, as on `msg`: sent again under
+    /// the same guid into the same room, lately, it is the same line.
+    #[serde(default)]
+    pub guid: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -625,6 +629,8 @@ struct ChatData<'a> {
     id: Option<hxd_core::history::LineId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     media: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guid: Option<&'a str>,
 }
 
 #[derive(serde::Serialize)]
@@ -669,6 +675,7 @@ pub fn event_json(se: &SeqEvent) -> String {
         id,
         at,
         media,
+        guid,
     } = &se.event
     {
         let data = ChatData {
@@ -681,6 +688,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             at: unix(*at),
             id: *id,
             media: media.as_ref().map(crate::media::media_json),
+            guid: guid.as_ref().map(|g| g.as_str()),
         };
         return serde_json::to_string(&EventOut {
             seq: se.seq,
@@ -854,6 +862,7 @@ fn in_room_json(room: u32, event: &Event) -> (&'static str, Value) {
             id,
             at,
             media,
+            guid,
             ..
         } => {
             let data = ChatData {
@@ -866,6 +875,7 @@ fn in_room_json(room: u32, event: &Event) -> (&'static str, Value) {
                 at: unix(*at),
                 id: *id,
                 media: media.as_ref().map(crate::media::media_json),
+                guid: guid.as_ref().map(|g| g.as_str()),
             };
             (
                 "chat",

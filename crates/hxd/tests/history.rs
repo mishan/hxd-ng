@@ -30,6 +30,18 @@ const REQ_USER_GETLIST: u32 = 0x12c;
 const REQ_HISTORY: u32 = 700;
 
 async fn start_server(dir: &Path, replay: usize) -> (SocketAddr, SocketAddr) {
+    start_stoppable(dir, replay).await.0
+}
+
+/// A server, the store it holds, and what stops its listeners.
+async fn start_stoppable(
+    dir: &Path,
+    replay: usize,
+) -> (
+    (SocketAddr, SocketAddr),
+    Arc<SqliteStore>,
+    [tokio::task::AbortHandle; 2],
+) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     std::fs::write(
@@ -47,7 +59,7 @@ async fn start_server(dir: &Path, replay: usize) -> (SocketAddr, SocketAddr) {
 
     let store = Arc::new(SqliteStore::open(dir.join("server.sqlite"), Synchronous::Full).unwrap());
     let core = Arc::new(Core::new().with_history(
-        store,
+        store.clone(),
         HistoryPolicy {
             max_lines: 10_000,
             max_days: 30,
@@ -102,9 +114,11 @@ async fn start_server(dir: &Path, replay: usize) -> (SocketAddr, SocketAddr) {
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addresses = (legacy.local_addr().unwrap(), ng.local_addr().unwrap());
-    tokio::spawn(hxd_session::serve(legacy, legacy_ctx));
-    tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
-    addresses
+    let stop = [
+        tokio::spawn(hxd_session::serve(legacy, legacy_ctx)).abort_handle(),
+        tokio::spawn(hxd_ng_session::serve(ng, ng_ctx)).abort_handle(),
+    ];
+    (addresses, store, stop)
 }
 
 fn xor(bytes: &[u8]) -> Vec<u8> {
@@ -230,6 +244,15 @@ impl Ng {
     }
 
     async fn login_as(addr: SocketAddr, login: &str, password: &str, nick: &str) -> (Self, Value) {
+        Self::handshake(
+            addr,
+            "login",
+            json!({ "login": login, "password": password, "nick": nick }),
+        )
+        .await
+    }
+
+    async fn handshake(addr: SocketAddr, method: &str, params: Value) -> (Self, Value) {
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
@@ -238,12 +261,7 @@ impl Ng {
             next: 1,
             events: Vec::new(),
         };
-        let reply = client
-            .request(
-                "login",
-                json!({ "login": login, "password": password, "nick": nick }),
-            )
-            .await;
+        let reply = client.request(method, params).await;
         assert!(reply.get("ok").is_some(), "{reply}");
         (client, reply["ok"].clone())
     }
@@ -531,4 +549,116 @@ async fn a_page_of_long_lines_stays_inside_one_transaction() {
     assert_eq!(forward.first().unwrap().0, 2);
     assert!((forward.len() as u64) < LINES - 1);
     assert!(has_more(&page));
+}
+
+/// A line sent again under its guid, from a resumed session after its
+/// socket dropped and from a new login of the account, is the line it
+/// repeats: answered with its id, and heard once on both wires. Its
+/// guid reaches the session that sent it and nobody else.
+#[tokio::test]
+async fn a_line_sent_again_under_its_guid_is_heard_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy_addr, ng_addr) = start_server(dir.path(), 0).await;
+    let (mut legacy, _) = Legacy::login(legacy_addr, "alice", "", "", false).await;
+    let (mut watcher, _) = Ng::login_as(ng_addr, "", "", "Watcher").await;
+    let (mut bob, hello) = Ng::login(ng_addr).await;
+    let guid = "5f5e1000-1234-4abc-89ab-000000000001";
+
+    let sent = bob
+        .request("chat", json!({ "text": "once", "guid": guid }))
+        .await;
+    let id = sent["ok"]["id"]
+        .as_u64()
+        .expect("a kept line is answered its id");
+    let mine = bob.event("chat").await;
+    assert_eq!(mine["data"]["id"], id);
+    assert_eq!(mine["data"]["guid"], guid);
+    let theirs = watcher.event("chat").await;
+    assert_eq!(theirs["data"]["id"], id);
+    assert!(theirs["data"].get("guid").is_none(), "{theirs}");
+    legacy.recv_type(HDR_CHAT).await;
+
+    // The socket dies before the client believes the reply.
+    drop(bob);
+    let (mut bob, _) = Ng::handshake(
+        ng_addr,
+        "resume",
+        json!({ "session": hello["session"], "token": hello["token"], "last_seq": mine["seq"] }),
+    )
+    .await;
+    let again = bob
+        .request(
+            "chat",
+            json!({ "text": "once", "guid": guid.to_uppercase() }),
+        )
+        .await;
+    assert_eq!(again["ok"], json!({ "id": id }), "the same line");
+    bob.request("logout", json!({})).await;
+
+    let (mut bob, _) = Ng::login(ng_addr).await;
+    let fresh = bob
+        .request("chat", json!({ "text": "once", "guid": guid }))
+        .await;
+    assert_eq!(fresh["ok"], json!({ "id": id }), "the account's line");
+    let junk = bob
+        .request("chat", json!({ "text": "x", "guid": "not-a-uuid" }))
+        .await;
+    assert_eq!(junk["error"]["code"], "bad_request");
+
+    // The next line anyone hears is the next one sent.
+    bob.request("chat", json!({ "text": "after" })).await;
+    assert_eq!(watcher.event("chat").await["data"]["text"], "after");
+    let line = legacy.recv_type(HDR_CHAT).await;
+    let body = line.chunks().find(|c| c.tag == tag::BODY).unwrap().data;
+    assert!(body.ends_with(b"after"), "{body:?}");
+    let page = bob.request("history", json!({})).await;
+    let texts: Vec<&str> = page["ok"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["once", "after"]);
+}
+
+/// A guid lasts as long as its line is kept: sent again to a server
+/// restarted on the same database, once the first has let go of it, the
+/// line is answered as it was and logged once, and `history` never
+/// carries the guid.
+#[tokio::test]
+async fn a_lines_guid_outlives_its_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let guid = "5f5e1000-1234-4abc-89ab-000000000002";
+    let ((_, ng), store, stop) = start_stoppable(dir.path(), 0).await;
+    let (mut bob, _) = Ng::login(ng).await;
+    let sent = bob
+        .request("chat", json!({ "text": "before", "guid": guid }))
+        .await;
+    let id = sent["ok"]["id"].as_u64().expect("a kept line's id");
+    bob.request("logout", json!({})).await;
+    stop.iter().for_each(tokio::task::AbortHandle::abort);
+    timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(&store) > 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first server let go of its store");
+    drop(store);
+
+    let (_, ng) = start_server(dir.path(), 0).await;
+    let (mut bob, hello) = Ng::login(ng).await;
+    assert!(hello["caps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cap| cap == "chat_guid"));
+    let again = bob
+        .request("chat", json!({ "text": "before", "guid": guid }))
+        .await;
+    assert_eq!(again["ok"], json!({ "id": id }), "the line it repeats");
+    let page = bob.request("history", json!({})).await;
+    let lines = page["ok"]["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 1, "{page}");
+    assert!(lines[0].get("guid").is_none(), "{page}");
 }
